@@ -74,7 +74,6 @@ async fn main() -> Result<(), IggyError> {
     tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
     println!("Stop the message stream and shutdown iggy client");
-    client.delete_stream(config.stream_id()).await?;
     client.shutdown().await?;
 
     Ok(())

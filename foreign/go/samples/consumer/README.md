@@ -20,7 +20,7 @@ In order to successfully launch the consumer app follow these steps:
     ```sh
     git clone https://github.com/iggy-rs/iggy.git
     cd iggy
-    cargo r --bin server -r
+    cargo run--bin server -r
     ```
 1. Open new terminal instance and enter `iggy-go` root folder
     ```sh
@@ -35,7 +35,7 @@ In order to successfully launch the consumer app follow these steps:
 
     ```sh
     $ go run ./samples/consumer
-    
+
     Stream with ID: 1 exists.
     Topic with ID: 1 exists.
     Messages will be polled from stream '1', topic '1', partition '1' with interval 1000 ms.

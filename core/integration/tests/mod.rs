@@ -30,7 +30,6 @@ mod bench;
 mod cli;
 mod config_provider;
 mod data_integrity;
-mod examples;
 mod sdk;
 mod server;
 mod state;

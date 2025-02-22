@@ -1,5 +1,5 @@
 <div align="center">
-    
+
 [![.NET](https://github.com/iggy-rs/iggy-dotnet-client/actions/workflows/dotnet.yml/badge.svg)](https://github.com/iggy-rs/iggy-dotnet-client/actions/workflows/dotnet.yml)
 [![Nuget (with prereleases)](https://img.shields.io/nuget/vpre/Iggy)](https://www.nuget.org/packages/Iggy)
 
@@ -179,18 +179,18 @@ Func<byte[], byte[]> encryptor = static payload =>
 {
     string aes_key = "AXe8YwuIn1zxt3FPWTZFlAa14EHdPAdN9FaZ9RQWihc=";
     string aes_iv = "bsxnWolsAyO7kCfWuyrnqg==";
-    
+
     var key = Convert.FromBase64String(aes_key);
     var iv = Convert.FromBase64String(aes_iv);
-    
+
     using Aes aes = Aes.Create();
     ICryptoTransform encryptor = aes.CreateEncryptor(key, iv);
-    
+
     using MemoryStream memoryStream = new MemoryStream();
     using CryptoStream cryptoStream = new CryptoStream(memoryStream, encryptor, CryptoStreamMode.Write);
     using BinaryWriter streamWriter = new BinaryWriter(cryptoStream);
     streamWriter.Write(payload);
-    
+
     return memoryStream.ToArray();
 };
 
@@ -219,11 +219,11 @@ Furthermore, there's a generic overload for this method that takes binary serial
 Func<Envelope, byte[]> serializer = static envelope =>
 {
     Span<byte> buffer = stackalloc byte[envelope.MessageType.Length + 4 + envelope.Payload.Length];
-    
+
     BinaryPrimitives.WriteInt32LittleEndian(buffer[..4], envelope.MessageType.Length);
     Encoding.UTF8.GetBytes(envelope.MessageType).CopyTo(buffer[4..(envelope.MessageType.Length + 4)]);
     Encoding.UTF8.GetBytes(envelope.Payload).CopyTo(buffer[(envelope.MessageType.Length + 4)..]);
-    
+
     return buffer.ToArray();
 };
 
@@ -270,17 +270,17 @@ Func<byte[], byte[]> decryptor = static payload =>
 {
     string aes_key = "AXe8YwuIn1zxt3FPWTZFlAa14EHdPAdN9FaZ9RQWihc=";
     string aes_iv = "bsxnWolsAyO7kCfWuyrnqg==";
-    
+
     var key = Convert.FromBase64String(aes_key);
     var iv = Convert.FromBase64String(aes_iv);
-    
+
     using Aes aes = Aes.Create();
     ICryptoTransform decryptor = aes.CreateDecryptor(key, iv);
-    
+
     using MemoryStream memoryStream = new MemoryStream(payload);
     using CryptoStream cryptoStream = new CryptoStream(memoryStream, decryptor, CryptoStreamMode.Read);
     using BinaryReader binaryReader = new BinaryReader(cryptoStream);
-    
+
     return binaryReader.ReadBytes(payload.Length);
 };
 
@@ -347,11 +347,11 @@ For more information about how Iggy works check its [documentation](https://docs
 
 https://github.com/iggy-rs/iggy-dotnet-client/assets/112548209/3a89d2f5-d066-40d2-8b82-96c3e338007e
 
-To run the samples, first get [Iggy](https://github.com/spetz/iggy), Run the server with `cargo r --bin server`, then get the SDK, cd into `Iggy_SDK`
+To run the samples, first get [Iggy](https://github.com/spetz/iggy), Run the server with `cargo run--bin server`, then get the SDK, cd into `Iggy_SDK`
 and run following commands: `dotnet run -c Release --project Iggy_Sample_Producer` for producer, `dotnet run -c Release --project Iggy_Sample_Consumer`
 for consumer.
 
-## TODO 
+## TODO
 - Add support for `ASP.NET Core` Dependency Injection
 
 

@@ -450,7 +450,7 @@ impl IggyProducer {
         mode: SendMode,
     ) -> Self {
         let core = Arc::new(ProducerCore {
-            initialized: AtomicBool::new(true),
+            initialized: AtomicBool::new(false),
             client: Arc::new(client),
             can_send: Arc::new(AtomicBool::new(true)),
             stream_id: Arc::new(stream),

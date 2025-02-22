@@ -16,8 +16,6 @@
  * under the License.
  */
 
-use std::{env, str::FromStr, time::Duration};
-
 use chrono::{DateTime, Days, Utc};
 use iggy::prelude::{
     Client, DirectConfig, IggyClient, IggyClientBuilder, IggyDuration, IggyError, IggyMessage,
@@ -28,8 +26,8 @@ use rand::{
     distr::{Alphanumeric, Uniform},
 };
 use serde::{Deserialize, Serialize};
+use std::{env, str::FromStr};
 use thiserror::Error;
-use tokio::time::sleep;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -70,8 +68,8 @@ async fn main() -> Result<(), DataProducerError> {
 
     let mut rng = rand::rng();
     let mut batches_count = 0;
-    while batches_count < 100000 {
-        let records_count = rng.sample(Uniform::new(500u32, 1000).unwrap());
+    while batches_count < 100 {
+        let records_count = rng.sample(Uniform::new(100u32, 500).unwrap());
         let messages = (0..records_count)
             .map(|_| random_record())
             .flat_map(|record| serde_json::to_string(&record).ok())
@@ -79,7 +77,6 @@ async fn main() -> Result<(), DataProducerError> {
             .collect::<Vec<_>>();
         producer.send(messages).await?;
         info!("Sent {records_count} messages");
-        sleep(Duration::from_millis(10)).await;
         batches_count += 1;
     }
 

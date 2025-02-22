@@ -145,6 +145,9 @@ jobs:
       - name: Run cargo test (doc)
         run: |
           cargo test --doc
+      - name: Run cargo doc
+        run: |
+          cargo doc --no-deps --all-features --quiet
 
   unused_dependencies:
     name: cargo machete

@@ -16,7 +16,6 @@
  * under the License.
  */
 
-use clap::Parser;
 use iggy::prelude::*;
 use iggy_examples::shared::args::Args;
 use iggy_examples::shared::messages_generator::MessagesGenerator;
@@ -30,7 +29,7 @@ use tracing_subscriber::{EnvFilter, Registry};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<(), Box<dyn Error>> {
-    let args = Args::parse();
+    let args = Args::parse_with_defaults("new-sdk-producer");
     Registry::default()
         .with(tracing_subscriber::fmt::layer())
         .with(EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("INFO")))
@@ -44,6 +43,11 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     let client = IggyClient::builder().with_client(client).build()?;
     client.connect().await?;
     let interval = IggyDuration::from_str(&args.interval)?;
+    let partitioning = if args.balanced_producer {
+        Partitioning::balanced()
+    } else {
+        Partitioning::partition_id(args.partition_id)
+    };
     let producer = client
         .producer(&args.stream_id, &args.topic_id)?
         .direct(
@@ -52,9 +56,9 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
                 .linger_time(interval)
                 .build(),
         )
-        .partitioning(Partitioning::balanced())
+        .partitioning(partitioning)
         .create_topic_if_not_exists(
-            3,
+            args.partitions_count,
             None,
             IggyExpiry::ServerDefault,
             MaxTopicSize::ServerDefault,

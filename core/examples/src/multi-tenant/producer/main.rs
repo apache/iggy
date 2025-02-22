@@ -17,7 +17,6 @@
  */
 
 use ahash::AHashMap;
-use clap::Parser;
 use futures_util::future::join_all;
 use iggy::prelude::*;
 use iggy_examples::shared::args::Args;
@@ -78,7 +77,7 @@ impl TenantProducer {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<(), Box<dyn Error>> {
-    let args = Args::parse();
+    let args = Args::parse_with_defaults("multi-tenant-producer");
     Registry::default()
         .with(tracing_subscriber::fmt::layer())
         .with(EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("INFO")))
