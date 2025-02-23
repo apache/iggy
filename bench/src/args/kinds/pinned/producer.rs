@@ -12,8 +12,9 @@ pub struct PinnedProducerArgs {
     pub transport: BenchmarkTransportCommand,
 
     /// Number of streams
-    #[arg(long, short = 's', default_value_t = DEFAULT_PINNED_NUMBER_OF_STREAMS)]
-    pub streams: NonZeroU32,
+    /// If not provided then number of streams will be equal to number of producers.
+    #[arg(long, short = 's')]
+    pub streams: Option<NonZeroU32>,
 
     /// Number of producers
     #[arg(long, short = 'c', default_value_t = DEFAULT_NUMBER_OF_PRODUCERS)]
@@ -26,7 +27,7 @@ pub struct PinnedProducerArgs {
 
 impl BenchmarkKindProps for PinnedProducerArgs {
     fn streams(&self) -> u32 {
-        self.streams.get()
+        self.streams.unwrap_or(self.producers).get()
     }
 
     fn partitions(&self) -> u32 {

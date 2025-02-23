@@ -12,8 +12,9 @@ pub struct PinnedProducerAndConsumerArgs {
     pub transport: BenchmarkTransportCommand,
 
     /// Number of streams
-    #[arg(long, short = 's', default_value_t = DEFAULT_PINNED_NUMBER_OF_STREAMS)]
-    pub streams: NonZeroU32,
+    /// If not provided then number of streams will be equal to number of producers.
+    #[arg(long, short = 's')]
+    pub streams: Option<NonZeroU32>,
 
     /// Number of partitions
     #[arg(long, short = 'a',default_value_t = DEFAULT_PINNED_NUMBER_OF_PARTITIONS)]
@@ -34,7 +35,7 @@ pub struct PinnedProducerAndConsumerArgs {
 
 impl BenchmarkKindProps for PinnedProducerAndConsumerArgs {
     fn streams(&self) -> u32 {
-        self.streams.get()
+        self.streams.unwrap_or(self.producers).get()
     }
 
     fn partitions(&self) -> u32 {
@@ -73,7 +74,7 @@ impl BenchmarkKindProps for PinnedProducerAndConsumerArgs {
             .exit();
         }
 
-        let streams = self.streams.get();
+        let streams = self.streams();
         let producers = self.producers.get();
         let mut cmd = IggyBenchArgs::command();
 

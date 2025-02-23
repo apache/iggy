@@ -8,6 +8,7 @@ const EXAMPLES: &str = r#"EXAMPLES:
     $ cargo r -r --bin iggy-bench -- pinned-producer --streams 10 --producers 10 tcp
     $ cargo r -r --bin iggy-bench -- pinned-consumer --streams 10 --consumers 10 tcp
     $ cargo r -r --bin iggy-bench -- pinned-producer-and-consumer --streams 10 --producers 10 --consumers 10 tcp
+    $ cargo r -r --bin iggy-bench -- -t 10GB pp --producers 5 tcp
 
 2) Balanced Mode Benchmarking:
 
@@ -17,6 +18,7 @@ const EXAMPLES: &str = r#"EXAMPLES:
     $ cargo r -r --bin iggy-bench -- balanced-producer --partitions 24 --producers 6 tcp
     $ cargo r -r --bin iggy-bench -- balanced-consumer-group --consumers 6 tcp
     $ cargo r -r --bin iggy-bench -- balanced-producer-and-consumer-group --partitions 24 --producers 6 --consumers 6 tcp
+    $ cargo r -r --bin iggy-bench -- -t 10GB bpc tcp
 
 3) End-to-End Benchmarking:
 
@@ -31,10 +33,14 @@ const EXAMPLES: &str = r#"EXAMPLES:
 
     Global options (before the benchmark command):
     --messages-per-batch (-p): Number of messages per batch [default: 1000]
+                               For random batch sizes, use range format: "100..1000"
     --message-batches (-b): Total number of batches [default: 1000]
+    --total-messages-size (-T): Total size of messages to send (e.g., "1GB", "500MB")
+                                Mutually exclusive with --message-batches
     --message-size (-m): Message size in bytes [default: 1000]
+                        For random sizes, use range format: "100..1000"
     --start-stream-id (-S): Start stream ID [default: 1]
-    --rate-limit (-r): Optional throughput limit per producer (e.g., "50KB/s", "10MB/s")
+    --rate-limit (-r): Optional throughput limit per producer (e.g., "50KB", "10MB")
     --warmup-time (-w): Warmup duration [default: 0s]
     --sampling-time (-t): Metrics sampling interval [default: 10ms]
     --moving-average-window (-W): Window size for moving average [default: 20]
@@ -48,19 +54,48 @@ const EXAMPLES: &str = r#"EXAMPLES:
     --consumers (-c): Number of consumers
     --max-topic-size (-t): Max topic size (e.g., "1GiB")
 
-    Example with detailed configuration:
-    $ cargo r --bin iggy-bench \
+    Examples with detailed configuration:
+
+    # Fixed message and batch sizes:
+    $ cargo r -r --bin iggy-bench -- \
         --message-size 1000 \
         --messages-per-batch 100 \
         --message-batches 1000 \
-        --rate-limit "100MB/s" \
-        --warmup-time "10s" \
-        --sampling-time "1s" \
+        --rate-limit "100MB" \
         balanced-producer \
         --streams 5 \
-        --partitions 2 \
         --producers 5 \
-        --max-topic-size "1GiB" \
+        tcp
+
+    # Random message sizes (100-1000 bytes):
+    $ cargo r -r --bin iggy-bench -- \
+        --message-size "100..1000" \
+        --messages-per-batch 100 \
+        --total-messages-size "1GB" \
+        balanced-producer \
+        --streams 5 \
+        --producers 5 \
+        tcp
+
+    # Random batch sizes (10-100 messages per batch):
+    $ cargo r -r --bin iggy-bench -- \
+        --message-size 1000 \
+        --messages-per-batch "10..100" \
+        --total-messages-size "500MB" \
+        balanced-producer \
+        --streams 5 \
+        --producers 5 \
+        tcp
+
+    # Random message and batch sizes with rate limiting:
+    $ cargo r -r --bin iggy-bench -- \
+        --message-size "500..2000" \
+        --messages-per-batch "50..200" \
+        --total-messages-size "2GB" \
+        --rate-limit "50MB" \
+        balanced-producer \
+        --streams 5 \
+        --producers 5 \
         tcp
 
 5) Remote Server Benchmarking:
@@ -75,14 +110,13 @@ const EXAMPLES: &str = r#"EXAMPLES:
 
     The benchmark tool can store detailed results for analysis and comparison:
 
-    # Basic result storage:
-    $ cargo r -r --bin iggy-bench -- pinned-producer --streams 10 --producers 10 tcp \
-        output --output-dir ./results
+    # Basic result storage (results will be stored in ./performance_results):
+    $ cargo r -r --bin iggy-bench -- pinned-producer --streams 10 --producers 10 tcp output
+
 
     # Organized benchmarking with metadata:
     $ cargo r -r --bin iggy-bench -- balanced-producer --partitions 24 --producers 6 tcp \
         output \
-        --output-dir performance_results \
         --identifier "prod-test-$(date +%Y%m%d)" \
         --remark "production-config" \
         --gitref "$(git rev-parse --short HEAD)" \
@@ -90,18 +124,13 @@ const EXAMPLES: &str = r#"EXAMPLES:
 
     # Quick result visualization:
     $ cargo r -r --bin iggy-bench -- end-to-end-producing-consumer --producers 12 --streams 12 tcp \
-        output \
-        --output-dir performance_results \
-        --open-charts
+        output --open-charts
 
     Output configuration options:
-    --output-dir (-o)  : Directory for storing results (required for output)
+    --output-dir (-o)  : Directory for storing results [default: performance_results]
     --identifier       : Benchmark run ID (defaults to hostname)
     --remark           : Additional context (e.g., "production-config")
     --extra-info       : Custom metadata for future analysis
-    --gitref           : Git reference for version tracking
-    --gitref-date      : Git reference date (merge/commit date)
-    --open-charts      : Auto-open result charts in browser
 
 7) Help and Documentation:
 
@@ -110,18 +139,13 @@ const EXAMPLES: &str = r#"EXAMPLES:
     # General help
     $ cargo r -r --bin iggy-bench -- --help
 
-    # Help for specific benchmark mode
+    # Specific benchmark help
     $ cargo r -r --bin iggy-bench -- pinned-producer --help
-    $ cargo r -r --bin iggy-bench -- balanced-consumer-group --help
-    $ cargo r -r --bin iggy-bench -- end-to-end-producing-consumer --help
 
-    # Help for transport options
+    # Protocol help
     $ cargo r -r --bin iggy-bench -- pinned-producer tcp --help
-    $ cargo r -r --bin iggy-bench -- balanced-producer http --help
-    $ cargo r -r --bin iggy-bench -- end-to-end-producing-consumer quic --help
-
 "#;
 
 pub fn print_examples() {
-    print!("{}", EXAMPLES)
+    println!("{}", EXAMPLES);
 }
