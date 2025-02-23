@@ -31,15 +31,15 @@ pub struct BalancedConsumerGroupArgs {
     pub transport: BenchmarkTransportCommand,
 
     /// Number of streams
-    #[arg(long, default_value_t = DEFAULT_BALANCED_NUMBER_OF_STREAMS)]
+    #[arg(long, short = 's', default_value_t = DEFAULT_BALANCED_NUMBER_OF_STREAMS)]
     pub streams: NonZeroU32,
 
     /// Number of consumers
-    #[arg(long, default_value_t = DEFAULT_NUMBER_OF_CONSUMERS)]
+    #[arg(long, short = 'c', default_value_t = DEFAULT_NUMBER_OF_CONSUMERS)]
     pub consumers: NonZeroU32,
 
     /// Number of consumer groups
-    #[arg(long, default_value_t = DEFAULT_NUMBER_OF_CONSUMER_GROUPS)]
+    #[arg(long, short = 'g', default_value_t = DEFAULT_NUMBER_OF_CONSUMER_GROUPS)]
     pub consumer_groups: NonZeroU32,
 }
 

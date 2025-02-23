@@ -35,10 +35,10 @@ pub struct EndToEndProducingConsumerArgs {
 
     /// Number of producing consumers
     #[arg(long, short = 'p', default_value_t = DEFAULT_NUMBER_OF_PRODUCERS)]
-    pub producers: NonZeroU32,
+    pub producing_consumers: NonZeroU32,
 
     /// Max topic size in human readable format, e.g. "1GiB", "2MB", "1GiB". If not provided then the server default will be used.
-    #[arg(long, short = 't')]
+    #[arg(long, short = 'T')]
     pub max_topic_size: Option<IggyByteSize>,
 }
 
@@ -52,11 +52,11 @@ impl BenchmarkKindProps for EndToEndProducingConsumerArgs {
     }
 
     fn consumers(&self) -> u32 {
-        self.producers.get()
+        self.producing_consumers.get()
     }
 
     fn producers(&self) -> u32 {
-        self.producers.get()
+        self.producing_consumers.get()
     }
 
     fn transport_command(&self) -> &BenchmarkTransportCommand {
@@ -74,11 +74,11 @@ impl BenchmarkKindProps for EndToEndProducingConsumerArgs {
     fn validate(&self) {
         let mut cmd = IggyBenchArgs::command();
         let streams = self.streams.get();
-        let producers = self.producers.get();
-        if streams > producers {
+        let producing_consumers = self.producers();
+        if streams > producing_consumers {
             cmd.error(
                 ErrorKind::ArgumentConflict,
-                format!("For producing consumer, number of streams ({streams}) must be less than or equal to the number of producers ({producers}).",
+                format!("For producing consumer, number of streams ({streams}) must be less than or equal to the number of producers ({producing_consumers}).",
             ))
             .exit();
         }

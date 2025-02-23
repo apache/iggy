@@ -31,6 +31,8 @@ pub struct BenchmarkIndividualMetricsSummary {
     pub total_user_data_bytes: u64,
     pub total_bytes: u64,
     pub total_messages: u64,
+    #[serde(default)]
+    pub total_message_batches: u64,
     #[serde(serialize_with = "round_float")]
     pub throughput_megabytes_per_second: f64,
     #[serde(serialize_with = "round_float")]
@@ -51,4 +53,10 @@ pub struct BenchmarkIndividualMetricsSummary {
     pub avg_latency_ms: f64,
     #[serde(serialize_with = "round_float")]
     pub median_latency_ms: f64,
+    #[serde(default, serialize_with = "round_float")]
+    pub min_latency_ms: f64,
+    #[serde(default, serialize_with = "round_float")]
+    pub max_latency_ms: f64,
+    #[serde(default, serialize_with = "round_float")]
+    pub std_dev_latency_ms: f64,
 }

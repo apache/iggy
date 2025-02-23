@@ -32,13 +32,14 @@ use std::sync::Arc;
 use tokio::task::JoinSet;
 use tracing::info;
 
-use super::consumer_benchmark::ConsumerBenchmark;
-use super::consumer_group_benchmark::ConsumerGroupBenchmark;
-use super::producer_and_consumer_benchmark::ProducerAndConsumerBenchmark;
-use super::producer_and_consumer_group_benchmark::ProducerAndConsumerGroupBenchmark;
-use super::producer_benchmark::ProducerBenchmark;
-use super::producing_consumer_benchmark::EndToEndProducingConsumerBenchmark;
-use super::producing_consumer_group_benchmark::EndToEndProducingConsumerGroupBenchmark;
+use super::balanced_consumer_group::BalancedConsumerGroupBenchmark;
+use super::balanced_producer::BalancedProducerBenchmark;
+use super::balanced_producer_and_consumer_group::BalancedProducerAndConsumerGroupBenchmark;
+use super::end_to_end_producing_consumer::EndToEndProducingConsumerBenchmark;
+use super::end_to_end_producing_consumer_group::EndToEndProducingConsumerGroupBenchmark;
+use super::pinned_consumer::PinnedConsumerBenchmark;
+use super::pinned_producer::PinnedProducerBenchmark;
+use super::pinned_producer_and_consumer::PinnedProducerAndConsumerBenchmark;
 
 impl From<IggyBenchArgs> for Box<dyn Benchmarkable> {
     fn from(args: IggyBenchArgs) -> Self {
@@ -46,30 +47,37 @@ impl From<IggyBenchArgs> for Box<dyn Benchmarkable> {
 
         match args.benchmark_kind {
             BenchmarkKindCommand::PinnedProducer(_) => {
-                Box::new(ProducerBenchmark::new(Arc::new(args), client_factory))
+                PinnedProducerBenchmark::new(Arc::new(args), client_factory)
             }
+
             BenchmarkKindCommand::PinnedConsumer(_) => {
-                Box::new(ConsumerBenchmark::new(Arc::new(args), client_factory))
+                PinnedConsumerBenchmark::new(Arc::new(args), client_factory)
             }
-            BenchmarkKindCommand::PinnedProducerAndConsumer(_) => Box::new(
-                ProducerAndConsumerBenchmark::new(Arc::new(args), client_factory),
-            ),
+
+            BenchmarkKindCommand::PinnedProducerAndConsumer(_) => {
+                PinnedProducerAndConsumerBenchmark::new(Arc::new(args), client_factory)
+            }
+
             BenchmarkKindCommand::BalancedProducer(_) => {
-                Box::new(ProducerBenchmark::new(Arc::new(args), client_factory))
+                BalancedProducerBenchmark::new(Arc::new(args), client_factory)
             }
+
             BenchmarkKindCommand::BalancedConsumerGroup(_) => {
-                Box::new(ConsumerGroupBenchmark::new(Arc::new(args), client_factory))
+                BalancedConsumerGroupBenchmark::new(Arc::new(args), client_factory)
             }
-            BenchmarkKindCommand::BalancedProducerAndConsumerGroup(_) => Box::new(
-                ProducerAndConsumerGroupBenchmark::new(Arc::new(args), client_factory),
-            ),
-            BenchmarkKindCommand::EndToEndProducingConsumer(_) => Box::new(
-                EndToEndProducingConsumerBenchmark::new(Arc::new(args), client_factory),
-            ),
-            BenchmarkKindCommand::EndToEndProducingConsumerGroup(_) => Box::new(
-                EndToEndProducingConsumerGroupBenchmark::new(Arc::new(args), client_factory),
-            ),
-            _ => unreachable!(),
+
+            BenchmarkKindCommand::BalancedProducerAndConsumerGroup(_) => {
+                BalancedProducerAndConsumerGroupBenchmark::new(Arc::new(args), client_factory)
+            }
+
+            BenchmarkKindCommand::EndToEndProducingConsumer(_) => {
+                EndToEndProducingConsumerBenchmark::new(Arc::new(args), client_factory)
+            }
+
+            BenchmarkKindCommand::EndToEndProducingConsumerGroup(_) => {
+                EndToEndProducingConsumerGroupBenchmark::new(Arc::new(args), client_factory)
+            }
+            _ => todo!(),
         }
     }
 }
@@ -82,6 +90,7 @@ pub trait Benchmarkable {
     fn kind(&self) -> BenchmarkKind;
     fn args(&self) -> &IggyBenchArgs;
     fn client_factory(&self) -> &Arc<dyn ClientFactory>;
+    fn print_info(&self);
 
     /// Below methods have common implementation for all benchmarks.
     /// Initializes the streams and topics for the benchmark.
@@ -148,11 +157,29 @@ pub trait Benchmarkable {
         Ok(())
     }
 
-    /// Returns the total number of messages that will be sent or polled by the benchmark.
-    fn total_messages(&self) -> u64 {
-        let messages_per_batch = self.args().messages_per_batch();
-        let message_batches = self.args().message_batches();
-        let streams = self.args().streams();
-        (messages_per_batch * message_batches * streams) as u64
+    fn common_params_str(&self) -> String {
+        let message_size = format!("message size: {} b,", self.args().message_size());
+        let messages_per_batch = format!(
+            " messages per batch: {} b,",
+            self.args().messages_per_batch()
+        );
+        let data = if let Some(data) = self.args().total_data() {
+            format!(" total data to send: {},", data)
+        } else {
+            format!(
+                " total batches to send: {},",
+                self.args().message_batches().unwrap()
+            )
+        };
+        let rate_limit = self
+            .args()
+            .rate_limit()
+            .map(|rl| format!(" global rate limit: {rl}/s"))
+            .unwrap_or_default();
+
+        format!(
+            "{}{}{}{}",
+            message_size, messages_per_batch, data, rate_limit,
+        )
     }
 }

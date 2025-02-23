@@ -18,14 +18,13 @@
 
 use crate::{
     benchmark_kind::BenchmarkKind, group_metrics::BenchmarkGroupMetrics,
-    group_metrics_kind::GroupMetricsKind, params::BenchmarkParams, report::BenchmarkReport,
+    group_metrics_kind::GroupMetricsKind, report::BenchmarkReport,
 };
-use byte_unit::{Byte, UnitType};
 use human_repr::HumanCount;
 
 impl BenchmarkReport {
     pub fn subtext(&self) -> String {
-        let params_text = self.params.format_params();
+        let params_text = self.format_params();
         let mut stats = Vec::new();
 
         // First add latency stats
@@ -79,6 +78,52 @@ impl BenchmarkReport {
             .collect::<Vec<String>>()
             .join("\n")
     }
+
+    pub fn format_params(&self) -> String {
+        let actors_info = self.params.format_actors_info();
+        let message_batches = self.params.message_batches;
+        let messages_per_batch = self.params.messages_per_batch;
+        let message_size = self.params.message_size;
+
+        let sent_msgs = self.total_messages_sent();
+        let polled_msgs = self.total_messages_received();
+        let total_bytes = self.total_bytes();
+
+        let mut user_data_print = String::new();
+
+        if sent_msgs > 0 && polled_msgs > 0 {
+            user_data_print.push_str(&format!(
+                "Sent {} Messages, Polled {} Messages, {} in Total",
+                sent_msgs.human_count_bare(),
+                polled_msgs.human_count_bare(),
+                total_bytes.human_count_bytes(),
+            ));
+        } else if polled_msgs > 0 {
+            user_data_print.push_str(&format!(
+                "Polled {} Messages, {} in Total",
+                polled_msgs.human_count_bare(),
+                total_bytes.human_count_bytes(),
+            ));
+        } else {
+            user_data_print.push_str(&format!(
+                "Sent {} Messages, {} in Total",
+                sent_msgs.human_count_bare(),
+                total_bytes.human_count_bytes(),
+            ));
+        }
+
+        let topics = "1 Topic per Stream".to_owned();
+        let partitions = if self.params.partitions == 0 {
+            "".to_owned()
+        } else {
+            format!("  •  {} Partitions per Topic", self.params.partitions)
+        };
+        let streams = format!("{} Streams", self.params.streams);
+
+        format!(
+            "{actors_info}  •  {streams}  •  {topics}{partitions}  •  {messages_per_batch} Msg/batch  •  {message_batches} Batches  •  {message_size} Bytes/msg  •  {user_data_print}",
+        )
+    }
 }
 
 impl BenchmarkGroupMetrics {
@@ -96,61 +141,17 @@ impl BenchmarkGroupMetrics {
 
     fn format_latency(&self) -> String {
         format!(
-            "{} Latency  •  Avg: {:.2} ms  •  Med: {:.2} ms  •  P95: {:.2} ms  •  P99: {:.2} ms  •  P999: {:.2} ms  •  P9999: {:.2} ms",
+            "{} Latency  •  Avg: {:.2} ms  •  Med: {:.2} ms  •  P95: {:.2} ms  •  P99: {:.2} ms  •  P999: {:.2} ms  •  P9999: {:.2} ms  •  Min: {:.2} ms  •  Max: {:.2} ms  •  Std Dev: {:.2} ms",
             self.summary.kind,
             self.summary.average_latency_ms,
             self.summary.average_median_latency_ms,
             self.summary.average_p95_latency_ms,
             self.summary.average_p99_latency_ms,
             self.summary.average_p999_latency_ms,
-            self.summary.average_p9999_latency_ms
-        )
-    }
-}
-
-impl BenchmarkParams {
-    pub fn format_params(&self) -> String {
-        let actors_info = self.format_actors_info();
-        let message_batches = self.message_batches as u64;
-        let messages_per_batch = self.messages_per_batch as u64;
-        let message_size = self.message_size as u64;
-
-        let sent = message_batches * messages_per_batch * message_size * self.producers as u64;
-        let polled = message_batches * messages_per_batch * message_size * self.consumers as u64;
-
-        let mut user_data_print = String::new();
-
-        if sent > 0 && polled > 0 {
-            user_data_print.push_str(&format!(
-                "Sent {:.2}, Polled {:.2}",
-                Byte::from_u64(sent).get_appropriate_unit(UnitType::Decimal),
-                Byte::from_u64(polled).get_appropriate_unit(UnitType::Decimal)
-            ));
-        } else if polled > 0 {
-            user_data_print.push_str(&format!(
-                "Polled {:.2}",
-                Byte::from_u64(polled).get_appropriate_unit(UnitType::Decimal)
-            ));
-        } else {
-            user_data_print.push_str(&format!(
-                "Sent {:.2}",
-                Byte::from_u64(sent).get_appropriate_unit(UnitType::Decimal),
-            ));
-        }
-
-        let message_batches = message_batches.human_count_bare();
-        let messages_per_batch = messages_per_batch.human_count_bare();
-
-        let topics = "1 topic per stream".to_owned();
-        let partitions = if self.partitions == 0 {
-            "".to_owned()
-        } else {
-            format!("  •  {} partitions per topic", self.partitions)
-        };
-        let streams = format!("{} streams", self.streams);
-
-        format!(
-            "{actors_info}  •  {streams}  •  {topics}{partitions}  •  {messages_per_batch} msg/batch  •  {message_batches} batches  •  {message_size} bytes/msg  •  {user_data_print}",
+            self.summary.average_p9999_latency_ms,
+            self.summary.min_latency_ms,
+            self.summary.max_latency_ms,
+            self.summary.std_dev_latency_ms
         )
     }
 }

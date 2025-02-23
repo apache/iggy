@@ -41,12 +41,16 @@ pub struct EndToEndProducingConsumerGroupArgs {
     #[arg(long, short = 'g', default_value_t = DEFAULT_NUMBER_OF_CONSUMER_GROUPS)]
     pub consumer_groups: NonZeroU32,
 
-    /// Number of producing consumers
+    /// Number of active producers
     #[arg(long, short = 'p', default_value_t = DEFAULT_NUMBER_OF_PRODUCERS)]
     pub producers: NonZeroU32,
 
+    /// Number of active consumers
+    #[arg(long, short = 'c', default_value_t = DEFAULT_NUMBER_OF_CONSUMERS)]
+    pub consumers: NonZeroU32,
+
     /// Max topic size in human readable format, e.g. "1GiB", "2MB", "1GiB". If not provided then topic size will be unlimited.
-    #[arg(long, short = 't')]
+    #[arg(long, short = 'T')]
     pub max_topic_size: Option<IggyByteSize>,
 }
 
@@ -60,7 +64,7 @@ impl BenchmarkKindProps for EndToEndProducingConsumerGroupArgs {
     }
 
     fn consumers(&self) -> u32 {
-        self.producers.get()
+        self.consumers.get()
     }
 
     fn producers(&self) -> u32 {
@@ -81,8 +85,8 @@ impl BenchmarkKindProps for EndToEndProducingConsumerGroupArgs {
 
     fn validate(&self) {
         let mut cmd = IggyBenchArgs::command();
-        let streams = self.streams.get();
-        let producers = self.producers.get();
+        let streams = self.streams();
+        let producers = self.producers();
         if streams > producers {
             cmd.error(
                 ErrorKind::ArgumentConflict,

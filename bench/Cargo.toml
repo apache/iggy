@@ -25,17 +25,19 @@ license = "Apache-2.0"
 
 [dependencies]
 async-trait = "0.1.88"
-atomic-time = "0.1.5"
+bytes = "1.10.1"
 charming = "0.4.0"
 chrono = "0.4.40"
 clap = { version = "4.5.37", features = ["derive"] }
 figlet-rs = "0.1.5"
+governor = "0.10.0"
 hostname = "0.4.1"
 human-repr = "1.1.0"
 iggy = { path = "../sdk" }
 iggy-bench-report = { path = "report" }
 integration = { path = "../integration" }
 nonzero_lit = "0.1.2"
+rand = "0.9.1"
 serde = { version = "1.0.219", features = ["derive"] }
 sysinfo = "0.34.2"
 tokio = { version = "1.44.2", features = ["full"] }

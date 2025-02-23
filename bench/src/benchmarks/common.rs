@@ -1,0 +1,386 @@
+use super::*;
+use crate::{
+    actors::{
+        consumer::BenchmarkConsumer, producer::BenchmarkProducer,
+        producing_consumer::BenchmarkProducingConsumer,
+    },
+    args::common::IggyBenchArgs,
+    utils::finish_condition::{BenchmarkFinishCondition, BenchmarkFinishConditionMode},
+};
+use iggy::prelude::*;
+use iggy_bench_report::{
+    benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics,
+};
+use integration::test_server::{login_root, ClientFactory};
+use std::{future::Future, sync::Arc};
+use tracing::{error, info};
+
+pub async fn create_consumer(
+    client: &IggyClient,
+    consumer_group_id: &Option<u32>,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    consumer_id: u32,
+) -> Consumer {
+    match consumer_group_id {
+        Some(consumer_group_id) => {
+            info!(
+                "Consumer #{} → joining consumer group #{}",
+                consumer_id, consumer_group_id
+            );
+            let cg_identifier = Identifier::try_from(*consumer_group_id).unwrap();
+            client
+                .join_consumer_group(stream_id, topic_id, &cg_identifier)
+                .await
+                .expect("Failed to join consumer group");
+            Consumer::group(cg_identifier)
+        }
+        None => Consumer::new(consumer_id.try_into().unwrap()),
+    }
+}
+
+pub fn rate_limit_per_actor(total_rate: Option<IggyByteSize>, actors: u32) -> Option<IggyByteSize> {
+    total_rate.map(|rl| (rl.as_bytes_u64() / (actors as u64)).into())
+}
+
+pub async fn init_consumer_groups(
+    client_factory: &Arc<dyn ClientFactory>,
+    args: &IggyBenchArgs,
+) -> Result<(), IggyError> {
+    let start_stream_id = args.start_stream_id();
+    let topic_id: u32 = 1;
+    let client = client_factory.create_client().await;
+    let client = IggyClient::create(client, None, None);
+    let cg_count = args.number_of_consumer_groups();
+
+    login_root(&client).await;
+    for i in 1..=cg_count {
+        let consumer_group_id = CONSUMER_GROUP_BASE_ID + i;
+        let stream_id = start_stream_id + i;
+        let consumer_group_name = format!("{}-{}", CONSUMER_GROUP_NAME_PREFIX, consumer_group_id);
+        info!(
+            "Creating test consumer group: name={}, id={}, stream={}, topic={}",
+            consumer_group_name, consumer_group_id, stream_id, topic_id
+        );
+        match client
+            .create_consumer_group(
+                &stream_id.try_into().unwrap(),
+                &topic_id.try_into().unwrap(),
+                &consumer_group_name,
+                Some(consumer_group_id),
+            )
+            .await
+        {
+            Err(IggyError::ConsumerGroupIdAlreadyExists(_, _)) => {
+                info!(
+                    "Consumer group with id {} already exists",
+                    consumer_group_id
+                );
+            }
+            Err(err) => {
+                error!("Error when creating consumer group {consumer_group_id}: {err}");
+            }
+            Ok(_) => {}
+        }
+    }
+    Ok(())
+}
+
+pub fn build_producer_futures(
+    client_factory: &Arc<dyn ClientFactory>,
+    args: &IggyBenchArgs,
+) -> Result<
+    Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send>,
+    IggyError,
+> {
+    let streams = args.streams();
+    let partitions = args.number_of_partitions();
+    let start_stream_id = args.start_stream_id();
+    let producers = args.producers();
+    let actors = args.producers() + args.consumers();
+    let warmup_time = args.warmup_time();
+    let messages_per_batch = args.messages_per_batch();
+    let message_size = args.message_size();
+    let sampling_time = args.sampling_time();
+    let moving_average_window = args.moving_average_window();
+    let kind = args.kind();
+    let shared_finish_condition =
+        BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::Shared);
+    let rate_limit = rate_limit_per_actor(args.rate_limit(), actors);
+
+    let futures = (1..=producers)
+        .map(|producer_id| {
+            let client_factory = client_factory.clone();
+
+            let finish_condition = if partitions > 1 {
+                shared_finish_condition.clone()
+            } else {
+                BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::PerProducer)
+            };
+
+            let stream_id = start_stream_id + 1 + (producer_id % streams);
+
+            async move {
+                let producer = BenchmarkProducer::new(
+                    client_factory,
+                    kind,
+                    producer_id,
+                    stream_id,
+                    partitions,
+                    messages_per_batch,
+                    message_size,
+                    finish_condition,
+                    warmup_time,
+                    sampling_time,
+                    moving_average_window,
+                    rate_limit,
+                );
+                producer.run().await
+            }
+        })
+        .collect();
+
+    Ok(futures)
+}
+
+pub fn build_consumer_futures(
+    client_factory: &Arc<dyn ClientFactory>,
+    args: &IggyBenchArgs,
+) -> Result<
+    Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send>,
+    IggyError,
+> {
+    let start_stream_id = args.start_stream_id();
+    let cg_count = args.number_of_consumer_groups();
+    let consumers = args.consumers();
+    let actors = args.producers() + args.consumers();
+    let warmup_time = args.warmup_time();
+    let messages_per_batch = args.messages_per_batch();
+    let sampling_time = args.sampling_time();
+    let moving_average_window = args.moving_average_window();
+    let kind = args.kind();
+    let polling_kind = if cg_count > 0 {
+        PollingKind::Next
+    } else {
+        PollingKind::Offset
+    };
+    let origin_timestamp_latency_calculation = match args.kind() {
+        BenchmarkKind::PinnedConsumer => false,
+        BenchmarkKind::PinnedProducerAndConsumer => false, // TODO(hubcio): in future, it can also be true
+        BenchmarkKind::BalancedConsumerGroup => false,
+        BenchmarkKind::BalancedProducerAndConsumerGroup => true,
+        _ => unreachable!(),
+    };
+
+    let global_finish_condition =
+        BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::Shared);
+    let rate_limit = rate_limit_per_actor(args.rate_limit(), actors);
+
+    let futures = (1..=consumers)
+        .map(|consumer_id| {
+            let client_factory = client_factory.clone();
+            let finish_condition = if cg_count > 0 {
+                global_finish_condition.clone()
+            } else {
+                BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::PerConsumer)
+            };
+            let stream_id = if cg_count > 0 {
+                start_stream_id + 1 + (consumer_id % cg_count)
+            } else {
+                start_stream_id + consumer_id
+            };
+            let consumer_group_id = if cg_count > 0 {
+                Some(CONSUMER_GROUP_BASE_ID + 1 + (consumer_id % cg_count))
+            } else {
+                None
+            };
+
+            async move {
+                let consumer = BenchmarkConsumer::new(
+                    client_factory,
+                    kind,
+                    consumer_id,
+                    consumer_group_id,
+                    stream_id,
+                    messages_per_batch,
+                    finish_condition,
+                    warmup_time,
+                    sampling_time,
+                    moving_average_window,
+                    polling_kind,
+                    rate_limit,
+                    origin_timestamp_latency_calculation,
+                );
+                consumer.run().await
+            }
+        })
+        .collect();
+
+    Ok(futures)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_producing_consumers_futures(
+    client_factory: Arc<dyn ClientFactory>,
+    args: Arc<IggyBenchArgs>,
+) -> Result<
+    Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send>,
+    IggyError,
+> {
+    let producing_consumers = args.producers();
+    let streams = args.streams();
+    let partitions = args.number_of_partitions();
+    let warmup_time = args.warmup_time();
+    let messages_per_batch = args.messages_per_batch();
+    let message_size = args.message_size();
+    let start_stream_id = args.start_stream_id();
+    let polling_kind = PollingKind::Offset;
+
+    let futures = (1..=producing_consumers)
+        .map(|actor_id| {
+            let client_factory_clone = client_factory.clone();
+            let args_clone = args.clone();
+            let stream_id = start_stream_id + 1 + (actor_id % streams);
+
+            let send_finish_condition = BenchmarkFinishCondition::new(
+                &args,
+                BenchmarkFinishConditionMode::PerProducingConsumer,
+            );
+            let poll_finish_condition = BenchmarkFinishCondition::new(
+                &args,
+                BenchmarkFinishConditionMode::PerProducingConsumer,
+            );
+
+            let rate_limit = rate_limit_per_actor(args.rate_limit(), producing_consumers);
+
+            async move {
+                info!(
+                    "Executing producing consumer #{}, stream_id={}",
+                    actor_id, stream_id
+                );
+                let actor = BenchmarkProducingConsumer::new(
+                    client_factory_clone,
+                    args_clone.kind(),
+                    actor_id,
+                    None,
+                    stream_id,
+                    partitions,
+                    messages_per_batch,
+                    message_size,
+                    send_finish_condition.clone(),
+                    poll_finish_condition.clone(),
+                    warmup_time,
+                    args_clone.sampling_time(),
+                    args_clone.moving_average_window(),
+                    rate_limit,
+                    polling_kind,
+                );
+                actor.run().await
+            }
+        })
+        .collect();
+
+    Ok(futures)
+}
+
+pub fn build_producing_consumer_groups_futures(
+    client_factory: Arc<dyn ClientFactory>,
+    args: Arc<IggyBenchArgs>,
+) -> Result<
+    Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send>,
+    IggyError,
+> {
+    let producers = args.producers();
+    let consumers = args.consumers();
+    let total_actors = producers.max(consumers);
+    let partitions = args.number_of_partitions();
+    let cg_count = args.number_of_consumer_groups();
+    let warmup_time = args.warmup_time();
+    let messages_per_batch = args.messages_per_batch();
+    let message_size = args.message_size();
+    let start_stream_id = args.start_stream_id();
+    let start_consumer_group_id = CONSUMER_GROUP_BASE_ID;
+    let polling_kind = PollingKind::Next;
+
+    let shared_send_finish_condition =
+        BenchmarkFinishCondition::new(&args, BenchmarkFinishConditionMode::SharedHalf);
+
+    let shared_poll_finish_condition =
+        BenchmarkFinishCondition::new(&args, BenchmarkFinishConditionMode::SharedHalf);
+
+    let futures = (1..=total_actors)
+        .map(|actor_id| {
+            let client_factory_clone = client_factory.clone();
+            let args_clone = args.clone();
+            let stream_id = start_stream_id + 1 + (actor_id % cg_count);
+
+            let should_produce = actor_id <= producers;
+            let should_consume = actor_id <= consumers;
+
+            let send_finish_condition = if should_produce {
+                shared_send_finish_condition.clone()
+            } else {
+                BenchmarkFinishCondition::new_empty()
+            };
+
+            let poll_finish_condition = if should_consume {
+                shared_poll_finish_condition.clone()
+            } else {
+                BenchmarkFinishCondition::new_empty()
+            };
+
+            let rate_limit = if should_produce {
+                rate_limit_per_actor(args.rate_limit(), producers)
+            } else {
+                None
+            };
+
+            let consumer_group_id = if should_consume {
+                Some(start_consumer_group_id + 1 + (actor_id % cg_count))
+            } else {
+                None
+            };
+
+            async move {
+                let actor_type = match (should_produce, should_consume) {
+                    (true, true) => "(producer+consumer)",
+                    (true, false) => "(producer only)",
+                    (false, true) => "(consumer only)",
+                    (false, false) => unreachable!(),
+                };
+
+                info!(
+                    "Executing producing consumer #{}{} stream_id={} {}",
+                    actor_id,
+                    if should_consume {
+                        format!(" in group={}", consumer_group_id.unwrap())
+                    } else {
+                        "".to_string()
+                    },
+                    stream_id,
+                    actor_type
+                );
+                let actor = BenchmarkProducingConsumer::new(
+                    client_factory_clone,
+                    args_clone.kind(),
+                    actor_id,
+                    consumer_group_id,
+                    stream_id,
+                    partitions,
+                    messages_per_batch,
+                    message_size,
+                    send_finish_condition,
+                    poll_finish_condition,
+                    warmup_time,
+                    args_clone.sampling_time(),
+                    args_clone.moving_average_window(),
+                    rate_limit,
+                    polling_kind,
+                );
+                actor.run().await
+            }
+        })
+        .collect();
+
+    Ok(futures)
+}

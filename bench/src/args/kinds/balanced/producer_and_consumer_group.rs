@@ -35,23 +35,23 @@ pub struct BalancedProducerAndConsumerGroupArgs {
     pub streams: NonZeroU32,
 
     /// Number of partitions
-    #[arg(long, default_value_t = DEFAULT_BALANCED_NUMBER_OF_PARTITIONS)]
+    #[arg(long, short = 'a', default_value_t = DEFAULT_BALANCED_NUMBER_OF_PARTITIONS)]
     pub partitions: NonZeroU32,
 
     /// Number of producers
-    #[arg(long, default_value_t = DEFAULT_NUMBER_OF_PRODUCERS)]
+    #[arg(long, short = 'p', default_value_t = DEFAULT_NUMBER_OF_PRODUCERS)]
     pub producers: NonZeroU32,
 
     /// Number of consumers
-    #[arg(long, default_value_t = DEFAULT_NUMBER_OF_CONSUMERS)]
+    #[arg(long, short = 'c', default_value_t = DEFAULT_NUMBER_OF_CONSUMERS)]
     pub consumers: NonZeroU32,
 
     /// Number of consumer groups
-    #[arg(long, default_value_t = DEFAULT_NUMBER_OF_CONSUMER_GROUPS)]
+    #[arg(long, short = 'g', default_value_t = DEFAULT_NUMBER_OF_CONSUMER_GROUPS)]
     pub consumer_groups: NonZeroU32,
 
     /// Max topic size in human readable format, e.g. "1GiB", "2MiB", "1GiB". If not provided then the server default will be used.
-    #[arg(long, short = 't')]
+    #[arg(long, short = 'T')]
     pub max_topic_size: Option<IggyByteSize>,
 }
 

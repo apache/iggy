@@ -18,109 +18,91 @@
 
 use crate::analytics::metrics::individual::from_records;
 use crate::analytics::record::BenchmarkRecord;
-use crate::rate_limiter::RateLimiter;
+use crate::utils::batch_generator::BenchmarkBatchGenerator;
+use crate::utils::finish_condition::BenchmarkFinishCondition;
+use crate::utils::rate_limiter::BenchmarkRateLimiter;
 use human_repr::HumanCount;
-use iggy::client::MessageClient;
-use iggy::clients::client::IggyClient;
-use iggy::error::IggyError;
-use iggy::prelude::IggyMessage;
-use iggy::prelude::Partitioning;
-use iggy::utils::byte_size::IggyByteSize;
-use iggy::utils::duration::IggyDuration;
-use iggy::utils::sizeable::Sizeable;
+use iggy::prelude::*;
 use iggy_bench_report::actor_kind::ActorKind;
 use iggy_bench_report::benchmark_kind::BenchmarkKind;
 use iggy_bench_report::individual_metrics::BenchmarkIndividualMetrics;
+use iggy_bench_report::numeric_parameter::BenchmarkNumericParameter;
 use integration::test_server::{login_root, ClientFactory};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 use tracing::info;
 
-pub struct Producer {
+pub struct BenchmarkProducer {
     client_factory: Arc<dyn ClientFactory>,
     benchmark_kind: BenchmarkKind,
     producer_id: u32,
     stream_id: u32,
-    partitions_count: u32,
-    message_batches: u32,
-    messages_per_batch: u32,
-    message_size: u32,
+    partitions: u32,
+    messages_per_batch: BenchmarkNumericParameter,
+    message_size: BenchmarkNumericParameter,
+    finish_condition: Arc<BenchmarkFinishCondition>,
     warmup_time: IggyDuration,
     sampling_time: IggyDuration,
     moving_average_window: u32,
-    rate_limiter: Option<RateLimiter>,
+    limit_bytes_per_second: Option<IggyByteSize>,
 }
 
-impl Producer {
+impl BenchmarkProducer {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         client_factory: Arc<dyn ClientFactory>,
         benchmark_kind: BenchmarkKind,
         producer_id: u32,
         stream_id: u32,
-        partitions_count: u32,
-        messages_per_batch: u32,
-        message_batches: u32,
-        message_size: u32,
+        partitions: u32,
+        messages_per_batch: BenchmarkNumericParameter,
+        message_size: BenchmarkNumericParameter,
+        finish_condition: Arc<BenchmarkFinishCondition>,
         warmup_time: IggyDuration,
         sampling_time: IggyDuration,
         moving_average_window: u32,
-        rate_limiter: Option<RateLimiter>,
+        limit_bytes_per_second: Option<IggyByteSize>,
     ) -> Self {
-        Producer {
+        BenchmarkProducer {
             client_factory,
             benchmark_kind,
             producer_id,
             stream_id,
-            partitions_count,
+            partitions,
             messages_per_batch,
-            message_batches,
             message_size,
+            finish_condition,
             warmup_time,
             sampling_time,
             moving_average_window,
-            rate_limiter,
+            limit_bytes_per_second,
         }
     }
 
     pub async fn run(self) -> Result<BenchmarkIndividualMetrics, IggyError> {
+        let mut batch_generator =
+            BenchmarkBatchGenerator::new(self.message_size, self.messages_per_batch);
+        let rate_limiter = self.limit_bytes_per_second.map(BenchmarkRateLimiter::new);
+
         let topic_id: u32 = 1;
         let default_partition_id: u32 = 1;
-        let partitions_count = self.partitions_count;
-        let message_batches = self.message_batches;
-        let messages_per_batch = self.messages_per_batch;
-        let message_size = self.message_size;
-
-        let total_messages = (messages_per_batch * message_batches) as u64;
+        let partitions = self.partitions;
         let client = self.client_factory.create_client().await;
         let client = IggyClient::create(client, None, None);
         login_root(&client).await;
-        info!(
-            "Producer #{} → preparing the test messages...",
-            self.producer_id
-        );
-        let payload = Self::create_payload(message_size);
-        let mut batch_user_data_bytes = 0;
-        let mut batch_total_bytes = 0;
-        let mut messages = Vec::with_capacity(messages_per_batch as usize);
-        for _ in 0..messages_per_batch {
-            let message = IggyMessage::from_str(&payload).unwrap();
-            batch_user_data_bytes += message.payload.len() as u64;
-            batch_total_bytes += message.get_size_bytes().as_bytes_u64();
-            messages.push(message);
-        }
-        let batch_user_data_bytes = batch_user_data_bytes;
-        let batch_total_bytes = batch_total_bytes;
 
         let stream_id = self.stream_id.try_into()?;
         let topic_id = topic_id.try_into()?;
-        let partitioning = match partitions_count {
+        let partitioning = match partitions {
             0 => panic!("Partition count must be greater than 0"),
             1 => Partitioning::partition_id(default_partition_id),
             2.. => Partitioning::balanced(),
         };
+
+        // -----------------------
+        // WARM-UP
+        // -----------------------
 
         if self.warmup_time.get_duration() != Duration::from_millis(0) {
             info!(
@@ -128,48 +110,53 @@ impl Producer {
                 self.producer_id, self.warmup_time
             );
             let warmup_end = Instant::now() + self.warmup_time.get_duration();
+
             while Instant::now() < warmup_end {
+                let batch = batch_generator.generate_batch();
                 client
-                    .send_messages(&stream_id, &topic_id, &partitioning, &mut messages)
+                    .send_messages(&stream_id, &topic_id, &partitioning, &mut batch.messages)
                     .await?;
             }
         }
+        // -----------------------
+        // MAIN BENCHMARK
+        // -----------------------
 
         info!(
-            "Producer #{} → sending {} messages in {} batches of {} messages to stream {} with {} partitions...",
+            "Producer #{} → sending {} in batches of {} messages to stream {} with {} partitions, partitioning: {}, rate limit: {:?}...",
             self.producer_id,
-            total_messages.human_count_bare(),
-            message_batches.human_count_bare(),
-            messages_per_batch.human_count_bare(),
+            self.finish_condition.total_str(),
+            self.messages_per_batch,
             stream_id,
-            partitions_count
+            partitions,
+            partitioning,
+            self.limit_bytes_per_second
         );
 
+        let max_capacity = self.finish_condition.max_capacity();
+        let mut latencies: Vec<Duration> = Vec::with_capacity(max_capacity);
+        let mut records: Vec<BenchmarkRecord> = Vec::with_capacity(max_capacity);
+        let mut messages_processed = 0;
+        let mut batches_processed = 0;
+        let mut total_bytes_processed = 0;
+        let mut user_data_bytes_processed = 0;
         let start_timestamp = Instant::now();
-        let mut latencies: Vec<Duration> = Vec::with_capacity(message_batches as usize);
-        let mut records = Vec::with_capacity(message_batches as usize);
-        let mut total_overhead_time = Duration::from_secs(0);
-        for i in 1..=message_batches {
-            let iteration_start = Instant::now();
 
-            // Apply rate limiting if configured
-            if let Some(limiter) = &self.rate_limiter {
-                limiter.throttle(batch_total_bytes).await;
+        loop {
+            if self.finish_condition.is_done() {
+                break;
             }
+            let batch = batch_generator.generate_batch();
             let before_send = Instant::now();
             client
-                .send_messages(&stream_id, &topic_id, &partitioning, &mut messages)
+                .send_messages(&stream_id, &topic_id, &partitioning, &mut batch.messages)
                 .await?;
             let latency = before_send.elapsed();
 
-            let iteration_time = iteration_start.elapsed();
-            let overhead_time = iteration_time - latency;
-            total_overhead_time += overhead_time;
-
-            let messages_processed = (i * messages_per_batch) as u64;
-            let batches_processed = i as u64;
-            let user_data_bytes = batches_processed * batch_user_data_bytes;
-            let total_bytes = batches_processed * batch_total_bytes;
+            messages_processed += batch.messages.len() as u64;
+            batches_processed += 1;
+            user_data_bytes_processed += batch.user_data_bytes;
+            total_bytes_processed += batch.total_bytes;
 
             latencies.push(latency);
             records.push(BenchmarkRecord {
@@ -177,10 +164,24 @@ impl Producer {
                 latency_us: latency.as_micros() as u64,
                 messages: messages_processed,
                 message_batches: batches_processed,
-                user_data_bytes,
-                total_bytes,
+                user_data_bytes: user_data_bytes_processed,
+                total_bytes: total_bytes_processed,
             });
+
+            if let Some(rate_limiter) = &rate_limiter {
+                rate_limiter
+                    .wait_until_necessary(batch.user_data_bytes)
+                    .await;
+            }
+
+            if self
+                .finish_condition
+                .account_and_check(batch.user_data_bytes)
+            {
+                break;
+            }
         }
+
         let metrics = from_records(
             records,
             self.benchmark_kind,
@@ -192,53 +193,29 @@ impl Producer {
 
         Self::log_statistics(
             self.producer_id,
-            total_messages,
-            message_batches,
-            messages_per_batch,
+            messages_processed,
+            batches_processed,
+            &self.messages_per_batch,
             &metrics,
-        );
-
-        let avg_overhead_per_batch =
-            total_overhead_time.as_micros() as f64 / message_batches as f64;
-        let total_elapsed = start_timestamp.elapsed();
-        let send_time = total_elapsed - total_overhead_time;
-        info!(
-            "Producer #{} → Overhead stats: Total time: {} ms, Send time: {} ms, Overhead time: {} ms ({:.2}%), Avg overhead per batch: {:.2} μs",
-            self.producer_id,
-            total_elapsed.as_millis(),
-            send_time.as_millis(),
-            total_overhead_time.as_millis(),
-            (total_overhead_time.as_micros() as f64 / total_elapsed.as_micros() as f64) * 100.0,
-            avg_overhead_per_batch
         );
 
         Ok(metrics)
     }
 
-    fn create_payload(size: u32) -> String {
-        let mut payload = String::with_capacity(size as usize);
-        for i in 0..size {
-            let char = (i % 26 + 97) as u8 as char;
-            payload.push(char);
-        }
-
-        payload
-    }
-
     fn log_statistics(
         producer_id: u32,
         total_messages: u64,
-        message_batches: u32,
-        messages_per_batch: u32,
+        message_batches: u64,
+        messages_per_batch: &BenchmarkNumericParameter,
         metrics: &BenchmarkIndividualMetrics,
     ) {
         info!(
             "Producer #{} → sent {} messages in {} batches of {} messages in {:.2} s, total size: {}, average throughput: {:.2} MB/s, \
     p50 latency: {:.2} ms, p90 latency: {:.2} ms, p95 latency: {:.2} ms, p99 latency: {:.2} ms, p999 latency: {:.2} ms, p9999 latency: {:.2} ms, \
-    average latency: {:.2} ms, median latency: {:.2} ms",
+    average latency: {:.2} ms, median latency: {:.2} ms, min latency: {:.2} ms, max latency: {:.2} ms, std dev latency: {:.2} ms",
             producer_id,
-            total_messages,
-            message_batches,
+            total_messages.human_count_bare(),
+            message_batches.human_count_bare(),
             messages_per_batch,
             metrics.summary.total_time_secs,
             IggyByteSize::from(metrics.summary.total_user_data_bytes),
@@ -250,7 +227,10 @@ impl Producer {
             metrics.summary.p999_latency_ms,
             metrics.summary.p9999_latency_ms,
             metrics.summary.avg_latency_ms,
-            metrics.summary.median_latency_ms
+            metrics.summary.median_latency_ms,
+            metrics.summary.min_latency_ms,
+            metrics.summary.max_latency_ms,
+            metrics.summary.std_dev_latency_ms,
         );
     }
 }

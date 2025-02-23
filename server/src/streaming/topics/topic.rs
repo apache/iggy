@@ -236,11 +236,6 @@ impl Topic {
         match max_topic_size {
             MaxTopicSize::ServerDefault => Ok(config.topic.max_size),
             _ => {
-                tracing::error!(
-                    "hubcio max topic size: {}, segment size: {}",
-                    max_topic_size.as_bytes_u64(),
-                    config.segment.size.as_bytes_u64()
-                );
                 if max_topic_size.as_bytes_u64() < config.segment.size.as_bytes_u64() {
                     Err(IggyError::InvalidTopicSize(
                         max_topic_size,

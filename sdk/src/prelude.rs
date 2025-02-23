@@ -64,9 +64,11 @@ pub use crate::models::partition::Partition;
 pub use crate::models::permissions::{
     GlobalPermissions, Permissions, StreamPermissions, TopicPermissions,
 };
+pub use crate::models::stats::Stats;
 pub use crate::models::stream::Stream;
 pub use crate::models::topic::Topic;
 pub use crate::models::user_status::UserStatus;
+pub use crate::snapshot::{SnapshotCompression, SystemSnapshotType};
 pub use crate::stream_builder::IggyConsumerConfig;
 pub use crate::stream_builder::IggyStreamConsumer;
 pub use crate::stream_builder::{IggyProducerConfig, IggyStreamProducer};

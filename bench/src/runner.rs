@@ -20,12 +20,11 @@ use crate::analytics::report_builder::BenchmarkReportBuilder;
 use crate::args::common::IggyBenchArgs;
 use crate::benchmarks::benchmark::Benchmarkable;
 use crate::plot::{plot_chart, ChartType};
-use crate::utils::collect_server_logs_and_save_to_file;
 use crate::utils::cpu_name::append_cpu_name_lowercase;
 use crate::utils::server_starter::start_server_if_needed;
+use crate::utils::{collect_server_logs_and_save_to_file, params_from_args_and_metrics};
 use iggy::error::IggyError;
 use iggy_bench_report::hardware::BenchmarkHardware;
-use iggy_bench_report::params::BenchmarkParams;
 use integration::test_server::TestServer;
 use std::path::Path;
 use std::time::Duration;
@@ -55,6 +54,7 @@ impl BenchmarkRunner {
         info!("Starting to benchmark: {transport} with server: {server_addr}",);
 
         let mut benchmark: Box<dyn Benchmarkable> = args.into();
+        benchmark.print_info();
         let mut join_handles = benchmark.run().await?;
 
         let mut individual_metrics = Vec::new();
@@ -70,7 +70,7 @@ impl BenchmarkRunner {
         info!("All actors joined!");
         let hardware =
             BenchmarkHardware::get_system_info_with_identifier(benchmark.args().identifier());
-        let params = BenchmarkParams::from(benchmark.args());
+        let params = params_from_args_and_metrics(benchmark.args(), &individual_metrics);
         let transport = params.transport;
         let server_addr = params.server_address.clone();
 

@@ -25,14 +25,12 @@ use clap::{CommandFactory, Parser};
 use iggy::utils::byte_size::IggyByteSize;
 use iggy::utils::duration::IggyDuration;
 use iggy_bench_report::benchmark_kind::BenchmarkKind;
-use iggy_bench_report::params::BenchmarkParams;
-use iggy_bench_report::transport::BenchmarkTransport;
+use iggy_bench_report::numeric_parameter::BenchmarkNumericParameter;
 use integration::test_server::Transport;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::str::FromStr;
-use tracing::info;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -41,24 +39,30 @@ pub struct IggyBenchArgs {
     #[command(subcommand)]
     pub benchmark_kind: BenchmarkKindCommand,
 
+    /// Message size in bytes. Accepts either a single value or a range (e.g. "200..500")
+    #[arg(long, short = 'm', value_parser = BenchmarkNumericParameter::from_str, default_value_t = BenchmarkNumericParameter::Value(DEFAULT_MESSAGE_SIZE.get()))]
+    pub message_size: BenchmarkNumericParameter,
+
     /// Number of messages per batch
-    #[arg(long, short = 'p', default_value_t = DEFAULT_MESSAGES_PER_BATCH)]
-    pub messages_per_batch: NonZeroU32,
+    #[arg(long, short = 'p', value_parser = BenchmarkNumericParameter::from_str, default_value_t = BenchmarkNumericParameter::Value(DEFAULT_MESSAGES_PER_BATCH.get()))]
+    pub messages_per_batch: BenchmarkNumericParameter,
 
-    /// Number of message batches
-    #[arg(long, short = 'b', default_value_t = DEFAULT_MESSAGE_BATCHES)]
-    pub message_batches: NonZeroU32,
+    /// Number of message batches per actor (producer / consumer / producing consumer).
+    /// This argument is mutually exclusive with `total_messages_size`.
+    #[arg(long, short = 'b', group = "data_to_process")]
+    pub message_batches: Option<NonZeroU32>,
 
-    /// Message size in bytes
-    #[arg(long, short = 'm', default_value_t = DEFAULT_MESSAGE_SIZE)]
-    pub message_size: NonZeroU32,
+    /// Total size of all messages to process in bytes (aggregate, for all actors).
+    /// This argument is mutually exclusive with `message_batches`.
+    #[arg(long, short = 'T', group = "data_to_process")]
+    pub total_data: Option<IggyByteSize>,
 
     /// Start stream id
     #[arg(long, short = 'S', default_value_t = DEFAULT_START_STREAM_ID)]
     pub start_stream_id: NonZeroU32,
 
-    /// Optional rate limit per individual producer in bytes per second (not aggregate).
-    /// Accepts human-readable formats like "50KB", "10MB", or "1GiB"
+    /// Optional total rate limit (aggregate, for all actors)
+    /// Accepts human-readable formats like "50KB", "10MB", or "1GB"
     #[arg(long, short = 'r', verbatim_doc_comment)]
     pub rate_limit: Option<IggyByteSize>,
 
@@ -126,7 +130,7 @@ impl IggyBenchArgs {
         self.start_stream_id.get()
     }
 
-    pub fn validate(&self) {
+    pub fn validate(&mut self) {
         let server_address = self.server_address().parse::<SocketAddr>().unwrap();
         if (self.cleanup || self.verbose) && !server_address.ip().is_loopback() {
             IggyBenchArgs::command()
@@ -155,19 +159,48 @@ impl IggyBenchArgs {
                 .exit();
         }
 
+        if let (None, None) = (self.message_batches, self.total_data) {
+            self.message_batches = Some(DEFAULT_MESSAGE_BATCHES);
+        }
+
+        if let Some(total_data) = self.total_data {
+            let samples = total_data.as_bytes_u64() / self.message_size().min() as u64;
+            if samples <= 1 {
+                IggyBenchArgs::command()
+                    .error(
+                        ErrorKind::ArgumentConflict,
+                        "--total-messages-size must be at least 2x greater than --message-size",
+                    )
+                    .exit();
+            }
+        }
+
         self.benchmark_kind.inner().validate()
     }
 
-    pub fn messages_per_batch(&self) -> u32 {
-        self.messages_per_batch.get()
+    pub fn messages_per_batch(&self) -> BenchmarkNumericParameter {
+        self.messages_per_batch
     }
 
-    pub fn message_batches(&self) -> u32 {
-        self.message_batches.get()
+    pub fn message_batches(&self) -> Option<NonZeroU32> {
+        self.message_batches
     }
 
-    pub fn message_size(&self) -> u32 {
-        self.message_size.get()
+    pub fn message_size(&self) -> BenchmarkNumericParameter {
+        self.message_size
+    }
+
+    pub fn total_data(&self) -> Option<IggyByteSize> {
+        self.total_data
+    }
+
+    // Used only for generation of unique directory name
+    pub fn data_volume_identifier(&self) -> String {
+        if let Some(total_messages_size) = self.total_data() {
+            format!("{}B", total_messages_size.as_bytes_u64())
+        } else {
+            self.message_batches().unwrap().to_string()
+        }
     }
 
     pub fn streams(&self) -> u32 {
@@ -216,7 +249,7 @@ impl IggyBenchArgs {
             .transport_command()
             .output_command()
             .as_ref()
-            .and_then(|cmd| match cmd {
+            .map(|cmd| match cmd {
                 BenchmarkOutputCommand::Output(args) => args.output_dir.clone(),
             })
     }
@@ -331,12 +364,18 @@ impl IggyBenchArgs {
             BenchmarkKindCommand::Examples => unreachable!(),
         };
 
+        let data_volume_arg = match (self.total_data, self.message_batches) {
+            (Some(total), None) => format!("{}", total),
+            (None, Some(batches)) => format!("{}", batches),
+            _ => unreachable!(),
+        };
+
         let mut parts = vec![
             benchmark_kind.to_string(),
             actors.to_string(),
             self.message_size().to_string(),
             self.messages_per_batch().to_string(),
-            self.message_batches().to_string(),
+            data_volume_arg,
             transport.to_string(),
         ];
 
@@ -396,237 +435,5 @@ impl IggyBenchArgs {
         }
 
         name
-    }
-}
-
-fn recreate_bench_command(args: &IggyBenchArgs) -> String {
-    let mut parts = Vec::new();
-
-    // If using localhost, add env vars
-    let server_address = args.server_address();
-    let is_localhost = server_address
-        .split(':')
-        .next()
-        .map(|host| host == "localhost" || host == "127.0.0.1")
-        .unwrap_or(false);
-
-    if is_localhost {
-        // Get all env vars starting with IGGY_
-        let iggy_vars: Vec<_> = std::env::vars()
-            .filter(|(k, _)| k.starts_with("IGGY_"))
-            .collect();
-
-        if !iggy_vars.is_empty() {
-            info!("Found env vars starting with IGGY_: {:?}", iggy_vars);
-            parts.extend(iggy_vars.into_iter().map(|(k, v)| format!("{}={}", k, v)));
-        }
-    }
-
-    parts.push("iggy-bench".to_string());
-
-    let messages_per_batch = args.messages_per_batch();
-    if messages_per_batch != DEFAULT_MESSAGES_PER_BATCH.get() {
-        parts.push(format!("--messages-per-batch {}", messages_per_batch));
-    }
-
-    let message_batches = args.message_batches();
-    if message_batches != DEFAULT_MESSAGE_BATCHES.get() {
-        parts.push(format!("--message-batches {}", message_batches));
-    }
-
-    let message_size = args.message_size();
-    if message_size != DEFAULT_MESSAGE_SIZE.get() {
-        parts.push(format!("--message-size {}", message_size));
-    }
-
-    if let Some(rate_limit) = args.rate_limit() {
-        parts.push(format!("--rate-limit \'{}\'", rate_limit));
-    }
-
-    if args.warmup_time().to_string() != DEFAULT_WARMUP_TIME {
-        parts.push(format!("--warmup-time \'{}\'", args.warmup_time()));
-    }
-
-    let kind_str = match args.benchmark_kind.as_simple_kind() {
-        BenchmarkKind::PinnedProducer => "pinned-producer",
-        BenchmarkKind::PinnedConsumer => "pinned-consumer",
-        BenchmarkKind::PinnedProducerAndConsumer => "pinned-producer-and-consumer",
-        BenchmarkKind::BalancedProducer => "balanced-producer",
-        BenchmarkKind::BalancedConsumerGroup => "balanced-consumer-group",
-        BenchmarkKind::BalancedProducerAndConsumerGroup => "balanced-producer-and-consumer-group",
-        BenchmarkKind::EndToEndProducingConsumer => "end-to-end-producing-consumer",
-        BenchmarkKind::EndToEndProducingConsumerGroup => "end-to-end-producing-consumer-group",
-    };
-    parts.push(kind_str.to_string());
-
-    // Add benchmark params, skipping defaults
-    let producers = args.producers();
-    let consumers = args.consumers();
-    let number_of_consumer_groups = args.number_of_consumer_groups();
-
-    match args.benchmark_kind.as_simple_kind() {
-        BenchmarkKind::PinnedProducer
-        | BenchmarkKind::BalancedProducer
-        | BenchmarkKind::EndToEndProducingConsumer => {
-            if producers != DEFAULT_NUMBER_OF_PRODUCERS.get() {
-                parts.push(format!("--producers {}", producers));
-            }
-        }
-        BenchmarkKind::PinnedConsumer | BenchmarkKind::BalancedConsumerGroup => {
-            if consumers != DEFAULT_NUMBER_OF_CONSUMERS.get() {
-                parts.push(format!("--consumers {}", consumers));
-            }
-        }
-        BenchmarkKind::PinnedProducerAndConsumer
-        | BenchmarkKind::BalancedProducerAndConsumerGroup => {
-            if producers != DEFAULT_NUMBER_OF_PRODUCERS.get() {
-                parts.push(format!("--producers {}", producers));
-            }
-            if consumers != DEFAULT_NUMBER_OF_CONSUMERS.get() {
-                parts.push(format!("--consumers {}", consumers));
-            }
-        }
-        BenchmarkKind::EndToEndProducingConsumerGroup => {
-            if producers != DEFAULT_NUMBER_OF_PRODUCERS.get() {
-                parts.push(format!("--producers {}", producers));
-            }
-            if consumers != DEFAULT_NUMBER_OF_CONSUMERS.get() {
-                parts.push(format!("--consumers {}", consumers));
-            }
-            if number_of_consumer_groups != DEFAULT_NUMBER_OF_CONSUMER_GROUPS.get() {
-                parts.push(format!("--consumer-groups {}", number_of_consumer_groups));
-            }
-        }
-    }
-
-    let streams = args.streams();
-    let default_streams = match args.benchmark_kind.as_simple_kind() {
-        BenchmarkKind::BalancedProducerAndConsumerGroup
-        | BenchmarkKind::BalancedConsumerGroup
-        | BenchmarkKind::BalancedProducer => DEFAULT_BALANCED_NUMBER_OF_STREAMS.get(),
-        _ => DEFAULT_PINNED_NUMBER_OF_STREAMS.get(),
-    };
-    if streams != default_streams {
-        parts.push(format!("--streams {}", streams));
-    }
-
-    let partitions = args.number_of_partitions();
-    let default_partitions = match args.benchmark_kind.as_simple_kind() {
-        BenchmarkKind::BalancedProducerAndConsumerGroup
-        | BenchmarkKind::BalancedConsumerGroup
-        | BenchmarkKind::BalancedProducer => DEFAULT_BALANCED_NUMBER_OF_PARTITIONS.get(),
-        _ => DEFAULT_PINNED_NUMBER_OF_PARTITIONS.get(),
-    };
-    if partitions != default_partitions {
-        parts.push(format!("--partitions {}", partitions));
-    }
-
-    let consumer_groups = args.number_of_consumer_groups();
-    if args.benchmark_kind.as_simple_kind() == BenchmarkKind::BalancedConsumerGroup
-        || args.benchmark_kind.as_simple_kind() == BenchmarkKind::BalancedProducerAndConsumerGroup
-            && consumer_groups != DEFAULT_NUMBER_OF_CONSUMER_GROUPS.get()
-    {
-        parts.push(format!("--consumer-groups {}", consumer_groups));
-    }
-
-    if let Some(max_topic_size) = args.max_topic_size() {
-        parts.push(format!("--max-topic-size \'{}\'", max_topic_size));
-    }
-
-    // Add transport and server address, skipping if default
-    let transport = args.transport().to_string().to_lowercase();
-    parts.push(transport.clone());
-
-    let default_address = match transport.as_str() {
-        "tcp" => DEFAULT_TCP_SERVER_ADDRESS,
-        "quic" => DEFAULT_QUIC_SERVER_ADDRESS,
-        "http" => DEFAULT_HTTP_SERVER_ADDRESS,
-        _ => "",
-    };
-
-    if server_address != default_address {
-        parts.push(format!("--server-address {}", server_address));
-    }
-
-    parts.push("output".to_string());
-
-    parts.push("-o performance_results".to_string());
-
-    let remark = args.remark();
-    if let Some(remark) = remark {
-        parts.push(format!("--remark \'{}\'", remark));
-    }
-    parts.join(" ")
-}
-
-impl From<&IggyBenchArgs> for BenchmarkParams {
-    fn from(args: &IggyBenchArgs) -> Self {
-        let benchmark_kind = args.benchmark_kind.as_simple_kind();
-
-        // Ugly conversion but let it stay here to have `iggy-bench-report` not depend on `iggy` or `integration`
-        let transport = match args.transport() {
-            Transport::Tcp => BenchmarkTransport::Tcp,
-            Transport::Quic => BenchmarkTransport::Quic,
-            Transport::Http => BenchmarkTransport::Http,
-        };
-        let server_address = args.server_address().to_string();
-        let remark = args.remark();
-        let extra_info = args.extra_info();
-        let gitref = args.gitref();
-        let gitref_date = args.gitref_date();
-        let messages_per_batch = args.messages_per_batch();
-        let message_batches = args.message_batches();
-        let message_size = args.message_size();
-        let producers = args.producers();
-        let consumers = args.consumers();
-        let streams = args.streams();
-        let partitions = args.number_of_partitions();
-        let consumer_groups = args.number_of_consumer_groups();
-        let rate_limit = args.rate_limit().map(|limit| limit.to_string());
-        let pretty_name = args.generate_pretty_name();
-        let bench_command = recreate_bench_command(args);
-
-        let remark_for_identifier = remark
-            .clone()
-            .unwrap_or("no_remark".to_string())
-            .replace(' ', "_");
-
-        let params_identifier = vec![
-            benchmark_kind.to_string(),
-            transport.to_string(),
-            remark_for_identifier,
-            messages_per_batch.to_string(),
-            message_batches.to_string(),
-            message_size.to_string(),
-            producers.to_string(),
-            consumers.to_string(),
-            streams.to_string(),
-            partitions.to_string(),
-            consumer_groups.to_string(),
-        ];
-
-        let params_identifier = params_identifier.join("_");
-
-        BenchmarkParams {
-            benchmark_kind,
-            transport,
-            server_address,
-            remark,
-            extra_info,
-            gitref,
-            gitref_date,
-            messages_per_batch,
-            message_batches,
-            message_size,
-            producers,
-            consumers,
-            streams,
-            partitions,
-            consumer_groups,
-            rate_limit,
-            pretty_name,
-            bench_command,
-            params_identifier,
-        }
     }
 }

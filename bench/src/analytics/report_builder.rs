@@ -68,10 +68,8 @@ impl BenchmarkReportBuilder {
 
         let mut group_metrics = Vec::new();
 
-        // Sort metrics by actor type and ID
         individual_metrics.sort_by_key(|m| (m.summary.actor_kind, m.summary.actor_id));
 
-        // Split metrics by actor type
         let producer_metrics: Vec<BenchmarkIndividualMetrics> = individual_metrics
             .iter()
             .filter(|m| m.summary.actor_kind == ActorKind::Producer)

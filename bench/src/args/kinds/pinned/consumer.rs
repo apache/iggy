@@ -30,8 +30,9 @@ pub struct PinnedConsumerArgs {
     pub transport: BenchmarkTransportCommand,
 
     /// Number of streams
-    #[arg(long, short = 's', default_value_t = DEFAULT_PINNED_NUMBER_OF_STREAMS)]
-    pub streams: NonZeroU32,
+    /// If not provided then number of streams will be equal to number of consumers.
+    #[arg(long, short = 's')]
+    pub streams: Option<NonZeroU32>,
 
     /// Number of consumers
     #[arg(long, short = 'c', default_value_t = DEFAULT_NUMBER_OF_PRODUCERS)]
@@ -40,7 +41,7 @@ pub struct PinnedConsumerArgs {
 
 impl BenchmarkKindProps for PinnedConsumerArgs {
     fn streams(&self) -> u32 {
-        self.streams.get()
+        self.streams.unwrap_or(self.consumers).get()
     }
 
     fn partitions(&self) -> u32 {

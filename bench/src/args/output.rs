@@ -27,8 +27,8 @@ pub enum BenchmarkOutputCommand {
 #[derive(Parser, Debug, Clone)]
 pub struct BenchmarkOutputArgs {
     /// Output directory path for storing benchmark results
-    #[arg(long, short = 'o')]
-    pub output_dir: Option<String>,
+    #[arg(long, short = 'o', default_value = "performance_results")]
+    pub output_dir: String,
 
     /// Identifier for the benchmark run (defaults to hostname if not provided)
     #[arg(long, default_value_t = hostname::get().unwrap().to_string_lossy().to_string())]
@@ -51,6 +51,6 @@ pub struct BenchmarkOutputArgs {
     pub gitref_date: Option<String>,
 
     /// Open generated charts in browser after benchmark is finished
-    #[arg(long, default_value_t = false)]
+    #[arg(long, short = 'c', default_value_t = false)]
     pub open_charts: bool,
 }

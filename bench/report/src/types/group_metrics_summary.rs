@@ -47,4 +47,10 @@ pub struct BenchmarkGroupMetricsSummary {
     pub average_latency_ms: f64,
     #[serde(serialize_with = "round_float")]
     pub average_median_latency_ms: f64,
+    #[serde(default, serialize_with = "round_float")]
+    pub min_latency_ms: f64,
+    #[serde(default, serialize_with = "round_float")]
+    pub max_latency_ms: f64,
+    #[serde(default, serialize_with = "round_float")]
+    pub std_dev_latency_ms: f64,
 }

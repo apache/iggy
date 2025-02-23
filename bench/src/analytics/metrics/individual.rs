@@ -26,6 +26,7 @@ use iggy_bench_report::benchmark_kind::BenchmarkKind;
 use iggy_bench_report::individual_metrics::BenchmarkIndividualMetrics;
 use iggy_bench_report::individual_metrics_summary::BenchmarkIndividualMetricsSummary;
 use iggy_bench_report::time_series::TimeSeries;
+use iggy_bench_report::utils::*;
 
 pub fn from_records(
     records: Vec<BenchmarkRecord>,
@@ -45,6 +46,7 @@ pub fn from_records(
                 total_user_data_bytes: 0,
                 total_bytes: 0,
                 total_messages: 0,
+                total_message_batches: 0,
                 throughput_megabytes_per_second: 0.0,
                 throughput_messages_per_second: 0.0,
                 p50_latency_ms: 0.0,
@@ -55,6 +57,9 @@ pub fn from_records(
                 p9999_latency_ms: 0.0,
                 avg_latency_ms: 0.0,
                 median_latency_ms: 0.0,
+                min_latency_ms: 0.0,
+                max_latency_ms: 0.0,
+                std_dev_latency_ms: 0.0,
             },
             throughput_mb_ts: TimeSeries::default(),
             throughput_msg_ts: TimeSeries::default(),
@@ -64,17 +69,41 @@ pub fn from_records(
 
     let total_time_secs = records.last().unwrap().elapsed_time_us as f64 / 1_000_000.0;
 
-    let total_user_data_bytes: u64 = records.iter().last().unwrap().user_data_bytes;
-    let total_bytes: u64 = records.iter().last().unwrap().total_bytes;
-    let total_messages: u64 = records.iter().last().unwrap().messages;
+    let total_user_data_bytes = records.iter().last().unwrap().user_data_bytes;
+    let total_bytes = records.iter().last().unwrap().total_bytes;
+    let total_messages = records.iter().last().unwrap().messages;
+    let total_message_batches = records.iter().last().unwrap().message_batches;
 
-    let throughput_megabytes_per_second = if total_time_secs > 0.0 {
-        (total_bytes as f64) / 1_000_000.0 / total_time_secs
+    let calculator = TimeSeriesCalculator::new();
+
+    let throughput_mb_ts = calculator.throughput_mb(&records, sampling_time);
+    let throughput_msg_ts = calculator.throughput_msg(&records, sampling_time);
+
+    let sma = MovingAverageProcessor::new(moving_average_window as usize);
+    let throughput_mb_ts = sma.process(&throughput_mb_ts);
+    let throughput_msg_ts = sma.process(&throughput_msg_ts);
+
+    let throughput_megabytes_per_second = if !throughput_mb_ts.points.is_empty() {
+        throughput_mb_ts
+            .points
+            .iter()
+            .map(|point| point.value)
+            .sum::<f64>()
+            / throughput_mb_ts.points.len() as f64
+    } else if total_time_secs > 0.0 {
+        (total_user_data_bytes as f64) / 1_000_000.0 / total_time_secs
     } else {
         0.0
     };
 
-    let throughput_messages_per_second = if total_time_secs > 0.0 {
+    let throughput_messages_per_second = if !throughput_msg_ts.points.is_empty() {
+        throughput_msg_ts
+            .points
+            .iter()
+            .map(|point| point.value)
+            .sum::<f64>()
+            / throughput_msg_ts.points.len() as f64
+    } else if total_time_secs > 0.0 {
         (total_messages as f64) / total_time_secs
     } else {
         0.0
@@ -101,17 +130,11 @@ pub fn from_records(
         latencies_ms[len]
     };
 
-    let calculator = TimeSeriesCalculator::new();
-
-    // Calculate throughput time series
-    let throughput_mb_ts = calculator.throughput_mb(&records, sampling_time);
-    let throughput_msg_ts = calculator.throughput_msg(&records, sampling_time);
-
-    let sma = MovingAverageProcessor::new(moving_average_window as usize);
-    let throughput_mb_ts = sma.process(&throughput_mb_ts);
-    let throughput_msg_ts = sma.process(&throughput_msg_ts);
-
     let latency_ts = calculator.latency(&records, sampling_time);
+
+    let min_latency_ms = min(&latency_ts).unwrap_or(0.0);
+    let max_latency_ms = max(&latency_ts).unwrap_or(0.0);
+    let std_dev_latency_ms = std_dev(&latency_ts).unwrap_or(0.0);
 
     BenchmarkIndividualMetrics {
         summary: BenchmarkIndividualMetricsSummary {
@@ -122,6 +145,7 @@ pub fn from_records(
             total_user_data_bytes,
             total_bytes,
             total_messages,
+            total_message_batches,
             throughput_megabytes_per_second,
             throughput_messages_per_second,
             p50_latency_ms,
@@ -132,6 +156,9 @@ pub fn from_records(
             p9999_latency_ms,
             avg_latency_ms,
             median_latency_ms,
+            min_latency_ms,
+            max_latency_ms,
+            std_dev_latency_ms,
         },
         throughput_mb_ts,
         throughput_msg_ts,

@@ -63,6 +63,10 @@ impl Default for IggyByteSize {
 }
 
 impl IggyByteSize {
+    pub const fn new(bytes: u64) -> Self {
+        Self(Byte::from_u64(bytes))
+    }
+
     /// Returns the byte size as a `u64`.
     pub fn as_bytes_u64(&self) -> u64 {
         self.0.as_u64()

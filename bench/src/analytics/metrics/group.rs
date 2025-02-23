@@ -23,7 +23,7 @@ use crate::analytics::time_series::{
 use iggy_bench_report::{
     actor_kind::ActorKind, group_metrics::BenchmarkGroupMetrics,
     group_metrics_kind::GroupMetricsKind, group_metrics_summary::BenchmarkGroupMetricsSummary,
-    individual_metrics::BenchmarkIndividualMetrics,
+    individual_metrics::BenchmarkIndividualMetrics, utils::*,
 };
 
 pub fn from_producers_and_consumers_statistics(
@@ -125,6 +125,32 @@ pub fn from_individual_metrics(
     avg_throughput_msg_ts = sma.process(&avg_throughput_msg_ts);
     avg_latency_ts = sma.process(&avg_latency_ts);
 
+    let min_latency_ms = if !stats.is_empty() {
+        stats
+            .iter()
+            .map(|s| s.summary.min_latency_ms)
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    } else {
+        None
+    };
+
+    let max_latency_ms = if !stats.is_empty() {
+        stats
+            .iter()
+            .map(|s| s.summary.max_latency_ms)
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    } else {
+        None
+    };
+
+    let min_latency_ms_value =
+        min_latency_ms.unwrap_or_else(|| min(&avg_latency_ts).unwrap_or(0.0));
+
+    let max_latency_ms_value =
+        max_latency_ms.unwrap_or_else(|| max(&avg_latency_ts).unwrap_or(0.0));
+
+    let std_dev_latency_ms = std_dev(&avg_latency_ts);
+
     let summary = BenchmarkGroupMetricsSummary {
         kind,
         total_throughput_megabytes_per_second,
@@ -139,6 +165,9 @@ pub fn from_individual_metrics(
         average_p9999_latency_ms,
         average_latency_ms: average_avg_latency_ms,
         average_median_latency_ms,
+        min_latency_ms: min_latency_ms_value,
+        max_latency_ms: max_latency_ms_value,
+        std_dev_latency_ms: std_dev_latency_ms.unwrap_or(0.0),
     };
 
     Some(BenchmarkGroupMetrics {
