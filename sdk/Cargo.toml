@@ -48,7 +48,7 @@ reqwest = { version = "0.12.12", default-features = false, features = [
     "json",
     "rustls-tls",
 ] }
-reqwest-middleware = { version = "0.4.0", features = ["json"] }
+reqwest-middleware = { version = "0.4.1", features = ["json"] }
 reqwest-retry = "0.7.0"
 rustls = { version = "0.23.23", features = ["ring"] }
 serde = { version = "1.0.218", features = ["derive", "rc"] }
