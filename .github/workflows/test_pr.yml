@@ -91,6 +91,7 @@ jobs:
           args: "--verbose"
 
       - name: Check CLI examples from README
+        timeout-minutes: 10
         run: ./scripts/run-examples-from-readme.sh
 
       - name: Check if workspace is clean

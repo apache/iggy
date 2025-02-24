@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::Arc;
+use std::time::Duration;
 use test_case::test_matrix;
 
 /*
@@ -174,6 +175,8 @@ async fn test_get_messages_by_timestamp(
         batch_timestamps.push(IggyTimestamp::now());
         current_pos += batch_size as usize;
     }
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
 
     let final_timestamp = IggyTimestamp::now();
 

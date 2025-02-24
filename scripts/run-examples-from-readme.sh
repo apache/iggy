@@ -27,14 +27,13 @@ test -e ${LOG_FILE} && rm ${LOG_FILE}
 test -e ${PID_FILE} && rm ${PID_FILE}
 
 # Run iggy server and let it run in the background
-cargo run --bin iggy-server &> ${LOG_FILE} & echo $! > ${PID_FILE}
+cargo run --bin iggy-server &>${LOG_FILE} &
+echo $! >${PID_FILE}
 
 # Wait until "Iggy server has started" string is present inside iggy-server.log
 SERVER_START_TIME=0
-while ! grep -q "Iggy server has started" ${LOG_FILE}
-do
-    if [ ${SERVER_START_TIME} -gt ${TIMEOUT} ]
-    then
+while ! grep -q "Iggy server has started" ${LOG_FILE}; do
+    if [ ${SERVER_START_TIME} -gt ${TIMEOUT} ]; then
         echo "Server did not start within ${TIMEOUT} seconds."
         ps fx
         cat ${LOG_FILE}
@@ -42,15 +41,14 @@ do
     fi
     echo "Waiting for Iggy server to start... ${SERVER_START_TIME}"
     sleep 1
-    ((SERVER_START_TIME+=1))
+    ((SERVER_START_TIME += 1))
 done
 
-# Execute all matching commands from README.md and check if they pass or fail
-while IFS= read -r command
-do
+# Execute all matching CLI commands from README.md and check if they pass or fail
+while IFS= read -r command; do
     # Remove backticks from command
     command=$(echo "${command}" | tr -d '`')
-    echo -e "\e[33mChecking command:\e[0m ${command}"
+    echo -e "\e[33mChecking CLI command:\e[0m ${command}"
     echo ""
 
     set +e
@@ -59,23 +57,49 @@ do
     set -e
 
     # Stop at first failure
-    if [ ${exit_code} -ne 0 ]
-    then
+    if [ ${exit_code} -ne 0 ]; then
         echo ""
-        echo -e "\e[31mCommand failed:\e[0m ${command}"
+        echo -e "\e[31mCLI command failed:\e[0m ${command}"
         echo ""
         break
     fi
 
 done < <(grep -E "^\`cargo r --bin iggy -- " README.md)
 
+# Execute all example commands from README.md and check if they pass or fail
+while IFS= read -r command; do
+    # Remove backticks and comments from command
+    command=$(echo "${command}" | tr -d '`' | sed 's/^#.*//')
+    # Skip empty lines
+    if [ -z "${command}" ]; then
+        continue
+    fi
+    echo -e "\e[33mChecking example command:\e[0m ${command}"
+    echo ""
+
+    set +e
+    eval "${command}"
+    exit_code=$?
+    set -e
+
+    # Stop at first failure
+    if [ ${exit_code} -ne 0 ]; then
+        echo ""
+        echo -e "\e[31mExample command failed:\e[0m ${command}"
+        echo ""
+        break
+    fi
+    # Add a small delay between examples to avoid potential race conditions
+    sleep 2
+
+done < <(grep -E "^cargo run --example" README.md)
+
 # Terminate server
 kill -TERM "$(cat ${PID_FILE})"
 test -e ${PID_FILE} && rm ${PID_FILE}
 
 # If everything is ok remove log and pid files otherwise cat server log
-if [ "${exit_code}" -eq 0 ]
-then
+if [ "${exit_code}" -eq 0 ]; then
     test -e ${LOG_FILE} && rm ${LOG_FILE}
 else
     cat ${LOG_FILE}

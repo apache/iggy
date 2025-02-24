@@ -64,7 +64,7 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 - **Consumer groups** providing the message ordering and horizontal scaling across the connected clients
 - **Message expiry** with auto deletion based on the configurable **retention policy**
 - Additional features such as **server side message deduplication**
-- **Multi-tenant** support via abstraction of **streams** whch group **topics**
+- **Multi-tenant** support via abstraction of **streams** which group **topics**
 - **TLS** support for all transport protocols (TCP, QUIC, HTTPS)
 - Optional server-side as well as client-side **data encryption** using AES-256-GCM
 - Optional metadata support in the form of **message headers**
@@ -209,13 +209,90 @@ To see the detailed logs from the CLI/server, run it with `RUST_LOG=trace` envir
 
 You can find the sample consumer & producer applications under `examples` directory. The purpose of these apps is to showcase the usage of the client SDK. To find out more about building the applications, please refer to the [getting started](https://docs.iggy.rs/introduction/getting-started) guide.
 
-To run the example, first start the server with `cargo r --bin iggy-server` and then run the producer and consumer apps with `cargo r --example message-envelope-producer` and `cargo r --example message-envelope-consumer` respectively.
+To run the example, first start the server with `cargo run --bin iggy-server` and then run the producer and consumer apps with `cargo run --example message-envelope-producer` and `cargo run --example message-envelope-consumer` respectively.
 
 You might start multiple producers and consumers at the same time to see how the messages are being handled across multiple clients. Check the [Args](https://github.com/spetz/iggy/blob/master/examples/src/shared/args.rs) struct to see the available options, such as the transport protocol, stream, topic, partition, consumer ID, message size etc.
 
 By default, the consumer will poll the messages using the `next` available offset with auto commit enabled, to store its offset on the server. With this approach, you can easily achieve *at-most-once* delivery.
 
 ![sample](assets/sample.png)
+
+### Getting Started
+
+Basic example showing how to connect to Iggy and perform fundamental operations. Perfect for newcomers.
+
+```bash
+# Run the producer
+cargo run --example getting-started-producer
+
+# Run the consumer
+cargo run --example getting-started-consumer
+```
+
+### Basic Usage
+
+Demonstrates core functionality with detailed comments explaining each operation.
+
+```bash
+cargo run --example basic-producer
+cargo run --example basic-consumer
+```
+
+### Message Headers
+
+Shows how to work with message headers for metadata management.
+
+```bash
+# Producer adds custom headers to messages
+cargo run --example message-headers-producer
+
+# Consumer reads and processes headers
+cargo run --example message-headers-consumer
+```
+
+### Message Envelope
+
+Demonstrates working with message envelopes for advanced message handling.
+
+```bash
+cargo run --example message-envelope-producer
+cargo run --example message-envelope-consumer
+```
+
+### Multi-tenant Setup
+
+Example of implementing multi-tenancy using streams for isolation.
+
+```bash
+# Start the multi-tenant producer
+cargo run --example multi-tenant-producer
+
+# Start the multi-tenant consumer
+cargo run --example multi-tenant-consumer
+```
+
+### Stream Builder
+
+Shows how to programmatically create and configure streams:
+
+- Setting up partitions
+- Configuring retention policies
+- Managing message expiry
+- Setting up consumer groups
+
+```bash
+cargo run --example stream-builder
+```
+
+### Running Examples
+
+All examples can be run directly from the repository. Make sure to:
+
+1. Start the Iggy server first: `cargo run --bin iggy-server`
+2. Run the examples using the commands shown above
+3. Check the example source code for detailed comments and explanations
+
+The examples are also tested automatically using the `scripts/run-examples-from-readme.sh` script, which ensures they stay up-to-date and working.
 
 ---
 
