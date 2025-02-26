@@ -3,33 +3,25 @@ use human_repr::HumanCount;
 use tracing::info;
 
 use crate::{
-    benchmark_kind::BenchmarkKind, group_metrics::BenchmarkGroupMetrics,
+    actor_kind::ActorKind, benchmark_kind::BenchmarkKind, group_metrics::BenchmarkGroupMetrics,
     group_metrics_kind::GroupMetricsKind, report::BenchmarkReport,
 };
 
 impl BenchmarkReport {
     pub fn print_summary(&self) {
         let kind = self.params.benchmark_kind;
-        let total_messages_sent: u64 = self.params.messages_per_batch as u64
-            * self.params.message_batches as u64
-            * self.params.producers as u64;
-        let total_messages_received: u64 = self.params.messages_per_batch as u64
-            * self.params.message_batches as u64
-            * self.params.consumers as u64;
-        let total_messages = total_messages_sent + total_messages_received;
-        let total_size_bytes: u64 = total_messages * self.params.message_size as u64;
-        let total_size = format!("{} of data processed", total_size_bytes.human_count_bytes());
-        let total_messages = format!("{} messages processed, ", total_messages.human_count_bare());
+        let total_messages = format!("{} messages, ", self.total_messages());
+        let total_size = format!(
+            "{} of data processed",
+            self.total_bytes().human_count_bytes()
+        );
 
         let streams = format!("{} streams, ", self.params.streams);
         // TODO: make this configurable
         let topics = "1 topic per stream, ";
         let messages_per_batch = format!("{} messages per batch, ", self.params.messages_per_batch);
         let message_batches = format!("{} message batches, ", self.params.message_batches);
-        let message_size = format!(
-            "{} per message, ",
-            self.params.message_size.human_count_bytes()
-        );
+        let message_size = format!("{} bytes per message, ", self.params.message_size);
         let producers = if self.params.producers == 0 {
             "".to_owned()
         } else if self.params.benchmark_kind == BenchmarkKind::EndToEndProducingConsumerGroup
@@ -62,6 +54,66 @@ impl BenchmarkReport {
         self.group_metrics
             .iter()
             .for_each(|s| info!("{}\n", s.formatted_string()));
+    }
+
+    pub fn total_messages(&self) -> u64 {
+        self.individual_metrics
+            .iter()
+            .map(|s| s.summary.total_messages)
+            .sum()
+    }
+
+    pub fn total_messages_sent(&self) -> u64 {
+        self.individual_metrics
+            .iter()
+            .filter(|s| s.summary.actor_kind != ActorKind::Consumer)
+            .map(|s| s.summary.total_messages)
+            .sum()
+    }
+
+    pub fn total_messages_received(&self) -> u64 {
+        self.individual_metrics
+            .iter()
+            .filter(|s| s.summary.actor_kind != ActorKind::Producer)
+            .map(|s| s.summary.total_messages)
+            .sum()
+    }
+
+    pub fn total_bytes_sent(&self) -> u64 {
+        self.individual_metrics
+            .iter()
+            .filter(|s| s.summary.actor_kind != ActorKind::Consumer)
+            .map(|s| s.summary.total_user_data_bytes)
+            .sum()
+    }
+
+    pub fn total_bytes_received(&self) -> u64 {
+        self.individual_metrics
+            .iter()
+            .filter(|s| s.summary.actor_kind != ActorKind::Producer)
+            .map(|s| s.summary.total_user_data_bytes)
+            .sum()
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        self.individual_metrics
+            .iter()
+            .map(|s| s.summary.total_user_data_bytes)
+            .sum()
+    }
+
+    pub fn total_message_batches(&self) -> u64 {
+        let batches = self
+            .individual_metrics
+            .iter()
+            .map(|s| s.summary.total_message_batches.unwrap_or_default())
+            .sum();
+
+        if batches == 0 {
+            self.params.message_batches as u64
+        } else {
+            batches
+        }
     }
 }
 

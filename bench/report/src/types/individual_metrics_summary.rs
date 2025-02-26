@@ -13,6 +13,7 @@ pub struct BenchmarkIndividualMetricsSummary {
     pub total_user_data_bytes: u64,
     pub total_bytes: u64,
     pub total_messages: u64,
+    pub total_message_batches: Option<u64>,
     #[serde(serialize_with = "round_float")]
     pub throughput_megabytes_per_second: f64,
     #[serde(serialize_with = "round_float")]
