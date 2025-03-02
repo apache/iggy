@@ -30,7 +30,6 @@ use iggy::models::consumer_offset_info::ConsumerOffsetInfo;
 use iggy::models::messages::PolledMessages;
 use iggy::models::stats::Stats;
 use iggy::models::user_info::UserId;
-use iggy::utils::byte_size::IggyByteSize;
 use iggy::utils::sizeable::Sizeable;
 use tokio::sync::RwLock;
 

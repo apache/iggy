@@ -54,10 +54,7 @@ impl System {
                 permissions: root.permissions.clone(),
             };
             self.state
-                .apply(0, EntryCommand::CreateUser(CreateUserWithId {
-                    user_id: root.id,
-                    command
-                }))
+                .apply(0, &EntryCommand::CreateUser(command))
                 .await
                 .with_error_context(|error| {
                     format!(

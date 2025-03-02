@@ -139,10 +139,7 @@ async fn create_topic(
     let system = system.downgrade();
     system
         .state
-        .apply(identity.user_id, EntryCommand::CreateTopic(CreateTopicWithId {
-            topic_id,
-            command
-        }))
+        .apply(identity.user_id, &EntryCommand::CreateTopic(command))
         .await
         .with_error_context(|error| {
             format!(
@@ -188,7 +185,7 @@ async fn update_topic(
     let system = system.downgrade();
     system
         .state
-        .apply(identity.user_id, EntryCommand::UpdateTopic(command))
+        .apply(identity.user_id, &EntryCommand::UpdateTopic(command))
         .await
         .with_error_context(|error| {
             format!(
@@ -227,7 +224,7 @@ async fn delete_topic(
         .state
         .apply(
             identity.user_id,
-            EntryCommand::DeleteTopic(DeleteTopic {
+            &EntryCommand::DeleteTopic(DeleteTopic {
                 stream_id: identifier_stream_id,
                 topic_id: identifier_topic_id,
             }),
@@ -268,7 +265,7 @@ async fn purge_topic(
         .state
         .apply(
             identity.user_id,
-            EntryCommand::PurgeTopic(PurgeTopic {
+            &EntryCommand::PurgeTopic(PurgeTopic {
                 stream_id: identifier_stream_id,
                 topic_id: identifier_topic_id,
             }),
