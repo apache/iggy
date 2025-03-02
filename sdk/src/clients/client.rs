@@ -14,11 +14,11 @@ use crate::locking::IggySharedMut;
 use crate::locking::IggySharedMutFn;
 use crate::messages::poll_messages::PollingStrategy;
 use crate::messages::send_messages::{Message, Partitioning};
+use crate::models::batch::IggyBatch;
 use crate::models::client_info::{ClientInfo, ClientInfoDetails};
 use crate::models::consumer_group::{ConsumerGroup, ConsumerGroupDetails};
 use crate::models::consumer_offset_info::ConsumerOffsetInfo;
 use crate::models::identity_info::IdentityInfo;
-use crate::models::messages::PolledMessages;
 use crate::models::permissions::Permissions;
 use crate::models::personal_access_token::{PersonalAccessTokenInfo, RawPersonalAccessToken};
 use crate::models::snapshot::Snapshot;
@@ -543,12 +543,12 @@ impl MessageClient for IggyClient {
         strategy: &PollingStrategy,
         count: u32,
         auto_commit: bool,
-    ) -> Result<PolledMessages, IggyError> {
+    ) -> Result<IggyBatch, IggyError> {
         if count == 0 {
             return Err(IggyError::InvalidMessagesCount);
         }
 
-        let mut polled_messages = self
+        let batch = self
             .client
             .read()
             .await
@@ -563,6 +563,8 @@ impl MessageClient for IggyClient {
             )
             .await?;
 
+        // TODO: Fix me
+        /*
         if let Some(ref encryptor) = self.encryptor {
             for message in &mut polled_messages.messages {
                 let payload = encryptor.decrypt(&message.payload)?;
@@ -570,8 +572,8 @@ impl MessageClient for IggyClient {
                 message.length = IggyByteSize::from(message.payload.len() as u64);
             }
         }
-
-        Ok(polled_messages)
+        */
+        Ok(batch)
     }
 
     async fn send_messages(

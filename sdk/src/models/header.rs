@@ -659,7 +659,7 @@ impl BytesSerializable for HashMap<HeaderKey, HeaderValue> {
 /// Returns the size in bytes of the specified headers.
 pub fn get_headers_size_bytes(headers: &Option<HashMap<HeaderKey, HeaderValue>>) -> IggyByteSize {
     // Headers length field
-    let mut size = 4;
+    let mut size = 0;
     if let Some(headers) = headers {
         for (key, value) in headers {
             // Key length + Key + Kind + Value length + Value

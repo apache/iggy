@@ -1,5 +1,5 @@
 use crate::archiver::ArchiverKind;
-use crate::channels::server_command::ServerCommand;
+use crate::channels::server_command::BackgroundServerCommand;
 use crate::configs::server::MessagesMaintenanceConfig;
 use crate::map_toggle_str;
 use crate::streaming::systems::system::SharedSystem;
@@ -75,7 +75,7 @@ impl MessagesMaintainer {
     }
 }
 
-impl ServerCommand<MaintainMessagesCommand> for MaintainMessagesExecutor {
+impl BackgroundServerCommand<MaintainMessagesCommand> for MaintainMessagesExecutor {
     #[instrument(skip_all, name = "trace_maintain_messages")]
     async fn execute(&mut self, system: &SharedSystem, command: MaintainMessagesCommand) {
         let system = system.read().await;

@@ -1,4 +1,4 @@
-use super::server_command::ServerCommand;
+use super::server_command::BackgroundServerCommand;
 use crate::configs::server::ServerConfig;
 use crate::streaming::systems::system::SharedSystem;
 
@@ -14,7 +14,7 @@ impl<'a> ServerCommandHandler<'a> {
 
     pub fn install_handler<C, E>(&mut self, mut executor: E) -> Self
     where
-        E: ServerCommand<C> + Send + Sync + 'static,
+        E: BackgroundServerCommand<C> + Send + Sync + 'static,
     {
         let (sender, receiver) = flume::unbounded();
         let system = self.system.clone();

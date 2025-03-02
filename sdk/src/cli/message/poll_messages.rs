@@ -5,8 +5,8 @@ use crate::consumer::Consumer;
 use crate::identifier::Identifier;
 use crate::messages::poll_messages::{PollMessages, PollingStrategy};
 use crate::messages::send_messages::Message;
+use crate::models::batch::IggyBatch;
 use crate::models::header::{HeaderKey, HeaderKind};
-use crate::models::messages::PolledMessages;
 use crate::utils::sizeable::Sizeable;
 use crate::utils::timestamp::IggyTimestamp;
 use crate::utils::{byte_size::IggyByteSize, duration::IggyDuration};
@@ -64,8 +64,10 @@ impl PollMessagesCmd {
 
     fn create_message_header_keys(
         &self,
-        polled_messages: &PolledMessages,
+        polled_messages: &IggyBatch,
     ) -> HashSet<(HeaderKey, HeaderKind)> {
+        //TODO: Fix me
+        /*
         if !self.show_headers {
             return HashSet::new();
         }
@@ -80,6 +82,8 @@ impl PollMessagesCmd {
                 None => vec![],
             })
             .collect::<HashSet<_>>()
+        */
+        todo!()
     }
 
     fn create_table_header(header_key_set: &HashSet<(HeaderKey, HeaderKind)>) -> Row {
@@ -102,9 +106,11 @@ impl PollMessagesCmd {
     }
 
     fn create_table_content(
-        polled_messages: &PolledMessages,
+        polled_messages: &IggyBatch,
         message_header_keys: &HashSet<(HeaderKey, HeaderKind)>,
     ) -> Vec<Row> {
+        //TODO: Fix me
+        /*
         polled_messages
             .messages
             .iter()
@@ -136,6 +142,8 @@ impl PollMessagesCmd {
                 Row::from(row)
             })
             .collect::<_>()
+            */
+        todo!()
     }
 }
 
@@ -169,6 +177,8 @@ impl CliCommand for PollMessagesCmd {
             })?;
         let elapsed = IggyDuration::new(start.elapsed());
 
+        //TODO: Fix me
+        /*
         event!(target: PRINT_TARGET, Level::INFO,
             "Polled messages from topic with ID: {} and stream with ID: {} (from partition with ID: {})",
             self.poll_messages.topic_id,
@@ -227,6 +237,7 @@ impl CliCommand for PollMessagesCmd {
 
             event!(target: PRINT_TARGET, Level::INFO, "{table}");
         }
+        */
 
         Ok(())
     }

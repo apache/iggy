@@ -5,7 +5,7 @@ use crate::error::IggyError;
 use crate::identifier::{IdKind, Identifier};
 use crate::locking::{IggySharedMut, IggySharedMutFn};
 use crate::messages::poll_messages::{PollingKind, PollingStrategy};
-use crate::models::messages::{PolledMessage, PolledMessages};
+use crate::models::batch::IggyBatch;
 use crate::utils::byte_size::IggyByteSize;
 use crate::utils::crypto::EncryptorKind;
 use crate::utils::duration::IggyDuration;
@@ -25,10 +25,10 @@ use tokio::time;
 use tokio::time::sleep;
 use tracing::{error, info, trace, warn};
 
-const EMPTY_MESSAGES: Vec<PolledMessage> = Vec::new();
+//const EMPTY_MESSAGES: Vec<PolledMessage> = Vec::new();
 
 const ORDERING: std::sync::atomic::Ordering = std::sync::atomic::Ordering::SeqCst;
-type PollMessagesFuture = Pin<Box<dyn Future<Output = Result<PolledMessages, IggyError>>>>;
+type PollMessagesFuture = Pin<Box<dyn Future<Output = Result<IggyBatch, IggyError>>>>;
 
 /// The auto-commit configuration for storing the offset on the server.
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -102,7 +102,7 @@ pub struct IggyConsumer {
     last_consumed_offsets: Arc<DashMap<u32, AtomicU64>>,
     current_offsets: Arc<DashMap<u32, AtomicU64>>,
     poll_future: Option<PollMessagesFuture>,
-    buffered_messages: VecDeque<PolledMessage>,
+    buffered_messages: VecDeque<IggyBatch>,
     encryptor: Option<Arc<EncryptorKind>>,
     store_offset_sender: flume::Sender<(u32, u64)>,
     store_offset_after_each_message: bool,
@@ -566,9 +566,7 @@ impl IggyConsumer {
         });
     }
 
-    fn create_poll_messages_future(
-        &self,
-    ) -> impl Future<Output = Result<PolledMessages, IggyError>> {
+    fn create_poll_messages_future(&self) -> impl Future<Output = Result<IggyBatch, IggyError>> {
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
         let partition_id = self.partition_id;
@@ -611,7 +609,10 @@ impl IggyConsumer {
                     auto_commit_after_polling,
                 )
                 .await;
+            polled_messages
 
+            //TODO: Fix me
+            /*
             if let Ok(mut polled_messages) = polled_messages {
                 if polled_messages.messages.is_empty() {
                     return Ok(polled_messages);
@@ -709,6 +710,7 @@ impl IggyConsumer {
                 sleep(retry_interval.get_duration()).await;
             }
             Err(error)
+            */
         }
     }
 
@@ -788,13 +790,13 @@ impl IggyConsumer {
 }
 
 pub struct ReceivedMessage {
-    pub message: PolledMessage,
+    pub message: IggyBatch,
     pub current_offset: u64,
     pub partition_id: u32,
 }
 
 impl ReceivedMessage {
-    pub fn new(message: PolledMessage, current_offset: u64, partition_id: u32) -> Self {
+    pub fn new(message: IggyBatch, current_offset: u64, partition_id: u32) -> Self {
         Self {
             message,
             current_offset,
@@ -809,126 +811,129 @@ impl Stream for IggyConsumer {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let partition_id = self.current_partition_id.load(ORDERING);
         if let Some(message) = self.buffered_messages.pop_front() {
-            {
-                if let Some(last_consumed_offset_entry) =
-                    self.last_consumed_offsets.get(&partition_id)
+            //TODO: Fix me
+            /*
                 {
-                    last_consumed_offset_entry.store(message.offset, ORDERING);
-                } else {
-                    self.last_consumed_offsets
-                        .insert(partition_id, AtomicU64::new(message.offset));
-                }
-
-                if (self.store_after_every_nth_message > 0
-                    && message.offset % self.store_after_every_nth_message == 0)
-                    || self.store_offset_after_each_message
-                {
-                    self.send_store_offset(partition_id, message.offset);
-                }
-            }
-
-            if self.buffered_messages.is_empty() {
-                if self.polling_strategy.kind == PollingKind::Offset {
-                    self.polling_strategy = PollingStrategy::offset(message.offset + 1);
-                }
-
-                if self.store_offset_after_all_messages {
-                    self.send_store_offset(partition_id, message.offset);
-                }
-            }
-
-            let current_offset;
-            if let Some(current_offset_entry) = self.current_offsets.get(&partition_id) {
-                current_offset = current_offset_entry.load(ORDERING);
-            } else {
-                current_offset = 0;
-            }
-
-            return Poll::Ready(Some(Ok(ReceivedMessage::new(
-                message,
-                current_offset,
-                partition_id,
-            ))));
-        }
-
-        if self.poll_future.is_none() {
-            let future = self.create_poll_messages_future();
-            self.poll_future = Some(Box::pin(future));
-        }
-
-        while let Some(future) = self.poll_future.as_mut() {
-            match future.poll_unpin(cx) {
-                Poll::Ready(Ok(mut polled_messages)) => {
-                    let partition_id = polled_messages.partition_id;
-                    self.current_partition_id.store(partition_id, ORDERING);
-                    if polled_messages.messages.is_empty() {
-                        self.poll_future = Some(Box::pin(self.create_poll_messages_future()));
+                    if let Some(last_consumed_offset_entry) =
+                        self.last_consumed_offsets.get(&partition_id)
+                    {
+                        last_consumed_offset_entry.store(message.offset, ORDERING);
                     } else {
-                        if let Some(ref encryptor) = self.encryptor {
-                            for message in &mut polled_messages.messages {
-                                let payload = encryptor.decrypt(&message.payload);
-                                if payload.is_err() {
-                                    self.poll_future = None;
-                                    error!("Failed to decrypt the message payload at offset: {}, partition ID: {}", message.offset, partition_id);
-                                    let error = payload.unwrap_err();
-                                    return Poll::Ready(Some(Err(error)));
-                                }
+                        self.last_consumed_offsets
+                            .insert(partition_id, AtomicU64::new(message.offset));
+                    }
 
-                                let payload = payload.unwrap();
-                                message.payload = Bytes::from(payload);
-                                message.length = IggyByteSize::from(message.payload.len() as u64);
-                            }
-                        }
-
-                        if let Some(current_offset_entry) = self.current_offsets.get(&partition_id)
-                        {
-                            current_offset_entry.store(polled_messages.current_offset, ORDERING);
-                        } else {
-                            self.current_offsets.insert(
-                                partition_id,
-                                AtomicU64::new(polled_messages.current_offset),
-                            );
-                        }
-
-                        let message = polled_messages.messages.remove(0);
-                        self.buffered_messages.extend(polled_messages.messages);
-
-                        if self.polling_strategy.kind == PollingKind::Offset {
-                            self.polling_strategy = PollingStrategy::offset(message.offset + 1);
-                        }
-
-                        if let Some(last_consumed_offset_entry) =
-                            self.last_consumed_offsets.get(&partition_id)
-                        {
-                            last_consumed_offset_entry.store(message.offset, ORDERING);
-                        } else {
-                            self.last_consumed_offsets
-                                .insert(partition_id, AtomicU64::new(message.offset));
-                        }
-
-                        if (self.store_after_every_nth_message > 0
-                            && message.offset % self.store_after_every_nth_message == 0)
-                            || self.store_offset_after_each_message
-                            || (self.store_offset_after_all_messages
-                                && self.buffered_messages.is_empty())
-                        {
-                            self.send_store_offset(polled_messages.partition_id, message.offset);
-                        }
-
-                        self.poll_future = None;
-                        return Poll::Ready(Some(Ok(ReceivedMessage::new(
-                            message,
-                            polled_messages.current_offset,
-                            polled_messages.partition_id,
-                        ))));
+                    if (self.store_after_every_nth_message > 0
+                        && message.offset % self.store_after_every_nth_message == 0)
+                        || self.store_offset_after_each_message
+                    {
+                        self.send_store_offset(partition_id, message.offset);
                     }
                 }
-                Poll::Ready(Err(err)) => {
-                    self.poll_future = None;
-                    return Poll::Ready(Some(Err(err)));
+
+                if self.buffered_messages.is_empty() {
+                    if self.polling_strategy.kind == PollingKind::Offset {
+                        self.polling_strategy = PollingStrategy::offset(message.offset + 1);
+                    }
+
+                    if self.store_offset_after_all_messages {
+                        self.send_store_offset(partition_id, message.offset);
+                    }
                 }
-                Poll::Pending => return Poll::Pending,
+
+                let current_offset;
+                if let Some(current_offset_entry) = self.current_offsets.get(&partition_id) {
+                    current_offset = current_offset_entry.load(ORDERING);
+                } else {
+                    current_offset = 0;
+                }
+
+                return Poll::Ready(Some(Ok(ReceivedMessage::new(
+                    message,
+                    current_offset,
+                    partition_id,
+                ))));
             }
+
+            if self.poll_future.is_none() {
+                let future = self.create_poll_messages_future();
+                self.poll_future = Some(Box::pin(future));
+            }
+
+            while let Some(future) = self.poll_future.as_mut() {
+                match future.poll_unpin(cx) {
+                    Poll::Ready(Ok(mut polled_messages)) => {
+                        let partition_id = polled_messages.partition_id;
+                        self.current_partition_id.store(partition_id, ORDERING);
+                        if polled_messages.messages.is_empty() {
+                            self.poll_future = Some(Box::pin(self.create_poll_messages_future()));
+                        } else {
+                            if let Some(ref encryptor) = self.encryptor {
+                                for message in &mut polled_messages.messages {
+                                    let payload = encryptor.decrypt(&message.payload);
+                                    if payload.is_err() {
+                                        self.poll_future = None;
+                                        error!("Failed to decrypt the message payload at offset: {}, partition ID: {}", message.offset, partition_id);
+                                        let error = payload.unwrap_err();
+                                        return Poll::Ready(Some(Err(error)));
+                                    }
+
+                                    let payload = payload.unwrap();
+                                    message.payload = Bytes::from(payload);
+                                    message.length = IggyByteSize::from(message.payload.len() as u64);
+                                }
+                            }
+
+                            if let Some(current_offset_entry) = self.current_offsets.get(&partition_id)
+                            {
+                                current_offset_entry.store(polled_messages.current_offset, ORDERING);
+                            } else {
+                                self.current_offsets.insert(
+                                    partition_id,
+                                    AtomicU64::new(polled_messages.current_offset),
+                                );
+                            }
+
+                            let message = polled_messages.messages.remove(0);
+                            self.buffered_messages.extend(polled_messages.messages);
+
+                            if self.polling_strategy.kind == PollingKind::Offset {
+                                self.polling_strategy = PollingStrategy::offset(message.offset + 1);
+                            }
+
+                            if let Some(last_consumed_offset_entry) =
+                                self.last_consumed_offsets.get(&partition_id)
+                            {
+                                last_consumed_offset_entry.store(message.offset, ORDERING);
+                            } else {
+                                self.last_consumed_offsets
+                                    .insert(partition_id, AtomicU64::new(message.offset));
+                            }
+
+                            if (self.store_after_every_nth_message > 0
+                                && message.offset % self.store_after_every_nth_message == 0)
+                                || self.store_offset_after_each_message
+                                || (self.store_offset_after_all_messages
+                                    && self.buffered_messages.is_empty())
+                            {
+                                self.send_store_offset(polled_messages.partition_id, message.offset);
+                            }
+
+                            self.poll_future = None;
+                            return Poll::Ready(Some(Ok(ReceivedMessage::new(
+                                message,
+                                polled_messages.current_offset,
+                                polled_messages.partition_id,
+                            ))));
+                        }
+                    }
+                    Poll::Ready(Err(err)) => {
+                        self.poll_future = None;
+                        return Poll::Ready(Some(Err(err)));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            */
         }
 
         Poll::Pending

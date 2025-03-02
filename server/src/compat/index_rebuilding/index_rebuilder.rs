@@ -1,7 +1,5 @@
+use crate::server_error::CompatError;
 use crate::streaming::utils::file;
-use crate::{
-    server_error::CompatError, streaming::batching::message_batch::RETAINED_BATCH_HEADER_LEN,
-};
 use std::io::SeekFrom;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter};
 
@@ -64,6 +62,8 @@ impl IndexRebuilder {
     }
 
     pub async fn rebuild(&self) -> Result<(), CompatError> {
+        //TODO: Fix me
+        /*
         let mut reader = BufReader::new(file::open(&self.log_path).await?);
         let mut writer = BufWriter::new(file::overwrite(&self.index_path).await?);
         let mut position = 0;
@@ -92,5 +92,7 @@ impl IndexRebuilder {
 
         writer.flush().await?;
         Ok(())
+        */
+        todo!()
     }
 }

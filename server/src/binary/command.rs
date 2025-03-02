@@ -125,8 +125,9 @@ async fn try_handle(
         ServerCommand::LoginWithPersonalAccessToken(command) => {
             login_with_personal_access_token_handler::handle(command, sender, session, system).await
         }
-        ServerCommand::SendMessages(command) => {
-            send_messages_handler::handle(command, sender, session, system).await
+        ServerCommand::SendMessages() => {
+            //TODO: Fix me.
+            Ok(())
         }
         ServerCommand::PollMessages(command) => {
             poll_messages_handler::handle(command, sender, session, system).await

@@ -2,7 +2,6 @@ use crate::configs::system::SystemConfig;
 use crate::streaming::cache::buffer::SmartCache;
 use crate::streaming::cache::memory_tracker::CacheMemoryTracker;
 use crate::streaming::deduplication::message_deduplicator::MessageDeduplicator;
-use crate::streaming::models::messages::RetainedMessage;
 use crate::streaming::segments::*;
 use crate::streaming::storage::SystemStorage;
 use dashmap::DashMap;
@@ -27,8 +26,9 @@ pub struct Partition {
     pub consumer_offsets_path: String,
     pub consumer_group_offsets_path: String,
     pub current_offset: u64,
-    pub cache: Option<SmartCache<Arc<RetainedMessage>>>,
-    pub cached_memory_tracker: Option<Arc<CacheMemoryTracker>>,
+    //TODO: Fix me, get rid of this cache impl.
+    //pub cache: Option<SmartCache<Arc<()>>>,
+    //pub cached_memory_tracker: Option<Arc<CacheMemoryTracker>>,
     pub message_deduplicator: Option<MessageDeduplicator>,
     pub unsaved_messages_count: u32,
     pub should_increment_offset: bool,
@@ -91,6 +91,8 @@ impl Partition {
             config.get_consumer_offsets_path(stream_id, topic_id, partition_id);
         let consumer_group_offsets_path =
             config.get_consumer_group_offsets_path(stream_id, topic_id, partition_id);
+        //TODO: Fix me
+        /*
         let (cached_memory_tracker, messages) = match config.cache.enabled {
             false => (None, None),
             true => (
@@ -98,6 +100,7 @@ impl Partition {
                 Some(SmartCache::new()),
             ),
         };
+        */
 
         let mut partition = Partition {
             stream_id,
@@ -108,8 +111,8 @@ impl Partition {
             consumer_offsets_path,
             consumer_group_offsets_path,
             message_expiry,
-            cache: messages,
-            cached_memory_tracker,
+            //cache: messages,
+            //cached_memory_tracker,
             message_deduplicator: match config.message_deduplication.enabled {
                 true => Some(MessageDeduplicator::new(
                     if config.message_deduplication.max_entries > 0 {
@@ -171,6 +174,8 @@ impl Partition {
     }
 
     pub fn get_cache_metrics(&self) -> CacheMetrics {
+        //TODO: Fix me
+        /*
         if let Some(cache) = self.cache.as_ref() {
             let cache_metrics = cache.get_metrics();
             CacheMetrics {
@@ -185,6 +190,8 @@ impl Partition {
                 hit_ratio: 0.0,
             }
         }
+        */
+        Default::default()
     }
 }
 
@@ -262,9 +269,7 @@ mod tests {
         assert_eq!(partition.current_offset, 0);
         assert_eq!(partition.unsaved_messages_count, 0);
         assert_eq!(partition.segments.len(), 1);
-        assert!(partition.cache.is_some());
         assert!(!partition.should_increment_offset);
-        assert!(partition.cache.as_ref().unwrap().is_empty());
         let consumer_offsets = partition.consumer_offsets;
         assert_eq!(partition.message_expiry, message_expiry);
         assert!(consumer_offsets.is_empty());
@@ -272,6 +277,8 @@ mod tests {
 
     #[tokio::test]
     async fn should_not_initialize_cache_given_zero_capacity() {
+        // TODO: Fix me
+        /*
         let tempdir = tempfile::TempDir::new().unwrap();
         let config = Arc::new(SystemConfig {
             path: tempdir.path().to_str().unwrap().to_string(),
@@ -305,6 +312,7 @@ mod tests {
         )
         .await;
         assert!(partition.cache.is_none());
+        */
     }
 
     #[tokio::test]

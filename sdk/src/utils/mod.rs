@@ -8,3 +8,4 @@ pub mod sizeable;
 pub mod text;
 pub mod timestamp;
 pub mod topic_size;
+pub mod varint;

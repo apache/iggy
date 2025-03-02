@@ -1,4 +1,4 @@
-use crate::channels::server_command::ServerCommand;
+use crate::channels::server_command::BackgroundServerCommand;
 use crate::configs::server::MessageSaverConfig;
 use crate::configs::server::ServerConfig;
 use crate::streaming::systems::system::SharedSystem;
@@ -55,7 +55,7 @@ impl MessagesSaver {
     }
 }
 
-impl ServerCommand<SaveMessagesCommand> for SaveMessagesExecutor {
+impl BackgroundServerCommand<SaveMessagesCommand> for SaveMessagesExecutor {
     #[instrument(skip_all, name = "trace_save_messages")]
     async fn execute(&mut self, system: &SharedSystem, _command: SaveMessagesCommand) {
         let saved_messages_count = system.read().await.persist_messages().await;

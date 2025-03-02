@@ -1,8 +1,9 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use iggy::{messages::send_messages::Message, models::messages::PolledMessage};
+use iggy::messages::send_messages::Message;
 
+//TODO: Fix me
 pub fn put_timestamp_in_first_message(message: &mut Message) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -27,6 +28,7 @@ pub fn put_timestamp_in_first_message(message: &mut Message) {
     message.payload = Bytes::from(payload_vec);
 }
 
+/*
 pub fn calculate_latency_from_first_message(message: &PolledMessage) -> Duration {
     let send_timestamp = u64::from_le_bytes(message.payload[0..8].try_into().unwrap());
     let now = std::time::SystemTime::now()
@@ -35,3 +37,4 @@ pub fn calculate_latency_from_first_message(message: &PolledMessage) -> Duration
         .as_micros() as u64;
     Duration::from_micros(now - send_timestamp)
 }
+*/
