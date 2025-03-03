@@ -3,7 +3,6 @@ mod analytics;
 mod args;
 mod benchmarks;
 mod plot;
-mod rate_limiter;
 mod runner;
 mod utils;
 
@@ -23,7 +22,7 @@ async fn main() -> Result<(), IggyError> {
     let figure = standard_font.convert("Iggy Bench");
     println!("{}", figure.unwrap());
 
-    let args = IggyBenchArgs::parse();
+    let mut args = IggyBenchArgs::parse();
     args.validate();
 
     // Store output_dir before moving args
