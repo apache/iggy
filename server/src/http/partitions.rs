@@ -55,7 +55,7 @@ async fn create_partitions(
     let system = system.downgrade();
     system
         .state
-        .apply(identity.user_id, EntryCommand::CreatePartitions(command))
+        .apply(identity.user_id, &EntryCommand::CreatePartitions(command))
         .await
         .with_error_context(|error| {
             format!(
@@ -98,7 +98,7 @@ async fn delete_partitions(
         .state
         .apply(
             identity.user_id,
-            EntryCommand::DeletePartitions(DeletePartitions {
+            &EntryCommand::DeletePartitions(DeletePartitions {
                 stream_id: query.stream_id.clone(),
                 topic_id: query.topic_id.clone(),
                 partitions_count: query.partitions_count,

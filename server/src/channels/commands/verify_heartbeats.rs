@@ -1,4 +1,4 @@
-use crate::channels::server_command::ServerCommand;
+use crate::channels::server_command::BackgroundServerCommand;
 use crate::configs::server::HeartbeatConfig;
 use crate::streaming::systems::system::SharedSystem;
 use flume::Sender;
@@ -62,7 +62,7 @@ impl VerifyHeartbeats {
     }
 }
 
-impl ServerCommand<VerifyHeartbeatsCommand> for VerifyHeartbeatsExecutor {
+impl BackgroundServerCommand<VerifyHeartbeatsCommand> for VerifyHeartbeatsExecutor {
     #[instrument(skip_all, name = "trace_verify_heartbeats")]
     async fn execute(&mut self, system: &SharedSystem, command: VerifyHeartbeatsCommand) {
         let system = system.read().await;

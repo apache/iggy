@@ -1,4 +1,4 @@
-use crate::channels::server_command::ServerCommand;
+use crate::channels::server_command::BackgroundServerCommand;
 use crate::configs::server::PersonalAccessTokenCleanerConfig;
 use crate::streaming::systems::system::SharedSystem;
 use flume::Sender;
@@ -57,7 +57,9 @@ impl PersonalAccessTokenCleaner {
     }
 }
 
-impl ServerCommand<CleanPersonalAccessTokensCommand> for CleanPersonalAccessTokensExecutor {
+impl BackgroundServerCommand<CleanPersonalAccessTokensCommand>
+    for CleanPersonalAccessTokensExecutor
+{
     #[instrument(skip_all, name = "trace_clean_personal_access_tokens")]
     async fn execute(&mut self, system: &SharedSystem, _command: CleanPersonalAccessTokensCommand) {
         // TODO: System write lock, investigate if it's necessary.

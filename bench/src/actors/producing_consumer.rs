@@ -1,4 +1,4 @@
-use crate::actors::utils::{calculate_latency_from_first_message, put_timestamp_in_first_message};
+use crate::actors::utils::put_timestamp_in_first_message;
 use crate::analytics::metrics::individual::from_records;
 use crate::analytics::record::BenchmarkRecord;
 use crate::rate_limiter::RateLimiter;
@@ -172,6 +172,7 @@ impl ProducingConsumer {
                         self.polling_kind
                     ),
                 };
+                /*
                 let polled_messages = client
                     .poll_messages(
                         &stream_id,
@@ -205,6 +206,7 @@ impl ProducingConsumer {
 
                     continue;
                 }
+                */
                 current_offset += messages_per_batch as u64;
             }
         }
@@ -253,6 +255,8 @@ impl ProducingConsumer {
                 )
                 .await?;
 
+            //TODO: Fix me
+            /*
             if polled_messages.messages.len() != messages_per_batch as usize {
                 let should_warn = last_warning_time
                     .map(|t| t.elapsed() >= Duration::from_secs(1))
@@ -275,10 +279,13 @@ impl ProducingConsumer {
 
                 continue;
             }
+            */
 
             // Extract send timestamp from first message in batch
             let latency = if self.calculate_latency_from_timestamp_in_first_message {
-                calculate_latency_from_first_message(&polled_messages.messages[0])
+                //TODO: Fix me
+                //calculate_latency_from_first_message(&polled_messages.messages[0])
+                before_send.elapsed()
             } else {
                 before_send.elapsed()
             };

@@ -1,4 +1,4 @@
-use super::utils::calculate_latency_from_first_message;
+//use super::utils::calculate_latency_from_first_message;
 use crate::analytics::metrics::individual::from_records;
 use crate::analytics::record::BenchmarkRecord;
 use crate::rate_limiter::RateLimiter;
@@ -15,6 +15,7 @@ use iggy_bench_report::actor_kind::ActorKind;
 use iggy_bench_report::benchmark_kind::BenchmarkKind;
 use iggy_bench_report::individual_metrics::BenchmarkIndividualMetrics;
 use integration::test_server::{login_root, ClientFactory};
+use std::hint::black_box;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -129,38 +130,40 @@ impl Consumer {
                     self.consumer_id, self.warmup_time
                 );
             }
-            let warmup_end = Instant::now() + self.warmup_time.get_duration();
-            while Instant::now() < warmup_end {
-                let offset = current_iteration * messages_per_batch as u64;
-                let (strategy, auto_commit) = match self.polling_kind {
-                    PollingKind::Offset => (PollingStrategy::offset(offset), false),
-                    PollingKind::Next => (PollingStrategy::next(), true),
-                    _ => panic!(
-                        "Unsupported polling kind for benchmark: {:?}",
-                        self.polling_kind
-                    ),
-                };
-                let polled_messages = client
-                    .poll_messages(
-                        &stream_id,
-                        &topic_id,
-                        partition_id,
-                        &consumer,
-                        &strategy,
-                        messages_per_batch,
-                        auto_commit,
-                    )
-                    .await?;
+            /*
+                let warmup_end = Instant::now() + self.warmup_time.get_duration();
+                while Instant::now() < warmup_end {
+                    let offset = current_iteration * messages_per_batch as u64;
+                    let (strategy, auto_commit) = match self.polling_kind {
+                        PollingKind::Offset => (PollingStrategy::offset(offset), false),
+                        PollingKind::Next => (PollingStrategy::next(), true),
+                        _ => panic!(
+                            "Unsupported polling kind for benchmark: {:?}",
+                            self.polling_kind
+                        ),
+                    };
+                    let polled_messages = client
+                        .poll_messages(
+                            &stream_id,
+                            &topic_id,
+                            partition_id,
+                            &consumer,
+                            &strategy,
+                            messages_per_batch,
+                            auto_commit,
+                        )
+                        .await?;
 
-                if polled_messages.messages.is_empty() {
-                    warn!(
-                        "Consumer: {} - Messages are empty for offset: {}, retrying...",
-                        self.consumer_id, offset
-                    );
-                    continue;
+                    if polled_messages.messages.is_empty() {
+                        warn!(
+                            "Consumer: {} - Messages are empty for offset: {}, retrying...",
+                            self.consumer_id, offset
+                        );
+                        continue;
+                    }
+                    current_iteration += 1;
                 }
-                current_iteration += 1;
-            }
+            */
         }
 
         if let Some(cg_id) = self.consumer_group_id {
@@ -202,7 +205,7 @@ impl Consumer {
                 ),
             };
             let before_poll = Instant::now();
-            let polled_messages = client
+            let batch = client
                 .poll_messages(
                     &stream_id,
                     &topic_id,
@@ -213,7 +216,7 @@ impl Consumer {
                     auto_commit,
                 )
                 .await;
-            if let Err(e) = polled_messages {
+            if let Err(e) = batch {
                 if matches!(e, IggyError::TopicIdNotFound(_, _)) {
                     topic_not_found_counter += 1;
                     if topic_not_found_counter > 1000 {
@@ -226,8 +229,8 @@ impl Consumer {
                 continue;
             }
 
-            let polled_messages = polled_messages.unwrap();
-            if polled_messages.messages.is_empty() {
+            let batch = batch.unwrap();
+            if batch.batch.is_empty() {
                 // Store initial poll timestamp if this is the first attempt
                 if initial_poll_timestamp.is_none() {
                     initial_poll_timestamp = Some(before_poll);
@@ -250,6 +253,8 @@ impl Consumer {
                 continue;
             }
 
+            //TODO: Fix me
+            /*
             if polled_messages.messages.len() != messages_per_batch as usize {
                 let should_warn = last_warning_time
                     .map(|t| t.elapsed() >= Duration::from_secs(1))
@@ -272,9 +277,12 @@ impl Consumer {
 
                 continue;
             }
+            */
 
             let latency = if self.calculate_latency_from_message_payload {
-                calculate_latency_from_first_message(&polled_messages.messages[0])
+                //TODO: Fix me
+                //calculate_latency_from_first_message(&polled_messages.messages[0])
+                initial_poll_timestamp.unwrap_or(before_poll).elapsed()
             } else {
                 initial_poll_timestamp.unwrap_or(before_poll).elapsed()
             };
@@ -283,15 +291,12 @@ impl Consumer {
 
             self.batches_left_to_receive.fetch_sub(1, Ordering::AcqRel);
 
-            received_messages += polled_messages.messages.len() as u64;
+            received_messages += batch.iter().count() as u64;
 
             // We don't need to calculate the size whole batch every time by iterating over it - just always use the size of the first message
             if batch_user_size_bytes == 0 || batch_size_total_bytes == 0 {
-                batch_user_size_bytes =
-                    polled_messages.messages[0].payload.len() as u64 * messages_per_batch as u64;
-                batch_size_total_bytes =
-                    polled_messages.messages[0].get_size_bytes().as_bytes_u64()
-                        * messages_per_batch as u64;
+                batch_user_size_bytes = batch.batch.len() as u64;
+                batch_size_total_bytes = batch.batch.len() as u64;
             }
 
             total_user_data_bytes += IggyByteSize::from(batch_user_size_bytes);

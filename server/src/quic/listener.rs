@@ -1,6 +1,5 @@
 use crate::binary::command;
 use crate::binary::sender::SenderKind;
-use crate::command::ServerCommand;
 use crate::server_error::ConnectionError;
 use crate::streaming::clients::client_manager::Transport;
 use crate::streaming::session::Session;
@@ -100,6 +99,8 @@ async fn handle_stream(
     system: SharedSystem,
     session: impl AsRef<Session>,
 ) -> anyhow::Result<()> {
+    // TODO: Fix me
+    /*
     let (send_stream, mut recv_stream) = stream;
     // TODO: read to BytesMut instead of Vec<u8>
     let request = recv_stream
@@ -132,4 +133,6 @@ async fn handle_stream(
     command::handle(command, &mut sender, session.as_ref(), system.clone())
         .await
         .with_context(|| "Error when handling the QUIC request.")
+        */
+    todo!()
 }

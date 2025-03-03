@@ -1,4 +1,5 @@
 use crate::streaming::cache::memory_tracker::CacheMemoryTracker;
+use crate::streaming::segments::IggyBatchFetchResult;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::System;
 use crate::streaming::systems::COMPONENT;
@@ -7,9 +8,8 @@ use error_set::ErrContext;
 use iggy::confirmation::Confirmation;
 use iggy::consumer::Consumer;
 use iggy::messages::poll_messages::PollingStrategy;
-use iggy::messages::send_messages::Message;
 use iggy::messages::send_messages::Partitioning;
-use iggy::models::messages::{PolledMessage, PolledMessages};
+use iggy::models::batch::{IggyBatch, IggyMutableBatch};
 use iggy::utils::byte_size::IggyByteSize;
 use iggy::utils::sizeable::Sizeable;
 use iggy::{error::IggyError, identifier::Identifier};
@@ -24,7 +24,7 @@ impl System {
         topic_id: &Identifier,
         partition_id: Option<u32>,
         args: PollingArgs,
-    ) -> Result<PolledMessages, IggyError> {
+    ) -> Result<IggyBatchFetchResult, IggyError> {
         self.ensure_authenticated(session)?;
         if args.count == 0 {
             return Err(IggyError::InvalidMessagesCount);
@@ -45,25 +45,35 @@ impl System {
         }
 
         // There might be no partition assigned, if it's the consumer group member without any partitions.
+        // TODO: Fix me
         let Some((polling_consumer, partition_id)) = topic
             .resolve_consumer_with_partition_id(consumer, session.client_id, partition_id, true)
             .await
             .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to resolve consumer with partition id, consumer: {consumer}, client ID: {}, partition ID: {:?}", session.client_id, partition_id))? else {
+            // TODO: Fix me
+            /*
             return Ok(PolledMessages {
                 messages: vec![],
                 partition_id: 0,
                 current_offset: 0,
             })
+            */
+            todo!()
         };
 
-        let mut polled_messages = topic
+        let result = topic
             .get_messages(polling_consumer, partition_id, args.strategy, args.count)
             .await?;
 
+        // TODO: Fix me
+        /*
         if polled_messages.messages.is_empty() {
             return Ok(polled_messages);
         }
+        */
 
+        // TODO: Fix me
+        /*
         let offset = polled_messages.messages.last().unwrap().offset;
         if args.auto_commit {
             trace!("Last offset: {} will be automatically stored for {}, stream: {}, topic: {}, partition: {}", offset, consumer, stream_id, topic_id, partition_id);
@@ -72,11 +82,13 @@ impl System {
                 .await
                 .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset internal, polling consumer: {}, offset: {}, partition ID: {}", polling_consumer, offset, partition_id)) ?;
         }
+        */
 
         if self.encryptor.is_none() {
-            return Ok(polled_messages);
+            return Ok(result);
         }
-
+        // TODO: Fix me
+        /*
         let encryptor = self.encryptor.as_ref().unwrap();
         let mut decrypted_messages = Vec::with_capacity(polled_messages.messages.len());
         for message in polled_messages.messages.iter() {
@@ -102,15 +114,17 @@ impl System {
         }
         polled_messages.messages = decrypted_messages;
         Ok(polled_messages)
+        */
+        todo!()
     }
 
     pub async fn append_messages(
         &self,
         session: &Session,
-        stream_id: Identifier,
-        topic_id: Identifier,
-        partitioning: Partitioning,
-        messages: Vec<Message>,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partitioning: &Partitioning,
+        batch: IggyMutableBatch,
         confirmation: Option<Confirmation>,
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
@@ -126,6 +140,8 @@ impl System {
             topic.topic_id
         ))?;
 
+        //TODO: Fix me
+        /*
         let mut batch_size_bytes = IggyByteSize::default();
         let mut messages = messages;
         if let Some(encryptor) = &self.encryptor {
@@ -149,17 +165,21 @@ impl System {
                 .map(|msg| msg.get_size_bytes())
                 .sum::<IggyByteSize>();
         }
+        */
 
+        /*
         if let Some(memory_tracker) = CacheMemoryTracker::get_instance() {
             if !memory_tracker.will_fit_into_cache(batch_size_bytes) {
                 self.clean_cache(batch_size_bytes).await;
             }
         }
-        let messages_count = messages.len() as u64;
+        */
+        let batch_size_bytes = batch.get_size();
         topic
-            .append_messages(batch_size_bytes, partitioning, messages, confirmation)
+            .append_messages(batch_size_bytes, partitioning, batch, confirmation)
             .await?;
-        self.metrics.increment_messages(messages_count);
+        //TODO: Fix me
+        //self.metrics.increment_messages(messages_count);
         Ok(())
     }
 

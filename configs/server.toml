@@ -374,7 +374,7 @@ sysinfo_print_interval = "10 s"
 # Enables or disables the system cache.
 # `true` activates caching for frequently accessed data.
 # `false` disables caching, data is always read from the source.
-enabled = true
+enabled = false
 
 # Maximum size of the cache, e.g. "4GB".
 size = "4 GB"

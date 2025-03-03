@@ -1,3 +1,5 @@
+use std::io::IoSlice;
+
 use crate::quic::COMPONENT;
 use crate::{binary::sender::Sender, server_error::ServerError};
 use error_set::ErrContext;
@@ -38,6 +40,15 @@ impl Sender for QuicSender {
 
     async fn shutdown(&mut self) -> Result<(), ServerError> {
         Ok(())
+    }
+
+    async fn send_ok_response_vectored(
+        &mut self,
+        length: &[u8],
+        slices: Vec<IoSlice<'_>>,
+    ) -> Result<(), IggyError> {
+        //TODO: Fix me, quinn seems to have support for write vectored.
+        todo!()
     }
 }
 

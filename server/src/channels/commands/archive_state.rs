@@ -1,4 +1,4 @@
-use crate::channels::server_command::ServerCommand;
+use crate::channels::server_command::BackgroundServerCommand;
 use crate::configs::server::StateMaintenanceConfig;
 use crate::streaming::systems::system::SharedSystem;
 use flume::Sender;
@@ -56,7 +56,7 @@ impl StateArchiver {
     }
 }
 
-impl ServerCommand<ArchiveStateCommand> for ArchiveStateExecutor {
+impl BackgroundServerCommand<ArchiveStateCommand> for ArchiveStateExecutor {
     #[instrument(skip_all, name = "trace_archive_state")]
     async fn execute(&mut self, system: &SharedSystem, command: ArchiveStateCommand) {
         let system = system.read().await;

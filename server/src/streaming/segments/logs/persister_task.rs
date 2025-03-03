@@ -1,6 +1,9 @@
-use crate::streaming::batching::message_batch::{RetainedMessageBatch, RETAINED_BATCH_HEADER_LEN};
 use flume::{unbounded, Receiver};
-use iggy::{error::IggyError, utils::duration::IggyDuration};
+use iggy::{
+    error::IggyError,
+    models::batch::{IggyBatch, IggyHeader, IggyMutableBatch, IGGY_BATCH_OVERHEAD},
+    utils::duration::IggyDuration,
+};
 use std::{
     io::IoSlice,
     sync::{
@@ -15,7 +18,7 @@ use tracing::{error, trace, warn};
 #[derive(Debug)]
 /// A command to the persister task.
 enum PersisterTaskCommand {
-    WriteRequest(RetainedMessageBatch),
+    WriteRequest(u64, IggyHeader, Vec<IggyMutableBatch>),
     Shutdown,
 }
 
@@ -38,32 +41,39 @@ impl PersisterTask {
         retry_delay: IggyDuration,
     ) -> Self {
         let (sender, receiver) = unbounded();
-        let log_file_size_clone = log_file_size.clone();
+        let log_file_size = log_file_size.clone();
         let file_path_clone = file_path.clone();
         let handle = tokio::spawn(async move {
             Self::run(
                 file,
-                file_path,
+                file_path_clone,
                 receiver,
                 fsync,
                 max_retries,
                 retry_delay,
-                log_file_size_clone,
+                log_file_size,
             )
             .await;
         });
         Self {
             sender,
-            file_path: file_path_clone,
+            file_path,
             _handle: handle,
         }
     }
 
     /// Sends the batch bytes to the persister task (fire-and-forget).
-    pub async fn persist(&self, batch_to_write: RetainedMessageBatch) {
+    pub async fn persist(
+        &self,
+        batch_size: u64,
+        header: IggyHeader,
+        batches: Vec<IggyMutableBatch>,
+    ) {
         if let Err(e) = self
             .sender
-            .send_async(PersisterTaskCommand::WriteRequest(batch_to_write))
+            .send_async(PersisterTaskCommand::WriteRequest(
+                batch_size, header, batches,
+            ))
             .await
         {
             error!(
@@ -173,11 +183,13 @@ impl PersisterTask {
     ) {
         while let Ok(request) = receiver.recv_async().await {
             match request {
-                PersisterTaskCommand::WriteRequest(batch_to_write) => {
+                PersisterTaskCommand::WriteRequest(batch_size, header, batches) => {
                     match Self::write_with_retries(
                         &mut file,
                         &file_path,
-                        batch_to_write,
+                        batch_size,
+                        header,
+                        batches,
                         fsync,
                         max_retries,
                         retry_delay,
@@ -214,23 +226,35 @@ impl PersisterTask {
     async fn write_with_retries(
         file: &mut File,
         file_path: &str,
-        batch_to_write: RetainedMessageBatch,
+        batch_size: u64,
+        header: IggyHeader,
+        batches: Vec<IggyMutableBatch>,
         fsync: bool,
         max_retries: u32,
         retry_delay: IggyDuration,
     ) -> Result<u64, IggyError> {
-        let header = batch_to_write.header_as_bytes();
-        let batch_bytes = batch_to_write.bytes;
-        let slices = [IoSlice::new(&header), IoSlice::new(&batch_bytes)];
-        let bytes_written = RETAINED_BATCH_HEADER_LEN + batch_bytes.len() as u64;
+        // TODO: Fix me, this logic is repeated, maybe could be encapsulated inside of the batch_accumulator
+        // that yields accumulated batches and leading header.
+        let mut slices = Vec::new();
+        let header = header.as_bytes();
+        slices.push(IoSlice::new(&header));
+        batches.iter().for_each(|b| {
+            slices.push(IoSlice::new(&b.batch));
+        });
 
         let mut attempts = 0;
+        // TODO: This "retry" logic should be rewritten.
+        // There are certain kind of errors whom retyring is considered harmful, for example fsync failure
+        // (https://www.usenix.org/system/files/atc20-rebello.pdf)
+        // There are few errors which are worth retrying such as LSE (Latent sector error), as the file system
+        // might be able to realocate a new sector for the data and recover, but not every file system supports that.
+        // In general this topic should be furthered researched rather than just naively retry when the write fails.
         loop {
             match file.write_vectored(&slices).await {
                 Ok(_) => {
                     if fsync {
                         match file.sync_all().await {
-                            Ok(_) => return Ok(bytes_written),
+                            Ok(_) => return Ok(batch_size),
                             Err(e) => {
                                 attempts += 1;
                                 error!(
@@ -240,7 +264,7 @@ impl PersisterTask {
                             }
                         }
                     } else {
-                        return Ok(bytes_written);
+                        return Ok(batch_size);
                     }
                 }
                 Err(e) => {

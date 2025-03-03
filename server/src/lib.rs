@@ -12,7 +12,6 @@ pub mod archiver;
 pub mod args;
 pub mod binary;
 pub mod channels;
-mod command;
 pub(crate) mod compat;
 pub mod configs;
 pub mod http;

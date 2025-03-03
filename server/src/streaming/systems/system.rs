@@ -269,6 +269,8 @@ impl System {
     }
 
     pub async fn clean_cache(&self, size_to_clean: IggyByteSize) {
+        //TODO: Fix me
+        /*
         for stream in self.streams.values() {
             for topic in stream.get_topics() {
                 for partition in topic.get_partitions().into_iter() {
@@ -285,5 +287,7 @@ impl System {
                 }
             }
         }
+        */
+        todo!()
     }
 }

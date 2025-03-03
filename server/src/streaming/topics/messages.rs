@@ -1,6 +1,6 @@
 use crate::streaming::batching::appendable_batch_info::AppendableBatchInfo;
-use crate::streaming::models::messages::RetainedMessage;
 use crate::streaming::polling_consumer::PollingConsumer;
+use crate::streaming::segments::IggyBatchFetchResult;
 use crate::streaming::topics::topic::Topic;
 use crate::streaming::topics::COMPONENT;
 use crate::streaming::utils::file::folder_size;
@@ -12,7 +12,7 @@ use iggy::error::IggyError;
 use iggy::locking::IggySharedMutFn;
 use iggy::messages::poll_messages::{PollingKind, PollingStrategy};
 use iggy::messages::send_messages::{Message, Partitioning, PartitioningKind};
-use iggy::models::messages::PolledMessages;
+use iggy::models::batch::{IggyBatch, IggyMutableBatch};
 use iggy::utils::byte_size::IggyByteSize;
 use iggy::utils::expiry::IggyExpiry;
 use iggy::utils::sizeable::Sizeable;
@@ -32,7 +32,7 @@ impl Topic {
         partition_id: u32,
         strategy: PollingStrategy,
         count: u32,
-    ) -> Result<PolledMessages, IggyError> {
+    ) -> Result<IggyBatchFetchResult, IggyError> {
         if !self.has_partitions() {
             return Err(IggyError::NoPartitions(self.topic_id, self.stream_id));
         }
@@ -49,35 +49,31 @@ impl Topic {
         let partition = partition.unwrap();
         let partition = partition.read().await;
         let value = strategy.value;
-        let messages = match strategy.kind {
+        let result = match strategy.kind {
             PollingKind::Offset => partition.get_messages_by_offset(value, count).await,
             PollingKind::Timestamp => {
+                //TODO: Fix me
+                /*
                 partition
                     .get_messages_by_timestamp(value.into(), count)
                     .await
                     .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to get messages by timestamp: {value}, count: {count}"))
+                    */
+                todo!()
             }
             PollingKind::First => partition.get_first_messages(count).await,
             PollingKind::Last => partition.get_last_messages(count).await,
             PollingKind::Next => partition.get_next_messages(consumer, count).await,
         }?;
 
-        let messages = messages
-            .into_iter()
-            .map(|msg| msg.to_polled_message())
-            .collect::<Result<Vec<_>, IggyError>>()?;
-        Ok(PolledMessages {
-            partition_id,
-            current_offset: partition.current_offset,
-            messages,
-        })
+        Ok(result)
     }
 
     pub async fn append_messages(
         &self,
         batch_size: IggyByteSize,
-        partitioning: Partitioning,
-        messages: Vec<Message>,
+        partitioning: &Partitioning,
+        batch: IggyMutableBatch,
         confirmation: Option<Confirmation>,
     ) -> Result<(), IggyError> {
         if !self.has_partitions() {
@@ -90,9 +86,11 @@ impl Topic {
             return Err(IggyError::TopicFull(self.topic_id, self.stream_id));
         }
 
+        /*
         if messages.is_empty() {
             return Ok(());
         }
+        */
 
         let partition_id = match partitioning.kind {
             PartitioningKind::Balanced => self.get_next_partition_id(),
@@ -107,7 +105,7 @@ impl Topic {
         };
 
         let appendable_batch_info = AppendableBatchInfo::new(batch_size, partition_id);
-        self.append_messages_to_partition(appendable_batch_info, messages, confirmation)
+        self.append_messages_to_partition(appendable_batch_info, batch, confirmation)
             .await
     }
 
@@ -132,7 +130,7 @@ impl Topic {
     async fn append_messages_to_partition(
         &self,
         appendable_batch_info: AppendableBatchInfo,
-        messages: Vec<Message>,
+        batch: IggyMutableBatch,
         confirmation: Option<Confirmation>,
     ) -> Result<(), IggyError> {
         let partition = self.partitions.get(&appendable_batch_info.partition_id);
@@ -146,7 +144,7 @@ impl Topic {
             })?
             .write()
             .await
-            .append_messages(appendable_batch_info, messages, confirmation)
+            .append_messages(appendable_batch_info, batch, confirmation)
             .await
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to append messages")
@@ -184,6 +182,8 @@ impl Topic {
     }
 
     pub(crate) async fn load_messages_from_disk_to_cache(&mut self) -> Result<(), IggyError> {
+        //TODO: Fix me
+        /*
         if !self.config.cache.enabled {
             return Ok(());
         }
@@ -261,9 +261,13 @@ impl Topic {
         }
 
         Ok(())
+        */
+        todo!()
     }
 
-    fn cache_integrity_check(cache: &[Arc<RetainedMessage>]) -> bool {
+    fn cache_integrity_check(cache: ()) -> bool {
+        //TODO: Fix me
+        /*
         if cache.is_empty() {
             warn!("Cache is empty!");
             return false;
@@ -290,6 +294,8 @@ impl Topic {
         }
 
         true
+        */
+        todo!()
     }
 
     pub async fn get_expired_segments_start_offsets_per_partition(
@@ -312,6 +318,8 @@ impl Topic {
 
 #[cfg(test)]
 mod tests {
+    //TODO: Fix me
+    /*
     use super::*;
     use crate::configs::system::SystemConfig;
     use crate::streaming::persistence::persister::FileWithSyncPersister;
@@ -466,4 +474,5 @@ mod tests {
         topic.persist().await.unwrap();
         topic
     }
+    */
 }

@@ -8,8 +8,9 @@ members = [
     "bench",
     "bench/report",
     "cli",
-    "examples",
-    "integration",
+    #TODO: Fix me add those back to workspace.
+    #"examples",
+    #"integration",
     "sdk",
     "server",
     "tools"

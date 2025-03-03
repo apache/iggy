@@ -36,9 +36,12 @@ impl Partition {
         self.should_increment_offset = false;
         self.consumer_offsets.clear();
         self.consumer_group_offsets.clear();
+        //TODO: Fix me
+        /*
         if let Some(cache) = self.cache.as_mut() {
             cache.purge();
         }
+        */
         for segment in &mut self.segments {
             segment.delete().await.with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to delete segment: {segment}",)

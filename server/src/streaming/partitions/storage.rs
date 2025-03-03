@@ -135,10 +135,7 @@ impl PartitionStorage for FilePartitionStorage {
             })?;
             let capacity = partition.config.partition.messages_required_to_save;
             if !segment.is_closed {
-                segment.unsaved_messages = Some(BatchAccumulator::new(
-                    segment.current_offset,
-                    capacity as usize,
-                ))
+                segment.unsaved_messages = Some(Default::default());
             }
 
             // If the first segment has at least a single message, we should increment the offset.

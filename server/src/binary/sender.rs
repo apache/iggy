@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::io::IoSlice;
 
 use crate::tcp::tcp_sender::TcpSender;
 use crate::tcp::tcp_tls_sender::TcpTlsSender;
@@ -35,6 +36,11 @@ pub trait Sender {
         &mut self,
         payload: &[u8],
     ) -> impl Future<Output = Result<(), IggyError>> + Send;
+    fn send_ok_response_vectored(
+        &mut self,
+        length: &[u8],
+        slices: Vec<IoSlice<'_>>,
+    ) -> impl Future<Output = Result<(), IggyError>> + Send;
     fn send_error_response(
         &mut self,
         error: IggyError,
@@ -68,6 +74,7 @@ impl SenderKind {
         async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, IggyError>;
         async fn send_empty_ok_response(&mut self) -> Result<(), IggyError>;
         async fn send_ok_response(&mut self, payload: &[u8]) -> Result<(), IggyError>;
+        async fn send_ok_response_vectored(&mut self, length: &[u8], slices: Vec<IoSlice<'_>>) -> Result<(), IggyError>;
         async fn send_error_response(&mut self, error: IggyError) -> Result<(), IggyError>;
         async fn shutdown(&mut self) -> Result<(), ServerError>;
     }

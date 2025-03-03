@@ -1,9 +1,11 @@
+mod fetch_result;
 mod indexes;
 mod logs;
 mod reading_messages;
 mod segment;
 mod writing_messages;
 
+pub use fetch_result::*;
 pub use indexes::Index;
 pub use segment::Segment;
 

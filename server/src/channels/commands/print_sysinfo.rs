@@ -1,5 +1,5 @@
 use crate::{
-    channels::server_command::ServerCommand, configs::server::ServerConfig,
+    channels::server_command::BackgroundServerCommand, configs::server::ServerConfig,
     streaming::systems::system::SharedSystem,
 };
 use flume::{Receiver, Sender};
@@ -45,7 +45,7 @@ impl SysInfoPrinter {
     }
 }
 
-impl ServerCommand<SysInfoPrintCommand> for SysInfoPrintExecutor {
+impl BackgroundServerCommand<SysInfoPrintCommand> for SysInfoPrintExecutor {
     async fn execute(&mut self, system: &SharedSystem, _command: SysInfoPrintCommand) {
         let stats = match system.read().await.get_stats().await {
             Ok(stats) => stats,

@@ -102,7 +102,10 @@ async fn create_consumer_group(
     let system = system.downgrade();
     system
         .state
-        .apply(identity.user_id, EntryCommand::CreateConsumerGroup(command))
+        .apply(
+            identity.user_id,
+            &EntryCommand::CreateConsumerGroup(command),
+        )
         .await?;
 
     Ok((StatusCode::CREATED, Json(consumer_group_details)))
@@ -134,7 +137,7 @@ async fn delete_consumer_group(
         .state
         .apply(
             identity.user_id,
-            EntryCommand::DeleteConsumerGroup(DeleteConsumerGroup {
+            &EntryCommand::DeleteConsumerGroup(DeleteConsumerGroup {
                 stream_id: identifier_stream_id,
                 topic_id: identifier_topic_id,
                 group_id: identifier_group_id,

@@ -28,7 +28,7 @@ pub trait State: Send {
     fn apply(
         &self,
         user_id: u32,
-        command: EntryCommand,
+        command: &EntryCommand,
     ) -> impl Future<Output = Result<(), IggyError>> + Send;
 }
 
@@ -49,7 +49,7 @@ impl StateKind {
         }
     }
 
-    pub async fn apply(&self, user_id: u32, command: EntryCommand) -> Result<(), IggyError> {
+    pub async fn apply(&self, user_id: u32, command: &EntryCommand) -> Result<(), IggyError> {
         match self {
             Self::File(s) => s.apply(user_id, command).await,
             #[cfg(test)]
