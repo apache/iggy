@@ -14,8 +14,17 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-
+#
+# -------------------------------------------------------------
+#
+# CI Compatibility Rust Workflow
+#
+# This workflow runs compatibility tests for Rust code on the master branch for pull requests.
+# This workflow is triggered by the ci-check-pr workflow. It checks if BREAKING_CHANGE in the PR body
+# and commit messages and skips the compatibility tests if found.
+#
 name: backwards_compatibility
+
 on:
   workflow_call:
     inputs:
@@ -177,4 +186,3 @@ jobs:
 
       - name: Print server logs (PR)
         run: cat local_data/logs/iggy*
-
