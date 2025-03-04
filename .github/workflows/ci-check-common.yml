@@ -1,0 +1,82 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+# -------------------------------------------------------------
+#
+# CI Check Common Workflow
+#
+# This workflow validates commit messages and checks for conventional commits.
+# This workflow is mandatory and runs on pull request events.
+#
+name: ci-check-common
+
+on:
+  workflow_call:
+    inputs:
+      commits-from:
+        description: 'Lower end of the commit range to check'
+        required: true
+        default: HEAD~1
+        type: string
+      commits-to:
+        description: 'Upper end of the commit range to check'
+        required: true
+        default: HEAD
+        type: string
+
+jobs:
+  check-commit-message:
+    name: commit messages
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'pull_request' }}
+    steps:
+      - name: Check subject line length
+        uses: gsactions/commit-message-checker@v2
+        with:
+          excludeDescription: "false" # exclude description body of a pull request
+          excludeTitle: "false" # exclude the title of a pull request
+          checkAllCommitMessages: "false" # checks all commits associated with the pull request
+          accessToken: ${{ secrets.GITHUB_TOKEN }} # needed only when checkAllCommitMessages is true
+          pattern: '^.{0,80}(\n.*)*$'
+          error: "Subject of all commits in the PR and PR body/title has to be shorter than 80 characters."
+
+  check-conventional-commits:
+    name: conventional commits
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+      - name: Install convco
+        uses: taiki-e/install-action@v2
+        with:
+          tool: convco
+      - name: Print commit range to check
+        run: |
+          echo "Checking commit range from ${{ inputs.commits-from }} to ${{ inputs.commits-to }}"
+      - name: Check commit messages
+        run: |
+          command -v convco
+          convco --version
+          git log ${{ inputs.commits-from }}..${{ inputs.commits-to }}
+          convco check ${{ inputs.commits-from }}..${{ inputs.commits-to }}
