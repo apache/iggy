@@ -37,5 +37,5 @@ jobs:
       - name: Check commit messages
         run: |
           git log ${{ inputs.commits-from }}..${{ inputs.commits-to }}
-          commitling --version
+          commitlint --version
           commitlint --from ${{ inputs.commits-from }} --to ${{ inputs.commits-to }}
