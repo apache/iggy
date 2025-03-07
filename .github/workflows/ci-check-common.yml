@@ -18,12 +18,19 @@ jobs:
     name: commit messages
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions-rs/toolchain@v1
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install rust toolchain
+        uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
           override: true
-      - uses: taiki-e/install-action@v2
+      - name: Install commitlint-rs
+        uses: taiki-e/install-action@v2
         with:
           tool: commitlint-rs
-      - run: commitlint --from ${{ github.event.inputs.commits-from }} --to ${{ github.event.inputs.commits-to }}
+      - name: Print commit range to check
+        run: |
+          echo "Checking commit range from ${{ inputs.commits-from }} to ${{ inputs.commits-to }}"
+      - name: Check commit messages
+        run: commitlint --from ${{ inputs.commits-from }} --to ${{ inputs.commits-to }}

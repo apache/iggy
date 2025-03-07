@@ -13,7 +13,8 @@ jobs:
     outputs:
       trigger-rust: ${{ steps.changed-files-yaml.outputs.rust_any_changed }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
       - name: Check changed files
         id: changed-files-yaml
         uses: tj-actions/changed-files@v45
@@ -24,13 +25,13 @@ jobs:
               - '**/Cargo.toml'
               - Cargo.toml
               - Cargo.lock
-      - name: Run step if doc file(s) change
+      - name: List all changed rust file(s)
         if: steps.changed-files-yaml.outputs.rust_any_changed == 'true'
         env:
           RUST_ALL_CHANGED_FILES: ${{ steps.changed-files-yaml.outputs.rust_all_changed_files }}
         run: |
-          echo "One or more doc file(s) has changed."
-          echo "List all the files that have changed: $RUST_ALL_CHANGED_FILES"
+          echo "One or more rust file(s) has changed."
+          echo "List all the files that have changed: ${RUST_ALL_CHANGED_FILES}"
 
   ci-check-common:
     name: ci-check-common
