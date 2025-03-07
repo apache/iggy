@@ -1,9 +1,9 @@
 name: performance
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - master
+#  push:
+#    branches:
+#      - master
 
 jobs:
   run_benchmarks:

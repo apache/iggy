@@ -27,16 +27,16 @@ jobs:
         with:
           toolchain: stable
           override: true
-      - name: Install commitlint-rs
+      - name: Install convco
         uses: taiki-e/install-action@v2
         with:
-          tool: commitlint-rs
+          tool: convco
       - name: Print commit range to check
         run: |
           echo "Checking commit range from ${{ inputs.commits-from }} to ${{ inputs.commits-to }}"
       - name: Check commit messages
         run: |
           set -x
-          command -v commitlint
+          command -v convco
           git log ${{ inputs.commits-from }}..${{ inputs.commits-to }}
-          commitlint --from a66cbe40fabb900cbb85a69be60c2066cd543bac
+          convco check ${{ inputs.commits-from }}..${{ inputs.commits-to }}
