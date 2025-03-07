@@ -35,6 +35,9 @@ jobs:
   ci-check-common:
     name: ci-check-common
     uses: ./.github/workflows/ci-check-common.yml
+    with:
+      commits-from: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || 'HEAD~1' }}
+      commits-to: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || 'HEAD' }}
 
   ci-check-rust:
     name: ci-check-rust

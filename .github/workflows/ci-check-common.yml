@@ -1,7 +1,17 @@
 name: ci-check-common
 on:
-  workflow_dispatch:
   workflow_call:
+    inputs:
+      commits-from:
+        description: 'Lower end of the commit range to check'
+        required: true
+        default: 'HEAD~1'
+        type: string
+      commits-to:
+        description: 'Upper end of the commit range to check'
+        required: true
+        default: 'HEAD'
+        type: string
 
 jobs:
   check-commit-message:
@@ -16,4 +26,4 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: commitlint-rs
-      - run: cargo commitlint --from HEAD~1
+      - run: commitlint --from ${{ github.event.inputs.commits-from }} --to ${{ github.event.inputs.commits-to }}
