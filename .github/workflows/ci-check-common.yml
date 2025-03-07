@@ -38,4 +38,5 @@ jobs:
         run: |
           git log ${{ inputs.commits-from }}..${{ inputs.commits-to }}
           commitlint --version
+          commitlint --print-config
           commitlint --from ${{ inputs.commits-from }} --to ${{ inputs.commits-to }}
