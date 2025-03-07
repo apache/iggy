@@ -1,0 +1,8 @@
+rules:
+  description-empty: # Description must not be empty
+    level: warning
+  subject-empty: # Subject line must not be empty
+    level: error
+  type-empty: # Type must not be empty
+    level: error
+
