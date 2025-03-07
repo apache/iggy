@@ -1,0 +1,20 @@
+name: ci-check-common
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  check-commit-message:
+    name: commit messages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+      - uses: actions-rs/cargo@v1
+        with:
+          command: install
+          args: cargo-commitlint
+      - run: cargo commitlint --from HEAD~1
