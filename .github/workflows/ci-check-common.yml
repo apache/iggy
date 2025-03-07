@@ -36,5 +36,6 @@ jobs:
           echo "Checking commit range from ${{ inputs.commits-from }} to ${{ inputs.commits-to }}"
       - name: Check commit messages
         run: |
+          set -x
           git log ${{ inputs.commits-from }}..${{ inputs.commits-to }}
           commitlint --from a66cbe40fabb900cbb85a69be60c2066cd543bac
