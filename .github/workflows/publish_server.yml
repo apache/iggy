@@ -1,9 +1,10 @@
 name: publish_server
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - master
+#  push:
+#    branches:
+#      - master
+
 env:
   DOCKERHUB_REGISTRY_NAME: iggyrs/iggy
   CRATE_NAME: iggy

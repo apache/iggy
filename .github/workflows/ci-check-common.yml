@@ -37,5 +37,6 @@ jobs:
       - name: Check commit messages
         run: |
           set -x
+          command -v commitlint
           git log ${{ inputs.commits-from }}..${{ inputs.commits-to }}
           commitlint --from a66cbe40fabb900cbb85a69be60c2066cd543bac

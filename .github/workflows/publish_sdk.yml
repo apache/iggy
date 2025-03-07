@@ -1,9 +1,9 @@
 name: publish_sdk
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - master
+#  push:
+#    branches:
+#      - master
 
 env:
   GITHUB_TOKEN: ${{ github.token }}
