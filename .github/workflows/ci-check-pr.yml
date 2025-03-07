@@ -8,12 +8,45 @@ on:
     types: [ opened, synchronize, reopened ]
 
 jobs:
+  pr-file-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.rust-changes.outputs.any_changed }}
+    steps:
+      - name: Get PR commit count
+        id: pr-commit-count
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            PR_COMMITS=$(gh api repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/commits --jq 'length')
+            echo "count=$PR_COMMITS" >> $GITHUB_OUTPUT
+          else
+            echo "count=1" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: ${{ steps.pr-commit-count.outputs.count }}
+      - name: Get changed Rust files
+        id: rust-changes
+        uses: tj-actions/changed-files@v41
+        with:
+          files: |
+            **/*.rs
+            **/Cargo.toml
+            Cargo.toml
+            Cargo.lock
+            rust-toolchain.toml
+            .cargo/**
+
   ci-check-common:
     name: ci-check-common
     uses: ./.github/workflows/ci-check-common.yml
 
   ci-check-rust:
     name: ci-check-rust
+    needs: pr-file-changes
+    if: ${{ needs.pr-file-changes.outputs.rust == 'true' || github.event_name == 'workflow_dispatch' }}
     uses: ./.github/workflows/ci-check-rust.yml
 
   finalize-pr:

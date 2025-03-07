@@ -13,8 +13,7 @@ jobs:
         with:
           toolchain: stable
           override: true
-      - uses: actions-rs/cargo@v1
+      - uses: taiki-e/install-action@v2
         with:
-          command: install
-          args: cargo-commitlint
+          tool: cargo-commitlint
       - run: cargo commitlint --from HEAD~1
