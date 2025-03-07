@@ -15,5 +15,5 @@ jobs:
           override: true
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-commitlint
+          tool: commitlint-rs
       - run: cargo commitlint --from HEAD~1
