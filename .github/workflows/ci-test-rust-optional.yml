@@ -1,0 +1,42 @@
+name: ci-build-rust-optional
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  coverage:
+    name: Code coverage
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Cache cargo & target directories
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: "coverage"
+      - name: Install gnome-keyring and keyutils on Linux
+        run: |
+          sudo apt-get update --yes && sudo apt-get install --yes gnome-keyring keyutils lcov
+          rm -f $HOME/.local/share/keyrings/*
+          echo -n "test" | gnome-keyring-daemon --unlock
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Build
+        run: source <(cargo llvm-cov show-env --export-prefix) && cargo build
+      - name: Test
+        run: source <(cargo llvm-cov show-env --export-prefix) && cargo test
+      - name: Generate code coverage
+        run: source <(cargo llvm-cov show-env --export-prefix) && cargo llvm-cov report --lcov --output-path coverage.lcov --ignore-filename-regex '(bench\/|integration\/|tools\/|tpc\/)'
+      - name: Display code coverage
+        run: lcov --summary coverage.lcov
+      - name: Upload code to Coveralls
+        # Do not upload coverage for user triggered workflows
+        if: github.event_name == 'workflow_call'
+        uses: coverallsapp/github-action@v2
+        with:
+          fail-on-error: false
+          github-token: ${{ secrets.GITHUB_TOKEN }}

@@ -46,11 +46,24 @@ jobs:
     if: ${{ needs.pr-file-changes.outputs.trigger-rust == 'true' }}
     uses: ./.github/workflows/ci-check-rust.yml
 
+  ci-test-rust:
+    name: ci-test-rust
+    needs: ci-check-rust
+    if: ${{ needs.ci-check-rust.result == 'success' }}
+    uses: ./.github/workflows/ci-test-rust.yml
+
+  ci-test-rust-optional:
+    name: ci-test-rust-optional
+    needs: ci-check-rust
+    if: ${{ needs.ci-check-rust.result == 'success' }}
+    uses: ./.github/workflows/ci-test-rust-optional.yml
+
   finalize-pr:
     runs-on: ubuntu-latest
     needs:
       - ci-check-common
       - ci-check-rust
+      - ci-test-rust
     if: always()
     steps:
       - name: Everything is fine

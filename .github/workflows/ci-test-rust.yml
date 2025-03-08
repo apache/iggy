@@ -1,0 +1,37 @@
+name: ci-build-rust
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  test_x86_64-unknown-linux-musl:
+    name: cargo test x86_64-unknown-linux-musl
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Cache cargo & target directories
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: "x86_64-unknown-linux-musl"
+      - name: Install musl-tools, gnome-keyring and keyutils
+        run: |
+          sudo apt-get update --yes && sudo apt-get install --yes musl-tools gnome-keyring keyutils
+          rm -f $HOME/.local/share/keyrings/*
+          echo -n "test" | gnome-keyring-daemon --unlock
+      - name: Prepare x86_64-unknown-linux-musl toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          target: x86_64-unknown-linux-musl
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: Build binary x86_64-unknown-linux-musl
+        run: cross +stable build --verbose --target x86_64-unknown-linux-musl
+      - name: Run tests x86_64-unknown-linux-musl
+        run: cross +stable test --verbose --target x86_64-unknown-linux-musl
+      - name: Check CLI examples from README
+        run: ./scripts/run-examples-from-readme.sh
