@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       trigger-rust: ${{ steps.changed-files-yaml.outputs.rust_any_changed }}
+      trigger-shell: ${{ steps.changed-files-yaml.outputs.shell_any_changed }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -71,7 +72,7 @@ jobs:
   ci-check-shell:
     name: ci-check-shell
     needs: pr-file-changes
-    if: ${{ needs.pr-file-changes.outputs.shell_any_changed == 'true' }}
+    if: ${{ needs.pr-file-changes.outputs.trigger-shell == 'true' }}
     uses: ./.github/workflows/ci-check-shell.yml
 
   finalize-pr:
