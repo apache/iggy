@@ -1,5 +1,7 @@
 #!/bin/bash
 
+# Just a comment
+
 # shellcheck disable=SC1091
 
 IGGY_BENCH_CMD=""
