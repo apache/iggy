@@ -13,24 +13,26 @@ jobs:
     name: x86_64-unknown-linux-musl
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      TARGET: x86_64-unknown-linux-musl
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Cache cargo & target directories
         uses: Swatinem/rust-cache@v2
         with:
-          key: "x86_64-unknown-linux-musl"
+          key: "${{ env.TARGET }}"
       - name: Install musl-tools, gnome-keyring and keyutils
         run: |
           sudo apt-get update --yes && sudo apt-get install --yes musl-tools gnome-keyring keyutils
           rm -f $HOME/.local/share/keyrings/*
           echo -n "test" | gnome-keyring-daemon --unlock
-      - name: Prepare x86_64-unknown-linux-musl toolchain
+      - name: Prepare ${{ env.TARGET }} toolchain
         uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
           override: true
-          target: x86_64-unknown-linux-musl
+          target: ${{ env.TARGET }}
       - name: Install cross
         uses: taiki-e/install-action@v2
         with:
@@ -38,10 +40,50 @@ jobs:
       - name: Set verbose flag
         shell: bash
         run: echo "VERBOSE_FLAG=$([[ "${RUNNER_DEBUG}" = "1" ]] && echo "--verbose" || echo "")" >> $GITHUB_ENV
-      - name: Build binary x86_64-unknown-linux-musl
-        run: cross +stable build ${{ env.VERBOSE_FLAG }} --target x86_64-unknown-linux-musl
-      - name: Run tests x86_64-unknown-linux-musl
-        run: cross +stable test ${{ env.VERBOSE_FLAG }} --target x86_64-unknown-linux-musl
+      - name: Build binary ${{ env.TARGET }}
+        run: cross +stable build ${{ env.VERBOSE_FLAG }} --target ${{ env.TARGET }}
+      - name: Run tests ${{ env.TARGET }}
+        run: cross +stable test ${{ env.VERBOSE_FLAG }} --target ${{ env.TARGET }}
+      - name: Check CLI examples from README
+        run: ./scripts/run-examples-from-readme.sh
+      - name: Check if workspace is clean
+        run: git status | grep "working tree clean" || { git status ; exit 1; }
+
+  x86_64-unknown-linux-gnu:
+    name: x86_64-unknown-linux-gnu
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Cache cargo & target directories
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: "${{ env.TARGET }}"
+      - name: Install musl-tools, gnome-keyring and keyutils
+        run: |
+          sudo apt-get update --yes && sudo apt-get install --yes musl-tools gnome-keyring keyutils
+          rm -f $HOME/.local/share/keyrings/*
+          echo -n "test" | gnome-keyring-daemon --unlock
+      - name: Prepare ${{ env.TARGET }} toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          target: ${{ env.TARGET }}
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - name: Set verbose flag
+        shell: bash
+        run: echo "VERBOSE_FLAG=$([[ "${RUNNER_DEBUG}" = "1" ]] && echo "--verbose" || echo "")" >> $GITHUB_ENV
+      - name: Build binary ${{ env.TARGET }}
+        run: cross +stable build ${{ env.VERBOSE_FLAG }} --target ${{ env.TARGET }}
+      - name: Run tests ${{ env.TARGET }}
+        run: cross +stable test ${{ env.VERBOSE_FLAG }} --target ${{ env.TARGET }}
       - name: Check CLI examples from README
         run: ./scripts/run-examples-from-readme.sh
       - name: Check if workspace is clean
