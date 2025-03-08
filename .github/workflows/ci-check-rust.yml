@@ -46,7 +46,7 @@ jobs:
           args: --all-targets --all-features -- -D warnings
 
   clippy-macos:
-    name: cargo clippy
+    name: cargo clippy macos
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4

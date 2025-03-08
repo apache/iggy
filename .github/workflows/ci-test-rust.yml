@@ -3,6 +3,13 @@ on:
   workflow_dispatch:
   workflow_call:
 
+env:
+  CRATE_NAME: iggy
+  GITHUB_TOKEN: ${{ github.token }}
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+  IGGY_CI_BUILD: true
+
 jobs:
   x86_64-unknown-linux-musl:
     name: x86_64-unknown-linux-musl
@@ -49,7 +56,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: "x86_64-pc-windows-msvc"
-      - uses: actions-rs/toolchain@v1
+      - name: Prepare x86_64-pc-windows-msvc toolchain
+        uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
           override: true
@@ -58,3 +66,12 @@ jobs:
         run: cargo build --target x86_64-pc-windows-msvc -p iggy
       - name: Build iggy-cli binary
         run: cargo build --verbose --target x86_64-pc-windows-msvc --bin iggy
+      - name: Check if workspace is clean
+        run: git status | grep "working tree clean" || { git status ; exit 1; }
+
+  backwards_compatibility:
+    if: github.event_name == 'pull_request'
+    name: backwards_compatibility
+    uses: ./.github/workflows/backwards_compatibility.yml
+    with:
+      pr_body: ${{ github.event.pull_request.body }}

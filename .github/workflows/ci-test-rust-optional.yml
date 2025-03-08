@@ -3,12 +3,17 @@ on:
   workflow_dispatch:
   workflow_call:
 
+env:
+  CRATE_NAME: iggy
+  GITHUB_TOKEN: ${{ github.token }}
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+  IGGY_CI_BUILD: true
+
 jobs:
   coverage:
     name: coverage
     runs-on: ubuntu-latest
-    env:
-      CARGO_TERM_COLOR: always
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -61,5 +66,6 @@ jobs:
       - name: Build binary
         run: cargo build --target aarch64-apple-darwin
       - name: Run tests
-        run: cargo test --verbose --target aarch64-apple-darwin
-
+        run: cargo test --target aarch64-apple-darwin
+      - name: Check if workspace is clean
+        run: git status | grep "working tree clean" || { git status ; exit 1; }
