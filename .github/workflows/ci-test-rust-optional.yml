@@ -4,8 +4,6 @@ on:
   workflow_call:
 
 env:
-  CRATE_NAME: iggy
-  GITHUB_TOKEN: ${{ github.token }}
   RUST_BACKTRACE: 1
   CARGO_TERM_COLOR: always
   IGGY_CI_BUILD: true
@@ -64,9 +62,12 @@ jobs:
           toolchain: stable
           override: true
           target: aarch64-apple-darwin
+      - name: Set verbose flag
+        shell: bash
+        run: echo "VERBOSE_FLAG=$([[ "${RUNNER_DEBUG}" = "1" ]] && echo "--verbose" || echo "")" >> $GITHUB_ENV
       - name: Build binary
-        run: cargo build --target aarch64-apple-darwin
+        run: cargo build ${{ env.VERBOSE_FLAG }} --target aarch64-apple-darwin
       - name: Run tests
-        run: cargo test --target aarch64-apple-darwin
+        run: cargo test ${{ env.VERBOSE_FLAG }} --target aarch64-apple-darwin
       - name: Check if workspace is clean
         run: git status | grep "working tree clean" || { git status ; exit 1; }
