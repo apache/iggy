@@ -26,6 +26,8 @@ jobs:
               - '**/Cargo.toml'
               - Cargo.toml
               - Cargo.lock
+            shell:
+              - 'scripts/**/*.sh'
       - name: List all changed rust file(s)
         if: steps.changed-files-yaml.outputs.rust_any_changed == 'true'
         env:
@@ -33,6 +35,13 @@ jobs:
         run: |
           echo "One or more rust file(s) has changed."
           echo "List all the files that have changed: ${RUST_ALL_CHANGED_FILES}"
+      - name: List all changed shell file(s)
+        if: steps.changed-files-yaml.outputs.shell_any_changed == 'true'
+        env:
+          SHELL_ALL_CHANGED_FILES: ${{ steps.changed-files-yaml.outputs.shell_all_changed_files }}
+        run: |
+          echo "One or more shell file(s) has changed."
+          echo "List all the files that have changed: ${SHELL_ALL_CHANGED_FILES}"
 
   ci-check-common:
     name: ci-check-common
@@ -58,6 +67,12 @@ jobs:
     needs: ci-check-rust
     if: ${{ needs.ci-check-rust.result == 'success' }}
     uses: ./.github/workflows/ci-test-rust-optional.yml
+
+  ci-check-shell:
+    name: ci-check-shell
+    needs: pr-file-changes
+    if: ${{ needs.pr-file-changes.outputs.shell_any_changed == 'true' }}
+    uses: ./.github/workflows/ci-check-shell.yml
 
   finalize-pr:
     runs-on: ubuntu-latest

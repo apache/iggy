@@ -1,0 +1,17 @@
+name: ci-check-shell
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Install shellcheck on Linux
+        run: |
+          sudo apt-get update --yes && sudo apt-get install --yes shellcheck
+      - name: Check shell scripts
+        run: find scripts -type f -name "*.sh" -exec shellcheck {} +

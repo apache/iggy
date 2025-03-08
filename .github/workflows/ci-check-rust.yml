@@ -59,6 +59,24 @@ jobs:
           command: clippy
           args: --all-targets --all-features -- -D warnings
 
+  clippy-windows:
+    name: cargo clippy macos
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+      - uses: actions-rs/cargo@v1
+        with:
+          command: clippy
+          args: --package iggy --all-features -- -D warnings
+      - uses: actions-rs/cargo@v1
+        with:
+          command: clippy
+          args: --bin iggy --all-features -- -D warnings
+
   sort:
     name: cargo sort
     runs-on: ubuntu-latest
