@@ -36,7 +36,7 @@ jobs:
           echo "Checking commit range from ${{ inputs.commits-from }} to ${{ inputs.commits-to }}"
       - name: Check commit messages
         run: |
-          set -x
           command -v convco
+          convco --version
           git log ${{ inputs.commits-from }}..${{ inputs.commits-to }}
           convco check ${{ inputs.commits-from }}..${{ inputs.commits-to }}
