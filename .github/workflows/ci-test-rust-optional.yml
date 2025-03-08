@@ -1,11 +1,11 @@
-name: ci-build-rust-optional
+name: ci-test-rust-optional
 on:
   workflow_dispatch:
   workflow_call:
 
 jobs:
   coverage:
-    name: Code coverage
+    name: coverage
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
@@ -40,3 +40,26 @@ jobs:
         with:
           fail-on-error: false
           github-token: ${{ secrets.GITHUB_TOKEN }}
+
+  aarch64-apple-darwin:
+    name: aarch64-apple-darwin
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Cache cargo & target directories
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: "aarch64-apple-darwin"
+      - name: Prepare aarch64-apple-darwin toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          target: aarch64-apple-darwin
+      - name: Build binary
+        run: cargo build --target aarch64-apple-darwin
+      - name: Run tests
+        run: cargo test --verbose --target aarch64-apple-darwin
+

@@ -9,6 +9,7 @@ on:
 
 jobs:
   pr-file-changes:
+    name: pr-file-changes
     runs-on: ubuntu-latest
     outputs:
       trigger-rust: ${{ steps.changed-files-yaml.outputs.rust_any_changed }}

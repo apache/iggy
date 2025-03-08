@@ -5,6 +5,7 @@ use crate::error::IggyError;
 
 /// The error type for the client.
 /// This is a wrapper around the `io::Error` and `IggyError` types.
+/// It also includes an error for invalid commands.
 #[derive(Debug, Error)]
 pub enum ClientError {
     /// Command is invalid and cannot be sent.

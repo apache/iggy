@@ -45,6 +45,20 @@ jobs:
           command: clippy
           args: --all-targets --all-features -- -D warnings
 
+  clippy-macos:
+    name: cargo clippy
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+      - uses: actions-rs/cargo@v1
+        with:
+          command: clippy
+          args: --all-targets --all-features -- -D warnings
+
   sort:
     name: cargo sort
     runs-on: ubuntu-latest
