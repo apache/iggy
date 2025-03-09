@@ -1,21 +1,21 @@
-use super::utils::calculate_latency_from_first_message;
 use crate::analytics::metrics::individual::from_records;
 use crate::analytics::record::BenchmarkRecord;
-use crate::rate_limiter::RateLimiter;
+use crate::benchmarks::common::create_consumer;
+use crate::utils::finish_condition::BenchmarkFinishCondition;
+use crate::utils::rate_limiter::BenchmarkRateLimiter;
+use crate::utils::{batch_total_size_bytes, batch_user_size_bytes};
 use human_repr::HumanCount;
-use iggy::client::{ConsumerGroupClient, MessageClient};
+use iggy::client::MessageClient;
 use iggy::clients::client::IggyClient;
-use iggy::consumer::Consumer as IggyConsumer;
 use iggy::error::IggyError;
 use iggy::messages::poll_messages::{PollingKind, PollingStrategy};
 use iggy::utils::byte_size::IggyByteSize;
 use iggy::utils::duration::IggyDuration;
-use iggy::utils::sizeable::Sizeable;
 use iggy_bench_report::actor_kind::ActorKind;
 use iggy_bench_report::benchmark_kind::BenchmarkKind;
 use iggy_bench_report::individual_metrics::BenchmarkIndividualMetrics;
+use iggy_bench_report::numeric_parameter::IggyBenchNumericParameter;
 use integration::test_server::{login_root, ClientFactory};
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -27,15 +27,13 @@ pub struct Consumer {
     consumer_id: u32,
     consumer_group_id: Option<u32>,
     stream_id: u32,
-    messages_per_batch: u32,
-    message_batches: u32,
-    batches_left_to_receive: Arc<AtomicI64>,
+    messages_per_batch: IggyBenchNumericParameter,
+    finish_condition: Arc<BenchmarkFinishCondition>,
     warmup_time: IggyDuration,
     sampling_time: IggyDuration,
     moving_average_window: u32,
     polling_kind: PollingKind,
-    calculate_latency_from_message_payload: bool,
-    rate_limiter: Option<RateLimiter>,
+    limit_bytes_per_second: Option<IggyByteSize>,
 }
 
 impl Consumer {
@@ -46,15 +44,13 @@ impl Consumer {
         consumer_id: u32,
         consumer_group_id: Option<u32>,
         stream_id: u32,
-        messages_per_batch: u32,
-        message_batches: u32,
-        batches_left_to_receive: Arc<AtomicI64>,
+        messages_per_batch: IggyBenchNumericParameter,
+        finish_condition: Arc<BenchmarkFinishCondition>,
         warmup_time: IggyDuration,
         sampling_time: IggyDuration,
         moving_average_window: u32,
         polling_kind: PollingKind,
-        calculate_latency_from_message_payload: bool,
-        rate_limiter: Option<RateLimiter>,
+        limit_bytes_per_second: Option<IggyByteSize>,
     ) -> Self {
         Self {
             client_factory,
@@ -63,26 +59,22 @@ impl Consumer {
             consumer_group_id,
             stream_id,
             messages_per_batch,
-            message_batches,
-            batches_left_to_receive,
+            finish_condition,
             warmup_time,
             sampling_time,
             moving_average_window,
             polling_kind,
-            calculate_latency_from_message_payload,
-            rate_limiter,
+            limit_bytes_per_second,
         }
     }
 
     pub async fn run(&self) -> Result<BenchmarkIndividualMetrics, IggyError> {
         let topic_id: u32 = 1;
         let default_partition_id: u32 = 1;
-        let message_batches = self.message_batches as u64;
-        let messages_per_batch = self.messages_per_batch;
-        let total_messages = (self.messages_per_batch * self.message_batches) as u64;
         let client = self.client_factory.create_client().await;
         let client = IggyClient::create(client, None, None);
         login_root(&client).await;
+
         let stream_id = self.stream_id.try_into().unwrap();
         let topic_id = topic_id.try_into().unwrap();
         let partition_id = if self.consumer_group_id.is_some() {
@@ -90,32 +82,15 @@ impl Consumer {
         } else {
             Some(default_partition_id)
         };
-        let total_batches_to_receive = self.batches_left_to_receive.load(Ordering::Relaxed);
-        let consumer = match self.consumer_group_id {
-            Some(consumer_group_id) => {
-                client
-                    .join_consumer_group(
-                        &stream_id,
-                        &topic_id,
-                        &consumer_group_id.try_into().unwrap(),
-                    )
-                    .await
-                    .expect("Failed to join consumer group");
-                IggyConsumer::group(consumer_group_id.try_into().unwrap())
-            }
-            None => IggyConsumer::new(self.consumer_id.try_into().unwrap()),
-        };
-        let mut latencies: Vec<Duration> = Vec::with_capacity(message_batches as usize);
-        let mut total_user_data_bytes = IggyByteSize::default();
-        let mut total_bytes = IggyByteSize::default();
-        let mut topic_not_found_counter = 0;
-        let mut initial_poll_timestamp: Option<Instant> = None;
-        let mut last_warning_time: Option<Instant> = None;
-        let mut skipped_warnings_count: u32 = 0;
-        let mut current_iteration: u64 = 0;
-        let mut received_messages = 0;
-        let mut batch_user_size_bytes = 0;
-        let mut batch_size_total_bytes = 0;
+        let cg_id = self.consumer_group_id;
+        let consumer =
+            create_consumer(&client, &cg_id, &stream_id, &topic_id, self.consumer_id).await;
+
+        let rate_limiter = self.limit_bytes_per_second.map(BenchmarkRateLimiter::new);
+
+        // -----------------------
+        // WARM-UP
+        // -----------------------
 
         if self.warmup_time.get_duration() != Duration::from_millis(0) {
             if let Some(cg_id) = self.consumer_group_id {
@@ -130,8 +105,18 @@ impl Consumer {
                 );
             }
             let warmup_end = Instant::now() + self.warmup_time.get_duration();
+            let mut messages_processed = 0;
+            let mut last_batch_user_size_bytes = 0;
             while Instant::now() < warmup_end {
-                let offset = current_iteration * messages_per_batch as u64;
+                if let Some(rate_limiter) = &rate_limiter {
+                    if last_batch_user_size_bytes > 0 {
+                        rate_limiter
+                            .wait_until_necessary(last_batch_user_size_bytes)
+                            .await;
+                    }
+                }
+                let messages_to_receive = self.messages_per_batch.get();
+                let offset = messages_processed;
                 let (strategy, auto_commit) = match self.polling_kind {
                     PollingKind::Offset => (PollingStrategy::offset(offset), false),
                     PollingKind::Next => (PollingStrategy::next(), true),
@@ -147,52 +132,75 @@ impl Consumer {
                         partition_id,
                         &consumer,
                         &strategy,
-                        messages_per_batch,
+                        messages_to_receive,
                         auto_commit,
                     )
                     .await?;
 
                 if polled_messages.messages.is_empty() {
                     warn!(
-                        "Consumer: {} - Messages are empty for offset: {}, retrying...",
+                        "Consumer #{} → Messages are empty for offset: {}, retrying...",
                         self.consumer_id, offset
                     );
                     continue;
                 }
-                current_iteration += 1;
+                messages_processed = polled_messages.messages.len() as u64;
+                last_batch_user_size_bytes = batch_user_size_bytes(&polled_messages);
             }
         }
 
+        // -----------------------
+        // MAIN BENCHMARK
+        // -----------------------
+
         if let Some(cg_id) = self.consumer_group_id {
             info!(
-                "Consumer #{}, part of consumer group #{} → polling {} messages in {} batches of {} messages from stream {}...",
+                "Consumer #{}, part of consumer group #{} → polling {} of batches of {} messages from stream {}...",
                 self.consumer_id,
                 cg_id,
-                total_messages.human_count_bare(),
-                message_batches.human_count_bare(),
-                messages_per_batch.human_count_bare(),
+                self.finish_condition.total_str(),
+                self.messages_per_batch,
                 stream_id,
             );
         } else {
             info!(
-                "Consumer #{} → polling {} messages in {} batches of {} messages from stream {}...",
+                "Consumer #{} → polling {} of batches of {} messages from stream {}...",
                 self.consumer_id,
-                total_messages.human_count_bare(),
-                message_batches.human_count_bare(),
-                messages_per_batch.human_count_bare(),
+                self.finish_condition.total_str(),
+                self.messages_per_batch,
                 stream_id
             );
         }
 
-        current_iteration = 0;
-        let mut records = Vec::with_capacity(message_batches as usize);
+        let max_capacity = self.finish_condition.max_capacity();
+        let mut records = Vec::with_capacity(max_capacity);
+        let mut latencies: Vec<Duration> = Vec::with_capacity(max_capacity);
+        let mut skipped_warnings_count: u32 = 0;
+        let mut topic_not_found_counter = 0;
+        let mut initial_poll_timestamp: Option<Instant> = None;
+        let mut last_warning_time: Option<Instant> = None;
+        let mut messages_processed = 0;
+        let mut batches_processed = 0;
+        let mut bytes_processed = 0;
+        let mut user_data_bytes_processed = 0;
+        let mut last_batch_user_size_bytes = 0;
         let start_timestamp = Instant::now();
-        while self.batches_left_to_receive.load(Ordering::Acquire) > 0 {
-            if let Some(limiter) = &self.rate_limiter {
-                limiter.throttle(batch_size_total_bytes).await;
-            }
-            let offset = current_iteration * messages_per_batch as u64;
 
+        loop {
+            if self.finish_condition.check() {
+                break;
+            }
+
+            if let Some(rate_limiter) = &rate_limiter {
+                if last_batch_user_size_bytes > 0 {
+                    rate_limiter
+                        .wait_until_necessary(last_batch_user_size_bytes)
+                        .await;
+                }
+            }
+
+            let messages_to_receive = self.messages_per_batch.get();
+            let offset = messages_processed;
             let (strategy, auto_commit) = match self.polling_kind {
                 PollingKind::Offset => (PollingStrategy::offset(offset), false),
                 PollingKind::Next => (PollingStrategy::next(), true),
@@ -209,7 +217,7 @@ impl Consumer {
                     partition_id,
                     &consumer,
                     &strategy,
-                    messages_per_batch,
+                    messages_to_receive,
                     auto_commit,
                 )
                 .await;
@@ -228,7 +236,6 @@ impl Consumer {
 
             let polled_messages = polled_messages.unwrap();
             if polled_messages.messages.is_empty() {
-                // Store initial poll timestamp if this is the first attempt
                 if initial_poll_timestamp.is_none() {
                     initial_poll_timestamp = Some(before_poll);
                 }
@@ -238,9 +245,8 @@ impl Consumer {
 
                 if should_warn {
                     warn!(
-                    "Consumer #{} → Messages are empty for offset: {}, received {} of {} batches, retrying... ({} warnings skipped)",
-                    self.consumer_id, offset, total_batches_to_receive - self.batches_left_to_receive.load(Ordering::Acquire), total_batches_to_receive,
-                        skipped_warnings_count
+                    "Consumer #{} → Messages are empty for offset: {}, received {}, retrying... ({} warnings skipped)",
+                    self.consumer_id, offset, self.finish_condition.status(), skipped_warnings_count
                     );
                     last_warning_time = Some(Instant::now());
                     skipped_warnings_count = 0;
@@ -250,18 +256,18 @@ impl Consumer {
                 continue;
             }
 
-            if polled_messages.messages.len() != messages_per_batch as usize {
+            if polled_messages.messages.len() != messages_to_receive as usize {
                 let should_warn = last_warning_time
                     .map(|t| t.elapsed() >= Duration::from_secs(1))
                     .unwrap_or(true);
 
                 if should_warn {
                     warn!(
-                        "Consumer #{} → expected {} messages, but got {} messages ({} batches remaining), retrying... ({} warnings skipped)",
+                        "Consumer #{} → expected {} messages, but got {} messages (received {}), retrying... ({} warnings skipped)",
                         self.consumer_id,
-                        messages_per_batch,
+                        messages_to_receive,
                         polled_messages.messages.len(),
-                        self.batches_left_to_receive.load(Ordering::Acquire),
+                        self.finish_condition.status(),
                         skipped_warnings_count
                     );
                     last_warning_time = Some(Instant::now());
@@ -273,39 +279,32 @@ impl Consumer {
                 continue;
             }
 
-            let latency = if self.calculate_latency_from_message_payload {
-                calculate_latency_from_first_message(&polled_messages.messages[0])
-            } else {
-                initial_poll_timestamp.unwrap_or(before_poll).elapsed()
-            };
-            initial_poll_timestamp = None; // Reset the timestamp after successful poll
+            let latency = initial_poll_timestamp.unwrap_or(before_poll).elapsed();
             latencies.push(latency);
 
-            self.batches_left_to_receive.fetch_sub(1, Ordering::AcqRel);
+            last_batch_user_size_bytes = batch_user_size_bytes(&polled_messages);
+            initial_poll_timestamp = None;
 
-            received_messages += polled_messages.messages.len() as u64;
+            messages_processed += polled_messages.messages.len() as u64;
+            batches_processed += 1;
+            bytes_processed += batch_total_size_bytes(&polled_messages);
+            user_data_bytes_processed += last_batch_user_size_bytes;
 
-            // We don't need to calculate the size whole batch every time by iterating over it - just always use the size of the first message
-            if batch_user_size_bytes == 0 || batch_size_total_bytes == 0 {
-                batch_user_size_bytes =
-                    polled_messages.messages[0].payload.len() as u64 * messages_per_batch as u64;
-                batch_size_total_bytes =
-                    polled_messages.messages[0].get_size_bytes().as_bytes_u64()
-                        * messages_per_batch as u64;
-            }
-
-            total_user_data_bytes += IggyByteSize::from(batch_user_size_bytes);
-            total_bytes += IggyByteSize::from(batch_size_total_bytes);
-            current_iteration += 1;
-            let message_batches = current_iteration;
             records.push(BenchmarkRecord {
                 elapsed_time_us: start_timestamp.elapsed().as_micros() as u64,
                 latency_us: latency.as_micros() as u64,
-                messages: received_messages,
-                message_batches,
-                user_data_bytes: total_user_data_bytes.as_bytes_u64(),
-                total_bytes: total_bytes.as_bytes_u64(),
+                messages: messages_processed,
+                message_batches: batches_processed,
+                user_data_bytes: user_data_bytes_processed,
+                total_bytes: bytes_processed,
             });
+
+            if self
+                .finish_condition
+                .account_and_check(last_batch_user_size_bytes)
+            {
+                break;
+            }
         }
 
         let metrics = from_records(
@@ -319,9 +318,9 @@ impl Consumer {
 
         Self::log_statistics(
             self.consumer_id,
-            total_messages,
-            current_iteration as u32,
-            messages_per_batch,
+            messages_processed,
+            batches_processed as u32,
+            &self.messages_per_batch,
             &metrics,
         );
 
@@ -332,17 +331,17 @@ impl Consumer {
         consumer_id: u32,
         total_messages: u64,
         message_batches: u32,
-        messages_per_batch: u32,
+        messages_per_batch: &IggyBenchNumericParameter,
         metrics: &BenchmarkIndividualMetrics,
     ) {
         info!(
             "Consumer #{} → polled {} messages, {} batches of {} messages in {:.2} s, total size: {}, average throughput: {:.2} MB/s, \
     p50 latency: {:.2} ms, p90 latency: {:.2} ms, p95 latency: {:.2} ms, p99 latency: {:.2} ms, p999 latency: {:.2} ms, \
-    p9999 latency: {:.2} ms, average latency: {:.2} ms, median latency: {:.2} ms",
+    p9999 latency: {:.2} ms, average latency: {:.2} ms, median latency: {:.2} ms, min latency: {:.2} ms, max latency: {:.2} ms, std dev latency: {:.2} ms",
             consumer_id,
             total_messages.human_count_bare(),
             message_batches.human_count_bare(),
-            messages_per_batch.human_count_bare(),
+            messages_per_batch,
             metrics.summary.total_time_secs,
             IggyByteSize::from(metrics.summary.total_user_data_bytes),
             metrics.summary.throughput_megabytes_per_second,
@@ -353,7 +352,10 @@ impl Consumer {
             metrics.summary.p999_latency_ms,
             metrics.summary.p9999_latency_ms,
             metrics.summary.avg_latency_ms,
-            metrics.summary.median_latency_ms
+            metrics.summary.median_latency_ms,
+            metrics.summary.min_latency_ms,
+            metrics.summary.max_latency_ms,
+            metrics.summary.std_dev_latency_ms,
         );
     }
 }

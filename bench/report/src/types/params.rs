@@ -1,4 +1,7 @@
-use super::{benchmark_kind::BenchmarkKind, transport::BenchmarkTransport};
+use super::{
+    benchmark_kind::BenchmarkKind, numeric_parameter::IggyBenchNumericParameter,
+    transport::BenchmarkTransport,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
@@ -10,9 +13,9 @@ pub struct BenchmarkParams {
     pub extra_info: Option<String>,
     pub gitref: Option<String>,
     pub gitref_date: Option<String>,
-    pub messages_per_batch: u32,
-    pub message_batches: u32,
-    pub message_size: u32,
+    pub messages_per_batch: IggyBenchNumericParameter,
+    pub message_batches: u64,
+    pub message_size: IggyBenchNumericParameter,
     pub producers: u32,
     pub consumers: u32,
     pub streams: u32,
@@ -27,25 +30,28 @@ pub struct BenchmarkParams {
 impl BenchmarkParams {
     pub fn format_actors_info(&self) -> String {
         match self.benchmark_kind {
-            BenchmarkKind::PinnedProducer => format!("{} producers", self.producers),
-            BenchmarkKind::PinnedConsumer => format!("{} consumers", self.consumers),
+            BenchmarkKind::PinnedProducer => format!("{} Producers", self.producers),
+            BenchmarkKind::PinnedConsumer => format!("{} Consumers", self.consumers),
             BenchmarkKind::PinnedProducerAndConsumer => {
-                format!("{} producers/{} consumers", self.producers, self.consumers)
+                format!("{} Producers/{} Consumers", self.producers, self.consumers)
             }
-            BenchmarkKind::BalancedProducer => format!("{} producers", self.producers),
+            BenchmarkKind::BalancedProducer => format!("{} Producers", self.producers),
             BenchmarkKind::BalancedConsumerGroup => format!(
-                "{} consumers/{} consumer groups",
+                "{} Consumers/{} Consumer Groups",
                 self.consumers, self.consumer_groups
             ),
             BenchmarkKind::BalancedProducerAndConsumerGroup => {
-                format!("{} producers/{} consumers", self.producers, self.consumers)
+                format!(
+                    "{} Producers/{} Consumer Groups",
+                    self.producers, self.consumer_groups
+                )
             }
             BenchmarkKind::EndToEndProducingConsumer => {
-                format!("{} producing consumers", self.producers)
+                format!("{} Producing Consumers", self.producers)
             }
             BenchmarkKind::EndToEndProducingConsumerGroup => {
                 format!(
-                    "{} producing consumers/{} consumer groups",
+                    "{} Producing Consumers/{} Consumer Groups",
                     self.producers, self.consumer_groups
                 )
             }

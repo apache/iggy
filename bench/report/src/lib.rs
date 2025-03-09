@@ -1,8 +1,8 @@
 pub mod plotting;
 pub mod types;
+pub mod utils;
 
 mod prints;
-mod utils;
 
 use crate::report::BenchmarkReport;
 use actor_kind::ActorKind;

@@ -1,6 +1,6 @@
 [package]
 name = "bench"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "Apache-2.0"
 # Due to dependency to integration, which has a dependency to server, setting
@@ -8,13 +8,13 @@ license = "Apache-2.0"
 
 [dependencies]
 async-trait = "0.1.86"
-atomic-time = "0.1.5"
-bytes = "1.10.0"
 charming = "0.4.0"
 chrono = "0.4.39"
 clap = { version = "4.5.30", features = ["derive"] }
 figlet-rs = "0.1.5"
+flume = "0.11.1"
 futures = "0.3.31"
+governor = "0.8.0"
 hostname = "0.4.0"
 human-repr = "1.1.0"
 iggy = { path = "../sdk" }
