@@ -21,7 +21,7 @@ clap = { version = "4.5.30", features = ["derive"] }
 clap_complete = "4.5.45"
 figlet-rs = "0.1.5"
 iggy = { path = "../sdk", features = ["iggy-cli"], version = "0.6.202" }
-keyring = { version = "3.6.1", features = [
+keyring = { version = "3.6.2", features = [
     "sync-secret-service",
     "vendored",
 ], optional = true }

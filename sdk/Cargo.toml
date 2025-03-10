@@ -38,7 +38,7 @@ flume = "0.11.1"
 futures = "0.3.31"
 futures-util = "0.3.31"
 humantime = "2.1.0"
-keyring = { version = "3.6.1", optional = true, features = [
+keyring = { version = "3.6.2", optional = true, features = [
     "sync-secret-service",
     "vendored",
 ] }
