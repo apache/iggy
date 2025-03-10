@@ -12,11 +12,12 @@ use super::MAX_SEGMENTS_COUNT;
 
 type SegmentsCountType = u32;
 
-/// `DeletePartitions` command is used to delete partitions from a topic.
+/// `DeleteSegments` command is used to delete segments from a partition.
 /// It has additional payload:
 /// - `stream_id` - unique stream ID (numeric or name).
 /// - `topic_id` - unique topic ID (numeric or name).
-/// - `partitions_count` - number of partitions in the topic to delete, max value is 1000.
+/// - `partition_id` - unique partition ID (numeric or name).
+/// - `segments_count` - number of segments in the partition to delete, max value is defined in MAX_SEGMENTS_COUNT.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct DeleteSegments {
     /// Unique stream ID (numeric or name).
@@ -28,7 +29,7 @@ pub struct DeleteSegments {
     /// Unique partition ID (numeric or name).
     #[serde(skip)]
     pub partition_id: Identifier,
-    /// Number of partitions in the topic to delete, max value is 1000.
+    /// Number of segments in the topic to delete, max value is 1000.
     pub segments_count: SegmentsCountType,
 }
 
