@@ -18,8 +18,7 @@ pub async fn handle(
     debug!("session: {session}, command: {command}");
 
     let mut system = system.write().await;
-    system
-            .create_partitions(
+    system.create_partitions(
                 session,
                 &command.stream_id,
                 &command.topic_id,
@@ -28,7 +27,7 @@ pub async fn handle(
             .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to create partitions for stream_id: {}, topic_id: {}, session: {}",
+                    "{COMPONENT} (error: {error}) - failed to create partitions for stream ID: {}, topic ID: {}, session: {}",
                     command.stream_id, command.topic_id, session
                 )
             })?;
@@ -46,7 +45,7 @@ pub async fn handle(
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply create partitions for stream_id: {}, topic_id: {}, session: {}",
+                "{COMPONENT} (error: {error}) - failed to apply create partitions for stream ID: {}, topic ID: {}, session: {}",
                 stream_id, topic_id, session
             )
         })?;

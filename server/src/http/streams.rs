@@ -18,6 +18,7 @@ use iggy::streams::update_stream::UpdateStream;
 use iggy::validatable::Validatable;
 
 use crate::state::command::EntryCommand;
+use crate::state::models::CreateStreamWithId;
 use std::sync::Arc;
 use tracing::instrument;
 
@@ -92,18 +93,20 @@ async fn create_stream(
                 command.stream_id
             )
         })?;
+    let stream_id = stream.stream_id;
     let response = Json(mapper::map_stream(stream));
 
     let system = system.downgrade();
-    let stream_id = command.stream_id;
     system
         .state
-        .apply(identity.user_id, EntryCommand::CreateStream(command))
+        .apply(identity.user_id, EntryCommand::CreateStream(CreateStreamWithId {
+            stream_id,
+            command
+        }))
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply create stream, stream ID: {:?}",
-                stream_id
+                "{COMPONENT} (error: {error}) - failed to apply create stream, stream ID: {stream_id}",
             )
         })?;
     Ok(response)

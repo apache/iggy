@@ -127,9 +127,9 @@ pub enum IggyError {
     #[error("Invalid number encoding")]
     InvalidNumberEncoding = 82,
     #[error("Invalid boolean value")]
-    InvalidBooleanValue,
+    InvalidBooleanValue = 83,
     #[error("Invalid number value")]
-    InvalidNumberValue,
+    InvalidNumberValue = 84,
     #[error("Client with ID: {0} was not found.")]
     ClientNotFound(u32) = 100,
     #[error("Invalid client ID")]

@@ -4,6 +4,7 @@ use crate::http::mapper;
 use crate::http::shared::AppState;
 use crate::http::COMPONENT;
 use crate::state::command::EntryCommand;
+use crate::state::models::CreateTopicWithId;
 use crate::streaming::session::Session;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -114,17 +115,20 @@ async fn create_topic(
         })?;
     command.message_expiry = topic.message_expiry;
     command.max_topic_size = topic.max_topic_size;
+    let topic_id = topic.topic_id;
     let response = Json(mapper::map_topic(topic).await);
 
     let system = system.downgrade();
     system
         .state
-        .apply(identity.user_id, EntryCommand::CreateTopic(command))
+        .apply(identity.user_id, EntryCommand::CreateTopic(CreateTopicWithId {
+            topic_id,
+            command
+        }))
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply create topic, stream ID: {}",
-                stream_id
+                "{COMPONENT} (error: {error}) - failed to apply create topic, stream ID: {stream_id}",
             )
         })?;
     Ok(response)

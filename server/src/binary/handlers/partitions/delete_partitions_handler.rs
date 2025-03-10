@@ -20,8 +20,7 @@ pub async fn handle(
     let topic_id = command.topic_id.clone();
 
     let mut system = system.write().await;
-    system
-            .delete_partitions(
+    system.delete_partitions(
                 session,
                 &command.stream_id,
                 &command.topic_id,
@@ -44,7 +43,7 @@ pub async fn handle(
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply delete partitions for stream_id: {}, topic_id: {}, session: {}",
+                "{COMPONENT} (error: {error}) - failed to apply delete partitions for stream ID: {}, topic ID: {}, session: {}",
                 stream_id, topic_id, session
             )
         })?;

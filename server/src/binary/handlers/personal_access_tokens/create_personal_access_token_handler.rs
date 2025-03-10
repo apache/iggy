@@ -39,11 +39,11 @@ pub async fn handle(
         .apply(
             session.get_user_id(),
             EntryCommand::CreatePersonalAccessToken(CreatePersonalAccessTokenWithHash {
+                hash: token_hash,
                 command: CreatePersonalAccessToken {
                     name: command.name.to_owned(),
                     expiry: command.expiry,
-                },
-                hash: token_hash,
+                }
             }),
         )
         .await

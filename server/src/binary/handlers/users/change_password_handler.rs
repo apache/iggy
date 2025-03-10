@@ -19,8 +19,7 @@ pub async fn handle(
     debug!("session: {session}, command: {command}");
 
     let mut system = system.write().await;
-    system
-            .change_password(
+    system.change_password(
                 session,
                 &command.user_id,
                 &command.current_password,
@@ -29,7 +28,7 @@ pub async fn handle(
             .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to change password for user_id: {}, session: {session}",
+                    "{COMPONENT} (error: {error}) - failed to change password for user ID: {}, session: {session}",
                     command.user_id
                 )
             })?;
@@ -49,7 +48,7 @@ pub async fn handle(
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply change password for user_id: {}, session: {session}",
+                "{COMPONENT} (error: {error}) - failed to apply change password for user ID: {}, session: {session}",
                 command.user_id
             )
         })?;

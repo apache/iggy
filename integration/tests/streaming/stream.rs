@@ -61,7 +61,6 @@ async fn should_load_existing_stream_from_disk() {
             name: name.clone(),
             created_at: IggyTimestamp::now(),
             topics: AHashMap::new(),
-            current_topic_id: 0,
         };
         loaded_stream.load(state).await.unwrap();
 

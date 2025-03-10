@@ -70,7 +70,7 @@ impl Display for Stream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Stream {{ stream_id: {}, name: {}, path: {}, topic_path: {}, created_at: {} }}",
+            "Stream {{ stream ID: {}, name: {}, path: {}, topic_path: {}, created_at: {} }}",
             self.stream_id, self.name, self.path, self.topics_path, self.created_at,
         )
     }

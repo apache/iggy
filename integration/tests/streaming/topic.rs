@@ -117,7 +117,6 @@ async fn should_load_existing_topic_from_disk() {
             max_topic_size: MaxTopicSize::ServerDefault,
             replication_factor: Some(1),
             created_at: Default::default(),
-            current_consumer_group_id: 0,
         };
         loaded_topic.load(topic_state).await.unwrap();
 

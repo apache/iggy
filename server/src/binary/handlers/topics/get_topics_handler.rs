@@ -21,7 +21,7 @@ pub async fn handle(
         .find_topics(session, &command.stream_id)
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to find topics, stream_id: {}, session: {session}",
+                "{COMPONENT} (error: {error}) - failed to find topics, stream ID: {}, session: {session}",
                 command.stream_id
             )
         })?;

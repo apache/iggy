@@ -1,6 +1,7 @@
 use crate::binary::mapper;
 use crate::binary::{handlers::streams::COMPONENT, sender::SenderKind};
 use crate::state::command::EntryCommand;
+use crate::state::models::CreateStreamWithId;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
@@ -25,21 +26,24 @@ pub async fn handle(
             .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to create stream with id: {:?}, session: {session}",
-                    stream_id
+                    "{COMPONENT} (error: {error}) - failed to create stream with ID: {:?}, name: {} session: {session}",
+                    stream_id, command.name
                 )
             })?;
+    let stream_id = stream.stream_id;
     let response = mapper::map_stream(stream);
 
     let system = system.downgrade();
     system
         .state
-        .apply(session.get_user_id(), EntryCommand::CreateStream(command))
+        .apply(session.get_user_id(), EntryCommand::CreateStream(CreateStreamWithId {
+            stream_id,
+            command
+        }))
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply create stream for id: {:?}, session: {session}",
-                stream_id
+                "{COMPONENT} (error: {error}) - failed to apply create stream with ID: {stream_id}, session: {session}",
             )
         })?;
     sender.send_ok_response(&response).await?;

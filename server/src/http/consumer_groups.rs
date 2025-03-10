@@ -4,6 +4,7 @@ use crate::http::mapper;
 use crate::http::shared::AppState;
 use crate::http::COMPONENT;
 use crate::state::command::EntryCommand;
+use crate::state::models::CreateConsumerGroupWithId;
 use crate::streaming::session::Session;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -96,13 +97,17 @@ async fn create_consumer_group(
             .await
             .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to create consumer group, stream ID: {}, topic ID: {}, group ID: {:?}", stream_id, topic_id, command.group_id))?;
     let consumer_group = consumer_group.read().await;
+    let group_id = consumer_group.group_id;
     let consumer_group_details = mapper::map_consumer_group(&consumer_group).await;
     drop(consumer_group);
 
     let system = system.downgrade();
     system
         .state
-        .apply(identity.user_id, EntryCommand::CreateConsumerGroup(command))
+        .apply(
+            identity.user_id,
+            EntryCommand::CreateConsumerGroup(CreateConsumerGroupWithId { group_id, command }),
+        )
         .await?;
 
     Ok((StatusCode::CREATED, Json(consumer_group_details)))

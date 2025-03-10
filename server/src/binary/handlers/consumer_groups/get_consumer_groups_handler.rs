@@ -21,7 +21,7 @@ pub async fn handle(
         .get_consumer_groups(session, &command.stream_id, &command.topic_id)
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed on getting consumer groups for stream_id: {}, topic_id: {}, session: {}",
+                "{COMPONENT} (error: {error}) - failed on getting consumer groups for stream ID: {}, topic ID: {}, session: {}",
                 command.stream_id, command.topic_id, session
             )
         })?;

@@ -16,8 +16,7 @@ pub async fn handle(
 ) -> Result<(), IggyError> {
     debug!("session: {session}, command: {command}");
     let system = system.read().await;
-    system
-        .store_consumer_offset(
+    system.store_consumer_offset(
             session,
             command.consumer,
             &command.stream_id,
@@ -26,7 +25,7 @@ pub async fn handle(
             command.offset,
         )
         .await
-        .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset for stream_id: {}, topic_id: {}, partition_id: {:?}, offset: {}, session: {}",
+        .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset for stream ID: {}, topic ID: {}, partition_id: {:?}, offset: {}, session: {}",
             command.stream_id, command.topic_id, command.partition_id, command.offset, session
         ))?;
     sender.send_empty_ok_response().await?;

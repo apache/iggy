@@ -7,7 +7,9 @@ use iggy::topics::create_topic::CreateTopic;
 use iggy::users::create_user::CreateUser;
 use iggy::utils::expiry::IggyExpiry;
 use server::state::command::EntryCommand;
-use server::state::models::CreatePersonalAccessTokenWithHash;
+use server::state::models::{
+    CreatePersonalAccessTokenWithHash, CreateStreamWithId, CreateTopicWithId, CreateUserWithId,
+};
 use server::state::system::SystemState;
 use server::state::State;
 
@@ -31,19 +33,21 @@ async fn should_be_initialized_based_on_state_entries() {
         permissions: None,
     };
 
+    let stream1_id = 1;
     let create_stream1 = CreateStream {
-        stream_id: Some(1),
+        stream_id: Some(stream1_id),
         name: "stream1".to_string(),
     };
 
     let create_stream1_clone = CreateStream {
-        stream_id: Some(1),
+        stream_id: Some(stream1_id),
         name: "stream1".to_string(),
     };
 
+    let topic1_id = 1;
     let create_topic1 = CreateTopic {
-        stream_id: create_stream1.stream_id.unwrap().try_into().unwrap(),
-        topic_id: Some(1),
+        stream_id: stream1_id.try_into().unwrap(),
+        topic_id: Some(topic1_id),
         partitions_count: 1,
         compression_algorithm: Default::default(),
         message_expiry: Default::default(),
@@ -53,8 +57,8 @@ async fn should_be_initialized_based_on_state_entries() {
     };
 
     let create_topic1_clone = CreateTopic {
-        stream_id: create_stream1.stream_id.unwrap().try_into().unwrap(),
-        topic_id: Some(1),
+        stream_id: stream1_id.try_into().unwrap(),
+        topic_id: Some(topic1_id),
         partitions_count: 1,
         compression_algorithm: Default::default(),
         message_expiry: Default::default(),
@@ -63,14 +67,16 @@ async fn should_be_initialized_based_on_state_entries() {
         replication_factor: None,
     };
 
+    let stream2_id = 2;
     let create_stream2 = CreateStream {
-        stream_id: Some(2),
+        stream_id: Some(stream2_id),
         name: "stream2".to_string(),
     };
 
+    let topic2_id = 2;
     let create_topic2 = CreateTopic {
-        stream_id: create_stream2.stream_id.unwrap().try_into().unwrap(),
-        topic_id: Some(2),
+        stream_id: stream2_id.try_into().unwrap(),
+        topic_id: Some(topic2_id),
         partitions_count: 1,
         compression_algorithm: Default::default(),
         message_expiry: Default::default(),
@@ -80,13 +86,13 @@ async fn should_be_initialized_based_on_state_entries() {
     };
 
     let create_partitions = CreatePartitions {
-        stream_id: create_topic1.stream_id.clone(),
-        topic_id: create_topic1.topic_id.unwrap().try_into().unwrap(),
+        stream_id: stream1_id.try_into().unwrap(),
+        topic_id: topic1_id.try_into().unwrap(),
         partitions_count: 2,
     };
 
     let delete_stream2 = DeleteStream {
-        stream_id: create_stream2.stream_id.unwrap().try_into().unwrap(),
+        stream_id: stream2_id.try_into().unwrap(),
     };
 
     let create_personal_access_token = CreatePersonalAccessTokenWithHash {
@@ -105,23 +111,53 @@ async fn should_be_initialized_based_on_state_entries() {
         hash: "hash".to_string(),
     };
     state
-        .apply(user_id, EntryCommand::CreateUser(create_user))
+        .apply(
+            user_id,
+            EntryCommand::CreateUser(CreateUserWithId {
+                user_id,
+                command: create_user,
+            }),
+        )
         .await
         .unwrap();
     state
-        .apply(user_id, EntryCommand::CreateStream(create_stream1))
+        .apply(
+            user_id,
+            EntryCommand::CreateStream(CreateStreamWithId {
+                stream_id: stream1_id,
+                command: create_stream1,
+            }),
+        )
         .await
         .unwrap();
     state
-        .apply(user_id, EntryCommand::CreateTopic(create_topic1))
+        .apply(
+            user_id,
+            EntryCommand::CreateTopic(CreateTopicWithId {
+                topic_id: topic1_id,
+                command: create_topic1,
+            }),
+        )
         .await
         .unwrap();
     state
-        .apply(user_id, EntryCommand::CreateStream(create_stream2))
+        .apply(
+            user_id,
+            EntryCommand::CreateStream(CreateStreamWithId {
+                stream_id: stream2_id,
+                command: create_stream2,
+            }),
+        )
         .await
         .unwrap();
     state
-        .apply(user_id, EntryCommand::CreateTopic(create_topic2))
+        .apply(
+            user_id,
+            EntryCommand::CreateTopic(CreateTopicWithId {
+                topic_id: topic2_id,
+                command: create_topic2,
+            }),
+        )
         .await
         .unwrap();
     state

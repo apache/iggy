@@ -1,4 +1,5 @@
 use crate::state::command::EntryCommand;
+use crate::state::models::CreateUserWithId;
 use crate::state::system::UserState;
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::session::Session;
@@ -35,7 +36,10 @@ impl System {
                 permissions: root.permissions.clone(),
             };
             self.state
-                .apply(0, EntryCommand::CreateUser(command))
+                .apply(0, EntryCommand::CreateUser(CreateUserWithId {
+                    user_id: root.id,
+                    command
+                }))
                 .await
                 .with_error_context(|error| {
                     format!(

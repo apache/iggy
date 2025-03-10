@@ -18,8 +18,7 @@ pub async fn handle(
     debug!("session: {session}, command: {command}");
 
     let mut system = system.write().await;
-    system
-            .update_user(
+    system.update_user(
                 session,
                 &command.user_id,
                 command.username.clone(),
@@ -28,7 +27,7 @@ pub async fn handle(
             .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to update user with user_id: {}, session: {session}",
+                    "{COMPONENT} (error: {error}) - failed to update user with user ID: {}, session: {session}",
                     command.user_id
                 )
             })?;
@@ -42,8 +41,7 @@ pub async fn handle(
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply update user with user_id: {}, session: {session}",
-                user_id
+                "{COMPONENT} (error: {error}) - failed to apply update user with user ID: {user_id}, session: {session}",
             )
         })?;
     sender.send_empty_ok_response().await?;

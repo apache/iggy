@@ -15,13 +15,13 @@ impl System {
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
         {
-            let topic = self.find_topic(session, stream_id, topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream_id: {stream_id}, topic_id: {topic_id}"))?;
+            let topic = self.find_topic(session, stream_id, topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
             self.permissioner.create_partitions(
                 session.get_user_id(),
                 topic.stream_id,
                 topic.topic_id,
             ).with_error_context(|error| format!(
-                "{COMPONENT} (error: {error}) - permission denied to create partitions for user {} on stream_id: {}, topic_id: {}",
+                "{COMPONENT} (error: {error}) - permission denied to create partitions for user {} on stream ID: {}, topic ID: {}",
                 session.get_user_id(),
                 topic.stream_id,
                 topic.topic_id
@@ -57,13 +57,13 @@ impl System {
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
         {
-            let topic = self.find_topic(session, stream_id, topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream_id: {stream_id}, topic_id: {topic_id}"))?;
+            let topic = self.find_topic(session, stream_id, topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
             self.permissioner.delete_partitions(
                 session.get_user_id(),
                 topic.stream_id,
                 topic.topic_id,
             ).with_error_context(|error| format!(
-                "{COMPONENT} (error: {error}) - permission denied to delete partitions for user {} on stream_id: {}, topic_id: {}",
+                "{COMPONENT} (error: {error}) - permission denied to delete partitions for user {} on stream ID: {}, topic ID: {}",
                 session.get_user_id(),
                 topic.stream_id,
                 topic.topic_id

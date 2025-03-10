@@ -490,4 +490,4 @@ expiry = "1 m"
 # Recovery configuration in case of lost data
 [system.recovery]
 # Controls whether streams/topics/partitions should be recreated if the expected data for existing state is missing (boolean).
-recreate_missing_state = true
+recreate_missing_state = false

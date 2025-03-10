@@ -198,7 +198,7 @@ impl fmt::Display for Partition {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Partition {{ stream_id: {}, topic_id: {}, partition_id: {}, path: {}, current_offset: {} }}",
+            "Partition {{ stream ID: {}, topic ID: {}, partition_id: {}, path: {}, current_offset: {} }}",
             self.stream_id,
             self.topic_id,
             self.partition_id,

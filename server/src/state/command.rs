@@ -1,4 +1,7 @@
-use crate::state::models::CreatePersonalAccessTokenWithHash;
+use crate::state::models::{
+    CreateConsumerGroupWithId, CreatePersonalAccessTokenWithHash, CreateStreamWithId,
+    CreateTopicWithId, CreateUserWithId,
+};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use iggy::bytes_serializable::BytesSerializable;
 use iggy::command::{
@@ -8,22 +11,18 @@ use iggy::command::{
     DELETE_STREAM_CODE, DELETE_TOPIC_CODE, DELETE_USER_CODE, PURGE_STREAM_CODE, PURGE_TOPIC_CODE,
     UPDATE_PERMISSIONS_CODE, UPDATE_STREAM_CODE, UPDATE_TOPIC_CODE, UPDATE_USER_CODE,
 };
-use iggy::consumer_groups::create_consumer_group::CreateConsumerGroup;
 use iggy::consumer_groups::delete_consumer_group::DeleteConsumerGroup;
 use iggy::error::IggyError;
 use iggy::partitions::create_partitions::CreatePartitions;
 use iggy::partitions::delete_partitions::DeletePartitions;
 use iggy::personal_access_tokens::delete_personal_access_token::DeletePersonalAccessToken;
-use iggy::streams::create_stream::CreateStream;
 use iggy::streams::delete_stream::DeleteStream;
 use iggy::streams::purge_stream::PurgeStream;
 use iggy::streams::update_stream::UpdateStream;
-use iggy::topics::create_topic::CreateTopic;
 use iggy::topics::delete_topic::DeleteTopic;
 use iggy::topics::purge_topic::PurgeTopic;
 use iggy::topics::update_topic::UpdateTopic;
 use iggy::users::change_password::ChangePassword;
-use iggy::users::create_user::CreateUser;
 use iggy::users::delete_user::DeleteUser;
 use iggy::users::update_permissions::UpdatePermissions;
 use iggy::users::update_user::UpdateUser;
@@ -31,19 +30,19 @@ use std::fmt::{Display, Formatter};
 
 #[derive(Debug, PartialEq)]
 pub enum EntryCommand {
-    CreateStream(CreateStream),
+    CreateStream(CreateStreamWithId),
     UpdateStream(UpdateStream),
     DeleteStream(DeleteStream),
     PurgeStream(PurgeStream),
-    CreateTopic(CreateTopic),
+    CreateTopic(CreateTopicWithId),
     UpdateTopic(UpdateTopic),
     DeleteTopic(DeleteTopic),
     PurgeTopic(PurgeTopic),
     CreatePartitions(CreatePartitions),
     DeletePartitions(DeletePartitions),
-    CreateConsumerGroup(CreateConsumerGroup),
+    CreateConsumerGroup(CreateConsumerGroupWithId),
     DeleteConsumerGroup(DeleteConsumerGroup),
-    CreateUser(CreateUser),
+    CreateUser(CreateUserWithId),
     UpdateUser(UpdateUser),
     DeleteUser(DeleteUser),
     ChangePassword(ChangePassword),
@@ -95,7 +94,7 @@ impl BytesSerializable for EntryCommand {
         let length = bytes.slice(4..8).get_u32_le();
         let payload = bytes.slice(8..8 + length as usize);
         match code {
-            CREATE_STREAM_CODE => Ok(EntryCommand::CreateStream(CreateStream::from_bytes(
+            CREATE_STREAM_CODE => Ok(EntryCommand::CreateStream(CreateStreamWithId::from_bytes(
                 payload,
             )?)),
             UPDATE_STREAM_CODE => Ok(EntryCommand::UpdateStream(UpdateStream::from_bytes(
@@ -105,7 +104,9 @@ impl BytesSerializable for EntryCommand {
                 payload,
             )?)),
             PURGE_STREAM_CODE => Ok(EntryCommand::PurgeStream(PurgeStream::from_bytes(payload)?)),
-            CREATE_TOPIC_CODE => Ok(EntryCommand::CreateTopic(CreateTopic::from_bytes(payload)?)),
+            CREATE_TOPIC_CODE => Ok(EntryCommand::CreateTopic(CreateTopicWithId::from_bytes(
+                payload,
+            )?)),
             UPDATE_TOPIC_CODE => Ok(EntryCommand::UpdateTopic(UpdateTopic::from_bytes(payload)?)),
             DELETE_TOPIC_CODE => Ok(EntryCommand::DeleteTopic(DeleteTopic::from_bytes(payload)?)),
             PURGE_TOPIC_CODE => Ok(EntryCommand::PurgeTopic(PurgeTopic::from_bytes(payload)?)),
@@ -116,12 +117,14 @@ impl BytesSerializable for EntryCommand {
                 DeletePartitions::from_bytes(payload)?,
             )),
             CREATE_CONSUMER_GROUP_CODE => Ok(EntryCommand::CreateConsumerGroup(
-                CreateConsumerGroup::from_bytes(payload)?,
+                CreateConsumerGroupWithId::from_bytes(payload)?,
             )),
             DELETE_CONSUMER_GROUP_CODE => Ok(EntryCommand::DeleteConsumerGroup(
                 DeleteConsumerGroup::from_bytes(payload)?,
             )),
-            CREATE_USER_CODE => Ok(EntryCommand::CreateUser(CreateUser::from_bytes(payload)?)),
+            CREATE_USER_CODE => Ok(EntryCommand::CreateUser(CreateUserWithId::from_bytes(
+                payload,
+            )?)),
             UPDATE_USER_CODE => Ok(EntryCommand::UpdateUser(UpdateUser::from_bytes(payload)?)),
             DELETE_USER_CODE => Ok(EntryCommand::DeleteUser(DeleteUser::from_bytes(payload)?)),
             CHANGE_PASSWORD_CODE => Ok(EntryCommand::ChangePassword(ChangePassword::from_bytes(
