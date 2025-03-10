@@ -1,15 +1,43 @@
+/* Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 use crate::streaming::common::test_setup::TestSetup;
 use bytes::Bytes;
 use iggy::bytes_serializable::BytesSerializable;
+use iggy::compression::compression_algorithm::CompressionAlgorithm;
 use iggy::confirmation::Confirmation;
+use iggy::error::IggyError;
+use iggy::identifier::Identifier;
+use iggy::locking::IggySharedMutFn;
 use iggy::models::messages::{MessageState, PolledMessage};
 use iggy::utils::byte_size::IggyByteSize;
 use iggy::utils::expiry::IggyExpiry;
+use iggy::utils::topic_size::MaxTopicSize;
 use iggy::utils::{checksum, timestamp::IggyTimestamp};
+use server::configs::server::{DataMaintenanceConfig, PersonalAccessTokenConfig};
 use server::configs::system::{SegmentConfig, SystemConfig};
 use server::streaming::local_sizeable::LocalSizeable;
 use server::streaming::models::messages::RetainedMessage;
 use server::streaming::segments::*;
+use server::streaming::session::Session;
+use server::streaming::systems::system::System;
+use std::fs::DirEntry;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
@@ -435,12 +463,178 @@ async fn given_at_least_one_not_expired_message_segment_should_not_be_expired() 
     assert!(!is_expired);
 }
 
+#[tokio::test]
+async fn should_delete_persisted_segments() -> Result<(), Box<dyn std::error::Error>> {
+    // Initial Setup.
+    let setup = TestSetup::init().await;
+    let mut system = System::new(
+        setup.config.clone(),
+        DataMaintenanceConfig::default(),
+        PersonalAccessTokenConfig::default(),
+    );
+
+    // Properties.
+    let stream_id = Identifier::numeric(1)?;
+    let stream_name = "test";
+    let topic_name = "test_topic";
+    let topic_id = Identifier::numeric(1)?;
+    let partition_id = 1;
+
+    setup
+        .create_partition_directory(
+            stream_id.get_u32_value()?,
+            topic_id.get_u32_value()?,
+            partition_id,
+        )
+        .await;
+
+    let session = Session::new(1, 1, SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 1234));
+    system.init().await.unwrap();
+
+    system
+        .create_stream(&session, Some(stream_id.get_u32_value()?), stream_name)
+        .await
+        .unwrap();
+
+    system
+        .create_topic(
+            &session,
+            &stream_id,
+            Some(topic_id.get_u32_value()?),
+            topic_name,
+            partition_id,
+            IggyExpiry::default(),
+            CompressionAlgorithm::default(),
+            MaxTopicSize::default(),
+            None,
+        )
+        .await?;
+
+    let topic = system.find_topic(&session, &stream_id, &topic_id)?;
+
+    let partitions = topic.get_partitions();
+
+    let mut partition = partitions
+        .first()
+        .ok_or(IggyError::Error)
+        .inspect_err(|_| log::error!("Cannot retrieve initial partition."))?
+        .write()
+        .await;
+
+    for n in 0..=3 {
+        partition.add_persisted_segment(n).await?;
+    }
+
+    // Explicitly drop the lock so that we can delete the segments through a different reference.
+    drop(partition);
+
+    let partition_path = setup.config.get_partition_path(
+        stream_id.get_u32_value()?,
+        topic_id.get_u32_value()?,
+        partition_id,
+    );
+
+    // Assert segment files were created correctly.
+    let segment_files = get_segment_paths_for_partiton(&partition_path)
+        .iter()
+        .rev()
+        .map(|dir_entry| dir_entry.file_name())
+        .collect::<Vec<_>>();
+
+    assert!(segment_files.len() == 4);
+
+    assert!((0..=3).all(|i| segment_files.iter().any(|val| val
+        .to_str()
+        .is_some_and(|file_str| file_str == format!("{:0>20}.{}", i, LOG_EXTENSION)))));
+
+    // Attempt to delete the segment files.
+    system
+        .delete_segments(&session, &stream_id, &topic_id, partition_id, 2)
+        .await?;
+
+    // Assert no changes as none are closed.
+    assert!((0..=3).all(|i| segment_files.iter().any(|val| val
+        .to_str()
+        .is_some_and(|file_str| file_str == format!("{:0>20}.{}", i, LOG_EXTENSION)))));
+
+    let topic = system.find_topic(&session, &stream_id, &topic_id)?;
+
+    let partitions = topic.get_partitions();
+
+    let mut partition = partitions
+        .first()
+        .ok_or(IggyError::Error)
+        .inspect_err(|_| log::error!("Cannot retrieve initial partition."))?
+        .write()
+        .await;
+
+    // Set the segments to closed.
+    for n in 0..=3 {
+        let segment = partition.get_segment_mut(n);
+
+        if let Some(segment_ref) = segment {
+            segment_ref.is_closed = true;
+        };
+    }
+
+    // Explicitly drop the lock so that we can delete the segments through a different reference.
+    drop(partition);
+
+    // Attempt to delete the segment files.
+    system
+        .delete_segments(&session, &stream_id, &topic_id, partition_id, 2)
+        .await?;
+
+    // Assert segment files were deleted correctly.
+    let segment_files = get_segment_paths_for_partiton(&partition_path)
+        .iter()
+        .map(|dir_entry| dir_entry.file_name())
+        .collect::<Vec<_>>();
+
+    assert!(segment_files.len() == 2);
+
+    // Check that the two segments with the largest start_offset's are preserved.
+    assert!((2..=3).all(|i| segment_files.iter().any(|val| val
+        .to_str()
+        .is_some_and(|file_str| file_str == format!("{:0>20}.{}", i, LOG_EXTENSION)))));
+
+    Ok(())
+}
+
 async fn assert_persisted_segment(partition_path: &str, start_offset: u64) {
     let segment_path = format!("{}/{:0>20}", partition_path, start_offset);
     let log_path = format!("{}.{}", segment_path, LOG_EXTENSION);
     let index_path = format!("{}.{}", segment_path, INDEX_EXTENSION);
     assert!(fs::metadata(&log_path).await.is_ok());
     assert!(fs::metadata(&index_path).await.is_ok());
+}
+
+fn get_segment_paths_for_partiton(partition_path: &str) -> Vec<DirEntry> {
+    let paths = std::fs::read_dir(partition_path)
+        .map(|read_dir| {
+            read_dir
+                .filter_map(|dir_entry| {
+                    let result = dir_entry
+                        .map(|dir_entry| {
+                            match dir_entry
+                                .path()
+                                .extension()
+                                .is_some_and(|ext| ext == LOG_EXTENSION)
+                            {
+                                true => Some(dir_entry),
+                                false => None,
+                            }
+                        })
+                        .ok()
+                        .flatten();
+
+                    result
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    paths
 }
 
 fn create_message(offset: u64, payload: &str, timestamp: IggyTimestamp) -> PolledMessage {

@@ -1,6 +1,25 @@
+/* Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 use crate::binary::mapper;
 use crate::binary::{handlers::streams::COMPONENT, sender::SenderKind};
 use crate::state::command::EntryCommand;
+use crate::state::models::CreateStreamWithId;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
@@ -25,21 +44,24 @@ pub async fn handle(
             .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to create stream with id: {:?}, session: {session}",
-                    stream_id
+                    "{COMPONENT} (error: {error}) - failed to create stream with ID: {:?}, name: {} session: {session}",
+                    stream_id, command.name
                 )
             })?;
+    let stream_id = stream.stream_id;
     let response = mapper::map_stream(stream);
 
     let system = system.downgrade();
     system
         .state
-        .apply(session.get_user_id(), EntryCommand::CreateStream(command))
+        .apply(session.get_user_id(), EntryCommand::CreateStream(CreateStreamWithId {
+            stream_id,
+            command
+        }))
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply create stream for id: {:?}, session: {session}",
-                stream_id
+                "{COMPONENT} (error: {error}) - failed to apply create stream with ID: {stream_id}, session: {session}",
             )
         })?;
     sender.send_ok_response(&response).await?;

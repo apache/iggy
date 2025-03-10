@@ -1,4 +1,22 @@
-use super::benchmark::{BenchmarkFutures, Benchmarkable};
+/* Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+use super::benchmark::Benchmarkable;
 use crate::{
     actors::consumer::Consumer,
     args::common::IggyBenchArgs,
@@ -10,9 +28,12 @@ use iggy::{
     client::ConsumerGroupClient, clients::client::IggyClient, error::IggyError,
     messages::poll_messages::PollingKind,
 };
-use iggy_bench_report::benchmark_kind::BenchmarkKind;
+use iggy_bench_report::{
+    benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics,
+};
 use integration::test_server::{login_root, ClientFactory};
 use std::sync::{atomic::AtomicI64, Arc};
+use tokio::task::JoinSet;
 use tracing::{error, info};
 
 pub struct ConsumerGroupBenchmark {
@@ -69,7 +90,9 @@ impl ConsumerGroupBenchmark {
 
 #[async_trait]
 impl Benchmarkable for ConsumerGroupBenchmark {
-    async fn run(&mut self) -> BenchmarkFutures {
+    async fn run(
+        &mut self,
+    ) -> Result<JoinSet<Result<BenchmarkIndividualMetrics, IggyError>>, IggyError> {
         self.check_streams().await?;
         let consumer_groups_count = self.args.number_of_consumer_groups();
         self.init_consumer_groups(consumer_groups_count)
@@ -81,11 +104,11 @@ impl Benchmarkable for ConsumerGroupBenchmark {
         let consumers = self.args.consumers();
         let messages_per_batch = self.args.messages_per_batch();
         let warmup_time = self.args.warmup_time();
-        let mut futures: BenchmarkFutures = Ok(Vec::with_capacity((consumers) as usize));
         let polling_kind = PollingKind::Next;
         let message_batches = self.args.message_batches();
         let total_message_batches = Arc::new(AtomicI64::new((message_batches * consumers) as i64));
 
+        let mut set = JoinSet::new();
         for consumer_id in 1..=consumers {
             let consumer_group_id =
                 start_consumer_group_id + 1 + (consumer_id % consumer_groups_count);
@@ -110,14 +133,14 @@ impl Benchmarkable for ConsumerGroupBenchmark {
                     .rate_limit()
                     .map(|rl| RateLimiter::new(rl.as_bytes_u64())),
             );
-            let future = Box::pin(async move { consumer.run().await });
-            futures.as_mut().unwrap().push(future);
+            set.spawn(consumer.run());
         }
+
         info!(
             "Starting consumer group benchmark with {} messages",
             self.total_messages()
         );
-        futures
+        Ok(set)
     }
 
     fn kind(&self) -> BenchmarkKind {

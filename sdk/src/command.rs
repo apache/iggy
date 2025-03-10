@@ -1,3 +1,21 @@
+/* Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 use crate::bytes_serializable::BytesSerializable;
 use crate::error::IggyError;
 use crate::validatable::Validatable;
@@ -86,7 +104,7 @@ pub const CREATE_PARTITIONS_CODE: u32 = 402;
 pub const DELETE_PARTITIONS: &str = "partition.delete";
 pub const DELETE_PARTITIONS_CODE: u32 = 403;
 pub const DELETE_SEGMENTS: &str = "segment.delete";
-pub const DELETE_SEGMENTS_CODE: u32 = 404;
+pub const DELETE_SEGMENTS_CODE: u32 = 503;
 pub const GET_CONSUMER_GROUP: &str = "consumer_group.get";
 pub const GET_CONSUMER_GROUP_CODE: u32 = 600;
 pub const GET_CONSUMER_GROUPS: &str = "consumer_group.list";

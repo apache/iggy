@@ -1,3 +1,21 @@
+/* Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 use crate::state::{EntryCommand, StateEntry, COMPONENT};
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use ahash::AHashMap;
@@ -11,7 +29,7 @@ use iggy::utils::expiry::IggyExpiry;
 use iggy::utils::timestamp::IggyTimestamp;
 use iggy::utils::topic_size::MaxTopicSize;
 use std::fmt::Display;
-use tracing::debug;
+use tracing::{debug, info};
 
 #[derive(Debug)]
 pub struct SystemState {
@@ -25,7 +43,6 @@ pub struct StreamState {
     pub name: String,
     pub created_at: IggyTimestamp,
     pub topics: AHashMap<u32, TopicState>,
-    pub current_topic_id: u32,
 }
 
 #[derive(Debug)]
@@ -39,7 +56,6 @@ pub struct TopicState {
     pub max_topic_size: MaxTopicSize,
     pub replication_factor: Option<u8>,
     pub created_at: IggyTimestamp,
-    pub current_consumer_group_id: u32,
 }
 
 #[derive(Debug)]
@@ -61,6 +77,7 @@ pub struct UserState {
     pub username: String,
     pub password_hash: String,
     pub status: UserStatus,
+    pub created_at: IggyTimestamp,
     pub permissions: Option<Permissions>,
     pub personal_access_tokens: AHashMap<String, PersonalAccessTokenState>,
 }
@@ -75,23 +92,19 @@ impl SystemState {
     pub async fn init(entries: Vec<StateEntry>) -> Result<Self, IggyError> {
         let mut streams = AHashMap::new();
         let mut users = AHashMap::new();
-        let mut current_stream_id = 0;
-        let mut current_user_id = 0;
         for entry in entries {
             debug!("Processing state entry: {entry}",);
             match entry.command().with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to retrieve state entry command: {entry}")
             })? {
                 EntryCommand::CreateStream(command) => {
-                    let stream_id = command.stream_id.unwrap_or_else(|| {
-                        current_stream_id += 1;
-                        current_stream_id
-                    });
+                    info!("Creating stream: {command:?}");
+                    let stream_id = command.stream_id;
+                    let command = command.command;
                     let stream = StreamState {
                         id: stream_id,
                         name: command.name.clone(),
                         topics: AHashMap::new(),
-                        current_topic_id: 0,
                         created_at: entry.timestamp,
                     };
                     streams.insert(stream.id, stream);
@@ -115,19 +128,16 @@ impl SystemState {
                     // It only affects the segments which are not part of the state
                 }
                 EntryCommand::CreateTopic(command) => {
-                    let stream_id = find_stream_id(&streams, &command.stream_id);
+                    let stream_id = find_stream_id(&streams, &command.command.stream_id);
                     let stream = streams
                         .get_mut(&stream_id)
                         .unwrap_or_else(|| panic!("{}", format!("Stream: {stream_id} not found")));
-                    let topic_id = command.topic_id.unwrap_or_else(|| {
-                        stream.current_topic_id += 1;
-                        stream.current_topic_id
-                    });
+                    let topic_id = command.topic_id;
+                    let command = command.command;
                     let topic = TopicState {
                         id: topic_id,
                         name: command.name,
                         consumer_groups: AHashMap::new(),
-                        current_consumer_group_id: 0,
                         compression_algorithm: command.compression_algorithm,
                         message_expiry: command.message_expiry,
                         max_topic_size: command.max_topic_size,
@@ -241,7 +251,7 @@ impl SystemState {
                         topic.partitions.remove(&(last_partition_id - i));
                     }
                 }
-                EntryCommand::CreateConsumerGroup(command) => {
+                EntryCommand::DeleteSegments(command) => {
                     let stream_id = find_stream_id(&streams, &command.stream_id);
                     let stream = streams
                         .get_mut(&stream_id)
@@ -251,10 +261,28 @@ impl SystemState {
                         .topics
                         .get_mut(&topic_id)
                         .unwrap_or_else(|| panic!("{}", format!("Topic: {topic_id} not found")));
-                    let consumer_group_id = command.group_id.unwrap_or_else(|| {
-                        topic.current_consumer_group_id += 1;
-                        topic.current_consumer_group_id
-                    });
+                    if topic.partitions.is_empty() {
+                        continue;
+                    }
+
+                    let partition_id = command.partition_id;
+
+                    let _partition = topic.partitions.get(&command.partition_id).unwrap_or_else(|| panic!("{}", format!("Partition {partition_id} not found.")));
+
+                    // State is not affected by the delete segments
+                }
+                EntryCommand::CreateConsumerGroup(command) => {
+                    let consumer_group_id = command.group_id;
+                    let command = command.command;
+                    let stream_id = find_stream_id(&streams, &command.stream_id);
+                    let stream = streams
+                        .get_mut(&stream_id)
+                        .unwrap_or_else(|| panic!("{}", format!("Stream: {stream_id} not found")));
+                    let topic_id = find_topic_id(&stream.topics, &command.topic_id);
+                    let topic = stream
+                        .topics
+                        .get_mut(&topic_id)
+                        .unwrap_or_else(|| panic!("{}", format!("Topic: {topic_id} not found")));
                     let consumer_group = ConsumerGroupState {
                         id: consumer_group_id,
                         name: command.name,
@@ -278,12 +306,14 @@ impl SystemState {
                     topic.consumer_groups.remove(&consumer_group_id);
                 }
                 EntryCommand::CreateUser(command) => {
-                    current_user_id += 1;
+                    let user_id = command.user_id;
+                    let command = command.command;
                     let user = UserState {
-                        id: current_user_id,
+                        id: user_id,
                         username: command.username,
                         password_hash: command.password, // This is already hashed
                         status: command.status,
+                        created_at: entry.timestamp,
                         permissions: command.permissions,
                         personal_access_tokens: AHashMap::new(),
                     };

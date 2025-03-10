@@ -1,3 +1,21 @@
+/* Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 use std::path::PathBuf;
 
 use clap::{Args, Command as ClapCommand};
@@ -7,6 +25,7 @@ use figlet_rs::FIGfont;
 
 use iggy::args::{Args as IggyArgs, ArgsOptional as IggyArgsOptional};
 use iggy::cli::context::common::ContextConfig;
+use segment::SegmentAction;
 use system::SnapshotArgs;
 
 use crate::args::{
@@ -36,6 +55,7 @@ pub(crate) mod message;
 pub(crate) mod partition;
 pub(crate) mod permissions;
 pub(crate) mod personal_access_token;
+pub(crate) mod segment;
 pub(crate) mod stream;
 pub(crate) mod system;
 pub(crate) mod topic;
@@ -121,6 +141,9 @@ pub(crate) enum Command {
     /// partition operations
     #[command(subcommand, visible_alias = "p")]
     Partition(PartitionAction),
+    /// segments operations
+    #[command(subcommand, visible_alias = "seg")]
+    Segment(SegmentAction),
     /// ping iggy server
     ///
     /// Check if iggy server is up and running and what's the response ping response time

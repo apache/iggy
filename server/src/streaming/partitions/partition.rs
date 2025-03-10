@@ -1,3 +1,21 @@
+/* Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 use crate::configs::system::SystemConfig;
 use crate::streaming::cache::buffer::SmartCache;
 use crate::streaming::cache::memory_tracker::CacheMemoryTracker;
@@ -198,7 +216,7 @@ impl fmt::Display for Partition {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Partition {{ stream_id: {}, topic_id: {}, partition_id: {}, path: {}, current_offset: {} }}",
+            "Partition {{ stream ID: {}, topic ID: {}, partition_id: {}, path: {}, current_offset: {} }}",
             self.stream_id,
             self.topic_id,
             self.partition_id,

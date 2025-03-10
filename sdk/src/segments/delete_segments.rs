@@ -1,3 +1,20 @@
+/* Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
 use crate::bytes_serializable::BytesSerializable;
 use crate::command::{Command, DELETE_SEGMENTS_CODE};
 use crate::error::IggyError;
@@ -8,15 +25,12 @@ use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 
-use super::MAX_SEGMENTS_COUNT;
-
-type SegmentsCountType = u32;
-
-/// `DeletePartitions` command is used to delete partitions from a topic.
+/// `DeleteSegments` command is used to delete segments from a partition.
 /// It has additional payload:
 /// - `stream_id` - unique stream ID (numeric or name).
 /// - `topic_id` - unique topic ID (numeric or name).
-/// - `partitions_count` - number of partitions in the topic to delete, max value is 1000.
+/// - `partition_id` - unique partition ID (numeric or name).
+/// - `segments_count` - number of segments in the partition to delete.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct DeleteSegments {
     /// Unique stream ID (numeric or name).
@@ -27,9 +41,9 @@ pub struct DeleteSegments {
     pub topic_id: Identifier,
     /// Unique partition ID (numeric or name).
     #[serde(skip)]
-    pub partition_id: Identifier,
-    /// Number of partitions in the topic to delete, max value is 1000.
-    pub segments_count: SegmentsCountType,
+    pub partition_id: u32,
+    /// Number of segments in the partition to delete, max value is 1000.
+    pub segments_count: u32,
 }
 
 impl Command for DeleteSegments {
@@ -44,17 +58,13 @@ impl Default for DeleteSegments {
             segments_count: 1,
             stream_id: Identifier::default(),
             topic_id: Identifier::default(),
-            partition_id: Identifier::default(),
+            partition_id: u32::default(),
         }
     }
 }
 
 impl Validatable<IggyError> for DeleteSegments {
     fn validate(&self) -> Result<(), IggyError> {
-        if !(1..=MAX_SEGMENTS_COUNT).contains(&self.segments_count) {
-            return Err(IggyError::TooManySegments);
-        }
-
         Ok(())
     }
 }
@@ -63,16 +73,15 @@ impl BytesSerializable for DeleteSegments {
     fn to_bytes(&self) -> Bytes {
         let stream_id_bytes = self.stream_id.to_bytes();
         let topic_id_bytes = self.topic_id.to_bytes();
-        let partition_id_bytes = self.partition_id.to_bytes();
         let mut bytes = BytesMut::with_capacity(
-            std::mem::size_of::<SegmentsCountType>()
+            std::mem::size_of::<u32>()
+                + std::mem::size_of::<u32>()
                 + stream_id_bytes.len()
-                + topic_id_bytes.len()
-                + partition_id_bytes.len(),
+                + topic_id_bytes.len(),
         );
         bytes.put_slice(&stream_id_bytes);
         bytes.put_slice(&topic_id_bytes);
-        bytes.put_slice(&partition_id_bytes);
+        bytes.put_u32_le(self.partition_id);
         bytes.put_u32_le(self.segments_count);
         bytes.freeze()
     }
@@ -87,10 +96,14 @@ impl BytesSerializable for DeleteSegments {
         position += stream_id.get_size_bytes().as_bytes_usize();
         let topic_id = Identifier::from_bytes(bytes.slice(position..))?;
         position += topic_id.get_size_bytes().as_bytes_usize();
-        let partition_id = Identifier::from_bytes(bytes.slice(position..))?;
-        position += partition_id.get_size_bytes().as_bytes_usize();
-        let segments_count = SegmentsCountType::from_le_bytes(
-            bytes[position..position + std::mem::size_of::<SegmentsCountType>()]
+        let partition_id = u32::from_le_bytes(
+            bytes[position..position + std::mem::size_of::<u32>()]
+                .try_into()
+                .map_err(|_| IggyError::InvalidNumberEncoding)?,
+        );
+        position += std::mem::size_of::<u32>();
+        let segments_count = u32::from_le_bytes(
+            bytes[position..position + std::mem::size_of::<u32>()]
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
@@ -124,7 +137,7 @@ mod tests {
         let command = DeleteSegments {
             stream_id: Identifier::numeric(1).unwrap(),
             topic_id: Identifier::numeric(2).unwrap(),
-            partition_id: Identifier::numeric(3).unwrap(),
+            partition_id: 3,
             segments_count: 3,
         };
 
@@ -134,10 +147,15 @@ mod tests {
         position += stream_id.get_size_bytes().as_bytes_usize();
         let topic_id = Identifier::from_bytes(bytes.slice(position..)).unwrap();
         position += topic_id.get_size_bytes().as_bytes_usize();
-        let partition_id = Identifier::from_bytes(bytes.slice(position..)).unwrap();
-        position += partition_id.get_size_bytes().as_bytes_usize();
-        let segments_count = SegmentsCountType::from_le_bytes(
-            bytes[position..position + std::mem::size_of::<SegmentsCountType>()]
+        let partition_id = u32::from_le_bytes(
+            bytes[position..position + std::mem::size_of::<u32>()]
+                .try_into()
+                .map_err(|_| IggyError::InvalidNumberEncoding)
+                .unwrap(),
+        );
+        position += std::mem::size_of::<u32>();
+        let segments_count = u32::from_le_bytes(
+            bytes[position..position + std::mem::size_of::<u32>()]
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)
                 .unwrap(),
@@ -154,20 +172,19 @@ mod tests {
     fn should_be_deserialized_from_bytes() {
         let stream_id = Identifier::numeric(1).unwrap();
         let topic_id = Identifier::numeric(2).unwrap();
-        let partition_id = Identifier::numeric(3).unwrap();
+        let partition_id = 3;
         let segments_count = 3u32;
         let stream_id_bytes = stream_id.to_bytes();
         let topic_id_bytes = topic_id.to_bytes();
-        let partition_id_bytes = partition_id.to_bytes();
         let mut bytes = BytesMut::with_capacity(
-            std::mem::size_of::<SegmentsCountType>()
+            std::mem::size_of::<u32>()
+                + std::mem::size_of::<u32>()
                 + stream_id_bytes.len()
-                + topic_id_bytes.len()
-                + partition_id_bytes.len(),
+                + topic_id_bytes.len(),
         );
         bytes.put_slice(&stream_id_bytes);
         bytes.put_slice(&topic_id_bytes);
-        bytes.put_slice(&partition_id_bytes);
+        bytes.put_u32_le(partition_id);
         bytes.put_u32_le(segments_count);
         let command = DeleteSegments::from_bytes(bytes.freeze());
         assert!(command.is_ok());

@@ -1,3 +1,21 @@
+/* Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 use crate::utils::byte_size::IggyByteSize;
 use crate::utils::topic_size::MaxTopicSize;
 use strum::{EnumDiscriminants, FromRepr, IntoStaticStr};
@@ -127,9 +145,9 @@ pub enum IggyError {
     #[error("Invalid number encoding")]
     InvalidNumberEncoding = 82,
     #[error("Invalid boolean value")]
-    InvalidBooleanValue,
+    InvalidBooleanValue = 83,
     #[error("Invalid number value")]
-    InvalidNumberValue,
+    InvalidNumberValue = 84,
     #[error("Client with ID: {0} was not found.")]
     ClientNotFound(u32) = 100,
     #[error("Invalid client ID")]
@@ -232,8 +250,6 @@ pub enum IggyError {
     CannotReadTopics(u32) = 2017,
     #[error("Invalid replication factor")]
     InvalidReplicationFactor = 2018,
-    #[error("Too many segments")]
-    TooManySegments = 2019,
     #[error("Cannot create partition with ID: {0} for stream with ID: {1} and topic with ID: {2}")]
     CannotCreatePartition(u32, u32, u32) = 3000,
     #[error(
@@ -330,6 +346,8 @@ pub enum IggyError {
     InvalidKeyValueLength = 4028,
     #[error("Command length error: {0}")]
     CommandLengthError(String) = 4029,
+    #[error("Incorrect Segments Count size: {0}")]
+    InvalidSegmentsCount(u32) = 4030,
     #[error("Cannot sed messages due to client disconnection")]
     CannotSendMessagesDueToClientDisconnection = 4050,
     #[error("Invalid offset: {0}")]
