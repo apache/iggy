@@ -16,8 +16,7 @@ pub async fn handle(
 ) -> Result<(), IggyError> {
     debug!("session: {session}, command: {command}");
     let system = system.read().await;
-    system
-        .delete_consumer_offset(
+    system.delete_consumer_offset(
             session,
             command.consumer,
             &command.stream_id,

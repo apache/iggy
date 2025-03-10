@@ -248,7 +248,7 @@ impl fmt::Display for Topic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Topic {{ id: {}, stream_id: {}, name: {}, path: {}, partitions: {}, message_expiry: {}, max_topic_size: {}, replication_factor: {} }}",
+            "Topic {{ id: {}, stream ID: {}, name: {}, path: {}, partitions: {}, message_expiry: {}, max_topic_size: {}, replication_factor: {} }}",
             self.topic_id,
             self.stream_id,
             self.name,

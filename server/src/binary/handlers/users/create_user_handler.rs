@@ -21,8 +21,7 @@ pub async fn handle(
     debug!("session: {session}, command: {command}");
 
     let mut system = system.write().await;
-    let user = system
-            .create_user(
+    let user = system.create_user(
                 session,
                 &command.username,
                 &command.password,

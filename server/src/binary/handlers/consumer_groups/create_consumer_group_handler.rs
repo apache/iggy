@@ -31,7 +31,7 @@ pub async fn handle(
             .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to create consumer group for stream_id: {}, topic_id: {}, group_id: {:?}, session: {:?}",
+                    "{COMPONENT} (error: {error}) - failed to create consumer group for stream ID: {}, topic ID: {}, group_id: {:?}, session: {:?}",
                     command.stream_id, command.topic_id, command.group_id, session
                 )
             })?;

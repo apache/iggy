@@ -43,8 +43,7 @@ pub async fn handle(
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply create stream for id: {:?}, session: {session}",
-                stream_id
+                "{COMPONENT} (error: {error}) - failed to apply create stream with ID: {stream_id}, session: {session}",
             )
         })?;
     sender.send_ok_response(&response).await?;

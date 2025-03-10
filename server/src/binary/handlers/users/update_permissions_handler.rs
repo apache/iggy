@@ -18,10 +18,9 @@ pub async fn handle(
     debug!("session: {session}, command: {command}");
 
     let mut system = system.write().await;
-    system
-            .update_permissions(session, &command.user_id, command.permissions.clone())
+    system.update_permissions(session, &command.user_id, command.permissions.clone())
             .await
-            .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to update permissions for user_id: {}, session: {session}",
+            .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to update permissions for user ID: {}, session: {session}",
                 command.user_id
             ))?;
 

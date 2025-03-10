@@ -109,7 +109,7 @@ impl Display for CreateStreamWithId {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
-            "CreateStreamWithId {{ command: {}, stream_id: {} }}",
+            "CreateStreamWithId {{ command: {}, stream ID: {} }}",
             self.command, self.stream_id
         )
     }
@@ -119,7 +119,7 @@ impl Display for CreateTopicWithId {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
-            "CreateTopicWithId {{ command: {}, topic_id: {} }}",
+            "CreateTopicWithId {{ command: {}, topic ID: {} }}",
             self.command, self.topic_id
         )
     }

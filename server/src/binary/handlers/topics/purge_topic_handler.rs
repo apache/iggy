@@ -22,7 +22,7 @@ pub async fn handle(
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to purge topic with id: {}, stream_id: {}",
+                "{COMPONENT} (error: {error}) - failed to purge topic with id: {}, stream ID: {}",
                 command.topic_id, command.stream_id
             )
         })?;

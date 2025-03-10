@@ -18,8 +18,7 @@ pub async fn handle(
     debug!("session: {session}, command: {command}");
 
     let mut system = system.write().await;
-    system
-            .delete_user(session, &command.user_id)
+    system.delete_user(session, &command.user_id)
             .await
             .with_error_context(|error| {
                 format!(

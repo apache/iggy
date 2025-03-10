@@ -30,11 +30,11 @@ impl System {
             return Err(IggyError::InvalidMessagesCount);
         }
 
-        let topic = self.find_topic(session, stream_id, topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream_id: {stream_id}, topic_id: {topic_id}"))?;
+        let topic = self.find_topic(session, stream_id, topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
         self.permissioner
             .poll_messages(session.get_user_id(), topic.stream_id, topic.topic_id)
             .with_error_context(|error| format!(
-                "{COMPONENT} (error: {error}) - permission denied to poll messages for user {} on stream_id: {}, topic_id: {}",
+                "{COMPONENT} (error: {error}) - permission denied to poll messages for user {} on stream ID: {}, topic ID: {}",
                 session.get_user_id(),
                 topic.stream_id,
                 topic.topic_id
@@ -114,13 +114,13 @@ impl System {
         confirmation: Option<Confirmation>,
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
-        let topic = self.find_topic(session, &stream_id, &topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream_id: {stream_id}, topic_id: {topic_id}"))?;
+        let topic = self.find_topic(session, &stream_id, &topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
         self.permissioner.append_messages(
             session.get_user_id(),
             topic.stream_id,
             topic.topic_id,
         ).with_error_context(|error| format!(
-            "{COMPONENT} (error: {error}) - permission denied to append messages for user {} on stream_id: {}, topic_id: {}",
+            "{COMPONENT} (error: {error}) - permission denied to append messages for user {} on stream ID: {}, topic ID: {}",
             session.get_user_id(),
             topic.stream_id,
             topic.topic_id
@@ -172,14 +172,14 @@ impl System {
         fsync: bool,
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
-        let topic = self.find_topic(session, &stream_id, &topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream_id: {stream_id}, topic_id: {topic_id}"))?;
+        let topic = self.find_topic(session, &stream_id, &topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
         // Reuse those permissions as if you can append messages you can flush them
         self.permissioner.append_messages(
             session.get_user_id(),
             topic.stream_id,
             topic.topic_id,
         ).with_error_context(|error| format!(
-            "{COMPONENT} (error: {error}) - permission denied to append messages for user {} on stream_id: {}, topic_id: {}",
+            "{COMPONENT} (error: {error}) - permission denied to append messages for user {} on stream ID: {}, topic ID: {}",
             session.get_user_id(),
             topic.stream_id,
             topic.topic_id

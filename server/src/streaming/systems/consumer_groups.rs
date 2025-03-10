@@ -66,18 +66,18 @@ impl System {
         self.ensure_authenticated(session)?;
         {
             let topic = self.find_topic(session, stream_id, topic_id)
-                .with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream_id: {stream_id}, topic_id: {topic_id}"))?;
+                .with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
 
             self.permissioner.create_consumer_group(
                 session.get_user_id(),
                 topic.stream_id,
                 topic.topic_id,
-            ).with_error_context(|error| format!("{COMPONENT} (error: {error}) - permission denied to create consumer group for user {} on stream_id: {}, topic_id: {}", session.get_user_id(), topic.stream_id, topic.topic_id))?;
+            ).with_error_context(|error| format!("{COMPONENT} (error: {error}) - permission denied to create consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), topic.stream_id, topic.topic_id))?;
         }
 
         let topic = self.get_stream_mut(stream_id)?
             .get_topic_mut(topic_id)
-            .with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream_id: {stream_id}, topic_id: {topic_id}"))?;
+            .with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
 
         topic
             .create_consumer_group(group_id, name)
@@ -99,13 +99,13 @@ impl System {
         let topic_id_value;
         {
             let topic = self.find_topic(session, stream_id, topic_id)
-                .with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream_id: {stream_id}, topic_id: {topic_id}"))?;
+                .with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
 
             self.permissioner.delete_consumer_group(
                 session.get_user_id(),
                 topic.stream_id,
                 topic.topic_id,
-            ).with_error_context(|error| format!("{COMPONENT} (error: {error}) - permission denied to delete consumer group for user {} on stream_id: {}, topic_id: {}", session.get_user_id(), topic.stream_id, topic.topic_id))?;
+            ).with_error_context(|error| format!("{COMPONENT} (error: {error}) - permission denied to delete consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), topic.stream_id, topic.topic_id))?;
 
             stream_id_value = topic.stream_id;
             topic_id_value = topic.topic_id;
@@ -118,7 +118,7 @@ impl System {
                     "{COMPONENT} (error: {error}) - failed to get mutable reference to stream with id: {stream_id}"
                 )
             })?;
-            let topic = stream.get_topic_mut(topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream_id: {stream_id}, topic_id: {topic_id}"))?;
+            let topic = stream.get_topic_mut(topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
 
             consumer_group = topic.delete_consumer_group(consumer_group_id)
                 .await
@@ -137,7 +137,7 @@ impl System {
                     consumer_group.group_id,
                 )
                 .await
-                .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to make client leave consumer group for client_id: {}, group_id: {}", member.id, consumer_group.group_id))?;
+                .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to make client leave consumer group for client ID: {}, group ID: {}", member.id, consumer_group.group_id))?;
         }
 
         Ok(())
@@ -158,7 +158,7 @@ impl System {
                 .find_topic(session, stream_id, topic_id)
                 .with_error_context(|error| {
                     format!(
-                        "{COMPONENT} (error: {error}) - topic not found for stream_id: {stream_id}, topic_id: {topic_id}",
+                        "{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}",
                     )
                 })?;
 
@@ -166,7 +166,7 @@ impl System {
                 session.get_user_id(),
                 topic.stream_id,
                 topic.topic_id,
-            ).with_error_context(|error| format!("{COMPONENT} (error: {error}) - permission denied to join consumer group for user {} on stream_id: {}, topic_id: {}", session.get_user_id(), topic.stream_id, topic.topic_id))?;
+            ).with_error_context(|error| format!("{COMPONENT} (error: {error}) - permission denied to join consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), topic.stream_id, topic.topic_id))?;
 
             stream_id_value = topic.stream_id;
             topic_id_value = topic.topic_id;
@@ -195,7 +195,7 @@ impl System {
                 .await
                 .with_error_context(|error| {
                     format!(
-                        "{COMPONENT} (error: {error}) - failed to join consumer group for group_id: {}",
+                        "{COMPONENT} (error: {error}) - failed to join consumer group for group ID: {}",
                         group_id
                     )
                 })?;
@@ -207,7 +207,7 @@ impl System {
             .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to make client join consumer group for client_id: {}",
+                    "{COMPONENT} (error: {error}) - failed to make client join consumer group for client ID: {}",
                     session.client_id
                 )
             })?;
@@ -228,7 +228,7 @@ impl System {
                 .find_topic(session, stream_id, topic_id)
                 .with_error_context(|error| {
                     format!(
-                        "{COMPONENT} (error: {error}) - topic not found for stream_id: {:?}, topic_id: {:?}",
+                        "{COMPONENT} (error: {error}) - topic not found for stream ID: {:?}, topic_id: {:?}",
                         stream_id, topic_id
                     )
                 })?;
@@ -237,7 +237,7 @@ impl System {
                 session.get_user_id(),
                 topic.stream_id,
                 topic.topic_id,
-            ).with_error_context(|error| format!("{COMPONENT} (error: {error}) - permission denied to leave consumer group for user {} on stream_id: {}, topic_id: {}", session.get_user_id(), topic.stream_id, topic.topic_id))?;
+            ).with_error_context(|error| format!("{COMPONENT} (error: {error}) - permission denied to leave consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), topic.stream_id, topic.topic_id))?;
         }
 
         self.leave_consumer_group_by_client(
@@ -249,7 +249,7 @@ impl System {
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to leave consumer group for client_id: {}",
+                "{COMPONENT} (error: {error}) - failed to leave consumer group for client ID: {}",
                 session.client_id
             )
         })
@@ -273,7 +273,7 @@ impl System {
             let topic = stream.get_topic(topic_id)
                 .with_error_context(|error| {
                     format!(
-                        "{COMPONENT} (error: {error}) - topic not found for stream_id: {stream_id}, topic_id: {topic_id}",
+                        "{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}",
                     )
                 })?;
             {

@@ -20,8 +20,7 @@ pub async fn handle(
     let topic_id = command.topic_id.clone();
 
     let mut system = system.write().await;
-    system
-            .delete_topic(session, &command.stream_id, &command.topic_id)
+    system.delete_topic(session, &command.stream_id, &command.topic_id)
             .await
             .with_error_context(|error| format!(
                 "{COMPONENT} (error: {error}) - failed to delete topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
