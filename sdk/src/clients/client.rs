@@ -1,6 +1,6 @@
 use crate::client::{
     Client, ConsumerGroupClient, ConsumerOffsetClient, MessageClient, PartitionClient,
-    PersonalAccessTokenClient, StreamClient, SystemClient, TopicClient, UserClient,
+    PersonalAccessTokenClient, SegmentClient, StreamClient, SystemClient, TopicClient, UserClient,
 };
 use crate::clients::builder::IggyClientBuilder;
 use crate::clients::consumer::IggyConsumerBuilder;
@@ -528,6 +528,23 @@ impl PartitionClient for IggyClient {
             .read()
             .await
             .delete_partitions(stream_id, topic_id, partitions_count)
+            .await
+    }
+}
+
+#[async_trait]
+impl SegmentClient for IggyClient {
+    async fn delete_segments(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: &Identifier,
+        segments_count: u32,
+    ) -> Result<(), IggyError> {
+        self.client
+            .read()
+            .await
+            .delete_segments(stream_id, topic_id, partition_id, segments_count)
             .await
     }
 }

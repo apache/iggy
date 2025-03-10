@@ -27,6 +27,8 @@ pub mod system;
 pub mod topics;
 #[allow(deprecated)]
 pub mod users;
+#[allow(deprecated)]
+pub mod segments;
 
 /// The state of the client.
 #[derive(Debug, Copy, Clone, PartialEq, Display)]

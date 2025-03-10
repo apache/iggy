@@ -16,6 +16,7 @@ pub mod streams;
 pub mod system;
 pub mod topics;
 pub mod users;
+pub mod segments;
 
 #[async_trait]
 pub trait HttpTransport {
