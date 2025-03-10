@@ -10,6 +10,7 @@ pub struct IggyMessagesMut {
     /// The number of messages in the buffer
     #[serde(skip)]
     count: u32,
+
     /// The buffer containing the messages
     buffer: BytesMut,
 }
@@ -48,7 +49,9 @@ impl IggyMessagesMut {
         for message in messages {
             buffer.extend_from_slice(&message.to_bytes());
         }
-        Self::new(buffer)
+        let mut messages_mut = Self::new(buffer);
+        messages_mut.count = messages.len() as u32;
+        messages_mut
     }
 
     /// Extends the messages container with another set of mutable messages by consuming them
@@ -96,15 +99,7 @@ impl IggyMessagesMut {
 
     /// Prepares all messages in the batch for persistence by setting their offsets, timestamps,
     /// and other necessary fields. This method should be called before the messages are written to disk.
-    ///
-    /// # Arguments
-    ///
-    /// * `base_offset` - The offset to start assigning from
-    /// * `timestamp` - The timestamp to use (if None, current timestamp will be used)
-    ///
-    /// # Returns
-    ///
-    /// The number of messages processed
+    /// Returns the number of messages processed.
     pub fn prepare_for_persistence(&mut self, base_offset: u64, timestamp: u64) -> u32 {
         let mut processed_count = 0;
         let mut current_offset = base_offset;
@@ -112,11 +107,10 @@ impl IggyMessagesMut {
         let mut iterator = self.iter_mut();
         while let Some(message_result) = LendingIterator::next(&mut iterator) {
             if let Ok(mut message) = message_result {
-                // TODO(hubcio): remove unwraps
-                message.msg_header_mut().unwrap().set_offset(current_offset);
+                message.msg_header_mut().set_offset(current_offset);
 
-                if message.msg_header().unwrap().timestamp() == 0 {
-                    message.msg_header_mut().unwrap().set_timestamp(timestamp);
+                if message.msg_header().timestamp() == 0 {
+                    message.msg_header_mut().set_timestamp(timestamp);
                 }
 
                 message.update_checksum();
@@ -131,5 +125,15 @@ impl IggyMessagesMut {
 
     pub fn make_immutable(self) -> IggyMessages {
         IggyMessages::new(self.buffer.freeze(), self.count)
+    }
+}
+
+impl From<&[IggyMessage]> for IggyMessagesMut {
+    fn from(messages: &[IggyMessage]) -> Self {
+        let messages_size: u32 = messages
+            .iter()
+            .map(|m| m.get_size_bytes().as_bytes_u64() as u32)
+            .sum();
+        Self::from_messages(messages, messages_size)
     }
 }

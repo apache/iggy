@@ -56,6 +56,11 @@ impl IggyMessages {
         &self.buffer
     }
 
+    /// Get access to the underlying buffer shallow  copy
+    pub fn shallow_copy(&self) -> Bytes {
+        self.buffer.clone()
+    }
+
     pub fn into_inner(self) -> Bytes {
         self.buffer
     }
@@ -93,7 +98,7 @@ impl BytesSerializable for IggyMessages {
         let iterator = IggyMessageViewIterator::new(&bytes);
 
         for result in iterator {
-            result?;
+            result;
             messages_count += 1;
         }
 

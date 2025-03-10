@@ -1,4 +1,3 @@
-use iggy::error::IggyError;
 use iggy::prelude::*;
 
 /// A typed, in-place view of a raw header in a buffer
@@ -10,8 +9,8 @@ pub struct IggyMessageHeaderViewMut<'a> {
 
 impl<'a> IggyMessageHeaderViewMut<'a> {
     /// Construct a mutable view over the header slice.
-    pub fn new(data: &'a mut [u8]) -> Result<Self, IggyError> {
-        Ok(Self { data })
+    pub fn new(data: &'a mut [u8]) -> Self {
+        Self { data }
     }
 
     pub fn checksum(&self) -> u64 {

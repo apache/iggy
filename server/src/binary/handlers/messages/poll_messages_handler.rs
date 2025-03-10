@@ -41,7 +41,15 @@ impl ServerCommandHandler for PollMessages {
                 self.consumer, self.stream_id, self.topic_id, self.partition_id
             ))?;
 
-        sender.send_ok_response(messages.buffer()).await?;
+        // Collect all chunks first into a Vec to extend their lifetimes.
+        // This ensures the Arc<[u8]> references from each ByteSliceView stay alive
+        // throughout the async vectored I/O operation, preventing "borrowed value does not live
+        // long enough" errors while optimizing transmission by using larger chunks.
+
+        let length = messages.size().to_le_bytes();
+        let slices: Vec<IoSlice> = messages.chunks().map(IoSlice::new).collect();
+
+        sender.send_ok_response_vectored(&length, slices).await?;
         Ok(())
     }
 }

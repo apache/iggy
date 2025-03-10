@@ -9,7 +9,6 @@ use iggy::error::IggyError;
 use iggy::identifier::Identifier;
 use iggy::prelude::*;
 use iggy::utils::sizeable::Sizeable;
-use std::time::Instant;
 use tracing::instrument;
 
 impl ServerCommandHandler for SendMessages {
@@ -68,8 +67,6 @@ impl ServerCommandHandler for SendMessages {
                 None,
             )
             .await?;
-
-        // TODO(hubcio): is it legal to drop here?
         drop(system);
 
         self.stream_id = stream_id;

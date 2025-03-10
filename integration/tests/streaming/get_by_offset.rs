@@ -1,16 +1,10 @@
 use crate::streaming::common::test_setup::TestSetup;
-use bytes::BytesMut;
-use iggy::bytes_serializable::BytesSerializable;
-use iggy::messages::send_messages::Message;
-use iggy::models::header::{HeaderKey, HeaderValue};
-use iggy::utils::byte_size::IggyByteSize;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::sizeable::Sizeable;
-use iggy::utils::timestamp::IggyTimestamp;
+use bytes::{Bytes, BytesMut};
+use iggy::prelude::*;
 use server::configs::resource_quota::MemoryResourceQuota;
 use server::configs::system::{CacheConfig, PartitionConfig, SegmentConfig, SystemConfig};
-use server::streaming::batching::appendable_batch_info::AppendableBatchInfo;
 use server::streaming::partitions::partition::Partition;
+use server::streaming::segments::IggyMessagesMut;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, AtomicU64};
@@ -144,12 +138,11 @@ async fn test_get_messages_by_offset(
             HeaderKey::new("key-3").unwrap(),
             HeaderValue::from_uint64(123456).unwrap(),
         );
-        let message = Message {
-            id,
-            length: payload.len() as u32,
-            payload: payload.clone(),
-            headers: Some(headers),
-        };
+        let message = IggyMessage::builder()
+            .id(id)
+            .payload(payload)
+            .headers(headers)
+            .build();
         all_messages.push(message);
     }
 
@@ -159,18 +152,11 @@ async fn test_get_messages_by_offset(
 
     // Append all batches
     for batch_size in batch_sizes {
-        let batch = all_messages[current_pos..current_pos + batch_size as usize].to_vec();
-        let batch_info = AppendableBatchInfo::new(
-            batch
-                .iter()
-                .map(|msg| msg.get_size_bytes())
-                .sum::<IggyByteSize>(),
-            partition.partition_id,
-        );
-        partition
-            .append_messages(batch_info, batch.clone(), None)
-            .await
-            .unwrap();
+        println!("batch_size: {}, current_pos: {}", batch_size, current_pos);
+        let batch =
+            IggyMessagesMut::from(&all_messages[current_pos..current_pos + batch_size as usize]);
+        assert_eq!(batch.count(), batch_size);
+        partition.append_messages(batch, None).await.unwrap();
 
         batch_offsets.push(partition.current_offset);
         current_pos += batch_size as usize;
@@ -182,11 +168,11 @@ async fn test_get_messages_by_offset(
         .await
         .unwrap();
     assert_eq!(
-        all_loaded_messages.len(),
-        total_messages as usize,
+        all_loaded_messages.count(),
+        total_messages,
         "Expected {} messages from start, but got {}",
         total_messages,
-        all_loaded_messages.len()
+        all_loaded_messages.count()
     );
 
     // Test 2: Get messages from middle (after 3rd batch)
@@ -197,11 +183,11 @@ async fn test_get_messages_by_offset(
         .await
         .unwrap();
     assert_eq!(
-        middle_messages.len(),
-        remaining_messages as usize,
+        middle_messages.count(),
+        remaining_messages,
         "Expected {} messages from middle offset, but got {}",
         remaining_messages,
-        middle_messages.len()
+        middle_messages.count()
     );
 
     // Test 3: No messages beyond final offset
@@ -211,10 +197,10 @@ async fn test_get_messages_by_offset(
         .await
         .unwrap();
     assert_eq!(
-        no_messages.len(),
+        no_messages.count(),
         0,
         "Expected no messages beyond final offset, but got {}",
-        no_messages.len()
+        no_messages.count()
     );
 
     // Test 4: Small subset from start
@@ -224,63 +210,77 @@ async fn test_get_messages_by_offset(
         .await
         .unwrap();
     assert_eq!(
-        subset_messages.len(),
-        subset_size as usize,
+        subset_messages.count(),
+        subset_size,
         "Expected {} messages in subset from start, but got {}",
         subset_size,
-        subset_messages.len()
+        subset_messages.count()
     );
 
     // Test 5: Messages spanning multiple batches
     let span_offset = batch_offsets[1] + 1; // Start from middle of 2nd batch
     let span_size = 8; // Should span across 2nd, 3rd, and into 4th batch
-    let spanning_messages = partition
+    let messages = partition
         .get_messages_by_offset(span_offset, span_size)
         .await
         .unwrap();
     assert_eq!(
-        spanning_messages.len(),
-        span_size as usize,
+        messages.count(),
+        span_size,
         "Expected {} messages spanning multiple batches, but got {}",
         span_size,
-        spanning_messages.len()
+        messages.count()
     );
 
     // Test 6: Validate message content and ordering
-    for (i, msg) in spanning_messages.iter().enumerate() {
+    // Convert to a Vec of IggyMessage to avoid lifetime issues
+    let message_vec = messages.to_messages();
+
+    for (i, msg) in message_vec.iter().enumerate() {
         let expected_offset = span_offset + i as u64;
         assert!(
-            msg.offset >= expected_offset,
+            msg.msg_header().offset() >= expected_offset,
             "Message offset {} at position {} should be >= expected offset {}",
-            msg.offset,
+            msg.msg_header().offset(),
             i,
             expected_offset
         );
 
         // Verify message contents match original
-        let original_idx = msg.offset as usize;
+        let original_idx = msg.msg_header().offset() as usize;
+
         let original_message = &all_messages[original_idx];
+        let original_msg_header = &original_message.header;
+        let original_headers = &original_message.headers.as_ref().unwrap().to_bytes();
+        let original_payload = &original_message.payload;
+
+        let msg_header = msg.msg_header();
+        let msg_payload = msg.payload();
+        let msg_headers = msg.headers();
+
         assert_eq!(
-            msg.id, original_message.id,
+            msg_header.id(),
+            original_msg_header.id,
             "Message ID mismatch at offset {}: expected {}, got {}",
-            msg.offset, original_message.id, msg.id
+            msg_header.offset(),
+            original_msg_header.id,
+            msg.msg_header().id()
         );
         assert_eq!(
-            msg.payload, original_message.payload,
+            msg_payload,
+            original_payload,
             "Payload mismatch at offset {}: expected {:?}, got {:?}",
-            msg.offset, original_message.payload, msg.payload
+            msg_header.offset(),
+            original_payload,
+            msg_payload
         );
         assert_eq!(
-            msg.headers
-                .as_ref()
-                .map(|bytes| HashMap::from_bytes(bytes.clone()).unwrap()),
-            original_message.headers,
+            &msg_headers,
+            &original_headers,
             "Headers mismatch at offset {}: expected {:?}, got {:?}",
-            msg.offset,
-            original_message.headers,
-            msg.headers
-                .as_ref()
-                .map(|bytes| HashMap::from_bytes(bytes.clone()).unwrap())
+            msg_header.offset(),
+            original_headers,
+            msg_headers
         );
     }
 }

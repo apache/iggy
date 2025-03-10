@@ -1,9 +1,6 @@
 use clap::builder::NonEmptyStringValueParser;
 use clap::{ArgGroup, Args, Subcommand};
-use iggy::error::IggyError;
-use iggy::error::IggyError::InvalidFormat;
-use iggy::identifier::Identifier;
-use iggy::models::header::{HeaderKey, HeaderValue};
+use iggy::prelude::*;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Subcommand)]
@@ -109,7 +106,7 @@ fn parse_key_val(s: &str) -> Result<(HeaderKey, HeaderValue), IggyError> {
     let parts = lower.split(':').collect::<Vec<_>>();
 
     if parts.len() != 3 {
-        Err(InvalidFormat)?;
+        return Err(IggyError::InvalidFormat);
     }
 
     let key = HeaderKey::from_str(parts[0])?;

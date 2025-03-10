@@ -1,10 +1,8 @@
-use crate::streaming::segments::indexes::IndexRange;
 use bytes::{Bytes, BytesMut};
 use error_set::ErrContext;
 use iggy::{
     error::IggyError,
     prelude::{BytesSerializable, IggyMessages},
-    utils::{byte_size::IggyByteSize, timestamp::IggyTimestamp},
 };
 use std::{
     fmt,
@@ -64,6 +62,8 @@ impl MessagesReader {
 
         log_size_bytes.store(actual_log_size, Ordering::Release);
 
+        trace!("Opened messages file for reading: {file_path}, size: {actual_log_size}");
+
         Ok(Self {
             file_path: file_path.to_string(),
             file: Arc::new(file),
@@ -71,10 +71,9 @@ impl MessagesReader {
         })
     }
 
-    // TODO: This one is most likely not needed anymore.
     /// Loads and returns all message IDs from the log file.
     pub async fn load_message_ids_impl(&self) -> Result<Vec<u128>, IggyError> {
-        let mut file_size = self.file_size();
+        let file_size = self.file_size();
         if file_size == 0 {
             trace!("Log file {} is empty.", self.file_path);
             return Ok(Vec::new());

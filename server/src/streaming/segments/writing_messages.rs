@@ -106,9 +106,7 @@ impl Segment {
             .unwrap()
             .save_batches(messages, confirmation)
             .await
-            .with_error_context(
-                |error| format!("Failed to save batch for seg: {self}. {error}",),
-            )?;
+            .with_error_context(|error| format!("Failed to save batch for {self}. {error}",))?;
 
         self.last_index_position += saved_bytes.as_bytes_u64() as u32;
 

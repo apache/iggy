@@ -61,30 +61,6 @@ impl SegmentIndexWriter {
         })
     }
 
-    /// Append the given index record to the index file.
-    pub async fn save_index(&mut self, index: Index) -> Result<(), IggyError> {
-        let mut buf = [0u8; INDEX_SIZE as usize];
-        buf[0..4].copy_from_slice(&index.offset.to_le_bytes());
-        buf[4..8].copy_from_slice(&index.position.to_le_bytes());
-        buf[8..16].copy_from_slice(&index.timestamp.to_le_bytes());
-
-        {
-            self.file
-                .write_all(&buf)
-                .await
-                .with_error_context(|error| {
-                    format!("Failed to write index to file: {}. {error}", self.file_path)
-                })
-                .map_err(|_| IggyError::CannotSaveIndexToSegment)?;
-        }
-        if self.fsync {
-            let _ = self.fsync().await;
-        }
-        self.index_size_bytes
-            .fetch_add(INDEX_SIZE as u64, Ordering::Release);
-        Ok(())
-    }
-
     /// Append multiple index records to the index file in a single operation.
     pub async fn save_indexes(&mut self, indexes: &[Index]) -> Result<(), IggyError> {
         if indexes.is_empty() {

@@ -88,16 +88,6 @@ impl Partition {
             config.get_consumer_offsets_path(stream_id, topic_id, partition_id);
         let consumer_group_offsets_path =
             config.get_consumer_group_offsets_path(stream_id, topic_id, partition_id);
-        //TODO: Fix me
-        /*
-        let (cached_memory_tracker, messages) = match config.cache.enabled {
-            false => (None, None),
-            true => (
-                CacheMemoryTracker::initialize(&config.cache),
-                Some(SmartCache::new()),
-            ),
-        };
-        */
 
         let mut partition = Partition {
             stream_id,
@@ -108,8 +98,6 @@ impl Partition {
             consumer_offsets_path,
             consumer_group_offsets_path,
             message_expiry,
-            //cache: messages,
-            //cached_memory_tracker,
             message_deduplicator: match config.message_deduplication.enabled {
                 true => Some(MessageDeduplicator::new(
                     if config.message_deduplication.max_entries > 0 {
@@ -169,27 +157,6 @@ impl Partition {
 
         partition
     }
-
-    pub fn get_cache_metrics(&self) -> CacheMetrics {
-        //TODO: Fix me
-        /*
-        if let Some(cache) = self.cache.as_ref() {
-            let cache_metrics = cache.get_metrics();
-            CacheMetrics {
-                hits: cache_metrics.hits,
-                misses: cache_metrics.misses,
-                hit_ratio: cache_metrics.hit_ratio,
-            }
-        } else {
-            CacheMetrics {
-                hits: 0,
-                misses: 0,
-                hit_ratio: 0.0,
-            }
-        }
-        */
-        Default::default()
-    }
 }
 
 impl Sizeable for Partition {
@@ -214,7 +181,7 @@ impl fmt::Display for Partition {
 
 #[cfg(test)]
 mod tests {
-    use crate::configs::system::{CacheConfig, SystemConfig};
+    use crate::configs::system::SystemConfig;
     use crate::streaming::partitions::partition::Partition;
     use crate::streaming::persistence::persister::{FileWithSyncPersister, PersisterKind};
     use crate::streaming::storage::SystemStorage;

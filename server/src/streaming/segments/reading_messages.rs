@@ -1,6 +1,7 @@
 use super::Index;
 use crate::streaming::segments::segment::Segment;
-use bytes::BytesMut;
+use crate::streaming::segments::types::IggyMessagesSlice;
+use bytes::{Bytes, BytesMut};
 use error_set::ErrContext;
 use iggy::prelude::*;
 use std::sync::Arc;
@@ -20,43 +21,32 @@ impl Segment {
     pub async fn get_messages_by_timestamp(
         &self,
         start_timestamp: u64,
-        count: usize,
-    ) -> Result<Vec<Arc<()>>, IggyError> {
-        todo!();
-        // if count == 0 {
-        //     return Ok(Vec::new());
-        // }
+        count: u32,
+    ) -> Result<IggyMessagesSlice, IggyError> {
+        if count == 0 {
+            return Ok(IggyMessagesSlice::empty());
+        }
 
-        // let mut messages = Vec::with_capacity(count);
-        // let mut remaining = count;
+        let index_opt = self.load_index_for_timestamp(start_timestamp).await?;
 
-        // let disk_messages = self
-        //     .load_messages_from_disk_by_timestamp(start_timestamp, remaining)
-        //     .await?;
-        // let disk_count = disk_messages.len();
-        // messages.extend(disk_messages);
-        // remaining -= disk_count;
+        let Some(index) = index_opt else {
+            trace!("No messages found for timestamp: {}", start_timestamp);
+            return Ok(IggyMessagesSlice::empty());
+        };
 
-        // if remaining > 0 {
-        //     if let Some(messages_accumulator) = &self.unsaved_messages {
-        //         let buffer_messages =
-        //             messages_accumulator.get_messages_by_timestamp(start_timestamp, remaining);
-        //         messages.extend(buffer_messages);
-        //     }
-        // }
+        let offset = self.start_offset + index.offset as u64;
+        trace!("Found offset {} for timestamp {}", offset, start_timestamp);
 
-        // // Ensure we return exactly requested count (truncate if buffer had more)
-        // messages.truncate(count);
-        // Ok(messages)
+        self.get_messages_by_offset(offset, count).await
     }
 
     pub async fn get_messages_by_offset(
         &self,
         mut offset: u64,
         count: u32,
-    ) -> Result<IggyMessages, IggyError> {
+    ) -> Result<IggyMessagesSlice, IggyError> {
         if count == 0 {
-            return Ok(IggyMessages::default());
+            return Ok(IggyMessagesSlice::empty());
         }
 
         if offset < self.start_offset {
@@ -74,12 +64,12 @@ impl Segment {
 
         // In case that the partition messages buffer is disabled, we need to check the unsaved messages buffer
         if self.unsaved_messages.is_none() {
-            return self.load_messages_from_disk(offset, count).await;
+            return Ok(self.load_messages_from_disk(offset, count).await?);
         }
 
         let messages_accumulator = self.unsaved_messages.as_ref().unwrap();
         if messages_accumulator.is_empty() {
-            return self.load_messages_from_disk(offset, count).await;
+            return Ok(self.load_messages_from_disk(offset, count).await?);
         }
 
         let accumulator_first_msg_offset = messages_accumulator.base_offset();
@@ -92,11 +82,12 @@ impl Segment {
 
         // Case 2: All messages are on disk
         if end_offset < accumulator_first_msg_offset {
-            return self.load_messages_from_disk(offset, count).await;
+            return Ok(self.load_messages_from_disk(offset, count).await?);
         }
 
         // Case 3: Messages span disk and messages_require_to_save buffer boundary
-        let mut buffer = BytesMut::new();
+
+        let mut slices = Vec::new();
 
         // Load messages from disk up to the messages_require_to_save buffer boundary
         if offset < accumulator_first_msg_offset {
@@ -106,37 +97,22 @@ impl Segment {
             "{COMPONENT} (error: {error}) - failed to load messages from disk, stream ID: {}, topic ID: {}, partition ID: {}, start offset: {offset}, end offset :{}",
             self.stream_id, self.topic_id, self.partition_id, accumulator_first_msg_offset - 1
         ))?;
-            buffer.extend_from_slice(disk_messages.buffer());
+            slices.push(disk_messages);
         }
 
         // Load remaining messages from messages_require_to_save buffer
         let buffer_start = std::cmp::max(offset, accumulator_first_msg_offset);
         let buffer_messages = self.load_messages_from_unsaved_buffer(buffer_start, end_offset);
-        buffer.extend_from_slice(buffer_messages.buffer());
+        slices.push(buffer_messages);
 
-        let total_count = if buffer.is_empty() {
-            0
-        } else {
-            IggyMessageViewIterator::new(&buffer).count() as u32
-        };
-
-        Ok(IggyMessages::new(buffer.freeze(), total_count))
-    }
-
-    pub async fn get_all_messages(&self) -> Result<IggyMessages, IggyError> {
-        //TODO: Fix me
-        /*
-        self.get_messages_by_offset(self.start_offset, self.get_messages_count() as u32)
-            .await
-            */
-        todo!()
+        Ok(IggyMessagesSlice::combine(slices))
     }
 
     fn load_messages_from_unsaved_buffer(
         &self,
         start_offset: u64,
         end_offset: u64,
-    ) -> IggyMessages {
+    ) -> IggyMessagesSlice {
         let messages_accumulator = self.unsaved_messages.as_ref().unwrap();
         messages_accumulator.get_messages_by_offset(start_offset, end_offset)
     }
@@ -145,127 +121,97 @@ impl Segment {
         &self,
         timestamp: u64,
     ) -> Result<Option<Index>, IggyError> {
-        todo!()
-
-        // trace!("Loading index for timestamp: {}", timestamp);
-        // let index = self
-        //     .index_reader
-        //     .as_ref()
-        //     .unwrap()
-        //     .load_index_for_timestamp_impl(timestamp)
-        //     .await
-        //     .with_error_context(|error| {
-        //         format!(
-        //             "Failed to load index for timestamp: {timestamp} for {}. {error}",
-        //             self
-        //         )
-        //     })?;
-
-        // trace!("Loaded index: {:?}", index);
-        // Ok(index)
-    }
-
-    async fn load_messages_from_disk_by_timestamp(
-        &self,
-        start_timestamp: u64,
-        count: usize,
-    ) -> Result<Vec<Arc<()>>, IggyError> {
-        //TODO Fix me
-        /*
-        let index = self.load_index_for_timestamp(start_timestamp).await?;
-        let Some(index) = index else {
-            return Ok(Vec::new());
-        };
-
-        let index_range = IndexRange {
-            start: index,
-            end: Index {
-                offset: u32::MAX,
-                position: u32::MAX,
-                timestamp: u64::MAX,
-            },
-        };
-        let batches = self.load_batches_by_range(&index_range).await?;
-
-        let mut messages = Vec::with_capacity(count);
-        for batch in batches {
-            for msg in batch.into_messages_iter() {
-                if msg.timestamp >= start_timestamp {
-                    messages.push(Arc::new(msg));
-                    if messages.len() >= count {
-                        break;
-                    }
-                }
-            }
-            if messages.len() >= count {
-                break;
-            }
+        if timestamp < self.start_timestamp {
+            trace!(
+                "Timestamp {} is earlier than segment start timestamp {}",
+                timestamp,
+                self.start_timestamp
+            );
+            return Ok(Some(Index::default()));
         }
 
-        Ok(messages)
-        */
-        todo!()
+        if timestamp > self.end_timestamp {
+            trace!(
+                "Timestamp {} is later than segment end timestamp {}",
+                timestamp,
+                self.end_timestamp
+            );
+            return Ok(None);
+        }
+
+        trace!("Loading index for timestamp: {}", timestamp);
+        let index = self
+            .index_reader
+            .as_ref()
+            .unwrap()
+            .load_index_for_timestamp_impl(timestamp)
+            .await
+            .with_error_context(|error| {
+                format!(
+                    "Failed to load index for timestamp: {timestamp} for {}. {error}",
+                    self
+                )
+            })?;
+
+        trace!("Loaded index: {:?}", index);
+        Ok(index)
     }
 
     /// Loads and verifies message checksums from the log file.
     pub async fn load_message_checksums(&self) -> Result<(), IggyError> {
-        //TODO: Fix me
-        /*
-        self.log_reader
-            .as_ref()
-            .unwrap()
-            .load_batches_by_range_with_callback(&IndexRange::max_range(), |batch| {
-                for message in batch.into_messages_iter() {
-                    let calculated_checksum = checksum::calculate(&message.payload);
-                    trace!(
-                        "Loaded message for offset: {}, checksum: {}, expected: {}",
-                        message.offset,
-                        calculated_checksum,
-                        message.checksum
-                    );
-                    if calculated_checksum != message.checksum {
-                        return Err(IggyError::InvalidMessageChecksum(
-                            calculated_checksum,
-                            message.checksum,
-                            message.offset,
-                        ));
-                    }
-                }
-                Ok(())
-            })
-            .await
-            .with_error_context(|error| {
-                format!("Failed to load batches by max range for {}. {error}", self)
-            })?;
-        Ok(())
-        */
+        // self.log_reader
+        //     .as_ref()
+        //     .unwrap()
+        //     .load_batches_by_range_with_callback(&IndexRange::max_range(), |batch| {
+        //         for message in batch.into_messages_iter() {
+        //             let calculated_checksum = checksum::calculate(&message.payload);
+        //             trace!(
+        //                 "Loaded message for offset: {}, checksum: {}, expected: {}",
+        //                 message.offset,
+        //                 calculated_checksum,
+        //                 message.checksum
+        //             );
+        //             if calculated_checksum != message.checksum {
+        //                 return Err(IggyError::InvalidMessageChecksum(
+        //                     calculated_checksum,
+        //                     message.checksum,
+        //                     message.offset,
+        //                 ));
+        //             }
+        //         }
+        //         Ok(())
+        //     })
+        //     .await
+        //     .with_error_context(|error| {
+        //         format!("Failed to load batches by max range for {}. {error}", self)
+        //     })?;
+        // Ok(())
+
         todo!()
     }
 
     /// Loads and returns all message IDs from the log file.
     pub async fn load_message_ids(&self) -> Result<Vec<u128>, IggyError> {
-        todo!()
-
-        // trace!("Loading message IDs from log file: {}", self.log_path);
-        // let ids = self
-        //     .log_reader
-        //     .as_ref()
-        //     .unwrap()
-        //     .load_message_ids_impl()
-        //     .await
-        //     .with_error_context(|error| {
-        //         format!("Failed to load message IDs, error: {error} for {self}")
-        //     })?;
-        // trace!("Loaded {} message IDs from log file.", ids.len());
-        // Ok(ids)
+        trace!("Loading message IDs from log file: {}", self.log_path);
+        let ids = self
+            .messages_reader
+            .as_ref()
+            .unwrap()
+            .load_message_ids_impl()
+            .await
+            .with_error_context(|error| {
+                format!("Failed to load message IDs, error: {error} for {self}")
+            })?;
+        trace!("Loaded {} message IDs from log file.", ids.len());
+        Ok(ids)
     }
 
     async fn load_messages_from_disk(
         &self,
         start_offset: u64,
         count: u32,
-    ) -> Result<IggyMessages, IggyError> {
-        trace!(
+    ) -> Result<IggyMessagesSlice, IggyError> {
+        tracing::trace!(
                 "Loading {count} messages from disk, start_offset: {start_offset}, current_offset: {}...",
                 self.current_offset
             );
@@ -301,6 +247,14 @@ impl Segment {
             .with_error_context(|error| {
                 format!("Failed to load messages from segment file: {self}. {error}")
             })?;
-        Ok(messages)
+
+        // Convert IggyMessages to IggyMessagesSlice
+        // This creates an Arc-backed slice that doesn't need to reference the original buffer
+        Ok(IggyMessagesSlice::new(
+            messages.shallow_copy(),
+            0,
+            messages.shallow_copy().len(),
+            messages.count(),
+        ))
     }
 }

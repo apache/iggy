@@ -1,4 +1,4 @@
-use crate::streaming::segments::IggyMessagesMut;
+use crate::streaming::segments::{IggyMessagesMut, IggyMessagesSlice};
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::System;
 use crate::streaming::systems::COMPONENT;
@@ -19,7 +19,7 @@ impl System {
         topic_id: &Identifier,
         partition_id: Option<u32>,
         args: PollingArgs,
-    ) -> Result<IggyMessages, IggyError> {
+    ) -> Result<IggyMessagesSlice, IggyError> {
         self.ensure_authenticated(session)?;
         if args.count == 0 {
             return Err(IggyError::InvalidMessagesCount);
@@ -60,57 +60,46 @@ impl System {
             .get_messages(polling_consumer, partition_id, args.strategy, args.count)
             .await?;
 
-        // TODO: Fix me
-        /*
-        if polled_messages.messages.is_empty() {
-            return Ok(polled_messages);
-        }
-        */
+        return Ok(result);
 
-        // TODO: Fix me
-        /*
-        let offset = polled_messages.messages.last().unwrap().offset;
-        if args.auto_commit {
-            trace!("Last offset: {} will be automatically stored for {}, stream: {}, topic: {}, partition: {}", offset, consumer, stream_id, topic_id, partition_id);
-            topic
-                .store_consumer_offset_internal(polling_consumer, offset, partition_id)
-                .await
-                .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset internal, polling consumer: {}, offset: {}, partition ID: {}", polling_consumer, offset, partition_id)) ?;
-        }
-        */
+        // let offset = polled_messages.messages.last().unwrap().offset;
+        // if args.auto_commit {
+        //     trace!("Last offset: {} will be automatically stored for {}, stream: {}, topic: {}, partition: {}", offset, consumer, stream_id, topic_id, partition_id);
+        //     topic
+        //         .store_consumer_offset_internal(polling_consumer, offset, partition_id)
+        //         .await
+        //         .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset internal, polling consumer: {}, offset: {}, partition ID: {}", polling_consumer, offset, partition_id)) ?;
+        // }
 
-        if self.encryptor.is_none() {
-            return Ok(result);
-        }
+        // if self.encryptor.is_none() {
+        //     return Ok(result);
+        // }
         // TODO: Fix me
-        /*
-        let encryptor = self.encryptor.as_ref().unwrap();
-        let mut decrypted_messages = Vec::with_capacity(polled_messages.messages.len());
-        for message in polled_messages.messages.iter() {
-            let payload = encryptor.decrypt(&message.payload);
-            match payload {
-                Ok(payload) => {
-                    decrypted_messages.push(PolledMessage {
-                        id: message.id,
-                        state: message.state,
-                        offset: message.offset,
-                        timestamp: message.timestamp,
-                        checksum: message.checksum,
-                        length: IggyByteSize::from(payload.len() as u64),
-                        payload: Bytes::from(payload),
-                        headers: message.headers.clone(),
-                    });
-                }
-                Err(error) => {
-                    error!("Cannot decrypt the message. Error: {}", error);
-                    return Err(IggyError::CannotDecryptData);
-                }
-            }
-        }
-        polled_messages.messages = decrypted_messages;
-        Ok(polled_messages)
-        */
-        todo!()
+        // let encryptor = self.encryptor.as_ref().unwrap();
+        // let mut decrypted_messages = Vec::with_capacity(polled_messages.messages.len());
+        // for message in polled_messages.messages.iter() {
+        //     let payload = encryptor.decrypt(&message.payload);
+        //     match payload {
+        //         Ok(payload) => {
+        //             decrypted_messages.push(PolledMessage {
+        //                 id: message.id,
+        //                 state: message.state,
+        //                 offset: message.offset,
+        //                 timestamp: message.timestamp,
+        //                 checksum: message.checksum,
+        //                 length: IggyByteSize::from(payload.len() as u64),
+        //                 payload: Bytes::from(payload),
+        //                 headers: message.headers.clone(),
+        //             });
+        //         }
+        //         Err(error) => {
+        //             error!("Cannot decrypt the message. Error: {}", error);
+        //             return Err(IggyError::CannotDecryptData);
+        //         }
+        //     }
+        // }
+        // polled_messages.messages = decrypted_messages;
+        // Ok(polled_messages)
     }
 
     pub async fn append_messages(

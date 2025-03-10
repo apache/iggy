@@ -6,6 +6,5 @@ mod index_writer;
 pub const INDEX_SIZE: u32 = 16;
 
 pub use index::Index;
-pub use index::IndexRange;
 pub use index_reader::SegmentIndexReader;
 pub use index_writer::SegmentIndexWriter;

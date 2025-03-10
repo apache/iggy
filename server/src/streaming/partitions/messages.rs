@@ -66,7 +66,7 @@ impl Partition {
         &self,
         start_offset: u64,
         count: u32,
-    ) -> Result<IggyMessages, IggyError> {
+    ) -> Result<IggyMessagesSlice, IggyError> {
         trace!(
             "Getting messages for start offset: {start_offset} for partition: {}, current offset: {}...",
             self.partition_id,
@@ -85,27 +85,20 @@ impl Partition {
         let segments = self.filter_segments_by_offsets(start_offset, end_offset);
         match segments.len() {
             0 => panic!("TODO"),
-            1 => {
-                let messages = segments[0]
-                    .get_messages_by_offset(start_offset, count)
-                    .await?;
-                Ok(messages)
-            }
-            _ => {
-                let messages =
-                    Self::get_messages_from_segments(segments, start_offset, count).await?;
-                Ok(messages)
-            }
+            1 => Ok(segments[0]
+                .get_messages_by_offset(start_offset, count)
+                .await?),
+            _ => Ok(Self::get_messages_from_segments(segments, start_offset, count).await?),
         }
     }
 
     // Retrieves the first messages (up to a specified count).
-    pub async fn get_first_messages(&self, count: u32) -> Result<IggyMessages, IggyError> {
+    pub async fn get_first_messages(&self, count: u32) -> Result<IggyMessagesSlice, IggyError> {
         self.get_messages_by_offset(0, count).await
     }
 
     // Retrieves the last messages (up to a specified count).
-    pub async fn get_last_messages(&self, count: u32) -> Result<IggyMessages, IggyError> {
+    pub async fn get_last_messages(&self, count: u32) -> Result<IggyMessagesSlice, IggyError> {
         let mut requested_count = count as u64;
         if requested_count > self.current_offset + 1 {
             requested_count = self.current_offset + 1
@@ -120,7 +113,7 @@ impl Partition {
         &self,
         consumer: PollingConsumer,
         count: u32,
-    ) -> Result<IggyMessages, IggyError> {
+    ) -> Result<IggyMessagesSlice, IggyError> {
         let (consumer_offsets, consumer_id) = match consumer {
             PollingConsumer::Consumer(consumer_id, _) => (&self.consumer_offsets, consumer_id),
             PollingConsumer::ConsumerGroup(group_id, _) => (&self.consumer_group_offsets, group_id),
@@ -183,13 +176,49 @@ impl Partition {
             .collect()
     }
 
-    // Retrieves messages from multiple segments.
+    /// Retrieves messages from multiple segments.
     async fn get_messages_from_segments(
         segments: Vec<&Segment>,
         offset: u64,
         count: u32,
-    ) -> Result<IggyMessages, IggyError> {
-        todo!()
+    ) -> Result<IggyMessagesSlice, IggyError> {
+        let mut slices = Vec::new();
+        let mut remaining_count = count;
+        let mut current_offset = offset;
+
+        for segment in segments {
+            if remaining_count == 0 {
+                break;
+            }
+
+            let messages = segment
+                .get_messages_by_offset(current_offset, remaining_count)
+                .await
+                .with_error_context(|error| {
+                    format!(
+                        "{COMPONENT} (error: {error}) - failed to get messages from segment, segment: {}, \
+                         offset: {}, count: {}",
+                        segment, current_offset, remaining_count
+                    )
+                })?;
+
+            // Update remaining count and offset for next segment
+            let messages_count = messages.count();
+            remaining_count = remaining_count.saturating_sub(messages_count);
+
+            // Update the offset for the next segment if needed
+            if messages_count > 0 {
+                // If we got messages, the next offset should be after the last message
+                // from this segment
+                current_offset += messages_count as u64;
+            }
+
+            slices.push(messages);
+        }
+
+        // Combine all segment slices into a single composite slice
+        // This avoids copying the data
+        Ok(IggyMessagesSlice::combine(slices))
         // let mut results = Vec::new();
         // let mut remaining_count = count;
         // for segment in segments {
@@ -221,6 +250,12 @@ impl Partition {
         messages: IggyMessagesMut,
         confirmation: Option<Confirmation>,
     ) -> Result<(), IggyError> {
+        trace!(
+            "Appending {} messages of size {} to partition with ID: {}...",
+            self.partition_id,
+            messages.count(),
+            messages.size()
+        );
         {
             let last_segment = self.segments.last_mut().ok_or(IggyError::SegmentNotFound)?;
             if last_segment.is_closed {
@@ -232,11 +267,10 @@ impl Partition {
                 self.add_persisted_segment(start_offset).await.with_error_context(|error| format!(
                     "{COMPONENT} (error: {error}) - failed to add persisted segment, partition: {}, start offset: {}",
                     self, start_offset,
-                ))?;
+                ))?
             }
         }
 
-        let messages_size = messages.size();
         let current_offset = if !self.should_increment_offset {
             0
         } else {
@@ -276,8 +310,6 @@ impl Partition {
         }
         */
 
-        // Why are we even doing it this way ? XD
-        // What are those scope
         let messages_count = {
             let last_segment = self.segments.last_mut().ok_or(IggyError::SegmentNotFound)?;
             last_segment
@@ -289,18 +321,20 @@ impl Partition {
                      )
                  })?
         };
-        let last_offset = current_offset + messages_count as u64 - 1;
+
+        // Handle the case when messages_count is 0 to avoid integer underflow
+        let last_offset = if messages_count == 0 {
+            current_offset
+        } else {
+            current_offset + messages_count as u64 - 1
+        };
+
         if self.should_increment_offset {
             self.current_offset = last_offset;
         } else {
             self.should_increment_offset = true;
             self.current_offset = last_offset;
         }
-        /*
-        if let Some(cache) = &mut self.cache {
-            cache.extend(retained_messages);
-        }
-        */
 
         self.unsaved_messages_count += messages_count;
         {

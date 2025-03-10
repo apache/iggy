@@ -14,7 +14,7 @@ use tracing::{error, trace, warn};
 #[derive(Debug)]
 /// A command to the persister task.
 enum PersisterTaskCommand {
-    WriteRequest(IggyMessages),
+    WriteRequest(Vec<IggyMessages>),
     Shutdown,
 }
 
@@ -59,7 +59,7 @@ impl PersisterTask {
     }
 
     /// Sends the batch bytes to the persister task (fire-and-forget).
-    pub async fn persist(&self, messages: IggyMessages) {
+    pub async fn persist(&self, messages: Vec<IggyMessages>) {
         if let Err(e) = self
             .sender
             .send_async(PersisterTaskCommand::WriteRequest(messages))
@@ -213,7 +213,7 @@ impl PersisterTask {
     async fn write_with_retries(
         file: &mut File,
         file_path: &str,
-        messages: IggyMessages,
+        messages: Vec<IggyMessages>,
         fsync: bool,
         max_retries: u32,
         retry_delay: IggyDuration,
@@ -225,10 +225,10 @@ impl PersisterTask {
         // There are few errors which are worth retrying such as LSE (Latent sector error), as the file system
         // might be able to reallocate a new sector for the data and recover, but not every file system supports that.
         // In general this topic should be furthered researched rather than just naively retry when the write fails.
-        let messages_size = messages.size();
+        let messages_size = messages.iter().map(|m| m.size()).sum();
         loop {
             // TODO: use vectored API
-            match file.write_all(messages.buffer()).await {
+            match super::write_batch_vectored(file, file_path, &messages).await {
                 Ok(_) => {
                     if fsync {
                         match file.sync_all().await {

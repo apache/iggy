@@ -7,6 +7,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use std::ops::Range;
 
 pub const IGGY_MESSAGE_HEADER_SIZE: u32 = 8 + 16 + 8 + 8 + 8 + 4 + 4;
+pub const IGGY_MESSAGE_HEADER_RANGE: Range<usize> = 0..(IGGY_MESSAGE_HEADER_SIZE as usize);
 
 pub const IGGY_MESSAGE_CHECKSUM_OFFSET_RANGE: Range<usize> = 0..8;
 pub const IGGY_MESSAGE_ID_OFFSET_RANGE: Range<usize> = 8..24;

@@ -9,12 +9,12 @@ use std::{panic, thread};
 
 mod archiver;
 mod bench;
-mod cli;
+// mod cli;
 mod config_provider;
 mod data_integrity;
 mod examples;
 mod server;
-mod state;
+// mod state;
 mod streaming;
 
 lazy_static! {
@@ -32,7 +32,7 @@ fn setup() {
 
     let mut logger = env_logger::builder();
     logger.is_test(true);
-    logger.filter(None, log::LevelFilter::Debug);
+    logger.filter(None, log::LevelFilter::Trace);
     logger.target(env_logger::Target::Pipe(Box::new(LogWriter(log_buffer))));
     logger.format(move |buf, record| {
         let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.6f");

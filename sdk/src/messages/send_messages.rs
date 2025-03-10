@@ -4,8 +4,9 @@ use crate::command::{Command, SEND_MESSAGES_CODE};
 use crate::error::IggyError;
 use crate::identifier::Identifier;
 use crate::messages::{MAX_HEADERS_SIZE, MAX_PAYLOAD_SIZE};
-use crate::models::header::{HeaderKey, HeaderValue};
+use crate::models::messaging::{HeaderKey, HeaderValue};
 use crate::models::messaging::{IggyMessage, IggyMessageHeader, IggyMessageViewIterator};
+use crate::prelude::IGGY_MESSAGE_HEADER_SIZE;
 use crate::utils::byte_size::IggyByteSize;
 use crate::utils::sizeable::Sizeable;
 use crate::utils::varint::IggyVarInt;
@@ -109,37 +110,30 @@ impl Validatable<IggyError> for SendMessages {
             return Err(IggyError::InvalidKeyValueLength);
         }
 
-        let mut headers_size = 0;
         let mut payload_size = 0;
         let mut message_count = 0;
 
-        for message_result in IggyMessageViewIterator::new(&self.messages) {
-            match message_result {
-                Ok(message_view) => {
-                    message_count += 1;
+        for message in IggyMessageViewIterator::new(&self.messages) {
+            message_count += 1;
 
-                    // // TODO: fix this
-                    // if let Ok(Some(headers)) = message_view.headers() {
-                    //     for value in headers.values() {
-                    //         headers_size += value.value.len() as u32;
-                    //         if headers_size > MAX_HEADERS_SIZE {
-                    //             return Err(IggyError::TooBigHeadersPayload);
-                    //         }
-                    //     }
-                    // }
+            // TODO(hubcio): IMHO validation of headers should be purely on SDK side
+            // if let Some(headers) = message.headers() {
+            //     for value in headers.values() {
+            //         headers_size += value.value.len() as u32;
+            //         if headers_size > MAX_HEADERS_SIZE {
+            //             return Err(IggyError::TooBigHeadersPayload);
+            //         }
+            //     }
+            // }
 
-                    let message_payload = message_view.payload();
-                    payload_size += message_payload.len() as u32;
-                    if payload_size > MAX_PAYLOAD_SIZE {
-                        return Err(IggyError::TooBigMessagePayload);
-                    }
+            let message_payload = message.payload();
+            payload_size += message_payload.len() as u32;
+            if payload_size > MAX_PAYLOAD_SIZE {
+                return Err(IggyError::TooBigMessagePayload);
+            }
 
-                    // todo(hubcio): make it use IGGY_MESSAGE_HEADER_SIZE
-                    if message_payload.len() < 56 {
-                        return Err(IggyError::InvalidMessagePayloadLength);
-                    }
-                }
-                Err(e) => return Err(e),
+            if message_payload.len() < IGGY_MESSAGE_HEADER_SIZE as usize {
+                return Err(IggyError::InvalidMessagePayloadLength);
             }
         }
 

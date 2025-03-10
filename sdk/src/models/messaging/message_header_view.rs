@@ -1,5 +1,4 @@
 use super::message_header::*;
-use crate::error::IggyError;
 
 /// A read-only, typed view into a message header in a raw buffer.
 ///
@@ -14,11 +13,13 @@ impl<'a> IggyMessageHeaderView<'a> {
     /// Creates a new `IggyMessageHeaderView` over `data`.
     ///
     /// Returns an error if `data.len() < IGGY_MESSAGE_HEADER_SIZE`.
-    pub fn new(data: &'a [u8]) -> Result<Self, IggyError> {
-        if data.len() < IGGY_MESSAGE_HEADER_SIZE as usize {
-            return Err(IggyError::InvalidCommand);
-        }
-        Ok(Self { data })
+    pub fn new(data: &'a [u8]) -> Self {
+        debug_assert!(
+            data.len() >= IGGY_MESSAGE_HEADER_SIZE as usize,
+            "Header view requires at least {} bytes",
+            IGGY_MESSAGE_HEADER_SIZE
+        );
+        Self { data }
     }
 
     /// The stored checksum at the start of the header

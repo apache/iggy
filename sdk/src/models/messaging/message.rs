@@ -1,8 +1,8 @@
+use super::header::get_headers_size_bytes;
 use super::message_header::{IggyMessageHeader, IGGY_MESSAGE_HEADER_SIZE};
 use crate::bytes_serializable::BytesSerializable;
 use crate::error::IggyError;
-use crate::models::header;
-use crate::models::header::{HeaderKey, HeaderValue};
+use crate::models::messaging::header::{HeaderKey, HeaderValue};
 use crate::utils::byte_size::IggyByteSize;
 use crate::utils::sizeable::Sizeable;
 use crate::utils::timestamp::IggyTimestamp;
@@ -83,7 +83,7 @@ impl std::fmt::Display for IggyMessage {
 impl Sizeable for IggyMessage {
     fn get_size_bytes(&self) -> IggyByteSize {
         let payload_len = IggyByteSize::from(self.payload.len() as u64);
-        let headers_len = header::get_headers_size_bytes(&self.headers);
+        let headers_len = get_headers_size_bytes(&self.headers);
         let message_header_len = IggyByteSize::from(IGGY_MESSAGE_HEADER_SIZE as u64);
 
         payload_len + headers_len + message_header_len
@@ -172,20 +172,28 @@ impl IggyMessageBuilder {
 
     pub fn build(self) -> IggyMessage {
         let payload = self.payload.unwrap_or_default();
-        let id = self.id.unwrap_or_else(|| uuid::Uuid::new_v4().as_u128());
+        let id = self.id.unwrap_or(0);
+        let headers_length = get_headers_size_bytes(&self.headers).as_bytes_u64() as u32;
 
-        let header = IggyMessageHeader {
+        let msg_header = IggyMessageHeader {
             checksum: 0, // Checksum is calculated on server side
             id,
             offset: 0,
             timestamp: 0,
             origin_timestamp: IggyTimestamp::now().as_micros(),
-            headers_length: 0,
+            headers_length,
             payload_length: payload.len() as u32,
         };
 
+        println!(
+            "created msg of user size {}, total size {}, headers size {}",
+            payload.len(),
+            msg_header.payload_length + msg_header.headers_length + IGGY_MESSAGE_HEADER_SIZE,
+            headers_length
+        );
+
         IggyMessage {
-            header,
+            header: msg_header,
             payload,
             headers: self.headers,
         }

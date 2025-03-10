@@ -19,7 +19,7 @@ pub use crate::messages::{
     FlushUnsavedBuffer, Partitioning, PollMessages, PollingKind, PollingStrategy, SendMessages,
 };
 pub use crate::models::messaging::{
-    IggyMessage, IggyMessageHeader, IggyMessageHeaderView, IggyMessageView,
+    HeaderKey, HeaderValue, IggyMessage, IggyMessageHeader, IggyMessageHeaderView, IggyMessageView,
     IggyMessageViewIterator, IggyMessages,
 };
 pub use crate::models::messaging::{
@@ -31,7 +31,10 @@ pub use crate::models::messaging::{
 pub use crate::models::partition::Partition;
 pub use crate::models::stream::Stream;
 pub use crate::models::topic::Topic;
+
 pub use crate::utils::byte_size::IggyByteSize;
+pub use crate::utils::expiry::IggyExpiry;
 pub use crate::utils::sizeable::Sizeable;
 pub use crate::utils::timestamp::IggyTimestamp;
+
 pub use crate::validatable::Validatable;

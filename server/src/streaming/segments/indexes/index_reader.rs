@@ -1,7 +1,4 @@
-use super::{
-    index::{Index, IndexRange},
-    INDEX_SIZE,
-};
+use super::{index::Index, INDEX_SIZE};
 use error_set::ErrContext;
 use iggy::error::IggyError;
 use std::{
@@ -92,66 +89,6 @@ impl SegmentIndexReader {
         Ok(indexes)
     }
 
-    /// Loads an index range from the index file given a start/end offset.
-    pub async fn load_index_range_impl(
-        &self,
-        index_start_offset: u64,
-        index_end_offset: u64,
-        segment_start_offset: u64,
-    ) -> Result<Option<IndexRange>, IggyError> {
-        if index_start_offset > index_end_offset {
-            trace!(
-                "Index start offset {} is greater than index end offset {} for file {}.",
-                index_start_offset,
-                index_end_offset,
-                self.file_path
-            );
-            return Ok(None);
-        }
-        let file_size = self.file_size();
-        if file_size == 0 {
-            trace!("Index file {} is empty.", self.file_path);
-            return Ok(None);
-        }
-        trace!("Index file length: {} bytes.", file_size);
-
-        let relative_start_offset = (index_start_offset - segment_start_offset) as u32;
-        let relative_end_offset = (index_end_offset - segment_start_offset) as u32;
-        let mut index_range = IndexRange::default();
-
-        let buf = match self.read_at(0, file_size).await {
-            Ok(buf) => buf,
-            Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(None),
-            Err(error) => {
-                error!(
-                    "Error reading batch header at offset 0 in file {}: {error}",
-                    self.file_path
-                );
-                return Err(IggyError::CannotReadFile);
-            }
-        };
-        let mut last_index = Index::default();
-        for chunk in buf.chunks_exact(INDEX_SIZE as usize) {
-            let current_index = parse_index(chunk).with_error_context(|error| {
-                format!("Failed to parse index {}: {error}", self.file_path)
-            })?;
-            if current_index.offset >= relative_start_offset
-                && index_range.start == Index::default()
-            {
-                index_range.start = current_index;
-            }
-            if current_index.offset >= relative_end_offset {
-                index_range.end = current_index;
-                break;
-            }
-            last_index = current_index;
-        }
-        if index_range.end == Index::default() {
-            index_range.end = last_index;
-        }
-        Ok(Some(index_range))
-    }
-
     pub async fn load_index_for_timestamp_impl(
         &self,
         timestamp: u64,
@@ -162,38 +99,57 @@ impl SegmentIndexReader {
             return Ok(Some(Index::default()));
         }
 
-        let buf = match self.read_at(0, file_size).await {
-            Ok(buf) => buf,
-            Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(None),
-            Err(error) => {
-                error!(
-                    "Error reading batch header at offset 0 in file {}: {error}",
-                    self.file_path
-                );
-                return Err(IggyError::CannotReadFile);
+        let total_indexes = file_size / INDEX_SIZE;
+        trace!(
+            "Searching for timestamp {} in {} indexes",
+            timestamp,
+            total_indexes
+        );
+
+        let mut left = 0;
+        let mut right = total_indexes - 1;
+        let mut result: Option<Index> = None;
+
+        while left <= right {
+            let mid = left + (right - left) / 2;
+            let buf = match self.read_at(mid * INDEX_SIZE, INDEX_SIZE).await {
+                Ok(buf) => buf,
+                Err(error) if error.kind() == ErrorKind::UnexpectedEof => return Ok(None),
+                Err(error) => {
+                    error!(
+                        "Error reading index at position {} in file {}: {error}",
+                        mid, self.file_path
+                    );
+                    return Err(IggyError::CannotReadFile);
+                }
+            };
+            let current = parse_index(&buf)?;
+            match current.timestamp.cmp(&timestamp) {
+                std::cmp::Ordering::Equal => {
+                    return Ok(Some(current));
+                }
+                std::cmp::Ordering::Less => {
+                    result = Some(current);
+                    left = mid + 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    if mid == 0 {
+                        return Ok(result.or(Some(Index::default())));
+                    }
+                    right = mid - 1;
+                }
             }
-        };
-        let mut last_index: Option<Index> = None;
-        for chunk in buf.chunks_exact(INDEX_SIZE as usize) {
-            let current = parse_index(chunk)?;
-            if current.timestamp >= timestamp {
-                return Ok(Some(last_index.unwrap_or_default()));
-            }
-            last_index = Some(current);
         }
-        Ok(None)
+        trace!("Index for timestamp {timestamp}: {result:?}");
+        Ok(result)
     }
 
+    /// Returns the size of the index file in bytes.
     fn file_size(&self) -> u32 {
         self.index_size_bytes.load(Ordering::Acquire) as u32
     }
 
-    /// Returns the total number of indexes stored in the file.
-    pub fn get_indexes_count(&self) -> u32 {
-        let file_size = self.file_size();
-        file_size / INDEX_SIZE
-    }
-
+    /// Reads a specified number of bytes from the index file at a given offset.
     async fn read_at(&self, offset: u32, len: u32) -> Result<Vec<u8>, std::io::Error> {
         let file = self.file.clone();
         spawn_blocking(move || {
@@ -246,6 +202,7 @@ impl SegmentIndexReader {
     }
 }
 
+/// Parses an index from a byte slice.
 fn parse_index(chunk: &[u8]) -> Result<Index, IggyError> {
     let offset = u32::from_le_bytes(
         chunk[0..4]

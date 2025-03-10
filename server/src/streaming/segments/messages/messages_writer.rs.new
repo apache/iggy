@@ -6,12 +6,9 @@ use iggy::{
     prelude::IggyMessages,
     utils::{byte_size::IggyByteSize, duration::IggyDuration},
 };
-use std::{
-    io::IoSlice,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
 };
 use tokio::{
     fs::{File, OpenOptions},
@@ -97,7 +94,7 @@ impl MessagesWriter {
         messages: Vec<IggyMessages>,
         confirmation: Confirmation,
     ) -> Result<IggyByteSize, IggyError> {
-        let messages_size: usize = messages.iter().map(|m| m.size() as usize).sum();
+        let messages_size: usize = messages.iter().map(|m| m.size()).sum();
         trace!(
             "Saving batch of size {messages_size} bytes to messages file: {}",
             self.file_path
@@ -130,10 +127,38 @@ impl MessagesWriter {
         Ok(IggyByteSize::from(messages_size as u64))
     }
 
-    /// Write a batch of bytes to the log file.
-    async fn write_batch_vectored(&mut self, batches: Vec<IggyMessages>) -> Result<(), IggyError> {
+    pub async fn write_batch_vectored(
+        &mut self,
+        messages: Vec<IggyMessages>,
+    ) -> Result<(), IggyError> {
         if let Some(ref mut file) = self.file {
-            super::write_batch_vectored(file, &self.file_path, &batches).await?;
+            // We'll write each message individually to avoid lifetime issues
+            for message in &messages {
+                let buffer = message.buffer();
+                let bytes_to_write: &[u8] = buffer.as_ref();
+                let mut bytes_written: usize = 0;
+
+                // Write until the entire buffer is written
+                while bytes_written < bytes_to_write.len() {
+                    let n = file
+                        .write(&bytes_to_write[bytes_written..])
+                        .await
+                        .with_error_context(|error| {
+                            format!(
+                                "Failed to write message to file: {}. {error}",
+                                self.file_path
+                            )
+                        })
+                        .map_err(|_| IggyError::CannotWriteToFile)?;
+
+                    if n == 0 {
+                        return Err(IggyError::CannotWriteToFile);
+                    }
+
+                    bytes_written += n;
+                }
+            }
+
             Ok(())
         } else {
             error!("File handle is not available for synchronous write.");
