@@ -12,7 +12,7 @@ atomic-time = "0.1.5"
 bytes = "1.10.0"
 charming = "0.4.0"
 chrono = "0.4.39"
-clap = { version = "4.5.30", features = ["derive"] }
+clap = { version = "4.5.32", features = ["derive"] }
 figlet-rs = "0.1.5"
 futures = "0.3.31"
 hostname = "0.4.0"
