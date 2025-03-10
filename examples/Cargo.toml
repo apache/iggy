@@ -76,7 +76,7 @@ path = "src/stream-builder/stream-producer-config/main.rs"
 ahash = { version = "0.8.11", features = ["serde"] }
 anyhow = "1.0.96"
 bytes = "1.10.0"
-clap = { version = "4.5.30", features = ["derive"] }
+clap = { version = "4.5.32", features = ["derive"] }
 futures-util = "0.3.31"
 iggy = { path = "../sdk" }
 rand = "0.9.0"
