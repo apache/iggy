@@ -88,7 +88,7 @@ opentelemetry_sdk = { version = "0.28.0", features = [
 prometheus-client = "0.23.1"
 quinn = { version = "0.11.6" }
 rcgen = "0.13.2"
-reqwest = { version = "0.12.12", features = [
+reqwest = { version = "0.12.13", features = [
     "rustls-tls",
     "rustls-tls-no-provider",
 ] }
