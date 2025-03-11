@@ -1,3 +1,20 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
 [data_maintenance.archiver]
 # Enables or disables the archiver process.
 enabled = false
@@ -102,16 +119,16 @@ allow_private_network = false
 algorithm = "HS256"
 
 # The issuer of the JWT, typically a URL or an identifier of the issuing entity.
-issuer = "iggy.rs"
+issuer = "iggy.apache.org"
 
 # Intended audience for the JWT, usually the recipient or system intended to process the token.
-audience = "iggy.rs"
+audience = "iggy.apache.org"
 
 # Lists valid issuers for JWT validation to ensure tokens are from trusted sources.
-valid_issuers = ["iggy.rs"]
+valid_issuers = ["iggy.apache.org"]
 
 # Lists valid audiences for JWT validation to confirm tokens are for the intended recipient.
-valid_audiences = ["iggy.rs"]
+valid_audiences = ["iggy.apache.org"]
 
 # Expiry time for access tokens.
 access_token_expiry = "1 h"
@@ -123,10 +140,10 @@ clock_skew = "5 s"
 not_before = "0 s"
 
 # Secret key for encoding JWTs.
-encoding_secret = "top_secret$iggy.rs$_jwt_HS256_key#!"
+encoding_secret = "top_secret$iggy123$_jwt_HS256_key#!"
 
 # Secret key for decoding JWTs.
-decoding_secret = "top_secret$iggy.rs$_jwt_HS256_key#!"
+decoding_secret = "top_secret$iggy123$_jwt_HS256_key#!"
 
 # Indicates if the secret key is base64 encoded.
 # `true` means the secret is base64 encoded.
