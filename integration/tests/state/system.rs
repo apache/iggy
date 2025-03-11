@@ -1,4 +1,5 @@
 use crate::state::StateSetup;
+use iggy::consumer_groups::create_consumer_group::CreateConsumerGroup;
 use iggy::partitions::create_partitions::CreatePartitions;
 use iggy::personal_access_tokens::create_personal_access_token::CreatePersonalAccessToken;
 use iggy::streams::create_stream::CreateStream;
@@ -8,7 +9,8 @@ use iggy::users::create_user::CreateUser;
 use iggy::utils::expiry::IggyExpiry;
 use server::state::command::EntryCommand;
 use server::state::models::{
-    CreatePersonalAccessTokenWithHash, CreateStreamWithId, CreateTopicWithId, CreateUserWithId,
+    CreateConsumerGroupWithId, CreatePersonalAccessTokenWithHash, CreateStreamWithId,
+    CreateTopicWithId, CreateUserWithId,
 };
 use server::state::system::SystemState;
 use server::state::State;
@@ -110,6 +112,22 @@ async fn should_be_initialized_based_on_state_entries() {
         },
         hash: "hash".to_string(),
     };
+
+    let group_id = 1;
+    let create_consumer_group = CreateConsumerGroup {
+        stream_id: stream1_id.try_into().unwrap(),
+        topic_id: topic1_id.try_into().unwrap(),
+        group_id: Some(group_id),
+        name: "test".to_string(),
+    };
+
+    let create_consumer_group_clone = CreateConsumerGroup {
+        stream_id: stream1_id.try_into().unwrap(),
+        topic_id: topic1_id.try_into().unwrap(),
+        group_id: Some(group_id),
+        name: "test".to_string(),
+    };
+
     state
         .apply(
             user_id,
@@ -175,13 +193,25 @@ async fn should_be_initialized_based_on_state_entries() {
         )
         .await
         .unwrap();
+    state
+        .apply(
+            user_id,
+            EntryCommand::CreateConsumerGroup(CreateConsumerGroupWithId {
+                group_id,
+                command: create_consumer_group,
+            }),
+        )
+        .await
+        .unwrap();
 
     let entries = state.load_entries().await.unwrap();
+    assert_eq!(entries.len(), 9);
+
     let mut system = SystemState::init(entries).await.unwrap();
 
     assert_eq!(system.users.len(), 1);
-    let mut user = system.users.remove(&1).unwrap();
-    assert_eq!(user.id, 1);
+    let mut user = system.users.remove(&user_id).unwrap();
+    assert_eq!(user.id, user_id);
     assert_eq!(user.username, create_user_clone.username);
     assert_eq!(user.password_hash, create_user_clone.password);
     assert_eq!(user.personal_access_tokens.len(), 1);
@@ -194,19 +224,34 @@ async fn should_be_initialized_based_on_state_entries() {
         personal_access_token.token_hash,
         create_personal_access_token_clone.hash
     );
+    assert_eq!(
+        personal_access_token.name,
+        create_personal_access_token_clone.command.name
+    );
 
     assert_eq!(system.streams.len(), 1);
     let mut stream = system
         .streams
         .remove(&create_stream1_clone.stream_id.unwrap())
         .unwrap();
+    assert_eq!(stream.id, create_stream1_clone.stream_id.unwrap());
     assert_eq!(stream.name, create_stream1_clone.name);
     assert_eq!(stream.topics.len(), 1);
 
-    let topic = stream
+    let mut topic = stream
         .topics
         .remove(&create_topic1_clone.topic_id.unwrap())
         .unwrap();
+    assert_eq!(topic.id, create_topic1_clone.topic_id.unwrap());
     assert_eq!(topic.name, create_topic1_clone.name);
     assert_eq!(topic.partitions.len(), 3);
+
+    assert_eq!(topic.consumer_groups.len(), 1);
+    let consumer_group = topic.consumer_groups.remove(&group_id).unwrap();
+
+    assert_eq!(
+        consumer_group.id,
+        create_consumer_group_clone.group_id.unwrap()
+    );
+    assert_eq!(consumer_group.name, create_consumer_group_clone.name);
 }

@@ -53,13 +53,15 @@ impl SystemInfoStorage for FileSystemInfoStorage {
                 )
             })
             .map_err(|_| IggyError::CannotReadFile)?;
-        bincode::deserialize(&buffer)
-            .with_context(|| "Failed to deserialize system info")
-            .map_err(|_| IggyError::CannotDeserializeResource)
+        let (system_info, _) =
+            bincode::serde::decode_from_slice(&buffer, bincode::config::standard())
+                .with_context(|| "Failed to deserialize system info")
+                .map_err(|_| IggyError::CannotDeserializeResource)?;
+        Ok(system_info)
     }
 
     async fn save(&self, system_info: &SystemInfo) -> Result<(), IggyError> {
-        let data = bincode::serialize(&system_info)
+        let data = bincode::serde::encode_to_vec(system_info, bincode::config::standard())
             .with_context(|| "Failed to serialize system info")
             .map_err(|_| IggyError::CannotSerializeResource)?;
         self.persister

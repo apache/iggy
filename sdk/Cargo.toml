@@ -14,20 +14,20 @@ readme = "../README.md"
 [dependencies]
 aes-gcm = "0.10.3"
 ahash = { version = "0.8.11", features = ["serde"] }
-anyhow = "1.0.96"
+anyhow = "1.0.97"
 async-broadcast = { version = "0.7.2" }
 async-dropper = { version = "0.3.1", features = ["tokio", "simple"] }
-async-trait = "0.1.86"
+async-trait = "0.1.87"
 base64 = "0.22.1"
-bon = { version = "3.3" }
+bon = { version = "3.4" }
 byte-unit = { version = "5.1.6", default-features = false, features = [
     "serde",
     "byte",
     "std",
 ] }
-bytes = "1.10.0"
-chrono = { version = "0.4.39" }
-clap = { version = "4.5.30", features = ["derive"] }
+bytes = "1.10.1"
+chrono = { version = "0.4.40" }
+clap = { version = "4.5.32", features = ["derive"] }
 comfy-table = { version = "7.1.4", optional = true }
 crc32fast = "1.4.2"
 dashmap = "6.1.0"
@@ -38,7 +38,7 @@ flume = "0.11.1"
 futures = "0.3.31"
 futures-util = "0.3.31"
 humantime = "2.1.0"
-keyring = { version = "3.6.1", optional = true, features = [
+keyring = { version = "3.6.2", optional = true, features = [
     "sync-secret-service",
     "vendored",
 ] }
@@ -48,26 +48,26 @@ reqwest = { version = "0.12.12", default-features = false, features = [
     "json",
     "rustls-tls",
 ] }
-reqwest-middleware = { version = "0.4.0", features = ["json"] }
+reqwest-middleware = { version = "0.4.1", features = ["json"] }
 reqwest-retry = "0.7.0"
 rustls = { version = "0.23.23", features = ["ring"] }
-serde = { version = "1.0.218", features = ["derive", "rc"] }
-serde_json = "1.0.139"
+serde = { version = "1.0.219", features = ["derive", "rc"] }
+serde_json = "1.0.140"
 serde_with = { version = "3.12.0", features = ["base64"] }
 strum = { version = "0.27.1", features = ["derive"] }
-thiserror = "2.0.11"
-tokio = { version = "1.43.0", features = ["full"] }
-tokio-rustls = { version = "0.26.1" }
+thiserror = "2.0.12"
+tokio = { version = "1.44.0", features = ["full"] }
+tokio-rustls = { version = "0.26.2" }
 toml = "0.8.20"
 tracing = { version = "0.1.41" }
 trait-variant = { version = "0.1.2" }
-uuid = { version = "1.14.0", features = ["v7", "fast-rng", "zerocopy"] }
+uuid = { version = "1.15.1", features = ["v7", "fast-rng", "zerocopy"] }
 webpki-roots = { version = "0.26.8" }
 
 [build-dependencies]
-convert_case = "0.7.1"
-serde = { version = "1.0.218", features = ["derive", "rc"] }
-serde_derive = "1.0.218"
+convert_case = "0.8.0"
+serde = { version = "1.0.219", features = ["derive", "rc"] }
+serde_derive = "1.0.219"
 
 [features]
 default = ["tokio_lock"]

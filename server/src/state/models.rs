@@ -169,15 +169,16 @@ impl BytesSerializable for CreateStreamWithId {
     where
         Self: Sized,
     {
+        let mut position = 0;
         let stream_id = u32::from_le_bytes(
-            bytes[0..4]
+            bytes[position..4]
                 .try_into()
                 .with_error_context(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to parse stream ID")
                 })
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
-        let mut position = 4;
+        position += 4;
         let command_length = u32::from_le_bytes(
             bytes[position..position + 4]
                 .try_into()
@@ -209,15 +210,16 @@ impl BytesSerializable for CreateTopicWithId {
     where
         Self: Sized,
     {
+        let mut position = 0;
         let topic_id = u32::from_le_bytes(
-            bytes[0..4]
+            bytes[position..4]
                 .try_into()
                 .with_error_context(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to parse topic ID")
                 })
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
-        let mut position = 4;
+        position += 4;
         let command_length = u32::from_le_bytes(
             bytes[position..position + 4]
                 .try_into()
@@ -249,15 +251,16 @@ impl BytesSerializable for CreateConsumerGroupWithId {
     where
         Self: Sized,
     {
+        let mut position = 0;
         let group_id = u32::from_le_bytes(
-            bytes[0..4]
+            bytes[position..4]
                 .try_into()
                 .with_error_context(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to parse consumer group ID")
                 })
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
-        let mut position = 4;
+        position += 4;
         let command_length = u32::from_le_bytes(
             bytes[position..position + 4]
                 .try_into()
@@ -290,15 +293,16 @@ impl BytesSerializable for CreateUserWithId {
     where
         Self: Sized,
     {
+        let mut position = 0;
         let user_id = u32::from_le_bytes(
-            bytes[0..4]
+            bytes[position..4]
                 .try_into()
                 .with_error_context(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to parse user ID")
                 })
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
-        let mut position = 4;
+        position += 4;
         let command_length = u32::from_le_bytes(
             bytes[position..position + 4]
                 .try_into()
@@ -331,19 +335,21 @@ impl BytesSerializable for CreatePersonalAccessTokenWithHash {
     where
         Self: Sized,
     {
+        let mut position = 0;
         let hash_length = u32::from_le_bytes(
-            bytes[0..4]
+            bytes[position..4]
                 .try_into()
                 .with_error_context(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to parse hash length")
                 })
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
-        let hash = from_utf8(&bytes[4..4 + hash_length as usize])
+        position += 4;
+        let hash = from_utf8(&bytes[position..position + hash_length as usize])
             .map_err(|_| IggyError::InvalidUtf8)?
             .to_string();
 
-        let mut position = 4 + hash_length as usize;
+        position += hash_length as usize;
         let command_length = u32::from_le_bytes(
             bytes[position..position + 4]
                 .try_into()

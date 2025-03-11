@@ -7,12 +7,12 @@ license = "Apache-2.0"
 # mimalloc on server is also setting it on bench.
 
 [dependencies]
-async-trait = "0.1.86"
+async-trait = "0.1.87"
 atomic-time = "0.1.5"
-bytes = "1.10.0"
+bytes = "1.10.1"
 charming = "0.4.0"
-chrono = "0.4.39"
-clap = { version = "4.5.30", features = ["derive"] }
+chrono = "0.4.40"
+clap = { version = "4.5.32", features = ["derive"] }
 figlet-rs = "0.1.5"
 futures = "0.3.31"
 hostname = "0.4.0"
@@ -21,14 +21,14 @@ iggy = { path = "../sdk" }
 iggy-bench-report = { path = "report" }
 integration = { path = "../integration" }
 nonzero_lit = "0.1.2"
-serde = { version = "1.0.218", features = ["derive"] }
+serde = { version = "1.0.219", features = ["derive"] }
 sysinfo = "0.33.1"
-tokio = { version = "1.43.0", features = ["full"] }
+tokio = { version = "1.44.0", features = ["full"] }
 toml = "0.8.20"
 tracing = { version = "0.1.41" }
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter"] }
-uuid = { version = "1.14.0", features = ["serde"] }
+uuid = { version = "1.15.1", features = ["serde"] }
 
 [[bin]]
 name = "iggy-bench"
