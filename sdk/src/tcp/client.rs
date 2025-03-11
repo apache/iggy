@@ -368,7 +368,7 @@ impl TcpClient {
         stream: &mut ConnectionStreamKind,
     ) -> Result<Bytes, IggyError> {
         if status != 0 {
-            // TEMP: See https://github.com/iggy-rs/iggy/pull/604 for context.
+            // TEMP: See https://github.com/apache/iggy/pull/604 for context.
             if status == IggyErrorDiscriminants::TopicIdAlreadyExists as u32
                 || status == IggyErrorDiscriminants::TopicNameAlreadyExists as u32
                 || status == IggyErrorDiscriminants::StreamIdAlreadyExists as u32

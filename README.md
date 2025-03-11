@@ -2,7 +2,7 @@
 
 <div style="display: flex; flex-wrap: wrap; justify-content: center; align-items: center; text-align: center;">
 
-  [Website](https://iggy.apache.org) | [Getting started](https://iggy.apache.org/docs/introduction/getting-started/) | [Documentation](https://iggy.apache.org/docs/) | [Blog](https://iggy.apache.org/blogs/) | [Discord](https://iggy.rs/discord) | [Crates](https://crates.io/crates/iggy)
+  [Website](https://iggy.apache.org) | [Getting started](https://iggy.apache.org/docs/introduction/getting-started/) | [Documentation](https://iggy.apache.org/docs/) | [Blog](https://iggy.apache.org/blogs/) | [Discord](https://discord.gg/C5Sux5NcRa) | [Crates](https://crates.io/crates/iggy)
 
 </div>
 <div style="display: flex; flex-wrap: wrap; justify-content: center; align-items: center; text-align: center;">
@@ -14,7 +14,7 @@
   [![coverage](https://coveralls.io/repos/github/iggy-rs/iggy/badge.svg?branch=master)](https://coveralls.io/github/iggy-rs/iggy?branch=master)
   [![dependency](https://deps.rs/repo/github/iggy-rs/iggy/status.svg)](https://deps.rs/repo/github/iggy-rs/iggy)
   [![x](https://img.shields.io/twitter/follow/iggy_rs_?style=social)](https://twitter.com/iggy_rs_)
-   [![discord-badge](https://img.shields.io/discord/1144142576266530928)](https://iggy.rs/discord)
+   [![discord-badge](https://img.shields.io/discord/1144142576266530928)](https://discord.gg/C5Sux5NcRa)
 
 </div>
 
