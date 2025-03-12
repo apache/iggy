@@ -12,11 +12,11 @@ pub mod consumer_offsets;
 pub mod messages;
 pub mod partitions;
 pub mod personal_access_tokens;
+pub mod segments;
 pub mod streams;
 pub mod system;
 pub mod topics;
 pub mod users;
-pub mod segments;
 
 #[async_trait]
 pub trait HttpTransport {

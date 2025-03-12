@@ -154,7 +154,7 @@ fn get_command(
             SegmentAction::Delete(args) => Box::new(DeleteSegmentsCmd::new(
                 args.stream_id.clone(),
                 args.topic_id.clone(),
-                args.partition_id.clone(),
+                args.partition_id,
                 args.segments_count,
             )),
         },

@@ -241,6 +241,26 @@ impl SystemState {
                         topic.partitions.remove(&(last_partition_id - i));
                     }
                 }
+                EntryCommand::DeleteSegments(command) => {
+                    let stream_id = find_stream_id(&streams, &command.stream_id);
+                    let stream = streams
+                        .get_mut(&stream_id)
+                        .unwrap_or_else(|| panic!("{}", format!("Stream: {stream_id} not found")));
+                    let topic_id = find_topic_id(&stream.topics, &command.topic_id);
+                    let topic = stream
+                        .topics
+                        .get_mut(&topic_id)
+                        .unwrap_or_else(|| panic!("{}", format!("Topic: {topic_id} not found")));
+                    if topic.partitions.is_empty() {
+                        continue;
+                    }
+
+                    let partition_id = command.partition_id;
+
+                    let _partition = topic.partitions.get(&command.partition_id).unwrap_or_else(|| panic!("{}", format!("Partition {partition_id} not found.")));
+
+                    // HOWTO: get the segments from PartitionState?
+                }
                 EntryCommand::CreateConsumerGroup(command) => {
                     let stream_id = find_stream_id(&streams, &command.stream_id);
                     let stream = streams

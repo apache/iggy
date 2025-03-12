@@ -20,6 +20,8 @@ pub mod partitions;
 #[allow(deprecated)]
 pub mod personal_access_tokens;
 #[allow(deprecated)]
+pub mod segments;
+#[allow(deprecated)]
 pub mod streams;
 #[allow(deprecated)]
 pub mod system;
@@ -27,8 +29,6 @@ pub mod system;
 pub mod topics;
 #[allow(deprecated)]
 pub mod users;
-#[allow(deprecated)]
-pub mod segments;
 
 /// The state of the client.
 #[derive(Debug, Copy, Clone, PartialEq, Display)]

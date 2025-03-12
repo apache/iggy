@@ -5,7 +5,6 @@ use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy::error::IggyError;
-use iggy::partitions::delete_partitions::DeletePartitions;
 use iggy::segments::delete_segments::DeleteSegments;
 use tracing::{debug, instrument};
 
@@ -22,12 +21,12 @@ pub async fn handle(
 
     let mut system = system.write().await;
     system
-            .delete_partitions(
+            .delete_segments(
                 session,
                 &command.stream_id,
                 &command.topic_id,
-                &command.partition_id,
-                command.partitions_count,
+                command.partition_id,
+                command.segments_count,
             )
             .await
             .with_error_context(|error| {
@@ -41,7 +40,7 @@ pub async fn handle(
         .state
         .apply(
             session.get_user_id(),
-            EntryCommand::DeletePartitions(command),
+            EntryCommand::DeleteSegments(command),
         )
         .await
         .with_error_context(|error| {

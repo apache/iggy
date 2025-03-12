@@ -9,7 +9,7 @@ pub(crate) enum SegmentAction {
     /// Stream ID can be specified as a stream name or ID
     /// Topic ID can be specified as a topic name or ID
     /// partition ID can be specified as a name or ID
-    /// 
+    ///
     /// Examples
     ///  iggy segment delete 1 1 1 10
     ///  iggy segment delete prod 2 2 2
@@ -33,7 +33,7 @@ pub(crate) struct SegmentDeleteArgs {
     pub(crate) topic_id: Identifier,
     /// Partition ID to delete segments
     #[arg(value_parser = clap::value_parser!(Identifier))]
-    pub(crate) partition_id: Identifier,
+    pub(crate) partition_id: u32,
     /// Segments count to be deleted
     #[arg(value_parser = clap::value_parser!(u32).range(1..100_001))]
     pub(crate) segments_count: u32,

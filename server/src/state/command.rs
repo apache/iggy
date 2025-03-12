@@ -14,6 +14,7 @@ use iggy::error::IggyError;
 use iggy::partitions::create_partitions::CreatePartitions;
 use iggy::partitions::delete_partitions::DeletePartitions;
 use iggy::personal_access_tokens::delete_personal_access_token::DeletePersonalAccessToken;
+use iggy::segments::delete_segments::DeleteSegments;
 use iggy::streams::create_stream::CreateStream;
 use iggy::streams::delete_stream::DeleteStream;
 use iggy::streams::purge_stream::PurgeStream;
@@ -41,6 +42,7 @@ pub enum EntryCommand {
     PurgeTopic(PurgeTopic),
     CreatePartitions(CreatePartitions),
     DeletePartitions(DeletePartitions),
+    DeleteSegments(DeleteSegments),
     CreateConsumerGroup(CreateConsumerGroup),
     DeleteConsumerGroup(DeleteConsumerGroup),
     CreateUser(CreateUser),
@@ -65,6 +67,7 @@ impl BytesSerializable for EntryCommand {
             EntryCommand::PurgeTopic(command) => (command.code(), command.to_bytes()),
             EntryCommand::CreatePartitions(command) => (command.code(), command.to_bytes()),
             EntryCommand::DeletePartitions(command) => (command.code(), command.to_bytes()),
+            EntryCommand::DeleteSegments(command) => (command.code(), command.to_bytes()),
             EntryCommand::CreateConsumerGroup(command) => (command.code(), command.to_bytes()),
             EntryCommand::DeleteConsumerGroup(command) => (command.code(), command.to_bytes()),
             EntryCommand::CreateUser(command) => (command.code(), command.to_bytes()),
@@ -154,6 +157,7 @@ impl Display for EntryCommand {
             EntryCommand::PurgeTopic(command) => write!(f, "PurgeTopic({})", command),
             EntryCommand::CreatePartitions(command) => write!(f, "CreatePartitions({})", command),
             EntryCommand::DeletePartitions(command) => write!(f, "DeletePartitions({})", command),
+            EntryCommand::DeleteSegments(command) => write!(f, "DeleteSegments({})", command),
             EntryCommand::CreateConsumerGroup(command) => {
                 write!(f, "CreateConsumerGroup({})", command)
             }

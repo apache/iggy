@@ -1,7 +1,6 @@
 use crate::cli_command::{CliCommand, PRINT_TARGET};
 use crate::client::Client;
 use crate::identifier::Identifier;
-use crate::models::partition;
 use crate::segments::delete_segments::DeleteSegments;
 use anyhow::Context;
 use async_trait::async_trait;
@@ -12,7 +11,12 @@ pub struct DeleteSegmentsCmd {
 }
 
 impl DeleteSegmentsCmd {
-    pub fn new(stream_id: Identifier, topic_id: Identifier, partition_id: Identifier, segments_count: u32) -> Self {
+    pub fn new(
+        stream_id: Identifier,
+        topic_id: Identifier,
+        partition_id: u32,
+        segments_count: u32,
+    ) -> Self {
         Self {
             delete_segments: DeleteSegments {
                 stream_id,
@@ -51,7 +55,7 @@ impl CliCommand for DeleteSegmentsCmd {
             .delete_segments(
                 &self.delete_segments.stream_id,
                 &self.delete_segments.topic_id,
-                &self.delete_segments.partition_id,
+                self.delete_segments.partition_id,
                 self.delete_segments.segments_count,
             )
             .await

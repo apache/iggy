@@ -37,11 +37,11 @@ pub(crate) mod message;
 pub(crate) mod partition;
 pub(crate) mod permissions;
 pub(crate) mod personal_access_token;
+pub(crate) mod segment;
 pub(crate) mod stream;
 pub(crate) mod system;
 pub(crate) mod topic;
 pub(crate) mod user;
-pub(crate) mod segment;
 
 static CARGO_BIN_NAME: &str = env!("CARGO_BIN_NAME");
 static CARGO_PKG_HOMEPAGE: &str = env!("CARGO_PKG_HOMEPAGE");
