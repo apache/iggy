@@ -17,24 +17,10 @@
 
 version: 2
 updates:
-  - package-ecosystem: "github-actions"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-    rebase-strategy: "disabled"
-    commit-message:
-      prefix: "chore(ci): "
-    labels:
-      - "ci-cd"
-    assignees:
-      - "apache/iggy-committers"
-    reviewers:
-      - "apache/iggy-committers"
-
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
-      interval: "daily"
+      interval: "weekly"
     rebase-strategy: "disabled"
     commit-message:
       prefix: "chore(deps): "
@@ -42,3 +28,10 @@ updates:
       - "apache/iggy-committers"
     reviewers:
       - "apache/iggy-committers"
+    groups:
+      minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
