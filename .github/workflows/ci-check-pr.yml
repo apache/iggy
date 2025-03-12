@@ -1,0 +1,139 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+# -------------------------------------------------------------
+#
+# CI Check PR Workflow
+#
+# This workflow validates pull requests to the master branch by detecting changed files
+# and running appropriate checks and tests.
+#
+# Flow:
+# 1. pr-file-changes: Detects which file types were modified (mandatory)
+# 2. ci-check-common: Validates commit message (mandatory)
+# 3. Conditional jobs based on file changes:
+#    - For Rust changes: ci-check-rust → ci-test-rust → ci-test-rust-optional & ci-compatibility-rust
+#    - For shell changes: ci-check-shell
+# 4. finalize-pr: Determines final PR status based on all job results (mandatory)
+#
+# Dependencies:
+# - ci-check-rust depends on pr-file-changes (outputs.trigger-rust)
+# - ci-test-rust and ci-compatibility-rust depend on ci-check-rust success
+# - ci-check-shell depends on pr-file-changes (outputs.trigger-shell)
+# - finalize-pr depends on all other jobs
+#
+# The workflow fails if any mandatory job fails.
+# Workflow can be triggered manually or on pull request events.
+#
+name: ci-check-pr
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - master
+    types: [ opened, synchronize, reopened ]
+
+jobs:
+  pr-file-changes:
+    name: pr-file-changes
+    runs-on: ubuntu-latest
+    outputs:
+      trigger-rust: ${{ steps.changed-files-yaml.outputs.rust_any_changed }}
+      trigger-shell: ${{ steps.changed-files-yaml.outputs.shell_any_changed }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Check changed files
+        id: changed-files-yaml
+        uses: tj-actions/changed-files@v45
+        with:
+          files_yaml: |
+            rust:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - Cargo.toml
+              - Cargo.lock
+            shell:
+              - 'scripts/**/*.sh'
+      - name: List all changed files
+        run: |
+          if [ "${{ steps.changed-files-yaml.outputs.rust_any_changed }}" == "true" ]; then
+            echo "One or more rust file(s) has changed."
+            echo "List all the files that have changed: ${{ steps.changed-files-yaml.outputs.rust_all_changed_files }}"
+          fi
+          if [ "${{ steps.changed-files-yaml.outputs.shell_any_changed }}" == "true" ]; then
+            echo "One or more shell file(s) has changed."
+            echo "List all the files that have changed: ${{ steps.changed-files-yaml.outputs.shell_all_changed_files }}"
+          fi
+
+  ci-check-common:
+    name: ci-check-common
+    uses: ./.github/workflows/ci-check-common.yml
+    with:
+      commits-from: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || 'HEAD~1' }}
+      commits-to: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || 'HEAD' }}
+
+  ci-check-rust:
+    name: ci-check-rust
+    needs: pr-file-changes
+    if: ${{ needs.pr-file-changes.outputs.trigger-rust == 'true' }}
+    uses: ./.github/workflows/ci-check-rust.yml
+
+  ci-test-rust:
+    name: ci-test-rust
+    needs: ci-check-rust
+    if: ${{ needs.ci-check-rust.result == 'success' }}
+    uses: ./.github/workflows/ci-test-rust.yml
+
+  ci-test-rust-optional:
+    name: ci-test-rust-optional
+    needs: ci-check-rust
+    if: ${{ needs.ci-check-rust.result == 'success' }}
+    uses: ./.github/workflows/ci-test-rust-optional.yml
+
+  ci-compatibility-rust:
+    name: ci-compatibility-rust
+    needs: ci-check-rust
+    if: ${{ needs.ci-check-rust.result == 'success' }}
+    uses: ./.github/workflows/ci-compatibility-rust.yml
+    with:
+      pr_body: ${{ github.event.pull_request.body }}
+
+  ci-check-shell:
+    name: ci-check-shell
+    needs: pr-file-changes
+    if: ${{ needs.pr-file-changes.outputs.trigger-shell == 'true' }}
+    uses: ./.github/workflows/ci-check-shell.yml
+
+  finalize-pr:
+    runs-on: ubuntu-latest
+    needs:
+      - ci-check-common
+      - ci-check-rust
+      - ci-test-rust
+      - ci-compatibility-rust
+      - ci-check-shell
+    if: always()
+    steps:
+      - name: Everything is fine
+        if: ${{ !(contains(needs.*.result, 'failure')) }}
+        run: exit 0
+
+      - name: Some tests failed
+        if: ${{ contains(needs.*.result, 'failure') }}
+        run: exit 1

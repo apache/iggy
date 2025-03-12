@@ -1,3 +1,21 @@
+/* Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 use crate::state::StateSetup;
 use bytes::Bytes;
 use iggy::bytes_serializable::BytesSerializable;
@@ -5,6 +23,7 @@ use iggy::streams::create_stream::CreateStream;
 use iggy::users::create_user::CreateUser;
 use server::state::command::EntryCommand;
 use server::state::entry::StateEntry;
+use server::state::models::{CreateStreamWithId, CreateUserWithId};
 use server::state::State;
 
 #[tokio::test]
@@ -23,11 +42,14 @@ async fn should_apply_single_entry() {
     state.init().await.unwrap();
 
     let user_id = 1;
-    let command = EntryCommand::CreateUser(CreateUser {
-        username: "test".to_string(),
-        password: "secret".to_string(),
-        status: Default::default(),
-        permissions: None,
+    let command = EntryCommand::CreateUser(CreateUserWithId {
+        user_id,
+        command: CreateUser {
+            username: "test".to_string(),
+            password: "secret".to_string(),
+            status: Default::default(),
+            permissions: None,
+        },
     });
     let command_bytes = command.to_bytes();
 
@@ -46,11 +68,14 @@ async fn should_apply_encrypted_entry() {
     state.init().await.unwrap();
 
     let user_id = 1;
-    let command = EntryCommand::CreateUser(CreateUser {
-        username: "test".to_string(),
-        password: "secret".to_string(),
-        status: Default::default(),
-        permissions: None,
+    let command = EntryCommand::CreateUser(CreateUserWithId {
+        user_id,
+        command: CreateUser {
+            username: "test".to_string(),
+            password: "secret".to_string(),
+            status: Default::default(),
+            permissions: None,
+        },
     });
     let command_bytes = command.to_bytes();
 
@@ -74,11 +99,14 @@ async fn should_apply_multiple_entries() {
     assert_eq!(state.term(), 0);
 
     let first_user_id = 1;
-    let create_user = EntryCommand::CreateUser(CreateUser {
-        username: "test".to_string(),
-        password: "secret".to_string(),
-        status: Default::default(),
-        permissions: None,
+    let create_user = EntryCommand::CreateUser(CreateUserWithId {
+        user_id: first_user_id,
+        command: CreateUser {
+            username: "test".to_string(),
+            password: "secret".to_string(),
+            status: Default::default(),
+            permissions: None,
+        },
     });
     let create_user_bytes = create_user.to_bytes();
 
@@ -88,9 +116,13 @@ async fn should_apply_multiple_entries() {
     assert_eq!(state.entries_count(), 1);
 
     let second_user_id = 2;
-    let create_stream = EntryCommand::CreateStream(CreateStream {
-        stream_id: Some(1),
-        name: "test".to_string(),
+    let stream_id = 1;
+    let create_stream = EntryCommand::CreateStream(CreateStreamWithId {
+        stream_id,
+        command: CreateStream {
+            stream_id: Some(stream_id),
+            name: "test".to_string(),
+        },
     });
     let create_stream_bytes = create_stream.to_bytes();
 

@@ -1,4 +1,23 @@
+/* Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 use crate::state::command::EntryCommand;
+use crate::state::models::CreateUserWithId;
 use crate::state::system::UserState;
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::session::Session;
@@ -35,7 +54,10 @@ impl System {
                 permissions: root.permissions.clone(),
             };
             self.state
-                .apply(0, EntryCommand::CreateUser(command))
+                .apply(0, EntryCommand::CreateUser(CreateUserWithId {
+                    user_id: root.id,
+                    command
+                }))
                 .await
                 .with_error_context(|error| {
                     format!(

@@ -1,10 +1,25 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
 name: publish_cli
 on:
-  workflow_dispatch:
-  workflow_run:
-    workflows: [ "publish_sdk" ]
-    types:
-      - completed
+  push:
+    tags:
+      - 'iggy-cli-[0-9]+.[0-9]+.[0-9]+'
 
 env:
   GITHUB_TOKEN: ${{ github.token }}
@@ -19,47 +34,35 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check if cli/Cargo.toml and Cargo.lock are changed
-        uses: tj-actions/changed-files@v45
-        id: all_changed_files
-        with:
-          files: |
-            Cargo.lock
-            cli/Cargo.toml
+      - name: Extract tag name
+        id: extract_tag
+        run: |
+          tag=${GITHUB_REF#refs/tags/}
+          echo "tag_name=$tag" >> "$GITHUB_OUTPUT"
+          echo "::notice ::Tag that triggered the workflow: $tag"
 
       - name: Extract iggy-cli version from Cargo.toml
-        if: ${{ steps.all_changed_files.outputs.all_changed_files == 'Cargo.lock cli/Cargo.toml' }}
         id: extract_version
         run: |
           version=$(cargo pkgid -p iggy-cli | cut -d@ -f2)
           echo "iggy_cli_version=$version" >> "$GITHUB_OUTPUT"
           echo "::notice ::Version from Cargo.toml $version"
 
-      - name: Check if version is a Git tag
-        uses: mukunku/tag-exists-action@v1.6.0
-        if: ${{ steps.all_changed_files.outputs.all_changed_files == 'Cargo.lock cli/Cargo.toml' }}
+      - name: Check if version from Cargo.toml is the same as the tag
         id: check_git_tag
-        with:
-          tag: "iggy-cli-${{ steps.extract_version.outputs.iggy_cli_version }}"
-
-      - name: Print message
-        if: ${{ steps.check_git_tag.outputs.exists == 'true' }}
         run: |
-          echo "::notice ::Tag iggy-cli-${{ steps.extract_version.outputs.iggy_cli_version }} exists, skipping tag creation"
+          if [[ "iggy-cli-${{ steps.extract_version.outputs.iggy_cli_version }}" == "${{ steps.extract_tag.outputs.tag_name }}" ]];
+          then
+            echo "::notice ::Tag ${{ steps.extract_tag.outputs.tag_name }} matches the version in Cargo.toml"
+            echo "tag_matches=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning ::Tag ${{ steps.extract_tag.outputs.tag_name }} does not matche the version from Cargo.toml"
+            echo "tag_matches=false" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Create tag
-        if: ${{ steps.check_git_tag.outputs.exists == 'false' }}
-        id: tagging
-        run: |
-          git config user.name "${{ github.actor }}"
-          git config user.email "${{ github.actor }}@users.noreply.github.com"
-          git tag -a iggy-cli-${{ steps.extract_version.outputs.iggy_cli_version }} -m "iggy-cli-${{ steps.extract_version.outputs.iggy_cli_version }}"
-          git push origin iggy-cli-${{ steps.extract_version.outputs.iggy_cli_version }}
-          echo "::notice ::Created iggy-cli-${{ steps.extract_version.outputs.iggy_cli_version }} tag"
-          echo "tag_created=true" >> "$GITHUB_OUTPUT"
     outputs:
-      iggy_cli_version: ${{ steps.extract_version.outputs.iggy_cli_version }}
-      tag_created: ${{ steps.tagging.outputs.tag_created }}
+      iggy_cli_version: ${{ steps.extract_tag.outputs.tag_name }}
+      tag_created: ${{ steps.check_git_tag.outputs.tag_matches }}
 
   publish:
     name: Publish CLI on crates.io

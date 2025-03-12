@@ -1,3 +1,21 @@
+/* Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
@@ -18,8 +36,7 @@ pub async fn handle(
     debug!("session: {session}, command: {command}");
 
     let mut system = system.write().await;
-    system
-            .update_user(
+    system.update_user(
                 session,
                 &command.user_id,
                 command.username.clone(),
@@ -28,7 +45,7 @@ pub async fn handle(
             .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to update user with user_id: {}, session: {session}",
+                    "{COMPONENT} (error: {error}) - failed to update user with user ID: {}, session: {session}",
                     command.user_id
                 )
             })?;
@@ -42,8 +59,7 @@ pub async fn handle(
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply update user with user_id: {}, session: {session}",
-                user_id
+                "{COMPONENT} (error: {error}) - failed to apply update user with user ID: {user_id}, session: {session}",
             )
         })?;
     sender.send_empty_ok_response().await?;
