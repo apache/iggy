@@ -8,14 +8,14 @@ use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 
-use super::MAX_SEGMENTS_COUNT;
+use super::MAX_NO_OF_SEGMENTS_TO_BE_DELETED;
 
 /// `DeleteSegments` command is used to delete segments from a partition.
 /// It has additional payload:
 /// - `stream_id` - unique stream ID (numeric or name).
 /// - `topic_id` - unique topic ID (numeric or name).
 /// - `partition_id` - unique partition ID (numeric or name).
-/// - `segments_count` - number of segments in the partition to delete, max value is defined in MAX_SEGMENTS_COUNT.
+/// - `segments_count` - number of segments in the partition to delete, max value is defined in MAX_NO_OF_SEGMENTS_TO_BE_DELETED.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 pub struct DeleteSegments {
     /// Unique stream ID (numeric or name).
@@ -50,8 +50,8 @@ impl Default for DeleteSegments {
 
 impl Validatable<IggyError> for DeleteSegments {
     fn validate(&self) -> Result<(), IggyError> {
-        if !(1..=MAX_SEGMENTS_COUNT).contains(&self.segments_count) {
-            return Err(IggyError::TooManySegments);
+        if !(1..=MAX_NO_OF_SEGMENTS_TO_BE_DELETED).contains(&self.segments_count) {
+            return Err(IggyError::TooManySegments(self.segments_count));
         }
 
         Ok(())
