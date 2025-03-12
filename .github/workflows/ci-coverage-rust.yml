@@ -14,25 +14,33 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-
-name: coverage
+#
+# -------------------------------------------------------------
+#
+# CI Coverage Rust Workflow
+#
+# This workflow runs tests for Rust code and generates coverage report.
+# This workflow can be triggered manually or by other workflows.
+#
+name: ci-coverage-rust
 
 on:
   workflow_dispatch:
   workflow_call:
 
 env:
+  RUST_BACKTRACE: 1
   CARGO_TERM_COLOR: always
+  IGGY_CI_BUILD: true
   GITHUB_BOT_CONTEXT_STRING: "coveralls coverage reporting job"
 
 jobs:
   coverage:
-    name: Code coverage
+    name: coverage
     runs-on: ubuntu-latest
-    env:
-      CARGO_TERM_COLOR: always
+    timeout-minutes: 30
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Cache cargo & target directories
@@ -40,7 +48,7 @@ jobs:
         with:
           key: "coverage"
 
-      - name: Install gnome-keyring and keyutils on Linux
+      - name: Install gnome-keyring, keyutils and lcov
         run: |
           sudo apt-get update --yes && sudo apt-get install --yes gnome-keyring keyutils lcov
           rm -f $HOME/.local/share/keyrings/*
@@ -65,7 +73,7 @@ jobs:
 
       - name: Upload code to Coveralls
         # Do not upload coverage for user triggered workflows
-        if: github.event_name == 'workflow_call'
+        if: ${{ github.event_name == 'workflow_call' }}
         uses: coverallsapp/github-action@v2
         with:
           fail-on-error: false

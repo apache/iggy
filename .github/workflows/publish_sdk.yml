@@ -17,10 +17,9 @@
 
 name: publish_sdk
 on:
-  workflow_dispatch:
   push:
-    branches:
-      - master
+    tags:
+      - 'iggy-[0-9]+.[0-9]+.[0-9]+'
 
 env:
   GITHUB_TOKEN: ${{ github.token }}
@@ -35,47 +34,35 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check if sdk/Cargo.toml and Cargo.lock are changed
-        uses: tj-actions/changed-files@v45
-        id: all_changed_files
-        with:
-          files: |
-            Cargo.lock
-            sdk/Cargo.toml
+      - name: Extract tag name
+        id: extract_tag
+        run: |
+          tag=${GITHUB_REF#refs/tags/}
+          echo "tag_name=$tag" >> "$GITHUB_OUTPUT"
+          echo "::notice ::Tag that triggered the workflow: $tag"
 
       - name: Extract iggy version from Cargo.toml
-        if: ${{ steps.all_changed_files.outputs.all_changed_files == 'Cargo.lock sdk/Cargo.toml' }}
         id: extract_version
         run: |
           version=$(cargo pkgid -p iggy | cut -d@ -f2)
           echo "iggy_version=$version" >> "$GITHUB_OUTPUT"
           echo "::notice ::Version from Cargo.toml $version"
 
-      - name: Check if version is a Git tag
-        uses: mukunku/tag-exists-action@v1.6.0
-        if: ${{ steps.all_changed_files.outputs.all_changed_files == 'Cargo.lock sdk/Cargo.toml' }}
+      - name: Check if version from Cargo.toml is the same as the tag
         id: check_git_tag
-        with:
-          tag: "iggy-${{ steps.extract_version.outputs.iggy_version }}"
-
-      - name: Print message
-        if: ${{ steps.check_git_tag.outputs.exists == 'true' }}
         run: |
-          echo "::notice ::Tag iggy-${{ steps.extract_version.outputs.iggy_version }} exists, skipping tag creation"
+          if [[ "iggy-${{ steps.extract_version.outputs.iggy_version }}" == "${{ steps.extract_tag.outputs.tag_name }}" ]];
+          then
+            echo "::notice ::Tag ${{ steps.extract_tag.outputs.tag_name }} matches the version in Cargo.toml"
+            echo "tag_matches=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning ::Tag ${{ steps.extract_tag.outputs.tag_name }} does not matche the version from Cargo.toml"
+            echo "tag_matches=false" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Create tag
-        if: ${{ steps.check_git_tag.outputs.exists == 'false' }}
-        id: tagging
-        run: |
-          git config user.name "${{ github.actor }}"
-          git config user.email "${{ github.actor }}@users.noreply.github.com"
-          git tag -a iggy-${{ steps.extract_version.outputs.iggy_version }} -m "iggy-${{ steps.extract_version.outputs.iggy_version }}"
-          git push origin iggy-${{ steps.extract_version.outputs.iggy_version }}
-          echo "::notice ::Created iggy-${{ steps.extract_version.outputs.iggy_version }} tag"
-          echo "tag_created=true" >> "$GITHUB_OUTPUT"
     outputs:
-      iggy_version: ${{ steps.extract_version.outputs.iggy_version }}
-      tag_created: ${{ steps.tagging.outputs.tag_created }}
+      iggy_version: ${{ steps.extract_tag.outputs.tag_name }}
+      tag_created: ${{ steps.check_git_tag.outputs.tag_matches }}
 
   publish:
     name: Publish SDK on crates.io
@@ -100,7 +87,7 @@ jobs:
     needs: tag
     if: ${{ needs.tag.outputs.tag_created == 'true' }}
     with:
-      tag_name: "iggy-${{ needs.tag.outputs.iggy_version }}"
+      tag_name: "${{ needs.tag.outputs.iggy_version }}"
 
   finalize_sdk:
     runs-on: ubuntu-latest

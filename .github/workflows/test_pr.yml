@@ -59,12 +59,12 @@ jobs:
         (contains(github.event.head_commit.modified, '.rs') ||
          contains(github.event.head_commit.modified, 'Cargo.toml') ||
          contains(github.event.head_commit.modified, 'Cargo.lock')))
-    uses: ./.github/workflows/coverage.yml
+    uses: ./.github/workflows/ci-coverage-rust.yml
     needs: sanity
 
   backwards_compatibility:
     name: Backwards compatibility
-    uses: ./.github/workflows/backwards_compatibility.yml
+    uses: ./.github/workflows/ci-compatibility-rust.yml
     needs: sanity
     with:
       pr_body: ${{ github.event.pull_request.body }}

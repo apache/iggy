@@ -113,7 +113,9 @@ NORMAL_BATCH_NO_WAIT_ONLY_CACHE_PINNED_PRODUCER=$(construct_bench_command "$IGGY
 NORMAL_BATCH_NO_WAIT_ONLY_CACHE_PINNED_CONSUMER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-consumer" 8 8 1000 1000 1000 tcp "send_no_wait_only_cache" "$IDENTIFIER") # 8GB data, 1KB messages, 1000 msgs/batch with no_wait config
 
 # Single actor tests with cache disabled
+# shellcheck disable=SC2034
 NO_CACHE_SINGLE_PINNED_PRODUCER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-producer" 1 1 1000 1000 5000 tcp "1_producer_no_cache" "$IDENTIFIER") # 5GB data, 1KB messages, 100 msgs/batch with forced cache
+# shellcheck disable=SC2034
 NO_CACHE_SINGLE_PINNED_CONSUMER=$(construct_bench_command "$IGGY_BENCH_CMD" "pinned-consumer" 1 1 1000 1000 5000 tcp "1_consumer_no_cache" "$IDENTIFIER") # 5GB data, 1KB messages, 100 msgs/batch with forced cache
 
 # Consumer group tests with cache enabled
