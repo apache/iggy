@@ -41,7 +41,7 @@ jobs:
       - uses: addnab/docker-run-action@v3
         name: Spin up Docker Container
         with:
-          image: iggyrs/iggy:latest
+          image: apache/iggy:latest
           options: -d -p 8090:8090
           run: /iggy/iggy-server
 
