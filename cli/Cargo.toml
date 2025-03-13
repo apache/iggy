@@ -44,7 +44,7 @@ keyring = { version = "3.6.2", features = [
 ], optional = true }
 passterm = "=2.0.1"
 thiserror = "2.0.12"
-tokio = { version = "1.44.0", features = ["full"] }
+tokio = { version = "1.44.1", features = ["full"] }
 tracing = "0.1.41"
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.19", default-features = false, features = [

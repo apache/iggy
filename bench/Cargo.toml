@@ -40,7 +40,7 @@ integration = { path = "../integration" }
 nonzero_lit = "0.1.2"
 serde = { version = "1.0.219", features = ["derive"] }
 sysinfo = "0.33.1"
-tokio = { version = "1.44.0", features = ["full"] }
+tokio = { version = "1.44.1", features = ["full"] }
 toml = "0.8.20"
 tracing = { version = "0.1.41" }
 tracing-appender = "0.2.3"
