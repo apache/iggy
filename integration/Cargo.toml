@@ -43,7 +43,7 @@ serial_test = "3.2.0"
 server = { path = "../server" }
 tempfile = "3.18.0"
 test-case = "3.3.1"
-tokio = { version = "1.44.0", features = ["full"] }
+tokio = { version = "1.44.1", features = ["full"] }
 tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter"] }
 twox-hash = { version = "2.1.0", features = ["xxhash32"] }
 uuid = { version = "1.15.1", features = ["v7", "fast-rng", "zerocopy"] }
