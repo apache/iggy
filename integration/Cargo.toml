@@ -31,7 +31,7 @@ ctor = "0.4.1"
 derive_more = "2.0.1"
 env_logger = "0.11.7"
 futures = "0.3.31"
-humantime = "2.1.0"
+humantime = "2.2.0"
 iggy = { path = "../sdk", features = ["iggy-cli"] }
 keyring = "3.6.2"
 lazy_static = "1.5.0"
