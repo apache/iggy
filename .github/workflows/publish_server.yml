@@ -1,10 +1,29 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
 name: publish_server
+
 on:
   push:
-    branches:
-      - master
+    tags:
+      - 'server-[0-9]+.[0-9]+.[0-9]+'
+
 env:
-  DOCKERHUB_REGISTRY_NAME: iggyrs/iggy
+  DOCKERHUB_REGISTRY_NAME: apache/iggy
   CRATE_NAME: iggy
   GITHUB_TOKEN: ${{ github.token }}
   RUST_BACKTRACE: 1
@@ -20,44 +39,31 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check if Cargo.toml and Cargo.lock are changed
-        uses: tj-actions/changed-files@v45
-        id: all_changed_files
-        with:
-          files: |
-            Cargo.lock
-            server/Cargo.toml
+      - name: Extract tag name
+        id: extract_tag
+        run: |
+          tag=${GITHUB_REF#refs/tags/}
+          echo "tag_name=$tag" >> "$GITHUB_OUTPUT"
+          echo "::notice ::Tag that triggered the workflow: $tag"
 
       - name: Extract iggy-server version from Cargo.toml
-        if: ${{ steps.all_changed_files.outputs.all_changed_files == 'Cargo.lock server/Cargo.toml' }}
         id: extract_version
         run: |
           version=$(cargo pkgid -p server | cut -d# -f2 | cut -d: -f2)
           echo "server_version=$version" >> "$GITHUB_OUTPUT"
           echo "::notice ::Version from Cargo.toml $version"
 
-      - name: Check if version is a Git tag
-        uses: mukunku/tag-exists-action@v1.6.0
-        if: ${{ steps.all_changed_files.outputs.all_changed_files == 'Cargo.lock server/Cargo.toml' }}
+      - name: Check if version from Cargo.toml is the same as the tag
         id: check_git_tag
-        with:
-          tag: "server-${{ steps.extract_version.outputs.server_version }}"
-
-      - name: Print message
-        if: ${{ steps.check_git_tag.outputs.exists == 'true' }}
         run: |
-          echo "::notice ::Tag server-${{ steps.extract_version.outputs.server_version }} exists, skipping tag creation"
-
-      - name: Create tag
-        if: ${{ steps.check_git_tag.outputs.exists == 'false' }}
-        id: tagging
-        run: |
-          git config user.name "${{ github.actor }}"
-          git config user.email "${{ github.actor }}@users.noreply.github.com"
-          git tag -a server-${{ steps.extract_version.outputs.server_version }} -m "server-${{ steps.extract_version.outputs.server_version }}"
-          git push origin server-${{ steps.extract_version.outputs.server_version }}
-          echo "::notice ::Created server-${{ steps.extract_version.outputs.server_version }} tag"
-          echo "tag_created=true" >> "$GITHUB_OUTPUT"
+          if [[ "iggy-${{ steps.extract_version.outputs.server_version }}" == "${{ steps.extract_tag.outputs.tag_name }}" ]];
+          then
+            echo "::notice ::Tag ${{ steps.extract_tag.outputs.tag_name }} matches the version in Cargo.toml"
+            echo "tag_matches=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning ::Tag ${{ steps.extract_tag.outputs.tag_name }} does not matche the version from Cargo.toml"
+            echo "tag_matches=false" >> "$GITHUB_OUTPUT"
+          fi
 
     outputs:
       server_version: ${{ steps.extract_version.outputs.server_version }}
@@ -149,8 +155,8 @@ jobs:
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Docker meta
         id: meta
@@ -192,7 +198,7 @@ jobs:
       - tag
     steps:
       - name: Download digests
-        uses: actions/download-artifact@65a9edc5881444af0b9093a5e628f2fe47ea3b2e
+        uses: actions/download-artifact@v4
         with:
           pattern: 'digests-*'
           merge-multiple: true
@@ -201,8 +207,8 @@ jobs:
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -222,7 +228,7 @@ jobs:
         with:
           images: ${{ env.DOCKERHUB_REGISTRY_NAME }}
           tags: |
-            latest
+            edge
 
       - name: Create manifest list and push
         working-directory: /tmp/digests

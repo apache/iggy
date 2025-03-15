@@ -1,3 +1,21 @@
+/* Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::mapper;
@@ -18,6 +36,7 @@ use iggy::streams::update_stream::UpdateStream;
 use iggy::validatable::Validatable;
 
 use crate::state::command::EntryCommand;
+use crate::state::models::CreateStreamWithId;
 use std::sync::Arc;
 use tracing::instrument;
 
@@ -92,18 +111,20 @@ async fn create_stream(
                 command.stream_id
             )
         })?;
+    let stream_id = stream.stream_id;
     let response = Json(mapper::map_stream(stream));
 
     let system = system.downgrade();
-    let stream_id = command.stream_id;
     system
         .state
-        .apply(identity.user_id, EntryCommand::CreateStream(command))
+        .apply(identity.user_id, EntryCommand::CreateStream(CreateStreamWithId {
+            stream_id,
+            command
+        }))
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply create stream, stream ID: {:?}",
-                stream_id
+                "{COMPONENT} (error: {error}) - failed to apply create stream, stream ID: {stream_id}",
             )
         })?;
     Ok(response)

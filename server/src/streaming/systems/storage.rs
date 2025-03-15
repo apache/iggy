@@ -1,3 +1,21 @@
+/* Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 use crate::streaming::persistence::persister::PersisterKind;
 use crate::streaming::storage::SystemInfoStorage;
 use crate::streaming::systems::info::SystemInfo;
@@ -53,13 +71,15 @@ impl SystemInfoStorage for FileSystemInfoStorage {
                 )
             })
             .map_err(|_| IggyError::CannotReadFile)?;
-        bincode::deserialize(&buffer)
-            .with_context(|| "Failed to deserialize system info")
-            .map_err(|_| IggyError::CannotDeserializeResource)
+        let (system_info, _) =
+            bincode::serde::decode_from_slice(&buffer, bincode::config::standard())
+                .with_context(|| "Failed to deserialize system info")
+                .map_err(|_| IggyError::CannotDeserializeResource)?;
+        Ok(system_info)
     }
 
     async fn save(&self, system_info: &SystemInfo) -> Result<(), IggyError> {
-        let data = bincode::serialize(&system_info)
+        let data = bincode::serde::encode_to_vec(system_info, bincode::config::standard())
             .with_context(|| "Failed to serialize system info")
             .map_err(|_| IggyError::CannotSerializeResource)?;
         self.persister

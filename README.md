@@ -2,7 +2,7 @@
 
 <div style="display: flex; flex-wrap: wrap; justify-content: center; align-items: center; text-align: center;">
 
-  [Website](https://iggy.rs) | [Getting started](https://docs.iggy.rs/introduction/getting-started/) | [Documentation](https://docs.iggy.rs) | [Blog](https://blog.iggy.rs) | [Discord](https://iggy.rs/discord) | [Crates](https://crates.io/crates/iggy)
+  [Website](https://iggy.apache.org) | [Getting started](https://iggy.apache.org/docs/introduction/getting-started/) | [Documentation](https://iggy.apache.org/docs/) | [Blog](https://iggy.apache.org/blogs/) | [Discord](https://discord.gg/C5Sux5NcRa) | [Crates](https://crates.io/crates/iggy)
 
 </div>
 <div style="display: flex; flex-wrap: wrap; justify-content: center; align-items: center; text-align: center;">
@@ -14,7 +14,7 @@
   [![coverage](https://coveralls.io/repos/github/iggy-rs/iggy/badge.svg?branch=master)](https://coveralls.io/github/iggy-rs/iggy?branch=master)
   [![dependency](https://deps.rs/repo/github/iggy-rs/iggy/status.svg)](https://deps.rs/repo/github/iggy-rs/iggy)
   [![x](https://img.shields.io/twitter/follow/iggy_rs_?style=social)](https://twitter.com/iggy_rs_)
-   [![discord-badge](https://img.shields.io/discord/1144142576266530928)](https://iggy.rs/discord)
+   [![discord-badge](https://img.shields.io/discord/1144142576266530928)](https://discord.gg/C5Sux5NcRa)
 
 </div>
 
@@ -137,7 +137,7 @@ The configuration file is loaded from the current working directory, but you can
 
 When config file is not found, the default values from embedded server.toml file are used.
 
-For the detailed documentation of the configuration file, please refer to the [configuration](https://docs.iggy.rs/server/configuration) section.
+For the detailed documentation of the configuration file, please refer to the [configuration](https://iggy.apache.org/docs//server/configuration) section.
 
 ---
 
@@ -207,7 +207,7 @@ To see the detailed logs from the CLI/server, run it with `RUST_LOG=trace` envir
 
 ## Examples
 
-You can find the sample consumer & producer applications under `examples` directory. The purpose of these apps is to showcase the usage of the client SDK. To find out more about building the applications, please refer to the [getting started](https://docs.iggy.rs/introduction/getting-started) guide.
+You can find the sample consumer & producer applications under `examples` directory. The purpose of these apps is to showcase the usage of the client SDK. To find out more about building the applications, please refer to the [getting started](https://iggy.apache.org/docs/introduction/getting-started) guide.
 
 To run the example, first start the server with `cargo r --bin iggy-server` and then run the producer and consumer apps with `cargo r --example message-envelope-producer` and `cargo r --example message-envelope-consumer` respectively.
 
@@ -242,7 +242,7 @@ let mut producer = client
 producer.init().await?;
 
 // Send some messages to the topic
-let messages = vec![Message::from_str("Hello Iggy.rs")?];
+let messages = vec![Message::from_str("Hello Apache Iggy")?];
 producer.send(messages).await?;
 
 // Create a consumer for the given stream and one of its topics
