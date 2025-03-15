@@ -453,8 +453,10 @@ impl TcpClient {
             let connection = TcpStream::connect(&self.config.server_address).await;
             if connection.is_err() {
                 error!(
-                    "Failed to connect to server: {}",
-                    self.config.server_address
+                    "Failed to connect to server: {}，\
+                     Error: {:?}",
+                    self.config.server_address,
+                    connection.as_ref().err().unwrap().to_string()
                 );
                 if !self.config.reconnection.enabled {
                     warn!("Automatic reconnection is disabled.");
