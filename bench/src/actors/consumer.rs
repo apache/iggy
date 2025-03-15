@@ -92,7 +92,7 @@ impl Consumer {
         }
     }
 
-    pub async fn run(&self) -> Result<BenchmarkIndividualMetrics, IggyError> {
+    pub async fn run(self) -> Result<BenchmarkIndividualMetrics, IggyError> {
         let topic_id: u32 = 1;
         let default_partition_id: u32 = 1;
         let message_batches = self.message_batches as u64;

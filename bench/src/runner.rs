@@ -23,7 +23,6 @@ use crate::plot::{plot_chart, ChartType};
 use crate::utils::collect_server_logs_and_save_to_file;
 use crate::utils::cpu_name::append_cpu_name_lowercase;
 use crate::utils::server_starter::start_server_if_needed;
-use futures::future::select_all;
 use iggy::error::IggyError;
 use iggy_bench_report::hardware::BenchmarkHardware;
 use iggy_bench_report::params::BenchmarkParams;
@@ -60,18 +59,15 @@ impl BenchmarkRunner {
 
         let mut individual_metrics = Vec::new();
 
-        while !join_handles.is_empty() {
-            let (result, _index, remaining) = select_all(join_handles).await;
-            join_handles = remaining;
-
-            match result {
-                Ok(r) => individual_metrics.push(r),
+        while let Some(individual_metric) = join_handles.join_next().await {
+            let individual_metric = individual_metric.expect("Failed to join actor!");
+            match individual_metric {
+                Ok(individual_metric) => individual_metrics.push(individual_metric),
                 Err(e) => return Err(e),
             }
         }
 
         info!("All actors joined!");
-
         let hardware =
             BenchmarkHardware::get_system_info_with_identifier(benchmark.args().identifier());
         let params = BenchmarkParams::from(benchmark.args());

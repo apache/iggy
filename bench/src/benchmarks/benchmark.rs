@@ -19,7 +19,6 @@
 use crate::args::kind::BenchmarkKindCommand;
 use crate::{args::common::IggyBenchArgs, utils::client_factory::create_client_factory};
 use async_trait::async_trait;
-use futures::Future;
 use iggy::client::{StreamClient, TopicClient};
 use iggy::clients::client::IggyClient;
 use iggy::compression::compression_algorithm::CompressionAlgorithm;
@@ -29,7 +28,8 @@ use iggy::utils::topic_size::MaxTopicSize;
 use iggy_bench_report::benchmark_kind::BenchmarkKind;
 use iggy_bench_report::individual_metrics::BenchmarkIndividualMetrics;
 use integration::test_server::{login_root, ClientFactory};
-use std::{pin::Pin, sync::Arc};
+use std::sync::Arc;
+use tokio::task::JoinSet;
 use tracing::info;
 
 use super::consumer_benchmark::ConsumerBenchmark;
@@ -39,11 +39,6 @@ use super::producer_and_consumer_group_benchmark::ProducerAndConsumerGroupBenchm
 use super::producer_benchmark::ProducerBenchmark;
 use super::producing_consumer_benchmark::EndToEndProducingConsumerBenchmark;
 use super::producing_consumer_group_benchmark::EndToEndProducingConsumerGroupBenchmark;
-
-pub type BenchmarkFutures = Result<
-    Vec<Pin<Box<dyn Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send>>>,
-    IggyError,
->;
 
 impl From<IggyBenchArgs> for Box<dyn Benchmarkable> {
     fn from(args: IggyBenchArgs) -> Self {
@@ -81,7 +76,9 @@ impl From<IggyBenchArgs> for Box<dyn Benchmarkable> {
 
 #[async_trait]
 pub trait Benchmarkable {
-    async fn run(&mut self) -> BenchmarkFutures;
+    async fn run(
+        &mut self,
+    ) -> Result<JoinSet<Result<BenchmarkIndividualMetrics, IggyError>>, IggyError>;
     fn kind(&self) -> BenchmarkKind;
     fn args(&self) -> &IggyBenchArgs;
     fn client_factory(&self) -> &Arc<dyn ClientFactory>;

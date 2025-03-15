@@ -607,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "bench"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "atomic-time",
@@ -616,7 +616,6 @@ dependencies = [
  "chrono",
  "clap",
  "figlet-rs",
- "futures",
  "hostname",
  "human-repr",
  "iggy",

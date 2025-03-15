@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use super::benchmark::{BenchmarkFutures, Benchmarkable};
+use super::benchmark::Benchmarkable;
 use crate::{
     actors::{consumer::Consumer, producer::Producer},
     args::common::IggyBenchArgs,
@@ -28,9 +28,12 @@ use iggy::{
     client::ConsumerGroupClient, clients::client::IggyClient, error::IggyError,
     messages::poll_messages::PollingKind,
 };
-use iggy_bench_report::benchmark_kind::BenchmarkKind;
+use iggy_bench_report::{
+    benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics,
+};
 use integration::test_server::{login_root, ClientFactory};
 use std::sync::{atomic::AtomicI64, Arc};
+use tokio::task::JoinSet;
 use tracing::{error, info};
 
 pub struct ProducerAndConsumerGroupBenchmark {
@@ -87,7 +90,9 @@ impl ProducerAndConsumerGroupBenchmark {
 
 #[async_trait]
 impl Benchmarkable for ProducerAndConsumerGroupBenchmark {
-    async fn run(&mut self) -> BenchmarkFutures {
+    async fn run(
+        &mut self,
+    ) -> Result<JoinSet<Result<BenchmarkIndividualMetrics, IggyError>>, IggyError> {
         self.init_streams().await.expect("Failed to init streams!");
         let consumer_groups_count = self.args.number_of_consumer_groups();
         self.init_consumer_groups(consumer_groups_count)
@@ -116,9 +121,7 @@ impl Benchmarkable for ProducerAndConsumerGroupBenchmark {
             message_batches * producers,
         );
 
-        let mut futures: BenchmarkFutures =
-            Ok(Vec::with_capacity((producers + consumers) as usize));
-
+        let mut set = JoinSet::new();
         for producer_id in 1..=producers {
             info!("Executing the benchmark on producer #{}...", producer_id);
             let stream_id = self.args.start_stream_id() + 1 + (producer_id % streams_number);
@@ -140,8 +143,7 @@ impl Benchmarkable for ProducerAndConsumerGroupBenchmark {
                     .map(|rl| RateLimiter::new(rl.as_bytes_u64())),
                 false, // TODO: Put latency into payload of first message, it should be an argument to iggy-bench
             );
-            let future = Box::pin(async move { producer.run().await });
-            futures.as_mut().unwrap().push(future);
+            set.spawn(producer.run());
         }
         info!("Created {} producer(s).", producers);
 
@@ -168,15 +170,14 @@ impl Benchmarkable for ProducerAndConsumerGroupBenchmark {
                     .rate_limit()
                     .map(|rl| RateLimiter::new(rl.as_bytes_u64())),
             );
-            let future = Box::pin(async move { consumer.run().await });
-            futures.as_mut().unwrap().push(future);
+            set.spawn(consumer.run());
         }
 
         info!(
             "Starting to send and poll {} messages",
             self.total_messages()
         );
-        futures
+        Ok(set)
     }
 
     fn kind(&self) -> BenchmarkKind {

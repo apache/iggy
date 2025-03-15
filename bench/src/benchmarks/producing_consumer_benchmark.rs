@@ -18,14 +18,17 @@
 
 use crate::actors::producing_consumer::ProducingConsumer;
 use crate::args::common::IggyBenchArgs;
-use crate::benchmarks::benchmark::{BenchmarkFutures, Benchmarkable};
+use crate::benchmarks::benchmark::Benchmarkable;
 use crate::rate_limiter::RateLimiter;
 use async_trait::async_trait;
+use iggy::error::IggyError;
 use iggy::messages::poll_messages::PollingKind;
 use iggy_bench_report::benchmark_kind::BenchmarkKind;
+use iggy_bench_report::individual_metrics::BenchmarkIndividualMetrics;
 use integration::test_server::ClientFactory;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
+use tokio::task::JoinSet;
 use tracing::info;
 
 pub struct EndToEndProducingConsumerBenchmark {
@@ -44,7 +47,9 @@ impl EndToEndProducingConsumerBenchmark {
 
 #[async_trait]
 impl Benchmarkable for EndToEndProducingConsumerBenchmark {
-    async fn run(&mut self) -> BenchmarkFutures {
+    async fn run(
+        &mut self,
+    ) -> Result<JoinSet<Result<BenchmarkIndividualMetrics, IggyError>>, IggyError> {
         self.init_streams().await.expect("Failed to init streams!");
         let actors_count = self.args.producers();
         info!("Creating {} producing consumer(s)...", actors_count);
@@ -54,7 +59,8 @@ impl Benchmarkable for EndToEndProducingConsumerBenchmark {
         let message_size = self.args.message_size();
         let warmup_time = self.args.warmup_time();
         let polling_kind = PollingKind::Offset;
-        let mut futures: BenchmarkFutures = Ok(Vec::with_capacity(actors_count as usize));
+
+        let mut set = JoinSet::new();
         for actor_id in 1..=actors_count {
             let args = self.args.clone();
             let client_factory = self.client_factory.clone();
@@ -83,11 +89,11 @@ impl Benchmarkable for EndToEndProducingConsumerBenchmark {
                 polling_kind,
                 false,
             );
-            let future = Box::pin(async move { actor.run().await });
-            futures.as_mut().unwrap().push(future);
+            set.spawn(actor.run());
         }
+
         info!("Created {} producing consumer(s).", actors_count);
-        futures
+        Ok(set)
     }
 
     fn kind(&self) -> BenchmarkKind {

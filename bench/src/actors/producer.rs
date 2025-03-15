@@ -88,7 +88,7 @@ impl Producer {
         }
     }
 
-    pub async fn run(&self) -> Result<BenchmarkIndividualMetrics, IggyError> {
+    pub async fn run(self) -> Result<BenchmarkIndividualMetrics, IggyError> {
         let topic_id: u32 = 1;
         let default_partition_id: u32 = 1;
         let partitions_count = self.partitions_count;

@@ -19,14 +19,17 @@
 use crate::actors::consumer::Consumer;
 use crate::actors::producer::Producer;
 use crate::args::common::IggyBenchArgs;
-use crate::benchmarks::benchmark::{BenchmarkFutures, Benchmarkable};
+use crate::benchmarks::benchmark::Benchmarkable;
 use crate::rate_limiter::RateLimiter;
 use async_trait::async_trait;
+use iggy::error::IggyError;
 use iggy::messages::poll_messages::PollingKind;
 use iggy_bench_report::benchmark_kind::BenchmarkKind;
+use iggy_bench_report::individual_metrics::BenchmarkIndividualMetrics;
 use integration::test_server::ClientFactory;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
+use tokio::task::JoinSet;
 use tracing::info;
 
 pub struct ProducerAndConsumerBenchmark {
@@ -45,7 +48,9 @@ impl ProducerAndConsumerBenchmark {
 
 #[async_trait]
 impl Benchmarkable for ProducerAndConsumerBenchmark {
-    async fn run(&mut self) -> BenchmarkFutures {
+    async fn run(
+        &mut self,
+    ) -> Result<JoinSet<Result<BenchmarkIndividualMetrics, IggyError>>, IggyError> {
         self.init_streams().await.expect("Failed to init streams!");
         let start_stream_id = self.args.start_stream_id();
         let producers = self.args.producers();
@@ -56,8 +61,7 @@ impl Benchmarkable for ProducerAndConsumerBenchmark {
         let partitions_count = self.args.number_of_partitions();
         let warmup_time = self.args.warmup_time();
 
-        let mut futures: BenchmarkFutures =
-            Ok(Vec::with_capacity((producers + consumers) as usize));
+        let mut set = JoinSet::new();
         for producer_id in 1..=producers {
             let stream_id = start_stream_id + producer_id;
             let producer = Producer::new(
@@ -77,8 +81,7 @@ impl Benchmarkable for ProducerAndConsumerBenchmark {
                     .map(|rl| RateLimiter::new(rl.as_bytes_u64())),
                 false, // TODO: put timestamp into first message, it should be an argument to iggy-bench
             );
-            let future = Box::pin(async move { producer.run().await });
-            futures.as_mut().unwrap().push(future);
+            set.spawn(producer.run());
         }
 
         let polling_kind = PollingKind::Offset;
@@ -103,14 +106,14 @@ impl Benchmarkable for ProducerAndConsumerBenchmark {
                     .rate_limit()
                     .map(|rl| RateLimiter::new(rl.as_bytes_u64())),
             );
-            let future = Box::pin(async move { consumer.run().await });
-            futures.as_mut().unwrap().push(future);
+            set.spawn(consumer.run());
         }
+
         info!(
             "Starting to send and poll {} messages",
             self.total_messages()
         );
-        futures
+        Ok(set)
     }
 
     fn kind(&self) -> BenchmarkKind {
