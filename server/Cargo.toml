@@ -17,6 +17,7 @@
 
 [package]
 name = "server"
+description = "Iggy.rs server"
 version = "0.4.214"
 edition = "2021"
 build = "src/build.rs"

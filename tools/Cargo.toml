@@ -17,6 +17,7 @@
 
 [package]
 name = "tools"
+description = "Iggy.rs tools"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"

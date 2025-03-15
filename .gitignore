@@ -1,4 +1,5 @@
 target*
+.direnv/
 .idea/
 .vscode/
 .DS_Store
@@ -8,4 +9,5 @@ bench_*
 /rust-clippy-results.sarif
 /Cross.toml
 /performance_results*
+/result
 .env
