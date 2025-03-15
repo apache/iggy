@@ -15,13 +15,16 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::streaming::users::permissioner::Permissioner;
+use iggy::error::IggyError;
 
-mod consumer_groups;
-pub mod consumer_offsets;
-mod messages;
-mod partitions;
-mod segments;
-mod streams;
-mod system;
-mod topics;
-mod users;
+impl Permissioner {
+    pub fn delete_segments(
+        &self,
+        user_id: u32,
+        stream_id: u32,
+        topic_id: u32,
+    ) -> Result<(), IggyError> {
+        self.update_topic(user_id, stream_id, topic_id)
+    }
+}

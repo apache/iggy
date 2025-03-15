@@ -15,13 +15,6 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+pub mod delete_segments;
 
-mod consumer_groups;
-pub mod consumer_offsets;
-mod messages;
-mod partitions;
-mod segments;
-mod streams;
-mod system;
-mod topics;
-mod users;
+const MAX_NO_OF_SEGMENTS_TO_BE_DELETED: u32 = 1000;

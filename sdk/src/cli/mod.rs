@@ -23,6 +23,7 @@ pub mod context;
 pub mod message;
 pub mod partitions;
 pub mod personal_access_tokens;
+pub mod segments;
 pub mod streams;
 pub mod system;
 pub mod topics;

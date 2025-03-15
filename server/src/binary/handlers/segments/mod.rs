@@ -15,13 +15,4 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
-mod consumer_groups;
-pub mod consumer_offsets;
-mod messages;
-mod partitions;
-mod segments;
-mod streams;
-mod system;
-mod topics;
-mod users;
+mod delete_segments_handler;

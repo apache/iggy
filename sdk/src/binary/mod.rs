@@ -38,6 +38,8 @@ pub mod partitions;
 #[allow(deprecated)]
 pub mod personal_access_tokens;
 #[allow(deprecated)]
+pub mod segments;
+#[allow(deprecated)]
 pub mod streams;
 #[allow(deprecated)]
 pub mod system;

@@ -33,12 +33,14 @@ use crate::logging::Logging;
 use args::context::ContextAction;
 use args::message::MessageAction;
 use args::partition::PartitionAction;
+use args::segment::SegmentAction;
 use args::user::UserAction;
 use args::{CliOptions, IggyMergedConsoleArgs};
 use clap::Parser;
 use iggy::args::Args;
 use iggy::cli::context::common::ContextManager;
 use iggy::cli::context::use_context::UseContextCmd;
+use iggy::cli::segments::delete_segments::DeleteSegmentsCmd;
 use iggy::cli::system::snapshot::GetSnapshotCmd;
 use iggy::cli::{
     client::{get_client::GetClientCmd, get_clients::GetClientsCmd},
@@ -164,6 +166,14 @@ fn get_command(
                 args.stream_id.clone(),
                 args.topic_id.clone(),
                 args.partitions_count,
+            )),
+        },
+        Command::Segment(command) => match command {
+            SegmentAction::Delete(args) => Box::new(DeleteSegmentsCmd::new(
+                args.stream_id.clone(),
+                args.topic_id.clone(),
+                args.partition_id,
+                args.segments_count,
             )),
         },
         Command::Ping(args) => Box::new(PingCmd::new(args.count)),

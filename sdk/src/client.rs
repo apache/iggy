@@ -79,6 +79,7 @@ pub trait Client:
     + StreamClient
     + TopicClient
     + PartitionClient
+    + SegmentClient
     + MessageClient
     + ConsumerOffsetClient
     + ConsumerGroupClient
@@ -328,6 +329,23 @@ pub trait PartitionClient {
         stream_id: &Identifier,
         topic_id: &Identifier,
         partitions_count: u32,
+    ) -> Result<(), IggyError>;
+}
+
+/// This trait defines the methods to interact with the partition module.
+#[async_trait]
+pub trait SegmentClient {
+    /// Delete last N segments for a partition by unique ID or name.
+    ///
+    /// For example, given a partition with 5 segments, if you delete 2 segments, the topic will have 3 segments left (from 1 to 3).
+    ///
+    /// Authentication is required, and the permission to manage the segments.
+    async fn delete_segments(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: u32,
+        segments_count: u32,
     ) -> Result<(), IggyError>;
 }
 

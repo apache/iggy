@@ -25,6 +25,7 @@ use figlet_rs::FIGfont;
 
 use iggy::args::{Args as IggyArgs, ArgsOptional as IggyArgsOptional};
 use iggy::cli::context::common::ContextConfig;
+use segment::SegmentAction;
 use system::SnapshotArgs;
 
 use crate::args::{
@@ -54,6 +55,7 @@ pub(crate) mod message;
 pub(crate) mod partition;
 pub(crate) mod permissions;
 pub(crate) mod personal_access_token;
+pub(crate) mod segment;
 pub(crate) mod stream;
 pub(crate) mod system;
 pub(crate) mod topic;
@@ -139,6 +141,9 @@ pub(crate) enum Command {
     /// partition operations
     #[command(subcommand, visible_alias = "p")]
     Partition(PartitionAction),
+    /// partition operations
+    #[command(subcommand, visible_alias = "p")]
+    Segment(SegmentAction),
     /// ping iggy server
     ///
     /// Check if iggy server is up and running and what's the response ping response time
