@@ -110,6 +110,7 @@ jobs:
         run: cross +stable test --verbose --target x86_64-unknown-linux-musl
 
       - name: Check CLI examples from README
+        timeout-minutes: 10
         run: ./scripts/run-examples-from-readme.sh
 
       - name: Check if workspace is clean
