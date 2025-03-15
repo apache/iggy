@@ -30,11 +30,18 @@ updates:
       - "apache/iggy-committers"
     reviewers:
       - "apache/iggy-committers"
+    groups:
+      minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
 
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
-      interval: "daily"
+      interval: "weekly"
     rebase-strategy: "disabled"
     commit-message:
       prefix: "chore(deps): "
@@ -42,3 +49,10 @@ updates:
       - "apache/iggy-committers"
     reviewers:
       - "apache/iggy-committers"
+    groups:
+      minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
