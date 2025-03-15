@@ -31,28 +31,26 @@ jobs:
     name: merge-file-changes
     runs-on: ubuntu-latest
     outputs:
-      trigger-rust: ${{ steps.changed-files-yaml.outputs.rust_any_changed }}
+      trigger-rust: ${{ steps.changed-files.outputs.RUST-PROD_FILES_CHANGED }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      - name: Check changed files
-        id: changed-files-yaml
-        uses: tj-actions/changed-files@v45
         with:
-          files_yaml: |
-            rust:
-              - '**/*.rs'
-              - '**/Cargo.toml'
-              - Cargo.toml
-              - Cargo.lock
-              - Dockerfile
-              - Dockerfile.*
-              - .github/workflows/ci-prod-rust.yml
+          fetch-depth: 0
+      - name: Install python3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3
+          python3 --version
+      - name: Detect file changes
+        id: changed-files
+        run: |
+          .github/scripts/detect-changed-files.sh master
       - name: List all changed files
         run: |
-          if [ "${{ steps.changed-files-yaml.outputs.rust_any_changed }}" == "true" ]; then
+          if [ "${{ steps.changed-files.outputs.RUST-PROD_FILES_CHANGED }}" == "true" ]; then
             echo "One or more rust file(s) has changed."
-            echo "List all the files that have changed: ${{ steps.changed-files-yaml.outputs.rust_all_changed_files }}"
+            echo "List all the files that have changed: ${{ steps.changed-files.outputs.RUST-PROD_FILES }}"
           fi
 
   ci-prod-rust:

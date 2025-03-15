@@ -1,0 +1,22 @@
+{
+  "rust": [
+    "(bench|cli|examples|integration|sdk|server|tools).*\\.rs",
+    "Cargo.toml",
+    "Cargo.lock",
+    ".github/workflows/ci-.*-rust.yml",
+    ".github/workflows/ci-check-pr.yml"
+  ],
+  "shell": [
+    ".github/scripts/.*\\.sh",
+    "scripts/.*\\.sh",
+    ".github/workflows/ci-.*-shell.yml",
+    ".github/workflows/ci-check-pr.yml"
+  ],
+  "rust-prod": [
+    "(bench|cli|examples|integration|sdk|server|tools).*\\.rs",
+    "Cargo.toml",
+    "Cargo.lock",
+    "Dockerfile.*",
+    ".github/workflows/ci-prod-rust.yml"
+  ]
+}
