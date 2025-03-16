@@ -31,7 +31,7 @@ name: ci-prod-rust
 
 on:
   workflow_call:
-    secretes:
+    secrets:
       DOCKERHUB_USER:
         required: true
       DOCKERHUB_TOKEN:

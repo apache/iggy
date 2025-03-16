@@ -59,8 +59,8 @@ jobs:
     if: ${{ needs.merge-file-changes.outputs.trigger-rust == 'true' }}
     uses: ./.github/workflows/ci-prod-rust.yml
     secrets:
-      DOCKERHUB_USER: ${{ secretes.DOCKERHUB_USER }}
-      DOCKERHUB_TOKEN: ${{ secretes.DOCKERHUB_TOKEN }}
+      DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
 
   finalize-prod:
     runs-on: ubuntu-latest
