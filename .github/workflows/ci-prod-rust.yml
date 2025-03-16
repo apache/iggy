@@ -117,7 +117,7 @@ jobs:
           platforms: ${{ matrix.platform.docker_arch }}
           labels: ${{ steps.meta.outputs.labels }}
           tags: ${{ env.DOCKERHUB_REGISTRY_NAME }}:edge
-          outputs: type=image,name=${{ env.DOCKERHUB_REGISTRY_NAME }},push-by-digest=true,name-canonical=true
+          outputs: type=image,name=${{ env.DOCKERHUB_REGISTRY_NAME }}
           push: true
           build-args: |
             IGGY_CMD_PATH=target/${{ matrix.platform.target }}/release/iggy
