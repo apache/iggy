@@ -31,6 +31,11 @@ name: ci-prod-rust
 
 on:
   workflow_call:
+    secretes:
+      DOCKERHUB_USER:
+        required: true
+      DOCKERHUB_TOKEN:
+        required: true
 
 env:
   DOCKERHUB_REGISTRY_NAME: apache/iggy
