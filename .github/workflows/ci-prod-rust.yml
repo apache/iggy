@@ -23,7 +23,9 @@
 # It is triggered by changes to Rust files. It builds and
 # iggy-server and iggy-cli binaries and creates Docker images
 # for x86_64 and aarch64 architectures, then images are pushed to
-# Docker Hub.
+# Docker Hub by digest. In the next step, the workflow creates
+# edge tag based on the digests and pushes the manifest list
+# to Docker Hub.
 #
 # This workflow can be triggered only oby other workflows.
 #
@@ -110,15 +112,61 @@ jobs:
         with:
           images: ${{ env.DOCKERHUB_REGISTRY_NAME }}
       - name: Build and push by digest
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.ci
           platforms: ${{ matrix.platform.docker_arch }}
           labels: ${{ steps.meta.outputs.labels }}
-          tags: ${{ env.DOCKERHUB_REGISTRY_NAME }}:edge
-          outputs: type=image,name=${{ env.DOCKERHUB_REGISTRY_NAME }}
+          outputs: type=image,name=${{ env.DOCKERHUB_REGISTRY_NAME }},push-by-digest=true,name-canonical=true
           push: true
           build-args: |
             IGGY_CMD_PATH=target/${{ matrix.platform.target }}/release/iggy
             IGGY_SERVER_PATH=target/${{ matrix.platform.target }}/release/iggy-server
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+          ls -l /tmp/digests
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.platform.os_name }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker_edge_publish:
+    name: Docker edge tag publish
+    runs-on: ubuntu-latest
+    needs: docker-edge-build
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "digests-*"
+          merge-multiple: true
+          path: /tmp/digests
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Create Docker meta
+        if: ${{ needs.tag.outputs.tag_created == '' }}
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKERHUB_REGISTRY_NAME }}
+          tags: edge
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.DOCKERHUB_REGISTRY_NAME }}@sha256:%s ' *)
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.DOCKERHUB_REGISTRY_NAME }}:edge
