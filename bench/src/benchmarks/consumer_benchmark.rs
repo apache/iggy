@@ -18,14 +18,17 @@
 
 use crate::actors::consumer::Consumer;
 use crate::args::common::IggyBenchArgs;
-use crate::benchmarks::benchmark::{BenchmarkFutures, Benchmarkable};
+use crate::benchmarks::benchmark::Benchmarkable;
 use crate::rate_limiter::RateLimiter;
 use async_trait::async_trait;
+use iggy::error::IggyError;
 use iggy::messages::poll_messages::PollingKind;
 use iggy_bench_report::benchmark_kind::BenchmarkKind;
+use iggy_bench_report::individual_metrics::BenchmarkIndividualMetrics;
 use integration::test_server::ClientFactory;
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
+use tokio::task::JoinSet;
 use tracing::info;
 
 pub struct ConsumerBenchmark {
@@ -44,14 +47,16 @@ impl ConsumerBenchmark {
 
 #[async_trait]
 impl Benchmarkable for ConsumerBenchmark {
-    async fn run(&mut self) -> BenchmarkFutures {
+    async fn run(
+        &mut self,
+    ) -> Result<JoinSet<Result<BenchmarkIndividualMetrics, IggyError>>, IggyError> {
         self.check_streams().await?;
         let consumers_count = self.args.consumers();
         info!("Creating {} consumer(s)...", consumers_count);
         let messages_per_batch = self.args.messages_per_batch();
         let message_batches = self.args.message_batches();
 
-        let mut futures: BenchmarkFutures = Ok(Vec::with_capacity(consumers_count as usize));
+        let mut set = JoinSet::new();
         for consumer_id in 1..=consumers_count {
             let args = self.args.clone();
             let client_factory = self.client_factory.clone();
@@ -94,12 +99,11 @@ impl Benchmarkable for ConsumerBenchmark {
                 args.rate_limit()
                     .map(|rl| RateLimiter::new(rl.as_bytes_u64())),
             );
-
-            let future = Box::pin(async move { consumer.run().await });
-            futures.as_mut().unwrap().push(future);
+            set.spawn(consumer.run());
         }
+
         info!("Created {} consumer(s).", consumers_count);
-        futures
+        Ok(set)
     }
 
     fn kind(&self) -> BenchmarkKind {
