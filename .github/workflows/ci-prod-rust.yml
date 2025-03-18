@@ -38,6 +38,7 @@ on:
         required: true
       DOCKERHUB_TOKEN:
         required: true
+
 env:
   DOCKERHUB_REGISTRY_NAME: apache/iggy
   RUST_BACKTRACE: 1
@@ -118,7 +119,6 @@ jobs:
           file: Dockerfile.ci
           platforms: ${{ matrix.platform.docker_arch }}
           labels: ${{ steps.meta.outputs.labels }}
-          tags: ${{ env.DOCKERHUB_REGISTRY_NAME }}:edge
           outputs: type=image,name=${{ env.DOCKERHUB_REGISTRY_NAME }},push-by-digest=true,name-canonical=true
           push: true
           build-args: |

@@ -1,1 +1,1 @@
-scopeRegex: "(ci|sdk|server|cli|bench|misc)(,(ci|sdk|server|cli|bench|misc))*"
+scopeRegex: "(ci|sdk|server|cli|bench|misc|docs|test)(,(ci|sdk|server|cli|bench|misc|docs|test))*"
