@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy"
-version = "0.6.203"
+version = "0.6.210"
 description = "Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
 edition = "2021"
 license = "Apache-2.0"
@@ -34,9 +34,9 @@ ahash = { version = "0.8.11", features = ["serde"] }
 anyhow = "1.0.97"
 async-broadcast = { version = "0.7.2" }
 async-dropper = { version = "0.3.1", features = ["tokio", "simple"] }
-async-trait = "0.1.87"
+async-trait = "0.1.88"
 base64 = "0.22.1"
-bon = { version = "3.4" }
+bon = { version = "3.5" }
 byte-unit = { version = "5.1.6", default-features = false, features = [
     "serde",
     "byte",
@@ -54,31 +54,31 @@ fast-async-mutex = { version = "0.6.7", optional = true }
 flume = "0.11.1"
 futures = "0.3.31"
 futures-util = "0.3.31"
-humantime = "2.1.0"
+humantime = "2.2.0"
 keyring = { version = "3.6.2", optional = true, features = [
     "sync-secret-service",
     "vendored",
 ] }
 passterm = { version = "=2.0.1", optional = true }
-quinn = { version = "0.11.6" }
-reqwest = { version = "0.12.12", default-features = false, features = [
+quinn = { version = "0.11.7" }
+reqwest = { version = "0.12.15", default-features = false, features = [
     "json",
     "rustls-tls",
 ] }
 reqwest-middleware = { version = "0.4.1", features = ["json"] }
 reqwest-retry = "0.7.0"
-rustls = { version = "0.23.23", features = ["ring"] }
+rustls = { version = "0.23.25", features = ["ring"] }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = "1.0.140"
 serde_with = { version = "3.12.0", features = ["base64"] }
 strum = { version = "0.27.1", features = ["derive"] }
 thiserror = "2.0.12"
-tokio = { version = "1.44.0", features = ["full"] }
+tokio = { version = "1.44.1", features = ["full"] }
 tokio-rustls = { version = "0.26.2" }
 toml = "0.8.20"
 tracing = { version = "0.1.41" }
 trait-variant = { version = "0.1.2" }
-uuid = { version = "1.15.1", features = ["v7", "fast-rng", "zerocopy"] }
+uuid = { version = "1.16.0", features = ["v7", "fast-rng", "zerocopy"] }
 webpki-roots = { version = "0.26.8" }
 
 [build-dependencies]
