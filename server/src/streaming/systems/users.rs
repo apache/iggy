@@ -47,17 +47,17 @@ impl System {
         if users.is_empty() {
             info!("No users found, creating the root user...");
             let root = Self::create_root_user();
-            let command = CreateUser {
-                username: root.username.clone(),
-                password: root.password.clone(),
-                status: root.status,
-                permissions: root.permissions.clone(),
+            let command = CreateUserWithId {
+                user_id: root.id,
+                command: CreateUser {
+                    username: root.username.clone(),
+                    password: root.password.clone(),
+                    status: root.status,
+                    permissions: root.permissions.clone(),
+                },
             };
             self.state
-                .apply(0, EntryCommand::CreateUser(CreateUserWithId {
-                    user_id: root.id,
-                    command
-                }))
+                .apply(0, &EntryCommand::CreateUser(command))
                 .await
                 .with_error_context(|error| {
                     format!(

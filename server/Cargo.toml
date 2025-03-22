@@ -52,14 +52,17 @@ console-subscriber = { version = "0.4.1", optional = true }
 dashmap = "6.1.0"
 derive_more = "2.0.1"
 dotenvy = { version = "0.15.7" }
+enum_dispatch = "0.3.13"
 error_set = { version = "0.8.5", features = ["tracing"] }
 figlet-rs = "0.1.5"
 figment = { version = "0.10.19", features = ["toml", "env"] }
 flume = "0.11.1"
 futures = "0.3.31"
+gxhash = "3.5.0"
 human-repr = "1.1.0"
 iggy = { path = "../sdk" }
 jsonwebtoken = "9.3.1"
+lending-iterator = "0.1.7"
 mimalloc = { version = "0.1", optional = true }
 moka = { version = "0.12.10", features = ["future"] }
 nix = { version = "0.29", features = ["fs"] }

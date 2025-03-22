@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 
 use crate::error::IggyError;
 
@@ -29,4 +29,14 @@ pub trait BytesSerializable {
     fn from_bytes(bytes: Bytes) -> Result<Self, IggyError>
     where
         Self: Sized;
+
+    /// Write the struct to a buffer.
+    fn write_to_buffer(&self, _buf: &mut BytesMut) {
+        unimplemented!();
+    }
+
+    /// Get the byte-size of the struct.
+    fn get_buffer_size(&self) -> u32 {
+        unimplemented!();
+    }
 }

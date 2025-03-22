@@ -20,12 +20,12 @@ use super::server_command::ServerCommand;
 use crate::configs::server::ServerConfig;
 use crate::streaming::systems::system::SharedSystem;
 
-pub struct ServerCommandHandler<'a> {
+pub struct BackgroundServerCommandHandler<'a> {
     system: SharedSystem,
     config: &'a ServerConfig,
 }
 
-impl<'a> ServerCommandHandler<'a> {
+impl<'a> BackgroundServerCommandHandler<'a> {
     pub fn new(system: SharedSystem, config: &'a ServerConfig) -> Self {
         Self { system, config }
     }
