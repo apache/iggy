@@ -67,11 +67,7 @@ impl ServerCommandHandler for GetConsumerOffset {
 }
 
 impl BinaryServerCommand for GetConsumerOffset {
-    async fn from_sender(
-        sender: &mut SenderKind,
-        code: u32,
-        length: u32,
-    ) -> Result<Self, IggyError>
+    async fn from_sender(sender: &mut SenderKind, code: u32, length: u32) -> Result<Self, IggyError>
     where
         Self: Sized,
     {

@@ -63,7 +63,7 @@ impl ServerCommandHandler for CreateUser {
                     )
                 })?;
 
-        let user_id = user.id;       
+        let user_id = user.id;
         let response = mapper::map_user(user);
 
         // For the security of the system, we hash the password before storing it in metadata.

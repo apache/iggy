@@ -55,7 +55,11 @@ impl ServerCommandHandler for Ping {
 }
 
 impl BinaryServerCommand for Ping {
-    async fn from_sender(_sender: &mut SenderKind, _length: u32, _code: u32) -> Result<Self, IggyError>
+    async fn from_sender(
+        _sender: &mut SenderKind,
+        _length: u32,
+        _code: u32,
+    ) -> Result<Self, IggyError>
     where
         Self: Sized,
     {
