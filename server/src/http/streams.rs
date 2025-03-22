@@ -117,7 +117,7 @@ async fn create_stream(
     let system = system.downgrade();
     system
         .state
-        .apply(identity.user_id, &EntryCommand::CreateStream(command))
+        .apply(identity.user_id, &EntryCommand::CreateStream(CreateStreamWithId{ stream_id, command} ))
         .await
         .with_error_context(|error| {
             format!(

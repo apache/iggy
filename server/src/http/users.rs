@@ -132,11 +132,14 @@ async fn create_user(
         .state
         .apply(
             identity.user_id,
-            &EntryCommand::CreateUser(CreateUser {
-                username: command.username.clone(),
-                password: crypto::hash_password(&command.password),
-                status: command.status,
-                permissions: command.permissions,
+            &EntryCommand::CreateUser(CreateUserWithId {
+                user_id: user_id,
+                command: CreateUser {
+                    username: command.username.clone(),
+                    password: crypto::hash_password(&command.password),
+                    status: command.status,
+                    permissions: command.permissions,
+                },
             }),
         )
         .await

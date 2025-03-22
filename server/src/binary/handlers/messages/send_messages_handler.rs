@@ -15,21 +15,18 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
 use crate::binary::command::{BinaryServerCommand, ServerCommandHandler};
-use crate::binary::{handlers::messages::COMPONENT, sender::SenderKind};
+use crate::binary::sender::SenderKind;
+use crate::streaming::segments::IggyMessagesMut;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use bytes::{Bytes, BytesMut};
-use error_set::ErrContext;
-use iggy::bytes_serializable::BytesSerializable;
+use bytes::{Buf, BytesMut};
 use iggy::error::IggyError;
 use iggy::identifier::Identifier;
-use iggy::messages::send_messages::{Partitioning, SendMessages};
-use iggy::models::batch::{IggyHeader, IggyMutableBatch, IGGY_BATCH_OVERHEAD};
+use iggy::prelude::*;
 use iggy::utils::sizeable::Sizeable;
-use tracing::{debug, instrument};
+use tracing::instrument;
 
 impl ServerCommandHandler for SendMessages {
     fn code(&self) -> u32 {
@@ -44,47 +41,54 @@ impl ServerCommandHandler for SendMessages {
         partitioning = %self.partitioning
     ))]
     async fn handle(
-        self,
+        mut self,
         sender: &mut SenderKind,
         length: u32,
         session: &Session,
         system: &SharedSystem,
     ) -> Result<(), IggyError> {
-        let mut metadata_len_bytes = [0u8; 4];
-        sender.read(&mut metadata_len_bytes).await?;
-        let metadata_len = u32::from_le_bytes(metadata_len_bytes);
+        let length = length - 4;
+        let mut buffer = BytesMut::with_capacity(length as usize);
+        unsafe {
+            buffer.set_len(length as usize);
+        }
+        sender.read(&mut buffer).await?;
 
-        let mut metadata = vec![0u8; metadata_len as usize];
-        sender.read(&mut metadata).await?;
-        let metadata = Bytes::from(metadata);
+        let mut element_size;
 
-        let stream_id = Identifier::from_bytes(metadata.clone())?;
-        let mut position = stream_id.get_size_bytes().as_bytes_usize();
-        let topic_id = Identifier::from_bytes(metadata.slice(position..))?;
-        position += topic_id.get_size_bytes().as_bytes_usize();
-        let partitioning = Partitioning::from_bytes(metadata.slice(position..))?;
+        let stream_id = Identifier::from_raw_bytes(buffer.chunk())?;
+        element_size = stream_id.get_size_bytes().as_bytes_usize();
+        buffer.advance(element_size);
 
-        let mut header_bytes = [0u8; IGGY_BATCH_OVERHEAD as usize];
-        sender.read(&mut header_bytes).await?;
-        let header = IggyHeader::from_bytes(&header_bytes);
+        let topic_id = Identifier::from_raw_bytes(buffer.chunk())?;
+        element_size = topic_id.get_size_bytes().as_bytes_usize();
+        buffer.advance(element_size);
 
-        let batch_length = length - metadata_len - IGGY_BATCH_OVERHEAD as u32 - 4 - 4; // TODO(hubcio): magic numbers
-        let mut batch_buffer = BytesMut::with_capacity(batch_length as _);
-        unsafe { batch_buffer.set_len(batch_length as _) };
-        sender.read(&mut batch_buffer).await?;
-        let batch = IggyMutableBatch::new(header, batch_buffer);
+        let partitioning = Partitioning::from_raw_bytes(buffer.chunk())?;
+        element_size = partitioning.get_size_bytes().as_bytes_usize();
+        buffer.advance(element_size);
 
-        debug!("session: {session}, command: {self}");
+        let messages_count = buffer.get_u32_le();
+        let messages = buffer.split();
+
+        let messages = IggyMessagesMut::from_bytes(messages, messages_count);
 
         let system = system.read().await;
         system
-            .append_messages(session, &stream_id, &topic_id, &partitioning, batch, None)
-            .await
-            .with_error_context(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to append messages, session: {session}"
-                )
-            })?;
+            .append_messages(
+                session,
+                &stream_id,
+                &topic_id,
+                &partitioning,
+                messages,
+                None,
+            )
+            .await?;
+        drop(system);
+
+        self.stream_id = stream_id;
+        self.topic_id = topic_id;
+        self.partitioning = partitioning;
 
         sender.send_empty_ok_response().await?;
         Ok(())

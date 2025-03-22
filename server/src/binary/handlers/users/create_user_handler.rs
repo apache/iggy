@@ -62,6 +62,8 @@ impl ServerCommandHandler for CreateUser {
                         self.username
                     )
                 })?;
+
+        let user_id = user.id;       
         let response = mapper::map_user(user);
 
         // For the security of the system, we hash the password before storing it in metadata.
@@ -70,12 +72,12 @@ impl ServerCommandHandler for CreateUser {
             .state
             .apply(
                 session.get_user_id(),
-                &EntryCommand::CreateUser(CreateUser {
+                &EntryCommand::CreateUser( CreateUserWithId { user_id, command:  CreateUser {
                     username: self.username.to_owned(),
                     password: crypto::hash_password(&self.password),
                     status: self.status,
                     permissions: self.permissions.clone(),
-                }),
+                }}),
             )
             .await
             .with_error_context(|error| {

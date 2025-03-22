@@ -67,10 +67,12 @@ impl ServerCommandHandler for CreateTopic {
         self.max_topic_size = topic.max_topic_size;
         let response = mapper::map_topic(topic).await;
 
+        let topic_id = topic.topic_id;
+
         let system = system.downgrade();
         system
             .state
-            .apply(session.get_user_id(),&EntryCommand::CreateTopic(self))
+            .apply(session.get_user_id(),&EntryCommand::CreateTopic(CreateTopicWithId { topic_id, command: self}))
             .await
             .with_error_context(|error| {
                 format!(

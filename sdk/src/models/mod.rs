@@ -31,3 +31,4 @@ pub mod stream;
 pub mod topic;
 pub mod user_info;
 pub mod user_status;
+pub mod messaging;

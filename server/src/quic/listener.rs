@@ -18,6 +18,7 @@
 
 use crate::binary::command;
 use crate::binary::sender::SenderKind;
+use crate::command::ServerCommand;
 use crate::server_error::ConnectionError;
 use crate::streaming::clients::client_manager::Transport;
 use crate::streaming::session::Session;

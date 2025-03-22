@@ -56,12 +56,15 @@ impl ServerCommandHandler for CreateStream {
                         stream_id
                     )
                 })?;
+
+        let stream_id = stream.stream_id;
+
         let response = mapper::map_stream(stream);
 
         let system = system.downgrade();
         system
             .state
-            .apply(session.get_user_id(), &EntryCommand::CreateStream(self))
+            .apply(session.get_user_id(), &EntryCommand::CreateStream(CreateStreamWithId { stream_id, command: self }))
             .await
             .with_error_context(|error| {
                 format!(

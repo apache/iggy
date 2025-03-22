@@ -62,6 +62,9 @@ impl ServerCommandHandler for CreateConsumerGroup {
                 })?;
         let consumer_group = consumer_group.read().await;
         let response = mapper::map_consumer_group(&consumer_group).await;
+
+        let consumer_group_id = consumer_group.group_id;
+
         drop(consumer_group);
 
         let system = system.downgrade();
@@ -73,7 +76,7 @@ impl ServerCommandHandler for CreateConsumerGroup {
             .state
             .apply(
                 session.get_user_id(),
-                &EntryCommand::CreateConsumerGroup(self),
+                &EntryCommand::CreateConsumerGroup(CreateConsumerGroupWithId { group_id: consumer_group_id, command: self }),
             )
             .await
             .with_error_context(|error| {

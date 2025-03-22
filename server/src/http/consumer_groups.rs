@@ -124,7 +124,7 @@ async fn create_consumer_group(
         .state
         .apply(
             identity.user_id,
-            &EntryCommand::CreateConsumerGroup(command),
+            &EntryCommand::CreateConsumerGroup(CreateConsumerGroupWithId { group_id, command }),
         )
         .await?;
 

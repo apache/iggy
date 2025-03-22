@@ -139,7 +139,7 @@ async fn create_topic(
     let system = system.downgrade();
     system
         .state
-        .apply(identity.user_id, &EntryCommand::CreateTopic(command))
+        .apply(identity.user_id, &EntryCommand::CreateTopic(CreateTopicWithId { topic_id, command } ))
         .await
         .with_error_context(|error| {
             format!(
