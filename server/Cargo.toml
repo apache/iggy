@@ -64,9 +64,9 @@ mimalloc = { version = "0.1", optional = true }
 moka = { version = "0.12.10", features = ["future"] }
 nix = { version = "0.29", features = ["fs"] }
 openssl = { version = "0.10.71", features = ["vendored"] }
-opentelemetry = { version = "0.28.0", features = ["trace", "logs"] }
-opentelemetry-appender-tracing = { version = "0.28.1", features = ["log"] }
-opentelemetry-otlp = { version = "0.28.0", features = [
+opentelemetry = { version = "0.29.0", features = ["trace", "logs"] }
+opentelemetry-appender-tracing = { version = "0.29.1", features = ["log"] }
+opentelemetry-otlp = { version = "0.29.0", features = [
     "logs",
     "trace",
     "grpc-tonic",
@@ -75,8 +75,8 @@ opentelemetry-otlp = { version = "0.28.0", features = [
     "reqwest-client",
     "tokio",
 ] }
-opentelemetry-semantic-conventions = { version = "0.28.0" }
-opentelemetry_sdk = { version = "0.28.0", features = [
+opentelemetry-semantic-conventions = { version = "0.29.0" }
+opentelemetry_sdk = { version = "0.29.0", features = [
     "rt-tokio",
     "logs",
     "trace",
@@ -115,7 +115,7 @@ tower-http = { version = "0.6.2", features = [
 ] }
 tracing = { version = "0.1.41" }
 tracing-appender = "0.2.3"
-tracing-opentelemetry = { version = "0.29.0" }
+tracing-opentelemetry = { version = "0.30.0" }
 tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter"] }
 twox-hash = { version = "2.1.0", features = ["xxhash32"] }
 ulid = "1.2.1"

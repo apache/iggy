@@ -79,6 +79,7 @@ impl System {
                 user_state.permissions,
             );
 
+            user.created_at = user_state.created_at;
             user.personal_access_tokens = user_state
                 .personal_access_tokens
                 .into_values()
