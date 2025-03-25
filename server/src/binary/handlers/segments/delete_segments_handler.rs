@@ -58,7 +58,7 @@ pub async fn handle(
         .state
         .apply(
             session.get_user_id(),
-            EntryCommand::DeleteSegments(command),
+            &EntryCommand::DeleteSegments(command),
         )
         .await
         .with_error_context(|error| {
