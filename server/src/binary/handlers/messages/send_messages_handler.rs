@@ -20,6 +20,7 @@ use crate::binary::handlers::messages::COMPONENT;
 use crate::binary::sender::SenderKind;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
+use crate::streaming::utils::random_id;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy::error::IggyError;
@@ -37,7 +38,12 @@ pub async fn handle(
     let stream_id = command.stream_id.clone();
     let topic_id = command.topic_id.clone();
     let partitioning = command.partitioning.clone();
-    let messages = command.messages;
+    let mut messages = command.messages;
+    messages.iter_mut().for_each(|msg| {
+        if msg.id == 0 {
+            msg.id = random_id::get_uuid();
+        }
+    });
     // TODO(haze): Add confirmation level after testing is complete
     system
         .append_messages(session, stream_id, topic_id, partitioning, messages, None)
