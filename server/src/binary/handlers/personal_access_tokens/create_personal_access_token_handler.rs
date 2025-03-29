@@ -38,7 +38,7 @@ pub async fn handle(
 ) -> Result<(), IggyError> {
     debug!("session: {session}, command: {command}");
 
-    let mut system = system.write().await;
+    let system = system.read().await;
     let token = system
             .create_personal_access_token(session, &command.name, command.expiry)
             .await
@@ -51,7 +51,6 @@ pub async fn handle(
     let bytes = mapper::map_raw_pat(&token);
     let token_hash = PersonalAccessToken::hash_token(&token);
 
-    let system = system.downgrade();
     system
         .state
         .apply(

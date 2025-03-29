@@ -82,8 +82,7 @@ async fn create_personal_access_token(
     Json(command): Json<CreatePersonalAccessToken>,
 ) -> Result<Json<RawPersonalAccessToken>, CustomError> {
     command.validate()?;
-
-    let mut system = state.system.write().await;
+    let system = state.system.read().await;
     let token = system
             .create_personal_access_token(
                 &Session::stateless(identity.user_id, identity.ip_address),
@@ -98,7 +97,6 @@ async fn create_personal_access_token(
                 )
             })?;
 
-    let system = system.downgrade();
     let token_hash = PersonalAccessToken::hash_token(&token);
     system
         .state

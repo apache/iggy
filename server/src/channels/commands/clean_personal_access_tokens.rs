@@ -78,14 +78,13 @@ impl PersonalAccessTokenCleaner {
 impl ServerCommand<CleanPersonalAccessTokensCommand> for CleanPersonalAccessTokensExecutor {
     #[instrument(skip_all, name = "trace_clean_personal_access_tokens")]
     async fn execute(&mut self, system: &SharedSystem, _command: CleanPersonalAccessTokensCommand) {
-        // TODO: System write lock, investigate if it's necessary.
-        let mut system = system.write().await;
+        let system = system.read().await;
         let now = IggyTimestamp::now();
         let mut deleted_tokens_count = 0;
-        for (_, user) in system.users.iter_mut() {
+        for (_, user) in system.users.iter() {
             let expired_tokens = user
                 .personal_access_tokens
-                .values()
+                .iter()
                 .filter(|token| token.is_expired(now))
                 .map(|token| token.token.clone())
                 .collect::<Vec<_>>();

@@ -15,21 +15,21 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
 use crate::streaming::utils::hash;
 use iggy::models::user_info::UserId;
 use iggy::utils::expiry::IggyExpiry;
 use iggy::utils::text::as_base64;
 use iggy::utils::timestamp::IggyTimestamp;
 use ring::rand::SecureRandom;
+use std::sync::Arc;
 
 const SIZE: usize = 50;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PersonalAccessToken {
     pub user_id: UserId,
-    pub name: String,
-    pub token: String,
+    pub name: Arc<String>,
+    pub token: Arc<String>,
     pub expiry_at: Option<IggyTimestamp>,
 }
 
@@ -49,8 +49,8 @@ impl PersonalAccessToken {
         (
             Self {
                 user_id,
-                name: name.to_string(),
-                token: token_hash,
+                name: Arc::new(name.to_string()),
+                token: Arc::new(token_hash),
                 expiry_at: Self::calculate_expiry_at(now, expiry),
             },
             token,
@@ -65,8 +65,8 @@ impl PersonalAccessToken {
     ) -> Self {
         Self {
             user_id,
-            name: name.into(),
-            token: token_hash.into(),
+            name: Arc::new(name.into()),
+            token: Arc::new(token_hash.into()),
             expiry_at,
         }
     }
@@ -106,12 +106,12 @@ mod tests {
         let name = "test_token";
         let (personal_access_token, raw_token) =
             PersonalAccessToken::new(user_id, name, now, IggyExpiry::NeverExpire);
-        assert_eq!(personal_access_token.name, name);
+        assert_eq!(personal_access_token.name.as_str(), name);
         assert!(!personal_access_token.token.is_empty());
         assert!(!raw_token.is_empty());
-        assert_ne!(personal_access_token.token, raw_token);
+        assert_ne!(personal_access_token.token.as_str(), raw_token);
         assert_eq!(
-            personal_access_token.token,
+            personal_access_token.token.as_str(),
             PersonalAccessToken::hash_token(&raw_token)
         );
     }

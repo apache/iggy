@@ -31,7 +31,7 @@ impl System {
     pub async fn get_personal_access_tokens(
         &self,
         session: &Session,
-    ) -> Result<Vec<&PersonalAccessToken>, IggyError> {
+    ) -> Result<Vec<PersonalAccessToken>, IggyError> {
         self.ensure_authenticated(session)?;
         let user_id = session.get_user_id();
         let user = self
@@ -40,7 +40,12 @@ impl System {
                 format!("{COMPONENT} (error: {error}) - failed to get user with id: {user_id}")
             })?;
         info!("Loading personal access tokens for user with ID: {user_id}...",);
-        let personal_access_tokens: Vec<_> = user.personal_access_tokens.values().collect();
+        let personal_access_tokens: Vec<_> = user
+            .personal_access_tokens
+            .iter()
+            .map(|pat| pat.clone())
+            .collect();
+
         info!(
             "Loaded {} personal access tokens for user with ID: {user_id}.",
             personal_access_tokens.len(),
@@ -49,7 +54,7 @@ impl System {
     }
 
     pub async fn create_personal_access_token(
-        &mut self,
+        &self,
         session: &Session,
         name: &str,
         expiry: IggyExpiry,
@@ -73,14 +78,14 @@ impl System {
             }
         }
 
-        let user = self.get_user_mut(&identifier).with_error_context(|error| {
+        let user = self.get_user(&identifier).with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to get mutable reference to the user with id: {user_id}")
         })?;
 
         if user
             .personal_access_tokens
-            .values()
-            .any(|pat| pat.name == name)
+            .iter()
+            .any(|pat| pat.name.as_str() == name)
         {
             error!("Personal access token: {name} for user with ID: {user_id} already exists.");
             return Err(IggyError::PersonalAccessTokenAlreadyExists(
@@ -113,20 +118,16 @@ impl System {
                 )
             })?;
 
-        let token;
-
+        let token = if let Some(pat) = user
+            .personal_access_tokens
+            .iter()
+            .find(|pat| pat.name.as_str() == name)
         {
-            let pat = user
-                .personal_access_tokens
-                .iter()
-                .find(|(_, pat)| pat.name == name);
-            if pat.is_none() {
-                error!("Personal access token: {name} for user with ID: {user_id} does not exist.",);
-                return Err(IggyError::ResourceNotFound(name.to_owned()));
-            }
-
-            token = pat.unwrap().1.token.clone();
-        }
+            pat.token.clone()
+        } else {
+            error!("Personal access token: {name} for user with ID: {user_id} does not exist.",);
+            return Err(IggyError::ResourceNotFound(name.to_owned()));
+        };
 
         info!("Deleting personal access token: {name} for user with ID: {user_id}...");
         user.personal_access_tokens.remove(&token);
@@ -160,7 +161,7 @@ impl System {
                 personal_access_token.name, personal_access_token.user_id
             );
             return Err(IggyError::PersonalAccessTokenExpired(
-                personal_access_token.name.clone(),
+                personal_access_token.name.as_str().to_owned(),
                 personal_access_token.user_id,
             ));
         }

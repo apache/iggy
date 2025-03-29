@@ -15,14 +15,14 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::utils::crypto;
-use ahash::AHashMap;
+use dashmap::DashMap;
 use iggy::models::user_status::UserStatus;
 use iggy::models::{permissions::Permissions, user_info::UserId};
 use iggy::users::defaults::*;
 use iggy::utils::timestamp::IggyTimestamp;
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct User {
@@ -32,7 +32,7 @@ pub struct User {
     pub password: String,
     pub created_at: IggyTimestamp,
     pub permissions: Option<Permissions>,
-    pub personal_access_tokens: AHashMap<String, PersonalAccessToken>,
+    pub personal_access_tokens: DashMap<Arc<String>, PersonalAccessToken>,
 }
 
 impl Default for User {
@@ -44,7 +44,7 @@ impl Default for User {
             password: "secret".to_string(),
             created_at: IggyTimestamp::now(),
             permissions: None,
-            personal_access_tokens: AHashMap::new(),
+            personal_access_tokens: DashMap::new(),
         }
     }
 }
@@ -87,7 +87,7 @@ impl User {
             created_at: IggyTimestamp::now(),
             status,
             permissions,
-            personal_access_tokens: AHashMap::new(),
+            personal_access_tokens: DashMap::new(),
         }
     }
 

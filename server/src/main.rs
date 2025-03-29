@@ -50,6 +50,10 @@ async fn main() -> Result<(), ServerError> {
     let figure = standard_font.convert("Iggy Server");
     println!("{}", figure.unwrap());
 
+    if let Some(sha) = option_env!("VERGEN_GIT_SHA") {
+        println!("Commit SHA: {sha}");
+    }
+
     if let Ok(env_path) = std::env::var("IGGY_ENV_PATH") {
         if dotenvy::from_path(&env_path).is_ok() {
             println!("Loaded environment variables from path: {env_path}");

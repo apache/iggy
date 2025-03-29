@@ -36,6 +36,7 @@ use iggy::users::create_user::CreateUser;
 use iggy::users::defaults::*;
 use std::env;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use tracing::{error, info, warn};
 
 static USER_ID: AtomicU32 = AtomicU32::new(1);
@@ -85,7 +86,7 @@ impl System {
                 .into_values()
                 .map(|token| {
                     (
-                        token.token_hash.clone(),
+                        Arc::new(token.token_hash.clone()),
                         PersonalAccessToken::raw(
                             user_state.id,
                             &token.name,
@@ -104,7 +105,7 @@ impl System {
         self.permissioner
             .init(&self.users.values().collect::<Vec<&User>>());
         self.metrics.increment_users(users_count as u32);
-        info!("Initialized {} user(s).", users_count);
+        info!("Initialized {users_count} user(s).");
         Ok(())
     }
 

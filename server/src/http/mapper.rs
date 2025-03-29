@@ -146,12 +146,12 @@ pub fn map_users(users: &[&User]) -> Vec<UserInfo> {
 }
 
 pub fn map_personal_access_tokens(
-    personal_access_tokens: &[&PersonalAccessToken],
+    personal_access_tokens: &[PersonalAccessToken],
 ) -> Vec<PersonalAccessTokenInfo> {
     let mut personal_access_tokens_data = Vec::with_capacity(personal_access_tokens.len());
     for personal_access_token in personal_access_tokens {
         let personal_access_token = PersonalAccessTokenInfo {
-            name: personal_access_token.name.clone(),
+            name: personal_access_token.name.as_str().to_owned(),
             expiry_at: personal_access_token.expiry_at,
         };
         personal_access_tokens_data.push(personal_access_token);

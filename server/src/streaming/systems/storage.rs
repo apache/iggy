@@ -91,7 +91,7 @@ impl SystemInfoStorage for FileSystemInfoStorage {
                     self.path
                 )
             })?;
-        info!("Saved system info, {}", system_info);
+        info!("Saved system info, {system_info}");
         Ok(())
     }
 }

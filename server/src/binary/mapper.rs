@@ -146,7 +146,7 @@ pub fn map_raw_pat(token: &str) -> Bytes {
     bytes.freeze()
 }
 
-pub fn map_personal_access_tokens(personal_access_tokens: &[&PersonalAccessToken]) -> Bytes {
+pub fn map_personal_access_tokens(personal_access_tokens: &[PersonalAccessToken]) -> Bytes {
     let mut bytes = BytesMut::new();
     for personal_access_token in personal_access_tokens {
         extend_pat(personal_access_token, &mut bytes);
