@@ -65,9 +65,6 @@ impl System {
             system_info = load_system_info.unwrap();
         }
 
-        if let Some(sha) = option_env!("VERGEN_GIT_SHA") {
-            info!("Commit SHA: {sha}");
-        }
         info!("Loaded {system_info}.");
         let loaded_version = SemanticVersion::from_str(&system_info.version.version)?;
         if current_version.is_equal_to(&loaded_version) {
