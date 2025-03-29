@@ -202,12 +202,6 @@ pub enum IggyError {
     InvalidStreamId = 1014,
     #[error("Cannot read streams")]
     CannotReadStreams = 1015,
-    #[error("Missing streams")]
-    MissingStreams = 1016,
-    #[error("Missing topics for stream with ID: {0}")]
-    MissingTopics(u32) = 1017,
-    #[error("Missing partitions for topic with ID: {0} for stream with ID: {1}.")]
-    MissingPartitions(u32, u32) = 1018,
     #[error("Max topic size cannot be lower than segment size. Max topic size: {0} < segment size: {1}.")]
     InvalidTopicSize(MaxTopicSize, IggyByteSize) = 1019,
     #[error("Cannot create topics directory for stream with ID: {0}, Path: {1}")]

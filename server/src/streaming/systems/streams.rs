@@ -85,39 +85,41 @@ impl System {
             .iter()
             .map(|stream| stream.stream_id)
             .collect::<AHashSet<u32>>();
-        let missing_ids = state_stream_ids
+        let mut missing_ids = state_stream_ids
             .difference(&unloaded_stream_ids)
             .copied()
             .collect::<AHashSet<u32>>();
         if missing_ids.is_empty() {
             info!("All streams found on disk were found in state.");
         } else {
-            error!("Streams with IDs: '{missing_ids:?}' were not found on disk.");
-            if !self.config.recovery.recreate_missing_state {
+            warn!("Streams with IDs: '{missing_ids:?}' were not found on disk.");
+            if self.config.recovery.recreate_missing_state {
+                info!("Recreating missing state in recovery config is enabled, missing streams will be created.");
+                for stream_id in missing_ids.iter() {
+                    let stream_id = *stream_id;
+                    let stream_state = streams.iter().find(|s| s.id == stream_id).unwrap();
+                    let stream = Stream::create(
+                        stream_id,
+                        &stream_state.name,
+                        self.config.clone(),
+                        self.storage.clone(),
+                    );
+                    stream.persist().await?;
+                    unloaded_streams.push(stream);
+                    info!(
+                        "Missing stream with ID: '{stream_id}', name: {} was recreated.",
+                        stream_state.name
+                    );
+                }
+                missing_ids.clear();
+            } else {
                 warn!("Recreating missing state in recovery config is disabled, missing streams will not be created.");
-                return Err(IggyError::MissingStreams);
-            }
-
-            info!("Recreating missing state in recovery config is enabled, missing streams will be created.");
-            for stream_id in missing_ids {
-                let stream_state = streams.iter().find(|s| s.id == stream_id).unwrap();
-                let stream = Stream::create(
-                    stream_id,
-                    &stream_state.name,
-                    self.config.clone(),
-                    self.storage.clone(),
-                );
-                stream.persist().await?;
-                unloaded_streams.push(stream);
-                info!(
-                    "Missing stream with ID: '{stream_id}', name: {} was recreated.",
-                    stream_state.name
-                );
             }
         }
 
         let mut streams_states = streams
             .into_iter()
+            .filter(|s| !missing_ids.contains(&s.id))
             .map(|s| (s.id, s))
             .collect::<AHashMap<_, _>>();
         let loaded_streams = RefCell::new(Vec::new());

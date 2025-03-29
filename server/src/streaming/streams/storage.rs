@@ -108,37 +108,36 @@ impl StreamStorage for FileStreamStorage {
                 stream.stream_id
             );
         } else {
-            error!("Topics with IDs: '{missing_ids:?}' for stream with ID: '{}' were not found on disk.", stream.stream_id);
-            if !stream.config.recovery.recreate_missing_state {
-                warn!("Recreating missing state in recovery config is disabled, missing topics will not be created for stream with ID: '{}'.", stream.stream_id);
-                return Err(IggyError::MissingTopics(stream.stream_id));
-            }
-
-            info!(
+            warn!("Topics with IDs: '{missing_ids:?}' for stream with ID: '{}' were not found on disk.", stream.stream_id);
+            if stream.config.recovery.recreate_missing_state {
+                info!(
                 "Recreating missing state in recovery config is enabled, missing topics will be created for stream with ID: '{}'.",
                 stream.stream_id
             );
-            for topic_id in missing_ids {
-                let topic_state = state.topics.get(&topic_id).unwrap();
-                let topic = Topic::empty(
-                    stream.stream_id,
-                    topic_id,
-                    &topic_state.name,
-                    stream.size_bytes.clone(),
-                    stream.messages_count.clone(),
-                    stream.segments_count.clone(),
-                    stream.config.clone(),
-                    stream.storage.clone(),
-                )
-                .await;
-                topic.persist().await.with_error_context(|error| {
-                    format!("{COMPONENT} (error: {error}) - failed to persist topic: {topic}")
-                })?;
-                unloaded_topics.push(topic);
-                info!(
-                    "Created missing topic with ID: '{}', name: {}, for stream with ID: '{}'.",
-                    topic_id, &topic_state.name, stream.stream_id
-                );
+                for topic_id in missing_ids {
+                    let topic_state = state.topics.get(&topic_id).unwrap();
+                    let topic = Topic::empty(
+                        stream.stream_id,
+                        topic_id,
+                        &topic_state.name,
+                        stream.size_bytes.clone(),
+                        stream.messages_count.clone(),
+                        stream.segments_count.clone(),
+                        stream.config.clone(),
+                        stream.storage.clone(),
+                    )
+                    .await;
+                    topic.persist().await.with_error_context(|error| {
+                        format!("{COMPONENT} (error: {error}) - failed to persist topic: {topic}")
+                    })?;
+                    unloaded_topics.push(topic);
+                    info!(
+                        "Created missing topic with ID: '{}', name: {}, for stream with ID: '{}'.",
+                        topic_id, &topic_state.name, stream.stream_id
+                    );
+                }
+            } else {
+                warn!("Recreating missing state in recovery config is disabled, missing topics will not be created for stream with ID: '{}'.", stream.stream_id);
             }
         }
 
