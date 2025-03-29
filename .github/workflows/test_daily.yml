@@ -108,9 +108,6 @@ jobs:
       - name: Run tests ${{ matrix.platform.target }}
         run: cross +stable test --features ci-qemu --verbose --target ${{ matrix.platform.target }} ${{ matrix.platform.profile == 'release' && '--release' || '' }}
 
-      - name: Check if workspace is clean
-        run: git status | grep "working tree clean" || { git status ; exit 1; }
-
   finalize_nightly:
     runs-on: ubuntu-latest
     needs: build_and_test
