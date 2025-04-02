@@ -16,15 +16,13 @@
  * under the License.
  */
 
+use crate::binary::command::ServerCommandHandler;
 use crate::binary::{command, sender::SenderKind};
-use crate::command::ServerCommand;
 use crate::server_error::ConnectionError;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
-use bytes::{BufMut, BytesMut};
-use iggy::bytes_serializable::BytesSerializable;
+use crate::tcp::connection_handler::command::ServerCommand;
 use iggy::error::IggyError;
-use iggy::validatable::Validatable;
 use std::io::ErrorKind;
 use std::sync::Arc;
 use tracing::{debug, error, info};
@@ -36,9 +34,10 @@ pub(crate) async fn handle_connection(
     sender: &mut SenderKind,
     system: SharedSystem,
 ) -> Result<(), ConnectionError> {
-    let mut initial_buffer = [0u8; INITIAL_BYTES_LENGTH];
+    let mut length_buffer = [0u8; INITIAL_BYTES_LENGTH];
+    let mut code_buffer = [0u8; INITIAL_BYTES_LENGTH];
     loop {
-        let read_length = match sender.read(&mut initial_buffer).await {
+        let read_length = match sender.read(&mut length_buffer).await {
             Ok(read_length) => read_length,
             Err(error) => {
                 if error.as_code() == IggyError::ConnectionClosed.as_code() {
@@ -57,27 +56,33 @@ pub(crate) async fn handle_connection(
             continue;
         }
 
-        let length = u32::from_le_bytes(initial_buffer);
-        debug!("Received a TCP request, length: {length}");
-        let mut command_buffer = BytesMut::with_capacity(length as usize);
-        command_buffer.put_bytes(0, length as usize);
-        sender.read(&mut command_buffer).await?;
-        let command = ServerCommand::from_bytes(command_buffer.freeze());
-        if command.is_err() {
-            sender
-                .send_error_response(IggyError::InvalidCommand)
-                .await?;
-            continue;
-        }
-        let command = command?;
-        if let Err(error) = command.validate() {
-            error!("Command validation failed: {error}");
-            sender.send_error_response(error).await?;
-            continue;
-        }
-
+        let length = u32::from_le_bytes(length_buffer);
+        sender.read(&mut code_buffer).await?;
+        let code = u32::from_le_bytes(code_buffer);
+        debug!("Received a TCP request, length: {length}, code: {code}");
+        let command = ServerCommand::from_code_and_reader(code, sender, length - 4).await?;
         debug!("Received a TCP command: {command}, payload size: {length}");
-        command::handle(command, sender, &session, system.clone()).await?;
+        match command.handle(sender, length, &session, &system).await {
+            Ok(_) => {
+                debug!(
+                    "Command was handled successfully, session: {session}. TCP response was sent."
+                );
+            }
+            Err(error) => {
+                error!("Command was not handled successfully, session: {session}, error: {error}.");
+                if let IggyError::ClientNotFound(_) = error {
+                    sender.send_error_response(error).await?;
+                    debug!("TCP error response was sent to: {session}.");
+                    error!("Session: {session} will be deleted.");
+                    return Err(ConnectionError::from(IggyError::ClientNotFound(
+                        session.client_id,
+                    )));
+                } else {
+                    sender.send_error_response(error).await?;
+                    debug!("TCP error response was sent to: {session}.");
+                }
+            }
+        }
     }
 }
 

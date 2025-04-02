@@ -22,7 +22,7 @@ use crate::benchmarks::benchmark::Benchmarkable;
 use crate::rate_limiter::RateLimiter;
 use async_trait::async_trait;
 use iggy::error::IggyError;
-use iggy::messages::poll_messages::PollingKind;
+use iggy::messages::PollingKind;
 use iggy_bench_report::benchmark_kind::BenchmarkKind;
 use iggy_bench_report::individual_metrics::BenchmarkIndividualMetrics;
 use integration::test_server::ClientFactory;

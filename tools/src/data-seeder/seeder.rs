@@ -16,13 +16,7 @@
  * under the License.
  */
 
-use iggy::client::{MessageClient, StreamClient, TopicClient};
-use iggy::clients::client::IggyClient;
-use iggy::error::IggyError;
-use iggy::messages::send_messages::{Message, Partitioning};
-use iggy::models::header::{HeaderKey, HeaderValue};
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy::prelude::*;
 use rand::Rng;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -121,17 +115,41 @@ async fn send_messages(client: &IggyClient) -> Result<(), IggyError> {
     let mut rng = rand::rng();
     let streams = [PROD_STREAM_ID, TEST_STREAM_ID, DEV_STREAM_ID];
     let partitioning = Partitioning::balanced();
-    for stream_id in streams {
-        let topics = client.get_topics(&stream_id.try_into()?).await?;
 
-        let stream_id = stream_id.try_into()?;
-        for topic in topics {
+    let message_batches_range = 100..=1000;
+    let messages_per_batch_range = 10..=100;
+
+    let mut total_messages_sent = 0;
+    let mut total_batches_sent = 0;
+
+    for (stream_idx, stream_id) in streams.iter().enumerate() {
+        let stream_id_identifier = (*stream_id).try_into()?;
+        let topics = client.get_topics(&stream_id_identifier).await?;
+        tracing::info!(
+            "Processing stream {} ({}/{})",
+            stream_id,
+            stream_idx + 1,
+            streams.len()
+        );
+
+        for (topic_idx, topic) in topics.iter().enumerate() {
             let topic_id = topic.id.try_into()?;
-            let mut messages = Vec::new();
-            let message_batches = rng.random_range(100..=1000);
+
+            let message_batches = rng.random_range(message_batches_range.clone());
+            tracing::info!(
+                "Processing topic {} ({}/{}) - {} batches planned",
+                topic.name,
+                topic_idx + 1,
+                topics.len(),
+                message_batches
+            );
+
             let mut message_id = 1;
-            for _ in 1..=message_batches {
-                let messages_count = rng.random_range(10..=100);
+
+            for batch_idx in 1..=message_batches {
+                let messages_count = rng.random_range(messages_per_batch_range.clone());
+                let mut messages = Vec::with_capacity(messages_count);
+
                 for _ in 1..=messages_count {
                     let payload = format!("{}_data_{}", topic.name, message_id);
                     let headers = match rng.random_bool(0.5) {
@@ -148,17 +166,46 @@ async fn send_messages(client: &IggyClient) -> Result<(), IggyError> {
                             Some(headers)
                         }
                     };
-                    let mut message = Message::from_str(&payload)?;
-                    message.headers = headers;
+
+                    let message = if let Some(headers) = headers {
+                        IggyMessage::builder()
+                            .payload(payload)
+                            .headers(headers)
+                            .build()?
+                    } else {
+                        IggyMessage::builder().payload(payload).build()?
+                    };
+
                     messages.push(message);
                     message_id += 1;
                 }
+
                 client
-                    .send_messages(&stream_id, &topic_id, &partitioning, &mut messages)
+                    .send_messages(
+                        &stream_id_identifier,
+                        &topic_id,
+                        &partitioning,
+                        &mut messages,
+                    )
                     .await?;
-                messages = Vec::new();
+
+                total_messages_sent += messages_count;
+                total_batches_sent += 1;
+
+                if batch_idx % 100 == 0 || batch_idx == message_batches {
+                    tracing::info!(
+                        "Sent {}/{} batches ({} messages total)...",
+                        batch_idx,
+                        message_batches,
+                        total_messages_sent
+                    );
+                }
             }
         }
     }
+
+    tracing::info!("Total messages sent: {}", total_messages_sent);
+    tracing::info!("Total batches sent: {}", total_batches_sent);
+
     Ok(())
 }

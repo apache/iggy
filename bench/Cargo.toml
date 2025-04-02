@@ -26,7 +26,6 @@ license = "Apache-2.0"
 [dependencies]
 async-trait = "0.1.88"
 atomic-time = "0.1.5"
-bytes = "1.10.1"
 charming = "0.4.0"
 chrono = "0.4.40"
 clap = { version = "4.5.34", features = ["derive"] }

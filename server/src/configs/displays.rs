@@ -28,8 +28,8 @@ use crate::configs::{
     resource_quota::MemoryResourceQuota,
     server::{MessageSaverConfig, ServerConfig},
     system::{
-        CacheConfig, CompressionConfig, EncryptionConfig, LoggingConfig, PartitionConfig,
-        SegmentConfig, StateConfig, StreamConfig, SystemConfig, TopicConfig,
+        CompressionConfig, EncryptionConfig, LoggingConfig, PartitionConfig, SegmentConfig,
+        StateConfig, StreamConfig, SystemConfig, TopicConfig,
     },
     tcp::{TcpConfig, TcpSocketConfig, TcpTlsConfig},
 };
@@ -220,12 +220,6 @@ impl Display for MessageSaverConfig {
     }
 }
 
-impl Display for CacheConfig {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{{ enabled: {}, size: {} }}", self.enabled, self.size)
-    }
-}
-
 impl Display for HeartbeatConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -262,9 +256,10 @@ impl Display for PartitionConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
           f,
-          "{{ path: {}, messages_required_to_save: {}, enforce_fsync: {}, validate_checksum: {} }}",
+          "{{ path: {}, messages_required_to_save: {}, size_of_messages_required_to_save: {}, enforce_fsync: {}, validate_checksum: {} }}",
           self.path,
           self.messages_required_to_save,
+          self.size_of_messages_required_to_save,
           self.enforce_fsync,
           self.validate_checksum
       )
@@ -378,10 +373,9 @@ impl Display for SystemConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
           f,
-          "{{ path: {}, logging: {}, cache: {}, stream: {}, topic: {}, partition: {}, segment: {}, encryption: {}, state: {} }}",
+          "{{ path: {}, logging: {}, stream: {}, topic: {}, partition: {}, segment: {}, encryption: {}, state: {} }}",
           self.path,
           self.logging,
-          self.cache,
           self.stream,
           self.topic,
           self.partition,

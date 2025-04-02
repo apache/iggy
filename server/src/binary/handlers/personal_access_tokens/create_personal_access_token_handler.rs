@@ -16,6 +16,8 @@
  * under the License.
  */
 
+use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::{handlers::personal_access_tokens::COMPONENT, sender::SenderKind};
 use crate::state::command::EntryCommand;
@@ -29,47 +31,69 @@ use iggy::error::IggyError;
 use iggy::personal_access_tokens::create_personal_access_token::CreatePersonalAccessToken;
 use tracing::{debug, instrument};
 
-#[instrument(skip_all, name = "trace_create_personal_access_token", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
-pub async fn handle(
-    command: CreatePersonalAccessToken,
-    sender: &mut SenderKind,
-    session: &Session,
-    system: &SharedSystem,
-) -> Result<(), IggyError> {
-    debug!("session: {session}, command: {command}");
+impl ServerCommandHandler for CreatePersonalAccessToken {
+    fn code(&self) -> u32 {
+        iggy::command::CREATE_PERSONAL_ACCESS_TOKEN_CODE
+    }
 
-    let system = system.read().await;
-    let token = system
-            .create_personal_access_token(session, &command.name, command.expiry)
+    #[instrument(skip_all, name = "trace_create_personal_access_token", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
+    async fn handle(
+        self,
+        sender: &mut SenderKind,
+        _length: u32,
+        session: &Session,
+        system: &SharedSystem,
+    ) -> Result<(), IggyError> {
+        debug!("session: {session}, command: {self}");
+
+        let system = system.write().await;
+        let token = system
+                .create_personal_access_token(session, &self.name, self.expiry)
+                .await
+                .with_error_context(|error| {
+                    format!(
+                        "{COMPONENT} (error: {error}) - failed to create personal access token with name: {}, session: {session}",
+                        self.name
+                    )
+                })?;
+        let bytes = mapper::map_raw_pat(&token);
+        let token_hash = PersonalAccessToken::hash_token(&token);
+
+        let system = system.downgrade();
+        system
+            .state
+            .apply(
+                session.get_user_id(),
+                &EntryCommand::CreatePersonalAccessToken(CreatePersonalAccessTokenWithHash {
+                    command: CreatePersonalAccessToken {
+                        name: self.name.to_owned(),
+                        expiry: self.expiry,
+                    },
+                    hash: token_hash,
+                }),
+            )
             .await
             .with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to create personal access token with name: {}, session: {session}",
-                    command.name
+                    self.name
                 )
             })?;
-    let bytes = mapper::map_raw_pat(&token);
-    let token_hash = PersonalAccessToken::hash_token(&token);
+        sender.send_ok_response(&bytes).await?;
+        Ok(())
+    }
+}
 
-    system
-        .state
-        .apply(
-            session.get_user_id(),
-            EntryCommand::CreatePersonalAccessToken(CreatePersonalAccessTokenWithHash {
-                hash: token_hash,
-                command: CreatePersonalAccessToken {
-                    name: command.name.to_owned(),
-                    expiry: command.expiry,
-                }
-            }),
-        )
-        .await
-        .with_error_context(|error| {
-            format!(
-                "{COMPONENT} (error: {error}) - failed to create personal access token with name: {}, session: {session}",
-                command.name
-            )
-        })?;
-    sender.send_ok_response(&bytes).await?;
-    Ok(())
+impl BinaryServerCommand for CreatePersonalAccessToken {
+    async fn from_sender(sender: &mut SenderKind, code: u32, length: u32) -> Result<Self, IggyError>
+    where
+        Self: Sized,
+    {
+        match receive_and_validate(sender, code, length).await? {
+            ServerCommand::CreatePersonalAccessToken(create_personal_access_token) => {
+                Ok(create_personal_access_token)
+            }
+            _ => Err(IggyError::InvalidCommand),
+        }
+    }
 }

@@ -132,7 +132,7 @@ async fn create_user(
         .state
         .apply(
             identity.user_id,
-            EntryCommand::CreateUser(CreateUserWithId {
+            &EntryCommand::CreateUser(CreateUserWithId {
                 user_id,
                 command: CreateUser {
                     username: command.username.to_owned(),
@@ -182,7 +182,7 @@ async fn update_user(
     let system = system.downgrade();
     system
         .state
-        .apply(identity.user_id, EntryCommand::UpdateUser(command))
+        .apply(identity.user_id, &EntryCommand::UpdateUser(command))
         .await
         .with_error_context(|error| {
             format!(
@@ -221,7 +221,7 @@ async fn update_permissions(
     let system = system.downgrade();
     system
         .state
-        .apply(identity.user_id, EntryCommand::UpdatePermissions(command))
+        .apply(identity.user_id, &EntryCommand::UpdatePermissions(command))
         .await
         .with_error_context(|error| {
             format!(
@@ -264,7 +264,7 @@ async fn change_password(
         .state
         .apply(
             identity.user_id,
-            EntryCommand::ChangePassword(ChangePassword {
+            &EntryCommand::ChangePassword(ChangePassword {
                 user_id: command.user_id,
                 current_password: "".into(),
                 new_password: crypto::hash_password(&command.new_password),
@@ -304,7 +304,7 @@ async fn delete_user(
         .state
         .apply(
             identity.user_id,
-            EntryCommand::DeleteUser(DeleteUser {
+            &EntryCommand::DeleteUser(DeleteUser {
                 user_id: identifier_user_id,
             }),
         )

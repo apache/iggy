@@ -43,7 +43,7 @@ impl System {
         &self,
         session: &Session,
         compression: SnapshotCompression,
-        snapshot_types: Vec<SystemSnapshotType>,
+        snapshot_types: &Vec<SystemSnapshotType>,
     ) -> Result<Snapshot, IggyError> {
         self.ensure_authenticated(session)?;
 
@@ -52,7 +52,7 @@ impl System {
                 error!("When using 'All' snapshot type, no other types can be specified");
                 return Err(IggyError::InvalidCommand);
             }
-            SystemSnapshotType::all_snapshot_types()
+            &SystemSnapshotType::all_snapshot_types()
         } else {
             snapshot_types
         };
@@ -72,7 +72,7 @@ impl System {
         info!("Executing snapshot commands: {:?}", snapshot_types);
         let now = Instant::now();
 
-        for snapshot_type in &snapshot_types {
+        for snapshot_type in snapshot_types {
             match get_command_result(snapshot_type, self.config.clone()).await {
                 Ok(temp_file) => {
                     let filename = format!("{}.txt", snapshot_type);

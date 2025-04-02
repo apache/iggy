@@ -21,6 +21,20 @@ version = "0.0.5"
 edition = "2021"
 license = "Apache-2.0"
 
+[dependencies]
+ahash = { version = "0.8.11", features = ["serde"] }
+anyhow = "1.0.97"
+bytes = "1.10.1"
+clap = { version = "4.5.34", features = ["derive"] }
+futures-util = "0.3.31"
+iggy = { path = "../sdk" }
+rand = "0.9.0"
+serde = { version = "1.0.219", features = ["derive", "rc"] }
+serde_json = "1.0.140"
+tokio = { version = "1.44.1", features = ["full"] }
+tracing = { version = "0.1.41" }
+tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter"] }
+
 [[example]]
 name = "getting-started-consumer"
 path = "src/getting-started/consumer/main.rs"
@@ -89,16 +103,3 @@ path = "src/stream-builder/stream-producer/main.rs"
 name = "stream-producer-config"
 path = "src/stream-builder/stream-producer-config/main.rs"
 
-[dependencies]
-ahash = { version = "0.8.11", features = ["serde"] }
-anyhow = "1.0.97"
-bytes = "1.10.1"
-clap = { version = "4.5.34", features = ["derive"] }
-futures-util = "0.3.31"
-iggy = { path = "../sdk" }
-rand = "0.9.0"
-serde = { version = "1.0.219", features = ["derive", "rc"] }
-serde_json = "1.0.140"
-tokio = { version = "1.44.1", features = ["full"] }
-tracing = { version = "0.1.41" }
-tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter"] }

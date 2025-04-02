@@ -21,6 +21,11 @@ version = "0.0.1"
 edition = "2021"
 license = "Apache-2.0"
 
+# Some tests are failing in CI due to lack of IPv6 interfaces
+# inside the docker containers. This is a temporary workaround (hopefully).
+[features]
+ci-qemu = []
+
 [dependencies]
 ahash = { version = "0.8.11", features = ["serde"] }
 assert_cmd = "2.0.16"
@@ -48,8 +53,3 @@ tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter"] }
 twox-hash = { version = "2.1.0", features = ["xxhash32"] }
 uuid = { version = "1.16.0", features = ["v7", "fast-rng", "zerocopy"] }
 zip = "2.5.0"
-
-# Some tests are failing in CI due to lack of IPv6 interfaces
-# inside the docker containers. This is a temporary workaround (hopefully).
-[features]
-ci-qemu = []

@@ -17,6 +17,9 @@
 
 [[profile.default.overrides]]
 # This is a solution (or actually a workaround) for the problem that nextest does not support
-# #[serial] macro which shall enfroce sequential execution of the test case.
+# #[serial] macro which shall enforce sequential execution of the test case.
 filter = 'package(integration) and test(cli::system::test_cli_session_scenario::should_be_successful)'
 threads-required = "num-cpus"
+
+[profile.default]
+slow-timeout = { period = "30s", terminate-after = 4 }

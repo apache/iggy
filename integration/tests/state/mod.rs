@@ -45,7 +45,7 @@ impl StateSetup {
 
     pub async fn create(encryption_key: Option<&[u8]>) -> StateSetup {
         let directory_path = format!("state_{}", Uuid::now_v7().to_u128_le());
-        let log_path = format!("{}/log", directory_path);
+        let messages_file_path = format!("{}/log", directory_path);
         create_dir(&directory_path).await.unwrap();
 
         let version = SemanticVersion::from_str("1.2.3").unwrap();
@@ -55,7 +55,12 @@ impl StateSetup {
                 Aes256GcmEncryptor::new(key).unwrap(),
             ))
         });
-        let state = FileState::new(&log_path, &version, Arc::new(persister), encryptor);
+        let state = FileState::new(
+            &messages_file_path,
+            &version,
+            Arc::new(persister),
+            encryptor,
+        );
 
         Self {
             directory_path,

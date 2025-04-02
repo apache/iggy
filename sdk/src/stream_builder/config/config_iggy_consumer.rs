@@ -16,15 +16,14 @@
  * under the License.
  */
 
-use bon::Builder;
-
 use crate::clients::consumer::{AutoCommit, AutoCommitWhen};
 use crate::consumer::ConsumerKind;
 use crate::error::IggyError;
 use crate::identifier::Identifier;
-use crate::messages::poll_messages::PollingStrategy;
+use crate::messages::PollingStrategy;
 use crate::utils::crypto::EncryptorKind;
 use crate::utils::duration::IggyDuration;
+use bon::Builder;
 use std::str::FromStr;
 use std::sync::Arc;
 

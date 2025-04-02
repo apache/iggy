@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::channels::server_command::ServerCommand;
+use crate::channels::server_command::BackgroundServerCommand;
 use crate::configs::server::StateMaintenanceConfig;
 use crate::streaming::systems::system::SharedSystem;
 use flume::Sender;
@@ -74,7 +74,7 @@ impl StateArchiver {
     }
 }
 
-impl ServerCommand<ArchiveStateCommand> for ArchiveStateExecutor {
+impl BackgroundServerCommand<ArchiveStateCommand> for ArchiveStateExecutor {
     #[instrument(skip_all, name = "trace_archive_state")]
     async fn execute(&mut self, system: &SharedSystem, command: ArchiveStateCommand) {
         let system = system.read().await;
@@ -88,11 +88,11 @@ impl ServerCommand<ArchiveStateCommand> for ArchiveStateExecutor {
         } else {
             Some(format!("{}_state", IggyTimestamp::now().as_micros()))
         };
-        let state_log_path = system.config.get_state_log_path();
+        let state_messages_file_path = system.config.get_state_messages_file_path();
         let state_info_path = system.config.get_state_info_path();
         info!("Archiving state...");
         let archiver = system.archiver.as_ref().unwrap();
-        let files = [state_info_path.as_ref(), state_log_path.as_ref()];
+        let files = [state_info_path.as_ref(), state_messages_file_path.as_ref()];
         if let Err(error) = archiver.archive(&files, base_directory).await {
             error!("Failed to archive state. Error: {}", error);
             return;

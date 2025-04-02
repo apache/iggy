@@ -117,7 +117,7 @@ async fn create_stream(
     let system = system.downgrade();
     system
         .state
-        .apply(identity.user_id, EntryCommand::CreateStream(CreateStreamWithId {
+        .apply(identity.user_id, &EntryCommand::CreateStream(CreateStreamWithId {
             stream_id,
             command
         }))
@@ -158,7 +158,7 @@ async fn update_stream(
     let system = system.downgrade();
     system
         .state
-        .apply(identity.user_id, EntryCommand::UpdateStream(command))
+        .apply(identity.user_id, &EntryCommand::UpdateStream(command))
         .await
         .with_error_context(|error| {
             format!(
@@ -193,7 +193,7 @@ async fn delete_stream(
         .state
         .apply(
             identity.user_id,
-            EntryCommand::DeleteStream(DeleteStream {
+            &EntryCommand::DeleteStream(DeleteStream {
                 stream_id: identifier_stream_id,
             }),
         )
@@ -230,7 +230,7 @@ async fn purge_stream(
         .state
         .apply(
             identity.user_id,
-            EntryCommand::PurgeStream(PurgeStream {
+            &EntryCommand::PurgeStream(PurgeStream {
                 stream_id: identifier_stream_id,
             }),
         )

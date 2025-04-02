@@ -17,27 +17,23 @@
  */
 
 use crate::streaming::common::test_setup::TestSetup;
+use crate::streaming::create_message;
 use bytes::Bytes;
-use iggy::bytes_serializable::BytesSerializable;
 use iggy::compression::compression_algorithm::CompressionAlgorithm;
 use iggy::confirmation::Confirmation;
 use iggy::error::IggyError;
 use iggy::identifier::Identifier;
 use iggy::locking::IggySharedMutFn;
-use iggy::models::messages::{MessageState, PolledMessage};
-use iggy::utils::byte_size::IggyByteSize;
-use iggy::utils::expiry::IggyExpiry;
+use iggy::prelude::*;
 use iggy::utils::topic_size::MaxTopicSize;
-use iggy::utils::{checksum, timestamp::IggyTimestamp};
 use server::configs::server::{DataMaintenanceConfig, PersonalAccessTokenConfig};
-use server::configs::system::{SegmentConfig, SystemConfig};
-use server::streaming::local_sizeable::LocalSizeable;
-use server::streaming::models::messages::RetainedMessage;
+use server::configs::system::{PartitionConfig, SegmentConfig, SystemConfig};
 use server::streaming::segments::*;
 use server::streaming::session::Session;
 use server::streaming::systems::system::System;
 use std::fs::DirEntry;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::str::FromStr;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
@@ -132,14 +128,19 @@ async fn should_load_existing_segment_from_disk() {
         loaded_segment.load_from_disk().await.unwrap();
         let loaded_messages = loaded_segment.get_messages_by_offset(0, 10).await.unwrap();
 
-        assert_eq!(loaded_segment.partition_id, segment.partition_id);
-        assert_eq!(loaded_segment.start_offset, segment.start_offset);
-        assert_eq!(loaded_segment.current_offset, segment.current_offset);
-        assert_eq!(loaded_segment.end_offset, segment.end_offset);
-        assert_eq!(loaded_segment.size_bytes, segment.size_bytes);
-        assert_eq!(loaded_segment.is_closed, segment.is_closed);
-        assert_eq!(loaded_segment.log_path, segment.log_path);
-        assert_eq!(loaded_segment.index_path, segment.index_path);
+        assert_eq!(loaded_segment.partition_id(), segment.partition_id());
+        assert_eq!(loaded_segment.start_offset(), segment.start_offset());
+        assert_eq!(loaded_segment.end_offset(), segment.end_offset());
+        assert_eq!(
+            loaded_segment.get_messages_size(),
+            segment.get_messages_size()
+        );
+        assert_eq!(loaded_segment.is_closed(), segment.is_closed());
+        assert_eq!(
+            loaded_segment.messages_file_path(),
+            segment.messages_file_path()
+        );
+        assert_eq!(loaded_segment.index_file_path(), segment.index_file_path());
         assert!(loaded_messages.is_empty());
     }
 }
@@ -179,27 +180,15 @@ async fn should_persist_and_load_segment_with_messages() {
     .await;
     let messages_count = 10;
     let mut messages = Vec::new();
-    let mut batch_size = IggyByteSize::default();
+    let mut messages_size = 0;
     for i in 0..messages_count {
-        let message = create_message(i, "test", IggyTimestamp::now());
-
-        let retained_message = Arc::new(RetainedMessage {
-            id: message.id,
-            offset: message.offset,
-            timestamp: message.timestamp,
-            checksum: message.checksum,
-            message_state: message.state,
-            headers: message.headers.map(|headers| headers.to_bytes()),
-            payload: message.payload.clone(),
-        });
-        batch_size += retained_message.get_size_bytes();
-        messages.push(retained_message);
+        let message = IggyMessage::with_id(i as u128, Bytes::from("test"));
+        messages_size += message.get_size_bytes().as_bytes_u32();
+        messages.push(message);
     }
+    let batch = IggyMessagesBatchMut::from_messages(&messages, messages_size);
 
-    segment
-        .append_batch(batch_size, messages_count as u32, &messages)
-        .await
-        .unwrap();
+    segment.append_batch(0, batch, None).await.unwrap();
     segment.persist_messages(None).await.unwrap();
     let mut loaded_segment = Segment::create(
         stream_id,
@@ -217,10 +206,10 @@ async fn should_persist_and_load_segment_with_messages() {
     );
     loaded_segment.load_from_disk().await.unwrap();
     let messages = loaded_segment
-        .get_messages_by_offset(0, messages_count as u32)
+        .get_messages_by_offset(0, messages_count)
         .await
         .unwrap();
-    assert_eq!(messages.len(), messages_count as usize);
+    assert_eq!(messages.count(), messages_count);
 }
 
 #[tokio::test]
@@ -265,27 +254,14 @@ async fn should_persist_and_load_segment_with_messages_with_nowait_confirmation(
     .await;
     let messages_count = 10;
     let mut messages = Vec::new();
-    let mut batch_size = IggyByteSize::default();
+    let mut messages_size = 0;
     for i in 0..messages_count {
-        let message = create_message(i, "test", IggyTimestamp::now());
-
-        let retained_message = Arc::new(RetainedMessage {
-            id: message.id,
-            offset: message.offset,
-            timestamp: message.timestamp,
-            checksum: message.checksum,
-            message_state: message.state,
-            headers: message.headers.map(|headers| headers.to_bytes()),
-            payload: message.payload.clone(),
-        });
-        batch_size += retained_message.get_size_bytes();
-        messages.push(retained_message);
+        let message = IggyMessage::with_id(i as u128, Bytes::from("test"));
+        messages_size += message.get_size_bytes().as_bytes_u32();
+        messages.push(message);
     }
-
-    segment
-        .append_batch(batch_size, messages_count as u32, &messages)
-        .await
-        .unwrap();
+    let batch = IggyMessagesBatchMut::from_messages(&messages, messages_size);
+    segment.append_batch(0, batch, None).await.unwrap();
     segment
         .persist_messages(Some(Confirmation::NoWait))
         .await
@@ -307,21 +283,32 @@ async fn should_persist_and_load_segment_with_messages_with_nowait_confirmation(
     );
     loaded_segment.load_from_disk().await.unwrap();
     let messages = loaded_segment
-        .get_messages_by_offset(0, messages_count as u32)
+        .get_messages_by_offset(0, messages_count)
         .await
         .unwrap();
-    assert_eq!(messages.len(), messages_count as usize);
+    assert_eq!(messages.count(), messages_count);
 }
 
 #[tokio::test]
 async fn given_all_expired_messages_segment_should_be_expired() {
-    let setup = TestSetup::init().await;
+    let config = SystemConfig {
+        partition: PartitionConfig {
+            enforce_fsync: true,
+            ..Default::default()
+        },
+        segment: SegmentConfig {
+            size: IggyByteSize::from_str("10B").unwrap(), // small size to force expiration
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let setup = TestSetup::init_with_config(config).await;
     let stream_id = 1;
     let topic_id = 2;
     let partition_id = 3;
     let start_offset = 0;
-    let message_expiry_ms = 1000;
-    let message_expiry = 1000u64.into();
+    let message_expiry_us = 100000;
+    let message_expiry = message_expiry_us.into();
     let mut segment = Segment::create(
         stream_id,
         topic_id,
@@ -349,46 +336,43 @@ async fn given_all_expired_messages_segment_should_be_expired() {
     )
     .await;
     let messages_count = 10;
-    let now = IggyTimestamp::now();
-    let mut expired_timestamp = (now.as_micros() - 2 * message_expiry_ms).into();
-    let mut batch_size = IggyByteSize::default();
     let mut messages = Vec::new();
+    let mut messages_size = 0;
     for i in 0..messages_count {
-        let message = create_message(i, "test", expired_timestamp);
-        expired_timestamp = (expired_timestamp.as_micros() + 1).into();
-
-        let retained_message = Arc::new(RetainedMessage {
-            id: message.id,
-            offset: message.offset,
-            timestamp: message.timestamp,
-            checksum: message.checksum,
-            message_state: message.state,
-            headers: message.headers.map(|headers| headers.to_bytes()),
-            payload: message.payload.clone(),
-        });
-        batch_size += retained_message.get_size_bytes();
-        messages.push(retained_message);
+        let message = IggyMessage::with_id(i as u128, Bytes::from("test"));
+        messages_size += message.get_size_bytes().as_bytes_u32();
+        messages.push(message);
     }
-    segment
-        .append_batch(batch_size, messages_count as u32, &messages)
-        .await
-        .unwrap();
+    let batch = IggyMessagesBatchMut::from_messages(&messages, messages_size);
+    segment.append_batch(0, batch, None).await.unwrap();
     segment.persist_messages(None).await.unwrap();
+    let not_expired_ts = IggyTimestamp::now();
+    let expired_ts = not_expired_ts + IggyDuration::from(message_expiry_us + 1);
 
-    segment.is_closed = true;
-    let is_expired = segment.is_expired(now).await;
-    assert!(is_expired);
+    assert!(segment.is_expired(expired_ts).await);
+    assert!(!segment.is_expired(not_expired_ts).await);
 }
 
 #[tokio::test]
 async fn given_at_least_one_not_expired_message_segment_should_not_be_expired() {
-    let setup = TestSetup::init().await;
+    let config = SystemConfig {
+        partition: PartitionConfig {
+            enforce_fsync: true,
+            ..Default::default()
+        },
+        segment: SegmentConfig {
+            size: IggyByteSize::from_str("10B").unwrap(), // small size to force expiration
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let setup = TestSetup::init_with_config(config).await;
     let stream_id = 1;
     let topic_id = 2;
     let partition_id = 3;
     let start_offset = 0;
-    let message_expiry_ms = 1000;
-    let message_expiry = message_expiry_ms.into();
+    let message_expiry_us = 50000;
+    let message_expiry = message_expiry_us.into();
     let mut segment = Segment::create(
         stream_id,
         topic_id,
@@ -415,65 +399,58 @@ async fn given_at_least_one_not_expired_message_segment_should_not_be_expired() 
         start_offset,
     )
     .await;
-    let now = IggyTimestamp::now();
-    let expired_timestamp = now.as_micros() - 2 * message_expiry_ms;
-    let not_expired_timestamp = now.as_micros() - message_expiry_ms + 1;
-    let expired_message = create_message(0, "test", expired_timestamp.into());
-    let not_expired_message = create_message(1, "test", not_expired_timestamp.into());
 
-    let expired_retained_message = Arc::new(RetainedMessage {
-        id: expired_message.id,
-        offset: expired_message.offset,
-        timestamp: expired_message.timestamp,
-        checksum: expired_message.checksum,
-        message_state: expired_message.state,
-        headers: expired_message.headers.map(|headers| headers.to_bytes()),
-        payload: expired_message.payload.clone(),
-    });
-    let mut expired_messages = Vec::new();
-    let expired_message_size = expired_retained_message.get_size_bytes();
-    expired_messages.push(expired_retained_message);
+    let nothing_expired_ts = IggyTimestamp::now();
 
-    let mut not_expired_messages = Vec::new();
-    let not_expired_retained_message = Arc::new(RetainedMessage {
-        id: not_expired_message.id,
-        offset: not_expired_message.offset,
-        timestamp: not_expired_message.timestamp,
-        checksum: not_expired_message.checksum,
-        message_state: not_expired_message.state,
-        headers: not_expired_message
-            .headers
-            .map(|headers| headers.to_bytes()),
-        payload: not_expired_message.payload.clone(),
-    });
-    let not_expired_message_size = not_expired_retained_message.get_size_bytes();
-    not_expired_messages.push(not_expired_retained_message);
+    let first_message = vec![IggyMessage::create(Bytes::from("expired"))];
+    let first_message_size = first_message[0].get_size_bytes().as_bytes_u32();
+    let first_batch = IggyMessagesBatchMut::from_messages(&first_message, first_message_size);
+    segment.append_batch(0, first_batch, None).await.unwrap();
 
-    segment
-        .append_batch(expired_message_size, 1, &expired_messages)
-        .await
-        .unwrap();
-    segment
-        .append_batch(not_expired_message_size, 1, &not_expired_messages)
-        .await
-        .unwrap();
+    sleep(Duration::from_micros(message_expiry_us / 2)).await;
+    let first_message_expired_ts = IggyTimestamp::now();
+
+    let second_message = vec![IggyMessage::create(Bytes::from("not-expired"))];
+    let second_message_size = second_message[0].get_size_bytes().as_bytes_u32();
+    let second_batch = IggyMessagesBatchMut::from_messages(&second_message, second_message_size);
+    segment.append_batch(1, second_batch, None).await.unwrap();
+
+    let second_message_expired_ts =
+        IggyTimestamp::now() + IggyDuration::from(message_expiry_us * 2);
+
     segment.persist_messages(None).await.unwrap();
 
-    let is_expired = segment.is_expired(now).await;
-    assert!(!is_expired);
+    assert!(
+        !segment.is_expired(nothing_expired_ts).await,
+        "Segment should not be expired for nothing expired timestamp"
+    );
+    assert!(
+        !segment.is_expired(first_message_expired_ts).await,
+        "Segment should not be expired for first message expired timestamp"
+    );
+    assert!(
+        segment.is_expired(second_message_expired_ts).await,
+        "Segment should be expired for second message expired timestamp"
+    );
 }
 
 #[tokio::test]
 async fn should_delete_persisted_segments() -> Result<(), Box<dyn std::error::Error>> {
-    // Initial Setup.
-    let setup = TestSetup::init().await;
+    let config = SystemConfig {
+        segment: SegmentConfig {
+            size: IggyByteSize::from_str("10B").unwrap(), // small size to force segment closure
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let setup = TestSetup::init_with_config(config).await;
     let mut system = System::new(
         setup.config.clone(),
         DataMaintenanceConfig::default(),
         PersonalAccessTokenConfig::default(),
     );
 
-    // Properties.
+    // Properties
     let stream_id = Identifier::numeric(1)?;
     let stream_name = "test";
     let topic_name = "test_topic";
@@ -511,22 +488,33 @@ async fn should_delete_persisted_segments() -> Result<(), Box<dyn std::error::Er
         .await?;
 
     let topic = system.find_topic(&session, &stream_id, &topic_id)?;
-
     let partitions = topic.get_partitions();
-
-    let mut partition = partitions
+    let partition = partitions
         .first()
         .ok_or(IggyError::Error)
-        .inspect_err(|_| log::error!("Cannot retrieve initial partition."))?
-        .write()
-        .await;
+        .inspect_err(|_| log::error!("Cannot retrieve initial partition."))?;
 
-    for n in 0..=3 {
-        partition.add_persisted_segment(n).await?;
+    // Create multiple segments by sending messages one by one
+    // Each message should be large enough to cause a segment to close
+    for i in 0..5 {
+        let mut partition_lock = partition.write().await;
+
+        let payload = "payload that will force segment closure due to size";
+        let message = create_message(i, payload);
+        let messages = vec![message];
+
+        let messages_size = messages
+            .iter()
+            .map(|m| m.get_size_bytes().as_bytes_u32())
+            .sum();
+        let batch = IggyMessagesBatchMut::from_messages(&messages, messages_size);
+
+        partition_lock.append_messages(batch, None).await.unwrap();
+
+        drop(partition_lock);
+
+        sleep(Duration::from_millis(100)).await;
     }
-
-    // Explicitly drop the lock so that we can delete the segments through a different reference.
-    drop(partition);
 
     let partition_path = setup.config.get_partition_path(
         stream_id.get_u32_value()?,
@@ -534,82 +522,131 @@ async fn should_delete_persisted_segments() -> Result<(), Box<dyn std::error::Er
         partition_id,
     );
 
-    // Assert segment files were created correctly.
-    let segment_files = get_segment_paths_for_partiton(&partition_path)
+    let initial_segments = get_segment_paths_for_partition(&partition_path);
+    println!(
+        "Created segments: {:?}",
+        initial_segments
+            .iter()
+            .map(|e| e.file_name())
+            .collect::<Vec<_>>()
+    );
+
+    // Since we've created 5 messages with large payloads, we should have multiple segments
+    assert!(
+        initial_segments.len() >= 4,
+        "Expected at least 4 segments but got {}",
+        initial_segments.len()
+    );
+
+    let mut initial_offsets = get_segment_offsets(&initial_segments);
+    initial_offsets.sort();
+    println!("Initial segment offsets (sorted): {:?}", initial_offsets);
+
+    let first_keep_count = 3usize;
+    system
+        .delete_segments(
+            &session,
+            &stream_id,
+            &topic_id,
+            partition_id,
+            first_keep_count as u32,
+        )
+        .await?;
+
+    let segments_after_first_delete = get_segment_paths_for_partition(&partition_path);
+    println!(
+        "Segments after first deletion (keep={}): {:?}",
+        first_keep_count,
+        segments_after_first_delete
+            .iter()
+            .map(|e| e.file_name())
+            .collect::<Vec<_>>()
+    );
+
+    // We should have at most first_keep_count + 1 segments after first deletion
+    // (keep_count closed segments + 1 open segment)
+    assert!(
+        segments_after_first_delete.len() <= first_keep_count + 1,
+        "Should have at most {} segments after first deletion but got {}",
+        first_keep_count + 1,
+        segments_after_first_delete.len()
+    );
+
+    // Second attempt to delete segments - keeping only 1 closed segment + 1 open
+    let second_keep_count = 1usize;
+    system
+        .delete_segments(
+            &session,
+            &stream_id,
+            &topic_id,
+            partition_id,
+            second_keep_count as u32,
+        )
+        .await?;
+
+    let segments_after_second_delete = get_segment_paths_for_partition(&partition_path);
+    println!(
+        "Segments after second deletion (keep={}): {:?}",
+        second_keep_count,
+        segments_after_second_delete
+            .iter()
+            .map(|e| e.file_name())
+            .collect::<Vec<_>>()
+    );
+
+    // We should have at most second_keep_count + 1 segments after second deletion
+    // (keep_count closed segments + 1 open segment)
+    assert!(
+        segments_after_second_delete.len() <= second_keep_count + 1,
+        "Should have at most {} segments after second deletion but got {}",
+        second_keep_count + 1,
+        segments_after_second_delete.len()
+    );
+
+    let mut final_offsets = get_segment_offsets(&segments_after_second_delete);
+    final_offsets.sort();
+
+    let highest_initial_offsets: Vec<u64> = initial_offsets
         .iter()
         .rev()
-        .map(|dir_entry| dir_entry.file_name())
-        .collect::<Vec<_>>();
+        .take(second_keep_count + 1)
+        .copied()
+        .collect();
 
-    assert!(segment_files.len() == 4);
-
-    assert!((0..=3).all(|i| segment_files.iter().any(|val| val
-        .to_str()
-        .is_some_and(|file_str| file_str == format!("{:0>20}.{}", i, LOG_EXTENSION)))));
-
-    // Attempt to delete the segment files.
-    system
-        .delete_segments(&session, &stream_id, &topic_id, partition_id, 2)
-        .await?;
-
-    // Assert no changes as none are closed.
-    assert!((0..=3).all(|i| segment_files.iter().any(|val| val
-        .to_str()
-        .is_some_and(|file_str| file_str == format!("{:0>20}.{}", i, LOG_EXTENSION)))));
-
-    let topic = system.find_topic(&session, &stream_id, &topic_id)?;
-
-    let partitions = topic.get_partitions();
-
-    let mut partition = partitions
-        .first()
-        .ok_or(IggyError::Error)
-        .inspect_err(|_| log::error!("Cannot retrieve initial partition."))?
-        .write()
-        .await;
-
-    // Set the segments to closed.
-    for n in 0..=3 {
-        let segment = partition.get_segment_mut(n);
-
-        if let Some(segment_ref) = segment {
-            segment_ref.is_closed = true;
-        };
+    for &offset in &final_offsets {
+        assert!(
+            highest_initial_offsets.contains(&offset),
+            "Offset {} should not remain after final deletion",
+            offset
+        );
     }
-
-    // Explicitly drop the lock so that we can delete the segments through a different reference.
-    drop(partition);
-
-    // Attempt to delete the segment files.
-    system
-        .delete_segments(&session, &stream_id, &topic_id, partition_id, 2)
-        .await?;
-
-    // Assert segment files were deleted correctly.
-    let segment_files = get_segment_paths_for_partiton(&partition_path)
-        .iter()
-        .map(|dir_entry| dir_entry.file_name())
-        .collect::<Vec<_>>();
-
-    assert!(segment_files.len() == 2);
-
-    // Check that the two segments with the largest start_offset's are preserved.
-    assert!((2..=3).all(|i| segment_files.iter().any(|val| val
-        .to_str()
-        .is_some_and(|file_str| file_str == format!("{:0>20}.{}", i, LOG_EXTENSION)))));
 
     Ok(())
 }
 
+// Helper function to extract segment offsets from DirEntry list
+fn get_segment_offsets(segments: &[DirEntry]) -> Vec<u64> {
+    segments
+        .iter()
+        .filter_map(|entry| {
+            entry.file_name().to_str().and_then(|name| {
+                name.split('.')
+                    .next()
+                    .and_then(|offset_str| offset_str.parse::<u64>().ok())
+            })
+        })
+        .collect()
+}
+
 async fn assert_persisted_segment(partition_path: &str, start_offset: u64) {
     let segment_path = format!("{}/{:0>20}", partition_path, start_offset);
-    let log_path = format!("{}.{}", segment_path, LOG_EXTENSION);
+    let messages_file_path = format!("{}.{}", segment_path, LOG_EXTENSION);
     let index_path = format!("{}.{}", segment_path, INDEX_EXTENSION);
-    assert!(fs::metadata(&log_path).await.is_ok());
+    assert!(fs::metadata(&messages_file_path).await.is_ok());
     assert!(fs::metadata(&index_path).await.is_ok());
 }
 
-fn get_segment_paths_for_partiton(partition_path: &str) -> Vec<DirEntry> {
+fn get_segment_paths_for_partition(partition_path: &str) -> Vec<DirEntry> {
     let paths = std::fs::read_dir(partition_path)
         .map(|read_dir| {
             read_dir
@@ -635,20 +672,6 @@ fn get_segment_paths_for_partiton(partition_path: &str) -> Vec<DirEntry> {
         .unwrap_or_default();
 
     paths
-}
-
-fn create_message(offset: u64, payload: &str, timestamp: IggyTimestamp) -> PolledMessage {
-    let payload = Bytes::from(payload.to_string());
-    let checksum = checksum::calculate(payload.as_ref());
-    PolledMessage::create(
-        offset,
-        MessageState::Available,
-        timestamp,
-        0,
-        payload,
-        checksum,
-        None,
-    )
 }
 
 fn get_start_offsets() -> Vec<u64> {

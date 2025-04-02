@@ -16,13 +16,12 @@
  * under the License.
  */
 
-use std::future::Future;
-
 use crate::configs::server::ServerConfig;
 use crate::streaming::systems::system::SharedSystem;
 use flume::{Receiver, Sender};
+use std::future::Future;
 
-pub trait ServerCommand<C> {
+pub trait BackgroundServerCommand<C> {
     fn execute(&mut self, system: &SharedSystem, command: C) -> impl Future<Output = ()>;
 
     fn start_command_sender(

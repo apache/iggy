@@ -17,7 +17,7 @@
  */
 
 use bytes::Bytes;
-use iggy::messages::send_messages::Message;
+use iggy::prelude::IggyMessage;
 
 mod common;
 mod consumer_offset;
@@ -32,7 +32,7 @@ mod system;
 mod topic;
 mod topic_messages;
 
-fn create_messages() -> Vec<Message> {
+fn create_messages() -> Vec<IggyMessage> {
     vec![
         create_message(1, "message 1"),
         create_message(2, "message 2"),
@@ -43,12 +43,11 @@ fn create_messages() -> Vec<Message> {
     ]
 }
 
-fn create_message(id: u128, payload: &str) -> Message {
+fn create_message(id: u128, payload: &str) -> IggyMessage {
     let payload = Bytes::from(payload.to_string());
-    Message {
-        id,
-        length: payload.len() as u32,
-        payload,
-        headers: None,
-    }
+    IggyMessage::builder()
+        .id(id)
+        .payload(payload)
+        .build()
+        .expect("Failed to create message with valid payload and headers")
 }

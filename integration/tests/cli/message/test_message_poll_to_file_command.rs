@@ -20,13 +20,7 @@ use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase};
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use bytes::Bytes;
-use iggy::client::Client;
-use iggy::identifier::Identifier;
-use iggy::messages::poll_messages::{PollingKind, PollingStrategy};
-use iggy::messages::send_messages::{Message, Partitioning};
-use iggy::models::header::{HeaderKey, HeaderValue};
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy::prelude::*;
 use predicates::str::{contains, is_match, starts_with};
 use serial_test::parallel;
 use std::collections::HashMap;
@@ -130,7 +124,7 @@ impl IggyCmdTestCase for TestMessagePollToFileCmd<'_> {
             .iter()
             .map(|s| {
                 let payload = Bytes::from(s.as_bytes().to_vec());
-                Message::new(None, payload, Some(self.headers.clone()))
+                IggyMessage::with_headers(payload, self.headers.clone())
             })
             .collect::<Vec<_>>();
 

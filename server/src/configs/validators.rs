@@ -25,17 +25,15 @@ use super::server::{
 use super::system::CompressionConfig;
 use crate::archiver::ArchiverKindType;
 use crate::configs::server::{PersonalAccessTokenConfig, ServerConfig};
-use crate::configs::system::{CacheConfig, SegmentConfig};
+use crate::configs::system::SegmentConfig;
 use crate::configs::COMPONENT;
 use crate::server_error::ConfigError;
 use crate::streaming::segments::*;
 use error_set::ErrContext;
 use iggy::compression::compression_algorithm::CompressionAlgorithm;
-use iggy::utils::byte_size::IggyByteSize;
 use iggy::utils::expiry::IggyExpiry;
 use iggy::utils::topic_size::MaxTopicSize;
 use iggy::validatable::Validatable;
-use sysinfo::{Pid, ProcessesToUpdate, System};
 
 impl Validatable<ConfigError> for ServerConfig {
     fn validate(&self) -> Result<(), ConfigError> {
@@ -51,9 +49,6 @@ impl Validatable<ConfigError> for ServerConfig {
             })?;
         self.system.segment.validate().with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to validate segment config")
-        })?;
-        self.system.cache.validate().with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to validate cache config")
         })?;
         self.system
             .compression
@@ -121,48 +116,6 @@ impl Validatable<ConfigError> for TelemetryConfig {
         if self.traces.endpoint.is_empty() {
             return Err(ConfigError::InvalidConfiguration);
         }
-
-        Ok(())
-    }
-}
-
-impl Validatable<ConfigError> for CacheConfig {
-    fn validate(&self) -> Result<(), ConfigError> {
-        if !self.enabled {
-            println!("Cache configuration -> cache is disabled.");
-            return Ok(());
-        }
-
-        let limit_bytes = self.size.clone().into();
-        let mut sys = System::new_all();
-        sys.refresh_all();
-        sys.refresh_processes(
-            ProcessesToUpdate::Some(&[Pid::from_u32(std::process::id())]),
-            true,
-        );
-        let total_memory = sys.total_memory();
-        let free_memory = sys.free_memory();
-        let cache_percentage = (limit_bytes.as_bytes_u64() as f64 / total_memory as f64) * 100.0;
-
-        let pretty_cache_limit = limit_bytes.as_human_string();
-        let pretty_total_memory = IggyByteSize::from(total_memory).as_human_string();
-        let pretty_free_memory = IggyByteSize::from(free_memory).as_human_string();
-
-        if limit_bytes > total_memory {
-            return Err(ConfigError::CacheConfigValidationFailure);
-        }
-
-        if limit_bytes > (total_memory as f64 * 0.75) as u64 {
-            println!(
-                "Cache configuration -> cache size exceeds 75% of total memory. Set to: {} ({:.2}% of total memory: {}).",
-                pretty_cache_limit, cache_percentage, pretty_total_memory
-            );
-        }
-
-        println!(
-            "Cache configuration -> cache size set to {} ({:.2}% of total memory: {}, free memory: {}).",
-            pretty_cache_limit, cache_percentage, pretty_total_memory, pretty_free_memory
-        );
 
         Ok(())
     }

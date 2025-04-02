@@ -16,15 +16,7 @@
  * under the License.
  */
 
-use iggy::client::{Client, StreamClient, TopicClient, UserClient};
-use iggy::clients::builder::IggyClientBuilder;
-use iggy::clients::client::IggyClient;
-use iggy::compression::compression_algorithm::CompressionAlgorithm;
-use iggy::messages::send_messages::{Message, Partitioning};
-use iggy::users::defaults::*;
-use iggy::utils::duration::IggyDuration;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy::prelude::*;
 use std::env;
 use std::error::Error;
 use std::str::FromStr;
@@ -112,7 +104,7 @@ async fn produce_messages(client: &dyn Client) -> Result<(), Box<dyn Error>> {
         for _ in 0..messages_per_batch {
             current_id += 1;
             let payload = format!("message-{current_id}");
-            let message = Message::from_str(&payload)?;
+            let message = IggyMessage::from_str(&payload)?;
             messages.push(message);
         }
         client

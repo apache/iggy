@@ -69,7 +69,7 @@ impl From<IggyBenchArgs> for Box<dyn Benchmarkable> {
             BenchmarkKindCommand::EndToEndProducingConsumerGroup(_) => Box::new(
                 EndToEndProducingConsumerGroupBenchmark::new(Arc::new(args), client_factory),
             ),
-            _ => todo!(),
+            _ => unreachable!(),
         }
     }
 }

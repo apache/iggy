@@ -23,7 +23,6 @@ use crate::models::client_info::{ClientInfo, ClientInfoDetails, ConsumerGroupInf
 use crate::models::consumer_group::{ConsumerGroup, ConsumerGroupDetails, ConsumerGroupMember};
 use crate::models::consumer_offset_info::ConsumerOffsetInfo;
 use crate::models::identity_info::IdentityInfo;
-use crate::models::messages::{MessageState, PolledMessage, PolledMessages};
 use crate::models::partition::Partition;
 use crate::models::permissions::Permissions;
 use crate::models::personal_access_token::{PersonalAccessTokenInfo, RawPersonalAccessToken};
@@ -39,7 +38,6 @@ use bytes::Bytes;
 use std::collections::HashMap;
 use std::str::from_utf8;
 
-const EMPTY_MESSAGES: Vec<PolledMessage> = vec![];
 const EMPTY_TOPICS: Vec<Topic> = vec![];
 const EMPTY_STREAMS: Vec<Stream> = vec![];
 const EMPTY_CLIENTS: Vec<ClientInfo> = vec![];
@@ -543,106 +541,6 @@ pub fn map_clients(payload: Bytes) -> Result<Vec<ClientInfo>, IggyError> {
     }
     clients.sort_by(|x, y| x.client_id.cmp(&y.client_id));
     Ok(clients)
-}
-
-pub fn map_polled_messages(payload: Bytes) -> Result<PolledMessages, IggyError> {
-    if payload.is_empty() {
-        return Ok(PolledMessages {
-            messages: EMPTY_MESSAGES,
-            partition_id: 0,
-            current_offset: 0,
-        });
-    }
-
-    let length = payload.len();
-    let partition_id = u32::from_le_bytes(
-        payload[..4]
-            .try_into()
-            .map_err(|_| IggyError::InvalidNumberEncoding)?,
-    );
-    let current_offset = u64::from_le_bytes(
-        payload[4..12]
-            .try_into()
-            .map_err(|_| IggyError::InvalidNumberEncoding)?,
-    );
-    // Currently ignored
-    let _messages_count = u32::from_le_bytes(
-        payload[12..16]
-            .try_into()
-            .map_err(|_| IggyError::InvalidNumberEncoding)?,
-    );
-    let mut position = 16;
-    let mut messages = Vec::new();
-    while position < length {
-        let offset = u64::from_le_bytes(
-            payload[position..position + 8]
-                .try_into()
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        let state = MessageState::from_code(payload[position + 8])?;
-        let timestamp = u64::from_le_bytes(
-            payload[position + 9..position + 17]
-                .try_into()
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        let id = u128::from_le_bytes(
-            payload[position + 17..position + 33]
-                .try_into()
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        let checksum = u32::from_le_bytes(
-            payload[position + 33..position + 37]
-                .try_into()
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        let headers_length = u32::from_le_bytes(
-            payload[position + 37..position + 41]
-                .try_into()
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        let headers = if headers_length > 0 {
-            let headers_payload =
-                payload.slice(position + 41..position + 41 + headers_length as usize);
-            Some(HashMap::from_bytes(headers_payload)?)
-        } else {
-            None
-        };
-        position += headers_length as usize;
-        let message_length = u32::from_le_bytes(
-            payload[position + 41..position + 45]
-                .try_into()
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
-        let payload_range = position + 45..position + 45 + message_length as usize;
-        if payload_range.start > length || payload_range.end > length {
-            break;
-        }
-
-        let payload = payload[payload_range].to_vec();
-        let total_size = 45 + message_length as usize;
-        position += total_size;
-        messages.push(PolledMessage {
-            offset,
-            timestamp,
-            state,
-            checksum,
-            id,
-            headers,
-            length: IggyByteSize::from(message_length as u64),
-            payload: Bytes::from(payload),
-        });
-
-        if position + 45 >= length {
-            break;
-        }
-    }
-
-    messages.sort_by(|x, y| x.offset.cmp(&y.offset));
-    Ok(PolledMessages {
-        partition_id,
-        current_offset,
-        messages,
-    })
 }
 
 pub fn map_streams(payload: Bytes) -> Result<Vec<Stream>, IggyError> {

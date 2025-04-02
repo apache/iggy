@@ -21,16 +21,7 @@ use crate::server::scenarios::{
     CONSUMER_GROUP_NAME, MESSAGES_COUNT, PARTITIONS_COUNT, STREAM_ID, STREAM_NAME, TOPIC_ID,
     TOPIC_NAME,
 };
-use iggy::client::{ConsumerGroupClient, MessageClient, StreamClient, SystemClient, TopicClient};
-use iggy::clients::client::IggyClient;
-use iggy::compression::compression_algorithm::CompressionAlgorithm;
-use iggy::consumer::Consumer;
-use iggy::identifier::Identifier;
-use iggy::messages::poll_messages::PollingStrategy;
-use iggy::messages::send_messages::{Message, Partitioning};
-use iggy::models::consumer_group::ConsumerGroupDetails;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy::prelude::*;
 use integration::test_server::{
     assert_clean_system, create_user, login_root, login_user, ClientFactory,
 };
@@ -122,7 +113,7 @@ async fn execute_using_messages_key_key(
 ) {
     // 1. Send messages to the calculated partition ID on the server side by using entity ID as a key
     for entity_id in 1..=MESSAGES_COUNT {
-        let message = Message::from_str(&create_message_payload(entity_id)).unwrap();
+        let message = IggyMessage::from_str(&create_message_payload(entity_id)).unwrap();
         let mut messages = vec![message];
         system_client
             .send_messages(
@@ -185,7 +176,8 @@ async fn execute_using_none_key(
         }
 
         let message =
-            Message::from_str(&create_extended_message_payload(partition_id, entity_id)).unwrap();
+            IggyMessage::from_str(&create_extended_message_payload(partition_id, entity_id))
+                .unwrap();
         let mut messages = vec![message];
         system_client
             .send_messages(
@@ -239,7 +231,7 @@ async fn validate_message_polling(client: &IggyClient, consumer_group: &Consumer
         assert_eq!(polled_messages.messages.len(), 1);
         let message = &polled_messages.messages[0];
         let offset = (i - 1) as u64;
-        assert_eq!(message.offset, offset);
+        assert_eq!(message.header.offset, offset);
         let entity_id = start_entity_id + ((i - 1) * PARTITIONS_COUNT);
         let payload = from_utf8(&message.payload).unwrap();
         assert_eq!(

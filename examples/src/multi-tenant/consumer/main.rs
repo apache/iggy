@@ -20,16 +20,7 @@ use ahash::AHashMap;
 use clap::Parser;
 use futures_util::future::join_all;
 use futures_util::StreamExt;
-use iggy::client::{Client, StreamClient, TopicClient, UserClient};
-use iggy::clients::client::IggyClient;
-use iggy::clients::consumer::{AutoCommit, AutoCommitWhen, IggyConsumer};
-use iggy::error::IggyError;
-use iggy::identifier::Identifier;
-use iggy::messages::poll_messages::PollingStrategy;
-use iggy::models::permissions::{Permissions, StreamPermissions, TopicPermissions};
-use iggy::models::user_status::UserStatus;
-use iggy::users::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
-use iggy::utils::duration::IggyDuration;
+use iggy::prelude::*;
 use iggy_examples::shared::args::Args;
 use std::collections::HashMap;
 use std::env;
@@ -251,7 +242,7 @@ fn start_consumers(tenant_id: u32, consumers: Vec<TenantConsumer>) -> Vec<JoinHa
                 if let Ok(message) = message {
                     let current_offset = message.current_offset;
                     let partition_id = message.partition_id;
-                    let offset = message.message.offset;
+                    let offset = message.message.header.offset;
                     let payload = std::str::from_utf8(&message.message.payload);
                     if payload.is_err() {
                         let error = payload.unwrap_err();
