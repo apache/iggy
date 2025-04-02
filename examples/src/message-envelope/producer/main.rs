@@ -18,11 +18,7 @@
 
 use anyhow::Result;
 use clap::Parser;
-use iggy::client::{Client, MessageClient};
-use iggy::client_provider;
-use iggy::client_provider::ClientProviderConfig;
-use iggy::clients::client::IggyClient;
-use iggy::messages::send_messages::{Message, Partitioning};
+use iggy::prelude::*;
 use iggy_examples::shared::args::Args;
 use iggy_examples::shared::messages_generator::MessagesGenerator;
 use iggy_examples::shared::system;
@@ -84,7 +80,7 @@ async fn produce_messages(args: &Args, client: &IggyClient) -> Result<(), Box<dy
             let serializable_message = message_generator.generate();
             // You can send the different message types to the same partition, or stick to the single type.
             let json_envelope = serializable_message.to_json_envelope();
-            let message = Message::from_str(&json_envelope)?;
+            let message = IggyMessage::from_str(&json_envelope)?;
             messages.push(message);
             // This is used for the logging purposes only.
             serializable_messages.push(serializable_message);

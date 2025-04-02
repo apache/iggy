@@ -22,10 +22,7 @@ use crate::cli::common::{
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
-use iggy::client::Client;
-use iggy::messages::send_messages::{Message, Partitioning};
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy::prelude::*;
 use predicates::str::diff;
 use serial_test::parallel;
 use std::str::FromStr;
@@ -97,7 +94,7 @@ impl IggyCmdTestCase for TestTopicPurgeCmd {
 
         let mut messages = (1..100)
             .map(|n| format!("message {}", n))
-            .filter_map(|s| Message::from_str(s.as_str()).ok())
+            .filter_map(|s| IggyMessage::from_str(s.as_str()).ok())
             .collect::<Vec<_>>();
 
         let send_status = client

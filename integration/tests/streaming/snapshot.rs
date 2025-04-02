@@ -42,7 +42,7 @@ async fn should_create_snapshot_file() {
         .get_snapshot(
             &session,
             SnapshotCompression::Deflated,
-            vec![SystemSnapshotType::Test],
+            &vec![SystemSnapshotType::Test],
         )
         .await
         .unwrap();

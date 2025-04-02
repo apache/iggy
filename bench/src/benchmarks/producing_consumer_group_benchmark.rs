@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use iggy::client::ConsumerGroupClient;
 use iggy::clients::client::IggyClient;
 use iggy::error::IggyError;
-use iggy::messages::poll_messages::PollingKind;
+use iggy::messages::PollingKind;
 use iggy_bench_report::benchmark_kind::BenchmarkKind;
 use iggy_bench_report::individual_metrics::BenchmarkIndividualMetrics;
 use integration::test_server::{login_root, ClientFactory};

@@ -16,13 +16,10 @@
  * under the License.
  */
 
-pub mod batching;
-pub mod cache;
 pub mod clients;
 mod deduplication;
 pub mod diagnostics;
 pub mod local_sizeable;
-pub mod models;
 pub mod partitions;
 pub mod persistence;
 pub mod personal_access_tokens;

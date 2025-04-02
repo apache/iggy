@@ -24,10 +24,8 @@ use crate::{
     rate_limiter::RateLimiter,
 };
 use async_trait::async_trait;
-use iggy::{
-    client::ConsumerGroupClient, clients::client::IggyClient, error::IggyError,
-    messages::poll_messages::PollingKind,
-};
+use iggy::messages::PollingKind;
+use iggy::{client::ConsumerGroupClient, clients::client::IggyClient, error::IggyError};
 use iggy_bench_report::{
     benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics,
 };
@@ -141,7 +139,6 @@ impl Benchmarkable for ProducerAndConsumerGroupBenchmark {
                 self.args
                     .rate_limit()
                     .map(|rl| RateLimiter::new(rl.as_bytes_u64())),
-                false, // TODO: Put latency into payload of first message, it should be an argument to iggy-bench
             );
             set.spawn(producer.run());
         }

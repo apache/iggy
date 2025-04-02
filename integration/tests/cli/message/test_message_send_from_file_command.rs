@@ -20,15 +20,7 @@ use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase};
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use bytes::Bytes;
-use iggy::bytes_serializable::BytesSerializable;
-use iggy::client::Client;
-use iggy::consumer::Consumer;
-use iggy::identifier::Identifier;
-use iggy::messages::poll_messages::PollingStrategy;
-use iggy::messages::send_messages::Message;
-use iggy::models::header::{HeaderKey, HeaderValue};
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy::prelude::*;
 use predicates::str::{ends_with, is_match, starts_with};
 use serial_test::parallel;
 use std::collections::HashMap;
@@ -127,15 +119,15 @@ impl IggyCmdTestCase for TestMessageSendFromFileCmd<'_> {
                 .iter()
                 .map(|s| {
                     let payload = Bytes::from(s.as_bytes().to_vec());
-                    Message::new(None, payload, Some(self.headers.clone()))
+                    IggyMessage::with_headers(payload, self.headers.clone())
                 })
                 .collect::<Vec<_>>();
 
             for message in messages.iter() {
-                let message = Message::new(
-                    Some(message.id),
+                let message = IggyMessage::with_id_and_headers(
+                    message.header.id,
                     message.payload.clone(),
-                    message.headers.clone(),
+                    message.user_headers_map().unwrap().unwrap(),
                 );
 
                 let write_result = file.write_all(&message.to_bytes()).await;
@@ -214,8 +206,11 @@ impl IggyCmdTestCase for TestMessageSendFromFileCmd<'_> {
                 message.payload,
                 Bytes::from(self.messages[i].as_bytes().to_vec())
             );
-            assert_eq!(message.headers.is_some(), !self.headers.is_empty());
-            assert_eq!(message.headers.as_ref().unwrap(), &self.headers);
+            assert_eq!(
+                message.user_headers_map().unwrap().is_some(),
+                !self.headers.is_empty()
+            );
+            assert_eq!(&message.user_headers_map().unwrap().unwrap(), &self.headers);
         }
 
         let topic_delete = client.delete_topic(&stream_id, &topic_id).await;

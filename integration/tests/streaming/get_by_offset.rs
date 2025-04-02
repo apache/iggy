@@ -18,17 +18,11 @@
 
 use crate::streaming::common::test_setup::TestSetup;
 use bytes::BytesMut;
-use iggy::bytes_serializable::BytesSerializable;
-use iggy::messages::send_messages::Message;
-use iggy::models::header::{HeaderKey, HeaderValue};
-use iggy::utils::byte_size::IggyByteSize;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::sizeable::Sizeable;
-use iggy::utils::timestamp::IggyTimestamp;
-use server::configs::resource_quota::MemoryResourceQuota;
-use server::configs::system::{CacheConfig, PartitionConfig, SegmentConfig, SystemConfig};
-use server::streaming::batching::appendable_batch_info::AppendableBatchInfo;
+use iggy::prelude::*;
+use server::configs::cache_indexes::CacheIndexesConfig;
+use server::configs::system::{PartitionConfig, SegmentConfig, SystemConfig};
 use server::streaming::partitions::partition::Partition;
+use server::streaming::segments::IggyMessagesBatchMut;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, AtomicU64};
@@ -40,53 +34,66 @@ use test_case::test_matrix;
  */
 
 fn msg_size(size: u64) -> IggyByteSize {
-    IggyByteSize::from_str(&format!("{}b", size)).unwrap()
+    IggyByteSize::from_str(&format!("{}B", size)).unwrap()
 }
 
 fn segment_size(size: u64) -> IggyByteSize {
-    IggyByteSize::from_str(&format!("{}b", size)).unwrap()
+    IggyByteSize::from_str(&format!("{}B", size)).unwrap()
 }
 
 fn msgs_req_to_save(count: u32) -> u32 {
     count
 }
 
-fn msg_cache_size(size: u64) -> Option<IggyByteSize> {
-    if size == 0 {
-        return None;
-    }
-    Some(IggyByteSize::from_str(&format!("{}b", size)).unwrap())
+fn index_cache_all() -> CacheIndexesConfig {
+    CacheIndexesConfig::All
 }
 
-fn index_cache_enabled() -> bool {
-    true
+fn index_cache_none() -> CacheIndexesConfig {
+    CacheIndexesConfig::None
 }
 
-fn index_cache_disabled() -> bool {
-    false
+fn index_cache_open_segment() -> CacheIndexesConfig {
+    CacheIndexesConfig::OpenSegment
+}
+
+fn small_batches() -> Vec<u32> {
+    vec![3, 4, 5, 6, 7]
+}
+
+fn medium_batches() -> Vec<u32> {
+    vec![10, 20, 30, 40]
+}
+
+fn large_batches() -> Vec<u32> {
+    vec![100, 200, 300, 400]
+}
+
+fn very_large_batches() -> Vec<u32> {
+    vec![500, 1000, 1500, 1000]
 }
 
 #[test_matrix(
     [msg_size(50), msg_size(1000), msg_size(20000)],
-    [msgs_req_to_save(10), msgs_req_to_save(24), msgs_req_to_save(1000)],
-    [segment_size(500), segment_size(2000), segment_size(100000)],
-    [msg_cache_size(0), msg_cache_size(5000), msg_cache_size(50000), msg_cache_size(2000000)],
-    [index_cache_disabled(), index_cache_enabled()])]
+    [small_batches(), medium_batches(), large_batches(), very_large_batches()],
+    [msgs_req_to_save(1), msgs_req_to_save(24), msgs_req_to_save(1000), msgs_req_to_save(10000)],
+    [segment_size(10), segment_size(200), segment_size(10000000)],
+    [index_cache_none(), index_cache_all(), index_cache_open_segment()])]
 #[tokio::test]
 async fn test_get_messages_by_offset(
     message_size: IggyByteSize,
+    batch_sizes: Vec<u32>,
     messages_required_to_save: u32,
     segment_size: IggyByteSize,
-    msg_cache_size: Option<IggyByteSize>,
-    index_cache_enabled: bool,
+    cache_indexes: CacheIndexesConfig,
 ) {
     println!(
-        "Running test with msg_cache_enabled: {}, messages_required_to_save: {}, segment_size: {}, message_size: {}, cache_indexes: {}",
-        msg_cache_size.is_some(),
+        "Running test with message_size: {}, batches: {:?}, messages_required_to_save: {}, segment_size: {}, cache_indexes: {}",
+        message_size,
+        batch_sizes,
         messages_required_to_save,
         segment_size,
-        message_size,
-        index_cache_enabled
+        cache_indexes
     );
 
     let setup = TestSetup::init().await;
@@ -94,26 +101,17 @@ async fn test_get_messages_by_offset(
     let topic_id = 1;
     let partition_id = 1;
 
-    // Define batch sizes for 5 appends
-    let batch_sizes = [3, 4, 5, 6, 7];
-    let total_messages: u32 = batch_sizes.iter().sum();
+    let total_messages_count = batch_sizes.iter().sum();
 
-    let msg_cache_enabled = msg_cache_size.is_some();
-    let msg_cache_size =
-        MemoryResourceQuota::Bytes(msg_cache_size.unwrap_or(IggyByteSize::from_str("0").unwrap()));
     let config = Arc::new(SystemConfig {
         path: setup.config.path.to_string(),
-        cache: CacheConfig {
-            enabled: msg_cache_enabled,
-            size: msg_cache_size,
-        },
         partition: PartitionConfig {
             messages_required_to_save,
             enforce_fsync: true,
             ..Default::default()
         },
         segment: SegmentConfig {
-            cache_indexes: index_cache_enabled,
+            cache_indexes,
             size: segment_size,
             ..Default::default()
         },
@@ -140,8 +138,10 @@ async fn test_get_messages_by_offset(
     setup.create_partitions_directory(stream_id, topic_id).await;
     partition.persist().await.unwrap();
 
-    let mut all_messages = Vec::with_capacity(total_messages as usize);
-    for i in 1..=total_messages {
+    let mut all_messages = Vec::with_capacity(total_messages_count as usize);
+
+    // Generate all messages as defined in the test matrix
+    for i in 1..=total_messages_count {
         let id = i as u128;
         let beginning_of_payload = format!("message {}", i);
         let mut payload = BytesMut::new();
@@ -162,12 +162,13 @@ async fn test_get_messages_by_offset(
             HeaderKey::new("key-3").unwrap(),
             HeaderValue::from_uint64(123456).unwrap(),
         );
-        let message = Message {
-            id,
-            length: payload.len() as u32,
-            payload: payload.clone(),
-            headers: Some(headers),
-        };
+
+        let message = IggyMessage::builder()
+            .id(id)
+            .payload(payload)
+            .headers(headers)
+            .build()
+            .expect("Failed to create message with valid payload and headers");
         all_messages.push(message);
     }
 
@@ -175,130 +176,205 @@ async fn test_get_messages_by_offset(
     let mut batch_offsets = Vec::with_capacity(batch_sizes.len());
     let mut current_pos = 0;
 
-    // Append all batches
-    for batch_size in batch_sizes {
-        let batch = all_messages[current_pos..current_pos + batch_size as usize].to_vec();
-        let batch_info = AppendableBatchInfo::new(
-            batch
-                .iter()
-                .map(|msg| msg.get_size_bytes())
-                .sum::<IggyByteSize>(),
-            partition.partition_id,
+    // Append all batches as defined in the test matrix
+    for (batch_idx, &batch_len) in batch_sizes.iter().enumerate() {
+        // If we've generated too many messages, skip the rest
+        if current_pos + batch_len as usize > all_messages.len() {
+            break;
+        }
+
+        println!(
+            "Appending batch {}/{} with {} messages",
+            batch_idx + 1,
+            batch_sizes.len(),
+            batch_len
         );
-        partition
-            .append_messages(batch_info, batch.clone(), None)
-            .await
-            .unwrap();
+
+        let batch_end_pos = current_pos + batch_len as usize;
+        let messages_slice_to_append = &all_messages[current_pos..batch_end_pos];
+
+        let messages_size = messages_slice_to_append
+            .iter()
+            .map(|m| m.get_size_bytes().as_bytes_u64() as u32)
+            .sum();
+
+        let batch = IggyMessagesBatchMut::from_messages(messages_slice_to_append, messages_size);
+        assert_eq!(batch.count(), batch_len);
+        partition.append_messages(batch, None).await.unwrap();
 
         batch_offsets.push(partition.current_offset);
-        current_pos += batch_size as usize;
+        current_pos += batch_len as usize;
     }
+
+    // Use the exact total messages count from the test matrix
+    let total_sent_messages = total_messages_count;
 
     // Test 1: All messages from start
     let all_loaded_messages = partition
-        .get_messages_by_offset(0, total_messages)
+        .get_messages_by_offset(0, total_sent_messages)
         .await
         .unwrap();
     assert_eq!(
-        all_loaded_messages.len(),
-        total_messages as usize,
+        all_loaded_messages.count(),
+        total_sent_messages,
         "Expected {} messages from start, but got {}",
-        total_messages,
-        all_loaded_messages.len()
+        total_sent_messages,
+        all_loaded_messages.count()
     );
 
     // Test 2: Get messages from middle (after 3rd batch)
-    let middle_offset = batch_offsets[2];
-    let remaining_messages = total_messages - (batch_sizes[0] + batch_sizes[1] + batch_sizes[2]);
-    let middle_messages = partition
-        .get_messages_by_offset(middle_offset + 1, remaining_messages)
-        .await
-        .unwrap();
-    assert_eq!(
-        middle_messages.len(),
-        remaining_messages as usize,
-        "Expected {} messages from middle offset, but got {}",
-        remaining_messages,
-        middle_messages.len()
-    );
+    if batch_offsets.len() >= 3 {
+        let middle_offset = batch_offsets[2];
+        let prior_batches_sum: u32 = batch_sizes[..3].iter().sum();
+        let remaining_messages = total_sent_messages - prior_batches_sum;
+
+        let middle_messages = partition
+            .get_messages_by_offset(middle_offset + 1, remaining_messages)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            middle_messages.count(),
+            remaining_messages,
+            "Expected {} messages from middle offset, but got {}",
+            remaining_messages,
+            middle_messages.count()
+        );
+    }
 
     // Test 3: No messages beyond final offset
-    let final_offset = batch_offsets.last().unwrap();
-    let no_messages = partition
-        .get_messages_by_offset(final_offset + 1, 1)
-        .await
-        .unwrap();
-    assert_eq!(
-        no_messages.len(),
-        0,
-        "Expected no messages beyond final offset, but got {}",
-        no_messages.len()
-    );
+    if !batch_offsets.is_empty() {
+        let final_offset = *batch_offsets.last().unwrap();
+        let no_messages = partition
+            .get_messages_by_offset(final_offset + 1, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            no_messages.count(),
+            0,
+            "Expected no messages beyond final offset, but got {}",
+            no_messages.count()
+        );
+    }
 
     // Test 4: Small subset from start
-    let subset_size = 3;
+    let subset_size = std::cmp::min(3, total_sent_messages);
     let subset_messages = partition
         .get_messages_by_offset(0, subset_size)
         .await
         .unwrap();
     assert_eq!(
-        subset_messages.len(),
-        subset_size as usize,
+        subset_messages.count(),
+        subset_size,
         "Expected {} messages in subset from start, but got {}",
         subset_size,
-        subset_messages.len()
+        subset_messages.count()
     );
 
     // Test 5: Messages spanning multiple batches
-    let span_offset = batch_offsets[1] + 1; // Start from middle of 2nd batch
-    let span_size = 8; // Should span across 2nd, 3rd, and into 4th batch
-    let spanning_messages = partition
-        .get_messages_by_offset(span_offset, span_size)
-        .await
-        .unwrap();
-    assert_eq!(
-        spanning_messages.len(),
-        span_size as usize,
-        "Expected {} messages spanning multiple batches, but got {}",
-        span_size,
-        spanning_messages.len()
+    if batch_offsets.len() >= 4 {
+        let span_offset = batch_offsets[1] + 1; // Start from middle of 2nd batch
+        let span_size = 8; // Should span across 2nd, 3rd, and into 4th batch
+        let batches = partition
+            .get_messages_by_offset(span_offset, span_size)
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.count(),
+            span_size,
+            "Expected {} messages spanning multiple batches, but got {}",
+            span_size,
+            batches.count()
+        );
+
+        // Test 6: Validate message content and ordering for all messages
+        let mut i = 0;
+
+        for batch in batches.iter() {
+            for msg in batch.iter() {
+                let expected_offset = span_offset + i as u64;
+                assert!(
+                    msg.header().offset() >= expected_offset,
+                    "Message offset {} at position {} should be >= expected offset {}",
+                    msg.header().offset(),
+                    i,
+                    expected_offset
+                );
+
+                let original_offset = msg.header().offset() as usize;
+                if original_offset < all_messages.len() {
+                    let original_message = &all_messages[original_offset];
+
+                    let loaded_id = msg.header().id();
+                    let original_id = original_message.header.id;
+                    assert_eq!(
+                        loaded_id,
+                        original_id,
+                        "Message ID mismatch at offset {}",
+                        msg.header().offset(),
+                    );
+
+                    let loaded_payload = msg.payload();
+                    let original_payload = &original_message.payload;
+                    assert_eq!(
+                        loaded_payload,
+                        original_payload,
+                        "Payload mismatch at offset {}",
+                        msg.header().offset(),
+                    );
+
+                    let loaded_headers = msg.user_headers_map().unwrap().unwrap();
+                    let original_headers = HashMap::from_bytes(
+                        original_message.user_headers.as_ref().unwrap().clone(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        loaded_headers,
+                        original_headers,
+                        "Headers mismatch at offset {}",
+                        msg.header().offset(),
+                    );
+                }
+                i += 1;
+            }
+        }
+    }
+
+    // Add sequential read test for all batch sizes
+    println!(
+        "Verifying sequential reads, expecting {} messages",
+        total_sent_messages
     );
 
-    // Test 6: Validate message content and ordering
-    for (i, msg) in spanning_messages.iter().enumerate() {
-        let expected_offset = span_offset + i as u64;
-        assert!(
-            msg.offset >= expected_offset,
-            "Message offset {} at position {} should be >= expected offset {}",
-            msg.offset,
-            i,
-            expected_offset
+    let chunk_size = 500;
+    let mut verified_count = 0;
+
+    for chunk_start in (0..total_sent_messages).step_by(chunk_size as usize) {
+        let read_size = std::cmp::min(chunk_size, total_sent_messages - chunk_start);
+
+        let chunk = partition
+            .get_messages_by_offset(chunk_start as u64, read_size)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            chunk.count(),
+            read_size,
+            "Failed to read chunk at offset {} with size {}",
+            chunk_start,
+            read_size
         );
 
-        // Verify message contents match original
-        let original_idx = msg.offset as usize;
-        let original_message = &all_messages[original_idx];
-        assert_eq!(
-            msg.id, original_message.id,
-            "Message ID mismatch at offset {}: expected {}, got {}",
-            msg.offset, original_message.id, msg.id
-        );
-        assert_eq!(
-            msg.payload, original_message.payload,
-            "Payload mismatch at offset {}: expected {:?}, got {:?}",
-            msg.offset, original_message.payload, msg.payload
-        );
-        assert_eq!(
-            msg.headers
-                .as_ref()
-                .map(|bytes| HashMap::from_bytes(bytes.clone()).unwrap()),
-            original_message.headers,
-            "Headers mismatch at offset {}: expected {:?}, got {:?}",
-            msg.offset,
-            original_message.headers,
-            msg.headers
-                .as_ref()
-                .map(|bytes| HashMap::from_bytes(bytes.clone()).unwrap())
+        verified_count += chunk.count();
+
+        println!(
+            "Read chunk at offset {} with size {}, verified count: {}",
+            chunk_start, read_size, verified_count
         );
     }
+
+    assert_eq!(
+        verified_count, total_sent_messages,
+        "Sequential chunk reads didn't cover all messages"
+    );
 }

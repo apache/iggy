@@ -16,13 +16,7 @@
  * under the License.
  */
 
-use iggy::client::{Client, UserClient};
-use iggy::clients::builder::IggyClientBuilder;
-use iggy::consumer::Consumer;
-use iggy::messages::poll_messages::PollingStrategy;
-use iggy::models::messages::PolledMessage;
-use iggy::users::defaults::*;
-use iggy::utils::duration::IggyDuration;
+use iggy::prelude::*;
 use std::env;
 use std::error::Error;
 use std::str::FromStr;
@@ -107,12 +101,12 @@ async fn consume_messages(client: &dyn Client) -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn handle_message(message: &PolledMessage) -> Result<(), Box<dyn Error>> {
+fn handle_message(message: &IggyMessage) -> Result<(), Box<dyn Error>> {
     // The payload can be of any type as it is a raw byte array. In this case it's a simple string.
     let payload = std::str::from_utf8(&message.payload)?;
     info!(
         "Handling message at offset: {}, payload: {}...",
-        message.offset, payload
+        message.header.offset, payload
     );
     Ok(())
 }

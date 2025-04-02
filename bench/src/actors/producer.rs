@@ -16,7 +16,6 @@
  * under the License.
  */
 
-use crate::actors::utils::put_timestamp_in_first_message;
 use crate::analytics::metrics::individual::from_records;
 use crate::analytics::record::BenchmarkRecord;
 use crate::rate_limiter::RateLimiter;
@@ -24,7 +23,8 @@ use human_repr::HumanCount;
 use iggy::client::MessageClient;
 use iggy::clients::client::IggyClient;
 use iggy::error::IggyError;
-use iggy::messages::send_messages::{Message, Partitioning};
+use iggy::prelude::IggyMessage;
+use iggy::prelude::Partitioning;
 use iggy::utils::byte_size::IggyByteSize;
 use iggy::utils::duration::IggyDuration;
 use iggy::utils::sizeable::Sizeable;
@@ -51,7 +51,6 @@ pub struct Producer {
     sampling_time: IggyDuration,
     moving_average_window: u32,
     rate_limiter: Option<RateLimiter>,
-    put_timestamp_in_first_message: bool,
 }
 
 impl Producer {
@@ -69,7 +68,6 @@ impl Producer {
         sampling_time: IggyDuration,
         moving_average_window: u32,
         rate_limiter: Option<RateLimiter>,
-        put_timestamp_in_first_message: bool,
     ) -> Self {
         Producer {
             client_factory,
@@ -84,7 +82,6 @@ impl Producer {
             sampling_time,
             moving_average_window,
             rate_limiter,
-            put_timestamp_in_first_message,
         }
     }
 
@@ -109,8 +106,8 @@ impl Producer {
         let mut batch_total_bytes = 0;
         let mut messages = Vec::with_capacity(messages_per_batch as usize);
         for _ in 0..messages_per_batch {
-            let message = Message::from_str(&payload).unwrap();
-            batch_user_data_bytes += message.length as u64;
+            let message = IggyMessage::from_str(&payload).unwrap();
+            batch_user_data_bytes += message.payload.len() as u64;
             batch_total_bytes += message.get_size_bytes().as_bytes_u64();
             messages.push(message);
         }
@@ -132,9 +129,6 @@ impl Producer {
             );
             let warmup_end = Instant::now() + self.warmup_time.get_duration();
             while Instant::now() < warmup_end {
-                if self.put_timestamp_in_first_message {
-                    put_timestamp_in_first_message(&mut messages[0]);
-                }
                 client
                     .send_messages(&stream_id, &topic_id, &partitioning, &mut messages)
                     .await?;
@@ -154,19 +148,23 @@ impl Producer {
         let start_timestamp = Instant::now();
         let mut latencies: Vec<Duration> = Vec::with_capacity(message_batches as usize);
         let mut records = Vec::with_capacity(message_batches as usize);
+        let mut total_overhead_time = Duration::from_secs(0);
         for i in 1..=message_batches {
+            let iteration_start = Instant::now();
+
             // Apply rate limiting if configured
             if let Some(limiter) = &self.rate_limiter {
                 limiter.throttle(batch_total_bytes).await;
-            }
-            if self.put_timestamp_in_first_message {
-                put_timestamp_in_first_message(&mut messages[0]);
             }
             let before_send = Instant::now();
             client
                 .send_messages(&stream_id, &topic_id, &partitioning, &mut messages)
                 .await?;
             let latency = before_send.elapsed();
+
+            let iteration_time = iteration_start.elapsed();
+            let overhead_time = iteration_time - latency;
+            total_overhead_time += overhead_time;
 
             let messages_processed = (i * messages_per_batch) as u64;
             let batches_processed = i as u64;
@@ -198,6 +196,20 @@ impl Producer {
             message_batches,
             messages_per_batch,
             &metrics,
+        );
+
+        let avg_overhead_per_batch =
+            total_overhead_time.as_micros() as f64 / message_batches as f64;
+        let total_elapsed = start_timestamp.elapsed();
+        let send_time = total_elapsed - total_overhead_time;
+        info!(
+            "Producer #{} → Overhead stats: Total time: {} ms, Send time: {} ms, Overhead time: {} ms ({:.2}%), Avg overhead per batch: {:.2} μs",
+            self.producer_id,
+            total_elapsed.as_millis(),
+            send_time.as_millis(),
+            total_overhead_time.as_millis(),
+            (total_overhead_time.as_micros() as f64 / total_elapsed.as_micros() as f64) * 100.0,
+            avg_overhead_per_batch
         );
 
         Ok(metrics)

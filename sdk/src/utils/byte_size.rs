@@ -68,6 +68,11 @@ impl IggyByteSize {
         self.0.as_u64()
     }
 
+    /// Returns the byte size as a `u32`.
+    pub fn as_bytes_u32(&self) -> u32 {
+        self.as_bytes_u64() as u32
+    }
+
     /// Returns the byte size as a `usize`.
     pub fn as_bytes_usize(&self) -> usize {
         self.as_bytes_u64() as usize

@@ -63,25 +63,21 @@ impl System {
         let partition_lock = topic.get_partition(partition_id)?;
         let mut partition = partition_lock.write().await;
 
-        partition
-            .segments
-            // Ensure sorting in ascending order as we want to delete the oldest segments first.
-            // This will likely be optimized to not sort the entirety of the vec.
-            .sort_by(|a, b| a.start_offset.cmp(&b.start_offset));
+        partition.segments.sort_by_key(|a| a.start_offset());
 
         // Retrieve the oldest segments for this partition.
         let segments = partition
             .segments
             .iter()
             // Filter to only get the closed segments.
-            .filter(|segment| segment.is_closed)
+            .filter(|segment| segment.is_closed())
             .take(
                 segments_count
                     .try_into()
                     .map_err(|_| IggyError::InvalidSegmentsCount(segments_count))?,
             )
             // coerce to tuple of u64 as this has copy implicit.
-            .map(|segment| (segment.start_offset, segment.get_messages_count()))
+            .map(|segment| (segment.start_offset(), segment.get_messages_count()))
             .collect::<Vec<_>>();
 
         // Delete the segments in sequence.
@@ -95,7 +91,7 @@ impl System {
 
                 // increment metrics.
                 segments_count += 1;
-                messages_count += segment.1;
+                messages_count += segment.1 as u64;
             }
 
             (segments_count, messages_count)

@@ -16,19 +16,16 @@
  * under the License.
  */
 
-use crate::binary::command;
+use crate::binary::command::{ServerCommand, ServerCommandHandler};
 use crate::binary::sender::SenderKind;
-use crate::command::ServerCommand;
 use crate::server_error::ConnectionError;
 use crate::streaming::clients::client_manager::Transport;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
-use anyhow::{anyhow, Context};
-use bytes::Bytes;
-use iggy::validatable::Validatable;
-use iggy::{bytes_serializable::BytesSerializable, messages::MAX_PAYLOAD_SIZE};
+use anyhow::anyhow;
+use iggy::error::IggyError;
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
-use tracing::{debug, error, info};
+use tracing::{error, info, trace};
 
 const LISTENERS_COUNT: u32 = 10;
 const INITIAL_BYTES_LENGTH: usize = 4;
@@ -116,38 +113,66 @@ async fn accept_stream(
 async fn handle_stream(
     stream: BiStream,
     system: SharedSystem,
-    session: impl AsRef<Session>,
+    session: impl AsRef<Session> + std::fmt::Debug,
 ) -> anyhow::Result<()> {
     let (send_stream, mut recv_stream) = stream;
-    // TODO: read to BytesMut instead of Vec<u8>
-    let request = recv_stream
-        .read_to_end(MAX_PAYLOAD_SIZE as usize)
-        .await
-        .with_context(|| "Error when reading the QUIC request.")?;
 
-    if request.len() < INITIAL_BYTES_LENGTH {
-        return Err(anyhow!(
-            "Unable to read the QUIC request length, expected: {INITIAL_BYTES_LENGTH} bytes, received: {} bytes.",
-            request.len()
-        ));
-    }
+    let mut length_buffer = [0u8; INITIAL_BYTES_LENGTH];
+    let mut code_buffer = [0u8; INITIAL_BYTES_LENGTH];
 
-    debug!("Trying to read command...");
-    let length = request[..INITIAL_BYTES_LENGTH]
-        .try_into()
-        .map(u32::from_le_bytes)
-        .unwrap_or_default();
-    let command =
-        ServerCommand::from_bytes(Bytes::copy_from_slice(&request[INITIAL_BYTES_LENGTH..]))
-            .with_context(|| "Error when reading the QUIC request command.")?;
-    command
-        .validate()
-        .with_context(|| "Error when validating the QUIC command.")?;
+    recv_stream.read_exact(&mut length_buffer).await?;
+    recv_stream.read_exact(&mut code_buffer).await?;
 
-    debug!("Received a QUIC command: {command}, payload size: {length}");
+    let length = u32::from_le_bytes(length_buffer);
+    let code = u32::from_le_bytes(code_buffer);
+
+    trace!("Received a QUIC request, length: {length}, code: {code}");
 
     let mut sender = SenderKind::get_quic_sender(send_stream, recv_stream);
-    command::handle(command, &mut sender, session.as_ref(), system.clone())
+
+    let command = match ServerCommand::from_code_and_reader(code, &mut sender, length - 4).await {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            sender.send_error_response(e.clone()).await?;
+            return Err(anyhow!("Failed to parse command: {e}"));
+        }
+    };
+
+    // if let Err(e) = command.validate() {
+    //     sender.send_error_response(e.clone()).await?;
+    //     return Err(anyhow!("Command validation failed: {e}"));
+    // }
+
+    trace!("Received a QUIC command: {command}, payload size: {length}");
+
+    match command
+        .handle(&mut sender, length, session.as_ref(), &system)
         .await
-        .with_context(|| "Error when handling the QUIC request.")
+    {
+        Ok(_) => {
+            trace!(
+                "Command was handled successfully, session: {:?}. QUIC response was sent.",
+                session
+            );
+            Ok(())
+        }
+        Err(e) => {
+            error!(
+                "Command was not handled successfully, session: {:?}, error: {e}.",
+                session
+            );
+            // Only return a connection-terminating error for client not found
+            if let IggyError::ClientNotFound(_) = e {
+                sender.send_error_response(e.clone()).await?;
+                trace!("QUIC error response was sent.");
+                error!("Session will be deleted.");
+                Err(anyhow!("Client not found: {e}"))
+            } else {
+                // For all other errors, send response and continue the connection
+                sender.send_error_response(e).await?;
+                trace!("QUIC error response was sent.");
+                Ok(())
+            }
+        }
+    }
 }

@@ -18,17 +18,11 @@
 
 use crate::streaming::common::test_setup::TestSetup;
 use bytes::Bytes;
-use iggy::bytes_serializable::BytesSerializable;
-use iggy::messages::send_messages::Message;
-use iggy::models::header::{HeaderKey, HeaderValue};
-use iggy::utils::byte_size::IggyByteSize;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::sizeable::Sizeable;
-use iggy::utils::timestamp::IggyTimestamp;
+use iggy::prelude::*;
 use server::configs::system::{PartitionConfig, SystemConfig};
 use server::state::system::PartitionState;
-use server::streaming::batching::appendable_batch_info::AppendableBatchInfo;
 use server::streaming::partitions::partition::Partition;
+use server::streaming::segments::IggyMessagesBatchMut;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, AtomicU64};
@@ -86,12 +80,13 @@ async fn should_persist_messages_and_then_load_them_by_timestamp() {
             HeaderKey::new("key-3").unwrap(),
             HeaderValue::from_uint64(123456).unwrap(),
         );
-        let message = Message {
-            id,
-            length: payload.len() as u32,
-            payload: payload.clone(),
-            headers: Some(headers),
-        };
+        let message = IggyMessage::builder()
+            .id(id)
+            .payload(payload)
+            .headers(headers)
+            .build()
+            .expect("Failed to create message with valid payload and headers");
+
         messages.push(message);
     }
 
@@ -111,41 +106,42 @@ async fn should_persist_messages_and_then_load_them_by_timestamp() {
             HeaderKey::new("key-3").unwrap(),
             HeaderValue::from_uint64(123456).unwrap(),
         );
-        let message = Message {
-            id,
-            length: payload.len() as u32,
-            payload: payload.clone(),
-            headers: Some(headers),
-        };
-        appended_messages.push(message.clone());
-        messages_two.push(message);
+
+        let message = IggyMessage::builder()
+            .id(id)
+            .payload(payload.clone())
+            .headers(headers.clone())
+            .build()
+            .expect("Failed to create message with valid payload and headers");
+
+        let message_clone = IggyMessage::builder()
+            .id(id)
+            .payload(payload)
+            .headers(headers)
+            .build()
+            .expect("Failed to create message with valid payload and headers");
+
+        appended_messages.push(message);
+        messages_two.push(message_clone);
     }
 
     setup.create_partitions_directory(stream_id, topic_id).await;
     partition.persist().await.unwrap();
-    let appendable_batch_info = AppendableBatchInfo::new(
-        messages
-            .iter()
-            .map(|msg| msg.get_size_bytes())
-            .sum::<IggyByteSize>(),
-        partition.partition_id,
-    );
-    let appendable_batch_info_two = AppendableBatchInfo::new(
-        messages_two
-            .iter()
-            .map(|msg| msg.get_size_bytes())
-            .sum::<IggyByteSize>(),
-        partition.partition_id,
-    );
-    partition
-        .append_messages(appendable_batch_info, messages, None)
-        .await
-        .unwrap();
+    let messages_size = messages
+        .iter()
+        .map(|msg| msg.get_size_bytes().as_bytes_u32())
+        .sum::<u32>();
+    let batch = IggyMessagesBatchMut::from_messages(&messages, messages_size);
+
+    let messages_size_two = messages_two
+        .iter()
+        .map(|msg| msg.get_size_bytes().as_bytes_u32())
+        .sum::<u32>();
+    let batch_two = IggyMessagesBatchMut::from_messages(&messages_two, messages_size_two);
+
+    partition.append_messages(batch, None).await.unwrap();
     let test_timestamp = IggyTimestamp::now();
-    partition
-        .append_messages(appendable_batch_info_two, messages_two, None)
-        .await
-        .unwrap();
+    partition.append_messages(batch_two, None).await.unwrap();
 
     let loaded_messages = partition
         .get_messages_by_timestamp(test_timestamp, messages_count)
@@ -153,47 +149,36 @@ async fn should_persist_messages_and_then_load_them_by_timestamp() {
         .unwrap();
 
     assert_eq!(
-        loaded_messages.len(),
-        messages_count as usize,
-        "Expected loaded messages count to be {}, but got {}",
+        loaded_messages.count(),
         messages_count,
-        loaded_messages.len()
+        "Unexpected loaded messages count"
     );
-    for i in 0..loaded_messages.len() {
-        let loaded_message = &loaded_messages[i];
+    (0..loaded_messages.count() as usize).for_each(|i| {
+        let loaded_message = &loaded_messages.get(i).unwrap();
         let appended_message = &appended_messages[i];
         assert_eq!(
-            loaded_message.id, appended_message.id,
-            "Message ID mismatch at position {}: expected {}, got {}",
-            i, appended_message.id, loaded_message.id
+            loaded_message.header().id(),
+            appended_message.header.id,
+            "Message ID mismatch at position {i}"
         );
         assert_eq!(
-            loaded_message.payload, appended_message.payload,
-            "Payload mismatch at position {}: expected {:?}, got {:?}",
-            i, appended_message.payload, loaded_message.payload
+            loaded_message.payload(),
+            appended_message.payload,
+            "Payload mismatch at position {i}",
         );
         assert!(
-            loaded_message.timestamp >= test_timestamp.as_micros(),
+            loaded_message.header().timestamp() >= test_timestamp.as_micros(),
             "Message timestamp {} at position {} is less than test timestamp {}",
-            loaded_message.timestamp,
+            loaded_message.header().timestamp(),
             i,
             test_timestamp
         );
         assert_eq!(
-            loaded_message
-                .headers
-                .as_ref()
-                .map(|bytes| HashMap::from_bytes(bytes.clone()).unwrap()),
-            appended_message.headers,
-            "Headers mismatch at position {}: expected {:?}, got {:?}",
-            i,
-            appended_message.headers,
-            loaded_message
-                .headers
-                .as_ref()
-                .map(|bytes| HashMap::from_bytes(bytes.clone()).unwrap())
+            loaded_message.user_headers_map().unwrap().unwrap(),
+            appended_message.user_headers_map().unwrap().unwrap(),
+            "Headers mismatch at position {i}",
         );
-    }
+    });
 }
 
 #[tokio::test]
@@ -247,35 +232,23 @@ async fn should_persist_messages_and_then_load_them_from_disk() {
             HeaderKey::new("key-3").unwrap(),
             HeaderValue::from_uint64(123456).unwrap(),
         );
-        let appended_message = Message {
-            id,
-            length: payload.len() as u32,
-            payload: payload.clone(),
-            headers: Some(headers.clone()),
-        };
-        let message = Message {
-            id,
-            length: payload.len() as u32,
-            payload: payload.clone(),
-            headers: Some(headers),
-        };
+
+        let appended_message =
+            IggyMessage::with_id_and_headers(id, payload.clone(), headers.clone());
+        let message = IggyMessage::with_id_and_headers(id, payload, headers);
+
         appended_messages.push(appended_message);
         messages.push(message);
     }
 
     setup.create_partitions_directory(stream_id, topic_id).await;
     partition.persist().await.unwrap();
-    let appendable_batch_info = AppendableBatchInfo::new(
-        messages
-            .iter()
-            .map(|msg| msg.get_size_bytes())
-            .sum::<IggyByteSize>(),
-        partition.partition_id,
-    );
-    partition
-        .append_messages(appendable_batch_info, messages, None)
-        .await
-        .unwrap();
+    let messages_size = messages
+        .iter()
+        .map(|msg| msg.get_size_bytes().as_bytes_u32())
+        .sum::<u32>();
+    let batch = IggyMessagesBatchMut::from_messages(&messages, messages_size);
+    partition.append_messages(batch, None).await.unwrap();
     assert_eq!(
         partition.unsaved_messages_count, 0,
         "Expected unsaved messages count to be 0, but got {}",
@@ -309,39 +282,27 @@ async fn should_persist_messages_and_then_load_them_from_disk() {
         .await
         .unwrap();
     assert_eq!(
-        loaded_messages.len(),
-        messages_count as usize,
-        "Expected loaded messages count to be {}, but got {}",
+        loaded_messages.count(),
         messages_count,
-        loaded_messages.len()
+        "Unexpected loaded messages count "
     );
-    for i in 1..=messages_count {
-        let index = i as usize - 1;
-        let loaded_message = &loaded_messages[index];
-        let appended_message = &appended_messages[index];
+    (0..messages_count as usize).for_each(|i| {
+        let loaded_message = &loaded_messages.get(i).unwrap();
+        let appended_message = &appended_messages[i];
         assert_eq!(
-            loaded_message.id, appended_message.id,
-            "Message ID mismatch at position {}: expected {}, got {}",
-            i, appended_message.id, loaded_message.id
+            loaded_message.header().id(),
+            appended_message.header.id,
+            "Message ID mismatch at position {i}",
         );
         assert_eq!(
-            loaded_message.payload, appended_message.payload,
-            "Payload mismatch at position {}: expected {:?}, got {:?}",
-            i, appended_message.payload, loaded_message.payload
+            loaded_message.payload(),
+            appended_message.payload,
+            "Payload mismatch at position {i}",
         );
         assert_eq!(
-            loaded_message
-                .headers
-                .as_ref()
-                .map(|bytes| HashMap::from_bytes(bytes.clone()).unwrap()),
-            appended_message.headers,
-            "Headers mismatch at position {}: expected {:?}, got {:?}",
-            i,
-            appended_message.headers,
-            loaded_message
-                .headers
-                .as_ref()
-                .map(|bytes| HashMap::from_bytes(bytes.clone()).unwrap())
+            loaded_message.user_headers_map().unwrap().unwrap(),
+            appended_message.user_headers_map().unwrap().unwrap(),
+            "Headers mismatch at position {i}",
         );
-    }
+    });
 }

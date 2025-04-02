@@ -17,73 +17,70 @@
  */
 
 use super::PersisterTask;
-use crate::streaming::batching::message_batch::RetainedMessageBatch;
+use crate::streaming::segments::{messages::write_batch, IggyMessagesBatchSet};
 use error_set::ErrContext;
-use iggy::{
-    confirmation::Confirmation,
-    error::IggyError,
-    utils::{byte_size::IggyByteSize, duration::IggyDuration, sizeable::Sizeable},
+use iggy::{confirmation::Confirmation, error::IggyError, utils::byte_size::IggyByteSize};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
 };
-use std::{
-    io::IoSlice,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-};
-use tokio::{
-    fs::{File, OpenOptions},
-    io::AsyncWriteExt,
-};
+use tokio::fs::{File, OpenOptions};
 use tracing::{error, trace};
 
-/// A dedicated struct for writing to the log file.
+/// A dedicated struct for writing to the messages file.
 #[derive(Debug)]
-pub struct SegmentLogWriter {
+pub struct MessagesWriter {
     file_path: String,
     /// Holds the file for synchronous writes; when asynchronous persistence is enabled, this will be None.
     file: Option<File>,
     /// When set, asynchronous writes are handled by this persister task.
     persister_task: Option<PersisterTask>,
-    log_size_bytes: Arc<AtomicU64>,
+    messages_size_bytes: Arc<AtomicU64>,
     fsync: bool,
 }
 
-impl SegmentLogWriter {
-    /// Opens the log file in write mode.
+impl MessagesWriter {
+    /// Opens the messages file in write mode.
     ///
     /// If the server confirmation is set to `NoWait`, the file handle is transferred to the
     /// persister task (and stored in `persister_task`) so that writes are done asynchronously.
     /// Otherwise, the file is retained in `self.file` for synchronous writes.
     pub async fn new(
         file_path: &str,
-        log_size_bytes: Arc<AtomicU64>,
+        messages_size_bytes: Arc<AtomicU64>,
         fsync: bool,
         server_confirmation: Confirmation,
-        max_file_operation_retries: u32,
-        retry_delay: IggyDuration,
+        file_exists: bool,
     ) -> Result<Self, IggyError> {
         let file = OpenOptions::new()
             .write(true)
-            .append(true)
             .create(true)
+            .append(true)
             .open(file_path)
             .await
             .map_err(|_| IggyError::CannotReadFile)?;
 
-        let _ = file.sync_all().await.with_error_context(|error| {
-            format!("Failed to fsync log file after creation: {file_path}. {error}",)
-        });
+        if file_exists {
+            let _ = file.sync_all().await.with_error_context(|error| {
+                format!("Failed to fsync messages file after creation: {file_path}, error: {error}")
+            });
 
-        let actual_log_size = file
-            .metadata()
-            .await
-            .map_err(|_| IggyError::CannotReadFileMetadata)?
-            .len();
+            let actual_messages_size = file
+                .metadata()
+                .await
+                .with_error_context(|error| {
+                    format!("Failed to get metadata of messages file: {file_path}, error: {error}")
+                })
+                .map_err(|_| IggyError::CannotReadFileMetadata)?
+                .len();
 
-        log_size_bytes.store(actual_log_size, Ordering::Release);
+            messages_size_bytes.store(actual_messages_size, Ordering::Release);
+        }
 
-        trace!("Opened log file for writing: {file_path}, size: {actual_log_size}");
+        trace!(
+            "Opened messages file for writing: {file_path}, size: {}",
+            messages_size_bytes.load(Ordering::Acquire)
+        );
 
         let (file, persister_task) = match server_confirmation {
             Confirmation::NoWait => {
@@ -91,9 +88,7 @@ impl SegmentLogWriter {
                     file,
                     file_path.to_string(),
                     fsync,
-                    log_size_bytes.clone(),
-                    max_file_operation_retries,
-                    retry_delay,
+                    messages_size_bytes.clone(),
                 );
                 (None, Some(persister))
             }
@@ -104,65 +99,65 @@ impl SegmentLogWriter {
             file_path: file_path.to_string(),
             file,
             persister_task,
-            log_size_bytes,
+            messages_size_bytes,
             fsync,
         })
     }
 
-    /// Append a message batch to the log file.
-    pub async fn save_batches(
+    /// Append a batch of messages to the messages file.
+    pub async fn save_batch_set(
         &mut self,
-        batch: RetainedMessageBatch,
+        batch_set: &IggyMessagesBatchSet,
         confirmation: Confirmation,
     ) -> Result<IggyByteSize, IggyError> {
-        let batch_size = batch.get_size_bytes();
+        let messages_size = batch_set.size();
+        let messages_count = batch_set.count();
+        let containers_count = batch_set.containers_count();
+        trace!(
+            "Saving batch set of size {messages_size} bytes ({containers_count} containers, {messages_count} messages) to messages file: {}",
+            self.file_path
+        );
         match confirmation {
             Confirmation::Wait => {
-                self.write_batch(batch).await?;
-                self.log_size_bytes
-                    .fetch_add(batch_size.as_bytes_u64(), Ordering::AcqRel);
-                trace!(
-                    "Written batch of size {batch_size} bytes to log file: {}",
-                    self.file_path
-                );
+                if let Some(ref mut file) = self.file {
+                    write_batch(file, &self.file_path, batch_set)
+                        .await
+                        .with_error_context(|error| {
+                            format!(
+                                "Failed to write batch to messages file: {}. {error}",
+                                self.file_path
+                            )
+                        })
+                        .map_err(|_| IggyError::CannotWriteToFile)?;
+                } else {
+                    error!("File handle is not available for synchronous write.");
+                    return Err(IggyError::CannotWriteToFile);
+                }
+
                 if self.fsync {
                     let _ = self.fsync().await;
                 }
+
+                self.messages_size_bytes
+                    .fetch_add(messages_size as u64, Ordering::Release);
+                trace!(
+                    "Written batch set of size {messages_size} bytes ({containers_count} containers, {messages_count} messages) to disk messages file: {}",
+                    self.file_path
+                );
             }
             Confirmation::NoWait => {
                 if let Some(task) = &self.persister_task {
-                    task.persist(batch).await;
+                    task.persist(batch_set.clone()).await;
                 } else {
                     panic!(
-                        "Confirmation::NoWait is used, but LogPersisterTask is not set for log file: {}",
+                        "Confirmation::NoWait is used, but MessagesPersisterTask is not set for messages file: {}",
                         self.file_path
                     );
                 }
             }
         }
 
-        Ok(batch_size)
-    }
-
-    /// Write a batch of bytes to the log file and return the new file position.
-    async fn write_batch(&mut self, batch_to_write: RetainedMessageBatch) -> Result<(), IggyError> {
-        if let Some(ref mut file) = self.file {
-            let header = batch_to_write.header_as_bytes();
-            let batch_bytes = batch_to_write.bytes;
-            let slices = [IoSlice::new(&header), IoSlice::new(&batch_bytes)];
-
-            file.write_vectored(&slices)
-                .await
-                .with_error_context(|error| {
-                    format!("Failed to log to file: {}. {error}", self.file_path)
-                })
-                .map_err(|_| IggyError::CannotWriteToFile)?;
-
-            Ok(())
-        } else {
-            error!("File handle is not available for synchronous write.");
-            Err(IggyError::CannotWriteToFile)
-        }
+        Ok(IggyByteSize::from(messages_size as u64))
     }
 
     pub async fn fsync(&self) -> Result<(), IggyError> {
@@ -170,7 +165,7 @@ impl SegmentLogWriter {
             file.sync_all()
                 .await
                 .with_error_context(|error| {
-                    format!("Failed to fsync log file: {}. {error}", self.file_path)
+                    format!("Failed to fsync messages file: {}. {error}", self.file_path)
                 })
                 .map_err(|_| IggyError::CannotWriteToFile)?;
         }

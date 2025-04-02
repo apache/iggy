@@ -129,7 +129,7 @@ async fn get_snapshot(
     let system = state.system.read().await;
 
     let snapshot = system
-        .get_snapshot(&session, command.compression, command.snapshot_types)
+        .get_snapshot(&session, command.compression, &command.snapshot_types)
         .await?;
 
     let zip_data = Bytes::from(snapshot.0);

@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy"
-version = "0.6.210"
+version = "0.7.0"
 description = "Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
 edition = "2021"
 license = "Apache-2.0"
@@ -27,6 +27,12 @@ homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "../README.md"
+
+[features]
+default = ["tokio_lock"]
+iggy-cli = ["dep:comfy-table", "dep:keyring", "dep:passterm"]
+tokio_lock = []
+fast_async_lock = ["dep:fast-async-mutex"]
 
 [dependencies]
 aes-gcm = "0.10.3"
@@ -42,7 +48,7 @@ byte-unit = { version = "5.1.6", default-features = false, features = [
     "byte",
     "std",
 ] }
-bytes = "1.10.1"
+bytes = { version = "1.10.1", features = ["serde"] }
 chrono = { version = "0.4.40" }
 clap = { version = "4.5.34", features = ["derive"] }
 comfy-table = { version = "7.1.4", optional = true }
@@ -78,16 +84,9 @@ tokio-rustls = { version = "0.26.2" }
 toml = "0.8.20"
 tracing = { version = "0.1.41" }
 trait-variant = { version = "0.1.2" }
-uuid = { version = "1.16.0", features = ["v7", "fast-rng", "zerocopy"] }
 webpki-roots = { version = "0.26.8" }
 
 [build-dependencies]
 convert_case = "0.8.0"
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_derive = "1.0.219"
-
-[features]
-default = ["tokio_lock"]
-iggy-cli = ["dep:comfy-table", "dep:keyring", "dep:passterm"]
-tokio_lock = []
-fast_async_lock = ["dep:fast-async-mutex"]

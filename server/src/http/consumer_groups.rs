@@ -124,7 +124,7 @@ async fn create_consumer_group(
         .state
         .apply(
             identity.user_id,
-            EntryCommand::CreateConsumerGroup(CreateConsumerGroupWithId { group_id, command }),
+            &EntryCommand::CreateConsumerGroup(CreateConsumerGroupWithId { group_id, command }),
         )
         .await?;
 
@@ -157,7 +157,7 @@ async fn delete_consumer_group(
         .state
         .apply(
             identity.user_id,
-            EntryCommand::DeleteConsumerGroup(DeleteConsumerGroup {
+            &EntryCommand::DeleteConsumerGroup(DeleteConsumerGroup {
                 stream_id: identifier_stream_id,
                 topic_id: identifier_topic_id,
                 group_id: identifier_group_id,

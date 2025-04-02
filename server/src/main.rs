@@ -27,7 +27,7 @@ use server::channels::commands::maintain_messages::MaintainMessagesExecutor;
 use server::channels::commands::print_sysinfo::SysInfoPrintExecutor;
 use server::channels::commands::save_messages::SaveMessagesExecutor;
 use server::channels::commands::verify_heartbeats::VerifyHeartbeatsExecutor;
-use server::channels::handler::ServerCommandHandler;
+use server::channels::handler::BackgroundServerCommandHandler;
 use server::configs::config_provider;
 use server::configs::server::ServerConfig;
 use server::http::http_server;
@@ -106,7 +106,7 @@ async fn main() -> Result<(), ServerError> {
     system.write().await.get_stats().await?;
     system.write().await.init().await?;
 
-    let _command_handler = ServerCommandHandler::new(system.clone(), &config)
+    let _command_handler = BackgroundServerCommandHandler::new(system.clone(), &config)
         .install_handler(SaveMessagesExecutor)
         .install_handler(MaintainMessagesExecutor)
         .install_handler(ArchiveStateExecutor)

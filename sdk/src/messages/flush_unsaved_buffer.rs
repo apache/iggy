@@ -16,11 +16,6 @@
  * under the License.
  */
 
-use std::fmt::Display;
-
-use bytes::{BufMut, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
-
 use crate::{
     bytes_serializable::BytesSerializable,
     command::{Command, FLUSH_UNSAVED_BUFFER_CODE},
@@ -28,6 +23,9 @@ use crate::{
     identifier::Identifier,
     validatable::Validatable,
 };
+use bytes::{BufMut, Bytes, BytesMut};
+use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 
 /// `FlushUnsavedBuffer` command is used to force a flush of `unsaved_buffer` to disk for specific stream -> topic -> partition.
 /// - `stream_id` - stream identifier

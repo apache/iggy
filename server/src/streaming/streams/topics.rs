@@ -150,7 +150,7 @@ impl Stream {
                 let mut partition = partition.write().await;
                 partition.message_expiry = message_expiry;
                 for segment in partition.segments.iter_mut() {
-                    segment.message_expiry = message_expiry;
+                    segment.update_message_expiry(message_expiry);
                 }
             }
             topic.max_topic_size = max_topic_size;

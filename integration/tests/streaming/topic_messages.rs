@@ -18,16 +18,10 @@
 
 use crate::streaming::common::test_setup::TestSetup;
 use bytes::Bytes;
-use iggy::locking::IggySharedMutFn;
-use iggy::messages::poll_messages::PollingStrategy;
-use iggy::messages::send_messages::{Message, Partitioning};
-use iggy::utils::byte_size::IggyByteSize;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::sizeable::Sizeable;
-use iggy::utils::topic_size::MaxTopicSize;
-use server::configs::resource_quota::MemoryResourceQuota;
-use server::configs::system::{CacheConfig, SystemConfig};
+use iggy::prelude::*;
+use server::configs::system::SystemConfig;
 use server::streaming::polling_consumer::PollingConsumer;
+use server::streaming::segments::IggyMessagesBatchMut;
 use server::streaming::topics::topic::Topic;
 use server::streaming::utils::hash;
 use std::collections::HashMap;
@@ -36,46 +30,10 @@ use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::Arc;
 
 #[tokio::test]
-async fn given_disabled_cache_all_messages_should_be_polled() {
-    assert_polling_messages(
-        CacheConfig {
-            enabled: false,
-            ..Default::default()
-        },
-        false,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn given_enabled_cache_with_enough_capacity_all_messages_should_be_polled() {
-    assert_polling_messages(
-        CacheConfig {
-            enabled: true,
-            size: MemoryResourceQuota::Bytes(IggyByteSize::from(100_000_000)),
-        },
-        true,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn given_enabled_cache_without_enough_capacity_all_messages_should_be_polled() {
-    assert_polling_messages(
-        CacheConfig {
-            enabled: true,
-            size: MemoryResourceQuota::Bytes(IggyByteSize::from(100_000)),
-        },
-        true,
-    )
-    .await;
-}
-
-async fn assert_polling_messages(cache: CacheConfig, expect_enabled_cache: bool) {
+async fn assert_polling_messages() {
     let messages_count = 1000;
     let payload_size_bytes = 1000;
     let config = SystemConfig {
-        cache,
         ..Default::default()
     };
     let setup = TestSetup::init_with_config(config).await;
@@ -93,7 +51,7 @@ async fn assert_polling_messages(cache: CacheConfig, expect_enabled_cache: bool)
     let mut sent_messages = Vec::new();
     for message in &messages {
         sent_messages.push(get_message(
-            message.id,
+            message.header.id,
             from_utf8(&message.payload).unwrap(),
         ))
     }
@@ -101,13 +59,14 @@ async fn assert_polling_messages(cache: CacheConfig, expect_enabled_cache: bool)
         .iter()
         .map(|m| m.get_size_bytes())
         .sum::<IggyByteSize>();
+    let batch = IggyMessagesBatchMut::from_messages(&messages, batch_size.as_bytes_u32());
     topic
-        .append_messages(batch_size, partitioning, messages, None)
+        .append_messages(&partitioning, batch, None)
         .await
         .unwrap();
 
     let consumer = PollingConsumer::Consumer(1, partition_id);
-    let polled_messages = topic
+    let (_, polled_messages) = topic
         .get_messages(
             consumer,
             partition_id,
@@ -117,18 +76,16 @@ async fn assert_polling_messages(cache: CacheConfig, expect_enabled_cache: bool)
         .await
         .unwrap();
     assert_eq!(topic.get_messages_count(), messages_count as u64);
-    assert_eq!(polled_messages.messages.len(), messages_count as usize);
-    let partition = topic.get_partition(partition_id).unwrap();
-    let partition = partition.read().await;
-    assert_eq!(partition.cache.is_some(), expect_enabled_cache);
-    if expect_enabled_cache {
-        assert!(partition.cache.as_ref().unwrap().current_size() > 0);
-    }
-    for (index, polled_message) in polled_messages.messages.iter().enumerate() {
-        let sent_message = sent_messages.get(index).unwrap();
-        assert_eq!(sent_message.payload, polled_message.payload);
-        let polled_payload_str = from_utf8(&polled_message.payload).unwrap();
-        assert!(polled_payload_str.starts_with(&format!("{}:", index + 1)));
+    assert_eq!(polled_messages.count(), messages_count);
+    let mut cnt = 0;
+    for batch in polled_messages.iter() {
+        for polled_message in batch.iter() {
+            let sent_message = sent_messages.get(cnt).unwrap();
+            assert_eq!(sent_message.payload, polled_message.payload());
+            let polled_payload_str = from_utf8(polled_message.payload()).unwrap();
+            assert!(polled_payload_str.starts_with(&format!("{}:", cnt + 1)));
+            cnt += 1;
+        }
     }
 }
 
@@ -142,13 +99,12 @@ async fn given_key_none_messages_should_be_appended_to_the_next_partition_using_
     for i in 1..=partitions_count * messages_per_partition_count {
         let payload = get_payload(i);
         let batch_size = IggyByteSize::from(16 + 4 + payload.len() as u64);
+        let messages = IggyMessagesBatchMut::from_messages(
+            &[get_message(i as u128, &payload)],
+            batch_size.as_bytes_u32(),
+        );
         topic
-            .append_messages(
-                batch_size,
-                partitioning.clone(),
-                vec![get_message(i as u128, &payload)],
-                None,
-            )
+            .append_messages(&partitioning, messages, None)
             .await
             .unwrap();
     }
@@ -168,13 +124,12 @@ async fn given_key_partition_id_messages_should_be_appended_to_the_chosen_partit
     for i in 1..=partitions_count * messages_per_partition_count {
         let payload = get_payload(i);
         let batch_size = IggyByteSize::from(16 + 4 + payload.len() as u64);
+        let messages = IggyMessagesBatchMut::from_messages(
+            &[get_message(i as u128, &payload)],
+            batch_size.as_bytes_u32(),
+        );
         topic
-            .append_messages(
-                batch_size,
-                partitioning.clone(),
-                vec![get_message(i as u128, &payload)],
-                None,
-            )
+            .append_messages(&partitioning, messages, None)
             .await
             .unwrap();
     }
@@ -198,13 +153,12 @@ async fn given_key_messages_key_messages_should_be_appended_to_the_calculated_pa
         let payload = get_payload(entity_id);
         let partitioning = Partitioning::messages_key_u32(entity_id);
         let batch_size = IggyByteSize::from(16 + 4 + payload.len() as u64);
+        let messages = IggyMessagesBatchMut::from_messages(
+            &[get_message(entity_id as u128, &payload)],
+            batch_size.as_bytes_u32(),
+        );
         topic
-            .append_messages(
-                batch_size,
-                partitioning,
-                vec![get_message(entity_id as u128, &payload)],
-                None,
-            )
+            .append_messages(&partitioning, messages, None)
             .await
             .unwrap();
     }
@@ -235,11 +189,11 @@ fn get_payload(id: u32) -> String {
 
 async fn assert_messages(topic: &Topic, partition_id: u32, expected_messages: u32) {
     let consumer = PollingConsumer::Consumer(0, partition_id);
-    let polled_messages = topic
+    let (_, polled_messages) = topic
         .get_messages(consumer, partition_id, PollingStrategy::offset(0), 1000)
         .await
         .unwrap();
-    assert_eq!(polled_messages.messages.len() as u32, expected_messages);
+    assert_eq!(polled_messages.count(), expected_messages);
 }
 
 async fn init_topic(setup: &TestSetup, partitions_count: u32) -> Topic {
@@ -268,13 +222,8 @@ async fn init_topic(setup: &TestSetup, partitions_count: u32) -> Topic {
     topic
 }
 
-fn get_message(id: u128, payload: &str) -> Message {
-    Message {
-        id,
-        length: payload.len() as u32,
-        payload: Bytes::from(payload.as_bytes().to_vec()),
-        headers: None,
-    }
+fn get_message(id: u128, payload: &str) -> IggyMessage {
+    IggyMessage::with_id(id, Bytes::from(payload.to_owned()))
 }
 
 fn create_payload(size: u32) -> String {

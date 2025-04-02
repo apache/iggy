@@ -17,15 +17,7 @@
  */
 
 use bytes::Bytes;
-use iggy::client::{MessageClient, StreamClient, TopicClient};
-use iggy::clients::client::IggyClient;
-use iggy::consumer::Consumer;
-use iggy::error::IggyError;
-use iggy::messages::poll_messages::PollingStrategy;
-use iggy::messages::send_messages::{Message, Partitioning};
-use iggy::models::header::{HeaderKey, HeaderValue};
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy::prelude::*;
 use integration::test_server::{assert_clean_system, login_root, ClientFactory};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -36,7 +28,7 @@ const STREAM_NAME: &str = "test-stream";
 const TOPIC_NAME: &str = "test-topic";
 const PARTITIONS_COUNT: u32 = 3;
 const PARTITION_ID: u32 = 1;
-const MAX_HEADER_SIZE: usize = 255;
+const MAX_SINGLE_HEADER_SIZE: usize = 200;
 
 enum MessageToSend {
     NoMessage,
@@ -82,7 +74,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     send_message_and_check_result(
         &client,
         MessageToSend::OfSizeWithHeaders(100_001, 10_000_000),
-        Err(IggyError::TooBigHeadersPayload),
+        Err(IggyError::TooBigUserHeaders),
     )
     .await;
     send_message_and_check_result(
@@ -190,29 +182,41 @@ fn create_string_of_size(size: usize) -> String {
     "x".repeat(size)
 }
 
-fn create_message_header_of_size(size: usize) -> HashMap<HeaderKey, HeaderValue> {
+fn create_message_header_of_size(target_size: usize) -> HashMap<HeaderKey, HeaderValue> {
     let mut headers = HashMap::new();
     let mut header_id = 1;
-    let mut size = size;
+    let mut current_size = 0;
 
-    while size > 0 {
-        let header_size = if size > MAX_HEADER_SIZE {
-            MAX_HEADER_SIZE
+    while current_size < target_size {
+        let remaining_size = target_size - current_size;
+
+        let key_str = format!("header-{header_id}");
+        let key_overhead = 4; // 4 bytes for key length
+        let value_overhead = 5; // 1 byte for type + 4 bytes for value length
+        let total_overhead = key_overhead + key_str.len() + value_overhead;
+
+        let value_size = if remaining_size <= total_overhead {
+            break;
+        } else if remaining_size - total_overhead > MAX_SINGLE_HEADER_SIZE {
+            MAX_SINGLE_HEADER_SIZE
         } else {
-            size
+            remaining_size - total_overhead
         };
-        headers.insert(
-            HeaderKey::new(format!("header-{header_id}").as_str()).unwrap(),
-            HeaderValue::from_str(create_string_of_size(header_size).as_str()).unwrap(),
-        );
+
+        let key = HeaderKey::new(key_str.as_str()).unwrap();
+        let value = HeaderValue::from_str(create_string_of_size(value_size).as_str()).unwrap();
+
+        let actual_header_size = 4 + key_str.len() + 1 + 4 + value_size;
+        current_size += actual_header_size;
+
+        headers.insert(key, value);
         header_id += 1;
-        size -= header_size;
     }
 
     headers
 }
 
-fn create_message(header_size: Option<usize>, payload_size: usize) -> Message {
+fn create_message(header_size: Option<usize>, payload_size: usize) -> IggyMessage {
     let headers = match header_size {
         Some(header_size) => {
             if header_size > 0 {
@@ -225,10 +229,10 @@ fn create_message(header_size: Option<usize>, payload_size: usize) -> Message {
     };
 
     let payload = create_string_of_size(payload_size);
-    Message {
-        id: 1u128,
-        length: payload.len() as u32,
-        payload: Bytes::from(payload),
-        headers,
+
+    if let Some(headers) = headers {
+        IggyMessage::with_id_and_headers(1u128, Bytes::from(payload), headers)
+    } else {
+        IggyMessage::with_id(1u128, Bytes::from(payload))
     }
 }

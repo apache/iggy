@@ -23,7 +23,7 @@ use crate::benchmarks::benchmark::Benchmarkable;
 use crate::rate_limiter::RateLimiter;
 use async_trait::async_trait;
 use iggy::error::IggyError;
-use iggy::messages::poll_messages::PollingKind;
+use iggy::messages::PollingKind;
 use iggy_bench_report::benchmark_kind::BenchmarkKind;
 use iggy_bench_report::individual_metrics::BenchmarkIndividualMetrics;
 use integration::test_server::ClientFactory;
@@ -79,7 +79,6 @@ impl Benchmarkable for ProducerAndConsumerBenchmark {
                 self.args
                     .rate_limit()
                     .map(|rl| RateLimiter::new(rl.as_bytes_u64())),
-                false, // TODO: put timestamp into first message, it should be an argument to iggy-bench
             );
             set.spawn(producer.run());
         }

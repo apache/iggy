@@ -17,8 +17,8 @@
  */
 
 use crate::compat::index_rebuilding::index_rebuilder::IndexRebuilder;
+use crate::configs::cache_indexes::CacheIndexesConfig;
 use crate::state::system::PartitionState;
-use crate::streaming::batching::batch_accumulator::BatchAccumulator;
 use crate::streaming::partitions::partition::{ConsumerOffset, Partition};
 use crate::streaming::partitions::COMPONENT;
 use crate::streaming::persistence::persister::PersisterKind;
@@ -61,12 +61,6 @@ impl PartitionStorage for FilePartitionStorage {
         let dir_entries = fs::read_dir(&partition.partition_path).await;
         if fs::read_dir(&partition.partition_path)
                 .await
-                .inspect_err(|err| {
-                    error!(
-                            "Failed to read partition with ID: {} for stream with ID: {} and topic with ID: {} and path: {}. Error: {}",
-                            partition.partition_id, partition.stream_id, partition.topic_id, partition.partition_path, err
-                        );
-                })
                 .with_error_context(|error| format!(
                     "{COMPONENT} (error: {error}) - failed to read partition with ID: {} for stream with ID: {} and topic with ID: {} and path: {}.",
                     partition.partition_id, partition.stream_id, partition.topic_id, partition.partition_path,
@@ -109,26 +103,29 @@ impl PartitionStorage for FilePartitionStorage {
                 partition.messages_count.clone(),
             );
 
-            let index_path = segment.index_path.to_owned();
-            let log_path = segment.log_path.to_owned();
+            let index_path = segment.index_file_path().to_owned();
+            let messages_file_path = segment.messages_file_path().to_owned();
             let time_index_path = index_path.replace(INDEX_EXTENSION, "timeindex");
-
-            let index_cache_enabled = partition.config.segment.cache_indexes;
 
             let index_path_exists = tokio::fs::try_exists(&index_path).await.unwrap();
             let time_index_path_exists = tokio::fs::try_exists(&time_index_path).await.unwrap();
+            let index_cache_enabled = matches!(
+                partition.config.segment.cache_indexes,
+                CacheIndexesConfig::All | CacheIndexesConfig::OpenSegment
+            );
 
-            // Rebuild indexes in 2 cases:
-            // 1. Index cache is enabled and index at path does not exists.
-            // 2. Index cache is enabled and time index at path exists.
+            // Rebuild indexes if index cache is enabled and index at path does not exists.
             if index_cache_enabled && (!index_path_exists || time_index_path_exists) {
                 warn!(
                     "Index at path {} does not exist, rebuilding it based on {}...",
-                    index_path, log_path
+                    index_path, messages_file_path
                 );
                 let now = tokio::time::Instant::now();
-                let index_rebuilder =
-                    IndexRebuilder::new(log_path.clone(), index_path.clone(), start_offset);
+                let index_rebuilder = IndexRebuilder::new(
+                    messages_file_path.clone(),
+                    index_path.clone(),
+                    start_offset,
+                );
                 index_rebuilder.rebuild().await.unwrap_or_else(|e| {
                     panic!(
                         "Failed to rebuild index for partition with ID: {} for
@@ -143,7 +140,6 @@ impl PartitionStorage for FilePartitionStorage {
                 );
             }
 
-            // Remove legacy time index if it exists.
             if time_index_path_exists {
                 tokio::fs::remove_file(&time_index_path).await.unwrap();
             }
@@ -151,40 +147,38 @@ impl PartitionStorage for FilePartitionStorage {
             segment.load_from_disk().await.with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to load segment: {segment}",)
             })?;
-            let capacity = partition.config.partition.messages_required_to_save;
-            if !segment.is_closed {
-                segment.unsaved_messages = Some(BatchAccumulator::new(
-                    segment.current_offset,
-                    capacity as usize,
-                ))
-            }
 
             // If the first segment has at least a single message, we should increment the offset.
             if !partition.should_increment_offset {
-                partition.should_increment_offset = segment.size_bytes > 0;
+                partition.should_increment_offset = segment.get_messages_size() > 0;
             }
 
             if partition.config.partition.validate_checksum {
-                info!("Validating messages checksum for partition with ID: {} and segment with start offset: {}...", partition.partition_id, segment.start_offset);
-                segment.load_message_checksums().await?;
-                info!("Validated messages checksum for partition with ID: {} and segment with start offset: {}.", partition.partition_id, segment.start_offset);
+                info!("Validating messages checksum for partition with ID: {} and segment with start offset: {}...", partition.partition_id, segment.start_offset());
+                segment.validate_messages_checksums().await?;
+                info!("Validated messages checksum for partition with ID: {} and segment with start offset: {}.", partition.partition_id, segment.start_offset());
             }
 
             // Load the unique message IDs for the partition if the deduplication feature is enabled.
             let mut unique_message_ids_count = 0;
             if let Some(message_deduplicator) = &partition.message_deduplicator {
-                info!("Loading unique message IDs for partition with ID: {} and segment with start offset: {}...", partition.partition_id, segment.start_offset);
-                let message_ids = segment.load_message_ids().await.with_error_context(|error| {
+                let max_entries = partition.config.message_deduplication.max_entries as u32;
+                info!("Loading {max_entries} unique message IDs for partition with ID: {} and segment with start offset: {}...", partition.partition_id, segment.start_offset());
+                let message_ids = segment.load_message_ids(max_entries).await.with_error_context(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to load message ids, segment: {segment}",)
                 })?;
                 for message_id in message_ids {
-                    if message_deduplicator.try_insert(&message_id).await {
+                    if message_deduplicator.try_insert(message_id).await {
                         unique_message_ids_count += 1;
                     } else {
-                        warn!("Duplicated message ID: {} for partition with ID: {} and segment with start offset: {}.", message_id, partition.partition_id, segment.start_offset);
+                        warn!("Duplicated message ID: {} for partition with ID: {} and segment with start offset: {}.", message_id, partition.partition_id, segment.start_offset());
                     }
                 }
-                info!("Loaded: {} unique message IDs for partition with ID: {} and segment with start offset: {}...", unique_message_ids_count, partition.partition_id, segment.start_offset);
+                info!("Loaded: {} unique message IDs for partition with ID: {} and segment with start offset: {}...", unique_message_ids_count, partition.partition_id, segment.start_offset());
+            }
+
+            if CacheIndexesConfig::None == partition.config.segment.cache_indexes {
+                segment.drop_indexes();
             }
 
             partition
@@ -193,15 +187,13 @@ impl PartitionStorage for FilePartitionStorage {
             partition.segments.push(segment);
         }
 
-        partition
-            .segments
-            .sort_by(|a, b| a.start_offset.cmp(&b.start_offset));
+        partition.segments.sort_by_key(|a| a.start_offset());
 
         let end_offsets = partition
             .segments
             .iter()
             .skip(1)
-            .map(|segment| segment.start_offset - 1)
+            .map(|segment| segment.start_offset() - 1)
             .collect::<Vec<u64>>();
 
         let segments_count = partition.segments.len();
@@ -209,17 +201,24 @@ impl PartitionStorage for FilePartitionStorage {
             if end_offset_index == segments_count - 1 {
                 break;
             }
-
-            segment.end_offset = end_offsets[end_offset_index];
+            segment.set_end_offset(end_offsets[end_offset_index]);
         }
 
         if !partition.segments.is_empty() {
             let last_segment = partition.segments.last_mut().unwrap();
-            if last_segment.is_closed {
-                last_segment.end_offset = last_segment.current_offset;
-            }
+            partition.current_offset = last_segment.end_offset();
+        }
 
-            partition.current_offset = last_segment.current_offset;
+        // If cache_indexes is OpenSegment, clear all segment indexes except the last one
+        if matches!(
+            partition.config.segment.cache_indexes,
+            CacheIndexesConfig::OpenSegment
+        ) && !partition.segments.is_empty()
+        {
+            let segments_count = partition.segments.len();
+            for i in 0..segments_count - 1 {
+                partition.segments[i].drop_indexes();
+            }
         }
 
         partition

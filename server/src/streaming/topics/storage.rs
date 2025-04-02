@@ -218,12 +218,6 @@ impl TopicStorage for FileTopicStorage {
                 .insert(consumer_group.group_id, RwLock::new(consumer_group));
         }
 
-        topic
-            .load_messages_from_disk_to_cache()
-            .await
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to load messages from disk to cache, topic: {topic}")
-            })?;
         info!("Loaded topic {topic}");
 
         Ok(())

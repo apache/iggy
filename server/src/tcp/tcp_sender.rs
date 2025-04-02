@@ -54,4 +54,12 @@ impl Sender for TcpSender {
             })
             .map_err(ServerError::IoError)
     }
+
+    async fn send_ok_response_vectored(
+        &mut self,
+        length: &[u8],
+        slices: Vec<std::io::IoSlice<'_>>,
+    ) -> Result<(), IggyError> {
+        sender::send_ok_response_vectored(&mut self.stream, length, slices).await
+    }
 }

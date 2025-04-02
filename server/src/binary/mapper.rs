@@ -27,10 +27,8 @@ use bytes::{BufMut, Bytes, BytesMut};
 use iggy::bytes_serializable::BytesSerializable;
 use iggy::locking::{IggySharedMut, IggySharedMutFn};
 use iggy::models::consumer_offset_info::ConsumerOffsetInfo;
-use iggy::models::messages::PolledMessages;
 use iggy::models::stats::Stats;
 use iggy::models::user_info::UserId;
-use iggy::utils::byte_size::IggyByteSize;
 use iggy::utils::sizeable::Sizeable;
 use tokio::sync::RwLock;
 
@@ -151,25 +149,6 @@ pub fn map_personal_access_tokens(personal_access_tokens: &[PersonalAccessToken]
     for personal_access_token in personal_access_tokens {
         extend_pat(personal_access_token, &mut bytes);
     }
-    bytes.freeze()
-}
-
-pub fn map_polled_messages(polled_messages: &PolledMessages) -> Bytes {
-    let messages_count = polled_messages.messages.len() as u32;
-    let messages_size = polled_messages
-        .messages
-        .iter()
-        .map(|message| message.get_size_bytes())
-        .sum::<IggyByteSize>();
-
-    let mut bytes = BytesMut::with_capacity(20 + messages_size.as_bytes_usize());
-    bytes.put_u32_le(polled_messages.partition_id);
-    bytes.put_u64_le(polled_messages.current_offset);
-    bytes.put_u32_le(messages_count);
-    for message in polled_messages.messages.iter() {
-        message.extend(&mut bytes);
-    }
-
     bytes.freeze()
 }
 

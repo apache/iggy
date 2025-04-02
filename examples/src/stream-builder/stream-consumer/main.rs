@@ -16,10 +16,7 @@
  * under the License.
  */
 
-use iggy::client::Client;
-use iggy::consumer_ext::IggyConsumerMessageExt;
-use iggy::error::IggyError;
-use iggy::stream_builder::{IggyConsumerConfig, IggyStreamConsumer};
+use iggy::prelude::*;
 use iggy_examples::shared::stream::PrintEventConsumer;
 use tokio::sync::oneshot;
 

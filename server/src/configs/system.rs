@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::configs::resource_quota::MemoryResourceQuota;
+use super::cache_indexes::CacheIndexesConfig;
 use iggy::confirmation::Confirmation;
 use iggy::utils::byte_size::IggyByteSize;
 use iggy::utils::expiry::IggyExpiry;
@@ -35,7 +35,6 @@ pub struct SystemConfig {
     pub state: StateConfig,
     pub runtime: RuntimeConfig,
     pub logging: LoggingConfig,
-    pub cache: CacheConfig,
     pub stream: StreamConfig,
     pub topic: TopicConfig,
     pub partition: PartitionConfig,
@@ -86,12 +85,6 @@ pub struct LoggingConfig {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub struct CacheConfig {
-    pub enabled: bool,
-    pub size: MemoryResourceQuota,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
 pub struct EncryptionConfig {
     pub enabled: bool,
     pub key: String,
@@ -115,6 +108,7 @@ pub struct TopicConfig {
 pub struct PartitionConfig {
     pub path: String,
     pub messages_required_to_save: u32,
+    pub size_of_messages_required_to_save: IggyByteSize,
     pub enforce_fsync: bool,
     pub validate_checksum: bool,
 }
@@ -137,7 +131,7 @@ pub struct RecoveryConfig {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct SegmentConfig {
     pub size: IggyByteSize,
-    pub cache_indexes: bool,
+    pub cache_indexes: CacheIndexesConfig,
     #[serde_as(as = "DisplayFromStr")]
     pub message_expiry: IggyExpiry,
     pub archive_expired: bool,
@@ -163,7 +157,7 @@ impl SystemConfig {
         format!("{}/state", self.get_system_path())
     }
 
-    pub fn get_state_log_path(&self) -> String {
+    pub fn get_state_messages_file_path(&self) -> String {
         format!("{}/log", self.get_state_path())
     }
 

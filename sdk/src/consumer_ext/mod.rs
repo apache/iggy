@@ -19,8 +19,7 @@
 mod consumer_message_ext;
 mod consumer_message_trait;
 
-use crate::clients::consumer::ReceivedMessage;
-use crate::error::IggyError;
+use crate::{clients::consumer::ReceivedMessage, error::IggyError};
 pub use consumer_message_trait::IggyConsumerMessageExt;
 
 /// Trait for message consumer

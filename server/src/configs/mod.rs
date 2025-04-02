@@ -23,6 +23,7 @@ pub mod http;
 pub mod quic;
 pub mod tcp;
 
+pub mod cache_indexes;
 pub mod config_provider;
 pub mod defaults;
 pub mod displays;

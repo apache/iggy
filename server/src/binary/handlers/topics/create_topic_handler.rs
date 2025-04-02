@@ -16,6 +16,8 @@
  * under the License.
  */
 
+use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::{handlers::topics::COMPONENT, sender::SenderKind};
 use crate::state::command::EntryCommand;
@@ -28,52 +30,70 @@ use iggy::error::IggyError;
 use iggy::topics::create_topic::CreateTopic;
 use tracing::{debug, instrument};
 
-#[instrument(skip_all, name = "trace_create_topic", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id, iggy_stream_id = command.stream_id.as_string()))]
-pub async fn handle(
-    mut command: CreateTopic,
-    sender: &mut SenderKind,
-    session: &Session,
-    system: &SharedSystem,
-) -> Result<(), IggyError> {
-    debug!("session: {session}, command: {command}");
-    let stream_id = command.stream_id.clone();
-    let topic_id = command.topic_id;
-    let mut system = system.write().await;
-    let topic = system
-            .create_topic(
-                session,
-                &command.stream_id,
-                command.topic_id,
-                &command.name,
-                command.partitions_count,
-                command.message_expiry,
-                command.compression_algorithm,
-                command.max_topic_size,
-                command.replication_factor,
-            )
-            .await
-            .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to create topic for stream ID: {stream_id}, topic_id: {:?}",
-                topic_id
-            ))?;
-    command.message_expiry = topic.message_expiry;
-    command.max_topic_size = topic.max_topic_size;
-    let topic_id = topic.topic_id;
-    let response = mapper::map_topic(topic).await;
+impl ServerCommandHandler for CreateTopic {
+    fn code(&self) -> u32 {
+        iggy::command::CREATE_TOPIC_CODE
+    }
 
-    let system = system.downgrade();
-    system
-        .state
-        .apply(session.get_user_id(), EntryCommand::CreateTopic(CreateTopicWithId {
-            topic_id,
-            command
-        }))
-        .await
-        .with_error_context(|error| {
-            format!(
-            "{COMPONENT} (error: {error}) - failed to apply create topic for stream ID: {stream_id}, topic_id: {:?}",
-            topic_id
-        )
-        })?;
-    sender.send_ok_response(&response).await?;
-    Ok(())
+    #[instrument(skip_all, name = "trace_create_topic", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string()))]
+    async fn handle(
+        mut self,
+        sender: &mut SenderKind,
+        _length: u32,
+        session: &Session,
+        system: &SharedSystem,
+    ) -> Result<(), IggyError> {
+        debug!("session: {session}, command: {self}");
+        let stream_id = self.stream_id.clone();
+        let topic_id = self.topic_id;
+        let mut system = system.write().await;
+        let topic = system
+                .create_topic(
+                    session,
+                    &self.stream_id,
+                    self.topic_id,
+                    &self.name,
+                    self.partitions_count,
+                    self.message_expiry,
+                    self.compression_algorithm,
+                    self.max_topic_size,
+                    self.replication_factor,
+                )
+                .await
+                .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to create topic for stream_id: {stream_id}, topic_id: {:?}",
+                    topic_id
+                ))?;
+        self.message_expiry = topic.message_expiry;
+        self.max_topic_size = topic.max_topic_size;
+        let topic_id = topic.topic_id;
+        let response = mapper::map_topic(topic).await;
+
+        let system = system.downgrade();
+        system
+            .state
+            .apply(session.get_user_id(), &EntryCommand::CreateTopic(CreateTopicWithId {
+                topic_id,
+                command: self
+            }))            .await
+            .with_error_context(|error| {
+                format!(
+                "{COMPONENT} (error: {error}) - failed to apply create topic for stream_id: {stream_id}, topic_id: {:?}",
+                topic_id
+            )
+            })?;
+        sender.send_ok_response(&response).await?;
+        Ok(())
+    }
+}
+
+impl BinaryServerCommand for CreateTopic {
+    async fn from_sender(sender: &mut SenderKind, code: u32, length: u32) -> Result<Self, IggyError>
+    where
+        Self: Sized,
+    {
+        match receive_and_validate(sender, code, length).await? {
+            ServerCommand::CreateTopic(create_topic) => Ok(create_topic),
+            _ => Err(IggyError::InvalidCommand),
+        }
+    }
 }

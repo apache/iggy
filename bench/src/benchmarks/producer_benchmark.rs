@@ -79,7 +79,6 @@ impl Benchmarkable for ProducerBenchmark {
                 args.moving_average_window(),
                 args.rate_limit()
                     .map(|rl| RateLimiter::new(rl.as_bytes_u64())),
-                false, // TODO: Put timestamp in payload of first message, it should be an argument to iggy-bench
             );
             set.spawn(producer.run());
         }

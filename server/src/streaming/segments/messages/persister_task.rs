@@ -16,24 +16,25 @@
  * under the License.
  */
 
-use crate::streaming::batching::message_batch::{RetainedMessageBatch, RETAINED_BATCH_HEADER_LEN};
+use crate::streaming::segments::IggyMessagesBatchSet;
+use error_set::ErrContext;
 use flume::{unbounded, Receiver};
-use iggy::{error::IggyError, utils::duration::IggyDuration};
 use std::{
-    io::IoSlice,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
 };
-use tokio::{fs::File, io::AsyncWriteExt, select, time::sleep};
+use tokio::{fs::File, select, time::sleep};
 use tracing::{error, trace, warn};
+
+use super::write_batch;
 
 #[derive(Debug)]
 /// A command to the persister task.
 enum PersisterTaskCommand {
-    WriteRequest(RetainedMessageBatch),
+    WriteRequest(IggyMessagesBatchSet),
     Shutdown,
 }
 
@@ -47,41 +48,25 @@ pub struct PersisterTask {
 
 impl PersisterTask {
     /// Creates a new persister task that takes ownership of `file`.
-    pub fn new(
-        file: File,
-        file_path: String,
-        fsync: bool,
-        log_file_size: Arc<AtomicU64>,
-        max_retries: u32,
-        retry_delay: IggyDuration,
-    ) -> Self {
+    pub fn new(file: File, file_path: String, fsync: bool, log_file_size: Arc<AtomicU64>) -> Self {
         let (sender, receiver) = unbounded();
-        let log_file_size_clone = log_file_size.clone();
+        let log_file_size = log_file_size.clone();
         let file_path_clone = file_path.clone();
         let handle = tokio::spawn(async move {
-            Self::run(
-                file,
-                file_path,
-                receiver,
-                fsync,
-                max_retries,
-                retry_delay,
-                log_file_size_clone,
-            )
-            .await;
+            Self::run(file, file_path_clone, receiver, fsync, log_file_size).await;
         });
         Self {
             sender,
-            file_path: file_path_clone,
+            file_path,
             _handle: handle,
         }
     }
 
     /// Sends the batch bytes to the persister task (fire-and-forget).
-    pub async fn persist(&self, batch_to_write: RetainedMessageBatch) {
+    pub async fn persist(&self, messages: IggyMessagesBatchSet) {
         if let Err(e) = self
             .sender
-            .send_async(PersisterTaskCommand::WriteRequest(batch_to_write))
+            .send_async(PersisterTaskCommand::WriteRequest(messages))
             .await
         {
             error!(
@@ -185,25 +170,26 @@ impl PersisterTask {
         file_path: String,
         receiver: Receiver<PersisterTaskCommand>,
         fsync: bool,
-        max_retries: u32,
-        retry_delay: IggyDuration,
         log_file_size: Arc<AtomicU64>,
     ) {
         while let Ok(request) = receiver.recv_async().await {
             match request {
-                PersisterTaskCommand::WriteRequest(batch_to_write) => {
-                    match Self::write_with_retries(
-                        &mut file,
-                        &file_path,
-                        batch_to_write,
-                        fsync,
-                        max_retries,
-                        retry_delay,
-                    )
-                    .await
-                    {
+                PersisterTaskCommand::WriteRequest(messages) => {
+                    match write_batch(&mut file, &file_path, &messages).await {
                         Ok(bytes_written) => {
-                            log_file_size.fetch_add(bytes_written, Ordering::AcqRel);
+                            if fsync {
+                                file.sync_all()
+                                    .await
+                                    .with_error_context(|error| {
+                                        format!(
+                                            "Failed to fsync messages file: {}. {error}",
+                                            file_path
+                                        )
+                                    })
+                                    .expect("Failed to fsync messages file");
+                            }
+
+                            log_file_size.fetch_add(bytes_written as u64, Ordering::Acquire);
                         }
                         Err(e) => {
                             error!(
@@ -226,56 +212,5 @@ impl PersisterTask {
             }
         }
         trace!("PersisterTask for file {file_path} has finished processing requests");
-    }
-
-    /// Writes the provided data to the file using simple retry logic.
-    async fn write_with_retries(
-        file: &mut File,
-        file_path: &str,
-        batch_to_write: RetainedMessageBatch,
-        fsync: bool,
-        max_retries: u32,
-        retry_delay: IggyDuration,
-    ) -> Result<u64, IggyError> {
-        let header = batch_to_write.header_as_bytes();
-        let batch_bytes = batch_to_write.bytes;
-        let slices = [IoSlice::new(&header), IoSlice::new(&batch_bytes)];
-        let bytes_written = RETAINED_BATCH_HEADER_LEN + batch_bytes.len() as u64;
-
-        let mut attempts = 0;
-        loop {
-            match file.write_vectored(&slices).await {
-                Ok(_) => {
-                    if fsync {
-                        match file.sync_all().await {
-                            Ok(_) => return Ok(bytes_written),
-                            Err(e) => {
-                                attempts += 1;
-                                error!(
-                                    "Error syncing file {file_path}: {:?} (attempt {attempts}/{max_retries})",
-                                     e,
-                                );
-                            }
-                        }
-                    } else {
-                        return Ok(bytes_written);
-                    }
-                }
-                Err(e) => {
-                    attempts += 1;
-                    error!(
-                        "Error writing to file {file_path}: {:?} (attempt {attempts}/{max_retries})",
-                        e,
-                    );
-                }
-            }
-            if attempts >= max_retries {
-                error!(
-                    "Failed to write to file {file_path} after {max_retries} attempts, something's terribly wrong",
-                );
-                return Err(IggyError::CannotWriteToFile);
-            }
-            sleep(retry_delay.get_duration()).await;
-        }
     }
 }

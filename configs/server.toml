@@ -386,16 +386,6 @@ retention = "7 days"
 # Interval for printing system information to the log.
 sysinfo_print_interval = "10 s"
 
-# Cache configuration.
-[system.cache]
-# Enables or disables the system cache.
-# `true` activates caching for frequently accessed data.
-# `false` disables caching, data is always read from the source.
-enabled = true
-
-# Maximum size of the cache, e.g. "4GB".
-size = "4 GB"
-
 # Encryption configuration
 [system.encryption]
 # Determines whether server-side data encryption for the messages payloads and state commands is enabled (boolean).
@@ -461,10 +451,19 @@ enforce_fsync = false
 # `false` skips these checks for faster loading at the risk of undetected corruption.
 validate_checksum = false
 
-# The threshold of buffered messages before triggering a save to disk (integer).
+# The count threshold of buffered messages before triggering a save to disk (integer).
 # Specifies how many messages accumulate before persisting to storage.
 # Adjusting this can balance between write performance and data durability.
+# This is soft limit, actual number of messages may be higher, depending on last batch size.
+# Together with `size_of_messages_required_to_save` it defines the threshold of buffered messages.
 messages_required_to_save = 1000
+
+# The size threshold of buffered messages before triggering a save to disk (string).
+# Specifies how much size of messages accumulate before persisting to storage.
+# Adjusting this can balance between write performance and data durability.
+# This is soft limit, actual number of messages may be higher, depending on last batch size.
+# Together with `messages_required_to_save` it defines the threshold of buffered messages.
+size_of_messages_required_to_save = "1 MB"
 
 # Segment configuration
 [system.segment]
@@ -472,6 +471,7 @@ messages_required_to_save = 1000
 # When a segment reaches this size, a new segment is created for subsequent data.
 # Example: if `size` is set "1GB", the actual segment size may be 1GB + the size of remaining messages in received batch.
 size = "1 GB"
+
 # Configures the message time-based expiry setting.
 # "none" means messages are kept indefinitely.
 # A time value in human-readable format determines the lifespan of messages.
@@ -488,10 +488,12 @@ server_confirmation = "wait"
 # Configures whether expired segments are archived (boolean) or just deleted without archiving.
 archive_expired = false
 
-# Controls whether to cache indexes (time and positional) for segment access (boolean).
-# `true` keeps indexes in memory, speeding up data retrieval.
-# `false` reads indexes from disk, which can conserve memory at the cost of access speed.
-cache_indexes = true
+# Controls whether to cache indexes (time and positional) for segment access.
+# Possible values:
+# - "true" or "all": keeps indexes in memory, speeding up data retrieval at the cost of memory
+# - "open_segment": keeps indexes in memory only for the currently open segment
+# - "false" or "none": reads indexes from disk, which can conserve memory at the cost of access speed
+cache_indexes = "open_segment"
 
 # Message deduplication configuration
 [system.message_deduplication]

@@ -23,7 +23,6 @@ use crate::map_toggle_str;
 use crate::state::file::FileState;
 use crate::state::system::SystemState;
 use crate::state::StateKind;
-use crate::streaming::cache::memory_tracker::CacheMemoryTracker;
 use crate::streaming::clients::client_manager::ClientManager;
 use crate::streaming::diagnostics::metrics::Metrics;
 use crate::streaming::persistence::persister::*;
@@ -40,7 +39,6 @@ use iggy::error::IggyError;
 use iggy::locking::IggySharedMut;
 use iggy::locking::IggySharedMutFn;
 use iggy::models::user_info::UserId;
-use iggy::utils::byte_size::IggyByteSize;
 use iggy::utils::crypto::{Aes256GcmEncryptor, EncryptorKind};
 use std::path::Path;
 use std::sync::Arc;
@@ -94,10 +92,6 @@ pub struct System {
     pub personal_access_token: PersonalAccessTokenConfig,
 }
 
-/// For each cache eviction, we want to remove more than the size we need.
-/// This is done on purpose to avoid evicting messages on every write.
-const CACHE_OVER_EVICTION_FACTOR: u64 = 5;
-
 impl System {
     pub fn new(
         config: Arc<SystemConfig>,
@@ -121,7 +115,7 @@ impl System {
         let partition_persister = Self::resolve_persister(config.partition.enforce_fsync);
 
         let state = Arc::new(StateKind::File(FileState::new(
-            &config.get_state_log_path(),
+            &config.get_state_messages_file_path(),
             &version,
             state_persister,
             encryptor.clone(),
@@ -283,25 +277,6 @@ impl System {
         } else {
             error!("{COMPONENT} - unauthenticated access attempt, session: {session}");
             Err(IggyError::Unauthenticated)
-        }
-    }
-
-    pub async fn clean_cache(&self, size_to_clean: IggyByteSize) {
-        for stream in self.streams.values() {
-            for topic in stream.get_topics() {
-                for partition in topic.get_partitions().into_iter() {
-                    tokio::task::spawn(async move {
-                        let memory_tracker = CacheMemoryTracker::get_instance().unwrap();
-                        let mut partition_guard = partition.write().await;
-                        let cache = &mut partition_guard.cache.as_mut().unwrap();
-                        let size_to_remove = (cache.current_size().as_bytes_u64() as f64
-                            / memory_tracker.usage_bytes().as_bytes_u64() as f64
-                            * size_to_clean.as_bytes_u64() as f64)
-                            .ceil() as u64;
-                        cache.evict_by_size(size_to_remove * CACHE_OVER_EVICTION_FACTOR);
-                    });
-                }
-            }
         }
     }
 }

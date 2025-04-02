@@ -19,8 +19,7 @@
 use crate::cli::common::IggyCmdTest;
 use crate::cli::message::test_message_poll_to_file_command::TestMessagePollToFileCmd;
 use crate::cli::message::test_message_send_from_file_command::TestMessageSendFromFileCmd;
-use iggy::messages::poll_messages::PollingStrategy;
-use iggy::models::header::{HeaderKey, HeaderValue};
+use iggy::prelude::*;
 use serial_test::parallel;
 use std::collections::HashMap;
 use std::str::FromStr;

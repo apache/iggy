@@ -19,19 +19,7 @@
 use ahash::AHashMap;
 use clap::Parser;
 use futures_util::future::join_all;
-use iggy::client::{Client, StreamClient, UserClient};
-use iggy::clients::builder::IggyClientBuilder;
-use iggy::clients::client::IggyClient;
-use iggy::clients::producer::IggyProducer;
-use iggy::error::IggyError;
-use iggy::identifier::Identifier;
-use iggy::messages::send_messages::{Message, Partitioning};
-use iggy::models::permissions::{Permissions, StreamPermissions};
-use iggy::models::user_status::UserStatus;
-use iggy::users::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
-use iggy::utils::duration::IggyDuration;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy::prelude::*;
 use iggy_examples::shared::args::Args;
 use std::collections::HashMap;
 use std::env;
@@ -234,7 +222,7 @@ fn start_producers(
                 let mut messages = Vec::with_capacity(batch_size as usize);
                 for _ in 1..=batch_size {
                     let payload = format!("{message}-{producer_id}-{message_id}");
-                    let message = Message::from_str(&payload).expect("Invalid message");
+                    let message = IggyMessage::from_str(&payload).expect("Invalid message");
                     messages.push(message);
                 }
 

@@ -18,21 +18,17 @@
 
 use crate::streaming::common::test_setup::TestSetup;
 use bytes::BytesMut;
-use iggy::bytes_serializable::BytesSerializable;
-use iggy::messages::send_messages::Message;
-use iggy::models::header::{HeaderKey, HeaderValue};
-use iggy::utils::byte_size::IggyByteSize;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::sizeable::Sizeable;
-use iggy::utils::timestamp::IggyTimestamp;
-use server::configs::resource_quota::MemoryResourceQuota;
-use server::configs::system::{CacheConfig, PartitionConfig, SegmentConfig, SystemConfig};
-use server::streaming::batching::appendable_batch_info::AppendableBatchInfo;
+use iggy::confirmation::Confirmation;
+use iggy::prelude::*;
+use server::configs::cache_indexes::CacheIndexesConfig;
+use server::configs::system::{PartitionConfig, SegmentConfig, SystemConfig};
 use server::streaming::partitions::partition::Partition;
+use server::streaming::segments::IggyMessagesBatchMut;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::Arc;
+use std::thread::sleep;
 use test_case::test_matrix;
 
 /*
@@ -40,53 +36,66 @@ use test_case::test_matrix;
  */
 
 fn msg_size(size: u64) -> IggyByteSize {
-    IggyByteSize::from_str(&format!("{}b", size)).unwrap()
+    IggyByteSize::from_str(&format!("{}B", size)).unwrap()
 }
 
 fn segment_size(size: u64) -> IggyByteSize {
-    IggyByteSize::from_str(&format!("{}b", size)).unwrap()
+    IggyByteSize::from_str(&format!("{}B", size)).unwrap()
 }
 
 fn msgs_req_to_save(count: u32) -> u32 {
     count
 }
 
-fn msg_cache_size(size: u64) -> Option<IggyByteSize> {
-    if size == 0 {
-        return None;
-    }
-    Some(IggyByteSize::from_str(&format!("{}b", size)).unwrap())
+fn index_cache_all() -> CacheIndexesConfig {
+    CacheIndexesConfig::All
 }
 
-fn index_cache_enabled() -> bool {
-    true
+fn index_cache_none() -> CacheIndexesConfig {
+    CacheIndexesConfig::None
 }
 
-fn index_cache_disabled() -> bool {
-    false
+fn index_cache_open_segment() -> CacheIndexesConfig {
+    CacheIndexesConfig::OpenSegment
+}
+
+fn small_batches() -> Vec<u32> {
+    vec![3, 4, 5, 6, 7]
+}
+
+fn medium_batches() -> Vec<u32> {
+    vec![10, 20, 30, 40]
+}
+
+fn large_batches() -> Vec<u32> {
+    vec![100, 200, 300, 400]
+}
+
+fn very_large_batches() -> Vec<u32> {
+    vec![500, 1000, 1500, 1000]
 }
 
 #[test_matrix(
     [msg_size(50), msg_size(1000), msg_size(20000)],
-    [msgs_req_to_save(3), msgs_req_to_save(10),  msgs_req_to_save(1000)],
-    [segment_size(500), segment_size(2000), segment_size(100000)],
-    [msg_cache_size(0), msg_cache_size(5000), msg_cache_size(50000), msg_cache_size(2000000)],
-    [index_cache_disabled(), index_cache_enabled()])]
+    [small_batches(), medium_batches(), large_batches(), very_large_batches()],
+    [msgs_req_to_save(1), msgs_req_to_save(24), msgs_req_to_save(1000), msgs_req_to_save(10000)],
+    [segment_size(10), segment_size(200), segment_size(10000000)],
+    [index_cache_none(), index_cache_all(), index_cache_open_segment()])]
 #[tokio::test]
 async fn test_get_messages_by_timestamp(
     message_size: IggyByteSize,
+    batch_sizes: Vec<u32>,
     messages_required_to_save: u32,
     segment_size: IggyByteSize,
-    msg_cache_size: Option<IggyByteSize>,
-    index_cache_enabled: bool,
+    cache_indexes: CacheIndexesConfig,
 ) {
     println!(
-        "Running test with msg_cache_enabled: {}, messages_required_to_save: {}, segment_size: {}, message_size: {}, cache_indexes: {}",
-        msg_cache_size.is_some(),
+        "Running test with message_size: {}, batches: {:?}, messages_required_to_save: {}, segment_size: {}, cache_indexes: {}",
+        message_size,
+        batch_sizes,
         messages_required_to_save,
         segment_size,
-        message_size,
-        index_cache_enabled
+        cache_indexes
     );
 
     let setup = TestSetup::init().await;
@@ -94,31 +103,23 @@ async fn test_get_messages_by_timestamp(
     let topic_id = 1;
     let partition_id = 1;
 
-    // Define batch sizes for 5 appends
-    let batch_sizes = [3, 4, 5, 6, 7];
-    let total_messages: u32 = batch_sizes.iter().sum();
+    let total_messages_count = batch_sizes.iter().sum();
 
-    let msg_cache_enabled = msg_cache_size.is_some();
-    let msg_cache_size =
-        MemoryResourceQuota::Bytes(msg_cache_size.unwrap_or(IggyByteSize::from_str("0").unwrap()));
     let config = Arc::new(SystemConfig {
         path: setup.config.path.to_string(),
-        cache: CacheConfig {
-            enabled: msg_cache_enabled,
-            size: msg_cache_size,
-        },
         partition: PartitionConfig {
             messages_required_to_save,
             enforce_fsync: true,
             ..Default::default()
         },
         segment: SegmentConfig {
-            cache_indexes: index_cache_enabled,
+            cache_indexes,
             size: segment_size,
             ..Default::default()
         },
         ..Default::default()
     });
+
     let mut partition = Partition::create(
         stream_id,
         topic_id,
@@ -139,8 +140,10 @@ async fn test_get_messages_by_timestamp(
     setup.create_partitions_directory(stream_id, topic_id).await;
     partition.persist().await.unwrap();
 
-    let mut all_messages = Vec::with_capacity(total_messages as usize);
-    for i in 1..=total_messages {
+    let mut all_messages = Vec::with_capacity(total_messages_count as usize);
+
+    // Generate all messages as defined in the test matrix
+    for i in 1..=total_messages_count {
         let id = i as u128;
         let beginning_of_payload = format!("message {}", i);
         let mut payload = BytesMut::new();
@@ -161,149 +164,200 @@ async fn test_get_messages_by_timestamp(
             HeaderKey::new("key-3").unwrap(),
             HeaderValue::from_uint64(123456).unwrap(),
         );
-        let message = Message {
-            id,
-            length: payload.len() as u32,
-            payload: payload.clone(),
-            headers: Some(headers),
-        };
+
+        let message = IggyMessage::builder()
+            .id(id)
+            .payload(payload)
+            .headers(headers)
+            .build()
+            .expect("Failed to create message with valid payload and headers");
+
         all_messages.push(message);
     }
 
+    // Timestamp tracking for messages
     let initial_timestamp = IggyTimestamp::now();
     let mut batch_timestamps = Vec::with_capacity(batch_sizes.len());
     let mut current_pos = 0;
 
-    // Append all batches with timestamps
-    for batch_size in batch_sizes {
-        let batch = all_messages[current_pos..current_pos + batch_size as usize].to_vec();
-        let batch_info = AppendableBatchInfo::new(
-            batch
-                .iter()
-                .map(|msg| msg.get_size_bytes())
-                .sum::<IggyByteSize>(),
-            partition.partition_id,
+    // Append all batches as defined in the test matrix with separate timestamps
+    for (batch_idx, &batch_len) in batch_sizes.iter().enumerate() {
+        // Add a small delay between batches to ensure distinct timestamps
+        sleep(std::time::Duration::from_millis(2));
+
+        // If we've generated too many messages, skip the rest
+        if current_pos + batch_len as usize > all_messages.len() {
+            break;
+        }
+
+        println!(
+            "Appending batch {}/{} with {} messages",
+            batch_idx + 1,
+            batch_sizes.len(),
+            batch_len
         );
+
+        let batch_end_pos = current_pos + batch_len as usize;
+        let messages_slice_to_append = &all_messages[current_pos..batch_end_pos];
+
+        let messages_size = messages_slice_to_append
+            .iter()
+            .map(|m| m.get_size_bytes().as_bytes_u64() as u32)
+            .sum();
+
+        let batch = IggyMessagesBatchMut::from_messages(messages_slice_to_append, messages_size);
+        assert_eq!(batch.count(), batch_len);
         partition
-            .append_messages(batch_info, batch.clone(), None)
+            .append_messages(batch, Some(Confirmation::Wait))
             .await
             .unwrap();
 
+        // Capture the timestamp of this batch
         batch_timestamps.push(IggyTimestamp::now());
-        current_pos += batch_size as usize;
+        current_pos += batch_len as usize;
+
+        // Add a small delay between batches to ensure distinct timestamps
+        sleep(std::time::Duration::from_millis(2));
     }
 
     let final_timestamp = IggyTimestamp::now();
 
+    // Use the exact total messages count from the test matrix
+    let total_sent_messages = total_messages_count;
+
     // Test 1: All messages from initial timestamp
     let all_loaded_messages = partition
-        .get_messages_by_timestamp(initial_timestamp, total_messages)
+        .get_messages_by_timestamp(initial_timestamp, total_sent_messages)
         .await
         .unwrap();
     assert_eq!(
-        all_loaded_messages.len(),
-        total_messages as usize,
+        all_loaded_messages.count(),
+        total_sent_messages,
         "Expected {} messages from initial timestamp, but got {}",
-        total_messages,
-        all_loaded_messages.len()
+        total_sent_messages,
+        all_loaded_messages.count()
     );
 
     // Test 2: Get messages from middle timestamp (after 3rd batch)
-    let middle_timestamp = batch_timestamps[2];
-    let remaining_messages = total_messages - (batch_sizes[0] + batch_sizes[1] + batch_sizes[2]);
-    let middle_messages = partition
-        .get_messages_by_timestamp(middle_timestamp, remaining_messages)
-        .await
-        .unwrap();
-    assert_eq!(
-        middle_messages.len(),
-        remaining_messages as usize,
-        "Expected {} messages from middle timestamp, but got {}",
-        remaining_messages,
-        middle_messages.len()
-    );
+    if batch_timestamps.len() >= 3 {
+        // Use a timestamp that's just before the 3rd batch's timestamp to ensure we get messages
+        // from that batch onwards
+        let middle_timestamp = IggyTimestamp::from(batch_timestamps[2].as_micros() + 1000);
 
-    // Test 3: No messages from final timestamp
+        // Calculate how many messages should be in batches after the 3rd
+        let prior_batches_sum: u32 = batch_sizes[..3].iter().sum();
+        let remaining_messages = total_sent_messages - prior_batches_sum;
+
+        let middle_messages = partition
+            .get_messages_by_timestamp(middle_timestamp, remaining_messages)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            middle_messages.count(),
+            remaining_messages,
+            "Expected {} messages from middle timestamp, but got {}",
+            remaining_messages,
+            middle_messages.count()
+        );
+    }
+
+    // Test 3: No messages after final timestamp
     let no_messages = partition
         .get_messages_by_timestamp(final_timestamp, 1)
         .await
         .unwrap();
     assert_eq!(
-        no_messages.len(),
+        no_messages.count(),
         0,
-        "Expected no messages from final timestamp, but got {}",
-        no_messages.len()
+        "Expected no messages after final timestamp, but got {}",
+        no_messages.count()
     );
 
     // Test 4: Small subset from initial timestamp
-    let subset_size = 3;
+    let subset_size = std::cmp::min(3, total_sent_messages);
     let subset_messages = partition
         .get_messages_by_timestamp(initial_timestamp, subset_size)
         .await
         .unwrap();
     assert_eq!(
-        subset_messages.len(),
-        subset_size as usize,
+        subset_messages.count(),
+        subset_size,
         "Expected {} messages in subset from initial timestamp, but got {}",
         subset_size,
-        subset_messages.len()
+        subset_messages.count()
     );
-    for i in 0..subset_messages.len() {
-        let loaded_message = &subset_messages[i];
-        let original_message = &all_messages[i];
-        assert_eq!(
-            loaded_message.id, original_message.id,
-            "Message ID mismatch at position {}: expected {}, got {}",
-            i, original_message.id, loaded_message.id
-        );
-        assert_eq!(
-            loaded_message.payload, original_message.payload,
-            "Payload mismatch at position {}: expected {:?}, got {:?}",
-            i, original_message.payload, loaded_message.payload
-        );
-        assert_eq!(
-            loaded_message
-                .headers
-                .as_ref()
-                .map(|bytes| HashMap::from_bytes(bytes.clone()).unwrap()),
-            original_message.headers,
-            "Headers mismatch at position {}: expected {:?}, got {:?}",
-            i,
-            original_message.headers,
-            loaded_message
-                .headers
-                .as_ref()
-                .map(|bytes| HashMap::from_bytes(bytes.clone()).unwrap())
-        );
-        assert!(
-            loaded_message.timestamp >= initial_timestamp.as_micros(),
-            "Message timestamp {} at position {} is less than initial timestamp {}",
-            loaded_message.timestamp,
-            i,
-            initial_timestamp
-        );
-    }
 
-    // Test 5: Messages spanning multiple batches (from middle of 2nd batch timestamp)
-    let span_timestamp = batch_timestamps[1];
-    let span_size = 8; // Should span across 2nd, 3rd, and into 4th batch
-    let spanning_messages = partition
-        .get_messages_by_timestamp(span_timestamp, span_size)
-        .await
-        .unwrap();
-    assert_eq!(
-        spanning_messages.len(),
-        span_size as usize,
-        "Expected {} messages spanning multiple batches, but got {}",
-        span_size,
-        spanning_messages.len()
-    );
-    for msg in spanning_messages.iter() {
-        assert!(
-            msg.timestamp >= span_timestamp.as_micros(),
-            "Message timestamp {} should be >= span timestamp {}",
-            msg.timestamp,
-            span_timestamp
+    // Test 5: Messages spanning multiple batches by timestamp
+    if batch_timestamps.len() >= 4 {
+        // Use a timestamp that's just before the 2nd batch's timestamp
+        let span_timestamp = IggyTimestamp::from(batch_timestamps[1].as_micros() + 1000);
+        let span_size = 8; // Should span across multiple batches
+
+        let spanning_messages = partition
+            .get_messages_by_timestamp(span_timestamp, span_size)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            spanning_messages.count(),
+            span_size,
+            "Expected {} messages spanning multiple batches, but got {}",
+            span_size,
+            spanning_messages.count()
         );
+
+        // Verify that all messages have timestamps >= our reference timestamp
+        let span_timestamp_micros = span_timestamp.as_micros();
+
+        // Test 6: Validate message content and ordering
+        for batch in spanning_messages.iter() {
+            for msg in batch.iter() {
+                let msg_timestamp = msg.header().timestamp();
+                assert!(
+                    msg_timestamp >= span_timestamp_micros,
+                    "Message timestamp {} should be >= span timestamp {}",
+                    msg_timestamp,
+                    span_timestamp_micros
+                );
+
+                // Verify message content
+                let loaded_id = msg.header().id();
+                let original_offset = msg.header().offset() as usize;
+
+                if original_offset < all_messages.len() {
+                    let original_message = &all_messages[original_offset];
+                    let original_id = original_message.header.id;
+
+                    assert_eq!(
+                        loaded_id,
+                        original_id,
+                        "Message ID mismatch at offset {}",
+                        msg.header().offset(),
+                    );
+
+                    let loaded_payload = msg.payload();
+                    let original_payload = &original_message.payload;
+                    assert_eq!(
+                        loaded_payload,
+                        original_payload,
+                        "Payload mismatch at offset {}",
+                        msg.header().offset(),
+                    );
+
+                    let loaded_headers = msg.user_headers_map().unwrap().unwrap();
+                    let original_headers = HashMap::from_bytes(
+                        original_message.user_headers.as_ref().unwrap().clone(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        loaded_headers,
+                        original_headers,
+                        "Headers mismatch at offset {}",
+                        msg.header().offset(),
+                    );
+                }
+            }
+        }
     }
 }

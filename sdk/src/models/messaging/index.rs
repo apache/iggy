@@ -16,19 +16,9 @@
  * under the License.
  */
 
-use iggy::utils::byte_size::IggyByteSize;
-
-#[derive(Debug)]
-pub struct AppendableBatchInfo {
-    pub batch_size: IggyByteSize,
-    pub partition_id: u32,
-}
-
-impl AppendableBatchInfo {
-    pub fn new(batch_size: IggyByteSize, partition_id: u32) -> Self {
-        Self {
-            batch_size,
-            partition_id,
-        }
-    }
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
+pub struct IggyIndex {
+    pub offset: u32,
+    pub position: u32,
+    pub timestamp: u64,
 }

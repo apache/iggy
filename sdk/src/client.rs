@@ -21,13 +21,10 @@ use crate::consumer::Consumer;
 use crate::diagnostic::DiagnosticEvent;
 use crate::error::IggyError;
 use crate::identifier::Identifier;
-use crate::messages::poll_messages::PollingStrategy;
-use crate::messages::send_messages::{Message, Partitioning};
 use crate::models::client_info::{ClientInfo, ClientInfoDetails};
 use crate::models::consumer_group::{ConsumerGroup, ConsumerGroupDetails};
 use crate::models::consumer_offset_info::ConsumerOffsetInfo;
 use crate::models::identity_info::IdentityInfo;
-use crate::models::messages::PolledMessages;
 use crate::models::permissions::Permissions;
 use crate::models::personal_access_token::{PersonalAccessTokenInfo, RawPersonalAccessToken};
 use crate::models::snapshot::Snapshot;
@@ -36,6 +33,7 @@ use crate::models::stream::{Stream, StreamDetails};
 use crate::models::topic::{Topic, TopicDetails};
 use crate::models::user_info::{UserInfo, UserInfoDetails};
 use crate::models::user_status::UserStatus;
+use crate::prelude::*;
 use crate::snapshot::{SnapshotCompression, SystemSnapshotType};
 use crate::tcp::config::{TcpClientConfig, TcpClientReconnectionConfig};
 use crate::utils::duration::IggyDuration;
@@ -366,6 +364,7 @@ pub trait MessageClient {
         count: u32,
         auto_commit: bool,
     ) -> Result<PolledMessages, IggyError>;
+
     /// Send messages using specified partitioning strategy to the given stream and topic by unique IDs or names.
     ///
     /// Authentication is required, and the permission to send the messages.
@@ -374,8 +373,9 @@ pub trait MessageClient {
         stream_id: &Identifier,
         topic_id: &Identifier,
         partitioning: &Partitioning,
-        messages: &mut [Message],
+        messages: &mut [IggyMessage],
     ) -> Result<(), IggyError>;
+
     /// Force flush of the `unsaved_messages` buffer to disk, optionally fsyncing the data.
     #[allow(clippy::too_many_arguments)]
     async fn flush_unsaved_buffer(

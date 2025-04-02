@@ -26,7 +26,7 @@ use crate::{
 use async_trait::async_trait;
 use iggy::{
     client::ConsumerGroupClient, clients::client::IggyClient, error::IggyError,
-    messages::poll_messages::PollingKind,
+    messages::PollingKind,
 };
 use iggy_bench_report::{
     benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics,

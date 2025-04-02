@@ -16,9 +16,9 @@
  * under the License.
  */
 
-use super::{Index, INDEX_SIZE};
 use error_set::ErrContext;
 use iggy::error::IggyError;
+use iggy::models::messaging::INDEX_SIZE;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -31,19 +31,20 @@ use tracing::trace;
 
 /// A dedicated struct for writing to the index file.
 #[derive(Debug)]
-pub struct SegmentIndexWriter {
+pub struct IndexWriter {
     file_path: String,
     file: File,
     index_size_bytes: Arc<AtomicU64>,
     fsync: bool,
 }
 
-impl SegmentIndexWriter {
+impl IndexWriter {
     /// Opens the index file in write mode.
     pub async fn new(
         file_path: &str,
         index_size_bytes: Arc<AtomicU64>,
         fsync: bool,
+        file_exists: bool,
     ) -> Result<Self, IggyError> {
         let file = OpenOptions::new()
             .write(true)
@@ -54,22 +55,27 @@ impl SegmentIndexWriter {
             .with_error_context(|error| format!("Failed to open index file: {file_path}. {error}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
-        let _ = file.sync_all().await.with_error_context(|error| {
-            format!("Failed to fsync index file after creation: {file_path}. {error}",)
-        });
+        if file_exists {
+            let _ = file.sync_all().await.with_error_context(|error| {
+                format!("Failed to fsync index file after creation: {file_path}. {error}",)
+            });
 
-        let actual_index_size = file
-            .metadata()
-            .await
-            .with_error_context(|error| {
-                format!("Failed to get metadata of index file: {file_path}. {error}")
-            })
-            .map_err(|_| IggyError::CannotReadFileMetadata)?
-            .len();
+            let actual_index_size = file
+                .metadata()
+                .await
+                .with_error_context(|error| {
+                    format!("Failed to get metadata of index file: {file_path}. {error}")
+                })
+                .map_err(|_| IggyError::CannotReadFileMetadata)?
+                .len();
 
-        index_size_bytes.store(actual_index_size, Ordering::Release);
+            index_size_bytes.store(actual_index_size, Ordering::Release);
+        }
 
-        trace!("Opened index file for writing: {file_path}, size: {actual_index_size}");
+        trace!(
+            "Opened index file for writing: {file_path}, size: {}",
+            index_size_bytes.load(Ordering::Acquire)
+        );
 
         Ok(Self {
             file_path: file_path.to_string(),
@@ -79,27 +85,38 @@ impl SegmentIndexWriter {
         })
     }
 
-    /// Append the given index record to the index file.
-    pub async fn save_index(&mut self, index: Index) -> Result<(), IggyError> {
-        let mut buf = [0u8; INDEX_SIZE as usize];
-        buf[0..4].copy_from_slice(&index.offset.to_le_bytes());
-        buf[4..8].copy_from_slice(&index.position.to_le_bytes());
-        buf[8..16].copy_from_slice(&index.timestamp.to_le_bytes());
-
-        {
-            self.file
-                .write_all(&buf)
-                .await
-                .with_error_context(|error| {
-                    format!("Failed to write index to file: {}. {error}", self.file_path)
-                })
-                .map_err(|_| IggyError::CannotSaveIndexToSegment)?;
+    /// Appends multiple index buffer to the index file in a single operation.
+    pub async fn save_indexes(&mut self, indexes: &[u8]) -> Result<(), IggyError> {
+        if indexes.is_empty() {
+            return Ok(());
         }
+
+        let count = indexes.len() / INDEX_SIZE;
+
+        self.file
+            .write_all(indexes)
+            .await
+            .with_error_context(|error| {
+                format!(
+                    "Failed to write {} indexes to file: {}. {error}",
+                    count, self.file_path
+                )
+            })
+            .map_err(|_| IggyError::CannotSaveIndexToSegment)?;
+
         if self.fsync {
             let _ = self.fsync().await;
         }
+
         self.index_size_bytes
-            .fetch_add(INDEX_SIZE, Ordering::Release);
+            .fetch_add(indexes.len() as u64, Ordering::Release);
+
+        trace!(
+            "Saved {count} indexes of size {} to file: {}",
+            INDEX_SIZE * count,
+            self.file_path
+        );
+
         Ok(())
     }
 

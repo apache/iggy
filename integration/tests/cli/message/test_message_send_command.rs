@@ -22,12 +22,7 @@ use crate::cli::common::{
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
-use iggy::client::Client;
-use iggy::consumer::Consumer;
-use iggy::messages::poll_messages::PollingStrategy;
-use iggy::models::header::{HeaderKey, HeaderValue};
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy::prelude::*;
 use predicates::str::diff;
 use serial_test::parallel;
 use std::collections::HashMap;
@@ -248,8 +243,8 @@ impl IggyCmdTestCase for TestMessageSendCmd {
 
         if let Some(expected_header) = &self.header {
             polled_messages.messages.iter().for_each(|m| {
-                assert!(m.headers.is_some());
-                assert_eq!(expected_header, m.headers.as_ref().unwrap());
+                assert!(m.user_headers.is_some());
+                assert_eq!(expected_header, &m.user_headers_map().unwrap().unwrap());
             })
         };
 
@@ -435,7 +430,7 @@ Options:
   -H, --headers <HEADERS>
           Comma separated list of key:kind:value, sent as header with the message
 {CLAP_INDENT}
-          Headers are comma seperated key-value pairs that can be sent with the message.
+          Headers are comma separated key-value pairs that can be sent with the message.
           Kind can be one of the following: raw, string, bool, int8, int16, int32, int64,
           int128, uint8, uint16, uint32, uint64, uint128, float32, float64
 

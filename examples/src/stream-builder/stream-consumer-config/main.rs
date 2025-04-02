@@ -16,15 +16,7 @@
  * under the License.
  */
 
-use iggy::client::Client;
-use iggy::clients::consumer::{AutoCommit, AutoCommitWhen};
-use iggy::consumer::ConsumerKind;
-use iggy::consumer_ext::IggyConsumerMessageExt;
-use iggy::error::IggyError;
-use iggy::identifier::Identifier;
-use iggy::messages::poll_messages::PollingStrategy;
-use iggy::stream_builder::{IggyConsumerConfig, IggyStreamConsumer};
-use iggy::utils::duration::IggyDuration;
+use iggy::prelude::*;
 use iggy_examples::shared::stream::PrintEventConsumer;
 use std::str::FromStr;
 use tokio::sync::oneshot;

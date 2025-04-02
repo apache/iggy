@@ -19,12 +19,7 @@
 use anyhow::Result;
 use bytes::Bytes;
 use clap::Parser;
-use iggy::client::{Client, MessageClient};
-use iggy::client_provider;
-use iggy::client_provider::ClientProviderConfig;
-use iggy::clients::client::IggyClient;
-use iggy::messages::send_messages::{Message, Partitioning};
-use iggy::models::header::{HeaderKey, HeaderValue};
+use iggy::prelude::*;
 use iggy_examples::shared::args::Args;
 use iggy_examples::shared::messages_generator::MessagesGenerator;
 use iggy_examples::shared::system;
@@ -96,7 +91,11 @@ async fn produce_messages(args: &Args, client: &IggyClient) -> Result<(), Box<dy
                 HeaderValue::from_str(message_type).unwrap(),
             );
 
-            let message = Message::new(None, Bytes::from(json), Some(headers));
+            let message = IggyMessage::builder()
+                .payload(Bytes::from(json))
+                .headers(headers)
+                .build()
+                .unwrap();
             messages.push(message);
             // This is used for the logging purposes only.
             serializable_messages.push(serializable_message);

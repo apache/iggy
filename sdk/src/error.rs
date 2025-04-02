@@ -21,7 +21,7 @@ use crate::utils::topic_size::MaxTopicSize;
 use strum::{EnumDiscriminants, FromRepr, IntoStaticStr};
 use thiserror::Error;
 
-#[derive(Debug, Error, EnumDiscriminants, IntoStaticStr, FromRepr)]
+#[derive(Clone, Debug, Error, EnumDiscriminants, IntoStaticStr, FromRepr)]
 #[repr(u32)]
 #[strum(serialize_all = "snake_case")]
 #[strum_discriminants(
@@ -315,7 +315,7 @@ pub enum IggyError {
     #[error("Cannot read headers payload")]
     CannotReadHeadersPayload = 4016,
     #[error("Too big headers payload")]
-    TooBigHeadersPayload = 4017,
+    TooBigUserHeaders = 4017,
     #[error("Invalid header key")]
     InvalidHeaderKey = 4018,
     #[error("Invalid header value")]
@@ -335,13 +335,27 @@ pub enum IggyError {
     #[error("Cannot read message checksum")]
     CannotReadMessageChecksum = 4026,
     #[error("Invalid message checksum: {0}, expected: {1}, for offset: {2}")]
-    InvalidMessageChecksum(u32, u32, u64) = 4027,
+    InvalidMessageChecksum(u64, u64, u64) = 4027,
     #[error("Invalid key value length")]
     InvalidKeyValueLength = 4028,
     #[error("Command length error: {0}")]
     CommandLengthError(String) = 4029,
     #[error("Incorrect Segments Count size: {0}")]
     InvalidSegmentsCount(u32) = 4030,
+    #[error("Non-zero offset: {0} at index: {1}")]
+    NonZeroOffset(u64, u32) = 4031,
+    #[error("Non-zero timestamp: {0} at index: {1}")]
+    NonZeroTimestamp(u64, u32) = 4032,
+    #[error("Missing index: {0}")]
+    MissingIndex(u32) = 4033,
+    #[error("Invalid indexes byte size: {0}B, should be divisible by 16")]
+    InvalidIndexesByteSize(u32) = 4034,
+    #[error("Invalid indexes count: {0}, expected: {1}")]
+    InvalidIndexesCount(u32, u32) = 4035,
+    #[error("Invalid messages byte size: {0}B, expected: {1}B")]
+    InvalidMessagesSize(u32, u32) = 4036,
+    #[error("Too small message: {0}B, expected: {1}B")]
+    TooSmallMessage(u32, u32) = 4037,
     #[error("Cannot sed messages due to client disconnection")]
     CannotSendMessagesDueToClientDisconnection = 4050,
     #[error("Invalid offset: {0}")]

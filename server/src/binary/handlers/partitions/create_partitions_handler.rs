@@ -16,6 +16,8 @@
  * under the License.
  */
 
+use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::partitions::COMPONENT, sender::SenderKind};
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
@@ -26,47 +28,67 @@ use iggy::error::IggyError;
 use iggy::partitions::create_partitions::CreatePartitions;
 use tracing::{debug, instrument};
 
-#[instrument(skip_all, name = "trace_create_partitions", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id, iggy_stream_id = command.stream_id.as_string(), iggy_topic_id = command.topic_id.as_string()))]
-pub async fn handle(
-    command: CreatePartitions,
-    sender: &mut SenderKind,
-    session: &Session,
-    system: &SharedSystem,
-) -> Result<(), IggyError> {
-    debug!("session: {session}, command: {command}");
+impl ServerCommandHandler for CreatePartitions {
+    fn code(&self) -> u32 {
+        iggy::command::CREATE_PARTITIONS_CODE
+    }
 
-    let mut system = system.write().await;
-    system.create_partitions(
+    #[instrument(skip_all, name = "trace_create_partitions", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string(), iggy_topic_id = self.topic_id.as_string()))]
+    async fn handle(
+        self,
+        sender: &mut SenderKind,
+        _length: u32,
+        session: &Session,
+        system: &SharedSystem,
+    ) -> Result<(), IggyError> {
+        debug!("session: {session}, command: {self}");
+
+        let mut system = system.write().await;
+        system
+            .create_partitions(
                 session,
-                &command.stream_id,
-                &command.topic_id,
-                command.partitions_count,
+                &self.stream_id,
+                &self.topic_id,
+                self.partitions_count,
             )
             .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to create partitions for stream ID: {}, topic ID: {}, session: {}",
-                    command.stream_id, command.topic_id, session
+                    "{COMPONENT} (error: {error}) - failed to create partitions for stream_id: {}, topic_id: {}, session: {}",
+                    self.stream_id, self.topic_id, session
                 )
             })?;
 
-    let system = system.downgrade();
-    let stream_id = command.stream_id.clone();
-    let topic_id = command.topic_id.clone();
+        let system = system.downgrade();
+        let stream_id = self.stream_id.clone();
+        let topic_id = self.topic_id.clone();
 
-    system
+        system
         .state
         .apply(
             session.get_user_id(),
-            EntryCommand::CreatePartitions(command),
+            &EntryCommand::CreatePartitions(self),
         )
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply create partitions for stream ID: {}, topic ID: {}, session: {}",
+                "{COMPONENT} (error: {error}) - failed to apply create partitions for stream_id: {}, topic_id: {}, session: {}",
                 stream_id, topic_id, session
             )
         })?;
-    sender.send_empty_ok_response().await?;
-    Ok(())
+        sender.send_empty_ok_response().await?;
+        Ok(())
+    }
+}
+
+impl BinaryServerCommand for CreatePartitions {
+    async fn from_sender(sender: &mut SenderKind, code: u32, length: u32) -> Result<Self, IggyError>
+    where
+        Self: Sized,
+    {
+        match receive_and_validate(sender, code, length).await? {
+            ServerCommand::CreatePartitions(create_partitions) => Ok(create_partitions),
+            _ => Err(IggyError::InvalidCommand),
+        }
+    }
 }

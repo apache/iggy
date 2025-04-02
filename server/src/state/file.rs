@@ -305,7 +305,7 @@ impl State for FileState {
         Ok(entries)
     }
 
-    async fn apply(&self, user_id: u32, command: EntryCommand) -> Result<(), IggyError> {
+    async fn apply(&self, user_id: u32, command: &EntryCommand) -> Result<(), IggyError> {
         debug!("Applying state entry with command: {command}, user ID: {user_id}");
         let timestamp = IggyTimestamp::now();
         let index = if self.entries_count.load(Ordering::SeqCst) == 0 {

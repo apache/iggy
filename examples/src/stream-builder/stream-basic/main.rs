@@ -17,11 +17,8 @@
  */
 
 use crate::shared::stream::PrintEventConsumer;
-use iggy::client::{Client, StreamClient};
 use iggy::consumer_ext::IggyConsumerMessageExt;
-use iggy::error::IggyError;
-use iggy::messages::send_messages::Message;
-use iggy::stream_builder::{IggyStream, IggyStreamConfig};
+use iggy::prelude::*;
 use iggy_examples::shared;
 use std::str::FromStr;
 use tokio::sync::oneshot;
@@ -50,9 +47,15 @@ async fn main() -> Result<(), IggyError> {
     });
 
     println!("Send 3 test messages...");
-    producer.send_one(Message::from_str("Hello World")?).await?;
-    producer.send_one(Message::from_str("Hola Iggy")?).await?;
-    producer.send_one(Message::from_str("Hi Apache")?).await?;
+    producer
+        .send_one(IggyMessage::from_str("Hello World")?)
+        .await?;
+    producer
+        .send_one(IggyMessage::from_str("Hola Iggy")?)
+        .await?;
+    producer
+        .send_one(IggyMessage::from_str("Hi Apache")?)
+        .await?;
 
     // Wait a bit for all messages to arrive.
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;

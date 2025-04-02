@@ -16,6 +16,8 @@
  * under the License.
  */
 
+use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::{handlers::streams::COMPONENT, sender::SenderKind};
 use crate::state::command::EntryCommand;
@@ -28,42 +30,62 @@ use iggy::error::IggyError;
 use iggy::streams::create_stream::CreateStream;
 use tracing::{debug, instrument};
 
-#[instrument(skip_all, name = "trace_create_stream", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
-pub async fn handle(
-    command: CreateStream,
-    sender: &mut SenderKind,
-    session: &Session,
-    system: &SharedSystem,
-) -> Result<(), IggyError> {
-    debug!("session: {session}, command: {command}");
-    let stream_id = command.stream_id;
+impl ServerCommandHandler for CreateStream {
+    fn code(&self) -> u32 {
+        iggy::command::CREATE_STREAM_CODE
+    }
 
-    let mut system = system.write().await;
-    let stream = system
-            .create_stream(session, command.stream_id, &command.name)
-            .await
+    #[instrument(skip_all, name = "trace_create_stream", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
+    async fn handle(
+        self,
+        sender: &mut SenderKind,
+        _length: u32,
+        session: &Session,
+        system: &SharedSystem,
+    ) -> Result<(), IggyError> {
+        debug!("session: {session}, command: {self}");
+        let stream_id = self.stream_id;
+
+        let mut system = system.write().await;
+        let stream = system
+                .create_stream(session, self.stream_id, &self.name)
+                .await
+                .with_error_context(|error| {
+                    format!(
+                        "{COMPONENT} (error: {error}) - failed to create stream with id: {:?}, session: {session}",
+                        stream_id
+                    )
+                })?;
+        let stream_id = stream.stream_id;
+        let response = mapper::map_stream(stream);
+
+        let system = system.downgrade();
+        system
+            .state
+        .apply(session.get_user_id(), &EntryCommand::CreateStream(CreateStreamWithId {
+            stream_id,
+            command: self
+        }))            .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to create stream with ID: {:?}, name: {} session: {session}",
-                    stream_id, command.name
+                    "{COMPONENT} (error: {error}) - failed to apply create stream for id: {:?}, session: {session}",
+                    stream_id
                 )
             })?;
-    let stream_id = stream.stream_id;
-    let response = mapper::map_stream(stream);
+        sender.send_ok_response(&response).await?;
+        Ok(())
+    }
+}
 
-    let system = system.downgrade();
-    system
-        .state
-        .apply(session.get_user_id(), EntryCommand::CreateStream(CreateStreamWithId {
-            stream_id,
-            command
-        }))
-        .await
-        .with_error_context(|error| {
-            format!(
-                "{COMPONENT} (error: {error}) - failed to apply create stream with ID: {stream_id}, session: {session}",
-            )
-        })?;
-    sender.send_ok_response(&response).await?;
-    Ok(())
+impl BinaryServerCommand for CreateStream {
+    async fn from_sender(
+        sender: &mut SenderKind,
+        code: u32,
+        length: u32,
+    ) -> Result<Self, IggyError> {
+        match receive_and_validate(sender, code, length).await? {
+            ServerCommand::CreateStream(create_stream) => Ok(create_stream),
+            _ => Err(IggyError::InvalidCommand),
+        }
+    }
 }

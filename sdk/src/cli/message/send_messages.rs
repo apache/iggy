@@ -20,8 +20,8 @@ use crate::bytes_serializable::BytesSerializable;
 use crate::cli_command::{CliCommand, PRINT_TARGET};
 use crate::client::Client;
 use crate::identifier::Identifier;
-use crate::messages::send_messages::{Message, Partitioning};
-use crate::models::header::{HeaderKey, HeaderValue};
+use crate::prelude::{HeaderKey, IggyMessage};
+use crate::prelude::{HeaderValue, Partitioning};
 use crate::utils::sizeable::Sizeable;
 use anyhow::Context;
 use async_trait::async_trait;
@@ -113,13 +113,13 @@ impl CliCommand for SendMessagesCmd {
                 "Read {} bytes from {} file", buffer.len(), input_file,
             );
 
-            let mut messages: Vec<Message> = Vec::new();
+            let mut messages: Vec<IggyMessage> = Vec::new();
             let mut bytes_read = 0usize;
             let all_messages_bytes: Bytes = buffer.into();
 
             while bytes_read < all_messages_bytes.len() {
                 let message_bytes = all_messages_bytes.slice(bytes_read..);
-                let message = Message::from_bytes(message_bytes);
+                let message = IggyMessage::from_bytes(message_bytes);
                 match message {
                     Ok(message) => {
                         let message_size = message.get_size_bytes().as_bytes_usize();
@@ -140,18 +140,31 @@ impl CliCommand for SendMessagesCmd {
 
             messages
         } else {
+            let headers = self.get_headers();
             match &self.messages {
                 Some(messages) => messages
                     .iter()
-                    .map(|s| Message::new(None, s.clone().into(), self.get_headers()))
-                    .collect::<Vec<_>>(),
+                    .map(|s| {
+                        IggyMessage::builder()
+                            .payload(Bytes::from(s.clone()))
+                            .headers(headers.clone().unwrap_or_default())
+                            .build()
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .with_context(|| "Failed to create messages from provided strings")?,
                 None => {
                     let input = self.read_message_from_stdin()?;
 
                     input
                         .lines()
-                        .map(|m| Message::new(None, String::from(m).into(), self.get_headers()))
-                        .collect()
+                        .map(|m| {
+                            IggyMessage::builder()
+                                .payload(m.to_owned())
+                                .headers(headers.clone().unwrap_or_default())
+                                .build()
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                        .with_context(|| "Failed to create messages from stdin")?
                 }
             }
         };
