@@ -8,3 +8,5 @@ bench_*
 /rust-clippy-results.sarif
 /performance_results*
 .env
+/iggy_release
+/iggy_release_tmp

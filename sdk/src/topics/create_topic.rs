@@ -38,7 +38,7 @@ use std::str::from_utf8;
 /// - `partitions_count` - number of partitions in the topic, max value is 1000.
 /// - `message_expiry` - message expiry, if `NeverExpire` then messages will never expire.
 /// - `max_topic_size` - maximum size of the topic, if `Unlimited` then topic size is unlimited.
-///                      Can't be lower than segment size in the config.
+///   Can't be lower than segment size in the config.
 /// - `replication_factor` - replication factor for the topic.
 /// - `name` - unique topic name, max length is 255 characters.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
