@@ -63,7 +63,7 @@ jsonwebtoken = "9.3.1"
 mimalloc = { version = "0.1", optional = true }
 moka = { version = "0.12.10", features = ["future"] }
 nix = { version = "0.29", features = ["fs"] }
-openssl = { version = "0.10.71", features = ["vendored"] }
+openssl = { version = "0.10.72", features = ["vendored"] }
 opentelemetry = { version = "0.29.0", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.29.1", features = ["log"] }
 opentelemetry-otlp = { version = "0.29.0", features = [
