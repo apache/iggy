@@ -104,7 +104,7 @@ strum = { version = "0.27.1", features = ["derive"] }
 sysinfo = "0.34.1"
 tempfile = "3.19"
 thiserror = "2.0.12"
-tokio = { version = "1.44.1", features = ["full"] }
+tokio = { version = "1.44.2", features = ["full"] }
 tokio-native-tls = "0.3.1"
 tokio-util = { version = "0.7.14", features = ["compat"] }
 toml = "0.8.20"
