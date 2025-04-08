@@ -30,6 +30,7 @@ use crate::args::kinds::pinned::producer_and_consumer::PinnedProducerAndConsumer
 use clap::Subcommand;
 use iggy::utils::byte_size::IggyByteSize;
 use iggy_bench_report::benchmark_kind::BenchmarkKind;
+use std::process::exit;
 
 #[derive(Subcommand, Debug)]
 pub enum BenchmarkKindCommand {
@@ -118,7 +119,7 @@ impl BenchmarkKindCommand {
             }
             BenchmarkKindCommand::Examples => {
                 print_examples();
-                std::process::exit(0);
+                exit(0);
             }
         }
     }
@@ -165,7 +166,7 @@ impl BenchmarkKindProps for BenchmarkKindCommand {
             BenchmarkKindCommand::EndToEndProducingConsumerGroup(args) => args,
             BenchmarkKindCommand::Examples => {
                 print_examples();
-                std::process::exit(0);
+                exit(0);
             }
         }
     }
