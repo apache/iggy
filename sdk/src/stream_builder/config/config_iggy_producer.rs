@@ -16,13 +16,12 @@
  * under the License.
  */
 
-use bon::Builder;
-
 use crate::error::IggyError;
 use crate::identifier::Identifier;
-use crate::messages::send_messages::Partitioning;
+use crate::messages::Partitioning;
 use crate::utils::crypto::EncryptorKind;
 use crate::utils::duration::IggyDuration;
+use bon::Builder;
 use std::str::FromStr;
 use std::sync::Arc;
 

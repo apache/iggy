@@ -17,15 +17,7 @@
  */
 
 use clap::Parser;
-use iggy::client::Client;
-use iggy::client_provider;
-use iggy::client_provider::ClientProviderConfig;
-use iggy::clients::client::IggyClient;
-use iggy::clients::producer::IggyProducer;
-use iggy::messages::send_messages::{Message, Partitioning};
-use iggy::utils::duration::IggyDuration;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy::prelude::*;
 use iggy_examples::shared::args::Args;
 use iggy_examples::shared::messages_generator::MessagesGenerator;
 use std::error::Error;
@@ -93,7 +85,7 @@ async fn produce_messages(
         for _ in 0..args.messages_per_batch {
             let serializable_message = message_generator.generate();
             let json_envelope = serializable_message.to_json_envelope();
-            let message = Message::from_str(&json_envelope)?;
+            let message = IggyMessage::from_str(&json_envelope)?;
             messages.push(message);
         }
         producer.send(messages).await?;

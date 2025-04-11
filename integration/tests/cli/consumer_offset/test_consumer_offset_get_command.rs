@@ -22,12 +22,7 @@ use crate::cli::common::{
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
-use iggy::client::Client;
-use iggy::consumer::{Consumer, ConsumerKind};
-use iggy::identifier::Identifier;
-use iggy::messages::send_messages::{Message, Partitioning};
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy::prelude::*;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
 use std::str::FromStr;
@@ -122,7 +117,7 @@ impl IggyCmdTestCase for TestConsumerOffsetGetCmd {
         assert!(topic.is_ok());
 
         let mut messages = (1..=self.messages_count)
-            .filter_map(|id| Message::from_str(format!("Test message {id}").as_str()).ok())
+            .filter_map(|id| IggyMessage::from_str(format!("Test message {id}").as_str()).ok())
             .collect::<Vec<_>>();
 
         let send_status = client

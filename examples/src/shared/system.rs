@@ -17,18 +17,10 @@
  */
 
 use crate::shared::args::Args;
-use iggy::client::Client;
-use iggy::compression::compression_algorithm::CompressionAlgorithm;
-use iggy::consumer::{Consumer, ConsumerKind};
-use iggy::error::IggyError;
-use iggy::identifier::Identifier;
-use iggy::messages::poll_messages::PollingStrategy;
-use iggy::models::messages::PolledMessage;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy::prelude::*;
 use tracing::info;
 
-type MessageHandler = dyn Fn(&PolledMessage) -> Result<(), Box<dyn std::error::Error>>;
+type MessageHandler = dyn Fn(&IggyMessage) -> Result<(), Box<dyn std::error::Error>>;
 
 pub async fn init_by_consumer(args: &Args, client: &dyn Client) {
     let (stream_id, topic_id, partition_id) = (

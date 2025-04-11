@@ -46,7 +46,7 @@ const USERNAME_2: &str = "user2";
 const USERNAME_3: &str = "user3";
 const CONSUMER_ID: u32 = 1;
 const CONSUMER_KIND: ConsumerKind = ConsumerKind::Consumer;
-const MESSAGES_COUNT: u32 = 1000;
+const MESSAGES_COUNT: u32 = 1337;
 
 async fn create_client(client_factory: &dyn ClientFactory) -> IggyClient {
     let client = client_factory.create_client().await;

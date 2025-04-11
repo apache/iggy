@@ -102,7 +102,7 @@ async fn create_personal_access_token(
         .state
         .apply(
             identity.user_id,
-            EntryCommand::CreatePersonalAccessToken(CreatePersonalAccessTokenWithHash {
+            &EntryCommand::CreatePersonalAccessToken(CreatePersonalAccessTokenWithHash {
                 command,
                 hash: token_hash,
             }),
@@ -142,7 +142,7 @@ async fn delete_personal_access_token(
         .state
         .apply(
             identity.user_id,
-            EntryCommand::DeletePersonalAccessToken(DeletePersonalAccessToken { name }),
+            &EntryCommand::DeletePersonalAccessToken(DeletePersonalAccessToken { name }),
         )
         .await
         .with_error_context(|error| {

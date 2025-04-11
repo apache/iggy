@@ -17,17 +17,15 @@
  */
 
 use crate::binary::binary_client::BinaryClient;
-use crate::binary::{fail_if_not_authenticated, mapper};
+use crate::binary::fail_if_not_authenticated;
 use crate::client::MessageClient;
 use crate::command::{POLL_MESSAGES_CODE, SEND_MESSAGES_CODE};
 use crate::consumer::Consumer;
 use crate::error::IggyError;
 use crate::identifier::Identifier;
-use crate::messages::flush_unsaved_buffer::FlushUnsavedBuffer;
-use crate::messages::poll_messages::PollingStrategy;
-use crate::messages::send_messages::{Message, Partitioning};
-use crate::messages::{poll_messages, send_messages};
-use crate::models::messages::PolledMessages;
+use crate::messages::{FlushUnsavedBuffer, PollingStrategy};
+use crate::models::messaging::IggyMessage;
+use crate::prelude::{BytesSerializable, Partitioning, PollMessages, PolledMessages, SendMessages};
 
 #[async_trait::async_trait]
 impl<B: BinaryClient> MessageClient for B {
@@ -45,7 +43,7 @@ impl<B: BinaryClient> MessageClient for B {
         let response = self
             .send_raw_with_response(
                 POLL_MESSAGES_CODE,
-                poll_messages::as_bytes(
+                PollMessages::as_bytes(
                     stream_id,
                     topic_id,
                     partition_id,
@@ -56,7 +54,7 @@ impl<B: BinaryClient> MessageClient for B {
                 ),
             )
             .await?;
-        mapper::map_polled_messages(response)
+        PolledMessages::from_bytes(response)
     }
 
     async fn send_messages(
@@ -64,12 +62,12 @@ impl<B: BinaryClient> MessageClient for B {
         stream_id: &Identifier,
         topic_id: &Identifier,
         partitioning: &Partitioning,
-        messages: &mut [Message],
+        messages: &mut [IggyMessage],
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
         self.send_raw_with_response(
             SEND_MESSAGES_CODE,
-            send_messages::as_bytes(stream_id, topic_id, partitioning, messages),
+            SendMessages::as_bytes(stream_id, topic_id, partitioning, messages),
         )
         .await?;
         Ok(())

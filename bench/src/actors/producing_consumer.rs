@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::actors::utils::{calculate_latency_from_first_message, put_timestamp_in_first_message};
+use crate::actors::utils::calculate_latency_from_first_message;
 use crate::analytics::metrics::individual::from_records;
 use crate::analytics::record::BenchmarkRecord;
 use crate::rate_limiter::RateLimiter;
@@ -26,8 +26,7 @@ use iggy::client::MessageClient;
 use iggy::clients::client::IggyClient;
 use iggy::consumer::Consumer as IggyConsumer;
 use iggy::error::IggyError;
-use iggy::messages::poll_messages::{PollingKind, PollingStrategy};
-use iggy::messages::send_messages::{Message, Partitioning};
+use iggy::prelude::*;
 use iggy::utils::byte_size::IggyByteSize;
 use iggy::utils::duration::IggyDuration;
 use iggy::utils::sizeable::Sizeable;
@@ -122,8 +121,8 @@ impl ProducingConsumer {
         let mut batch_total_bytes = 0;
         let mut messages = Vec::with_capacity(messages_per_batch as usize);
         for _ in 0..messages_per_batch {
-            let message = Message::from_str(&payload).unwrap();
-            batch_user_data_bytes += message.length as u64;
+            let message = IggyMessage::from_str(&payload).unwrap();
+            batch_user_data_bytes += message.payload.len() as u64;
             batch_total_bytes += message.get_size_bytes().as_bytes_u64();
             messages.push(message);
         }
@@ -190,6 +189,7 @@ impl ProducingConsumer {
                         self.polling_kind
                     ),
                 };
+
                 let polled_messages = client
                     .poll_messages(
                         &stream_id,
@@ -223,6 +223,7 @@ impl ProducingConsumer {
 
                     continue;
                 }
+
                 current_offset += messages_per_batch as u64;
             }
         }
@@ -245,8 +246,6 @@ impl ProducingConsumer {
             if let Some(rate_limiter) = &self.rate_limiter {
                 rate_limiter.throttle(batch_user_data_bytes).await;
             }
-
-            put_timestamp_in_first_message(&mut messages[0]);
             let before_send = Instant::now();
             client
                 .send_messages(&stream_id, &topic_id, &partitioning, &mut messages)

@@ -17,11 +17,7 @@
  */
 
 use clap::Parser;
-use iggy::client::Client;
-use iggy::client_provider;
-use iggy::client_provider::ClientProviderConfig;
-use iggy::clients::client::IggyClient;
-use iggy::messages::send_messages::{Message, Partitioning};
+use iggy::prelude::*;
 use iggy_examples::shared::args::Args;
 use iggy_examples::shared::system;
 use std::error::Error;
@@ -82,7 +78,7 @@ async fn produce_messages(args: &Args, client: &dyn Client) -> Result<(), Box<dy
         for _ in 0..args.messages_per_batch {
             current_id += 1;
             let payload = format!("message-{current_id}");
-            let message = Message::from_str(&payload)?;
+            let message = IggyMessage::from_str(&payload)?;
             messages.push(message);
             sent_messages.push(payload);
         }

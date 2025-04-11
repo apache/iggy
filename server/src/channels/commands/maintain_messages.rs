@@ -17,7 +17,7 @@
  */
 
 use crate::archiver::ArchiverKind;
-use crate::channels::server_command::ServerCommand;
+use crate::channels::server_command::BackgroundServerCommand;
 use crate::configs::server::MessagesMaintenanceConfig;
 use crate::map_toggle_str;
 use crate::streaming::systems::system::SharedSystem;
@@ -93,7 +93,7 @@ impl MessagesMaintainer {
     }
 }
 
-impl ServerCommand<MaintainMessagesCommand> for MaintainMessagesExecutor {
+impl BackgroundServerCommand<MaintainMessagesCommand> for MaintainMessagesExecutor {
     #[instrument(skip_all, name = "trace_maintain_messages")]
     async fn execute(&mut self, system: &SharedSystem, command: MaintainMessagesCommand) {
         let system = system.read().await;
@@ -295,15 +295,15 @@ async fn handle_oldest_segments(
             let mut start_offsets = Vec::new();
             let partition = partition.read().await;
             for segment in partition.get_segments() {
-                if !segment.is_closed {
+                if !segment.is_closed() {
                     continue;
                 }
 
-                let is_archived = archiver.is_archived(&segment.index_path, None).await;
+                let is_archived = archiver.is_archived(segment.index_file_path(), None).await;
                 if is_archived.is_err() {
                     error!(
                         "Failed to check if segment with start offset: {} is archived for stream ID: {}, topic ID: {}, partition ID: {}. Error: {}",
-                        segment.start_offset, topic.stream_id, topic.topic_id, partition.partition_id, is_archived.err().unwrap()
+                        segment.start_offset(), topic.stream_id, topic.topic_id, partition.partition_id, is_archived.err().unwrap()
                     );
                     continue;
                 }
@@ -311,9 +311,9 @@ async fn handle_oldest_segments(
                 if !is_archived.unwrap() {
                     debug!(
                         "Segment with start offset: {} is not archived for stream ID: {}, topic ID: {}, partition ID: {}",
-                        segment.start_offset, topic.stream_id, topic.topic_id, partition.partition_id
+                        segment.start_offset(), topic.stream_id, topic.topic_id, partition.partition_id
                     );
-                    start_offsets.push(segment.start_offset);
+                    start_offsets.push(segment.start_offset());
                 }
             }
             if !start_offsets.is_empty() {
@@ -384,13 +384,13 @@ async fn get_oldest_segments(topic: &Topic) -> Vec<SegmentsToHandle> {
     for partition in topic.partitions.values() {
         let partition = partition.read().await;
         if let Some(segment) = partition.get_segments().first() {
-            if !segment.is_closed {
+            if !segment.is_closed() {
                 continue;
             }
 
             oldest_segments.push(SegmentsToHandle {
                 partition_id: partition.partition_id,
-                start_offsets: vec![segment.start_offset],
+                start_offsets: vec![segment.start_offset()],
             });
         }
     }
@@ -466,7 +466,7 @@ async fn archive_segments(
                     }
 
                     let segment = segment.unwrap();
-                    let files = [segment.index_path.as_ref(), segment.log_path.as_ref()];
+                    let files = [segment.index_file_path(), segment.messages_file_path()];
                     if let Err(error) = archiver.archive(&files, None).await {
                         error!(
                             "Failed to archive segment with start offset: {} for stream ID: {}, topic ID: {}, partition ID: {}. Error: {}",
@@ -518,7 +518,7 @@ async fn delete_segments(
                     })?;
                     last_end_offset = deleted_segment.end_offset;
                     segments_count += 1;
-                    messages_count += deleted_segment.messages_count;
+                    messages_count += deleted_segment.messages_count as u64;
                 }
 
                 if partition.get_segments().is_empty() {

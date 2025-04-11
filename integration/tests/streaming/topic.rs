@@ -19,16 +19,10 @@
 use crate::streaming::common::test_setup::TestSetup;
 use crate::streaming::create_messages;
 use ahash::AHashMap;
-use iggy::compression::compression_algorithm::CompressionAlgorithm;
-use iggy::messages::poll_messages::PollingStrategy;
-use iggy::messages::send_messages::Partitioning;
-use iggy::utils::byte_size::IggyByteSize;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::sizeable::Sizeable;
-use iggy::utils::timestamp::IggyTimestamp;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy::prelude::*;
 use server::state::system::{PartitionState, TopicState};
 use server::streaming::polling_consumer::PollingConsumer;
+use server::streaming::segments::IggyMessagesBatchMut;
 use server::streaming::topics::topic::Topic;
 use std::default::Default;
 use std::sync::atomic::{AtomicU32, AtomicU64};
@@ -225,16 +219,17 @@ async fn should_purge_existing_topic_on_disk() {
         .await;
 
         let messages = create_messages();
-        let messages_count = messages.len();
+        let messages_count = messages.len() as u32;
         let batch_size = messages
             .iter()
-            .map(|msg| msg.get_size_bytes())
-            .sum::<IggyByteSize>();
+            .map(|msg| msg.get_size_bytes().as_bytes_u32())
+            .sum::<u32>();
+        let batch = IggyMessagesBatchMut::from_messages(&messages, batch_size);
         topic
-            .append_messages(batch_size, Partitioning::partition_id(1), messages, None)
+            .append_messages(&Partitioning::partition_id(1), batch, None)
             .await
             .unwrap();
-        let loaded_messages = topic
+        let (_, loaded_messages) = topic
             .get_messages(
                 PollingConsumer::Consumer(1, 1),
                 1,
@@ -243,10 +238,10 @@ async fn should_purge_existing_topic_on_disk() {
             )
             .await
             .unwrap();
-        assert_eq!(loaded_messages.messages.len(), messages_count);
+        assert_eq!(loaded_messages.count(), messages_count);
 
         topic.purge().await.unwrap();
-        let loaded_messages = topic
+        let (metadata, loaded_messages) = topic
             .get_messages(
                 PollingConsumer::Consumer(1, 1),
                 1,
@@ -255,8 +250,8 @@ async fn should_purge_existing_topic_on_disk() {
             )
             .await
             .unwrap();
-        assert_eq!(loaded_messages.current_offset, 0);
-        assert!(loaded_messages.messages.is_empty());
+        assert_eq!(metadata.current_offset, 0);
+        assert!(loaded_messages.is_empty());
     }
 }
 

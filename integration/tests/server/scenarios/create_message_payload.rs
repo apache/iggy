@@ -17,14 +17,7 @@
  */
 
 use bytes::Bytes;
-use iggy::client::{MessageClient, StreamClient, TopicClient};
-use iggy::clients::client::IggyClient;
-use iggy::consumer::Consumer;
-use iggy::messages::poll_messages::PollingStrategy;
-use iggy::messages::send_messages::{Message, Partitioning};
-use iggy::models::header::{HeaderKey, HeaderValue};
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy::prelude::*;
 use integration::test_server::{assert_clean_system, login_root, ClientFactory};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -50,12 +43,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
         let id = (offset + 1) as u128;
         let payload = create_message_payload(offset as u64);
         let headers = create_message_headers();
-        messages.push(Message {
-            id,
-            length: payload.len() as u32,
-            payload,
-            headers: Some(headers),
-        });
+        let message = IggyMessage::with_id_and_headers(id, payload, headers);
+        messages.push(message);
     }
 
     client
@@ -85,8 +74,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     assert_eq!(polled_messages.messages.len() as u32, MESSAGES_COUNT);
     for i in 0..MESSAGES_COUNT {
         let message = polled_messages.messages.get(i as usize).unwrap();
-        assert!(message.headers.is_some());
-        let headers = message.headers.as_ref().unwrap();
+        assert!(message.user_headers.is_some());
+        let headers = message.user_headers_map().unwrap().unwrap();
         assert_eq!(headers.len(), 3);
         assert_eq!(
             headers

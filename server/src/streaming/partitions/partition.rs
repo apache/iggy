@@ -17,15 +17,11 @@
  */
 
 use crate::configs::system::SystemConfig;
-use crate::streaming::cache::buffer::SmartCache;
-use crate::streaming::cache::memory_tracker::CacheMemoryTracker;
 use crate::streaming::deduplication::message_deduplicator::MessageDeduplicator;
-use crate::streaming::models::messages::RetainedMessage;
 use crate::streaming::segments::*;
 use crate::streaming::storage::SystemStorage;
 use dashmap::DashMap;
 use iggy::consumer::ConsumerKind;
-use iggy::models::stats::CacheMetrics;
 use iggy::utils::byte_size::IggyByteSize;
 use iggy::utils::duration::IggyDuration;
 use iggy::utils::expiry::IggyExpiry;
@@ -45,10 +41,9 @@ pub struct Partition {
     pub consumer_offsets_path: String,
     pub consumer_group_offsets_path: String,
     pub current_offset: u64,
-    pub cache: Option<SmartCache<Arc<RetainedMessage>>>,
-    pub cached_memory_tracker: Option<Arc<CacheMemoryTracker>>,
     pub message_deduplicator: Option<MessageDeduplicator>,
     pub unsaved_messages_count: u32,
+    pub unsaved_messages_size: IggyByteSize,
     pub should_increment_offset: bool,
     pub created_at: IggyTimestamp,
     pub avg_timestamp_delta: IggyDuration,
@@ -109,12 +104,23 @@ impl Partition {
             config.get_consumer_offsets_path(stream_id, topic_id, partition_id);
         let consumer_group_offsets_path =
             config.get_consumer_group_offsets_path(stream_id, topic_id, partition_id);
-        let (cached_memory_tracker, messages) = match config.cache.enabled {
-            false => (None, None),
-            true => (
-                CacheMemoryTracker::initialize(&config.cache),
-                Some(SmartCache::new()),
-            ),
+
+        let message_deduplicator = match config.message_deduplication.enabled {
+            true => Some(MessageDeduplicator::new(
+                if config.message_deduplication.max_entries > 0 {
+                    Some(config.message_deduplication.max_entries)
+                } else {
+                    None
+                },
+                {
+                    if config.message_deduplication.expiry.is_zero() {
+                        None
+                    } else {
+                        Some(config.message_deduplication.expiry)
+                    }
+                },
+            )),
+            false => None,
         };
 
         let mut partition = Partition {
@@ -126,28 +132,11 @@ impl Partition {
             consumer_offsets_path,
             consumer_group_offsets_path,
             message_expiry,
-            cache: messages,
-            cached_memory_tracker,
-            message_deduplicator: match config.message_deduplication.enabled {
-                true => Some(MessageDeduplicator::new(
-                    if config.message_deduplication.max_entries > 0 {
-                        Some(config.message_deduplication.max_entries)
-                    } else {
-                        None
-                    },
-                    {
-                        if config.message_deduplication.expiry.is_zero() {
-                            None
-                        } else {
-                            Some(config.message_deduplication.expiry)
-                        }
-                    },
-                )),
-                false => None,
-            },
+            message_deduplicator,
             segments: vec![],
             current_offset: 0,
             unsaved_messages_count: 0,
+            unsaved_messages_size: IggyByteSize::from(0),
             should_increment_offset: false,
             consumer_offsets: DashMap::new(),
             consumer_group_offsets: DashMap::new(),
@@ -187,23 +176,6 @@ impl Partition {
 
         partition
     }
-
-    pub fn get_cache_metrics(&self) -> CacheMetrics {
-        if let Some(cache) = self.cache.as_ref() {
-            let cache_metrics = cache.get_metrics();
-            CacheMetrics {
-                hits: cache_metrics.hits,
-                misses: cache_metrics.misses,
-                hit_ratio: cache_metrics.hit_ratio,
-            }
-        } else {
-            CacheMetrics {
-                hits: 0,
-                misses: 0,
-                hit_ratio: 0.0,
-            }
-        }
-    }
 }
 
 impl Sizeable for Partition {
@@ -228,7 +200,7 @@ impl fmt::Display for Partition {
 
 #[cfg(test)]
 mod tests {
-    use crate::configs::system::{CacheConfig, SystemConfig};
+    use crate::configs::system::SystemConfig;
     use crate::streaming::partitions::partition::Partition;
     use crate::streaming::persistence::persister::{FileWithSyncPersister, PersisterKind};
     use crate::streaming::storage::SystemStorage;
@@ -280,49 +252,10 @@ mod tests {
         assert_eq!(partition.current_offset, 0);
         assert_eq!(partition.unsaved_messages_count, 0);
         assert_eq!(partition.segments.len(), 1);
-        assert!(partition.cache.is_some());
         assert!(!partition.should_increment_offset);
-        assert!(partition.cache.as_ref().unwrap().is_empty());
         let consumer_offsets = partition.consumer_offsets;
         assert_eq!(partition.message_expiry, message_expiry);
         assert!(consumer_offsets.is_empty());
-    }
-
-    #[tokio::test]
-    async fn should_not_initialize_cache_given_zero_capacity() {
-        let tempdir = tempfile::TempDir::new().unwrap();
-        let config = Arc::new(SystemConfig {
-            path: tempdir.path().to_str().unwrap().to_string(),
-            ..Default::default()
-        });
-        let storage = Arc::new(SystemStorage::new(
-            config.clone(),
-            Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister {})),
-        ));
-
-        let partition = Partition::create(
-            1,
-            1,
-            1,
-            true,
-            Arc::new(SystemConfig {
-                cache: CacheConfig {
-                    enabled: false,
-                    size: "0".parse().unwrap(),
-                },
-                ..Default::default()
-            }),
-            storage,
-            IggyExpiry::NeverExpire,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU32::new(0)),
-            IggyTimestamp::now(),
-        )
-        .await;
-        assert!(partition.cache.is_none());
     }
 
     #[tokio::test]

@@ -41,8 +41,8 @@ impl MessageDeduplicator {
     }
 
     /// Checks if the given ID exists.
-    pub fn exists(&self, id: &u128) -> bool {
-        self.cache.contains_key(id)
+    pub fn exists(&self, id: u128) -> bool {
+        self.cache.contains_key(&id)
     }
 
     /// Inserts the given ID.
@@ -51,11 +51,11 @@ impl MessageDeduplicator {
     }
 
     /// Tries to insert the given ID, returns false if it already exists.
-    pub async fn try_insert(&self, id: &u128) -> bool {
+    pub async fn try_insert(&self, id: u128) -> bool {
         if self.exists(id) {
             false
         } else {
-            self.insert(*id).await;
+            self.insert(id).await;
             true
         }
     }
@@ -73,9 +73,9 @@ mod tests {
         let deduplicator = MessageDeduplicator::new(Some(max_entries), Some(ttl));
         for i in 0..max_entries {
             let id = i as u128;
-            assert!(deduplicator.try_insert(&id).await);
-            assert!(deduplicator.exists(&id));
-            assert!(!deduplicator.try_insert(&id).await);
+            assert!(deduplicator.try_insert(id).await);
+            assert!(deduplicator.exists(id));
+            assert!(!deduplicator.try_insert(id).await);
         }
     }
 
@@ -86,11 +86,11 @@ mod tests {
         let deduplicator = MessageDeduplicator::new(Some(max_entries), Some(ttl));
         for i in 0..max_entries {
             let id = i as u128;
-            assert!(deduplicator.try_insert(&id).await);
-            assert!(deduplicator.exists(&id));
+            assert!(deduplicator.try_insert(id).await);
+            assert!(deduplicator.exists(id));
             sleep(2 * ttl.get_duration()).await;
-            assert!(!deduplicator.exists(&id));
-            assert!(deduplicator.try_insert(&id).await);
+            assert!(!deduplicator.exists(id));
+            assert!(deduplicator.try_insert(id).await);
         }
     }
 }

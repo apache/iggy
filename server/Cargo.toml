@@ -17,10 +17,18 @@
 
 [package]
 name = "server"
-version = "0.4.300"
+version = "0.5.0"
 edition = "2021"
 build = "src/build.rs"
 license = "Apache-2.0"
+
+# This is a workaround for cargo-udeps to ignore these dependencies
+# in case if feature 'tokio-console' is enabled.
+[package.metadata.cargo-udeps.ignore]
+normal = ["tracing-appender"]
+
+[package.metadata.cargo-machete]
+ignored = ["rust-s3"]
 
 [features]
 default = ["mimalloc"]
@@ -39,7 +47,6 @@ async_zip = { version = "0.0.17", features = [
     "deflate",
     "zstd",
 ] }
-atone = "0.3.7"
 axum = "0.8.3"
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
 bcrypt = "0.17.0"
@@ -52,6 +59,7 @@ console-subscriber = { version = "0.4.1", optional = true }
 dashmap = "6.1.0"
 derive_more = "2.0.1"
 dotenvy = { version = "0.15.7" }
+enum_dispatch = "0.3.13"
 error_set = { version = "0.8.5", features = ["tracing"] }
 figlet-rs = "0.1.5"
 figment = { version = "0.10.19", features = ["toml", "env"] }
@@ -60,6 +68,7 @@ futures = "0.3.31"
 human-repr = "1.1.0"
 iggy = { path = "../sdk" }
 jsonwebtoken = "9.3.1"
+lending-iterator = "0.1.7"
 mimalloc = { version = "0.1", optional = true }
 moka = { version = "0.12.10", features = ["future"] }
 nix = { version = "0.29", features = ["fs"] }
@@ -83,7 +92,7 @@ opentelemetry_sdk = { version = "0.29.0", features = [
     "tokio",
     "experimental_async_runtime",
     "experimental_logs_batch_log_processor_with_async_runtime",
-    "experimental_trace_batch_span_processor_with_async_runtime"
+    "experimental_trace_batch_span_processor_with_async_runtime",
 ] }
 prometheus-client = "0.23.1"
 quinn = { version = "0.11.7" }
@@ -92,7 +101,7 @@ reqwest = { version = "0.12.15", features = [
     "rustls-tls",
     "rustls-tls-no-provider",
 ] }
-ring = "0.17.14"
+ring = "0.17.9"
 rust-s3 = { version = "0.35.1", features = ["default"] }
 rustls = { version = "0.23.25" }
 rustls-pemfile = "2.2.0"
@@ -119,10 +128,7 @@ tracing-opentelemetry = { version = "0.30.0" }
 tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter"] }
 twox-hash = { version = "2.1.0", features = ["xxhash32"] }
 ulid = "1.2.1"
-uuid = { version = "1.16.0", features = ["v7", "fast-rng", "zerocopy"] }
-
-[dev-dependencies]
-mockall = "0.13.1"
+uuid = { version = "1.13.2", features = ["v7", "fast-rng", "zerocopy"] }
 
 [build-dependencies]
 figment = { version = "0.10.19", features = ["json", "toml", "env"] }
@@ -134,14 +140,9 @@ vergen-git2 = { version = "1.0.5", features = [
     "si",
 ] }
 
+[dev-dependencies]
+mockall = "0.13.1"
+
 [[bin]]
 name = "iggy-server"
 path = "src/main.rs"
-
-# This is a workaround for cargo-udeps to ignore these dependencies
-# in case if feature 'tokio-console' is enabled.
-[package.metadata.cargo-udeps.ignore]
-normal = ["tracing-appender"]
-
-[package.metadata.cargo-machete]
-ignored = ["rust-s3"]

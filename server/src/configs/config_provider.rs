@@ -317,7 +317,10 @@ impl ConfigProvider for FileConfigProvider {
                 println!("Using Config: {config}");
                 Ok(config)
             }
-            Err(_) => Err(ConfigError::CannotLoadConfiguration),
+            Err(e) => {
+                println!("Failed to load config: {e}");
+                Err(ConfigError::CannotLoadConfiguration)
+            }
         }
     }
 }

@@ -16,10 +16,8 @@
  * under the License.
  */
 
-use atone::Vc;
-use iggy::utils::byte_size::IggyByteSize;
-use std::path::{Path, PathBuf};
-use tokio::fs::{read_dir, remove_file, File, OpenOptions};
+use std::path::Path;
+use tokio::fs::{remove_file, File, OpenOptions};
 
 pub async fn open(path: &str) -> Result<File, std::io::Error> {
     OpenOptions::new().read(true).open(path).await
@@ -47,28 +45,4 @@ pub async fn rename(old_path: &str, new_path: &str) -> Result<(), std::io::Error
 
 pub async fn exists(path: &str) -> Result<bool, std::io::Error> {
     tokio::fs::try_exists(path).await
-}
-
-pub async fn folder_size<P>(path: P) -> std::io::Result<IggyByteSize>
-where
-    P: Into<PathBuf> + AsRef<Path>,
-{
-    let mut total_size = 0;
-    let mut queue: Vc<PathBuf> = Vc::new();
-    queue.push_back(path.into());
-
-    while let Some(current_path) = queue.pop_front() {
-        let mut entries = read_dir(&current_path).await.unwrap();
-
-        while let Some(entry) = entries.next_entry().await.unwrap() {
-            let metadata = entry.metadata().await.unwrap();
-
-            if metadata.is_file() {
-                total_size += metadata.len();
-            } else if metadata.is_dir() {
-                queue.push_back(entry.path());
-            }
-        }
-    }
-    Ok(total_size.into())
 }

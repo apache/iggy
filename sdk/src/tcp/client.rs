@@ -641,13 +641,12 @@ impl TcpClient {
         let mut stream = self.stream.lock().await;
         if let Some(stream) = stream.as_mut() {
             let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
-            trace!("Sending a TCP request with code: {code}");
+            trace!("Sending a TCP request of size {payload_length} with code: {code}");
             stream.write(&(payload_length as u32).to_le_bytes()).await?;
             stream.write(&code.to_le_bytes()).await?;
             stream.write(&payload).await?;
             stream.flush().await?;
             trace!("Sent a TCP request with code: {code}, waiting for a response...");
-
             let mut response_buffer = [0u8; RESPONSE_INITIAL_BYTES_LENGTH];
             let read_bytes = stream.read(&mut response_buffer).await.map_err(|error| {
                 error!(

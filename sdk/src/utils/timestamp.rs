@@ -23,9 +23,11 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
 };
 use std::{
-    ops::Add,
+    ops::{Add, Sub},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+use crate::prelude::IggyDuration;
 
 /// A struct that represents a timestamp.
 ///
@@ -94,6 +96,32 @@ impl Add<SystemTime> for IggyTimestamp {
 
     fn add(self, other: SystemTime) -> IggyTimestamp {
         IggyTimestamp(self.0 + other.duration_since(UNIX_EPOCH).unwrap())
+    }
+}
+
+impl Sub<SystemTime> for IggyTimestamp {
+    type Output = IggyTimestamp;
+
+    fn sub(self, rhs: SystemTime) -> Self::Output {
+        IggyTimestamp(self.0 - rhs.duration_since(UNIX_EPOCH).unwrap())
+    }
+}
+
+impl Add<IggyDuration> for IggyTimestamp {
+    type Output = IggyTimestamp;
+
+    fn add(self, other: IggyDuration) -> Self::Output {
+        IggyTimestamp(self.0 + other.get_duration())
+    }
+}
+
+impl Sub for IggyTimestamp {
+    type Output = Duration;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        self.0
+            .duration_since(rhs.0)
+            .expect("Failed to subtract timestamps rhs < self")
     }
 }
 

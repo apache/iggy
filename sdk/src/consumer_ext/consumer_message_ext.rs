@@ -88,7 +88,7 @@ impl IggyConsumerMessageExt for IggyConsumer {
                         Some(Ok(received_message)) => {
                             let partition_id = received_message.partition_id;
                             let current_offset = received_message.current_offset;
-                            let message_offset = received_message.message.offset;
+                            let message_offset = received_message.message.header.offset;
                             if let Err(err) = message_consumer.consume(received_message).await {
                                 error!("Error while handling message at offset: {message_offset}/{current_offset}, partition: {partition_id} for consumer: {name} on topic: {topic} and stream: {stream} due to error: {err}",
                                     name = self.name(), topic = self.topic(), stream = self.stream());

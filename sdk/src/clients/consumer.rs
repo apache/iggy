@@ -22,9 +22,8 @@ use crate::diagnostic::DiagnosticEvent;
 use crate::error::IggyError;
 use crate::identifier::{IdKind, Identifier};
 use crate::locking::{IggySharedMut, IggySharedMutFn};
-use crate::messages::poll_messages::{PollingKind, PollingStrategy};
-use crate::models::messages::{PolledMessage, PolledMessages};
-use crate::utils::byte_size::IggyByteSize;
+use crate::messages::PollingStrategy;
+use crate::prelude::{IggyMessage, PolledMessages, PollingKind};
 use crate::utils::crypto::EncryptorKind;
 use crate::utils::duration::IggyDuration;
 use crate::utils::timestamp::IggyTimestamp;
@@ -42,8 +41,6 @@ use std::time::Duration;
 use tokio::time;
 use tokio::time::sleep;
 use tracing::{error, info, trace, warn};
-
-const EMPTY_MESSAGES: Vec<PolledMessage> = Vec::new();
 
 const ORDERING: std::sync::atomic::Ordering = std::sync::atomic::Ordering::SeqCst;
 type PollMessagesFuture = Pin<Box<dyn Future<Output = Result<PolledMessages, IggyError>>>>;
@@ -120,7 +117,7 @@ pub struct IggyConsumer {
     last_consumed_offsets: Arc<DashMap<u32, AtomicU64>>,
     current_offsets: Arc<DashMap<u32, AtomicU64>>,
     poll_future: Option<PollMessagesFuture>,
-    buffered_messages: VecDeque<PolledMessage>,
+    buffered_messages: VecDeque<IggyMessage>,
     encryptor: Option<Arc<EncryptorKind>>,
     store_offset_sender: flume::Sender<(u32, u64)>,
     store_offset_after_each_message: bool,
@@ -650,13 +647,9 @@ impl IggyConsumer {
                 if !allow_replay && has_consumed_offset {
                     polled_messages
                         .messages
-                        .retain(|message| message.offset > consumed_offset);
+                        .retain(|message| message.header.offset > consumed_offset);
                     if polled_messages.messages.is_empty() {
-                        return Ok(PolledMessages {
-                            messages: EMPTY_MESSAGES,
-                            current_offset: polled_messages.current_offset,
-                            partition_id,
-                        });
+                        return Ok(PolledMessages::empty());
                     }
                 }
 
@@ -708,9 +701,10 @@ impl IggyConsumer {
                     }
 
                     return Ok(PolledMessages {
-                        messages: EMPTY_MESSAGES,
+                        messages: vec![],
                         current_offset: polled_messages.current_offset,
                         partition_id,
+                        count: 0,
                     });
                 }
 
@@ -806,13 +800,13 @@ impl IggyConsumer {
 }
 
 pub struct ReceivedMessage {
-    pub message: PolledMessage,
+    pub message: IggyMessage,
     pub current_offset: u64,
     pub partition_id: u32,
 }
 
 impl ReceivedMessage {
-    pub fn new(message: PolledMessage, current_offset: u64, partition_id: u32) -> Self {
+    pub fn new(message: IggyMessage, current_offset: u64, partition_id: u32) -> Self {
         Self {
             message,
             current_offset,
@@ -831,27 +825,27 @@ impl Stream for IggyConsumer {
                 if let Some(last_consumed_offset_entry) =
                     self.last_consumed_offsets.get(&partition_id)
                 {
-                    last_consumed_offset_entry.store(message.offset, ORDERING);
+                    last_consumed_offset_entry.store(message.header.offset, ORDERING);
                 } else {
                     self.last_consumed_offsets
-                        .insert(partition_id, AtomicU64::new(message.offset));
+                        .insert(partition_id, AtomicU64::new(message.header.offset));
                 }
 
                 if (self.store_after_every_nth_message > 0
-                    && message.offset % self.store_after_every_nth_message == 0)
+                    && message.header.offset % self.store_after_every_nth_message == 0)
                     || self.store_offset_after_each_message
                 {
-                    self.send_store_offset(partition_id, message.offset);
+                    self.send_store_offset(partition_id, message.header.offset);
                 }
             }
 
             if self.buffered_messages.is_empty() {
                 if self.polling_strategy.kind == PollingKind::Offset {
-                    self.polling_strategy = PollingStrategy::offset(message.offset + 1);
+                    self.polling_strategy = PollingStrategy::offset(message.header.offset + 1);
                 }
 
                 if self.store_offset_after_all_messages {
-                    self.send_store_offset(partition_id, message.offset);
+                    self.send_store_offset(partition_id, message.header.offset);
                 }
             }
 
@@ -887,14 +881,14 @@ impl Stream for IggyConsumer {
                                 let payload = encryptor.decrypt(&message.payload);
                                 if payload.is_err() {
                                     self.poll_future = None;
-                                    error!("Failed to decrypt the message payload at offset: {}, partition ID: {}", message.offset, partition_id);
+                                    error!("Failed to decrypt the message payload at offset: {}, partition ID: {}", message.header.offset, partition_id);
                                     let error = payload.unwrap_err();
                                     return Poll::Ready(Some(Err(error)));
                                 }
 
                                 let payload = payload.unwrap();
                                 message.payload = Bytes::from(payload);
-                                message.length = IggyByteSize::from(message.payload.len() as u64);
+                                message.header.payload_length = message.payload.len() as u32;
                             }
                         }
 
@@ -912,25 +906,29 @@ impl Stream for IggyConsumer {
                         self.buffered_messages.extend(polled_messages.messages);
 
                         if self.polling_strategy.kind == PollingKind::Offset {
-                            self.polling_strategy = PollingStrategy::offset(message.offset + 1);
+                            self.polling_strategy =
+                                PollingStrategy::offset(message.header.offset + 1);
                         }
 
                         if let Some(last_consumed_offset_entry) =
                             self.last_consumed_offsets.get(&partition_id)
                         {
-                            last_consumed_offset_entry.store(message.offset, ORDERING);
+                            last_consumed_offset_entry.store(message.header.offset, ORDERING);
                         } else {
                             self.last_consumed_offsets
-                                .insert(partition_id, AtomicU64::new(message.offset));
+                                .insert(partition_id, AtomicU64::new(message.header.offset));
                         }
 
                         if (self.store_after_every_nth_message > 0
-                            && message.offset % self.store_after_every_nth_message == 0)
+                            && message.header.offset % self.store_after_every_nth_message == 0)
                             || self.store_offset_after_each_message
                             || (self.store_offset_after_all_messages
                                 && self.buffered_messages.is_empty())
                         {
-                            self.send_store_offset(polled_messages.partition_id, message.offset);
+                            self.send_store_offset(
+                                polled_messages.partition_id,
+                                message.header.offset,
+                            );
                         }
 
                         self.poll_future = None;

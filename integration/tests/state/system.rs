@@ -149,7 +149,7 @@ async fn should_be_initialized_based_on_state_entries() {
     state
         .apply(
             user_id,
-            EntryCommand::CreateUser(CreateUserWithId {
+            &EntryCommand::CreateUser(CreateUserWithId {
                 user_id,
                 command: create_user,
             }),
@@ -159,7 +159,7 @@ async fn should_be_initialized_based_on_state_entries() {
     state
         .apply(
             user_id,
-            EntryCommand::CreateStream(CreateStreamWithId {
+            &EntryCommand::CreateStream(CreateStreamWithId {
                 stream_id: stream1_id,
                 command: create_stream1,
             }),
@@ -169,7 +169,7 @@ async fn should_be_initialized_based_on_state_entries() {
     state
         .apply(
             user_id,
-            EntryCommand::CreateTopic(CreateTopicWithId {
+            &EntryCommand::CreateTopic(CreateTopicWithId {
                 topic_id: topic1_id,
                 command: create_topic1,
             }),
@@ -179,7 +179,7 @@ async fn should_be_initialized_based_on_state_entries() {
     state
         .apply(
             user_id,
-            EntryCommand::CreateStream(CreateStreamWithId {
+            &EntryCommand::CreateStream(CreateStreamWithId {
                 stream_id: stream2_id,
                 command: create_stream2,
             }),
@@ -189,7 +189,7 @@ async fn should_be_initialized_based_on_state_entries() {
     state
         .apply(
             user_id,
-            EntryCommand::CreateTopic(CreateTopicWithId {
+            &EntryCommand::CreateTopic(CreateTopicWithId {
                 topic_id: topic2_id,
                 command: create_topic2,
             }),
@@ -197,24 +197,24 @@ async fn should_be_initialized_based_on_state_entries() {
         .await
         .unwrap();
     state
-        .apply(user_id, EntryCommand::CreatePartitions(create_partitions))
+        .apply(user_id, &EntryCommand::CreatePartitions(create_partitions))
         .await
         .unwrap();
     state
-        .apply(user_id, EntryCommand::DeleteStream(delete_stream2))
+        .apply(user_id, &EntryCommand::DeleteStream(delete_stream2))
         .await
         .unwrap();
     state
         .apply(
             user_id,
-            EntryCommand::CreatePersonalAccessToken(create_personal_access_token),
+            &EntryCommand::CreatePersonalAccessToken(create_personal_access_token),
         )
         .await
         .unwrap();
     state
         .apply(
             user_id,
-            EntryCommand::CreateConsumerGroup(CreateConsumerGroupWithId {
+            &EntryCommand::CreateConsumerGroup(CreateConsumerGroupWithId {
                 group_id,
                 command: create_consumer_group,
             }),

@@ -118,7 +118,7 @@ impl<'a> IggyExampleTest<'a> {
     pub(crate) async fn setup(&mut self, existing_stream_and_topic: bool) {
         self.client.connect().await.unwrap();
         let ping_result = self.client.ping().await;
-        assert!(ping_result.is_ok());
+        assert!(ping_result.is_ok(), "Failed to ping server");
         self.client
             .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
             .await
@@ -185,6 +185,11 @@ impl IggyExampleTest<'_> {
                 .as_ref()
                 .to_string()
         });
+
+        let producer_stdout = producer_handle
+            .await
+            .expect("Failed to join producer, check producer logs");
+
         let consumer_handle = tokio::spawn(async move {
             let consumer_assert = consumer_cmd
                 .timeout(Duration::from_secs(10))
@@ -195,9 +200,11 @@ impl IggyExampleTest<'_> {
                 .as_ref()
                 .to_string()
         });
-        (
-            producer_handle.await.unwrap(),
-            consumer_handle.await.unwrap(),
-        )
+
+        let consumer_stdout = consumer_handle
+            .await
+            .expect("Failed to join consumer, check consumer logs");
+
+        (producer_stdout, consumer_stdout)
     }
 }

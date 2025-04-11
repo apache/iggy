@@ -18,14 +18,7 @@
 
 use clap::Parser;
 use futures_util::StreamExt;
-use iggy::client::Client;
-use iggy::client_provider;
-use iggy::client_provider::ClientProviderConfig;
-use iggy::clients::client::IggyClient;
-use iggy::clients::consumer::{AutoCommit, AutoCommitWhen, IggyConsumer, ReceivedMessage};
-use iggy::consumer::ConsumerKind;
-use iggy::messages::poll_messages::PollingStrategy;
-use iggy::utils::duration::IggyDuration;
+use iggy::prelude::*;
 use iggy_examples::shared::args::Args;
 use iggy_examples::shared::messages::{
     Envelope, OrderConfirmed, OrderCreated, OrderRejected, ORDER_CONFIRMED_TYPE,
@@ -112,7 +105,10 @@ fn handle_message(message: &ReceivedMessage) -> anyhow::Result<(), Box<dyn Error
     let envelope = serde_json::from_str::<Envelope>(json)?;
     info!(
         "Handling message type: {} at offset: {} in partition ID: {} with current offset: {}",
-        envelope.message_type, message.message.offset, message.partition_id, message.current_offset,
+        envelope.message_type,
+        message.message.header.offset,
+        message.partition_id,
+        message.current_offset,
     );
     match envelope.message_type.as_str() {
         ORDER_CREATED_TYPE => {

@@ -16,31 +16,15 @@
  * under the License.
  */
 
-use bytes::Bytes;
-use std::str::FromStr;
-
 use crate::server::scenarios::{
     get_consumer_group, leave_consumer_group, CONSUMER_GROUP_ID, CONSUMER_GROUP_NAME, CONSUMER_ID,
     CONSUMER_KIND, MESSAGES_COUNT, PARTITIONS_COUNT, PARTITION_ID, STREAM_ID, STREAM_NAME,
     TOPIC_ID, TOPIC_NAME,
 };
-use iggy::client::{
-    ConsumerGroupClient, ConsumerOffsetClient, MessageClient, PartitionClient, StreamClient,
-    SystemClient, TopicClient, UserClient,
-};
-use iggy::clients::client::IggyClient;
-use iggy::compression::compression_algorithm::CompressionAlgorithm;
-use iggy::consumer::Consumer;
-use iggy::error::IggyError;
-use iggy::identifier::Identifier;
-use iggy::messages::poll_messages::PollingStrategy;
-use iggy::messages::send_messages::{Message, Partitioning};
-use iggy::models::messages::PolledMessage;
-use iggy::users::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
-use iggy::utils::byte_size::IggyByteSize;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
+use bytes::Bytes;
+use iggy::prelude::*;
 use integration::test_server::{assert_clean_system, ClientFactory};
+use std::str::FromStr;
 
 pub async fn run(client_factory: &dyn ClientFactory) {
     let client = client_factory.create_client().await;
@@ -307,7 +291,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     assert_eq!(topic.name, TOPIC_NAME);
     assert_eq!(topic.partitions_count, PARTITIONS_COUNT);
     assert_eq!(topic.partitions.len(), PARTITIONS_COUNT as usize);
-    assert_eq!(topic.size, 55914);
+    assert_eq!(topic.size, 89806);
     assert_eq!(topic.messages_count, MESSAGES_COUNT as u64);
     let topic_partition = topic.partitions.get((PARTITION_ID - 1) as usize).unwrap();
     assert_eq!(topic_partition.id, PARTITION_ID);
@@ -421,8 +405,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
         .await
         .unwrap();
     assert_eq!(polled_messages.messages.len() as u32, messages_count);
-    let first_offset = polled_messages.messages.first().unwrap().offset;
-    let last_offset = polled_messages.messages.last().unwrap().offset;
+    let first_offset = polled_messages.messages.first().unwrap().header.offset;
+    let last_offset = polled_messages.messages.last().unwrap().header.offset;
     let expected_last_offset = stored_offset + messages_count as u64;
     assert_eq!(first_offset, stored_offset + 1);
     assert_eq!(last_offset, expected_last_offset);
@@ -803,24 +787,19 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     assert_clean_system(&client).await;
 }
 
-fn assert_message(message: &PolledMessage, offset: u64) {
+fn assert_message(message: &IggyMessage, offset: u64) {
     let expected_payload = create_message_payload(offset);
-    assert!(message.timestamp > 0);
-    assert_eq!(message.offset, offset);
+    assert!(message.header.timestamp > 0);
+    assert_eq!(message.header.offset, offset);
     assert_eq!(message.payload, expected_payload);
 }
 
-fn create_messages() -> Vec<Message> {
+fn create_messages() -> Vec<IggyMessage> {
     let mut messages = Vec::new();
     for offset in 0..MESSAGES_COUNT {
         let id = (offset + 1) as u128;
         let payload = create_message_payload(offset as u64);
-        messages.push(Message {
-            id,
-            length: payload.len() as u32,
-            payload,
-            headers: None,
-        });
+        messages.push(IggyMessage::with_id(id, payload));
     }
     messages
 }

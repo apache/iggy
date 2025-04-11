@@ -22,10 +22,9 @@ use crate::error::IggyError;
 use crate::http::client::HttpClient;
 use crate::http::HttpTransport;
 use crate::identifier::Identifier;
-use crate::messages::flush_unsaved_buffer::FlushUnsavedBuffer;
-use crate::messages::poll_messages::{PollMessages, PollingStrategy};
-use crate::messages::send_messages::{Message, Partitioning, SendMessages};
-use crate::models::messages::PolledMessages;
+use crate::messages::{Partitioning, PollingStrategy};
+use crate::models::messaging::IggyMessagesBatch;
+use crate::prelude::{FlushUnsavedBuffer, IggyMessage, PollMessages, PolledMessages, SendMessages};
 use async_trait::async_trait;
 
 #[async_trait]
@@ -66,15 +65,16 @@ impl MessageClient for HttpClient {
         stream_id: &Identifier,
         topic_id: &Identifier,
         partitioning: &Partitioning,
-        messages: &mut [Message],
+        messages: &mut [IggyMessage],
     ) -> Result<(), IggyError> {
+        let batch = IggyMessagesBatch::from(&*messages);
         self.post(
             &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
             &SendMessages {
                 stream_id: stream_id.clone(),
                 topic_id: topic_id.clone(),
                 partitioning: partitioning.clone(),
-                messages: messages.to_vec(),
+                batch,
             },
         )
         .await?;
