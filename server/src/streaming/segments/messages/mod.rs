@@ -34,7 +34,7 @@ pub use persister_task::PersisterTask;
 async fn write_batch(
     file: &mut File,
     file_path: &str,
-    batches: &IggyMessagesBatchSet,
+    batches: IggyMessagesBatchSet,
 ) -> Result<usize, IggyError> {
     let mut slices: Vec<IoSlice> = batches.iter().map(|b| IoSlice::new(b)).collect();
 

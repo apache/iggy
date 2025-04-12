@@ -104,13 +104,12 @@ impl IndexWriter {
             })
             .map_err(|_| IggyError::CannotSaveIndexToSegment)?;
 
-        if self.fsync {
-            let _ = self.fsync().await;
-        }
-
         self.index_size_bytes
             .fetch_add(indexes.len() as u64, Ordering::Release);
 
+        if self.fsync {
+            let _ = self.fsync().await;
+        }
         trace!(
             "Saved {count} indexes of size {} to file: {}",
             INDEX_SIZE * count,

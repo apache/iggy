@@ -49,19 +49,6 @@ impl Sizeable for IggyMessagesBatchMut {
 }
 
 impl IggyMessagesBatchMut {
-    /// Creates an empty messages container with the specified capacity to avoid reallocations.
-    ///
-    /// # Arguments
-    ///
-    /// * `bytes_capacity` - The expected total size of all messages in bytes
-    pub fn with_capacity(bytes_capacity: usize) -> Self {
-        let index_capacity = bytes_capacity / INDEX_SIZE + 1; // Add 1 to avoid rounding down to 0
-        Self {
-            indexes: IggyIndexesMut::with_capacity(index_capacity, 0),
-            messages: BytesMut::with_capacity(bytes_capacity),
-        }
-    }
-
     /// Creates a new messages container from existing index and message buffers.
     ///
     /// # Arguments

@@ -31,8 +31,6 @@ use std::sync::Arc;
 use tokio::fs::remove_file;
 use tracing::{info, warn};
 
-const INDEXES_CAPACITY: usize = 20 * 1000 * 1000; // 24 MB, 15 million indexes (16 bytes each) for 15 million messages of 1kB
-
 #[derive(Debug)]
 pub struct Segment {
     pub(super) stream_id: u32,
@@ -102,7 +100,7 @@ impl Segment {
             last_index_position: 0,
             max_size_bytes: config.segment.size,
             message_expiry,
-            indexes: IggyIndexesMut::with_capacity(INDEXES_CAPACITY, 0),
+            indexes: IggyIndexesMut::with_capacity(1_000_000, 0),
             accumulator: MessagesAccumulator::default(),
             is_closed: false,
             messages_writer: None,
@@ -402,9 +400,9 @@ impl Segment {
         self.end_offset = end_offset;
     }
 
+    /// Explicitly drop the old indexes to ensure memory is freed
     pub fn drop_indexes(&mut self) {
         let old_indexes = std::mem::replace(&mut self.indexes, IggyIndexesMut::empty());
-        // Explicitly drop the old indexes to ensure memory is freed
         drop(old_indexes);
     }
 }

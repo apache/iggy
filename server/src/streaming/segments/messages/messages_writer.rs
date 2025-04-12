@@ -107,7 +107,7 @@ impl MessagesWriter {
     /// Append a batch of messages to the messages file.
     pub async fn save_batch_set(
         &mut self,
-        batch_set: &IggyMessagesBatchSet,
+        batch_set: IggyMessagesBatchSet,
         confirmation: Confirmation,
     ) -> Result<IggyByteSize, IggyError> {
         let messages_size = batch_set.size();
@@ -147,7 +147,7 @@ impl MessagesWriter {
             }
             Confirmation::NoWait => {
                 if let Some(task) = &self.persister_task {
-                    task.persist(batch_set.clone()).await;
+                    task.persist(batch_set).await;
                 } else {
                     panic!(
                         "Confirmation::NoWait is used, but MessagesPersisterTask is not set for messages file: {}",

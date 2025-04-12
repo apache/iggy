@@ -90,6 +90,8 @@ impl Segment {
             None => self.config.segment.server_confirmation,
         };
 
+        batches.extract_indexes_to(&mut self.indexes);
+
         let batch_size = batches.size();
         let batch_count = batches.count();
 
@@ -97,7 +99,7 @@ impl Segment {
             .messages_writer
             .as_mut()
             .expect("Messages writer not initialized")
-            .save_batch_set(&batches, confirmation)
+            .save_batch_set(batches, confirmation)
             .await
             .with_error_context(|error| {
                 format!(
@@ -106,8 +108,6 @@ impl Segment {
             })?;
 
         self.last_index_position += saved_bytes.as_bytes_u64() as u32;
-
-        batches.extract_indexes_to(&mut self.indexes);
 
         let unsaved_indexes_slice = self.indexes.unsaved_slice();
         self.index_writer
@@ -168,7 +168,9 @@ impl Segment {
                 current_segment_size,
                 max_segment_size_from_config
             );
-            if self.config.segment.cache_indexes == CacheIndexesConfig::OpenSegment {
+            if self.config.segment.cache_indexes == CacheIndexesConfig::OpenSegment
+                || self.config.segment.cache_indexes == CacheIndexesConfig::None
+            {
                 self.drop_indexes();
             }
             self.shutdown_writing().await;

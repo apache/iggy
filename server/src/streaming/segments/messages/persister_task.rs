@@ -175,7 +175,7 @@ impl PersisterTask {
         while let Ok(request) = receiver.recv_async().await {
             match request {
                 PersisterTaskCommand::WriteRequest(messages) => {
-                    match write_batch(&mut file, &file_path, &messages).await {
+                    match write_batch(&mut file, &file_path, messages).await {
                         Ok(bytes_written) => {
                             if fsync {
                                 file.sync_all()

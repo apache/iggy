@@ -26,7 +26,7 @@ use std::ops::Index;
 use tracing::trace;
 
 /// A container for multiple IggyMessagesBatch objects
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct IggyMessagesBatchSet {
     /// The collection of message containers
     batches: Vec<IggyMessagesBatch>,
@@ -221,8 +221,8 @@ impl IggyMessagesBatchSet {
             }
 
             let first_offset = container.first_offset();
-            if first_offset.is_some()
-                && first_offset.unwrap() + container.count() as u64 <= start_offset
+            if first_offset.is_none()
+                || first_offset.unwrap() + container.count() as u64 <= start_offset
             {
                 continue;
             }
@@ -256,7 +256,7 @@ impl IggyMessagesBatchSet {
             }
 
             let first_timestamp = container.first_timestamp();
-            if first_timestamp.is_some() && first_timestamp.unwrap() < timestamp {
+            if first_timestamp.is_none() || first_timestamp.unwrap() < timestamp {
                 continue;
             }
 
