@@ -16,10 +16,9 @@
  * under the License.
  */
 
-use super::IggyMessagesBatchSet;
+use super::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet};
 use crate::streaming::segments::segment::Segment;
 use error_set::ErrContext;
-use iggy::models::messaging::{IggyIndexes, IggyMessagesBatch};
 use iggy::prelude::*;
 use std::sync::atomic::Ordering;
 use tracing::trace;
@@ -276,7 +275,7 @@ impl Segment {
         &self,
         relative_start_offset: u32,
         count: u32,
-    ) -> Result<Option<IggyIndexes>, IggyError> {
+    ) -> Result<Option<IggyIndexesMut>, IggyError> {
         let indexes = if !self.indexes.is_empty() {
             self.indexes.slice_by_offset(relative_start_offset, count)
         } else {
@@ -293,7 +292,7 @@ impl Segment {
         &self,
         timestamp: u64,
         count: u32,
-    ) -> Result<Option<IggyIndexes>, IggyError> {
+    ) -> Result<Option<IggyIndexesMut>, IggyError> {
         let indexes = if !self.indexes.is_empty() {
             self.indexes.slice_by_timestamp(timestamp, count)
         } else {
@@ -359,7 +358,7 @@ impl Segment {
         &self,
         timestamp: u64,
         count: u32,
-    ) -> Result<IggyMessagesBatch, IggyError> {
+    ) -> Result<IggyMessagesBatchMut, IggyError> {
         tracing::trace!(
             "Loading {count} messages from disk, timestamp: {timestamp}, current_timestamp: {}...",
             self.end_timestamp
@@ -368,7 +367,7 @@ impl Segment {
         let indexes_to_read = self.load_indexes_by_timestamp(timestamp, count).await?;
 
         if indexes_to_read.is_none() {
-            return Ok(IggyMessagesBatch::empty());
+            return Ok(IggyMessagesBatchMut::empty());
         }
 
         let indexes_to_read = indexes_to_read.unwrap();

@@ -17,13 +17,14 @@
  */
 
 use crate::http::jwt::COMPONENT;
+use crate::streaming::utils::bytes_mut_pool::{BytesMutExt, BYTES_MUT_POOL};
 use crate::streaming::utils::file;
 use crate::{
     http::jwt::json_web_token::RevokedAccessToken, streaming::persistence::persister::PersisterKind,
 };
 use ahash::AHashMap;
 use anyhow::Context;
-use bytes::{BufMut, BytesMut};
+use bytes::BufMut;
 use error_set::ErrContext;
 use iggy::error::IggyError;
 use std::sync::Arc;
@@ -69,7 +70,7 @@ impl TokenStorage {
             })
             .map_err(|_| IggyError::CannotReadFileMetadata)?
             .len() as usize;
-        let mut buffer = BytesMut::with_capacity(file_size);
+        let mut buffer = BYTES_MUT_POOL.get_buffer(file_size);
         buffer.put_bytes(0, file_size);
         file.read_exact(&mut buffer)
             .await
@@ -86,6 +87,8 @@ impl TokenStorage {
                 .with_context(|| "Failed to deserialize revoked access tokens")
                 .map_err(|_| IggyError::CannotDeserializeResource)?
                 .0;
+
+        buffer.return_to_pool();
 
         let tokens = tokens
             .into_iter()

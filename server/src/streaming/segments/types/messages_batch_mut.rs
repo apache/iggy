@@ -19,14 +19,15 @@
 use super::message_view_mut::IggyMessageViewMutIterator;
 use crate::streaming::deduplication::message_deduplicator::MessageDeduplicator;
 use crate::streaming::segments::indexes::IggyIndexesMut;
+use crate::streaming::utils::bytes_mut_pool::{BytesMutExt, BYTES_MUT_POOL};
 use crate::streaming::utils::random_id;
 use bytes::{BufMut, BytesMut};
 use iggy::messages::MAX_PAYLOAD_SIZE;
-use iggy::models::messaging::{IggyIndexView, IggyMessagesBatch, INDEX_SIZE};
+use iggy::models::messaging::{IggyIndexView, INDEX_SIZE};
 use iggy::prelude::*;
 use iggy::utils::timestamp::IggyTimestamp;
 use lending_iterator::prelude::*;
-use std::ops::Deref;
+use std::ops::{Deref, Index};
 use tracing::{error, warn};
 
 /// A container for mutable messages that are being prepared for persistence.
@@ -35,6 +36,9 @@ use tracing::{error, warn};
 /// and the corresponding index data that allows for efficient message lookup.
 #[derive(Debug, Default)]
 pub struct IggyMessagesBatchMut {
+    /// The number of messages in the batch
+    count: u32,
+
     /// The index data for all messages in the buffer
     indexes: IggyIndexesMut,
 
@@ -49,14 +53,32 @@ impl Sizeable for IggyMessagesBatchMut {
 }
 
 impl IggyMessagesBatchMut {
+    /// Creates a new empty messages container
+    pub fn empty() -> Self {
+        Self {
+            count: 0,
+            indexes: IggyIndexesMut::empty(),
+            messages: BytesMut::new(),
+        }
+    }
+
     /// Creates a new messages container from existing index and message buffers.
     ///
     /// # Arguments
     ///
     /// * `indexes` - Preprocessed index data
     /// * `messages` - Serialized message data
-    pub fn from_indexes_and_messages(indexes: IggyIndexesMut, messages: BytesMut) -> Self {
-        Self { indexes, messages }
+    /// * `count` - Number of messages in the batch
+    pub fn from_indexes_and_messages(
+        count: u32,
+        indexes: IggyIndexesMut,
+        messages: BytesMut,
+    ) -> Self {
+        Self {
+            count,
+            indexes,
+            messages,
+        }
     }
 
     /// Creates a new messages container from a slice of IggyMessage objects.
@@ -70,7 +92,7 @@ impl IggyMessagesBatchMut {
     /// * `messages` - Slice of message objects to store
     /// * `messages_size` - Total size of all messages in bytes
     pub fn from_messages(messages: &[IggyMessage], messages_size: u32) -> Self {
-        let mut messages_buffer = BytesMut::with_capacity(messages_size as usize);
+        let mut messages_buffer = BYTES_MUT_POOL.get_buffer(messages_size as usize);
         let mut indexes_buffer = IggyIndexesMut::with_capacity(messages.len(), 0);
         let mut position = 0;
 
@@ -81,7 +103,7 @@ impl IggyMessagesBatchMut {
             indexes_buffer.insert(0, position, 0);
         }
 
-        Self::from_indexes_and_messages(indexes_buffer, messages_buffer)
+        Self::from_indexes_and_messages(messages.len() as u32, indexes_buffer, messages_buffer)
     }
 
     /// Creates a lending iterator that yields mutable views of messages.
@@ -117,15 +139,15 @@ impl IggyMessagesBatchMut {
     ///
     /// An immutable `IggyMessagesBatch` ready for persistence
     pub async fn prepare_for_persistence(
-        self,
+        &mut self,
         start_offset: u64,
         base_offset: u64,
         current_position: u32,
         deduplicator: Option<&MessageDeduplicator>,
-    ) -> IggyMessagesBatch {
+    ) {
         let messages_count = self.count();
         if messages_count == 0 {
-            return IggyMessagesBatch::empty();
+            return;
         }
 
         let mut curr_abs_offset = base_offset;
@@ -138,9 +160,10 @@ impl IggyMessagesBatchMut {
         let mut invalid_messages_indexes =
             deduplicator.map(|_| Vec::with_capacity(messages_count as usize));
 
-        let (mut indexes, mut messages) = self.decompose();
-        indexes.set_base_position(current_position);
-        let mut iter = IggyMessageViewMutIterator::new(&mut messages);
+        // let (mut indexes, mut messages) = self.decompose();
+        self.indexes.set_base_position(current_position);
+        let mut iter: IggyMessageViewMutIterator<'_> =
+            IggyMessageViewMutIterator::new(&mut self.messages);
         let timestamp = IggyTimestamp::now().as_micros();
 
         while let Some(mut message) = iter.next() {
@@ -169,9 +192,9 @@ impl IggyMessagesBatchMut {
             curr_position += message_size;
 
             let relative_offset = (curr_abs_offset - start_offset) as u32;
-            indexes.set_offset_at(curr_rel_offset, relative_offset);
-            indexes.set_position_at(curr_rel_offset, curr_position);
-            indexes.set_timestamp_at(curr_rel_offset, timestamp);
+            self.indexes.set_offset_at(curr_rel_offset, relative_offset);
+            self.indexes.set_position_at(curr_rel_offset, curr_position);
+            self.indexes.set_timestamp_at(curr_rel_offset, timestamp);
 
             curr_abs_offset += 1;
             curr_rel_offset += 1;
@@ -179,48 +202,53 @@ impl IggyMessagesBatchMut {
 
         if let Some(invalid_messages_indexes) = invalid_messages_indexes {
             if invalid_messages_indexes.is_empty() {
-                return IggyMessagesBatch::new(
-                    indexes.make_immutable(),
-                    messages.freeze(),
-                    messages_count,
-                );
+                return;
             }
-            let batch = IggyMessagesBatchMut::from_indexes_and_messages(indexes, messages)
-                .remove_messages(&invalid_messages_indexes, current_position);
-
-            let messages_count = batch.count();
-
-            let (indexes, messages) = batch.decompose();
-
-            return IggyMessagesBatch::new(
-                indexes.make_immutable(),
-                messages.freeze(),
-                messages_count,
-            );
+            self.remove_messages(&invalid_messages_indexes, current_position);
         }
+    }
 
-        IggyMessagesBatch::new(indexes.make_immutable(), messages.freeze(), messages_count)
+    /// Returns the first offset in the batch
+    pub fn first_offset(&self) -> Option<u64> {
+        if self.is_empty() {
+            return None;
+        }
+        Some(IggyMessageView::new(&self.messages).header().offset())
     }
 
     /// Returns the first timestamp in the batch
-    pub fn first_timestamp(&self) -> u64 {
-        IggyMessageView::new(&self.messages).header().timestamp()
+    pub fn first_timestamp(&self) -> Option<u64> {
+        if self.is_empty() {
+            return None;
+        }
+        Some(IggyMessageView::new(&self.messages).header().timestamp())
     }
 
     /// Returns the last timestamp in the batch
-    pub fn last_timestamp(&self) -> u64 {
+    pub fn last_timestamp(&self) -> Option<u64> {
         if self.is_empty() {
-            return 0;
+            return None;
         }
 
         let last_index = self.count() as usize - 1;
-        self.get_message_boundaries(last_index)
-            .map(|(start, _)| {
-                IggyMessageView::new(&self.messages[start..])
-                    .header()
-                    .timestamp()
-            })
-            .unwrap_or(0)
+        self.get_message_boundaries(last_index).map(|(start, _)| {
+            IggyMessageView::new(&self.messages[start..])
+                .header()
+                .timestamp()
+        })
+    }
+
+    /// Returns the last offset in the batch
+    pub fn last_offset(&self) -> Option<u64> {
+        if self.is_empty() {
+            return None;
+        }
+        let last_index = self.count() as usize - 1;
+        self.get_message_boundaries(last_index).map(|(start, _)| {
+            IggyMessageView::new(&self.messages[start..])
+                .header()
+                .offset()
+        })
     }
 
     /// Checks if the batch is empty.
@@ -229,8 +257,21 @@ impl IggyMessagesBatchMut {
     }
 
     /// Decomposes the batch into its constituent parts.
-    pub fn decompose(self) -> (IggyIndexesMut, BytesMut) {
-        (self.indexes, self.messages)
+    pub fn decompose(mut self) -> (IggyIndexesMut, BytesMut) {
+        let indexes = std::mem::replace(&mut self.indexes, IggyIndexesMut::empty());
+        let messages = std::mem::replace(&mut self.messages, BytesMut::new());
+
+        (indexes, messages)
+    }
+
+    /// Take the indexes from the batch
+    pub fn take_indexes(&mut self) -> IggyIndexesMut {
+        std::mem::take(&mut self.indexes)
+    }
+
+    /// Borrows the indexes from the batch
+    pub fn indexes(&self) -> &IggyIndexesMut {
+        &self.indexes
     }
 
     /// Get message position from the indexes at the given index
@@ -264,6 +305,152 @@ impl IggyMessagesBatchMut {
             self.position_at(index as u32)
                 .map(|pos| (pos - self.indexes.base_position()) as usize)
         }
+    }
+
+    /// Returns a contiguous slice (as a new `IggyMessagesBatch`) of up to `count` messages
+    /// whose message headers have an offset greater than or equal to the provided `start_offset`.
+    pub fn slice_by_offset(&self, start_offset: u64, count: u32) -> Option<Self> {
+        if self.is_empty() || count == 0 {
+            return None;
+        }
+
+        let first_offset = self.first_offset()?;
+
+        if start_offset < first_offset {
+            return self.slice_by_index(0, count);
+        }
+
+        let last_offset = self.last_offset()?;
+        if start_offset > last_offset {
+            return None;
+        }
+
+        let offset_diff = start_offset - first_offset;
+        let first_message_index = offset_diff as usize;
+
+        if first_message_index >= self.count() as usize {
+            return None;
+        }
+
+        self.slice_by_index(first_message_index as u32, count)
+    }
+
+    /// Helper method to slice the batch starting from a specific index
+    fn slice_by_index(&self, start_index: u32, count: u32) -> Option<Self> {
+        if start_index >= self.count() {
+            return None;
+        }
+
+        let last_message_index =
+            std::cmp::min((start_index + count) as usize, self.count() as usize);
+
+        let sub_indexes = self.indexes.slice_by_offset(
+            start_index,
+            (last_message_index - start_index as usize) as u32,
+        )?;
+
+        let first_message_position = self.message_start_position(start_index as usize)?;
+        let last_message_position = self.message_end_position(last_message_index - 1)?;
+
+        // TODO(hubcio): messages from accumulator unfortunately are deep-copied
+        let mut sub_buffer =
+            BYTES_MUT_POOL.get_buffer(last_message_position - first_message_position);
+        sub_buffer.put_slice(&self.messages[first_message_position..last_message_position]);
+
+        Some(IggyMessagesBatchMut {
+            count: sub_indexes.count(),
+            indexes: sub_indexes,
+            messages: sub_buffer,
+        })
+    }
+
+    /// Returns a contiguous slice (as a new `IggyMessagesBatch`) of up to `count` messages
+    /// whose message headers have a timestamp greater than or equal to the provided `timestamp`.
+    ///
+    /// If no messages meet the criteria, returns `None`.
+    pub fn slice_by_timestamp(&self, timestamp: u64, count: u32) -> Option<Self> {
+        if self.is_empty() || count == 0 {
+            return None;
+        }
+
+        // Use binary search to find the first message with timestamp >= the target
+        let first_message_index = self.binary_search_timestamp(timestamp)?;
+
+        self.slice_by_index(first_message_index, count)
+    }
+
+    /// Find the position of the index with timestamp closest to (but not exceeding) the target
+    fn binary_search_timestamp(&self, target_timestamp: u64) -> Option<u32> {
+        if self.count() == 0 {
+            return None;
+        }
+
+        let last_timestamp = self.get(self.count() as usize - 1)?.header().timestamp();
+        if target_timestamp > last_timestamp {
+            return Some(self.count() - 1);
+        }
+
+        let first_timestamp = self.get(0)?.header().timestamp();
+        if target_timestamp <= first_timestamp {
+            return Some(0);
+        }
+
+        let mut low = 0;
+        let mut high = self.count() - 1;
+
+        while low <= high {
+            let mid = low + (high - low) / 2;
+            let mid_index = self.get(mid as usize)?;
+            let mid_timestamp = mid_index.header().timestamp();
+
+            match mid_timestamp.cmp(&target_timestamp) {
+                std::cmp::Ordering::Equal => return Some(mid),
+                std::cmp::Ordering::Less => low = mid + 1,
+                std::cmp::Ordering::Greater => {
+                    if mid == 0 {
+                        break;
+                    }
+                    high = mid - 1;
+                }
+            }
+        }
+
+        Some(low)
+    }
+
+    /// Validates that all messages have correct checksums and offsets.
+    /// This function should be called after messages have been read from disk.
+    ///
+    /// # Arguments
+    ///
+    /// * `absolute_start_offset` - The absolute offset of the first message in the batch.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(())` - If all messages have correct checksums and offsets.
+    /// * `Err(IggyError)` - If any message has an invalid checksum or offset.
+    pub fn validate_checksums_and_offsets(
+        &self,
+        absolute_start_offset: u64,
+    ) -> Result<(), IggyError> {
+        let mut current_offset = absolute_start_offset;
+        for message in self.iter() {
+            let calculated_checksum = message.calculate_checksum();
+            let actual_checksum = message.header().checksum();
+            let offset = message.header().offset();
+            if offset != current_offset {
+                return Err(IggyError::InvalidOffset(offset));
+            }
+            if calculated_checksum != actual_checksum {
+                return Err(IggyError::InvalidMessageChecksum(
+                    actual_checksum,
+                    calculated_checksum,
+                    offset,
+                ));
+            }
+            current_offset += 1;
+        }
+        Ok(())
     }
 
     /// Gets the byte range for a message at the given index
@@ -325,7 +512,7 @@ impl IggyMessagesBatchMut {
     /// # Returns
     ///
     /// A new `IggyMessagesBatchMut` with the specified messages removed
-    pub fn remove_messages(self, indexes_to_remove: &[u32], current_position: u32) -> Self {
+    pub fn remove_messages(&mut self, indexes_to_remove: &[u32], current_position: u32) {
         /*
             A temporary list of message boundaries is first collected for each index
             that should be removed. Chunks of data that are not removed are appended
@@ -336,14 +523,13 @@ impl IggyMessagesBatchMut {
             This allows for avoiding copying unnecessary data and ensures that indexes
             match the newly constructed buffer.
         */
-
         if indexes_to_remove.is_empty() || self.is_empty() {
-            return self;
+            return;
         }
 
         let msg_count = self.count() as usize;
         if indexes_to_remove.len() >= msg_count {
-            return IggyMessagesBatchMut::default();
+            return;
         }
 
         let current_size = self.size();
@@ -369,11 +555,11 @@ impl IggyMessagesBatchMut {
         let new_size = current_size - size_to_remove;
         let new_message_count = msg_count as u32 - indexes_to_remove.len() as u32;
 
-        let mut new_buffer = BytesMut::with_capacity(new_size as usize);
+        let mut new_buffer = BYTES_MUT_POOL.get_buffer(new_size as usize);
         let mut new_indexes =
             IggyIndexesMut::with_capacity(new_message_count as usize, current_position);
 
-        let mut source = self.messages;
+        let mut source = std::mem::take(&mut self.messages);
         let mut last_pos = 0_usize;
         let mut new_pos = current_position;
 
@@ -413,8 +599,23 @@ impl IggyMessagesBatchMut {
                 chunk_len,
             );
         }
+    }
 
-        IggyMessagesBatchMut::from_indexes_and_messages(new_indexes, new_buffer)
+    /// Validates that all messages in batch have correct checksums.
+    pub fn validate_checksums(&self) -> Result<(), IggyError> {
+        for message in self.iter() {
+            let calculated_checksum = message.calculate_checksum();
+            let actual_checksum = message.header().checksum();
+            let offset = message.header().offset();
+            if calculated_checksum != actual_checksum {
+                return Err(IggyError::InvalidMessageChecksum(
+                    actual_checksum,
+                    calculated_checksum,
+                    offset,
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Validates the structure of the indexes (sizes, counts, etc.)
@@ -587,6 +788,35 @@ impl Validatable<IggyError> for IggyMessagesBatchMut {
 
         self.validate_indexes_structure()?;
         self.validate_message_contents()
+    }
+}
+
+impl Index<usize> for IggyMessagesBatchMut {
+    type Output = [u8];
+
+    fn index(&self, index: usize) -> &Self::Output {
+        if index >= self.count as usize {
+            panic!(
+                "Index out of bounds: the len is {} but the index is {}",
+                self.count, index
+            );
+        }
+
+        let (start, end) = self
+            .get_message_boundaries(index)
+            .expect("Invalid message boundaries");
+
+        &self.messages[start..end]
+    }
+}
+
+impl Drop for IggyMessagesBatchMut {
+    fn drop(&mut self) {
+        let indexes = std::mem::replace(&mut self.indexes, IggyIndexesMut::empty());
+        let messages = std::mem::replace(&mut self.messages, BytesMut::new());
+
+        messages.return_to_pool();
+        drop(indexes);
     }
 }
 

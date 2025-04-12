@@ -143,6 +143,8 @@ fn make_mutable(batch: IggyMessagesBatch) -> IggyMessagesBatchMut {
     let (_, indexes, messages) = batch.decompose();
     let (_, indexes_buffer) = indexes.decompose();
     let indexes_buffer_mut = BytesMut::from(indexes_buffer);
-    let indexes_mut = IggyIndexesMut::from_bytes(indexes_buffer_mut);
-    IggyMessagesBatchMut::from_indexes_and_messages(indexes_mut, messages.into())
+    let indexes_mut = IggyIndexesMut::from_bytes(indexes_buffer_mut, 0);
+    let count = indexes_mut.count();
+    let messages_mut = messages.into();
+    IggyMessagesBatchMut::from_indexes_and_messages(count, indexes_mut, messages_mut)
 }

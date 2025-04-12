@@ -16,13 +16,16 @@
  * under the License.
  */
 
-use crate::streaming::persistence::persister::PersisterKind;
 use crate::streaming::storage::SystemInfoStorage;
 use crate::streaming::systems::info::SystemInfo;
 use crate::streaming::systems::COMPONENT;
+use crate::streaming::utils::bytes_mut_pool::BytesMutExt;
 use crate::streaming::utils::file;
+use crate::streaming::{
+    persistence::persister::PersisterKind, utils::bytes_mut_pool::BYTES_MUT_POOL,
+};
 use anyhow::Context;
-use bytes::{BufMut, BytesMut};
+use bytes::BufMut;
 use error_set::ErrContext;
 use iggy::error::IggyError;
 use std::sync::Arc;
@@ -60,7 +63,7 @@ impl SystemInfoStorage for FileSystemInfoStorage {
             })
             .map_err(|_| IggyError::CannotReadFileMetadata)?
             .len() as usize;
-        let mut buffer = BytesMut::with_capacity(file_size);
+        let mut buffer = BYTES_MUT_POOL.get_buffer(file_size);
         buffer.put_bytes(0, file_size);
         file.read_exact(&mut buffer)
             .await
@@ -75,6 +78,7 @@ impl SystemInfoStorage for FileSystemInfoStorage {
             bincode::serde::decode_from_slice(&buffer, bincode::config::standard())
                 .with_context(|| "Failed to deserialize system info")
                 .map_err(|_| IggyError::CannotDeserializeResource)?;
+        buffer.return_to_pool();
         Ok(system_info)
     }
 

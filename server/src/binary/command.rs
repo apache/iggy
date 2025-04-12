@@ -69,8 +69,6 @@ use iggy::users::update_user::UpdateUser;
 use strum::EnumString;
 use tracing::error;
 
-// todo add missing commands
-
 define_server_command_enum! {
     Ping(Ping), PING_CODE, PING, false;
     GetStats(GetStats), GET_STATS_CODE, GET_STATS, false;

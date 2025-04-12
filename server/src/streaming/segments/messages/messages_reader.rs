@@ -16,12 +16,11 @@
  * under the License.
  */
 
-use bytes::{Bytes, BytesMut};
+use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
+use crate::streaming::utils::bytes_mut_pool::BYTES_MUT_POOL;
+use bytes::BytesMut;
 use error_set::ErrContext;
-use iggy::{
-    error::IggyError,
-    models::messaging::{IggyIndexes, IggyMessagesBatch},
-};
+use iggy::error::IggyError;
 use std::{fs::File as StdFile, os::unix::prelude::FileExt};
 use std::{
     io::ErrorKind,
@@ -90,12 +89,11 @@ impl MessagesReader {
     /// Loads and returns all message IDs from the messages file.
     pub async fn load_all_message_ids_from_disk(
         &self,
-        indexes: IggyIndexes,
+        indexes: IggyIndexesMut,
         messages_count: u32,
     ) -> Result<Vec<u128>, IggyError> {
         let file_size = self.file_size();
         if file_size == 0 {
-            trace!("Messages file {} is empty.", self.file_path);
             return Ok(vec![]);
         }
 
@@ -113,7 +111,11 @@ impl MessagesReader {
             }
         };
 
-        let messages = IggyMessagesBatch::new(indexes, messages_bytes, messages_count);
+        let messages = IggyMessagesBatchMut::from_indexes_and_messages(
+            messages_count,
+            indexes,
+            messages_bytes,
+        );
         let mut ids = Vec::with_capacity(messages_count as usize);
 
         for message in messages.iter() {
@@ -126,12 +128,11 @@ impl MessagesReader {
     /// Loads and returns a batch of messages from the messages file.
     pub async fn load_messages_from_disk(
         &self,
-        indexes: IggyIndexes,
-    ) -> Result<IggyMessagesBatch, IggyError> {
+        indexes: IggyIndexesMut,
+    ) -> Result<IggyMessagesBatchMut, IggyError> {
         let file_size = self.file_size();
         if file_size == 0 {
-            trace!("Messages file {} is empty.", self.file_path);
-            return Ok(IggyMessagesBatch::empty());
+            return Ok(IggyMessagesBatchMut::empty());
         }
 
         let start_pos = indexes.base_position();
@@ -139,13 +140,13 @@ impl MessagesReader {
         let messages_count = indexes.count();
 
         if start_pos + count_bytes > file_size {
-            return Ok(IggyMessagesBatch::empty());
+            return Ok(IggyMessagesBatchMut::empty());
         }
 
         let messages_bytes = match self.read_at(start_pos as u64, count_bytes).await {
             Ok(buf) => buf,
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
-                return Ok(IggyMessagesBatch::empty());
+                return Ok(IggyMessagesBatchMut::empty());
             }
             Err(error) => {
                 error!(
@@ -156,10 +157,10 @@ impl MessagesReader {
             }
         };
 
-        Ok(IggyMessagesBatch::new(
+        Ok(IggyMessagesBatchMut::from_indexes_and_messages(
+            messages_count,
             indexes,
             messages_bytes,
-            messages_count,
         ))
     }
 
@@ -169,13 +170,13 @@ impl MessagesReader {
     }
 
     /// Reads `len` bytes from the messages file at the specified `offset`.
-    async fn read_at(&self, offset: u64, len: u32) -> Result<Bytes, std::io::Error> {
+    async fn read_at(&self, offset: u64, len: u32) -> Result<BytesMut, std::io::Error> {
         let file = self.file.clone();
         spawn_blocking(move || {
-            let mut buf = BytesMut::with_capacity(len as usize);
+            let mut buf = BYTES_MUT_POOL.get_buffer(len as usize);
             unsafe { buf.set_len(len as usize) };
             file.read_exact_at(&mut buf, offset)?;
-            Ok(buf.freeze())
+            Ok(buf)
         })
         .await?
     }

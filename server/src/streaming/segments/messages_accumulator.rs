@@ -66,11 +66,10 @@ impl MessagesAccumulator {
         segment_start_offset: u64,
         segment_current_offset: u64,
         segment_current_position: u32,
-        batch: IggyMessagesBatchMut,
+        mut batch: IggyMessagesBatchMut,
         deduplicator: Option<&MessageDeduplicator>,
     ) {
         let batch_messages_count = batch.count();
-
         if batch_messages_count == 0 {
             return;
         }
@@ -85,7 +84,7 @@ impl MessagesAccumulator {
 
         self.initialize_or_update_offsets(segment_current_offset, segment_current_position);
 
-        let prepared_batch = batch
+        batch
             .prepare_for_persistence(
                 segment_start_offset,
                 self.current_offset,
@@ -94,9 +93,9 @@ impl MessagesAccumulator {
             )
             .await;
 
-        let batch_size = prepared_batch.size();
+        let batch_size = batch.size();
 
-        self.batches.add_batch(prepared_batch);
+        self.batches.add_batch(batch);
 
         self.messages_count += batch_messages_count;
         self.current_offset = self.base_offset + self.messages_count as u64 - 1;
@@ -151,7 +150,7 @@ impl MessagesAccumulator {
 
     /// Checks if the accumulator is empty (has no messages).
     pub fn is_empty(&self) -> bool {
-        self.batches.is_empty() || self.messages_count == 0
+        self.messages_count == 0
     }
 
     /// Returns the number of messages in the accumulator that have not been persisted.

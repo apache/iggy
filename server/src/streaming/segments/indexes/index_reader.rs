@@ -17,9 +17,10 @@
  */
 
 use super::IggyIndexesMut;
+use crate::streaming::utils::bytes_mut_pool::{BytesMutExt, BYTES_MUT_POOL};
 use bytes::BytesMut;
 use error_set::ErrContext;
-use iggy::models::messaging::{IggyIndex, IggyIndexes, INDEX_SIZE};
+use iggy::models::messaging::{IggyIndex, INDEX_SIZE};
 use iggy::{error::IggyError, models::messaging::IggyIndexView};
 use std::{
     fs::File as StdFile,
@@ -102,7 +103,7 @@ impl IndexReader {
             }
         };
         let index_count = file_size / INDEX_SIZE as u32;
-        let indexes = IggyIndexesMut::from_bytes(buf);
+        let indexes = IggyIndexesMut::from_bytes(buf, index_count);
         if indexes.count() != index_count {
             error!(
                 "Loaded {} indexes from disk, expected {}, file {} is probably corrupted!",
@@ -123,7 +124,7 @@ impl IndexReader {
         &self,
         relative_start_offset: u32,
         count: u32,
-    ) -> Result<Option<IggyIndexes>, IggyError> {
+    ) -> Result<Option<IggyIndexesMut>, IggyError> {
         let file_size = self.file_size();
         let total_indexes = file_size / INDEX_SIZE as u32;
 
@@ -198,8 +199,8 @@ impl IndexReader {
             base_position
         );
 
-        Ok(Some(IggyIndexes::new(
-            indexes_bytes.freeze(),
+        Ok(Some(IggyIndexesMut::from_bytes(
+            indexes_bytes,
             base_position,
         )))
     }
@@ -212,7 +213,7 @@ impl IndexReader {
         &self,
         timestamp: u64,
         count: u32,
-    ) -> Result<Option<IggyIndexes>, IggyError> {
+    ) -> Result<Option<IggyIndexesMut>, IggyError> {
         let file_size = self.file_size();
         let total_indexes = file_size / INDEX_SIZE as u32;
 
@@ -281,8 +282,8 @@ impl IndexReader {
             base_position
         );
 
-        Ok(Some(IggyIndexes::new(
-            indexes_bytes.freeze(),
+        Ok(Some(IggyIndexesMut::from_bytes(
+            indexes_bytes,
             base_position,
         )))
     }
@@ -354,7 +355,7 @@ impl IndexReader {
     async fn read_at(&self, offset: u32, len: u32) -> Result<BytesMut, std::io::Error> {
         let file = self.file.clone();
         spawn_blocking(move || {
-            let mut buf = BytesMut::with_capacity(len as usize);
+            let mut buf = BYTES_MUT_POOL.get_buffer(len as usize);
             unsafe { buf.set_len(len as usize) };
             file.read_exact_at(&mut buf, offset as u64)?;
             Ok(buf)
@@ -395,6 +396,9 @@ impl IndexReader {
             }
         };
 
-        Ok(Some(IggyIndexView::new(&buf).to_index()))
+        let index = IggyIndexView::new(&buf).to_index();
+        buf.return_to_pool();
+
+        Ok(Some(index))
     }
 }

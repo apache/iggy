@@ -21,11 +21,10 @@ use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessa
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::System;
 use crate::streaming::systems::COMPONENT;
-use bytes::BytesMut;
+use crate::streaming::utils::bytes_mut_pool::BYTES_MUT_POOL;
 use error_set::ErrContext;
 use iggy::confirmation::Confirmation;
 use iggy::consumer::Consumer;
-use iggy::models::messaging::IggyMessagesBatch;
 use iggy::prelude::*;
 use iggy::utils::crypto::EncryptorKind;
 use iggy::{error::IggyError, identifier::Identifier};
@@ -164,7 +163,7 @@ impl System {
             let count = batch.count();
 
             let mut indexes = IggyIndexesMut::with_capacity(batch.count() as usize, 0);
-            let mut decrypted_messages = BytesMut::with_capacity(batch.size() as usize);
+            let mut decrypted_messages = BYTES_MUT_POOL.get_buffer(batch.size() as usize);
             let mut position = 0;
 
             for message in batch.iter() {
@@ -185,9 +184,8 @@ impl System {
                     }
                 }
             }
-            let indexes = indexes.make_immutable();
-            let decrypted_messages = decrypted_messages.freeze();
-            let decrypted_batch = IggyMessagesBatch::new(indexes, decrypted_messages, count);
+            let decrypted_batch =
+                IggyMessagesBatchMut::from_indexes_and_messages(count, indexes, decrypted_messages);
             decrypted_batches.push(decrypted_batch);
         }
 
@@ -199,7 +197,8 @@ impl System {
         batch: IggyMessagesBatchMut,
         encryptor: &EncryptorKind,
     ) -> Result<IggyMessagesBatchMut, IggyError> {
-        let mut encrypted_messages = BytesMut::with_capacity(batch.size() as usize * 2);
+        let mut encrypted_messages = BYTES_MUT_POOL.get_buffer(batch.size() as usize * 2);
+        let count = batch.count();
         let mut indexes = IggyIndexesMut::with_capacity(batch.count() as usize, 0);
         let mut position = 0;
 
@@ -230,6 +229,7 @@ impl System {
         }
 
         Ok(IggyMessagesBatchMut::from_indexes_and_messages(
+            count,
             indexes,
             encrypted_messages,
         ))

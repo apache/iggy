@@ -56,6 +56,7 @@ bytes = "1.10.1"
 chrono = "0.4.40"
 clap = { version = "4.5.34", features = ["derive"] }
 console-subscriber = { version = "0.4.1", optional = true }
+crossbeam = "0.8.4"
 dashmap = "6.1.0"
 derive_more = "2.0.1"
 dotenvy = { version = "0.15.7" }
@@ -72,6 +73,7 @@ lending-iterator = "0.1.7"
 mimalloc = { version = "0.1", optional = true }
 moka = { version = "0.12.10", features = ["future"] }
 nix = { version = "0.29", features = ["fs"] }
+once_cell = "1.21.3"
 openssl = { version = "0.10.71", features = ["vendored"] }
 opentelemetry = { version = "0.29.0", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.29.1", features = ["log"] }

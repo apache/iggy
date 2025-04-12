@@ -18,18 +18,20 @@
 
 use crate::binary::handlers::messages::poll_messages_handler::IggyPollMetadata;
 use crate::streaming::segments::IggyIndexesMut;
+use crate::streaming::utils::bytes_mut_pool::BytesMutExt;
 use bytes::Bytes;
 use iggy::models::messaging::IggyMessageView;
-use iggy::models::messaging::IggyMessagesBatch;
 use iggy::prelude::*;
 use std::ops::Index;
 use tracing::trace;
+
+use super::IggyMessagesBatchMut;
 
 /// A container for multiple IggyMessagesBatch objects
 #[derive(Debug, Default)]
 pub struct IggyMessagesBatchSet {
     /// The collection of message containers
-    batches: Vec<IggyMessagesBatch>,
+    batches: Vec<IggyMessagesBatchMut>,
     /// Total number of messages across all containers
     count: u32,
     /// Total size in bytes across all containers
@@ -56,7 +58,7 @@ impl IggyMessagesBatchSet {
     }
 
     /// Create a batch set from an existing vector of IggyMessages
-    pub fn from_vec(messages: Vec<IggyMessagesBatch>) -> Self {
+    pub fn from_vec(messages: Vec<IggyMessagesBatchMut>) -> Self {
         let mut batch = Self::with_capacity(messages.len());
         for msg in messages {
             batch.add_batch(msg);
@@ -65,25 +67,25 @@ impl IggyMessagesBatchSet {
     }
 
     /// Add a message container to the batch
-    pub fn add_batch(&mut self, messages: IggyMessagesBatch) {
+    pub fn add_batch(&mut self, messages: IggyMessagesBatchMut) {
         self.count += messages.count();
         self.size += messages.size();
         self.batches.push(messages);
     }
 
     /// Add another batch of messages to the batch
-    pub fn add_batch_set(&mut self, other: IggyMessagesBatchSet) {
+    pub fn add_batch_set(&mut self, mut other: IggyMessagesBatchSet) {
         self.count += other.count();
         self.size += other.size();
-        self.batches.extend(other.batches);
+        let other_batches = std::mem::take(&mut other.batches);
+        self.batches.extend(other_batches);
     }
 
     /// Extract indexes from all batches in the set
-    pub fn extract_indexes_to(&mut self, target: &mut IggyIndexesMut) {
-        for batch in self.iter_mut() {
-            let indexes = batch.take_indexes();
-            let (_, indexes_buffer) = indexes.decompose();
-            target.concatenate(indexes_buffer);
+    pub fn append_indexes_to(&self, target: &mut IggyIndexesMut) {
+        for batch in self.iter() {
+            let indexes = batch.indexes();
+            target.append_slice(indexes);
         }
     }
 
@@ -109,16 +111,25 @@ impl IggyMessagesBatchSet {
 
     /// Get timestamp of first message in first batch
     pub fn first_timestamp(&self) -> Option<u64> {
+        if self.is_empty() {
+            return None;
+        }
         self.batches.first().map(|batch| batch.first_timestamp())?
     }
 
     /// Get offset of first message in first batch
     pub fn first_offset(&self) -> Option<u64> {
+        if self.is_empty() {
+            return None;
+        }
         self.batches.first().map(|batch| batch.first_offset())?
     }
 
     /// Get timestamp of last message in last batch
     pub fn last_timestamp(&self) -> Option<u64> {
+        if self.is_empty() {
+            return None;
+        }
         self.batches.last().map(|batch| batch.last_timestamp())?
     }
 
@@ -128,22 +139,22 @@ impl IggyMessagesBatchSet {
     }
 
     /// Get a reference to the underlying vector of message containers
-    pub fn inner(&self) -> &Vec<IggyMessagesBatch> {
+    pub fn inner(&self) -> &Vec<IggyMessagesBatchMut> {
         &self.batches
     }
 
     /// Consume the batch, returning the underlying vector of message containers
-    pub fn into_inner(self) -> Vec<IggyMessagesBatch> {
-        self.batches
+    pub fn into_inner(mut self) -> Vec<IggyMessagesBatchMut> {
+        std::mem::take(&mut self.batches)
     }
 
     /// Iterate over all message containers in the batch
-    pub fn iter(&self) -> impl Iterator<Item = &IggyMessagesBatch> {
+    pub fn iter(&self) -> impl Iterator<Item = &IggyMessagesBatchMut> {
         self.batches.iter()
     }
 
     /// Iterate over all mutable message containers in the batch
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut IggyMessagesBatch> {
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut IggyMessagesBatchMut> {
         self.batches.iter_mut()
     }
 
@@ -334,31 +345,44 @@ impl Sizeable for IggyMessagesBatchSet {
     }
 }
 
-impl From<Vec<IggyMessagesBatch>> for IggyMessagesBatchSet {
-    fn from(messages: Vec<IggyMessagesBatch>) -> Self {
+impl From<Vec<IggyMessagesBatchMut>> for IggyMessagesBatchSet {
+    fn from(messages: Vec<IggyMessagesBatchMut>) -> Self {
         Self::from_vec(messages)
     }
 }
 
-impl From<IggyMessagesBatch> for IggyMessagesBatchSet {
-    fn from(messages: IggyMessagesBatch) -> Self {
+impl From<IggyMessagesBatchMut> for IggyMessagesBatchSet {
+    fn from(messages: IggyMessagesBatchMut) -> Self {
         Self::from_vec(vec![messages])
+    }
+}
+
+impl Drop for IggyMessagesBatchSet {
+    fn drop(&mut self) {
+        for batch in self.batches.iter_mut() {
+            let batch = std::mem::take(batch);
+            let (indexes, messages) = batch.decompose();
+            messages.return_to_pool();
+            drop(indexes);
+        }
     }
 }
 
 /// Iterator that consumes an IggyMessagesBatchSet and yields batches
 pub struct IggyMessagesBatchSetIntoIter {
-    batches: Vec<IggyMessagesBatch>,
+    batches: Vec<IggyMessagesBatchMut>,
     position: usize,
 }
 
 impl Iterator for IggyMessagesBatchSetIntoIter {
-    type Item = IggyMessagesBatch;
+    type Item = IggyMessagesBatchMut;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.position < self.batches.len() {
-            let batch =
-                std::mem::replace(&mut self.batches[self.position], IggyMessagesBatch::empty());
+            let batch = std::mem::replace(
+                &mut self.batches[self.position],
+                IggyMessagesBatchMut::empty(),
+            );
             self.position += 1;
             Some(batch)
         } else {
@@ -369,17 +393,5 @@ impl Iterator for IggyMessagesBatchSetIntoIter {
     fn size_hint(&self) -> (usize, Option<usize>) {
         let remaining = self.batches.len() - self.position;
         (remaining, Some(remaining))
-    }
-}
-
-impl IntoIterator for IggyMessagesBatchSet {
-    type Item = IggyMessagesBatch;
-    type IntoIter = IggyMessagesBatchSetIntoIter;
-
-    fn into_iter(self) -> Self::IntoIter {
-        IggyMessagesBatchSetIntoIter {
-            batches: self.batches,
-            position: 0,
-        }
     }
 }

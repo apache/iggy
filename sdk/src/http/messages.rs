@@ -71,6 +71,7 @@ impl MessageClient for HttpClient {
         self.post(
             &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
             &SendMessages {
+                metadata_length: 0, // this field is used only for TCP/QUIC
                 stream_id: stream_id.clone(),
                 topic_id: topic_id.clone(),
                 partitioning: partitioning.clone(),

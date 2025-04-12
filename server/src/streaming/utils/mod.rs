@@ -16,6 +16,7 @@
  * under the License.
  */
 
+pub mod bytes_mut_pool;
 pub mod crypto;
 pub mod file;
 pub mod hash;

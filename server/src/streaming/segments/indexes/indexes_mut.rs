@@ -16,10 +16,12 @@
  * under the License.
  */
 
-use bytes::{BufMut, Bytes, BytesMut};
-use iggy::models::messaging::{IggyIndexView, IggyIndexes, INDEX_SIZE};
+use bytes::{BufMut, BytesMut};
+use iggy::models::messaging::{IggyIndexView, INDEX_SIZE};
 use std::fmt;
 use std::ops::{Deref, Index as StdIndex};
+
+use crate::streaming::utils::bytes_mut_pool::{BytesMutExt, BYTES_MUT_POOL};
 
 /// A container for binary-encoded index data.
 /// Optimized for efficient storage and I/O operations.
@@ -41,17 +43,24 @@ impl IggyIndexesMut {
     }
 
     /// Creates indexes from bytes
-    pub fn from_bytes(indexes: BytesMut) -> Self {
+    pub fn from_bytes(indexes: BytesMut, base_position: u32) -> Self {
         Self {
             buffer: indexes,
             saved_count: 0,
-            base_position: 0,
+            base_position,
         }
+    }
+
+    /// Decompose the container into its components
+    pub fn decompose(mut self) -> (u32, BytesMut) {
+        let base_position = self.base_position;
+        let buffer = std::mem::replace(&mut self.buffer, BytesMut::new());
+        (base_position, buffer)
     }
 
     /// Gets the size of all indexes messages
     pub fn messages_size(&self) -> u32 {
-        self.last_position()
+        self.last_position() - self.base_position
     }
 
     /// Gets the base position of the indexes
@@ -74,15 +83,15 @@ impl IggyIndexesMut {
     /// Creates a new container with the specified capacity
     pub fn with_capacity(capacity: usize, base_position: u32) -> Self {
         Self {
-            buffer: BytesMut::with_capacity(capacity * INDEX_SIZE),
+            buffer: BYTES_MUT_POOL.get_buffer(capacity * INDEX_SIZE),
             saved_count: 0,
             base_position,
         }
     }
 
-    /// Makes the indexes immutable
-    pub fn make_immutable(self) -> IggyIndexes {
-        IggyIndexes::new(self.buffer.freeze(), self.base_position)
+    /// Gets the capacity of the buffer
+    pub fn capacity(&self) -> usize {
+        self.buffer.capacity()
     }
 
     /// Inserts a new index at the end of buffer
@@ -93,8 +102,8 @@ impl IggyIndexesMut {
     }
 
     /// Appends another slice of indexes to this one.
-    pub fn concatenate(&mut self, other: Bytes) {
-        self.buffer.put(other);
+    pub fn append_slice(&mut self, other: &[u8]) {
+        self.buffer.put_slice(other);
     }
 
     /// Gets the number of indexes in the container
@@ -225,7 +234,11 @@ impl IggyIndexesMut {
     }
 
     /// Slices the container to return a view of a specific range of indexes
-    pub fn slice_by_offset(&self, relative_start_offset: u32, count: u32) -> Option<IggyIndexes> {
+    pub fn slice_by_offset(
+        &self,
+        relative_start_offset: u32,
+        count: u32,
+    ) -> Option<IggyIndexesMut> {
         let available_count = self.count().saturating_sub(relative_start_offset);
         let actual_count = std::cmp::min(count, available_count);
 
@@ -240,15 +253,15 @@ impl IggyIndexesMut {
         let slice = BytesMut::from(&self.buffer[start_byte..end_byte]);
 
         if relative_start_offset == 0 {
-            Some(IggyIndexes::new(slice.freeze(), self.base_position))
+            Some(IggyIndexesMut::from_bytes(slice, self.base_position))
         } else {
             let position_offset = self.get(relative_start_offset - 1).unwrap().position();
-            Some(IggyIndexes::new(slice.freeze(), position_offset))
+            Some(IggyIndexesMut::from_bytes(slice, position_offset))
         }
     }
 
     /// Loads indexes from cache based on timestamp
-    pub fn slice_by_timestamp(&self, timestamp: u64, count: u32) -> Option<IggyIndexes> {
+    pub fn slice_by_timestamp(&self, timestamp: u64, count: u32) -> Option<IggyIndexesMut> {
         if self.count() == 0 {
             return None;
         }
@@ -274,7 +287,7 @@ impl IggyIndexesMut {
             0
         };
 
-        Some(IggyIndexes::new(slice.freeze(), base_position))
+        Some(IggyIndexesMut::from_bytes(slice, base_position))
     }
 
     /// Find the position of the index with timestamp closest to (but not exceeding) the target
@@ -314,6 +327,13 @@ impl IggyIndexesMut {
         }
 
         Some(low)
+    }
+}
+
+impl Drop for IggyIndexesMut {
+    fn drop(&mut self) {
+        let indexes = std::mem::replace(&mut self.buffer, BytesMut::new());
+        indexes.return_to_pool();
     }
 }
 

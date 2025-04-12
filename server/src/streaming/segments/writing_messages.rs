@@ -84,16 +84,16 @@ impl Segment {
 
         let accumulator = std::mem::take(&mut self.accumulator);
 
-        let mut batches = accumulator.into_batch_set();
+        let batches = accumulator.into_batch_set();
         let confirmation = match confirmation {
             Some(val) => val,
             None => self.config.segment.server_confirmation,
         };
 
-        batches.extract_indexes_to(&mut self.indexes);
-
         let batch_size = batches.size();
         let batch_count = batches.count();
+
+        batches.append_indexes_to(&mut self.indexes);
 
         let saved_bytes = self
             .messages_writer
@@ -130,17 +130,15 @@ impl Segment {
 
         self.check_and_handle_segment_full().await?;
 
-        let saved_messages_count = unsaved_messages_count;
-
         trace!(
             "Saved {} messages on disk in segment with start offset: {} for partition with ID: {}, total bytes written: {}.",
-            saved_messages_count,
+            unsaved_messages_count,
             self.start_offset,
             self.partition_id,
             saved_bytes
         );
 
-        Ok(saved_messages_count)
+        Ok(unsaved_messages_count)
     }
 
     fn update_counters(&mut self, messages_size: u64, messages_count: u64) {

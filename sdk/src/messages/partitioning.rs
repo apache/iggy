@@ -155,6 +155,11 @@ impl Partitioning {
             value,
         })
     }
+
+    /// Maximum size of the Partitioning struct
+    pub const fn maximum_byte_size() -> usize {
+        2 + 255
+    }
 }
 
 impl Hash for Partitioning {

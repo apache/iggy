@@ -43,6 +43,8 @@ use super::{Partitioning, PartitioningKind};
 /// - `batch` - collection of messages to be sent.
 #[derive(Debug, PartialEq)]
 pub struct SendMessages {
+    /// Length of stream_id, topic_id, partitioning and messages_count (4 bytes)
+    pub metadata_length: u32,
     /// Unique stream ID (numeric or name).
     pub stream_id: Identifier,
     /// Unique topic ID (numeric or name).
@@ -60,25 +62,33 @@ impl SendMessages {
         partitioning: &Partitioning,
         messages: &[IggyMessage],
     ) -> Bytes {
-        let stream_id_size = stream_id.get_buffer_size();
-        let topic_id_size = topic_id.get_buffer_size();
-        let partitioning_size = partitioning.get_buffer_size();
+        let stream_id_field_size = stream_id.get_buffer_size();
+        let topic_id_field_size = topic_id.get_buffer_size();
+        let partitioning_field_size = partitioning.get_buffer_size();
+        let metadata_length_field_size = std::mem::size_of::<u32>();
         let messages_count = messages.len();
-        let messages_count_size = std::mem::size_of::<u32>();
+        let messages_count_field_size = std::mem::size_of::<u32>();
+        let metadata_length = stream_id_field_size
+            + topic_id_field_size
+            + partitioning_field_size
+            + messages_count_field_size;
         let indexes_size = messages_count * INDEX_SIZE;
+        let messages_size = messages
+            .iter()
+            .map(|m| m.get_size_bytes().as_bytes_usize())
+            .sum::<usize>();
 
-        let total_size = stream_id_size
-            + topic_id_size
-            + partitioning_size
-            + messages_count_size
+        let total_size = metadata_length_field_size
+            + stream_id_field_size
+            + topic_id_field_size
+            + partitioning_field_size
+            + messages_count_field_size
             + indexes_size
-            + messages
-                .iter()
-                .map(|m| m.get_size_bytes().as_bytes_usize())
-                .sum::<usize>();
+            + messages_size;
 
         let mut bytes = BytesMut::with_capacity(total_size);
 
+        bytes.put_u32_le(metadata_length as u32);
         stream_id.write_to_buffer(&mut bytes);
         topic_id.write_to_buffer(&mut bytes);
         partitioning.write_to_buffer(&mut bytes);
@@ -121,6 +131,7 @@ fn write_value_at<const N: usize>(slice: &mut [u8], value: [u8; N], position: us
 impl Default for SendMessages {
     fn default() -> Self {
         SendMessages {
+            metadata_length: 0,
             stream_id: Identifier::default(),
             topic_id: Identifier::default(),
             partitioning: Partitioning::default(),
@@ -327,6 +338,7 @@ impl<'de> Deserialize<'de> for SendMessages {
                 let batch = IggyMessagesBatch::from(&messages);
 
                 Ok(SendMessages {
+                    metadata_length: 0, // this field is used only for TCP/QUIC
                     stream_id: Identifier::default(),
                     topic_id: Identifier::default(),
                     partitioning,

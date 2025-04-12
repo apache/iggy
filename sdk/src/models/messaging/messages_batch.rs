@@ -156,116 +156,6 @@ impl IggyMessagesBatch {
         }
     }
 
-    /// Returns a contiguous slice (as a new `IggyMessagesBatch`) of up to `count` messages
-    /// whose message headers have an offset greater than or equal to the provided `start_offset`.
-    pub fn slice_by_offset(&self, start_offset: u64, count: u32) -> Option<Self> {
-        if self.is_empty() || count == 0 {
-            return None;
-        }
-
-        let first_offset = self.first_offset()?;
-
-        if start_offset < first_offset {
-            return self.slice_by_index(0, count);
-        }
-
-        let last_offset = self.last_offset()?;
-        if start_offset > last_offset {
-            return None;
-        }
-
-        let offset_diff = start_offset - first_offset;
-        let first_message_index = offset_diff as usize;
-
-        if first_message_index >= self.count() as usize {
-            return None;
-        }
-
-        self.slice_by_index(first_message_index as u32, count)
-    }
-
-    /// Helper method to slice the batch starting from a specific index
-    fn slice_by_index(&self, start_index: u32, count: u32) -> Option<Self> {
-        if start_index >= self.count() {
-            return None;
-        }
-
-        let last_message_index =
-            std::cmp::min((start_index + count) as usize, self.count() as usize);
-
-        let sub_indexes = self.indexes.slice_by_offset(
-            start_index,
-            (last_message_index - start_index as usize) as u32,
-        )?;
-
-        let first_message_position = self.message_start_position(start_index as usize);
-        let last_message_position = self.message_end_position(last_message_index - 1);
-
-        let sub_buffer = self
-            .messages
-            .slice(first_message_position..last_message_position);
-
-        Some(IggyMessagesBatch {
-            count: (last_message_index - start_index as usize) as u32,
-            indexes: sub_indexes,
-            messages: sub_buffer,
-        })
-    }
-
-    /// Returns a contiguous slice (as a new `IggyMessagesBatch`) of up to `count` messages
-    /// whose message headers have a timestamp greater than or equal to the provided `timestamp`.
-    ///
-    /// If no messages meet the criteria, returns `None`.
-    pub fn slice_by_timestamp(&self, timestamp: u64, count: u32) -> Option<Self> {
-        if self.is_empty() || count == 0 {
-            return None;
-        }
-
-        // Use binary search to find the first message with timestamp >= the target
-        let first_message_index = self.binary_search_timestamp(timestamp)?;
-
-        self.slice_by_index(first_message_index, count)
-    }
-
-    /// Find the position of the index with timestamp closest to (but not exceeding) the target
-    fn binary_search_timestamp(&self, target_timestamp: u64) -> Option<u32> {
-        if self.count() == 0 {
-            return None;
-        }
-
-        let last_timestamp = self.get(self.count() as usize - 1)?.header().timestamp();
-        if target_timestamp > last_timestamp {
-            return Some(self.count() - 1);
-        }
-
-        let first_timestamp = self.get(0)?.header().timestamp();
-        if target_timestamp <= first_timestamp {
-            return Some(0);
-        }
-
-        let mut low = 0;
-        let mut high = self.count() - 1;
-
-        while low <= high {
-            let mid = low + (high - low) / 2;
-            let mid_index = self.get(mid as usize)?;
-            let mid_timestamp = mid_index.header().timestamp();
-
-            match mid_timestamp.cmp(&target_timestamp) {
-                std::cmp::Ordering::Equal => return Some(mid),
-                std::cmp::Ordering::Less => low = mid + 1,
-                std::cmp::Ordering::Greater => {
-                    if mid == 0 {
-                        break;
-                    }
-                    high = mid - 1;
-                }
-            }
-        }
-
-        Some(low)
-    }
-
     /// Get the message at the specified index.
     /// Returns None if the index is out of bounds.
     pub fn get(&self, index: usize) -> Option<IggyMessageView> {
@@ -293,58 +183,6 @@ impl IggyMessagesBatch {
         }
 
         result
-    }
-
-    /// Validates that all messages in batch have correct checksums.
-    pub fn validate_checksums(&self) -> Result<(), IggyError> {
-        for message in self.iter() {
-            let calculated_checksum = message.calculate_checksum();
-            let actual_checksum = message.header().checksum();
-            let offset = message.header().offset();
-            if calculated_checksum != actual_checksum {
-                return Err(IggyError::InvalidMessageChecksum(
-                    actual_checksum,
-                    calculated_checksum,
-                    offset,
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// Validates that all messages have correct checksums and offsets.
-    /// This function should be called after messages have been read from disk.
-    ///
-    /// # Arguments
-    ///
-    /// * `absolute_start_offset` - The absolute offset of the first message in the batch.
-    ///
-    /// # Returns
-    ///
-    /// * `Ok(())` - If all messages have correct checksums and offsets.
-    /// * `Err(IggyError)` - If any message has an invalid checksum or offset.
-    pub fn validate_checksums_and_offsets(
-        &self,
-        absolute_start_offset: u64,
-    ) -> Result<(), IggyError> {
-        let mut current_offset = absolute_start_offset;
-        for message in self.iter() {
-            let calculated_checksum = message.calculate_checksum();
-            let actual_checksum = message.header().checksum();
-            let offset = message.header().offset();
-            if offset != current_offset {
-                return Err(IggyError::InvalidOffset(offset));
-            }
-            if calculated_checksum != actual_checksum {
-                return Err(IggyError::InvalidMessageChecksum(
-                    actual_checksum,
-                    calculated_checksum,
-                    offset,
-                ));
-            }
-            current_offset += 1;
-        }
-        Ok(())
     }
 }
 
@@ -375,6 +213,7 @@ impl Index<usize> for IggyMessagesBatch {
         &self.messages[start..end]
     }
 }
+
 impl BytesSerializable for IggyMessagesBatch {
     fn to_bytes(&self) -> Bytes {
         panic!("should not be used");

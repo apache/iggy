@@ -17,8 +17,9 @@
  */
 
 use crate::{
-    channels::server_command::BackgroundServerCommand, configs::server::ServerConfig,
-    streaming::systems::system::SharedSystem,
+    channels::server_command::BackgroundServerCommand,
+    configs::server::ServerConfig,
+    streaming::{systems::system::SharedSystem, utils::bytes_mut_pool::BYTES_MUT_POOL},
 };
 use flume::{Receiver, Sender};
 use human_repr::HumanCount;
@@ -89,6 +90,8 @@ impl BackgroundServerCommand<SysInfoPrintCommand> for SysInfoPrintExecutor {
               stats.read_bytes,
               stats.written_bytes,
               stats.run_time);
+
+        BYTES_MUT_POOL.log_stats();
     }
 
     fn start_command_sender(

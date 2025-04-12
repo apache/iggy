@@ -100,7 +100,7 @@ impl Segment {
             last_index_position: 0,
             max_size_bytes: config.segment.size,
             message_expiry,
-            indexes: IggyIndexesMut::with_capacity(1_000_000, 0),
+            indexes: IggyIndexesMut::with_capacity(1024 * 1024, 0),
             accumulator: MessagesAccumulator::default(),
             is_closed: false,
             messages_writer: None,

@@ -200,6 +200,11 @@ impl Identifier {
         identifier.validate()?;
         Ok(identifier)
     }
+
+    /// Maximum size of the Identifier struct
+    pub const fn maximum_byte_size() -> usize {
+        2 + 255
+    }
 }
 
 impl Sizeable for Identifier {

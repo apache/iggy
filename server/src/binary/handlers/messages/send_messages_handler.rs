@@ -21,8 +21,8 @@ use crate::binary::sender::SenderKind;
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
+use crate::streaming::utils::bytes_mut_pool::{BytesMutExt, BYTES_MUT_POOL};
 use anyhow::Result;
-use bytes::{Buf, BytesMut};
 use iggy::error::IggyError;
 use iggy::identifier::Identifier;
 use iggy::models::messaging::INDEX_SIZE;
@@ -49,40 +49,56 @@ impl ServerCommandHandler for SendMessages {
         session: &Session,
         system: &SharedSystem,
     ) -> Result<(), IggyError> {
-        let length = length - 4;
-        let mut buffer = BytesMut::with_capacity(length as usize);
-        unsafe {
-            buffer.set_len(length as usize);
-        }
-        sender.read(&mut buffer).await?;
+        let total_payload_size = length as usize - std::mem::size_of::<u32>();
+        let metadata_len_field_size = std::mem::size_of::<u32>();
 
-        let mut element_size;
+        let mut metadata_length_buffer = [0u8; 4];
+        sender.read(&mut metadata_length_buffer).await?;
+        let metadata_size = u32::from_le_bytes(metadata_length_buffer);
 
-        let stream_id = Identifier::from_raw_bytes(buffer.chunk())?;
-        element_size = stream_id.get_size_bytes().as_bytes_usize();
-        buffer.advance(element_size);
+        let mut metadata_buffer = BYTES_MUT_POOL.get_buffer(metadata_size as usize);
+        unsafe { metadata_buffer.set_len(metadata_size as usize) };
+        sender.read(&mut metadata_buffer).await?;
+
+        let mut element_size = 0;
+
+        let stream_id = Identifier::from_raw_bytes(&metadata_buffer)?;
+        element_size += stream_id.get_size_bytes().as_bytes_usize();
         self.stream_id = stream_id;
 
-        let topic_id = Identifier::from_raw_bytes(buffer.chunk())?;
-        element_size = topic_id.get_size_bytes().as_bytes_usize();
-        buffer.advance(element_size);
+        let topic_id = Identifier::from_raw_bytes(&metadata_buffer[element_size..])?;
+        element_size += topic_id.get_size_bytes().as_bytes_usize();
         self.topic_id = topic_id;
 
-        let partitioning = Partitioning::from_raw_bytes(buffer.chunk())?;
-        element_size = partitioning.get_size_bytes().as_bytes_usize();
-        buffer.advance(element_size);
+        let partitioning = Partitioning::from_raw_bytes(&metadata_buffer[element_size..])?;
+        element_size += partitioning.get_size_bytes().as_bytes_usize();
         self.partitioning = partitioning;
 
-        let messages_count = buffer.get_u32_le() as usize;
+        let messages_count = u32::from_le_bytes(
+            metadata_buffer[element_size..element_size + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let indexes_size = messages_count as usize * INDEX_SIZE;
 
-        let mut indexes_and_messages = buffer.split();
+        metadata_buffer.return_to_pool();
 
-        let messages = indexes_and_messages.split_off(messages_count * INDEX_SIZE);
-        let indexes = indexes_and_messages;
+        let mut indexes_buffer = BYTES_MUT_POOL.get_buffer(indexes_size);
+        unsafe { indexes_buffer.set_len(indexes_size) };
+        sender.read(&mut indexes_buffer).await?;
 
-        let indexes = IggyIndexesMut::from_bytes(indexes);
+        let messages_size =
+            total_payload_size - metadata_size as usize - indexes_size - metadata_len_field_size;
+        let mut messages_buffer = BYTES_MUT_POOL.get_buffer(messages_size);
+        unsafe { messages_buffer.set_len(messages_size) };
+        sender.read(&mut messages_buffer).await?;
 
-        let batch = IggyMessagesBatchMut::from_indexes_and_messages(indexes, messages);
+        let indexes = IggyIndexesMut::from_bytes(indexes_buffer, 0);
+        let batch = IggyMessagesBatchMut::from_indexes_and_messages(
+            messages_count,
+            indexes,
+            messages_buffer,
+        );
 
         batch.validate()?;
 
