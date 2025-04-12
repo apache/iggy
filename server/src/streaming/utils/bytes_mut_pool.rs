@@ -211,40 +211,17 @@ impl BytesMutPool {
         let lg_size = IggyByteSize::from((lg_pool * Self::LARGE_BUFFER_SIZE) as u64);
         let xl_size = IggyByteSize::from((xl_pool * Self::EXTRA_LARGE_BUFFER_SIZE) as u64);
         let mx_size = IggyByteSize::from((mx_pool * Self::MAX_BUFFER_SIZE) as u64);
+        let limit_size = sm_size + md_size + lg_size + xl_size + mx_size;
 
-        let total_size = IggyByteSize::from(
+        let current_total_size = IggyByteSize::from(
             (sm_pool * Self::SMALL_BUFFER_SIZE
                 + md_pool * Self::MEDIUM_BUFFER_SIZE
                 + lg_pool * Self::LARGE_BUFFER_SIZE
                 + xl_pool * Self::EXTRA_LARGE_BUFFER_SIZE
                 + mx_pool * Self::MAX_BUFFER_SIZE) as u64,
         );
-
-        let sm_reuse = if sm_created > 0 {
-            sm_returned as f64 / sm_created as f64 * 100.0
-        } else {
-            0.0
-        };
-        let md_reuse = if md_created > 0 {
-            md_returned as f64 / md_created as f64 * 100.0
-        } else {
-            0.0
-        };
-        let lg_reuse = if lg_created > 0 {
-            lg_returned as f64 / lg_created as f64 * 100.0
-        } else {
-            0.0
-        };
-        let xl_reuse = if xl_created > 0 {
-            xl_returned as f64 / xl_created as f64 * 100.0
-        } else {
-            0.0
-        };
-        let mx_reuse = if mx_created > 0 {
-            mx_returned as f64 / mx_created as f64 * 100.0
-        } else {
-            0.0
-        };
+        let utilization =
+            current_total_size.as_bytes_u64() as f64 / limit_size.as_bytes_u64() as f64 * 100.0;
 
         let sm_util = sm_pool as f64 / Self::SMALL_POOL_SIZE as f64 * 100.0;
         let md_util = md_pool as f64 / Self::MEDIUM_POOL_SIZE as f64 * 100.0;
@@ -252,24 +229,13 @@ impl BytesMutPool {
         let xl_util = xl_pool as f64 / Self::EXTRA_LARGE_POOL_SIZE as f64 * 100.0;
         let mx_util = mx_pool as f64 / Self::MAX_POOL_SIZE as f64 * 100.0;
 
-        info!("BytesPool: Small[{}/{}|{:.1}%|{:.1}%|{}] Medium[{}/{}|{:.1}%|{:.1}%|{}] Large[{}/{}|{:.1}%|{:.1}%|{}]",
-        sm_returned, sm_created, sm_reuse, sm_util, sm_size,
-        md_returned, md_created, md_reuse, md_util, md_size,
-        lg_returned, lg_created, lg_reuse, lg_util, lg_size);
-
-        info!(
-            "BytesPool: XLarge[{}/{}|{:.1}%|{:.1}%|{}] Max[{}/{}|{:.1}%|{:.1}%|{}] Total: {}",
-            xl_returned,
-            xl_created,
-            xl_reuse,
-            xl_util,
-            xl_size,
-            mx_returned,
-            mx_created,
-            mx_reuse,
-            mx_util,
-            mx_size,
-            total_size
+        info!("BytesPool: {}/{}/{:.1}% (Current/Limit/Utilization), Small[{}/{}|{:.1}%|{}] Medium[{}/{}|{:.1}%|{}] Large[{}/{}|{:.1}%|{}] XLarge[{}/{}|{:.1}%|{}] Max[{}/{}|{:.1}%|{}] (Created/Returned|Utilization|Current)",
+           current_total_size, limit_size, utilization,
+           sm_created, sm_returned, sm_util, sm_size,
+           md_created, md_returned, md_util, md_size,
+           lg_created, lg_returned, lg_util, lg_size,
+           xl_created, xl_returned, xl_util, xl_size,
+           mx_created, mx_returned, mx_util, mx_size,
         );
     }
 }
