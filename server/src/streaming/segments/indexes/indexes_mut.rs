@@ -70,7 +70,6 @@ impl IggyIndexesMut {
 
     /// Sets the base position of the indexes
     pub fn set_base_position(&mut self, base_position: u32) {
-        tracing::error!("Setting base position to {base_position}");
         self.base_position = base_position;
     }
 
