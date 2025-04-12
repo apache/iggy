@@ -211,7 +211,13 @@ impl BytesMutPool {
         let lg_size = IggyByteSize::from((lg_pool * Self::LARGE_BUFFER_SIZE) as u64);
         let xl_size = IggyByteSize::from((xl_pool * Self::EXTRA_LARGE_BUFFER_SIZE) as u64);
         let mx_size = IggyByteSize::from((mx_pool * Self::MAX_BUFFER_SIZE) as u64);
-        let limit_size = sm_size + md_size + lg_size + xl_size + mx_size;
+        let limit_size = IggyByteSize::from(
+            (Self::SMALL_BUFFER_SIZE * Self::SMALL_POOL_SIZE
+                + Self::MEDIUM_BUFFER_SIZE * Self::MEDIUM_POOL_SIZE
+                + Self::LARGE_BUFFER_SIZE * Self::LARGE_POOL_SIZE
+                + Self::EXTRA_LARGE_BUFFER_SIZE * Self::EXTRA_LARGE_POOL_SIZE
+                + Self::MAX_BUFFER_SIZE * Self::MAX_POOL_SIZE) as u64,
+        );
 
         let current_total_size = IggyByteSize::from(
             (sm_pool * Self::SMALL_BUFFER_SIZE
