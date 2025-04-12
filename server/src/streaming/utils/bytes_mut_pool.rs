@@ -57,11 +57,11 @@ impl BytesMutPool {
     const EXTRA_LARGE_BUFFER_SIZE: usize = 2 * 1024 * 1024;
     const MAX_BUFFER_SIZE: usize = 16 * 1024 * 1024;
 
-    const SMALL_POOL_SIZE: usize = 4096;
-    const MEDIUM_POOL_SIZE: usize = 1024;
-    const LARGE_POOL_SIZE: usize = 512;
-    const EXTRA_LARGE_POOL_SIZE: usize = 128;
-    const MAX_POOL_SIZE: usize = 64;
+    const SMALL_POOL_SIZE: usize = 16384;
+    const MEDIUM_POOL_SIZE: usize = 4096;
+    const LARGE_POOL_SIZE: usize = 1024;
+    const EXTRA_LARGE_POOL_SIZE: usize = 256;
+    const MAX_POOL_SIZE: usize = 128;
 
     /// Initialize the bytes pool
     pub fn init_pool() {
@@ -153,35 +153,30 @@ impl BytesMutPool {
                 trace!("Small buffer pool full, dropping buffer");
             } else {
                 self.small_returned.fetch_add(1, Ordering::Relaxed);
-                trace!("Returned small buffer to pool");
             }
         } else if capacity == Self::MEDIUM_BUFFER_SIZE {
             if self.medium_buffers.push(buffer).is_err() {
                 trace!("Medium buffer pool full, dropping buffer");
             } else {
                 self.medium_returned.fetch_add(1, Ordering::Relaxed);
-                trace!("Returned medium buffer to pool");
             }
         } else if capacity == Self::LARGE_BUFFER_SIZE {
             if self.large_buffers.push(buffer).is_err() {
                 trace!("Large buffer pool full, dropping buffer");
             } else {
                 self.large_returned.fetch_add(1, Ordering::Relaxed);
-                trace!("Returned large buffer to pool");
             }
         } else if capacity == Self::EXTRA_LARGE_BUFFER_SIZE {
             if self.extra_large_buffers.push(buffer).is_err() {
                 trace!("Extra large buffer pool full, dropping buffer");
             } else {
                 self.extra_large_returned.fetch_add(1, Ordering::Relaxed);
-                trace!("Returned extra large buffer to pool");
             }
         } else if capacity == Self::MAX_BUFFER_SIZE {
             if self.max_buffers.push(buffer).is_err() {
                 trace!("Max buffer pool full, dropping buffer");
             } else {
                 self.max_returned.fetch_add(1, Ordering::Relaxed);
-                trace!("Returned max buffer to pool");
             }
         } else if capacity != 0 {
             trace!(

@@ -165,34 +165,6 @@ impl IggyMessagesBatch {
             None
         }
     }
-
-    /// Consumes the batch and returns a vector of messages.
-    pub fn into_messages(self) -> Vec<IggyMessage> {
-        if self.is_empty() {
-            return Vec::new();
-        }
-
-        let mut result = Vec::with_capacity(self.count as usize);
-
-        for i in 0..self.count as usize {
-            if let Some((start, end)) = self.get_message_boundaries(i) {
-                if let Ok(message) = IggyMessage::from_bytes(self.messages.slice(start..end)) {
-                    result.push(message);
-                }
-            }
-        }
-
-        result
-    }
-}
-
-impl IntoIterator for IggyMessagesBatch {
-    type Item = IggyMessage;
-    type IntoIter = std::vec::IntoIter<IggyMessage>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.into_messages().into_iter()
-    }
 }
 
 impl Index<usize> for IggyMessagesBatch {

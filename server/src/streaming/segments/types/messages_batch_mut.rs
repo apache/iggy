@@ -84,8 +84,8 @@ impl IggyMessagesBatchMut {
     /// Creates a new messages container from a slice of IggyMessage objects.
     ///
     /// # Note
-    /// This function should be used only for testing purposes, because it creates
-    /// deep copies of the messages.
+    /// This function should be used only for testing purposes,
+    /// because it creates deep copies of the messages.
     ///
     /// # Arguments
     ///
@@ -160,7 +160,6 @@ impl IggyMessagesBatchMut {
         let mut invalid_messages_indexes =
             deduplicator.map(|_| Vec::with_capacity(messages_count as usize));
 
-        // let (mut indexes, mut messages) = self.decompose();
         self.indexes.set_base_position(current_position);
         let mut iter: IggyMessageViewMutIterator<'_> =
             IggyMessageViewMutIterator::new(&mut self.messages);
@@ -175,7 +174,7 @@ impl IggyMessagesBatchMut {
 
             if let Some(deduplicator) = deduplicator {
                 if !deduplicator.try_insert(message.header().id()).await {
-                    warn!(
+                    eprintln!(
                         "Detected duplicate message ID {}, removing...",
                         message.header().id()
                     );
@@ -528,7 +527,7 @@ impl IggyMessagesBatchMut {
         }
 
         let msg_count = self.count() as usize;
-        if indexes_to_remove.len() >= msg_count {
+        if indexes_to_remove.len() > msg_count {
             return;
         }
 
@@ -543,6 +542,8 @@ impl IggyMessagesBatchMut {
                     })
             })
             .collect();
+
+        eprintln!("boundaries_to_remove: {boundaries_to_remove:?}");
 
         assert_eq!(
             boundaries_to_remove.len(),
@@ -599,6 +600,9 @@ impl IggyMessagesBatchMut {
                 chunk_len,
             );
         }
+
+        self.messages = new_buffer;
+        self.indexes = new_indexes;
     }
 
     /// Validates that all messages in batch have correct checksums.
@@ -787,7 +791,8 @@ impl Validatable<IggyError> for IggyMessagesBatchMut {
         }
 
         self.validate_indexes_structure()?;
-        self.validate_message_contents()
+        self.validate_message_contents()?;
+        Ok(())
     }
 }
 
@@ -825,61 +830,5 @@ impl Deref for IggyMessagesBatchMut {
 
     fn deref(&self) -> &Self::Target {
         &self.messages
-    }
-}
-
-/// Iterator over messages batch that yields immutable message views
-pub struct IggyMessageViewIterator<'a> {
-    buffer: &'a BytesMut,
-    position: usize,
-}
-
-impl<'a> IggyMessageViewIterator<'a> {
-    pub fn new(buffer: &'a BytesMut) -> Self {
-        Self {
-            buffer,
-            position: 0,
-        }
-    }
-}
-
-impl<'a> Iterator for IggyMessageViewIterator<'a> {
-    type Item = IggyMessageView<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.position >= self.buffer.len() {
-            return None;
-        }
-
-        let remaining = &self.buffer[self.position..];
-        if remaining.len() < IGGY_MESSAGE_HEADER_SIZE {
-            error!(
-                "Buffer too small for message header at position {}, buffer len: {}",
-                self.position,
-                self.buffer.len()
-            );
-            return None;
-        }
-
-        let header_view = IggyMessageHeaderView::new(remaining);
-        let message_size = header_view.payload_length()
-            + header_view.user_headers_length()
-            + IGGY_MESSAGE_HEADER_SIZE;
-
-        if message_size > remaining.len() {
-            error!(
-                "Message size {} exceeds remaining buffer size {} at position {}",
-                message_size,
-                remaining.len(),
-                self.position
-            );
-            return None;
-        }
-
-        let message_view =
-            IggyMessageView::new(&self.buffer[self.position..self.position + message_size]);
-        self.position += message_size;
-
-        Some(message_view)
     }
 }
