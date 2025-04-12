@@ -174,7 +174,7 @@ impl IggyMessagesBatchMut {
 
             if let Some(deduplicator) = deduplicator {
                 if !deduplicator.try_insert(message.header().id()).await {
-                    eprintln!(
+                    warn!(
                         "Detected duplicate message ID {}, removing...",
                         message.header().id()
                     );
@@ -513,15 +513,15 @@ impl IggyMessagesBatchMut {
     /// A new `IggyMessagesBatchMut` with the specified messages removed
     pub fn remove_messages(&mut self, indexes_to_remove: &[u32], current_position: u32) {
         /*
-            A temporary list of message boundaries is first collected for each index
-            that should be removed. Chunks of data that are not removed are appended
-            to a new buffer, and indexes are rebuilt to reflect the shifted positions.
-            In this process, split_to() is used to carve out slices from the source
-            buffer, and those slices are either copied or discarded, depending on
-            whether they are part of the messages that are to be removed.
-            This allows for avoiding copying unnecessary data and ensures that indexes
-            match the newly constructed buffer.
-        */
+         *  A temporary list of message boundaries is first collected for each index
+         *  that should be removed. Chunks of data that are not removed are appended
+         *  to a new buffer, and indexes are rebuilt to reflect the shifted positions.
+         *  In this process, split_to() is used to carve out slices from the source
+         *  buffer, and those slices are either copied or discarded, depending on
+         *  whether they are part of the messages that are to be removed.
+         *  This allows for avoiding copying unnecessary data and ensures that indexes
+         *  match the newly constructed buffer.
+         */
         if indexes_to_remove.is_empty() || self.is_empty() {
             return;
         }
@@ -542,8 +542,6 @@ impl IggyMessagesBatchMut {
                     })
             })
             .collect();
-
-        eprintln!("boundaries_to_remove: {boundaries_to_remove:?}");
 
         assert_eq!(
             boundaries_to_remove.len(),
