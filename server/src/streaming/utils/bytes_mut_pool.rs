@@ -36,12 +36,14 @@ pub struct BytesMutPool {
     extra_large_buffers: Arc<ArrayQueue<BytesMut>>,
     max_buffers: Arc<ArrayQueue<BytesMut>>,
 
-    // Stats
+    // Creation stats
     small_created: Arc<AtomicUsize>,
     medium_created: Arc<AtomicUsize>,
     large_created: Arc<AtomicUsize>,
     extra_large_created: Arc<AtomicUsize>,
     max_created: Arc<AtomicUsize>,
+
+    // Return stats
     small_returned: Arc<AtomicUsize>,
     medium_returned: Arc<AtomicUsize>,
     large_returned: Arc<AtomicUsize>,
@@ -188,30 +190,43 @@ impl BytesMutPool {
 
     /// Log stats about buffer allocation and reuse
     pub fn log_stats(&self) {
+        // How many times a buffer was created
         let sm_created = self.small_created.load(Ordering::Relaxed);
         let md_created = self.medium_created.load(Ordering::Relaxed);
         let lg_created = self.large_created.load(Ordering::Relaxed);
         let xl_created = self.extra_large_created.load(Ordering::Relaxed);
         let mx_created = self.max_created.load(Ordering::Relaxed);
 
-        let sm_returned = self.small_returned.load(Ordering::Relaxed);
-        let md_returned = self.medium_returned.load(Ordering::Relaxed);
-        let lg_returned = self.large_returned.load(Ordering::Relaxed);
-        let xl_returned = self.extra_large_returned.load(Ordering::Relaxed);
-        let mx_returned = self.max_returned.load(Ordering::Relaxed);
+        // Limit of each buffer pool
+        let sm_limit = Self::SMALL_POOL_SIZE;
+        let md_limit = Self::MEDIUM_POOL_SIZE;
+        let lg_limit = Self::LARGE_POOL_SIZE;
+        let xl_limit = Self::EXTRA_LARGE_POOL_SIZE;
+        let mx_limit = Self::MAX_POOL_SIZE;
 
-        let sm_pool = self.small_buffers.len();
-        let md_pool = self.medium_buffers.len();
-        let lg_pool = self.large_buffers.len();
-        let xl_pool = self.extra_large_buffers.len();
-        let mx_pool = self.max_buffers.len();
+        // How many buffers are currently in use
+        let sm_used = self.small_buffers.len();
+        let md_used = self.medium_buffers.len();
+        let lg_used = self.large_buffers.len();
+        let xl_used = self.extra_large_buffers.len();
+        let mx_used = self.max_buffers.len();
 
-        let sm_size = IggyByteSize::from((sm_pool * Self::SMALL_BUFFER_SIZE) as u64);
-        let md_size = IggyByteSize::from((md_pool * Self::MEDIUM_BUFFER_SIZE) as u64);
-        let lg_size = IggyByteSize::from((lg_pool * Self::LARGE_BUFFER_SIZE) as u64);
-        let xl_size = IggyByteSize::from((xl_pool * Self::EXTRA_LARGE_BUFFER_SIZE) as u64);
-        let mx_size = IggyByteSize::from((mx_pool * Self::MAX_BUFFER_SIZE) as u64);
-        let limit_size = IggyByteSize::from(
+        // Utilization of each buffer pool
+        let sm_util = sm_used as f64 / sm_limit as f64 * 100.0;
+        let md_util = md_used as f64 / md_limit as f64 * 100.0;
+        let lg_util = lg_used as f64 / lg_limit as f64 * 100.0;
+        let xl_util = xl_used as f64 / xl_limit as f64 * 100.0;
+        let mx_util = mx_used as f64 / mx_limit as f64 * 100.0;
+
+        // Size of each buffer pool
+        let sm_size = IggyByteSize::from((sm_used * Self::SMALL_BUFFER_SIZE) as u64);
+        let md_size = IggyByteSize::from((md_used * Self::MEDIUM_BUFFER_SIZE) as u64);
+        let lg_size = IggyByteSize::from((lg_used * Self::LARGE_BUFFER_SIZE) as u64);
+        let xl_size = IggyByteSize::from((xl_used * Self::EXTRA_LARGE_BUFFER_SIZE) as u64);
+        let mx_size = IggyByteSize::from((mx_used * Self::MAX_BUFFER_SIZE) as u64);
+
+        // Total limit of the buffer pool
+        let total_limit_size = IggyByteSize::from(
             (Self::SMALL_BUFFER_SIZE * Self::SMALL_POOL_SIZE
                 + Self::MEDIUM_BUFFER_SIZE * Self::MEDIUM_POOL_SIZE
                 + Self::LARGE_BUFFER_SIZE * Self::LARGE_POOL_SIZE
@@ -219,29 +234,34 @@ impl BytesMutPool {
                 + Self::MAX_BUFFER_SIZE * Self::MAX_POOL_SIZE) as u64,
         );
 
+        // Total size of the buffer pool
         let current_total_size = IggyByteSize::from(
-            (sm_pool * Self::SMALL_BUFFER_SIZE
-                + md_pool * Self::MEDIUM_BUFFER_SIZE
-                + lg_pool * Self::LARGE_BUFFER_SIZE
-                + xl_pool * Self::EXTRA_LARGE_BUFFER_SIZE
-                + mx_pool * Self::MAX_BUFFER_SIZE) as u64,
+            (sm_created * Self::SMALL_BUFFER_SIZE
+                + md_created * Self::MEDIUM_BUFFER_SIZE
+                + lg_created * Self::LARGE_BUFFER_SIZE
+                + xl_created * Self::EXTRA_LARGE_BUFFER_SIZE
+                + mx_created * Self::MAX_BUFFER_SIZE) as u64,
         );
-        let utilization =
-            current_total_size.as_bytes_u64() as f64 / limit_size.as_bytes_u64() as f64 * 100.0;
 
-        let sm_util = sm_pool as f64 / Self::SMALL_POOL_SIZE as f64 * 100.0;
-        let md_util = md_pool as f64 / Self::MEDIUM_POOL_SIZE as f64 * 100.0;
-        let lg_util = lg_pool as f64 / Self::LARGE_POOL_SIZE as f64 * 100.0;
-        let xl_util = xl_pool as f64 / Self::EXTRA_LARGE_POOL_SIZE as f64 * 100.0;
-        let mx_util = mx_pool as f64 / Self::MAX_POOL_SIZE as f64 * 100.0;
+        // Utilization of the buffer pool
+        let total_util = current_total_size.as_bytes_u64() as f64
+            / total_limit_size.as_bytes_u64() as f64
+            * 100.0;
 
-        info!("BytesPool: {}/{}/{:.1}% (Current/Limit/Utilization), Small[{}/{}|{:.1}%|{}] Medium[{}/{}|{:.1}%|{}] Large[{}/{}|{:.1}%|{}] XLarge[{}/{}|{:.1}%|{}] Max[{}/{}|{:.1}%|{}] (Created/Returned|Utilization|Current)",
-           current_total_size, limit_size, utilization,
-           sm_created, sm_returned, sm_util, sm_size,
-           md_created, md_returned, md_util, md_size,
-           lg_created, lg_returned, lg_util, lg_size,
-           xl_created, xl_returned, xl_util, xl_size,
-           mx_created, mx_returned, mx_util, mx_size,
+        // How many times a buffer was returned to pool
+        let sm_returned = self.small_returned.load(Ordering::Relaxed);
+        let md_returned = self.medium_returned.load(Ordering::Relaxed);
+        let lg_returned = self.large_returned.load(Ordering::Relaxed);
+        let xl_returned = self.extra_large_returned.load(Ordering::Relaxed);
+        let mx_returned = self.max_returned.load(Ordering::Relaxed);
+
+        info!("BytesPool: {}/{}/{:.1}% (Current/Limit/Utilization), Small[{}/{}|{:.1}%|{}|{}] Medium[{}/{}|{:.1}%|{}|{}] Large[{}/{}|{:.1}%|{}|{}] XLarge[{}/{}|{:.1}%|{}|{}] Max[{}/{}|{:.1}%|{}|{}] [Created/Limit|Utilization|Current|Returns]",
+           current_total_size, total_limit_size, total_util,
+           sm_created, sm_limit, sm_util, sm_size, sm_returned,
+           md_created, md_limit, md_util, md_size, md_returned,
+           lg_created, lg_limit, lg_util, lg_size, lg_returned,
+           xl_created, xl_limit, xl_util, xl_size, xl_returned,
+           mx_created, mx_limit, mx_util, mx_size, mx_returned,
         );
     }
 }
