@@ -51,10 +51,10 @@ axum = "0.8.3"
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
 bcrypt = "0.17.0"
 bincode = { version = "2.0.1", features = ["serde"] }
-blake3 = "1.7.0"
+blake3 = "1.8.1"
 bytes = "1.10.1"
 chrono = "0.4.40"
-clap = { version = "4.5.34", features = ["derive"] }
+clap = { version = "4.5.36", features = ["derive"] }
 console-subscriber = { version = "0.4.1", optional = true }
 crossbeam = "0.8.4"
 dashmap = "6.1.0"
@@ -74,8 +74,8 @@ mimalloc = { version = "0.1", optional = true }
 moka = { version = "0.12.10", features = ["future"] }
 nix = { version = "0.29", features = ["fs"] }
 once_cell = "1.21.3"
-openssl = { version = "0.10.71", features = ["vendored"] }
-opentelemetry = { version = "0.29.0", features = ["trace", "logs"] }
+openssl = { version = "0.10.72", features = ["vendored"] }
+opentelemetry = { version = "0.29.1", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.29.1", features = ["log"] }
 opentelemetry-otlp = { version = "0.29.0", features = [
     "logs",
@@ -103,19 +103,19 @@ reqwest = { version = "0.12.15", features = [
     "rustls-tls",
     "rustls-tls-no-provider",
 ] }
-ring = "0.17.9"
+ring = "0.17.14"
 rust-s3 = { version = "0.35.1", features = ["default"] }
-rustls = { version = "0.23.25" }
+rustls = { version = "0.23.26" }
 rustls-pemfile = "2.2.0"
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = "1.0.140"
 serde_with = { version = "3.12.0", features = ["base64", "macros"] }
 static-toml = "1.3.0"
 strum = { version = "0.27.1", features = ["derive"] }
-sysinfo = "0.34.1"
+sysinfo = "0.34.2"
 tempfile = "3.19"
 thiserror = "2.0.12"
-tokio = { version = "1.44.1", features = ["full"] }
+tokio = { version = "1.44.2", features = ["full"] }
 tokio-native-tls = "0.3.1"
 tokio-util = { version = "0.7.14", features = ["compat"] }
 toml = "0.8.20"
@@ -130,12 +130,12 @@ tracing-opentelemetry = { version = "0.30.0" }
 tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter"] }
 twox-hash = { version = "2.1.0", features = ["xxhash32"] }
 ulid = "1.2.1"
-uuid = { version = "1.13.2", features = ["v7", "fast-rng", "zerocopy"] }
+uuid = { version = "1.16.0", features = ["v7", "fast-rng", "zerocopy"] }
 
 [build-dependencies]
 figment = { version = "0.10.19", features = ["json", "toml", "env"] }
 serde_json = "1.0.140"
-vergen-git2 = { version = "1.0.5", features = [
+vergen-git2 = { version = "1.0.7", features = [
     "build",
     "cargo",
     "rustc",
