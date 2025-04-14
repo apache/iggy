@@ -22,7 +22,7 @@ edition = "2021"
 license = "Apache-2.0"
 
 [dependencies]
-anyhow = "1.0.97"
+anyhow = "1.0.98"
 clap = { version = "4.5.36", features = ["derive"] }
 iggy = { path = "../sdk" }
 rand = "0.9.0"

@@ -23,7 +23,7 @@ license = "Apache-2.0"
 
 [dependencies]
 ahash = { version = "0.8.11", features = ["serde"] }
-anyhow = "1.0.97"
+anyhow = "1.0.98"
 bytes = "1.10.1"
 clap = { version = "4.5.36", features = ["derive"] }
 futures-util = "0.3.31"
