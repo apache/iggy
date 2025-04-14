@@ -166,6 +166,9 @@ impl Segment {
                 current_segment_size,
                 max_segment_size_from_config
             );
+
+            // Since segment is closing, indexes should be dropped if index cache is disabled
+            // or when only open (last) segment is allowed to have indexes in memory.
             if self.config.segment.cache_indexes == CacheIndexesConfig::OpenSegment
                 || self.config.segment.cache_indexes == CacheIndexesConfig::None
             {

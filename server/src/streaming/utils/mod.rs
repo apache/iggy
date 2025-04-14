@@ -23,7 +23,7 @@ pub mod head_tail_buf;
 pub mod random_id;
 
 mod memory_pool;
-mod pooled_bytes_mut;
+mod pooled_buffer;
 
 pub use memory_pool::{memory_pool, MemoryPool};
-pub use pooled_bytes_mut::PooledBytesMut;
+pub use pooled_buffer::PooledBuffer;

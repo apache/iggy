@@ -16,8 +16,7 @@
  * under the License.
  */
 
-use crate::streaming::utils::PooledBytesMut;
-use bytes::BufMut;
+use crate::streaming::utils::PooledBuffer;
 use iggy::models::messaging::{IggyIndexView, INDEX_SIZE};
 use std::fmt;
 use std::ops::{Deref, Index as StdIndex};
@@ -26,7 +25,7 @@ use std::ops::{Deref, Index as StdIndex};
 /// Optimized for efficient storage and I/O operations.
 #[derive(Default)]
 pub struct IggyIndexesMut {
-    buffer: PooledBytesMut,
+    buffer: PooledBuffer,
     saved_count: u32,
     base_position: u32,
 }
@@ -35,14 +34,14 @@ impl IggyIndexesMut {
     /// Creates a new empty container
     pub fn empty() -> Self {
         Self {
-            buffer: PooledBytesMut::empty(),
+            buffer: PooledBuffer::empty(),
             saved_count: 0,
             base_position: 0,
         }
     }
 
     /// Creates indexes from bytes
-    pub fn from_bytes(indexes: PooledBytesMut, base_position: u32) -> Self {
+    pub fn from_bytes(indexes: PooledBuffer, base_position: u32) -> Self {
         Self {
             buffer: indexes,
             saved_count: 0,
@@ -51,9 +50,9 @@ impl IggyIndexesMut {
     }
 
     /// Decompose the container into its components
-    pub fn decompose(mut self) -> (u32, PooledBytesMut) {
+    pub fn decompose(mut self) -> (u32, PooledBuffer) {
         let base_position = self.base_position;
-        let buffer = std::mem::replace(&mut self.buffer, PooledBytesMut::empty());
+        let buffer = std::mem::replace(&mut self.buffer, PooledBuffer::empty());
         (base_position, buffer)
     }
 
@@ -82,7 +81,7 @@ impl IggyIndexesMut {
     /// Creates a new container with the specified capacity
     pub fn with_capacity(capacity: usize, base_position: u32) -> Self {
         Self {
-            buffer: PooledBytesMut::with_capacity(capacity * INDEX_SIZE),
+            buffer: PooledBuffer::with_capacity(capacity * INDEX_SIZE),
             saved_count: 0,
             base_position,
         }
@@ -249,7 +248,7 @@ impl IggyIndexesMut {
 
         let start_byte = relative_start_offset as usize * INDEX_SIZE;
         let end_byte = end_pos as usize * INDEX_SIZE;
-        let slice = PooledBytesMut::from(&self.buffer[start_byte..end_byte]);
+        let slice = PooledBuffer::from(&self.buffer[start_byte..end_byte]);
 
         if relative_start_offset == 0 {
             Some(IggyIndexesMut::from_bytes(slice, self.base_position))
@@ -278,7 +277,7 @@ impl IggyIndexesMut {
 
         let start_byte = start_index_pos as usize * INDEX_SIZE;
         let end_byte = end_pos as usize * INDEX_SIZE;
-        let slice = PooledBytesMut::from(&self.buffer[start_byte..end_byte]);
+        let slice = PooledBuffer::from(&self.buffer[start_byte..end_byte]);
 
         let base_position = if start_index_pos > 0 {
             self.get(start_index_pos - 1).unwrap().position()

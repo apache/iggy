@@ -21,9 +21,8 @@ use crate::streaming::storage::SystemInfoStorage;
 use crate::streaming::systems::info::SystemInfo;
 use crate::streaming::systems::COMPONENT;
 use crate::streaming::utils::file;
-use crate::streaming::utils::PooledBytesMut;
+use crate::streaming::utils::PooledBuffer;
 use anyhow::Context;
-use bytes::BufMut;
 use error_set::ErrContext;
 use iggy::error::IggyError;
 use std::sync::Arc;
@@ -61,7 +60,7 @@ impl SystemInfoStorage for FileSystemInfoStorage {
             })
             .map_err(|_| IggyError::CannotReadFileMetadata)?
             .len() as usize;
-        let mut buffer = PooledBytesMut::with_capacity(file_size);
+        let mut buffer = PooledBuffer::with_capacity(file_size);
         buffer.put_bytes(0, file_size);
         file.read_exact(&mut buffer)
             .await

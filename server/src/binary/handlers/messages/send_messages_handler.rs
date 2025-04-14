@@ -21,7 +21,7 @@ use crate::binary::sender::SenderKind;
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
-use crate::streaming::utils::PooledBytesMut;
+use crate::streaming::utils::PooledBuffer;
 use anyhow::Result;
 use iggy::error::IggyError;
 use iggy::identifier::Identifier;
@@ -56,7 +56,7 @@ impl ServerCommandHandler for SendMessages {
         sender.read(&mut metadata_length_buffer).await?;
         let metadata_size = u32::from_le_bytes(metadata_length_buffer);
 
-        let mut metadata_buffer = PooledBytesMut::with_capacity(metadata_size as usize);
+        let mut metadata_buffer = PooledBuffer::with_capacity(metadata_size as usize);
         unsafe { metadata_buffer.set_len(metadata_size as usize) };
         sender.read(&mut metadata_buffer).await?;
 
@@ -81,13 +81,13 @@ impl ServerCommandHandler for SendMessages {
         );
         let indexes_size = messages_count as usize * INDEX_SIZE;
 
-        let mut indexes_buffer = PooledBytesMut::with_capacity(indexes_size);
+        let mut indexes_buffer = PooledBuffer::with_capacity(indexes_size);
         unsafe { indexes_buffer.set_len(indexes_size) };
         sender.read(&mut indexes_buffer).await?;
 
         let messages_size =
             total_payload_size - metadata_size as usize - indexes_size - metadata_len_field_size;
-        let mut messages_buffer = PooledBytesMut::with_capacity(messages_size);
+        let mut messages_buffer = PooledBuffer::with_capacity(messages_size);
         unsafe { messages_buffer.set_len(messages_size) };
         sender.read(&mut messages_buffer).await?;
 

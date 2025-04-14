@@ -20,7 +20,7 @@ use super::message_view_mut::IggyMessageViewMutIterator;
 use crate::streaming::deduplication::message_deduplicator::MessageDeduplicator;
 use crate::streaming::segments::indexes::IggyIndexesMut;
 use crate::streaming::utils::random_id;
-use crate::streaming::utils::PooledBytesMut;
+use crate::streaming::utils::PooledBuffer;
 use bytes::{BufMut, BytesMut};
 use iggy::messages::MAX_PAYLOAD_SIZE;
 use iggy::models::messaging::{IggyIndexView, INDEX_SIZE};
@@ -43,7 +43,7 @@ pub struct IggyMessagesBatchMut {
     indexes: IggyIndexesMut,
 
     /// The buffer containing the serialized message data
-    messages: PooledBytesMut,
+    messages: PooledBuffer,
 }
 
 impl Sizeable for IggyMessagesBatchMut {
@@ -58,7 +58,7 @@ impl IggyMessagesBatchMut {
         Self {
             count: 0,
             indexes: IggyIndexesMut::empty(),
-            messages: PooledBytesMut::empty(),
+            messages: PooledBuffer::empty(),
         }
     }
 
@@ -72,7 +72,7 @@ impl IggyMessagesBatchMut {
     pub fn from_indexes_and_messages(
         count: u32,
         indexes: IggyIndexesMut,
-        messages: PooledBytesMut,
+        messages: PooledBuffer,
     ) -> Self {
         Self {
             count,
@@ -92,7 +92,7 @@ impl IggyMessagesBatchMut {
     /// * `messages` - Slice of message objects to store
     /// * `messages_size` - Total size of all messages in bytes
     pub fn from_messages(messages: &[IggyMessage], messages_size: u32) -> Self {
-        let mut messages_buffer = PooledBytesMut::with_capacity(messages_size as usize);
+        let mut messages_buffer = PooledBuffer::with_capacity(messages_size as usize);
         let mut indexes_buffer = IggyIndexesMut::with_capacity(messages.len(), 0);
         let mut position = 0;
 
@@ -256,9 +256,9 @@ impl IggyMessagesBatchMut {
     }
 
     /// Decomposes the batch into its constituent parts.
-    pub fn decompose(mut self) -> (IggyIndexesMut, PooledBytesMut) {
+    pub fn decompose(mut self) -> (IggyIndexesMut, PooledBuffer) {
         let indexes = std::mem::replace(&mut self.indexes, IggyIndexesMut::empty());
-        let messages = std::mem::replace(&mut self.messages, PooledBytesMut::empty());
+        let messages = std::mem::replace(&mut self.messages, PooledBuffer::empty());
 
         (indexes, messages)
     }
@@ -353,7 +353,7 @@ impl IggyMessagesBatchMut {
 
         // TODO(hubcio): messages from accumulator unfortunately are deep-copied
         let mut sub_buffer =
-            PooledBytesMut::with_capacity(last_message_position - first_message_position);
+            PooledBuffer::with_capacity(last_message_position - first_message_position);
         sub_buffer.put_slice(&self.messages[first_message_position..last_message_position]);
 
         Some(IggyMessagesBatchMut {
@@ -554,7 +554,7 @@ impl IggyMessagesBatchMut {
         let new_size = current_size - size_to_remove;
         let new_message_count = msg_count as u32 - indexes_to_remove.len() as u32;
 
-        let mut new_buffer = PooledBytesMut::with_capacity(new_size as usize);
+        let mut new_buffer = PooledBuffer::with_capacity(new_size as usize);
         let mut new_indexes =
             IggyIndexesMut::with_capacity(new_message_count as usize, current_position);
 

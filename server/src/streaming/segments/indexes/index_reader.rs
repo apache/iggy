@@ -17,7 +17,7 @@
  */
 
 use super::IggyIndexesMut;
-use crate::streaming::utils::PooledBytesMut;
+use crate::streaming::utils::PooledBuffer;
 use bytes::BytesMut;
 use error_set::ErrContext;
 use iggy::models::messaging::{IggyIndex, INDEX_SIZE};
@@ -360,11 +360,11 @@ impl IndexReader {
         offset: u32,
         len: u32,
         use_pool: bool,
-    ) -> Result<PooledBytesMut, std::io::Error> {
+    ) -> Result<PooledBuffer, std::io::Error> {
         let file = self.file.clone();
         spawn_blocking(move || {
             if use_pool {
-                let mut buf = PooledBytesMut::with_capacity(len as usize);
+                let mut buf = PooledBuffer::with_capacity(len as usize);
                 unsafe { buf.set_len(len as usize) };
                 file.read_exact_at(&mut buf, offset as u64)?;
                 Ok(buf)
@@ -372,7 +372,7 @@ impl IndexReader {
                 let mut buf = BytesMut::with_capacity(len as usize);
                 unsafe { buf.set_len(len as usize) };
                 file.read_exact_at(&mut buf, offset as u64)?;
-                Ok(PooledBytesMut::from_existing(buf))
+                Ok(PooledBuffer::from_existing(buf))
             }
         })
         .await?

@@ -21,7 +21,7 @@ use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessa
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::System;
 use crate::streaming::systems::COMPONENT;
-use crate::streaming::utils::PooledBytesMut;
+use crate::streaming::utils::PooledBuffer;
 use error_set::ErrContext;
 use iggy::confirmation::Confirmation;
 use iggy::consumer::Consumer;
@@ -163,7 +163,7 @@ impl System {
             let count = batch.count();
 
             let mut indexes = IggyIndexesMut::with_capacity(batch.count() as usize, 0);
-            let mut decrypted_messages = PooledBytesMut::with_capacity(batch.size() as usize);
+            let mut decrypted_messages = PooledBuffer::with_capacity(batch.size() as usize);
             let mut position = 0;
 
             for message in batch.iter() {
@@ -197,7 +197,7 @@ impl System {
         batch: IggyMessagesBatchMut,
         encryptor: &EncryptorKind,
     ) -> Result<IggyMessagesBatchMut, IggyError> {
-        let mut encrypted_messages = PooledBytesMut::with_capacity(batch.size() as usize * 2);
+        let mut encrypted_messages = PooledBuffer::with_capacity(batch.size() as usize * 2);
         let count = batch.count();
         let mut indexes = IggyIndexesMut::with_capacity(batch.count() as usize, 0);
         let mut position = 0;
