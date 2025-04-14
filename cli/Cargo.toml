@@ -33,8 +33,8 @@ login-session = ["dep:keyring"]
 
 [dependencies]
 ahash = { version = "0.8.11", features = ["serde"] }
-anyhow = "1.0.97"
-clap = { version = "4.5.34", features = ["derive"] }
+anyhow = "1.0.98"
+clap = { version = "4.5.36", features = ["derive"] }
 clap_complete = "4.5.47"
 figlet-rs = "0.1.5"
 iggy = { path = "../sdk", features = ["iggy-cli"], version = "0.6.210" }
@@ -42,9 +42,9 @@ keyring = { version = "3.6.2", features = [
     "sync-secret-service",
     "vendored",
 ], optional = true }
-passterm = "=2.0.1"
+passterm = "=2.0.5"
 thiserror = "2.0.12"
-tokio = { version = "1.44.1", features = ["full"] }
+tokio = { version = "1.44.2", features = ["full"] }
 tracing = "0.1.41"
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.19", default-features = false, features = [
