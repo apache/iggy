@@ -61,6 +61,7 @@ async fn should_persist_segment() {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            true,
         );
 
         setup
@@ -98,6 +99,7 @@ async fn should_load_existing_segment_from_disk() {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            true,
         );
         setup
             .create_partition_directory(stream_id, topic_id, partition_id)
@@ -124,6 +126,7 @@ async fn should_load_existing_segment_from_disk() {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            false,
         );
         loaded_segment.load_from_disk().await.unwrap();
         let loaded_messages = loaded_segment.get_messages_by_offset(0, 10).await.unwrap();
@@ -165,6 +168,7 @@ async fn should_persist_and_load_segment_with_messages() {
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
+        true,
     );
 
     setup
@@ -203,6 +207,7 @@ async fn should_persist_and_load_segment_with_messages() {
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
+        false,
     );
     loaded_segment.load_from_disk().await.unwrap();
     let messages = loaded_segment
@@ -239,6 +244,7 @@ async fn should_persist_and_load_segment_with_messages_with_nowait_confirmation(
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
+        true,
     );
 
     setup
@@ -280,6 +286,7 @@ async fn should_persist_and_load_segment_with_messages_with_nowait_confirmation(
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
+        false,
     );
     loaded_segment.load_from_disk().await.unwrap();
     let messages = loaded_segment
@@ -322,6 +329,7 @@ async fn given_all_expired_messages_segment_should_be_expired() {
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
+        true,
     );
 
     setup
@@ -386,6 +394,7 @@ async fn given_at_least_one_not_expired_message_segment_should_not_be_expired() 
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
+        true,
     );
 
     setup

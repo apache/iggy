@@ -17,7 +17,7 @@
  */
 
 use super::IggyIndexesMut;
-use crate::streaming::utils::bytes_mut_pool::{BytesMutExt, BYTES_MUT_POOL};
+use crate::streaming::utils::PooledBytesMut;
 use bytes::BytesMut;
 use error_set::ErrContext;
 use iggy::models::messaging::{IggyIndex, INDEX_SIZE};
@@ -83,13 +83,16 @@ impl IndexReader {
     }
 
     /// Loads all indexes from the index file into the optimized binary format.
+    /// Note that this function does not use the pool, as the messages are not cached.
+    /// This is expected - this method is called at startup and we want to preserve
+    /// memory pool usage.
     pub async fn load_all_indexes_from_disk(&self) -> Result<IggyIndexesMut, IggyError> {
         let file_size = self.file_size();
         if file_size == 0 {
             return Ok(IggyIndexesMut::empty());
         }
 
-        let buf = match self.read_at(0, file_size).await {
+        let buf = match self.read_at(0, file_size, false).await {
             Ok(buf) => buf,
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
                 return Ok(IggyIndexesMut::empty());
@@ -161,7 +164,7 @@ impl IndexReader {
         let end_byte = start_byte + (actual_count as usize * INDEX_SIZE);
 
         let indexes_bytes = match self
-            .read_at(start_byte as u32, (end_byte - start_byte) as u32)
+            .read_at(start_byte as u32, (end_byte - start_byte) as u32, true)
             .await
         {
             Ok(buf) => buf,
@@ -246,7 +249,7 @@ impl IndexReader {
         let end_byte = start_byte + (actual_count as usize * INDEX_SIZE);
 
         let indexes_bytes = match self
-            .read_at(start_byte as u32, (end_byte - start_byte) as u32)
+            .read_at(start_byte as u32, (end_byte - start_byte) as u32, true)
             .await
         {
             Ok(buf) => buf,
@@ -352,13 +355,25 @@ impl IndexReader {
     }
 
     /// Reads a specified number of bytes from the index file at a given offset.
-    async fn read_at(&self, offset: u32, len: u32) -> Result<BytesMut, std::io::Error> {
+    async fn read_at(
+        &self,
+        offset: u32,
+        len: u32,
+        use_pool: bool,
+    ) -> Result<PooledBytesMut, std::io::Error> {
         let file = self.file.clone();
         spawn_blocking(move || {
-            let mut buf = BYTES_MUT_POOL.get_buffer(len as usize);
-            unsafe { buf.set_len(len as usize) };
-            file.read_exact_at(&mut buf, offset as u64)?;
-            Ok(buf)
+            if use_pool {
+                let mut buf = PooledBytesMut::with_capacity(len as usize);
+                unsafe { buf.set_len(len as usize) };
+                file.read_exact_at(&mut buf, offset as u64)?;
+                Ok(buf)
+            } else {
+                let mut buf = BytesMut::with_capacity(len as usize);
+                unsafe { buf.set_len(len as usize) };
+                file.read_exact_at(&mut buf, offset as u64)?;
+                Ok(PooledBytesMut::from_existing(buf))
+            }
         })
         .await?
     }
@@ -382,7 +397,7 @@ impl IndexReader {
 
         let offset = position * INDEX_SIZE as u32;
 
-        let buf = match self.read_at(offset, INDEX_SIZE as u32).await {
+        let buf = match self.read_at(offset, INDEX_SIZE as u32, true).await {
             Ok(buf) => buf,
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
                 return Ok(None);
@@ -397,7 +412,6 @@ impl IndexReader {
         };
 
         let index = IggyIndexView::new(&buf).to_index();
-        buf.return_to_pool();
 
         Ok(Some(index))
     }

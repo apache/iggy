@@ -16,9 +16,8 @@
  * under the License.
  */
 
-use iggy::utils::byte_size::IggyByteSize;
-use iggy::utils::duration::IggyDuration;
-
+use super::system::MemoryPoolConfig;
+use super::tcp::TcpSocketConfig;
 use crate::configs::http::{
     HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig,
 };
@@ -35,10 +34,10 @@ use crate::configs::system::{
     StateConfig, StreamConfig, SystemConfig, TopicConfig,
 };
 use crate::configs::tcp::{TcpConfig, TcpTlsConfig};
+use iggy::utils::byte_size::IggyByteSize;
+use iggy::utils::duration::IggyDuration;
 use std::sync::Arc;
 use std::time::Duration;
-
-use super::tcp::TcpSocketConfig;
 
 static_toml::static_toml! {
     // static_toml crate always starts from CARGO_MANIFEST_DIR (in this case iggy-server root directory)
@@ -323,6 +322,7 @@ impl Default for SystemConfig {
             compression: CompressionConfig::default(),
             message_deduplication: MessageDeduplicationConfig::default(),
             recovery: RecoveryConfig::default(),
+            memory_pool: MemoryPoolConfig::default(),
         }
     }
 }
@@ -490,6 +490,15 @@ impl Default for RecoveryConfig {
     fn default() -> RecoveryConfig {
         RecoveryConfig {
             recreate_missing_state: SERVER_CONFIG.system.recovery.recreate_missing_state,
+        }
+    }
+}
+
+impl Default for MemoryPoolConfig {
+    fn default() -> MemoryPoolConfig {
+        MemoryPoolConfig {
+            enabled: SERVER_CONFIG.system.memory_pool.enabled,
+            size: SERVER_CONFIG.system.memory_pool.size.parse().unwrap(),
         }
     }
 }

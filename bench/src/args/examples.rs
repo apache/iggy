@@ -52,7 +52,7 @@ const EXAMPLES: &str = r#"EXAMPLES:
     --message-batches (-b): Total number of batches [default: 1000]
     --message-size (-m): Message size in bytes [default: 1000]
     --start-stream-id (-S): Start stream ID [default: 1]
-    --rate-limit (-r): Optional throughput limit per producer (e.g., "50KB/s", "10MB/s")
+    --rate-limit (-r): Optional throughput limit per actor, as bytes per second (e.g., "50KB", "10MiB", "1GB")
     --warmup-time (-w): Warmup duration [default: 0s]
     --sampling-time (-t): Metrics sampling interval [default: 10ms]
     --moving-average-window (-W): Window size for moving average [default: 20]

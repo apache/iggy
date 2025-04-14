@@ -167,6 +167,7 @@ impl Partition {
                 partition.messages_count_of_parent_stream.clone(),
                 partition.messages_count_of_parent_topic.clone(),
                 partition.messages_count.clone(),
+                true,
             );
             partition.segments.push(segment);
             partition
@@ -204,6 +205,7 @@ mod tests {
     use crate::streaming::partitions::partition::Partition;
     use crate::streaming::persistence::persister::{FileWithSyncPersister, PersisterKind};
     use crate::streaming::storage::SystemStorage;
+    use crate::streaming::utils::MemoryPool;
     use iggy::utils::duration::IggyDuration;
     use iggy::utils::expiry::IggyExpiry;
     use iggy::utils::timestamp::IggyTimestamp;
@@ -221,6 +223,7 @@ mod tests {
             config.clone(),
             Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister {})),
         ));
+        MemoryPool::init_pool(config.clone());
 
         let stream_id = 1;
         let topic_id = 2;

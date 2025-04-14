@@ -282,7 +282,10 @@ impl fmt::Display for Topic {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::streaming::persistence::persister::{FileWithSyncPersister, PersisterKind};
+    use crate::streaming::{
+        persistence::persister::{FileWithSyncPersister, PersisterKind},
+        utils::MemoryPool,
+    };
     use iggy::locking::IggySharedMutFn;
     use std::str::FromStr;
 
@@ -297,6 +300,7 @@ mod tests {
             config.clone(),
             Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister {})),
         ));
+        MemoryPool::init_pool(config.clone());
 
         let stream_id = 1;
         let topic_id = 2;

@@ -22,7 +22,7 @@ use super::server::{
     ArchiverConfig, DataMaintenanceConfig, MessageSaverConfig, MessagesMaintenanceConfig,
     StateMaintenanceConfig, TelemetryConfig,
 };
-use super::system::CompressionConfig;
+use super::system::{CompressionConfig, MemoryPoolConfig};
 use crate::archiver::ArchiverKindType;
 use crate::configs::server::{PersonalAccessTokenConfig, ServerConfig};
 use crate::configs::system::SegmentConfig;
@@ -34,6 +34,7 @@ use iggy::compression::compression_algorithm::CompressionAlgorithm;
 use iggy::utils::expiry::IggyExpiry;
 use iggy::utils::topic_size::MaxTopicSize;
 use iggy::validatable::Validatable;
+use tracing::error;
 
 impl Validatable<ConfigError> for ServerConfig {
     fn validate(&self) -> Result<(), ConfigError> {
@@ -234,6 +235,30 @@ impl Validatable<ConfigError> for PersonalAccessTokenConfig {
         }
 
         if self.cleaner.enabled && self.cleaner.interval.is_zero() {
+            return Err(ConfigError::InvalidConfiguration);
+        }
+
+        Ok(())
+    }
+}
+
+impl Validatable<ConfigError> for MemoryPoolConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.enabled && self.size == 0 {
+            error!(
+                "Server is unable to start because system.memory_pool.enabled is true and system.memory_pool.size is zero"
+            );
+            return Err(ConfigError::InvalidConfiguration);
+        }
+
+        const MIN_POOL_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB
+
+        if self.size < MIN_POOL_SIZE {
+            error!(
+                "Server is unable to start because system.memory_pool.size is less than minimum {} MiB, ({} B)",
+                MIN_POOL_SIZE / (1024 * 1024),
+                MIN_POOL_SIZE
+            );
             return Err(ConfigError::InvalidConfiguration);
         }
 

@@ -38,7 +38,7 @@ use server::log::tokio_console::Logging;
 use server::quic::quic_server;
 use server::server_error::ServerError;
 use server::streaming::systems::system::{SharedSystem, System};
-use server::streaming::utils::bytes_mut_pool::BytesMutPool;
+use server::streaming::utils::MemoryPool;
 use server::tcp::tcp_server;
 use tokio::time::Instant;
 use tracing::{info, instrument};
@@ -95,7 +95,7 @@ async fn main() -> Result<(), ServerError> {
     #[cfg(not(feature = "disable-mimalloc"))]
     info!("Using mimalloc allocator");
 
-    BytesMutPool::init_pool();
+    MemoryPool::init_pool(config.system.clone());
 
     let system = SharedSystem::new(System::new(
         config.system.clone(),

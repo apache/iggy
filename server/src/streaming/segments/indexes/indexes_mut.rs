@@ -16,18 +16,17 @@
  * under the License.
  */
 
-use bytes::{BufMut, BytesMut};
+use crate::streaming::utils::PooledBytesMut;
+use bytes::BufMut;
 use iggy::models::messaging::{IggyIndexView, INDEX_SIZE};
 use std::fmt;
 use std::ops::{Deref, Index as StdIndex};
 
-use crate::streaming::utils::bytes_mut_pool::{BytesMutExt, BYTES_MUT_POOL};
-
 /// A container for binary-encoded index data.
 /// Optimized for efficient storage and I/O operations.
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub struct IggyIndexesMut {
-    buffer: BytesMut,
+    buffer: PooledBytesMut,
     saved_count: u32,
     base_position: u32,
 }
@@ -36,14 +35,14 @@ impl IggyIndexesMut {
     /// Creates a new empty container
     pub fn empty() -> Self {
         Self {
-            buffer: BytesMut::new(),
+            buffer: PooledBytesMut::empty(),
             saved_count: 0,
             base_position: 0,
         }
     }
 
     /// Creates indexes from bytes
-    pub fn from_bytes(indexes: BytesMut, base_position: u32) -> Self {
+    pub fn from_bytes(indexes: PooledBytesMut, base_position: u32) -> Self {
         Self {
             buffer: indexes,
             saved_count: 0,
@@ -52,9 +51,9 @@ impl IggyIndexesMut {
     }
 
     /// Decompose the container into its components
-    pub fn decompose(mut self) -> (u32, BytesMut) {
+    pub fn decompose(mut self) -> (u32, PooledBytesMut) {
         let base_position = self.base_position;
-        let buffer = std::mem::replace(&mut self.buffer, BytesMut::new());
+        let buffer = std::mem::replace(&mut self.buffer, PooledBytesMut::empty());
         (base_position, buffer)
     }
 
@@ -83,7 +82,7 @@ impl IggyIndexesMut {
     /// Creates a new container with the specified capacity
     pub fn with_capacity(capacity: usize, base_position: u32) -> Self {
         Self {
-            buffer: BYTES_MUT_POOL.get_buffer(capacity * INDEX_SIZE),
+            buffer: PooledBytesMut::with_capacity(capacity * INDEX_SIZE),
             saved_count: 0,
             base_position,
         }
@@ -250,7 +249,7 @@ impl IggyIndexesMut {
 
         let start_byte = relative_start_offset as usize * INDEX_SIZE;
         let end_byte = end_pos as usize * INDEX_SIZE;
-        let slice = BytesMut::from(&self.buffer[start_byte..end_byte]);
+        let slice = PooledBytesMut::from(&self.buffer[start_byte..end_byte]);
 
         if relative_start_offset == 0 {
             Some(IggyIndexesMut::from_bytes(slice, self.base_position))
@@ -279,7 +278,7 @@ impl IggyIndexesMut {
 
         let start_byte = start_index_pos as usize * INDEX_SIZE;
         let end_byte = end_pos as usize * INDEX_SIZE;
-        let slice = BytesMut::from(&self.buffer[start_byte..end_byte]);
+        let slice = PooledBytesMut::from(&self.buffer[start_byte..end_byte]);
 
         let base_position = if start_index_pos > 0 {
             self.get(start_index_pos - 1).unwrap().position()
@@ -327,13 +326,6 @@ impl IggyIndexesMut {
         }
 
         Some(low)
-    }
-}
-
-impl Drop for IggyIndexesMut {
-    fn drop(&mut self) {
-        let indexes = std::mem::replace(&mut self.buffer, BytesMut::new());
-        indexes.return_to_pool();
     }
 }
 

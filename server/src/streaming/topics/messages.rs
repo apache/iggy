@@ -211,6 +211,7 @@ mod tests {
     use crate::streaming::persistence::persister::FileWithSyncPersister;
     use crate::streaming::persistence::persister::PersisterKind;
     use crate::streaming::storage::SystemStorage;
+    use crate::streaming::utils::MemoryPool;
     use bytes::Bytes;
     use iggy::compression::compression_algorithm::CompressionAlgorithm;
     use iggy::prelude::IggyMessage;
@@ -335,6 +336,7 @@ mod tests {
             config.clone(),
             Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister {})),
         ));
+        MemoryPool::init_pool(config.clone());
         let stream_id = 1;
         let id = 2;
         let name = "test";

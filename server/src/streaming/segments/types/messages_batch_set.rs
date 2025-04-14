@@ -18,7 +18,6 @@
 
 use crate::binary::handlers::messages::poll_messages_handler::IggyPollMetadata;
 use crate::streaming::segments::IggyIndexesMut;
-use crate::streaming::utils::bytes_mut_pool::BytesMutExt;
 use bytes::Bytes;
 use iggy::models::messaging::IggyMessageView;
 use iggy::prelude::*;
@@ -354,17 +353,6 @@ impl From<Vec<IggyMessagesBatchMut>> for IggyMessagesBatchSet {
 impl From<IggyMessagesBatchMut> for IggyMessagesBatchSet {
     fn from(messages: IggyMessagesBatchMut) -> Self {
         Self::from_vec(vec![messages])
-    }
-}
-
-impl Drop for IggyMessagesBatchSet {
-    fn drop(&mut self) {
-        for batch in self.batches.iter_mut() {
-            let batch = std::mem::take(batch);
-            let (indexes, messages) = batch.decompose();
-            messages.return_to_pool();
-            drop(indexes);
-        }
     }
 }
 

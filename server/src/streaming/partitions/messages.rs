@@ -366,6 +366,7 @@ mod tests {
     use crate::configs::system::{MessageDeduplicationConfig, SystemConfig};
     use crate::streaming::persistence::persister::{FileWithSyncPersister, PersisterKind};
     use crate::streaming::storage::SystemStorage;
+    use crate::streaming::utils::MemoryPool;
     use bytes::Bytes;
     use std::sync::atomic::{AtomicU32, AtomicU64};
     use std::sync::Arc;
@@ -721,6 +722,7 @@ mod tests {
             config.clone(),
             Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister {})),
         ));
+        MemoryPool::init_pool(config.clone());
 
         (
             Partition::create(

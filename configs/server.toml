@@ -502,7 +502,7 @@ cache_indexes = "open_segment"
 # `false` treats each message as unique, even if IDs are duplicated.
 enabled = false
 # Maximum number of ID entries in the deduplication cache (u64).
-max_entries = 1000
+max_entries = 10000
 # Maximum age of ID entries in the deduplication cache in human-readable format.
 expiry = "1 m"
 
@@ -510,3 +510,14 @@ expiry = "1 m"
 [system.recovery]
 # Controls whether streams/topics/partitions should be recreated if the expected data for existing state is missing (boolean).
 recreate_missing_state = false
+
+# Memory pool configuration
+[system.memory_pool]
+# Enables or disables the memory pool (boolean).
+# `true` enables the memory pool.
+# `false` disables the memory pool.
+enabled = true
+# Size of the memory pool (string).
+# Example: "1 GB" or "4096 MiB".
+# This defines the maximum, total memory allocated for the memory pool.
+size = "4 GiB"

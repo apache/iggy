@@ -16,9 +16,14 @@
  * under the License.
  */
 
-pub mod bytes_mut_pool;
 pub mod crypto;
 pub mod file;
 pub mod hash;
 pub mod head_tail_buf;
 pub mod random_id;
+
+mod memory_pool;
+mod pooled_bytes_mut;
+
+pub use memory_pool::{memory_pool, MemoryPool};
+pub use pooled_bytes_mut::PooledBytesMut;

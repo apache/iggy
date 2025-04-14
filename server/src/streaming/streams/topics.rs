@@ -278,6 +278,7 @@ mod tests {
         streaming::{
             persistence::persister::{FileWithSyncPersister, PersisterKind},
             storage::SystemStorage,
+            utils::MemoryPool,
         },
     };
     use iggy::utils::byte_size::IggyByteSize;
@@ -294,6 +295,7 @@ mod tests {
             config.clone(),
             Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister {})),
         ));
+        MemoryPool::init_pool(config.clone());
         let stream_id = 1;
         let stream_name = "test_stream";
         let topic_id = 2;

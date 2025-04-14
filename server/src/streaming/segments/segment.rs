@@ -23,6 +23,7 @@ use crate::configs::system::SystemConfig;
 use crate::streaming::segments::*;
 use error_set::ErrContext;
 use iggy::error::IggyError;
+use iggy::models::messaging::INDEX_SIZE;
 use iggy::utils::byte_size::IggyByteSize;
 use iggy::utils::expiry::IggyExpiry;
 use iggy::utils::timestamp::IggyTimestamp;
@@ -30,6 +31,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::fs::remove_file;
 use tracing::{info, warn};
+
+const SIZE_16MB: usize = 16 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct Segment {
@@ -78,6 +81,7 @@ impl Segment {
         messages_count_of_parent_stream: Arc<AtomicU64>,
         messages_count_of_parent_topic: Arc<AtomicU64>,
         messages_count_of_parent_partition: Arc<AtomicU64>,
+        fresh: bool, // `fresh` means created and persisted in this runtime, in other words it's set to false when loading from disk
     ) -> Segment {
         let path = config.get_segment_path(stream_id, topic_id, partition_id, start_offset);
         let messages_path = Self::get_messages_file_path(&path);
@@ -86,6 +90,10 @@ impl Segment {
             IggyExpiry::ServerDefault => config.segment.message_expiry,
             _ => message_expiry,
         };
+
+        // In order to preserve BytesMut buffer between restarts, initialize it with a capacity 0.
+        // We don't care whether server startup would be couple of seconds longer.
+        let indexes_capacity = if fresh { SIZE_16MB / INDEX_SIZE } else { 0 };
 
         Segment {
             stream_id,
@@ -100,7 +108,7 @@ impl Segment {
             last_index_position: 0,
             max_size_bytes: config.segment.size,
             message_expiry,
-            indexes: IggyIndexesMut::with_capacity(1024 * 1024, 0),
+            indexes: IggyIndexesMut::with_capacity(indexes_capacity, 0),
             accumulator: MessagesAccumulator::default(),
             is_closed: false,
             messages_writer: None,
@@ -430,6 +438,7 @@ mod tests {
     use super::*;
     use crate::configs::cache_indexes::CacheIndexesConfig;
     use crate::configs::system::SegmentConfig;
+    use crate::streaming::utils::MemoryPool;
     use iggy::utils::duration::IggyDuration;
 
     #[tokio::test]
@@ -449,6 +458,7 @@ mod tests {
         let messages_count_of_parent_stream = Arc::new(AtomicU64::new(0));
         let messages_count_of_parent_topic = Arc::new(AtomicU64::new(0));
         let messages_count_of_parent_partition = Arc::new(AtomicU64::new(0));
+        MemoryPool::init_pool(config.clone());
 
         let segment = Segment::create(
             stream_id,
@@ -463,6 +473,7 @@ mod tests {
             messages_count_of_parent_stream,
             messages_count_of_parent_topic,
             messages_count_of_parent_partition,
+            true,
         );
 
         assert_eq!(segment.stream_id, stream_id);
@@ -499,6 +510,7 @@ mod tests {
         let messages_count_of_parent_stream = Arc::new(AtomicU64::new(0));
         let messages_count_of_parent_topic = Arc::new(AtomicU64::new(0));
         let messages_count_of_parent_partition = Arc::new(AtomicU64::new(0));
+        MemoryPool::init_pool(config.clone());
 
         let segment = Segment::create(
             stream_id,
@@ -513,6 +525,7 @@ mod tests {
             messages_count_of_parent_stream,
             messages_count_of_parent_topic,
             messages_count_of_parent_partition,
+            true,
         );
 
         assert!(segment.indexes.is_empty());

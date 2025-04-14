@@ -97,7 +97,10 @@ impl Display for Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::streaming::persistence::persister::{FileWithSyncPersister, PersisterKind};
+    use crate::streaming::{
+        persistence::persister::{FileWithSyncPersister, PersisterKind},
+        utils::MemoryPool,
+    };
 
     #[test]
     fn should_be_created_given_valid_parameters() {
@@ -110,6 +113,7 @@ mod tests {
             config.clone(),
             Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister {})),
         ));
+        MemoryPool::init_pool(config.clone());
         let id = 1;
         let name = "test";
         let config = Arc::new(SystemConfig::default());

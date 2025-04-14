@@ -43,6 +43,7 @@ pub struct SystemConfig {
     pub compression: CompressionConfig,
     pub message_deduplication: MessageDeduplicationConfig,
     pub recovery: RecoveryConfig,
+    pub memory_pool: MemoryPoolConfig,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -125,6 +126,12 @@ pub struct MessageDeduplicationConfig {
 #[derive(Debug, Deserialize, Serialize)]
 pub struct RecoveryConfig {
     pub recreate_missing_state: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct MemoryPoolConfig {
+    pub enabled: bool,
+    pub size: IggyByteSize,
 }
 
 #[serde_as]

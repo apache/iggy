@@ -19,7 +19,7 @@
 use crate::{
     channels::server_command::BackgroundServerCommand,
     configs::server::ServerConfig,
-    streaming::{systems::system::SharedSystem, utils::bytes_mut_pool::BYTES_MUT_POOL},
+    streaming::{systems::system::SharedSystem, utils::memory_pool},
 };
 use flume::{Receiver, Sender};
 use human_repr::HumanCount;
@@ -78,7 +78,7 @@ impl BackgroundServerCommand<SysInfoPrintCommand> for SysInfoPrintExecutor {
             / stats.total_memory.as_bytes_u64() as f64)
             * 100f64;
 
-        info!("CPU: {:.2}% / {:.2}% (IggyUsage/Total), Mem: {:.2}% / {} / {} / {} (Free/IggyUsage/TotalUsed/Total), Clients: {}, Messages processed: {}, Read: {}, Written: {}, Uptime: {}",
+        info!("CPU: {:.2}%/{:.2}% (IggyUsage/Total), Mem: {:.2}%/{}/{}/{} (Free/IggyUsage/TotalUsed/Total), Clients: {}, Messages processed: {}, Read: {}, Written: {}, Uptime: {}",
               stats.cpu_usage,
               stats.total_cpu_usage,
               free_memory_percent,
@@ -91,7 +91,7 @@ impl BackgroundServerCommand<SysInfoPrintCommand> for SysInfoPrintExecutor {
               stats.written_bytes,
               stats.run_time);
 
-        BYTES_MUT_POOL.log_stats();
+        memory_pool().log_stats();
     }
 
     fn start_command_sender(

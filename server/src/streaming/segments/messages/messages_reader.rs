@@ -17,7 +17,7 @@
  */
 
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
-use crate::streaming::utils::bytes_mut_pool::BYTES_MUT_POOL;
+use crate::streaming::utils::PooledBytesMut;
 use bytes::BytesMut;
 use error_set::ErrContext;
 use iggy::error::IggyError;
@@ -87,6 +87,9 @@ impl MessagesReader {
     }
 
     /// Loads and returns all message IDs from the messages file.
+    /// Note that this function does not use the pool, as the messages are not cached.
+    /// This is expected - this method is called at startup and we want to preserve
+    /// memory pool usage.
     pub async fn load_all_message_ids_from_disk(
         &self,
         indexes: IggyIndexesMut,
@@ -97,7 +100,7 @@ impl MessagesReader {
             return Ok(vec![]);
         }
 
-        let messages_bytes = match self.read_at(0, file_size).await {
+        let messages_bytes = match self.read_at(0, file_size, false).await {
             Ok(buf) => buf,
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
                 return Ok(vec![]);
@@ -143,7 +146,7 @@ impl MessagesReader {
             return Ok(IggyMessagesBatchMut::empty());
         }
 
-        let messages_bytes = match self.read_at(start_pos as u64, count_bytes).await {
+        let messages_bytes = match self.read_at(start_pos, count_bytes, true).await {
             Ok(buf) => buf,
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
                 return Ok(IggyMessagesBatchMut::empty());
@@ -170,13 +173,25 @@ impl MessagesReader {
     }
 
     /// Reads `len` bytes from the messages file at the specified `offset`.
-    async fn read_at(&self, offset: u64, len: u32) -> Result<BytesMut, std::io::Error> {
+    async fn read_at(
+        &self,
+        offset: u32,
+        len: u32,
+        use_pool: bool,
+    ) -> Result<PooledBytesMut, std::io::Error> {
         let file = self.file.clone();
         spawn_blocking(move || {
-            let mut buf = BYTES_MUT_POOL.get_buffer(len as usize);
-            unsafe { buf.set_len(len as usize) };
-            file.read_exact_at(&mut buf, offset)?;
-            Ok(buf)
+            if use_pool {
+                let mut buf = PooledBytesMut::with_capacity(len as usize);
+                unsafe { buf.set_len(len as usize) };
+                file.read_exact_at(&mut buf, offset as u64)?;
+                Ok(buf)
+            } else {
+                let mut buf = BytesMut::with_capacity(len as usize);
+                unsafe { buf.set_len(len as usize) };
+                file.read_exact_at(&mut buf, offset as u64)?;
+                Ok(PooledBytesMut::from_existing(buf))
+            }
         })
         .await?
     }

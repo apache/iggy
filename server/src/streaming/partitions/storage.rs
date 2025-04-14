@@ -101,6 +101,7 @@ impl PartitionStorage for FilePartitionStorage {
                 partition.messages_count_of_parent_stream.clone(),
                 partition.messages_count_of_parent_topic.clone(),
                 partition.messages_count.clone(),
+                false,
             );
 
             let index_path = segment.index_file_path().to_owned();
