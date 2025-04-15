@@ -168,7 +168,7 @@ async fn test_get_messages_by_timestamp(
         let message = IggyMessage::builder()
             .id(id)
             .payload(payload)
-            .headers(headers)
+            .user_headers(headers)
             .build()
             .expect("Failed to create message with valid payload and headers");
 
@@ -346,10 +346,9 @@ async fn test_get_messages_by_timestamp(
                     );
 
                     let loaded_headers = msg.user_headers_map().unwrap().unwrap();
-                    let original_headers = HashMap::from_bytes(
-                        original_message.user_headers.as_ref().unwrap().clone(),
-                    )
-                    .unwrap();
+                    let original_headers =
+                        HashMap::from_bytes(original_message.user_headers.clone().unwrap())
+                            .unwrap();
                     assert_eq!(
                         loaded_headers,
                         original_headers,

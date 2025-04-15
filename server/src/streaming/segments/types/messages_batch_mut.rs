@@ -22,8 +22,6 @@ use crate::streaming::segments::indexes::IggyIndexesMut;
 use crate::streaming::utils::random_id;
 use crate::streaming::utils::PooledBuffer;
 use bytes::{BufMut, BytesMut};
-use iggy::messages::MAX_PAYLOAD_SIZE;
-use iggy::models::messaging::{IggyIndexView, INDEX_SIZE};
 use iggy::prelude::*;
 use iggy::utils::timestamp::IggyTimestamp;
 use lending_iterator::prelude::*;

@@ -111,7 +111,7 @@ fn messages_from_bytes_and_count(buffer: Bytes, count: u32) -> Result<Vec<IggyMe
         let payload = buffer.slice(position..payload_end);
         position = payload_end;
 
-        let headers: Option<Bytes> = if header.user_headers_length > 0 {
+        let user_headers = if header.user_headers_length > 0 {
             Some(buffer.slice(position..position + header.user_headers_length as usize))
         } else {
             None
@@ -121,7 +121,7 @@ fn messages_from_bytes_and_count(buffer: Bytes, count: u32) -> Result<Vec<IggyMe
         messages.push(IggyMessage {
             header,
             payload,
-            user_headers: headers,
+            user_headers,
         });
     }
 

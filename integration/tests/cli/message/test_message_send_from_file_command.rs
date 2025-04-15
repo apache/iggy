@@ -119,16 +119,21 @@ impl IggyCmdTestCase for TestMessageSendFromFileCmd<'_> {
                 .iter()
                 .map(|s| {
                     let payload = Bytes::from(s.as_bytes().to_vec());
-                    IggyMessage::with_headers(payload, self.headers.clone())
+                    IggyMessage::builder()
+                        .payload(payload)
+                        .user_headers(self.headers.clone())
+                        .build()
+                        .expect("Failed to create message with headers")
                 })
                 .collect::<Vec<_>>();
 
             for message in messages.iter() {
-                let message = IggyMessage::with_id_and_headers(
-                    message.header.id,
-                    message.payload.clone(),
-                    message.user_headers_map().unwrap().unwrap(),
-                );
+                let message = IggyMessage::builder()
+                    .id(message.header.id)
+                    .payload(message.payload.clone())
+                    .user_headers(message.user_headers_map().unwrap().unwrap())
+                    .build()
+                    .expect("Failed to create message with headers");
 
                 let write_result = file.write_all(&message.to_bytes()).await;
                 assert!(

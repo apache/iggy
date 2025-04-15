@@ -18,7 +18,6 @@
 
 use crate::bytes_serializable::BytesSerializable;
 use crate::error::IggyError;
-use crate::utils::byte_size::IggyByteSize;
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use serde_with::base64::Base64;
@@ -639,13 +638,13 @@ impl BytesSerializable for HashMap<HeaderKey, HeaderValue> {
                     .map_err(|_| IggyError::InvalidNumberEncoding)?,
             ) as usize;
             if key_length == 0 || key_length > 255 {
-                println!("A Invalid header key length: {}", key_length);
+                tracing::error!("A Invalid header key length: {}", key_length);
                 return Err(IggyError::InvalidHeaderKey);
             }
             position += 4;
             let key = String::from_utf8(bytes[position..position + key_length].to_vec());
             if key.is_err() {
-                println!("B Invalid header key: {}", key.unwrap_err());
+                tracing::error!("B Invalid header key: {}", key.unwrap_err());
                 return Err(IggyError::InvalidHeaderKey);
             }
             let key = key.unwrap();
@@ -678,14 +677,14 @@ impl BytesSerializable for HashMap<HeaderKey, HeaderValue> {
 }
 
 /// Returns the size in bytes of the specified headers.
-pub fn get_headers_size_bytes(headers: &Option<HashMap<HeaderKey, HeaderValue>>) -> IggyByteSize {
+pub fn get_user_headers_size(headers: &Option<HashMap<HeaderKey, HeaderValue>>) -> Option<u32> {
     let mut size = 0;
     if let Some(headers) = headers {
         for (key, value) in headers {
             size += 4 + key.as_str().len() as u32 + 1 + 4 + value.value.len() as u32;
         }
     }
-    (size as u64).into()
+    Some(size)
 }
 
 #[cfg(test)]

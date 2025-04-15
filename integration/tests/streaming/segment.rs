@@ -186,7 +186,11 @@ async fn should_persist_and_load_segment_with_messages() {
     let mut messages = Vec::new();
     let mut messages_size = 0;
     for i in 0..messages_count {
-        let message = IggyMessage::with_id(i as u128, Bytes::from("test"));
+        let message = IggyMessage::builder()
+            .id(i as u128)
+            .payload(Bytes::from("test"))
+            .build()
+            .expect("Failed to create message");
         messages_size += message.get_size_bytes().as_bytes_u32();
         messages.push(message);
     }
@@ -262,7 +266,11 @@ async fn should_persist_and_load_segment_with_messages_with_nowait_confirmation(
     let mut messages = Vec::new();
     let mut messages_size = 0;
     for i in 0..messages_count {
-        let message = IggyMessage::with_id(i as u128, Bytes::from("test"));
+        let message = IggyMessage::builder()
+            .id(i as u128)
+            .payload(Bytes::from("test"))
+            .build()
+            .expect("Failed to create message");
         messages_size += message.get_size_bytes().as_bytes_u32();
         messages.push(message);
     }
@@ -347,7 +355,11 @@ async fn given_all_expired_messages_segment_should_be_expired() {
     let mut messages = Vec::new();
     let mut messages_size = 0;
     for i in 0..messages_count {
-        let message = IggyMessage::with_id(i as u128, Bytes::from("test"));
+        let message = IggyMessage::builder()
+            .id(i as u128)
+            .payload(Bytes::from("test"))
+            .build()
+            .expect("Failed to create message");
         messages_size += message.get_size_bytes().as_bytes_u32();
         messages.push(message);
     }
@@ -411,7 +423,10 @@ async fn given_at_least_one_not_expired_message_segment_should_not_be_expired() 
 
     let nothing_expired_ts = IggyTimestamp::now();
 
-    let first_message = vec![IggyMessage::create(Bytes::from("expired"))];
+    let first_message = vec![IggyMessage::builder()
+        .payload(Bytes::from("expired"))
+        .build()
+        .expect("Failed to create message")];
     let first_message_size = first_message[0].get_size_bytes().as_bytes_u32();
     let first_batch = IggyMessagesBatchMut::from_messages(&first_message, first_message_size);
     segment.append_batch(0, first_batch, None).await.unwrap();
@@ -419,7 +434,10 @@ async fn given_at_least_one_not_expired_message_segment_should_not_be_expired() 
     sleep(Duration::from_micros(message_expiry_us / 2)).await;
     let first_message_expired_ts = IggyTimestamp::now();
 
-    let second_message = vec![IggyMessage::create(Bytes::from("not-expired"))];
+    let second_message = vec![IggyMessage::builder()
+        .payload(Bytes::from("not-expired"))
+        .build()
+        .expect("Failed to create message")];
     let second_message_size = second_message[0].get_size_bytes().as_bytes_u32();
     let second_batch = IggyMessagesBatchMut::from_messages(&second_message, second_message_size);
     segment.append_batch(1, second_batch, None).await.unwrap();

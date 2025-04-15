@@ -64,6 +64,10 @@ impl IggyTimestamp {
         self.0.duration_since(UNIX_EPOCH).unwrap().as_micros() as u64
     }
 
+    pub fn to_rfc3339_string(&self) -> String {
+        DateTime::<Utc>::from(self.0).to_rfc3339()
+    }
+
     pub fn to_utc_string(&self, format: &str) -> String {
         DateTime::<Utc>::from(self.0).format(format).to_string()
     }

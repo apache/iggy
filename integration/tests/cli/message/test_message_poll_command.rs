@@ -145,7 +145,11 @@ impl IggyCmdTestCase for TestMessagePollCmd {
             .iter()
             .map(|s| {
                 let payload = Bytes::from(s.as_bytes().to_vec());
-                IggyMessage::with_headers(payload, HashMap::from([self.headers.clone()]))
+                IggyMessage::builder()
+                    .payload(payload)
+                    .user_headers(HashMap::from([self.headers.clone()]))
+                    .build()
+                    .expect("Failed to create message with headers")
             })
             .collect::<Vec<_>>();
 

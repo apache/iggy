@@ -757,6 +757,10 @@ mod tests {
     }
 
     fn create_message(id: u128, payload: &str) -> IggyMessage {
-        IggyMessage::with_id(id, Bytes::from(payload.to_string()))
+        IggyMessage::builder()
+            .id(id)
+            .payload(Bytes::from(payload.to_string()))
+            .build()
+            .expect("Failed to create message with ID")
     }
 }

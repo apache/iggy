@@ -169,11 +169,11 @@ async fn send_messages(client: &IggyClient) -> Result<(), IggyError> {
 
                     let message = if let Some(headers) = headers {
                         IggyMessage::builder()
-                            .payload(payload)
-                            .headers(headers)
+                            .payload(payload.into())
+                            .user_headers(headers)
                             .build()?
                     } else {
-                        IggyMessage::builder().payload(payload).build()?
+                        IggyMessage::builder().payload(payload.into()).build()?
                     };
 
                     messages.push(message);

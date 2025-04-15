@@ -147,7 +147,7 @@ impl CliCommand for SendMessagesCmd {
                     .map(|s| {
                         IggyMessage::builder()
                             .payload(Bytes::from(s.clone()))
-                            .headers(headers.clone().unwrap_or_default())
+                            .user_headers(headers.clone().unwrap_or_default())
                             .build()
                     })
                     .collect::<Result<Vec<_>, _>>()
@@ -159,8 +159,8 @@ impl CliCommand for SendMessagesCmd {
                         .lines()
                         .map(|m| {
                             IggyMessage::builder()
-                                .payload(m.to_owned())
-                                .headers(headers.clone().unwrap_or_default())
+                                .payload(m.to_owned().into())
+                                .user_headers(headers.clone().unwrap_or_default())
                                 .build()
                         })
                         .collect::<Result<Vec<_>, _>>()

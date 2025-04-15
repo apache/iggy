@@ -318,9 +318,26 @@ impl<'de> Deserialize<'de> for SendMessages {
                                 };
 
                                 let iggy_message = if let Some(headers) = headers_map {
-                                    IggyMessage::with_id_and_headers(id, payload_bytes, headers)
+                                    IggyMessage::builder()
+                                        .id(id)
+                                        .payload(payload_bytes.into())
+                                        .user_headers(headers)
+                                        .build()
+                                        .map_err(|e| {
+                                            de::Error::custom(format!(
+                                                "Failed to create message with headers: {e}"
+                                            ))
+                                        })?
                                 } else {
-                                    IggyMessage::with_id(id, payload_bytes)
+                                    IggyMessage::builder()
+                                        .id(id)
+                                        .payload(payload_bytes.into())
+                                        .build()
+                                        .map_err(|e| {
+                                            de::Error::custom(format!(
+                                                "Failed to create message: {e}"
+                                            ))
+                                        })?
                                 };
 
                                 iggy_messages.push(iggy_message);

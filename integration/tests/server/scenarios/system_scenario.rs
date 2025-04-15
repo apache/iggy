@@ -799,7 +799,13 @@ fn create_messages() -> Vec<IggyMessage> {
     for offset in 0..MESSAGES_COUNT {
         let id = (offset + 1) as u128;
         let payload = create_message_payload(offset as u64);
-        messages.push(IggyMessage::with_id(id, payload));
+        messages.push(
+            IggyMessage::builder()
+                .id(id)
+                .payload(payload)
+                .build()
+                .expect("Failed to create message"),
+        );
     }
     messages
 }

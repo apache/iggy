@@ -49,11 +49,10 @@ pub use crate::messages::{
     FlushUnsavedBuffer, Partitioning, PollMessages, PolledMessages, PollingKind, PollingStrategy,
     SendMessages,
 };
-pub use crate::messages::{MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE};
 pub use crate::models::consumer_group::ConsumerGroupDetails;
 pub use crate::models::messaging::{
-    HeaderKey, HeaderValue, IggyMessage, IggyMessageHeader, IggyMessageHeaderView, IggyMessageView,
-    IggyMessageViewIterator,
+    HeaderKey, HeaderValue, IggyIndexView, IggyMessage, IggyMessageHeader, IggyMessageHeaderView,
+    IggyMessageView, IggyMessageViewIterator, INDEX_SIZE, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE,
 };
 pub use crate::models::messaging::{
     IGGY_MESSAGE_CHECKSUM_OFFSET_RANGE, IGGY_MESSAGE_HEADERS_LENGTH_OFFSET_RANGE,

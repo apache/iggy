@@ -42,18 +42,20 @@ async fn assert_polling_messages() {
     let partitioning = Partitioning::partition_id(partition_id);
     let messages = (0..messages_count)
         .map(|id| {
-            get_message(
-                id as u128,
-                format!("{}:{}", id + 1, create_payload(payload_size_bytes)).as_str(),
-            )
+            IggyMessage::builder()
+                .id(id as u128)
+                .payload(Bytes::from(format!(
+                    "{}:{}",
+                    id + 1,
+                    create_payload(payload_size_bytes)
+                )))
+                .build()
+                .expect("Failed to create message")
         })
         .collect::<Vec<_>>();
     let mut sent_messages = Vec::new();
     for message in &messages {
-        sent_messages.push(get_message(
-            message.header.id,
-            from_utf8(&message.payload).unwrap(),
-        ))
+        sent_messages.push(message);
     }
     let batch_size = messages
         .iter()
@@ -100,7 +102,11 @@ async fn given_key_none_messages_should_be_appended_to_the_next_partition_using_
         let payload = get_payload(i);
         let batch_size = IggyByteSize::from(16 + 4 + payload.len() as u64);
         let messages = IggyMessagesBatchMut::from_messages(
-            &[get_message(i as u128, &payload)],
+            &[IggyMessage::builder()
+                .id(i as u128)
+                .payload(Bytes::from(payload.to_owned()))
+                .build()
+                .expect("Failed to create message")],
             batch_size.as_bytes_u32(),
         );
         topic
@@ -125,7 +131,11 @@ async fn given_key_partition_id_messages_should_be_appended_to_the_chosen_partit
         let payload = get_payload(i);
         let batch_size = IggyByteSize::from(16 + 4 + payload.len() as u64);
         let messages = IggyMessagesBatchMut::from_messages(
-            &[get_message(i as u128, &payload)],
+            &[IggyMessage::builder()
+                .id(i as u128)
+                .payload(Bytes::from(payload.to_owned()))
+                .build()
+                .expect("Failed to create message")],
             batch_size.as_bytes_u32(),
         );
         topic
@@ -154,7 +164,11 @@ async fn given_key_messages_key_messages_should_be_appended_to_the_calculated_pa
         let partitioning = Partitioning::messages_key_u32(entity_id);
         let batch_size = IggyByteSize::from(16 + 4 + payload.len() as u64);
         let messages = IggyMessagesBatchMut::from_messages(
-            &[get_message(entity_id as u128, &payload)],
+            &[IggyMessage::builder()
+                .id(entity_id as u128)
+                .payload(Bytes::from(payload.to_owned()))
+                .build()
+                .expect("Failed to create message")],
             batch_size.as_bytes_u32(),
         );
         topic
@@ -220,10 +234,6 @@ async fn init_topic(setup: &TestSetup, partitions_count: u32) -> Topic {
     .unwrap();
     topic.persist().await.unwrap();
     topic
-}
-
-fn get_message(id: u128, payload: &str) -> IggyMessage {
-    IggyMessage::with_id(id, Bytes::from(payload.to_owned()))
 }
 
 fn create_payload(size: u32) -> String {

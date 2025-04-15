@@ -264,7 +264,7 @@ mod tests {
             let partitioning = Partitioning::messages_key_u32(entity_id);
             let message = IggyMessage::builder()
                 .id(entity_id as u128)
-                .payload(Bytes::new())
+                .payload(Bytes::from("test message"))
                 .build()
                 .expect("Failed to create message with valid payload and headers");
             let messages = IggyMessagesBatchMut::from_messages(&[message], 1);

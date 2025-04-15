@@ -19,8 +19,7 @@
 use super::{IggyIndexes, IggyMessage, IggyMessageView, IggyMessageViewIterator};
 use crate::{
     error::IggyError,
-    messages::MAX_PAYLOAD_SIZE,
-    models::messaging::INDEX_SIZE,
+    models::messaging::{INDEX_SIZE, MAX_PAYLOAD_SIZE},
     prelude::{BytesSerializable, IggyByteSize, Sizeable, Validatable},
 };
 use bytes::{BufMut, Bytes, BytesMut};

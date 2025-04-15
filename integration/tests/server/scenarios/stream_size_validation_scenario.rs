@@ -287,7 +287,11 @@ fn create_messages() -> Vec<IggyMessage> {
         let id = (offset + 1) as u128;
         let payload = Bytes::from(vec![0xD; MESSAGE_PAYLOAD_SIZE_BYTES as usize]);
 
-        let message = IggyMessage::with_id(id, payload);
+        let message = IggyMessage::builder()
+            .id(id)
+            .payload(payload)
+            .build()
+            .expect("Failed to create message");
         messages.push(message);
     }
     messages

@@ -93,7 +93,7 @@ async fn produce_messages(args: &Args, client: &IggyClient) -> Result<(), Box<dy
 
             let message = IggyMessage::builder()
                 .payload(Bytes::from(json))
-                .headers(headers)
+                .user_headers(headers)
                 .build()
                 .unwrap();
             messages.push(message);

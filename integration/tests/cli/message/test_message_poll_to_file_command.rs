@@ -124,7 +124,11 @@ impl IggyCmdTestCase for TestMessagePollToFileCmd<'_> {
             .iter()
             .map(|s| {
                 let payload = Bytes::from(s.as_bytes().to_vec());
-                IggyMessage::with_headers(payload, self.headers.clone())
+                IggyMessage::builder()
+                    .payload(payload)
+                    .user_headers(self.headers.clone())
+                    .build()
+                    .expect("Failed to create message with headers")
             })
             .collect::<Vec<_>>();
 

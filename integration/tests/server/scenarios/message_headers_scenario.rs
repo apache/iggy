@@ -37,7 +37,14 @@ pub async fn run(client_factory: &dyn ClientFactory) {
         let id = (offset + 1) as u128;
         let payload = create_message_payload(offset as u64);
         let headers = create_message_headers();
-        messages.push(IggyMessage::with_id_and_headers(id, payload, headers));
+        messages.push(
+            IggyMessage::builder()
+                .id(id)
+                .payload(payload)
+                .user_headers(headers)
+                .build()
+                .expect("Failed to create message with headers"),
+        );
     }
 
     client

@@ -84,20 +84,24 @@ impl PollMessagesCmd {
         if !self.show_headers {
             return HashSet::new();
         }
+
         polled_messages
             .iter()
-            .flat_map(|m| match m.user_headers.as_ref() {
-                Some(h) => match HashMap::<HeaderKey, HeaderValue>::from_bytes(h.clone()) {
-                    Ok(headers) => headers
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.kind))
-                        .collect::<Vec<_>>(),
-                    Err(e) => {
-                        tracing::error!("Failed to parse user headers, error: {e}");
-                        vec![]
+            .flat_map(|m| {
+                if let Some(user_headers) = &m.user_headers {
+                    match HashMap::<HeaderKey, HeaderValue>::from_bytes(user_headers.clone()) {
+                        Ok(headers) => headers
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.kind))
+                            .collect::<Vec<_>>(),
+                        Err(e) => {
+                            tracing::error!("Failed to parse user headers, error: {e}");
+                            vec![]
+                        }
                     }
-                },
-                None => vec![],
+                } else {
+                    vec![]
+                }
             })
             .collect::<HashSet<_>>()
     }

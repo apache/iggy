@@ -83,7 +83,7 @@ async fn should_persist_messages_and_then_load_them_by_timestamp() {
         let message = IggyMessage::builder()
             .id(id)
             .payload(payload)
-            .headers(headers)
+            .user_headers(headers)
             .build()
             .expect("Failed to create message with valid payload and headers");
 
@@ -110,14 +110,14 @@ async fn should_persist_messages_and_then_load_them_by_timestamp() {
         let message = IggyMessage::builder()
             .id(id)
             .payload(payload.clone())
-            .headers(headers.clone())
+            .user_headers(headers.clone())
             .build()
             .expect("Failed to create message with valid payload and headers");
 
         let message_clone = IggyMessage::builder()
             .id(id)
             .payload(payload)
-            .headers(headers)
+            .user_headers(headers)
             .build()
             .expect("Failed to create message with valid payload and headers");
 
@@ -233,9 +233,18 @@ async fn should_persist_messages_and_then_load_them_from_disk() {
             HeaderValue::from_uint64(123456).unwrap(),
         );
 
-        let appended_message =
-            IggyMessage::with_id_and_headers(id, payload.clone(), headers.clone());
-        let message = IggyMessage::with_id_and_headers(id, payload, headers);
+        let appended_message = IggyMessage::builder()
+            .id(id)
+            .payload(payload.clone())
+            .user_headers(headers.clone())
+            .build()
+            .expect("Failed to create message with headers");
+        let message = IggyMessage::builder()
+            .id(id)
+            .payload(payload)
+            .user_headers(headers)
+            .build()
+            .expect("Failed to create message with headers");
 
         appended_messages.push(appended_message);
         messages.push(message);

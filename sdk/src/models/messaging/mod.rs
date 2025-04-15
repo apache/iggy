@@ -31,7 +31,7 @@ pub const INDEX_SIZE: usize = 16;
 pub use index::IggyIndex;
 pub use index_view::IggyIndexView;
 pub use indexes::IggyIndexes;
-pub use message::IggyMessage;
+pub use message::{IggyMessage, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE};
 pub use message_header::{
     IggyMessageHeader, IGGY_MESSAGE_CHECKSUM_OFFSET_RANGE,
     IGGY_MESSAGE_HEADERS_LENGTH_OFFSET_RANGE, IGGY_MESSAGE_HEADER_RANGE, IGGY_MESSAGE_HEADER_SIZE,

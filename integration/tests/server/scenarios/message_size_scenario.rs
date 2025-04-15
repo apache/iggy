@@ -142,21 +142,40 @@ async fn send_message_and_check_result(
     message_params: MessageToSend,
     expected_result: Result<(), IggyError>,
 ) {
-    let mut messages = Vec::new();
-
-    match message_params {
+    let message_result = match message_params {
         MessageToSend::NoMessage => {
             println!("Sending message without messages inside");
+            Ok(Vec::new())
         }
         MessageToSend::OfSize(size) => {
             println!("Sending message with payload size = {size}");
-            messages.push(create_message(None, size));
+            match create_message(None, size) {
+                Ok(msg) => Ok(vec![msg]),
+                Err(e) => Err(e),
+            }
         }
         MessageToSend::OfSizeWithHeaders(header_size, payload_size) => {
             println!("Sending message with header size = {header_size} and payload size = {payload_size}");
-            messages.push(create_message(Some(header_size), payload_size));
+            match create_message(Some(header_size), payload_size) {
+                Ok(msg) => Ok(vec![msg]),
+                Err(e) => Err(e),
+            }
         }
     };
+
+    if let Err(creation_error) = &message_result {
+        println!("Message creation failed: {creation_error:?}, expected: {expected_result:?}");
+        match expected_result {
+            Err(expected_error) if expected_error.as_code() == creation_error.as_code() => {
+                return;
+            }
+            _ => {
+                panic!("Expected {expected_result:?} but message creation failed with {creation_error:?}");
+            }
+        }
+    }
+
+    let mut messages = message_result.unwrap();
 
     let send_result = client
         .send_messages(
@@ -166,6 +185,7 @@ async fn send_message_and_check_result(
             &mut messages,
         )
         .await;
+
     println!("Received = {send_result:?}, expected = {expected_result:?}");
     match expected_result {
         Ok(()) => assert!(send_result.is_ok()),
@@ -216,7 +236,10 @@ fn create_message_header_of_size(target_size: usize) -> HashMap<HeaderKey, Heade
     headers
 }
 
-fn create_message(header_size: Option<usize>, payload_size: usize) -> IggyMessage {
+fn create_message(
+    header_size: Option<usize>,
+    payload_size: usize,
+) -> Result<IggyMessage, IggyError> {
     let headers = match header_size {
         Some(header_size) => {
             if header_size > 0 {
@@ -231,8 +254,15 @@ fn create_message(header_size: Option<usize>, payload_size: usize) -> IggyMessag
     let payload = create_string_of_size(payload_size);
 
     if let Some(headers) = headers {
-        IggyMessage::with_id_and_headers(1u128, Bytes::from(payload), headers)
+        IggyMessage::builder()
+            .id(1u128)
+            .payload(Bytes::from(payload))
+            .user_headers(headers)
+            .build()
     } else {
-        IggyMessage::with_id(1u128, Bytes::from(payload))
+        IggyMessage::builder()
+            .id(1u128)
+            .payload(Bytes::from(payload))
+            .build()
     }
 }
