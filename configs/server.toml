@@ -517,7 +517,16 @@ recreate_missing_state = false
 # `true` enables the memory pool.
 # `false` disables the memory pool.
 enabled = true
+
 # Size of the memory pool (string).
-# Example: "1 GB" or "4096 MiB".
+# Example: "512 MiB" or "1 GiB".
 # This defines the maximum, total memory allocated for the memory pool.
+# Note: This number has to be multiplication of 4096 (default linux page size).
+# Minimum size is 512 MiB.
 size = "4 GiB"
+
+# Maximum number of buffers in each bucket (u32).
+# There are 32 buckets in the memory pool. Each bucket can hold up to this number of buffers
+# and holds different buffer sizes, from 256 B to 512 MiB.
+# Note: This number has to be a power of 2. Minimum value is 128.
+bucket_capacity = 8192

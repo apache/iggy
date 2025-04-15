@@ -132,6 +132,7 @@ pub struct RecoveryConfig {
 pub struct MemoryPoolConfig {
     pub enabled: bool,
     pub size: IggyByteSize,
+    pub bucket_capacity: u32,
 }
 
 #[serde_as]

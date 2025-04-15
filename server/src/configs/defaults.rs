@@ -499,6 +499,7 @@ impl Default for MemoryPoolConfig {
         MemoryPoolConfig {
             enabled: SERVER_CONFIG.system.memory_pool.enabled,
             size: SERVER_CONFIG.system.memory_pool.size.parse().unwrap(),
+            bucket_capacity: SERVER_CONFIG.system.memory_pool.bucket_capacity as u32,
         }
     }
 }

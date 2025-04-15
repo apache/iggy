@@ -38,6 +38,12 @@ use tracing::error;
 
 impl Validatable<ConfigError> for ServerConfig {
     fn validate(&self) -> Result<(), ConfigError> {
+        self.system
+            .memory_pool
+            .validate()
+            .with_error_context(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to validate memory pool config")
+            })?;
         self.data_maintenance
             .validate()
             .with_error_context(|error| {
@@ -246,18 +252,47 @@ impl Validatable<ConfigError> for MemoryPoolConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         if self.enabled && self.size == 0 {
             error!(
-                "Server is unable to start because system.memory_pool.enabled is true and system.memory_pool.size is zero"
+                "Configured system.memory_pool.enabled is true and system.memory_pool.size is 0"
             );
             return Err(ConfigError::InvalidConfiguration);
         }
 
         const MIN_POOL_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB
+        const MIN_BUCKET_CAPACITY: u32 = 128;
+        const DEFAULT_PAGE_SIZE: u64 = 4096;
 
-        if self.size < MIN_POOL_SIZE {
+        if self.enabled && self.size < MIN_POOL_SIZE {
             error!(
-                "Server is unable to start because system.memory_pool.size is less than minimum {} MiB, ({} B)",
+                "Configured system.memory_pool.size {} B ({} MiB) is less than minimum {} B, ({} MiB)",
+                self.size.as_bytes_u64(),
+                self.size.as_bytes_u64() / (1024 * 1024),
+                MIN_POOL_SIZE,
                 MIN_POOL_SIZE / (1024 * 1024),
-                MIN_POOL_SIZE
+            );
+            return Err(ConfigError::InvalidConfiguration);
+        }
+
+        if self.enabled && self.size.as_bytes_u64() % DEFAULT_PAGE_SIZE != 0 {
+            error!(
+                "Configured system.memory_pool.size {} B is not a multiple of default page size {} B",
+                self.size.as_bytes_u64(),
+                DEFAULT_PAGE_SIZE
+            );
+            return Err(ConfigError::InvalidConfiguration);
+        }
+
+        if self.enabled && self.bucket_capacity < MIN_BUCKET_CAPACITY {
+            error!(
+                "Configured system.memory_pool.buffers {} is less than minimum {}",
+                self.bucket_capacity, MIN_BUCKET_CAPACITY
+            );
+            return Err(ConfigError::InvalidConfiguration);
+        }
+
+        if self.enabled && !self.bucket_capacity.is_power_of_two() {
+            error!(
+                "Configured system.memory_pool.buffers {} is not a power of 2",
+                self.bucket_capacity
             );
             return Err(ConfigError::InvalidConfiguration);
         }

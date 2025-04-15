@@ -16,18 +16,16 @@
  * under the License.
  */
 
-pub mod server;
-pub mod system;
-
-pub mod http;
-pub mod quic;
-pub mod tcp;
-
 pub mod cache_indexes;
 pub mod config_provider;
 pub mod defaults;
 pub mod displays;
+pub mod http;
+pub mod quic;
 pub mod resource_quota;
+pub mod server;
+pub mod system;
+pub mod tcp;
 pub mod validators;
 
 pub const COMPONENT: &str = "CONFIG";

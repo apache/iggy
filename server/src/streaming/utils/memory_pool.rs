@@ -31,10 +31,6 @@ pub static MEMORY_POOL: OnceCell<MemoryPool> = OnceCell::new();
 /// Total number of distinct bucket sizes.
 const NUM_BUCKETS: usize = 32;
 
-/// Maximum queue length (number of reusable buffers) each bucket can hold.
-/// TODO: move this to config
-const BUCKET_CAPACITY: usize = 8192;
-
 /// Array of bucket sizes in ascending order. Each entry is a distinct buffer size (in bytes).
 const BUCKET_SIZES: [usize; NUM_BUCKETS] = [
     256,
@@ -52,8 +48,8 @@ const BUCKET_SIZES: [usize; NUM_BUCKETS] = [
     768 * 1024,
     1024 * 1024,
     1536 * 1024,
-    2 * 1024 * 1024, // Above 2MiB everything should be rounded up to the next power of 2 to take advantage of mimalloc's
-    4 * 1024 * 1024, // transparent hugepages (environment variable MI_LARGE_OS_PAGES=1).
+    2 * 1024 * 1024, // Above 2MiB everything should be rounded up to the next power of 2 to take advantage of hugepages
+    4 * 1024 * 1024, // (environment variables MIMALLOC_ALLOW_LARGE_OS_PAGES=1 and MIMALLOC_LARGE_OS_PAGES=1).
     6 * 1024 * 1024,
     8 * 1024 * 1024,
     10 * 1024 * 1024,
@@ -94,7 +90,10 @@ pub struct MemoryPool {
     /// Configured maximum bytes for which the pool is responsible.
     pub memory_limit: usize,
 
-    /// Array of queues for reusable buffers. Each queue can store up to `BUCKET_CAPACITY` buffers.
+    /// Configured maximum number of buffers in each bucket.
+    pub bucket_capacity: usize,
+
+    /// Array of queues for reusable buffers. Each queue can store up to `bucket_capacity` buffers.
     /// The length of each queue (`buckets[i].len()`) is how many **free** buffers are currently available.
     /// Free doesn't mean the buffer is allocated, it just means it's not in use.
     buckets: [Arc<ArrayQueue<BytesMut>>; NUM_BUCKETS],
@@ -126,12 +125,12 @@ pub struct MemoryPool {
 
 impl MemoryPool {
     /// Create a new memory pool. Usually called from `init_pool` below.
-    pub fn new(is_enabled: bool, memory_limit: usize) -> Self {
-        let bucket_arrays = [0; NUM_BUCKETS].map(|_| Arc::new(ArrayQueue::new(BUCKET_CAPACITY)));
+    pub fn new(is_enabled: bool, memory_limit: usize, bucket_capacity: usize) -> Self {
+        let buckets = [0; NUM_BUCKETS].map(|_| Arc::new(ArrayQueue::new(bucket_capacity)));
 
         if is_enabled {
             info!(
-                "Initializing MemoryPool with {NUM_BUCKETS} buckets, each capacity={BUCKET_CAPACITY}."
+                "Initializing MemoryPool with {NUM_BUCKETS} buckets, each will have capacity: {bucket_capacity}."
             );
         } else {
             info!("MemoryPool is disabled.");
@@ -140,7 +139,8 @@ impl MemoryPool {
         Self {
             is_enabled,
             memory_limit,
-            buckets: bucket_arrays,
+            bucket_capacity,
+            buckets,
             in_use: [0; NUM_BUCKETS].map(|_| Arc::new(AtomicUsize::new(0))),
             allocations: [0; NUM_BUCKETS].map(|_| Arc::new(AtomicUsize::new(0))),
             returned: [0; NUM_BUCKETS].map(|_| Arc::new(AtomicUsize::new(0))),
@@ -156,8 +156,9 @@ impl MemoryPool {
     pub fn init_pool(config: Arc<SystemConfig>) {
         let is_enabled = config.memory_pool.enabled;
         let memory_limit = config.memory_pool.size.as_bytes_usize();
+        let bucket_capacity = config.memory_pool.bucket_capacity as usize;
 
-        let pool = MemoryPool::new(is_enabled, memory_limit);
+        let pool = MemoryPool::new(is_enabled, memory_limit, bucket_capacity);
         if MEMORY_POOL.set(pool).is_err() {
             warn!("Memory pool already initialized.");
             // This shouldn't ever happen in production code, only in tests
@@ -307,7 +308,7 @@ impl MemoryPool {
             ext_dealloc = self.external_deallocations(),
             drop_ret = self.dropped_returns(),
             resize_events = self.resize_events(),
-            cap = BUCKET_CAPACITY,
+            cap = self.bucket_capacity,
         );
 
         if self.should_print_warning() {
@@ -472,6 +473,7 @@ mod tests {
                 memory_pool: MemoryPoolConfig {
                     enabled: true,
                     size: IggyByteSize::from_str("4GiB").unwrap(),
+                    bucket_capacity: 8192,
                 },
                 ..SystemConfig::default()
             });
