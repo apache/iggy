@@ -1162,15 +1162,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "convert_case"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "baaaa0ecca5b51987b9423ccdc971514dd8b0bb7b4060b983d3664dad3f1f89f"
-dependencies = [
- "unicode-segmentation",
-]
-
-[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2573,7 +2564,6 @@ dependencies = [
  "chrono",
  "clap",
  "comfy-table",
- "convert_case 0.8.0",
  "crc32fast",
  "dashmap",
  "derive_more",
@@ -2591,7 +2581,6 @@ dependencies = [
  "reqwest-retry",
  "rustls",
  "serde",
- "serde_derive",
  "serde_json",
  "serde_with",
  "strum",

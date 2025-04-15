@@ -42,7 +42,7 @@ async-broadcast = { version = "0.7.2" }
 async-dropper = { version = "0.3.1", features = ["tokio", "simple"] }
 async-trait = "0.1.88"
 base64 = "0.22.1"
-bon = { version = "3.6" }
+bon = { version = "3.6.0" }
 byte-unit = { version = "5.1.6", default-features = false, features = [
     "serde",
     "byte",
@@ -85,8 +85,3 @@ toml = "0.8.20"
 tracing = { version = "0.1.41" }
 trait-variant = { version = "0.1.2" }
 webpki-roots = { version = "0.26.8" }
-
-[build-dependencies]
-convert_case = "0.8.0"
-serde = { version = "1.0.219", features = ["derive", "rc"] }
-serde_derive = "1.0.219"
