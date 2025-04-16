@@ -65,18 +65,18 @@ impl IggyMessagesBatchSet {
         batch
     }
 
-    /// Add a message container to the batch
-    pub fn add_batch(&mut self, messages: IggyMessagesBatchMut) {
-        self.count += messages.count();
-        self.size += messages.size();
-        self.batches.push(messages);
+    /// Add another batch of messages to the batch set
+    pub fn add_batch(&mut self, batch: IggyMessagesBatchMut) {
+        self.count += batch.count();
+        self.size += batch.size();
+        self.batches.push(batch);
     }
 
-    /// Add another batch of messages to the batch
-    pub fn add_batch_set(&mut self, mut other: IggyMessagesBatchSet) {
-        self.count += other.count();
-        self.size += other.size();
-        let other_batches = std::mem::take(&mut other.batches);
+    /// Add another batch set of messages to the batch set
+    pub fn add_batch_set(&mut self, mut other_batch_set: IggyMessagesBatchSet) {
+        self.count += other_batch_set.count();
+        self.size += other_batch_set.size();
+        let other_batches = std::mem::take(&mut other_batch_set.batches);
         self.batches.extend(other_batches);
     }
 

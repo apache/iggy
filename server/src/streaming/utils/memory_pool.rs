@@ -162,8 +162,8 @@ impl MemoryPool {
         if MEMORY_POOL.set(pool).is_err() {
             warn!("Memory pool already initialized.");
             // This shouldn't ever happen in production code, only in tests
-            // if someone forgets to add #[serial] tag to tests with different
-            // memory pool limits.
+            // if someone forgets to add #[serial] tag to tests that have different
+            // memory pool limits (different instances are created within same executable).
             if memory_pool().memory_limit != memory_limit {
                 panic!("Previously initialized memory pool has a different limit.");
             }

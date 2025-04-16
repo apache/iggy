@@ -83,6 +83,12 @@ pub const MAX_USER_HEADERS_SIZE: u32 = 100 * 1000;
 ///     .build()
 ///     .unwrap();
 ///
+/// // Create a simple message with raw binary payload
+/// let message = IggyMessage::builder()
+///     .payload(Bytes::from(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]))
+///     .build()
+///     .unwrap();
+///
 /// // Create a message with custom ID
 /// let message = IggyMessage::builder()
 ///     .id(42)

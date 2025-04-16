@@ -53,24 +53,6 @@ impl IndexReader {
             .with_error_context(|error| format!("Failed to open index file: {file_path}. {error}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
-        // posix_fadvise() doesn't exist on MacOS
-        #[cfg(not(target_os = "macos"))]
-        {
-            use std::os::unix::io::AsRawFd;
-            let fd = file.as_raw_fd();
-            let _ = nix::fcntl::posix_fadvise(
-                fd,
-                0,
-                0, // 0 means the entire file
-                nix::fcntl::PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL,
-            )
-            .with_info_context(|error| {
-                format!(
-                    "Failed to set sequential access pattern on index file: {file_path}. {error}"
-                )
-            });
-        }
-
         trace!(
             "Opened index file for reading: {file_path}, size: {}",
             index_size_bytes.load(Ordering::Acquire)

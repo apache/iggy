@@ -22,7 +22,6 @@ pub mod defaults;
 pub mod displays;
 pub mod http;
 pub mod quic;
-pub mod resource_quota;
 pub mod server;
 pub mod system;
 pub mod tcp;

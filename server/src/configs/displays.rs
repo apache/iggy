@@ -25,7 +25,6 @@ use crate::configs::server::{
 use crate::configs::system::MessageDeduplicationConfig;
 use crate::configs::{
     http::{HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig},
-    resource_quota::MemoryResourceQuota,
     server::{MessageSaverConfig, ServerConfig},
     system::{
         CompressionConfig, EncryptionConfig, LoggingConfig, PartitionConfig, SegmentConfig,
@@ -111,15 +110,6 @@ impl Display for QuicCertificateConfig {
             "{{ self_signed: {}, cert_file: {}, key_file: {} }}",
             self.self_signed, self.cert_file, self.key_file
         )
-    }
-}
-
-impl Display for MemoryResourceQuota {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            MemoryResourceQuota::Bytes(byte) => write!(f, "{}", byte),
-            MemoryResourceQuota::Percentage(percentage) => write!(f, "{}%", percentage),
-        }
     }
 }
 
