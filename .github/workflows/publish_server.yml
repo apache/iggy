@@ -74,7 +74,7 @@ jobs:
       - name: Check if version from Cargo.toml is the same as the tag
         id: check_git_tag
         run: |
-          if [[ "iggy-${{ steps.extract_version.outputs.server_version }}" == "${{ steps.extract_tag.outputs.tag_name }}" ]];
+          if [[ "server-${{ steps.extract_version.outputs.server_version }}" == "${{ steps.extract_tag.outputs.tag_name }}" ]];
           then
             echo "::notice ::Tag ${{ steps.extract_tag.outputs.tag_name }} matches the version in Cargo.toml"
             echo "tag_matches=true" >> "$GITHUB_OUTPUT"

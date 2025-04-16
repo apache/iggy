@@ -91,7 +91,7 @@ jobs:
           tool: cross
 
       - name: Build ${{ matrix.platform.target }} release binary
-        run: cross +stable build --verbose --release --target ${{ matrix.platform.target }}
+        run: cross +stable build --verbose --release --target ${{ matrix.platform.target }} -p iggy
 
       - name: Collect ${{ matrix.platform.target }} executable
         run: |
