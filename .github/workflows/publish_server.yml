@@ -85,7 +85,7 @@ jobs:
 
     outputs:
       server_version: ${{ steps.extract_version.outputs.server_version }}
-      tag_created: ${{ steps.tagging.outputs.tag_created }}
+      tag_created: ${{ steps.check_git_tag.outputs.tag_matches }}
 
   release_and_publish:
     name: build release ${{ matrix.platform.os_name }}
