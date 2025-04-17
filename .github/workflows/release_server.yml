@@ -55,6 +55,7 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cross
+          version: latest
 
       - name: Build iggy-server release binary for x86_64-unknown-linux-musl
         run: cross +stable build --verbose --target x86_64-unknown-linux-musl --release --bin iggy-server
