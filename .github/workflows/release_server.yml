@@ -57,12 +57,12 @@ jobs:
           tool: cross
 
       - name: Build iggy-server release binary for x86_64-unknown-linux-musl
-        run: cross +stable build --verbose --target x86_64-unknown-linux-musl --release --bin iggy-server
+        run: cross +stable build --verbose --target x86_64-unknown-linux-musl --release --bin iggy-server --target-dir target_x86
 
       - name: Prepare x86_64-unknown-linux-musl artifacts
         run: |
           mkdir -p all_artifacts/Linux-x86_64
-          cp target/x86_64-unknown-linux-musl/release/iggy-server all_artifacts/Linux-x86_64/
+          cp target_x86/x86_64-unknown-linux-musl/release/iggy-server all_artifacts/Linux-x86_64/
 
       - name: Prepare aarch64-unknown-linux-musl toolchain
         uses: actions-rs/toolchain@v1
@@ -72,12 +72,12 @@ jobs:
           target: aarch64-unknown-linux-musl
 
       - name: Build iggy-server release binary for aarch64-unknown-linux-musl
-        run: cross +stable build --verbose --target aarch64-unknown-linux-musl --release --bin iggy-server
+        run: cross +stable build --verbose --target aarch64-unknown-linux-musl --release --bin iggy-server --target-dir target_aarch64
 
       - name: Prepare aarch64-unknown-linux-musl artifacts
         run: |
           mkdir -p all_artifacts/Linux-aarch64
-          cp target/aarch64-unknown-linux-musl/release/iggy-server all_artifacts/Linux-aarch64/
+          cp target_aarch64/aarch64-unknown-linux-musl/release/iggy-server all_artifacts/Linux-aarch64/
 
       - name: Zip artifacts for each platform
         run: |
