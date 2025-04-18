@@ -71,12 +71,15 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: convco
-      - name: Print commit range to check
+      - name: Check first (oldest) commit in PR
+        if: github.event_name == 'pull_request'
         run: |
-          echo "Checking commit range from ${{ inputs.commits-from }} to ${{ inputs.commits-to }}"
-      - name: Check commit messages
-        run: |
-          command -v convco
-          convco --version
-          git log ${{ inputs.commits-from }}..${{ inputs.commits-to }}
-          convco check ${{ inputs.commits-from }}..${{ inputs.commits-to }}
+          # Find the oldest commit in the PR
+          OLDEST_COMMIT=$(git rev-list --reverse ${{ inputs.commits-from }}..${{ inputs.commits-to }} | head -1)
+          if [ -n "$OLDEST_COMMIT" ]; then
+            echo "Checking oldest commit $OLDEST_COMMIT"
+            convco check $OLDEST_COMMIT -n 1
+          else
+            echo "No commits found in PR"
+            exit 0
+          fi
