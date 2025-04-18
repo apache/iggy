@@ -456,16 +456,16 @@ validate_checksum = false
 # Adjusting this can balance between write performance and data durability.
 # This is soft limit, actual number of messages may be higher, depending on last batch size.
 # Together with `size_of_messages_required_to_save` it defines the threshold of buffered messages.
-# Minimum value is 32.
-messages_required_to_save = 1000
+# Minimum value is 32. Value has to be a multiple of 32.
+messages_required_to_save = 1024
 
 # The size threshold of buffered messages before triggering a save to disk (string).
 # Specifies how much size of messages accumulate before persisting to storage.
 # Adjusting this can balance between write performance and data durability.
 # This is soft limit, actual number of messages may be higher, depending on last batch size.
 # Together with `messages_required_to_save` it defines the threshold of buffered messages.
-# Minimum value is 512
-size_of_messages_required_to_save = "1 MB"
+# Minimum value is 512. Value has to be a multiple of 512 B.
+size_of_messages_required_to_save = "1 MiB"
 
 # Segment configuration
 [system.segment]
