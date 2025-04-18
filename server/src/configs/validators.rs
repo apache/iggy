@@ -22,7 +22,7 @@ use super::server::{
     ArchiverConfig, DataMaintenanceConfig, MessageSaverConfig, MessagesMaintenanceConfig,
     StateMaintenanceConfig, TelemetryConfig,
 };
-use super::system::{CompressionConfig, MemoryPoolConfig};
+use super::system::{CompressionConfig, MemoryPoolConfig, PartitionConfig};
 use crate::archiver::ArchiverKindType;
 use crate::configs::server::{PersonalAccessTokenConfig, ServerConfig};
 use crate::configs::system::SegmentConfig;
@@ -128,9 +128,60 @@ impl Validatable<ConfigError> for TelemetryConfig {
     }
 }
 
+impl Validatable<ConfigError> for PartitionConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.messages_required_to_save < 32 {
+            eprintln!(
+                "Configured system.partition.messages_required_to_save {} is less than minimum {}",
+                self.messages_required_to_save, 32
+            );
+            return Err(ConfigError::InvalidConfiguration);
+        }
+
+        if self.messages_required_to_save % 32 != 0 {
+            eprintln!(
+                "Configured system.partition.messages_required_to_save {} is not a multiple of 32",
+                self.messages_required_to_save
+            );
+            return Err(ConfigError::InvalidConfiguration);
+        }
+
+        if self.size_of_messages_required_to_save < 512 {
+            eprintln!(
+                "Configured system.partition.size_of_messages_required_to_save {} is less than minimum {}",
+                self.size_of_messages_required_to_save, 512
+            );
+            return Err(ConfigError::InvalidConfiguration);
+        }
+
+        if self.size_of_messages_required_to_save.as_bytes_u64() % 512 != 0 {
+            eprintln!(
+                "Configured system.partition.size_of_messages_required_to_save {} is not a multiple of 512 B",
+                self.size_of_messages_required_to_save
+            );
+            return Err(ConfigError::InvalidConfiguration);
+        }
+
+        Ok(())
+    }
+}
+
 impl Validatable<ConfigError> for SegmentConfig {
     fn validate(&self) -> Result<(), ConfigError> {
         if self.size > SEGMENT_MAX_SIZE_BYTES {
+            eprintln!(
+                "Configured system.segment.size {} B is greater than maximum {} B",
+                self.size.as_bytes_u64(),
+                SEGMENT_MAX_SIZE_BYTES
+            );
+            return Err(ConfigError::InvalidConfiguration);
+        }
+
+        if self.size.as_bytes_u64() % 1024 != 0 {
+            eprintln!(
+                "Configured system.segment.size {} B is not a multiple of 1024 B",
+                self.size.as_bytes_u64()
+            );
             return Err(ConfigError::InvalidConfiguration);
         }
 

@@ -74,7 +74,7 @@ jobs:
             echo "::notice ::Tag ${{ steps.extract_tag.outputs.tag_name }} matches the version in Cargo.toml"
             echo "tag_matches=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning ::Tag ${{ steps.extract_tag.outputs.tag_name }} does not matche the version from Cargo.toml"
+            echo "::warning ::Tag ${{ steps.extract_tag.outputs.tag_name }} does not match the version from Cargo.toml"
             echo "tag_matches=false" >> "$GITHUB_OUTPUT"
           fi
 
