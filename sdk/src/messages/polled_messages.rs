@@ -28,6 +28,7 @@ use tracing::error;
 /// It consists of the following fields:
 /// - `partition_id`: the identifier of the partition.
 /// - `current_offset`: the current offset of the partition.
+/// - `count`: the count of messages.
 /// - `messages`: the collection of messages.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PolledMessages {

@@ -26,9 +26,7 @@ use crate::utils::sizeable::Sizeable;
 use crate::utils::timestamp::IggyTimestamp;
 use bon::bon;
 use bytes::{BufMut, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
-use serde_with::base64::Base64;
-use serde_with::serde_as;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::str::FromStr;
@@ -107,18 +105,15 @@ pub const MAX_USER_HEADERS_SIZE: u32 = 100 * 1000;
 ///     .build()
 ///     .unwrap();
 /// ```
-#[serde_as]
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct IggyMessage {
     /// Message metadata
     pub header: IggyMessageHeader,
 
     /// Message content
-    #[serde_as(as = "Base64")]
     pub payload: Bytes,
 
     /// Optional user-defined headers
-    #[serde_as(as = "Option<Base64>")]
     pub user_headers: Option<Bytes>,
 }
 
@@ -541,6 +536,108 @@ impl TryFrom<Bytes> for IggyMessage {
     }
 }
 
+impl Serialize for IggyMessage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use serde::ser::SerializeStruct;
+
+        let field_count = 2 + self.user_headers.is_some() as usize;
+
+        let mut state = serializer.serialize_struct("IggyMessage", field_count)?;
+        state.serialize_field("header", &self.header)?;
+
+        let base64_payload = STANDARD.encode(&self.payload);
+        state.serialize_field("payload", &base64_payload)?;
+
+        if self.user_headers.is_some() {
+            let headers_map = self.user_headers_map().map_err(serde::ser::Error::custom)?;
+
+            state.serialize_field("user_headers", &headers_map)?;
+        }
+
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for IggyMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::{self, MapAccess, Visitor};
+        use std::fmt;
+
+        struct IggyMessageVisitor;
+
+        impl<'de> Visitor<'de> for IggyMessageVisitor {
+            type Value = IggyMessage;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("struct IggyMessage")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut header: Option<IggyMessageHeader> = None;
+                let mut payload: Option<Bytes> = None;
+                let mut user_headers: Option<HashMap<HeaderKey, HeaderValue>> = None;
+
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "header" => {
+                            header = Some(map.next_value()?);
+                        }
+                        "payload" => {
+                            let payload_str: String = map.next_value()?;
+                            use base64::{engine::general_purpose::STANDARD, Engine as _};
+                            let decoded = STANDARD.decode(payload_str.as_bytes()).map_err(|e| {
+                                de::Error::custom(format!("Failed to decode base64: {}", e))
+                            })?;
+                            payload = Some(Bytes::from(decoded));
+                        }
+                        "user_headers" => {
+                            user_headers = Some(map.next_value()?);
+                        }
+                        _ => {
+                            let _ = map.next_value::<de::IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                let header = header.ok_or_else(|| de::Error::missing_field("header"))?;
+                let payload = payload.ok_or_else(|| de::Error::missing_field("payload"))?;
+
+                let user_headers_bytes = user_headers.map(|headers| headers.to_bytes());
+
+                let user_headers_length = user_headers_bytes
+                    .as_ref()
+                    .map(|h| h.len() as u32)
+                    .unwrap_or(0);
+
+                let mut header = header;
+                header.user_headers_length = user_headers_length;
+
+                Ok(IggyMessage {
+                    header,
+                    payload,
+                    user_headers: user_headers_bytes,
+                })
+            }
+        }
+
+        deserializer.deserialize_struct(
+            "IggyMessage",
+            &["header", "payload", "user_headers"],
+            IggyMessageVisitor,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,5 +718,67 @@ mod tests {
 
         assert_eq!(original.header.id, decoded.header.id);
         assert_eq!(original.payload, decoded.payload);
+    }
+
+    #[test]
+    fn test_json_serialization_with_headers() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            HeaderKey::new("content-type").unwrap(),
+            HeaderValue::from_str("text/plain").unwrap(),
+        );
+        headers.insert(
+            HeaderKey::new("correlation-id").unwrap(),
+            HeaderValue::from_str("123456").unwrap(),
+        );
+
+        let original = IggyMessage::builder()
+            .id(42)
+            .payload(Bytes::from("JSON serialization test"))
+            .user_headers(headers)
+            .build()
+            .expect("Message creation should not fail");
+
+        let json = serde_json::to_string(&original).expect("JSON serialization should not fail");
+
+        let deserialized: IggyMessage =
+            serde_json::from_str(&json).expect("JSON deserialization should not fail");
+
+        assert_eq!(original.header.id, deserialized.header.id);
+        assert_eq!(original.payload, deserialized.payload);
+        assert!(deserialized.user_headers.is_some());
+
+        let original_headers_result = original.user_headers_map();
+        let deserialized_headers_result = deserialized.user_headers_map();
+
+        let original_map = match original_headers_result {
+            Ok(Some(map)) => map,
+            Ok(None) => {
+                panic!("Original user_headers_map() returned None");
+            }
+            Err(e) => {
+                panic!("Error getting original user_headers_map: {:?}", e);
+            }
+        };
+
+        let deserialized_map = match deserialized_headers_result {
+            Ok(Some(map)) => map,
+            Ok(None) => {
+                panic!("Deserialized user_headers_map() returned None");
+            }
+            Err(e) => {
+                panic!("Error getting deserialized user_headers_map: {:?}", e);
+            }
+        };
+
+        assert_eq!(original_map.len(), deserialized_map.len());
+        assert_eq!(
+            original_map.get(&HeaderKey::new("content-type").unwrap()),
+            deserialized_map.get(&HeaderKey::new("content-type").unwrap())
+        );
+        assert_eq!(
+            original_map.get(&HeaderKey::new("correlation-id").unwrap()),
+            deserialized_map.get(&HeaderKey::new("correlation-id").unwrap())
+        );
     }
 }

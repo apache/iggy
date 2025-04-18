@@ -456,7 +456,9 @@ validate_checksum = false
 # Adjusting this can balance between write performance and data durability.
 # This is soft limit, actual number of messages may be higher, depending on last batch size.
 # Together with `size_of_messages_required_to_save` it defines the threshold of buffered messages.
-# Minimum value is 32. Value has to be a multiple of 32.
+# Minimum value is 32. Value has to be a multiple of 32 due to minimum
+# direct I/O block size (512 bytes) and message index size (16 bytes per message).
+# With direct I/O, writes must occur in blocks of at least 512 bytes, which equals 32 message indices.
 messages_required_to_save = 1024
 
 # The size threshold of buffered messages before triggering a save to disk (string).
@@ -464,7 +466,8 @@ messages_required_to_save = 1024
 # Adjusting this can balance between write performance and data durability.
 # This is soft limit, actual number of messages may be higher, depending on last batch size.
 # Together with `messages_required_to_save` it defines the threshold of buffered messages.
-# Minimum value is 512 B. Value has to be a multiple of 512 B.
+# Minimum value is 512 B. Value has to be a multiple of 512 B due to direct I/O requirements.
+# Direct I/O operations must align with the underlying storage block size (typically 512 B or 4 KiB).
 size_of_messages_required_to_save = "1 MiB"
 
 # Segment configuration
@@ -525,11 +528,11 @@ enabled = true
 # Example: "512 MiB" or "1 GiB".
 # This defines the maximum, total memory allocated for the memory pool.
 # Note: This number has to be multiplication of 4096 (default linux page size).
-# Minimum size is 512 MiB.
+# Minimum size is 512 MiB due to internal implementation details.
 size = "4 GiB"
 
 # Maximum number of buffers in each bucket (u32).
 # There are 32 buckets in the memory pool. Each bucket can hold up to this number of buffers
 # and holds different buffer sizes, from 256 B to 512 MiB.
-# Note: This number has to be a power of 2. Minimum value is 128.
+# Note: This number has to be a power of 2. Minimum value is 128 due to internal implementation details.
 bucket_capacity = 8192
