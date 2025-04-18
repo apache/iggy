@@ -425,9 +425,9 @@ path = "topics"
 # "unlimited" or "0" means topics are kept indefinitely.
 # A size value in human-readable format determines the maximum size of a topic.
 # When a topic reaches this size, the oldest messages are deleted to make room for new ones.
-# Messages are removed in full segments, so if segment size is 1 GB and the topic size is 10 GB,
-# the oldest segment will be deleted upon reaching 10 GB.
-# Example: `max_topic_size = "10 GB"` means oldest messages in topics will be deleted when they reach 10 GB.
+# Messages are removed in full segments, so if segment size is 1 GiB and the topic size is 10 GiB,
+# the oldest segment will be deleted upon reaching 10 GiB.
+# Example: `max_topic_size = "10 GiB"` means oldest messages in topics will be deleted when they reach 10 GiB.
 # Note: this setting can be overwritten with CreateTopic and UpdateTopic requests.
 max_size = "unlimited"
 
@@ -471,7 +471,7 @@ size_of_messages_required_to_save = "1 MiB"
 [system.segment]
 # Defines the soft limit for the size of a storage segment.
 # When a segment reaches this size, a new segment is created for subsequent data.
-# Example: if `size` is set "1GB", the actual segment size may be 1GB + the size of remaining messages in received batch.
+# Example: if `size` is set "1GiB", the actual segment size may be 1GiB + the size of remaining messages in received batch.
 # Maximum size is 1 GiB. Size has to be a multiple of 512 B.
 size = "1 GiB"
 

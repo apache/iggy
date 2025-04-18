@@ -50,7 +50,7 @@ pub struct BalancedProducerAndConsumerGroupArgs {
     #[arg(long, default_value_t = DEFAULT_NUMBER_OF_CONSUMER_GROUPS)]
     pub consumer_groups: NonZeroU32,
 
-    /// Max topic size in human readable format, e.g. "1GiB", "2MB", "1GB". If not provided then the server default will be used.
+    /// Max topic size in human readable format, e.g. "1GiB", "2MiB", "1GiB". If not provided then the server default will be used.
     #[arg(long, short = 't')]
     pub max_topic_size: Option<IggyByteSize>,
 }

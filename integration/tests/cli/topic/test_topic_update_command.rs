@@ -253,7 +253,7 @@ pub async fn should_be_successful() {
             String::from("new_name"),
             CompressionAlgorithm::Gzip,
             None,
-            MaxTopicSize::Custom(IggyByteSize::from_str("1GB").unwrap()),
+            MaxTopicSize::Custom(IggyByteSize::from_str("1GiB").unwrap()),
             1,
             TestStreamId::Numeric,
             TestTopicId::Numeric,

@@ -45,7 +45,7 @@ pub struct EndToEndProducingConsumerGroupArgs {
     #[arg(long, short = 'p', default_value_t = DEFAULT_NUMBER_OF_PRODUCERS)]
     pub producers: NonZeroU32,
 
-    /// Max topic size in human readable format, e.g. "1GiB", "2MB", "1GB". If not provided then topic size will be unlimited.
+    /// Max topic size in human readable format, e.g. "1GiB", "2MB", "1GiB". If not provided then topic size will be unlimited.
     #[arg(long, short = 't')]
     pub max_topic_size: Option<IggyByteSize>,
 }

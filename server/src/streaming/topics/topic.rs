@@ -236,7 +236,7 @@ impl Topic {
         match max_topic_size {
             MaxTopicSize::ServerDefault => Ok(config.topic.max_size),
             _ => {
-                if max_topic_size.as_bytes_u64() >= config.segment.size.as_bytes_u64() {
+                if max_topic_size.as_bytes_u64() > config.segment.size.as_bytes_u64() {
                     Ok(max_topic_size)
                 } else {
                     Err(IggyError::InvalidTopicSize(

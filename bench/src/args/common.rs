@@ -58,7 +58,7 @@ pub struct IggyBenchArgs {
     pub start_stream_id: NonZeroU32,
 
     /// Optional rate limit per individual producer in bytes per second (not aggregate).
-    /// Accepts human-readable formats like "50KB", "10MB", or "1GB"
+    /// Accepts human-readable formats like "50KB", "10MB", or "1GiB"
     #[arg(long, short = 'r', verbatim_doc_comment)]
     pub rate_limit: Option<IggyByteSize>,
 
