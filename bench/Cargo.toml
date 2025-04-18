@@ -28,7 +28,7 @@ async-trait = "0.1.88"
 atomic-time = "0.1.5"
 charming = "0.4.0"
 chrono = "0.4.40"
-clap = { version = "4.5.36", features = ["derive"] }
+clap = { version = "4.5.37", features = ["derive"] }
 figlet-rs = "0.1.5"
 hostname = "0.4.1"
 human-repr = "1.1.0"

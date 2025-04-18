@@ -23,7 +23,7 @@ license = "Apache-2.0"
 
 [dependencies]
 anyhow = "1.0.98"
-clap = { version = "4.5.36", features = ["derive"] }
+clap = { version = "4.5.37", features = ["derive"] }
 iggy = { path = "../sdk" }
 rand = "0.9.1"
 tokio = { version = "1.44.2", features = ["full"] }

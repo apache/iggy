@@ -51,7 +51,7 @@ bincode = { version = "2.0.1", features = ["serde"] }
 blake3 = "1.8.1"
 bytes = "1.10.1"
 chrono = "0.4.40"
-clap = { version = "4.5.36", features = ["derive"] }
+clap = { version = "4.5.37", features = ["derive"] }
 console-subscriber = { version = "0.4.1", optional = true }
 crossbeam = "0.8.4"
 dashmap = "6.1.0"
