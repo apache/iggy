@@ -327,3 +327,7 @@ For example, to run the benchmark for the already started server, provide the ad
 Depending on the hardware, transport protocol (`quic`, `tcp` or `http`) and payload size (`messages-per-batch * message-size`) you might expect **over 5000 MB/s (e.g. 5M of 1 KB msg/sec) throughput for writes and reads**. These results have been achieved on Ryzen 9 7950X with 64 GB RAM and gen 4 NVMe SSD.
 
 ---
+
+## Contributing
+
+Please see [Contributing](CONTRIBUTING.md)
