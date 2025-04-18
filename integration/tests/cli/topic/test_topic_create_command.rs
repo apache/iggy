@@ -254,7 +254,7 @@ pub async fn should_be_successful() {
                 String::from("1m"),
                 String::from("1s"),
             ]),
-            MaxTopicSize::Custom(IggyByteSize::from_str("1GiB").unwrap()),
+            MaxTopicSize::Custom(IggyByteSize::from_str("2GiB").unwrap()),
             1,
             TestStreamId::Numeric,
         ))

@@ -464,7 +464,7 @@ messages_required_to_save = 1024
 # Adjusting this can balance between write performance and data durability.
 # This is soft limit, actual number of messages may be higher, depending on last batch size.
 # Together with `messages_required_to_save` it defines the threshold of buffered messages.
-# Minimum value is 512. Value has to be a multiple of 512 B.
+# Minimum value is 512 B. Value has to be a multiple of 512 B.
 size_of_messages_required_to_save = "1 MiB"
 
 # Segment configuration
