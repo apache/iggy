@@ -29,34 +29,29 @@ pub struct PooledBuffer {
 }
 
 impl Default for PooledBuffer {
+    /// Creates a default pooled buffer.
     fn default() -> Self {
         Self::empty()
     }
 }
 
 impl PooledBuffer {
-    /// Creates a new pooled buffer with the specified capacity.
-    ///
-    /// # Arguments
-    ///
-    /// * `capacity` - The capacity of the buffer
+    /// Creates a new pooled buffer with the specified minimum capacity.
+    /// Acquires a buffer from the memory pool.
     pub fn with_capacity(capacity: usize) -> Self {
-        let buffer = memory_pool().acquire_buffer(capacity);
-        let original_capacity = buffer.capacity();
+        let inner = memory_pool().acquire_buffer(capacity);
+        let original_capacity = inner.capacity();
         let original_bucket_idx = memory_pool().best_fit(original_capacity);
+
         Self {
-            from_pool: true,
+            from_pool: original_bucket_idx.is_some(),
             original_capacity,
             original_bucket_idx,
-            inner: buffer,
+            inner,
         }
     }
 
-    /// Creates a new pooled buffer from an existing `BytesMut`.
-    ///
-    /// # Arguments
-    ///
-    /// * `existing` - The existing `BytesMut` buffer
+    /// Creates a buffer wrapper around an existing BytesMut without using the memory pool.
     pub fn from_existing(existing: BytesMut) -> Self {
         Self {
             from_pool: false,
@@ -66,7 +61,7 @@ impl PooledBuffer {
         }
     }
 
-    /// Creates an empty pooled buffer.
+    /// Creates an empty non-pooled buffer.
     pub fn empty() -> Self {
         Self {
             from_pool: false,
@@ -76,112 +71,95 @@ impl PooledBuffer {
         }
     }
 
-    /// Checks if the buffer needs to be resized and updates the memory pool accordingly.
-    /// This shall be called after operations that might cause a resize.
-    pub fn check_for_resize(&mut self) {
-        if !self.from_pool {
+    /// Ensures the buffer has capacity for additional bytes without BytesMut reallocation.
+    /// Copies data to a larger pooled buffer if needed.
+    fn ensure_capacity(&mut self, additional: usize) {
+        let need = self.len().saturating_add(additional);
+        if need <= self.inner.capacity() {
             return;
         }
 
-        let current_capacity = self.inner.capacity();
-        if current_capacity != self.original_capacity {
-            memory_pool().inc_resize_events();
+        let mut new_buf = memory_pool().acquire_buffer(need);
+        new_buf.extend_from_slice(&self.inner);
 
-            if let Some(orig_idx) = self.original_bucket_idx {
-                memory_pool().dec_bucket_in_use(orig_idx);
+        let old_cap = self.original_capacity;
+        let old_buf = std::mem::replace(&mut self.inner, new_buf);
 
-                if let Some(new_idx) = memory_pool().best_fit(current_capacity) {
-                    // Track as a new allocation in the new bucket
-                    memory_pool().inc_bucket_alloc(new_idx);
-                    memory_pool().inc_bucket_in_use(new_idx);
-                    self.original_bucket_idx = Some(new_idx);
-                } else {
-                    // Track as an external allocation if no bucket fits
-                    memory_pool().inc_external_allocations();
-                    self.original_bucket_idx = None;
-                }
-            }
-
-            self.original_capacity = current_capacity;
+        if self.from_pool {
+            old_buf.return_to_pool(old_cap);
         }
+
+        self.from_pool =
+            memory_pool().best_fit(self.inner.capacity()).is_some() && memory_pool().is_enabled;
+        self.original_capacity = self.inner.capacity();
+        self.original_bucket_idx = memory_pool().best_fit(self.original_capacity);
+
+        memory_pool().inc_resize_events();
     }
 
-    /// Wrapper for reserve which might cause resize
+    /// Reserves capacity for at least `additional` more bytes.
+    /// Uses the memory pool for efficient buffer management.
     pub fn reserve(&mut self, additional: usize) {
-        let before_cap = self.inner.capacity();
-        self.inner.reserve(additional);
-
-        if self.inner.capacity() != before_cap {
-            self.check_for_resize();
+        if additional > 0 {
+            self.ensure_capacity(additional);
+            self.inner.reserve(additional);
         }
     }
 
-    /// Wrapper for extend_from_slice which might cause resize
-    pub fn extend_from_slice(&mut self, extend_from: &[u8]) {
-        let before_cap = self.inner.capacity();
-        self.inner.extend_from_slice(extend_from);
-
-        if self.inner.capacity() != before_cap {
-            self.check_for_resize();
-        }
+    /// Extends the buffer with the given slice.
+    /// Ensures capacity before extending.
+    pub fn extend_from_slice(&mut self, src: &[u8]) {
+        self.ensure_capacity(src.len());
+        self.inner.extend_from_slice(src);
     }
 
-    /// Wrapper for put_bytes which might cause resize
+    /// Writes `len` copies of `byte` to the buffer.
+    /// Ensures capacity before writing.
     pub fn put_bytes(&mut self, byte: u8, len: usize) {
-        let before_cap = self.inner.capacity();
+        self.ensure_capacity(len);
         self.inner.put_bytes(byte, len);
-
-        if self.inner.capacity() != before_cap {
-            self.check_for_resize();
-        }
     }
 
-    /// Wrapper for put_slice which might cause resize
+    /// Writes the contents of `src` to the buffer.
+    /// Ensures capacity before writing.
     pub fn put_slice(&mut self, src: &[u8]) {
-        let before_cap = self.inner.capacity();
+        self.ensure_capacity(src.len());
         self.inner.put_slice(src);
-
-        if self.inner.capacity() != before_cap {
-            self.check_for_resize();
-        }
     }
 
-    /// Wrapper for put_u32_le which might cause resize
+    /// Writes a u32 in little endian format to the buffer.
+    /// Ensures capacity before writing.
     pub fn put_u32_le(&mut self, value: u32) {
-        let before_cap = self.inner.capacity();
+        self.ensure_capacity(std::mem::size_of::<u32>());
         self.inner.put_u32_le(value);
-
-        if self.inner.capacity() != before_cap {
-            self.check_for_resize();
-        }
     }
 
-    /// Wrapper for put_u64_le which might cause resize
+    /// Writes a u64 in little endian format to the buffer.
+    /// Ensures capacity before writing.
     pub fn put_u64_le(&mut self, value: u64) {
-        let before_cap = self.inner.capacity();
+        self.ensure_capacity(std::mem::size_of::<u64>());
         self.inner.put_u64_le(value);
-
-        if self.inner.capacity() != before_cap {
-            self.check_for_resize();
-        }
     }
 }
 
 impl Deref for PooledBuffer {
     type Target = BytesMut;
 
+    /// Returns a reference to the inner BytesMut buffer.
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
 
 impl DerefMut for PooledBuffer {
+    /// Returns a mutable reference to the inner BytesMut buffer.
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }
 }
 
 impl Drop for PooledBuffer {
+    /// Returns the buffer to the memory pool if it was acquired from there.
     fn drop(&mut self) {
         if self.from_pool {
             let buf = std::mem::take(&mut self.inner);
@@ -191,6 +169,7 @@ impl Drop for PooledBuffer {
 }
 
 impl From<&[u8]> for PooledBuffer {
+    /// Creates a pooled buffer from a byte slice.
     fn from(slice: &[u8]) -> Self {
         let mut buf = PooledBuffer::with_capacity(slice.len());
         buf.inner.extend_from_slice(slice);
@@ -199,18 +178,22 @@ impl From<&[u8]> for PooledBuffer {
 }
 
 impl Buf for PooledBuffer {
+    /// Returns the number of bytes between the cursor and the end of the buffer.
     fn remaining(&self) -> usize {
         self.inner.remaining()
     }
 
+    /// Returns a slice of bytes starting at the current position.
     fn chunk(&self) -> &[u8] {
         self.inner.chunk()
     }
 
+    /// Advances the cursor position by `cnt` bytes.
     fn advance(&mut self, cnt: usize) {
         self.inner.advance(cnt)
     }
 
+    /// Fills `dst` with references to the bytes in this buffer.
     fn chunks_vectored<'t>(&'t self, dst: &mut [std::io::IoSlice<'t>]) -> usize {
         self.inner.chunks_vectored(dst)
     }
