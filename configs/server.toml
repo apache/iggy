@@ -472,7 +472,7 @@ size_of_messages_required_to_save = "1 MiB"
 # Defines the soft limit for the size of a storage segment.
 # When a segment reaches this size, a new segment is created for subsequent data.
 # Example: if `size` is set "1GB", the actual segment size may be 1GB + the size of remaining messages in received batch.
-# Maximum size is 1 GiB. Size has to be a multiple of 1024 B.
+# Maximum size is 1 GiB. Size has to be a multiple of 512 B.
 size = "1 GiB"
 
 # Configures the message time-based expiry setting.

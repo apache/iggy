@@ -177,9 +177,9 @@ impl Validatable<ConfigError> for SegmentConfig {
             return Err(ConfigError::InvalidConfiguration);
         }
 
-        if self.size.as_bytes_u64() % 1024 != 0 {
+        if self.size.as_bytes_u64() % 512 != 0 {
             eprintln!(
-                "Configured system.segment.size {} B is not a multiple of 1024 B",
+                "Configured system.segment.size {} B is not a multiple of 512 B",
                 self.size.as_bytes_u64()
             );
             return Err(ConfigError::InvalidConfiguration);
