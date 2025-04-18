@@ -31,12 +31,12 @@ readme = "../README.md"
 [dependencies]
 aes-gcm = "0.10.3"
 ahash = { version = "0.8.11", features = ["serde"] }
-anyhow = "1.0.97"
+anyhow = "1.0.98"
 async-broadcast = { version = "0.7.2" }
 async-dropper = { version = "0.3.1", features = ["tokio", "simple"] }
 async-trait = "0.1.88"
 base64 = "0.22.1"
-bon = { version = "3.5" }
+bon = { version = "3.6" }
 byte-unit = { version = "5.1.6", default-features = false, features = [
     "serde",
     "byte",
@@ -44,7 +44,7 @@ byte-unit = { version = "5.1.6", default-features = false, features = [
 ] }
 bytes = "1.10.1"
 chrono = { version = "0.4.40" }
-clap = { version = "4.5.34", features = ["derive"] }
+clap = { version = "4.5.36", features = ["derive"] }
 comfy-table = { version = "7.1.4", optional = true }
 crc32fast = "1.4.2"
 dashmap = "6.1.0"
@@ -59,21 +59,21 @@ keyring = { version = "3.6.2", optional = true, features = [
     "sync-secret-service",
     "vendored",
 ] }
-passterm = { version = "=2.0.1", optional = true }
+passterm = { version = "=2.0.5", optional = true }
 quinn = { version = "0.11.7" }
 reqwest = { version = "0.12.15", default-features = false, features = [
     "json",
     "rustls-tls",
 ] }
-reqwest-middleware = { version = "0.4.1", features = ["json"] }
+reqwest-middleware = { version = "0.4.2", features = ["json"] }
 reqwest-retry = "0.7.0"
-rustls = { version = "0.23.25", features = ["ring"] }
+rustls = { version = "0.23.26", features = ["ring"] }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = "1.0.140"
 serde_with = { version = "3.12.0", features = ["base64"] }
 strum = { version = "0.27.1", features = ["derive"] }
 thiserror = "2.0.12"
-tokio = { version = "1.44.1", features = ["full"] }
+tokio = { version = "1.44.2", features = ["full"] }
 tokio-rustls = { version = "0.26.2" }
 toml = "0.8.20"
 tracing = { version = "0.1.41" }
