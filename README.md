@@ -28,7 +28,7 @@
 
 ---
 
-**Iggy** is the persistent message streaming platform written in Rust, supporting [QUIC](https://www.chromium.org/quic/), TCP (custom binary specification) and HTTP (regular REST API) transport protocols, **capable of processing millions of messages per second at the low latency**.
+**Iggy** is the persistent message streaming platform written in Rust, supporting QUIC, TCP (custom binary specification) and HTTP (regular REST API) transport protocols, **capable of processing millions of messages per second at the low latency**.
 
 Iggy provides **exceptionally high throughput and performance** while utilizing minimal computing resources.
 
@@ -51,7 +51,7 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 - Fully operational RESTful API which can be optionally enabled
 - Available client SDK in multiple languages
 - **Works directly with the binary data** (lack of enforced schema and serialization/deserialization)
-- Custom **Zero-copy (de)serialization**, which greatly improves the performance and reduces memory usage.
+- Custom **zero-copy (de)serialization**, which greatly improves the performance and reduces memory usage.
 - Configurable server features (e.g. caching, segment size, data flush interval, transport protocols etc.)
 - Possibility of storing the **consumer offsets** on the server
 - Multiple ways of polling the messages:
@@ -68,7 +68,7 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 - Optional server-side as well as client-side **data encryption** using AES-256-GCM
 - Optional metadata support in the form of **message headers**
 - Optional **data backups & archivization** on disk and/or the **S3** compatible cloud storage (e.g. AWS S3)
-- Support for **[OpenTelemetry](https://opentelemetry.io/)** logs & traces + Prometheus metrics
+- Support for **OpenTelemetry** logs & traces + Prometheus metrics
 - Built-in **CLI** to manage the streaming server installable via `cargo install iggy-cli`
 - Built-in **benchmarking app** to test the performance
 - **Single binary deployment** (no external dependencies)
@@ -82,9 +82,9 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 
 ## Architecture
 
-This is the high-level architecture of the Iggy message streaming server, where extremely high performance and ultra low and stable tail latencies are the primary goals. The server is designed to handle high throughput and very low latency (submillisecond tail latencies), making it suitable for real-time applications. For more details, please refer to the [architecture documentation](https://iggy.apache.org/docs/introduction/architecture).
+This is the high-level architecture of the Iggy message streaming server, where extremely high performance and ultra low and stable tail latencies are the primary goals. The server is designed to handle high throughput and very low latency (submillisecond tail latencies), making it suitable for real-time applications. For more details, please refer to the [documentation](https://iggy.apache.org/docs/introduction/architecture).
 
-![server](assets/architecture.png)*Architecture*
+![server](assets/iggy_architecture.png)*Architecture*
 
 
 ---
@@ -157,7 +157,7 @@ For the detailed documentation of the configuration file, please refer to the [c
 
 ## Quick start
 
-Build the project (the longer compilation time is due to [LTO](https://doc.rust-lang.org/rustc/linker-plugin-lto.html) enabled in release [profile](https://github.com/apache/iggy/blob/master/Cargo.toml#L2)):
+Build the project (the longer compilation time is due to [LTO](https://doc.rust-lang.org/rustc/linker-plugin-lto.html) enabled in release [profile](https://github.com/apache/iggy/blob/master/Cargo.toml#L2):
 
 `cargo build`
 
@@ -285,7 +285,8 @@ while let Some(message) = consumer.next().await {
 
 ## Benchmarks
 
-**Benchmarks should be the first-class citizens**. We believe that performance is crucial for any system, and we strive to provide the best possible performance for our users. Please check, why we believe that the **[transpart benchmarking](https://iggy.apache.org/blogs/2025/02/17/transparent-benchmarks)** is so important.
+**Benchmarks should be the first-class citizens**. We believe that performance is crucial for any system, and we strive to provide the best possible performance for our users. Please check, why we believe that the **[transparent
+benchmarking](https://iggy.apache.org/blogs/2025/02/17/transparent-benchmarks)** is so important.
 
 We've also built the **[benchmarking platform](https://benchmarks.iggy.rs)** where anyone can upload the benchmarks and compare the results with others. This is the another open-source project available [here](https://github.com/iggy-rs/iggy-bench-dashboard).
 
