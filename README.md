@@ -11,7 +11,7 @@
   [![crates.io](https://img.shields.io/crates/d/iggy.svg)](https://crates.io/crates/iggy)
   [![docs](https://docs.rs/iggy/badge.svg)](https://docs.rs/iggy)
   [![workflow](https://github.com/apache/iggy/actions/workflows/test.yml/badge.svg)](https://github.com/apache/iggy/actions/workflows/test.yml)
-  [![coverage](https://coveralls.io/repos/github/apache/iggy/badge.svg?branch=master)](https://coveralls.io/github/apache/iggy?branch=master)
+  [![coverage](https://coveralls.io/repos/github/iggy-rs/iggy/badge.svg?branch=master)](https://coveralls.io/github/iggy-rs/iggy?branch=master)
   [![dependency](https://deps.rs/repo/github/apache/iggy/status.svg)](https://deps.rs/repo/github/apache/iggy)
   [![x](https://img.shields.io/twitter/follow/ApacheIggy?style=social)](https://twitter.com/ApacheIggy)
   [![discord-badge](https://img.shields.io/discord/1144142576266530928)](https://discord.gg/C5Sux5NcRa)
@@ -74,9 +74,9 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 - **Single binary deployment** (no external dependencies)
 - Running as a single node (clustering based on Viewstamped Replication will be implemented in the near future)
 
-![server](assets/server.png)*Server*
+![server](assets/server.png)
 
-![files structure](assets/files_structure.png)*Files structure*
+![files structure](assets/files_structure.png)
 
 ---
 
@@ -84,7 +84,7 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 
 This is the high-level architecture of the Iggy message streaming server, where extremely high performance and ultra low and stable tail latencies are the primary goals. The server is designed to handle high throughput and very low latency (submillisecond tail latencies), making it suitable for real-time applications. For more details, please refer to the [documentation](https://iggy.apache.org/docs/introduction/architecture).
 
-![server](assets/iggy_architecture.png)*Architecture*
+![server](assets/iggy_architecture.png)
 
 
 ---
@@ -290,11 +290,11 @@ benchmarking](https://iggy.apache.org/blogs/2025/02/17/transparent-benchmarks)**
 
 We've also built the **[benchmarking platform](https://benchmarks.iggy.rs)** where anyone can upload the benchmarks and compare the results with others. This is the another open-source project available [here](https://github.com/iggy-rs/iggy-bench-dashboard).
 
-![server](assets/bench_platform.png)*Bench Platform*
+![server](assets/benchmarking_platform.png)
 
 For the benchmarking purposes, we've developed the dedicated **iggy-bench** tool, which is a part of the **iggy** project. It is a command-line tool that allows you to run the variety of fully customizable benchmarks.
 
-![server](assets/bench.png)*Bench CLI*
+![server](assets/bench.png)
 
 To benchmark the project, first build the project in release mode:
 
