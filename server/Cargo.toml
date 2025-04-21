@@ -48,7 +48,7 @@ axum = "0.8.3"
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
 bcrypt = "0.17.0"
 bincode = { version = "2.0.1", features = ["serde"] }
-blake3 = "1.8.1"
+blake3 = "1.8.2"
 bytes = "1.10.1"
 chrono = "0.4.40"
 clap = { version = "4.5.37", features = ["derive"] }
