@@ -48,7 +48,7 @@ axum = "0.8.3"
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
 bcrypt = "0.17.0"
 bincode = { version = "2.0.1", features = ["serde"] }
-blake3 = "1.8.1"
+blake3 = "1.8.2"
 bytes = "1.10.1"
 chrono = "0.4.40"
 clap = { version = "4.5.37", features = ["derive"] }
@@ -113,8 +113,8 @@ tempfile = "3.19"
 thiserror = "2.0.12"
 tokio = { version = "1.44.2", features = ["full"] }
 tokio-native-tls = "0.3.1"
-tokio-util = { version = "0.7.14", features = ["compat"] }
-toml = "0.8.20"
+tokio-util = { version = "0.7.15", features = ["compat"] }
+toml = "0.8.22"
 tower-http = { version = "0.6.2", features = [
     "add-extension",
     "cors",
