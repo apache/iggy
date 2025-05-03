@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <PackageId>Apache Iggy</PackageId>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <TargetFrameworks>net7.0;net8.0</TargetFrameworks>
+    </PropertyGroup>
+    
+    <PropertyGroup>
+        <Description>C# SDK for Apache Iggy</Description>
+        <Authors>Apache Iggy</Authors>
+        <IsPackable>true</IsPackable>
+        <PackageTags>SDK Iggy Messaging</PackageTags>
+        <RepositoryUrl>https://github.com/iggy-rs/iggy-dotnet-client</RepositoryUrl>
+        <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <None Include="../README.md" Pack="true" PackagePath="">
+            <Link>Properties/README.md</Link>
+        </None>
+        <None Include="../LICENSE" Pack="true" PackagePath="">
+            <Link>Properties/LICENSE</Link>
+        </None>
+    </ItemGroup>
+
+    <ItemGroup>
+      <PackageReference Include="Microsoft.Extensions.Logging" Version="8.0.0" />
+    </ItemGroup>
+</Project>

@@ -10,3 +10,5 @@ bench_*
 .env
 /iggy_release
 /iggy_release_tmp
+/**/obj
+/**/bin
