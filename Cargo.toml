@@ -22,14 +22,14 @@ codegen-units = 1
 [workspace]
 resolver = "2"
 members = [
-    "bench",
-    "bench/report",
-    "cli",
-    "examples",
-    "integration",
-    "sdk",
-    "server",
-    "tools",
+    "core/bench",
+    "core/bench/report",
+    "core/cli",
+    "core/examples",
+    "core/integration",
+    "core/sdk",
+    "core/server",
+    "core/tools",
 ]
 
 [workspace.metadata.cargo-machete]
