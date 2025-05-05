@@ -1,0 +1,103 @@
+@url = http://localhost:3000
+@access_token = eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJqdGkiOiI4YmYyY2FmNS04MTgwLTQ1YzItOGZmMy1kOWJhNWJiZjE0OWUiLCJpc3MiOiJpZ2d5LnJzIiwiYXVkIjoiaWdneS5ycyIsInN1YiI6MSwiaWF0IjoxNzAxMTA5MTg4LCJleHAiOjE3MDExMTI3ODgsIm5iZiI6MTcwMTEwOTE4OH0.i1kkVUCGOzLUR3tiDuD5xwOLS3AKGKLsMu_5QbFfhRY
+###
+
+GET {{url}}
+
+
+###
+POST {{url}}/users/login
+Content-Type: application/json
+
+{
+    "username":"iggy",
+    "password":"iggy"
+}
+
+###
+POST {{url}}/users/refresh-token
+Content-Type: application/json
+
+{
+  "token": "bhVdVpdPM29AZGbKLIqqoCailFnkO2Xq6fwEWZPxL%2B5k3hT%2Fp%2FteEfZM0OHWDCtiKJY%3D"
+}
+
+
+###
+POST {{url}}/users
+Content-Type: application/json
+Authorization: Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJqdGkiOiIwMzg5Y2RlNS1lZGRlLTQzZDItOWIyZS0zMDNkODc3ZGRmM2EiLCJpc3MiOiJpZ2d5LnJzIiwiYXVkIjoiaWdneS5ycyIsInN1YiI6MSwiaWF0IjoxNzAwNTk4NDYwLCJleHAiOjE3MDA2MDIwNjAsIm5iZiI6MTcwMDU5ODQ2MH0.x-KgfXp-3arpZy-FA9j5V85M88eHVa5Q1AERYjo3Pow
+
+{
+    "username":"asf2sdssdfafa2edad14dd22",
+    "password":"asdasd",
+    "status":"inactive",
+    "permissions":null
+}
+
+
+###
+GET {{url}}/users
+Content-Type: application/json
+Authorization: Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJqdGkiOiI5NmJlY2QwNy03ZTYyLTRiYTktYTcyZS02NzgwOThmMjE1MmMiLCJpc3MiOiJpZ2d5LnJzIiwiYXVkIjoiaWdneS5ycyIsInN1YiI6MSwiaWF0IjoxNzAwNTk4NTI5LCJleHAiOjE3MDA2MDIxMjksIm5iZiI6MTcwMDU5ODUyOX0.IYaIwFA1VajunF_P2KLQWOnnEzCYHJT31QuIQa__TS0
+
+
+### Create stream
+POST {{url}}/streams
+Content-Type: application/json
+Authorization: Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJqdGkiOiJjMmQ5ZWZmNS03OTQ5LTQ1MTEtYmM2YS1hZGY3MmQwN2VjNDkiLCJpc3MiOiJpZ2d5LnJzIiwiYXVkIjoiaWdneS5ycyIsInN1YiI6MSwiaWF0IjoxNjk5OTg0MzU4LCJleHAiOjE2OTk5ODc5NTgsIm5iZiI6MTY5OTk4NDM1OH0.-C96N0kTHKnjxkUXobGnfkejkvUIHrQa8yEKHD-N5cU
+
+{
+    "stream_id": 29,
+    "name":"stream29"
+}
+
+### Create topic
+POST {{url}}/streams/11/topics
+Content-Type: application/json
+Authorization: Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJqdGkiOiJmODM0NTI5MC05NzBlLTQ3YzAtOTMwOS02YWM5MmZiMWEyYTYiLCJpc3MiOiJpZ2d5LnJzIiwiYXVkIjoiaWdneS5ycyIsInN1YiI6MSwiaWF0IjoxNjk5OTgxMTU4LCJleHAiOjE2OTk5ODQ3NTgsIm5iZiI6MTY5OTk4MTE1OH0.6WxgKsOAZQfeAPciwHOcE1oR3iJXM0VORX-RtsvT2hU
+
+{
+  "topic_id": 16,
+  "name": "topic16",
+  "partitions_count": 10,
+  "message_expiry": 0,
+  "compression_algorithm": "none",
+  "max_topic_size": "1000000000"
+}
+
+ 
+### Create partitions
+POST {{url}}/streams/3/topics/3/partitions
+Content-Type: application/json
+
+{
+  "partitions_count": 45
+}
+
+###
+GET {{url}}/users/13
+Authorization: Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJqdGkiOiI5NmJlY2QwNy03ZTYyLTRiYTktYTcyZS02NzgwOThmMjE1MmMiLCJpc3MiOiJpZ2d5LnJzIiwiYXVkIjoiaWdneS5ycyIsInN1YiI6MSwiaWF0IjoxNzAwNTk4NTI5LCJleHAiOjE3MDA2MDIxMjksIm5iZiI6MTcwMDU5ODUyOX0.IYaIwFA1VajunF_P2KLQWOnnEzCYHJT31QuIQa__TS0
+
+
+
+###Create User
+POST {{url}}/users
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+{
+  "username": "airport.security.logs",
+  "password": "test",
+  "status": "active",
+  "permissions": null
+}
+
+###GET User
+GET {{url}}/users/37
+Authorization: Bearer {{access_token}}
+Content-Type: application/json
+
+### Delete User
+DELETE {{url}}/users/2
+Authorization: Bearer {{access_token}}

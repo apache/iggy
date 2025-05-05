@@ -1,0 +1,16 @@
+services:
+  iggy-server:
+    image: apache/iggy:edge
+    environment:
+      IGGY_ROOT_USERNAME: admin
+      IGGY_ROOT_PASSWORD: admin
+    ports:
+      - 3000:3000
+      - 8080:8080
+      - 8090:8090
+    volumes:
+      - iggy-server:/local_data
+
+volumes:
+  iggy-server:
+    driver: local

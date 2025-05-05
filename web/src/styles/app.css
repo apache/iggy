@@ -1,0 +1,91 @@
+@import url('./tooltip.css');
+@import url('./variables.css');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+.transitions-disabled * {
+  -webkit-transition: none !important;
+  -moz-transition: none !important;
+  -o-transition: none !important;
+  -ms-transition: none !important;
+  transition: none !important;
+}
+
+@layer base {
+  *,
+  ::before,
+  ::after {
+    @apply border-shadeL500 dark:border-shadeD300;
+  }
+
+  .hoverable {
+    @apply dark:hover:bg-shadeD200 hover:bg-shadeL300 hover:cursor-pointer transition-colors;
+  }
+
+  .hoverable-strong {
+    @apply hover:bg-shadeL500 dark:hover:bg-shadeD1000 hover:cursor-pointer transition-colors;
+  }
+}
+
+@layer components {
+  .debug {
+    outline: 2px solid red;
+  }
+
+  .noData {
+    @apply text-gray-400 text-xl;
+  }
+
+  .chip {
+    @apply bg-gray-300 dark:bg-shadeD300 dark:text-white rounded-3xl px-3 py-1 whitespace-nowrap;
+  }
+
+  .text-color {
+    @apply text-black dark:text-white;
+  }
+
+  .text-color-gray {
+    @apply text-shadeL1000 dark:text-white;
+  }
+
+  .card-shadow {
+    box-shadow: rgb(145 157 171 / 20%) 0px 0px 2px 0px, rgb(145 158 171 / 12%) 0px 12px 24px -4px;
+  }
+}
+
+/* width */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+/* Track */
+::-webkit-scrollbar-track {
+  @apply bg-shadeL500;
+}
+
+.dark ::-webkit-scrollbar-track {
+  @apply bg-shadeD300;
+}
+
+/* Handle */
+::-webkit-scrollbar-thumb {
+  @apply rounded-md bg-shadeL800;
+}
+
+.dark ::-webkit-scrollbar-thumb {
+  @apply rounded-md bg-shadeD1000;
+}
+
+/* Handle on hover */
+::-webkit-scrollbar-thumb:hover {
+  background: #555;
+}
+
+.dark :-webkit-autofill,
+.dark :-webkit-autofill:hover,
+.dark :-webkit-autofill:focus {
+  color-scheme: dark;
+}

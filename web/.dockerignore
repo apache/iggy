@@ -1,0 +1,17 @@
+build/
+node_modules/
+.husky/
+.next/
+.svelte-kit/
+.vscode/
+
+.dockerignore
+.gitignore
+.markdownlint_ignore
+.markdownlint.json
+*.log
+docker-compose.yml
+Dockerfile
+LICENSE
+makefile
+README.md
