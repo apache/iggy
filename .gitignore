@@ -12,3 +12,12 @@ bench_*
 /iggy_release_tmp
 /**/obj
 /**/bin
+# Go build artifacts, workspaces and module files
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
