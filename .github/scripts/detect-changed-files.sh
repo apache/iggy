@@ -63,7 +63,7 @@ else
         fi
         # Get the changed files based on the base and head refs of the pull request
         echo "The script is running in a GitHub Actions environment for a pull request event"
-        CHANGED_FILES=$(git diff --name-only "origin/${GITHUB_BASE_REF}" "origin/${GITHUB_HEAD_REF}")
+        CHANGED_FILES=$(git diff --name-only "origin/${GITHUB_BASE_REF}" "HEAD")
     fi
 fi
 
