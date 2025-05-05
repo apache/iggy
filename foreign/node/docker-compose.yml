@@ -1,0 +1,21 @@
+services:
+  iggy-server:
+    image: iggyrs/iggy:latest
+    container_name: iggy-server
+    restart: unless-stopped
+    networks:
+      - iggy
+    ports:
+      - 3000:3000
+      - 8080:8080
+      - 8090:8090
+    volumes:
+      - iggy-server:/local_data
+
+volumes:
+  iggy-server:
+    driver: local
+
+networks:
+  iggy:
+    name: iggy-network
