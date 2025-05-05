@@ -31,7 +31,7 @@ ahash = { version = "0.8.11", features = ["serde"] }
 assert_cmd = "2.0.17"
 async-trait = "0.1.88"
 bytes = "1.10.1"
-chrono = "0.4.40"
+chrono = "0.4.41"
 ctor = "0.4.2"
 derive_more = "2.0.1"
 env_logger = "0.11.8"

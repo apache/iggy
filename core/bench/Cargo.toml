@@ -27,7 +27,7 @@ license = "Apache-2.0"
 async-trait = "0.1.88"
 bytes = "1.10.1"
 charming = "0.4.0"
-chrono = "0.4.40"
+chrono = "0.4.41"
 clap = { version = "4.5.37", features = ["derive"] }
 figlet-rs = "0.1.5"
 governor = "0.10.0"
@@ -39,9 +39,9 @@ integration = { path = "../integration" }
 nonzero_lit = "0.1.2"
 rand = "0.9.1"
 serde = { version = "1.0.219", features = ["derive"] }
-sysinfo = "0.34.2"
+sysinfo = "0.35.0"
 tokio = { version = "1.44.2", features = ["full"] }
-toml = "0.8.20"
+toml = "0.8.22"
 tracing = { version = "0.1.41" }
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter"] }
