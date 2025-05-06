@@ -2,6 +2,7 @@ target*
 .idea/
 .vscode/
 .DS_Store
+.gradle
 local_data*
 bench_*
 /sdk/errors_table/
@@ -12,6 +13,9 @@ bench_*
 /iggy_release_tmp
 /**/obj
 /**/bin
+*.iml
+foreign/java/**/build
+foreign/java/**/out
 # Go build artifacts, workspaces and module files
 *.exe
 *.exe~
