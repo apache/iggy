@@ -1,0 +1,103 @@
+
+
+import assert from 'node:assert/strict';
+import { Client } from './client/index.js';
+import { uuidv7, uuidv4 } from 'uuidv7'
+import { groupConsumerStream } from './stream/consumer-stream.js';
+import { PollingStrategy, Partitioning, type PollMessagesResponse } from './wire/index.js';
+
+const streamId = 123;
+const topicId = 345;
+const groupId = 12353;
+
+const stream = {
+  streamId,
+  name: 'debug-send-message-stream'
+};
+
+const topic = {
+  streamId,
+  topicId,
+  name: 'debug-send-message-topic',
+  partitionCount: 1,
+  compressionAlgorithm: 1
+};
+
+const opt = {
+  transport: 'TCP' as const,
+  options: { port: 8090, host: '127.0.0.1', allowHalfOpen: true, keepAlive: true },
+  credentials: { username: 'iggy', password: 'iggy' },
+};2
+
+const c = new Client(opt);
+
+const cleanup = async () => {
+  assert.ok(await c.stream.delete(stream));
+  assert.ok(await c.session.logout());
+  c.destroy();
+}
+
+const msg = {
+  streamId,
+  topicId,
+  messages: [
+    { payload: 'yolo msg 2' },
+    { id: 0 as const, payload: 'nooooooooo' },
+    { id: 0n as const, payload: 'aye' },
+    { id: uuidv4(), payload: 'yolo msg v4' },
+    { id: uuidv7(), payload: 'yolo msg v7' },
+  ],
+};
+
+try {
+
+  await c.stream.create(stream);
+  console.log('server stream CREATED::', { streamId });
+  await c.topic.create(topic);
+  console.log('server topic CREATED::', { topicId });
+  // send
+  assert.ok(await c.message.send(msg));
+  console.log('message SEND::', { msg })
+
+  // POLL MESSAGE
+  const pollReq = {
+    groupId,
+    streamId,
+    topicId,
+    pollingStrategy: PollingStrategy.Next,
+    count: 1,
+    interval: 5000
+  };
+
+  const cs = await groupConsumerStream(opt)(pollReq);
+  const dataCb = (d: PollMessagesResponse) => {
+    console.log('cli/DATA POLLED:', d);
+    // recv += d.messageCount;
+    // if (recv === ct)
+    //   str.destroy();
+  };
+
+  cs.on('data', dataCb);
+
+  cs.on('error', (err) => {
+    console.error('cli/=>>Stream ERROR:: // DESTROY ', err)
+    // cs.destroy(err);
+  });
+
+  cs.on('end', async () => {
+    console.log('cli/=>>Stream END::')
+    cs.destroy();
+    await cleanup();
+  });
+
+  cs.on('close', async () => {
+    console.log('cli/=>>Stream CLOSE::')
+    // await cleanup();
+  });
+
+
+} catch {
+
+  await cleanup();
+
+}

@@ -1,0 +1,40 @@
+.tooltip {
+  transition-property: opacity, transform;
+  @apply bg-white hidden text-color z-20 dark:bg-black  p-2 rounded-md text-xs fixed duration-200  shadow-md font-normal border;
+}
+
+.tooltip[data-placement^='top'] {
+  @apply origin-bottom;
+}
+
+.tooltip[data-placement^='right'] {
+  @apply origin-left;
+}
+
+.tooltip[data-placement^='bottom'] {
+  @apply origin-top;
+}
+
+.tooltip[data-placement^='left'] {
+  @apply origin-right;
+}
+
+.tooltip .arrow {
+  @apply absolute bg-white dark:bg-black w-[10px] h-[10px] rotate-45;
+}
+
+.tooltip .arrow[data-placement^='top'] {
+  @apply border-r border-b rounded-b-[1px] translate-y-[0.5px];
+}
+
+.tooltip .arrow[data-placement^='bottom'] {
+  @apply border-l border-t rounded-t-[1px] -translate-y-[0.5px];
+}
+
+.tooltip .arrow[data-placement^='left'] {
+  @apply border-r border-t rounded-r-[1px] translate-x-[0.5px];
+}
+
+.tooltip .arrow[data-placement^='right'] {
+  @apply border-b border-l rounded-l-[1px] -translate-x-[0.5px];
+}

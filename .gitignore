@@ -16,7 +16,10 @@ bench_*
 *.iml
 foreign/java/**/build
 foreign/java/**/out
-# Go build artifacts, workspaces and module files
+foreign/node/**/node_modules
+foreign/node/**/dist
+foreign/node/npm-debug.log*
+foreign/node/.npm
 *.exe
 *.exe~
 *.dll
