@@ -16,22 +16,27 @@
  * under the License.
  */
 
-mod binary_client;
-pub mod binary_consumer_groups;
-pub mod binary_consumer_offsets;
-pub mod binary_messages;
-pub mod binary_partitions;
-pub mod binary_personal_access_tokens;
-pub mod binary_segments;
-pub mod binary_streams;
-pub mod binary_topics;
-pub mod binary_transport;
-pub mod binary_users;
-mod client_state;
-mod clients;
-mod utils;
+use derive_more::Display;
 
-pub use binary_client::BinaryClient;
-pub use binary_transport::BinaryTransport;
-pub use client_state::client_state::ClientState;
-pub use clients::*;
+/// The state of the client.
+#[derive(Debug, Copy, Clone, PartialEq, Display)]
+pub enum ClientState {
+    /// The client is shutdown.
+    #[display("shutdown")]
+    Shutdown,
+    /// The client is disconnected.
+    #[display("disconnected")]
+    Disconnected,
+    /// The client is connecting.
+    #[display("connecting")]
+    Connecting,
+    /// The client is connected.
+    #[display("connected")]
+    Connected,
+    /// The client is authenticating.
+    #[display("authenticating")]
+    Authenticating,
+    /// The client is connected and authenticated.
+    #[display("authenticated")]
+    Authenticated,
+}

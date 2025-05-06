@@ -16,22 +16,20 @@
  * under the License.
  */
 
-mod binary_client;
-pub mod binary_consumer_groups;
-pub mod binary_consumer_offsets;
-pub mod binary_messages;
-pub mod binary_partitions;
-pub mod binary_personal_access_tokens;
-pub mod binary_segments;
-pub mod binary_streams;
-pub mod binary_topics;
-pub mod binary_transport;
-pub mod binary_users;
-mod client_state;
-mod clients;
-mod utils;
+use crate::ClientState;
+use async_trait::async_trait;
+use bytes::Bytes;
+use iggy_common::{Command, DiagnosticEvent, IggyDuration, IggyError};
 
-pub use binary_client::BinaryClient;
-pub use binary_transport::BinaryTransport;
-pub use client_state::client_state::ClientState;
-pub use clients::*;
+#[async_trait]
+pub trait BinaryTransport {
+    /// Gets the state of the client.
+    async fn get_state(&self) -> ClientState;
+    /// Sets the state of the client.
+    async fn set_state(&self, state: ClientState);
+    async fn publish_event(&self, event: DiagnosticEvent);
+    /// Sends a command and returns the response.
+    async fn send_with_response<T: Command>(&self, command: &T) -> Result<Bytes, IggyError>;
+    async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError>;
+    fn get_heartbeat_interval(&self) -> IggyDuration;
+}

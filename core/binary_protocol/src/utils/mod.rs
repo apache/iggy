@@ -16,22 +16,5 @@
  * under the License.
  */
 
-mod binary_client;
-pub mod binary_consumer_groups;
-pub mod binary_consumer_offsets;
-pub mod binary_messages;
-pub mod binary_partitions;
-pub mod binary_personal_access_tokens;
-pub mod binary_segments;
-pub mod binary_streams;
-pub mod binary_topics;
-pub mod binary_transport;
-pub mod binary_users;
-mod client_state;
-mod clients;
-mod utils;
-
-pub use binary_client::BinaryClient;
-pub use binary_transport::BinaryTransport;
-pub use client_state::client_state::ClientState;
-pub use clients::*;
+pub(crate) mod auth;
+pub(crate) mod mapper;

@@ -66,7 +66,7 @@ pub struct PollMessages {
 }
 
 impl PollMessages {
-    pub(crate) fn as_bytes(
+    pub fn as_bytes(
         stream_id: &Identifier,
         topic_id: &Identifier,
         partition_id: Option<u32>,

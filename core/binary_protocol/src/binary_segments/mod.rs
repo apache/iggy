@@ -16,22 +16,30 @@
  * under the License.
  */
 
-mod binary_client;
-pub mod binary_consumer_groups;
-pub mod binary_consumer_offsets;
-pub mod binary_messages;
-pub mod binary_partitions;
-pub mod binary_personal_access_tokens;
-pub mod binary_segments;
-pub mod binary_streams;
-pub mod binary_topics;
-pub mod binary_transport;
-pub mod binary_users;
-mod client_state;
-mod clients;
-mod utils;
+use crate::utils::auth::fail_if_not_authenticated;
+#[allow(deprecated)]
+use crate::BinaryClient;
+use crate::SegmentClient;
+use iggy_common::delete_segments::DeleteSegments;
+use iggy_common::{Identifier, IggyError};
 
-pub use binary_client::BinaryClient;
-pub use binary_transport::BinaryTransport;
-pub use client_state::client_state::ClientState;
-pub use clients::*;
+#[async_trait::async_trait]
+impl<B: BinaryClient> SegmentClient for B {
+    async fn delete_segments(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: u32,
+        segments_count: u32,
+    ) -> Result<(), IggyError> {
+        fail_if_not_authenticated(self).await?;
+        self.send_with_response(&DeleteSegments {
+            stream_id: stream_id.clone(),
+            topic_id: topic_id.clone(),
+            partition_id,
+            segments_count,
+        })
+        .await?;
+        Ok(())
+    }
+}

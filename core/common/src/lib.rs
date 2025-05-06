@@ -9,9 +9,11 @@ mod utils;
 pub use error::client_error::ClientError;
 pub use error::iggy_error::IggyError;
 // Messages
+pub use messages::consumer_groups::*;
 pub use messages::consumer_offsets::*;
 pub use messages::messaging::*;
 pub use messages::partitions::*;
+pub use messages::personal_access_tokens::*;
 pub use messages::segments::*;
 pub use messages::streams::*;
 pub use messages::system::*;

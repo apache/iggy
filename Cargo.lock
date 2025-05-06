@@ -2670,6 +2670,8 @@ version = "0.7.0"
 dependencies = [
  "async-broadcast",
  "async-trait",
+ "bytes",
+ "derive_more",
  "iggy_common",
  "trait-variant",
 ]
