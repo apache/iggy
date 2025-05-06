@@ -620,6 +620,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "binary_protocol"
+version = "0.7.0"
+
+[[package]]
 name = "bincode"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2662,6 +2666,52 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "iggy_common"
+version = "0.7.0"
+dependencies = [
+ "aes-gcm",
+ "ahash 0.8.11",
+ "anyhow",
+ "async-broadcast",
+ "async-dropper",
+ "async-trait",
+ "base64 0.22.1",
+ "bon",
+ "byte-unit",
+ "bytes",
+ "chrono",
+ "clap",
+ "comfy-table",
+ "crc32fast",
+ "dashmap",
+ "derive_more",
+ "dirs",
+ "fast-async-mutex",
+ "flume",
+ "futures",
+ "futures-util",
+ "humantime",
+ "keyring",
+ "passterm",
+ "quinn",
+ "reqwest",
+ "reqwest-middleware",
+ "reqwest-retry",
+ "rustls",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "strum",
+ "thiserror 2.0.12",
+ "tokio",
+ "tokio-rustls",
+ "toml",
+ "tracing",
+ "trait-variant",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -5734,6 +5784,10 @@ dependencies = [
  "quote",
  "syn 2.0.100",
 ]
+
+[[package]]
+name = "transport"
+version = "0.7.0"
 
 [[package]]
 name = "trim-in-place"

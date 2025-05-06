@@ -24,7 +24,10 @@ resolver = "2"
 members = [
     "core/bench",
     "core/bench/report",
+    "core/binary_protocol",
     "core/cli",
+    "core/common",
+    "core/transport",
     "core/examples",
     "core/integration",
     "core/sdk",
