@@ -1,0 +1,62 @@
+{
+  "name": "@iggy.rs/sdk",
+  "type": "module",
+  "version": "1.0.6",
+  "description": "Official nodejs iggy.rs binary client",
+  "keywords": [
+    "iggy",
+    "iggy-rs",
+    "driver",
+    "client",
+    "protocol"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iggy-rs/iggy-node-client.git"
+  },
+  "publishConfig": {
+    "access": "public",
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts"
+  },
+  "homepage": "https://iggy.rs",
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.d.ts",
+    "dist/index.d.ts"
+  ],
+  "types": "dist/index.d.ts",
+  "main": "dist/index.js",
+  "scripts": {
+    "test": "node --import @swc-node/register/esm-register --test --experimental-test-coverage './src/**/*.test.ts'",
+    "test:e2e": "node --import @swc-node/register/esm-register --test --experimental-test-coverage --test-force-exit './src/e2e/*.e2e.ts'",
+    "clean": "rm -Rf dist/",
+    "lint": "eslint src/**/*.ts",
+    "commitlint": "commitlint --edit",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "prepare": "husky"
+  },
+  "author": "github.com/T1B0",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "debug": "4.3.7",
+    "generic-pool": "3.9.0",
+    "uuidv7": "1.0.2"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "19.6.1",
+    "@commitlint/config-conventional": "19.6.0",
+    "@semantic-release/changelog": "6.0.3",
+    "@semantic-release/exec": "6.0.3",
+    "@semantic-release/git": "10.0.1",
+    "@semantic-release/release-notes-generator": "14.0.1",
+    "@swc-node/register": "1.10.9",
+    "@types/debug": "4.1.12",
+    "@types/node": "22.9.3",
+    "husky": "9.1.7",
+    "semantic-release": "24.2.0",
+    "typescript": "5.7.2",
+    "typescript-eslint": "8.16.0"
+  }
+}

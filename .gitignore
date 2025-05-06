@@ -16,3 +16,7 @@ bench_*
 *.iml
 foreign/java/**/build
 foreign/java/**/out
+foreign/node/**/node_modules
+foreign/node/**/dist
+foreign/node/npm-debug.log*
+foreign/node/.npm
