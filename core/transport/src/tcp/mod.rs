@@ -16,18 +16,8 @@
  * under the License.
  */
 
-use crate::BinaryTransport;
-use iggy_common::{ClientState, IggyError};
-
-pub(crate) async fn fail_if_not_authenticated<T: BinaryTransport>(
-    transport: &T,
-) -> Result<(), IggyError> {
-    match transport.get_state().await {
-        ClientState::Shutdown => Err(IggyError::ClientShutdown),
-        ClientState::Disconnected | ClientState::Connecting | ClientState::Authenticating => {
-            Err(IggyError::Disconnected)
-        }
-        ClientState::Connected => Err(IggyError::Unauthenticated),
-        ClientState::Authenticated => Ok(()),
-    }
-}
+pub(crate) mod connection_stream;
+pub(crate) mod tcp_client;
+pub(crate) mod tcp_connection_stream;
+pub(crate) mod tcp_connection_stream_kind;
+pub(crate) mod tcp_tls_connection_stream;

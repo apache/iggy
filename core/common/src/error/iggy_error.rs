@@ -26,7 +26,7 @@ use thiserror::Error;
 #[repr(u32)]
 #[strum(serialize_all = "snake_case")]
 #[strum_discriminants(
-    vis(pub(crate)),
+    vis(pub),
     derive(FromRepr, IntoStaticStr),
     strum(serialize_all = "snake_case")
 )]

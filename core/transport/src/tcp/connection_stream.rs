@@ -16,18 +16,13 @@
  * under the License.
  */
 
-use crate::BinaryTransport;
-use iggy_common::{ClientState, IggyError};
+use async_trait::async_trait;
+use iggy_common::IggyError;
 
-pub(crate) async fn fail_if_not_authenticated<T: BinaryTransport>(
-    transport: &T,
-) -> Result<(), IggyError> {
-    match transport.get_state().await {
-        ClientState::Shutdown => Err(IggyError::ClientShutdown),
-        ClientState::Disconnected | ClientState::Connecting | ClientState::Authenticating => {
-            Err(IggyError::Disconnected)
-        }
-        ClientState::Connected => Err(IggyError::Unauthenticated),
-        ClientState::Authenticated => Ok(()),
-    }
+#[async_trait]
+pub trait ConnectionStream {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, IggyError>;
+    async fn write(&mut self, buf: &[u8]) -> Result<(), IggyError>;
+    async fn flush(&mut self) -> Result<(), IggyError>;
+    async fn shutdown(&mut self) -> Result<(), IggyError>;
 }

@@ -15,19 +15,4 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
-use crate::BinaryTransport;
-use iggy_common::{ClientState, IggyError};
-
-pub(crate) async fn fail_if_not_authenticated<T: BinaryTransport>(
-    transport: &T,
-) -> Result<(), IggyError> {
-    match transport.get_state().await {
-        ClientState::Shutdown => Err(IggyError::ClientShutdown),
-        ClientState::Disconnected | ClientState::Connecting | ClientState::Authenticating => {
-            Err(IggyError::Disconnected)
-        }
-        ClientState::Connected => Err(IggyError::Unauthenticated),
-        ClientState::Authenticated => Ok(()),
-    }
-}
+pub(crate) mod quic_client;

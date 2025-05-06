@@ -2673,7 +2673,6 @@ dependencies = [
  "bytes",
  "derive_more",
  "iggy_common",
- "trait-variant",
 ]
 
 [[package]]
@@ -2682,7 +2681,6 @@ version = "0.7.0"
 dependencies = [
  "aes-gcm",
  "ahash 0.8.11",
- "async-trait",
  "base64 0.22.1",
  "bon",
  "byte-unit",
@@ -2691,6 +2689,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "derive_more",
+ "fast-async-mutex",
  "humantime",
  "serde",
  "serde_json",
@@ -2699,7 +2698,6 @@ dependencies = [
  "thiserror 2.0.12",
  "tokio",
  "tracing",
- "trait-variant",
 ]
 
 [[package]]
@@ -5776,6 +5774,21 @@ dependencies = [
 [[package]]
 name = "transport"
 version = "0.7.0"
+dependencies = [
+ "async-broadcast",
+ "async-trait",
+ "bytes",
+ "iggy_common",
+ "quinn",
+ "reqwest",
+ "reqwest-middleware",
+ "reqwest-retry",
+ "rustls",
+ "serde",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+]
 
 [[package]]
 name = "trim-in-place"

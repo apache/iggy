@@ -26,6 +26,27 @@ categories = ["command-line-utilities", "database", "network-programming"]
 homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
-readme = "../README.md"
+readme = "../../README.md"
 
 [dependencies]
+# Internal deps
+iggy_common = { path = "../common", features = ["fast_async_lock"] }
+
+# External deps
+async-broadcast = { version = "0.7.2" }
+async-trait = "0.1.88"
+bytes = "1.10.1"
+quinn = { version = "0.11.7" }
+
+reqwest = { version = "0.12.15", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+reqwest-middleware = { version = "0.4.2", features = ["json"] }
+reqwest-retry = "0.7.0"
+rustls = { version = "0.23.26", features = ["ring"] }
+
+serde = { version = "1.0.219", features = ["derive", "rc"] }
+tokio = { version = "1.44.2", features = ["full"] }
+tokio-rustls = { version = "0.26.2" }
+tracing = { version = "0.1.41" }

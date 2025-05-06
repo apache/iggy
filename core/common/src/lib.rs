@@ -8,6 +8,8 @@ mod utils;
 // Errors
 pub use error::client_error::ClientError;
 pub use error::iggy_error::IggyError;
+// Locking
+pub mod locking;
 // Messages
 pub use messages::consumer_groups::*;
 pub use messages::consumer_offsets::*;
@@ -29,6 +31,7 @@ pub use traits::sizeable::Sizeable;
 pub use traits::validatable::Validatable;
 // Types
 pub use types::args::*;
+pub use types::client_state::client_state::ClientState;
 pub use types::command::*;
 pub use types::compression::compression_algorithm::*;
 pub use types::configuration::auth_config::auto_login::*;

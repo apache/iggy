@@ -26,7 +26,7 @@ categories = ["command-line-utilities", "database", "network-programming"]
 homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
-readme = "../README.md"
+readme = "../../README.md"
 
 [features]
 default = ["tokio_lock"]

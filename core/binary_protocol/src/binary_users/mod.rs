@@ -18,7 +18,7 @@
 
 use crate::utils::auth::fail_if_not_authenticated;
 use crate::utils::mapper;
-use crate::{BinaryClient, ClientState, UserClient};
+use crate::{BinaryClient, UserClient};
 use iggy_common::change_password::ChangePassword;
 use iggy_common::create_user::CreateUser;
 use iggy_common::delete_user::DeleteUser;
@@ -29,8 +29,8 @@ use iggy_common::logout_user::LogoutUser;
 use iggy_common::update_permissions::UpdatePermissions;
 use iggy_common::update_user::UpdateUser;
 use iggy_common::{
-    DiagnosticEvent, Identifier, IdentityInfo, IggyError, Permissions, UserInfo, UserInfoDetails,
-    UserStatus,
+    ClientState, DiagnosticEvent, Identifier, IdentityInfo, IggyError, Permissions, UserInfo,
+    UserInfoDetails, UserStatus,
 };
 
 #[async_trait::async_trait]

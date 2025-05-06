@@ -26,8 +26,8 @@ mod polling_strategy;
 mod send_messages;
 
 pub use flush_unsaved_buffer::FlushUnsavedBuffer;
-pub use partitioning_kind::PartitioningKind;
 pub use partitioning::Partitioning;
+pub use partitioning_kind::PartitioningKind;
 pub use poll_messages::PollMessages;
 pub use polled_messages::PolledMessages;
 pub use polling_kind::PollingKind;

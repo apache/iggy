@@ -27,11 +27,9 @@ pub mod binary_streams;
 pub mod binary_topics;
 pub mod binary_transport;
 pub mod binary_users;
-mod client_state;
 mod clients;
 mod utils;
 
 pub use binary_client::BinaryClient;
 pub use binary_transport::BinaryTransport;
-pub use client_state::client_state::ClientState;
 pub use clients::*;

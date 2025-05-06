@@ -16,10 +16,9 @@
  * under the License.
  */
 
-use crate::ClientState;
 use async_trait::async_trait;
 use bytes::Bytes;
-use iggy_common::{Command, DiagnosticEvent, IggyDuration, IggyError};
+use iggy_common::{ClientState, Command, DiagnosticEvent, IggyDuration, IggyError};
 
 #[async_trait]
 pub trait BinaryTransport {
