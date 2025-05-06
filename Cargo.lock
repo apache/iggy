@@ -620,10 +620,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "binary_protocol"
-version = "0.7.0"
-
-[[package]]
 name = "bincode"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2667,6 +2663,10 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "iggy_binary_protocol"
+version = "0.7.0"
 
 [[package]]
 name = "iggy_common"

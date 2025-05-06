@@ -16,62 +16,73 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
-use crate::{Command, GET_CONSUMER_GROUP_CODE};
+use super::MAX_PARTITIONS_COUNT;
 use crate::error::IggyError;
+use crate::BytesSerializable;
 use crate::Identifier;
 use crate::Sizeable;
 use crate::Validatable;
+use crate::{Command, CREATE_PARTITIONS_CODE};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 
-/// `GetConsumerGroup` command retrieves the consumer group from the topic.
+/// `CreatePartitions` command is used to create new partitions for a topic.
 /// It has additional payload:
 /// - `stream_id` - unique stream ID (numeric or name).
 /// - `topic_id` - unique topic ID (numeric or name).
-/// - `group_id` - unique consumer group ID (numeric or name).
-#[derive(Debug, Serialize, Deserialize, PartialEq, Default)]
-pub struct GetConsumerGroup {
+/// - `partitions_count` - number of partitions in the topic to create, max value is 1000.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct CreatePartitions {
     /// Unique stream ID (numeric or name).
     #[serde(skip)]
     pub stream_id: Identifier,
     /// Unique topic ID (numeric or name).
     #[serde(skip)]
     pub topic_id: Identifier,
-    /// Unique consumer group ID (numeric or name).
-    #[serde(skip)]
-    pub group_id: Identifier,
+    /// Number of partitions in the topic to create, max value is 1000.
+    pub partitions_count: u32,
 }
 
-impl Command for GetConsumerGroup {
+impl Command for CreatePartitions {
     fn code(&self) -> u32 {
-        GET_CONSUMER_GROUP_CODE
+        CREATE_PARTITIONS_CODE
     }
 }
 
-impl Validatable<IggyError> for GetConsumerGroup {
+impl Default for CreatePartitions {
+    fn default() -> Self {
+        CreatePartitions {
+            stream_id: Identifier::default(),
+            topic_id: Identifier::default(),
+            partitions_count: 1,
+        }
+    }
+}
+
+impl Validatable<IggyError> for CreatePartitions {
     fn validate(&self) -> Result<(), IggyError> {
+        if !(1..=MAX_PARTITIONS_COUNT).contains(&self.partitions_count) {
+            return Err(IggyError::TooManyPartitions);
+        }
+
         Ok(())
     }
 }
 
-impl BytesSerializable for GetConsumerGroup {
+impl BytesSerializable for CreatePartitions {
     fn to_bytes(&self) -> Bytes {
         let stream_id_bytes = self.stream_id.to_bytes();
         let topic_id_bytes = self.topic_id.to_bytes();
-        let group_id_bytes = self.group_id.to_bytes();
-        let mut bytes = BytesMut::with_capacity(
-            stream_id_bytes.len() + topic_id_bytes.len() + group_id_bytes.len(),
-        );
+        let mut bytes = BytesMut::with_capacity(4 + stream_id_bytes.len() + topic_id_bytes.len());
         bytes.put_slice(&stream_id_bytes);
         bytes.put_slice(&topic_id_bytes);
-        bytes.put_slice(&group_id_bytes);
+        bytes.put_u32_le(self.partitions_count);
         bytes.freeze()
     }
 
-    fn from_bytes(bytes: Bytes) -> Result<GetConsumerGroup, IggyError> {
-        if bytes.len() < 9 {
+    fn from_bytes(bytes: Bytes) -> std::result::Result<CreatePartitions, IggyError> {
+        if bytes.len() < 10 {
             return Err(IggyError::InvalidCommand);
         }
 
@@ -80,32 +91,41 @@ impl BytesSerializable for GetConsumerGroup {
         position += stream_id.get_size_bytes().as_bytes_usize();
         let topic_id = Identifier::from_bytes(bytes.slice(position..))?;
         position += topic_id.get_size_bytes().as_bytes_usize();
-        let group_id = Identifier::from_bytes(bytes.slice(position..))?;
-        let command = GetConsumerGroup {
+        let partitions_count = u32::from_le_bytes(
+            bytes[position..position + 4]
+                .try_into()
+                .map_err(|_| IggyError::InvalidNumberEncoding)?,
+        );
+        let command = CreatePartitions {
             stream_id,
             topic_id,
-            group_id,
+            partitions_count,
         };
         Ok(command)
     }
 }
 
-impl Display for GetConsumerGroup {
+impl Display for CreatePartitions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}|{}|{}", self.stream_id, self.topic_id, self.group_id)
+        write!(
+            f,
+            "{}|{}|{}",
+            self.stream_id, self.topic_id, self.partitions_count
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::BufMut;
 
     #[test]
     fn should_be_serialized_as_bytes() {
-        let command = GetConsumerGroup {
+        let command = CreatePartitions {
             stream_id: Identifier::numeric(1).unwrap(),
             topic_id: Identifier::numeric(2).unwrap(),
-            group_id: Identifier::numeric(3).unwrap(),
+            partitions_count: 3,
         };
 
         let bytes = command.to_bytes();
@@ -114,34 +134,32 @@ mod tests {
         position += stream_id.get_size_bytes().as_bytes_usize();
         let topic_id = Identifier::from_bytes(bytes.slice(position..)).unwrap();
         position += topic_id.get_size_bytes().as_bytes_usize();
-        let group_id = Identifier::from_bytes(bytes.slice(position..)).unwrap();
+        let partitions_count =
+            u32::from_le_bytes(bytes[position..position + 4].try_into().unwrap());
 
         assert!(!bytes.is_empty());
         assert_eq!(stream_id, command.stream_id);
         assert_eq!(topic_id, command.topic_id);
-        assert_eq!(group_id, command.group_id);
+        assert_eq!(partitions_count, command.partitions_count);
     }
 
     #[test]
     fn should_be_deserialized_from_bytes() {
         let stream_id = Identifier::numeric(1).unwrap();
         let topic_id = Identifier::numeric(2).unwrap();
-        let group_id = Identifier::numeric(3).unwrap();
+        let partitions_count = 3u32;
         let stream_id_bytes = stream_id.to_bytes();
         let topic_id_bytes = topic_id.to_bytes();
-        let group_id_bytes = group_id.to_bytes();
-        let mut bytes = BytesMut::with_capacity(
-            stream_id_bytes.len() + topic_id_bytes.len() + group_id_bytes.len(),
-        );
+        let mut bytes = BytesMut::with_capacity(4 + stream_id_bytes.len() + topic_id_bytes.len());
         bytes.put_slice(&stream_id_bytes);
         bytes.put_slice(&topic_id_bytes);
-        bytes.put_slice(&group_id_bytes);
-        let command = GetConsumerGroup::from_bytes(bytes.freeze());
+        bytes.put_u32_le(partitions_count);
+        let command = CreatePartitions::from_bytes(bytes.freeze());
         assert!(command.is_ok());
 
         let command = command.unwrap();
         assert_eq!(command.stream_id, stream_id);
         assert_eq!(command.topic_id, topic_id);
-        assert_eq!(command.group_id, group_id);
+        assert_eq!(command.partitions_count, partitions_count);
     }
 }

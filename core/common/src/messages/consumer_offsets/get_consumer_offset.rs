@@ -16,13 +16,13 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
-use crate::{Command, GET_CONSUMER_OFFSET_CODE};
-use crate::{Consumer, ConsumerKind};
 use crate::error::IggyError;
+use crate::BytesSerializable;
 use crate::Identifier;
 use crate::Sizeable;
 use crate::Validatable;
+use crate::{Command, GET_CONSUMER_OFFSET_CODE};
+use crate::{Consumer, ConsumerKind};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;

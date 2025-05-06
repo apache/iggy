@@ -1,4 +1,5 @@
 mod error;
+mod messages;
 mod traits;
 mod types;
 mod utils;
@@ -6,23 +7,37 @@ mod utils;
 // Errors
 pub use error::client_error::ClientError;
 pub use error::iggy_error::IggyError;
+// Messages
+pub use messages::consumer_offsets::*;
+pub use messages::messaging::*;
+pub use messages::partitions::*;
+pub use messages::segments::*;
+pub use messages::streams::*;
+pub use messages::system::*;
+pub use messages::topics::*;
+pub use messages::users::*;
 // Traits
 pub use traits::bytes_serializable::BytesSerializable;
+pub use traits::partitioner::Partitioner;
 pub use traits::sizeable::Sizeable;
 pub use traits::validatable::Validatable;
 // Types
 pub use types::command::*;
 pub use types::compression::compression_algorithm::*;
-
-pub use types::messages::consumer_offsets::*;
-pub use types::messages::partitions::*;
-pub use types::messages::segments::*;
-pub use types::messages::streams::*;
-pub use types::messages::system::*;
-pub use types::messages::topics::*;
-pub use types::messages::users::*;
-pub use types::messaging::*;
-
+pub use types::configuration::auth_config::auto_login::*;
+pub use types::configuration::auth_config::connection_string::*;
+pub use types::configuration::auth_config::connection_string_options::*;
+pub use types::configuration::auth_config::credentials::*;
+pub use types::configuration::http_config::config::*;
+pub use types::configuration::quick_config::quic_client_config::*;
+pub use types::configuration::quick_config::quic_client_config_builder::*;
+pub use types::configuration::quick_config::quic_client_reconnection_config::*;
+pub use types::configuration::tcp_config::tcp_client_config::*;
+pub use types::configuration::tcp_config::tcp_client_config_builder::*;
+pub use types::configuration::tcp_config::tcp_client_reconnection_config::*;
+pub use types::confirmation::*;
+pub use types::diagnostic::diagnostic_event::DiagnosticEvent;
+pub use types::identifier::identifier::*;
 pub use types::model::client::client_info::*;
 pub use types::model::consumer::consumer::*;
 pub use types::model::consumer::consumer_group::*;
@@ -37,12 +52,7 @@ pub use types::model::topic::topic::*;
 pub use types::model::user::user_identity_info::*;
 pub use types::model::user::user_info::*;
 pub use types::model::user::user_status::*;
-
-pub use types::confirmation::*;
-pub use types::diagnostic::diagnostic_event::DiagnosticEvent;
-pub use types::identifier::identifier::*;
 pub use types::snapshot::snapshot::*;
-
 // Utils
 pub use utils::byte_size::IggyByteSize;
 pub use utils::checksum::*;

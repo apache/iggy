@@ -16,43 +16,43 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
-use crate::{Command, CREATE_PARTITIONS_CODE};
-use crate::error::IggyError;
-use crate::Identifier;
 use super::MAX_PARTITIONS_COUNT;
+use crate::error::IggyError;
+use crate::BytesSerializable;
+use crate::Identifier;
 use crate::Sizeable;
 use crate::Validatable;
+use crate::{Command, DELETE_PARTITIONS_CODE};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 
-/// `CreatePartitions` command is used to create new partitions for a topic.
+/// `DeletePartitions` command is used to delete partitions from a topic.
 /// It has additional payload:
 /// - `stream_id` - unique stream ID (numeric or name).
 /// - `topic_id` - unique topic ID (numeric or name).
-/// - `partitions_count` - number of partitions in the topic to create, max value is 1000.
+/// - `partitions_count` - number of partitions in the topic to delete, max value is 1000.
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
-pub struct CreatePartitions {
+pub struct DeletePartitions {
     /// Unique stream ID (numeric or name).
     #[serde(skip)]
     pub stream_id: Identifier,
     /// Unique topic ID (numeric or name).
     #[serde(skip)]
     pub topic_id: Identifier,
-    /// Number of partitions in the topic to create, max value is 1000.
+    /// Number of partitions in the topic to delete, max value is 1000.
     pub partitions_count: u32,
 }
 
-impl Command for CreatePartitions {
+impl Command for DeletePartitions {
     fn code(&self) -> u32 {
-        CREATE_PARTITIONS_CODE
+        DELETE_PARTITIONS_CODE
     }
 }
 
-impl Default for CreatePartitions {
+impl Default for DeletePartitions {
     fn default() -> Self {
-        CreatePartitions {
+        DeletePartitions {
             stream_id: Identifier::default(),
             topic_id: Identifier::default(),
             partitions_count: 1,
@@ -60,7 +60,7 @@ impl Default for CreatePartitions {
     }
 }
 
-impl Validatable<IggyError> for CreatePartitions {
+impl Validatable<IggyError> for DeletePartitions {
     fn validate(&self) -> Result<(), IggyError> {
         if !(1..=MAX_PARTITIONS_COUNT).contains(&self.partitions_count) {
             return Err(IggyError::TooManyPartitions);
@@ -70,7 +70,7 @@ impl Validatable<IggyError> for CreatePartitions {
     }
 }
 
-impl BytesSerializable for CreatePartitions {
+impl BytesSerializable for DeletePartitions {
     fn to_bytes(&self) -> Bytes {
         let stream_id_bytes = self.stream_id.to_bytes();
         let topic_id_bytes = self.topic_id.to_bytes();
@@ -81,7 +81,7 @@ impl BytesSerializable for CreatePartitions {
         bytes.freeze()
     }
 
-    fn from_bytes(bytes: Bytes) -> std::result::Result<CreatePartitions, IggyError> {
+    fn from_bytes(bytes: Bytes) -> std::result::Result<DeletePartitions, IggyError> {
         if bytes.len() < 10 {
             return Err(IggyError::InvalidCommand);
         }
@@ -96,7 +96,7 @@ impl BytesSerializable for CreatePartitions {
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
         );
-        let command = CreatePartitions {
+        let command = DeletePartitions {
             stream_id,
             topic_id,
             partitions_count,
@@ -105,7 +105,7 @@ impl BytesSerializable for CreatePartitions {
     }
 }
 
-impl Display for CreatePartitions {
+impl Display for DeletePartitions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -122,7 +122,7 @@ mod tests {
 
     #[test]
     fn should_be_serialized_as_bytes() {
-        let command = CreatePartitions {
+        let command = DeletePartitions {
             stream_id: Identifier::numeric(1).unwrap(),
             topic_id: Identifier::numeric(2).unwrap(),
             partitions_count: 3,
@@ -154,7 +154,7 @@ mod tests {
         bytes.put_slice(&stream_id_bytes);
         bytes.put_slice(&topic_id_bytes);
         bytes.put_u32_le(partitions_count);
-        let command = CreatePartitions::from_bytes(bytes.freeze());
+        let command = DeletePartitions::from_bytes(bytes.freeze());
         assert!(command.is_ok());
 
         let command = command.unwrap();

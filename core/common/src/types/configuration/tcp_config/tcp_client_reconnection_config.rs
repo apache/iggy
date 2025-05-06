@@ -15,19 +15,24 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::IggyDuration;
+use std::str::FromStr;
 
-use crate::error::IggyError;
-use crate::messages::messaging::IggyMessage;
-use crate::Identifier;
-use std::fmt::Debug;
+#[derive(Debug, Clone)]
+pub struct TcpClientReconnectionConfig {
+    pub enabled: bool,
+    pub max_retries: Option<u32>,
+    pub interval: IggyDuration,
+    pub reestablish_after: IggyDuration,
+}
 
-/// The trait represent the logic responsible for calculating the partition ID and is used by the `IggyClient`.
-/// This might be especially useful when the partition ID is not constant and might be calculated based on the stream ID, topic ID and other parameters.
-pub trait Partitioner: Send + Sync + Debug {
-    fn calculate_partition_id(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        messages: &[IggyMessage],
-    ) -> Result<u32, IggyError>;
+impl Default for TcpClientReconnectionConfig {
+    fn default() -> TcpClientReconnectionConfig {
+        TcpClientReconnectionConfig {
+            enabled: true,
+            max_retries: None,
+            interval: IggyDuration::from_str("1s").unwrap(),
+            reestablish_after: IggyDuration::from_str("5s").unwrap(),
+        }
+    }
 }

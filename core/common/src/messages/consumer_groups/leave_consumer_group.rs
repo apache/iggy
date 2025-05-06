@@ -16,23 +16,23 @@
  * under the License.
  */
 
-use crate::BytesSerializable;
-use crate::{Command, JOIN_CONSUMER_GROUP_CODE};
 use crate::error::IggyError;
+use crate::BytesSerializable;
 use crate::Identifier;
 use crate::Sizeable;
 use crate::Validatable;
+use crate::{Command, LEAVE_CONSUMER_GROUP_CODE};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 
-/// `JoinConsumerGroup` command joins the consumer group by currently authenticated user.
+/// `LeaveConsumerGroup` command leaves the consumer group by currently authenticated user.
 /// It has additional payload:
 /// - `stream_id` - unique stream ID (numeric or name).
 /// - `topic_id` - unique topic ID (numeric or name).
 /// - `group_id` - unique consumer group ID (numeric or name).
 #[derive(Debug, Serialize, Deserialize, PartialEq, Default)]
-pub struct JoinConsumerGroup {
+pub struct LeaveConsumerGroup {
     /// Unique stream ID (numeric or name).
     #[serde(skip)]
     pub stream_id: Identifier,
@@ -44,19 +44,19 @@ pub struct JoinConsumerGroup {
     pub group_id: Identifier,
 }
 
-impl Command for JoinConsumerGroup {
+impl Command for LeaveConsumerGroup {
     fn code(&self) -> u32 {
-        JOIN_CONSUMER_GROUP_CODE
+        LEAVE_CONSUMER_GROUP_CODE
     }
 }
 
-impl Validatable<IggyError> for JoinConsumerGroup {
+impl Validatable<IggyError> for LeaveConsumerGroup {
     fn validate(&self) -> Result<(), IggyError> {
         Ok(())
     }
 }
 
-impl BytesSerializable for JoinConsumerGroup {
+impl BytesSerializable for LeaveConsumerGroup {
     fn to_bytes(&self) -> Bytes {
         let stream_id_bytes = self.stream_id.to_bytes();
         let topic_id_bytes = self.topic_id.to_bytes();
@@ -70,7 +70,7 @@ impl BytesSerializable for JoinConsumerGroup {
         bytes.freeze()
     }
 
-    fn from_bytes(bytes: Bytes) -> Result<JoinConsumerGroup, IggyError> {
+    fn from_bytes(bytes: Bytes) -> Result<LeaveConsumerGroup, IggyError> {
         if bytes.len() < 9 {
             return Err(IggyError::InvalidCommand);
         }
@@ -81,7 +81,7 @@ impl BytesSerializable for JoinConsumerGroup {
         let topic_id = Identifier::from_bytes(bytes.slice(position..))?;
         position += topic_id.get_size_bytes().as_bytes_usize();
         let group_id = Identifier::from_bytes(bytes.slice(position..))?;
-        let command = JoinConsumerGroup {
+        let command = LeaveConsumerGroup {
             stream_id,
             topic_id,
             group_id,
@@ -90,7 +90,7 @@ impl BytesSerializable for JoinConsumerGroup {
     }
 }
 
-impl Display for JoinConsumerGroup {
+impl Display for LeaveConsumerGroup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}|{}|{}", self.stream_id, self.topic_id, self.group_id)
     }
@@ -102,7 +102,7 @@ mod tests {
 
     #[test]
     fn should_be_serialized_as_bytes() {
-        let command = JoinConsumerGroup {
+        let command = LeaveConsumerGroup {
             stream_id: Identifier::numeric(1).unwrap(),
             topic_id: Identifier::numeric(2).unwrap(),
             group_id: Identifier::numeric(3).unwrap(),
@@ -136,7 +136,7 @@ mod tests {
         bytes.put_slice(&stream_id_bytes);
         bytes.put_slice(&topic_id_bytes);
         bytes.put_slice(&group_id_bytes);
-        let command = JoinConsumerGroup::from_bytes(bytes.freeze());
+        let command = LeaveConsumerGroup::from_bytes(bytes.freeze());
         assert!(command.is_ok());
 
         let command = command.unwrap();
