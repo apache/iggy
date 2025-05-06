@@ -13,3 +13,10 @@ readme = "../README.md"
 
 
 [dependencies]
+# Internal deps
+iggy_common = { path = "../common" }
+
+# External deps
+async-trait = "0.1.88"
+trait-variant = { version = "0.1.2" }
+async-broadcast = { version = "0.7.2" }

@@ -1,3 +1,4 @@
+pub(crate) mod args;
 pub(crate) mod command;
 pub(crate) mod compression;
 pub(crate) mod configuration;

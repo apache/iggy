@@ -1,0 +1,23 @@
+pub(crate) mod client;
+pub(crate) mod consumer_group_client;
+pub(crate) mod consumer_offset_client;
+pub(crate) mod message_client;
+pub(crate) mod partition_client;
+pub(crate) mod personal_access_token_client;
+pub(crate) mod segment_client;
+pub(crate) mod stream_client;
+pub(crate) mod system_client;
+pub(crate) mod topic_client;
+pub(crate) mod user_client;
+
+pub use client::Client;
+pub use consumer_group_client::ConsumerGroupClient;
+pub use consumer_offset_client::ConsumerOffsetClient;
+pub use message_client::MessageClient;
+pub use partition_client::PartitionClient;
+pub use personal_access_token_client::PersonalAccessTokenClient;
+pub use segment_client::SegmentClient;
+pub use stream_client::StreamClient;
+pub use system_client::SystemClient;
+pub use topic_client::TopicClient;
+pub use user_client::UserClient;

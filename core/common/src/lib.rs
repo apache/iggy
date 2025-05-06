@@ -1,5 +1,6 @@
 mod error;
 mod messages;
+mod messages_shared;
 mod traits;
 mod types;
 mod utils;
@@ -16,12 +17,16 @@ pub use messages::streams::*;
 pub use messages::system::*;
 pub use messages::topics::*;
 pub use messages::users::*;
+// Messages shared
+pub use messages_shared::*;
+
 // Traits
 pub use traits::bytes_serializable::BytesSerializable;
 pub use traits::partitioner::Partitioner;
 pub use traits::sizeable::Sizeable;
 pub use traits::validatable::Validatable;
 // Types
+pub use types::args::*;
 pub use types::command::*;
 pub use types::compression::compression_algorithm::*;
 pub use types::configuration::auth_config::auto_login::*;
