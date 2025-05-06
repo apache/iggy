@@ -8,6 +8,7 @@ mod utils;
 // Errors
 pub use error::client_error::ClientError;
 pub use error::iggy_error::IggyError;
+pub use error::iggy_error::IggyErrorDiscriminants;
 // Locking
 pub mod locking;
 // Messages

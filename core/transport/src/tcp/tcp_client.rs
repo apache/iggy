@@ -1,10 +1,7 @@
 use crate::tcp::tcp_connection_stream_kind::ConnectionStreamKind;
 use async_broadcast::{broadcast, Receiver, Sender};
 use bytes::{BufMut, Bytes, BytesMut};
-use iggy_common::{
-    AutoLogin, ClientState, ConnectionString, DiagnosticEvent, IggyDuration, IggyError,
-    IggyTimestamp, TcpClientConfig,
-};
+use iggy_common::{AutoLogin, ClientState, ConnectionString, DiagnosticEvent, IggyDuration, IggyError, IggyErrorDiscriminants, IggyTimestamp, TcpClientConfig};
 use rustls::pki_types::ServerName;
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -89,17 +86,14 @@ impl TcpClient {
     ) -> Result<Bytes, IggyError> {
         if status != 0 {
             // TEMP: See https://github.com/apache/iggy/pull/604 for context.
-            // [MH]: Had to remove the IggyErrorDiscriminants as it did not worked
-            // when the IggyError is imported from the common crate.
-            if status == IggyError::TopicIdAlreadyExists as u32
-                || status == IggyError::TopicNameAlreadyExists as u32
-                || status == IggyError::StreamIdAlreadyExists as u32
-                || status == IggyError::StreamNameAlreadyExists as u32
-                // Non primitive type cannot be cast into u32
-                // || status == IggyError::UserAlreadyExists as u32
-                || status == IggyError::PersonalAccessTokenAlreadyExists as u32
-                || status == IggyError::ConsumerGroupIdAlreadyExists as u32
-                || status == IggyError::ConsumerGroupNameAlreadyExists as u32
+            if status == IggyErrorDiscriminants::TopicIdAlreadyExists as u32
+                || status == IggyErrorDiscriminants::TopicNameAlreadyExists as u32
+                || status == IggyErrorDiscriminants::StreamIdAlreadyExists as u32
+                || status == IggyErrorDiscriminants::StreamNameAlreadyExists as u32
+                || status == IggyErrorDiscriminants::UserAlreadyExists as u32
+                || status == IggyErrorDiscriminants::PersonalAccessTokenAlreadyExists as u32
+                || status == IggyErrorDiscriminants::ConsumerGroupIdAlreadyExists as u32
+                || status == IggyErrorDiscriminants::ConsumerGroupNameAlreadyExists as u32
             {
                 tracing::debug!(
                     "Received a server resource already exists response: {} ({})",
