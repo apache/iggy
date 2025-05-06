@@ -1,7 +1,10 @@
 use crate::tcp::tcp_connection_stream_kind::ConnectionStreamKind;
 use async_broadcast::{broadcast, Receiver, Sender};
 use bytes::{BufMut, Bytes, BytesMut};
-use iggy_common::{AutoLogin, ClientState, ConnectionString, DiagnosticEvent, IggyDuration, IggyError, IggyErrorDiscriminants, IggyTimestamp, TcpClientConfig};
+use iggy_common::{
+    AutoLogin, ClientState, ConnectionString, DiagnosticEvent, IggyDuration, IggyError,
+    IggyErrorDiscriminants, IggyTimestamp, TcpClientConfig,
+};
 use rustls::pki_types::ServerName;
 use std::net::SocketAddr;
 use std::str::FromStr;
