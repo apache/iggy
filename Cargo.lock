@@ -2671,7 +2671,6 @@ dependencies = [
  "async-broadcast",
  "async-trait",
  "bytes",
- "derive_more",
  "iggy_common",
 ]
 
