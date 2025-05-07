@@ -22,11 +22,11 @@ use super::messages_accumulator::MessagesAccumulator;
 use crate::configs::system::SystemConfig;
 use crate::streaming::segments::*;
 use error_set::ErrContext;
-use iggy::error::IggyError;
-use iggy::models::messaging::INDEX_SIZE;
-use iggy::utils::byte_size::IggyByteSize;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::timestamp::IggyTimestamp;
+use iggy_common::IggyByteSize;
+use iggy_common::IggyError;
+use iggy_common::IggyExpiry;
+use iggy_common::IggyTimestamp;
+use iggy_common::INDEX_SIZE;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::fs::remove_file;
@@ -439,7 +439,7 @@ mod tests {
     use crate::configs::cache_indexes::CacheIndexesConfig;
     use crate::configs::system::SegmentConfig;
     use crate::streaming::utils::MemoryPool;
-    use iggy::utils::duration::IggyDuration;
+    use iggy_common::IggyDuration;
 
     #[tokio::test]
     async fn should_be_created_given_valid_parameters() {

@@ -23,11 +23,10 @@ use crate::streaming::systems::system::System;
 use crate::streaming::systems::COMPONENT;
 use crate::streaming::utils::PooledBuffer;
 use error_set::ErrContext;
-use iggy::confirmation::Confirmation;
-use iggy::consumer::Consumer;
-use iggy::prelude::*;
-use iggy::utils::crypto::EncryptorKind;
-use iggy::{error::IggyError, identifier::Identifier};
+use iggy_common::{
+    BytesSerializable, Confirmation, Consumer, EncryptorKind, Identifier, IggyError, Partitioning,
+    PollingStrategy, IGGY_MESSAGE_HEADER_SIZE,
+};
 use tracing::{error, trace};
 
 impl System {

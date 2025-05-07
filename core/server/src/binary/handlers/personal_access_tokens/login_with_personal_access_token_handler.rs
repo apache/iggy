@@ -24,13 +24,13 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy::error::IggyError;
-use iggy::personal_access_tokens::login_with_personal_access_token::LoginWithPersonalAccessToken;
+use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
+use iggy_common::IggyError;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for LoginWithPersonalAccessToken {
     fn code(&self) -> u32 {
-        iggy::command::LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE
+        iggy_common::LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE
     }
 
     #[instrument(skip_all, name = "trace_login_with_personal_access_token", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]

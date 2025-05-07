@@ -23,13 +23,13 @@ use crate::binary::sender::SenderKind;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use iggy::error::IggyError;
-use iggy::streams::get_stream::GetStream;
+use iggy_common::get_stream::GetStream;
+use iggy_common::IggyError;
 use tracing::debug;
 
 impl ServerCommandHandler for GetStream {
     fn code(&self) -> u32 {
-        iggy::command::GET_STREAM_CODE
+        iggy_common::GET_STREAM_CODE
     }
 
     async fn handle(

@@ -23,13 +23,13 @@ use crate::binary::sender::SenderKind;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use iggy::error::IggyError;
-use iggy::topics::get_topic::GetTopic;
+use iggy_common::get_topic::GetTopic;
+use iggy_common::IggyError;
 use tracing::debug;
 
 impl ServerCommandHandler for GetTopic {
     fn code(&self) -> u32 {
-        iggy::command::GET_TOPIC_CODE
+        iggy_common::GET_TOPIC_CODE
     }
 
     async fn handle(

@@ -20,12 +20,12 @@ use crate::streaming::streams::stream::Stream;
 use crate::streaming::streams::COMPONENT;
 use crate::streaming::topics::topic::Topic;
 use error_set::ErrContext;
-use iggy::compression::compression_algorithm::CompressionAlgorithm;
-use iggy::error::IggyError;
-use iggy::identifier::{IdKind, Identifier};
-use iggy::locking::IggySharedMutFn;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy_common::locking::IggySharedMutFn;
+use iggy_common::CompressionAlgorithm;
+use iggy_common::IggyError;
+use iggy_common::IggyExpiry;
+use iggy_common::MaxTopicSize;
+use iggy_common::{IdKind, Identifier};
 use std::sync::atomic::Ordering;
 use tracing::info;
 
@@ -281,7 +281,7 @@ mod tests {
             utils::MemoryPool,
         },
     };
-    use iggy::utils::byte_size::IggyByteSize;
+    use iggy_common::IggyByteSize;
     use std::sync::Arc;
 
     #[tokio::test]

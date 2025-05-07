@@ -20,8 +20,8 @@ use crate::state::system::TopicState;
 use crate::streaming::topics::topic::Topic;
 use crate::streaming::topics::COMPONENT;
 use error_set::ErrContext;
-use iggy::error::IggyError;
-use iggy::locking::IggySharedMutFn;
+use iggy_common::locking::IggySharedMutFn;
+use iggy_common::IggyError;
 
 impl Topic {
     pub async fn load(&mut self, state: TopicState) -> Result<(), IggyError> {

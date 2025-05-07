@@ -23,15 +23,12 @@ use crate::streaming::storage::SystemStorage;
 use crate::streaming::topics::consumer_group::ConsumerGroup;
 use ahash::AHashMap;
 use core::fmt;
-use iggy::compression::compression_algorithm::CompressionAlgorithm;
-use iggy::consumer::{Consumer, ConsumerKind};
-use iggy::error::IggyError;
-use iggy::locking::IggySharedMut;
-use iggy::utils::byte_size::IggyByteSize;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::sizeable::Sizeable;
-use iggy::utils::timestamp::IggyTimestamp;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy_common::locking::IggySharedMut;
+use iggy_common::{
+    CompressionAlgorithm, Consumer, ConsumerKind, IggyByteSize, IggyError, IggyExpiry,
+    IggyTimestamp, MaxTopicSize, Sizeable,
+};
+
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -286,7 +283,7 @@ mod tests {
         persistence::persister::{FileWithSyncPersister, PersisterKind},
         utils::MemoryPool,
     };
-    use iggy::locking::IggySharedMutFn;
+    use iggy_common::locking::IggySharedMutFn;
     use std::str::FromStr;
 
     #[tokio::test]

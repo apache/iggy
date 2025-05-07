@@ -24,13 +24,13 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy::consumer_offsets::delete_consumer_offset::DeleteConsumerOffset;
-use iggy::error::IggyError;
+use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
+use iggy_common::IggyError;
 use tracing::debug;
 
 impl ServerCommandHandler for DeleteConsumerOffset {
     fn code(&self) -> u32 {
-        iggy::command::DELETE_CONSUMER_OFFSET_CODE
+        iggy_common::DELETE_CONSUMER_OFFSET_CODE
     }
 
     async fn handle(

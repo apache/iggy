@@ -23,8 +23,8 @@ use crate::{
     streaming::deduplication::message_deduplicator::MessageDeduplicator,
 };
 use error_set::ErrContext;
-use iggy::confirmation::Confirmation;
-use iggy::prelude::*;
+use iggy_common::Confirmation;
+use iggy_common::IggyError;
 use std::sync::atomic::Ordering;
 use tracing::{info, trace};
 

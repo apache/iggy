@@ -20,7 +20,7 @@ use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use crate::streaming::utils::PooledBuffer;
 use bytes::BytesMut;
 use error_set::ErrContext;
-use iggy::error::IggyError;
+use iggy_common::IggyError;
 use std::{fs::File as StdFile, os::unix::prelude::FileExt};
 use std::{
     io::ErrorKind,

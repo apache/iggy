@@ -25,7 +25,7 @@ use crate::streaming::systems::messages::PollingArgs;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy::prelude::*;
+use iggy_common::{IggyError, PollMessages};
 use std::io::IoSlice;
 use tracing::{debug, trace};
 
@@ -46,7 +46,7 @@ impl IggyPollMetadata {
 
 impl ServerCommandHandler for PollMessages {
     fn code(&self) -> u32 {
-        iggy::command::POLL_MESSAGES_CODE
+        iggy_common::POLL_MESSAGES_CODE
     }
 
     async fn handle(

@@ -30,10 +30,10 @@ use crate::configs::COMPONENT;
 use crate::server_error::ConfigError;
 use crate::streaming::segments::*;
 use error_set::ErrContext;
-use iggy::compression::compression_algorithm::CompressionAlgorithm;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
-use iggy::validatable::Validatable;
+use iggy_common::CompressionAlgorithm;
+use iggy_common::IggyExpiry;
+use iggy_common::MaxTopicSize;
+use iggy_common::Validatable;
 use tracing::error;
 
 impl Validatable<ConfigError> for ServerConfig {

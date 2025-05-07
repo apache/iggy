@@ -31,12 +31,12 @@ use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use error_set::ErrContext;
-use iggy::models::identity_info::IdentityInfo;
-use iggy::models::personal_access_token::{PersonalAccessTokenInfo, RawPersonalAccessToken};
-use iggy::personal_access_tokens::create_personal_access_token::CreatePersonalAccessToken;
-use iggy::personal_access_tokens::delete_personal_access_token::DeletePersonalAccessToken;
-use iggy::personal_access_tokens::login_with_personal_access_token::LoginWithPersonalAccessToken;
-use iggy::validatable::Validatable;
+use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
+use iggy_common::delete_personal_access_token::DeletePersonalAccessToken;
+use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
+use iggy_common::IdentityInfo;
+use iggy_common::Validatable;
+use iggy_common::{PersonalAccessTokenInfo, RawPersonalAccessToken};
 use std::sync::Arc;
 use tracing::instrument;
 

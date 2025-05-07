@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use iggy::error::IggyError;
+use iggy_common::IggyError;
 use std::io::IoSlice;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;

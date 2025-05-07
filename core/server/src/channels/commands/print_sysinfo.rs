@@ -23,7 +23,7 @@ use crate::{
 };
 use flume::{Receiver, Sender};
 use human_repr::HumanCount;
-use iggy::utils::duration::IggyDuration;
+use iggy_common::IggyDuration;
 use tokio::time::{self};
 use tracing::{error, info, warn};
 

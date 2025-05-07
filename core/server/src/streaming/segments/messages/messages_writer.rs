@@ -19,7 +19,7 @@
 use super::PersisterTask;
 use crate::streaming::segments::{messages::write_batch, IggyMessagesBatchSet};
 use error_set::ErrContext;
-use iggy::{confirmation::Confirmation, error::IggyError, utils::byte_size::IggyByteSize};
+use iggy_common::{Confirmation, IggyByteSize, IggyError};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,

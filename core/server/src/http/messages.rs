@@ -29,11 +29,10 @@ use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use error_set::ErrContext;
-use iggy::consumer::Consumer;
-use iggy::identifier::Identifier;
-use iggy::models::messaging::IggyMessagesBatch;
-use iggy::prelude::*;
-use iggy::validatable::Validatable;
+use iggy_common::Identifier;
+use iggy_common::IggyMessagesBatch;
+use iggy_common::Validatable;
+use iggy_common::{Consumer, PollMessages, PolledMessages, SendMessages};
 use std::sync::Arc;
 use tracing::instrument;
 

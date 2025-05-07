@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use iggy::utils::duration::IggyDuration;
+use iggy_common::IggyDuration;
 use moka::future::Cache;
 
 #[derive(Debug)]

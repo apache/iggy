@@ -23,16 +23,16 @@ use crate::streaming::streams::stream::Stream;
 use crate::streaming::topics::consumer_group::ConsumerGroup;
 use crate::streaming::topics::topic::Topic;
 use crate::streaming::users::user::User;
-use iggy::locking::IggySharedMut;
-use iggy::locking::IggySharedMutFn;
-use iggy::models::client_info::ConsumerGroupInfo;
-use iggy::models::consumer_group::{ConsumerGroupDetails, ConsumerGroupMember};
-use iggy::models::identity_info::{IdentityInfo, TokenInfo};
-use iggy::models::personal_access_token::PersonalAccessTokenInfo;
-use iggy::models::stream::StreamDetails;
-use iggy::models::topic::TopicDetails;
-use iggy::models::user_info::{UserInfo, UserInfoDetails};
-use iggy::utils::sizeable::Sizeable;
+use iggy_common::locking::IggySharedMut;
+use iggy_common::locking::IggySharedMutFn;
+use iggy_common::ConsumerGroupInfo;
+use iggy_common::PersonalAccessTokenInfo;
+use iggy_common::Sizeable;
+use iggy_common::StreamDetails;
+use iggy_common::TopicDetails;
+use iggy_common::{ConsumerGroupDetails, ConsumerGroupMember};
+use iggy_common::{IdentityInfo, TokenInfo};
+use iggy_common::{UserInfo, UserInfoDetails};
 use tokio::sync::RwLock;
 
 pub fn map_stream(stream: &Stream) -> StreamDetails {
@@ -50,10 +50,10 @@ pub fn map_stream(stream: &Stream) -> StreamDetails {
     stream_details
 }
 
-pub fn map_streams(streams: &[&Stream]) -> Vec<iggy::models::stream::Stream> {
+pub fn map_streams(streams: &[&Stream]) -> Vec<iggy_common::Stream> {
     let mut streams_data = Vec::with_capacity(streams.len());
     for stream in streams {
-        let stream = iggy::models::stream::Stream {
+        let stream = iggy_common::Stream {
             id: stream.stream_id,
             created_at: stream.created_at,
             name: stream.name.clone(),
@@ -68,10 +68,10 @@ pub fn map_streams(streams: &[&Stream]) -> Vec<iggy::models::stream::Stream> {
     streams_data
 }
 
-pub fn map_topics(topics: &[&Topic]) -> Vec<iggy::models::topic::Topic> {
+pub fn map_topics(topics: &[&Topic]) -> Vec<iggy_common::Topic> {
     let mut topics_data = Vec::with_capacity(topics.len());
     for topic in topics {
-        let topic = iggy::models::topic::Topic {
+        let topic = iggy_common::Topic {
             id: topic.topic_id,
             created_at: topic.created_at,
             name: topic.name.clone(),
@@ -105,16 +105,14 @@ pub async fn map_topic(topic: &Topic) -> TopicDetails {
     };
     for partition in topic.get_partitions() {
         let partition = partition.read().await;
-        topic_details
-            .partitions
-            .push(iggy::models::partition::Partition {
-                id: partition.partition_id,
-                created_at: partition.created_at,
-                segments_count: partition.get_segments().len() as u32,
-                current_offset: partition.current_offset,
-                size: partition.get_size_bytes(),
-                messages_count: partition.get_messages_count(),
-            });
+        topic_details.partitions.push(iggy_common::Partition {
+            id: partition.partition_id,
+            created_at: partition.created_at,
+            segments_count: partition.get_segments().len() as u32,
+            current_offset: partition.current_offset,
+            size: partition.get_size_bytes(),
+            messages_count: partition.get_messages_count(),
+        });
     }
     topic_details.partitions.sort_by(|a, b| a.id.cmp(&b.id));
     topic_details
@@ -160,8 +158,8 @@ pub fn map_personal_access_tokens(
     personal_access_tokens_data
 }
 
-pub fn map_client(client: &Client) -> iggy::models::client_info::ClientInfoDetails {
-    let client = iggy::models::client_info::ClientInfoDetails {
+pub fn map_client(client: &Client) -> iggy_common::ClientInfoDetails {
+    let client = iggy_common::ClientInfoDetails {
         client_id: client.session.client_id,
         user_id: client.user_id,
         transport: client.transport.to_string(),
@@ -180,13 +178,11 @@ pub fn map_client(client: &Client) -> iggy::models::client_info::ClientInfoDetai
     client
 }
 
-pub async fn map_clients(
-    clients: &[IggySharedMut<Client>],
-) -> Vec<iggy::models::client_info::ClientInfo> {
+pub async fn map_clients(clients: &[IggySharedMut<Client>]) -> Vec<iggy_common::ClientInfo> {
     let mut all_clients = Vec::new();
     for client in clients {
         let client = client.read().await;
-        let client = iggy::models::client_info::ClientInfo {
+        let client = iggy_common::ClientInfo {
             client_id: client.session.client_id,
             user_id: client.user_id,
             transport: client.transport.to_string(),
@@ -202,11 +198,11 @@ pub async fn map_clients(
 
 pub async fn map_consumer_groups(
     consumer_groups: &[&RwLock<ConsumerGroup>],
-) -> Vec<iggy::models::consumer_group::ConsumerGroup> {
+) -> Vec<iggy_common::ConsumerGroup> {
     let mut groups = Vec::new();
     for consumer_group in consumer_groups {
         let consumer_group = consumer_group.read().await;
-        let consumer_group = iggy::models::consumer_group::ConsumerGroup {
+        let consumer_group = iggy_common::ConsumerGroup {
             id: consumer_group.group_id,
             name: consumer_group.name.clone(),
             partitions_count: consumer_group.partitions_count,

@@ -17,7 +17,7 @@
  */
 
 use crate::streaming::users::permissioner::Permissioner;
-use iggy::error::IggyError;
+use iggy_common::IggyError;
 
 impl Permissioner {
     pub fn poll_messages(

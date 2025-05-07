@@ -24,7 +24,7 @@ use crate::streaming::utils::file;
 use crate::streaming::utils::PooledBuffer;
 use anyhow::Context;
 use error_set::ErrContext;
-use iggy::error::IggyError;
+use iggy_common::IggyError;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tracing::info;

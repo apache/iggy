@@ -20,8 +20,7 @@ use super::IggyIndexesMut;
 use crate::streaming::utils::PooledBuffer;
 use bytes::BytesMut;
 use error_set::ErrContext;
-use iggy::models::messaging::{IggyIndex, INDEX_SIZE};
-use iggy::{error::IggyError, models::messaging::IggyIndexView};
+use iggy_common::{IggyError, IggyIndex, IggyIndexView, INDEX_SIZE};
 use std::{
     fs::File as StdFile,
     io::ErrorKind,

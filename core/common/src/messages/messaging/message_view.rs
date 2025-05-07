@@ -137,7 +137,7 @@ impl<'a> IggyMessageView<'a> {
 
         // TODO(hubcio): checksum field is 64 bits, but actual checksum is 32 bits (crc32fast)
         // in future, we should change it to cryptographic safe hash
-        u64::from(checksum::calculate(data))
+        u64::from(checksum::calculate_checksum(data))
     }
 }
 

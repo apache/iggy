@@ -27,10 +27,10 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Extension, Json, Router};
 use error_set::ErrContext;
-use iggy::identifier::Identifier;
-use iggy::partitions::create_partitions::CreatePartitions;
-use iggy::partitions::delete_partitions::DeletePartitions;
-use iggy::validatable::Validatable;
+use iggy_common::create_partitions::CreatePartitions;
+use iggy_common::delete_partitions::DeletePartitions;
+use iggy_common::Identifier;
+use iggy_common::Validatable;
 use std::sync::Arc;
 use tracing::instrument;
 

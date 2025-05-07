@@ -19,11 +19,11 @@
 use crate::streaming::session::Session;
 use crate::streaming::utils::hash;
 use ahash::AHashMap;
-use iggy::error::IggyError;
-use iggy::locking::IggySharedMut;
-use iggy::locking::IggySharedMutFn;
-use iggy::models::user_info::UserId;
-use iggy::utils::timestamp::IggyTimestamp;
+use iggy_common::locking::IggySharedMut;
+use iggy_common::locking::IggySharedMutFn;
+use iggy_common::IggyError;
+use iggy_common::IggyTimestamp;
+use iggy_common::UserId;
 use std::fmt::{Display, Formatter};
 use std::net::SocketAddr;
 use std::sync::Arc;

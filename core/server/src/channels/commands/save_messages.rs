@@ -21,7 +21,7 @@ use crate::configs::server::MessageSaverConfig;
 use crate::configs::server::ServerConfig;
 use crate::streaming::systems::system::SharedSystem;
 use flume::{Receiver, Sender};
-use iggy::utils::duration::IggyDuration;
+use iggy_common::IggyDuration;
 use tokio::time;
 use tracing::{error, info, instrument, warn};
 

@@ -22,13 +22,13 @@ use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
-use iggy::error::IggyError;
-use iggy::users::get_user::GetUser;
+use iggy_common::get_user::GetUser;
+use iggy_common::IggyError;
 use tracing::debug;
 
 impl ServerCommandHandler for GetUser {
     fn code(&self) -> u32 {
-        iggy::command::GET_USER_CODE
+        iggy_common::GET_USER_CODE
     }
 
     async fn handle(

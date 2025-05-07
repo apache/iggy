@@ -20,7 +20,7 @@ use crate::state::system::PartitionState;
 use crate::streaming::partitions::partition::Partition;
 use crate::streaming::partitions::COMPONENT;
 use error_set::ErrContext;
-use iggy::error::IggyError;
+use iggy_common::IggyError;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use tokio::fs::create_dir_all;

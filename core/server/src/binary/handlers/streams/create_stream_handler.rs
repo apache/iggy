@@ -26,13 +26,13 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy::error::IggyError;
-use iggy::streams::create_stream::CreateStream;
+use iggy_common::create_stream::CreateStream;
+use iggy_common::IggyError;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for CreateStream {
     fn code(&self) -> u32 {
-        iggy::command::CREATE_STREAM_CODE
+        iggy_common::CREATE_STREAM_CODE
     }
 
     #[instrument(skip_all, name = "trace_create_stream", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]

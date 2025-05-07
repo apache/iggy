@@ -7,9 +7,8 @@ mod utils;
 
 // Errors
 pub use error::client_error::ClientError;
-pub use error::iggy_error::IggyError;
-pub use error::iggy_error::IggyErrorDiscriminants;
-// Locking
+pub use error::iggy_error::{IggyError, IggyErrorDiscriminants};
+// Locking is feature gated, thus only mod level re-export.
 pub mod locking;
 // Messages
 pub use messages::consumer_groups::*;

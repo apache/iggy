@@ -21,9 +21,9 @@ use crate::streaming::systems::system::System;
 use crate::streaming::systems::COMPONENT;
 use crate::streaming::topics::consumer_group::ConsumerGroup;
 use error_set::ErrContext;
-use iggy::error::IggyError;
-use iggy::identifier::Identifier;
-use iggy::locking::IggySharedMutFn;
+use iggy_common::locking::IggySharedMutFn;
+use iggy_common::Identifier;
+use iggy_common::IggyError;
 use tokio::sync::RwLock;
 
 impl System {

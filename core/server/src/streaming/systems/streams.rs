@@ -24,9 +24,8 @@ use crate::streaming::systems::COMPONENT;
 use ahash::{AHashMap, AHashSet};
 use error_set::ErrContext;
 use futures::future::try_join_all;
-use iggy::error::IggyError;
-use iggy::identifier::{IdKind, Identifier};
-use iggy::locking::IggySharedMutFn;
+use iggy_common::locking::IggySharedMutFn;
+use iggy_common::{IdKind, Identifier, IggyError};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::fs;
@@ -457,7 +456,7 @@ mod tests {
     use crate::streaming::persistence::persister::{FileWithSyncPersister, PersisterKind};
     use crate::streaming::storage::SystemStorage;
     use crate::streaming::users::user::User;
-    use iggy::users::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
+    use iggy_common::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
     use std::{
         net::{Ipv4Addr, SocketAddr},
         sync::Arc,

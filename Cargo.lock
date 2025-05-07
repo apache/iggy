@@ -4965,7 +4965,7 @@ dependencies = [
  "flume",
  "futures",
  "human-repr",
- "iggy",
+ "iggy_common",
  "jsonwebtoken",
  "lending-iterator",
  "mimalloc",

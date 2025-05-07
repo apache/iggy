@@ -23,16 +23,15 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use crate::streaming::utils::PooledBuffer;
 use anyhow::Result;
-use iggy::error::IggyError;
-use iggy::identifier::Identifier;
-use iggy::models::messaging::INDEX_SIZE;
-use iggy::prelude::*;
-use iggy::utils::sizeable::Sizeable;
+use iggy_common::Identifier;
+use iggy_common::Sizeable;
+use iggy_common::INDEX_SIZE;
+use iggy_common::{IggyError, Partitioning, SendMessages, Validatable};
 use tracing::instrument;
 
 impl ServerCommandHandler for SendMessages {
     fn code(&self) -> u32 {
-        iggy::command::SEND_MESSAGES_CODE
+        iggy_common::SEND_MESSAGES_CODE
     }
 
     #[instrument(skip_all, name = "trace_send_messages", fields(

@@ -21,8 +21,7 @@ use crate::streaming::partitions::COMPONENT;
 use crate::streaming::polling_consumer::PollingConsumer;
 use crate::streaming::segments::*;
 use error_set::ErrContext;
-use iggy::confirmation::Confirmation;
-use iggy::prelude::*;
+use iggy_common::{Confirmation, IggyError, IggyTimestamp, Sizeable};
 use std::sync::atomic::Ordering;
 use tracing::trace;
 
@@ -368,6 +367,7 @@ mod tests {
     use crate::streaming::storage::SystemStorage;
     use crate::streaming::utils::MemoryPool;
     use bytes::Bytes;
+    use iggy_common::{IggyExpiry, IggyMessage};
     use std::sync::atomic::{AtomicU32, AtomicU64};
     use std::sync::Arc;
     use tempfile::TempDir;

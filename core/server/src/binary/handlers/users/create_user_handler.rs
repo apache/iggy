@@ -27,13 +27,13 @@ use crate::streaming::systems::system::SharedSystem;
 use crate::streaming::utils::crypto;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy::error::IggyError;
-use iggy::users::create_user::CreateUser;
+use iggy_common::create_user::CreateUser;
+use iggy_common::IggyError;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for CreateUser {
     fn code(&self) -> u32 {
-        iggy::command::CREATE_USER_CODE
+        iggy_common::CREATE_USER_CODE
     }
 
     #[instrument(skip_all, name = "trace_create_user", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]
