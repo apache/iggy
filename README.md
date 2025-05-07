@@ -123,7 +123,7 @@ Iggy CLI can be installed with `cargo install iggy-cli` and then simply accessed
 
 ## Web UI
 
-There's a dedicated Web UI for the server, which allows managing the streams, topics, partitions, browsing the messages and so on. This is an ongoing effort to build the compressive dashboard for the administrative purposes of the Iggy server. Check the [Web UI repository](https://github.com/iggy-rs/iggy-web-ui). The docker image for Web UI is available [here](https://hub.docker.com/r/iggyrs/iggy-web-ui), and can be fetched via `docker pull iggyrs/iggy-web-ui`.
+There's a dedicated Web UI for the server, which allows managing the streams, topics, partitions, browsing the messages and so on. This is an ongoing effort to build the compressive dashboard for the administrative purposes of the Iggy server. Check the Web UI in the `/web` directory. The docker image for Web UI is available [here](https://hub.docker.com/r/iggyrs/iggy-web-ui), and can be fetched via `docker pull iggyrs/iggy-web-ui`.
 
 ![Web UI](assets/web_ui.png)
 
@@ -357,3 +357,7 @@ Depending on the hardware, transport protocol (`quic`, `tcp` or `http`) and payl
 Please refer to the mentioned [benchmarking platform](https://benchmarks.iggy.rs) where you can browse the results achieved on the different hardware configurations, using the different Iggy server versions.
 
 ---
+
+## Contributing
+
+Please see [Contributing](CONTRIBUTING.md)
