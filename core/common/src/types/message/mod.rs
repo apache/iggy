@@ -17,10 +17,10 @@
  */
 
 pub mod flush_unsaved_buffer;
+mod iggy_message;
 mod index;
 mod index_view;
 mod indexes;
-mod iggy_message;
 mod message_header;
 mod message_header_view;
 mod message_view;
@@ -37,10 +37,10 @@ mod user_headers;
 pub const INDEX_SIZE: usize = 16;
 
 pub use flush_unsaved_buffer::FlushUnsavedBuffer;
+pub use iggy_message::{IggyMessage, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE};
 pub use index::IggyIndex;
 pub use index_view::IggyIndexView;
 pub use indexes::IggyIndexes;
-pub use iggy_message::{IggyMessage, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE};
 pub use message_header::{
     IggyMessageHeader, IGGY_MESSAGE_CHECKSUM_OFFSET_RANGE,
     IGGY_MESSAGE_HEADERS_LENGTH_OFFSET_RANGE, IGGY_MESSAGE_HEADER_RANGE, IGGY_MESSAGE_HEADER_SIZE,
