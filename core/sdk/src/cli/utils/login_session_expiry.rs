@@ -16,6 +16,6 @@
  * under the License.
  */
 
-use crate::utils::expiry::IggyExpiry;
+use crate::prelude::IggyExpiry;
 
 pub type LoginSessionExpiry = IggyExpiry;

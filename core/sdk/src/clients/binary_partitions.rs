@@ -16,23 +16,37 @@
  * under the License.
  */
 
-use crate::prelude::Client;
-use anyhow::{Error, Result};
+use crate::prelude::IggyClient;
 use async_trait::async_trait;
-
-pub static PRINT_TARGET: &str = "iggy::cli::output";
+use iggy_binary_protocol::PartitionClient;
+use iggy_common::locking::IggySharedMutFn;
+use iggy_common::{Identifier, IggyError};
 
 #[async_trait]
-pub trait CliCommand {
-    fn explain(&self) -> String;
-    fn use_tracing(&self) -> bool {
-        true
+impl PartitionClient for IggyClient {
+    async fn create_partitions(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partitions_count: u32,
+    ) -> Result<(), IggyError> {
+        self.client
+            .read()
+            .await
+            .create_partitions(stream_id, topic_id, partitions_count)
+            .await
     }
-    fn login_required(&self) -> bool {
-        true
+
+    async fn delete_partitions(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partitions_count: u32,
+    ) -> Result<(), IggyError> {
+        self.client
+            .read()
+            .await
+            .delete_partitions(stream_id, topic_id, partitions_count)
+            .await
     }
-    fn connection_required(&self) -> bool {
-        true
-    }
-    async fn execute_cmd(&mut self, client: &dyn Client) -> Result<(), Error>;
 }

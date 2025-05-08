@@ -16,7 +16,22 @@
  * under the License.
  */
 
-pub mod builder;
+pub mod client_builder;
 pub mod client;
 pub mod consumer;
+pub mod consumer_builder;
 pub mod producer;
+pub mod  producer_builder;
+mod binary_consumer_group;
+mod binary_consumer_offset;
+mod binary_message;
+mod binary_partitions;
+mod binary_segments;
+mod binary_topics;
+mod binary_streams;
+mod binary_system;
+mod binary_personal_access_tokens;
+mod binary_users;
+
+const ORDERING: std::sync::atomic::Ordering = std::sync::atomic::Ordering::SeqCst;
+const MAX_BATCH_SIZE: usize = 1000000;

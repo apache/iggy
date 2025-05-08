@@ -16,5 +16,6 @@
  * under the License.
  */
 
-pub mod client;
-pub mod config;
+pub mod quick_client;
+pub mod quick_config;
+mod skip_server_verification;

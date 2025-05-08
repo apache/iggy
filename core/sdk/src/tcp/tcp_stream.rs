@@ -16,16 +16,13 @@
  * under the License.
  */
 
-#[cfg(feature = "iggy-cli")]
-pub mod cli;
-pub mod cli_command;
-#[allow(deprecated)]
-pub mod client_provider;
-#[allow(deprecated)]
-pub mod clients;
-pub mod consumer_ext;
-pub mod http;
-pub mod prelude;
-pub mod quic;
-pub mod stream_builder;
-pub mod tcp;
+use async_trait::async_trait;
+use iggy_common::IggyError;
+
+#[async_trait]
+pub trait ConnectionStream {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, IggyError>;
+    async fn write(&mut self, buf: &[u8]) -> Result<(), IggyError>;
+    async fn flush(&mut self) -> Result<(), IggyError>;
+    async fn shutdown(&mut self) -> Result<(), IggyError>;
+}

@@ -15,10 +15,8 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
-use crate::client::Client;
-use crate::clients::client::IggyClient;
-use crate::error::IggyError;
+use iggy_binary_protocol::Client;
+use crate::prelude::{IggyClient, IggyError};
 
 /// Builds an `IggyClient` from the given connection string.
 ///

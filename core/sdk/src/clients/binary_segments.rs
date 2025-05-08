@@ -16,16 +16,25 @@
  * under the License.
  */
 
-#[cfg(feature = "iggy-cli")]
-pub mod cli;
-pub mod cli_command;
-#[allow(deprecated)]
-pub mod client_provider;
-#[allow(deprecated)]
-pub mod clients;
-pub mod consumer_ext;
-pub mod http;
-pub mod prelude;
-pub mod quic;
-pub mod stream_builder;
-pub mod tcp;
+use crate::prelude::IggyClient;
+use async_trait::async_trait;
+use iggy_binary_protocol::SegmentClient;
+use iggy_common::locking::IggySharedMutFn;
+use iggy_common::{Identifier, IggyError};
+
+#[async_trait]
+impl SegmentClient for IggyClient {
+    async fn delete_segments(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: u32,
+        segments_count: u32,
+    ) -> Result<(), IggyError> {
+        self.client
+            .read()
+            .await
+            .delete_segments(stream_id, topic_id, partition_id, segments_count)
+            .await
+    }
+}
