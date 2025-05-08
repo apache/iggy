@@ -23,7 +23,6 @@ pub use messages::topics::*;
 pub use messages::users::*;
 // Messages shared
 pub use messages_shared::*;
-
 // Traits
 pub use traits::bytes_serializable::BytesSerializable;
 pub use traits::partitioner::Partitioner;
