@@ -210,7 +210,8 @@ impl HttpTransport for HttpClient {
     }
 
     /// Refresh the access token using the current access token.
-    async fn refresh_access_token(&self) -> Result<(), IggyError> {
+    // method `refresh_access_token` is never used
+    async fn _refresh_access_token(&self) -> Result<(), IggyError> {
         let token = self.access_token.read().await;
         if token.is_empty() {
             return Err(IggyError::AccessTokenMissing);

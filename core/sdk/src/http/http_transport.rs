@@ -46,7 +46,8 @@ pub trait HttpTransport {
     async fn is_authenticated(&self) -> bool;
 
     /// Refresh the access token using the provided refresh token.
-    async fn refresh_access_token(&self) -> Result<(), IggyError>;
+    //method `refresh_access_token` is never used
+    async fn _refresh_access_token(&self) -> Result<(), IggyError>;
 
     /// Set the access token.
     async fn set_access_token(&self, token: Option<String>);
