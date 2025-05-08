@@ -17,123 +17,13 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::identifier::Identifier;
-use crate::models::permissions::{GlobalPermissions, StreamPermissions, TopicPermissions};
-use crate::users::get_user::GetUser;
+use crate::prelude::Client;
+use crate::prelude::Identifier;
 use anyhow::Context;
 use async_trait::async_trait;
-use comfy_table::presets::ASCII_NO_BORDERS;
 use comfy_table::Table;
+use iggy_common::get_user::GetUser;
 use tracing::{event, Level};
-
-impl From<GlobalPermissions> for Table {
-    fn from(value: GlobalPermissions) -> Self {
-        let mut table = Self::new();
-
-        table.load_preset(ASCII_NO_BORDERS);
-        table.set_header(vec!["Permission", "Value"]);
-        table.add_row(vec![
-            "Manage Servers",
-            value.manage_servers.to_string().as_str(),
-        ]);
-        table.add_row(vec![
-            "Read Servers",
-            value.read_servers.to_string().as_str(),
-        ]);
-        table.add_row(vec![
-            "Manage Users",
-            value.manage_users.to_string().as_str(),
-        ]);
-        table.add_row(vec!["Read Users", value.read_users.to_string().as_str()]);
-        table.add_row(vec![
-            "Manage Streams",
-            value.manage_streams.to_string().as_str(),
-        ]);
-        table.add_row(vec![
-            "Read Streams",
-            value.read_streams.to_string().as_str(),
-        ]);
-        table.add_row(vec![
-            "Manage Topics",
-            value.manage_topics.to_string().as_str(),
-        ]);
-        table.add_row(vec!["Read Topics", value.read_topics.to_string().as_str()]);
-        table.add_row(vec![
-            "Poll Messages",
-            value.poll_messages.to_string().as_str(),
-        ]);
-        table.add_row(vec![
-            "Send Messages",
-            value.send_messages.to_string().as_str(),
-        ]);
-
-        table
-    }
-}
-
-impl From<&TopicPermissions> for Table {
-    fn from(value: &TopicPermissions) -> Self {
-        let mut table = Self::new();
-
-        table.load_preset(ASCII_NO_BORDERS);
-        table.set_header(vec!["Permission", "Value"]);
-        table.add_row(vec![
-            "Manage Topic",
-            value.manage_topic.to_string().as_str(),
-        ]);
-        table.add_row(vec!["Read Topic", value.read_topic.to_string().as_str()]);
-        table.add_row(vec![
-            "Poll Messages",
-            value.poll_messages.to_string().as_str(),
-        ]);
-        table.add_row(vec![
-            "Send Messages",
-            value.send_messages.to_string().as_str(),
-        ]);
-
-        table
-    }
-}
-
-impl From<&StreamPermissions> for Table {
-    fn from(value: &StreamPermissions) -> Self {
-        let mut table = Self::new();
-
-        table.load_preset(ASCII_NO_BORDERS);
-        table.set_header(vec!["Permission", "Value"]);
-        table.add_row(vec![
-            "Manage Stream",
-            value.manage_stream.to_string().as_str(),
-        ]);
-        table.add_row(vec!["Read Stream", value.read_stream.to_string().as_str()]);
-        table.add_row(vec![
-            "Manage Topics",
-            value.manage_topics.to_string().as_str(),
-        ]);
-        table.add_row(vec!["Read Topics", value.read_topics.to_string().as_str()]);
-        table.add_row(vec![
-            "Poll Messages",
-            value.poll_messages.to_string().as_str(),
-        ]);
-        table.add_row(vec![
-            "Send Messages",
-            value.send_messages.to_string().as_str(),
-        ]);
-
-        if let Some(topics) = &value.topics {
-            topics.iter().for_each(|(topic_id, topic_permissions)| {
-                let topic_table: Table = topic_permissions.into();
-                table.add_row(vec![
-                    format!("Topic: {}", topic_id).as_str(),
-                    format!("{}", topic_table).as_str(),
-                ]);
-            });
-        }
-
-        table
-    }
-}
 
 pub struct GetUserCmd {
     get_user: GetUser,

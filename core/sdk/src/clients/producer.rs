@@ -19,7 +19,7 @@ use super::{MAX_BATCH_SIZE, ORDERING};
 
 use bytes::Bytes;
 use futures_util::StreamExt;
-use iggy_binary_protocol::{Client, MessageClient};
+use iggy_binary_protocol::Client;
 use iggy_common::locking::{IggySharedMut, IggySharedMutFn};
 use iggy_common::{
     CompressionAlgorithm, DiagnosticEvent, EncryptorKind, IdKind, Identifier, IggyDuration,

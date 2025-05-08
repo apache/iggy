@@ -23,7 +23,7 @@ use iggy::args::Args;
 use iggy::cli::system::session::ServerSession;
 use iggy::client::{PersonalAccessTokenClient, UserClient};
 use iggy::clients::client::IggyClient;
-use iggy::error::IggyError;
+use iggy::prelude::IggyError;
 use passterm::{isatty, prompt_password_stdin, prompt_password_tty, Stream};
 use std::env::var;
 

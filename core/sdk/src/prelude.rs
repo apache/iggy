@@ -42,6 +42,7 @@ pub use crate::stream_builder::IggyConsumerConfig;
 pub use crate::stream_builder::IggyStreamConsumer;
 pub use crate::stream_builder::{IggyProducerConfig, IggyStreamProducer};
 pub use crate::stream_builder::{IggyStream, IggyStreamConfig};
+pub use crate::tcp::tcp_client::TcpClient;
 //
 pub use iggy_binary_protocol::{
     Client, ConsumerGroupClient, ConsumerOffsetClient, MessageClient, PartitionClient,
@@ -49,19 +50,21 @@ pub use iggy_binary_protocol::{
 };
 //
 pub use iggy_common::{
+    defaults, Aes256GcmEncryptor, Args, ArgsOptional, AutoLogin, BytesSerializable, CacheMetrics,
+    CacheMetricsKey, ClientError, CompressionAlgorithm, Consumer, ConsumerGroupDetails,
+    ConsumerKind, EncryptorKind, FlushUnsavedBuffer, GlobalPermissions, HeaderKey, HeaderValue,
+    IdKind, Identifier, IdentityInfo, IggyByteSize, IggyDuration, IggyError, IggyExpiry,
+    IggyIndexView, IggyMessage, IggyMessageHeader, IggyMessageHeaderView, IggyMessageView,
+    IggyMessageViewIterator, IggyTimestamp, MaxTopicSize, Partition, Partitioner, Partitioning,
+    Permissions, PollMessages, PolledMessages, PollingKind, PollingStrategy, SendMessages,
+    Sizeable, SnapshotCompression, Stats, Stream, StreamPermissions, SystemSnapshotType,
+    TcpClientConfig, TcpClientConfigBuilder, TcpClientReconnectionConfig, Topic, TopicPermissions,
+    UserStatus, Validatable,
+};
+pub use iggy_common::{
     defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_USER_ID},
     IGGY_MESSAGE_CHECKSUM_OFFSET_RANGE, IGGY_MESSAGE_HEADERS_LENGTH_OFFSET_RANGE,
     IGGY_MESSAGE_HEADER_SIZE, IGGY_MESSAGE_ID_OFFSET_RANGE, IGGY_MESSAGE_OFFSET_OFFSET_RANGE,
     IGGY_MESSAGE_ORIGIN_TIMESTAMP_OFFSET_RANGE, IGGY_MESSAGE_PAYLOAD_LENGTH_OFFSET_RANGE,
     IGGY_MESSAGE_TIMESTAMP_OFFSET_RANGE, INDEX_SIZE, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE,
-};
-pub use iggy_common::{
-    Args, AutoLogin, BytesSerializable, ClientError, CompressionAlgorithm, Consumer,
-    ConsumerGroupDetails, ConsumerKind, EncryptorKind, FlushUnsavedBuffer, GlobalPermissions,
-    HeaderKey, HeaderValue, IdKind, Identifier, IdentityInfo, IggyByteSize, IggyDuration,
-    IggyError, IggyExpiry, IggyIndexView, IggyMessage, IggyMessageHeader, IggyMessageHeaderView,
-    IggyMessageView, IggyMessageViewIterator, IggyTimestamp, MaxTopicSize, Partition, Partitioner,
-    Partitioning, Permissions, PollMessages, PolledMessages, PollingKind, PollingStrategy,
-    SendMessages, Sizeable, SnapshotCompression, Stats, Stream, StreamPermissions,
-    SystemSnapshotType, Topic, TopicPermissions, UserStatus, Validatable,
 };

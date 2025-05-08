@@ -20,7 +20,7 @@ use crate::shared::args::Args;
 use iggy::client_provider;
 use iggy::client_provider::ClientProviderConfig;
 use iggy::clients::client::IggyClient;
-use iggy::error::IggyError;
+use iggy::prelude::IggyError;
 use std::sync::Arc;
 
 /// Builds an Iggy client using the provided stream and topic identifiers.
@@ -54,7 +54,7 @@ pub async fn build_client(
 /// A `Result` wrapping the `IggyClient` instance or an `IggyError`.
 ///
 pub async fn build_client_from_args(
-    args: iggy::args::Args,
+    args: iggy::prelude::Args,
     connect: bool,
 ) -> Result<IggyClient, IggyError> {
     // Build client provider configuration

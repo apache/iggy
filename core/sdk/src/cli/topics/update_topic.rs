@@ -17,15 +17,15 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::compression::compression_algorithm::CompressionAlgorithm;
-use crate::identifier::Identifier;
-use crate::topics::update_topic::UpdateTopic;
-use crate::utils::expiry::IggyExpiry;
-use crate::utils::topic_size::MaxTopicSize;
+use crate::prelude::Client;
+use crate::prelude::CompressionAlgorithm;
+use crate::prelude::Identifier;
+use crate::prelude::IggyExpiry;
+use crate::prelude::MaxTopicSize;
 use anyhow::Context;
 use async_trait::async_trait;
 use core::fmt;
+use iggy_common::update_topic::UpdateTopic;
 use tracing::{event, Level};
 
 pub struct UpdateTopicCmd {
@@ -98,7 +98,7 @@ impl CliCommand for UpdateTopicCmd {
 }
 
 impl fmt::Display for UpdateTopicCmd {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let topic_id = &self.update_topic.topic_id;
         let topic_name = &self.update_topic.name;
         let compression_algorithm = &self.update_topic.compression_algorithm;

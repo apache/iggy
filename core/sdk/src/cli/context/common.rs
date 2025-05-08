@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::{collections::HashMap, env::var, path};
 use tokio::join;
 
-use crate::args::ArgsOptional;
+use crate::prelude::ArgsOptional;
 
 static ENV_IGGY_HOME: &str = "IGGY_HOME";
 static DEFAULT_IGGY_HOME_VALUE: &str = ".iggy";

@@ -17,7 +17,7 @@
  */
 
 use crate::shared::messages::{OrderConfirmed, OrderCreated, OrderRejected, SerializableMessage};
-use iggy::utils::timestamp::IggyTimestamp;
+use iggy::prelude::IggyTimestamp;
 use rand::rngs::ThreadRng;
 use rand::Rng;
 

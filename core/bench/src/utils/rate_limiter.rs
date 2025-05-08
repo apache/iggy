@@ -3,7 +3,7 @@ use governor::{
     state::{InMemoryState, NotKeyed},
     Quota, RateLimiter as GovernorRateLimiter,
 };
-use iggy::utils::byte_size::IggyByteSize;
+use iggy::prelude::IggyByteSize;
 use std::num::NonZeroU32;
 
 pub struct BenchmarkRateLimiter {

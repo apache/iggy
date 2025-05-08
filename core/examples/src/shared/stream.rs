@@ -18,7 +18,7 @@
 
 use iggy::clients::consumer::ReceivedMessage;
 use iggy::consumer_ext::MessageConsumer;
-use iggy::error::IggyError;
+use iggy::prelude::IggyError;
 
 #[derive(Debug)]
 pub struct PrintEventConsumer {}

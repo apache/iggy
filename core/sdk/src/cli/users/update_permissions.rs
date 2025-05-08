@@ -17,12 +17,12 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::identifier::Identifier;
-use crate::models::permissions::Permissions;
-use crate::users::update_permissions::UpdatePermissions;
+use crate::prelude::Client;
+use crate::prelude::Identifier;
 use anyhow::Context;
 use async_trait::async_trait;
+use iggy_common::update_permissions::UpdatePermissions;
+use iggy_common::Permissions;
 use tracing::{event, Level};
 
 pub struct UpdatePermissionsCmd {

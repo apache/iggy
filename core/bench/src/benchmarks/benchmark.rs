@@ -19,12 +19,12 @@
 use crate::args::kind::BenchmarkKindCommand;
 use crate::{args::common::IggyBenchArgs, utils::client_factory::create_client_factory};
 use async_trait::async_trait;
-use iggy::client::{StreamClient, TopicClient};
 use iggy::clients::client::IggyClient;
-use iggy::compression::compression_algorithm::CompressionAlgorithm;
-use iggy::error::IggyError;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy::prelude::CompressionAlgorithm;
+use iggy::prelude::IggyError;
+use iggy::prelude::IggyExpiry;
+use iggy::prelude::MaxTopicSize;
+use iggy::prelude::{StreamClient, TopicClient};
 use iggy_bench_report::benchmark_kind::BenchmarkKind;
 use iggy_bench_report::individual_metrics::BenchmarkIndividualMetrics;
 use integration::test_server::{login_root, ClientFactory};

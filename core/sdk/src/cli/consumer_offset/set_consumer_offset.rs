@@ -17,12 +17,12 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::consumer::{Consumer, ConsumerKind};
-use crate::consumer_offsets::store_consumer_offset::StoreConsumerOffset;
-use crate::identifier::Identifier;
+use crate::prelude::Client;
+use crate::prelude::Identifier;
+use crate::prelude::{Consumer, ConsumerKind};
 use anyhow::Context;
 use async_trait::async_trait;
+use iggy_common::store_consumer_offset::StoreConsumerOffset;
 use tracing::{event, Level};
 
 pub struct SetConsumerOffsetCmd {

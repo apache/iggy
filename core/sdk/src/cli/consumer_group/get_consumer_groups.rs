@@ -17,12 +17,12 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::consumer_groups::get_consumer_groups::GetConsumerGroups;
-use crate::identifier::Identifier;
+use crate::prelude::Client;
+use crate::prelude::Identifier;
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;
+use iggy_common::get_consumer_groups::GetConsumerGroups;
 use std::fmt::{self, Display, Formatter};
 use tracing::{event, Level};
 

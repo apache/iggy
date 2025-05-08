@@ -20,7 +20,7 @@ use crate::analytics::record::BenchmarkRecord;
 use crate::analytics::time_series::calculator::TimeSeriesCalculator;
 use crate::analytics::time_series::processors::moving_average::MovingAverageProcessor;
 use crate::analytics::time_series::processors::TimeSeriesProcessor;
-use iggy::utils::duration::IggyDuration;
+use iggy::prelude::IggyDuration;
 use iggy_bench_report::actor_kind::ActorKind;
 use iggy_bench_report::benchmark_kind::BenchmarkKind;
 use iggy_bench_report::individual_metrics::BenchmarkIndividualMetrics;

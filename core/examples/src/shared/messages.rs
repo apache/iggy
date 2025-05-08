@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use iggy::utils::timestamp::IggyTimestamp;
+use iggy::prelude::IggyTimestamp;
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Debug};
 

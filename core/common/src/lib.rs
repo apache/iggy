@@ -67,7 +67,7 @@ pub use types::snapshot::snapshot::*;
 pub use utils::byte_size::IggyByteSize;
 pub use utils::checksum::*;
 pub use utils::crypto::*;
-pub use utils::duration::IggyDuration;
+pub use utils::duration::{IggyDuration, SEC_IN_MICRO};
 pub use utils::expiry::IggyExpiry;
 pub use utils::personal_access_token_expiry::PersonalAccessTokenExpiry;
 pub use utils::text;

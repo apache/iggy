@@ -63,32 +63,6 @@ impl Validatable<IggyError> for Consumer {
     }
 }
 
-impl Consumer {
-    /// Creates a new `Consumer` from a `Consumer`.
-    pub fn from_consumer(consumer: &Consumer) -> Self {
-        Self {
-            kind: consumer.kind,
-            id: consumer.id.clone(),
-        }
-    }
-
-    /// Creates a new `Consumer` from the `Identifier`.
-    pub fn new(id: Identifier) -> Self {
-        Self {
-            kind: ConsumerKind::Consumer,
-            id,
-        }
-    }
-
-    // Creates a new `ConsumerGroup` from the `Identifier`.
-    pub fn group(id: Identifier) -> Self {
-        Self {
-            kind: ConsumerKind::ConsumerGroup,
-            id,
-        }
-    }
-}
-
 impl BytesSerializable for Consumer {
     fn to_bytes(&self) -> Bytes {
         let id_bytes = self.id.to_bytes();

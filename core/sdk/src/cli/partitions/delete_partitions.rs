@@ -17,11 +17,11 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::identifier::Identifier;
-use crate::partitions::delete_partitions::DeletePartitions;
+use crate::prelude::Client;
+use crate::prelude::Identifier;
 use anyhow::Context;
 use async_trait::async_trait;
+use iggy_common::delete_partitions::DeletePartitions;
 use tracing::{event, Level};
 
 pub struct DeletePartitionsCmd {

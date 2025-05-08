@@ -21,10 +21,7 @@ use std::collections::HashMap;
 use super::metrics::group::{from_individual_metrics, from_producers_and_consumers_statistics};
 use crate::utils::get_server_stats;
 use chrono::{DateTime, Utc};
-use iggy::{
-    models::stats::{CacheMetrics, CacheMetricsKey, Stats},
-    utils::timestamp::IggyTimestamp,
-};
+use iggy::prelude::{CacheMetrics, CacheMetricsKey, IggyTimestamp, Stats};
 use iggy_bench_report::{
     actor_kind::ActorKind,
     benchmark_kind::BenchmarkKind,

@@ -17,11 +17,11 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::identifier::Identifier;
-use crate::topics::delete_topic::DeleteTopic;
+use crate::prelude::Client;
+use crate::prelude::Identifier;
 use anyhow::Context;
 use async_trait::async_trait;
+use iggy_common::delete_topic::DeleteTopic;
 use tracing::{event, Level};
 
 pub struct DeleteTopicCmd {

@@ -17,11 +17,11 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::system::get_stats::GetStats;
+use crate::prelude::Client;
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;
+use iggy_common::get_stats::GetStats;
 use std::fmt::Display;
 use std::time::SystemTime;
 use tracing::{event, Level};

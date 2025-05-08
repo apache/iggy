@@ -17,9 +17,9 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::consumer_groups::create_consumer_group::CreateConsumerGroup;
-use crate::identifier::Identifier;
+ use crate::prelude::Client;
+use iggy_common::create_consumer_group::CreateConsumerGroup;
+use crate::prelude::Identifier;
 use anyhow::Context;
 use async_trait::async_trait;
 use tracing::{event, Level};

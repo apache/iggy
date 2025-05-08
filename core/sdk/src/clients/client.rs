@@ -17,34 +17,17 @@
  */
 
 use crate::clients::client_builder::IggyClientBuilder;
-use iggy_common::{
-    ClientInfoDetails, Consumer, ConsumerGroup, ConsumerGroupDetails, ConsumerOffsetInfo,
-    DiagnosticEvent, Identifier, IdentityInfo, IggyMessage, Partitioner, Permissions,
-    PersonalAccessTokenExpiry, PersonalAccessTokenInfo, PollingStrategy, RawPersonalAccessToken,
-    Snapshot, Stats, Stream, StreamDetails, Topic, TopicDetails, UserInfo, UserInfoDetails,
-    UserStatus,
-};
-
 use iggy_common::locking::{IggySharedMut, IggySharedMutFn};
 
 use crate::prelude::EncryptorKind;
 use crate::prelude::IggyConsumerBuilder;
-use crate::prelude::IggyDuration;
 use crate::prelude::IggyError;
-use crate::prelude::IggyExpiry;
 use crate::prelude::IggyProducerBuilder;
-use crate::prelude::MaxTopicSize;
-use crate::prelude::{Partitioning, PolledMessages};
-use crate::prelude::{SnapshotCompression, SystemSnapshotType};
 use crate::tcp::tcp_client::TcpClient;
 use async_broadcast::Receiver;
-use async_dropper::AsyncDrop;
 use async_trait::async_trait;
-use bytes::Bytes;
-use iggy_binary_protocol::{
-    Client, ConsumerGroupClient, ConsumerOffsetClient, MessageClient, PartitionClient,
-    PersonalAccessTokenClient, SegmentClient, StreamClient, SystemClient, TopicClient, UserClient,
-};
+use iggy_binary_protocol::Client;
+use iggy_common::{Consumer, DiagnosticEvent, Partitioner};
 use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::spawn;

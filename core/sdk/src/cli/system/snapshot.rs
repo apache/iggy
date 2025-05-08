@@ -19,9 +19,9 @@
 use std::path::Path;
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::snapshot::{SnapshotCompression, SystemSnapshotType};
-use crate::system::get_snapshot::GetSnapshot;
+ use crate::prelude::Client;
+use iggy_common::{SnapshotCompression, SystemSnapshotType};
+use iggy_common::get_snapshot::GetSnapshot;
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;

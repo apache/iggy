@@ -16,19 +16,15 @@
  * under the License.
  */
 
-use crate::bytes_serializable::BytesSerializable;
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::consumer::Consumer;
-use crate::identifier::Identifier;
-use crate::messages::{PollMessages, PollingStrategy};
-use crate::models::messaging::HeaderKind;
-use crate::prelude::{HeaderKey, HeaderValue, IggyMessage, Sizeable};
-use crate::utils::timestamp::IggyTimestamp;
-use crate::utils::{byte_size::IggyByteSize, duration::IggyDuration};
+use crate::prelude::{
+    BytesSerializable, Client, Consumer, HeaderKey, HeaderValue, Identifier, IggyByteSize,
+    IggyDuration, IggyMessage, IggyTimestamp, PollMessages, PollingStrategy, Sizeable,
+};
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::{Cell, CellAlignment, Row, Table};
+use iggy_common::HeaderKind;
 use std::collections::{HashMap, HashSet};
 use tokio::io::AsyncWriteExt;
 use tracing::{event, Level};

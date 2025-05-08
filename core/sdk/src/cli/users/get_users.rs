@@ -17,8 +17,8 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::users::get_users::GetUsers;
+use crate::prelude::Client;
+use iggy_common::get_users::GetUsers;
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;

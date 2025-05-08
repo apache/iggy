@@ -19,10 +19,10 @@
 use crate::cli::system::session::ServerSession;
 use crate::cli::utils::login_session_expiry::LoginSessionExpiry;
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::utils::duration::SEC_IN_MICRO;
+use crate::prelude::Client;
 use anyhow::Context;
 use async_trait::async_trait;
+use iggy_common::SEC_IN_MICRO;
 use tracing::{event, Level};
 
 const DEFAULT_LOGIN_SESSION_TIMEOUT: u64 = SEC_IN_MICRO * 15 * 60;

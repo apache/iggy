@@ -21,7 +21,7 @@ use crate::args::{
     transport::BenchmarkTransportCommand,
 };
 use clap::{error::ErrorKind, CommandFactory, Parser};
-use iggy::utils::byte_size::IggyByteSize;
+use iggy::prelude::IggyByteSize;
 use std::num::NonZeroU32;
 
 /// Polling benchmark with consumer group

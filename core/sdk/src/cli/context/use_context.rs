@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use tracing::{event, Level};
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
+ use crate::prelude::Client;
 
 use super::common::{ContextManager, DEFAULT_CONTEXT_NAME};
 

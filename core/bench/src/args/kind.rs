@@ -28,7 +28,7 @@ use crate::args::kinds::pinned::consumer::PinnedConsumerArgs;
 use crate::args::kinds::pinned::producer::PinnedProducerArgs;
 use crate::args::kinds::pinned::producer_and_consumer::PinnedProducerAndConsumerArgs;
 use clap::Subcommand;
-use iggy::utils::byte_size::IggyByteSize;
+use iggy::prelude::IggyByteSize;
 use iggy_bench_report::benchmark_kind::BenchmarkKind;
 
 #[derive(Subcommand, Debug)]

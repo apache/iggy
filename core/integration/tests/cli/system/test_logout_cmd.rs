@@ -20,7 +20,7 @@ use crate::cli::common::{IggyCmdCommand, IggyCmdTestCase};
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::cli::system::session::ServerSession;
-use iggy::client::Client;
+use iggy::prelude::Client;
 use predicates::str::diff;
 
 #[derive(Debug)]

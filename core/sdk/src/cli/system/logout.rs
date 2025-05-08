@@ -18,7 +18,7 @@
 
 use crate::cli::system::session::ServerSession;
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
+ use crate::prelude::Client;
 use anyhow::Context;
 use async_trait::async_trait;
 use tracing::{event, Level};

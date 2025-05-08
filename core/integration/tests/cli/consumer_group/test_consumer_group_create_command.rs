@@ -22,9 +22,7 @@ use crate::cli::common::{
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
-use iggy::client::Client;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy::prelude::{Client, IggyExpiry, MaxTopicSize};
 use predicates::str::diff;
 use serial_test::parallel;
 

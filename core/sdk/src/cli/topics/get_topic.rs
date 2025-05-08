@@ -17,13 +17,13 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::identifier::Identifier;
-use crate::topics::get_topic::GetTopic;
-use crate::utils::expiry::IggyExpiry;
+use crate::prelude::Client;
+use crate::prelude::Identifier;
+use crate::prelude::IggyExpiry;
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;
+use iggy_common::get_topic::GetTopic;
 use tracing::{event, Level};
 
 pub struct GetTopicCmd {

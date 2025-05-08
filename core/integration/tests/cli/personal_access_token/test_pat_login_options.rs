@@ -19,7 +19,7 @@
 use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase};
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
-use iggy::client::Client;
+use iggy::prelude::Client;
 use iggy::utils::personal_access_token_expiry::PersonalAccessTokenExpiry;
 use keyring::Entry;
 use predicates::str::{contains, starts_with};

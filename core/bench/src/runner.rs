@@ -23,7 +23,7 @@ use crate::plot::{plot_chart, ChartType};
 use crate::utils::cpu_name::append_cpu_name_lowercase;
 use crate::utils::server_starter::start_server_if_needed;
 use crate::utils::{collect_server_logs_and_save_to_file, params_from_args_and_metrics};
-use iggy::error::IggyError;
+use iggy::prelude::IggyError;
 use iggy_bench_report::hardware::BenchmarkHardware;
 use integration::test_server::TestServer;
 use std::path::Path;

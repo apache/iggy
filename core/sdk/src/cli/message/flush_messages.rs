@@ -17,8 +17,8 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::identifier::Identifier;
+ use crate::prelude::Client;
+use crate::prelude::Identifier;
 use anyhow::{Context, Error};
 use async_trait::async_trait;
 use tracing::{event, Level};

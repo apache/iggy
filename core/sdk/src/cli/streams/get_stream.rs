@@ -17,9 +17,9 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::identifier::Identifier;
-use crate::streams::get_stream::GetStream;
+ use crate::prelude::Client;
+use crate::prelude::Identifier;
+use iggy_common::get_stream::GetStream;
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;

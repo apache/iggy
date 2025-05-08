@@ -17,11 +17,11 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::consumer_groups::delete_consumer_group::DeleteConsumerGroup;
-use crate::identifier::Identifier;
+use crate::prelude::Client;
+use crate::prelude::Identifier;
 use anyhow::Context;
 use async_trait::async_trait;
+use iggy_common::delete_consumer_group::DeleteConsumerGroup;
 use tracing::{event, Level};
 
 pub struct DeleteConsumerGroupCmd {

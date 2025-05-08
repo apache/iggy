@@ -17,11 +17,11 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::system::get_client::GetClient;
+use crate::prelude::Client;
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::{presets::ASCII_NO_BORDERS, Table};
+use iggy_common::get_client::GetClient;
 use tracing::{event, Level};
 
 pub struct GetClientCmd {

@@ -23,7 +23,7 @@ use crate::cli::common::{
 use ahash::AHashMap;
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
-use iggy::client::Client;
+use iggy::prelude::Client;
 use iggy::models::permissions::{Permissions, StreamPermissions, TopicPermissions};
 use iggy::models::user_info::UserId;
 use iggy::models::user_status::UserStatus;

@@ -37,7 +37,7 @@ use args::segment::SegmentAction;
 use args::user::UserAction;
 use args::{CliOptions, IggyMergedConsoleArgs};
 use clap::Parser;
-use iggy::args::Args;
+use iggy::prelude::Args;
 use iggy::cli::context::common::ContextManager;
 use iggy::cli::context::use_context::UseContextCmd;
 use iggy::cli::segments::delete_segments::DeleteSegmentsCmd;

@@ -20,7 +20,7 @@ use crate::cli::common::CLAP_INDENT;
 use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX};
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
-use iggy::client::Client;
+use iggy::prelude::Client;
 use predicates::str::starts_with;
 use serial_test::parallel;
 use std::{

@@ -16,7 +16,7 @@
  * under the License.
  */
 
-#[cfg(feature = "iggy-cli")]
+// #[cfg(feature = "iggy-cli")]
 pub mod cli;
 pub mod cli_command;
 #[allow(deprecated)]

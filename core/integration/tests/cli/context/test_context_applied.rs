@@ -20,7 +20,7 @@ use std::collections::HashMap;
 
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
-use iggy::client::Client;
+use iggy::prelude::Client;
 use iggy::{args::ArgsOptional, cli::context::common::ContextConfig};
 use integration::test_server::TestServer;
 use predicates::str::{contains, starts_with};

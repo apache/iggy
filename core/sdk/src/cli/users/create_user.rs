@@ -17,12 +17,12 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::models::permissions::Permissions;
-use crate::models::user_status::UserStatus;
-use crate::users::create_user::CreateUser;
+use crate::prelude::Client;
 use anyhow::Context;
 use async_trait::async_trait;
+use iggy_common::create_user::CreateUser;
+use iggy_common::Permissions;
+use iggy_common::UserStatus;
 use tracing::{event, Level};
 
 pub struct CreateUserCmd {

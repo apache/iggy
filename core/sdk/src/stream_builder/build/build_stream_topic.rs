@@ -17,8 +17,8 @@
  */
 
 use crate::prelude::{
-    CompressionAlgorithm, EncryptorKind, IdKind, Identifier, IggyClient, IggyDuration, IggyError,
-    IggyExpiry, MaxTopicSize, PollingStrategy, StreamClient, TopicClient,
+    CompressionAlgorithm, IdKind, Identifier, IggyClient, IggyError,
+    IggyExpiry, MaxTopicSize, StreamClient, TopicClient,
 };
 
 use crate::stream_builder::IggyConsumerConfig;

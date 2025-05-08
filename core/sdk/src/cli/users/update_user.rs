@@ -17,12 +17,12 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::identifier::Identifier;
-use crate::models::user_status::UserStatus;
-use crate::users::update_user::UpdateUser;
+use crate::prelude::Client;
+use crate::prelude::Identifier;
 use anyhow::Context;
 use async_trait::async_trait;
+use iggy_common::update_user::UpdateUser;
+use iggy_common::UserStatus;
 use tracing::{event, Level};
 
 #[derive(Debug, Clone)]

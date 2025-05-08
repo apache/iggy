@@ -17,8 +17,8 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::system::ping::Ping;
+ use crate::prelude::Client;
+use iggy_common::ping::Ping;
 use anyhow::Context;
 use async_trait::async_trait;
 use std::fmt::{Display, Formatter, Result};

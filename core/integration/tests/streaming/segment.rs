@@ -21,7 +21,7 @@ use crate::streaming::create_message;
 use bytes::Bytes;
 use iggy::compression::compression_algorithm::CompressionAlgorithm;
 use iggy::confirmation::Confirmation;
-use iggy::error::IggyError;
+use iggy::prelude::IggyError;
 use iggy::identifier::Identifier;
 use iggy::locking::IggySharedMutFn;
 use iggy::prelude::*;

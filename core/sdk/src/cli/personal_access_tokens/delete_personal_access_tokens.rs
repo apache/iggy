@@ -17,10 +17,10 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::personal_access_tokens::delete_personal_access_token::DeletePersonalAccessToken;
+use crate::prelude::Client;
 use anyhow::Context;
 use async_trait::async_trait;
+use iggy_common::delete_personal_access_token::DeletePersonalAccessToken;
 use keyring::Entry;
 use tracing::{event, Level};
 

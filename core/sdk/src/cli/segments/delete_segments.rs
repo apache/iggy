@@ -16,11 +16,11 @@
  * under the License.
  */
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::identifier::Identifier;
-use crate::segments::delete_segments::DeleteSegments;
+use crate::prelude::Client;
+use crate::prelude::Identifier;
 use anyhow::Context;
 use async_trait::async_trait;
+use iggy_common::delete_segments::DeleteSegments;
 use tracing::{event, Level};
 
 pub struct DeleteSegmentsCmd {

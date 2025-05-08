@@ -17,9 +17,9 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::identifier::Identifier;
-use crate::streams::purge_stream::PurgeStream;
+ use crate::prelude::Client;
+use crate::prelude::Identifier;
+use iggy_common::purge_stream::PurgeStream;
 use anyhow::Context;
 use async_trait::async_trait;
 use tracing::{event, Level};

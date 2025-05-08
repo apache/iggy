@@ -22,7 +22,7 @@ use crate::cli::common::{
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
-use iggy::client::Client;
+use iggy::prelude::Client;
 use iggy::models::user_status::UserStatus;
 use predicates::str::diff;
 use serial_test::parallel;

@@ -17,15 +17,12 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::compression::compression_algorithm::CompressionAlgorithm;
-use crate::identifier::Identifier;
-use crate::topics::create_topic::CreateTopic;
-use crate::utils::expiry::IggyExpiry;
-use crate::utils::topic_size::MaxTopicSize;
 use anyhow::Context;
 use async_trait::async_trait;
 use core::fmt;
+use iggy_binary_protocol::Client;
+use iggy_common::create_topic::CreateTopic;
+use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize};
 use tracing::{event, Level};
 
 pub struct CreateTopicCmd {
@@ -106,7 +103,7 @@ impl CliCommand for CreateTopicCmd {
 }
 
 impl fmt::Display for CreateTopicCmd {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let topic_id = self.get_topic_id_info();
         let topic_name = &self.create_topic.name;
         let compression_algorithm = &self.create_topic.compression_algorithm;

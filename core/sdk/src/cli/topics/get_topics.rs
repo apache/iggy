@@ -17,10 +17,10 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::identifier::Identifier;
-use crate::topics::get_topics::GetTopics;
-use crate::utils::expiry::IggyExpiry;
+ use crate::prelude::Client;
+use crate::prelude::Identifier;
+use iggy_common::get_topics::GetTopics;
+use crate::prelude::IggyExpiry;
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;

@@ -17,7 +17,9 @@
  */
 
 use crate::prelude::AutoLogin;
-use iggy_binary_protocol::{BinaryClient, BinaryTransport, Client, PersonalAccessTokenClient, SystemClient, UserClient};
+use iggy_binary_protocol::{
+    BinaryClient, BinaryTransport, Client, PersonalAccessTokenClient, UserClient,
+};
 
 use crate::prelude::IggyDuration;
 use crate::prelude::IggyError;
@@ -27,13 +29,10 @@ use crate::quic::skip_server_verification::SkipServerVerification;
 use async_broadcast::{broadcast, Receiver, Sender};
 use async_trait::async_trait;
 use bytes::Bytes;
-use iggy_common::{ClientInfo, ClientInfoDetails, ClientState, Command, Credentials, DiagnosticEvent, Snapshot, SnapshotCompression, Stats, SystemSnapshotType};
+use iggy_common::{ClientState, Command, Credentials, DiagnosticEvent};
 use quinn::crypto::rustls::QuicClientConfig as QuinnQuicClientConfig;
 use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, RecvStream, VarInt};
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, Error, SignatureScheme};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -95,6 +94,12 @@ impl BinaryTransport for QuicClient {
         *self.state.lock().await = state;
     }
 
+    async fn publish_event(&self, event: DiagnosticEvent) {
+        if let Err(error) = self.events.0.broadcast(event).await {
+            error!("Failed to send a QUIC diagnostic event: {error}");
+        }
+    }
+
     async fn send_with_response<T: Command>(&self, command: &T) -> Result<Bytes, IggyError> {
         command.validate()?;
         self.send_raw_with_response(command.code(), command.to_bytes())
@@ -126,12 +131,6 @@ impl BinaryTransport for QuicClient {
         );
         self.connect().await?;
         self.send_raw(code, payload).await
-    }
-
-    async fn publish_event(&self, event: DiagnosticEvent) {
-        if let Err(error) = self.events.0.broadcast(event).await {
-            error!("Failed to send a QUIC diagnostic event: {error}");
-        }
     }
 
     fn get_heartbeat_interval(&self) -> IggyDuration {

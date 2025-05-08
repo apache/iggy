@@ -17,8 +17,8 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
-use crate::client::Client;
-use crate::streams::create_stream::CreateStream;
+ use crate::prelude::Client;
+use iggy_common::create_stream::CreateStream;
 use anyhow::Context;
 use async_trait::async_trait;
 use tracing::{event, Level};
