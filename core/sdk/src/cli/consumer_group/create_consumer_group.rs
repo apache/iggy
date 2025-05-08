@@ -17,11 +17,11 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
- use crate::prelude::Client;
-use iggy_common::create_consumer_group::CreateConsumerGroup;
+use crate::prelude::Client;
 use crate::prelude::Identifier;
 use anyhow::Context;
 use async_trait::async_trait;
+use iggy_common::create_consumer_group::CreateConsumerGroup;
 use tracing::{event, Level};
 
 pub struct CreateConsumerGroupCmd {

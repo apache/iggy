@@ -17,10 +17,10 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
- use crate::prelude::Client;
-use iggy_common::ping::Ping;
+use crate::prelude::Client;
 use anyhow::Context;
 use async_trait::async_trait;
+use iggy_common::ping::Ping;
 use std::fmt::{Display, Formatter, Result};
 use std::time::Duration;
 use tokio::time::{sleep, Instant};

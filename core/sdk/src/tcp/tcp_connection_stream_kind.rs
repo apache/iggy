@@ -15,10 +15,10 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use iggy_common::IggyError;
-use crate::tcp::tcp_stream::ConnectionStream;
 use crate::tcp::tcp_connection_stream::TcpConnectionStream;
+use crate::tcp::tcp_stream::ConnectionStream;
 use crate::tcp::tcp_tls_connection_stream::TcpTlsConnectionStream;
+use iggy_common::IggyError;
 
 #[derive(Debug)]
 pub(crate) enum ConnectionStreamKind {

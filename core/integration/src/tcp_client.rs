@@ -43,14 +43,12 @@ impl ClientFactory for TcpClientFactory {
                 self.server_addr, e
             )
         });
-        Client::connect(&client)
-            .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "Failed to connect to iggy-server at {}, error: {:?}",
-                    self.server_addr, e
-                )
-            });
+        Client::connect(&client).await.unwrap_or_else(|e| {
+            panic!(
+                "Failed to connect to iggy-server at {}, error: {:?}",
+                self.server_addr, e
+            )
+        });
         Box::new(client)
     }
 }

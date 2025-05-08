@@ -17,8 +17,8 @@
  */
 
 use clap::Parser;
-use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use iggy::prelude::IggyDuration;
+use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use std::str::FromStr;
 
 #[derive(Parser, Debug)]

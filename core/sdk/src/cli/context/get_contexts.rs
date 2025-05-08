@@ -21,7 +21,7 @@ use comfy_table::Table;
 use tracing::{event, Level};
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
- use crate::prelude::Client;
+use crate::prelude::Client;
 
 use super::common::ContextManager;
 

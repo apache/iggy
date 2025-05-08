@@ -23,8 +23,8 @@ use crate::cli::common::{
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use humantime::Duration as HumanDuration;
-use iggy::prelude::Client;
 use iggy::compression::compression_algorithm::CompressionAlgorithm;
+use iggy::prelude::Client;
 use iggy::prelude::IggyByteSize;
 use iggy::utils::expiry::IggyExpiry;
 use iggy::utils::topic_size::MaxTopicSize;

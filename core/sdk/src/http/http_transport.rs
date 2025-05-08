@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use reqwest::{Response, Url};
 use iggy_common::{IdentityInfo, IggyError};
+use reqwest::{Response, Url};
 use serde::Serialize;
 
 #[async_trait]

@@ -17,10 +17,10 @@
  */
 
 use crate::cli_command::{CliCommand, PRINT_TARGET};
- use crate::prelude::Client;
-use iggy_common::create_stream::CreateStream;
+use crate::prelude::Client;
 use anyhow::Context;
 use async_trait::async_trait;
+use iggy_common::create_stream::CreateStream;
 use tracing::{event, Level};
 
 pub struct CreateStreamCmd {

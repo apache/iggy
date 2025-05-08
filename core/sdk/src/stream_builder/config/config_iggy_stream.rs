@@ -16,9 +16,7 @@
  * under the License.
  */
 
-use crate::prelude::{
-    Identifier, IggyDuration, IggyError,
-};
+use crate::prelude::{Identifier, IggyDuration, IggyError};
 use crate::stream_builder::{IggyConsumerConfig, IggyProducerConfig};
 use bon::Builder;
 

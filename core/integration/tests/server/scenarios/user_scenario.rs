@@ -18,9 +18,9 @@
 
 use crate::server::scenarios::create_client;
 use iggy::client::{PersonalAccessTokenClient, SystemClient, UserClient};
-use iggy::identifier::Identifier;
 use iggy::models::permissions::{GlobalPermissions, Permissions};
 use iggy::models::user_status::UserStatus;
+use iggy::prelude::Identifier;
 use iggy::users::defaults::DEFAULT_ROOT_USERNAME;
 use iggy::utils::duration::SEC_IN_MICRO;
 use iggy::utils::personal_access_token_expiry::PersonalAccessTokenExpiry;

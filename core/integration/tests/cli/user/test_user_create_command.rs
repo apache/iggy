@@ -23,9 +23,9 @@ use crate::cli::user::common::PermissionsTestArgs;
 use ahash::AHashMap;
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
-use iggy::prelude::Client;
 use iggy::models::permissions::{GlobalPermissions, StreamPermissions, TopicPermissions};
 use iggy::models::{permissions::Permissions, user_status::UserStatus};
+use iggy::prelude::Client;
 use predicates::str::diff;
 use serial_test::parallel;
 

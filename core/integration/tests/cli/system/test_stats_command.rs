@@ -23,7 +23,7 @@ use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::cli::system::stats::GetStatsOutput;
 use iggy::prelude::Client;
-use iggy::identifier::Identifier;
+use iggy::prelude::Identifier;
 use iggy::utils::expiry::IggyExpiry;
 use iggy::utils::topic_size::MaxTopicSize;
 use predicates::str::{contains, starts_with};

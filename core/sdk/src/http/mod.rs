@@ -16,12 +16,8 @@
  * under the License.
  */
 
-#[allow(deprecated)]
-pub mod http_client;
-pub mod http_config;
 pub mod binary_consumer_groups;
 pub mod binary_consumer_offsets;
-mod http_transport;
 pub mod binary_messages;
 pub mod binary_partitions;
 pub mod binary_personal_access_tokens;
@@ -30,3 +26,7 @@ pub mod binary_streams;
 pub mod binary_system;
 pub mod binary_topics;
 pub mod binary_users;
+#[allow(deprecated)]
+pub mod http_client;
+pub mod http_config;
+mod http_transport;

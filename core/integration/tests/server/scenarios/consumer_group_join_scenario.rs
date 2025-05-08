@@ -24,9 +24,9 @@ use crate::server::scenarios::{
 use iggy::client::{ConsumerGroupClient, StreamClient, SystemClient, TopicClient};
 use iggy::clients::client::IggyClient;
 use iggy::compression::compression_algorithm::CompressionAlgorithm;
-use iggy::identifier::Identifier;
 use iggy::models::client_info::ClientInfoDetails;
 use iggy::models::consumer_group::ConsumerGroupDetails;
+use iggy::prelude::Identifier;
 use iggy::utils::expiry::IggyExpiry;
 use iggy::utils::topic_size::MaxTopicSize;
 use integration::test_server::{

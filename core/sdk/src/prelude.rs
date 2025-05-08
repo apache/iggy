@@ -46,7 +46,7 @@ pub use crate::tcp::tcp_client::TcpClient;
 //
 pub use iggy_binary_protocol::{
     Client, ConsumerGroupClient, ConsumerOffsetClient, MessageClient, PartitionClient,
-    StreamClient, SystemClient, TopicClient, UserClient,
+    PersonalAccessTokenClient, StreamClient, SystemClient, TopicClient, UserClient,
 };
 //
 pub use iggy_common::{
@@ -56,10 +56,10 @@ pub use iggy_common::{
     IdKind, Identifier, IdentityInfo, IggyByteSize, IggyDuration, IggyError, IggyExpiry,
     IggyIndexView, IggyMessage, IggyMessageHeader, IggyMessageHeaderView, IggyMessageView,
     IggyMessageViewIterator, IggyTimestamp, MaxTopicSize, Partition, Partitioner, Partitioning,
-    Permissions, PollMessages, PolledMessages, PollingKind, PollingStrategy, SendMessages,
-    Sizeable, SnapshotCompression, Stats, Stream, StreamPermissions, SystemSnapshotType,
-    TcpClientConfig, TcpClientConfigBuilder, TcpClientReconnectionConfig, Topic, TopicPermissions,
-    UserStatus, Validatable,
+    Permissions, PersonalAccessTokenExpiry, PollMessages, PolledMessages, PollingKind,
+    PollingStrategy, SendMessages, Sizeable, SnapshotCompression, Stats, Stream, StreamPermissions,
+    SystemSnapshotType, TcpClientConfig, TcpClientConfigBuilder, TcpClientReconnectionConfig,
+    Topic, TopicPermissions, UserStatus, Validatable,
 };
 pub use iggy_common::{
     defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_USER_ID},
