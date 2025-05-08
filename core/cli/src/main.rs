@@ -37,7 +37,6 @@ use args::segment::SegmentAction;
 use args::user::UserAction;
 use args::{CliOptions, IggyMergedConsoleArgs};
 use clap::Parser;
-use iggy::prelude::Args;
 use iggy::cli::context::common::ContextManager;
 use iggy::cli::context::use_context::UseContextCmd;
 use iggy::cli::segments::delete_segments::DeleteSegmentsCmd;
@@ -85,8 +84,9 @@ use iggy::cli::{
 use iggy::cli_command::{CliCommand, PRINT_TARGET};
 use iggy::client_provider::{self, ClientProviderConfig};
 use iggy::clients::client::IggyClient;
-use iggy::utils::crypto::{Aes256GcmEncryptor, EncryptorKind};
-use iggy::utils::personal_access_token_expiry::PersonalAccessTokenExpiry;
+use iggy::prelude::Args;
+use iggy::prelude::PersonalAccessTokenExpiry;
+use iggy::prelude::{Aes256GcmEncryptor, EncryptorKind};
 use std::sync::Arc;
 use tracing::{event, Level};
 

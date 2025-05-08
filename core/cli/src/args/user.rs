@@ -20,7 +20,7 @@ use crate::args::common::ListMode;
 use crate::args::permissions::stream::StreamPermissionsArg;
 use crate::args::permissions::UserStatusArg;
 use clap::{Args, Subcommand};
-use iggy::identifier::Identifier;
+use iggy::prelude::Identifier;
 
 use super::permissions::global::GlobalPermissionsArg;
 

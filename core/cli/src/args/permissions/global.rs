@@ -23,7 +23,7 @@ use super::constants::{
     READ_STREAMS_LONG, READ_STREAMS_SHORT, READ_TOPICS_LONG, READ_TOPICS_SHORT, READ_USERS_LONG,
     READ_USERS_SHORT, SEND_MESSAGES_LONG, SEND_MESSAGES_SHORT,
 };
-use iggy::models::permissions::GlobalPermissions;
+use iggy::prelude::GlobalPermissions;
 use std::str::FromStr;
 
 #[derive(Debug, PartialEq)]

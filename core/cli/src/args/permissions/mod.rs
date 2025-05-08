@@ -19,10 +19,7 @@
 use self::{global::GlobalPermissionsArg, stream::StreamPermissionsArg};
 use ahash::AHashMap;
 use clap::ValueEnum;
-use iggy::models::{
-    permissions::{Permissions, StreamPermissions},
-    user_status::UserStatus,
-};
+use iggy::prelude::{Permissions, StreamPermissions, UserStatus};
 
 pub(crate) mod constants;
 pub(crate) mod global;

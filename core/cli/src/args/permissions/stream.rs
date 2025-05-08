@@ -23,7 +23,7 @@ use super::constants::{
 };
 use crate::args::permissions::topic::TopicPermissionsArg;
 use ahash::AHashMap;
-use iggy::models::permissions::StreamPermissions;
+use iggy::prelude::StreamPermissions;
 use std::str::FromStr;
 
 #[derive(Debug, PartialEq)]
@@ -199,7 +199,7 @@ impl FromStr for StreamPermissionsArg {
 
 #[cfg(test)]
 mod tests {
-    use iggy::models::permissions::TopicPermissions;
+    use iggy::prelude::TopicPermissions;
 
     use super::*;
 

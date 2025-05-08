@@ -19,11 +19,11 @@
 use crate::args::CliOptions;
 use crate::error::{CmdToolError, IggyCmdError};
 use anyhow::{bail, Context};
-use iggy::args::Args;
 use iggy::cli::system::session::ServerSession;
-use iggy::client::{PersonalAccessTokenClient, UserClient};
 use iggy::clients::client::IggyClient;
+use iggy::prelude::Args;
 use iggy::prelude::IggyError;
+use iggy::prelude::{PersonalAccessTokenClient, UserClient};
 use passterm::{isatty, prompt_password_stdin, prompt_password_tty, Stream};
 use std::env::var;
 
@@ -131,8 +131,8 @@ impl<'a> IggyCredentials<'a> {
         } else if var(ENV_IGGY_USERNAME).is_ok() && var(ENV_IGGY_PASSWORD).is_ok() {
             Ok(Self {
                 credentials: Some(Credentials::UserNameAndPassword(IggyUserClient {
-                    username: var(ENV_IGGY_USERNAME).unwrap(),
-                    password: var(ENV_IGGY_PASSWORD).unwrap(),
+                    username: var(ENV_IGGY_USERNAME)?,
+                    password: var(ENV_IGGY_PASSWORD)?,
                 })),
                 iggy_client: None,
                 login_required,

@@ -43,7 +43,7 @@ impl Display for CmdToolError {
 #[derive(Error, Debug)]
 pub(crate) enum IggyCmdError {
     #[error("Iggy client error")]
-    IggyClient(#[from] iggy::client_error::ClientError),
+    IggyClient(#[from] iggy::prelude::ClientError),
 
     #[error("Iggy sdk or command error")]
     CommandError(#[from] anyhow::Error),
