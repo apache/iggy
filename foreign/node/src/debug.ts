@@ -69,10 +69,12 @@ try {
     interval: 5000
   };
 
+  console.log('poll req', pollReq);
+  
   const cs = await groupConsumerStream(opt)(pollReq);
   const dataCb = (d: PollMessagesResponse) => {
     console.log('cli/DATA POLLED:', d);
-    // recv += d.messageCount;
+    // recv += d.count;
     // if (recv === ct)
     //   str.destroy();
   };
@@ -96,8 +98,8 @@ try {
   });
 
 
-} catch {
-
+} catch (err) {
+  console.log('catch cleanup', err);
   await cleanup();
 
 }
