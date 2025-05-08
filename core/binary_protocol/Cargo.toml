@@ -28,7 +28,6 @@ documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 
-
 [dependencies]
 async-broadcast = { version = "0.7.2" }
 async-trait = "0.1.88"

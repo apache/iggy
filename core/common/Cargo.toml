@@ -28,7 +28,6 @@ documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 
-
 [features]
 default = ["tokio_lock"]
 tokio_lock = []

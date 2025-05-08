@@ -45,11 +45,12 @@ chrono = { version = "0.4.40" }
 comfy-table = { version = "7.1.4", optional = false }
 dashmap = "6.1.0"
 dirs = "6.0.0"
+fast-async-mutex = { version = "0.6.7", optional = true }
 flume = "0.11.1"
 futures = "0.3.31"
 futures-util = "0.3.31"
-iggy_common = { path = "../common" }
 iggy_binary_protocol = { path = "../binary_protocol" }
+iggy_common = { path = "../common" }
 keyring = { version = "3.6.2", optional = false, features = [
     "sync-secret-service",
     "vendored",
