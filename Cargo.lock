@@ -2608,6 +2608,8 @@ dependencies = [
  "futures",
  "futures-util",
  "humantime",
+ "iggy_binary_protocol",
+ "iggy_common",
  "keyring",
  "passterm",
  "quinn",
@@ -2617,9 +2619,6 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "serde_with",
- "strum",
- "thiserror 2.0.12",
  "tokio",
  "tokio-rustls",
  "toml",
@@ -5768,25 +5767,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.100",
-]
-
-[[package]]
-name = "transport"
-version = "0.7.0"
-dependencies = [
- "async-broadcast",
- "async-trait",
- "bytes",
- "iggy_common",
- "quinn",
- "reqwest",
- "reqwest-middleware",
- "reqwest-retry",
- "rustls",
- "serde",
- "tokio",
- "tokio-rustls",
- "tracing",
 ]
 
 [[package]]

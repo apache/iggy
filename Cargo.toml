@@ -27,7 +27,6 @@ members = [
     "core/binary_protocol",
     "core/cli",
     "core/common",
-    "core/transport",
     "core/examples",
     "core/integration",
     "core/sdk",
