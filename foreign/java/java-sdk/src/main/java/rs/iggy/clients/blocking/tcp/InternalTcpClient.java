@@ -52,10 +52,22 @@ final class InternalTcpClient {
         this.connection.inbound().receiveObject().ofType(IggyResponse.class).subscribe(responses::add);
     }
 
+    ByteBuf send(CommandCode code) {
+        return send(code.getValue());
+    }
+
+    /** Use {@link #send(CommandCode)} instead. */
+    @Deprecated
     ByteBuf send(int command) {
         return send(command, Unpooled.EMPTY_BUFFER);
     }
 
+    ByteBuf send(CommandCode code, ByteBuf payload) {
+        return send(code.getValue(), payload);
+    }
+
+    /** Use {@link #send(CommandCode, ByteBuf)} instead. */
+    @Deprecated
     ByteBuf send(int command, ByteBuf payload) {
         var payloadSize = payload.readableBytes() + COMMAND_LENGTH;
         var buffer = Unpooled.buffer(REQUEST_INITIAL_BYTES_LENGTH + payloadSize);
