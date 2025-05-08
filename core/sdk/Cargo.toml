@@ -31,7 +31,8 @@ readme = "../../README.md"
 [features]
 default = ["tokio_lock"]
 tokio_lock = []
-fast_async_lock = ["dep:fast-async-mutex"]
+# Moved to common crate. Not sure if this is even needed anymore
+#fast_async_lock = ["dep:fast-async-mutex"]
 
 [dependencies]
 async-broadcast = { version = "0.7.2" }
@@ -40,7 +41,8 @@ async-trait = "0.1.88"
 bon = { version = "3.6.3" }
 bytes = "1.10.1"
 dashmap = "6.1.0"
-fast-async-mutex = { version = "0.6.7", optional = true }
+# Can be removed if the feature above gets removed.
+#fast-async-mutex = { version = "0.6.7", optional = true }
 flume = "0.11.1"
 futures = "0.3.31"
 futures-util = "0.3.31"

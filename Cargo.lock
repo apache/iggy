@@ -2592,7 +2592,6 @@ dependencies = [
  "bon",
  "bytes",
  "dashmap",
- "fast-async-mutex",
  "flume",
  "futures",
  "futures-util",
