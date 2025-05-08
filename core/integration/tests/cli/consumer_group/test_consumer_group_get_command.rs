@@ -23,8 +23,8 @@ use crate::cli::common::{
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy::prelude::IggyExpiry;
+use iggy::prelude::MaxTopicSize;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
 

@@ -20,7 +20,7 @@ use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpC
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
-use iggy::utils::personal_access_token_expiry::PersonalAccessTokenExpiry;
+use iggy::prelude::PersonalAccessTokenExpiry;
 use predicates::str::diff;
 use serial_test::parallel;
 

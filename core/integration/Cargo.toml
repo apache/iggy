@@ -38,6 +38,7 @@ env_logger = "0.11.8"
 futures = "0.3.31"
 humantime = "2.2.0"
 iggy = { path = "../sdk" } # features = ["iggy-cli"]
+iggy_common = { path = "../common" } 
 keyring = "3.6.2"
 lazy_static = "1.5.0"
 libc = "0.2.172"

@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use iggy::utils::crypto::{Aes256GcmEncryptor, EncryptorKind};
+use iggy::prelude::{Aes256GcmEncryptor, EncryptorKind};
 use server::state::file::FileState;
 use server::streaming::persistence::persister::{FileWithSyncPersister, PersisterKind};
 use server::versioning::SemanticVersion;

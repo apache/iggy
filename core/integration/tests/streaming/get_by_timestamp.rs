@@ -18,7 +18,7 @@
 
 use crate::streaming::common::test_setup::TestSetup;
 use bytes::BytesMut;
-use iggy::confirmation::Confirmation;
+use iggy::prelude::Confirmation;
 use iggy::prelude::*;
 use server::configs::cache_indexes::CacheIndexesConfig;
 use server::configs::system::{PartitionConfig, SegmentConfig, SystemConfig};

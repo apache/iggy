@@ -24,8 +24,8 @@ use async_trait::async_trait;
 use iggy::cli::system::stats::GetStatsOutput;
 use iggy::prelude::Client;
 use iggy::prelude::Identifier;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy::prelude::IggyExpiry;
+use iggy::prelude::MaxTopicSize;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
 

@@ -17,14 +17,14 @@
  */
 
 use crate::state::StateSetup;
-use iggy::consumer_groups::create_consumer_group::CreateConsumerGroup;
-use iggy::partitions::create_partitions::CreatePartitions;
-use iggy::personal_access_tokens::create_personal_access_token::CreatePersonalAccessToken;
-use iggy::streams::create_stream::CreateStream;
-use iggy::streams::delete_stream::DeleteStream;
-use iggy::topics::create_topic::CreateTopic;
-use iggy::users::create_user::CreateUser;
-use iggy::utils::expiry::IggyExpiry;
+use iggy::prelude::IggyExpiry;
+use iggy_common::create_consumer_group::CreateConsumerGroup;
+use iggy_common::create_partitions::CreatePartitions;
+use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
+use iggy_common::create_stream::CreateStream;
+use iggy_common::create_topic::CreateTopic;
+use iggy_common::create_user::CreateUser;
+use iggy_common::delete_stream::DeleteStream;
 use server::state::command::EntryCommand;
 use server::state::models::{
     CreateConsumerGroupWithId, CreatePersonalAccessTokenWithHash, CreateStreamWithId,

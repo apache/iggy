@@ -2781,6 +2781,7 @@ dependencies = [
  "futures",
  "humantime",
  "iggy",
+ "iggy_common",
  "keyring",
  "lazy_static",
  "libc",
