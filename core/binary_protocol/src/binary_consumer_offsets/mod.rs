@@ -15,7 +15,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::binary_client::BinaryClient;
+use crate::binary_clients::BinaryClient;
 use crate::utils::auth::fail_if_not_authenticated;
 use crate::utils::mapper;
 use crate::ConsumerOffsetClient;

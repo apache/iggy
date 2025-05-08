@@ -15,7 +15,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
+pub(crate) mod binary_client;
 pub(crate) mod client;
 pub(crate) mod consumer_group_client;
 pub(crate) mod consumer_offset_client;
@@ -28,14 +28,15 @@ pub(crate) mod system_client;
 pub(crate) mod topic_client;
 pub(crate) mod user_client;
 
-pub use client::Client;
-pub use consumer_group_client::ConsumerGroupClient;
-pub use consumer_offset_client::ConsumerOffsetClient;
-pub use message_client::MessageClient;
-pub use partition_client::PartitionClient;
-pub use personal_access_token_client::PersonalAccessTokenClient;
-pub use segment_client::SegmentClient;
-pub use stream_client::StreamClient;
-pub use system_client::SystemClient;
-pub use topic_client::TopicClient;
-pub use user_client::UserClient;
+pub use crate::binary_clients::binary_client::BinaryClient;
+pub use crate::binary_clients::client::Client;
+pub use crate::binary_clients::consumer_group_client::ConsumerGroupClient;
+pub use crate::binary_clients::consumer_offset_client::ConsumerOffsetClient;
+pub use crate::binary_clients::message_client::MessageClient;
+pub use crate::binary_clients::partition_client::PartitionClient;
+pub use crate::binary_clients::personal_access_token_client::PersonalAccessTokenClient;
+pub use crate::binary_clients::segment_client::SegmentClient;
+pub use crate::binary_clients::stream_client::StreamClient;
+pub use crate::binary_clients::system_client::SystemClient;
+pub use crate::binary_clients::topic_client::TopicClient;
+pub use crate::binary_clients::user_client::UserClient;
