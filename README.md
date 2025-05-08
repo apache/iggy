@@ -357,3 +357,7 @@ Depending on the hardware, transport protocol (`quic`, `tcp` or `http`) and payl
 Please refer to the mentioned [benchmarking platform](https://benchmarks.iggy.rs) where you can browse the results achieved on the different hardware configurations, using the different Iggy server versions.
 
 ---
+
+## Contributing
+
+Please see [Contributing](CONTRIBUTING.md)
