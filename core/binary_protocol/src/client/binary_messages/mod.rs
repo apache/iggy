@@ -39,7 +39,7 @@ impl<B: BinaryClient> MessageClient for B {
         let response = self
             .send_raw_with_response(
                 POLL_MESSAGES_CODE,
-                PollMessages::as_bytes(
+                PollMessages::bytes(
                     stream_id,
                     topic_id,
                     partition_id,
@@ -63,7 +63,7 @@ impl<B: BinaryClient> MessageClient for B {
         fail_if_not_authenticated(self).await?;
         self.send_raw_with_response(
             SEND_MESSAGES_CODE,
-            SendMessages::as_bytes(stream_id, topic_id, partitioning, messages),
+            SendMessages::bytes(stream_id, topic_id, partitioning, messages),
         )
         .await?;
         Ok(())

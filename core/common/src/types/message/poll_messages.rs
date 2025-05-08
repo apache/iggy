@@ -62,7 +62,7 @@ pub struct PollMessages {
 }
 
 impl PollMessages {
-    pub fn as_bytes(
+    pub fn bytes(
         stream_id: &Identifier,
         topic_id: &Identifier,
         partition_id: Option<u32>,
@@ -137,7 +137,7 @@ impl Validatable<IggyError> for PollMessages {
 
 impl BytesSerializable for PollMessages {
     fn to_bytes(&self) -> Bytes {
-        PollMessages::as_bytes(
+        PollMessages::bytes(
             &self.stream_id,
             &self.topic_id,
             self.partition_id,

@@ -55,7 +55,7 @@ pub struct SendMessages {
 }
 
 impl SendMessages {
-    pub fn as_bytes(
+    pub fn bytes(
         stream_id: &Identifier,
         topic_id: &Identifier,
         partitioning: &Partitioning,
@@ -64,9 +64,9 @@ impl SendMessages {
         let stream_id_field_size = stream_id.get_buffer_size();
         let topic_id_field_size = topic_id.get_buffer_size();
         let partitioning_field_size = partitioning.get_buffer_size();
-        let metadata_length_field_size = std::mem::size_of::<u32>();
+        let metadata_length_field_size = size_of::<u32>();
         let messages_count = messages.len();
-        let messages_count_field_size = std::mem::size_of::<u32>();
+        let messages_count_field_size = size_of::<u32>();
         let metadata_length = stream_id_field_size
             + topic_id_field_size
             + partitioning_field_size
@@ -97,12 +97,12 @@ impl SendMessages {
 
         bytes.put_bytes(0, indexes_size);
 
-        let mut msgs_size: u32 = 0;
+        let mut msg_size: u32 = 0;
         for message in messages.iter() {
             message.write_to_buffer(&mut bytes);
-            msgs_size += message.get_size_bytes().as_bytes_u64() as u32;
+            msg_size += message.get_size_bytes().as_bytes_u64() as u32;
             write_value_at(&mut bytes, 0u64.to_le_bytes(), current_position);
-            write_value_at(&mut bytes, msgs_size.to_le_bytes(), current_position + 4);
+            write_value_at(&mut bytes, msg_size.to_le_bytes(), current_position + 4);
             write_value_at(&mut bytes, 0u64.to_le_bytes(), current_position + 8);
             current_position += INDEX_SIZE;
         }
@@ -171,7 +171,7 @@ impl BytesSerializable for SendMessages {
 }
 
 impl Display for SendMessages {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let messages_count = self.batch.count();
         let messages_size = self.batch.size();
         write!(
