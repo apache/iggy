@@ -20,3 +20,11 @@ foreign/node/**/node_modules
 foreign/node/**/dist
 foreign/node/npm-debug.log*
 foreign/node/.npm
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
