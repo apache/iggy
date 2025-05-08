@@ -19,17 +19,17 @@
 use crate::args::CliOptions;
 use crate::error::{CmdToolError, IggyCmdError};
 use anyhow::{bail, Context};
-use iggy::cli::system::session::ServerSession;
 use iggy::clients::client::IggyClient;
 use iggy::prelude::Args;
 use iggy::prelude::IggyError;
 use iggy::prelude::{PersonalAccessTokenClient, UserClient};
+use iggy_binary_protocol::cli::system::session::ServerSession;
 use passterm::{isatty, prompt_password_stdin, prompt_password_tty, Stream};
 use std::env::var;
 
 #[cfg(feature = "login-session")]
 mod credentials_login_session {
-    pub(crate) use iggy::cli_command::PRINT_TARGET;
+    pub(crate) use iggy_binary_protocol::cli::cli_command::PRINT_TARGET;
     pub(crate) use keyring::Entry;
     pub(crate) use tracing::{event, Level};
 }

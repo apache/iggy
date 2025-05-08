@@ -30,32 +30,22 @@ readme = "../../README.md"
 
 [features]
 default = ["tokio_lock"]
-#iggy-cli = ["dep:comfy-table", "dep:keyring", "dep:passterm"]
 tokio_lock = []
 fast_async_lock = ["dep:fast-async-mutex"]
 
 [dependencies]
-anyhow = "1.0.98"
 async-broadcast = { version = "0.7.2" }
 async-dropper = { version = "0.3.1", features = ["tokio", "simple"] }
 async-trait = "0.1.88"
 bon = { version = "3.6.3" }
 bytes = "1.10.1"
-chrono = { version = "0.4.40" }
-comfy-table = { version = "7.1.4", optional = false }
 dashmap = "6.1.0"
-dirs = "6.0.0"
 fast-async-mutex = { version = "0.6.7", optional = true }
 flume = "0.11.1"
 futures = "0.3.31"
 futures-util = "0.3.31"
-iggy_binary_protocol = { path = "../binary_protocol" }
-iggy_common = { path = "../common" }
-keyring = { version = "3.6.2", optional = false, features = [
-    "sync-secret-service",
-    "vendored",
-] }
-passterm = { version = "=2.0.1", optional = false }
+iggy_binary_protocol = { path = "../binary_protocol" , version = "0.7.0"}
+iggy_common = { path = "../common" , version = "0.7.0"}
 quinn = { version = "0.11.7" }
 reqwest = { version = "0.12.15", default-features = false, features = [
     "json",
@@ -65,10 +55,8 @@ reqwest-middleware = { version = "0.4.2", features = ["json"] }
 reqwest-retry = "0.7.0"
 rustls = { version = "0.23.26", features = ["ring"] }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
-serde_json = "1.0.140"
 tokio = { version = "1.44.2", features = ["full"] }
 tokio-rustls = { version = "0.26.2" }
-toml = "0.8.20"
 tracing = { version = "0.1.41" }
 trait-variant = { version = "0.1.2" }
 webpki-roots = "0.26.8"

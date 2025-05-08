@@ -1,0 +1,12 @@
+pub mod binary_clients;
+pub mod binary_consumer_groups;
+pub mod binary_consumer_offsets;
+pub mod binary_messages;
+pub mod binary_partitions;
+pub mod binary_personal_access_tokens;
+pub mod binary_segments;
+pub mod binary_streams;
+mod binary_system;
+pub mod binary_topics;
+pub mod binary_transport;
+pub mod binary_users;

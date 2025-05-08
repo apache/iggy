@@ -37,11 +37,17 @@ use args::segment::SegmentAction;
 use args::user::UserAction;
 use args::{CliOptions, IggyMergedConsoleArgs};
 use clap::Parser;
-use iggy::cli::context::common::ContextManager;
-use iggy::cli::context::use_context::UseContextCmd;
-use iggy::cli::segments::delete_segments::DeleteSegmentsCmd;
-use iggy::cli::system::snapshot::GetSnapshotCmd;
-use iggy::cli::{
+use iggy::client_provider::{self, ClientProviderConfig};
+use iggy::clients::client::IggyClient;
+use iggy::prelude::Args;
+use iggy::prelude::PersonalAccessTokenExpiry;
+use iggy::prelude::{Aes256GcmEncryptor, EncryptorKind};
+use iggy_binary_protocol::cli::cli_command::{CliCommand, PRINT_TARGET};
+use iggy_binary_protocol::cli::context::common::ContextManager;
+use iggy_binary_protocol::cli::context::use_context::UseContextCmd;
+use iggy_binary_protocol::cli::segments::delete_segments::DeleteSegmentsCmd;
+use iggy_binary_protocol::cli::system::snapshot::GetSnapshotCmd;
+use iggy_binary_protocol::cli::{
     client::{get_client::GetClientCmd, get_clients::GetClientsCmd},
     consumer_group::{
         create_consumer_group::CreateConsumerGroupCmd,
@@ -81,19 +87,13 @@ use iggy::cli::{
         update_user::{UpdateUserCmd, UpdateUserType},
     },
 };
-use iggy::cli_command::{CliCommand, PRINT_TARGET};
-use iggy::client_provider::{self, ClientProviderConfig};
-use iggy::clients::client::IggyClient;
-use iggy::prelude::Args;
-use iggy::prelude::PersonalAccessTokenExpiry;
-use iggy::prelude::{Aes256GcmEncryptor, EncryptorKind};
 use std::sync::Arc;
 use tracing::{event, Level};
 
 #[cfg(feature = "login-session")]
 mod main_login_session {
-    pub(crate) use iggy::cli::system::{login::LoginCmd, logout::LogoutCmd};
-    pub(crate) use iggy::cli::utils::login_session_expiry::LoginSessionExpiry;
+    pub(crate) use iggy_binary_protocol::cli::system::{login::LoginCmd, logout::LogoutCmd};
+    pub(crate) use iggy_binary_protocol::cli::utils::login_session_expiry::LoginSessionExpiry;
 }
 
 #[cfg(feature = "login-session")]

@@ -20,9 +20,9 @@ use std::collections::HashMap;
 
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
-use iggy::cli::context::common::ContextConfig;
 use iggy::prelude::ArgsOptional;
 use iggy::prelude::Client;
+use iggy_binary_protocol::cli::context::common::ContextConfig;
 use integration::test_server::TestServer;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;

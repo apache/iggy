@@ -19,9 +19,9 @@
 use crate::cli::common::{IggyCmdCommand, IggyCmdTestCase};
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
-use iggy::cli::system::session::ServerSession;
 use iggy::prelude::Client;
 use iggy::utils::personal_access_token_expiry::PersonalAccessTokenExpiry;
+use iggy_binary_protocol::cli::system::session::ServerSession;
 use predicates::str::diff;
 
 #[derive(Debug)]

@@ -23,8 +23,8 @@ use clap::{Parser, Subcommand};
 use clap_complete::{generate, Generator, Shell};
 use figlet_rs::FIGfont;
 
-use iggy::cli::context::common::ContextConfig;
 use iggy::prelude::{Args as IggyArgs, ArgsOptional as IggyArgsOptional};
+use iggy_binary_protocol::cli::context::common::ContextConfig;
 use segment::SegmentAction;
 use system::SnapshotArgs;
 

@@ -25,7 +25,7 @@ homepage = "https://iggy.apache.org"
 description = "CLI for Iggy message streaming platform"
 license = "Apache-2.0"
 keywords = ["iggy", "cli", "messaging", "streaming"]
-readme = "../README.md"
+readme = "../../README.md"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/{ name }-{ version }/{ name }-{ target }{ archive-suffix }"
@@ -41,7 +41,8 @@ anyhow = "1.0.98"
 clap = { version = "4.5.37", features = ["derive"] }
 clap_complete = "4.5.47"
 figlet-rs = "0.1.5"
-iggy = { path = "../sdk", version = "0.7.0" } # features = ["iggy-cli"]
+iggy = { path = "../sdk", version = "0.7.0" }
+iggy_binary_protocol = { path = "../binary_protocol" , version = "0.7.0"}
 keyring = { version = "3.6.2", features = [
     "sync-secret-service",
     "vendored",

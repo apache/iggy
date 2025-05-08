@@ -27,7 +27,6 @@
 //! use iggy::prelude::*;
 //! ```
 
-pub use crate::cli::*;
 pub use crate::client_provider;
 pub use crate::client_provider::ClientProviderConfig;
 pub use crate::clients::client::IggyClient;
