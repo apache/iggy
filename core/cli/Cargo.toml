@@ -42,7 +42,7 @@ clap = { version = "4.5.37", features = ["derive"] }
 clap_complete = "4.5.47"
 figlet-rs = "0.1.5"
 iggy = { path = "../sdk", version = "0.7.0" }
-iggy_binary_protocol = { path = "../binary_protocol" , version = "0.7.0"}
+iggy_binary_protocol = { path = "../binary_protocol", version = "0.7.0" }
 keyring = { version = "3.6.2", features = [
     "sync-secret-service",
     "vendored",
