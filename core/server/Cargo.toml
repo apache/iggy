@@ -101,7 +101,6 @@ reqwest = { version = "0.12.15", features = [
     "rustls-tls-no-provider",
 ] }
 ring = "0.17.14"
-rust-s3 = { version = "0.35.1", features = ["default"] }
 rustls = { version = "0.23.26" }
 rustls-pemfile = "2.2.0"
 serde = { version = "1.0.219", features = ["derive", "rc"] }
