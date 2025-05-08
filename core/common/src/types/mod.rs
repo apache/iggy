@@ -7,5 +7,6 @@ pub(crate) mod confirmation;
 pub(crate) mod consumer;
 pub(crate) mod diagnostic;
 pub(crate) mod identifier;
+pub(crate) mod message;
 pub(crate) mod model;
 pub(crate) mod snapshot;

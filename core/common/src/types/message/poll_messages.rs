@@ -16,12 +16,8 @@
  * under the License.
  */
 
-use super::{PollingKind, PollingStrategy};
 use crate::error::IggyError;
-use crate::BytesSerializable;
-use crate::Identifier;
-use crate::Sizeable;
-use crate::Validatable;
+use crate::{BytesSerializable, Identifier, PollingKind, PollingStrategy, Sizeable, Validatable};
 use crate::{Command, POLL_MESSAGES_CODE};
 use crate::{Consumer, ConsumerKind};
 use bytes::{BufMut, Bytes, BytesMut};

@@ -1,6 +1,5 @@
+mod commands;
 mod error;
-mod messages;
-mod messages_shared;
 mod traits;
 mod types;
 mod utils;
@@ -10,19 +9,16 @@ pub use error::client_error::ClientError;
 pub use error::iggy_error::{IggyError, IggyErrorDiscriminants};
 // Locking is feature gated, thus only mod level re-export.
 pub mod locking;
-// Messages
-pub use messages::consumer_groups::*;
-pub use messages::consumer_offsets::*;
-pub use messages::messaging::*;
-pub use messages::partitions::*;
-pub use messages::personal_access_tokens::*;
-pub use messages::segments::*;
-pub use messages::streams::*;
-pub use messages::system::*;
-pub use messages::topics::*;
-pub use messages::users::*;
-// Messages shared
-pub use messages_shared::*;
+// Commands
+pub use commands::consumer_groups::*;
+pub use commands::consumer_offsets::*;
+pub use commands::partitions::*;
+pub use commands::personal_access_tokens::*;
+pub use commands::segments::*;
+pub use commands::streams::*;
+pub use commands::system::*;
+pub use commands::topics::*;
+pub use commands::users::*;
 // Traits
 pub use traits::bytes_serializable::BytesSerializable;
 pub use traits::partitioner::Partitioner;
@@ -47,6 +43,7 @@ pub use types::configuration::tcp_config::tcp_client_reconnection_config::*;
 pub use types::confirmation::*;
 pub use types::diagnostic::diagnostic_event::DiagnosticEvent;
 pub use types::identifier::*;
+pub use types::message::*;
 pub use types::model::client::client_info::*;
 pub use types::model::consumer::consumer_group::*;
 pub use types::model::consumer::consumer_kind::*;

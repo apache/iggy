@@ -16,8 +16,8 @@
  * under the License.
  */
 
-use super::polling_kind::PollingKind;
 use crate::error::IggyError;
+use crate::types::message::polling_kind::PollingKind;
 use crate::utils::timestamp::IggyTimestamp;
 use crate::BytesSerializable;
 use bytes::{BufMut, Bytes, BytesMut};

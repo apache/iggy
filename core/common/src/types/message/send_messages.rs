@@ -18,7 +18,7 @@
 
 use super::PartitioningKind;
 use crate::error::IggyError;
-use crate::messages_shared::partitioning::Partitioning;
+use crate::types::message::partitioning::Partitioning;
 use crate::BytesSerializable;
 use crate::Identifier;
 use crate::IggyMessageView;

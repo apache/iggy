@@ -17,7 +17,7 @@
  */
 
 use crate::error::IggyError;
-use crate::messages::messaging::IggyMessage;
+use crate::types::message::IggyMessage;
 use crate::Identifier;
 use std::fmt::Debug;
 

@@ -1,6 +1,5 @@
 pub(crate) mod consumer_groups;
 pub(crate) mod consumer_offsets;
-pub(crate) mod messaging;
 pub(crate) mod partitions;
 pub(crate) mod personal_access_tokens;
 pub(crate) mod segments;
