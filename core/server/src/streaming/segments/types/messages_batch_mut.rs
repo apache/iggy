@@ -455,7 +455,11 @@ impl IggyMessagesBatchMut {
         let start = self.message_start_position(index)?;
         let end = self.message_end_position(index)?;
 
-        if start > self.messages.len() || end > self.messages.len() || start > end {
+        if start > self.messages.len()
+            || end > self.messages.len()
+            || start > end
+            || end - start < IGGY_MESSAGE_HEADER_SIZE
+        {
             return None;
         }
 
@@ -739,7 +743,11 @@ impl IggyMessagesBatchMut {
         let message = match self.get(i as usize) {
             Some(msg) => msg,
             None => {
-                error!("Message at index {} is missing", i);
+                error!(
+                    "Message at index {} is missing, or message size is less than minimum message size {} B (header)",
+                    i,
+                    IGGY_MESSAGE_HEADER_SIZE
+                );
                 return Err(IggyError::MissingIndex(i));
             }
         };
