@@ -16,4 +16,27 @@
  * under the License.
  */
 
-pub(crate) mod client_state;
+use derive_more::Display;
+
+/// The state of the client.
+#[derive(Debug, Copy, Clone, PartialEq, Display)]
+pub enum ClientState {
+    /// The client is shutdown.
+    #[display("shutdown")]
+    Shutdown,
+    /// The client is disconnected.
+    #[display("disconnected")]
+    Disconnected,
+    /// The client is connecting.
+    #[display("connecting")]
+    Connecting,
+    /// The client is connected.
+    #[display("connected")]
+    Connected,
+    /// The client is authenticating.
+    #[display("authenticating")]
+    Authenticating,
+    /// The client is connected and authenticated.
+    #[display("authenticated")]
+    Authenticated,
+}

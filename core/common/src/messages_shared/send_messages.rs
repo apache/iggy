@@ -31,7 +31,6 @@ use bytes::{BufMut, Bytes, BytesMut};
 use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 
