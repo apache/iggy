@@ -24,20 +24,6 @@ const STRING = 2;
 type NUMERIC = typeof NUMERIC;
 type STRING = typeof STRING;
 
-// type NumericId = {
-//   kind: NUMERIC,
-//   length: 4,
-//   value: number
-// };
-
-// type StringId = {
-//   kind: STRING,
-//   length: number,
-//   value: string
-// };
-
-// export type Identifier = NumericId | StringId;
-
 export type Id = number | string;
 
 export const serializeIdentifier = (id: Id): Buffer => {
