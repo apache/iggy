@@ -71,15 +71,11 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: convco
-      - name: Check first (oldest) commit in PR
+      - name: Check PR title for conventional commit format
         if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          # Find the oldest commit in the PR
-          OLDEST_COMMIT=$(git rev-list --reverse ${{ inputs.commits-from }}..${{ inputs.commits-to }} | head -1)
-          if [ -n "$OLDEST_COMMIT" ]; then
-            echo "Checking oldest commit $OLDEST_COMMIT"
-            convco check $OLDEST_COMMIT -n 1
-          else
-            echo "No commits found in PR"
-            exit 0
-          fi
+          echo "Checking PR title for conventional commit format using 'convco check':"
+          echo "Title: $PR_TITLE"
+          echo "$PR_TITLE" | convco check
