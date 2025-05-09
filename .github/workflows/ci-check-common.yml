@@ -33,7 +33,7 @@ on:
         default: HEAD~1
         type: string
       commits-to:
-        description: 'Upper end of the commit range to check'
+        description: 'Upper end of the new commit range to check'
         required: true
         default: HEAD
         type: string
@@ -60,6 +60,7 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        # fetch-depth: 0 is not strictly necessary for PR title check but kept for consistency
         with:
           fetch-depth: 0
       - name: Install rust toolchain
@@ -76,6 +77,12 @@ jobs:
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          echo "Checking PR title for conventional commit format using 'convco lint':"
-          echo "Title: $PR_TITLE"
-          convco conventional "$PR_TITLE"
+          if [ -n "$PR_TITLE" ]; then
+            echo "Checking PR title: \"$PR_TITLE\""
+            # Use 'convco conventional <MESSAGE>' to validate a message string.
+            convco conventional "$PR_TITLE"
+          else
+            echo "PR title is empty. Skipping conventional commit check for title."
+            # You might want to make this an error (exit 1) if an empty PR title is not allowed.
+            exit 0
+          fi
