@@ -76,6 +76,6 @@ jobs:
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          echo "Checking PR title for conventional commit format using 'convco check':"
+          echo "Checking PR title for conventional commit format using 'convco lint':"
           echo "Title: $PR_TITLE"
-          echo "$PR_TITLE" | convco check
+          echo "$PR_TITLE" | convco lint
