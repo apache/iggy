@@ -39,50 +39,42 @@ on:
         type: string
 
 jobs:
-  check-commit-message:
-    name: commit messages
-    runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'pull_request' }}
-    steps:
-      - name: Check subject line length
-        uses: gsactions/commit-message-checker@v2
-        with:
-          excludeDescription: "false" # exclude description body of a pull request
-          excludeTitle: "false" # exclude the title of a pull request
-          checkAllCommitMessages: "false" # checks all commits associated with the pull request
-          accessToken: ${{ secrets.GITHUB_TOKEN }} # needed only when checkAllCommitMessages is true
-          pattern: '^.{0,80}(\n.*)*$'
-          error: "Subject of all commits in the PR and PR body/title has to be shorter than 80 characters."
-
-  check-conventional-commits:
-    name: conventional commits
+  check-pr-title:
+    name: Check PR Title
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        # fetch-depth: 0 is not strictly necessary for PR title check but kept for consistency
-        with:
-          fetch-depth: 0
-      - name: Install rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-      - name: Install convco
-        uses: taiki-e/install-action@v2
-        with:
-          tool: convco
-      - name: Check PR title for conventional commit format
-        if: github.event_name == 'pull_request'
+      - name: Validate PR Title
+        uses: amannn/action-semantic-pull-request@v5
         env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
-        run: |
-          if [ -n "$PR_TITLE" ]; then
-            echo "Checking PR title: \"$PR_TITLE\""
-            # Use 'convco conventional <MESSAGE>' to validate a message string.
-            convco check $PR_TITLE
-          else
-            echo "PR title is empty. Skipping conventional commit check for title."
-            # You might want to make this an error (exit 1) if an empty PR title is not allowed.
-            exit 0
-          fi
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+        # Configure types as needed (optional, defaults to common ones)
+          types: |
+             feat
+             fix
+             docs
+             style
+             refactor
+             perf
+             test
+             build
+             ci
+             chore
+             revert
+             repo
+        # Optional: Disallow certain scopes
+        # disallowedScopes: |
+        #   foo
+        #   bar
+        # Optional: Require a scope
+        # requireScope: true
+        # Optional: Configure weather the subject should be sentence case or not
+        # subjectPattern: ^[A-Z].* # This is for sentence case
+        # subjectPatternError: |
+        #   The subject "{subject}" found in the pull request title "{title}"
+        #   didn't match the configured pattern. Please ensure that the subject
+        #   doesn't start with an uppercase character.
+        # Optional: If you want to ignore labels to skip the check
+        # ignoreLabels: |
+        #   ignore-semantic-pull-request
+        #   WIP
