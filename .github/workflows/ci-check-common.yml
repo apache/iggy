@@ -78,4 +78,4 @@ jobs:
         run: |
           echo "Checking PR title for conventional commit format using 'convco lint':"
           echo "Title: $PR_TITLE"
-          echo "$PR_TITLE" | convco lint
+          convco conventional "$PR_TITLE"
