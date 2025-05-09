@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use super::PartitioningKind;
+use crate::PartitioningKind;
 use crate::error::IggyError;
 use crate::types::message::partitioning::Partitioning;
 use crate::BytesSerializable;

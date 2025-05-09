@@ -12,6 +12,7 @@ pub mod locking;
 // Commands
 pub use commands::consumer_groups::*;
 pub use commands::consumer_offsets::*;
+pub use commands::messages::*;
 pub use commands::partitions::*;
 pub use commands::personal_access_tokens::*;
 pub use commands::segments::*;

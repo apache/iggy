@@ -16,7 +16,6 @@
  * under the License.
  */
 
-pub mod flush_unsaved_buffer;
 mod iggy_message;
 mod index;
 mod index_view;
@@ -27,16 +26,14 @@ mod message_view;
 mod messages_batch;
 pub mod partitioning;
 pub mod partitioning_kind;
-pub mod poll_messages;
 pub mod polled_messages;
 pub mod polling_kind;
 pub mod polling_strategy;
-pub mod send_messages;
 mod user_headers;
 
 pub const INDEX_SIZE: usize = 16;
 
-pub use flush_unsaved_buffer::FlushUnsavedBuffer;
+pub use crate::commands::messages::flush_unsaved_buffer::FlushUnsavedBuffer;
 pub use iggy_message::{IggyMessage, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE};
 pub use index::IggyIndex;
 pub use index_view::IggyIndexView;
@@ -53,9 +50,9 @@ pub use message_view::{IggyMessageView, IggyMessageViewIterator};
 pub use messages_batch::IggyMessagesBatch;
 pub use partitioning::Partitioning;
 pub use partitioning_kind::PartitioningKind;
-pub use poll_messages::PollMessages;
+pub use crate::commands::messages::poll_messages::PollMessages;
 pub use polled_messages::PolledMessages;
 pub use polling_kind::PollingKind;
 pub use polling_strategy::PollingStrategy;
-pub use send_messages::SendMessages;
+pub use crate::commands::messages::send_messages::SendMessages;
 pub use user_headers::{HeaderKey, HeaderKind, HeaderValue};
