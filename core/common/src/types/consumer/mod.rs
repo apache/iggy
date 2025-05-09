@@ -25,6 +25,10 @@ use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DisplayFromStr};
 use std::fmt::Display;
 
+pub(crate) mod consumer_group;
+pub(crate) mod consumer_kind;
+pub(crate) mod consumer_offset_info;
+
 /// `Consumer` represents the type of consumer that is consuming a message.
 /// It can be either a `Consumer` or a `ConsumerGroup`.
 /// It consists of the following fields:

@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::types::model::user::user_status::UserStatus;
+use crate::types::user::user_status::UserStatus;
 use crate::utils::timestamp::IggyTimestamp;
 use crate::Permissions;
 use serde::{Deserialize, Serialize};

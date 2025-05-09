@@ -18,9 +18,18 @@
 
 use std::{fmt, str::FromStr};
 
+use crate::error::IggyError;
+
 use serde::{Deserialize, Serialize};
 
-use crate::error::IggyError;
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Snapshot(pub Vec<u8>);
+
+impl Snapshot {
+    pub fn new(data: Vec<u8>) -> Self {
+        Snapshot(data)
+    }
+}
 
 /// Enum representing the different types of system snapshots that can be taken.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

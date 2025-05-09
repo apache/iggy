@@ -80,7 +80,7 @@ jobs:
           if [ -n "$PR_TITLE" ]; then
             echo "Checking PR title: \"$PR_TITLE\""
             # Use 'convco conventional <MESSAGE>' to validate a message string.
-            convco conventional "$PR_TITLE"
+            convco check "$PR_TITLE"
           else
             echo "PR title is empty. Skipping conventional commit check for title."
             # You might want to make this an error (exit 1) if an empty PR title is not allowed.

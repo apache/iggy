@@ -16,12 +16,12 @@
  * under the License.
  */
 
-use crate::PartitioningKind;
 use crate::error::IggyError;
 use crate::types::message::partitioning::Partitioning;
 use crate::BytesSerializable;
 use crate::Identifier;
 use crate::IggyMessageView;
+use crate::PartitioningKind;
 use crate::Sizeable;
 use crate::Validatable;
 use crate::{Command, SEND_MESSAGES_CODE};

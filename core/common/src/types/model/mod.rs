@@ -1,9 +1,0 @@
-pub(crate) mod client;
-pub(crate) mod consumer;
-pub(crate) mod partition;
-pub(crate) mod permissions;
-pub(crate) mod snapshot;
-pub(crate) mod stats;
-pub(crate) mod stream;
-pub(crate) mod topic;
-pub(crate) mod user;

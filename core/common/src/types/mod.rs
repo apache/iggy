@@ -1,4 +1,5 @@
 pub(crate) mod args;
+pub(crate) mod client;
 pub(crate) mod client_state;
 pub(crate) mod command;
 pub(crate) mod compression;
@@ -8,5 +9,10 @@ pub(crate) mod consumer;
 pub(crate) mod diagnostic;
 pub(crate) mod identifier;
 pub(crate) mod message;
-pub(crate) mod model;
+pub(crate) mod partition;
+pub(crate) mod permissions;
 pub(crate) mod snapshot;
+pub(crate) mod stats;
+pub(crate) mod stream;
+pub(crate) mod topic;
+pub(crate) mod user;
