@@ -25,7 +25,7 @@ use iggy::prelude::Client;
 use iggy::prelude::Identifier;
 use iggy::prelude::IggyExpiry;
 use iggy::prelude::MaxTopicSize;
-use iggy_binary_protocol::cli::system::stats::GetStatsOutput;
+use iggy_binary_protocol::cli::binary_system::stats::GetStatsOutput;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
 

@@ -16,8 +16,8 @@
  * under the License.
  */
 
+use crate::cli::binary_system::session::ServerSession;
 use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
-use crate::cli::system::session::ServerSession;
 use crate::cli::utils::login_session_expiry::LoginSessionExpiry;
 use crate::Client;
 use anyhow::Context;

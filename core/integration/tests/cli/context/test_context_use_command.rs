@@ -24,7 +24,7 @@ use crate::cli::common::{
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
-use iggy_binary_protocol::cli::context::common::ContextConfig;
+use iggy_binary_protocol::cli::binary_context::common::ContextConfig;
 use predicates::str::contains;
 use serial_test::parallel;
 
