@@ -1,4 +1,0 @@
----
-ignored:
-    - DL3008  # Ignore pinned versions check for APT
-    - DL3018  # Ignore pinning versions check for pip
