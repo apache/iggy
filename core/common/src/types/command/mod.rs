@@ -16,9 +16,9 @@
  * under the License.
  */
 
-use crate::error::IggyError;
 use crate::BytesSerializable;
 use crate::Validatable;
+use crate::error::IggyError;
 use std::fmt::Display;
 
 pub trait Command: BytesSerializable + Validatable<IggyError> + Send + Sync + Display {

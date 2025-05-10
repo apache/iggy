@@ -18,7 +18,7 @@
 [package]
 name = "iggy_examples"
 version = "0.0.5"
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
 
 [dependencies]

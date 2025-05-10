@@ -78,6 +78,8 @@ impl Benchmarkable for BalancedConsumerGroupBenchmark {
         let cg_count = format!("consumer groups: {}", self.args.number_of_consumer_groups());
         let common_params = self.common_params_str();
 
-        info!("Staring benchmark BalancedConsumerGroup, {streams}, {consumers}, {cg_count}, {common_params}");
+        info!(
+            "Staring benchmark BalancedConsumerGroup, {streams}, {consumers}, {cg_count}, {common_params}"
+        );
     }
 }

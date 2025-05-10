@@ -15,10 +15,10 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::ConsumerOffsetClient;
 use crate::client::binary_clients::BinaryClient;
 use crate::utils::auth::fail_if_not_authenticated;
 use crate::utils::mapper;
-use crate::ConsumerOffsetClient;
 use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
 use iggy_common::get_consumer_offset::GetConsumerOffset;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;

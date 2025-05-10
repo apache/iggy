@@ -119,7 +119,7 @@ pub trait PartitionStorage: Send {
         state: PartitionState,
     ) -> impl Future<Output = Result<(), IggyError>> + Send;
     fn save(&self, partition: &mut Partition)
-        -> impl Future<Output = Result<(), IggyError>> + Send;
+    -> impl Future<Output = Result<(), IggyError>> + Send;
     fn delete(&self, partition: &Partition) -> impl Future<Output = Result<(), IggyError>> + Send;
     fn save_consumer_offset(
         &self,

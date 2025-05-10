@@ -16,14 +16,14 @@
  * under the License.
  */
 
+use crate::Client;
 use crate::cli::binary_system::session::ServerSession;
 use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
 use crate::cli::utils::login_session_expiry::LoginSessionExpiry;
-use crate::Client;
 use anyhow::Context;
 use async_trait::async_trait;
 use iggy_common::SEC_IN_MICRO;
-use tracing::{event, Level};
+use tracing::{Level, event};
 
 const DEFAULT_LOGIN_SESSION_TIMEOUT: u64 = SEC_IN_MICRO * 15 * 60;
 

@@ -17,15 +17,15 @@
  */
 
 use super::{MAX_NAME_LENGTH, MAX_PARTITIONS_COUNT};
-use crate::error::IggyError;
-use crate::utils::expiry::IggyExpiry;
-use crate::utils::topic_size::MaxTopicSize;
 use crate::BytesSerializable;
 use crate::CompressionAlgorithm;
 use crate::Identifier;
 use crate::Sizeable;
 use crate::Validatable;
-use crate::{Command, CREATE_TOPIC_CODE};
+use crate::error::IggyError;
+use crate::utils::expiry::IggyExpiry;
+use crate::utils::topic_size::MaxTopicSize;
+use crate::{CREATE_TOPIC_CODE, Command};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;

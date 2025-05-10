@@ -23,8 +23,8 @@ use ahash::AHashMap;
 use iggy_common::IggyByteSize;
 use iggy_common::IggyTimestamp;
 use std::fmt::Display;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 #[derive(Debug)]
 pub struct Stream {

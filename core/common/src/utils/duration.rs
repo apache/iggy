@@ -16,8 +16,8 @@
  * under the License.
  */
 
-use humantime::format_duration;
 use humantime::Duration as HumanDuration;
+use humantime::format_duration;
 use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::{

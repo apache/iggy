@@ -18,8 +18,8 @@
 
 use crate::state::system::StreamState;
 use crate::streaming::storage::StreamStorage;
-use crate::streaming::streams::stream::Stream;
 use crate::streaming::streams::COMPONENT;
+use crate::streaming::streams::stream::Stream;
 use crate::streaming::topics::topic::Topic;
 use ahash::AHashSet;
 use error_set::ErrContext;
@@ -69,11 +69,15 @@ impl StreamStorage for FileStreamStorage {
             let topic_state = state.topics.get(&topic_id);
             if topic_state.is_none() {
                 let stream_id = stream.stream_id;
-                error!("Topic with ID: '{topic_id}' for stream with ID: '{stream_id}' was not found in state, but exists on disk and will be removed.");
+                error!(
+                    "Topic with ID: '{topic_id}' for stream with ID: '{stream_id}' was not found in state, but exists on disk and will be removed."
+                );
                 if let Err(error) = fs::remove_dir_all(&dir_entry.path()).await {
                     error!("Cannot remove topic directory: {error}");
                 } else {
-                    warn!("Topic with ID: '{topic_id}' for stream with ID: '{stream_id}' was removed.");
+                    warn!(
+                        "Topic with ID: '{topic_id}' for stream with ID: '{stream_id}' was removed."
+                    );
                 }
                 continue;
             }
@@ -108,12 +112,15 @@ impl StreamStorage for FileStreamStorage {
                 stream.stream_id
             );
         } else {
-            warn!("Topics with IDs: '{missing_ids:?}' for stream with ID: '{}' were not found on disk.", stream.stream_id);
-            if stream.config.recovery.recreate_missing_state {
-                info!(
-                "Recreating missing state in recovery config is enabled, missing topics will be created for stream with ID: '{}'.",
+            warn!(
+                "Topics with IDs: '{missing_ids:?}' for stream with ID: '{}' were not found on disk.",
                 stream.stream_id
             );
+            if stream.config.recovery.recreate_missing_state {
+                info!(
+                    "Recreating missing state in recovery config is enabled, missing topics will be created for stream with ID: '{}'.",
+                    stream.stream_id
+                );
                 for topic_id in missing_ids {
                     let topic_state = state.topics.get(&topic_id).unwrap();
                     let topic = Topic::empty(
@@ -137,7 +144,10 @@ impl StreamStorage for FileStreamStorage {
                     );
                 }
             } else {
-                warn!("Recreating missing state in recovery config is disabled, missing topics will not be created for stream with ID: '{}'.", stream.stream_id);
+                warn!(
+                    "Recreating missing state in recovery config is disabled, missing topics will not be created for stream with ID: '{}'.",
+                    stream.stream_id
+                );
             }
         }
 

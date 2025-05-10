@@ -128,10 +128,7 @@ impl Segment {
 
         trace!(
             "Getting messages by offset: {}, count: {}, segment start_offset: {}, segment end_offset: {}",
-            offset,
-            count,
-            self.start_offset,
-            self.end_offset
+            offset, count, self.start_offset, self.end_offset
         );
 
         // Case 0: Accumulator is empty, so all messages have to be on disk

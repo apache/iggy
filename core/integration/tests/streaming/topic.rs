@@ -25,8 +25,8 @@ use server::streaming::polling_consumer::PollingConsumer;
 use server::streaming::segments::IggyMessagesBatchMut;
 use server::streaming::topics::topic::Topic;
 use std::default::Default;
-use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use tokio::fs;
 
 #[tokio::test]

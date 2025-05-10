@@ -24,8 +24,8 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
 use iggy_common::IggyError;
+use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for LoginWithPersonalAccessToken {

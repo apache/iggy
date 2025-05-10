@@ -16,13 +16,13 @@
  * under the License.
  */
 
-use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
 use crate::Client;
+use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
 use iggy_common::Identifier;
-use passterm::{isatty, prompt_password_stdin, prompt_password_tty, Stream};
-use tracing::{event, Level};
+use passterm::{Stream, isatty, prompt_password_stdin, prompt_password_tty};
+use tracing::{Level, event};
 
 pub struct ChangePasswordCmd {
     user_id: Identifier,

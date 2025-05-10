@@ -94,9 +94,7 @@ impl ConsumerGroup {
         );
         trace!(
             "Added member with ID: {} to consumer group: {} for topic with ID: {}",
-            member_id,
-            self.group_id,
-            self.topic_id
+            member_id, self.group_id, self.topic_id
         );
         self.assign_partitions().await;
     }
@@ -105,9 +103,7 @@ impl ConsumerGroup {
         if self.members.remove(&member_id).is_some() {
             trace!(
                 "Deleted member with ID: {} in consumer group: {} for topic with ID: {}",
-                member_id,
-                self.group_id,
-                self.topic_id
+                member_id, self.group_id, self.topic_id
             );
             self.assign_partitions().await;
         }
@@ -140,8 +136,10 @@ impl ConsumerGroup {
                 member.current_partition_id = Some(partition_id);
                 member.current_partition_index = Some(member_partition_index);
             }
-            trace!("Assigned partition ID: {} to member with ID: {} for topic with ID: {} in consumer group: {}",
-                partition_id, member.id, self.topic_id, self.group_id)
+            trace!(
+                "Assigned partition ID: {} to member with ID: {} for topic with ID: {} in consumer group: {}",
+                partition_id, member.id, self.topic_id, self.group_id
+            )
         }
     }
 }
@@ -156,8 +154,7 @@ impl ConsumerGroupMember {
         let Some(partition_id) = self.partitions.get(&partition_index) else {
             trace!(
                 "No partition ID found for index: {} for member with ID: {}.",
-                partition_index,
-                self.id
+                partition_index, self.id
             );
             return None;
         };
@@ -171,8 +168,7 @@ impl ConsumerGroupMember {
         }
         trace!(
             "Calculated partition ID: {} for member with ID: {}",
-            partition_id,
-            self.id
+            partition_id, self.id
         );
         Some(partition_id)
     }

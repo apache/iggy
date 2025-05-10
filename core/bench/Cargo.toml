@@ -18,7 +18,7 @@
 [package]
 name = "bench"
 version = "0.2.4"
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
 # Due to dependency to integration, which has a dependency to server, setting
 # mimalloc on server is also setting it on bench.

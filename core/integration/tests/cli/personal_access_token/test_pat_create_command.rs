@@ -17,12 +17,12 @@
  */
 
 use crate::cli::common::{
-    IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, CLAP_INDENT, USAGE_PREFIX,
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
-use humantime::format_duration;
 use humantime::Duration as HumanDuration;
+use humantime::format_duration;
 use iggy::prelude::Client;
 use predicates::str::starts_with;
 use serial_test::parallel;
@@ -70,8 +70,10 @@ impl IggyCmdTestCase for TestPatCreateCmd {
             None => String::from("without token expire time"),
         };
 
-        let message = format!("Executing create personal access token with name: {} and {}\nPersonal access token with name: {} and {} created\nToken: ",
-                                self.name, expiry, self.name, expiry);
+        let message = format!(
+            "Executing create personal access token with name: {} and {}\nPersonal access token with name: {} and {} created\nToken: ",
+            self.name, expiry, self.name, expiry
+        );
 
         command_state.success().stdout(starts_with(message));
     }

@@ -19,10 +19,10 @@ use crate::{
     api,
     components::layout::{main_content::MainContent, sidebar::Sidebar},
     state::{
-        benchmark::{use_benchmark, BenchmarkAction, BenchmarkContext},
-        gitref::{use_gitref, GitrefAction, GitrefContext},
-        hardware::{use_hardware, HardwareAction, HardwareContext},
-        ui::{use_ui, UiAction},
+        benchmark::{BenchmarkAction, BenchmarkContext, use_benchmark},
+        gitref::{GitrefAction, GitrefContext, use_gitref},
+        hardware::{HardwareAction, HardwareContext, use_hardware},
+        ui::{UiAction, use_ui},
     },
 };
 use gloo::console::log;

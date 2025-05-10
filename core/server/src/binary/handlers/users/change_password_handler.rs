@@ -25,8 +25,8 @@ use crate::streaming::systems::system::SharedSystem;
 use crate::streaming::utils::crypto;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy_common::change_password::ChangePassword;
 use iggy_common::IggyError;
+use iggy_common::change_password::ChangePassword;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for ChangePassword {

@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::state::{EntryCommand, StateEntry, COMPONENT};
+use crate::state::{COMPONENT, EntryCommand, StateEntry};
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use ahash::AHashMap;
 use error_set::ErrContext;
@@ -93,7 +93,9 @@ impl SystemState {
         for entry in entries {
             debug!("Processing state entry: {entry}",);
             match entry.command().with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to retrieve state entry command: {entry}")
+                format!(
+                    "{COMPONENT} (error: {error}) - failed to retrieve state entry command: {entry}"
+                )
             })? {
                 EntryCommand::CreateStream(command) => {
                     info!("Creating stream: {command:?}");
@@ -265,7 +267,13 @@ impl SystemState {
 
                     let partition_id = command.partition_id;
 
-                    let _partition = topic.partitions.get(&command.partition_id).unwrap_or_else(|| panic!("{}", format!("Partition {partition_id} not found.")));
+                    let _partition =
+                        topic
+                            .partitions
+                            .get(&command.partition_id)
+                            .unwrap_or_else(|| {
+                                panic!("{}", format!("Partition {partition_id} not found."))
+                            });
 
                     // State is not affected by the delete segments
                 }

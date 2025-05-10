@@ -16,35 +16,35 @@
  * under the License.
  */
 
+use crate::VERSION;
 use crate::configs::server::{TelemetryConfig, TelemetryTransport};
 use crate::configs::system::LoggingConfig;
 use crate::server_error::LogError;
-use crate::VERSION;
+use opentelemetry::KeyValue;
 use opentelemetry::global;
 use opentelemetry::trace::TracerProvider;
-use opentelemetry::KeyValue;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
+use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::log_processor_with_async_runtime;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::runtime;
 use opentelemetry_sdk::trace::span_processor_with_async_runtime;
-use opentelemetry_sdk::Resource;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use tracing::{event, info, trace, Level};
+use tracing::{Level, event, info, trace};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::field::{RecordFields, VisitOutput};
-use tracing_subscriber::fmt::format::DefaultVisitor;
 use tracing_subscriber::fmt::FormatFields;
+use tracing_subscriber::fmt::format::DefaultVisitor;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{
-    filter::LevelFilter, fmt, fmt::format::Format, fmt::MakeWriter, reload, reload::Handle,
-    EnvFilter, Layer, Registry,
+    EnvFilter, Layer, Registry, filter::LevelFilter, fmt, fmt::MakeWriter, fmt::format::Format,
+    reload, reload::Handle,
 };
 
 const IGGY_LOG_FILE_PREFIX: &str = "iggy-server.log";
@@ -404,7 +404,9 @@ impl Logging {
                 hash, built_at, rust_version, target
             );
         } else {
-            info!("It seems that you are a developer. Environment variable IGGY_CI_BUILD is not set to 'true', skipping build info print.")
+            info!(
+                "It seems that you are a developer. Environment variable IGGY_CI_BUILD is not set to 'true', skipping build info print."
+            )
         }
     }
 }

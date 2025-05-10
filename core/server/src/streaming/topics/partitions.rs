@@ -17,8 +17,8 @@
  */
 
 use crate::streaming::partitions::partition::Partition;
-use crate::streaming::topics::topic::Topic;
 use crate::streaming::topics::COMPONENT;
+use crate::streaming::topics::topic::Topic;
 use error_set::ErrContext;
 use iggy_common::locking::{IggySharedMut, IggySharedMutFn};
 use iggy_common::{IggyError, IggyTimestamp};

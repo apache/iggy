@@ -19,8 +19,8 @@
 use chrono::{DateTime, Local, Utc};
 use core::fmt;
 use serde::{
-    de::{self, Visitor},
     Deserialize, Deserializer, Serialize, Serializer,
+    de::{self, Visitor},
 };
 use std::{
     ops::{Add, Sub},

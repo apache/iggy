@@ -21,8 +21,8 @@ use futures_util::StreamExt;
 use iggy::prelude::*;
 use iggy_examples::shared::args::Args;
 use iggy_examples::shared::messages::{
-    Envelope, OrderConfirmed, OrderCreated, OrderRejected, ORDER_CONFIRMED_TYPE,
-    ORDER_CREATED_TYPE, ORDER_REJECTED_TYPE,
+    Envelope, ORDER_CONFIRMED_TYPE, ORDER_CREATED_TYPE, ORDER_REJECTED_TYPE, OrderConfirmed,
+    OrderCreated, OrderRejected,
 };
 use std::error::Error;
 use std::str::FromStr;
@@ -78,8 +78,14 @@ pub async fn consume_messages(
     let interval = args.get_interval();
     let mut consumed_batches = 0;
 
-    info!("Messages will be polled by consumer: {} from stream: {}, topic: {}, partition: {} with interval {}.",
-        args.consumer_id, args.stream_id, args.topic_id, args.partition_id, interval.map_or("none".to_string(), |i| i.as_human_time_string()));
+    info!(
+        "Messages will be polled by consumer: {} from stream: {}, topic: {}, partition: {} with interval {}.",
+        args.consumer_id,
+        args.stream_id,
+        args.topic_id,
+        args.partition_id,
+        interval.map_or("none".to_string(), |i| i.as_human_time_string())
+    );
 
     while let Some(message) = consumer.next().await {
         if args.message_batches_limit > 0 && consumed_batches == args.message_batches_limit {

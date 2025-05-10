@@ -30,7 +30,7 @@ use bench_report::individual_metrics::BenchmarkIndividualMetrics;
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use human_repr::HumanCount;
 use iggy::prelude::*;
-use integration::test_server::{login_root, ClientFactory};
+use integration::test_server::{ClientFactory, login_root};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -272,10 +272,15 @@ impl BenchmarkProducingConsumer {
                     .account_and_check(batch.user_data_bytes)
                 {
                     info!(
-                    "ProducingConsumer #{} → finished sending {} messages in {} batches ({} bytes of user data, {} bytes of total data), send finish condition: {}, poll finish condition: {}",
-                    self.actor_id, sent_messages.human_count_bare(), sent_batches.human_count_bare(), sent_user_bytes_processed.human_count_bytes(),
-                    sent_total_bytes_processed.human_count_bytes(), self.send_finish_condition.status(), self.poll_finish_condition.status()
-                );
+                        "ProducingConsumer #{} → finished sending {} messages in {} batches ({} bytes of user data, {} bytes of total data), send finish condition: {}, poll finish condition: {}",
+                        self.actor_id,
+                        sent_messages.human_count_bare(),
+                        sent_batches.human_count_bare(),
+                        sent_user_bytes_processed.human_count_bytes(),
+                        sent_total_bytes_processed.human_count_bytes(),
+                        self.send_finish_condition.status(),
+                        self.poll_finish_condition.status()
+                    );
                 }
             }
 
@@ -305,13 +310,13 @@ impl BenchmarkProducingConsumer {
 
                     if should_warn {
                         warn!(
-                        "ProducingConsumer #{} → received empty batch, sent: {}, polled: {}, polling kind: {:?}, retrying... ({} warnings skipped in last second)",
-                        self.actor_id,
-                        self.send_finish_condition.status(),
-                        self.poll_finish_condition.status(),
-                        self.polling_kind,
-                        skipped_warnings_count
-                    );
+                            "ProducingConsumer #{} → received empty batch, sent: {}, polled: {}, polling kind: {:?}, retrying... ({} warnings skipped in last second)",
+                            self.actor_id,
+                            self.send_finish_condition.status(),
+                            self.poll_finish_condition.status(),
+                            self.polling_kind,
+                            skipped_warnings_count
+                        );
                         last_warning_time = Some(Instant::now());
                         skipped_warnings_count = 0;
                     } else {

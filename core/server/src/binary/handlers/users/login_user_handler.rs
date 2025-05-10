@@ -24,8 +24,8 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy_common::login_user::LoginUser;
 use iggy_common::IggyError;
+use iggy_common::login_user::LoginUser;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for LoginUser {

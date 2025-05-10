@@ -16,13 +16,13 @@
  * under the License.
  */
 
-use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
 use crate::Client;
+use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
 use iggy_common::delete_personal_access_token::DeletePersonalAccessToken;
 use keyring::Entry;
-use tracing::{event, Level};
+use tracing::{Level, event};
 
 pub struct DeletePersonalAccessTokenCmd {
     delete_token: DeletePersonalAccessToken,

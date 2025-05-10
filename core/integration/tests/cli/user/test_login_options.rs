@@ -19,8 +19,8 @@
 use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase};
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
-use iggy::prelude::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use iggy::prelude::Client;
+use iggy::prelude::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
 

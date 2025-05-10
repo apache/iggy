@@ -24,8 +24,8 @@ use crate::binary::sender::SenderKind;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use error_set::ErrContext;
-use iggy_common::get_users::GetUsers;
 use iggy_common::IggyError;
+use iggy_common::get_users::GetUsers;
 use tracing::debug;
 
 impl ServerCommandHandler for GetUsers {

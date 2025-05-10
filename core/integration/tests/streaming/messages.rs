@@ -25,8 +25,8 @@ use server::streaming::partitions::partition::Partition;
 use server::streaming::segments::IggyMessagesBatchMut;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 
 #[tokio::test]
 async fn should_persist_messages_and_then_load_them_by_timestamp() {

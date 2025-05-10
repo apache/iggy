@@ -17,7 +17,7 @@
 
 use crate::{
     components::selectors::benchmark_kind_selector::BenchmarkKindSelector,
-    state::benchmark::{use_benchmark, BenchmarkAction},
+    state::benchmark::{BenchmarkAction, use_benchmark},
 };
 use bench_report::benchmark_kind::BenchmarkKind;
 use std::collections::HashSet;

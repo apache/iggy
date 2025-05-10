@@ -24,9 +24,9 @@ use super::server::{
 };
 use super::system::{CompressionConfig, MemoryPoolConfig, PartitionConfig};
 use crate::archiver::ArchiverKindType;
+use crate::configs::COMPONENT;
 use crate::configs::server::{PersonalAccessTokenConfig, ServerConfig};
 use crate::configs::system::SegmentConfig;
-use crate::configs::COMPONENT;
 use crate::server_error::ConfigError;
 use crate::streaming::segments::*;
 use error_set::ErrContext;
@@ -52,7 +52,9 @@ impl Validatable<ConfigError> for ServerConfig {
         self.personal_access_token
             .validate()
             .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to validate personal access token config")
+                format!(
+                    "{COMPONENT} (error: {error}) - failed to validate personal access token config"
+                )
             })?;
         self.system.segment.validate().with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to validate segment config")

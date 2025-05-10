@@ -24,9 +24,9 @@ use bench_report::{
     plotting::{chart::IggyChart, chart_kind::ChartKind},
 };
 use charming::{
+    Chart, Echarts, WasmRenderer,
     element::{Symbol, Tooltip, Trigger},
     theme::Theme,
-    Chart, Echarts, WasmRenderer,
 };
 
 fn trend_chart_title(params: &BenchmarkParams, kind: ChartKind) -> String {

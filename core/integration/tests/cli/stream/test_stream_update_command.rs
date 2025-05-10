@@ -17,7 +17,7 @@
  */
 
 use crate::cli::common::{
-    IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId, CLAP_INDENT,
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId,
     USAGE_PREFIX,
 };
 use assert_cmd::assert::Assert;
@@ -70,8 +70,14 @@ impl IggyCmdTestCase for TestStreamUpdateCmd {
 
     fn verify_command(&self, command_state: Assert) {
         let message = match self.using_identifier {
-            TestStreamId::Named => format!("Executing update stream with ID: {} and name: {}\nStream with ID: {} updated name: {}\n", self.name, self.new_name, self.name, self.new_name),
-            TestStreamId::Numeric => format!("Executing update stream with ID: {} and name: {}\nStream with ID: {} updated name: {}\n", self.stream_id, self.new_name, self.stream_id, self.new_name),
+            TestStreamId::Named => format!(
+                "Executing update stream with ID: {} and name: {}\nStream with ID: {} updated name: {}\n",
+                self.name, self.new_name, self.name, self.new_name
+            ),
+            TestStreamId::Numeric => format!(
+                "Executing update stream with ID: {} and name: {}\nStream with ID: {} updated name: {}\n",
+                self.stream_id, self.new_name, self.stream_id, self.new_name
+            ),
         };
 
         command_state.success().stdout(diff(message));

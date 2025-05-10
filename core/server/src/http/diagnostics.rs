@@ -54,7 +54,9 @@ pub async fn request_diagnostics(
     if let Ok(response) = &result {
         let status = response.status();
         if status != StatusCode::NOT_FOUND && status >= StatusCode::BAD_REQUEST {
-            error!("Returning an invalid status code: {status}, IP address: {ip_address}, request ID: {request_id}");
+            error!(
+                "Returning an invalid status code: {status}, IP address: {ip_address}, request ID: {request_id}"
+            );
         }
     }
     let elapsed = now.elapsed();

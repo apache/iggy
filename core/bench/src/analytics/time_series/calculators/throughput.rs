@@ -126,7 +126,7 @@ impl<T: ThroughputCalculation> TimeSeriesCalculation for ThroughputTimeSeriesCal
         let points = values_per_bucket
             .iter()
             .enumerate()
-            .filter(|(_, &value)| value > 0)
+            .filter(|&(_, &value)| value > 0)
             .map(|(i, &value)| {
                 let time_s = (i as u64 * bucket_size_us) as f64 / 1_000_000.0;
                 let throughput = self.calculator.calculate_throughput(value, bucket_size_us);

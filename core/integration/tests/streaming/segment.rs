@@ -19,12 +19,12 @@
 use crate::streaming::common::test_setup::TestSetup;
 use crate::streaming::create_message;
 use bytes::Bytes;
-use iggy::prelude::locking::IggySharedMutFn;
 use iggy::prelude::CompressionAlgorithm;
 use iggy::prelude::Confirmation;
 use iggy::prelude::Identifier;
 use iggy::prelude::IggyError;
 use iggy::prelude::MaxTopicSize;
+use iggy::prelude::locking::IggySharedMutFn;
 use iggy::prelude::*;
 use server::configs::server::{DataMaintenanceConfig, PersonalAccessTokenConfig};
 use server::configs::system::{PartitionConfig, SegmentConfig, SystemConfig};
@@ -34,8 +34,8 @@ use server::streaming::systems::system::System;
 use std::fs::DirEntry;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::str::FromStr;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 use tokio::fs;
 use tokio::time::sleep;
@@ -423,10 +423,12 @@ async fn given_at_least_one_not_expired_message_segment_should_not_be_expired() 
 
     let nothing_expired_ts = IggyTimestamp::now();
 
-    let first_message = vec![IggyMessage::builder()
-        .payload(Bytes::from("expired"))
-        .build()
-        .expect("Failed to create message")];
+    let first_message = vec![
+        IggyMessage::builder()
+            .payload(Bytes::from("expired"))
+            .build()
+            .expect("Failed to create message"),
+    ];
     let first_message_size = first_message[0].get_size_bytes().as_bytes_u32();
     let first_batch = IggyMessagesBatchMut::from_messages(&first_message, first_message_size);
     segment.append_batch(0, first_batch, None).await.unwrap();
@@ -434,10 +436,12 @@ async fn given_at_least_one_not_expired_message_segment_should_not_be_expired() 
     sleep(Duration::from_micros(message_expiry_us / 2)).await;
     let first_message_expired_ts = IggyTimestamp::now();
 
-    let second_message = vec![IggyMessage::builder()
-        .payload(Bytes::from("not-expired"))
-        .build()
-        .expect("Failed to create message")];
+    let second_message = vec![
+        IggyMessage::builder()
+            .payload(Bytes::from("not-expired"))
+            .build()
+            .expect("Failed to create message"),
+    ];
     let second_message_size = second_message[0].get_size_bytes().as_bytes_u32();
     let second_batch = IggyMessagesBatchMut::from_messages(&second_message, second_message_size);
     segment.append_batch(1, second_batch, None).await.unwrap();

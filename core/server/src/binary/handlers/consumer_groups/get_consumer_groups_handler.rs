@@ -25,8 +25,8 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy_common::get_consumer_groups::GetConsumerGroups;
 use iggy_common::IggyError;
+use iggy_common::get_consumer_groups::GetConsumerGroups;
 use tracing::debug;
 
 impl ServerCommandHandler for GetConsumerGroups {

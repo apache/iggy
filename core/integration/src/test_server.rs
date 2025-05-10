@@ -34,7 +34,7 @@ use uuid::Uuid;
 
 use iggy::prelude::UserStatus::Active;
 use iggy::prelude::{
-    Client, StreamClient, UserClient, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME,
+    Client, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, StreamClient, UserClient,
 };
 use iggy::prelude::{GlobalPermissions, Identifier, IdentityInfo, IggyClient, Permissions};
 use server::configs::config_provider::{ConfigProvider, FileConfigProvider};
@@ -216,8 +216,8 @@ impl TestServer {
         if let Some(mut child_handle) = self.child_handle.take() {
             #[cfg(unix)]
             unsafe {
-                use libc::kill;
                 use libc::SIGTERM;
+                use libc::kill;
                 kill(child_handle.id() as libc::pid_t, SIGTERM);
             }
 

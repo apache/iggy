@@ -28,8 +28,8 @@ use iggy_common::IggyExpiry;
 use iggy_common::IggyTimestamp;
 use iggy_common::Sizeable;
 use std::fmt;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 #[derive(Debug)]
 pub struct Partition {
@@ -209,8 +209,8 @@ mod tests {
     use iggy_common::IggyDuration;
     use iggy_common::IggyExpiry;
     use iggy_common::IggyTimestamp;
-    use std::sync::atomic::{AtomicU32, AtomicU64};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, AtomicU64};
 
     #[tokio::test]
     async fn should_be_created_with_a_single_segment_given_valid_parameters() {

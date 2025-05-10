@@ -16,9 +16,9 @@
  * under the License.
  */
 
-use crate::error::IggyError;
 use crate::BytesSerializable;
 use crate::Validatable;
+use crate::error::IggyError;
 use crate::{Command, GET_SNAPSHOT_FILE_CODE};
 use crate::{SnapshotCompression, SystemSnapshotType};
 use bytes::{BufMut, Bytes, BytesMut};

@@ -17,7 +17,7 @@
  */
 
 use crate::cli::common::{
-    IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId, CLAP_INDENT,
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId,
     USAGE_PREFIX,
 };
 use assert_cmd::assert::Assert;

@@ -24,8 +24,8 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy_common::delete_consumer_group::DeleteConsumerGroup;
 use iggy_common::IggyError;
+use iggy_common::delete_consumer_group::DeleteConsumerGroup;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for DeleteConsumerGroup {

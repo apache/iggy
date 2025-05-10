@@ -16,13 +16,13 @@
  * under the License.
  */
 
-use super::message_header::*;
 use super::HeaderValue;
-use crate::error::IggyError;
-use crate::utils::checksum;
+use super::message_header::*;
 use crate::BytesSerializable;
 use crate::IggyByteSize;
 use crate::Sizeable;
+use crate::error::IggyError;
+use crate::utils::checksum;
 use crate::{HeaderKey, IggyMessageHeaderView};
 use bytes::{Bytes, BytesMut};
 use std::{collections::HashMap, iter::Iterator};

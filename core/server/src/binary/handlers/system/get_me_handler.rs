@@ -24,9 +24,9 @@ use crate::binary::sender::SenderKind;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use error_set::ErrContext;
+use iggy_common::IggyError;
 use iggy_common::get_me::GetMe;
 use iggy_common::locking::IggySharedMutFn;
-use iggy_common::IggyError;
 
 impl ServerCommandHandler for GetMe {
     fn code(&self) -> u32 {

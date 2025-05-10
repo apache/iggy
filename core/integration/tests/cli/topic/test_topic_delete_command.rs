@@ -17,8 +17,8 @@
  */
 
 use crate::cli::common::{
-    IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId, TestTopicId,
-    CLAP_INDENT, USAGE_PREFIX,
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId,
+    TestTopicId, USAGE_PREFIX,
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
@@ -116,8 +116,10 @@ impl IggyCmdTestCase for TestTopicDeleteCmd {
         // Executing delete topic with ID: 4 in stream with ID: 1
         // Topic with ID: 4 in stream with ID: 1 deleted
 
-        let message = format!("Executing delete topic with ID: {} in stream with ID: {}\nTopic with ID: {} in stream with ID: {} deleted\n",
-            topic_id, stream_id, topic_id,  stream_id);
+        let message = format!(
+            "Executing delete topic with ID: {} in stream with ID: {}\nTopic with ID: {} in stream with ID: {} deleted\n",
+            topic_id, stream_id, topic_id, stream_id
+        );
 
         command_state.success().stdout(diff(message));
     }

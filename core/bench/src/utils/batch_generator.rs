@@ -18,7 +18,7 @@
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use bytes::Bytes;
 use iggy::prelude::*;
-use rand::{distr::Alphanumeric, Rng};
+use rand::{Rng, distr::Alphanumeric};
 
 pub struct BenchmarkMessagesBatch {
     pub messages: Vec<IggyMessage>,
@@ -45,7 +45,7 @@ impl BenchmarkBatchGenerator {
 
         let random: Vec<u8> = rand::rng().sample_iter(distr).take(max_len).collect();
 
-        let mut gen = Self {
+        let mut batch_generator = Self {
             message_size,
             messages_per_batch,
             full_payload: Bytes::from(random),
@@ -58,10 +58,10 @@ impl BenchmarkBatchGenerator {
         };
 
         if is_fixed {
-            gen.batch = gen.build_single_fixed();
+            batch_generator.batch = batch_generator.build_single_fixed();
         }
 
-        gen
+        batch_generator
     }
 
     pub fn generate_batch(&mut self) -> &mut BenchmarkMessagesBatch {

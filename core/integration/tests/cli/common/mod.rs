@@ -19,14 +19,14 @@
 pub(crate) mod command;
 pub(crate) mod help;
 pub(crate) use crate::cli::common::command::IggyCmdCommand;
-pub(crate) use crate::cli::common::help::{TestHelpCmd, CLAP_INDENT, USAGE_PREFIX};
+pub(crate) use crate::cli::common::help::{CLAP_INDENT, TestHelpCmd, USAGE_PREFIX};
 use assert_cmd::assert::{Assert, OutputAssertExt};
 use assert_cmd::prelude::CommandCargoExt;
 use async_trait::async_trait;
 use iggy::clients::client::IggyClient;
-use iggy::prelude::defaults::*;
 use iggy::prelude::TcpClient;
 use iggy::prelude::TcpClientConfig;
+use iggy::prelude::defaults::*;
 use iggy::prelude::{Client, SystemClient, UserClient};
 use integration::test_server::TestServer;
 use std::fmt::{Display, Formatter, Result};

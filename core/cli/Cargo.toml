@@ -18,7 +18,7 @@
 [package]
 name = "iggy-cli"
 version = "0.9.0"
-edition = "2021"
+edition = "2024"
 authors = ["bartosz.ciesla@gmail.com"]
 repository = "https://github.com/apache/iggy"
 homepage = "https://iggy.apache.org"

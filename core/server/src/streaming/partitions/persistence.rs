@@ -17,8 +17,8 @@
  */
 
 use crate::state::system::PartitionState;
-use crate::streaming::partitions::partition::Partition;
 use crate::streaming::partitions::COMPONENT;
+use crate::streaming::partitions::partition::Partition;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use std::path::Path;

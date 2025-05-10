@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::state::hardware::{use_hardware, HardwareAction};
+use crate::state::hardware::{HardwareAction, use_hardware};
 use web_sys::HtmlSelectElement;
 use yew::prelude::*;
 

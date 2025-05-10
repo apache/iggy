@@ -21,7 +21,7 @@ use crate::prelude::TcpClientConfig;
 use crate::tcp::tcp_connection_stream::TcpConnectionStream;
 use crate::tcp::tcp_connection_stream_kind::ConnectionStreamKind;
 use crate::tcp::tcp_tls_connection_stream::TcpTlsConnectionStream;
-use async_broadcast::{broadcast, Receiver, Sender};
+use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_binary_protocol::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
@@ -29,7 +29,7 @@ use iggy_common::{
     AutoLogin, ClientState, Command, ConnectionString, Credentials, DiagnosticEvent, IggyDuration,
     IggyError, IggyErrorDiscriminants, IggyTimestamp,
 };
-use rustls::pki_types::{pem::PemObject, CertificateDer, ServerName};
+use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -410,12 +410,16 @@ impl TcpClient {
                 match credentials {
                     Credentials::UsernamePassword(username, password) => {
                         self.login_user(username, password).await?;
-                        info!("{NAME} client: {client_address} has signed in with the user credentials, username: {username}",);
+                        info!(
+                            "{NAME} client: {client_address} has signed in with the user credentials, username: {username}",
+                        );
                         Ok(())
                     }
                     Credentials::PersonalAccessToken(token) => {
                         self.login_with_personal_access_token(token).await?;
-                        info!("{NAME} client: {client_address} has signed in with a personal access token.",);
+                        info!(
+                            "{NAME} client: {client_address} has signed in with a personal access token.",
+                        );
                         Ok(())
                     }
                 }

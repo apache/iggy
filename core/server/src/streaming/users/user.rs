@@ -18,9 +18,9 @@
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::utils::crypto;
 use dashmap::DashMap;
-use iggy_common::defaults::*;
 use iggy_common::IggyTimestamp;
 use iggy_common::UserStatus;
+use iggy_common::defaults::*;
 use iggy_common::{Permissions, UserId};
 use std::sync::Arc;
 

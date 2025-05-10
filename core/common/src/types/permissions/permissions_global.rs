@@ -16,12 +16,12 @@
  * under the License.
  */
 
-use crate::error::IggyError;
 use crate::BytesSerializable;
+use crate::error::IggyError;
 use ahash::AHashMap;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use comfy_table::presets::ASCII_NO_BORDERS;
 use comfy_table::Table;
+use comfy_table::presets::ASCII_NO_BORDERS;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 

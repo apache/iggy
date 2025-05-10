@@ -17,25 +17,25 @@
  */
 
 use crate::configs::http::HttpMetricsConfig;
+use crate::http::COMPONENT;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::mapper;
 use crate::http::shared::AppState;
-use crate::http::COMPONENT;
 use crate::streaming::session::Session;
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::{header, HeaderMap};
+use axum::http::{HeaderMap, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use bytes::Bytes;
 use chrono::Local;
 use error_set::ErrContext;
-use iggy_common::get_snapshot::GetSnapshot;
-use iggy_common::locking::IggySharedMutFn;
 use iggy_common::Stats;
 use iggy_common::Validatable;
+use iggy_common::get_snapshot::GetSnapshot;
+use iggy_common::locking::IggySharedMutFn;
 use iggy_common::{ClientInfo, ClientInfoDetails};
 use std::sync::Arc;
 

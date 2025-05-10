@@ -16,23 +16,23 @@
  * under the License.
  */
 
+use crate::http::COMPONENT;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::shared::AppState;
-use crate::http::COMPONENT;
 use crate::streaming::session::Session;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get};
 use axum::{Extension, Json, Router};
 use error_set::ErrContext;
-use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
-use iggy_common::get_consumer_offset::GetConsumerOffset;
-use iggy_common::store_consumer_offset::StoreConsumerOffset;
 use iggy_common::Consumer;
 use iggy_common::ConsumerOffsetInfo;
 use iggy_common::Identifier;
 use iggy_common::Validatable;
+use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
+use iggy_common::get_consumer_offset::GetConsumerOffset;
+use iggy_common::store_consumer_offset::StoreConsumerOffset;
 use std::sync::Arc;
 
 pub fn router(state: Arc<AppState>) -> Router {

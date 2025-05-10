@@ -25,9 +25,10 @@ use crate::cache::CacheWatcher;
 use actix_cors::Cors;
 use actix_files::{self as fs, NamedFile};
 use actix_web::{
+    App, HttpServer,
     http::header,
     middleware::{Compress, Logger},
-    web, App, HttpServer,
+    web,
 };
 use args::{IggyBenchDashboardServerArgs, PollGithub};
 use cache::BenchmarkCache;
@@ -36,10 +37,10 @@ use handlers::AppState;
 use std::sync::Arc;
 use tracing::{error, info};
 use tracing_subscriber::{
+    EnvFilter,
     fmt::{self, format::Format},
     layer::SubscriberExt,
     util::SubscriberInitExt,
-    EnvFilter,
 };
 
 #[derive(Clone)]

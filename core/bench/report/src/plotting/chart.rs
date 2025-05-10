@@ -17,6 +17,7 @@
  */
 
 use charming::{
+    Chart,
     component::{
         Axis, DataView, DataZoom, DataZoomType, Feature, Grid, Legend, LegendSelectedMode,
         LegendType, Restore, SaveAsImage, Title, Toolbox, ToolboxDataZoom,
@@ -26,7 +27,6 @@ use charming::{
         NameLocation, Orient, SplitLine, Symbol, TextAlign, TextStyle, Tooltip,
     },
     series::Line,
-    Chart,
 };
 
 pub struct IggyChart {

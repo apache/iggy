@@ -17,7 +17,7 @@
  */
 
 use crate::args::common::IggyBenchArgs;
-use integration::test_server::{IpAddrKind, TestServer, Transport, SYSTEM_PATH_ENV_VAR};
+use integration::test_server::{IpAddrKind, SYSTEM_PATH_ENV_VAR, TestServer, Transport};
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::{collections::HashMap, time::Instant};
@@ -126,7 +126,11 @@ pub async fn start_server_if_needed(args: &mut IggyBenchArgs) -> Option<TestServ
         test_server.start();
         let elapsed = now.elapsed();
         if elapsed.as_millis() > 1000 {
-            warn!("Test iggy-server started, pid: {}, startup took {} ms because it had to load messages from disk to cache", test_server.pid(), elapsed.as_millis());
+            warn!(
+                "Test iggy-server started, pid: {}, startup took {} ms because it had to load messages from disk to cache",
+                test_server.pid(),
+                elapsed.as_millis()
+            );
         } else {
             info!(
                 "Test iggy-server started, pid: {}, startup time: {} ms",

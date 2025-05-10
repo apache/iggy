@@ -16,8 +16,8 @@
  * under the License.
  */
 
-use crate::streaming::partitions::partition::{ConsumerOffset, Partition};
 use crate::streaming::partitions::COMPONENT;
+use crate::streaming::partitions::partition::{ConsumerOffset, Partition};
 use crate::streaming::polling_consumer::PollingConsumer;
 use dashmap::DashMap;
 use error_set::ErrContext;
@@ -32,9 +32,7 @@ impl Partition {
     ) -> Result<Option<u64>, IggyError> {
         trace!(
             "Getting consumer offset for {}, partition: {}, current: {}...",
-            consumer,
-            self.partition_id,
-            self.current_offset
+            consumer, self.partition_id, self.current_offset
         );
 
         match consumer {
@@ -62,10 +60,7 @@ impl Partition {
     ) -> Result<(), IggyError> {
         trace!(
             "Storing offset: {} for {}, partition: {}, current: {}...",
-            offset,
-            consumer,
-            self.partition_id,
-            self.current_offset
+            offset, consumer, self.partition_id, self.current_offset
         );
         if offset > self.current_offset {
             return Err(IggyError::InvalidOffset(offset));
@@ -132,9 +127,7 @@ impl Partition {
     pub async fn load_consumer_offsets(&mut self) -> Result<(), IggyError> {
         trace!(
             "Loading consumer offsets for partition with ID: {} for topic with ID: {} and stream with ID: {}...",
-            self.partition_id,
-            self.topic_id,
-            self.stream_id
+            self.partition_id, self.topic_id, self.stream_id
         );
         self.load_consumer_offsets_from_storage(ConsumerKind::Consumer)
             .await
@@ -179,14 +172,15 @@ impl Partition {
     }
 
     fn log_consumer_offset(&self, consumer_offset: &ConsumerOffset) {
-        trace!("Loaded consumer offset value: {} for {} with ID: {} for partition with ID: {} for topic with ID: {} and stream with ID: {}.",
-                consumer_offset.offset,
-                consumer_offset.kind,
-                consumer_offset.consumer_id,
-                self.partition_id,
-                self.topic_id,
-                self.stream_id
-            );
+        trace!(
+            "Loaded consumer offset value: {} for {} with ID: {} for partition with ID: {} for topic with ID: {} and stream with ID: {}.",
+            consumer_offset.offset,
+            consumer_offset.kind,
+            consumer_offset.consumer_id,
+            self.partition_id,
+            self.topic_id,
+            self.stream_id
+        );
     }
 
     pub async fn delete_consumer_offset(

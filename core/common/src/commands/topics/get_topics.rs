@@ -16,10 +16,10 @@
  * under the License.
  */
 
-use crate::error::IggyError;
 use crate::BytesSerializable;
 use crate::Identifier;
 use crate::Validatable;
+use crate::error::IggyError;
 use crate::{Command, GET_TOPICS_CODE};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};

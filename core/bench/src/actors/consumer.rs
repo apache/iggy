@@ -28,7 +28,7 @@ use bench_report::individual_metrics::BenchmarkIndividualMetrics;
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use human_repr::HumanCount;
 use iggy::prelude::*;
-use integration::test_server::{login_root, ClientFactory};
+use integration::test_server::{ClientFactory, login_root};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -255,8 +255,11 @@ impl BenchmarkConsumer {
 
                 if should_warn {
                     warn!(
-                    "Consumer #{} → Messages are empty for offset: {}, received {}, retrying... ({} warnings skipped)",
-                    self.consumer_id, offset, self.finish_condition.status(), skipped_warnings_count
+                        "Consumer #{} → Messages are empty for offset: {}, received {}, retrying... ({} warnings skipped)",
+                        self.consumer_id,
+                        offset,
+                        self.finish_condition.status(),
+                        skipped_warnings_count
                     );
                     last_warning_time = Some(Instant::now());
                     skipped_warnings_count = 0;

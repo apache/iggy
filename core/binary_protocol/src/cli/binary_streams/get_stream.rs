@@ -16,14 +16,14 @@
  * under the License.
  */
 
-use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
 use crate::Client;
+use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;
-use iggy_common::get_stream::GetStream;
 use iggy_common::Identifier;
-use tracing::{event, Level};
+use iggy_common::get_stream::GetStream;
+use tracing::{Level, event};
 
 pub struct GetStreamCmd {
     get_stream: GetStream,

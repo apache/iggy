@@ -16,11 +16,11 @@
  * under the License.
  */
 
+use crate::http::COMPONENT;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::mapper;
 use crate::http::shared::AppState;
-use crate::http::COMPONENT;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateConsumerGroupWithId;
 use crate::streaming::session::Session;
@@ -29,10 +29,10 @@ use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use error_set::ErrContext;
-use iggy_common::create_consumer_group::CreateConsumerGroup;
-use iggy_common::delete_consumer_group::DeleteConsumerGroup;
 use iggy_common::Identifier;
 use iggy_common::Validatable;
+use iggy_common::create_consumer_group::CreateConsumerGroup;
+use iggy_common::delete_consumer_group::DeleteConsumerGroup;
 use iggy_common::{ConsumerGroup, ConsumerGroupDetails};
 use std::sync::Arc;
 use tracing::instrument;

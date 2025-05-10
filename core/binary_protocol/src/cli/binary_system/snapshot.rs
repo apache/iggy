@@ -18,15 +18,15 @@
 
 use std::path::Path;
 
-use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
 use crate::Client;
+use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;
 use iggy_common::get_snapshot::GetSnapshot;
 use iggy_common::{SnapshotCompression, SystemSnapshotType};
 use tokio::io::AsyncWriteExt;
-use tracing::{event, Level};
+use tracing::{Level, event};
 
 pub struct GetSnapshotCmd {
     _get_snapshot: GetSnapshot,

@@ -17,7 +17,7 @@
  */
 
 use crate::{
-    error::IggyError, BytesSerializable, IggyMessage, IggyMessageHeader, IGGY_MESSAGE_HEADER_SIZE,
+    BytesSerializable, IGGY_MESSAGE_HEADER_SIZE, IggyMessage, IggyMessageHeader, error::IggyError,
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};

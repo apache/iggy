@@ -16,12 +16,12 @@
 // under the License.
 
 use crate::{cache::BenchmarkCache, error::IggyBenchDashboardServerError};
-use actix_web::{get, web, HttpRequest, HttpResponse};
+use actix_web::{HttpRequest, HttpResponse, get, web};
 use std::sync::Arc;
 use tracing::{info, warn};
 use uuid::Uuid;
 use walkdir::WalkDir;
-use zip::{write::FileOptions, ZipWriter};
+use zip::{ZipWriter, write::FileOptions};
 
 type Result<T> = std::result::Result<T, IggyBenchDashboardServerError>;
 

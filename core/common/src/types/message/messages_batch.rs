@@ -17,8 +17,8 @@
  */
 
 use crate::{
-    error::IggyError, BytesSerializable, IggyByteSize, IggyIndexes, IggyMessage, IggyMessageView,
-    IggyMessageViewIterator, Sizeable, Validatable, INDEX_SIZE, MAX_PAYLOAD_SIZE,
+    BytesSerializable, INDEX_SIZE, IggyByteSize, IggyIndexes, IggyMessage, IggyMessageView,
+    IggyMessageViewIterator, MAX_PAYLOAD_SIZE, Sizeable, Validatable, error::IggyError,
 };
 use bytes::{BufMut, Bytes, BytesMut};
 use std::ops::{Deref, Index};

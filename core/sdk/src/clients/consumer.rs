@@ -29,8 +29,8 @@ use iggy_common::{
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::time;
@@ -294,7 +294,9 @@ impl IggyConsumer {
 
             loop {
                 if stream_exists && topic_exists {
-                    info!("Stream: {stream_id} and topic: {topic_id} were found. Initializing consumer...",);
+                    info!(
+                        "Stream: {stream_id} and topic: {topic_id} were found. Initializing consumer...",
+                    );
                     break;
                 }
 
@@ -304,7 +306,9 @@ impl IggyConsumer {
 
                 retries += 1;
                 if !stream_exists {
-                    warn!("Stream: {stream_id} does not exist. Retrying ({retries}/{init_retries}) in {interval}...",);
+                    warn!(
+                        "Stream: {stream_id} does not exist. Retrying ({retries}/{init_retries}) in {interval}...",
+                    );
                     timer.tick().await;
                     stream_exists = client.get_stream(&stream_id).await?.is_some();
                 }
@@ -318,7 +322,9 @@ impl IggyConsumer {
                     break;
                 }
 
-                warn!("Topic: {topic_id} does not exist in stream: {stream_id}. Retrying ({retries}/{init_retries}) in {interval}...",);
+                warn!(
+                    "Topic: {topic_id} does not exist in stream: {stream_id}. Retrying ({retries}/{init_retries}) in {interval}...",
+                );
                 timer.tick().await;
             }
 
@@ -358,7 +364,9 @@ impl IggyConsumer {
 
         tokio::spawn(async move {
             while let Ok((partition_id, offset)) = store_offset_receiver.recv_async().await {
-                trace!("Received offset to store: {offset}, partition ID: {partition_id}, stream: {stream_id}, topic: {topic_id}");
+                trace!(
+                    "Received offset to store: {offset}, partition ID: {partition_id}, stream: {stream_id}, topic: {topic_id}"
+                );
                 _ = Self::store_consumer_offset(
                     &client,
                     &consumer,
@@ -392,7 +400,9 @@ impl IggyConsumer {
         last_stored_offsets: &DashMap<u32, AtomicU64>,
         allow_replay: bool,
     ) -> Result<(), IggyError> {
-        trace!("Storing offset: {offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}...");
+        trace!(
+            "Storing offset: {offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}..."
+        );
         let stored_offset;
         if let Some(offset_entry) = last_stored_offsets.get(&partition_id) {
             stored_offset = offset_entry.load(ORDERING);
@@ -402,7 +412,9 @@ impl IggyConsumer {
         }
 
         if !allow_replay && (offset <= stored_offset && offset >= 1) {
-            trace!("Offset: {offset} is less than or equal to the last stored offset: {stored_offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}. Skipping storing the offset.");
+            trace!(
+                "Offset: {offset} is less than or equal to the last stored offset: {stored_offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}. Skipping storing the offset."
+            );
             return Ok(());
         }
 
@@ -411,10 +423,14 @@ impl IggyConsumer {
             .store_consumer_offset(consumer, stream_id, topic_id, Some(partition_id), offset)
             .await
         {
-            error!("Failed to store offset: {offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}. {error}");
+            error!(
+                "Failed to store offset: {offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}. {error}"
+            );
             return Err(error);
         }
-        trace!("Stored offset: {offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}.");
+        trace!(
+            "Stored offset: {offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}."
+        );
         if let Some(last_offset_entry) = last_stored_offsets.get(&partition_id) {
             last_offset_entry.store(offset, ORDERING);
         } else {
@@ -454,7 +470,9 @@ impl IggyConsumer {
 
     pub(crate) fn send_store_offset(&self, partition_id: u32, offset: u64) {
         if let Err(error) = self.store_offset_sender.send((partition_id, offset)) {
-            error!("Failed to send offset to store: {error}, please verify if `init()` on IggyConsumer object has been called.");
+            error!(
+                "Failed to send offset to store: {error}, please verify if `init()` on IggyConsumer object has been called."
+            );
         }
     }
 
@@ -549,7 +567,9 @@ impl IggyConsumer {
                             continue;
                         }
 
-                        info!("Rejoining consumer group: {consumer_name} for stream: {stream_id}, topic: {topic_id}...");
+                        info!(
+                            "Rejoining consumer group: {consumer_name} for stream: {stream_id}, topic: {topic_id}..."
+                        );
                         if let Err(error) = Self::initialize_consumer_group(
                             client.clone(),
                             create_consumer_group_if_not_exists,
@@ -561,10 +581,14 @@ impl IggyConsumer {
                         )
                         .await
                         {
-                            error!("Failed to join consumer group: {consumer_name} for stream: {stream_id}, topic: {topic_id}. {error}");
+                            error!(
+                                "Failed to join consumer group: {consumer_name} for stream: {stream_id}, topic: {topic_id}. {error}"
+                            );
                             continue;
                         }
-                        info!("Rejoined consumer group: {consumer_name} for stream: {stream_id}, topic: {topic_id}");
+                        info!(
+                            "Rejoined consumer group: {consumer_name} for stream: {stream_id}, topic: {topic_id}"
+                        );
                         can_poll.store(true, ORDERING);
                     }
                     DiagnosticEvent::SignedOut => {
@@ -578,7 +602,7 @@ impl IggyConsumer {
 
     fn create_poll_messages_future(
         &self,
-    ) -> impl Future<Output = Result<PolledMessages, IggyError>> {
+    ) -> impl Future<Output = Result<PolledMessages, IggyError>> + use<> {
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
         let partition_id = self.partition_id;
@@ -673,9 +697,13 @@ impl IggyConsumer {
                 if !allow_replay
                     && (has_consumed_offset && polled_messages.current_offset == consumed_offset)
                 {
-                    trace!("No new messages to consume in partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}, consumer: {consumer}");
+                    trace!(
+                        "No new messages to consume in partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}, consumer: {consumer}"
+                    );
                     if auto_commit_enabled && stored_offset < consumed_offset {
-                        trace!("Auto-committing the offset: {consumed_offset} in partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}, consumer: {consumer}");
+                        trace!(
+                            "Auto-committing the offset: {consumed_offset} in partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}, consumer: {consumer}"
+                        );
                         client
                             .read()
                             .await
@@ -732,7 +760,9 @@ impl IggyConsumer {
         }
 
         let remaining = interval - elapsed;
-        trace!("Waiting for {remaining} microseconds before polling messages... {interval} - {elapsed} = {remaining}");
+        trace!(
+            "Waiting for {remaining} microseconds before polling messages... {interval} - {elapsed} = {remaining}"
+        );
         sleep(Duration::from_micros(remaining)).await;
     }
 
@@ -756,7 +786,9 @@ impl IggyConsumer {
         };
 
         let consumer_group_id = name.to_owned().try_into()?;
-        trace!("Validating consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}");
+        trace!(
+            "Validating consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}"
+        );
         if client
             .get_consumer_group(&stream_id, &topic_id, &consumer_group_id)
             .await?
@@ -770,19 +802,25 @@ impl IggyConsumer {
                 ));
             }
 
-            info!("Creating consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}");
+            info!(
+                "Creating consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}"
+            );
             client
                 .create_consumer_group(&stream_id, &topic_id, &name, id)
                 .await?;
         }
 
-        info!("Joining consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}",);
+        info!(
+            "Joining consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}",
+        );
         if let Err(error) = client
             .join_consumer_group(&stream_id, &topic_id, &consumer_group_id)
             .await
         {
             joined_consumer_group.store(false, ORDERING);
-            error!("Failed to join consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}: {error}");
+            error!(
+                "Failed to join consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}: {error}"
+            );
             return Err(error);
         }
 
@@ -876,7 +914,10 @@ impl Stream for IggyConsumer {
                                 let payload = encryptor.decrypt(&message.payload);
                                 if payload.is_err() {
                                     self.poll_future = None;
-                                    error!("Failed to decrypt the message payload at offset: {}, partition ID: {}", message.header.offset, partition_id);
+                                    error!(
+                                        "Failed to decrypt the message payload at offset: {}, partition ID: {}",
+                                        message.header.offset, partition_id
+                                    );
                                     let error = payload.unwrap_err();
                                     return Poll::Ready(Some(Err(error)));
                                 }

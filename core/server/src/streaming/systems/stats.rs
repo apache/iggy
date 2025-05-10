@@ -16,9 +16,9 @@
  * under the License.
  */
 
+use crate::VERSION;
 use crate::streaming::systems::system::System;
 use crate::versioning::SemanticVersion;
-use crate::VERSION;
 use iggy_common::locking::IggySharedMutFn;
 use iggy_common::{IggyDuration, IggyError, Stats};
 use std::sync::OnceLock;

@@ -27,7 +27,7 @@ use crate::{
 };
 use bench_report::{benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics};
 use iggy::prelude::*;
-use integration::test_server::{login_root, ClientFactory};
+use integration::test_server::{ClientFactory, login_root};
 use std::{future::Future, sync::Arc};
 use tracing::{error, info};
 
@@ -106,7 +106,7 @@ pub fn build_producer_futures(
     client_factory: &Arc<dyn ClientFactory>,
     args: &IggyBenchArgs,
 ) -> Result<
-    Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send>,
+    Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send + use<>>,
     IggyError,
 > {
     let streams = args.streams();
@@ -163,7 +163,7 @@ pub fn build_consumer_futures(
     client_factory: &Arc<dyn ClientFactory>,
     args: &IggyBenchArgs,
 ) -> Result<
-    Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send>,
+    Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send + use<>>,
     IggyError,
 > {
     let start_stream_id = args.start_stream_id();

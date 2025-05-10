@@ -22,9 +22,9 @@ use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
+use iggy_common::IggyError;
 use iggy_common::get_client::GetClient;
 use iggy_common::locking::IggySharedMutFn;
-use iggy_common::IggyError;
 use tracing::debug;
 
 impl ServerCommandHandler for GetClient {

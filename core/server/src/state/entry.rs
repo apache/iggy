@@ -20,7 +20,7 @@ use crate::state::command::EntryCommand;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
-use iggy_common::{calculate_checksum, BytesSerializable};
+use iggy_common::{BytesSerializable, calculate_checksum};
 use std::fmt::{Display, Formatter};
 
 /// State entry in the log

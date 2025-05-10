@@ -16,13 +16,13 @@
  * under the License.
  */
 
-use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
 use crate::Client;
+use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
-use iggy_common::create_partitions::CreatePartitions;
 use iggy_common::Identifier;
-use tracing::{event, Level};
+use iggy_common::create_partitions::CreatePartitions;
+use tracing::{Level, event};
 
 pub struct CreatePartitionsCmd {
     create_partition: CreatePartitions,

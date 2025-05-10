@@ -17,7 +17,7 @@
  */
 
 use crate::cli::common::{
-    IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestUserId, CLAP_INDENT,
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestUserId,
     USAGE_PREFIX,
 };
 use assert_cmd::assert::Assert;
@@ -88,8 +88,10 @@ impl IggyCmdTestCase for TestUserNameCmd {
             TestUserId::Numeric => &numeric_id,
         };
 
-        let message = format!("Executing update user with ID: {} with username: {}\nUser with ID: {} updated with username: {}\n",
-                                      identifier, self.new_username, identifier, self.new_username);
+        let message = format!(
+            "Executing update user with ID: {} with username: {}\nUser with ID: {} updated with username: {}\n",
+            identifier, self.new_username, identifier, self.new_username
+        );
 
         command_state.success().stdout(diff(message));
     }

@@ -19,7 +19,7 @@ use crate::components::chart::single_chart::SingleChart;
 use crate::components::chart::trend_chart::TrendChart;
 use crate::components::layout::topbar::TopBar;
 use crate::state::benchmark::use_benchmark;
-use crate::state::ui::{use_ui, ViewMode};
+use crate::state::ui::{ViewMode, use_ui};
 use yew::prelude::*;
 
 #[derive(Properties, PartialEq)]

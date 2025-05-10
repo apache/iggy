@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::{IggyIndexView, INDEX_SIZE};
+use crate::{INDEX_SIZE, IggyIndexView};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_with::base64::Base64;

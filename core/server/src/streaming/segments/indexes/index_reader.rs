@@ -20,14 +20,14 @@ use super::IggyIndexesMut;
 use crate::streaming::utils::PooledBuffer;
 use bytes::BytesMut;
 use error_set::ErrContext;
-use iggy_common::{IggyError, IggyIndex, IggyIndexView, INDEX_SIZE};
+use iggy_common::{INDEX_SIZE, IggyError, IggyIndex, IggyIndexView};
 use std::{
     fs::File as StdFile,
     io::ErrorKind,
     os::unix::fs::FileExt,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
 };
 use tokio::fs::OpenOptions;
@@ -123,8 +123,7 @@ impl IndexReader {
         if relative_start_offset >= total_indexes {
             trace!(
                 "Start offset {} is out of bounds. Total indexes: {}",
-                relative_start_offset,
-                total_indexes
+                relative_start_offset, total_indexes
             );
             return Ok(None);
         }
@@ -135,8 +134,7 @@ impl IndexReader {
         if actual_count == 0 {
             trace!(
                 "No available indexes to load. Start offset: {}, requested count: {}",
-                relative_start_offset,
-                count
+                relative_start_offset, count
             );
             return Ok(None);
         }
@@ -178,9 +176,7 @@ impl IndexReader {
 
         trace!(
             "Loaded {} indexes from disk starting at offset {}, base position: {}",
-            actual_count,
-            relative_start_offset,
-            base_position
+            actual_count, relative_start_offset, base_position
         );
 
         Ok(Some(IggyIndexesMut::from_bytes(
@@ -220,8 +216,7 @@ impl IndexReader {
         if actual_count == 0 {
             trace!(
                 "No available indexes to load. Start index pos: {}, requested count: {}",
-                start_index_pos,
-                count
+                start_index_pos, count
             );
             return Ok(None);
         }
@@ -261,9 +256,7 @@ impl IndexReader {
 
         trace!(
             "Loaded {} indexes from disk starting at timestamp {}, base position: {}",
-            actual_count,
-            timestamp,
-            base_position
+            actual_count, timestamp, base_position
         );
 
         Ok(Some(IggyIndexesMut::from_bytes(
@@ -370,8 +363,7 @@ impl IndexReader {
         if position >= total_indexes {
             trace!(
                 "Index position {} is out of bounds. Total indexes: {}",
-                position,
-                total_indexes
+                position, total_indexes
             );
             return Ok(None);
         }

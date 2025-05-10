@@ -20,9 +20,9 @@ use crate::components::selectors::benchmark_selector::BenchmarkSelector;
 use crate::components::selectors::gitref_selector::GitrefSelector;
 use crate::components::selectors::hardware_selector::HardwareSelector;
 use crate::components::selectors::view_mode_selector::ViewModeSelector;
-use crate::state::benchmark::{use_benchmark, BenchmarkAction};
+use crate::state::benchmark::{BenchmarkAction, use_benchmark};
 use crate::state::gitref::use_gitref;
-use crate::state::ui::{use_ui, ViewMode};
+use crate::state::ui::{ViewMode, use_ui};
 use bench_report::benchmark_kind::BenchmarkKind;
 use yew::prelude::*;
 

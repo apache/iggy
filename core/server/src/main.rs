@@ -119,7 +119,7 @@ async fn main() -> Result<(), ServerError> {
 
     #[cfg(unix)]
     let (mut ctrl_c, mut sigterm) = {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         (
             signal(SignalKind::interrupt())?,
             signal(SignalKind::terminate())?,

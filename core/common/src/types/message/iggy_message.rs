@@ -16,13 +16,13 @@
  * under the License.
  */
 
-use super::message_header::{IggyMessageHeader, IGGY_MESSAGE_HEADER_SIZE};
+use super::message_header::{IGGY_MESSAGE_HEADER_SIZE, IggyMessageHeader};
 use super::user_headers::get_user_headers_size;
+use crate::BytesSerializable;
+use crate::Sizeable;
 use crate::error::IggyError;
 use crate::utils::byte_size::IggyByteSize;
 use crate::utils::timestamp::IggyTimestamp;
-use crate::BytesSerializable;
-use crate::Sizeable;
 use crate::{HeaderKey, HeaderValue};
 use bon::bon;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -541,7 +541,7 @@ impl Serialize for IggyMessage {
     where
         S: Serializer,
     {
-        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
         use serde::ser::SerializeStruct;
 
         let field_count = 2 + self.user_headers.is_some() as usize;
@@ -594,7 +594,7 @@ impl<'de> Deserialize<'de> for IggyMessage {
                         }
                         "payload" => {
                             let payload_str: String = map.next_value()?;
-                            use base64::{engine::general_purpose::STANDARD, Engine as _};
+                            use base64::{Engine as _, engine::general_purpose::STANDARD};
                             let decoded = STANDARD.decode(payload_str.as_bytes()).map_err(|e| {
                                 de::Error::custom(format!("Failed to decode base64: {}", e))
                             })?;

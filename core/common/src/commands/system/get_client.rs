@@ -16,9 +16,9 @@
  * under the License.
  */
 
-use crate::error::IggyError;
 use crate::BytesSerializable;
 use crate::Validatable;
+use crate::error::IggyError;
 use crate::{Command, GET_CLIENT_CODE};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};

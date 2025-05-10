@@ -16,9 +16,9 @@
  * under the License.
  */
 
+use crate::Identifier;
 use crate::error::IggyError;
 use crate::types::message::IggyMessage;
-use crate::Identifier;
 use std::fmt::Debug;
 
 /// The trait represent the logic responsible for calculating the partition ID and is used by the `IggyClient`.

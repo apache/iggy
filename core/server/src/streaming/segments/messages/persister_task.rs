@@ -18,11 +18,11 @@
 
 use crate::streaming::segments::IggyMessagesBatchSet;
 use error_set::ErrContext;
-use flume::{unbounded, Receiver};
+use flume::{Receiver, unbounded};
 use std::{
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -193,9 +193,9 @@ impl PersisterTask {
                         }
                         Err(e) => {
                             error!(
-                            "Failed to persist data in LogPersisterTask for file {file_path}: {:?}",
-                            e
-                        )
+                                "Failed to persist data in LogPersisterTask for file {file_path}: {:?}",
+                                e
+                            )
                         }
                     }
                 }

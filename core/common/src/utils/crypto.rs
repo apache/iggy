@@ -16,8 +16,8 @@
  * under the License.
  */
 
-use crate::text;
 use crate::IggyError;
+use crate::text;
 use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::aead::{Aead, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, KeyInit};

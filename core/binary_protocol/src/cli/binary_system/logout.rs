@@ -16,12 +16,12 @@
  * under the License.
  */
 
+use crate::Client;
 use crate::cli::binary_system::session::ServerSession;
 use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
-use crate::Client;
 use anyhow::Context;
 use async_trait::async_trait;
-use tracing::{event, Level};
+use tracing::{Level, event};
 
 pub struct LogoutCmd {
     server_session: ServerSession,

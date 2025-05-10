@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::state::ui::{use_ui, UiAction, ViewMode};
+use crate::state::ui::{UiAction, ViewMode, use_ui};
 use yew::prelude::*;
 
 #[function_component(ViewModeSelector)]

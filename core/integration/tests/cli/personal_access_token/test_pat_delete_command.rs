@@ -56,8 +56,10 @@ impl IggyCmdTestCase for TestPatDeleteCmd {
     }
 
     fn verify_command(&self, command_state: Assert) {
-        let message = format!("Executing delete personal access tokens with name: {}\nPersonal access token with name: {} deleted\n",
-                                self.name, self.name);
+        let message = format!(
+            "Executing delete personal access tokens with name: {}\nPersonal access token with name: {} deleted\n",
+            self.name, self.name
+        );
 
         command_state.success().stdout(diff(message));
     }

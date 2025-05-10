@@ -17,8 +17,8 @@
  */
 
 use crate::cli::common::{
-    IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId, TestTopicId,
-    CLAP_INDENT, USAGE_PREFIX,
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId,
+    TestTopicId, USAGE_PREFIX,
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
@@ -200,8 +200,10 @@ impl IggyCmdTestCase for TestMessageSendCmd {
             TestTopicId::Named => self.topic_name.clone(),
         };
 
-        let message = format!("Executing send messages to topic with ID: {} and stream with ID: {}\nSent messages to topic with ID: {} and stream with ID: {}\n",
-            topic_id, stream_id, topic_id, stream_id);
+        let message = format!(
+            "Executing send messages to topic with ID: {} and stream with ID: {}\nSent messages to topic with ID: {} and stream with ID: {}\n",
+            topic_id, stream_id, topic_id, stream_id
+        );
 
         command_state.success().stdout(diff(message));
     }

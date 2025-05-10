@@ -16,10 +16,10 @@
  * under the License.
  */
 
+use crate::http::COMPONENT;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::shared::AppState;
-use crate::http::COMPONENT;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use axum::extract::{Path, Query, State};
@@ -27,10 +27,10 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Extension, Json, Router};
 use error_set::ErrContext;
-use iggy_common::create_partitions::CreatePartitions;
-use iggy_common::delete_partitions::DeletePartitions;
 use iggy_common::Identifier;
 use iggy_common::Validatable;
+use iggy_common::create_partitions::CreatePartitions;
+use iggy_common::delete_partitions::DeletePartitions;
 use std::sync::Arc;
 use tracing::instrument;
 

@@ -20,9 +20,9 @@ use crate::channels::server_command::BackgroundServerCommand;
 use crate::configs::server::HeartbeatConfig;
 use crate::streaming::systems::system::SharedSystem;
 use flume::Sender;
-use iggy_common::locking::IggySharedMutFn;
 use iggy_common::IggyDuration;
 use iggy_common::IggyTimestamp;
+use iggy_common::locking::IggySharedMutFn;
 use tokio::time;
 use tracing::{debug, error, info, instrument, warn};
 
@@ -99,16 +99,14 @@ impl BackgroundServerCommand<VerifyHeartbeatsCommand> for VerifyHeartbeatsExecut
             if client.last_heartbeat.as_micros() < heartbeat_to.as_micros() {
                 warn!(
                     "Stale client session: {}, last heartbeat at: {}, max allowed timestamp: {heartbeat_to}",
-                    client.session,
-                    client.last_heartbeat,
+                    client.session, client.last_heartbeat,
                 );
                 client.session.set_stale();
                 stale_clients.push(client.session.client_id);
             } else {
                 debug!(
                     "Valid heartbeat at: {} for client session: {}, max allowed timestamp: {heartbeat_to}",
-                    client.last_heartbeat,
-                    client.session,
+                    client.last_heartbeat, client.session,
                 );
             }
         }

@@ -17,15 +17,15 @@
  */
 
 use crate::server::scenarios::{
-    cleanup, create_client, get_consumer_group, join_consumer_group, CONSUMER_GROUP_ID,
-    CONSUMER_GROUP_NAME, MESSAGES_COUNT, PARTITIONS_COUNT, STREAM_ID, STREAM_NAME, TOPIC_ID,
-    TOPIC_NAME,
+    CONSUMER_GROUP_ID, CONSUMER_GROUP_NAME, MESSAGES_COUNT, PARTITIONS_COUNT, STREAM_ID,
+    STREAM_NAME, TOPIC_ID, TOPIC_NAME, cleanup, create_client, get_consumer_group,
+    join_consumer_group,
 };
 use iggy::prelude::*;
 use integration::test_server::{
-    assert_clean_system, create_user, login_root, login_user, ClientFactory,
+    ClientFactory, assert_clean_system, create_user, login_root, login_user,
 };
-use std::str::{from_utf8, FromStr};
+use std::str::{FromStr, from_utf8};
 
 pub async fn run(client_factory: &dyn ClientFactory) {
     let system_client = create_client(client_factory).await;

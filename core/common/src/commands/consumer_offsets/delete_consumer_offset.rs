@@ -16,11 +16,11 @@
  * under the License.
  */
 
-use crate::error::IggyError;
 use crate::BytesSerializable;
 use crate::Identifier;
 use crate::Sizeable;
 use crate::Validatable;
+use crate::error::IggyError;
 use crate::{Command, DELETE_CONSUMER_OFFSET_CODE};
 use crate::{Consumer, ConsumerKind};
 use bytes::{BufMut, Bytes, BytesMut};

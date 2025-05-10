@@ -17,8 +17,9 @@
  */
 
 use crate::{
+    BytesSerializable, Identifier, Validatable,
     error::IggyError,
-    BytesSerializable, Identifier, Validatable, {Command, FLUSH_UNSAVED_BUFFER_CODE},
+    {Command, FLUSH_UNSAVED_BUFFER_CODE},
 };
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
@@ -39,11 +40,7 @@ pub struct FlushUnsavedBuffer {
 
 impl FlushUnsavedBuffer {
     fn fsync_stringified(&self) -> &'static str {
-        if self.fsync {
-            "f"
-        } else {
-            "n"
-        }
+        if self.fsync { "f" } else { "n" }
     }
 }
 

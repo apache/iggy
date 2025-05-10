@@ -16,12 +16,12 @@
  * under the License.
  */
 
+use crate::BytesSerializable;
+use crate::Validatable;
 use crate::defaults::*;
 use crate::error::IggyError;
 use crate::utils::expiry::IggyExpiry;
-use crate::BytesSerializable;
-use crate::Validatable;
-use crate::{Command, CREATE_PERSONAL_ACCESS_TOKEN_CODE};
+use crate::{CREATE_PERSONAL_ACCESS_TOKEN_CODE, Command};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};

@@ -22,8 +22,8 @@ use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
-use iggy_common::get_user::GetUser;
 use iggy_common::IggyError;
+use iggy_common::get_user::GetUser;
 use tracing::debug;
 
 impl ServerCommandHandler for GetUser {

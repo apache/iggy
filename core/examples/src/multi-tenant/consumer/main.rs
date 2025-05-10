@@ -18,8 +18,8 @@
 
 use ahash::AHashMap;
 use clap::Parser;
-use futures_util::future::join_all;
 use futures_util::StreamExt;
+use futures_util::future::join_all;
 use iggy::prelude::*;
 use iggy_examples::shared::args::Args;
 use std::collections::HashMap;
@@ -100,7 +100,9 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
         .parse::<bool>()
         .expect("Invalid ensure stream access");
 
-    print_info(&format!("Multi-tenant consumers has started, tenants: {tenants_count}, consumers: {consumers_count}"));
+    print_info(&format!(
+        "Multi-tenant consumers has started, tenants: {tenants_count}, consumers: {consumers_count}"
+    ));
     let address = args.tcp_server_address;
 
     print_info("Creating root client to manage streams and users");
@@ -246,14 +248,20 @@ fn start_consumers(tenant_id: u32, consumers: Vec<TenantConsumer>) -> Vec<JoinHa
                     let payload = std::str::from_utf8(&message.message.payload);
                     if payload.is_err() {
                         let error = payload.unwrap_err();
-                        error!("Error while decoding the message payload at offset: {offset}, partition ID: {partition_id}, perhaps it's encrypted? {error}");
+                        error!(
+                            "Error while decoding the message payload at offset: {offset}, partition ID: {partition_id}, perhaps it's encrypted? {error}"
+                        );
                         continue;
                     }
 
                     let payload = payload.unwrap();
-                    info!("Tenant: {tenant_id} consumer: {consumer_id} received: {payload} from partition: {partition_id}, topic: {topic}, stream: {stream}, at offset: {offset}, current offset: {current_offset}");
+                    info!(
+                        "Tenant: {tenant_id} consumer: {consumer_id} received: {payload} from partition: {partition_id}, topic: {topic}, stream: {stream}, at offset: {offset}, current offset: {current_offset}"
+                    );
                 } else if let Err(error) = message {
-                    error!("Error while handling message: {error} by tenant: {tenant_id} consumer: {consumer_id}, topic: {topic}, stream: {stream}");
+                    error!(
+                        "Error while handling message: {error} by tenant: {tenant_id} consumer: {consumer_id}, topic: {topic}, stream: {stream}"
+                    );
                     continue;
                 }
             }

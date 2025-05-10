@@ -17,7 +17,7 @@
  */
 
 use crate::state::command::EntryCommand;
-use crate::state::{State, StateEntry, COMPONENT};
+use crate::state::{COMPONENT, State, StateEntry};
 use crate::streaming::persistence::persister::PersisterKind;
 use crate::streaming::utils::file;
 use crate::versioning::SemanticVersion;
@@ -30,8 +30,8 @@ use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
 use std::fmt::Debug;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use tokio::io::{AsyncReadExt, BufReader};
 use tracing::{debug, error, info};
 

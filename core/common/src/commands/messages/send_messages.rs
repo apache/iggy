@@ -16,17 +16,17 @@
  * under the License.
  */
 
-use crate::error::IggyError;
-use crate::types::message::partitioning::Partitioning;
 use crate::BytesSerializable;
 use crate::Identifier;
 use crate::IggyMessageView;
 use crate::PartitioningKind;
 use crate::Sizeable;
 use crate::Validatable;
+use crate::error::IggyError;
+use crate::types::message::partitioning::Partitioning;
 use crate::{Command, SEND_MESSAGES_CODE};
-use crate::{IggyMessage, IggyMessagesBatch, INDEX_SIZE};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use crate::{INDEX_SIZE, IggyMessage, IggyMessagesBatch};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeStruct;

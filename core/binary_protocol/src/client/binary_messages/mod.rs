@@ -19,8 +19,8 @@ use crate::utils::auth::fail_if_not_authenticated;
 use crate::{BinaryClient, MessageClient};
 use iggy_common::{
     BytesSerializable, Consumer, FlushUnsavedBuffer, Identifier, IggyError, IggyMessage,
-    Partitioning, PollMessages, PolledMessages, PollingStrategy, SendMessages, POLL_MESSAGES_CODE,
-    SEND_MESSAGES_CODE,
+    POLL_MESSAGES_CODE, Partitioning, PollMessages, PolledMessages, PollingStrategy,
+    SEND_MESSAGES_CODE, SendMessages,
 };
 
 #[async_trait::async_trait]

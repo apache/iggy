@@ -18,7 +18,7 @@
 
 use crate::analytics::time_series::{
     calculator::TimeSeriesCalculator,
-    processors::{moving_average::MovingAverageProcessor, TimeSeriesProcessor},
+    processors::{TimeSeriesProcessor, moving_average::MovingAverageProcessor},
 };
 use bench_report::{
     actor_kind::ActorKind, group_metrics::BenchmarkGroupMetrics,
