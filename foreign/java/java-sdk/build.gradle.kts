@@ -21,6 +21,7 @@ plugins {
     id("java-library")
     id("maven-publish")
     id("org.jreleaser") version ("1.14.0")
+    id("checkstyle")
 }
 
 group = "rs.iggy"
@@ -33,6 +34,11 @@ repositories {
 java {
     withJavadocJar()
     withSourcesJar()
+}
+
+checkstyle {
+    toolVersion = "10.23.1"
+    configFile = file("../dev-support/checkstyle/checkstyle.xml")
 }
 
 dependencies {
