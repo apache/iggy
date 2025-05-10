@@ -44,7 +44,7 @@ async function* genAutoCommitedPoll(
 
     const k = `${r.partitionId}`;
     let part = state.get(k) || 0;    
-    part = r.messageCount;
+    part = r.count;
     state.set(k, part);
 
     if (Array.from(state).every(([, last]) => last === 0)) {
