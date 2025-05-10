@@ -18,6 +18,7 @@
 use crate::{
     api,
     components::layout::{main_content::MainContent, sidebar::Sidebar},
+    router::AppRoute,
     state::{
         benchmark::{use_benchmark, BenchmarkAction, BenchmarkContext},
         gitref::{use_gitref, GitrefAction, GitrefContext},
@@ -28,7 +29,7 @@ use crate::{
 use gloo::console::log;
 use urlencoding::decode;
 use yew::prelude::*;
-use yew_router::hooks::use_location;
+use yew_router::hooks::{use_location, use_route};
 
 // Props definitions
 #[derive(Properties, PartialEq)]
@@ -171,6 +172,63 @@ pub fn app_content() -> Html {
     let is_dark = theme_ctx.0;
     let theme_toggle = theme_ctx.1;
     let location = use_location().expect("Should have <BrowserRouter> in the tree");
+    let route = use_route::<AppRoute>().expect("AppRoute not found");
+
+    let uuid_option = match &route {
+        AppRoute::Benchmark { uuid } => Some(uuid.clone()),
+        _ => None,
+    };
+
+    let benchmark_ctx_clone = benchmark_ctx.clone();
+    let hardware_ctx_clone = hardware_ctx.clone();
+    let gitref_ctx_clone = gitref_ctx.clone();
+
+    use_effect_with(uuid_option.clone(), move |uuid_opt| {
+        if let Some(uuid) = uuid_opt {
+            let uuid = uuid.clone();
+            let benchmark_ctx = benchmark_ctx_clone.clone();
+            let hardware_ctx = hardware_ctx_clone.clone();
+            let gitref_ctx = gitref_ctx_clone.clone();
+
+            log!(format!("Loading benchmark by UUID from URL: {}", uuid));
+
+            let already_loaded = benchmark_ctx
+                .state
+                .selected_benchmark
+                .as_ref()
+                .map(|b| b.uuid.to_string() == uuid)
+                .unwrap_or(false);
+
+            if !already_loaded {
+                yew::platform::spawn_local(async move {
+                    match api::fetch_benchmark_by_uuid(&uuid).await {
+                        Ok(benchmark) => {
+                            log!(format!("Successfully loaded benchmark from URL: {}", uuid));
+
+                            hardware_ctx
+                                .dispatch
+                                .emit(HardwareAction::SelectHardware(Some(
+                                    benchmark.hardware.identifier.clone().unwrap(),
+                                )));
+
+                            if let Some(gr) = &benchmark.params.gitref {
+                                gitref_ctx
+                                    .dispatch
+                                    .emit(GitrefAction::SetSelectedGitref(Some(gr.clone())));
+                            }
+
+                            benchmark_ctx
+                                .dispatch
+                                .emit(BenchmarkAction::SelectBenchmark(Box::new(Some(benchmark))));
+                        }
+                        Err(e) => log!(format!("Error loading benchmark by UUID from URL: {}", e)),
+                    }
+                });
+            }
+        }
+
+        || ()
+    });
 
     use_init_hardware(hardware_ctx.clone());
 
@@ -180,8 +238,16 @@ pub fn app_content() -> Html {
         let benchmark_ctx = benchmark_ctx.clone();
         let ui_state = ui_state.clone();
         let query_str = location.query_str().to_string();
+        let has_uuid = uuid_option.is_some();
 
         use_effect_with((), move |_| {
+            let empty_cleanup = || ();
+
+            if has_uuid {
+                log!("Skipping query param processing because UUID is already in the URL");
+                return empty_cleanup;
+            }
+
             let search = query_str.clone();
             let (hw_opt, gitref_opt, meas_opt, pid_opt) = parse_query_params_from_str(&search);
             if hw_opt.is_none() && gitref_opt.is_none() && meas_opt.is_none() && pid_opt.is_none() {
@@ -232,7 +298,7 @@ pub fn app_content() -> Html {
                 }
             }
 
-            || ()
+            empty_cleanup
         });
     }
 
