@@ -126,6 +126,42 @@ pub async fn fetch_benchmarks_for_hardware_and_gitref(
         .map_err(|e| IggyBenchDashboardError::Parse(e.to_string()))
 }
 
+pub async fn fetch_benchmark_by_uuid(uuid: &str) -> Result<BenchmarkReportLight> {
+    check_server_health().await?;
+
+    log!(format!("Fetching benchmark for UUID: {}", uuid));
+    let base_url = get_api_base_url();
+    let url = format!("{}/api/benchmark/light/{}", base_url, uuid);
+    let response = Request::get(&url).send().await.map_err(|e| {
+        log!(format!("Network error fetching benchmark: {}", e));
+        IggyBenchDashboardError::Network(e.to_string())
+    })?;
+
+    if response.status() != 200 {
+        return Err(IggyBenchDashboardError::Server(format!(
+            "Failed to fetch benchmark: {}",
+            response.status()
+        )));
+    }
+
+    let text = response.text().await.map_err(|e| {
+        log!(format!("Error getting response text: {}", e));
+        IggyBenchDashboardError::Parse(e.to_string())
+    })?;
+
+    if text.is_empty() {
+        log!("Got empty response body despite 200 status code");
+        return Err(IggyBenchDashboardError::Parse(
+            "Empty response body".to_string(),
+        ));
+    }
+
+    serde_json::from_str::<BenchmarkReportLight>(&text).map_err(|e| {
+        log!(format!("JSON parse error: {}", e));
+        IggyBenchDashboardError::Parse(e.to_string())
+    })
+}
+
 pub async fn fetch_benchmark_report_full(uuid: &Uuid) -> Result<BenchmarkReport> {
     check_server_health().await?;
 
@@ -179,14 +215,35 @@ pub async fn fetch_benchmark_trend(
 }
 
 pub fn download_test_artifacts(uuid: &Uuid) {
-    // Create the download URL
     let url = format!("{}/api/artifacts/{}", get_api_base_url(), uuid);
 
-    // Use browser's native download functionality
     if let Some(window) = window() {
         let _ = window
             .location()
             .set_href(&url)
             .map_err(|_| log!("Failed to initiate download"));
     }
+}
+
+pub async fn fetch_recent_benchmarks(limit: Option<u32>) -> Result<Vec<BenchmarkReportLight>> {
+    check_server_health().await?;
+
+    let limit_param = limit.unwrap_or(20);
+    let url = format!("{}/api/recent/{}", get_api_base_url(), limit_param);
+
+    let resp = Request::get(&url)
+        .send()
+        .await
+        .map_err(|e| IggyBenchDashboardError::Network(e.to_string()))?;
+
+    if !resp.ok() {
+        return Err(IggyBenchDashboardError::Server(format!(
+            "Failed to fetch recent benchmarks: {}",
+            resp.status()
+        )));
+    }
+
+    resp.json()
+        .await
+        .map_err(|e| IggyBenchDashboardError::Parse(e.to_string()))
 }

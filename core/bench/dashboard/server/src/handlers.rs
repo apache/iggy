@@ -305,7 +305,6 @@ pub async fn get_test_artifacts_zip(
                     ))
                 })?;
 
-                // Add file to zip
                 zip.start_file(
                     relative_path.to_string_lossy().into_owned(),
                     options.clone(),
@@ -332,21 +331,19 @@ pub async fn get_test_artifacts_zip(
             }
         }
 
-        // Finish zip file
         zip.finish().map_err(|e| {
             IggyBenchDashboardServerError::InternalError(format!(
                 "Error finalizing zip file: {}",
                 e
             ))
         })?;
-    } // zip is dropped here
+    }
 
     info!(
         "{}: Successfully created zip archive for test artifacts of uuid '{}'",
         client_addr, uuid_str
     );
 
-    // Return the zip file
     Ok(HttpResponse::Ok()
         .content_type("application/zip")
         .append_header((
@@ -354,6 +351,30 @@ pub async fn get_test_artifacts_zip(
             format!("attachment; filename=\"test_artifacts_{}.zip\"", uuid_str),
         ))
         .body(zip_buffer))
+}
+
+#[get("/api/recent/{limit}")]
+pub async fn get_recent_benchmarks(
+    data: web::Data<AppState>,
+    path: web::Path<usize>,
+    req: HttpRequest,
+) -> Result<HttpResponse> {
+    let client_addr = get_client_addr(&req);
+    let limit = path.into_inner();
+    info!(
+        "{}: Requesting recent benchmarks with limit {}",
+        client_addr, limit
+    );
+
+    let benchmarks = data.cache.get_recent_benchmarks(limit);
+
+    info!(
+        "{}: Found {} recent benchmarks",
+        client_addr,
+        benchmarks.len()
+    );
+
+    Ok(HttpResponse::Ok().json(benchmarks))
 }
 
 fn get_client_addr(req: &HttpRequest) -> String {

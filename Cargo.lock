@@ -863,16 +863,17 @@ dependencies = [
 
 [[package]]
 name = "bench-dashboard-frontend"
-version = "0.1.0"
+version = "0.4.1"
 dependencies = [
  "bench-dashboard-shared",
  "bench-report",
  "charming",
+ "chrono",
  "getrandom 0.3.3",
  "gloo 0.11.0",
  "js-sys",
+ "serde_json",
  "thiserror 2.0.12",
- "urlencoding",
  "uuid",
  "wasm-bindgen",
  "web-sys",
@@ -883,7 +884,7 @@ dependencies = [
 
 [[package]]
 name = "bench-dashboard-server"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "actix-cors",
  "actix-files",
