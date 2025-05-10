@@ -1,0 +1,3 @@
+genhtml_branch_coverage = 1
+lcov_branch_coverage = 1
+lcov_excl_br_line = LCOV_EXCL_BR_LINE|CHECK|REQUIRE
