@@ -17,8 +17,8 @@
  */
 
 use serde::{
-    de::{self, Deserializer, Visitor},
     Deserialize, Serialize, Serializer,
+    de::{self, Deserializer, Visitor},
 };
 use std::{
     fmt::{Display, Formatter},

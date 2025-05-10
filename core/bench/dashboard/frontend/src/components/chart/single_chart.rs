@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::api::fetch_benchmark_report_full;
-use crate::components::chart::{dispose_chart, PlotConfig};
+use crate::components::chart::{PlotConfig, dispose_chart};
 use crate::components::selectors::measurement_type_selector::MeasurementType;
 use bench_report::report::BenchmarkReport;
 use charming::theme::Theme;

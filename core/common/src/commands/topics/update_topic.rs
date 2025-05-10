@@ -17,14 +17,14 @@
  */
 
 use super::MAX_NAME_LENGTH;
-use crate::error::IggyError;
-use crate::utils::expiry::IggyExpiry;
-use crate::utils::topic_size::MaxTopicSize;
 use crate::BytesSerializable;
 use crate::CompressionAlgorithm;
 use crate::Identifier;
 use crate::Sizeable;
 use crate::Validatable;
+use crate::error::IggyError;
+use crate::utils::expiry::IggyExpiry;
+use crate::utils::topic_size::MaxTopicSize;
 use crate::{Command, UPDATE_TOPIC_CODE};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};

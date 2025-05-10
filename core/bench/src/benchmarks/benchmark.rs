@@ -27,7 +27,7 @@ use iggy::prelude::IggyError;
 use iggy::prelude::IggyExpiry;
 use iggy::prelude::MaxTopicSize;
 use iggy::prelude::{StreamClient, TopicClient};
-use integration::test_server::{login_root, ClientFactory};
+use integration::test_server::{ClientFactory, login_root};
 use std::sync::Arc;
 use tokio::task::JoinSet;
 use tracing::info;

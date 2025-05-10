@@ -16,12 +16,12 @@
  * under the License.
  */
 
+use crate::http::COMPONENT;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::mapper;
 use crate::http::mapper::map_generated_access_token_to_identity_info;
 use crate::http::shared::AppState;
-use crate::http::COMPONENT;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreatePersonalAccessTokenWithHash;
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
@@ -31,11 +31,11 @@ use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use error_set::ErrContext;
+use iggy_common::IdentityInfo;
+use iggy_common::Validatable;
 use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
 use iggy_common::delete_personal_access_token::DeletePersonalAccessToken;
 use iggy_common::login_with_personal_access_token::LoginWithPersonalAccessToken;
-use iggy_common::IdentityInfo;
-use iggy_common::Validatable;
 use iggy_common::{PersonalAccessTokenInfo, RawPersonalAccessToken};
 use std::sync::Arc;
 use tracing::instrument;

@@ -83,6 +83,8 @@ impl Benchmarkable for PinnedProducerBenchmark {
         };
         let common_params = self.common_params_str();
 
-        info!("Staring benchmark PinnedProducer, {streams}, {producers}, {max_topic_size}, {common_params}");
+        info!(
+            "Staring benchmark PinnedProducer, {streams}, {producers}, {max_topic_size}, {common_params}"
+        );
     }
 }

@@ -17,12 +17,12 @@
  */
 
 use super::PersisterTask;
-use crate::streaming::segments::{messages::write_batch, IggyMessagesBatchSet};
+use crate::streaming::segments::{IggyMessagesBatchSet, messages::write_batch};
 use error_set::ErrContext;
 use iggy_common::{Confirmation, IggyByteSize, IggyError};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicU64, Ordering},
 };
 use tokio::fs::{File, OpenOptions};
 use tracing::{error, trace};

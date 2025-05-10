@@ -16,13 +16,13 @@
  * under the License.
  */
 
-use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
 use crate::Client;
+use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
-use iggy_common::delete_topic::DeleteTopic;
 use iggy_common::Identifier;
-use tracing::{event, Level};
+use iggy_common::delete_topic::DeleteTopic;
+use tracing::{Level, event};
 
 pub struct DeleteTopicCmd {
     delete_topic: DeleteTopic,

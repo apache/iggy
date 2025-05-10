@@ -25,8 +25,8 @@ use std::{fs::File as StdFile, os::unix::prelude::FileExt};
 use std::{
     io::ErrorKind,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
 };
 use tokio::fs::OpenOptions;
@@ -60,16 +60,16 @@ impl MessagesReader {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = nix::fcntl::posix_fadvise(
-                    &file,
-                    0,
-                    0, // 0 means the entire file
-                    nix::fcntl::PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL,
+                &file,
+                0,
+                0, // 0 means the entire file
+                nix::fcntl::PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL,
+            )
+            .with_info_context(|error| {
+                format!(
+                    "Failed to set sequential access pattern on messages file: {file_path}. {error}"
                 )
-                .with_info_context(|error| {
-                    format!(
-                        "Failed to set sequential access pattern on messages file: {file_path}. {error}"
-                    )
-                });
+            });
         }
 
         trace!(

@@ -16,10 +16,10 @@
  * under the License.
  */
 
-use crate::defaults::*;
-use crate::error::IggyError;
 use crate::Command;
 use crate::Validatable;
+use crate::defaults::*;
+use crate::error::IggyError;
 use crate::{BytesSerializable, DELETE_PERSONAL_ACCESS_TOKEN_CODE};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};

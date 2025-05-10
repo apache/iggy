@@ -20,8 +20,8 @@ use human_repr::HumanCount;
 use std::{
     fmt::Display,
     sync::{
-        atomic::{AtomicI64, Ordering},
         Arc,
+        atomic::{AtomicI64, Ordering},
     },
 };
 

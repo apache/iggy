@@ -19,8 +19,8 @@
 use crate::compat::index_rebuilding::index_rebuilder::IndexRebuilder;
 use crate::configs::cache_indexes::CacheIndexesConfig;
 use crate::state::system::PartitionState;
-use crate::streaming::partitions::partition::{ConsumerOffset, Partition};
 use crate::streaming::partitions::COMPONENT;
+use crate::streaming::partitions::partition::{ConsumerOffset, Partition};
 use crate::streaming::persistence::persister::PersisterKind;
 use crate::streaming::segments::*;
 use crate::streaming::storage::PartitionStorage;
@@ -29,8 +29,8 @@ use error_set::ErrContext;
 use iggy_common::ConsumerKind;
 use iggy_common::IggyError;
 use std::path::Path;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::fs;
 use tokio::fs::create_dir_all;
 use tokio::io::AsyncReadExt;
@@ -55,7 +55,10 @@ impl PartitionStorage for FilePartitionStorage {
     ) -> Result<(), IggyError> {
         info!(
             "Loading partition with ID: {} for stream with ID: {} and topic with ID: {}, for path: {} from disk...",
-            partition.partition_id, partition.stream_id, partition.topic_id, partition.partition_path
+            partition.partition_id,
+            partition.stream_id,
+            partition.topic_id,
+            partition.partition_path
         );
         partition.created_at = state.created_at;
         let dir_entries = fs::read_dir(&partition.partition_path).await;
@@ -155,16 +158,28 @@ impl PartitionStorage for FilePartitionStorage {
             }
 
             if partition.config.partition.validate_checksum {
-                info!("Validating messages checksum for partition with ID: {} and segment with start offset: {}...", partition.partition_id, segment.start_offset());
+                info!(
+                    "Validating messages checksum for partition with ID: {} and segment with start offset: {}...",
+                    partition.partition_id,
+                    segment.start_offset()
+                );
                 segment.validate_messages_checksums().await?;
-                info!("Validated messages checksum for partition with ID: {} and segment with start offset: {}.", partition.partition_id, segment.start_offset());
+                info!(
+                    "Validated messages checksum for partition with ID: {} and segment with start offset: {}.",
+                    partition.partition_id,
+                    segment.start_offset()
+                );
             }
 
             // Load the unique message IDs for the partition if the deduplication feature is enabled.
             let mut unique_message_ids_count = 0;
             if let Some(message_deduplicator) = &partition.message_deduplicator {
                 let max_entries = partition.config.message_deduplication.max_entries as u32;
-                info!("Loading {max_entries} unique message IDs for partition with ID: {} and segment with start offset: {}...", partition.partition_id, segment.start_offset());
+                info!(
+                    "Loading {max_entries} unique message IDs for partition with ID: {} and segment with start offset: {}...",
+                    partition.partition_id,
+                    segment.start_offset()
+                );
                 let message_ids = segment.load_message_ids(max_entries).await.with_error_context(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to load message ids, segment: {segment}",)
                 })?;
@@ -172,10 +187,20 @@ impl PartitionStorage for FilePartitionStorage {
                     if message_deduplicator.try_insert(message_id).await {
                         unique_message_ids_count += 1;
                     } else {
-                        warn!("Duplicated message ID: {} for partition with ID: {} and segment with start offset: {}.", message_id, partition.partition_id, segment.start_offset());
+                        warn!(
+                            "Duplicated message ID: {} for partition with ID: {} and segment with start offset: {}.",
+                            message_id,
+                            partition.partition_id,
+                            segment.start_offset()
+                        );
                     }
                 }
-                info!("Loaded: {} unique message IDs for partition with ID: {} and segment with start offset: {}...", unique_message_ids_count, partition.partition_id, segment.start_offset());
+                info!(
+                    "Loaded: {} unique message IDs for partition with ID: {} and segment with start offset: {}...",
+                    unique_message_ids_count,
+                    partition.partition_id,
+                    segment.start_offset()
+                );
             }
 
             if CacheIndexesConfig::None == partition.config.segment.cache_indexes {
@@ -230,7 +255,10 @@ impl PartitionStorage for FilePartitionStorage {
             })?;
         info!(
             "Loaded partition with ID: {} for stream with ID: {} and topic with ID: {}, current offset: {}.",
-            partition.partition_id, partition.stream_id, partition.topic_id, partition.current_offset
+            partition.partition_id,
+            partition.stream_id,
+            partition.topic_id,
+            partition.current_offset
         );
 
         Ok(())
@@ -303,7 +331,13 @@ impl PartitionStorage for FilePartitionStorage {
             })?;
         }
 
-        info!("Saved partition with start ID: {} for stream with ID: {} and topic with ID: {}, path: {}.", partition.partition_id, partition.stream_id, partition.topic_id, partition.partition_path);
+        info!(
+            "Saved partition with start ID: {} for stream with ID: {} and topic with ID: {}, path: {}.",
+            partition.partition_id,
+            partition.stream_id,
+            partition.topic_id,
+            partition.partition_path
+        );
 
         Ok(())
     }
@@ -318,7 +352,10 @@ impl PartitionStorage for FilePartitionStorage {
             .delete_consumer_offsets(&partition.consumer_offsets_path)
             .await
         {
-            error!("Cannot delete consumer offsets for partition with ID: {} for topic with ID: {} for stream with ID: {}. Error: {}", partition.partition_id, partition.topic_id, partition.stream_id, err);
+            error!(
+                "Cannot delete consumer offsets for partition with ID: {} for topic with ID: {} for stream with ID: {}. Error: {}",
+                partition.partition_id, partition.topic_id, partition.stream_id, err
+            );
             return Err(IggyError::CannotDeletePartition(
                 partition.partition_id,
                 partition.topic_id,
@@ -330,7 +367,10 @@ impl PartitionStorage for FilePartitionStorage {
             .delete_consumer_offsets(&partition.consumer_group_offsets_path)
             .await
         {
-            error!("Cannot delete consumer group offsets for partition with ID: {} for topic with ID: {} for stream with ID: {}. Error: {}", partition.partition_id, partition.topic_id, partition.stream_id, err);
+            error!(
+                "Cannot delete consumer group offsets for partition with ID: {} for topic with ID: {} for stream with ID: {}. Error: {}",
+                partition.partition_id, partition.topic_id, partition.stream_id, err
+            );
             return Err(IggyError::CannotDeletePartition(
                 partition.partition_id,
                 partition.topic_id,
@@ -339,7 +379,13 @@ impl PartitionStorage for FilePartitionStorage {
         }
 
         if fs::remove_dir_all(&partition.partition_path).await.is_err() {
-            error!("Cannot delete partition directory: {} for partition with ID: {} for topic with ID: {} for stream with ID: {}.", partition.partition_path, partition.partition_id, partition.topic_id, partition.stream_id);
+            error!(
+                "Cannot delete partition directory: {} for partition with ID: {} for topic with ID: {} for stream with ID: {}.",
+                partition.partition_path,
+                partition.partition_id,
+                partition.topic_id,
+                partition.stream_id
+            );
             return Err(IggyError::CannotDeletePartitionDirectory(
                 partition.partition_id,
                 partition.stream_id,

@@ -22,8 +22,8 @@ use crate::binary::sender::SenderKind;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use bytes::Bytes;
-use iggy_common::get_snapshot::GetSnapshot;
 use iggy_common::IggyError;
+use iggy_common::get_snapshot::GetSnapshot;
 use tracing::debug;
 
 impl ServerCommandHandler for GetSnapshot {

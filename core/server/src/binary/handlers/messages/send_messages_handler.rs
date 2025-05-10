@@ -23,9 +23,9 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use crate::streaming::utils::PooledBuffer;
 use anyhow::Result;
+use iggy_common::INDEX_SIZE;
 use iggy_common::Identifier;
 use iggy_common::Sizeable;
-use iggy_common::INDEX_SIZE;
 use iggy_common::{IggyError, Partitioning, SendMessages, Validatable};
 use tracing::instrument;
 

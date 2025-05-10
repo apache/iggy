@@ -59,7 +59,9 @@ impl MessagesSaver {
         let enforce_fsync = self.enforce_fsync;
         let interval = self.interval;
         let sender = self.sender.clone();
-        info!("Message saver is enabled, buffered messages will be automatically saved every: {interval}, enforce fsync: {enforce_fsync}.");
+        info!(
+            "Message saver is enabled, buffered messages will be automatically saved every: {interval}, enforce fsync: {enforce_fsync}."
+        );
         tokio::spawn(async move {
             let mut interval_timer = time::interval(interval.get_duration());
             loop {

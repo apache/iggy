@@ -18,13 +18,13 @@
 
 use crate::streaming::clients::client_manager::{Client, Transport};
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::System;
 use crate::streaming::systems::COMPONENT;
+use crate::streaming::systems::system::System;
 use error_set::ErrContext;
-use iggy_common::locking::IggySharedMut;
-use iggy_common::locking::IggySharedMutFn;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
+use iggy_common::locking::IggySharedMut;
+use iggy_common::locking::IggySharedMutFn;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{error, info};

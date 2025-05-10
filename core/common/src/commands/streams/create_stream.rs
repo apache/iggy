@@ -17,10 +17,10 @@
  */
 
 use super::MAX_NAME_LENGTH;
-use crate::error::IggyError;
 use crate::BytesSerializable;
 use crate::Validatable;
-use crate::{Command, CREATE_STREAM_CODE};
+use crate::error::IggyError;
+use crate::{CREATE_STREAM_CODE, Command};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;

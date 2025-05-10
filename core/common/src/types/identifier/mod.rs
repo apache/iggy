@@ -16,11 +16,11 @@
  * under the License.
  */
 
-use crate::error::IggyError;
-use crate::utils::byte_size::IggyByteSize;
 use crate::BytesSerializable;
 use crate::Sizeable;
 use crate::Validatable;
+use crate::error::IggyError;
+use crate::utils::byte_size::IggyByteSize;
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use serde_with::base64::Base64;

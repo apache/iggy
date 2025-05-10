@@ -17,12 +17,12 @@
  */
 
 use super::defaults::*;
-use crate::error::IggyError;
 use crate::BytesSerializable;
 use crate::Permissions;
 use crate::UserStatus;
 use crate::Validatable;
-use crate::{Command, CREATE_USER_CODE};
+use crate::error::IggyError;
+use crate::{CREATE_USER_CODE, Command};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;

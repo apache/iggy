@@ -17,7 +17,7 @@
  */
 
 use crate::cli::common::{
-    IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestUserId, CLAP_INDENT,
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestUserId,
     USAGE_PREFIX,
 };
 use crate::cli::user::common::PermissionsTestArgs;
@@ -98,7 +98,8 @@ impl IggyCmdTestCase for TestUserPermissionsCmd {
             ),
             TestUserId::Numeric => format!(
                 "Executing update permissions for user with ID: {}\nPermissions for user with ID: {} updated\n",
-                self.user_id.unwrap(), self.user_id.unwrap()
+                self.user_id.unwrap(),
+                self.user_id.unwrap()
             ),
         };
 

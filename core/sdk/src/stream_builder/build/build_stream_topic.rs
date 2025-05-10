@@ -73,8 +73,10 @@ pub(crate) async fn build_iggy_stream_topic_if_not_exists(
     {
         trace!("Check if topic should be created.");
         if !config.create_topic_if_not_exists() {
-            warn!("Topic {topic_name} for stream {stream_name} does not exists and create topic is disabled.\
-            If you want to create the topic automatically, please set create_topic_if_not_exists to true.");
+            warn!(
+                "Topic {topic_name} for stream {stream_name} does not exists and create topic is disabled.\
+            If you want to create the topic automatically, please set create_topic_if_not_exists to true."
+            );
             return Ok(());
         }
 

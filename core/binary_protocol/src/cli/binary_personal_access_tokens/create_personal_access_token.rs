@@ -16,14 +16,14 @@
  * under the License.
  */
 
-use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
 use crate::Client;
+use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
-use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
 use iggy_common::PersonalAccessTokenExpiry;
+use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
 use keyring::Entry;
-use tracing::{event, Level};
+use tracing::{Level, event};
 
 pub struct CreatePersonalAccessTokenCmd {
     create_token: CreatePersonalAccessToken,

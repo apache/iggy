@@ -17,12 +17,12 @@
  */
 
 use super::defaults::*;
-use crate::error::IggyError;
 use crate::BytesSerializable;
 use crate::Identifier;
 use crate::Sizeable;
 use crate::Validatable;
-use crate::{Command, CHANGE_PASSWORD_CODE};
+use crate::error::IggyError;
+use crate::{CHANGE_PASSWORD_CODE, Command};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;

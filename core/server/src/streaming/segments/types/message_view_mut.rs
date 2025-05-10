@@ -17,7 +17,7 @@
  */
 
 use super::IggyMessageHeaderViewMut;
-use iggy_common::{calculate_checksum, IggyMessageHeaderView, IGGY_MESSAGE_HEADER_SIZE};
+use iggy_common::{IGGY_MESSAGE_HEADER_SIZE, IggyMessageHeaderView, calculate_checksum};
 use lending_iterator::prelude::*;
 
 /// A mutable view of a message for in-place modifications

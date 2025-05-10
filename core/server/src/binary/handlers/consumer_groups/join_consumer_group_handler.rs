@@ -23,8 +23,8 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy_common::join_consumer_group::JoinConsumerGroup;
 use iggy_common::IggyError;
+use iggy_common::join_consumer_group::JoinConsumerGroup;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for JoinConsumerGroup {

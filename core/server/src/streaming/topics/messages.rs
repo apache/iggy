@@ -19,8 +19,8 @@
 use crate::binary::handlers::messages::poll_messages_handler::IggyPollMetadata;
 use crate::streaming::polling_consumer::PollingConsumer;
 use crate::streaming::segments::{IggyMessagesBatchMut, IggyMessagesBatchSet};
-use crate::streaming::topics::topic::Topic;
 use crate::streaming::topics::COMPONENT;
+use crate::streaming::topics::topic::Topic;
 use crate::streaming::utils::hash;
 use ahash::AHashMap;
 use error_set::ErrContext;
@@ -175,9 +175,7 @@ impl Topic {
         }
         trace!(
             "Calculated partition ID: {} for messages key: {:?}, hash: {}",
-            partition_id,
-            messages_key,
-            messages_key_hash
+            partition_id, messages_key, messages_key_hash
         );
         partition_id
     }
@@ -211,9 +209,9 @@ mod tests {
     use bytes::Bytes;
     use iggy_common::CompressionAlgorithm;
     use iggy_common::{IggyMessage, MaxTopicSize};
+    use std::sync::Arc;
     use std::sync::atomic::AtomicU32;
     use std::sync::atomic::AtomicU64;
-    use std::sync::Arc;
 
     #[tokio::test]
     async fn given_partition_id_key_messages_should_be_appended_only_to_the_chosen_partition() {
@@ -283,8 +281,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_multiple_partitions_calculate_next_partition_id_should_return_next_partition_id_using_round_robin(
-    ) {
+    async fn given_multiple_partitions_calculate_next_partition_id_should_return_next_partition_id_using_round_robin()
+     {
         let partitions_count = 3;
         let messages_count = 1000;
         let topic = init_topic(partitions_count).await;
@@ -302,8 +300,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn given_multiple_partitions_calculate_partition_id_by_hash_should_return_next_partition_id(
-    ) {
+    async fn given_multiple_partitions_calculate_partition_id_by_hash_should_return_next_partition_id()
+     {
         let partitions_count = 3;
         let messages_count = 1000;
         let topic = init_topic(partitions_count).await;

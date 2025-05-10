@@ -31,7 +31,7 @@ use iggy::prelude::IggyError;
 use std::fs;
 use std::path::Path;
 use tracing::{error, info};
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use utils::cpu_name::append_cpu_name_lowercase;
 
 #[tokio::main]

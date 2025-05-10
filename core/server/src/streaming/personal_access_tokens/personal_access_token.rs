@@ -16,10 +16,10 @@
  * under the License.
  */
 use crate::streaming::utils::hash;
-use iggy_common::text::as_base64;
 use iggy_common::IggyExpiry;
 use iggy_common::IggyTimestamp;
 use iggy_common::UserId;
+use iggy_common::text::as_base64;
 use ring::rand::SecureRandom;
 use std::sync::Arc;
 

@@ -55,21 +55,23 @@ async fn validate_custom_env_provider() {
     let expected_message_saver_enabled = false;
     let expected_message_expiry = "10s";
 
-    env::set_var(
-        "IGGY_QUIC_DATAGRAM_SEND_BUFFER_SIZE",
-        expected_datagram_send_buffer_size,
-    );
-    env::set_var(
-        "IGGY_QUIC_CERTIFICATE_SELF_SIGNED",
-        expected_quic_certificate_self_signed.to_string(),
-    );
-    env::set_var("IGGY_HTTP_ENABLED", expected_http_enabled.to_string());
-    env::set_var("IGGY_TCP_ENABLED", expected_tcp_enabled);
-    env::set_var(
-        "IGGY_MESSAGE_SAVER_ENABLED",
-        expected_message_saver_enabled.to_string(),
-    );
-    env::set_var("IGGY_SYSTEM_SEGMENT_MESSAGE_EXPIRY", "10s");
+    unsafe {
+        env::set_var(
+            "IGGY_QUIC_DATAGRAM_SEND_BUFFER_SIZE",
+            expected_datagram_send_buffer_size,
+        );
+        env::set_var(
+            "IGGY_QUIC_CERTIFICATE_SELF_SIGNED",
+            expected_quic_certificate_self_signed.to_string(),
+        );
+        env::set_var("IGGY_HTTP_ENABLED", expected_http_enabled.to_string());
+        env::set_var("IGGY_TCP_ENABLED", expected_tcp_enabled);
+        env::set_var(
+            "IGGY_MESSAGE_SAVER_ENABLED",
+            expected_message_saver_enabled.to_string(),
+        );
+        env::set_var("IGGY_SYSTEM_SEGMENT_MESSAGE_EXPIRY", "10s");
+    }
 
     let config_path = get_root_path().join("../configs/server.toml");
     let file_config_provider = FileConfigProvider::new(config_path.as_path().display().to_string());
@@ -94,10 +96,12 @@ async fn validate_custom_env_provider() {
         expected_message_expiry
     );
 
-    env::remove_var("IGGY_QUIC_DATAGRAM_SEND_BUFFER_SIZE");
-    env::remove_var("IGGY_QUIC_CERTIFICATE_SELF_SIGNED");
-    env::remove_var("IGGY_HTTP_ENABLED");
-    env::remove_var("IGGY_TCP_ENABLED");
-    env::remove_var("IGGY_MESSAGE_SAVER_ENABLED");
-    env::remove_var("IGGY_SYSTEM_RETENTION_POLICY_MESSAGE_EXPIRY");
+    unsafe {
+        env::remove_var("IGGY_QUIC_DATAGRAM_SEND_BUFFER_SIZE");
+        env::remove_var("IGGY_QUIC_CERTIFICATE_SELF_SIGNED");
+        env::remove_var("IGGY_HTTP_ENABLED");
+        env::remove_var("IGGY_TCP_ENABLED");
+        env::remove_var("IGGY_MESSAGE_SAVER_ENABLED");
+        env::remove_var("IGGY_SYSTEM_RETENTION_POLICY_MESSAGE_EXPIRY");
+    }
 }

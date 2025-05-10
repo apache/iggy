@@ -26,7 +26,7 @@ use crate::prelude::IggyError;
 use crate::prelude::IggyTimestamp;
 use crate::quic::quick_config::QuicClientConfig;
 use crate::quic::skip_server_verification::SkipServerVerification;
-use async_broadcast::{broadcast, Receiver, Sender};
+use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy_common::{ClientState, Command, Credentials, DiagnosticEvent};
@@ -356,7 +356,10 @@ impl QuicClient {
                     Credentials::UsernamePassword(username, password) => {
                         self.login_user(username, password).await?;
                         self.publish_event(DiagnosticEvent::SignedIn).await;
-                        info!("{NAME} client: {} has signed in with the user credentials, username: {username}", self.config.client_address);
+                        info!(
+                            "{NAME} client: {} has signed in with the user credentials, username: {username}",
+                            self.config.client_address
+                        );
                         Ok(())
                     }
                     Credentials::PersonalAccessToken(token) => {
@@ -507,7 +510,10 @@ fn configure(config: &QuicClientConfig) -> Result<ClientConfig, IggyError> {
 
     if CryptoProvider::get_default().is_none() {
         if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
-            warn!("Failed to install rustls crypto provider. Error: {:?}. This may be normal if another thread installed it first.", e);
+            warn!(
+                "Failed to install rustls crypto provider. Error: {:?}. This may be normal if another thread installed it first.",
+                e
+            );
         }
     }
     let mut client_config = match config.validate_certificate {

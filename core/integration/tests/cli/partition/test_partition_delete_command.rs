@@ -17,8 +17,8 @@
  */
 
 use crate::cli::common::{
-    IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId, TestTopicId,
-    CLAP_INDENT, USAGE_PREFIX,
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId,
+    TestTopicId, USAGE_PREFIX,
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
@@ -127,8 +127,10 @@ impl IggyCmdTestCase for TestPartitionDeleteCmd {
             partitions.push('s');
         };
 
-        let message = format!("Executing delete {} {partitions} for topic with ID: {} and stream with ID: {}\nDeleted {} {partitions} for topic with ID: {} and stream with ID: {}\n",
-            self.new_partitions, topic_id, stream_id, self.new_partitions, topic_id, stream_id);
+        let message = format!(
+            "Executing delete {} {partitions} for topic with ID: {} and stream with ID: {}\nDeleted {} {partitions} for topic with ID: {} and stream with ID: {}\n",
+            self.new_partitions, topic_id, stream_id, self.new_partitions, topic_id, stream_id
+        );
 
         command_state.success().stdout(diff(message));
     }

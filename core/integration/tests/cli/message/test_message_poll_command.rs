@@ -17,8 +17,8 @@
  */
 
 use crate::cli::common::{
-    IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId, TestTopicId,
-    CLAP_INDENT, USAGE_PREFIX,
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId,
+    TestTopicId, USAGE_PREFIX,
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
@@ -188,8 +188,10 @@ impl IggyCmdTestCase for TestMessagePollCmd {
             _ => format!("Polled {} messages", self.message_count),
         };
 
-        let message = format!("Executing poll messages from topic ID: {} and stream with ID: {}\nPolled messages from topic with ID: {} and stream with ID: {} (from partition with ID: {})\n{polled_status}",
-            topic_id, stream_id, topic_id, stream_id, self.partition_id);
+        let message = format!(
+            "Executing poll messages from topic ID: {} and stream with ID: {}\nPolled messages from topic with ID: {} and stream with ID: {} (from partition with ID: {})\n{polled_status}",
+            topic_id, stream_id, topic_id, stream_id, self.partition_id
+        );
 
         let mut status = command_state.success().stdout(starts_with(message));
 

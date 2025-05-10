@@ -18,8 +18,8 @@
 
 use crate::analytics::record::BenchmarkRecord;
 use crate::analytics::time_series::calculator::TimeSeriesCalculator;
-use crate::analytics::time_series::processors::moving_average::MovingAverageProcessor;
 use crate::analytics::time_series::processors::TimeSeriesProcessor;
+use crate::analytics::time_series::processors::moving_average::MovingAverageProcessor;
 use bench_report::actor_kind::ActorKind;
 use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::individual_metrics::BenchmarkIndividualMetrics;

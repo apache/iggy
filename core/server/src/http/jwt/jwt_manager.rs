@@ -17,20 +17,20 @@
  */
 
 use crate::configs::http::HttpJwtConfig;
+use crate::http::jwt::COMPONENT;
 use crate::http::jwt::json_web_token::{GeneratedToken, JwtClaims, RevokedAccessToken};
 use crate::http::jwt::storage::TokenStorage;
-use crate::http::jwt::COMPONENT;
 use crate::streaming::persistence::persister::PersisterKind;
 use ahash::AHashMap;
 use error_set::ErrContext;
-use iggy_common::locking::IggySharedMut;
-use iggy_common::locking::IggySharedMutFn;
 use iggy_common::IggyDuration;
 use iggy_common::IggyError;
 use iggy_common::IggyExpiry;
 use iggy_common::IggyTimestamp;
 use iggy_common::UserId;
-use jsonwebtoken::{encode, Algorithm, DecodingKey, EncodingKey, Header, TokenData, Validation};
+use iggy_common::locking::IggySharedMut;
+use iggy_common::locking::IggySharedMutFn;
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, TokenData, Validation, encode};
 use std::sync::Arc;
 use tracing::{debug, error, info};
 

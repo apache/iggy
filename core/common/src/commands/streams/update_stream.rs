@@ -17,11 +17,11 @@
  */
 
 use super::MAX_NAME_LENGTH;
-use crate::error::IggyError;
 use crate::BytesSerializable;
 use crate::Identifier;
 use crate::Sizeable;
 use crate::Validatable;
+use crate::error::IggyError;
 use crate::{Command, UPDATE_STREAM_CODE};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};

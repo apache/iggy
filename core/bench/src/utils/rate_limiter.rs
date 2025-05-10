@@ -16,9 +16,9 @@
 // under the License.
 
 use governor::{
+    Quota, RateLimiter as GovernorRateLimiter,
     clock::DefaultClock,
     state::{InMemoryState, NotKeyed},
-    Quota, RateLimiter as GovernorRateLimiter,
 };
 use iggy::prelude::IggyByteSize;
 use std::num::NonZeroU32;

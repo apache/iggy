@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use super::memory_pool::{memory_pool, BytesMutExt};
+use super::memory_pool::{BytesMutExt, memory_pool};
 use bytes::{Buf, BufMut, BytesMut};
 use std::ops::{Deref, DerefMut};
 

@@ -17,12 +17,12 @@
  */
 
 use super::MAX_PARTITIONS_COUNT;
-use crate::error::IggyError;
 use crate::BytesSerializable;
 use crate::Identifier;
 use crate::Sizeable;
 use crate::Validatable;
-use crate::{Command, CREATE_PARTITIONS_CODE};
+use crate::error::IggyError;
+use crate::{CREATE_PARTITIONS_CODE, Command};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;

@@ -25,8 +25,8 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy_common::get_streams::GetStreams;
 use iggy_common::IggyError;
+use iggy_common::get_streams::GetStreams;
 use tracing::debug;
 
 impl ServerCommandHandler for GetStreams {

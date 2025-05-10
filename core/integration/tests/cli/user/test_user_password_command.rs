@@ -17,7 +17,7 @@
  */
 
 use crate::cli::common::{
-    IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestUserId, CLAP_INDENT,
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestUserId,
     USAGE_PREFIX,
 };
 use assert_cmd::assert::Assert;
@@ -122,7 +122,8 @@ impl IggyCmdTestCase for TestUserPasswordCmd {
             ),
             TestUserId::Numeric => format!(
                 "Executing change password for user with ID: {}\nPassword for user with ID: {} changed\n",
-                self.user_id.unwrap(), self.user_id.unwrap()
+                self.user_id.unwrap(),
+                self.user_id.unwrap()
             ),
         };
 

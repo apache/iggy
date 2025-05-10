@@ -17,13 +17,13 @@
 
 use crate::error::IggyBenchDashboardServerError;
 use octocrab::{
+    Octocrab,
     models::{
+        RunId,
         repos::Tag,
         workflows::{Run, WorkflowListArtifact},
-        RunId,
     },
     params::actions::ArchiveFormat,
-    Octocrab,
 };
 use std::io::Cursor;
 use tempfile::TempDir;

@@ -157,8 +157,10 @@ impl IggyCmdTestCase for TestMessagePollToFileCmd<'_> {
             _ => format!("Polled {} messages", self.message_count),
         };
 
-        let message_prefix = format!("Executing poll messages from topic ID: {} and stream with ID: {}\nPolled messages from topic with ID: {} and stream with ID: {} (from partition with ID: 1)\n{polled_status}",
-                                     self.topic_name, self.stream_name, self.topic_name, self.stream_name);
+        let message_prefix = format!(
+            "Executing poll messages from topic ID: {} and stream with ID: {}\nPolled messages from topic with ID: {} and stream with ID: {} (from partition with ID: 1)\n{polled_status}",
+            self.topic_name, self.stream_name, self.topic_name, self.stream_name
+        );
         let message_file = format!("Storing messages to {} binary file", self.output_file);
         let message_count = format!(
             "Stored {} of total size [0-9.]+ K?B to {} binary file",

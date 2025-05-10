@@ -23,8 +23,8 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy_common::leave_consumer_group::LeaveConsumerGroup;
 use iggy_common::IggyError;
+use iggy_common::leave_consumer_group::LeaveConsumerGroup;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for LeaveConsumerGroup {

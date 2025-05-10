@@ -27,8 +27,8 @@ use crate::streaming::systems::system::SharedSystem;
 use crate::streaming::utils::crypto;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy_common::create_user::CreateUser;
 use iggy_common::IggyError;
+use iggy_common::create_user::CreateUser;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for CreateUser {

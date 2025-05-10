@@ -16,8 +16,8 @@
  * under the License.
  */
 
-use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
 use crate::Client;
+use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -27,7 +27,7 @@ use iggy_common::{
 use std::collections::HashMap;
 use std::io::{self, Read};
 use tokio::io::AsyncReadExt;
-use tracing::{event, Level};
+use tracing::{Level, event};
 
 pub struct SendMessagesCmd {
     stream_id: Identifier,

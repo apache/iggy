@@ -16,12 +16,12 @@
  * under the License.
  */
 
-use crate::error::IggyError;
 use crate::BytesSerializable;
 use crate::Identifier;
 use crate::Permissions;
 use crate::Sizeable;
 use crate::Validatable;
+use crate::error::IggyError;
 use crate::{Command, UPDATE_PERMISSIONS_CODE};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};

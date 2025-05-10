@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use dircpy::*;
 use git2::{
-    build::CheckoutBuilder, Branch, BranchType, Cred, FetchOptions, RemoteCallbacks, Repository,
+    Branch, BranchType, Cred, FetchOptions, RemoteCallbacks, Repository, build::CheckoutBuilder,
 };
 use tempfile::TempDir;
 use tokio::{fs, process::Command};

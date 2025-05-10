@@ -20,7 +20,7 @@ use crate::clients::client::IggyClient;
 use crate::clients::consumer::IggyConsumer;
 use crate::clients::producer::IggyProducer;
 use crate::prelude::{IggyError, SystemClient};
-use crate::stream_builder::{build, IggyStreamConfig};
+use crate::stream_builder::{IggyStreamConfig, build};
 use tracing::trace;
 
 #[derive(Debug, Default, Clone, Eq, PartialEq)]

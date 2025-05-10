@@ -90,6 +90,8 @@ impl Benchmarkable for BalancedProducerAndConsumerGroupBenchmark {
         };
         let common_params = self.common_params_str();
 
-        info!("Staring benchmark BalancedProducerAndConsumerGroup, {streams}, {partitions}, {producers}, {consumers}, {cg_count}, {max_topic_size}, {common_params}");
+        info!(
+            "Staring benchmark BalancedProducerAndConsumerGroup, {streams}, {partitions}, {producers}, {consumers}, {cg_count}, {max_topic_size}, {common_params}"
+        );
     }
 }

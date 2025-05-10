@@ -2,7 +2,7 @@
 name = "bench-dashboard-frontend"
 license = "Apache-2.0"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [package.metadata.cargo-machete]
 ignored = ["getrandom"]

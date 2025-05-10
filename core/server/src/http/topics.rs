@@ -16,11 +16,11 @@
  * under the License.
  */
 
+use crate::http::COMPONENT;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::mapper;
 use crate::http::shared::AppState;
-use crate::http::COMPONENT;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateTopicWithId;
 use crate::streaming::session::Session;
@@ -29,12 +29,12 @@ use axum::http::StatusCode;
 use axum::routing::{delete, get};
 use axum::{Extension, Json, Router};
 use error_set::ErrContext;
+use iggy_common::Identifier;
+use iggy_common::Validatable;
 use iggy_common::create_topic::CreateTopic;
 use iggy_common::delete_topic::DeleteTopic;
 use iggy_common::purge_topic::PurgeTopic;
 use iggy_common::update_topic::UpdateTopic;
-use iggy_common::Identifier;
-use iggy_common::Validatable;
 use iggy_common::{Topic, TopicDetails};
 use std::sync::Arc;
 use tracing::instrument;

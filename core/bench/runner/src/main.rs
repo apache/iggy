@@ -24,10 +24,10 @@ use args::IggyBenchRunnerArgs;
 use clap::Parser;
 use tracing::{error, info};
 use tracing_subscriber::{
+    EnvFilter,
     fmt::{self, format::Format},
     layer::SubscriberExt,
     util::SubscriberInitExt,
-    EnvFilter,
 };
 
 #[tokio::main]

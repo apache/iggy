@@ -24,7 +24,7 @@ use iggy::prelude::{MessageClient, SystemClient};
 use integration::{
     tcp_client::TcpClientFactory,
     test_server::{
-        login_root, ClientFactory, IpAddrKind, TestServer, Transport, SYSTEM_PATH_ENV_VAR,
+        ClientFactory, IpAddrKind, SYSTEM_PATH_ENV_VAR, TestServer, Transport, login_root,
     },
 };
 use serial_test::parallel;

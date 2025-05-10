@@ -16,15 +16,15 @@
  * under the License.
  */
 
-use crate::streaming::streams::stream::Stream;
 use crate::streaming::streams::COMPONENT;
+use crate::streaming::streams::stream::Stream;
 use crate::streaming::topics::topic::Topic;
 use error_set::ErrContext;
-use iggy_common::locking::IggySharedMutFn;
 use iggy_common::CompressionAlgorithm;
 use iggy_common::IggyError;
 use iggy_common::IggyExpiry;
 use iggy_common::MaxTopicSize;
+use iggy_common::locking::IggySharedMutFn;
 use iggy_common::{IdKind, Identifier};
 use std::sync::atomic::Ordering;
 use tracing::info;

@@ -16,9 +16,9 @@
  * under the License.
  */
 
+use crate::Permissions;
 use crate::types::user::user_status::UserStatus;
 use crate::utils::timestamp::IggyTimestamp;
-use crate::Permissions;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::AtomicU32;
 

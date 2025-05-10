@@ -17,7 +17,7 @@
  */
 
 use std::path::Path;
-use tokio::fs::{remove_file, File, OpenOptions};
+use tokio::fs::{File, OpenOptions, remove_file};
 
 pub async fn open(path: &str) -> Result<File, std::io::Error> {
     OpenOptions::new().read(true).open(path).await

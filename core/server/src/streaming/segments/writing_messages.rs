@@ -77,9 +77,7 @@ impl Segment {
         let unsaved_messages_count = self.accumulator.unsaved_messages_count();
         trace!(
             "Saving {} messages on disk in segment with start offset: {} for partition with ID: {}...",
-            unsaved_messages_count,
-            self.start_offset,
-            self.partition_id
+            unsaved_messages_count, self.start_offset, self.partition_id
         );
 
         let accumulator = std::mem::take(&mut self.accumulator);
@@ -132,10 +130,7 @@ impl Segment {
 
         trace!(
             "Saved {} messages on disk in segment with start offset: {} for partition with ID: {}, total bytes written: {}.",
-            unsaved_messages_count,
-            self.start_offset,
-            self.partition_id,
-            saved_bytes
+            unsaved_messages_count, self.start_offset, self.partition_id, saved_bytes
         );
 
         Ok(unsaved_messages_count)
@@ -177,7 +172,10 @@ impl Segment {
             self.shutdown_writing().await;
             info!(
                 "Closed segment with start offset: {}, end offset: {}, size: {} for partition with ID: {}.",
-                self.start_offset, self.end_offset, self.get_messages_size(), self.partition_id
+                self.start_offset,
+                self.end_offset,
+                self.get_messages_size(),
+                self.partition_id
             );
             self.is_closed = true;
         }

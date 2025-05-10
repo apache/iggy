@@ -21,7 +21,7 @@ use iggy::prelude::ConsumerGroupDetails;
 use iggy::prelude::ConsumerKind;
 use iggy::prelude::Identifier;
 use iggy::prelude::{ConsumerGroupClient, StreamClient};
-use integration::test_server::{delete_user, ClientFactory};
+use integration::test_server::{ClientFactory, delete_user};
 
 pub mod consumer_group_join_scenario;
 pub mod consumer_group_with_multiple_clients_polling_messages_scenario;

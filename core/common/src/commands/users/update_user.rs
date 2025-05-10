@@ -17,12 +17,12 @@
  */
 
 use super::defaults::*;
-use crate::error::IggyError;
 use crate::BytesSerializable;
 use crate::Identifier;
 use crate::Sizeable;
 use crate::UserStatus;
 use crate::Validatable;
+use crate::error::IggyError;
 use crate::{Command, UPDATE_USER_CODE};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};

@@ -17,11 +17,11 @@
  */
 
 use error_set::ErrContext;
-use iggy_common::IggyError;
 use iggy_common::INDEX_SIZE;
+use iggy_common::IggyError;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicU64, Ordering},
 };
 use tokio::{
     fs::{File, OpenOptions},

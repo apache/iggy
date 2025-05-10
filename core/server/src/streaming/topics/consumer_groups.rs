@@ -16,12 +16,12 @@
  * under the License.
  */
 
+use crate::streaming::topics::COMPONENT;
 use crate::streaming::topics::consumer_group::ConsumerGroup;
 use crate::streaming::topics::topic::Topic;
-use crate::streaming::topics::COMPONENT;
 use error_set::ErrContext;
-use iggy_common::locking::IggySharedMutFn;
 use iggy_common::IggyError;
+use iggy_common::locking::IggySharedMutFn;
 use iggy_common::{IdKind, Identifier};
 use std::sync::atomic::Ordering;
 use tokio::sync::RwLock;
@@ -238,8 +238,8 @@ mod tests {
     use crate::streaming::storage::SystemStorage;
     use crate::streaming::utils::MemoryPool;
     use iggy_common::{CompressionAlgorithm, IggyExpiry, MaxTopicSize};
-    use std::sync::atomic::{AtomicU32, AtomicU64};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, AtomicU64};
 
     #[tokio::test]
     async fn should_be_created_given_valid_parameters() {

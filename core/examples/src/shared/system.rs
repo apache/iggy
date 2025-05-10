@@ -104,8 +104,14 @@ pub async fn consume_messages(
     handle_message: &MessageHandler,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let interval = args.get_interval();
-    info!("Messages will be polled by consumer: {} from stream: {}, topic: {}, partition: {} with interval {}.",
-        args.consumer_id, args.stream_id, args.topic_id, args.partition_id, interval.map_or("none".to_string(), |i| i.as_human_time_string()));
+    info!(
+        "Messages will be polled by consumer: {} from stream: {}, topic: {}, partition: {} with interval {}.",
+        args.consumer_id,
+        args.stream_id,
+        args.topic_id,
+        args.partition_id,
+        interval.map_or("none".to_string(), |i| i.as_human_time_string())
+    );
 
     let stream_id = args.stream_id.clone().try_into()?;
     let topic_id = args.topic_id.clone().try_into()?;

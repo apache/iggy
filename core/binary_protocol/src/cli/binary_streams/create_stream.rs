@@ -16,12 +16,12 @@
  * under the License.
  */
 
-use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
 use crate::Client;
+use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::Context;
 use async_trait::async_trait;
 use iggy_common::create_stream::CreateStream;
-use tracing::{event, Level};
+use tracing::{Level, event};
 
 pub struct CreateStreamCmd {
     create_stream: CreateStream,

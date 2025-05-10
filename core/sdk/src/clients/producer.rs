@@ -25,10 +25,10 @@ use iggy_common::{
     CompressionAlgorithm, DiagnosticEvent, EncryptorKind, IdKind, Identifier, IggyDuration,
     IggyError, IggyExpiry, IggyMessage, IggyTimestamp, MaxTopicSize, Partitioner, Partitioning,
 };
-use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::Duration;
-use tokio::time::{sleep, Interval};
+use tokio::time::{Interval, sleep};
 use tracing::{error, info, trace, warn};
 
 unsafe impl Send for IggyProducer {}
@@ -370,7 +370,9 @@ impl IggyProducer {
         }
 
         let remaining = interval - elapsed;
-        trace!("Waiting for {remaining} microseconds before sending messages... {interval} - {elapsed} = {remaining}");
+        trace!(
+            "Waiting for {remaining} microseconds before sending messages... {interval} - {elapsed} = {remaining}"
+        );
         sleep(Duration::from_micros(remaining)).await;
     }
 

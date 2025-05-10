@@ -24,8 +24,8 @@ use crate::binary::sender::SenderKind;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use error_set::ErrContext;
-use iggy_common::get_personal_access_tokens::GetPersonalAccessTokens;
 use iggy_common::IggyError;
+use iggy_common::get_personal_access_tokens::GetPersonalAccessTokens;
 use tracing::debug;
 
 impl ServerCommandHandler for GetPersonalAccessTokens {

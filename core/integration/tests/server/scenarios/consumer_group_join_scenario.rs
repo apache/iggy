@@ -17,9 +17,8 @@
  */
 
 use crate::server::scenarios::{
-    cleanup, create_client, join_consumer_group, CONSUMER_GROUP_ID, CONSUMER_GROUP_NAME,
-    PARTITIONS_COUNT, STREAM_ID, STREAM_NAME, TOPIC_ID, TOPIC_NAME, USERNAME_1, USERNAME_2,
-    USERNAME_3,
+    CONSUMER_GROUP_ID, CONSUMER_GROUP_NAME, PARTITIONS_COUNT, STREAM_ID, STREAM_NAME, TOPIC_ID,
+    TOPIC_NAME, USERNAME_1, USERNAME_2, USERNAME_3, cleanup, create_client, join_consumer_group,
 };
 use iggy::clients::client::IggyClient;
 use iggy::prelude::ClientInfoDetails;
@@ -30,7 +29,7 @@ use iggy::prelude::IggyExpiry;
 use iggy::prelude::MaxTopicSize;
 use iggy::prelude::{ConsumerGroupClient, StreamClient, SystemClient, TopicClient};
 use integration::test_server::{
-    assert_clean_system, create_user, login_root, login_user, ClientFactory,
+    ClientFactory, assert_clean_system, create_user, login_root, login_user,
 };
 
 pub async fn run(client_factory: &dyn ClientFactory) {

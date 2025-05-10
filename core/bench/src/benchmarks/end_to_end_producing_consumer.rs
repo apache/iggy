@@ -82,6 +82,8 @@ impl Benchmarkable for EndToEndProducingConsumerBenchmark {
         };
         let common_params = self.common_params_str();
 
-        info!("Staring benchmark EndToEndProducingConsumer, {streams}, {producers}, {max_topic_size}, {common_params}");
+        info!(
+            "Staring benchmark EndToEndProducingConsumer, {streams}, {producers}, {max_topic_size}, {common_params}"
+        );
     }
 }

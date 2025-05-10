@@ -22,10 +22,9 @@ mod error;
 mod logging;
 
 use crate::args::{
-    client::ClientAction, consumer_group::ConsumerGroupAction,
+    Command, IggyConsoleArgs, client::ClientAction, consumer_group::ConsumerGroupAction,
     consumer_offset::ConsumerOffsetAction, permissions::PermissionsArgs,
     personal_access_token::PersonalAccessTokenAction, stream::StreamAction, topic::TopicAction,
-    Command, IggyConsoleArgs,
 };
 use crate::credentials::IggyCredentials;
 use crate::error::IggyCmdError;
@@ -90,7 +89,7 @@ use iggy_binary_protocol::cli::{
     },
 };
 use std::sync::Arc;
-use tracing::{event, Level};
+use tracing::{Level, event};
 
 #[cfg(feature = "login-session")]
 mod main_login_session {

@@ -19,16 +19,16 @@
 use crate::state::system::TopicState;
 use crate::streaming::partitions::partition::Partition;
 use crate::streaming::storage::TopicStorage;
+use crate::streaming::topics::COMPONENT;
 use crate::streaming::topics::consumer_group::ConsumerGroup;
 use crate::streaming::topics::topic::Topic;
-use crate::streaming::topics::COMPONENT;
 use ahash::AHashSet;
 use anyhow::Context;
 use error_set::ErrContext;
 use futures::future::join_all;
+use iggy_common::IggyError;
 use iggy_common::locking::IggySharedMut;
 use iggy_common::locking::IggySharedMutFn;
-use iggy_common::IggyError;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -85,11 +85,15 @@ impl TopicStorage for FileTopicStorage {
             if partition_state.is_none() {
                 let stream_id = topic.stream_id;
                 let topic_id = topic.topic_id;
-                error!("Partition with ID: '{partition_id}' for stream with ID: '{stream_id}' and topic with ID: '{topic_id}' was not found in state, but exists on disk and will be removed.");
+                error!(
+                    "Partition with ID: '{partition_id}' for stream with ID: '{stream_id}' and topic with ID: '{topic_id}' was not found in state, but exists on disk and will be removed."
+                );
                 if let Err(error) = fs::remove_dir_all(&dir_entry.path()).await {
                     error!("Cannot remove partition directory: {error}");
                 } else {
-                    warn!("Partition with ID: '{partition_id}' for stream with ID: '{stream_id}' and topic with ID: '{topic_id}' was removed.");
+                    warn!(
+                        "Partition with ID: '{partition_id}' for stream with ID: '{stream_id}' and topic with ID: '{topic_id}' was removed."
+                    );
                 }
                 continue;
             }
@@ -131,7 +135,8 @@ impl TopicStorage for FileTopicStorage {
         } else {
             warn!(
                 "Partitions with IDs: '{missing_ids:?}' for topic with ID: '{topic_id}' for stream with ID: '{stream_id}' were not found on disk.",
-                topic_id = topic.topic_id, stream_id = topic.stream_id
+                topic_id = topic.topic_id,
+                stream_id = topic.stream_id
             );
             if topic.config.recovery.recreate_missing_state {
                 info!(
@@ -165,12 +170,15 @@ impl TopicStorage for FileTopicStorage {
                     partition.segments.clear();
                     unloaded_partitions.push(partition);
                     info!(
-                    "Created missing partition with ID: '{partition_id}', for topic with ID: '{}' for stream with ID: '{}'.",
-                    topic.topic_id, topic.stream_id
-                );
+                        "Created missing partition with ID: '{partition_id}', for topic with ID: '{}' for stream with ID: '{}'.",
+                        topic.topic_id, topic.stream_id
+                    );
                 }
             } else {
-                warn!("Recreating missing state in recovery config is disabled, missing partitions will not be created for topic with ID: '{}' for stream with ID: '{}'.", topic.topic_id, topic.stream_id);
+                warn!(
+                    "Recreating missing state in recovery config is disabled, missing partitions will not be created for topic with ID: '{}' for stream with ID: '{}'.",
+                    topic.topic_id, topic.stream_id
+                );
             }
         }
 
@@ -189,7 +197,8 @@ impl TopicStorage for FileTopicStorage {
                     Err(error) => {
                         error!(
                             "Failed to load partition with ID: {} for stream with ID: {stream_id} and topic with ID: {topic_id}. Error: {error}",
-                            partition.partition_id);
+                            partition.partition_id
+                        );
                     }
                 }
             });

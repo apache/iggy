@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::{error::IggyError, utils::byte_size::IggyByteSize, BytesSerializable, Sizeable};
+use crate::{BytesSerializable, Sizeable, error::IggyError, utils::byte_size::IggyByteSize};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;

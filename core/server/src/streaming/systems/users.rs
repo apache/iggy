@@ -21,22 +21,22 @@ use crate::state::models::CreateUserWithId;
 use crate::state::system::UserState;
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::System;
 use crate::streaming::systems::COMPONENT;
+use crate::streaming::systems::system::System;
 use crate::streaming::users::user::User;
 use crate::streaming::utils::crypto;
 use crate::{IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV};
 use error_set::ErrContext;
-use iggy_common::create_user::CreateUser;
-use iggy_common::defaults::*;
-use iggy_common::locking::IggySharedMutFn;
 use iggy_common::IggyError;
 use iggy_common::Permissions;
 use iggy_common::UserStatus;
+use iggy_common::create_user::CreateUser;
+use iggy_common::defaults::*;
+use iggy_common::locking::IggySharedMutFn;
 use iggy_common::{IdKind, Identifier};
 use std::env;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::{error, info, warn};
 
 static USER_ID: AtomicU32 = AtomicU32::new(1);
@@ -113,7 +113,9 @@ impl System {
         let username = env::var(IGGY_ROOT_USERNAME_ENV);
         let password = env::var(IGGY_ROOT_PASSWORD_ENV);
         if (username.is_ok() && password.is_err()) || (username.is_err() && password.is_ok()) {
-            panic!("When providing the custom root user credentials, both username and password must be set.");
+            panic!(
+                "When providing the custom root user credentials, both username and password must be set."
+            );
         }
         if username.is_ok() && password.is_ok() {
             info!("Using the custom root user credentials.");

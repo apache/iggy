@@ -16,8 +16,8 @@
  * under the License.
  */
 
-use server::archiver::s3::S3Archiver;
 use server::archiver::Archiver;
+use server::archiver::s3::S3Archiver;
 use server::configs::server::S3ArchiverConfig;
 
 #[tokio::test]

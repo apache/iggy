@@ -22,8 +22,8 @@ use iggy_common::IggyError;
 use iggy_common::IggyExpiry;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey};
 use serde::{Deserialize, Serialize};
-use serde_with::serde_as;
 use serde_with::DisplayFromStr;
+use serde_with::serde_as;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct HttpConfig {

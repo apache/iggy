@@ -17,8 +17,8 @@
  */
 
 use crate::cli::common::{
-    IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId, TestTopicId,
-    CLAP_INDENT, USAGE_PREFIX,
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId,
+    TestTopicId, USAGE_PREFIX,
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
@@ -145,7 +145,9 @@ impl IggyCmdTestCase for TestMessageFetchCmd {
             }
         );
 
-        let message = format!("Executing flush messages {identification_part}\nFlushed messages {identification_part}\n");
+        let message = format!(
+            "Executing flush messages {identification_part}\nFlushed messages {identification_part}\n"
+        );
 
         command_state.success().stdout(diff(message));
     }

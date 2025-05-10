@@ -23,7 +23,7 @@ use crate::components::tooltips::benchmark_info_tooltip::BenchmarkInfoTooltip;
 use crate::components::tooltips::server_stats_toggle::ServerStatsToggle;
 use crate::components::tooltips::server_stats_tooltip::ServerStatsTooltip;
 use crate::state::benchmark::use_benchmark;
-use crate::state::ui::{use_ui, UiAction};
+use crate::state::ui::{UiAction, use_ui};
 use yew::prelude::*;
 
 #[derive(Properties, PartialEq)]

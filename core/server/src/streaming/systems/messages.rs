@@ -19,13 +19,13 @@
 use crate::binary::handlers::messages::poll_messages_handler::IggyPollMetadata;
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet};
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::System;
 use crate::streaming::systems::COMPONENT;
+use crate::streaming::systems::system::System;
 use crate::streaming::utils::PooledBuffer;
 use error_set::ErrContext;
 use iggy_common::{
-    BytesSerializable, Confirmation, Consumer, EncryptorKind, Identifier, IggyError, Partitioning,
-    PollingStrategy, IGGY_MESSAGE_HEADER_SIZE,
+    BytesSerializable, Confirmation, Consumer, EncryptorKind, IGGY_MESSAGE_HEADER_SIZE, Identifier,
+    IggyError, Partitioning, PollingStrategy,
 };
 use tracing::{error, trace};
 
@@ -74,7 +74,10 @@ impl System {
             let offset = batch_set
                 .last_offset()
                 .expect("Batch set should have at least one batch");
-            trace!("Last offset: {} will be automatically stored for {}, stream: {}, topic: {}, partition: {}", offset, consumer, stream_id, topic_id, partition_id);
+            trace!(
+                "Last offset: {} will be automatically stored for {}, stream: {}, topic: {}, partition: {}",
+                offset, consumer, stream_id, topic_id, partition_id
+            );
             topic
                 .store_consumer_offset_internal(polling_consumer, offset, partition_id)
                 .await

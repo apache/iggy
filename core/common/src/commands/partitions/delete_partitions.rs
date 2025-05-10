@@ -17,11 +17,11 @@
  */
 
 use super::MAX_PARTITIONS_COUNT;
-use crate::error::IggyError;
 use crate::BytesSerializable;
 use crate::Identifier;
 use crate::Sizeable;
 use crate::Validatable;
+use crate::error::IggyError;
 use crate::{Command, DELETE_PARTITIONS_CODE};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};

@@ -16,8 +16,8 @@
  * under the License.
  */
 
-use crate::streaming::partitions::partition::Partition;
 use crate::streaming::partitions::COMPONENT;
+use crate::streaming::partitions::partition::Partition;
 use crate::streaming::polling_consumer::PollingConsumer;
 use crate::streaming::segments::*;
 use error_set::ErrContext;
@@ -61,8 +61,7 @@ impl Partition {
     ) -> Result<IggyMessagesBatchSet, IggyError> {
         trace!(
             "Getting {count} messages for start offset: {start_offset} for partition: {}, current offset: {}...",
-            self.partition_id,
-            self.current_offset
+            self.partition_id, self.current_offset
         );
 
         if self.segments.is_empty() || start_offset > self.current_offset || count == 0 {
@@ -114,8 +113,7 @@ impl Partition {
         if consumer_offset.is_none() {
             trace!(
                 "Consumer: {} hasn't stored offset for partition: {}, returning the first messages...",
-                consumer_id,
-                self.partition_id
+                consumer_id, self.partition_id
             );
             return self.get_first_messages(count).await;
         }
@@ -124,9 +122,7 @@ impl Partition {
         if consumer_offset.offset == self.current_offset {
             trace!(
                 "Consumer: {} has the latest offset: {} for partition: {}, returning empty messages...",
-                consumer_id,
-                consumer_offset.offset,
-                self.partition_id
+                consumer_id, consumer_offset.offset, self.partition_id
             );
             return Ok(IggyMessagesBatchSet::empty());
         }
@@ -134,9 +130,7 @@ impl Partition {
         let offset = consumer_offset.offset + 1;
         trace!(
             "Getting next messages for consumer id: {} for partition: {} from offset: {}...",
-            consumer_id,
-            self.partition_id,
-            offset
+            consumer_id, self.partition_id, offset
         );
 
         self.get_messages_by_offset(offset, count).await
@@ -241,9 +235,9 @@ impl Partition {
         if last_segment.is_closed() {
             let start_offset = last_segment.end_offset() + 1;
             trace!(
-                    "Current segment is closed, creating new segment with start offset: {} for partition with ID: {}...",
-                    start_offset, self.partition_id
-                );
+                "Current segment is closed, creating new segment with start offset: {} for partition with ID: {}...",
+                start_offset, self.partition_id
+            );
             self.add_persisted_segment(start_offset).await.with_error_context(|error| format!(
                     "{COMPONENT} (error: {error}) - failed to add persisted segment, partition: {}, start offset: {}",
                     self, start_offset,
@@ -305,16 +299,20 @@ impl Partition {
                         self.unsaved_messages_count,
                         self.config.partition.messages_required_to_save
                     )
-                    } else if unsaved_messages_size_exceeded {
-                        format!("unsaved messages size exceeded: {}, max from config: {}",
+                } else if unsaved_messages_size_exceeded {
+                    format!(
+                        "unsaved messages size exceeded: {}, max from config: {}",
                         self.unsaved_messages_size,
-                        self.config.partition.size_of_messages_required_to_save)
-                    } else {
-                        format!("segment is full, current size: {}, max from config: {}",
+                        self.config.partition.size_of_messages_required_to_save
+                    )
+                } else {
+                    format!(
+                        "segment is full, current size: {}, max from config: {}",
                         last_segment.get_messages_size(),
-                        self.config.segment.size)
-                    }
-                );
+                        self.config.segment.size
+                    )
+                }
+            );
 
             last_segment.persist_messages(confirmation).await.with_error_context(|error| {
                 format!(
@@ -368,8 +366,8 @@ mod tests {
     use crate::streaming::utils::MemoryPool;
     use bytes::Bytes;
     use iggy_common::{IggyExpiry, IggyMessage};
-    use std::sync::atomic::{AtomicU32, AtomicU64};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, AtomicU64};
     use tempfile::TempDir;
 
     #[tokio::test]

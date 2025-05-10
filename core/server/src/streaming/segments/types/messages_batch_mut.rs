@@ -19,13 +19,13 @@
 use super::message_view_mut::IggyMessageViewMutIterator;
 use crate::streaming::deduplication::message_deduplicator::MessageDeduplicator;
 use crate::streaming::segments::indexes::IggyIndexesMut;
-use crate::streaming::utils::random_id;
 use crate::streaming::utils::PooledBuffer;
+use crate::streaming::utils::random_id;
 use bytes::{BufMut, BytesMut};
 use iggy_common::{
-    BytesSerializable, IggyByteSize, IggyError, IggyIndexView, IggyMessage, IggyMessageView,
-    IggyMessageViewIterator, IggyTimestamp, Sizeable, Validatable, IGGY_MESSAGE_HEADER_SIZE,
-    INDEX_SIZE, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE,
+    BytesSerializable, IGGY_MESSAGE_HEADER_SIZE, INDEX_SIZE, IggyByteSize, IggyError,
+    IggyIndexView, IggyMessage, IggyMessageView, IggyMessageViewIterator, IggyTimestamp,
+    MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE, Sizeable, Validatable,
 };
 use lending_iterator::prelude::*;
 use std::ops::{Deref, Index};
@@ -662,21 +662,21 @@ impl IggyMessagesBatchMut {
 
             if message.header().offset() < prev_offset {
                 error!(
-                "Offset of previous message: {} is smaller than current message {} at offset {}",
-                prev_offset,
-                message.header().offset(),
-                i
-            );
+                    "Offset of previous message: {} is smaller than current message {} at offset {}",
+                    prev_offset,
+                    message.header().offset(),
+                    i
+                );
                 return Err(IggyError::InvalidOffset(message.header().offset()));
             }
 
             if index.position() < prev_position {
                 error!(
-                "Position of previous message: {} is smaller than current message {} at offset {}",
-                prev_position,
-                index.position(),
-                i
-            );
+                    "Position of previous message: {} is smaller than current message {} at offset {}",
+                    prev_position,
+                    index.position(),
+                    i
+                );
                 return Err(IggyError::CannotReadIndexPosition);
             }
 
@@ -748,8 +748,7 @@ impl IggyMessagesBatchMut {
             None => {
                 error!(
                     "Message at index {} is missing, or message size is less than minimum message size {} B (header)",
-                    i,
-                    IGGY_MESSAGE_HEADER_SIZE
+                    i, IGGY_MESSAGE_HEADER_SIZE
                 );
                 return Err(IggyError::MissingIndex(i));
             }

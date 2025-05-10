@@ -16,12 +16,12 @@
  * under the License.
  */
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::System;
 use crate::streaming::systems::COMPONENT;
+use crate::streaming::systems::system::System;
 use error_set::ErrContext;
-use iggy_common::locking::IggySharedMutFn;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
+use iggy_common::locking::IggySharedMutFn;
 
 impl System {
     pub async fn delete_segments(

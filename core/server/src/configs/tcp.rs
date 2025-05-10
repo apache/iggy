@@ -18,8 +18,8 @@
 
 use iggy_common::{IggyByteSize, IggyDuration};
 use serde::{Deserialize, Serialize};
-use serde_with::serde_as;
 use serde_with::DisplayFromStr;
+use serde_with::serde_as;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct TcpConfig {

@@ -24,8 +24,8 @@ use iggy::prelude::Sizeable;
 use server::state::system::PartitionState;
 use server::streaming::partitions::partition::Partition;
 use server::streaming::segments::*;
-use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use tokio::fs;
 
 #[tokio::test]

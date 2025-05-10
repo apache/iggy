@@ -24,10 +24,10 @@ use crate::streaming::systems::system::SharedSystem;
 use crate::streaming::topics::topic::Topic;
 use error_set::ErrContext;
 use flume::Sender;
-use iggy_common::locking::IggySharedMutFn;
 use iggy_common::IggyDuration;
 use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
+use iggy_common::locking::IggySharedMutFn;
 use std::sync::Arc;
 use tokio::time;
 use tracing::{debug, error, info, instrument, trace};
@@ -147,8 +147,7 @@ impl BackgroundServerCommand<MaintainMessagesCommand> for MaintainMessagesExecut
                 if deleted_segments.segments_count == 0 {
                     trace!(
                         "No segments were deleted for stream ID: {}, topic ID: {}",
-                        topic.stream_id,
-                        topic.topic_id
+                        topic.stream_id, topic.topic_id
                     );
                     continue;
                 }
@@ -303,7 +302,11 @@ async fn handle_oldest_segments(
                 if is_archived.is_err() {
                     error!(
                         "Failed to check if segment with start offset: {} is archived for stream ID: {}, topic ID: {}, partition ID: {}. Error: {}",
-                        segment.start_offset(), topic.stream_id, topic.topic_id, partition.partition_id, is_archived.err().unwrap()
+                        segment.start_offset(),
+                        topic.stream_id,
+                        topic.topic_id,
+                        partition.partition_id,
+                        is_archived.err().unwrap()
                     );
                     continue;
                 }
@@ -311,7 +314,10 @@ async fn handle_oldest_segments(
                 if !is_archived.unwrap() {
                     debug!(
                         "Segment with start offset: {} is not archived for stream ID: {}, topic ID: {}, partition ID: {}",
-                        segment.start_offset(), topic.stream_id, topic.topic_id, partition.partition_id
+                        segment.start_offset(),
+                        topic.stream_id,
+                        topic.topic_id,
+                        partition.partition_id
                     );
                     start_offsets.push(segment.start_offset());
                 }
@@ -470,7 +476,11 @@ async fn archive_segments(
                     if let Err(error) = archiver.archive(&files, None).await {
                         error!(
                             "Failed to archive segment with start offset: {} for stream ID: {}, topic ID: {}, partition ID: {}. Error: {}",
-                            start_offset, topic.stream_id, topic.topic_id, partition.partition_id, error
+                            start_offset,
+                            topic.stream_id,
+                            topic.topic_id,
+                            partition.partition_id,
+                            error
                         );
                         continue;
                     }

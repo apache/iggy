@@ -17,10 +17,10 @@
  */
 
 use crate::utils::duration::IggyDuration;
-use humantime::format_duration;
 use humantime::Duration as HumanDuration;
+use humantime::format_duration;
 use serde::de::Visitor;
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::fmt;
 use std::fmt::Display;
 use std::iter::Sum;

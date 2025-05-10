@@ -17,8 +17,8 @@
  */
 
 use crate::cli::common::{
-    IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId, TestTopicId,
-    CLAP_INDENT, USAGE_PREFIX,
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId,
+    TestTopicId, USAGE_PREFIX,
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
@@ -130,8 +130,17 @@ impl IggyCmdTestCase for TestConsumerGroupCreateCmd {
             None => "ID auto incremented".to_string(),
         };
 
-        let message = format!("Executing create consumer group: {}, name: {} for topic with ID: {} and stream with ID: {}\nConsumer group: {}, name: {} created for topic with ID: {} and stream with ID: {}\n",
-                              group_id, self.group_name, topic_id, stream_id, group_id, self.group_name, topic_id, stream_id);
+        let message = format!(
+            "Executing create consumer group: {}, name: {} for topic with ID: {} and stream with ID: {}\nConsumer group: {}, name: {} created for topic with ID: {} and stream with ID: {}\n",
+            group_id,
+            self.group_name,
+            topic_id,
+            stream_id,
+            group_id,
+            self.group_name,
+            topic_id,
+            stream_id
+        );
 
         command_state.success().stdout(diff(message));
     }

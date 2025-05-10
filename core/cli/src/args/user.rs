@@ -17,8 +17,8 @@
  */
 
 use crate::args::common::ListMode;
-use crate::args::permissions::stream::StreamPermissionsArg;
 use crate::args::permissions::UserStatusArg;
+use crate::args::permissions::stream::StreamPermissionsArg;
 use clap::{Args, Subcommand};
 use iggy::prelude::Identifier;
 

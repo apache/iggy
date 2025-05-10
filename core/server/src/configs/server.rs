@@ -17,20 +17,20 @@
  */
 
 use crate::archiver::ArchiverKindType;
+use crate::configs::COMPONENT;
 use crate::configs::config_provider::ConfigProviderKind;
 use crate::configs::http::HttpConfig;
 use crate::configs::quic::QuicConfig;
 use crate::configs::system::SystemConfig;
 use crate::configs::tcp::TcpConfig;
-use crate::configs::COMPONENT;
 use crate::server_error::ConfigError;
 use derive_more::Display;
 use error_set::ErrContext;
 use iggy_common::IggyDuration;
 use iggy_common::Validatable;
 use serde::{Deserialize, Serialize};
-use serde_with::serde_as;
 use serde_with::DisplayFromStr;
+use serde_with::serde_as;
 use std::str::FromStr;
 use std::sync::Arc;
 

@@ -20,7 +20,7 @@ use crate::args::{
     common::IggyBenchArgs, defaults::*, props::BenchmarkKindProps,
     transport::BenchmarkTransportCommand,
 };
-use clap::{error::ErrorKind, CommandFactory, Parser};
+use clap::{CommandFactory, Parser, error::ErrorKind};
 use iggy::prelude::IggyByteSize;
 use std::num::NonZeroU32;
 

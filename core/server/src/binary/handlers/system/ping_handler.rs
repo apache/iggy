@@ -21,10 +21,10 @@ use crate::binary::sender::SenderKind;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use iggy_common::locking::IggySharedMutFn;
-use iggy_common::ping::Ping;
 use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
+use iggy_common::locking::IggySharedMutFn;
+use iggy_common::ping::Ping;
 use tracing::debug;
 
 impl ServerCommandHandler for Ping {

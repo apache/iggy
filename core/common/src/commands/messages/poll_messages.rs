@@ -222,11 +222,7 @@ impl Display for PollMessages {
 }
 
 fn auto_commit_to_string(auto_commit: bool) -> &'static str {
-    if auto_commit {
-        "a"
-    } else {
-        "n"
-    }
+    if auto_commit { "a" } else { "n" }
 }
 
 #[cfg(test)]

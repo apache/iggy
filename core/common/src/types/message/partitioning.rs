@@ -17,7 +17,7 @@
  */
 
 use super::PartitioningKind;
-use crate::{error::IggyError, BytesSerializable, IggyByteSize, Sizeable};
+use crate::{BytesSerializable, IggyByteSize, Sizeable, error::IggyError};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use serde_with::base64::Base64;

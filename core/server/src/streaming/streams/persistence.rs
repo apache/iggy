@@ -17,8 +17,8 @@
  */
 
 use crate::state::system::StreamState;
-use crate::streaming::streams::stream::Stream;
 use crate::streaming::streams::COMPONENT;
+use crate::streaming::streams::stream::Stream;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 

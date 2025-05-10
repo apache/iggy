@@ -18,7 +18,7 @@
 name = "iggy_common"
 version = "0.7.0"
 description = "Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
 keywords = ["iggy", "messaging", "streaming"]
 categories = ["command-line-utilities", "database", "network-programming"]

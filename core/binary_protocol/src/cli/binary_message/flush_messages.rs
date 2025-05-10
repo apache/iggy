@@ -16,12 +16,12 @@
  * under the License.
  */
 
-use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
 use crate::Client;
+use crate::cli::cli_command::{CliCommand, PRINT_TARGET};
 use anyhow::{Context, Error};
 use async_trait::async_trait;
 use iggy_common::Identifier;
-use tracing::{event, Level};
+use tracing::{Level, event};
 
 pub struct FlushMessagesCmd {
     stream_id: Identifier,

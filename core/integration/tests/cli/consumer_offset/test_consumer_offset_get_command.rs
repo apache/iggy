@@ -17,8 +17,8 @@
  */
 
 use crate::cli::common::{
-    IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestConsumerId, TestHelpCmd, TestStreamId,
-    TestTopicId, CLAP_INDENT, USAGE_PREFIX,
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestConsumerId, TestHelpCmd,
+    TestStreamId, TestTopicId, USAGE_PREFIX,
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
@@ -175,10 +175,7 @@ impl IggyCmdTestCase for TestConsumerOffsetGetCmd {
 
         let message = format!(
             "Executing get consumer offset for consumer with ID: {} for stream with ID: {} and topic with ID: {} and partition with ID: {}",
-            consumer_id,
-            stream_id,
-            topic_id,
-            self.partition_id,
+            consumer_id, stream_id, topic_id, self.partition_id,
         );
 
         command_state

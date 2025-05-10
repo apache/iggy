@@ -41,7 +41,9 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                 .display()
         );
     } else {
-        println!("cargo:info=Skipping build script because CI environment variable IGGY_CI_BUILD is not set to 'true'");
+        println!(
+            "cargo:info=Skipping build script because CI environment variable IGGY_CI_BUILD is not set to 'true'"
+        );
     }
 
     Ok(())

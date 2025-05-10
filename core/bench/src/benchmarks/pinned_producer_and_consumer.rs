@@ -88,6 +88,8 @@ impl Benchmarkable for PinnedProducerAndConsumerBenchmark {
         };
         let common_params = self.common_params_str();
 
-        info!("Staring benchmark PinnedProducerAndConsumer, {streams}, {partitions}, {producers}, {consumers}, {max_topic_size}, {common_params}");
+        info!(
+            "Staring benchmark PinnedProducerAndConsumer, {streams}, {partitions}, {producers}, {consumers}, {max_topic_size}, {common_params}"
+        );
     }
 }

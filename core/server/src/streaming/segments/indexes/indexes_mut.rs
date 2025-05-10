@@ -17,7 +17,7 @@
  */
 
 use crate::streaming::utils::PooledBuffer;
-use iggy_common::{IggyIndexView, INDEX_SIZE};
+use iggy_common::{INDEX_SIZE, IggyIndexView};
 use std::fmt;
 use std::ops::{Deref, Index as StdIndex};
 

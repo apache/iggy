@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use dirs::home_dir;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

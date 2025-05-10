@@ -26,8 +26,8 @@ use server::streaming::partitions::partition::Partition;
 use server::streaming::segments::IggyMessagesBatchMut;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::thread::sleep;
 use test_case::test_matrix;
 
@@ -91,11 +91,7 @@ async fn test_get_messages_by_timestamp(
 ) {
     println!(
         "Running test with message_size: {}, batches: {:?}, messages_required_to_save: {}, segment_size: {}, cache_indexes: {}",
-        message_size,
-        batch_sizes,
-        messages_required_to_save,
-        segment_size,
-        cache_indexes
+        message_size, batch_sizes, messages_required_to_save, segment_size, cache_indexes
     );
 
     let setup = TestSetup::init().await;
