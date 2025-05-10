@@ -14,6 +14,7 @@ bench_*
 /**/obj
 /**/bin
 *.iml
+foreign/cpp/build
 foreign/java/**/build
 foreign/java/**/out
 foreign/node/**/node_modules
@@ -25,7 +26,11 @@ foreign/node/.npm
 *.dll
 *.so
 *.dylib
-*.test
+*.lai
+*.la
+*.a
+*.lib
 *.out
+*.test
 go.work
 core/bench/dashboard/frontend/dist
