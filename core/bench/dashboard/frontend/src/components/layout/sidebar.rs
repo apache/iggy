@@ -16,9 +16,11 @@
 // under the License.
 
 use super::logo::Logo;
+use crate::components::selectors::benchmark_search_box::BenchmarkSearchBox;
 use crate::components::selectors::benchmark_selector::BenchmarkSelector;
 use crate::components::selectors::gitref_selector::GitrefSelector;
 use crate::components::selectors::hardware_selector::HardwareSelector;
+use crate::components::selectors::recent_benchmarks_selector::RecentBenchmarksSelector;
 use crate::components::selectors::view_mode_selector::ViewModeSelector;
 use crate::state::benchmark::{BenchmarkAction, use_benchmark};
 use crate::state::gitref::use_gitref;
@@ -36,6 +38,7 @@ pub enum BenchmarkTab {
 #[derive(Properties, PartialEq)]
 pub struct SidebarProps {
     pub on_gitref_select: Callback<String>,
+    pub on_hardware_select: Callback<String>,
 }
 
 #[function_component(Sidebar)]
@@ -43,7 +46,11 @@ pub fn sidebar(props: &SidebarProps) -> Html {
     let gitref_ctx = use_gitref();
     let ui_state = use_ui();
     let benchmark_ctx = use_benchmark();
+    let search_query = use_state(String::new);
+
     let is_trend_view = matches!(ui_state.view_mode, ViewMode::GitrefTrend);
+
+    let is_recent_view = matches!(ui_state.view_mode, ViewMode::RecentBenchmarks);
 
     let active_tab = match benchmark_ctx.state.selected_kind {
         BenchmarkKind::PinnedProducer
@@ -129,83 +136,100 @@ pub fn sidebar(props: &SidebarProps) -> Html {
 
     html! {
         <div class="sidebar">
-            <Logo />
-            <HardwareSelector />
-            <ViewModeSelector />
+            <div class="sidebar-fixed-header">
+                <Logo />
+                <ViewModeSelector />
 
-            if !is_trend_view {
-                <GitrefSelector
-                    gitrefs={gitref_ctx.state.gitrefs.clone()}
-                    selected_gitref={gitref_ctx.state.selected_gitref.clone().unwrap_or_default()}
-                    on_gitref_select={props.on_gitref_select.clone()}
-                />
+                if !is_recent_view {
+                    <HardwareSelector
+                        on_hardware_select={props.on_hardware_select.clone()}
+                    />
+                }
+
+                if !is_trend_view && !is_recent_view {
+                    <GitrefSelector
+                        gitrefs={gitref_ctx.state.gitrefs.clone()}
+                        selected_gitref={gitref_ctx.state.selected_gitref.clone().unwrap_or_default()}
+                        on_gitref_select={props.on_gitref_select.clone()}
+                    />
+                }
+
+                <h3 class="benchmarks-heading">{"Benchmarks"}</h3>
+                if is_recent_view {
+                    <BenchmarkSearchBox search_query={search_query.clone()} />
+                }
+            </div>
+
+            <div class="sidebar-scrollable-content">
+                if is_recent_view {
+                    <RecentBenchmarksSelector limit={10000} search_query={(*search_query).clone()} />
+                } else {
+                    <div class="sidebar-tabs">
+                    <div class="tab-list">
+                        <button
+                            class={classes!(
+                                "tab-button",
+                                (active_tab == BenchmarkTab::Pinned).then_some("active"),
+                                (!has_pinned_benchmarks).then_some("inactive")
+                            )}
+                            disabled={!has_pinned_benchmarks}
+                            onclick={
+                                let on_tab_click = on_tab_click.clone();
+                                Callback::from(move |_| on_tab_click.emit(BenchmarkTab::Pinned))
+                            }
+                        >
+                            { "Pinned (" }{pinned_benchmark_count}{")" }
+                        </button>
+                        <button
+                            class={classes!(
+                                "tab-button",
+                                (active_tab == BenchmarkTab::Balanced).then_some("active"),
+                                (!has_balanced_benchmarks).then_some("inactive")
+                            )}
+                            disabled={!has_balanced_benchmarks}
+                            onclick={
+                                let on_tab_click = on_tab_click.clone();
+                                Callback::from(move |_| on_tab_click.emit(BenchmarkTab::Balanced))
+                            }
+                        >
+                            { "Balanced (" }{balanced_benchmark_count}{")" }
+                        </button>
+                        <button
+                            class={classes!(
+                                "tab-button",
+                                (active_tab == BenchmarkTab::EndToEnd).then_some("active"),
+                                (!has_end_to_end_benchmarks).then_some("inactive")
+                            )}
+                            disabled={!has_end_to_end_benchmarks}
+                            onclick={
+                                let on_tab_click = on_tab_click.clone();
+                                Callback::from(move |_| on_tab_click.emit(BenchmarkTab::EndToEnd))
+                            }
+                        >
+                            { "End to End (" }{end_to_end_benchmark_count}{")" }
+                        </button>
+                    </div>
+
+                    <div class={classes!(
+                        "tab-content",
+                        (active_tab == BenchmarkTab::Pinned).then_some("active")
+                    )}>
+                        <BenchmarkSelector kind={get_default_kind_for_tab(&BenchmarkTab::Pinned)} />
+                    </div>
+                    <div class={classes!(
+                        "tab-content",
+                        (active_tab == BenchmarkTab::Balanced).then_some("active")
+                    )}>
+                        <BenchmarkSelector kind={get_default_kind_for_tab(&BenchmarkTab::Balanced)} />
+                    </div>
+                    <div class={classes!(
+                        "tab-content",
+                        (active_tab == BenchmarkTab::EndToEnd).then_some("active")
+                    )}>
+                        <BenchmarkSelector kind={get_default_kind_for_tab(&BenchmarkTab::EndToEnd)} />
+                    </div>
+                </div>
             }
-
-            <h3>{"Benchmarks"}</h3>
-            <div class="sidebar-tabs">
-                <div class="tab-list">
-                    <button
-                        class={classes!(
-                            "tab-button",
-                            (active_tab == BenchmarkTab::Pinned).then_some("active"),
-                            (!has_pinned_benchmarks).then_some("inactive")
-                        )}
-                        disabled={!has_pinned_benchmarks}
-                        onclick={
-                            let on_tab_click = on_tab_click.clone();
-                            Callback::from(move |_| on_tab_click.emit(BenchmarkTab::Pinned))
-                        }
-                    >
-                        { "Pinned (" }{pinned_benchmark_count}{")" }
-                    </button>
-                    <button
-                        class={classes!(
-                            "tab-button",
-                            (active_tab == BenchmarkTab::Balanced).then_some("active"),
-                            (!has_balanced_benchmarks).then_some("inactive")
-                        )}
-                        disabled={!has_balanced_benchmarks}
-                        onclick={
-                            let on_tab_click = on_tab_click.clone();
-                            Callback::from(move |_| on_tab_click.emit(BenchmarkTab::Balanced))
-                        }
-                    >
-                        { "Balanced (" }{balanced_benchmark_count}{")" }
-                    </button>
-                    <button
-                        class={classes!(
-                            "tab-button",
-                            (active_tab == BenchmarkTab::EndToEnd).then_some("active"),
-                            (!has_end_to_end_benchmarks).then_some("inactive")
-                        )}
-                        disabled={!has_end_to_end_benchmarks}
-                        onclick={
-                            let on_tab_click = on_tab_click.clone();
-                            Callback::from(move |_| on_tab_click.emit(BenchmarkTab::EndToEnd))
-                        }
-                    >
-                        { "End to End (" }{end_to_end_benchmark_count}{")" }
-                    </button>
-                </div>
-
-                <div class={classes!(
-                    "tab-content",
-                    (active_tab == BenchmarkTab::Pinned).then_some("active")
-                )}>
-                    <BenchmarkSelector kind={get_default_kind_for_tab(&BenchmarkTab::Pinned)} />
-                </div>
-                <div class={classes!(
-                    "tab-content",
-                    (active_tab == BenchmarkTab::Balanced).then_some("active")
-                )}>
-                    <BenchmarkSelector kind={get_default_kind_for_tab(&BenchmarkTab::Balanced)} />
-                </div>
-                <div class={classes!(
-                    "tab-content",
-                    (active_tab == BenchmarkTab::EndToEnd).then_some("active")
-                )}>
-                    <BenchmarkSelector kind={get_default_kind_for_tab(&BenchmarkTab::EndToEnd)} />
-                </div>
             </div>
         </div>
     }
