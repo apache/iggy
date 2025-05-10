@@ -1,0 +1,14 @@
+{
+    "dependencies": [
+        "ada-url",
+        "catch2",
+        "fmt",
+        "inja",
+        "libsodium",
+        "libuv",
+        "nlohmann-json",
+        "reproc",
+        "spdlog",
+        "utf8h"
+    ]
+}

@@ -1,0 +1,7 @@
+---
+BasedOnStyle: Chromium
+BreakConstructorInitializers: BeforeComma
+ConstructorInitializerAllOnOneLineOrOnePerLine: false
+ColumnLimit: 140
+IndentWidth: 4
+AccessModifierOffset: -4
