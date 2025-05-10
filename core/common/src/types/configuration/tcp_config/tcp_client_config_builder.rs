@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{AutoLogin, IggyDuration, TcpClientConfig};
+use crate::{AutoLogin, IggyDuration, IggyError, TcpClientConfig};
 
 /// Builder for the TCP client configuration.
 /// Allows configuring the TCP client with custom settings or using defaults:
@@ -89,7 +89,15 @@ impl TcpClientConfigBuilder {
     }
 
     /// Builds the TCP client configuration.
-    pub fn build(self) -> TcpClientConfig {
-        self.config
+    pub fn build(self) -> Result<TcpClientConfig, IggyError> {
+        let parts: Vec<&str> = self.config.server_address.split(':').collect();
+        if parts.len() != 2
+            || parts[0].parse::<std::net::Ipv4Addr>().is_err()
+            || parts[0].parse::<std::net::Ipv6Addr>().is_err()
+            || parts[1].parse::<u16>().is_err()
+        {
+            return Err(IggyError::ValidatedServerAddress);
+        }
+        Ok(self.config)
     }
 }

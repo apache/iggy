@@ -174,7 +174,7 @@ impl TcpClientBuilder {
 
     /// Builds the parent `IggyClient` with TCP configuration.
     pub fn build(self) -> Result<IggyClient, IggyError> {
-        let client = TcpClient::create(Arc::new(self.config.build()))?;
+        let client = TcpClient::create(Arc::new(self.config.build()?))?;
         let client = self.parent_builder.with_client(Box::new(client)).build()?;
         Ok(client)
     }
