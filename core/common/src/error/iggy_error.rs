@@ -77,6 +77,8 @@ pub enum IggyError {
     InvalidServerAddress = 33,
     #[error("Invalid client address")]
     InvalidClientAddress = 34,
+    #[error("Invalid IP address: {0}:{1}")]
+    InvalidIpAddress(String, String) = 35,
     #[error("Unauthenticated")]
     Unauthenticated = 40,
     #[error("Unauthorized")]
