@@ -20,8 +20,8 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::system::System;
 use crate::streaming::systems::COMPONENT;
 use error_set::ErrContext;
-use iggy::error::IggyError;
-use iggy::identifier::Identifier;
+use iggy_common::Identifier;
+use iggy_common::IggyError;
 
 impl System {
     pub async fn create_partitions(

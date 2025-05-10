@@ -17,8 +17,8 @@
  */
 
 use clap::Parser;
-use iggy::users::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
-use iggy::utils::duration::IggyDuration;
+use iggy::prelude::IggyDuration;
+use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use std::str::FromStr;
 
 #[derive(Parser, Debug)]
@@ -220,8 +220,8 @@ impl Default for Args {
 }
 
 impl Args {
-    pub fn to_sdk_args(&self) -> iggy::args::Args {
-        iggy::args::Args {
+    pub fn to_sdk_args(&self) -> iggy::prelude::Args {
+        iggy::prelude::Args {
             transport: self.transport.clone(),
             encryption_key: self.encryption_key.clone(),
             http_api_url: self.http_api_url.clone(),

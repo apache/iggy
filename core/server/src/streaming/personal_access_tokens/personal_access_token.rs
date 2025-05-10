@@ -16,10 +16,10 @@
  * under the License.
  */
 use crate::streaming::utils::hash;
-use iggy::models::user_info::UserId;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::text::as_base64;
-use iggy::utils::timestamp::IggyTimestamp;
+use iggy_common::text::as_base64;
+use iggy_common::IggyExpiry;
+use iggy_common::IggyTimestamp;
+use iggy_common::UserId;
 use ring::rand::SecureRandom;
 use std::sync::Arc;
 
@@ -96,8 +96,8 @@ impl PersonalAccessToken {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy::utils::duration::IggyDuration;
-    use iggy::utils::timestamp::IggyTimestamp;
+    use iggy_common::IggyDuration;
+    use iggy_common::IggyTimestamp;
 
     #[test]
     fn personal_access_token_should_be_created_with_random_secure_value_and_hashed_successfully() {

@@ -20,7 +20,7 @@ use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use crate::streaming::utils::PooledBuffer;
 use bytes::BytesMut;
 use error_set::ErrContext;
-use iggy::error::IggyError;
+use iggy_common::IggyError;
 use std::{fs::File as StdFile, os::unix::prelude::FileExt};
 use std::{
     io::ErrorKind,
@@ -59,10 +59,8 @@ impl MessagesReader {
         // posix_fadvise() doesn't exist on MacOS
         #[cfg(not(target_os = "macos"))]
         {
-            use std::os::unix::io::AsRawFd;
-            let fd = file.as_raw_fd();
             let _ = nix::fcntl::posix_fadvise(
-                    fd,
+                    &file,
                     0,
                     0, // 0 means the entire file
                     nix::fcntl::PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL,

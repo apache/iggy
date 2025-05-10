@@ -24,13 +24,13 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy::error::IggyError;
-use iggy::partitions::delete_partitions::DeletePartitions;
+use iggy_common::delete_partitions::DeletePartitions;
+use iggy_common::IggyError;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for DeletePartitions {
     fn code(&self) -> u32 {
-        iggy::command::DELETE_PARTITIONS_CODE
+        iggy_common::DELETE_PARTITIONS_CODE
     }
 
     #[instrument(skip_all, name = "trace_delete_partitions", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string(), iggy_topic_id = self.topic_id.as_string()))]

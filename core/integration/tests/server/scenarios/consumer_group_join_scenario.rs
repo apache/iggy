@@ -21,14 +21,14 @@ use crate::server::scenarios::{
     PARTITIONS_COUNT, STREAM_ID, STREAM_NAME, TOPIC_ID, TOPIC_NAME, USERNAME_1, USERNAME_2,
     USERNAME_3,
 };
-use iggy::client::{ConsumerGroupClient, StreamClient, SystemClient, TopicClient};
 use iggy::clients::client::IggyClient;
-use iggy::compression::compression_algorithm::CompressionAlgorithm;
-use iggy::identifier::Identifier;
-use iggy::models::client_info::ClientInfoDetails;
-use iggy::models::consumer_group::ConsumerGroupDetails;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy::prelude::ClientInfoDetails;
+use iggy::prelude::CompressionAlgorithm;
+use iggy::prelude::ConsumerGroupDetails;
+use iggy::prelude::Identifier;
+use iggy::prelude::IggyExpiry;
+use iggy::prelude::MaxTopicSize;
+use iggy::prelude::{ConsumerGroupClient, StreamClient, SystemClient, TopicClient};
 use integration::test_server::{
     assert_clean_system, create_user, login_root, login_user, ClientFactory,
 };

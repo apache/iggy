@@ -24,13 +24,13 @@ use crate::binary::sender::SenderKind;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use error_set::ErrContext;
-use iggy::error::IggyError;
-use iggy::system::get_stats::GetStats;
+use iggy_common::get_stats::GetStats;
+use iggy_common::IggyError;
 use tracing::debug;
 
 impl ServerCommandHandler for GetStats {
     fn code(&self) -> u32 {
-        iggy::command::GET_STATS_CODE
+        iggy_common::GET_STATS_CODE
     }
 
     async fn handle(

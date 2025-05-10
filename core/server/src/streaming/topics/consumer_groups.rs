@@ -20,9 +20,9 @@ use crate::streaming::topics::consumer_group::ConsumerGroup;
 use crate::streaming::topics::topic::Topic;
 use crate::streaming::topics::COMPONENT;
 use error_set::ErrContext;
-use iggy::error::IggyError;
-use iggy::identifier::{IdKind, Identifier};
-use iggy::locking::IggySharedMutFn;
+use iggy_common::locking::IggySharedMutFn;
+use iggy_common::IggyError;
+use iggy_common::{IdKind, Identifier};
 use std::sync::atomic::Ordering;
 use tokio::sync::RwLock;
 use tracing::info;
@@ -237,9 +237,7 @@ mod tests {
     use crate::streaming::persistence::persister::{FileWithSyncPersister, PersisterKind};
     use crate::streaming::storage::SystemStorage;
     use crate::streaming::utils::MemoryPool;
-    use iggy::compression::compression_algorithm::CompressionAlgorithm;
-    use iggy::utils::expiry::IggyExpiry;
-    use iggy::utils::topic_size::MaxTopicSize;
+    use iggy_common::{CompressionAlgorithm, IggyExpiry, MaxTopicSize};
     use std::sync::atomic::{AtomicU32, AtomicU64};
     use std::sync::Arc;
 

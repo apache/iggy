@@ -18,7 +18,7 @@
 
 use crate::args::common::ListMode;
 use clap::{Args, Subcommand};
-use iggy::identifier::Identifier;
+use iggy::prelude::Identifier;
 
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum StreamAction {

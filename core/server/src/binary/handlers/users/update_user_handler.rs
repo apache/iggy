@@ -24,13 +24,13 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy::error::IggyError;
-use iggy::users::update_user::UpdateUser;
+use iggy_common::update_user::UpdateUser;
+use iggy_common::IggyError;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for UpdateUser {
     fn code(&self) -> u32 {
-        iggy::command::UPDATE_USER_CODE
+        iggy_common::UPDATE_USER_CODE
     }
 
     #[instrument(skip_all, name = "trace_update_user", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id))]

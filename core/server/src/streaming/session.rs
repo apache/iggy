@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use iggy::models::user_info::{AtomicUserId, UserId};
+use iggy_common::{AtomicUserId, UserId};
 use std::fmt::Display;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -16,11 +16,11 @@
  * under the License.
  */
 
-use iggy::client::{ConsumerGroupClient, StreamClient};
 use iggy::clients::client::IggyClient;
-use iggy::consumer::ConsumerKind;
-use iggy::identifier::Identifier;
-use iggy::models::consumer_group::ConsumerGroupDetails;
+use iggy::prelude::ConsumerGroupDetails;
+use iggy::prelude::ConsumerKind;
+use iggy::prelude::Identifier;
+use iggy::prelude::{ConsumerGroupClient, StreamClient};
 use integration::test_server::{delete_user, ClientFactory};
 
 pub mod consumer_group_join_scenario;

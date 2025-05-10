@@ -24,28 +24,28 @@ license = "Apache-2.0"
 # mimalloc on server is also setting it on bench.
 
 [dependencies]
-async-trait = "0.1.88"
-bytes = "1.10.1"
-charming = "0.4.0"
-chrono = "0.4.40"
-clap = { version = "4.5.37", features = ["derive"] }
-figlet-rs = "0.1.5"
+async-trait = { workspace = true }
+bytes = { workspace = true }
+charming = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+figlet-rs = { workspace = true }
 governor = "0.10.0"
 hostname = "0.4.1"
-human-repr = "1.1.0"
-iggy = { path = "../sdk" }
-iggy-bench-report = { path = "report" }
-integration = { path = "../integration" }
-nonzero_lit = "0.1.2"
-rand = "0.9.1"
-serde = { version = "1.0.219", features = ["derive"] }
-sysinfo = "0.34.2"
-tokio = { version = "1.44.2", features = ["full"] }
-toml = "0.8.20"
-tracing = { version = "0.1.41" }
-tracing-appender = "0.2.3"
-tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter"] }
-uuid = { version = "1.16.0", features = ["serde"] }
+human-repr = { workspace = true }
+iggy = { workspace = true }
+iggy-bench-report = { workspace = true }
+integration = { workspace = true }
+nonzero_lit = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+sysinfo = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
 
 [[bin]]
 name = "iggy-bench"

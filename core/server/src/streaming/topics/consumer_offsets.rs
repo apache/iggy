@@ -20,10 +20,9 @@ use crate::streaming::polling_consumer::PollingConsumer;
 use crate::streaming::topics::topic::Topic;
 use crate::streaming::topics::COMPONENT;
 use error_set::ErrContext;
-use iggy::consumer::Consumer;
-use iggy::error::IggyError;
-use iggy::locking::IggySharedMutFn;
-use iggy::models::consumer_offset_info::ConsumerOffsetInfo;
+use iggy_common::locking::IggySharedMutFn;
+use iggy_common::IggyError;
+use iggy_common::{Consumer, ConsumerOffsetInfo};
 
 impl Topic {
     pub async fn store_consumer_offset(

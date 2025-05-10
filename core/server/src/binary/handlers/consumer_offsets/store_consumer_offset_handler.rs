@@ -24,13 +24,13 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy::consumer_offsets::store_consumer_offset::StoreConsumerOffset;
-use iggy::error::IggyError;
+use iggy_common::store_consumer_offset::StoreConsumerOffset;
+use iggy_common::IggyError;
 use tracing::debug;
 
 impl ServerCommandHandler for StoreConsumerOffset {
     fn code(&self) -> u32 {
-        iggy::command::STORE_CONSUMER_OFFSET_CODE
+        iggy_common::STORE_CONSUMER_OFFSET_CODE
     }
 
     async fn handle(

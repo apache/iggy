@@ -26,13 +26,13 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy::error::IggyError;
-use iggy::topics::create_topic::CreateTopic;
+use iggy_common::create_topic::CreateTopic;
+use iggy_common::IggyError;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for CreateTopic {
     fn code(&self) -> u32 {
-        iggy::command::CREATE_TOPIC_CODE
+        iggy_common::CREATE_TOPIC_CODE
     }
 
     #[instrument(skip_all, name = "trace_create_topic", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string()))]

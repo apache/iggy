@@ -17,7 +17,7 @@
  */
 
 use crate::streaming::common::test_setup::TestSetup;
-use iggy::snapshot::{SnapshotCompression, SystemSnapshotType};
+use iggy::prelude::{SnapshotCompression, SystemSnapshotType};
 use server::configs::server::{DataMaintenanceConfig, PersonalAccessTokenConfig};
 use server::streaming::session::Session;
 use server::streaming::systems::system::System;

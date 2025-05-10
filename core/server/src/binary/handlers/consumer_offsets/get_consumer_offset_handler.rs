@@ -23,13 +23,13 @@ use crate::binary::sender::SenderKind;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
-use iggy::consumer_offsets::get_consumer_offset::GetConsumerOffset;
-use iggy::error::IggyError;
+use iggy_common::get_consumer_offset::GetConsumerOffset;
+use iggy_common::IggyError;
 use tracing::debug;
 
 impl ServerCommandHandler for GetConsumerOffset {
     fn code(&self) -> u32 {
-        iggy::command::GET_CONSUMER_OFFSET_CODE
+        iggy_common::GET_CONSUMER_OFFSET_CODE
     }
 
     async fn handle(

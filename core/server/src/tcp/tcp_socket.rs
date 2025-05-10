@@ -62,7 +62,7 @@ pub fn build(ipv6: bool, config: TcpSocketConfig) -> TcpSocket {
 mod tests {
     use std::time::Duration;
 
-    use iggy::utils::{byte_size::IggyByteSize, duration::IggyDuration};
+    use iggy_common::{IggyByteSize, IggyDuration};
 
     use super::*;
 

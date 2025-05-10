@@ -16,5 +16,8 @@
  * under the License.
  */
 
-pub mod client;
-pub mod config;
+pub(crate) mod tcp_client;
+pub(crate) mod tcp_connection_stream;
+pub(crate) mod tcp_connection_stream_kind;
+pub(crate) mod tcp_stream;
+pub(crate) mod tcp_tls_connection_stream;

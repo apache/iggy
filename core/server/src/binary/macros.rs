@@ -85,7 +85,7 @@ macro_rules! define_server_command_enum {
             pub fn validate(&self) -> Result<(), IggyError> {
                 match self {
                     $(
-                        ServerCommand::$variant(cmd) => <$ty as iggy::validatable::Validatable<iggy::error::IggyError>>::validate(cmd),
+                        ServerCommand::$variant(cmd) => <$ty as iggy_common::Validatable<iggy_common::IggyError>>::validate(cmd),
                     )*
                 }
             }

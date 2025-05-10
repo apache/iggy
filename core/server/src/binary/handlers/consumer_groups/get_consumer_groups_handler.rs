@@ -25,13 +25,13 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy::consumer_groups::get_consumer_groups::GetConsumerGroups;
-use iggy::error::IggyError;
+use iggy_common::get_consumer_groups::GetConsumerGroups;
+use iggy_common::IggyError;
 use tracing::debug;
 
 impl ServerCommandHandler for GetConsumerGroups {
     fn code(&self) -> u32 {
-        iggy::command::GET_CONSUMER_GROUPS_CODE
+        iggy_common::GET_CONSUMER_GROUPS_CODE
     }
 
     async fn handle(

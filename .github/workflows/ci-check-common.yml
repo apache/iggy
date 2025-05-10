@@ -33,53 +33,48 @@ on:
         default: HEAD~1
         type: string
       commits-to:
-        description: 'Upper end of the commit range to check'
+        description: 'Upper end of the new commit range to check'
         required: true
         default: HEAD
         type: string
 
 jobs:
-  check-commit-message:
-    name: commit messages
-    runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'pull_request' }}
-    steps:
-      - name: Check subject line length
-        uses: gsactions/commit-message-checker@v2
-        with:
-          excludeDescription: "false" # exclude description body of a pull request
-          excludeTitle: "false" # exclude the title of a pull request
-          checkAllCommitMessages: "false" # checks all commits associated with the pull request
-          accessToken: ${{ secrets.GITHUB_TOKEN }} # needed only when checkAllCommitMessages is true
-          pattern: '^.{0,80}(\n.*)*$'
-          error: "Subject of all commits in the PR and PR body/title has to be shorter than 80 characters."
-
-  check-conventional-commits:
-    name: conventional commits
+  check-pr-title:
+    name: Check PR Title
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Validate PR Title
+        uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          fetch-depth: 0
-      - name: Install rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-      - name: Install convco
-        uses: taiki-e/install-action@v2
-        with:
-          tool: convco
-      - name: Check first (oldest) commit in PR
-        if: github.event_name == 'pull_request'
-        run: |
-          # Find the oldest commit in the PR
-          OLDEST_COMMIT=$(git rev-list --reverse ${{ inputs.commits-from }}..${{ inputs.commits-to }} | head -1)
-          if [ -n "$OLDEST_COMMIT" ]; then
-            echo "Checking oldest commit $OLDEST_COMMIT"
-            convco check $OLDEST_COMMIT -n 1
-          else
-            echo "No commits found in PR"
-            exit 0
-          fi
+        # Configure types as needed (optional, defaults to common ones)
+          types: |
+             feat
+             fix
+             docs
+             style
+             refactor
+             perf
+             test
+             build
+             ci
+             chore
+             revert
+             repo
+        # Optional: Disallow certain scopes
+        # disallowedScopes: |
+        #   foo
+        #   bar
+        # Optional: Require a scope
+        # requireScope: true
+        # Optional: Configure weather the subject should be sentence case or not
+        # subjectPattern: ^[A-Z].* # This is for sentence case
+        # subjectPatternError: |
+        #   The subject "{subject}" found in the pull request title "{title}"
+        #   didn't match the configured pattern. Please ensure that the subject
+        #   doesn't start with an uppercase character.
+        # Optional: If you want to ignore labels to skip the check
+        # ignoreLabels: |
+        #   ignore-semantic-pull-request
+        #   WIP

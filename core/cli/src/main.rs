@@ -37,42 +37,49 @@ use args::segment::SegmentAction;
 use args::user::UserAction;
 use args::{CliOptions, IggyMergedConsoleArgs};
 use clap::Parser;
-use iggy::args::Args;
-use iggy::cli::context::common::ContextManager;
-use iggy::cli::context::use_context::UseContextCmd;
-use iggy::cli::segments::delete_segments::DeleteSegmentsCmd;
-use iggy::cli::system::snapshot::GetSnapshotCmd;
-use iggy::cli::{
-    client::{get_client::GetClientCmd, get_clients::GetClientsCmd},
-    consumer_group::{
+use iggy::client_provider::{self, ClientProviderConfig};
+use iggy::clients::client::IggyClient;
+use iggy::prelude::Args;
+use iggy::prelude::PersonalAccessTokenExpiry;
+use iggy::prelude::{Aes256GcmEncryptor, EncryptorKind};
+use iggy_binary_protocol::cli::binary_context::common::ContextManager;
+use iggy_binary_protocol::cli::binary_context::use_context::UseContextCmd;
+use iggy_binary_protocol::cli::binary_segments::delete_segments::DeleteSegmentsCmd;
+use iggy_binary_protocol::cli::binary_system::snapshot::GetSnapshotCmd;
+use iggy_binary_protocol::cli::cli_command::{CliCommand, PRINT_TARGET};
+use iggy_binary_protocol::cli::{
+    binary_client::{get_client::GetClientCmd, get_clients::GetClientsCmd},
+    binary_consumer_groups::{
         create_consumer_group::CreateConsumerGroupCmd,
         delete_consumer_group::DeleteConsumerGroupCmd, get_consumer_group::GetConsumerGroupCmd,
         get_consumer_groups::GetConsumerGroupsCmd,
     },
-    consumer_offset::{
+    binary_consumer_offsets::{
         get_consumer_offset::GetConsumerOffsetCmd, set_consumer_offset::SetConsumerOffsetCmd,
     },
-    context::get_contexts::GetContextsCmd,
-    message::{
+    binary_context::get_contexts::GetContextsCmd,
+    binary_message::{
         flush_messages::FlushMessagesCmd, poll_messages::PollMessagesCmd,
         send_messages::SendMessagesCmd,
     },
-    partitions::{create_partitions::CreatePartitionsCmd, delete_partitions::DeletePartitionsCmd},
-    personal_access_tokens::{
+    binary_partitions::{
+        create_partitions::CreatePartitionsCmd, delete_partitions::DeletePartitionsCmd,
+    },
+    binary_personal_access_tokens::{
         create_personal_access_token::CreatePersonalAccessTokenCmd,
         delete_personal_access_tokens::DeletePersonalAccessTokenCmd,
         get_personal_access_tokens::GetPersonalAccessTokensCmd,
     },
-    streams::{
+    binary_streams::{
         create_stream::CreateStreamCmd, delete_stream::DeleteStreamCmd, get_stream::GetStreamCmd,
         get_streams::GetStreamsCmd, purge_stream::PurgeStreamCmd, update_stream::UpdateStreamCmd,
     },
-    system::{me::GetMeCmd, ping::PingCmd, stats::GetStatsCmd},
-    topics::{
+    binary_system::{me::GetMeCmd, ping::PingCmd, stats::GetStatsCmd},
+    binary_topics::{
         create_topic::CreateTopicCmd, delete_topic::DeleteTopicCmd, get_topic::GetTopicCmd,
         get_topics::GetTopicsCmd, purge_topic::PurgeTopicCmd, update_topic::UpdateTopicCmd,
     },
-    users::{
+    binary_users::{
         change_password::ChangePasswordCmd,
         create_user::CreateUserCmd,
         delete_user::DeleteUserCmd,
@@ -82,18 +89,13 @@ use iggy::cli::{
         update_user::{UpdateUserCmd, UpdateUserType},
     },
 };
-use iggy::cli_command::{CliCommand, PRINT_TARGET};
-use iggy::client_provider::{self, ClientProviderConfig};
-use iggy::clients::client::IggyClient;
-use iggy::utils::crypto::{Aes256GcmEncryptor, EncryptorKind};
-use iggy::utils::personal_access_token_expiry::PersonalAccessTokenExpiry;
 use std::sync::Arc;
 use tracing::{event, Level};
 
 #[cfg(feature = "login-session")]
 mod main_login_session {
-    pub(crate) use iggy::cli::system::{login::LoginCmd, logout::LogoutCmd};
-    pub(crate) use iggy::cli::utils::login_session_expiry::LoginSessionExpiry;
+    pub(crate) use iggy_binary_protocol::cli::binary_system::{login::LoginCmd, logout::LogoutCmd};
+    pub(crate) use iggy_binary_protocol::cli::utils::login_session_expiry::LoginSessionExpiry;
 }
 
 #[cfg(feature = "login-session")]

@@ -17,7 +17,7 @@
  */
 
 use crate::http::shared::AppState;
-use iggy::utils::timestamp::IggyTimestamp;
+use iggy_common::IggyTimestamp;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, trace};

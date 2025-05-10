@@ -17,8 +17,7 @@
  */
 
 use super::IggyMessageHeaderViewMut;
-use iggy::prelude::*;
-use iggy::utils::checksum;
+use iggy_common::{calculate_checksum, IggyMessageHeaderView, IGGY_MESSAGE_HEADER_SIZE};
 use lending_iterator::prelude::*;
 
 /// A mutable view of a message for in-place modifications
@@ -61,7 +60,7 @@ impl<'a> IggyMessageViewMut<'a> {
 
         // TODO(hubcio): checksum field is 64 bits, but actual checksum is 32 bits (crc32fast)
         // in future, we should change it to some cryptographic safe hash function
-        let checksum = checksum::calculate(data);
+        let checksum = calculate_checksum(data);
 
         self.header_mut().set_checksum(checksum as u64);
     }

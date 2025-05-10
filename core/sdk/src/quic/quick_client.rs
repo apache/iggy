@@ -1,0 +1,532 @@
+/* Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+use crate::prelude::AutoLogin;
+use iggy_binary_protocol::{
+    BinaryClient, BinaryTransport, Client, PersonalAccessTokenClient, UserClient,
+};
+
+use crate::prelude::IggyDuration;
+use crate::prelude::IggyError;
+use crate::prelude::IggyTimestamp;
+use crate::quic::quick_config::QuicClientConfig;
+use crate::quic::skip_server_verification::SkipServerVerification;
+use async_broadcast::{broadcast, Receiver, Sender};
+use async_trait::async_trait;
+use bytes::Bytes;
+use iggy_common::{ClientState, Command, Credentials, DiagnosticEvent};
+use quinn::crypto::rustls::QuicClientConfig as QuinnQuicClientConfig;
+use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, RecvStream, VarInt};
+use rustls::crypto::CryptoProvider;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio::time::sleep;
+use tracing::{error, info, trace, warn};
+
+const REQUEST_INITIAL_BYTES_LENGTH: usize = 4;
+const RESPONSE_INITIAL_BYTES_LENGTH: usize = 8;
+const NAME: &str = "Iggy";
+
+/// QUIC client for interacting with the Iggy API.
+#[derive(Debug)]
+pub struct QuicClient {
+    pub(crate) endpoint: Endpoint,
+    pub(crate) connection: Mutex<Option<Connection>>,
+    pub(crate) config: Arc<QuicClientConfig>,
+    pub(crate) server_address: SocketAddr,
+    pub(crate) state: Mutex<ClientState>,
+    events: (Sender<DiagnosticEvent>, Receiver<DiagnosticEvent>),
+    connected_at: Mutex<Option<IggyTimestamp>>,
+}
+
+unsafe impl Send for QuicClient {}
+unsafe impl Sync for QuicClient {}
+
+impl Default for QuicClient {
+    fn default() -> Self {
+        QuicClient::create(Arc::new(QuicClientConfig::default())).unwrap()
+    }
+}
+
+#[async_trait]
+impl Client for QuicClient {
+    async fn connect(&self) -> Result<(), IggyError> {
+        QuicClient::connect(self).await
+    }
+
+    async fn disconnect(&self) -> Result<(), IggyError> {
+        QuicClient::disconnect(self).await
+    }
+
+    async fn shutdown(&self) -> Result<(), IggyError> {
+        QuicClient::shutdown(self).await
+    }
+
+    async fn subscribe_events(&self) -> Receiver<DiagnosticEvent> {
+        self.events.1.clone()
+    }
+}
+
+#[async_trait]
+impl BinaryTransport for QuicClient {
+    async fn get_state(&self) -> ClientState {
+        *self.state.lock().await
+    }
+
+    async fn set_state(&self, state: ClientState) {
+        *self.state.lock().await = state;
+    }
+
+    async fn publish_event(&self, event: DiagnosticEvent) {
+        if let Err(error) = self.events.0.broadcast(event).await {
+            error!("Failed to send a QUIC diagnostic event: {error}");
+        }
+    }
+
+    async fn send_with_response<T: Command>(&self, command: &T) -> Result<Bytes, IggyError> {
+        command.validate()?;
+        self.send_raw_with_response(command.code(), command.to_bytes())
+            .await
+    }
+
+    async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+        let result = self.send_raw(code, payload.clone()).await;
+        if result.is_ok() {
+            return result;
+        }
+
+        let error = result.unwrap_err();
+        if !matches!(
+            error,
+            IggyError::Disconnected | IggyError::EmptyResponse | IggyError::Unauthenticated
+        ) {
+            return Err(error);
+        }
+
+        if !self.config.reconnection.enabled {
+            return Err(IggyError::Disconnected);
+        }
+
+        self.disconnect().await?;
+        info!(
+            "Reconnecting to the server: {}, by client: {}",
+            self.config.server_address, self.config.client_address
+        );
+        self.connect().await?;
+        self.send_raw(code, payload).await
+    }
+
+    fn get_heartbeat_interval(&self) -> IggyDuration {
+        self.config.heartbeat_interval
+    }
+}
+
+impl BinaryClient for QuicClient {}
+
+impl QuicClient {
+    /// Creates a new QUIC client for the provided client and server addresses.
+    pub fn new(
+        client_address: &str,
+        server_address: &str,
+        server_name: &str,
+        validate_certificate: bool,
+        auto_sign_in: AutoLogin,
+    ) -> Result<Self, IggyError> {
+        Self::create(Arc::new(QuicClientConfig {
+            client_address: client_address.to_string(),
+            server_address: server_address.to_string(),
+            server_name: server_name.to_string(),
+            validate_certificate,
+            auto_login: auto_sign_in,
+            ..Default::default()
+        }))
+    }
+
+    /// Create a new QUIC client for the provided configuration.
+    pub fn create(config: Arc<QuicClientConfig>) -> Result<Self, IggyError> {
+        let server_address = config
+            .server_address
+            .parse::<SocketAddr>()
+            .map_err(|error| {
+                error!("Invalid server address: {error}");
+                IggyError::InvalidServerAddress
+            })?;
+        let client_address = if server_address.is_ipv6()
+            && config.client_address == QuicClientConfig::default().client_address
+        {
+            "[::1]:0"
+        } else {
+            &config.client_address
+        }
+        .parse::<SocketAddr>()
+        .map_err(|error| {
+            error!("Invalid client address: {error}");
+            IggyError::InvalidClientAddress
+        })?;
+
+        let quic_config = configure(&config)?;
+        let endpoint = Endpoint::client(client_address);
+        if endpoint.is_err() {
+            error!("Cannot create client endpoint");
+            return Err(IggyError::CannotCreateEndpoint);
+        }
+
+        let mut endpoint = endpoint.unwrap();
+        endpoint.set_default_client_config(quic_config);
+
+        Ok(Self {
+            config,
+            endpoint,
+            server_address,
+            connection: Mutex::new(None),
+            state: Mutex::new(ClientState::Disconnected),
+            events: broadcast(1000),
+            connected_at: Mutex::new(None),
+        })
+    }
+
+    async fn handle_response(&self, recv: &mut RecvStream) -> Result<Bytes, IggyError> {
+        let buffer = recv
+            .read_to_end(self.config.response_buffer_size as usize)
+            .await
+            .map_err(|error| {
+                error!("Failed to read response data: {error}");
+                IggyError::QuicError
+            })?;
+        if buffer.is_empty() {
+            return Err(IggyError::EmptyResponse);
+        }
+
+        let status = u32::from_le_bytes(
+            buffer[..4]
+                .try_into()
+                .map_err(|_| IggyError::InvalidNumberEncoding)?,
+        );
+        if status != 0 {
+            error!(
+                "Received an invalid response with status: {} ({}).",
+                status,
+                IggyError::from_code_as_string(status)
+            );
+
+            return Err(IggyError::from_code(status));
+        }
+
+        let length = u32::from_le_bytes(
+            buffer[4..RESPONSE_INITIAL_BYTES_LENGTH]
+                .try_into()
+                .map_err(|_| IggyError::InvalidNumberEncoding)?,
+        );
+        trace!("Status: OK. Response length: {}", length);
+        if length <= 1 {
+            return Ok(Bytes::new());
+        }
+
+        Ok(Bytes::copy_from_slice(
+            &buffer[RESPONSE_INITIAL_BYTES_LENGTH..RESPONSE_INITIAL_BYTES_LENGTH + length as usize],
+        ))
+    }
+
+    async fn connect(&self) -> Result<(), IggyError> {
+        match self.get_state().await {
+            ClientState::Shutdown => {
+                trace!("Cannot connect. Client is shutdown.");
+                return Err(IggyError::ClientShutdown);
+            }
+            ClientState::Connected | ClientState::Authenticating | ClientState::Authenticated => {
+                trace!("Client is already connected.");
+                return Ok(());
+            }
+            ClientState::Connecting => {
+                trace!("Client is already connecting.");
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        self.set_state(ClientState::Connecting).await;
+        if let Some(connected_at) = self.connected_at.lock().await.as_ref() {
+            let now = IggyTimestamp::now();
+            let elapsed = now.as_micros() - connected_at.as_micros();
+            let interval = self.config.reconnection.reestablish_after.as_micros();
+            trace!(
+                "Elapsed time since last connection: {}",
+                IggyDuration::from(elapsed)
+            );
+            if elapsed < interval {
+                let remaining = IggyDuration::from(interval - elapsed);
+                info!("Trying to connect to the server in: {remaining}",);
+                sleep(remaining.get_duration()).await;
+            }
+        }
+
+        let mut retry_count = 0;
+        let connection;
+        let remote_address;
+        loop {
+            info!(
+                "{NAME} client is connecting to server: {}...",
+                self.config.server_address
+            );
+            let connection_result = self
+                .endpoint
+                .connect(self.server_address, &self.config.server_name)
+                .unwrap()
+                .await;
+
+            if connection_result.is_err() {
+                error!(
+                    "Failed to connect to server: {}",
+                    self.config.server_address
+                );
+                if !self.config.reconnection.enabled {
+                    warn!("Automatic reconnection is disabled.");
+                    return Err(IggyError::CannotEstablishConnection);
+                }
+
+                let unlimited_retries = self.config.reconnection.max_retries.is_none();
+                let max_retries = self.config.reconnection.max_retries.unwrap_or_default();
+                let max_retries_str =
+                    if let Some(max_retries) = self.config.reconnection.max_retries {
+                        max_retries.to_string()
+                    } else {
+                        "unlimited".to_string()
+                    };
+
+                let interval_str = self.config.reconnection.interval.as_human_time_string();
+                if unlimited_retries || retry_count < max_retries {
+                    retry_count += 1;
+                    info!(
+                        "Retrying to connect to server ({retry_count}/{max_retries_str}): {} in: {interval_str}",
+                        self.config.server_address,
+                    );
+                    sleep(self.config.reconnection.interval.get_duration()).await;
+                    continue;
+                }
+
+                self.set_state(ClientState::Disconnected).await;
+                self.publish_event(DiagnosticEvent::Disconnected).await;
+                return Err(IggyError::CannotEstablishConnection);
+            }
+
+            connection = connection_result.map_err(|error| {
+                error!("Failed to establish QUIC connection: {error}");
+                IggyError::CannotEstablishConnection
+            })?;
+            remote_address = connection.remote_address();
+            break;
+        }
+
+        let now = IggyTimestamp::now();
+        info!("{NAME} client has connected to server: {remote_address} at {now}",);
+        self.set_state(ClientState::Connected).await;
+        self.connection.lock().await.replace(connection);
+        self.connected_at.lock().await.replace(now);
+        self.publish_event(DiagnosticEvent::Connected).await;
+
+        match &self.config.auto_login {
+            AutoLogin::Disabled => {
+                info!("Automatic sign-in is disabled.");
+                Ok(())
+            }
+            AutoLogin::Enabled(credentials) => {
+                info!(
+                    "{NAME} client: {} is signing in...",
+                    self.config.client_address
+                );
+                self.set_state(ClientState::Authenticating).await;
+                match credentials {
+                    Credentials::UsernamePassword(username, password) => {
+                        self.login_user(username, password).await?;
+                        self.publish_event(DiagnosticEvent::SignedIn).await;
+                        info!("{NAME} client: {} has signed in with the user credentials, username: {username}", self.config.client_address);
+                        Ok(())
+                    }
+                    Credentials::PersonalAccessToken(token) => {
+                        self.login_with_personal_access_token(token).await?;
+                        self.publish_event(DiagnosticEvent::SignedIn).await;
+                        info!(
+                            "{NAME} client: {} has signed in with a personal access token.",
+                            self.config.client_address
+                        );
+                        Ok(())
+                    }
+                }
+            }
+        }
+    }
+
+    async fn shutdown(&self) -> Result<(), IggyError> {
+        if self.get_state().await == ClientState::Shutdown {
+            return Ok(());
+        }
+
+        info!("Shutting down the {NAME} QUIC client.");
+        let connection = self.connection.lock().await.take();
+        if let Some(connection) = connection {
+            connection.close(0u32.into(), b"");
+        }
+
+        self.endpoint.wait_idle().await;
+        self.set_state(ClientState::Shutdown).await;
+        self.publish_event(DiagnosticEvent::Shutdown).await;
+        info!("{NAME} QUIC client has been shutdown.");
+        Ok(())
+    }
+
+    async fn disconnect(&self) -> Result<(), IggyError> {
+        if self.get_state().await == ClientState::Disconnected {
+            return Ok(());
+        }
+
+        info!(
+            "{NAME} client: {} is disconnecting from server...",
+            self.config.client_address
+        );
+        self.set_state(ClientState::Disconnected).await;
+        self.connection.lock().await.take();
+        self.endpoint.wait_idle().await;
+        self.publish_event(DiagnosticEvent::Disconnected).await;
+        let now = IggyTimestamp::now();
+        info!(
+            "{NAME} client: {} has disconnected from server at: {now}.",
+            self.config.client_address
+        );
+        Ok(())
+    }
+
+    async fn send_raw(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+        match self.get_state().await {
+            ClientState::Shutdown => {
+                trace!("Cannot send data. Client is shutdown.");
+                return Err(IggyError::ClientShutdown);
+            }
+            ClientState::Disconnected => {
+                trace!(
+                    "Cannot send data. Client: {} is not connected.",
+                    self.config.client_address
+                );
+                return Err(IggyError::NotConnected);
+            }
+            ClientState::Connecting => {
+                trace!(
+                    "Cannot send data. Client: {} is still connecting.",
+                    self.config.client_address
+                );
+                return Err(IggyError::NotConnected);
+            }
+            _ => {}
+        }
+
+        let connection = self.connection.lock().await;
+        if let Some(connection) = connection.as_ref() {
+            let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
+            let (mut send, mut recv) = connection.open_bi().await.map_err(|error| {
+                error!("Failed to open a bidirectional stream: {error}");
+                IggyError::QuicError
+            })?;
+            trace!("Sending a QUIC request with code: {code}");
+            send.write_all(&(payload_length as u32).to_le_bytes())
+                .await
+                .map_err(|error| {
+                    error!("Failed to write payload length: {error}");
+                    IggyError::QuicError
+                })?;
+            send.write_all(&code.to_le_bytes()).await.map_err(|error| {
+                error!("Failed to write payload code: {error}");
+                IggyError::QuicError
+            })?;
+            send.write_all(&payload).await.map_err(|error| {
+                error!("Failed to write payload: {error}");
+                IggyError::QuicError
+            })?;
+            send.finish().map_err(|error| {
+                error!("Failed to finish sending data: {error}");
+                IggyError::QuicError
+            })?;
+            trace!("Sent a QUIC request with code: {code}, waiting for a response...");
+            return self.handle_response(&mut recv).await;
+        }
+
+        error!("Cannot send data. Client is not connected.");
+        Err(IggyError::NotConnected)
+    }
+}
+
+fn configure(config: &QuicClientConfig) -> Result<ClientConfig, IggyError> {
+    let max_concurrent_bidi_streams = VarInt::try_from(config.max_concurrent_bidi_streams);
+    if max_concurrent_bidi_streams.is_err() {
+        error!(
+            "Invalid 'max_concurrent_bidi_streams': {}",
+            config.max_concurrent_bidi_streams
+        );
+        return Err(IggyError::InvalidConfiguration);
+    }
+
+    let receive_window = VarInt::try_from(config.receive_window);
+    if receive_window.is_err() {
+        error!("Invalid 'receive_window': {}", config.receive_window);
+        return Err(IggyError::InvalidConfiguration);
+    }
+
+    let mut transport = quinn::TransportConfig::default();
+    transport.initial_mtu(config.initial_mtu);
+    transport.send_window(config.send_window);
+    transport.receive_window(receive_window.unwrap());
+    transport.datagram_send_buffer_size(config.datagram_send_buffer_size as usize);
+    transport.max_concurrent_bidi_streams(max_concurrent_bidi_streams.unwrap());
+    if config.keep_alive_interval > 0 {
+        transport.keep_alive_interval(Some(Duration::from_millis(config.keep_alive_interval)));
+    }
+    if config.max_idle_timeout > 0 {
+        let max_idle_timeout =
+            IdleTimeout::try_from(Duration::from_millis(config.max_idle_timeout));
+        if max_idle_timeout.is_err() {
+            error!("Invalid 'max_idle_timeout': {}", config.max_idle_timeout);
+            return Err(IggyError::InvalidConfiguration);
+        }
+        transport.max_idle_timeout(Some(max_idle_timeout.unwrap()));
+    }
+
+    if CryptoProvider::get_default().is_none() {
+        if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
+            warn!("Failed to install rustls crypto provider. Error: {:?}. This may be normal if another thread installed it first.", e);
+        }
+    }
+    let mut client_config = match config.validate_certificate {
+        true => ClientConfig::with_platform_verifier(),
+        false => {
+            match QuinnQuicClientConfig::try_from(
+                rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(SkipServerVerification::new())
+                    .with_no_client_auth(),
+            ) {
+                Ok(config) => ClientConfig::new(Arc::new(config)),
+                Err(error) => {
+                    error!("Failed to create QUIC client configuration: {error}");
+                    return Err(IggyError::InvalidConfiguration);
+                }
+            }
+        }
+    };
+    client_config.transport_config(Arc::new(transport));
+    Ok(client_config)
+}

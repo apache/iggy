@@ -20,10 +20,8 @@ use crate::streaming::partitions::partition::Partition;
 use crate::streaming::topics::topic::Topic;
 use crate::streaming::topics::COMPONENT;
 use error_set::ErrContext;
-use iggy::error::IggyError;
-use iggy::locking::IggySharedMut;
-use iggy::locking::IggySharedMutFn;
-use iggy::utils::timestamp::IggyTimestamp;
+use iggy_common::locking::{IggySharedMut, IggySharedMutFn};
+use iggy_common::{IggyError, IggyTimestamp};
 
 const MAX_PARTITIONS_COUNT: u32 = 100_000;
 

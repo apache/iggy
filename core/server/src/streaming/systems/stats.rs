@@ -19,10 +19,8 @@
 use crate::streaming::systems::system::System;
 use crate::versioning::SemanticVersion;
 use crate::VERSION;
-use iggy::error::IggyError;
-use iggy::locking::IggySharedMutFn;
-use iggy::models::stats::Stats;
-use iggy::utils::duration::IggyDuration;
+use iggy_common::locking::IggySharedMutFn;
+use iggy_common::{IggyDuration, IggyError, Stats};
 use std::sync::OnceLock;
 use sysinfo::{Pid, ProcessesToUpdate, System as SysinfoSystem};
 use tokio::sync::Mutex;

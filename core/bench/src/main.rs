@@ -27,7 +27,7 @@ mod utils;
 use crate::{args::common::IggyBenchArgs, runner::BenchmarkRunner};
 use clap::Parser;
 use figlet_rs::FIGfont;
-use iggy::error::IggyError;
+use iggy::prelude::IggyError;
 use std::fs;
 use std::path::Path;
 use tracing::{error, info};

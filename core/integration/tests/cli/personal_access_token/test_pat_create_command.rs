@@ -23,7 +23,7 @@ use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use humantime::format_duration;
 use humantime::Duration as HumanDuration;
-use iggy::client::Client;
+use iggy::prelude::Client;
 use predicates::str::starts_with;
 use serial_test::parallel;
 use std::time::Duration;

@@ -18,7 +18,7 @@
 
 use crate::clients::consumer::{AutoCommit, AutoCommitAfter, IggyConsumer};
 use crate::consumer_ext::{IggyConsumerMessageExt, MessageConsumer};
-use crate::error::IggyError;
+use crate::prelude::IggyError;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use tokio::sync::oneshot;

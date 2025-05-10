@@ -19,7 +19,7 @@
 use crate::streaming::persistence::COMPONENT;
 use crate::streaming::utils::file;
 use error_set::ErrContext;
-use iggy::error::IggyError;
+use iggy_common::IggyError;
 use std::fmt::Debug;
 use std::future::Future;
 use tokio::fs;

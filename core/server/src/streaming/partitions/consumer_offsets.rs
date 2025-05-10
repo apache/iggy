@@ -21,8 +21,8 @@ use crate::streaming::partitions::COMPONENT;
 use crate::streaming::polling_consumer::PollingConsumer;
 use dashmap::DashMap;
 use error_set::ErrContext;
-use iggy::consumer::ConsumerKind;
-use iggy::error::IggyError;
+use iggy_common::ConsumerKind;
+use iggy_common::IggyError;
 use tracing::trace;
 
 impl Partition {

@@ -23,10 +23,7 @@ use crate::cli::common::{
 use ahash::AHashMap;
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
-use iggy::client::Client;
-use iggy::models::permissions::{Permissions, StreamPermissions, TopicPermissions};
-use iggy::models::user_info::UserId;
-use iggy::models::user_status::UserStatus;
+use iggy::prelude::{Client, Permissions, StreamPermissions, TopicPermissions, UserId, UserStatus};
 use predicates::str::{is_match, starts_with};
 use serial_test::parallel;
 

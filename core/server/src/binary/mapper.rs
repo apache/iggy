@@ -24,12 +24,8 @@ use crate::streaming::topics::consumer_group::ConsumerGroup;
 use crate::streaming::topics::topic::Topic;
 use crate::streaming::users::user::User;
 use bytes::{BufMut, Bytes, BytesMut};
-use iggy::bytes_serializable::BytesSerializable;
-use iggy::locking::{IggySharedMut, IggySharedMutFn};
-use iggy::models::consumer_offset_info::ConsumerOffsetInfo;
-use iggy::models::stats::Stats;
-use iggy::models::user_info::UserId;
-use iggy::utils::sizeable::Sizeable;
+use iggy_common::locking::{IggySharedMut, IggySharedMutFn};
+use iggy_common::{BytesSerializable, ConsumerOffsetInfo, Sizeable, Stats, UserId};
 use tokio::sync::RwLock;
 
 pub fn map_stats(stats: &Stats) -> Bytes {

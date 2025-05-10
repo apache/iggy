@@ -17,7 +17,7 @@
  */
 
 use super::run_bench_and_wait_for_finish;
-use iggy::utils::byte_size::IggyByteSize;
+use iggy::prelude::IggyByteSize;
 use integration::test_server::{IpAddrKind, TestServer, Transport};
 use serial_test::parallel;
 use std::str::FromStr;

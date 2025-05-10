@@ -16,14 +16,12 @@
  * under the License.
  */
 
-use crate::client::{StreamClient, TopicClient};
-use crate::clients::client::IggyClient;
-use crate::compression::compression_algorithm::CompressionAlgorithm;
-use crate::error::IggyError;
-use crate::identifier::{IdKind, Identifier};
+use crate::prelude::{
+    CompressionAlgorithm, IdKind, Identifier, IggyClient, IggyError, IggyExpiry, MaxTopicSize,
+    StreamClient, TopicClient,
+};
+
 use crate::stream_builder::IggyConsumerConfig;
-use crate::utils::expiry::IggyExpiry;
-use crate::utils::topic_size::MaxTopicSize;
 use tracing::{trace, warn};
 
 /// Builds an `IggyStream` and `IggyTopic` if any of them does not exists

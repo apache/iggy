@@ -16,17 +16,18 @@
  * under the License.
  */
 
-use crate::client::{AutoLogin, Client, Credentials};
-use crate::client_error::ClientError;
 #[allow(deprecated)]
 use crate::clients::client::IggyClient;
-use crate::http::client::HttpClient;
-use crate::http::config::HttpClientConfig;
-use crate::quic::client::QuicClient;
-use crate::quic::config::{QuicClientConfig, QuicClientReconnectionConfig};
-use crate::tcp::client::TcpClient;
-use crate::tcp::config::{TcpClientConfig, TcpClientReconnectionConfig};
-use crate::utils::duration::IggyDuration;
+use crate::http::http_client::HttpClient;
+use crate::http::http_config::HttpClientConfig;
+use crate::prelude::ClientError;
+use crate::prelude::IggyDuration;
+use crate::prelude::{TcpClientConfig, TcpClientReconnectionConfig};
+use crate::quic::quick_client::QuicClient;
+use crate::quic::quick_config::{QuicClientConfig, QuicClientReconnectionConfig};
+use crate::tcp::tcp_client::TcpClient;
+use iggy_binary_protocol::Client;
+use iggy_common::{AutoLogin, Credentials};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -65,14 +66,14 @@ impl Default for ClientProviderConfig {
 
 impl ClientProviderConfig {
     /// Create a new `ClientProviderConfig` from the provided `Args`.
-    pub fn from_args(args: crate::args::Args) -> Result<Self, ClientError> {
+    pub fn from_args(args: crate::prelude::Args) -> Result<Self, ClientError> {
         Self::from_args_set_autologin(args, true)
     }
 
     /// Create a new `ClientProviderConfig` from the provided `Args` with possibility to enable or disable
     /// auto login option for TCP or QUIC protocols.
     pub fn from_args_set_autologin(
-        args: crate::args::Args,
+        args: crate::prelude::Args,
         auto_login: bool,
     ) -> Result<Self, ClientError> {
         let transport = args.transport;

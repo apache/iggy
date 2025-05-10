@@ -20,12 +20,10 @@ mod seeder;
 
 use anyhow::Result;
 use clap::Parser;
-use iggy::args::{Args, ArgsOptional};
-use iggy::client::{Client, UserClient};
 use iggy::client_provider;
 use iggy::client_provider::ClientProviderConfig;
 use iggy::clients::client::IggyClient;
-use iggy::utils::crypto::{Aes256GcmEncryptor, EncryptorKind};
+use iggy::prelude::{Aes256GcmEncryptor, Args, ArgsOptional, Client, EncryptorKind, UserClient};
 use std::error::Error;
 use std::sync::Arc;
 use tracing::info;

@@ -18,7 +18,7 @@
 
 use charming::theme::Theme;
 use charming::{Chart, HtmlRenderer};
-use iggy::utils::byte_size::IggyByteSize;
+use iggy::prelude::IggyByteSize;
 use iggy_bench_report::report::BenchmarkReport;
 use std::path::Path;
 use std::process::Command;

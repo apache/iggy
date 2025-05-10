@@ -20,7 +20,7 @@ use crate::binary::sender::Sender;
 use crate::tcp::COMPONENT;
 use crate::{server_error::ServerError, tcp::sender};
 use error_set::ErrContext;
-use iggy::error::IggyError;
+use iggy_common::IggyError;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_native_tls::TlsStream;

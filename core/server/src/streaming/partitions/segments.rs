@@ -22,8 +22,8 @@ use crate::streaming::partitions::partition::Partition;
 use crate::streaming::partitions::COMPONENT;
 use crate::streaming::segments::*;
 use error_set::ErrContext;
-use iggy::error::IggyError;
-use iggy::utils::timestamp::IggyTimestamp;
+use iggy_common::IggyError;
+use iggy_common::IggyTimestamp;
 use tracing::info;
 
 pub struct DeletedSegment {

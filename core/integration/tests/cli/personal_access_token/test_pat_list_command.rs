@@ -22,8 +22,8 @@ use crate::cli::common::{
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
-use iggy::client::Client;
-use iggy::utils::personal_access_token_expiry::PersonalAccessTokenExpiry;
+use iggy::prelude::Client;
+use iggy::prelude::PersonalAccessTokenExpiry;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
 

@@ -22,7 +22,7 @@ use std::io::IoSlice;
 use crate::tcp::tcp_sender::TcpSender;
 use crate::tcp::tcp_tls_sender::TcpTlsSender;
 use crate::{quic::quic_sender::QuicSender, server_error::ServerError};
-use iggy::error::IggyError;
+use iggy_common::IggyError;
 use quinn::{RecvStream, SendStream};
 use tokio::net::TcpStream;
 use tokio_native_tls::TlsStream;

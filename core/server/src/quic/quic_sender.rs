@@ -19,7 +19,7 @@
 use crate::quic::COMPONENT;
 use crate::{binary::sender::Sender, server_error::ServerError};
 use error_set::ErrContext;
-use iggy::error::IggyError;
+use iggy_common::IggyError;
 use quinn::{RecvStream, SendStream};
 use std::io::IoSlice;
 use tracing::{debug, error};

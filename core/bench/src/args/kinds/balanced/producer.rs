@@ -21,7 +21,7 @@ use crate::args::{
     transport::BenchmarkTransportCommand,
 };
 use clap::{error::ErrorKind, CommandFactory, Parser};
-use iggy::utils::byte_size::IggyByteSize;
+use iggy::prelude::IggyByteSize;
 use std::num::NonZeroU32;
 
 /// N producers sending to N separated stream-topic with single partition (one stream per one producer)

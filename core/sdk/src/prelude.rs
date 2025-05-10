@@ -27,59 +27,45 @@
 //! use iggy::prelude::*;
 //! ```
 
-pub use crate::bytes_serializable::BytesSerializable;
-pub use crate::client::{
-    Client, ConsumerGroupClient, ConsumerOffsetClient, MessageClient, PartitionClient,
-    StreamClient, SystemClient, TopicClient, UserClient,
-};
 pub use crate::client_provider;
 pub use crate::client_provider::ClientProviderConfig;
-pub use crate::clients::builder::IggyClientBuilder;
 pub use crate::clients::client::IggyClient;
+pub use crate::clients::client_builder::IggyClientBuilder;
 pub use crate::clients::consumer::{
     AutoCommit, AutoCommitAfter, AutoCommitWhen, IggyConsumer, ReceivedMessage,
 };
-pub use crate::clients::producer::{IggyProducer, IggyProducerBuilder};
-pub use crate::compression::compression_algorithm::CompressionAlgorithm;
-pub use crate::consumer::{Consumer, ConsumerKind};
+pub use crate::clients::consumer_builder::IggyConsumerBuilder;
+pub use crate::clients::producer::IggyProducer;
+pub use crate::clients::producer_builder::IggyProducerBuilder;
 pub use crate::consumer_ext::IggyConsumerMessageExt;
-pub use crate::error::IggyError;
-pub use crate::identifier::Identifier;
-pub use crate::messages::{
-    FlushUnsavedBuffer, Partitioning, PollMessages, PolledMessages, PollingKind, PollingStrategy,
-    SendMessages,
-};
-pub use crate::models::consumer_group::ConsumerGroupDetails;
-pub use crate::models::messaging::{
-    HeaderKey, HeaderValue, IggyIndexView, IggyMessage, IggyMessageHeader, IggyMessageHeaderView,
-    IggyMessageView, IggyMessageViewIterator, INDEX_SIZE, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE,
-};
-pub use crate::models::messaging::{
-    IGGY_MESSAGE_CHECKSUM_OFFSET_RANGE, IGGY_MESSAGE_HEADERS_LENGTH_OFFSET_RANGE,
-    IGGY_MESSAGE_HEADER_SIZE, IGGY_MESSAGE_ID_OFFSET_RANGE, IGGY_MESSAGE_OFFSET_OFFSET_RANGE,
-    IGGY_MESSAGE_ORIGIN_TIMESTAMP_OFFSET_RANGE, IGGY_MESSAGE_PAYLOAD_LENGTH_OFFSET_RANGE,
-    IGGY_MESSAGE_TIMESTAMP_OFFSET_RANGE,
-};
-pub use crate::models::partition::Partition;
-pub use crate::models::permissions::{
-    GlobalPermissions, Permissions, StreamPermissions, TopicPermissions,
-};
-pub use crate::models::stats::Stats;
-pub use crate::models::stream::Stream;
-pub use crate::models::topic::Topic;
-pub use crate::models::user_status::UserStatus;
-pub use crate::snapshot::{SnapshotCompression, SystemSnapshotType};
 pub use crate::stream_builder::IggyConsumerConfig;
 pub use crate::stream_builder::IggyStreamConsumer;
 pub use crate::stream_builder::{IggyProducerConfig, IggyStreamProducer};
 pub use crate::stream_builder::{IggyStream, IggyStreamConfig};
-pub use crate::users::defaults::{
-    DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_USER_ID,
+pub use crate::tcp::tcp_client::TcpClient;
+//
+pub use iggy_binary_protocol::{
+    Client, ConsumerGroupClient, ConsumerOffsetClient, MessageClient, PartitionClient,
+    PersonalAccessTokenClient, StreamClient, SystemClient, TopicClient, UserClient,
 };
-pub use crate::utils::byte_size::IggyByteSize;
-pub use crate::utils::duration::IggyDuration;
-pub use crate::utils::expiry::IggyExpiry;
-pub use crate::utils::sizeable::Sizeable;
-pub use crate::utils::timestamp::IggyTimestamp;
-pub use crate::utils::topic_size::MaxTopicSize;
-pub use crate::validatable::Validatable;
+//
+pub use iggy_common::{
+    defaults, locking, Aes256GcmEncryptor, Args, ArgsOptional, AutoLogin, BytesSerializable,
+    CacheMetrics, CacheMetricsKey, ClientError, ClientInfoDetails, CompressionAlgorithm,
+    Confirmation, Consumer, ConsumerGroupDetails, ConsumerKind, EncryptorKind, FlushUnsavedBuffer,
+    GlobalPermissions, HeaderKey, HeaderValue, IdKind, Identifier, IdentityInfo, IggyByteSize,
+    IggyDuration, IggyError, IggyExpiry, IggyIndexView, IggyMessage, IggyMessageHeader,
+    IggyMessageHeaderView, IggyMessageView, IggyMessageViewIterator, IggyTimestamp, MaxTopicSize,
+    Partition, Partitioner, Partitioning, Permissions, PersonalAccessTokenExpiry, PollMessages,
+    PolledMessages, PollingKind, PollingStrategy, SendMessages, Sizeable, SnapshotCompression,
+    Stats, Stream, StreamPermissions, SystemSnapshotType, TcpClientConfig, TcpClientConfigBuilder,
+    TcpClientReconnectionConfig, Topic, TopicPermissions, UserId, UserStatus, Validatable,
+};
+pub use iggy_common::{
+    defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_USER_ID},
+    IGGY_MESSAGE_CHECKSUM_OFFSET_RANGE, IGGY_MESSAGE_HEADERS_LENGTH_OFFSET_RANGE,
+    IGGY_MESSAGE_HEADER_SIZE, IGGY_MESSAGE_ID_OFFSET_RANGE, IGGY_MESSAGE_OFFSET_OFFSET_RANGE,
+    IGGY_MESSAGE_ORIGIN_TIMESTAMP_OFFSET_RANGE, IGGY_MESSAGE_PAYLOAD_LENGTH_OFFSET_RANGE,
+    IGGY_MESSAGE_TIMESTAMP_OFFSET_RANGE, INDEX_SIZE, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE,
+    SEC_IN_MICRO,
+};

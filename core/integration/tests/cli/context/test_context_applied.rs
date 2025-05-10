@@ -20,8 +20,9 @@ use std::collections::HashMap;
 
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
-use iggy::client::Client;
-use iggy::{args::ArgsOptional, cli::context::common::ContextConfig};
+use iggy::prelude::ArgsOptional;
+use iggy::prelude::Client;
+use iggy_binary_protocol::cli::binary_context::common::ContextConfig;
 use integration::test_server::TestServer;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
@@ -74,27 +75,6 @@ impl IggyCmdTestCase for TestContextApplied {
         self.test_iggy_context.prepare().await;
     }
 
-    fn protocol(&self, server: &TestServer) -> Vec<String> {
-        let transport = self
-            .set_transport_arg
-            .as_ref()
-            .or(self.set_transport_context.as_ref());
-
-        match transport {
-            Some(protocol) => match protocol.as_str() {
-                "quic" => vec![
-                    "--quic-server-address".into(),
-                    server.get_quic_udp_addr().unwrap(),
-                ],
-                _ => vec![
-                    "--tcp-server-address".into(),
-                    server.get_raw_tcp_addr().unwrap(),
-                ],
-            },
-            None => panic!("either set_transport_arg or set_transport_context must be set"),
-        }
-    }
-
     fn get_command(&self) -> IggyCmdCommand {
         let cmd = IggyCmdCommand::new()
             .env(
@@ -135,6 +115,27 @@ impl IggyCmdTestCase for TestContextApplied {
     }
 
     async fn verify_server_state(&self, _client: &dyn Client) {}
+
+    fn protocol(&self, server: &TestServer) -> Vec<String> {
+        let transport = self
+            .set_transport_arg
+            .as_ref()
+            .or(self.set_transport_context.as_ref());
+
+        match transport {
+            Some(protocol) => match protocol.as_str() {
+                "quic" => vec![
+                    "--quic-server-address".into(),
+                    server.get_quic_udp_addr().unwrap(),
+                ],
+                _ => vec![
+                    "--tcp-server-address".into(),
+                    server.get_raw_tcp_addr().unwrap(),
+                ],
+            },
+            None => panic!("either set_transport_arg or set_transport_context must be set"),
+        }
+    }
 }
 
 #[tokio::test]

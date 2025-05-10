@@ -17,7 +17,7 @@
  */
 
 use super::{output::BenchmarkOutputCommand, transport::BenchmarkTransportCommand};
-use iggy::utils::byte_size::IggyByteSize;
+use iggy::prelude::IggyByteSize;
 use integration::test_server::Transport;
 
 pub trait BenchmarkKindProps {

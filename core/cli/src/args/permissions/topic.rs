@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use iggy::models::permissions::TopicPermissions;
+use iggy::prelude::TopicPermissions;
 use std::str::FromStr;
 
 use super::constants::{

@@ -18,10 +18,9 @@
 
 use crate::state::command::EntryCommand;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use iggy::bytes_serializable::BytesSerializable;
-use iggy::error::IggyError;
-use iggy::utils::checksum;
-use iggy::utils::timestamp::IggyTimestamp;
+use iggy_common::IggyError;
+use iggy_common::IggyTimestamp;
+use iggy_common::{calculate_checksum, BytesSerializable};
 use std::fmt::{Display, Formatter};
 
 /// State entry in the log
@@ -106,7 +105,7 @@ impl StateEntry {
         bytes.put_u32_le(context.len() as u32);
         bytes.put_slice(context);
         bytes.extend(command);
-        checksum::calculate(&bytes.freeze())
+        calculate_checksum(&bytes.freeze())
     }
 }
 

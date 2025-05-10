@@ -20,7 +20,7 @@ use crate::state::system::StreamState;
 use crate::streaming::streams::stream::Stream;
 use crate::streaming::streams::COMPONENT;
 use error_set::ErrContext;
-use iggy::error::IggyError;
+use iggy_common::IggyError;
 
 impl Stream {
     pub async fn load(&mut self, state: StreamState) -> Result<(), IggyError> {

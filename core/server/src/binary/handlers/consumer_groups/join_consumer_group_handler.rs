@@ -23,13 +23,13 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy::consumer_groups::join_consumer_group::JoinConsumerGroup;
-use iggy::error::IggyError;
+use iggy_common::join_consumer_group::JoinConsumerGroup;
+use iggy_common::IggyError;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for JoinConsumerGroup {
     fn code(&self) -> u32 {
-        iggy::command::JOIN_CONSUMER_GROUP_CODE
+        iggy_common::JOIN_CONSUMER_GROUP_CODE
     }
 
     #[instrument(skip_all, name = "trace_join_consumer_group", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string(), iggy_topic_id = self.topic_id.as_string(), iggy_group_id = self.group_id.as_string()))]

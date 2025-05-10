@@ -24,13 +24,9 @@ use crate::streaming::topics::COMPONENT;
 use crate::streaming::utils::hash;
 use ahash::AHashMap;
 use error_set::ErrContext;
-use iggy::error::IggyError;
-use iggy::locking::IggySharedMutFn;
-use iggy::messages::{PartitioningKind, PollingKind};
-use iggy::prelude::Partitioning;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::timestamp::IggyTimestamp;
-use iggy::{confirmation::Confirmation, prelude::PollingStrategy};
+use iggy_common::locking::IggySharedMutFn;
+use iggy_common::{Confirmation, IggyTimestamp, PollingStrategy};
+use iggy_common::{IggyError, IggyExpiry, Partitioning, PartitioningKind, PollingKind};
 use std::sync::atomic::Ordering;
 use tracing::trace;
 
@@ -213,9 +209,8 @@ mod tests {
     use crate::streaming::storage::SystemStorage;
     use crate::streaming::utils::MemoryPool;
     use bytes::Bytes;
-    use iggy::compression::compression_algorithm::CompressionAlgorithm;
-    use iggy::prelude::IggyMessage;
-    use iggy::utils::topic_size::MaxTopicSize;
+    use iggy_common::CompressionAlgorithm;
+    use iggy_common::{IggyMessage, MaxTopicSize};
     use std::sync::atomic::AtomicU32;
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;

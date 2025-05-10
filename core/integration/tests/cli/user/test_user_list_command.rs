@@ -22,8 +22,8 @@ use crate::cli::common::{
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
-use iggy::client::Client;
-use iggy::models::user_status::UserStatus;
+use iggy::prelude::Client;
+use iggy::prelude::UserStatus;
 use predicates::str::{contains, starts_with};
 use serial_test::parallel;
 

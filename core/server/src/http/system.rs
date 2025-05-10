@@ -32,11 +32,11 @@ use axum::{Extension, Json, Router};
 use bytes::Bytes;
 use chrono::Local;
 use error_set::ErrContext;
-use iggy::locking::IggySharedMutFn;
-use iggy::models::client_info::{ClientInfo, ClientInfoDetails};
-use iggy::models::stats::Stats;
-use iggy::system::get_snapshot::GetSnapshot;
-use iggy::validatable::Validatable;
+use iggy_common::get_snapshot::GetSnapshot;
+use iggy_common::locking::IggySharedMutFn;
+use iggy_common::Stats;
+use iggy_common::Validatable;
+use iggy_common::{ClientInfo, ClientInfoDetails};
 use std::sync::Arc;
 
 const NAME: &str = "Iggy API";

@@ -17,13 +17,11 @@
  */
 
 use super::cache_indexes::CacheIndexesConfig;
-use iggy::confirmation::Confirmation;
-use iggy::utils::byte_size::IggyByteSize;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
-use iggy::{
-    compression::compression_algorithm::CompressionAlgorithm, utils::duration::IggyDuration,
-};
+use iggy_common::Confirmation;
+use iggy_common::IggyByteSize;
+use iggy_common::IggyExpiry;
+use iggy_common::MaxTopicSize;
+use iggy_common::{CompressionAlgorithm, IggyDuration};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use serde_with::DisplayFromStr;

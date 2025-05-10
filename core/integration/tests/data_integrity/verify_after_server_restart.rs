@@ -17,10 +17,10 @@
  */
 
 use crate::bench::run_bench_and_wait_for_finish;
-use iggy::client::{MessageClient, SystemClient};
 use iggy::clients::client::IggyClient;
-use iggy::identifier::Identifier;
-use iggy::utils::byte_size::IggyByteSize;
+use iggy::prelude::Identifier;
+use iggy::prelude::IggyByteSize;
+use iggy::prelude::{MessageClient, SystemClient};
 use integration::{
     tcp_client::TcpClientFactory,
     test_server::{

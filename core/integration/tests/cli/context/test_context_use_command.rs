@@ -23,8 +23,8 @@ use crate::cli::common::{
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
-use iggy::cli::context::common::ContextConfig;
-use iggy::client::Client;
+use iggy::prelude::Client;
+use iggy_binary_protocol::cli::binary_context::common::ContextConfig;
 use predicates::str::contains;
 use serial_test::parallel;
 

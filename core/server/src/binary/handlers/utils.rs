@@ -18,7 +18,7 @@
 
 use crate::binary::{command::ServerCommand, sender::SenderKind};
 use bytes::BytesMut;
-use iggy::error::IggyError;
+use iggy_common::IggyError;
 
 pub async fn receive_and_validate(
     sender: &mut SenderKind,

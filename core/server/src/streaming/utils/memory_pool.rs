@@ -461,7 +461,7 @@ fn size_str(size: usize) -> String {
 mod tests {
     use super::*;
     use crate::{configs::system::MemoryPoolConfig, streaming::utils::PooledBuffer};
-    use iggy::prelude::IggyByteSize;
+    use iggy_common::IggyByteSize;
     use serial_test::serial;
     use std::{str::FromStr, sync::Once};
 

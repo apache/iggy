@@ -22,8 +22,11 @@ use crate::streaming::segments::indexes::IggyIndexesMut;
 use crate::streaming::utils::random_id;
 use crate::streaming::utils::PooledBuffer;
 use bytes::{BufMut, BytesMut};
-use iggy::prelude::*;
-use iggy::utils::timestamp::IggyTimestamp;
+use iggy_common::{
+    BytesSerializable, IggyByteSize, IggyError, IggyIndexView, IggyMessage, IggyMessageView,
+    IggyMessageViewIterator, IggyTimestamp, Sizeable, Validatable, IGGY_MESSAGE_HEADER_SIZE,
+    INDEX_SIZE, MAX_PAYLOAD_SIZE, MAX_USER_HEADERS_SIZE,
+};
 use lending_iterator::prelude::*;
 use std::ops::{Deref, Index};
 use tracing::{error, warn};

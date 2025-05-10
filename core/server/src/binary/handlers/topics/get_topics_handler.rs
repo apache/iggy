@@ -25,13 +25,13 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy::error::IggyError;
-use iggy::topics::get_topics::GetTopics;
+use iggy_common::get_topics::GetTopics;
+use iggy_common::IggyError;
 use tracing::debug;
 
 impl ServerCommandHandler for GetTopics {
     fn code(&self) -> u32 {
-        iggy::command::GET_TOPICS_CODE
+        iggy_common::GET_TOPICS_CODE
     }
 
     async fn handle(

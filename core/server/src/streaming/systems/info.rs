@@ -18,7 +18,7 @@
 
 use crate::streaming::systems::system::System;
 use crate::versioning::SemanticVersion;
-use iggy::error::IggyError;
+use iggy_common::IggyError;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::fmt::Display;

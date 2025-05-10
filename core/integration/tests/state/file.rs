@@ -18,9 +18,9 @@
 
 use crate::state::StateSetup;
 use bytes::Bytes;
-use iggy::bytes_serializable::BytesSerializable;
-use iggy::streams::create_stream::CreateStream;
-use iggy::users::create_user::CreateUser;
+use iggy::prelude::BytesSerializable;
+use iggy_common::create_stream::CreateStream;
+use iggy_common::create_user::CreateUser;
 use server::state::command::EntryCommand;
 use server::state::entry::StateEntry;
 use server::state::models::{CreateStreamWithId, CreateUserWithId};

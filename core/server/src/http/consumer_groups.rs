@@ -29,11 +29,11 @@ use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Extension, Json, Router};
 use error_set::ErrContext;
-use iggy::consumer_groups::create_consumer_group::CreateConsumerGroup;
-use iggy::consumer_groups::delete_consumer_group::DeleteConsumerGroup;
-use iggy::identifier::Identifier;
-use iggy::models::consumer_group::{ConsumerGroup, ConsumerGroupDetails};
-use iggy::validatable::Validatable;
+use iggy_common::create_consumer_group::CreateConsumerGroup;
+use iggy_common::delete_consumer_group::DeleteConsumerGroup;
+use iggy_common::Identifier;
+use iggy_common::Validatable;
+use iggy_common::{ConsumerGroup, ConsumerGroupDetails};
 use std::sync::Arc;
 use tracing::instrument;
 

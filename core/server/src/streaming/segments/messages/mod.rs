@@ -22,7 +22,7 @@ mod persister_task;
 
 use super::IggyMessagesBatchSet;
 use error_set::ErrContext;
-use iggy::error::IggyError;
+use iggy_common::IggyError;
 use std::io::IoSlice;
 use tokio::{fs::File, io::AsyncWriteExt};
 

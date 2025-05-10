@@ -17,7 +17,7 @@
  */
 
 use ahash::AHashMap;
-use iggy::error::IggyError;
+use iggy_common::IggyError;
 use tokio::sync::RwLock;
 use tracing::trace;
 

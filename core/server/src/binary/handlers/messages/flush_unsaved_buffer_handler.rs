@@ -23,12 +23,12 @@ use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy::prelude::*;
+use iggy_common::{FlushUnsavedBuffer, IggyError};
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for FlushUnsavedBuffer {
     fn code(&self) -> u32 {
-        iggy::command::FLUSH_UNSAVED_BUFFER_CODE
+        iggy_common::FLUSH_UNSAVED_BUFFER_CODE
     }
 
     #[instrument(skip_all, name = "trace_flush_unsaved_buffer", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string(), iggy_topic_id = self.topic_id.as_string(), iggy_partition_id = self.partition_id, iggy_fsync = self.fsync))]

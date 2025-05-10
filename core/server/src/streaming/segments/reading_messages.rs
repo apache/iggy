@@ -19,7 +19,7 @@
 use super::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet};
 use crate::streaming::segments::segment::Segment;
 use error_set::ErrContext;
-use iggy::prelude::*;
+use iggy_common::{IggyByteSize, IggyError};
 use std::sync::atomic::Ordering;
 use tracing::trace;
 
