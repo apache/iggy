@@ -22,8 +22,6 @@ edition = "2021"
 build = "src/build.rs"
 license = "Apache-2.0"
 
-# This is a workaround for cargo-udeps to ignore these dependencies
-# in case if feature 'tokio-console' is enabled.
 [package.metadata.cargo-udeps.ignore]
 normal = ["tracing-appender"]
 
@@ -34,44 +32,37 @@ disable-mimalloc = []
 mimalloc = ["dep:mimalloc"]
 
 [dependencies]
-ahash = { version = "0.8.11" }
-anyhow = "1.0.98"
-async_zip = { version = "0.0.17", features = [
-    "tokio",
-    "lzma",
-    "bzip2",
-    "xz",
-    "deflate",
-    "zstd",
-] }
-axum = "0.8.3"
-axum-server = { version = "0.7.2", features = ["tls-rustls"] }
-bcrypt = "0.17.0"
-bincode = { version = "2.0.1", features = ["serde"] }
-blake3 = "1.8.2"
-bytes = "1.10.1"
-chrono = "0.4.40"
-clap = { version = "4.5.37", features = ["derive"] }
-console-subscriber = { version = "0.4.1", optional = true }
-crossbeam = "0.8.4"
-dashmap = "6.1.0"
-derive_more = "2.0.1"
-dotenvy = { version = "0.15.7" }
-enum_dispatch = "0.3.13"
+ahash = { workspace = true }
+anyhow = { workspace = true }
+async_zip = { workspace = true }
+axum = { workspace = true }
+axum-server = { workspace = true }
+bcrypt = { workspace = true }
+bincode = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+console-subscriber = { workspace = true, optional = true }
+crossbeam = { workspace = true }
+dashmap = { workspace = true }
+derive_more = { workspace = true }
+dotenvy = "0.15.7"
+enum_dispatch = { workspace = true }
 error_set = { version = "0.8.5", features = ["tracing"] }
-figlet-rs = "0.1.5"
+figlet-rs = { workspace = true }
 figment = { version = "0.10.19", features = ["toml", "env"] }
-flume = "0.11.1"
-futures = "0.3.31"
-human-repr = "1.1.0"
-iggy_common = { path = "../common", version = "0.7.0" }
+flume = { workspace = true }
+futures = { workspace = true }
+human-repr = { workspace = true }
+iggy_common = { workspace = true }
 jsonwebtoken = "9.3.1"
 lending-iterator = "0.1.7"
-mimalloc = { version = "0.1", optional = true }
+mimalloc = { workspace = true, optional = true }
 moka = { version = "0.12.10", features = ["future"] }
-nix = { version = "0.29", features = ["fs"] }
+nix = { version = "0.30", features = ["fs"] }
 once_cell = "1.21.3"
-openssl = { version = "0.10.72", features = ["vendored"] }
+openssl = { workspace = true }
 opentelemetry = { version = "0.29.1", features = ["trace", "logs"] }
 opentelemetry-appender-tracing = { version = "0.29.1", features = ["log"] }
 opentelemetry-otlp = { version = "0.29.0", features = [
@@ -83,7 +74,7 @@ opentelemetry-otlp = { version = "0.29.0", features = [
     "reqwest-client",
     "tokio",
 ] }
-opentelemetry-semantic-conventions = { version = "0.29.0" }
+opentelemetry-semantic-conventions = "0.29.0"
 opentelemetry_sdk = { version = "0.29.0", features = [
     "rt-tokio",
     "logs",
@@ -94,39 +85,32 @@ opentelemetry_sdk = { version = "0.29.0", features = [
     "experimental_trace_batch_span_processor_with_async_runtime",
 ] }
 prometheus-client = "0.23.1"
-quinn = { version = "0.11.7" }
+quinn = { workspace = true }
 rcgen = "0.13.2"
-reqwest = { version = "0.12.15", features = [
-    "rustls-tls",
-    "rustls-tls-no-provider",
-] }
+reqwest = { workspace = true, features = ["rustls-tls-no-provider"] }
 ring = "0.17.14"
-rust-s3 = { version = "0.35.1", features = ["default"] }
-rustls = { version = "0.23.26" }
+rust-s3 = { workspace = true }
+rustls = { workspace = true }
 rustls-pemfile = "2.2.0"
-serde = { version = "1.0.219", features = ["derive", "rc"] }
-serde_with = { version = "3.12.0", features = ["base64", "macros"] }
+serde = { workspace = true }
+serde_with = { workspace = true }
 static-toml = "1.3.0"
-strum = { version = "0.27.1", features = ["derive"] }
-sysinfo = "0.34.2"
-tempfile = "3.19"
-thiserror = "2.0.12"
-tokio = { version = "1.44.2", features = ["full"] }
+strum = { workspace = true }
+sysinfo = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
 tokio-native-tls = "0.3.1"
-tokio-util = { version = "0.7.14", features = ["compat"] }
-toml = "0.8.20"
-tower-http = { version = "0.6.2", features = [
-    "add-extension",
-    "cors",
-    "trace",
-] }
-tracing = { version = "0.1.41" }
-tracing-appender = "0.2.3"
-tracing-opentelemetry = { version = "0.30.0" }
-tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter"] }
-twox-hash = { version = "2.1.0", features = ["xxhash32"] }
+tokio-util = { workspace = true }
+toml = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-opentelemetry = "0.30.0"
+tracing-subscriber = { workspace = true }
+twox-hash = { workspace = true }
 ulid = "1.2.1"
-uuid = { version = "1.16.0", features = ["v7", "fast-rng", "zerocopy"] }
+uuid = { workspace = true }
 
 [build-dependencies]
 figment = { version = "0.10.19", features = ["json", "toml", "env"] }
@@ -138,8 +122,8 @@ vergen-git2 = { version = "1.0.7", features = [
 ] }
 
 [dev-dependencies]
-mockall = "0.13.1"
-serial_test = "3.2.0"
+mockall = { workspace = true }
+serial_test = { workspace = true }
 
 [[bin]]
 name = "iggy-server"

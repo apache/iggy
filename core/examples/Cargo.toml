@@ -22,18 +22,18 @@ edition = "2021"
 license = "Apache-2.0"
 
 [dependencies]
-ahash = { version = "0.8.11", features = ["serde"] }
-anyhow = "1.0.98"
-bytes = "1.10.1"
-clap = { version = "4.5.37", features = ["derive"] }
-futures-util = "0.3.31"
-iggy = { path = "../sdk" }
-rand = "0.9.1"
-serde = { version = "1.0.219", features = ["derive", "rc"] }
-serde_json = "1.0.140"
-tokio = { version = "1.44.2", features = ["full"] }
-tracing = { version = "0.1.41" }
-tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter"] }
+ahash = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+futures-util = { workspace = true }
+iggy = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [[example]]
 name = "getting-started-consumer"
@@ -102,4 +102,3 @@ path = "src/stream-builder/stream-producer/main.rs"
 [[example]]
 name = "stream-producer-config"
 path = "src/stream-builder/stream-producer-config/main.rs"
-

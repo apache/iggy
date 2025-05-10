@@ -23,14 +23,14 @@ description = "Benchmark report and chart generation library for iggy-bench bina
 license = "Apache-2.0"
 
 [dependencies]
-charming = "0.4.0"
-colored = "3.0.0"
-derive-new = "0.7.0"
-derive_more = { version = "2.0.1", features = ["full"] }
-human-repr = "1.1.0"
-rand = "0.9.1"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-sysinfo = "0.34.2"
-tracing = "0.1"
-uuid = { version = "1.16.0", features = ["serde"] }
+charming = { workspace = true }
+colored = { workspace = true }
+derive-new = { workspace = true }
+derive_more = { workspace = true }
+human-repr = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sysinfo = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }

@@ -36,26 +36,20 @@ default = ["login-session"]
 login-session = ["dep:keyring"]
 
 [dependencies]
-ahash = { version = "0.8.11", features = ["serde"] }
-anyhow = "1.0.98"
-clap = { version = "4.5.37", features = ["derive"] }
-clap_complete = "4.5.47"
-figlet-rs = "0.1.5"
-iggy = { path = "../sdk", version = "0.7.0" }
-iggy_binary_protocol = { path = "../binary_protocol", version = "0.7.0" }
-keyring = { version = "3.6.2", features = [
-    "sync-secret-service",
-    "vendored",
-], optional = true }
-passterm = "=2.0.1"
-thiserror = "2.0.12"
-tokio = { version = "1.44.2", features = ["full"] }
-tracing = "0.1.41"
-tracing-appender = "0.2.3"
-tracing-subscriber = { version = "0.3.19", default-features = false, features = [
-    "fmt",
-    "env-filter",
-] }
+ahash = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+clap_complete = "4.5.50"
+figlet-rs = { workspace = true }
+iggy = { workspace = true }
+iggy_binary_protocol = { workspace = true }
+keyring = { workspace = true, optional = true }
+passterm = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true, default-features = false }
 
 [[bin]]
 name = "iggy"

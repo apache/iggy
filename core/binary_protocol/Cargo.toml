@@ -29,21 +29,18 @@ repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 
 [dependencies]
-anyhow = "1.0.98"
-async-broadcast = { version = "0.7.2" }
-async-trait = "0.1.88"
-bytes = "1.10.1"
-chrono = { version = "0.4.40" }
-comfy-table = { version = "7.1.4", optional = false }
-dirs = "6.0.0"
-iggy_common = { path = "../common" }
-keyring = { version = "3.6.2", optional = false, features = [
-    "sync-secret-service",
-    "vendored",
-] }
-passterm = { version = "=2.0.1", optional = false }
-serde = { version = "1.0.219", features = ["derive", "rc"] }
-serde_json = "1.0.140"
-tokio = { version = "1.44.2", features = ["full"] }
-toml = "0.8.20"
-tracing = { version = "0.1.41" }
+anyhow = { workspace = true }
+async-broadcast = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+comfy-table = { workspace = true, optional = false }
+dirs = { workspace = true }
+iggy_common = { workspace = true }
+keyring = { workspace = true, optional = false }
+passterm = { workspace = true, optional = false }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }

@@ -27,31 +27,31 @@ license = "Apache-2.0"
 ci-qemu = []
 
 [dependencies]
-ahash = { version = "0.8.11", features = ["serde"] }
+ahash = { workspace = true }
 assert_cmd = "2.0.17"
-async-trait = "0.1.88"
-bytes = "1.10.1"
-chrono = "0.4.40"
+async-trait = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
 ctor = "0.4.2"
-derive_more = "2.0.1"
-env_logger = "0.11.8"
-futures = "0.3.31"
-humantime = "2.2.0"
-iggy = { path = "../sdk" }
-iggy_binary_protocol = { path = "../binary_protocol", version = "0.7.0" }
-iggy_common = { path = "../common", version = "0.7.0" }
-keyring = "3.6.2"
-lazy_static = "1.5.0"
+derive_more = { workspace = true }
+env_logger = { workspace = true }
+futures = { workspace = true }
+humantime = { workspace = true }
+iggy = { workspace = true }
+iggy_binary_protocol = { workspace = true }
+iggy_common = { workspace = true }
+keyring = { workspace = true }
+lazy_static = { workspace = true }
 libc = "0.2.172"
-log = "0.4.27"
-predicates = "3.1.3"
-regex = "1.11.1"
-serial_test = "3.2.0"
-server = { path = "../server" }
-tempfile = "3.19.1"
-test-case = "3.3.1"
-tokio = { version = "1.44.2", features = ["full"] }
-tracing-subscriber = { version = "0.3.19", features = ["fmt", "env-filter"] }
-twox-hash = { version = "2.1.0", features = ["xxhash32"] }
-uuid = { version = "1.16.0", features = ["v7", "fast-rng", "zerocopy"] }
-zip = "2.6.1"
+log = { workspace = true }
+predicates = { workspace = true }
+regex = { workspace = true }
+serial_test = { workspace = true }
+server = { workspace = true }
+tempfile = { workspace = true }
+test-case = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+twox-hash = { workspace = true }
+uuid = { workspace = true }
+zip = { workspace = true }

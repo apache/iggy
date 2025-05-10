@@ -14,7 +14,6 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-
 [package]
 name = "iggy_common"
 version = "0.7.0"
@@ -34,28 +33,23 @@ tokio_lock = []
 fast_async_lock = ["dep:fast-async-mutex"]
 
 [dependencies]
-aes-gcm = "0.10.3"
-ahash = { version = "0.8.11", features = ["serde"] }
-base64 = "0.22.1"
-bon = { version = "3.6.3" }
-
-byte-unit = { version = "5.1.6", default-features = false, features = [
-    "serde",
-    "byte",
-    "std",
-] }
-bytes = "1.10.1"
-chrono = { version = "0.4.40" }
-clap = { version = "4.5.37", features = ["derive"] }
-comfy-table = { version = "7.1.4" }
-crc32fast = "1.4.2"
-derive_more = { version = "2.0.1", features = ["full"] }
+aes-gcm = { workspace = true }
+ahash = { workspace = true }
+base64 = { workspace = true }
+bon = { workspace = true }
+byte-unit = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+comfy-table = { workspace = true }
+crc32fast = { workspace = true }
+derive_more = { workspace = true }
 fast-async-mutex = { version = "0.6.7", optional = true }
-humantime = "2.2.0"
-serde = { version = "1.0.219", features = ["derive", "rc"] }
-serde_json = "1.0.140"
-serde_with = { version = "3.12.0", features = ["base64"] }
-strum = { version = "0.27.1", features = ["derive"] }
-thiserror = "2.0.12"
-tokio = { version = "1.44.2", features = ["full"] }
-tracing = { version = "0.1.41" }
+humantime = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_with = { workspace = true, features = ["base64"] }
+strum = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

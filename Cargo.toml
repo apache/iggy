@@ -36,3 +36,120 @@ members = [
 
 [workspace.metadata.cargo-machete]
 ignored = ["openssl"]
+
+[workspace.dependencies]
+ahash = { version = "0.8.12", features = ["serde"] }
+anyhow = "1.0.98"
+async-broadcast = "0.7.2"
+async-dropper = { version = "0.3.1", features = ["tokio", "simple"] }
+async-trait = "0.1.88"
+async_zip = { version = "0.0.17", features = [
+    "tokio",
+    "lzma",
+    "bzip2",
+    "xz",
+    "deflate",
+    "zstd",
+] }
+axum = "0.8.4"
+axum-server = { version = "0.7.2", features = ["tls-rustls"] }
+bcrypt = "0.17.0"
+bincode = { version = "2.0.1", features = ["serde"] }
+blake3 = "1.8.2"
+bon = "3.6.3"
+byte-unit = { version = "5.1.6", default-features = false, features = [
+    "serde",
+    "byte",
+    "std",
+] }
+bytes = "1.10.1"
+charming = "0.4.0"
+chrono = "0.4.41"
+clap = { version = "4.5.37", features = ["derive"] }
+comfy-table = "7.1.4"
+crc32fast = "1.4.2"
+crossbeam = "0.8.4"
+dashmap = "6.1.0"
+derive_more = { version = "2.0.1", features = ["full"] }
+derive-new = "0.7.0"
+dirs = "6.0.0"
+derive_builder = "0.20.2"
+enum_dispatch = "0.3.13"
+figlet-rs = "0.1.5"
+flume = "0.11.1"
+futures = "0.3.31"
+futures-util = "0.3.31"
+human-repr = "1.1.0"
+humantime = "2.2.0"
+keyring = { version = "3.6.2", features = ["sync-secret-service", "vendored"] }
+nonzero_lit = "0.1.2"
+openssl = { version = "0.10.72", features = ["vendored"] }
+passterm = "=2.0.1"
+quinn = "0.11.8"
+rand = "0.9.1"
+reqwest = { version = "0.12.15", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+reqwest-middleware = { version = "0.4.2", features = ["json"] }
+reqwest-retry = "0.7.0"
+rustls = { version = "0.23.27", features = ["ring"] }
+serde = { version = "1.0.219", features = ["derive", "rc"] }
+serde_json = "1.0.140"
+serde_with = { version = "3.12.0", features = ["base64", "macros"] }
+serial_test = "3.2.0"
+sysinfo = "0.35.0"
+tempfile = "3.19.1"
+thiserror = "2.0.12"
+tokio = { version = "1.45.0", features = ["full"] }
+tokio-rustls = "0.26.2"
+toml = "0.8.22"
+tracing = "0.1.41"
+tracing-appender = "0.2.3"
+tracing-subscriber = { version = "0.3.19", default-features = false, features = [
+    "fmt",
+    "env-filter",
+    "ansi",
+] }
+uuid = { version = "1.16.0", features = [
+    "v7",
+    "fast-rng",
+    "serde",
+    "zerocopy",
+] }
+rust-s3 = { version = "0.35.1", features = ["default"] }
+strum = { version = "0.27.1", features = ["derive"] }
+aes-gcm = "0.10.3"
+base64 = "0.22.1"
+twox-hash = { version = "2.1.0", features = ["xxhash32"] }
+
+# Common dependencies across multiple packages
+colored = "3.0.0"
+env_logger = "0.11.8"
+lazy_static = "1.5.0"
+log = "0.4.27"
+mockall = "0.13.1"
+predicates = "3.1.3"
+regex = "1.11.1"
+test-case = "3.3.1"
+tokio-util = { version = "0.7.15", features = ["compat"] }
+tower-http = { version = "0.6.2", features = [
+    "add-extension",
+    "cors",
+    "trace",
+] }
+trait-variant = "0.1.2"
+webpki-roots = "1.0.0"
+zip = "2.6.1"
+
+# Optional dependencies
+mimalloc = "0.1"
+console-subscriber = "0.4.1"
+
+# Path dependencies
+iggy_common = { path = "core/common", version = "0.7.0" }
+iggy_binary_protocol = { path = "core/binary_protocol", version = "0.7.0" }
+iggy = { path = "core/sdk", version = "0.7.0" }
+server = { path = "core/server" }
+integration = { path = "core/integration" }
+iggy-bench-report = { path = "core/bench/report" }
