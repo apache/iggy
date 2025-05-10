@@ -68,3 +68,15 @@ profile-io-server:
 
 profile-io-client:
   ./scripts/profile.sh iggy-bench io
+
+licenses-fix:
+  docker run --rm -v $(pwd):/src -w /src ghcr.io/google/addlicense:latest -f ASF_LICENSE.txt .
+
+licenses-check:
+  docker run --rm -v $(pwd):/src -w /src ghcr.io/google/addlicense:latest -check -f ASF_LICENSE.txt .
+
+licenses-list-check:
+  ./scripts/licenses-list.sh --check
+
+licenses-list-update:
+  ./scripts/licenses-list.sh --update

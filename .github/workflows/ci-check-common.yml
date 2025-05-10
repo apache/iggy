@@ -14,6 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+
 #
 # -------------------------------------------------------------
 #
@@ -78,3 +79,26 @@ jobs:
         # ignoreLabels: |
         #   ignore-semantic-pull-request
         #   WIP
+
+  ci-check-licenses:
+    name: Check license headers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull addlicense Docker image
+        run: docker pull ghcr.io/google/addlicense:latest
+
+      - name: Check license headers
+        run: docker run --rm -v ${{ github.workspace }}:/src -w /src ghcr.io/google/addlicense:latest -check -f ASF_LICENSE.txt .
+
+  ci-check-licenses-list:
+    name: Check licenses list
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+      - run: scripts/licenses-list.sh --check
