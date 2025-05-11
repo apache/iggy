@@ -21,7 +21,7 @@ use crate::configs::server::MessageSaverConfig;
 use crate::configs::server::ServerConfig;
 use crate::streaming::systems::system::SharedSystem;
 use flume::{Receiver, Sender};
-use iggy::utils::duration::IggyDuration;
+use iggy_common::IggyDuration;
 use tokio::time;
 use tracing::{error, info, instrument, warn};
 
@@ -59,7 +59,9 @@ impl MessagesSaver {
         let enforce_fsync = self.enforce_fsync;
         let interval = self.interval;
         let sender = self.sender.clone();
-        info!("Message saver is enabled, buffered messages will be automatically saved every: {interval}, enforce fsync: {enforce_fsync}.");
+        info!(
+            "Message saver is enabled, buffered messages will be automatically saved every: {interval}, enforce fsync: {enforce_fsync}."
+        );
         tokio::spawn(async move {
             let mut interval_timer = time::interval(interval.get_duration());
             loop {

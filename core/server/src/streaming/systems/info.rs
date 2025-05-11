@@ -18,7 +18,7 @@
 
 use crate::streaming::systems::system::System;
 use crate::versioning::SemanticVersion;
-use iggy::error::IggyError;
+use iggy_common::IggyError;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::fmt::Display;
@@ -70,11 +70,15 @@ impl System {
         if current_version.is_equal_to(&loaded_version) {
             info!("System version {current_version} is up to date.");
         } else if current_version.is_greater_than(&loaded_version) {
-            info!("System version {current_version} is greater than {loaded_version}, checking the available migrations...");
+            info!(
+                "System version {current_version} is greater than {loaded_version}, checking the available migrations..."
+            );
             self.update_system_info(&mut system_info, &current_version)
                 .await?;
         } else {
-            info!("System version {current_version} is lower than {loaded_version}, possible downgrade.");
+            info!(
+                "System version {current_version} is lower than {loaded_version}, possible downgrade."
+            );
             self.update_system_info(&mut system_info, &current_version)
                 .await?;
         }

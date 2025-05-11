@@ -113,7 +113,7 @@ jobs:
         run: ./scripts/run-examples-from-readme.sh
 
       - name: Check if workspace is clean
-        run: git status | grep "working tree clean" || { git status ; exit 1; }
+        run: git status --porcelain
 
   # TODO: below job is non-blocking: temporary solution until we decide whether
   #       we want to use the new M1 macs for CI, determine cost and performance

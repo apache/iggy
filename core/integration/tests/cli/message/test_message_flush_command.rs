@@ -17,15 +17,15 @@
  */
 
 use crate::cli::common::{
-    IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId, TestTopicId,
-    CLAP_INDENT, USAGE_PREFIX,
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId,
+    TestTopicId, USAGE_PREFIX,
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
-use iggy::client::Client;
-use iggy::identifier::Identifier;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy::prelude::Client;
+use iggy::prelude::Identifier;
+use iggy::prelude::IggyExpiry;
+use iggy::prelude::MaxTopicSize;
 use predicates::str::diff;
 use serial_test::parallel;
 use std::str::FromStr;
@@ -145,7 +145,9 @@ impl IggyCmdTestCase for TestMessageFetchCmd {
             }
         );
 
-        let message = format!("Executing flush messages {identification_part}\nFlushed messages {identification_part}\n");
+        let message = format!(
+            "Executing flush messages {identification_part}\nFlushed messages {identification_part}\n"
+        );
 
         command_state.success().stdout(diff(message));
     }

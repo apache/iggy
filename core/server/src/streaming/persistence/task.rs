@@ -19,8 +19,8 @@
 use crate::streaming::persistence::COMPONENT;
 use bytes::Bytes;
 use error_set::ErrContext;
-use flume::{unbounded, Receiver, Sender};
-use iggy::error::IggyError;
+use flume::{Receiver, Sender, unbounded};
+use iggy_common::IggyError;
 use std::{sync::Arc, time::Duration};
 use tokio::task;
 use tracing::error;

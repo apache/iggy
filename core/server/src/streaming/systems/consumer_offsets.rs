@@ -17,13 +17,10 @@
  */
 
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::System;
 use crate::streaming::systems::COMPONENT;
+use crate::streaming::systems::system::System;
 use error_set::ErrContext;
-use iggy::consumer::Consumer;
-use iggy::error::IggyError;
-use iggy::identifier::Identifier;
-use iggy::models::consumer_offset_info::ConsumerOffsetInfo;
+use iggy_common::{Consumer, ConsumerOffsetInfo, Identifier, IggyError};
 
 impl System {
     pub async fn store_consumer_offset(

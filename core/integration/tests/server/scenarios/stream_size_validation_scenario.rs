@@ -16,10 +16,10 @@
  * under the License.
  */
 
-use crate::server::scenarios::{create_client, PARTITIONS_COUNT, PARTITION_ID};
+use crate::server::scenarios::{PARTITION_ID, PARTITIONS_COUNT, create_client};
 use bytes::Bytes;
 use iggy::prelude::*;
-use integration::test_server::{assert_clean_system, login_root, ClientFactory};
+use integration::test_server::{ClientFactory, assert_clean_system, login_root};
 use std::str::FromStr;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;

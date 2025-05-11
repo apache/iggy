@@ -17,12 +17,12 @@
  */
 
 use crate::server::scenarios::{
-    cleanup, create_client, MESSAGES_COUNT, PARTITIONS_COUNT, PARTITION_ID, STREAM_ID, STREAM_NAME,
-    TOPIC_ID, TOPIC_NAME,
+    MESSAGES_COUNT, PARTITION_ID, PARTITIONS_COUNT, STREAM_ID, STREAM_NAME, TOPIC_ID, TOPIC_NAME,
+    cleanup, create_client,
 };
 use bytes::Bytes;
 use iggy::prelude::*;
-use integration::test_server::{assert_clean_system, login_root, ClientFactory};
+use integration::test_server::{ClientFactory, assert_clean_system, login_root};
 use std::collections::HashMap;
 use std::str::FromStr;
 
@@ -86,11 +86,13 @@ pub async fn run(client_factory: &dyn ClientFactory) {
                 .unwrap(),
             "Value 1"
         );
-        assert!(headers
-            .get(&HeaderKey::new("key 2").unwrap())
-            .unwrap()
-            .as_bool()
-            .unwrap(),);
+        assert!(
+            headers
+                .get(&HeaderKey::new("key 2").unwrap())
+                .unwrap()
+                .as_bool()
+                .unwrap(),
+        );
         assert_eq!(
             headers
                 .get(&HeaderKey::new("key-3").unwrap())

@@ -17,7 +17,7 @@
  */
 
 use crate::streaming::common::test_setup::TestSetup;
-use iggy::consumer::ConsumerKind;
+use iggy::prelude::ConsumerKind;
 use server::configs::system::SystemConfig;
 use server::streaming::partitions::partition::ConsumerOffset;
 use server::streaming::storage::PartitionStorageKind;
@@ -72,7 +72,7 @@ async fn assert_persisted_offset(
     assert_eq!(consumer_offsets.len(), expected_offsets_count);
     let loaded_consumer_offset = consumer_offsets.get(expected_offsets_count - 1).unwrap();
 
-    assert!(loaded_consumer_offset.offset == consumer_offset.offset);
+    assert_eq!(loaded_consumer_offset.offset, consumer_offset.offset);
 
     assert_eq!(loaded_consumer_offset.kind, consumer_offset.kind);
     assert_eq!(

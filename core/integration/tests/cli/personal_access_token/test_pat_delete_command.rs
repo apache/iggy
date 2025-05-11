@@ -19,8 +19,8 @@
 use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX};
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
-use iggy::client::Client;
-use iggy::utils::personal_access_token_expiry::PersonalAccessTokenExpiry;
+use iggy::prelude::Client;
+use iggy::prelude::PersonalAccessTokenExpiry;
 use predicates::str::diff;
 use serial_test::parallel;
 
@@ -56,8 +56,10 @@ impl IggyCmdTestCase for TestPatDeleteCmd {
     }
 
     fn verify_command(&self, command_state: Assert) {
-        let message = format!("Executing delete personal access tokens with name: {}\nPersonal access token with name: {} deleted\n",
-                                self.name, self.name);
+        let message = format!(
+            "Executing delete personal access tokens with name: {}\nPersonal access token with name: {} deleted\n",
+            self.name, self.name
+        );
 
         command_state.success().stdout(diff(message));
     }

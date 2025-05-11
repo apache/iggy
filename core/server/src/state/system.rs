@@ -16,18 +16,16 @@
  * under the License.
  */
 
-use crate::state::{EntryCommand, StateEntry, COMPONENT};
+use crate::state::{COMPONENT, EntryCommand, StateEntry};
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use ahash::AHashMap;
 use error_set::ErrContext;
-use iggy::compression::compression_algorithm::CompressionAlgorithm;
-use iggy::error::IggyError;
-use iggy::identifier::{IdKind, Identifier};
-use iggy::models::permissions::Permissions;
-use iggy::models::user_status::UserStatus;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::timestamp::IggyTimestamp;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy_common::CompressionAlgorithm;
+use iggy_common::IggyError;
+use iggy_common::IggyExpiry;
+use iggy_common::IggyTimestamp;
+use iggy_common::MaxTopicSize;
+use iggy_common::{IdKind, Identifier, Permissions, UserStatus};
 use std::fmt::Display;
 use tracing::{debug, info};
 
@@ -95,7 +93,9 @@ impl SystemState {
         for entry in entries {
             debug!("Processing state entry: {entry}",);
             match entry.command().with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to retrieve state entry command: {entry}")
+                format!(
+                    "{COMPONENT} (error: {error}) - failed to retrieve state entry command: {entry}"
+                )
             })? {
                 EntryCommand::CreateStream(command) => {
                     info!("Creating stream: {command:?}");
@@ -267,7 +267,13 @@ impl SystemState {
 
                     let partition_id = command.partition_id;
 
-                    let _partition = topic.partitions.get(&command.partition_id).unwrap_or_else(|| panic!("{}", format!("Partition {partition_id} not found.")));
+                    let _partition =
+                        topic
+                            .partitions
+                            .get(&command.partition_id)
+                            .unwrap_or_else(|| {
+                                panic!("{}", format!("Partition {partition_id} not found."))
+                            });
 
                     // State is not affected by the delete segments
                 }

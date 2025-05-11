@@ -21,8 +21,8 @@ mod quic;
 mod tcp;
 
 use assert_cmd::prelude::CommandCargoExt;
-use iggy::utils::byte_size::IggyByteSize;
-use integration::test_server::{Transport, TEST_VERBOSITY_ENV_VAR};
+use iggy::prelude::IggyByteSize;
+use integration::test_server::{TEST_VERBOSITY_ENV_VAR, Transport};
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,

@@ -15,8 +15,12 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
-use iggy::prelude::*;
+use iggy_common::{
+    IGGY_MESSAGE_CHECKSUM_OFFSET_RANGE, IGGY_MESSAGE_HEADERS_LENGTH_OFFSET_RANGE,
+    IGGY_MESSAGE_ID_OFFSET_RANGE, IGGY_MESSAGE_OFFSET_OFFSET_RANGE,
+    IGGY_MESSAGE_ORIGIN_TIMESTAMP_OFFSET_RANGE, IGGY_MESSAGE_PAYLOAD_LENGTH_OFFSET_RANGE,
+    IGGY_MESSAGE_TIMESTAMP_OFFSET_RANGE,
+};
 
 /// A typed, in-place view of a raw header in a buffer
 #[derive(Debug)]

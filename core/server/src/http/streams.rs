@@ -16,24 +16,24 @@
  * under the License.
  */
 
+use crate::http::COMPONENT;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::mapper;
 use crate::http::shared::AppState;
-use crate::http::COMPONENT;
 use crate::streaming::session::Session;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get};
 use axum::{Extension, Json, Router};
 use error_set::ErrContext;
-use iggy::identifier::Identifier;
-use iggy::models::stream::{Stream, StreamDetails};
-use iggy::streams::create_stream::CreateStream;
-use iggy::streams::delete_stream::DeleteStream;
-use iggy::streams::purge_stream::PurgeStream;
-use iggy::streams::update_stream::UpdateStream;
-use iggy::validatable::Validatable;
+use iggy_common::Identifier;
+use iggy_common::Validatable;
+use iggy_common::create_stream::CreateStream;
+use iggy_common::delete_stream::DeleteStream;
+use iggy_common::purge_stream::PurgeStream;
+use iggy_common::update_stream::UpdateStream;
+use iggy_common::{Stream, StreamDetails};
 
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateStreamWithId;

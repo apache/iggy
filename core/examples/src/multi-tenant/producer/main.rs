@@ -103,7 +103,9 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
         .parse::<bool>()
         .expect("Invalid ensure stream access");
 
-    print_info(&format!("Multi-tenant producer has started, tenants: {tenants_count}, producers: {producers_count}, partitions: {partitions_count}"));
+    print_info(&format!(
+        "Multi-tenant producer has started, tenants: {tenants_count}, producers: {producers_count}, partitions: {partitions_count}"
+    ));
     let address = args.tcp_server_address;
 
     print_info("Creating root client to manage streams and users");
@@ -228,7 +230,8 @@ fn start_producers(
 
                 if let Err(error) = producer.producer.send(messages).await {
                     error!(
-                        "Failed to send: {batch_size} message(s) to: {} -> {} by tenant: {tenant_id}, producer: {producer_id} with error: {error}", producer.stream, producer.topic,
+                        "Failed to send: {batch_size} message(s) to: {} -> {} by tenant: {tenant_id}, producer: {producer_id} with error: {error}",
+                        producer.stream, producer.topic,
                     );
                     continue;
                 }

@@ -18,7 +18,7 @@
 
 use crate::state::command::EntryCommand;
 use crate::state::entry::StateEntry;
-use iggy::error::IggyError;
+use iggy_common::IggyError;
 #[cfg(test)]
 use mockall::automock;
 use std::fmt::Debug;

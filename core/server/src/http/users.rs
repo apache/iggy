@@ -16,31 +16,31 @@
  * under the License.
  */
 
+use crate::http::COMPONENT;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::mapper;
 use crate::http::mapper::map_generated_access_token_to_identity_info;
 use crate::http::shared::AppState;
-use crate::http::COMPONENT;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateUserWithId;
 use crate::streaming::session::Session;
 use crate::streaming::utils::crypto;
+use ::iggy_common::change_password::ChangePassword;
+use ::iggy_common::create_user::CreateUser;
+use ::iggy_common::delete_user::DeleteUser;
+use ::iggy_common::login_user::LoginUser;
+use ::iggy_common::update_permissions::UpdatePermissions;
+use ::iggy_common::update_user::UpdateUser;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post, put};
 use axum::{Extension, Json, Router};
 use error_set::ErrContext;
-use iggy::identifier::Identifier;
-use iggy::models::identity_info::IdentityInfo;
-use iggy::models::user_info::{UserInfo, UserInfoDetails};
-use iggy::users::change_password::ChangePassword;
-use iggy::users::create_user::CreateUser;
-use iggy::users::delete_user::DeleteUser;
-use iggy::users::login_user::LoginUser;
-use iggy::users::update_permissions::UpdatePermissions;
-use iggy::users::update_user::UpdateUser;
-use iggy::validatable::Validatable;
+use iggy_common::Identifier;
+use iggy_common::IdentityInfo;
+use iggy_common::Validatable;
+use iggy_common::{UserInfo, UserInfoDetails};
 use serde::Deserialize;
 use std::sync::Arc;
 use tracing::instrument;

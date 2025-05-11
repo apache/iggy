@@ -20,12 +20,7 @@ use std::collections::HashMap;
 
 use super::metrics::group::{from_individual_metrics, from_producers_and_consumers_statistics};
 use crate::utils::get_server_stats;
-use chrono::{DateTime, Utc};
-use iggy::{
-    models::stats::{CacheMetrics, CacheMetricsKey, Stats},
-    utils::timestamp::IggyTimestamp,
-};
-use iggy_bench_report::{
+use bench_report::{
     actor_kind::ActorKind,
     benchmark_kind::BenchmarkKind,
     hardware::BenchmarkHardware,
@@ -34,6 +29,8 @@ use iggy_bench_report::{
     report::BenchmarkReport,
     server_stats::{BenchmarkCacheMetrics, BenchmarkCacheMetricsKey, BenchmarkServerStats},
 };
+use chrono::{DateTime, Utc};
+use iggy::prelude::{CacheMetrics, CacheMetricsKey, IggyTimestamp, Stats};
 
 pub struct BenchmarkReportBuilder;
 
@@ -137,7 +134,7 @@ impl BenchmarkReportBuilder {
 }
 
 /// This function is a workaround.
-/// See server_stats.rs in `iggy_bench_report` crate for more details.
+/// See server_stats.rs in `bench_report` crate for more details.
 fn stats_to_benchmark_server_stats(stats: Stats) -> BenchmarkServerStats {
     BenchmarkServerStats {
         process_id: stats.process_id,
@@ -169,7 +166,7 @@ fn stats_to_benchmark_server_stats(stats: Stats) -> BenchmarkServerStats {
 }
 
 /// This function is a workaround.
-/// See server_stats.rs in `iggy_bench_report` crate for more details.
+/// See server_stats.rs in `bench_report` crate for more details.
 fn cache_metrics_to_benchmark_cache_metrics(
     cache_metrics: HashMap<CacheMetricsKey, CacheMetrics>,
 ) -> HashMap<BenchmarkCacheMetricsKey, BenchmarkCacheMetrics> {

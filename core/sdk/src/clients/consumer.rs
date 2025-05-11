@@ -16,26 +16,21 @@
  * under the License.
  */
 
-use crate::client::Client;
-use crate::consumer::{Consumer, ConsumerKind};
-use crate::diagnostic::DiagnosticEvent;
-use crate::error::IggyError;
-use crate::identifier::{IdKind, Identifier};
-use crate::locking::{IggySharedMut, IggySharedMutFn};
-use crate::messages::PollingStrategy;
-use crate::prelude::{IggyMessage, PolledMessages, PollingKind};
-use crate::utils::crypto::EncryptorKind;
-use crate::utils::duration::IggyDuration;
-use crate::utils::timestamp::IggyTimestamp;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::Stream;
 use futures_util::{FutureExt, StreamExt};
+use iggy_binary_protocol::Client;
+use iggy_common::locking::{IggySharedMut, IggySharedMutFn};
+use iggy_common::{
+    Consumer, ConsumerKind, DiagnosticEvent, EncryptorKind, IdKind, Identifier, IggyDuration,
+    IggyError, IggyMessage, IggyTimestamp, PolledMessages, PollingKind, PollingStrategy,
+};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::time;
@@ -299,7 +294,9 @@ impl IggyConsumer {
 
             loop {
                 if stream_exists && topic_exists {
-                    info!("Stream: {stream_id} and topic: {topic_id} were found. Initializing consumer...",);
+                    info!(
+                        "Stream: {stream_id} and topic: {topic_id} were found. Initializing consumer...",
+                    );
                     break;
                 }
 
@@ -309,7 +306,9 @@ impl IggyConsumer {
 
                 retries += 1;
                 if !stream_exists {
-                    warn!("Stream: {stream_id} does not exist. Retrying ({retries}/{init_retries}) in {interval}...",);
+                    warn!(
+                        "Stream: {stream_id} does not exist. Retrying ({retries}/{init_retries}) in {interval}...",
+                    );
                     timer.tick().await;
                     stream_exists = client.get_stream(&stream_id).await?.is_some();
                 }
@@ -323,7 +322,9 @@ impl IggyConsumer {
                     break;
                 }
 
-                warn!("Topic: {topic_id} does not exist in stream: {stream_id}. Retrying ({retries}/{init_retries}) in {interval}...",);
+                warn!(
+                    "Topic: {topic_id} does not exist in stream: {stream_id}. Retrying ({retries}/{init_retries}) in {interval}...",
+                );
                 timer.tick().await;
             }
 
@@ -363,7 +364,9 @@ impl IggyConsumer {
 
         tokio::spawn(async move {
             while let Ok((partition_id, offset)) = store_offset_receiver.recv_async().await {
-                trace!("Received offset to store: {offset}, partition ID: {partition_id}, stream: {stream_id}, topic: {topic_id}");
+                trace!(
+                    "Received offset to store: {offset}, partition ID: {partition_id}, stream: {stream_id}, topic: {topic_id}"
+                );
                 _ = Self::store_consumer_offset(
                     &client,
                     &consumer,
@@ -397,7 +400,9 @@ impl IggyConsumer {
         last_stored_offsets: &DashMap<u32, AtomicU64>,
         allow_replay: bool,
     ) -> Result<(), IggyError> {
-        trace!("Storing offset: {offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}...");
+        trace!(
+            "Storing offset: {offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}..."
+        );
         let stored_offset;
         if let Some(offset_entry) = last_stored_offsets.get(&partition_id) {
             stored_offset = offset_entry.load(ORDERING);
@@ -407,7 +412,9 @@ impl IggyConsumer {
         }
 
         if !allow_replay && (offset <= stored_offset && offset >= 1) {
-            trace!("Offset: {offset} is less than or equal to the last stored offset: {stored_offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}. Skipping storing the offset.");
+            trace!(
+                "Offset: {offset} is less than or equal to the last stored offset: {stored_offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}. Skipping storing the offset."
+            );
             return Ok(());
         }
 
@@ -416,10 +423,14 @@ impl IggyConsumer {
             .store_consumer_offset(consumer, stream_id, topic_id, Some(partition_id), offset)
             .await
         {
-            error!("Failed to store offset: {offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}. {error}");
+            error!(
+                "Failed to store offset: {offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}. {error}"
+            );
             return Err(error);
         }
-        trace!("Stored offset: {offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}.");
+        trace!(
+            "Stored offset: {offset} for consumer: {consumer}, partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}."
+        );
         if let Some(last_offset_entry) = last_stored_offsets.get(&partition_id) {
             last_offset_entry.store(offset, ORDERING);
         } else {
@@ -459,7 +470,9 @@ impl IggyConsumer {
 
     pub(crate) fn send_store_offset(&self, partition_id: u32, offset: u64) {
         if let Err(error) = self.store_offset_sender.send((partition_id, offset)) {
-            error!("Failed to send offset to store: {error}, please verify if `init()` on IggyConsumer object has been called.");
+            error!(
+                "Failed to send offset to store: {error}, please verify if `init()` on IggyConsumer object has been called."
+            );
         }
     }
 
@@ -554,7 +567,9 @@ impl IggyConsumer {
                             continue;
                         }
 
-                        info!("Rejoining consumer group: {consumer_name} for stream: {stream_id}, topic: {topic_id}...");
+                        info!(
+                            "Rejoining consumer group: {consumer_name} for stream: {stream_id}, topic: {topic_id}..."
+                        );
                         if let Err(error) = Self::initialize_consumer_group(
                             client.clone(),
                             create_consumer_group_if_not_exists,
@@ -566,10 +581,14 @@ impl IggyConsumer {
                         )
                         .await
                         {
-                            error!("Failed to join consumer group: {consumer_name} for stream: {stream_id}, topic: {topic_id}. {error}");
+                            error!(
+                                "Failed to join consumer group: {consumer_name} for stream: {stream_id}, topic: {topic_id}. {error}"
+                            );
                             continue;
                         }
-                        info!("Rejoined consumer group: {consumer_name} for stream: {stream_id}, topic: {topic_id}");
+                        info!(
+                            "Rejoined consumer group: {consumer_name} for stream: {stream_id}, topic: {topic_id}"
+                        );
                         can_poll.store(true, ORDERING);
                     }
                     DiagnosticEvent::SignedOut => {
@@ -583,7 +602,7 @@ impl IggyConsumer {
 
     fn create_poll_messages_future(
         &self,
-    ) -> impl Future<Output = Result<PolledMessages, IggyError>> {
+    ) -> impl Future<Output = Result<PolledMessages, IggyError>> + use<> {
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
         let partition_id = self.partition_id;
@@ -678,9 +697,13 @@ impl IggyConsumer {
                 if !allow_replay
                     && (has_consumed_offset && polled_messages.current_offset == consumed_offset)
                 {
-                    trace!("No new messages to consume in partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}, consumer: {consumer}");
+                    trace!(
+                        "No new messages to consume in partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}, consumer: {consumer}"
+                    );
                     if auto_commit_enabled && stored_offset < consumed_offset {
-                        trace!("Auto-committing the offset: {consumed_offset} in partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}, consumer: {consumer}");
+                        trace!(
+                            "Auto-committing the offset: {consumed_offset} in partition ID: {partition_id}, topic: {topic_id}, stream: {stream_id}, consumer: {consumer}"
+                        );
                         client
                             .read()
                             .await
@@ -737,7 +760,9 @@ impl IggyConsumer {
         }
 
         let remaining = interval - elapsed;
-        trace!("Waiting for {remaining} microseconds before polling messages... {interval} - {elapsed} = {remaining}");
+        trace!(
+            "Waiting for {remaining} microseconds before polling messages... {interval} - {elapsed} = {remaining}"
+        );
         sleep(Duration::from_micros(remaining)).await;
     }
 
@@ -761,7 +786,9 @@ impl IggyConsumer {
         };
 
         let consumer_group_id = name.to_owned().try_into()?;
-        trace!("Validating consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}");
+        trace!(
+            "Validating consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}"
+        );
         if client
             .get_consumer_group(&stream_id, &topic_id, &consumer_group_id)
             .await?
@@ -775,19 +802,25 @@ impl IggyConsumer {
                 ));
             }
 
-            info!("Creating consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}");
+            info!(
+                "Creating consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}"
+            );
             client
                 .create_consumer_group(&stream_id, &topic_id, &name, id)
                 .await?;
         }
 
-        info!("Joining consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}",);
+        info!(
+            "Joining consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}",
+        );
         if let Err(error) = client
             .join_consumer_group(&stream_id, &topic_id, &consumer_group_id)
             .await
         {
             joined_consumer_group.store(false, ORDERING);
-            error!("Failed to join consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}: {error}");
+            error!(
+                "Failed to join consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}: {error}"
+            );
             return Err(error);
         }
 
@@ -881,7 +914,10 @@ impl Stream for IggyConsumer {
                                 let payload = encryptor.decrypt(&message.payload);
                                 if payload.is_err() {
                                     self.poll_future = None;
-                                    error!("Failed to decrypt the message payload at offset: {}, partition ID: {}", message.header.offset, partition_id);
+                                    error!(
+                                        "Failed to decrypt the message payload at offset: {}, partition ID: {}",
+                                        message.header.offset, partition_id
+                                    );
                                     let error = payload.unwrap_err();
                                     return Poll::Ready(Some(Err(error)));
                                 }
@@ -948,222 +984,5 @@ impl Stream for IggyConsumer {
         }
 
         Poll::Pending
-    }
-}
-
-#[derive(Debug)]
-pub struct IggyConsumerBuilder {
-    client: IggySharedMut<Box<dyn Client>>,
-    consumer_name: String,
-    consumer: Consumer,
-    stream: Identifier,
-    topic: Identifier,
-    partition: Option<u32>,
-    polling_strategy: PollingStrategy,
-    polling_interval: Option<IggyDuration>,
-    batch_size: u32,
-    auto_commit: AutoCommit,
-    auto_join_consumer_group: bool,
-    create_consumer_group_if_not_exists: bool,
-    encryptor: Option<Arc<EncryptorKind>>,
-    polling_retry_interval: IggyDuration,
-    init_retries: Option<u32>,
-    init_retry_interval: IggyDuration,
-    allow_replay: bool,
-}
-
-impl IggyConsumerBuilder {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        client: IggySharedMut<Box<dyn Client>>,
-        consumer_name: String,
-        consumer: Consumer,
-        stream_id: Identifier,
-        topic_id: Identifier,
-        partition_id: Option<u32>,
-        encryptor: Option<Arc<EncryptorKind>>,
-        polling_interval: Option<IggyDuration>,
-    ) -> Self {
-        Self {
-            client,
-            consumer_name,
-            consumer,
-            stream: stream_id,
-            topic: topic_id,
-            partition: partition_id,
-            polling_strategy: PollingStrategy::next(),
-            batch_size: 1000,
-            auto_commit: AutoCommit::IntervalOrWhen(
-                IggyDuration::ONE_SECOND,
-                AutoCommitWhen::PollingMessages,
-            ),
-            auto_join_consumer_group: true,
-            create_consumer_group_if_not_exists: true,
-            encryptor,
-            polling_interval,
-            polling_retry_interval: IggyDuration::ONE_SECOND,
-            init_retries: None,
-            init_retry_interval: IggyDuration::ONE_SECOND,
-            allow_replay: false,
-        }
-    }
-
-    /// Sets the stream identifier.
-    pub fn stream(self, stream: Identifier) -> Self {
-        Self { stream, ..self }
-    }
-
-    /// Sets the topic identifier.
-    pub fn topic(self, topic: Identifier) -> Self {
-        Self { topic, ..self }
-    }
-
-    /// Sets the partition identifier.
-    pub fn partition(self, partition: Option<u32>) -> Self {
-        Self { partition, ..self }
-    }
-
-    /// Sets the polling strategy.
-    pub fn polling_strategy(self, polling_strategy: PollingStrategy) -> Self {
-        Self {
-            polling_strategy,
-            ..self
-        }
-    }
-
-    /// Sets the batch size for polling messages.
-    pub fn batch_size(self, batch_size: u32) -> Self {
-        Self { batch_size, ..self }
-    }
-
-    /// Sets the auto-commit configuration for storing the offset on the server.
-    pub fn auto_commit(self, auto_commit: AutoCommit) -> Self {
-        Self {
-            auto_commit,
-            ..self
-        }
-    }
-
-    pub fn commit_failed_messages(self) -> Self {
-        Self {
-            auto_commit: AutoCommit::Disabled,
-            ..self
-        }
-    }
-
-    /// Automatically joins the consumer group if the consumer is a part of a consumer group.
-    pub fn auto_join_consumer_group(self) -> Self {
-        Self {
-            auto_join_consumer_group: true,
-            ..self
-        }
-    }
-
-    /// Does not automatically join the consumer group if the consumer is a part of a consumer group.
-    pub fn do_not_auto_join_consumer_group(self) -> Self {
-        Self {
-            auto_join_consumer_group: false,
-            ..self
-        }
-    }
-
-    /// Automatically creates the consumer group if it does not exist.
-    pub fn create_consumer_group_if_not_exists(self) -> Self {
-        Self {
-            create_consumer_group_if_not_exists: true,
-            ..self
-        }
-    }
-
-    /// Does not automatically create the consumer group if it does not exist.
-    pub fn do_not_create_consumer_group_if_not_exists(self) -> Self {
-        Self {
-            create_consumer_group_if_not_exists: false,
-            ..self
-        }
-    }
-
-    /// Sets the polling interval for messages.
-    pub fn poll_interval(self, interval: IggyDuration) -> Self {
-        Self {
-            polling_interval: Some(interval),
-            ..self
-        }
-    }
-
-    /// Clears the polling interval for messages.
-    pub fn without_poll_interval(self) -> Self {
-        Self {
-            polling_interval: None,
-            ..self
-        }
-    }
-
-    /// Sets the encryptor for decrypting the messages' payloads.
-    pub fn encryptor(self, encryptor: Arc<EncryptorKind>) -> Self {
-        Self {
-            encryptor: Some(encryptor),
-            ..self
-        }
-    }
-
-    /// Clears the encryptor for decrypting the messages' payloads.
-    pub fn without_encryptor(self) -> Self {
-        Self {
-            encryptor: None,
-            ..self
-        }
-    }
-
-    /// Sets the polling retry interval in case of server disconnection.
-    pub fn polling_retry_interval(self, interval: IggyDuration) -> Self {
-        Self {
-            polling_retry_interval: interval,
-            ..self
-        }
-    }
-
-    /// Sets the number of retries and the interval when initializing the consumer if the stream or topic is not found.
-    /// Might be useful when the stream or topic is created dynamically by the producer.
-    /// By default, the consumer will not retry.
-    pub fn init_retries(self, retries: u32, interval: IggyDuration) -> Self {
-        Self {
-            init_retries: Some(retries),
-            init_retry_interval: interval,
-            ..self
-        }
-    }
-
-    /// Allows replaying the messages, `false` by default.
-    pub fn allow_replay(self) -> Self {
-        Self {
-            allow_replay: true,
-            ..self
-        }
-    }
-
-    /// Builds the consumer.
-    ///
-    /// Note: After building the consumer, `init()` must be invoked before producing messages.
-    pub fn build(self) -> IggyConsumer {
-        IggyConsumer::new(
-            self.client,
-            self.consumer_name,
-            self.consumer,
-            self.stream,
-            self.topic,
-            self.partition,
-            self.polling_interval,
-            self.polling_strategy,
-            self.batch_size,
-            self.auto_commit,
-            self.auto_join_consumer_group,
-            self.create_consumer_group_if_not_exists,
-            self.encryptor,
-            self.polling_retry_interval,
-            self.init_retries,
-            self.init_retry_interval,
-            self.allow_replay,
-        )
     }
 }

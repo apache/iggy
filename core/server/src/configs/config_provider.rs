@@ -16,16 +16,16 @@
  * under the License.
  */
 
+use crate::IGGY_ROOT_PASSWORD_ENV;
 use crate::configs::server::ServerConfig;
 use crate::server_error::ConfigError;
-use crate::IGGY_ROOT_PASSWORD_ENV;
 use figment::{
+    Error, Figment, Metadata, Profile, Provider,
     providers::{Format, Toml},
     value::{Dict, Map as FigmentMap, Tag, Value as FigmentValue},
-    Error, Figment, Metadata, Profile, Provider,
 };
 use std::{env, future::Future, path::Path};
-use toml::{map::Map, Value as TomlValue};
+use toml::{Value as TomlValue, map::Map};
 use tracing::debug;
 
 const DEFAULT_CONFIG_PROVIDER: &str = "file";
@@ -131,7 +131,7 @@ impl CustomEnvProvider {
                         );
                     }
 
-                    if let Some(FigmentValue::Dict(_, ref mut actual_inner_target_dict)) =
+                    if let Some(FigmentValue::Dict(_, actual_inner_target_dict)) =
                         current_target.get_mut(&key_to_check)
                     {
                         current_source = inner_source_dict;

@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use iggy::utils::byte_size::IggyByteSize;
+use iggy_common::IggyByteSize;
 
 /// Trait for types that return their size in bytes.
 /// repeated from the sdk because of the coherence rule, see messages.rs

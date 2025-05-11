@@ -19,7 +19,7 @@
 use super::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet};
 use crate::streaming::segments::segment::Segment;
 use error_set::ErrContext;
-use iggy::prelude::*;
+use iggy_common::{IggyByteSize, IggyError};
 use std::sync::atomic::Ordering;
 use tracing::trace;
 
@@ -128,10 +128,7 @@ impl Segment {
 
         trace!(
             "Getting messages by offset: {}, count: {}, segment start_offset: {}, segment end_offset: {}",
-            offset,
-            count,
-            self.start_offset,
-            self.end_offset
+            offset, count, self.start_offset, self.end_offset
         );
 
         // Case 0: Accumulator is empty, so all messages have to be on disk

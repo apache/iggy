@@ -72,9 +72,13 @@ pub async fn start(address: &str, socket: TcpSocket, system: SharedSystem) -> So
                             handle_error(error);
                             system.read().await.delete_client(client_id).await;
                             if let Err(error) = sender.shutdown().await {
-                                error!("Failed to shutdown TCP stream for client: {client_id}, address: {address}. {error}");
+                                error!(
+                                    "Failed to shutdown TCP stream for client: {client_id}, address: {address}. {error}"
+                                );
                             } else {
-                                info!("Successfully closed TCP stream for client: {client_id}, address: {address}.");
+                                info!(
+                                    "Successfully closed TCP stream for client: {client_id}, address: {address}."
+                                );
                             }
                         }
                     });

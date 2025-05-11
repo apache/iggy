@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use iggy_bench_report::time_series::TimeSeries;
+use bench_report::time_series::TimeSeries;
 
 pub mod moving_average;
 

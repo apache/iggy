@@ -22,13 +22,13 @@ use crate::benchmarks::common::create_consumer;
 use crate::utils::finish_condition::BenchmarkFinishCondition;
 use crate::utils::rate_limiter::BenchmarkRateLimiter;
 use crate::utils::{batch_total_size_bytes, batch_user_size_bytes};
+use bench_report::actor_kind::ActorKind;
+use bench_report::benchmark_kind::BenchmarkKind;
+use bench_report::individual_metrics::BenchmarkIndividualMetrics;
+use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use human_repr::HumanCount;
 use iggy::prelude::*;
-use iggy_bench_report::actor_kind::ActorKind;
-use iggy_bench_report::benchmark_kind::BenchmarkKind;
-use iggy_bench_report::individual_metrics::BenchmarkIndividualMetrics;
-use iggy_bench_report::numeric_parameter::BenchmarkNumericParameter;
-use integration::test_server::{login_root, ClientFactory};
+use integration::test_server::{ClientFactory, login_root};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -255,8 +255,11 @@ impl BenchmarkConsumer {
 
                 if should_warn {
                     warn!(
-                    "Consumer #{} → Messages are empty for offset: {}, received {}, retrying... ({} warnings skipped)",
-                    self.consumer_id, offset, self.finish_condition.status(), skipped_warnings_count
+                        "Consumer #{} → Messages are empty for offset: {}, received {}, retrying... ({} warnings skipped)",
+                        self.consumer_id,
+                        offset,
+                        self.finish_condition.status(),
+                        skipped_warnings_count
                     );
                     last_warning_time = Some(Instant::now());
                     skipped_warnings_count = 0;

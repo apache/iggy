@@ -27,8 +27,8 @@ use crate::streaming::systems::info::SystemInfo;
 use crate::streaming::systems::storage::FileSystemInfoStorage;
 use crate::streaming::topics::storage::FileTopicStorage;
 use crate::streaming::topics::topic::Topic;
-use iggy::consumer::ConsumerKind;
-use iggy::error::IggyError;
+use iggy_common::ConsumerKind;
+use iggy_common::IggyError;
 #[cfg(test)]
 use mockall::automock;
 use std::fmt::Debug;
@@ -119,7 +119,7 @@ pub trait PartitionStorage: Send {
         state: PartitionState,
     ) -> impl Future<Output = Result<(), IggyError>> + Send;
     fn save(&self, partition: &mut Partition)
-        -> impl Future<Output = Result<(), IggyError>> + Send;
+    -> impl Future<Output = Result<(), IggyError>> + Send;
     fn delete(&self, partition: &Partition) -> impl Future<Output = Result<(), IggyError>> + Send;
     fn save_consumer_offset(
         &self,

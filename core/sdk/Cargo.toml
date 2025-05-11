@@ -19,69 +19,43 @@
 name = "iggy"
 version = "0.7.0"
 description = "Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
 keywords = ["iggy", "messaging", "streaming"]
 categories = ["command-line-utilities", "database", "network-programming"]
 homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
-readme = "../README.md"
+readme = "../../README.md"
 
 [features]
 default = ["tokio_lock"]
-iggy-cli = ["dep:comfy-table", "dep:keyring", "dep:passterm"]
 tokio_lock = []
-fast_async_lock = ["dep:fast-async-mutex"]
+# Moved to common crate. Not sure if this is even needed anymore
+#fast_async_lock = ["dep:fast-async-mutex"]
 
 [dependencies]
-aes-gcm = "0.10.3"
-ahash = { version = "0.8.11", features = ["serde"] }
-anyhow = "1.0.98"
-async-broadcast = { version = "0.7.2" }
-async-dropper = { version = "0.3.1", features = ["tokio", "simple"] }
-async-trait = "0.1.88"
-base64 = "0.22.1"
-bon = { version = "3.6.3" }
-byte-unit = { version = "5.1.6", default-features = false, features = [
-    "serde",
-    "byte",
-    "std",
-] }
-bytes = "1.10.1"
-chrono = { version = "0.4.40" }
-clap = { version = "4.5.37", features = ["derive"] }
-comfy-table = { version = "7.1.4", optional = true }
-crc32fast = "1.4.2"
-dashmap = "6.1.0"
-derive_more = { version = "2.0.1", features = ["full"] }
-dirs = "6.0.0"
-fast-async-mutex = { version = "0.6.7", optional = true }
-flume = "0.11.1"
-futures = "0.3.31"
-futures-util = "0.3.31"
-humantime = "2.2.0"
-keyring = { version = "3.6.2", optional = true, features = [
-    "sync-secret-service",
-    "vendored",
-] }
-passterm = { version = "=2.0.1", optional = true }
-quinn = { version = "0.11.7" }
-reqwest = { version = "0.12.15", default-features = false, features = [
-    "json",
-    "rustls-tls",
-] }
-reqwest-middleware = { version = "0.4.2", features = ["json"] }
-reqwest-retry = "0.7.0"
-rustls = { version = "0.23.26", features = ["ring"] }
-serde = { version = "1.0.219", features = ["derive", "rc"] }
-serde_json = "1.0.140"
-serde_with = { version = "3.12.0", features = ["base64"] }
-strum = { version = "0.27.1", features = ["derive"] }
-thiserror = "2.0.12"
-tokio = { version = "1.44.2", features = ["full"] }
-tokio-rustls = { version = "0.26.2" }
-toml = "0.8.20"
-tracing = { version = "0.1.41" }
-trait-variant = { version = "0.1.2" }
-webpki-roots = { version = "0.26.8" }
+async-broadcast = { workspace = true }
+async-dropper = { workspace = true }
+async-trait = { workspace = true }
+bon = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+# Can be removed if the feature above gets removed.
+#fast-async-mutex = { version = "0.6.7", optional = true }
+flume = { workspace = true }
+futures = { workspace = true }
+futures-util = { workspace = true }
+iggy_binary_protocol = { workspace = true }
+iggy_common = { workspace = true }
+quinn = { workspace = true }
+reqwest = { workspace = true }
+reqwest-middleware = { workspace = true }
+reqwest-retry = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tracing = { workspace = true }
+trait-variant = { workspace = true }
+webpki-roots = { workspace = true }

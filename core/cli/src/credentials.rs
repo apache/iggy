@@ -18,20 +18,20 @@
 
 use crate::args::CliOptions;
 use crate::error::{CmdToolError, IggyCmdError};
-use anyhow::{bail, Context};
-use iggy::args::Args;
-use iggy::cli::system::session::ServerSession;
-use iggy::client::{PersonalAccessTokenClient, UserClient};
+use anyhow::{Context, bail};
 use iggy::clients::client::IggyClient;
-use iggy::error::IggyError;
-use passterm::{isatty, prompt_password_stdin, prompt_password_tty, Stream};
+use iggy::prelude::Args;
+use iggy::prelude::IggyError;
+use iggy::prelude::{PersonalAccessTokenClient, UserClient};
+use iggy_binary_protocol::cli::binary_system::session::ServerSession;
+use passterm::{Stream, isatty, prompt_password_stdin, prompt_password_tty};
 use std::env::var;
 
 #[cfg(feature = "login-session")]
 mod credentials_login_session {
-    pub(crate) use iggy::cli_command::PRINT_TARGET;
+    pub(crate) use iggy_binary_protocol::cli::cli_command::PRINT_TARGET;
     pub(crate) use keyring::Entry;
-    pub(crate) use tracing::{event, Level};
+    pub(crate) use tracing::{Level, event};
 }
 
 #[cfg(feature = "login-session")]
@@ -131,8 +131,8 @@ impl<'a> IggyCredentials<'a> {
         } else if var(ENV_IGGY_USERNAME).is_ok() && var(ENV_IGGY_PASSWORD).is_ok() {
             Ok(Self {
                 credentials: Some(Credentials::UserNameAndPassword(IggyUserClient {
-                    username: var(ENV_IGGY_USERNAME).unwrap(),
-                    password: var(ENV_IGGY_PASSWORD).unwrap(),
+                    username: var(ENV_IGGY_USERNAME)?,
+                    password: var(ENV_IGGY_PASSWORD)?,
                 })),
                 iggy_client: None,
                 login_required,
@@ -185,7 +185,9 @@ impl<'a> IggyCredentials<'a> {
                             ) {
                                 let server_session = ServerSession::new(server_address.clone());
                                 server_session.delete()?;
-                                bail!("Login session expired for Iggy server: {server_address}, please login again or use other authentication method");
+                                bail!(
+                                    "Login session expired for Iggy server: {server_address}, please login again or use other authentication method"
+                                );
                             } else {
                                 bail!("Problem with server login with token: {token_value}");
                             }

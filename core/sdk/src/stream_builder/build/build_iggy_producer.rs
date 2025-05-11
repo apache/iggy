@@ -18,10 +18,8 @@
 
 use crate::clients::client::IggyClient;
 use crate::clients::producer::IggyProducer;
-use crate::error::IggyError;
+use crate::prelude::{IggyError, IggyExpiry, MaxTopicSize};
 use crate::stream_builder::IggyProducerConfig;
-use crate::utils::expiry::IggyExpiry;
-use crate::utils::topic_size::MaxTopicSize;
 use tracing::{error, trace};
 
 /// Build a producer from the stream configuration.

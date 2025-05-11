@@ -22,7 +22,7 @@ use crate::server_error::ConnectionError;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use crate::tcp::connection_handler::command::ServerCommand;
-use iggy::error::IggyError;
+use iggy_common::IggyError;
 use std::io::ErrorKind;
 use std::sync::Arc;
 use tracing::{debug, error, info};

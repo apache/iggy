@@ -1,0 +1,13 @@
+[build]
+target = "index.html"
+dist = "dist"
+
+[watch]
+watch = ["src", "assets"]
+
+[serve]
+port = 8060
+
+[[hooks]]
+stage = "pre_build"
+command = "scripts/select_index.sh"

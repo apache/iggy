@@ -19,14 +19,13 @@
 use crate::state::system::StreamState;
 use crate::streaming::session::Session;
 use crate::streaming::streams::stream::Stream;
-use crate::streaming::systems::system::System;
 use crate::streaming::systems::COMPONENT;
+use crate::streaming::systems::system::System;
 use ahash::{AHashMap, AHashSet};
 use error_set::ErrContext;
 use futures::future::try_join_all;
-use iggy::error::IggyError;
-use iggy::identifier::{IdKind, Identifier};
-use iggy::locking::IggySharedMutFn;
+use iggy_common::locking::IggySharedMutFn;
+use iggy_common::{IdKind, Identifier, IggyError};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::fs;
@@ -57,7 +56,9 @@ impl System {
             })?;
             let stream_state = streams.iter().find(|s| s.id == stream_id);
             if stream_state.is_none() {
-                error!("Stream with ID: '{stream_id}' was not found in state, but exists on disk and will be removed.");
+                error!(
+                    "Stream with ID: '{stream_id}' was not found in state, but exists on disk and will be removed."
+                );
                 if let Err(error) = fs::remove_dir_all(&dir_entry.path()).await {
                     error!("Cannot remove stream directory: {error}");
                 } else {
@@ -94,7 +95,9 @@ impl System {
         } else {
             warn!("Streams with IDs: '{missing_ids:?}' were not found on disk.");
             if self.config.recovery.recreate_missing_state {
-                info!("Recreating missing state in recovery config is enabled, missing streams will be created.");
+                info!(
+                    "Recreating missing state in recovery config is enabled, missing streams will be created."
+                );
                 for stream_id in missing_ids.iter() {
                     let stream_id = *stream_id;
                     let stream_state = streams.iter().find(|s| s.id == stream_id).unwrap();
@@ -113,7 +116,9 @@ impl System {
                 }
                 missing_ids.clear();
             } else {
-                warn!("Recreating missing state in recovery config is disabled, missing streams will not be created.");
+                warn!(
+                    "Recreating missing state in recovery config is disabled, missing streams will not be created."
+                );
             }
         }
 
@@ -457,7 +462,7 @@ mod tests {
     use crate::streaming::persistence::persister::{FileWithSyncPersister, PersisterKind};
     use crate::streaming::storage::SystemStorage;
     use crate::streaming::users::user::User;
-    use iggy::users::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
+    use iggy_common::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
     use std::{
         net::{Ipv4Addr, SocketAddr},
         sync::Arc,

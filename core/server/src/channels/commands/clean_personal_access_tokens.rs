@@ -20,8 +20,8 @@ use crate::channels::server_command::BackgroundServerCommand;
 use crate::configs::server::PersonalAccessTokenCleanerConfig;
 use crate::streaming::systems::system::SharedSystem;
 use flume::Sender;
-use iggy::utils::duration::IggyDuration;
-use iggy::utils::timestamp::IggyTimestamp;
+use iggy_common::IggyDuration;
+use iggy_common::IggyTimestamp;
 use tokio::time;
 use tracing::{debug, error, info, instrument};
 
@@ -57,7 +57,9 @@ impl PersonalAccessTokenCleaner {
 
         let interval = self.interval;
         let sender = self.sender.clone();
-        info!("Personal access token cleaner is enabled, expired tokens will be deleted every: {interval}.");
+        info!(
+            "Personal access token cleaner is enabled, expired tokens will be deleted every: {interval}."
+        );
         tokio::spawn(async move {
             let mut interval_timer = time::interval(interval.get_duration());
             loop {

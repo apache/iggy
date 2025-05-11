@@ -18,7 +18,7 @@
 
 use bytes::Bytes;
 use iggy::prelude::*;
-use integration::test_server::{assert_clean_system, login_root, ClientFactory};
+use integration::test_server::{ClientFactory, assert_clean_system, login_root};
 use std::collections::HashMap;
 use std::str::FromStr;
 
@@ -155,7 +155,9 @@ async fn send_message_and_check_result(
             }
         }
         MessageToSend::OfSizeWithHeaders(header_size, payload_size) => {
-            println!("Sending message with header size = {header_size} and payload size = {payload_size}");
+            println!(
+                "Sending message with header size = {header_size} and payload size = {payload_size}"
+            );
             match create_message(Some(header_size), payload_size) {
                 Ok(msg) => Ok(vec![msg]),
                 Err(e) => Err(e),
@@ -170,7 +172,9 @@ async fn send_message_and_check_result(
                 return;
             }
             _ => {
-                panic!("Expected {expected_result:?} but message creation failed with {creation_error:?}");
+                panic!(
+                    "Expected {expected_result:?} but message creation failed with {creation_error:?}"
+                );
             }
         }
     }

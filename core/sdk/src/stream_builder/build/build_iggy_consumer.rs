@@ -18,8 +18,7 @@
 
 use crate::clients::client::IggyClient;
 use crate::clients::consumer::IggyConsumer;
-use crate::consumer::ConsumerKind;
-use crate::error::IggyError;
+use crate::prelude::{ConsumerKind, IggyError};
 use crate::stream_builder::IggyConsumerConfig;
 use tracing::{error, trace};
 

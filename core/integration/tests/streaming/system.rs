@@ -17,7 +17,7 @@
  */
 
 use crate::streaming::common::test_setup::TestSetup;
-use iggy::identifier::Identifier;
+use iggy::prelude::Identifier;
 use server::configs::server::{DataMaintenanceConfig, PersonalAccessTokenConfig};
 use server::streaming::session::Session;
 use server::streaming::systems::system::System;

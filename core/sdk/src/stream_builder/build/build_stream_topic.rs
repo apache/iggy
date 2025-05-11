@@ -16,14 +16,12 @@
  * under the License.
  */
 
-use crate::client::{StreamClient, TopicClient};
-use crate::clients::client::IggyClient;
-use crate::compression::compression_algorithm::CompressionAlgorithm;
-use crate::error::IggyError;
-use crate::identifier::{IdKind, Identifier};
+use crate::prelude::{
+    CompressionAlgorithm, IdKind, Identifier, IggyClient, IggyError, IggyExpiry, MaxTopicSize,
+    StreamClient, TopicClient,
+};
+
 use crate::stream_builder::IggyConsumerConfig;
-use crate::utils::expiry::IggyExpiry;
-use crate::utils::topic_size::MaxTopicSize;
 use tracing::{trace, warn};
 
 /// Builds an `IggyStream` and `IggyTopic` if any of them does not exists
@@ -75,8 +73,10 @@ pub(crate) async fn build_iggy_stream_topic_if_not_exists(
     {
         trace!("Check if topic should be created.");
         if !config.create_topic_if_not_exists() {
-            warn!("Topic {topic_name} for stream {stream_name} does not exists and create topic is disabled.\
-            If you want to create the topic automatically, please set create_topic_if_not_exists to true.");
+            warn!(
+                "Topic {topic_name} for stream {stream_name} does not exists and create topic is disabled.\
+            If you want to create the topic automatically, please set create_topic_if_not_exists to true."
+            );
             return Ok(());
         }
 

@@ -17,14 +17,13 @@
  */
 
 use crate::server::scenarios::create_client;
-use iggy::client::{PersonalAccessTokenClient, SystemClient, UserClient};
-use iggy::identifier::Identifier;
-use iggy::models::permissions::{GlobalPermissions, Permissions};
-use iggy::models::user_status::UserStatus;
-use iggy::users::defaults::DEFAULT_ROOT_USERNAME;
-use iggy::utils::duration::SEC_IN_MICRO;
-use iggy::utils::personal_access_token_expiry::PersonalAccessTokenExpiry;
-use integration::test_server::{assert_clean_system, login_root, ClientFactory};
+use iggy::prelude::Identifier;
+use iggy::prelude::PersonalAccessTokenExpiry;
+use iggy::prelude::UserStatus;
+use iggy::prelude::defaults::DEFAULT_ROOT_USERNAME;
+use iggy::prelude::{GlobalPermissions, Permissions};
+use iggy::prelude::{PersonalAccessTokenClient, SEC_IN_MICRO, SystemClient, UserClient};
+use integration::test_server::{ClientFactory, assert_clean_system, login_root};
 
 pub async fn run(client_factory: &dyn ClientFactory) {
     let client = create_client(client_factory).await;

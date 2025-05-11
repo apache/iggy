@@ -14,7 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-#
+
 # -------------------------------------------------------------
 #
 # CI Test Rust Workflow
@@ -74,7 +74,7 @@ jobs:
       - name: Check CLI examples from README
         run: ./scripts/run-examples-from-readme.sh
       - name: Check if workspace is clean
-        run: git status | grep "working tree clean" || { git status ; exit 1; }
+        run: git status --porcelain
 
   x86_64-pc-windows-msvc:
     name: x86_64-pc-windows-msvc
@@ -106,4 +106,4 @@ jobs:
       - name: Build iggy-cli binary
         run: cargo build ${{ env.VERBOSE_FLAG }} --target x86_64-pc-windows-msvc --bin iggy
       - name: Check if workspace is clean
-        run: git status | grep "working tree clean" || { git status ; exit 1; }
+        run: git status --porcelain

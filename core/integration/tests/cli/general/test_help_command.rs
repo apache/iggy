@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::cli::common::{help::TestHelpCmd, IggyCmdTest, CLAP_INDENT, USAGE_PREFIX};
+use crate::cli::common::{CLAP_INDENT, IggyCmdTest, USAGE_PREFIX, help::TestHelpCmd};
 use serial_test::parallel;
 
 #[tokio::test]

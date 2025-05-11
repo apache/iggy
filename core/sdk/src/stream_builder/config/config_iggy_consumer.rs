@@ -17,12 +17,9 @@
  */
 
 use crate::clients::consumer::{AutoCommit, AutoCommitWhen};
-use crate::consumer::ConsumerKind;
-use crate::error::IggyError;
-use crate::identifier::Identifier;
-use crate::messages::PollingStrategy;
-use crate::utils::crypto::EncryptorKind;
-use crate::utils::duration::IggyDuration;
+use crate::prelude::{
+    ConsumerKind, EncryptorKind, Identifier, IggyDuration, IggyError, PollingStrategy,
+};
 use bon::Builder;
 use std::str::FromStr;
 use std::sync::Arc;

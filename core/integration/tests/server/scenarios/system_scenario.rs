@@ -17,13 +17,13 @@
  */
 
 use crate::server::scenarios::{
-    get_consumer_group, leave_consumer_group, CONSUMER_GROUP_ID, CONSUMER_GROUP_NAME, CONSUMER_ID,
-    CONSUMER_KIND, MESSAGES_COUNT, PARTITIONS_COUNT, PARTITION_ID, STREAM_ID, STREAM_NAME,
-    TOPIC_ID, TOPIC_NAME,
+    CONSUMER_GROUP_ID, CONSUMER_GROUP_NAME, CONSUMER_ID, CONSUMER_KIND, MESSAGES_COUNT,
+    PARTITION_ID, PARTITIONS_COUNT, STREAM_ID, STREAM_NAME, TOPIC_ID, TOPIC_NAME,
+    get_consumer_group, leave_consumer_group,
 };
 use bytes::Bytes;
 use iggy::prelude::*;
-use integration::test_server::{assert_clean_system, ClientFactory};
+use integration::test_server::{ClientFactory, assert_clean_system};
 use std::str::FromStr;
 
 pub async fn run(client_factory: &dyn ClientFactory) {

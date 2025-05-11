@@ -17,7 +17,7 @@
  */
 
 use crate::streaming::utils::hash;
-use iggy::identifier::{IdKind, Identifier};
+use iggy_common::{IdKind, Identifier};
 use std::fmt::{Display, Formatter};
 
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -65,7 +65,7 @@ impl Display for PollingConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy::consumer::Consumer;
+    use iggy_common::Consumer;
 
     #[test]
     fn given_consumer_with_numeric_id_polling_consumer_should_be_created() {

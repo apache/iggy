@@ -20,8 +20,8 @@ use ctor::{ctor, dtor};
 use lazy_static::lazy_static;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
 use std::{panic, thread};
 

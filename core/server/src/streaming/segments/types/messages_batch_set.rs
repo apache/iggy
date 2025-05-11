@@ -19,8 +19,7 @@
 use crate::binary::handlers::messages::poll_messages_handler::IggyPollMetadata;
 use crate::streaming::segments::IggyIndexesMut;
 use bytes::Bytes;
-use iggy::models::messaging::IggyMessageView;
-use iggy::prelude::*;
+use iggy_common::{IggyByteSize, IggyMessage, IggyMessageView, PolledMessages, Sizeable};
 use std::ops::Index;
 use tracing::trace;
 

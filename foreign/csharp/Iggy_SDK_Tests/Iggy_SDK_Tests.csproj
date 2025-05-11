@@ -13,7 +13,6 @@
         <PackageReference Include="FluentAssertions" Version="6.12.0" />
         <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.8.0" />
         <PackageReference Include="Moq" Version="4.18.4" />
-        <PackageReference Include="SpecFlow.xUnit" Version="3.9.74" />
         <PackageReference Include="Testcontainers" Version="3.7.0" />
         <PackageReference Include="xunit" Version="2.6.6" />
         <PackageReference Include="xunit.runner.visualstudio" Version="2.5.6">

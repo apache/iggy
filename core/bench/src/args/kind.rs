@@ -27,9 +27,9 @@ use crate::args::kinds::balanced::consumer_group::BalancedConsumerGroupArgs;
 use crate::args::kinds::pinned::consumer::PinnedConsumerArgs;
 use crate::args::kinds::pinned::producer::PinnedProducerArgs;
 use crate::args::kinds::pinned::producer_and_consumer::PinnedProducerAndConsumerArgs;
+use bench_report::benchmark_kind::BenchmarkKind;
 use clap::Subcommand;
-use iggy::utils::byte_size::IggyByteSize;
-use iggy_bench_report::benchmark_kind::BenchmarkKind;
+use iggy::prelude::IggyByteSize;
 
 #[derive(Subcommand, Debug)]
 pub enum BenchmarkKindCommand {

@@ -20,13 +20,13 @@ use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use crate::streaming::utils::PooledBuffer;
 use bytes::BytesMut;
 use error_set::ErrContext;
-use iggy::error::IggyError;
+use iggy_common::IggyError;
 use std::{fs::File as StdFile, os::unix::prelude::FileExt};
 use std::{
     io::ErrorKind,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
 };
 use tokio::fs::OpenOptions;
@@ -59,19 +59,17 @@ impl MessagesReader {
         // posix_fadvise() doesn't exist on MacOS
         #[cfg(not(target_os = "macos"))]
         {
-            use std::os::unix::io::AsRawFd;
-            let fd = file.as_raw_fd();
             let _ = nix::fcntl::posix_fadvise(
-                    fd,
-                    0,
-                    0, // 0 means the entire file
-                    nix::fcntl::PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL,
+                &file,
+                0,
+                0, // 0 means the entire file
+                nix::fcntl::PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL,
+            )
+            .with_info_context(|error| {
+                format!(
+                    "Failed to set sequential access pattern on messages file: {file_path}. {error}"
                 )
-                .with_info_context(|error| {
-                    format!(
-                        "Failed to set sequential access pattern on messages file: {file_path}. {error}"
-                    )
-                });
+            });
         }
 
         trace!(

@@ -20,8 +20,8 @@ use crate::channels::server_command::BackgroundServerCommand;
 use crate::configs::server::StateMaintenanceConfig;
 use crate::streaming::systems::system::SharedSystem;
 use flume::Sender;
-use iggy::utils::duration::IggyDuration;
-use iggy::utils::timestamp::IggyTimestamp;
+use iggy_common::IggyDuration;
+use iggy_common::IggyTimestamp;
 use tokio::time;
 use tracing::{error, info, instrument, warn};
 

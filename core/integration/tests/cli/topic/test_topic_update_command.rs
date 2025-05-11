@@ -17,17 +17,17 @@
  */
 
 use crate::cli::common::{
-    IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId, TestTopicId,
-    CLAP_INDENT, USAGE_PREFIX,
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId,
+    TestTopicId, USAGE_PREFIX,
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use humantime::Duration as HumanDuration;
-use iggy::client::Client;
-use iggy::compression::compression_algorithm::CompressionAlgorithm;
-use iggy::utils::byte_size::IggyByteSize;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy::prelude::Client;
+use iggy::prelude::CompressionAlgorithm;
+use iggy::prelude::IggyByteSize;
+use iggy::prelude::IggyExpiry;
+use iggy::prelude::MaxTopicSize;
 use predicates::str::diff;
 use serial_test::parallel;
 use std::str::FromStr;
@@ -183,12 +183,14 @@ impl IggyCmdTestCase for TestTopicUpdateCmd {
         let new_topic_name = &self.topic_new_name;
         let new_max_topic_size = self.topic_new_max_size.to_string();
 
-        let expected_message = format!("Executing update topic with ID: {topic_id}, name: {new_topic_name}, \
+        let expected_message = format!(
+            "Executing update topic with ID: {topic_id}, name: {new_topic_name}, \
                                 message expiry: {message_expiry}, compression algorithm: {compression_algorithm}, max topic size: {new_max_topic_size}, \
                                 replication factor: {replication_factor}, in stream with ID: {stream_id}\n\
                                 Topic with ID: {topic_id} updated name: {new_topic_name}, updated message expiry: {message_expiry}, \
                                 updated compression algorithm: {compression_algorithm}, updated max topic size: {new_max_topic_size}, \
-                                updated replication factor: {replication_factor} in stream with ID: {stream_id}\n");
+                                updated replication factor: {replication_factor} in stream with ID: {stream_id}\n"
+        );
 
         command_state.success().stdout(diff(expected_message));
     }

@@ -21,15 +21,15 @@ use crate::streaming::deduplication::message_deduplicator::MessageDeduplicator;
 use crate::streaming::segments::*;
 use crate::streaming::storage::SystemStorage;
 use dashmap::DashMap;
-use iggy::consumer::ConsumerKind;
-use iggy::utils::byte_size::IggyByteSize;
-use iggy::utils::duration::IggyDuration;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::sizeable::Sizeable;
-use iggy::utils::timestamp::IggyTimestamp;
+use iggy_common::ConsumerKind;
+use iggy_common::IggyByteSize;
+use iggy_common::IggyDuration;
+use iggy_common::IggyExpiry;
+use iggy_common::IggyTimestamp;
+use iggy_common::Sizeable;
 use std::fmt;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 #[derive(Debug)]
 pub struct Partition {
@@ -206,11 +206,11 @@ mod tests {
     use crate::streaming::persistence::persister::{FileWithSyncPersister, PersisterKind};
     use crate::streaming::storage::SystemStorage;
     use crate::streaming::utils::MemoryPool;
-    use iggy::utils::duration::IggyDuration;
-    use iggy::utils::expiry::IggyExpiry;
-    use iggy::utils::timestamp::IggyTimestamp;
-    use std::sync::atomic::{AtomicU32, AtomicU64};
+    use iggy_common::IggyDuration;
+    use iggy_common::IggyExpiry;
+    use iggy_common::IggyTimestamp;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, AtomicU64};
 
     #[tokio::test]
     async fn should_be_created_with_a_single_segment_given_valid_parameters() {

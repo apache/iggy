@@ -14,7 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-#
+
 # -------------------------------------------------------------
 #
 # CI Test Rust Optional Workflow
@@ -63,4 +63,4 @@ jobs:
       - name: Run tests
         run: cargo test ${{ env.VERBOSE_FLAG }} --target aarch64-apple-darwin
       - name: Check if workspace is clean
-        run: git status | grep "working tree clean" || { git status ; exit 1; }
+        run: git status --porcelain

@@ -18,14 +18,14 @@
 
 use crate::streaming::common::test_setup::TestSetup;
 use crate::streaming::create_messages;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::sizeable::Sizeable;
-use iggy::utils::timestamp::IggyTimestamp;
+use iggy::prelude::IggyExpiry;
+use iggy::prelude::IggyTimestamp;
+use iggy::prelude::Sizeable;
 use server::state::system::PartitionState;
 use server::streaming::partitions::partition::Partition;
 use server::streaming::segments::*;
-use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use tokio::fs;
 
 #[tokio::test]

@@ -17,7 +17,7 @@
  */
 
 use crate::VERSION;
-use iggy::error::IggyError;
+use iggy_common::IggyError;
 use std::fmt::Display;
 use std::str::FromStr;
 

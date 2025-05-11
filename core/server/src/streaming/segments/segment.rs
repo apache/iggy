@@ -22,13 +22,13 @@ use super::messages_accumulator::MessagesAccumulator;
 use crate::configs::system::SystemConfig;
 use crate::streaming::segments::*;
 use error_set::ErrContext;
-use iggy::error::IggyError;
-use iggy::models::messaging::INDEX_SIZE;
-use iggy::utils::byte_size::IggyByteSize;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::timestamp::IggyTimestamp;
-use std::sync::atomic::{AtomicU64, Ordering};
+use iggy_common::INDEX_SIZE;
+use iggy_common::IggyByteSize;
+use iggy_common::IggyError;
+use iggy_common::IggyExpiry;
+use iggy_common::IggyTimestamp;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::fs::remove_file;
 use tracing::{info, warn};
 
@@ -161,12 +161,14 @@ impl Segment {
 
         self.end_offset = self.start_offset + last_index_offset;
 
-        info!("Loaded {} indexes for segment with start offset: {} and partition with ID: {} for topic with ID: {} and stream with ID: {}.",
-              self.indexes.count(),
-              self.start_offset,
-              self.partition_id,
-              self.topic_id,
-              self.stream_id);
+        info!(
+            "Loaded {} indexes for segment with start offset: {} and partition with ID: {} for topic with ID: {} and stream with ID: {}.",
+            self.indexes.count(),
+            self.start_offset,
+            self.partition_id,
+            self.topic_id,
+            self.stream_id
+        );
 
         if self.is_full().await {
             self.is_closed = true;
@@ -203,12 +205,16 @@ impl Segment {
 
     /// Save the segment state to disk.
     pub async fn persist(&mut self) -> Result<(), IggyError> {
-        info!("Saving segment with start offset: {} for partition with ID: {} for topic with ID: {} and stream with ID: {}",
-            self.start_offset, self.partition_id, self.topic_id, self.stream_id);
+        info!(
+            "Saving segment with start offset: {} for partition with ID: {} for topic with ID: {} and stream with ID: {}",
+            self.start_offset, self.partition_id, self.topic_id, self.stream_id
+        );
         self.initialize_writing(false).await?;
         self.initialize_reading().await?;
-        info!("Saved segment log file with start offset: {} for partition with ID: {} for topic with ID: {} and stream with ID: {}",
-            self.start_offset, self.partition_id, self.topic_id, self.stream_id);
+        info!(
+            "Saved segment log file with start offset: {} for partition with ID: {} for topic with ID: {} and stream with ID: {}",
+            self.start_offset, self.partition_id, self.topic_id, self.stream_id
+        );
         Ok(())
     }
 
@@ -439,7 +445,7 @@ mod tests {
     use crate::configs::cache_indexes::CacheIndexesConfig;
     use crate::configs::system::SegmentConfig;
     use crate::streaming::utils::MemoryPool;
-    use iggy::utils::duration::IggyDuration;
+    use iggy_common::IggyDuration;
 
     #[tokio::test]
     async fn should_be_created_given_valid_parameters() {

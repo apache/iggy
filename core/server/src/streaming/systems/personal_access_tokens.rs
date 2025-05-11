@@ -18,13 +18,13 @@
 
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::System;
 use crate::streaming::systems::COMPONENT;
+use crate::streaming::systems::system::System;
 use crate::streaming::users::user::User;
 use error_set::ErrContext;
-use iggy::error::IggyError;
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::timestamp::IggyTimestamp;
+use iggy_common::IggyError;
+use iggy_common::IggyExpiry;
+use iggy_common::IggyTimestamp;
 use tracing::{error, info};
 
 impl System {
@@ -69,8 +69,8 @@ impl System {
             let max_token_per_user = self.personal_access_token.max_tokens_per_user;
             if user.personal_access_tokens.len() as u32 >= max_token_per_user {
                 error!(
-                "User with ID: {user_id} has reached the maximum number of personal access tokens: {max_token_per_user}.",
-            );
+                    "User with ID: {user_id} has reached the maximum number of personal access tokens: {max_token_per_user}.",
+                );
                 return Err(IggyError::PersonalAccessTokensLimitReached(
                     user_id,
                     max_token_per_user,

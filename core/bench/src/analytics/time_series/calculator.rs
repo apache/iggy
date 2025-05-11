@@ -21,8 +21,8 @@ use super::calculators::{
     ThroughputTimeSeriesCalculator, TimeSeriesCalculation,
 };
 use crate::analytics::record::BenchmarkRecord;
-use iggy::utils::duration::IggyDuration;
-use iggy_bench_report::time_series::{TimePoint, TimeSeries, TimeSeriesKind};
+use bench_report::time_series::{TimePoint, TimeSeries, TimeSeriesKind};
+use iggy::prelude::IggyDuration;
 use tracing::warn;
 
 /// Calculate time series data from benchmark records

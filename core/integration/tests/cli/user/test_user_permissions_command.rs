@@ -17,18 +17,18 @@
  */
 
 use crate::cli::common::{
-    IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestUserId, CLAP_INDENT,
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestUserId,
     USAGE_PREFIX,
 };
 use crate::cli::user::common::PermissionsTestArgs;
 use ahash::AHashMap;
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
-use iggy::client::Client;
-use iggy::models::permissions::Permissions;
-use iggy::models::permissions::{GlobalPermissions, StreamPermissions, TopicPermissions};
-use iggy::models::user_info::UserId;
-use iggy::models::user_status::UserStatus;
+use iggy::prelude::Client;
+use iggy::prelude::Permissions;
+use iggy::prelude::UserId;
+use iggy::prelude::UserStatus;
+use iggy::prelude::{GlobalPermissions, StreamPermissions, TopicPermissions};
 use predicates::str::diff;
 use serial_test::parallel;
 
@@ -98,7 +98,8 @@ impl IggyCmdTestCase for TestUserPermissionsCmd {
             ),
             TestUserId::Numeric => format!(
                 "Executing update permissions for user with ID: {}\nPermissions for user with ID: {} updated\n",
-                self.user_id.unwrap(), self.user_id.unwrap()
+                self.user_id.unwrap(),
+                self.user_id.unwrap()
             ),
         };
 

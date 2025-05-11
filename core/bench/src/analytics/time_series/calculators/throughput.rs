@@ -18,8 +18,8 @@
 
 use super::TimeSeriesCalculation;
 use crate::analytics::record::BenchmarkRecord;
-use iggy::utils::duration::IggyDuration;
-use iggy_bench_report::time_series::{TimePoint, TimeSeries, TimeSeriesKind};
+use bench_report::time_series::{TimePoint, TimeSeries, TimeSeriesKind};
+use iggy::prelude::IggyDuration;
 
 /// Common functionality for throughput calculations
 pub trait ThroughputCalculation {
@@ -126,7 +126,7 @@ impl<T: ThroughputCalculation> TimeSeriesCalculation for ThroughputTimeSeriesCal
         let points = values_per_bucket
             .iter()
             .enumerate()
-            .filter(|(_, &value)| value > 0)
+            .filter(|&(_, &value)| value > 0)
             .map(|(i, &value)| {
                 let time_s = (i as u64 * bucket_size_us) as f64 / 1_000_000.0;
                 let throughput = self.calculator.calculate_throughput(value, bucket_size_us);

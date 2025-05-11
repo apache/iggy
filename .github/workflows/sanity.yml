@@ -125,3 +125,26 @@ jobs:
           accessToken: ${{ secrets.GITHUB_TOKEN }} # needed only when checkAllCommitMessages is true
           pattern: '^.{0,80}(\n.*)*$'
           error: "Subject of all commits in the PR and PR body/title has to be shorter than 80 characters."
+  check-license-headers:
+    name: license headers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull addlicense Docker image
+        run: docker pull ghcr.io/google/addlicense:latest
+
+      - name: Check license headers
+        run: docker run --rm -v ${{ github.workspace }}:/src -w /src ghcr.io/google/addlicense:latest -check -f ASF_LICENSE.txt .
+
+  check-licenses-list:
+    name: licenses list
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+      - run: scripts/licenses-list.sh --check
+

@@ -18,7 +18,7 @@
 
 use crate::server_error::CompatError;
 use crate::streaming::utils::file;
-use iggy::prelude::{IggyMessageHeader, IGGY_MESSAGE_HEADER_SIZE};
+use iggy_common::{IGGY_MESSAGE_HEADER_SIZE, IggyMessageHeader};
 use std::io::SeekFrom;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter};
 

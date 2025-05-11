@@ -16,12 +16,12 @@
  * under the License.
  */
 
-use iggy::prelude::*;
-use iggy_bench_report::{
+use bench_report::{
     benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics,
     numeric_parameter::BenchmarkNumericParameter, params::BenchmarkParams,
     transport::BenchmarkTransport,
 };
+use iggy::prelude::*;
 use integration::test_server::Transport;
 use std::{fs, path::Path};
 use tracing::{error, info};
@@ -134,7 +134,7 @@ pub fn params_from_args_and_metrics(
 ) -> BenchmarkParams {
     let benchmark_kind = args.benchmark_kind.as_simple_kind();
 
-    // Ugly conversion but let it stay here to have `iggy-bench-report` not depend on `iggy` or `integration`
+    // Ugly conversion but let it stay here to have `bench-report` not depend on `iggy` or `integration`
     let transport = match args.transport() {
         Transport::Tcp => BenchmarkTransport::Tcp,
         Transport::Quic => BenchmarkTransport::Quic,

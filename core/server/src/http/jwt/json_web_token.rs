@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use iggy::models::user_info::UserId;
+use iggy_common::UserId;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 

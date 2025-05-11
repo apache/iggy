@@ -18,7 +18,7 @@
 
 use bytes::Bytes;
 use iggy::prelude::*;
-use integration::test_server::{assert_clean_system, login_root, ClientFactory};
+use integration::test_server::{ClientFactory, assert_clean_system, login_root};
 use std::collections::HashMap;
 use std::str::FromStr;
 
@@ -90,11 +90,13 @@ pub async fn run(client_factory: &dyn ClientFactory) {
                 .unwrap(),
             "Value 1"
         );
-        assert!(headers
-            .get(&HeaderKey::new("key 2").unwrap())
-            .unwrap()
-            .as_bool()
-            .unwrap(),);
+        assert!(
+            headers
+                .get(&HeaderKey::new("key 2").unwrap())
+                .unwrap()
+                .as_bool()
+                .unwrap(),
+        );
         assert_eq!(
             headers
                 .get(&HeaderKey::new("key-3").unwrap())

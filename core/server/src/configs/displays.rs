@@ -39,7 +39,13 @@ impl Display for HttpConfig {
         write!(
             f,
             "{{ enabled: {}, address: {}, max_request_size: {}, cors: {}, jwt: {}, metrics: {}, tls: {} }}",
-            self.enabled, self.address, self.max_request_size, self.cors, self.jwt, self.metrics, self.tls
+            self.enabled,
+            self.address,
+            self.max_request_size,
+            self.cors,
+            self.jwt,
+            self.metrics,
+            self.tls
         )
     }
 }
@@ -47,10 +53,16 @@ impl Display for HttpConfig {
 impl Display for HttpCorsConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
-          f,
-          "{{ enabled: {}, allowed_methods: {:?}, allowed_origins: {:?}, allowed_headers: {:?}, exposed_headers: {:?}, allow_credentials: {}, allow_private_network: {} }}",
-          self.enabled, self.allowed_methods, self.allowed_origins, self.allowed_headers, self.exposed_headers, self.allow_credentials, self.allow_private_network
-      )
+            f,
+            "{{ enabled: {}, allowed_methods: {:?}, allowed_origins: {:?}, allowed_headers: {:?}, exposed_headers: {:?}, allow_credentials: {}, allow_private_network: {} }}",
+            self.enabled,
+            self.allowed_methods,
+            self.allowed_origins,
+            self.allowed_headers,
+            self.exposed_headers,
+            self.allow_credentials,
+            self.allow_private_network
+        )
     }
 }
 
@@ -87,19 +99,19 @@ impl Display for HttpTlsConfig {
 impl Display for QuicConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
-          f,
-          "{{ enabled: {}, address: {}, max_concurrent_bidi_streams: {}, datagram_send_buffer_size: {}, initial_mtu: {}, send_window: {}, receive_window: {}, keep_alive_interval: {}, max_idle_timeout: {}, certificate: {} }}",
-          self.enabled,
-          self.address,
-          self.max_concurrent_bidi_streams,
-          self.datagram_send_buffer_size,
-          self.initial_mtu,
-          self.send_window,
-          self.receive_window,
-          self.keep_alive_interval,
-          self.max_idle_timeout,
-          self.certificate
-      )
+            f,
+            "{{ enabled: {}, address: {}, max_concurrent_bidi_streams: {}, datagram_send_buffer_size: {}, initial_mtu: {}, send_window: {}, receive_window: {}, keep_alive_interval: {}, max_idle_timeout: {}, certificate: {} }}",
+            self.enabled,
+            self.address,
+            self.max_concurrent_bidi_streams,
+            self.datagram_send_buffer_size,
+            self.initial_mtu,
+            self.send_window,
+            self.receive_window,
+            self.keep_alive_interval,
+            self.max_idle_timeout,
+            self.certificate
+        )
     }
 }
 
@@ -195,7 +207,14 @@ impl Display for ServerConfig {
         write!(
             f,
             "{{ data_maintenance: {}, message_saver: {}, heartbeat: {}, system: {}, quic: {}, tcp: {}, http: {}, telemetry: {} }}",
-            self.data_maintenance, self.message_saver, self.heartbeat, self.system, self.quic, self.tcp, self.http, self.telemetry
+            self.data_maintenance,
+            self.message_saver,
+            self.heartbeat,
+            self.system,
+            self.quic,
+            self.tcp,
+            self.http,
+            self.telemetry
         )
     }
 }
@@ -245,14 +264,14 @@ impl Display for TopicConfig {
 impl Display for PartitionConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
-          f,
-          "{{ path: {}, messages_required_to_save: {}, size_of_messages_required_to_save: {}, enforce_fsync: {}, validate_checksum: {} }}",
-          self.path,
-          self.messages_required_to_save,
-          self.size_of_messages_required_to_save,
-          self.enforce_fsync,
-          self.validate_checksum
-      )
+            f,
+            "{{ path: {}, messages_required_to_save: {}, size_of_messages_required_to_save: {}, enforce_fsync: {}, validate_checksum: {} }}",
+            self.path,
+            self.messages_required_to_save,
+            self.size_of_messages_required_to_save,
+            self.enforce_fsync,
+            self.validate_checksum
+        )
     }
 }
 
@@ -271,7 +290,11 @@ impl Display for SegmentConfig {
         write!(
             f,
             "{{ size_bytes: {}, cache_indexes: {}, message_expiry: {}, archive_expired: {}, server_confirmation: {} }}",
-            self.size, self.cache_indexes, self.message_expiry, self.archive_expired, self.server_confirmation,
+            self.size,
+            self.cache_indexes,
+            self.message_expiry,
+            self.archive_expired,
+            self.server_confirmation,
         )
     }
 }
@@ -314,7 +337,12 @@ impl Display for TcpSocketConfig {
         write!(
             f,
             "{{ override defaults: {}, recv buffer size: {}, send buffer size {}, keepalive: {}, nodelay: {}, linger: {} }}",
-            self.override_defaults, self.recv_buffer_size, self.send_buffer_size, self.keepalive, self.nodelay, self.linger,
+            self.override_defaults,
+            self.recv_buffer_size,
+            self.send_buffer_size,
+            self.keepalive,
+            self.nodelay,
+            self.linger,
         )
     }
 }
@@ -362,16 +390,16 @@ impl Display for TelemetryTracesConfig {
 impl Display for SystemConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
-          f,
-          "{{ path: {}, logging: {}, stream: {}, topic: {}, partition: {}, segment: {}, encryption: {}, state: {} }}",
-          self.path,
-          self.logging,
-          self.stream,
-          self.topic,
-          self.partition,
-          self.segment,
-          self.encryption,
-          self.state,
-      )
+            f,
+            "{{ path: {}, logging: {}, stream: {}, topic: {}, partition: {}, segment: {}, encryption: {}, state: {} }}",
+            self.path,
+            self.logging,
+            self.stream,
+            self.topic,
+            self.partition,
+            self.segment,
+            self.encryption,
+            self.state,
+        )
     }
 }

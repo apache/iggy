@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use iggy::models::permissions::Permissions;
+use iggy::prelude::Permissions;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PermissionsTestArgs {

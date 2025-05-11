@@ -213,7 +213,7 @@ Poll messages by a regular consumer with ID 1 from the stream `dev` for topic `s
 
 Finally, restart the server to see it is able to load the persisted data.
 
-The HTTP API endpoints can be found in [server.http](https://github.com/apache/iggy/blob/master/server/server.http) file, which can be used with [REST Client](https://marketplace.visualstudio.com/items?itemName=humao.rest-client) extension for VS Code.
+The HTTP API endpoints can be found in [server.http](https://github.com/apache/iggy/blob/master/core/server/server.http) file, which can be used with [REST Client](https://marketplace.visualstudio.com/items?itemName=humao.rest-client) extension for VS Code.
 
 To see the detailed logs from the CLI/server, run it with `RUST_LOG=trace` environment variable. See images below:
 
@@ -225,7 +225,7 @@ You can find the sample consumer & producer applications under `examples` direct
 
 To run the example, first start the server with `cargo r --bin iggy-server` and then run the producer and consumer apps with `cargo r --example message-envelope-producer` and `cargo r --example message-envelope-consumer` respectively.
 
-You might start multiple producers and consumers at the same time to see how the messages are being handled across multiple clients. Check the [Args](https://github.com/apache/iggy/blob/master/examples/src/shared/args.rs) struct to see the available options, such as the transport protocol, stream, topic, partition, consumer ID, message size etc.
+You might start multiple producers and consumers at the same time to see how the messages are being handled across multiple clients. Check the [Args](https://github.com/apache/iggy/blob/master/core/examples/src/shared/args.rs) struct to see the available options, such as the transport protocol, stream, topic, partition, consumer ID, message size etc.
 
 By default, the consumer will poll the messages using the `next` available offset with auto commit enabled, to store its offset on the server. With this approach, you can easily achieve *at-most-once* delivery.
 
@@ -357,3 +357,7 @@ Depending on the hardware, transport protocol (`quic`, `tcp` or `http`) and payl
 Please refer to the mentioned [benchmarking platform](https://benchmarks.iggy.rs) where you can browse the results achieved on the different hardware configurations, using the different Iggy server versions.
 
 ---
+
+## Contributing
+
+Please see [Contributing](CONTRIBUTING.md)

@@ -26,8 +26,8 @@ use server::streaming::topics::topic::Topic;
 use server::streaming::utils::hash;
 use std::collections::HashMap;
 use std::str::from_utf8;
-use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 
 #[tokio::test]
 async fn assert_polling_messages() {

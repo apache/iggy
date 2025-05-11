@@ -138,10 +138,10 @@ function construct_bench_command() {
         actor_args="--producers ${actors} --consumers ${actors}"
         ;;
     "end-to-end-producing-consumer")
-        actor_args="--producers ${actors}"
+        actor_args="--producing-consumers ${actors}"
         ;;
     "end-to-end-producing-consumer-group")
-        actor_args="--producers ${actors}"
+        actor_args="--producers ${actors} --consumers ${actors}"
         ;;
     *)
         echo "Error: Invalid benchmark mode '$benchmark_mode'." >&2

@@ -23,7 +23,7 @@ use crate::streaming::clients::client_manager::Transport;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::anyhow;
-use iggy::error::IggyError;
+use iggy_common::IggyError;
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use tracing::{error, info, trace};
 
