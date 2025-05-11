@@ -17,7 +17,7 @@
  * under the License.
  */
 
-package rs.iggy.clients.blocking.tcp;
+package org.apache.iggy.client.blocking.tcp;
 
 public interface CommandCode {
 
