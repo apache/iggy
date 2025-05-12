@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::{AutoLogin, IggyDuration, IggyError, TcpClientConfig};
+use std::net::SocketAddr;
 
 /// Builder for the TCP client configuration.
 /// Allows configuring the TCP client with custom settings or using defaults:
@@ -91,34 +92,10 @@ impl TcpClientConfigBuilder {
     /// Builds the TCP client configuration.
     pub fn build(self) -> Result<TcpClientConfig, IggyError> {
         let addr = self.config.server_address.trim();
-        let (ip_part, port_part) = if let Some(rest) = addr.strip_prefix('[') {
-            let split: Vec<&str> = rest.splitn(2, "]:").collect();
-            if split.len() != 2 {
-                return Err(IggyError::InvalidIpAddress(
-                    addr.to_string(),
-                    "".to_string(),
-                ));
-            }
-            (split[0], split[1])
-        } else {
-            let split: Vec<&str> = addr.splitn(2, ':').collect();
-            if split.len() != 2 {
-                return Err(IggyError::InvalidIpAddress(
-                    addr.to_string(),
-                    "".to_string(),
-                ));
-            }
-            (split[0], split[1])
-        };
 
-        let ip_valid = ip_part.parse::<std::net::Ipv4Addr>().is_ok()
-            || ip_part.parse::<std::net::Ipv6Addr>().is_ok();
-
-        if !ip_valid || port_part.parse::<u16>().is_err() {
-            return Err(IggyError::InvalidIpAddress(
-                ip_part.to_string(),
-                port_part.to_string(),
-            ));
+        if addr.parse::<SocketAddr>().is_err() {
+            let (ip, port) = addr.rsplit_once(':').unwrap_or((addr, ""));
+            return Err(IggyError::InvalidIpAddress(ip.to_owned(), port.to_owned()));
         }
 
         Ok(self.config)
