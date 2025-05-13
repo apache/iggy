@@ -21,8 +21,8 @@ plugins {
     id("java")
 }
 
-group = "rs.iggy"
-version = "0.0.1-SNAPSHOT"
+group = "org.apache.iggy"
+version = "0.2.0-SNAPSHOT"
 
 repositories {
     mavenCentral()

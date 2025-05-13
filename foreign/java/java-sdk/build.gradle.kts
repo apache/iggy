@@ -23,8 +23,8 @@ plugins {
     id("org.jreleaser") version ("1.14.0")
 }
 
-group = "rs.iggy"
-version = "0.1.1"
+group = "org.apache.iggy"
+version = "0.2.0-SNAPSHOT"
 
 repositories {
     mavenCentral()
@@ -59,31 +59,26 @@ tasks.withType<Test> {
 publishing {
     publications {
         create<MavenPublication>("maven") {
+            groupId = "org.apache.iggy"
             artifactId = "iggy-java-sdk"
+            version = "0.2.0-SNAPSHOT"
 
             from(components["java"])
 
             pom {
                 name = "Apache Iggy Java Client SDK"
                 description = "Official Java client SDK for Apache Iggy message streaming"
-                url = "https://github.com/iggy-rs/iggy-java-client"
+                url = "https://github.com/apache/iggy"
                 licenses {
                     license {
                         name = "Apache License, Version 2.0"
-                        url = "https://github.com/iggy-rs/iggy-java-client/blob/main/LICENSE"
-                    }
-                }
-                developers {
-                    developer {
-                        id = "mmodzelewski"
-                        name = "Maciej Modzelewski"
-                        email = "maciej@modzelewski.dev"
+                        url = "https://www.apache.org/licenses/LICENSE-2.0.txt"
                     }
                 }
                 scm {
-                    url = "https://github.com/iggy-rs/iggy-java-client"
-                    connection = "scm:git:git://github.com/iggy-rs/iggy-java-client.git"
-                    developerConnection = "scm:git:git://github.com/iggy-rs/iggy-java-client.git"
+                    url = "https://github.com/apache/iggy"
+                    connection = "scm:git:git://github.com/apache/iggy.git"
+                    developerConnection = "scm:git:git://github.com/apache/iggy.git"
                 }
             }
         }
