@@ -21,6 +21,7 @@
   ],
   "java-sdk": [
     "foreign/java/.*\\.java",
+    "foreign/java/.*\\.kts",
     "foreign/java/.*\\.sh",
     ".github/workflows/ci-check-java-sdk.yml"
   ]
