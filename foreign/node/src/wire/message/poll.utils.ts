@@ -24,6 +24,7 @@ import { deserializeUUID, toDate } from '../serialize.utils.js';
 import { serializeGetOffset, type Consumer } from '../offset/offset.utils.js';
 import { deserializeHeaders, type HeadersMap } from './header.utils.js';
 import { Transform, type TransformCallback } from 'node:stream';
+import { deserializeIggyMessageHeaders, IGGY_MESSAGE_HEADER_SIZE, IggyMessageHeader } from './iggy-header.utils.js';
 
 export const PollingStrategyKind = {
   Offset: 1,
@@ -145,70 +146,58 @@ export const mapMessageState = (k: number): MessageStateId => {
 }
 
 export type Message = {
-  id: string,
-  state: string,
-  timestamp: Date,
-  offset: bigint,
-  headers: HeadersMap,
+  headers: IggyMessageHeader,
   payload: Buffer,
-  checksum: number,
+  userHeaders: HeadersMap
 };
 
 export type PollMessagesResponse = {
   partitionId: number,
   currentOffset: bigint,
-  messageCount: number,
+  count: number,
   messages: Message[]
 };
 
-export const deserializePollMessages = (r: Buffer, pos = 0) => {
-  const len = r.length;
-  const partitionId = r.readUInt32LE(pos);
-  const currentOffset = r.readBigUInt64LE(pos + 4);
-  const messageCount = r.readUInt32LE(pos + 12);
-
+export const deserializeMessagesCount = (b: Buffer, count: number) => {
   const messages: Message[] = [];
-  pos += 16;
-
-  if (pos >= len) {
-    return {
-      partitionId,
-      currentOffset,
-      messageCount,
-      messages
-    }
-  }
-
+  let pos = 0;
+  const len = b.length;
   while (pos < len) {
-    const offset = r.readBigUInt64LE(pos);
-    const state = mapMessageState(r.readUInt8(pos + 8));
-    const timestamp = toDate(r.readBigUInt64LE(pos + 9));
-    const id = deserializeUUID(r.subarray(pos + 17, pos + 17 + 16));
-    const checksum = r.readUInt32LE(pos + 33);
-    const headersLength = r.readUInt32LE(pos + 37);
-    const headers = deserializeHeaders(r.subarray(pos + 41, pos + 41 + headersLength));
-    pos += headersLength;
-    const messageLength = r.readUInt32LE(pos + 41)
-    const payload = r.subarray(pos + 45, pos + 45 + messageLength);
-    pos += 45 + messageLength;
+    if(pos + IGGY_MESSAGE_HEADER_SIZE > len)
+      break;
+    const bHead = b.subarray(pos, pos + IGGY_MESSAGE_HEADER_SIZE);
+    const headers = deserializeIggyMessageHeaders(bHead);
+    pos += IGGY_MESSAGE_HEADER_SIZE;
+    const plEnd = pos + headers.payloadLength;
+    if(plEnd > len)
+      break;
+    const payload = b.subarray(pos, plEnd);
+    let userHeaders: HeadersMap = {};
+    if(headers.userHeadersLength > 0 && plEnd + headers.userHeadersLength <= len)
+      userHeaders = deserializeHeaders(b.subarray(plEnd, plEnd + headers.userHeadersLength));
     messages.push({
-      id,
-      state,
-      timestamp,
-      offset,
       headers,
       payload,
-      checksum
+      userHeaders
     });
   }
+  return messages;
+}
+
+export const deserializePollMessages = (r: Buffer, pos = 0) => {
+  const partitionId = r.readUInt32LE(pos);
+  const currentOffset = r.readBigUInt64LE(pos + 4);
+  const count = r.readUInt32LE(pos + 12);
+  const messages = deserializeMessagesCount(r.subarray(16), count);
 
   return {
     partitionId,
     currentOffset,
-    messageCount,
+    count,
     messages
   }
 };
+
 
 export const deserializePollMessagesTransform = () => new Transform({
   objectMode: true,
