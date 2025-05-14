@@ -1,0 +1,5 @@
+# E2E test -- likely will be removed, so keeping it local to C++ SDK
+.iggy/
+
+# when we move to Bazel this will be removed, so also keeping local to C++ SDK
+vcpkg_installed/

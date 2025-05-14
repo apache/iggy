@@ -1,0 +1,54 @@
+{
+    "version": 3,
+    "configurePresets": [
+        {
+            "name": "default",
+            "binaryDir": "${sourceDir}/build",
+            "generator": "Ninja Multi-Config",
+            "cacheVariables": {
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+            }
+        },
+        {
+            "name": "unit-tests",
+            "description": "Preset for building unit tests",
+            "hidden": false,
+            "cacheVariables": {
+                "BUILD_TESTS": "ON",
+                "ENABLE_CODE_COVERAGE": "ON"
+            },
+            "inherits": [
+                "default"
+            ]
+        },
+        {
+            "name": "docs",
+            "description": "Preset for building API docs",
+            "hidden": false,
+            "cacheVariables": {
+                "BUILD_DOCS": "ON"
+            },
+            "inherits": [
+                "default"
+            ]
+        },
+        {
+            "name": "ci",
+            "description": "Preset for build and test in CI",
+            "hidden": false,
+            "inherits": [
+                "unit-tests",
+                "docs"
+            ]
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "ninja",
+            "configurePreset": "ci",
+            "displayName": "Build with Ninja",
+            "description": "Build with Ninja"
+        }
+    ]
+}

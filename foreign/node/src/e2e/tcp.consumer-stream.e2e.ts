@@ -79,7 +79,7 @@ describe('e2e -> consumer-stream', async () => {
     const s2 = await pollStream(pollReq);
     let recv = 0;
     const dataCb = (str: Readable) => (d: PollMessagesResponse) => {      
-      recv += d.messageCount;
+      recv += d.count;
       if (recv === ct)
         str.destroy();
     };

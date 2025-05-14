@@ -28,9 +28,12 @@ impl MessageConsumer for PrintEventConsumer {
         // Extract message payload as raw bytes
         let raw_message = message.message.payload.as_ref();
         // Convert raw bytes into string
-        let message = String::from_utf8_lossy(raw_message);
+        let payload = String::from_utf8_lossy(raw_message);
         // Print message
-        println!("Message received: {}", message);
+        println!(
+            "Message received: {} at offset: {} in partition ID: {}",
+            payload, message.message.header.offset, message.partition_id
+        );
 
         Ok(())
     }

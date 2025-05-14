@@ -18,9 +18,7 @@
 
 use crate::streaming::common::test_setup::TestSetup;
 use crate::streaming::create_messages;
-use iggy::prelude::IggyExpiry;
-use iggy::prelude::IggyTimestamp;
-use iggy::prelude::Sizeable;
+use iggy::prelude::{IggyExpiry, IggyTimestamp, Sizeable};
 use server::state::system::PartitionState;
 use server::streaming::partitions::partition::Partition;
 use server::streaming::segments::*;

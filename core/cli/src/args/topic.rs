@@ -18,10 +18,7 @@
 
 use crate::args::common::ListMode;
 use clap::{Args, Subcommand};
-use iggy::prelude::CompressionAlgorithm;
-use iggy::prelude::Identifier;
-use iggy::prelude::IggyExpiry;
-use iggy::prelude::MaxTopicSize;
+use iggy::prelude::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize};
 
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum TopicAction {

@@ -66,10 +66,8 @@ const msg = {
   topicId,
   messages: [
     { payload: 'yolo msg 2' },
-    { id: 0 as const, payload: 'nooooooooo' },
-    { id: 0n as const, payload: 'aye' },
-    { id: uuidv4(), payload: 'yolo msg v4' },
-    { id: uuidv7(), payload: 'yolo msg v7' },
+    { payload: 'yolo msg v4' },
+    { payload: 'yolo msg v7' },
   ],
 };
 
@@ -100,7 +98,7 @@ try {
   // const cs = await groupConsumerStream(opt)(pollReq);
   // const dataCb = (d: PollMessagesResponse) => {
   //   console.log('cli/DATA POLLED:', d);
-  //   // recv += d.messageCount;
+  //   // recv += d.count;
   //   // if (recv === ct)
   //   //   str.destroy();
   // };
@@ -127,7 +125,11 @@ try {
 } catch (err) {
   console.error('client catchALL END', err)
   await cleanup();
+} finally {
+  console.error('finally::cleanup')
+  await cleanup();
 }
+
 
 // process.on('SIGINT', async () => {
 //   await cleanup();

@@ -1,0 +1,375 @@
+# HTTP server configuration
+[http]
+# Determines if the HTTP server is active.
+# `true` enables the server, allowing it to handle HTTP requests.
+# `false` disables the server, preventing it from handling HTTP requests.
+enabled = true
+
+# Specifies the network address and port for the HTTP server.
+# The format is "HOST:PORT". For example, "0.0.0.0:3000" listens on all network interfaces on port 3000.
+address = "0.0.0.0:3000"
+
+# Maximum size of the request body in bytes. For security reasons, the default limit is 2 MB.
+max_request_size = "2 MB"
+
+# Configuration for Cross-Origin Resource Sharing (CORS).
+[http.cors]
+# Controls whether CORS is enabled for the HTTP server.
+# `true` allows handling cross-origin requests with specified rules.
+# `false` blocks cross-origin requests, enhancing security.
+enabled = true
+
+# Specifies which HTTP methods are allowed when CORS is enabled.
+# For example, ["GET", "POST"] would allow only GET and POST requests.
+allowed_methods = ["GET", "POST", "PUT", "DELETE"]
+
+# Defines which origins are permitted to make cross-origin requests.
+# An asterisk "*" allows all origins. Specific domains can be listed to restrict access.
+allowed_origins = ["*"]
+
+# Lists allowed headers that can be used in CORS requests.
+# For example, ["content-type"] permits only the content-type header.
+allowed_headers = ["content-type"]
+
+# Headers that browsers are allowed to access in CORS responses.
+# An empty array means no additional headers are exposed to browsers.
+exposed_headers = [""]
+
+# Determines if credentials like cookies or HTTP auth can be included in CORS requests.
+# `true` allows credentials to be included, useful for authenticated sessions.
+# `false` prevents credentials, enhancing privacy and security.
+allow_credentials = false
+
+# Allows or blocks requests from private networks in CORS.
+# `true` permits requests from private networks.
+# `false` disallows such requests, providing additional security.
+allow_private_network = false
+
+# JWT (JSON Web Token) configuration for HTTP.
+[http.jwt]
+# Specifies the algorithm used for signing JWTs.
+# For example, "HS256" indicates HMAC with SHA-256.
+algorithm = "HS256"
+
+# The issuer of the JWT, typically a URL or an identifier of the issuing entity.
+issuer = "iggy.rs"
+
+# Intended audience for the JWT, usually the recipient or system intended to process the token.
+audience = "iggy.rs"
+
+# Lists valid issuers for JWT validation to ensure tokens are from trusted sources.
+valid_issuers = ["iggy.rs"]
+
+# Lists valid audiences for JWT validation to confirm tokens are for the intended recipient.
+valid_audiences = ["iggy.rs"]
+
+# Expiry time for access tokens.
+access_token_expiry = "1 h"
+
+# Expiry time for refresh tokens.
+refresh_token_expiry = "1 d"
+
+# Tolerance for timing discrepancies during token validation.
+clock_skew = "5 s"
+
+# Time before which the token should not be considered valid.
+not_before = "0 s"
+
+# Secret key for encoding JWTs.
+encoding_secret = "top_secret$iggy.rs$_jwt_HS256_key#!"
+
+# Secret key for decoding JWTs.
+decoding_secret = "top_secret$iggy.rs$_jwt_HS256_key#!"
+
+# Indicates if the secret key is base64 encoded.
+# `true` means the secret is base64 encoded.
+# `false` means the secret is in plain text.
+use_base64_secret = false
+
+# Metrics configuration for HTTP.
+[http.metrics]
+# Enable or disable the metrics endpoint.
+# `true` makes metrics available at the specified endpoint.
+# `false` disables metrics collection.
+enabled = true
+
+# Specifies the endpoint for accessing metrics, e.g., "/metrics".
+endpoint = "/metrics"
+
+# TLS (Transport Layer Security) configuration for HTTP.
+[http.tls]
+# Controls the use of TLS for encrypted HTTP connections.
+# `true` enables TLS, enhancing security.
+# `false` disables TLS, which may be appropriate in secure internal networks.
+enabled = false
+
+# Path to the TLS certificate file.
+cert_file = "certs/iggy_cert.pem"
+
+# Path to the TLS key file.
+key_file = "certs/iggy_key.pem"
+
+# TCP server configuration.
+[tcp]
+# Determines if the TCP server is active.
+# `true` enables the TCP server for handling TCP connections.
+# `false` disables it, preventing any TCP communication.
+enabled = true
+
+# Defines the network address and port for the TCP server.
+# For example, "0.0.0.0:8090" listens on all network interfaces on port 8090.
+address = "0.0.0.0:8090"
+
+# TLS configuration for the TCP server.
+[tcp.tls]
+# Enables or disables TLS for TCP connections.
+# `true` secures TCP connections with TLS.
+# `false` leaves TCP connections unencrypted.
+enabled = false
+
+# Path to the TLS certificate for TCP.
+certificate = "certs/iggy.pfx"
+
+# Password for the TLS certificate, required for accessing the private key.
+password = "iggy123"
+
+# QUIC protocol configuration.
+[quic]
+# Controls whether the QUIC server is enabled.
+# `true` enables QUIC for fast, secure connections.
+# `false` disables QUIC, possibly for compatibility or simplicity.
+enabled = true
+
+# Network address and port for the QUIC server.
+# For example, "0.0.0.0:8080" binds to all interfaces on port 8080.
+address = "0.0.0.0:8080"
+
+# Maximum number of simultaneous bidirectional streams in QUIC.
+max_concurrent_bidi_streams = 10_000
+
+# Size of the buffer for sending datagrams in QUIC.
+datagram_send_buffer_size = "100 KB"
+
+# Initial Maximum Transmission Unit (MTU) for QUIC connections.
+initial_mtu = "8 KB"
+
+# Size of the sending window in QUIC, controlling data flow.
+send_window = "100 KB"
+
+# Size of the receiving window in QUIC, controlling data flow.
+receive_window = "100 KB"
+
+# Interval for sending keep-alive messages in QUIC.
+keep_alive_interval = "5 s"
+
+# Maximum idle time before a QUIC connection is closed.
+max_idle_timeout = "10 s"
+
+# QUIC certificate configuration.
+[quic.certificate]
+# Indicates whether the QUIC certificate is self-signed.
+# `true` for self-signed certificates, often used in internal or testing environments.
+# `false` for certificates issued by a certificate authority, common in production.
+self_signed = true
+
+# Path to the QUIC TLS certificate file.
+cert_file = "certs/iggy_cert.pem"
+
+# Path to the QUIC TLS key file.
+key_file = "certs/iggy_key.pem"
+
+# Message cleaner configuration.
+[message_cleaner]
+# Enables or disables the background process for deleting expired messages.
+# `true` activates the message cleaner.
+# `false` turns it off, messages will not be auto-deleted based on expiry.
+enabled = true
+
+# Interval for running the message cleaner.
+interval = "1 m"
+
+# Message saver configuration.
+[message_saver]
+# Enables or disables the background process for saving buffered data to disk.
+# `true` ensures data is periodically written to disk.
+# `false` turns off automatic saving, relying on other triggers for data persistence.
+enabled = true
+
+# Controls whether data saving is synchronous (enforce fsync) or asynchronous.
+# `true` for synchronous saving, ensuring data integrity at the cost of performance.
+# `false` for asynchronous saving, improving performance but with delayed data writing.
+enforce_fsync = true
+
+# Interval for running the message saver.
+interval = "30 s"
+
+# Personal access token configuration.
+[personal_access_token]
+# Sets the maximum number of active tokens allowed per user.
+max_tokens_per_user = 100
+
+# Personal access token cleaner configuration.
+[personal_access_token.cleaner]
+# Enables or disables the token cleaner process.
+# `true` activates periodic token cleaning.
+# `false` disables it, tokens remain active until manually revoked or expired.
+enabled = true
+
+# Interval for running the token cleaner.
+interval = "1 m"
+
+# System configuration.
+[system]
+# Base path for system data storage.
+path = ".iggy/local_data"
+
+# Backup configuration
+[system.backup]
+# Path for storing backup.
+path = "backup"
+
+# Compatibility conversion configuration
+[system.backup.compatibility]
+# Subpath of the backup directory where converted segment data is stored after compatibility conversion.
+path = "compatibility"
+
+# Database configuration.
+[system.database]
+# Path for storing database files.
+# Specifies the directory where database files are stored, relative to `system.path`.
+path = "database"
+
+# Runtime configuration.
+[system.runtime]
+# Path for storing runtime data.
+# Specifies the directory where any runtime data is stored, relative to `system.path`.
+path = "runtime"
+
+# Logging configuration.
+[system.logging]
+# Path for storing log files.
+path = "logs"
+
+# Level of logging detail. Options: "debug", "info", "warn", "error".
+level = "info"
+
+# Maximum size of the log files before rotation.
+max_size = "512 MB"
+
+# Time to retain log files before deletion.
+retention = "7 days"
+
+# Interval for printing system information to the log.
+sysinfo_print_interval = "10 s"
+
+# Cache configuration.
+[system.cache]
+# Enables or disables the system cache.
+# `true` activates caching for frequently accessed data.
+# `false` disables caching, data is always read from the source.
+enabled = true
+
+# Maximum size of the cache, e.g. "4GB".
+size = "4 GB"
+
+# Data retention policy configuration.
+[system.retention_policy]
+# Configures the message time-based expiry setting.
+# "disabled" means messages are kept indefinitely.
+# A time value in human-readable format determines the lifespan of messages.
+# Example: `message_expiry = "2 days 4 hours 15 minutes"` means messages will expire after that duration.
+message_expiry = "disabled"
+
+# Configures the topic size-based expiry setting.
+# "unlimited" or "0" means topics are kept indefinitely.
+# A size value in human-readable format determines the maximum size of a topic.
+# When a topic reaches this size, the oldest messages are deleted to make room for new ones.
+# Messages are removed in full segments, so if segment size is 1 GB and the topic size is 10 GB,
+# the oldest segment will be deleted upon reaching 10 GB.
+# Example: `max_topic_size = "10 GB"` means oldest messages in topics will be deleted when they reach 10 GB.
+# Note: this setting can be overwritten with CreateTopic and UpdateTopic requests.
+max_topic_size = "10 GB"
+
+# Encryption configuration
+[system.encryption]
+# Determines whether server-side data encryption is enabled (boolean).
+# `true` enables encryption for stored data using AES-256-GCM.
+# `false` means data is stored without encryption.
+enabled = false
+
+# The encryption key used when encryption is enabled (string).
+# Should be a 32 bytes length key, provided as a base64 encoded string.
+# This key is required and used only if encryption is enabled.
+key = ""
+
+# Compression configuration
+[system.compression]
+# Allows overriding the default compression algorithm per data segment (boolean).
+# `true` permits different compression algorithms for individual segments.
+# `false` means all data segments use the default compression algorithm.
+allow_override = false
+
+# The default compression algorithm used for data storage (string).
+# "none" indicates no compression, other values can specify different algorithms.
+default_algorithm = "none"
+
+# Stream configuration
+[system.stream]
+# Path for storing stream-related data (string).
+# Specifies the directory where stream data is stored, relative to `system.path`.
+path = "streams"
+
+# Topic configuration
+[system.topic]
+# Path for storing topic-related data (string).
+# Specifies the directory where topic data is stored, relative to `stream.path`.
+path = "topics"
+
+# Partition configuration
+[system.partition]
+# Path for storing partition-related data (string).
+# Specifies the directory where partition data is stored, relative to `topic.path`.
+path = "partitions"
+
+# Determines whether to enforce file synchronization on partition updates (boolean).
+# `true` ensures immediate writing of data to disk for durability.
+# `false` allows the OS to manage write operations, which can improve performance.
+enforce_fsync = false
+
+# Enables checksum validation for data integrity (boolean).
+# `true` activates CRC checks when loading data, guarding against corruption.
+# `false` skips these checks for faster loading at the risk of undetected corruption.
+validate_checksum = false
+
+# The threshold of buffered messages before triggering a save to disk (integer).
+# Specifies how many messages accumulate before persisting to storage.
+# Adjusting this can balance between write performance and data durability.
+messages_required_to_save = 10_000
+
+# Segment configuration
+[system.segment]
+# Defines the soft limit for the size of a storage segment.
+# When a segment reaches this size, a new segment is created for subsequent data.
+# Example: if `size` is set "1GB", the actual segment size may be 1GB + the size of remaining messages in received batch.
+size = "1 GB"
+
+# Controls whether to cache indexes for segment access (boolean).
+# `true` keeps indexes in memory, speeding up data retrieval.
+# `false` reads indexes from disk, which can conserve memory at the cost of access speed.
+cache_indexes = true
+
+# Determines whether to cache time-based indexes for segments (boolean).
+# `true` allows faster timestamp-based data retrieval by keeping indexes in memory.
+# `false` conserves memory by reading time indexes from disk, which may slow down access.
+cache_time_indexes = true
+
+# Message deduplication configuration
+[system.message_deduplication]
+# Controls whether message deduplication is enabled (boolean).
+# `true` activates deduplication, ignoring messages with duplicate IDs.
+# `false` treats each message as unique, even if IDs are duplicated.
+enabled = false
+# Maximum number of ID entries in the deduplication cache (u64).
+max_entries = 1000
+# Maximum age of ID entries in the deduplication cache in human-readable format.
+expiry = "1 m"

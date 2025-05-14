@@ -23,13 +23,8 @@ mod test_message_headers;
 
 use assert_cmd::Command;
 use iggy::clients::client::IggyClient;
-use iggy::prelude::CompressionAlgorithm;
-use iggy::prelude::IggyExpiry;
-use iggy::prelude::MaxTopicSize;
-use iggy::prelude::TcpClient;
-use iggy::prelude::TcpClientConfig;
 use iggy::prelude::defaults::*;
-use iggy::prelude::{Client, StreamClient, SystemClient, TopicClient, UserClient};
+use iggy::prelude::*;
 use integration::test_server::{IpAddrKind, TestServer};
 use regex::Regex;
 use std::sync::Arc;
