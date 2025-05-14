@@ -15,20 +15,31 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-mod connector;
-mod namespace;
-mod frame;
+pub mod builder;
+pub mod connector;
+pub mod frame;
+pub mod namespace;
 
-
-
-use std::cell::RefCell;
 use ahash::HashMap;
-use connector::ShardConnector;
+use builder::IggyShardBuilder;
+use connector::{Receiver, ShardConnector, StopReceiver, StopSender};
 use frame::ShardFrame;
 use namespace::IggyNamespace;
-struct Shard {
+use std::cell::{Cell, RefCell};
+
+use crate::configs::server::ServerConfig;
+pub(crate) struct Shard {
     id: u16,
     connection: ShardConnector<ShardFrame>,
+}
+
+impl Shard {
+    pub fn new(connection: ShardConnector<ShardFrame>) -> Self {
+        Self {
+            id: connection.id,
+            connection,
+        }
+    }
 }
 
 struct ShardInfo {
@@ -38,22 +49,48 @@ struct ShardInfo {
 pub struct IggyShard {
     pub id: u16,
     shards: Vec<Shard>,
-    shards_table: RefCell<HashMap<IggyNamespace, ShardInfo>>,
+    //shards_table: RefCell<HashMap<IggyNamespace, ShardInfo>>,
 
-    pub(crate) permissioner: RefCell<Permissioner>,
-    pub(crate) storage: Rc<SystemStorage>,
-    pub(crate) streams: RwLock<HashMap<u32, Stream>>,
-    pub(crate) streams_ids: RefCell<HashMap<String, u32>>,
-    pub(crate) users: RefCell<HashMap<UserId, User>>,
+    //pub(crate) permissioner: RefCell<Permissioner>,
+    //pub(crate) streams: RwLock<HashMap<u32, Stream>>,
+    //pub(crate) streams_ids: RefCell<HashMap<String, u32>>,
+    //pub(crate) users: RefCell<HashMap<UserId, User>>,
 
     // TODO - get rid of this dynamic dispatch.
-    pub(crate) state: Rc<FileState>,
-    pub(crate) encryptor: Option<Rc<dyn Encryptor>>,
-    pub(crate) config: ServerConfig,
-    pub(crate) client_manager: RefCell<ClientManager>,
-    pub(crate) active_sessions: RefCell<Vec<Session>>,
-    pub(crate) metrics: Metrics,
+    //pub(crate) state: Rc<FileState>,
+    //pub(crate) encryptor: Option<Rc<dyn Encryptor>>,
+    config: ServerConfig,
+    //pub(crate) client_manager: RefCell<ClientManager>,
+    //pub(crate) active_sessions: RefCell<Vec<Session>>,
+    //pub(crate) metrics: Metrics,
     pub message_receiver: Cell<Option<Receiver<ShardFrame>>>,
     stop_receiver: StopReceiver,
     stop_sender: StopSender,
+}
+
+impl IggyShard {
+    pub fn builder() -> IggyShardBuilder {
+        Default::default()
+    }
+
+    pub(crate) fn new(
+        id: u16,
+        shards: Vec<Shard>,
+        config: ServerConfig,
+        stop_receiver: StopReceiver,
+        stop_sender: StopSender,
+        shard_messages_receiver: Receiver<ShardFrame>,
+    ) -> Self {
+        Self {
+            id,
+            shards,
+            config,
+            stop_receiver,
+            stop_sender,
+            message_receiver: Cell::new(Some(shard_messages_receiver)),
+        }
+    }
+
+    pub fn assert_init(&self) {
+    }
 }
