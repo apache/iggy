@@ -16,11 +16,15 @@
  * under the License.
  */
 
+use std::thread::available_parallelism;
+
 use anyhow::Result;
 use clap::Parser;
 use dotenvy::dotenv;
 use figlet_rs::FIGfont;
+use monoio::Buildable;
 use server::args::Args;
+use server::bootstrap::{create_directories, create_root_user, create_shard_connections};
 use server::channels::commands::archive_state::ArchiveStateExecutor;
 use server::channels::commands::clean_personal_access_tokens::CleanPersonalAccessTokensExecutor;
 use server::channels::commands::maintain_messages::MaintainMessagesExecutor;
@@ -37,15 +41,15 @@ use server::log::logger::Logging;
 use server::log::tokio_console::Logging;
 use server::quic::quic_server;
 use server::server_error::ServerError;
+use server::shard::IggyShard;
 use server::streaming::systems::system::{SharedSystem, System};
 use server::streaming::utils::MemoryPool;
 use server::tcp::tcp_server;
 use tokio::time::Instant;
 use tracing::{info, instrument};
 
-#[tokio::main]
 #[instrument(skip_all, name = "trace_start_server")]
-async fn main() -> Result<(), ServerError> {
+fn main() -> Result<(), ServerError> {
     let startup_timestamp = Instant::now();
     let standard_font = FIGfont::standard().unwrap();
     let figure = standard_font.convert("Iggy Server");
@@ -68,6 +72,24 @@ async fn main() -> Result<(), ServerError> {
 
     let args = Args::parse();
     let config_provider = config_provider::resolve(&args.config_provider)?;
+    let config = ServerConfig::default();
+    //TODO: Load config.
+    /*
+    let xd = std::thread::scope(|scope| {
+        let config = scope.spawn(move || {
+            let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new().build().unwrap();
+            let config: Result<ServerConfig, ServerError> = rt.block_on(async {
+                let config = ServerConfig::load(&config_provider).await?;
+                create_directories().await;
+                create_root_user().await;
+                Ok(config)
+            });
+            config
+        }).join().unwrap();
+        config
+    });
+    */
+    /*
     let config = ServerConfig::load(&config_provider).await?;
     if args.fresh {
         let system_path = config.system.get_system_path();
@@ -80,9 +102,56 @@ async fn main() -> Result<(), ServerError> {
     }
     let mut logging = Logging::new(config.telemetry.clone());
     logging.early_init();
+    */
+    // TODO: Make this configurable from config as a range
+    // for example this instance of Iggy will use cores from 0..4
+    let available_cpus = available_parallelism()
+        .expect("Failed to get num of cores")
+        .into();
+    let shards_count = available_cpus;
+    let shards_set = 0..shards_count;
 
+    let connections = create_shard_connections(shards_set.clone());
+
+    for shard_id in shards_set {
+        let id = shard_id as u16;
+        let connections = connections.clone();
+        let server_config = config.clone();
+        std::thread::Builder::new()
+            .name(format!("shard-{id}"))
+            .spawn(move || {
+                monoio::utils::bind_to_cpu_set(Some(shard_id))
+                    .expect(format!("Failed to set CPU affinity for shard-{id}").as_str());
+
+                // TODO: Figure out what else we could tweak there
+                // We for sure want to disable the userspace interrupts on new cq entry (set_coop_taskrun)
+                // let urb = io_uring::IoUring::builder();
+                // TODO: Shall we make the size of ring be configureable ?
+                let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+                    //.uring_builder(urb.setup_coop_taskrun())
+                    .with_entries(1024) // Default size
+                    .enable_timer()
+                    .build()
+                    .expect(format!("Failed to build monoio runtime for shard-{id}").as_str());
+                rt.block_on(async move {
+                    let builder = IggyShard::builder();
+                    let shard = builder
+                        .id(id)
+                        .connections(connections)
+                        .server_config(server_config)
+                        .build_and_init()
+                        .await;
+
+                    shard.assert_init();
+                })
+            })
+            .expect(format!("Failed to spawn thread for shard-{id}").as_str())
+            .join()
+            .expect(format!("Failed to join thread for shard-{id}").as_str());
+    }
     // From this point on, we can use tracing macros to log messages.
 
+    /*
     logging.late_init(config.system.get_system_path(), &config.system.logging)?;
 
     #[cfg(feature = "disable-mimalloc")]
@@ -99,13 +168,15 @@ async fn main() -> Result<(), ServerError> {
         config.data_maintenance.clone(),
         config.personal_access_token.clone(),
     ));
+    */
 
     // Workaround to ensure that the statistics are initialized before the server
     // loads streams and starts accepting connections. This is necessary to
     // have the correct statistics when the server starts.
-    system.write().await.get_stats().await?;
-    system.write().await.init().await?;
+    //system.write().await.get_stats().await?;
+    //system.write().await.init().await?;
 
+    /*
     let _command_handler = BackgroundServerCommandHandler::new(system.clone(), &config)
         .install_handler(SaveMessagesExecutor)
         .install_handler(MaintainMessagesExecutor)
@@ -181,5 +252,6 @@ async fn main() -> Result<(), ServerError> {
         "Iggy server has shutdown successfully. Shutdown took {} ms.",
         elapsed_time.as_millis()
     );
+    */
     Ok(())
 }

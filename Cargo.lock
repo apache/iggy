@@ -7145,6 +7145,7 @@ dependencies = [
  "futures",
  "human-repr",
  "iggy_common",
+ "io-uring",
  "jsonwebtoken",
  "lending-iterator",
  "mimalloc",

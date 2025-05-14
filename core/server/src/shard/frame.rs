@@ -27,8 +27,7 @@ pub enum ShardMessage {
 }
 
 #[derive(Debug, Clone)]
-pub enum ShardEvent {
-}
+pub enum ShardEvent {}
 
 #[derive(Debug)]
 pub enum ShardResponse {
