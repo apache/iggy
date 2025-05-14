@@ -59,6 +59,7 @@ flume = { workspace = true }
 futures = { workspace = true }
 human-repr = { workspace = true }
 iggy_common = { workspace = true }
+io-uring = "0.6"
 jsonwebtoken = "9.3.1"
 lending-iterator = "0.1.7"
 mimalloc = { workspace = true, optional = true }

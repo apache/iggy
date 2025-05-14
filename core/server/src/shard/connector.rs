@@ -54,6 +54,8 @@ impl<T: Clone> ShardConnector<T> {
     }
 }
 
+// TODO: I think those Arcs can be replaced with 'static lifetimes...
+// Those shards will live for the entire duration of the application.
 #[derive(Clone)]
 pub struct Receiver<T> {
     channel: Arc<ShardedChannel<T>>,
