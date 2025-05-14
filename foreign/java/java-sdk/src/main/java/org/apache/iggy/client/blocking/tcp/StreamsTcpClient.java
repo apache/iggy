@@ -35,11 +35,6 @@ import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytes;
 
 class StreamsTcpClient implements StreamsClient {
 
-    private static final int GET_STREAM_CODE = 200;
-    private static final int GET_STREAMS_CODE = 201;
-    private static final int CREATE_STREAM_CODE = 202;
-    private static final int DELETE_STREAM_CODE = 203;
-    private static final int UPDATE_STREAM_CODE = 204;
     private final InternalTcpClient tcpClient;
 
     StreamsTcpClient(InternalTcpClient tcpClient) {
@@ -53,14 +48,14 @@ class StreamsTcpClient implements StreamsClient {
 
         payload.writeIntLE(streamId.orElse(0L).intValue());
         payload.writeBytes(nameToBytes(name));
-        var response = tcpClient.send(CREATE_STREAM_CODE, payload);
+        var response = tcpClient.send(CommandCode.Stream.CREATE, payload);
         return readStreamDetails(response);
     }
 
     @Override
     public Optional<StreamDetails> getStream(StreamId streamId) {
         var payload = toBytes(streamId);
-        var response = tcpClient.send(GET_STREAM_CODE, payload);
+        var response = tcpClient.send(CommandCode.Stream.GET, payload);
         if (response.isReadable()) {
             return Optional.of(readStreamDetails(response));
         }
@@ -69,7 +64,7 @@ class StreamsTcpClient implements StreamsClient {
 
     @Override
     public List<StreamBase> getStreams() {
-        ByteBuf response = tcpClient.send(GET_STREAMS_CODE);
+        ByteBuf response = tcpClient.send(CommandCode.Stream.GET_ALL);
         List<StreamBase> streams = new ArrayList<>();
         while (response.isReadable()) {
             streams.add(readStreamBase(response));
@@ -85,13 +80,13 @@ class StreamsTcpClient implements StreamsClient {
 
         payload.writeBytes(idBytes);
         payload.writeBytes(nameToBytes(name));
-        tcpClient.send(UPDATE_STREAM_CODE, payload);
+        tcpClient.send(CommandCode.Stream.UPDATE, payload);
     }
 
     @Override
     public void deleteStream(StreamId streamId) {
         var payload = toBytes(streamId);
-        tcpClient.send(DELETE_STREAM_CODE, payload);
+        tcpClient.send(CommandCode.Stream.DELETE, payload);
     }
 
 }

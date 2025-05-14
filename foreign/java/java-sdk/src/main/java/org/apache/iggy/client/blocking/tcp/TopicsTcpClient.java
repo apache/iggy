@@ -36,12 +36,6 @@ import static org.apache.iggy.client.blocking.tcp.BytesSerializer.*;
 
 class TopicsTcpClient implements TopicsClient {
 
-    private static final int GET_TOPIC_CODE = 300;
-    private static final int GET_TOPICS_CODE = 301;
-    private static final int CREATE_TOPIC_CODE = 302;
-    private static final int DELETE_TOPIC_CODE = 303;
-    private static final int UPDATE_TOPIC_CODE = 304;
-    private static final int PURGE_TOPIC_CODE = 305;
     private final InternalTcpClient tcpClient;
 
     TopicsTcpClient(InternalTcpClient tcpClient) {
@@ -52,7 +46,7 @@ class TopicsTcpClient implements TopicsClient {
     public Optional<TopicDetails> getTopic(StreamId streamId, TopicId topicId) {
         var payload = toBytes(streamId);
         payload.writeBytes(toBytes(topicId));
-        var response = tcpClient.send(GET_TOPIC_CODE, payload);
+        var response = tcpClient.send(CommandCode.Topic.GET, payload);
         if (response.isReadable()) {
             return Optional.of(readTopicDetails(response));
         }
@@ -62,7 +56,7 @@ class TopicsTcpClient implements TopicsClient {
     @Override
     public List<Topic> getTopics(StreamId streamId) {
         var payload = toBytes(streamId);
-        var response = tcpClient.send(GET_TOPICS_CODE, payload);
+        var response = tcpClient.send(CommandCode.Topic.GET_ALL, payload);
         List<Topic> topics = new ArrayList<>();
         while (response.isReadable()) {
             topics.add(readTopic(response));
@@ -84,7 +78,7 @@ class TopicsTcpClient implements TopicsClient {
         payload.writeByte(replicationFactor.orElse((short) 0));
         payload.writeBytes(nameToBytes(name));
 
-        var response = tcpClient.send(CREATE_TOPIC_CODE, payload);
+        var response = tcpClient.send(CommandCode.Topic.CREATE, payload);
         return readTopicDetails(response);
     }
 
@@ -105,13 +99,13 @@ class TopicsTcpClient implements TopicsClient {
         payload.writeByte(replicationFactor.orElse((short) 0));
         payload.writeBytes(nameToBytes(name));
 
-        tcpClient.send(UPDATE_TOPIC_CODE, payload);
+        tcpClient.send(CommandCode.Topic.UPDATE, payload);
     }
 
     @Override
     public void deleteTopic(StreamId streamId, TopicId topicId) {
         var payload = toBytes(streamId);
         payload.writeBytes(toBytes(topicId));
-        tcpClient.send(DELETE_TOPIC_CODE, payload);
+        tcpClient.send(CommandCode.Topic.DELETE, payload);
     }
 }

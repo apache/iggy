@@ -29,11 +29,6 @@ import java.util.List;
 import static org.apache.iggy.client.blocking.tcp.BytesDeserializer.*;
 
 class SystemTcpClient implements SystemClient {
-    private static final int PING_CODE = 1;
-    private static final int GET_STATS_CODE = 10;
-    private static final int GET_ME_CODE = 20;
-    private static final int GET_CLIENT_CODE = 21;
-    private static final int GET_CLIENTS_CODE = 22;
 
     private final InternalTcpClient tcpClient;
 
@@ -43,13 +38,13 @@ class SystemTcpClient implements SystemClient {
 
     @Override
     public Stats getStats() {
-        var response = tcpClient.send(GET_STATS_CODE);
+        var response = tcpClient.send(CommandCode.System.GET_STATS);
         return readStats(response);
     }
 
     @Override
     public ClientInfoDetails getMe() {
-        var response = tcpClient.send(GET_ME_CODE);
+        var response = tcpClient.send(CommandCode.System.GET_ME);
         return readClientInfoDetails(response);
     }
 
@@ -57,13 +52,13 @@ class SystemTcpClient implements SystemClient {
     public ClientInfoDetails getClient(Long clientId) {
         var payload = Unpooled.buffer(4);
         payload.writeIntLE(clientId.intValue());
-        var response = tcpClient.send(GET_CLIENT_CODE, payload);
+        var response = tcpClient.send(CommandCode.System.GET_CLIENT, payload);
         return readClientInfoDetails(response);
     }
 
     @Override
     public List<ClientInfo> getClients() {
-        var response = tcpClient.send(GET_CLIENTS_CODE);
+        var response = tcpClient.send(CommandCode.System.GET_ALL_CLIENTS);
         List<ClientInfo> clients = new ArrayList<>();
         while (response.isReadable()) {
             clients.add(readClientInfo(response));
@@ -73,7 +68,7 @@ class SystemTcpClient implements SystemClient {
 
     @Override
     public String ping() {
-        tcpClient.send(PING_CODE);
+        tcpClient.send(CommandCode.System.PING);
         return "";
     }
 }

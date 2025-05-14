@@ -32,9 +32,6 @@ import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytesAsU64;
 
 class ConsumerOffsetTcpClient implements ConsumerOffsetsClient {
 
-    private static final int GET_CONSUMER_OFFSET_CODE = 120;
-    private static final int STORE_CONSUMER_OFFSET_CODE = 121;
-
     private final InternalTcpClient tcpClient;
 
     public ConsumerOffsetTcpClient(InternalTcpClient tcpClient) {
@@ -49,7 +46,7 @@ class ConsumerOffsetTcpClient implements ConsumerOffsetsClient {
         payload.writeIntLE(partitionId.orElse(0L).intValue());
         payload.writeBytes(toBytesAsU64(offset));
 
-        tcpClient.send(STORE_CONSUMER_OFFSET_CODE, payload);
+        tcpClient.send(CommandCode.ConsumerOffset.STORE, payload);
     }
 
     @Override
@@ -59,7 +56,7 @@ class ConsumerOffsetTcpClient implements ConsumerOffsetsClient {
         payload.writeBytes(toBytes(topicId));
         payload.writeIntLE(partitionId.orElse(0L).intValue());
 
-        var response = tcpClient.send(GET_CONSUMER_OFFSET_CODE, payload);
+        var response = tcpClient.send(CommandCode.ConsumerOffset.GET, payload);
         if (response.isReadable()) {
             return Optional.of(readConsumerOffsetInfo(response));
         }

@@ -33,9 +33,6 @@ import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytes;
 
 class MessagesTcpClient implements MessagesClient {
 
-    private static final int POLL_MESSAGES_CODE = 100;
-    private static final int SEND_MESSAGES_CODE = 101;
-
     private final InternalTcpClient tcpClient;
 
     public MessagesTcpClient(InternalTcpClient tcpClient) {
@@ -52,7 +49,7 @@ class MessagesTcpClient implements MessagesClient {
         payload.writeIntLE(count.intValue());
         payload.writeByte(autoCommit ? 1 : 0);
 
-        var response = tcpClient.send(POLL_MESSAGES_CODE, payload);
+        var response = tcpClient.send(CommandCode.Messages.POLL, payload);
 
         return BytesDeserializer.readPolledMessages(response);
     }
@@ -66,6 +63,6 @@ class MessagesTcpClient implements MessagesClient {
             payload.writeBytes(toBytes(message));
         }
 
-        tcpClient.send(SEND_MESSAGES_CODE, payload);
+        tcpClient.send(CommandCode.Messages.SEND, payload);
     }
 }

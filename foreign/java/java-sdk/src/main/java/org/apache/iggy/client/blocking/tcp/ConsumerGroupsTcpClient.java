@@ -37,13 +37,6 @@ import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytes;
 
 class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
 
-    private static final int GET_CONSUMER_GROUP_CODE = 600;
-    private static final int GET_CONSUMER_GROUPS_CODE = 601;
-    private static final int CREATE_CONSUMER_GROUP_CODE = 602;
-    private static final int DELETE_CONSUMER_GROUP_CODE = 603;
-    private static final int JOIN_CONSUMER_GROUP_CODE = 604;
-    private static final int LEAVE_CONSUMER_GROUP_CODE = 605;
-
     private final InternalTcpClient tcpClient;
 
     public ConsumerGroupsTcpClient(InternalTcpClient tcpClient) {
@@ -55,7 +48,7 @@ class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
         var payload = toBytes(streamId);
         payload.writeBytes(toBytes(topicId));
         payload.writeBytes(toBytes(groupId));
-        var response = tcpClient.send(GET_CONSUMER_GROUP_CODE, payload);
+        var response = tcpClient.send(CommandCode.ConsumerGroup.GET, payload);
         if (response.isReadable()) {
             return Optional.of(readConsumerGroupDetails(response));
         }
@@ -66,7 +59,7 @@ class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
     public List<ConsumerGroup> getConsumerGroups(StreamId streamId, TopicId topicId) {
         var payload = toBytes(streamId);
         payload.writeBytes(toBytes(topicId));
-        var response = tcpClient.send(GET_CONSUMER_GROUPS_CODE, payload);
+        var response = tcpClient.send(CommandCode.ConsumerGroup.GET_ALL, payload);
         List<ConsumerGroup> groups = new ArrayList<>();
         while (response.isReadable()) {
             groups.add(readConsumerGroup(response));
@@ -85,7 +78,7 @@ class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
         payload.writeIntLE(groupId.orElse(0L).intValue());
         payload.writeBytes(nameToBytes(name));
 
-        ByteBuf response = tcpClient.send(CREATE_CONSUMER_GROUP_CODE, payload);
+        ByteBuf response = tcpClient.send(CommandCode.ConsumerGroup.CREATE, payload);
         return readConsumerGroupDetails(response);
     }
 
@@ -94,7 +87,7 @@ class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
         var payload = toBytes(streamId);
         payload.writeBytes(toBytes(topicId));
         payload.writeBytes(toBytes(groupId));
-        tcpClient.send(DELETE_CONSUMER_GROUP_CODE, payload);
+        tcpClient.send(CommandCode.ConsumerGroup.DELETE, payload);
     }
 
     @Override
@@ -103,7 +96,7 @@ class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
         payload.writeBytes(toBytes(topicId));
         payload.writeBytes(toBytes(groupId));
 
-        tcpClient.send(JOIN_CONSUMER_GROUP_CODE, payload);
+        tcpClient.send(CommandCode.ConsumerGroup.JOIN, payload);
     }
 
     @Override
@@ -112,7 +105,7 @@ class ConsumerGroupsTcpClient implements ConsumerGroupsClient {
         payload.writeBytes(toBytes(topicId));
         payload.writeBytes(toBytes(groupId));
 
-        tcpClient.send(LEAVE_CONSUMER_GROUP_CODE, payload);
+        tcpClient.send(CommandCode.ConsumerGroup.LEAVE, payload);
     }
 
 }

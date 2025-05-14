@@ -36,16 +36,6 @@ import static org.apache.iggy.client.blocking.tcp.BytesSerializer.toBytes;
 
 class UsersTcpClient implements UsersClient {
 
-    private static final int GET_USER_CODE = 31;
-    private static final int GET_USERS_CODE = 32;
-    private static final int CREATE_USER_CODE = 33;
-    private static final int DELETE_USER_CODE = 34;
-    private static final int UPDATE_USER_CODE = 35;
-    private static final int UPDATE_PERMISSIONS_CODE = 36;
-    private static final int CHANGE_PASSWORD_CODE = 37;
-    private static final int LOGIN_USER_CODE = 38;
-    private static final int LOGOUT_USER_CODE = 39;
-
     private final InternalTcpClient tcpClient;
 
     UsersTcpClient(InternalTcpClient tcpClient) {
@@ -55,7 +45,7 @@ class UsersTcpClient implements UsersClient {
     @Override
     public Optional<UserInfoDetails> getUser(UserId userId) {
         var payload = toBytes(userId);
-        var response = tcpClient.send(GET_USER_CODE, payload);
+        var response = tcpClient.send(CommandCode.User.GET, payload);
         if (response.isReadable()) {
             return Optional.of(readUserInfoDetails(response));
         }
@@ -64,7 +54,7 @@ class UsersTcpClient implements UsersClient {
 
     @Override
     public List<UserInfo> getUsers() {
-        var response = tcpClient.send(GET_USERS_CODE);
+        var response = tcpClient.send(CommandCode.User.GET_ALL);
         List<UserInfo> users = new ArrayList<>();
         while (response.isReadable()) {
             users.add(BytesDeserializer.readUserInfo(response));
@@ -85,14 +75,14 @@ class UsersTcpClient implements UsersClient {
             payload.writeBytes(permissionBytes);
         }, () -> payload.writeByte(0));
 
-        var response = tcpClient.send(CREATE_USER_CODE, payload);
+        var response = tcpClient.send(CommandCode.User.CREATE, payload);
         return readUserInfoDetails(response);
     }
 
     @Override
     public void deleteUser(UserId userId) {
         var payload = toBytes(userId);
-        tcpClient.send(DELETE_USER_CODE, payload);
+        tcpClient.send(CommandCode.User.DELETE, payload);
     }
 
     @Override
@@ -107,7 +97,7 @@ class UsersTcpClient implements UsersClient {
             payload.writeByte(status.asCode());
         }, () -> payload.writeByte(0));
 
-        tcpClient.send(UPDATE_USER_CODE, payload);
+        tcpClient.send(CommandCode.User.UPDATE, payload);
     }
 
     @Override
@@ -121,7 +111,7 @@ class UsersTcpClient implements UsersClient {
             payload.writeBytes(permissionBytes);
         }, () -> payload.writeByte(0));
 
-        tcpClient.send(UPDATE_PERMISSIONS_CODE, payload);
+        tcpClient.send(CommandCode.User.UPDATE_PERMISSIONS, payload);
     }
 
     @Override
@@ -130,7 +120,7 @@ class UsersTcpClient implements UsersClient {
         payload.writeBytes(nameToBytes(currentPassword));
         payload.writeBytes(nameToBytes(newPassword));
 
-        tcpClient.send(CHANGE_PASSWORD_CODE, payload);
+        tcpClient.send(CommandCode.User.CHANGE_PASSWORD, payload);
     }
 
     @Override
@@ -147,7 +137,7 @@ class UsersTcpClient implements UsersClient {
         payload.writeIntLE(context.length());
         payload.writeBytes(context.getBytes());
 
-        var response = tcpClient.send(LOGIN_USER_CODE, payload);
+        var response = tcpClient.send(CommandCode.User.LOGIN, payload);
 
         var userId = response.readUnsignedIntLE();
         return new IdentityInfo(userId, Optional.empty());
@@ -155,6 +145,6 @@ class UsersTcpClient implements UsersClient {
 
     @Override
     public void logout() {
-        tcpClient.send(LOGOUT_USER_CODE);
+        tcpClient.send(CommandCode.User.LOGOUT);
     }
 }
