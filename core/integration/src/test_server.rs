@@ -33,10 +33,7 @@ use futures::executor::block_on;
 use uuid::Uuid;
 
 use iggy::prelude::UserStatus::Active;
-use iggy::prelude::{
-    Client, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, StreamClient, UserClient,
-};
-use iggy::prelude::{GlobalPermissions, Identifier, IdentityInfo, IggyClient, Permissions};
+use iggy::prelude::*;
 use server::configs::config_provider::{ConfigProvider, FileConfigProvider};
 
 pub const SYSTEM_PATH_ENV_VAR: &str = "IGGY_SYSTEM_PATH";

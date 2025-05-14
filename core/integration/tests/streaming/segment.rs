@@ -19,11 +19,6 @@
 use crate::streaming::common::test_setup::TestSetup;
 use crate::streaming::create_message;
 use bytes::Bytes;
-use iggy::prelude::CompressionAlgorithm;
-use iggy::prelude::Confirmation;
-use iggy::prelude::Identifier;
-use iggy::prelude::IggyError;
-use iggy::prelude::MaxTopicSize;
 use iggy::prelude::locking::IggySharedMutFn;
 use iggy::prelude::*;
 use server::configs::server::{DataMaintenanceConfig, PersonalAccessTokenConfig};

@@ -18,9 +18,7 @@
 
 use crate::test_server::ClientFactory;
 use async_trait::async_trait;
-use iggy::prelude::Client;
-use iggy::prelude::TcpClient;
-use iggy::prelude::TcpClientConfig;
+use iggy::prelude::{Client, TcpClient, TcpClientConfig};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Default)]
