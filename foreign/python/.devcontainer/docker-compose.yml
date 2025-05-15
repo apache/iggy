@@ -1,0 +1,13 @@
+services:
+  devcontainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ..:/workspace:cached
+    network_mode: service:iggy
+    command: sleep infinity
+
+  iggy:
+    image: iggyrs/iggy:latest
+    restart: unless-stopped

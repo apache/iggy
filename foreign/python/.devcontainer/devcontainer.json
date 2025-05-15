@@ -1,0 +1,9 @@
+{
+  "name": "Iggy Python SDK devcontainer",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "devcontainer",
+  "features": {
+    "ghcr.io/devcontainers/features/rust:1": {}
+  },
+  "workspaceFolder": "/workspace"
+}
