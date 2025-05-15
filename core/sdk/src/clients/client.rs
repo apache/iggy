@@ -75,6 +75,8 @@ impl IggyClient {
         }
     }
 
+    /// Creates a new `IggyClient` with the provided connection string.
+    /// Currently only support TCP transport by default, more transports will be supported in the future.
     pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
         let client = Box::new(TcpClient::from_connection_string(connection_string)?);
         Ok(IggyClient::new(client))
