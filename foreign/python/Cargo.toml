@@ -8,6 +8,8 @@ description = "Apache Iggy is the persistent message streaming platform written 
 documentation = "https://docs.iggy.rs"
 repository = "https://github.com/iggy-rs/iggy"
 
+[workspace]
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
 name = "iggy_py"
@@ -21,4 +23,5 @@ pyo3-stub-gen = "0.7.0"
 
 [[bin]]
 name = "stub_gen"
+path = "src/bin/stub_gen.rs"
 doc = false
