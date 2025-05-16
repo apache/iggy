@@ -142,7 +142,7 @@ impl<'a> IggyExampleTest<'a> {
     pub(crate) async fn execute_test(&mut self, test_case: impl IggyExampleTestCase) {
         assert!(
             self.server.is_started(),
-            "Server is not running, make sure it has been started with IggyExampleTest::setup()"
+            "Server is not running, make sure it has been started with IggyExampleTest::new()"
         );
         let (producer_stdout, consumer_stdout) = self
             .spawn_executables(test_case.protocol(&self.server))
