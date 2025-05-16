@@ -61,13 +61,6 @@ impl IggyShardBuilder {
             .expect("Failed to find connection with the specified ID");
         let shards = connections.into_iter().map(Shard::new).collect();
 
-        IggyShard::new(
-            id,
-            shards,
-            config,
-            stop_receiver,
-            stop_sender,
-            receiver,
-        )
+        IggyShard::new(id, shards, config, stop_receiver, stop_sender, receiver)
     }
 }
