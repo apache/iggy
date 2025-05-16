@@ -91,6 +91,5 @@ impl IggyShard {
         }
     }
 
-    pub fn assert_init(&self) {
-    }
+    pub fn assert_init(&self) {}
 }
