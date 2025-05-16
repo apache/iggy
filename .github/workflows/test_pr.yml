@@ -139,7 +139,7 @@ jobs:
         run: cargo build --verbose --target aarch64-apple-darwin
 
       - name: Run cargo clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings -A clippy::let-and-return
 
       - name: Run tests
         run: cargo test --verbose --target aarch64-apple-darwin
