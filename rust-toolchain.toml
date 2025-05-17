@@ -1,0 +1,4 @@
+[toolchain]
+channel = "1.85.1"
+components = ["rustc", "cargo", "clippy", "rustfmt"]
+targets = ["aarch64-apple-darwin"]  # 可选，指定目标平台

@@ -48,19 +48,16 @@ jobs:
           command: fmt
           args: --all -- --check
 
-#  clippy:
-#    name: cargo clippy
-#    runs-on: ubuntu-latest
-#    steps:
-#      - uses: actions/checkout@v4
-#      - uses: actions-rs/toolchain@v1
-#        with:
-#          toolchain: stable
-#          override: true
-#      - uses: actions-rs/cargo@v1
-#        with:
-#          command: clippy
-#          args: --all-targets --all-features -- -D warnings
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rs/toolchain@v1
+      - uses: actions-rs/cargo@v1
+        with:
+          command: clippy
+          args: --all-targets --all-features -- -D warnings
 
   sort:
     name: cargo sort
