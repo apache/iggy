@@ -159,7 +159,7 @@ pub fn map_personal_access_tokens(
 }
 
 pub fn map_client(client: &Client) -> iggy_common::ClientInfoDetails {
-    let client = iggy_common::ClientInfoDetails {
+    iggy_common::ClientInfoDetails {
         client_id: client.session.client_id,
         user_id: client.user_id,
         transport: client.transport.to_string(),
@@ -174,8 +174,7 @@ pub fn map_client(client: &Client) -> iggy_common::ClientInfoDetails {
                 group_id: consumer_group.group_id,
             })
             .collect(),
-    };
-    client
+    }
 }
 
 pub async fn map_clients(clients: &[IggySharedMut<Client>]) -> Vec<iggy_common::ClientInfo> {

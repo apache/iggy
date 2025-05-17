@@ -276,9 +276,8 @@ impl Default for ContextReaderWriter {
 }
 
 pub fn iggy_home() -> Option<PathBuf> {
-    let iggy_home = match var(ENV_IGGY_HOME) {
+    match var(ENV_IGGY_HOME) {
         Ok(home) => Some(PathBuf::from(home)),
         Err(_) => home_dir().map(|dir| dir.join(path::Path::new(DEFAULT_IGGY_HOME_VALUE))),
-    };
-    iggy_home
+    }
 }

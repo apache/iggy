@@ -52,7 +52,7 @@ impl IggyIndexesMut {
     /// Decompose the container into its components
     pub fn decompose(mut self) -> (u32, PooledBuffer) {
         let base_position = self.base_position;
-        let buffer = std::mem::replace(&mut self.buffer, PooledBuffer::empty());
+        let buffer = std::mem::take(&mut self.buffer);
         (base_position, buffer)
     }
 

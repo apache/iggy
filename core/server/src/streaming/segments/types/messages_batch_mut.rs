@@ -259,7 +259,7 @@ impl IggyMessagesBatchMut {
     /// Decomposes the batch into its constituent parts.
     pub fn decompose(mut self) -> (IggyIndexesMut, PooledBuffer) {
         let indexes = std::mem::replace(&mut self.indexes, IggyIndexesMut::empty());
-        let messages = std::mem::replace(&mut self.messages, PooledBuffer::empty());
+        let messages = std::mem::take(&mut self.messages);
 
         (indexes, messages)
     }

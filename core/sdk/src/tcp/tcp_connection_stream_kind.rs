@@ -21,6 +21,7 @@ use crate::tcp::tcp_tls_connection_stream::TcpTlsConnectionStream;
 use iggy_common::IggyError;
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // TODO(hubcio): consider `Box`ing
 pub(crate) enum ConnectionStreamKind {
     Tcp(TcpConnectionStream),
     TcpTls(TcpTlsConnectionStream),
