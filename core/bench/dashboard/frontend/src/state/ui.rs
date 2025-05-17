@@ -20,9 +20,11 @@ use std::rc::Rc;
 use yew::prelude::*;
 
 #[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)]
 pub enum ViewMode {
-    SingleGitref, // View detailed performance for a specific gitref
-    GitrefTrend,  // View performance trends across all gitrefs
+    SingleGitref,     // View detailed performance for a specific gitref
+    GitrefTrend,      // View performance trends across all gitrefs
+    RecentBenchmarks, // View recently added benchmarks
 }
 
 #[derive(Clone, Debug, PartialEq)]

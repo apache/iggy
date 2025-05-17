@@ -32,10 +32,6 @@ The project is organized as a Rust workspace with four main components:
   - Configurable through command-line arguments
   - Built-in security features
 
-- `runner/`: Benchmark runner
-  - Runs local benchmarks and collects results
-  - Organizes benchmark results in a structured format
-
 - `shared/`: Common code between components
   - Type definitions
   - Serialization logic
@@ -116,15 +112,6 @@ All endpoints return JSON responses (except artifacts which returns a ZIP file) 
 - 200: Success
 - 404: Resource not found
 - 500: Server error
-
-### Runner
-
-Allows to run and collect performance results for multiple gitrefs back:
-
-```bash
-cargo run --bin bench-runner -- --directory ~/rust/iggy --count 10 --gitref master --skip-master-check
-out --output-dir performance_results
-```
 
 ## Prerequisites
 

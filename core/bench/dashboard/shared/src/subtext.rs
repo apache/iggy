@@ -57,6 +57,15 @@ impl BenchmarkReportLight {
         format!("{params_text}\n{stats_text}")
     }
 
+    pub fn identifier_with_cpu_and_version(&self) -> String {
+        format!(
+            "{} @ {} (server {})",
+            self.hardware.identifier.as_deref().unwrap_or("identifier"),
+            self.hardware.cpu_name,
+            self.params.gitref.as_deref().unwrap_or("version")
+        )
+    }
+
     fn format_latency_stats(&self) -> String {
         self.group_metrics
             .iter()
