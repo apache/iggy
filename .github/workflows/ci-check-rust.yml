@@ -100,7 +100,7 @@ jobs:
       - name: Install toolchain
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: stable
+          toolchain: 1.85.0
           override: true
       - name: Run cargo clippy (macos)
         uses: actions-rs/cargo@v1
