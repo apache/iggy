@@ -138,6 +138,9 @@ jobs:
       - name: Build binary
         run: cargo build --verbose --target aarch64-apple-darwin
 
+      - name: Run cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
       - name: Run tests
         run: cargo test --verbose --target aarch64-apple-darwin
 
