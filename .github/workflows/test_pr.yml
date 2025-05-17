@@ -127,7 +127,7 @@ jobs:
 
       - uses: actions-rs/toolchain@v1
         with:
-          toolchain: "1.85"
+          toolchain: 1.85.0
           override: true
 
       - name: Cache cargo & target directories
