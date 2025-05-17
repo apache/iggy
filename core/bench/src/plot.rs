@@ -132,10 +132,7 @@ fn save_chart(
     let full_output_path = Path::new(output_directory).join(format!("{}.html", file_name));
 
     let mut renderer = HtmlRenderer::new(file_name, width, height).theme(Theme::Dark);
-    renderer.save(chart, &full_output_path).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to save HTML plot: {}", e),
-        )
-    })
+    renderer
+        .save(chart, &full_output_path)
+        .map_err(|e| std::io::Error::other(format!("Failed to save HTML plot: {}", e)))
 }

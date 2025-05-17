@@ -68,6 +68,7 @@ pub trait Archiver: Send {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // TODO(hubcio): consider `Box`ing
 pub enum ArchiverKind {
     Disk(DiskArchiver),
     S3(S3Archiver),
