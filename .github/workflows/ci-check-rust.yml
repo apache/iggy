@@ -83,7 +83,7 @@ jobs:
       - name: Install toolchain
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: 1.85.1
+          toolchain: stable
           override: true
       - name: Run cargo clippy
         uses: actions-rs/cargo@v1
