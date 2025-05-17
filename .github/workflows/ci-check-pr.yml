@@ -56,6 +56,7 @@ jobs:
       trigger-rust: ${{ steps.changed-files.outputs.RUST_FILES_CHANGED }}
       trigger-shell: ${{ steps.changed-files.outputs.SHELL_FILES_CHANGED }}
       trigger-java-sdk: ${{ steps.changed-files.outputs.JAVA-SDK_FILES_CHANGED }}
+      trigger-python-sdk: ${{ steps.changed-files.outputs.PYTHON-SDK_FILES_CHANGED }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -126,6 +127,12 @@ jobs:
     if: ${{ needs.pr-file-changes.outputs.trigger-java-sdk == 'true' }}
     uses: ./.github/workflows/ci-check-java-sdk.yml
 
+  ci-check-python-sdk:
+    name: ci-check-python-sdk
+    needs: pr-file-changes
+    if: ${{ needs.pr-file-changes.outputs.trigger-python-sdk == 'true' }}
+    uses: ./.github/workflows/ci-check-python-sdk.yml
+
   finalize-pr:
     runs-on: ubuntu-latest
     needs:
@@ -136,6 +143,7 @@ jobs:
       - ci-compatibility-rust
       - ci-check-shell
       - ci-check-java-sdk
+      - ci-check-python-sdk
     if: always()
     steps:
       - name: Everything is fine

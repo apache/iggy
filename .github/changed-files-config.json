@@ -24,5 +24,12 @@
     "foreign/java/.*\\.kts",
     "foreign/java/.*\\.sh",
     ".github/workflows/ci-check-java-sdk.yml"
+  ],
+  "python-sdk": [
+    "foreign/python/.*\\.py",
+    "foreign/python/.*\\.rs",
+    "foreign/python/pyproject.toml",
+    "foreign/python/Cargo.toml",
+    ".github/workflows/ci-check-python-sdk.yml"
   ]
 }
