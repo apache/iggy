@@ -15,6 +15,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+
 pub mod builder;
 pub mod connector;
 pub mod frame;
@@ -25,9 +26,9 @@ use builder::IggyShardBuilder;
 use connector::{Receiver, ShardConnector, StopReceiver, StopSender};
 use frame::ShardFrame;
 use namespace::IggyNamespace;
-use std::cell::{Cell, RefCell};
+use std::{cell::{Cell, RefCell}, rc::Rc, sync::Arc};
 
-use crate::configs::server::ServerConfig;
+use crate::{bootstrap::create_root_user, configs::server::ServerConfig, state::file::FileState, streaming::storage::SystemStorage};
 pub(crate) struct Shard {
     id: u16,
     connection: ShardConnector<ShardFrame>,
@@ -49,21 +50,23 @@ struct ShardInfo {
 pub struct IggyShard {
     pub id: u16,
     shards: Vec<Shard>,
-    //shards_table: RefCell<HashMap<IggyNamespace, ShardInfo>>,
+    shards_table: RefCell<HashMap<IggyNamespace, ShardInfo>>,
 
     //pub(crate) permissioner: RefCell<Permissioner>,
     //pub(crate) streams: RwLock<HashMap<u32, Stream>>,
     //pub(crate) streams_ids: RefCell<HashMap<String, u32>>,
     //pub(crate) users: RefCell<HashMap<UserId, User>>,
+    // TODO: Refactor.
+    pub(crate) storage: Arc<SystemStorage>,
 
     // TODO - get rid of this dynamic dispatch.
-    //pub(crate) state: Rc<FileState>,
+    pub(crate) state: Rc<FileState>,
     //pub(crate) encryptor: Option<Rc<dyn Encryptor>>,
     config: ServerConfig,
     //pub(crate) client_manager: RefCell<ClientManager>,
     //pub(crate) active_sessions: RefCell<Vec<Session>>,
     //pub(crate) metrics: Metrics,
-    pub message_receiver: Cell<Option<Receiver<ShardFrame>>>,
+    pub frame_receiver: Cell<Option<Receiver<ShardFrame>>>,
     stop_receiver: StopReceiver,
     stop_sender: StopSender,
 }
@@ -73,22 +76,26 @@ impl IggyShard {
         Default::default()
     }
 
-    pub(crate) fn new(
-        id: u16,
-        shards: Vec<Shard>,
-        config: ServerConfig,
-        stop_receiver: StopReceiver,
-        stop_sender: StopSender,
-        shard_messages_receiver: Receiver<ShardFrame>,
-    ) -> Self {
-        Self {
-            id,
-            shards,
-            config,
-            stop_receiver,
-            stop_sender,
-            message_receiver: Cell::new(Some(shard_messages_receiver)),
-        }
+    pub async fn init(&mut self) {
+        let user = create_root_user();
+        self.load_state().await;
+        self.load_users().await;
+        // Add default root user.
+        todo!();
+        self.load_streams().await;
+
+    }
+
+    async fn load_state(&self) {
+        todo!()
+    }
+
+    async fn load_users(&self) {
+        todo!()
+    }
+
+    async fn load_streams(&self) {
+        todo!()
     }
 
     pub fn assert_init(&self) {}
