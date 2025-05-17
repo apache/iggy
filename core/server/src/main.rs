@@ -21,11 +21,13 @@ use std::thread::available_parallelism;
 use anyhow::Result;
 use clap::Parser;
 use dotenvy::dotenv;
+use error_set::ErrContext;
 use figlet_rs::FIGfont;
 use monoio::Buildable;
 use server::args::Args;
 use server::bootstrap::{
     create_default_executor, create_directories, create_root_user, create_shard_connections,
+    load_config,
 };
 use server::channels::commands::archive_state::ArchiveStateExecutor;
 use server::channels::commands::clean_personal_access_tokens::CleanPersonalAccessTokensExecutor;
@@ -73,17 +75,12 @@ fn main() -> Result<(), ServerError> {
     }
 
     let args = Args::parse();
+    // TODO: I think we could get rid of config provider, since we support only TOML
+    // as config provider.
     let config_provider = config_provider::resolve(&args.config_provider)?;
     let config = std::thread::scope(|scope| {
         let config = scope
             .spawn(move || {
-                async fn load_config(
-                    config_provider: &ConfigProviderKind,
-                ) -> Result<ServerConfig, ServerError> {
-                    let config = ServerConfig::load(config_provider).await?;
-                    Ok(config)
-                }
-
                 let mut rt = create_default_executor::<monoio::IoUringDriver>();
                 rt.block_on(load_config(&config_provider))
             })
@@ -93,7 +90,7 @@ fn main() -> Result<(), ServerError> {
     })?;
 
     // Create directories and root user.
-    // Remove `local_data` directory if run with `--fresh` flag. 
+    // Remove `local_data` directory if run with `--fresh` flag.
     std::thread::scope(|scope| {
         scope
             .spawn(|| {
@@ -115,14 +112,15 @@ fn main() -> Result<(), ServerError> {
                         }
                     }
 
-                    // Create directories and root user
-                    create_directories().await;
-                    create_root_user().await;
-                });
+                    // Create directories. 
+                    create_directories(&config.system).await?;
+                    Ok::<(), ServerError>(())
+                })
             })
             .join()
-            .expect("Failed to create directories and root user");
-    });
+            .expect("Failed to create directories and root user")
+    })
+    .with_error_context(|err| format!("Failed to create directories, err: {err}"))?;
 
     // Initialize logging
     let mut logging = Logging::new(config.telemetry.clone());
@@ -153,20 +151,21 @@ fn main() -> Result<(), ServerError> {
                 // let urb = io_uring::IoUring::builder();
                 // TODO: Shall we make the size of ring be configureable ?
                 let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-                    //.uring_builder(urb.setup_coop_taskrun())
+                    //.uring_builder(urb.setup_coop_taskrun()) // broken shit.
                     .with_entries(1024) // Default size
                     .enable_timer()
                     .build()
                     .expect(format!("Failed to build monoio runtime for shard-{id}").as_str());
                 rt.block_on(async move {
                     let builder = IggyShard::builder();
-                    let shard = builder
+                    let mut shard = builder
                         .id(id)
                         .connections(connections)
                         .server_config(server_config)
-                        .build_and_init()
+                        .build()
                         .await;
 
+                    shard.init().await;
                     shard.assert_init();
                 })
             })
