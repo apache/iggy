@@ -15,6 +15,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct IggyNamespace {
     pub(crate) stream_id: u32,

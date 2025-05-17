@@ -16,7 +16,12 @@
  * under the License.
  */
 
-use crate::{configs::server::ServerConfig, shard::Shard};
+use std::{cell::Cell, rc::Rc, sync::Arc};
+
+use iggy_common::{Aes256GcmEncryptor, EncryptorKind};
+use tracing::info;
+
+use crate::{configs::server::ServerConfig, map_toggle_str, shard::Shard, state::{file::FileState, StateKind}, streaming::{persistence::persister::{FilePersister, FileWithSyncPersister, PersisterKind}, storage::SystemStorage}, versioning::SemanticVersion};
 
 use super::{connector::ShardConnector, frame::ShardFrame, IggyShard};
 
@@ -43,11 +48,12 @@ impl IggyShardBuilder {
         self
     }
 
-    pub async fn build_and_init(self) -> IggyShard {
+    // TODO: Too much happens in there, some of those bootstrapping logic should be moved outside.
+    pub async fn build(self) -> IggyShard {
         let id = self.id.unwrap();
         let config = self.config.unwrap();
         let connections = self.connections.unwrap();
-        let (stop_sender, stop_receiver, receiver) = connections
+        let (stop_sender, stop_receiver, frame_receiver) = connections
             .iter()
             .filter(|c| c.id == id)
             .map(|c| {
@@ -60,7 +66,47 @@ impl IggyShardBuilder {
             .next()
             .expect("Failed to find connection with the specified ID");
         let shards = connections.into_iter().map(Shard::new).collect();
+        let version = SemanticVersion::current().expect("Invalid version");
 
-        IggyShard::new(id, shards, config, stop_receiver, stop_sender, receiver)
+        info!(
+            "Server-side encryption is {}.",
+            map_toggle_str(config.system.encryption.enabled)
+        );
+        let encryptor: Option<Arc<EncryptorKind>> = match config.system.encryption.enabled {
+            true => Some(Arc::new(EncryptorKind::Aes256Gcm(
+                Aes256GcmEncryptor::from_base64_key(&config.system.encryption.key).unwrap(),
+            ))),
+            false => None,
+        };
+
+        let state_persister = Self::resolve_persister(config.system.state.enforce_fsync);
+        let state = Rc::new(StateKind::File(FileState::new(
+            &config.system.get_state_messages_file_path(),
+            &version,
+            state_persister,
+            encryptor.clone(),
+        )));
+
+        let partition_persister = Self::resolve_persister(config.system.partition.enforce_fsync);
+        let storage = SystemStorage::new(config.system, partition_persister);
+
+        IggyShard {
+                id: id,
+                shards: shards,
+                shards_table: Default::default(),
+                storage: storage,
+                state: state,
+                config: config,
+                stop_receiver: stop_receiver,
+                stop_sender: stop_sender,
+                frame_receiver: Cell::new(Some(frame_receiver)),
+            }
+    }
+
+    fn resolve_persister(enforce_fsync: bool) -> Arc<PersisterKind> {
+        match enforce_fsync {
+            true => Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister)),
+            false => Arc::new(PersisterKind::File(FilePersister)),
+        }
     }
 }
