@@ -54,6 +54,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rs/toolchain@v1
+        with:
+          toolchain: 1.85
+          override: true
       - uses: actions-rs/cargo@v1
         with:
           command: clippy
