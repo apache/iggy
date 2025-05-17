@@ -83,7 +83,7 @@ jobs:
       - name: Install toolchain
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: stable
+          toolchain: 1.85.1
           override: true
       - name: Run cargo clippy
         uses: actions-rs/cargo@v1
@@ -107,8 +107,6 @@ jobs:
         with:
           command: clippy
           args: --all-targets --all-features -- -D warnings
-          toolchain: 1.85.1
-          override: true
 
   clippy-windows:
     name: cargo clippy windows
