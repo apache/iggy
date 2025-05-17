@@ -84,18 +84,7 @@ impl FileState {
 
 impl State for FileState {
     async fn init(&self) -> Result<Vec<StateEntry>, IggyError> {
-        if !Path::new(&self.path).exists() {
-            info!("State file does not exist, creating a new one");
-            self.persister
-                .overwrite(&self.path, &[])
-                .await
-                .with_error_context(|error| {
-                    format!(
-                        "{COMPONENT} (error: {error}) - failed to overwrite state file, path: {}",
-                        self.path
-                    )
-                })?;
-        }
+        assert!(Path::new(&self.path).exists());
 
         let entries = self.load_entries().await.with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to load entries")
