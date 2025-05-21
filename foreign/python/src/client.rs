@@ -19,8 +19,8 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use iggy::client::{SystemClient, TopicClient};
 use iggy::client::{Client, MessageClient, StreamClient, UserClient};
+use iggy::client::{SystemClient, TopicClient};
 use iggy::clients::builder::IggyClientBuilder;
 use iggy::clients::client::IggyClient as RustIggyClient;
 use iggy::compression::compression_algorithm::CompressionAlgorithm;
