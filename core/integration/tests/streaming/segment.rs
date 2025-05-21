@@ -673,11 +673,11 @@ async fn assert_persisted_segment(partition_path: &str, start_offset: u64) {
 }
 
 fn get_segment_paths_for_partition(partition_path: &str) -> Vec<DirEntry> {
-    let paths = std::fs::read_dir(partition_path)
+    std::fs::read_dir(partition_path)
         .map(|read_dir| {
             read_dir
                 .filter_map(|dir_entry| {
-                    let result = dir_entry
+                    dir_entry
                         .map(|dir_entry| {
                             match dir_entry
                                 .path()
@@ -689,15 +689,11 @@ fn get_segment_paths_for_partition(partition_path: &str) -> Vec<DirEntry> {
                             }
                         })
                         .ok()
-                        .flatten();
-
-                    result
+                        .flatten()
                 })
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_default();
-
-    paths
+        .unwrap_or_default()
 }
 
 fn get_start_offsets() -> Vec<u64> {

@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{AutoLogin, IggyDuration, TcpClientConfig};
+use crate::{AutoLogin, IggyDuration, IggyError, TcpClientConfig};
+use std::net::SocketAddr;
 
 /// Builder for the TCP client configuration.
 /// Allows configuring the TCP client with custom settings or using defaults:
@@ -89,7 +90,83 @@ impl TcpClientConfigBuilder {
     }
 
     /// Builds the TCP client configuration.
-    pub fn build(self) -> TcpClientConfig {
-        self.config
+    pub fn build(self) -> Result<TcpClientConfig, IggyError> {
+        let addr = self.config.server_address.trim();
+
+        if addr.parse::<SocketAddr>().is_err() {
+            let (ip, port) = addr.rsplit_once(':').unwrap_or((addr, ""));
+            return Err(IggyError::InvalidIpAddress(ip.to_owned(), port.to_owned()));
+        }
+
+        Ok(self.config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::IggyError;
+
+    fn builder_with_address(addr: &str) -> TcpClientConfigBuilder {
+        let mut builder = TcpClientConfigBuilder::default();
+        builder.config.server_address = addr.to_string();
+        builder
+    }
+
+    #[test]
+    fn valid_ipv4_should_succeed() {
+        let builder = builder_with_address("127.0.0.1:8080");
+        assert!(builder.build().is_ok());
+    }
+
+    #[test]
+    fn valid_ipv6_with_brackets_should_succeed() {
+        let builder = builder_with_address("[::1]:8080");
+        assert!(builder.build().is_ok());
+    }
+
+    #[test]
+    fn valid_ipv6_without_brackets_should_fail() {
+        let builder = builder_with_address("::1:8080");
+        assert!(matches!(
+            builder.build(),
+            Err(IggyError::InvalidIpAddress(_, _))
+        ));
+    }
+
+    #[test]
+    fn invalid_ip_should_fail() {
+        let builder = builder_with_address("invalid.ip:8080");
+        assert!(matches!(
+            builder.build(),
+            Err(IggyError::InvalidIpAddress(_, _))
+        ));
+    }
+
+    #[test]
+    fn invalid_port_should_fail() {
+        let builder = builder_with_address("127.0.0.1:invalid");
+        assert!(matches!(
+            builder.build(),
+            Err(IggyError::InvalidIpAddress(_, _))
+        ));
+    }
+
+    #[test]
+    fn ipv6_missing_closing_bracket_should_fail() {
+        let builder = builder_with_address("[::1:8080");
+        assert!(matches!(
+            builder.build(),
+            Err(IggyError::InvalidIpAddress(_, _))
+        ));
+    }
+
+    #[test]
+    fn missing_port_should_fail() {
+        let builder = builder_with_address("127.0.0.1");
+        assert!(matches!(
+            builder.build(),
+            Err(IggyError::InvalidIpAddress(_, _))
+        ));
     }
 }

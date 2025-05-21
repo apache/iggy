@@ -130,12 +130,12 @@ impl System {
         let loaded_streams = RefCell::new(Vec::new());
         let load_stream_tasks = unloaded_streams.into_iter().map(|mut stream| {
             let state = streams_states.remove(&stream.stream_id).unwrap();
-            let load_stream_task = async {
+
+            async {
                 stream.load(state).await?;
                 loaded_streams.borrow_mut().push(stream);
                 Result::<(), IggyError>::Ok(())
-            };
-            load_stream_task
+            }
         });
         try_join_all(load_stream_tasks).await?;
 
