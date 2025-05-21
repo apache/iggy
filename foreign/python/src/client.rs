@@ -95,10 +95,10 @@ impl IggyClient {
     fn ping<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
-            inner.ping().await.map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e))
-            })?;
-            Ok(())
+            inner
+                .ping()
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e)))
         })
     }
 

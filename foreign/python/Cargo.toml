@@ -16,9 +16,9 @@ name = "iggy_py"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pyo3 = "0.22.0"
+pyo3 = "0.25.0"
 iggy = "0.6.201"
-pyo3-async-runtimes = { version = "0.22.0", features = ["attributes", "tokio-runtime"] }
+pyo3-async-runtimes = { version = "0.25.0", features = ["attributes", "tokio-runtime"] }
 pyo3-stub-gen = "0.7.0"
 
 [[bin]]
