@@ -53,7 +53,7 @@ impl TopicDetails {
     }
 
     #[getter]
-    pub fn topics_count(&self) -> u32 {
+    pub fn partitions_count(&self) -> u32 {
         self.inner.partitions_count
     }
 }
