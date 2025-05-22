@@ -194,7 +194,7 @@ class TopicDetails:
     id: builtins.int
     name: builtins.str
     messages_count: builtins.int
-    topics_count: builtins.int
+    partitions_count: builtins.int
 
 class MessageState(Enum):
     Available = auto()
