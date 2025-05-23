@@ -18,12 +18,11 @@
 
 use crate::clients::client::IggyClient;
 use crate::http::http_client::HttpClient;
-use crate::http::http_config::HttpClientConfigBuilder;
 use crate::prelude::{
-    AutoLogin, Client, EncryptorKind, IggyDuration, IggyError, Partitioner, TcpClientConfigBuilder,
+    AutoLogin, Client, EncryptorKind, HttpClientConfigBuilder, IggyDuration, IggyError,
+    Partitioner, QuicClientConfigBuilder, TcpClientConfigBuilder,
 };
 use crate::quic::quick_client::QuicClient;
-use crate::quic::quick_config::QuicClientConfigBuilder;
 use crate::tcp::tcp_client::TcpClient;
 use std::sync::Arc;
 use tracing::error;

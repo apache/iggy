@@ -21,19 +21,20 @@ use iggy_binary_protocol::{
     BinaryClient, BinaryTransport, Client, PersonalAccessTokenClient, UserClient,
 };
 
-use crate::prelude::IggyDuration;
-use crate::prelude::IggyError;
-use crate::prelude::IggyTimestamp;
-use crate::quic::quick_config::QuicClientConfig;
+use crate::prelude::{IggyDuration, IggyError, IggyTimestamp, QuicClientConfig};
 use crate::quic::skip_server_verification::SkipServerVerification;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::Bytes;
-use iggy_common::{ClientState, Command, Credentials, DiagnosticEvent};
+use iggy_common::{
+    ClientState, Command, ConnectionString, ConnectionStringUtils, Credentials, DiagnosticEvent,
+    QuicConnectionStringOptions,
+};
 use quinn::crypto::rustls::QuicClientConfig as QuinnQuicClientConfig;
 use quinn::{ClientConfig, Connection, Endpoint, IdleTimeout, RecvStream, VarInt};
 use rustls::crypto::CryptoProvider;
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -200,6 +201,17 @@ impl QuicClient {
             events: broadcast(1000),
             connected_at: Mutex::new(None),
         })
+    }
+
+    /// Creates a new QUIC client from a connection string.
+    pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
+        if ConnectionStringUtils::parse_protocol(connection_string)? != "QUIC" {
+            return Err(IggyError::InvalidConnectionString);
+        }
+
+        Self::create(Arc::new(
+            ConnectionString::<QuicConnectionStringOptions>::from_str(connection_string)?.into(),
+        ))
     }
 
     async fn handle_response(&self, recv: &mut RecvStream) -> Result<Bytes, IggyError> {

@@ -16,16 +16,15 @@
  * under the License.
  */
 
-use crate::http::http_config::HttpClientConfig;
 use crate::http::http_transport::HttpTransport;
-use crate::prelude::Client;
-use crate::prelude::IggyDuration;
-use crate::prelude::IggyError;
+use crate::prelude::{Client, HttpClientConfig, IggyDuration, IggyError};
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
-use iggy_common::DiagnosticEvent;
-use iggy_common::IdentityInfo;
 use iggy_common::locking::{IggySharedMut, IggySharedMutFn};
+use iggy_common::{
+    ConnectionString, ConnectionStringUtils, DiagnosticEvent, HttpConnectionStringOptions,
+    IdentityInfo,
+};
 use reqwest::{Response, StatusCode, Url};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
@@ -284,6 +283,17 @@ impl HttpClient {
             access_token: IggySharedMut::new("".to_string()),
             events: broadcast(1000),
         })
+    }
+
+    /// Create a new HttpClient from a connection string.
+    pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
+        if ConnectionStringUtils::parse_protocol(connection_string)? != "HTTP" {
+            return Err(IggyError::InvalidConnectionString);
+        }
+
+        Self::create(Arc::new(
+            ConnectionString::<HttpConnectionStringOptions>::from_str(connection_string)?.into(),
+        ))
     }
 
     async fn handle_response(response: Response) -> Result<Response, IggyError> {

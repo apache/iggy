@@ -18,9 +18,8 @@
 
 use crate::test_server::ClientFactory;
 use async_trait::async_trait;
-use iggy::prelude::Client;
+use iggy::prelude::{Client, QuicClientConfig};
 use iggy::quic::quick_client::QuicClient;
-use iggy::quic::quick_config::QuicClientConfig;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
