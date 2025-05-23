@@ -23,7 +23,6 @@ using Iggy_SDK.Contracts.Tcp;
 using Iggy_SDK.Enums;
 using Iggy_SDK_Tests.Utils.Groups;
 using Iggy_SDK_Tests.Utils.Messages;
-using Iggy_SDK_Tests.Utils.Offset;
 using Iggy_SDK_Tests.Utils.Partitions;
 using Iggy_SDK_Tests.Utils.Streams;
 using Iggy_SDK_Tests.Utils.Topics;
@@ -31,6 +30,7 @@ using Iggy_SDK_Tests.Utils.Users;
 using Iggy_SDK.Contracts.Http.Auth;
 using System.Buffers.Binary;
 using System.Text;
+using Iggy_SDK_Tests.Utils.Offsets;
 
 namespace Iggy_SDK_Tests.ContractTests;
 

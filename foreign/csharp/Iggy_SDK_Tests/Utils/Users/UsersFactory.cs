@@ -16,6 +16,7 @@
 // under the License.
 
 using Iggy_SDK.Contracts.Http;
+using Iggy_SDK.Contracts.Http.Auth;
 using Iggy_SDK.Enums;
 namespace Iggy_SDK_Tests.Utils.Users;
 

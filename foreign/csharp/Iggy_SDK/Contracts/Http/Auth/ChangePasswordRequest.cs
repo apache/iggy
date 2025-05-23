@@ -16,7 +16,8 @@
 // under the License.
 
 using System.Text.Json.Serialization;
-namespace Iggy_SDK.Contracts.Http;
+
+namespace Iggy_SDK.Contracts.Http.Auth;
 
 public sealed class ChangePasswordRequest
 {

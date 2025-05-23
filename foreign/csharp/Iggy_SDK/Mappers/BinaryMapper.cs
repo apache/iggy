@@ -22,6 +22,7 @@ using Iggy_SDK.Headers;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Text;
+using Iggy_SDK.Contracts.Http.Auth;
 
 namespace Iggy_SDK.Mappers;
 //TODO - write unit tests for all the users related mappers

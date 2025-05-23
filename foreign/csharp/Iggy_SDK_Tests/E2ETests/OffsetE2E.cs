@@ -19,7 +19,7 @@ using FluentAssertions;
 using Iggy_SDK_Tests.E2ETests.Fixtures;
 using Iggy_SDK_Tests.E2ETests.Fixtures.Bootstraps;
 using Iggy_SDK_Tests.Utils;
-using Iggy_SDK_Tests.Utils.Offset;
+using Iggy_SDK_Tests.Utils.Offsets;
 using Iggy_SDK.Contracts.Http;
 
 namespace Iggy_SDK_Tests.E2ETests;
