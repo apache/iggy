@@ -1,0 +1,168 @@
+/* Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+use std::{str::FromStr, time::Duration};
+
+use async_trait::async_trait;
+use iggy_connector_sdk::{
+    Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
+};
+use rand::{
+    Rng,
+    distr::{Alphanumeric, Uniform},
+};
+use serde::{Deserialize, Serialize};
+use tokio::{sync::Mutex, time::sleep};
+use tracing::info;
+use uuid::Uuid;
+
+source_connector!(TestSource);
+
+#[derive(Debug)]
+pub struct TestSource {
+    id: u32,
+    max_count: Option<usize>,
+    interval: Duration,
+    messages_range: (u32, u32),
+    payload_size: u32,
+    state: Mutex<State>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TestSourceConfig {
+    interval: Option<String>,
+    max_count: Option<usize>,
+    messages_range: Option<(u32, u32)>,
+    payload_size: Option<u32>,
+}
+
+#[derive(Debug)]
+struct State {
+    current_number: usize,
+}
+
+impl TestSource {
+    pub fn new(id: u32, config: TestSourceConfig) -> Self {
+        let interval = config.interval.unwrap_or("1s".to_string());
+        let interval = humantime::Duration::from_str(&interval)
+            .unwrap_or(humantime::Duration::from_str("1s").unwrap());
+        TestSource {
+            id,
+            max_count: config.max_count,
+            interval: *interval,
+            messages_range: config.messages_range.unwrap_or((10, 50)),
+            payload_size: config.payload_size.unwrap_or(100),
+            state: Mutex::new(State { current_number: 0 }),
+        }
+    }
+
+    fn generate_messages(&self) -> Vec<ProducedMessage> {
+        let mut messages = Vec::new();
+        let mut rng = rand::rng();
+        let messages_count =
+            rng.sample(Uniform::new(self.messages_range.0, self.messages_range.1).unwrap());
+        for _ in 0..messages_count {
+            let record = Record {
+                id: Uuid::new_v4(),
+                title: "Hello".to_string(),
+                name: "World".to_string(),
+                text: self.generate_random_text(),
+            };
+            let Ok(payload) = simd_json::to_vec(&record) else {
+                panic!("Failed to serialize record");
+            };
+
+            let message = ProducedMessage {
+                id: None,
+                headers: None,
+                checksum: None,
+                timestamp: None,
+                origin_timestamp: None,
+                payload,
+            };
+            messages.push(message);
+        }
+        messages
+    }
+
+    fn generate_random_text(&self) -> String {
+        let mut rng = rand::rng();
+        let text: String = (0..self.payload_size)
+            .map(|_| rng.sample(Alphanumeric) as char)
+            .collect();
+        text
+    }
+}
+
+#[async_trait]
+impl Source for TestSource {
+    async fn open(&mut self) -> Result<(), iggy_connector_sdk::Error> {
+        info!(
+            "Initialized test source with ID {}. Interval: {:#?}, max offset: {:#?}, messages range: {} - {}, payload size: {}",
+            self.id,
+            self.interval,
+            self.max_count,
+            self.messages_range.0,
+            self.messages_range.1,
+            self.payload_size
+        );
+        Ok(())
+    }
+
+    async fn poll(&self) -> Result<ProducedMessages, iggy_connector_sdk::Error> {
+        sleep(self.interval).await;
+        let mut state = self.state.lock().await;
+        if let Some(max_count) = self.max_count {
+            if state.current_number >= max_count {
+                info!(
+                    "Reached max number of {max_count} messages for test source with ID {}",
+                    self.id
+                );
+                return Ok(ProducedMessages {
+                    schema: Schema::Json,
+                    messages: vec![],
+                });
+            }
+        }
+
+        let messages = self.generate_messages();
+        state.current_number += messages.len();
+        info!(
+            "Generated {} messages by test source with ID {}",
+            messages.len(),
+            self.id
+        );
+        Ok(ProducedMessages {
+            schema: Schema::Json,
+            messages,
+        })
+    }
+
+    async fn close(&mut self) -> Result<(), Error> {
+        info!("Test source with ID {} is shutting down", self.id);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Record {
+    id: Uuid,
+    title: String,
+    name: String,
+    text: String,
+}
