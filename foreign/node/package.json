@@ -1,8 +1,8 @@
 {
-  "name": "@iggy.rs/sdk",
+  "name": "apache-iggy",
   "type": "module",
   "version": "1.0.6",
-  "description": "Official nodejs iggy.rs binary client",
+  "description": "Official apache iggy nodejs binary client",
   "keywords": [
     "iggy",
     "iggy-rs",
