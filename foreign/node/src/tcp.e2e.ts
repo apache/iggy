@@ -18,7 +18,7 @@
  */
 
 
-import { TcpClient } from './client/index.js';
+import { getRawClient } from './client/index.js';
 
 import {
   login, logout,
@@ -32,7 +32,14 @@ import {
 
 try {
   // create socket
-  const cli = TcpClient({ host: '127.0.0.1', port: 8090 });
+  const cli = getRawClient({
+    transport: 'TCP' as const,
+    options: {
+      host: '127.0.0.1',
+      port: 8090
+    },
+    credentials: { username: 'iggy', password: 'iggy' }
+  });
   const s = () => Promise.resolve(cli);
 
   // LOGIN

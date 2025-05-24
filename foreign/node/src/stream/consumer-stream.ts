@@ -20,10 +20,12 @@
 
 import { Readable, pipeline, PassThrough } from "node:stream";
 import type { ClientConfig, RawClient } from "../client/client.type.js";
+import { getRawClient } from '../client/client.socket.js';
 import type { Id } from '../wire/identifier.utils.js';
-import { SimpleClient, rawClientGetter } from "../client/client.js";
+import { getClient } from "../client/client.js";
 import { type PollMessages, POLL_MESSAGES } from "../wire/message/poll-messages.command.js";
 import { type PollingStrategy, ConsumerKind, type CommandAPI } from "../wire/index.js";
+import { debug } from "../client/client.debug.js";
 
 
 const wait = (interval: number, cb?: () => void): Promise<void> =>
@@ -41,12 +43,8 @@ async function* genAutoCommitedPoll(
   while (true) {
     const r = await c.message.poll(poll);
     yield r;
-
-    const k = `${r.partitionId}`;
-    let part = state.get(k) || 0;    
-    part = r.count;
-    state.set(k, part);
-
+    state.set(`${r.partitionId}`, r.count);
+    
     if (Array.from(state).every(([, last]) => last === 0)) {
       await wait(interval);
     }
@@ -62,12 +60,11 @@ async function* genPoll(
 };
 
 
-
 export const singleConsumerStream = (config: ClientConfig) => async (
   poll: PollMessages,
   // interval: 1000
 ): Promise<Readable> => {
-  const c = await rawClientGetter(config);
+  const c = getRawClient(config);
   if (!c.isAuthenticated)
     await c.authenticate(config.credentials);
   const ps = Readable.from(genPoll(c, poll), { objectMode: true });
@@ -100,16 +97,15 @@ export const groupConsumerStream = (config: ClientConfig) =>
     interval = 1000,
     autocommit = true
   }: ConsumerGroupStreamRequest): Promise<Readable> {
-    const c = await rawClientGetter(config);
-    const s = new SimpleClient(c);
-    if (!c.isAuthenticated)
-      await c.authenticate(config.credentials);
-
+    const s = await getClient(config);
+    
     try {
       await s.group.get({ streamId, topicId, groupId })
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
     } catch (err) {
-      await s.group.create({ streamId, topicId, groupId, name: `auto-${groupId}` })
+      const ng = { streamId, topicId, groupId, name: `auto-${groupId}` };
+      debug('group does not exist, creating it', ng);
+      await s.group.create(ng)
     }
 
     await s.group.join({ streamId, topicId, groupId });
@@ -124,6 +120,17 @@ export const groupConsumerStream = (config: ClientConfig) =>
       autocommit
     }
     const ps = Readable.from(genAutoCommitedPoll(s, poll, interval), { objectMode: true });
+    // return (await s.clientProvider()).getReadStream();
+    // c.on('error', (err: unknown) => {
+    //   debug('groupConsumerStream::client error', err);
+    //   // ps.emit('error', err);
+    // });
+
+    // c.on('end', () => {
+    //   debug('groupConsumerStream::END');
+    //   // ps.emit('end');
+    // });
+
     return ps;
   };
 
