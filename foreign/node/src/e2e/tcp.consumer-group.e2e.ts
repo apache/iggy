@@ -107,7 +107,7 @@ describe('e2e -> consumer-group', async () => {
     };
     let ct = 0;
     while (ct < payloadLength) {
-      const { messages, ...resp } = await c.message.poll(pollReq);
+      const { messages /** , ...resp*/ } = await c.message.poll(pollReq);
       // console.log('POLL', messages.length, 'R/C', resp.count, messages, resp, ct);
       // assert.equal(messages.length, resp.count);
       ct += messages.length;
