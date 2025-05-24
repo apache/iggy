@@ -17,13 +17,11 @@
  * under the License.
  */
 
-
-
 import assert from 'node:assert/strict';
 import { Client } from './client/index.js';
 import { uuidv7, uuidv4 } from 'uuidv7'
 import { groupConsumerStream } from './stream/consumer-stream.js';
-import { PollingStrategy, Partitioning, type PollMessagesResponse } from './wire/index.js';
+import { PollingStrategy, type PollMessagesResponse } from './wire/index.js';
 
 const streamId = 123;
 const topicId = 345;
@@ -46,7 +44,13 @@ const opt = {
   transport: 'TCP' as const,
   options: { port: 8090, host: '127.0.0.1', allowHalfOpen: true, keepAlive: true },
   credentials: { username: 'iggy', password: 'iggy' },
-};2
+  reconnect: {
+    enabled: true,
+    interval: 10 * 1000,
+    maxRetries: 10
+  },
+  heartbeatInterval: 5 * 1000
+};
 
 const c = new Client(opt);
 
@@ -74,6 +78,7 @@ try {
   console.log('server stream CREATED::', { streamId });
   await c.topic.create(topic);
   console.log('server topic CREATED::', { topicId });
+  
   // send
   assert.ok(await c.message.send(msg));
   console.log('message SEND::', { msg })
@@ -84,7 +89,7 @@ try {
     streamId,
     topicId,
     pollingStrategy: PollingStrategy.Next,
-    count: 1,
+    count: 5,
     interval: 5000
   };
 
@@ -93,16 +98,13 @@ try {
   const cs = await groupConsumerStream(opt)(pollReq);
   const dataCb = (d: PollMessagesResponse) => {
     console.log('cli/DATA POLLED:', d);
-    // recv += d.count;
-    // if (recv === ct)
-    //   str.destroy();
   };
 
   cs.on('data', dataCb);
 
   cs.on('error', (err) => {
     console.error('cli/=>>Stream ERROR:: // DESTROY ', err)
-    // cs.destroy(err);
+    cs.destroy(err);
   });
 
   cs.on('end', async () => {

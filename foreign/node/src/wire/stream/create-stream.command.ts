@@ -45,7 +45,7 @@ export const CREATE_STREAM = {
       bName
     ]);
   },
-
+  
   deserialize: (r: CommandResponse) => {
     return deserializeToStream(r.data, 0).data
   }

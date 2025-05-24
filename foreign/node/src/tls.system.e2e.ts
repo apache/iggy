@@ -18,12 +18,19 @@
  */
 
 
-import { TlsClient } from './client/index.js';
+import { getRawClient } from './client/index.js';
 import { login, logout, getStats, ping } from './wire/index.js';
 
 try {
   // create socket
-  const cli = TlsClient({ host: '127.0.0.1', port: 8090 });
+  const cli = getRawClient({
+    transport: 'TCP' as const,
+    options: {
+      host: '127.0.0.1',
+      port: 8090
+    },
+    credentials: { username: 'iggy', password: 'iggy' }
+  });
   const s = () => Promise.resolve(cli);
 
   // PING
