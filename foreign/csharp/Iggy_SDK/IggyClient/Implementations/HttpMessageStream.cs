@@ -60,17 +60,32 @@ public class HttpMessageStream : IIggyClient
         _logger = loggerFactory.CreateLogger<HttpMessageStream>();
     }
     
-    public async Task CreateStreamAsync(StreamRequest request, CancellationToken token = default)
+    public async Task<StreamResponse?> CreateStreamAsync(StreamRequest request, CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(request, JsonConverterFactory.SnakeCaseOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
         var response = await _httpClient.PostAsync("/streams", data, token);
+        
+        if (response.IsSuccessStatusCode)
+        {
+            return await response.Content.ReadFromJsonAsync<StreamResponse>(JsonConverterFactory.StreamResponseOptions, cancellationToken: token);
+        }
+        
+        await HandleResponseAsync(response);
+        
+        return null;
+    }
+    
+    public async Task PurgeStreamAsync(Identifier streamId, CancellationToken token = default)
+    {
+        var response = await _httpClient.DeleteAsync($"/streams/{streamId}/purge", token);
         if (!response.IsSuccessStatusCode)
         {
             await HandleResponseAsync(response);
         }
     }
+    
     public async Task DeleteStreamAsync(Identifier streamId, CancellationToken token = default)
     {
         var response = await _httpClient.DeleteAsync($"/streams/{streamId}", token);

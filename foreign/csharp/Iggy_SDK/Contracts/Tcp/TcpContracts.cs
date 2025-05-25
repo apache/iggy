@@ -520,6 +520,7 @@ internal static class TcpContracts
             _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, null)
         };
     }
+    
     private static byte[] GetBytesFromHeader(HeaderKey headerKey, HeaderValue headerValue)
     {
         var headerBytesLength = 4 + headerKey.Value.Length + 1 + 4 + headerValue.Value.Length;
@@ -538,6 +539,7 @@ internal static class TcpContracts
 
         return headerBytes.ToArray();
     }
+    
     internal static byte[] CreateStream(StreamRequest request)
     {
         Span<byte> bytes = stackalloc byte[4 + request.Name.Length + 1];
@@ -546,6 +548,7 @@ internal static class TcpContracts
         Encoding.UTF8.GetBytes(request.Name, bytes[5..]);
         return bytes.ToArray();
     }
+    
     internal static byte[] UpdateStream(Identifier streamId, UpdateStreamRequest request)
     {
         Span<byte> bytes = stackalloc byte[streamId.Length + request.Name.Length + 3];

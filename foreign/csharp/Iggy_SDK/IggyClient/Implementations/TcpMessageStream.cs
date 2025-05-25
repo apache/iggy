@@ -55,7 +55,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         _logger = loggerFactory.CreateLogger<TcpMessageStream>();
     }
     
-    public async Task CreateStreamAsync(StreamRequest request, CancellationToken token = default)
+    public async Task<StreamResponse?> CreateStreamAsync(StreamRequest request, CancellationToken token = default)
     {
         var message = TcpContracts.CreateStream(request);
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
@@ -64,8 +64,14 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await _stream.SendAsync(payload, token);
         await _stream.FlushAsync(token);
 
-        // TODO: Return stream information
-        await GetMessageAsync(token);
+        var responseBuffer = await GetMessageAsync(token);
+        
+        if (responseBuffer.Length == 0)
+        {
+            throw new InvalidResponseException("Received empty response while trying to create stream.");
+        }
+        
+        return BinaryMapper.MapStream(responseBuffer);
     }
 
     public async Task<StreamResponse?> GetStreamByIdAsync(Identifier streamId, CancellationToken token = default)
@@ -81,24 +87,12 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
 
         if (responseBuffer.Length == 0)
         {
-            return null;
+            throw new InvalidResponseException("Received empty response while trying to get stream by ID.");
         }
         
         return BinaryMapper.MapStream(responseBuffer);
     }
-
-    public async Task UpdateStreamAsync(Identifier streamId, UpdateStreamRequest request, CancellationToken token = default)
-    {
-        var message = TcpContracts.UpdateStream(streamId, request);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
-        TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.UPDATE_STREAM_CODE);
-
-        await _stream.SendAsync(payload, token);
-        await _stream.FlushAsync(token);
-
-        await CheckResponseAsync(token);
-    }
-
+    
     public async Task<IReadOnlyList<StreamResponse>> GetStreamsAsync(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
@@ -112,10 +106,34 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         
         if (responseBuffer.Length == 0)
         {
-            return Array.Empty<StreamResponse>();
+            return [];
         }
         
         return BinaryMapper.MapStreams(responseBuffer);
+    }
+
+    public async Task UpdateStreamAsync(Identifier streamId, UpdateStreamRequest request, CancellationToken token = default)
+    {
+        var message = TcpContracts.UpdateStream(streamId, request);
+        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.UPDATE_STREAM_CODE);
+
+        await _stream.SendAsync(payload, token);
+        await _stream.FlushAsync(token);
+
+        await CheckResponseAsync(token);
+    }
+    
+    public async Task PurgeStreamAsync(Identifier streamId, CancellationToken token = default)
+    {
+        var message = TcpMessageStreamHelpers.GetBytesFromIdentifier(streamId);
+        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.PURGE_STREAM_CODE);
+
+        await _stream.SendAsync(payload, token);
+        await _stream.FlushAsync(token);
+
+        await CheckResponseAsync(token);
     }
 
     public async Task DeleteStreamAsync(Identifier streamId, CancellationToken token = default)

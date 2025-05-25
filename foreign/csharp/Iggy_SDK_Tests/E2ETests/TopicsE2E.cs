@@ -39,10 +39,16 @@ public sealed class TopicsE2E : IClassFixture<IggyTopicFixture>
     {
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
-            await sut.Invoking(async x =>
-                 await x.CreateTopicAsync(Identifier.Numeric((int)TopicsFixtureBootstrap.StreamRequest.StreamId!), TopicsFixtureBootstrap.TopicRequest))
-                .Should()
-                .NotThrowAsync();
+            var response = await sut.CreateTopicAsync(Identifier.Numeric((int)TopicsFixtureBootstrap.StreamRequest.StreamId!), TopicsFixtureBootstrap.TopicRequest);
+            
+            response.Should().NotBeNull();
+            response!.Id.Should().Be(TopicsFixtureBootstrap.TopicRequest.TopicId);
+            response.Name.Should().Be(TopicsFixtureBootstrap.TopicRequest.Name);
+            response.CompressionAlgorithm.Should().Be(TopicsFixtureBootstrap.TopicRequest.CompressionAlgorithm);
+            response.Partitions.Should().HaveCount(TopicsFixtureBootstrap.TopicRequest.PartitionsCount);
+            response.MessageExpiry.Should().Be(TopicsFixtureBootstrap.TopicRequest.MessageExpiry);
+            response.Size.Should().Be(0);
+            response.CreatedAt.UtcDateTime.Should().BeAfter(DateTimeOffset.UtcNow.UtcDateTime.AddSeconds(-20));
         })).ToArray();
         await Task.WhenAll(tasks);
     }
