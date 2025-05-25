@@ -51,6 +51,7 @@ internal static class CommandCodes
     internal const int CREATE_TOPIC_CODE = 302;
     internal const int DELETE_TOPIC_CODE = 303;
     internal const int UPDATE_TOPIC_CODE = 304;
+    internal const int PURGE_TOPIC_CODE = 305;
     internal const int CREATE_PARTITIONS_CODE = 402;
     internal const int DELETE_PARTITIONS_CODE = 403;
     internal const int GET_CONSUMER_GROUP_CODE = 600;

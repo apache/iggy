@@ -26,7 +26,10 @@ public class TopicsFixtureBootstrap : IIggyBootstrap
 {
     public static readonly StreamRequest StreamRequest = StreamFactory.CreateStreamRequest();
     public static readonly TopicRequest TopicRequest = TopicFactory.CreateTopicRequest();
+    public static readonly TopicRequest TopicRequestSecond = TopicFactory.CreateTopicRequest();
     public static readonly UpdateTopicRequest UpdateTopicRequest = TopicFactory.CreateUpdateTopicRequest();
+    
+    
     public async Task BootstrapResourcesAsync(int tcpPort, int httpPort, IIggyClient httpClient, IIggyClient tcpClient)
     {
         await tcpClient.CreateStreamAsync(StreamRequest);

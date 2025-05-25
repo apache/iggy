@@ -38,6 +38,7 @@ internal static class BinaryMapper
             Token = token
         };
     }
+    
     internal static IReadOnlyList<PersonalAccessTokenResponse> MapPersonalAccessTokens(ReadOnlySpan<byte> payload)
     {
         if (payload.Length == 0)
@@ -55,6 +56,7 @@ internal static class BinaryMapper
         }
         return result.AsReadOnly();
     }
+    
     private static (PersonalAccessTokenResponse response, int position) MapToPersonalAccessTokenResponse(ReadOnlySpan<byte> payload, int position)
     {
         var nameLength = (int)payload[position];
@@ -67,6 +69,7 @@ internal static class BinaryMapper
             ExpiryAt = expiry == 0 ? null : DateTimeOffsetUtils.FromUnixTimeMicroSeconds(expiry).LocalDateTime
         }, readBytes);
     }
+    
     internal static IReadOnlyList<UserResponse> MapUsers(ReadOnlySpan<byte> payload)
     {
         if (payload.Length == 0)
@@ -84,6 +87,7 @@ internal static class BinaryMapper
         }
         return result.AsReadOnly();
     }
+    
     internal static UserResponse MapUser(ReadOnlySpan<byte> payload)
     {
         var (response, position) = MapToUserResponse(payload, 0);
@@ -110,8 +114,8 @@ internal static class BinaryMapper
             Status = response.Status,
             Permissions = null
         };
-
     }
+    
     private static Permissions MapPermissions(ReadOnlySpan<byte> bytes)
     {
         var streamMap = new Dictionary<int, StreamPermissions>();
@@ -296,6 +300,7 @@ internal static class BinaryMapper
             ConsumerGroupsCount = consumerGroupsCount
         }, readBytes);
     }
+    
     internal static OffsetResponse MapOffsets(ReadOnlySpan<byte> payload)
     {
         var partitionId = BinaryPrimitives.ReadInt32LittleEndian(payload[0..4]);
@@ -309,6 +314,7 @@ internal static class BinaryMapper
             PartitionId = partitionId
         };
     }
+    
     private static MessageState MapMessageState(ReadOnlySpan<byte> payload, int position)
     {
         var state = payload[position + 8] switch
@@ -321,6 +327,7 @@ internal static class BinaryMapper
         };
         return state;
     }
+    
     internal static PolledMessages MapMessages(ReadOnlySpan<byte> payload,
         Func<byte[], byte[]>? decryptor = null)
     {
@@ -402,6 +409,7 @@ internal static class BinaryMapper
             Messages = messages.AsReadOnly()
         };
     }
+    
     internal static PolledMessages<TMessage> MapMessages<TMessage>(ReadOnlySpan<byte> payload,
         Func<byte[], TMessage> serializer, Func<byte[], byte[]>? decryptor = null)
     {
@@ -482,6 +490,7 @@ internal static class BinaryMapper
             Messages = messages.AsReadOnly()
         };
     }
+    
     private static Dictionary<HeaderKey, HeaderValue> MapHeaders(ReadOnlySpan<byte> payload)
     {
         var headers = new Dictionary<HeaderKey, HeaderValue>();
@@ -601,6 +610,7 @@ internal static class BinaryMapper
                 CreatedAt = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(createdAt).LocalDateTime
             }, readBytes);
     }
+    
     internal static IReadOnlyList<TopicResponse> MapTopics(ReadOnlySpan<byte> payload)
     {
         List<TopicResponse> topics = new();
@@ -635,6 +645,7 @@ internal static class BinaryMapper
             Id = topic.Id,
             Name = topic.Name,
             PartitionsCount = topic.PartitionsCount,
+            CompressionAlgorithm = topic.CompressionAlgorithm,
             CreatedAt = topic.CreatedAt,
             MessageExpiry = topic.MessageExpiry,
             MessagesCount = topic.MessagesCount,
@@ -650,14 +661,15 @@ internal static class BinaryMapper
         int id = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
         ulong createdAt = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 4)..(position + 12)]);
         int partitionsCount = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 12)..(position + 16)]);
-        int messageExpiry = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 16)..(position + 20)]);
-        ulong maxTopicSize = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 20)..(position + 28)]);
-        byte replicationFactor = payload[position + 28];
-        ulong sizeBytes = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 29)..(position + 37)]);
-        ulong messagesCount = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 37)..(position + 45)]);
-        int nameLength = (int)payload[position + 45];
-        string name = Encoding.UTF8.GetString(payload[(position + 46)..(position + 46 + nameLength)]);
-        int readBytes = 4 + 8 + 4 + 4 + 8 + 8 + 8 + 1 + 1 + name.Length;
+        ulong messageExpiry = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 16)..(position + 24)]);
+        byte complessionAlgoritm = payload[24];
+        ulong maxTopicSize = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 25)..(position + 33)]);
+        byte replicationFactor = payload[position + 33];
+        ulong sizeBytes = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 34)..(position + 42)]);
+        ulong messagesCount = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 42)..(position + 50)]);
+        int nameLength = (int)payload[position + 50];
+        string name = Encoding.UTF8.GetString(payload[(position + 51)..(position + 51 + nameLength)]);
+        int readBytes = 4 + 8 + 4 + 8 + 1 + 8 + 1 + 8 + 8 + 1 + name.Length;
 
         return (
             new TopicResponse
@@ -665,6 +677,7 @@ internal static class BinaryMapper
                 Id = id,
                 PartitionsCount = partitionsCount,
                 Name = name,
+                CompressionAlgorithm = (CompressionAlgorithm)complessionAlgoritm,
                 MessagesCount = messagesCount,
                 Size = sizeBytes,
                 CreatedAt = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(createdAt).LocalDateTime,
@@ -791,6 +804,7 @@ internal static class BinaryMapper
             Members = members
         };
     }
+    
     private static (ConsumerGroupMember, int readBytes) MapToMember(ReadOnlySpan<byte> payload, int position)
     {
         var id = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);

@@ -37,15 +37,11 @@ internal static class TcpMessageStreamHelpers
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static (int Status, int Length) GetResponseLengthAndStatus(Span<byte> buffer)
     {
-        var status = GetResponseStatus(buffer);
+        var status = BinaryPrimitives.ReadInt32LittleEndian(buffer[..4]);
         var length = BinaryPrimitives.ReadInt32LittleEndian(buffer[4..]);
 
         return (status, length);
     }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static int GetResponseStatus(Span<byte> buffer) =>
-        BinaryPrimitives.ReadInt32LittleEndian(buffer[..4]);
 
     internal static int CalculateMessageBytesCount(IList<Message> messages)
     {

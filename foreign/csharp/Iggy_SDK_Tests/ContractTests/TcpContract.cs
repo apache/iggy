@@ -761,7 +761,7 @@ public sealed class TcpContract
         Assert.Equal(streamId.Kind, BytesToIdentifierNumeric(result, 0).Kind);
         Assert.Equal(request.TopicId, BitConverter.ToInt32(result[6..10]));
         Assert.Equal(request.PartitionsCount, BitConverter.ToInt32(result[10..14]));
-        Assert.Equal(request.MessageExpiry, BitConverter.ToInt32(result[14..18]));
+        Assert.Equal(request.MessageExpiry, BitConverter.ToUInt64(result[14..18]));
         Assert.Equal(request.MaxTopicSize, BitConverter.ToUInt64(result[18..26]));
         Assert.Equal(request.ReplicationFactor, (int)result[26]);
         Assert.Equal(request.Name.Length, (int)result[27]);

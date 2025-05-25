@@ -70,35 +70,35 @@ public abstract class IggyBaseFixture : IAsyncLifetime
         var tcpPort = _tcpContainer.GetMappedPublicPort(8090);
         var httpPort = _httpContainer.GetMappedPublicPort(3000);
         
-         var firstSubject = MessageStreamFactory.CreateMessageStream(options =>
+        var tcpSubject = MessageStreamFactory.CreateMessageStream(options =>
         {
             options.BaseAdress = $"127.0.0.1:{tcpPort}";
             options.Protocol = Protocol.Tcp;
             options.MessageBatchingSettings = _batchingSettings;
             options.MessagePollingSettings = _pollingSettings;
         }, NullLoggerFactory.Instance);
-        await firstSubject.LoginUser(new LoginUserRequest
+        await tcpSubject.LoginUser(new LoginUserRequest
         {
             Password = "iggy",
             Username = "iggy"
         });
-        SubjectsUnderTest[0] = firstSubject;
+        SubjectsUnderTest[0] = tcpSubject;
         
-        var secondSubject = (MessageStreamFactory.CreateMessageStream(options =>
+        var httpSubject = (MessageStreamFactory.CreateMessageStream(options =>
         {
             options.BaseAdress = $"http://127.0.0.1:{httpPort}";
             options.Protocol = Protocol.Http;
             options.MessageBatchingSettings = _batchingSettings;
             options.MessagePollingSettings = _pollingSettings;
         }, NullLoggerFactory.Instance));
-        await secondSubject.LoginUser(new LoginUserRequest
+        await httpSubject.LoginUser(new LoginUserRequest
         {
             Password = "iggy",
             Username = "iggy"
         });
-        SubjectsUnderTest[1] = secondSubject;
+        SubjectsUnderTest[1] = httpSubject;
         
-        await _bootstraper.BootstrapResourcesAsync(tcpPort, httpPort, firstSubject, secondSubject);
+        await _bootstraper.BootstrapResourcesAsync(tcpPort, httpPort, httpSubject, tcpSubject);
     }
 
     public async Task DisposeAsync()

@@ -624,32 +624,34 @@ internal static class TcpContracts
 
     internal static byte[] UpdateTopic(Identifier streamId, Identifier topicId, UpdateTopicRequest request)
     {
-        Span<byte> bytes = stackalloc byte[streamId.Length + topicId.Length + 18 + request.Name.Length];
-        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId , topicId);
+        Span<byte> bytes = stackalloc byte[4+streamId.Length + topicId.Length + 19 + request.Name.Length];
+        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId);
         var position = 4 + streamId.Length + topicId.Length;
-        BinaryPrimitives.WriteInt32LittleEndian(bytes[position..(position + 4)],
+        bytes[position] = (byte)request.CompressionAlgorithm;
+        position+= 1;
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes[position..(position + 8)],
             request.MessageExpiry);
-        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 4)..(position + 12)],
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 8)..(position + 16)],
             request.MaxTopicSize);
-        bytes[position + 12] = request.ReplicationFactor;
-        bytes[position + 13] = (byte)request.Name.Length;
-        Encoding.UTF8.GetBytes(request.Name, bytes[(position + 14)..]);
+        bytes[position + 16] = request.ReplicationFactor;
+        bytes[position + 17] = (byte)request.Name.Length;
+        Encoding.UTF8.GetBytes(request.Name, bytes[(position + 18)..]);
         return bytes.ToArray();
     }
 
     internal static byte[] CreateTopic(Identifier streamId, TopicRequest request)
     {
-        Span<byte> bytes = stackalloc byte[2 + streamId.Length + 22 + request.Name.Length];
+        Span<byte> bytes = stackalloc byte[2 + streamId.Length + 27 + request.Name.Length];
         bytes.WriteBytesFromIdentifier(streamId);
-        var streamIdBytesLength = 2 + streamId.Length;
-        BinaryPrimitives.WriteInt32LittleEndian(bytes[streamIdBytesLength..(streamIdBytesLength + 4)], request.TopicId ?? 0);
-        int position = 4 + streamIdBytesLength;
-        BinaryPrimitives.WriteInt32LittleEndian(bytes[position..(position + 4)], request.PartitionsCount);
-        BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 4)..(position + 8)], request.MessageExpiry);
-        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 8)..(position + 16)], request.MaxTopicSize);
-        bytes[position + 16] = request.ReplicationFactor;
-        bytes[position + 17] = (byte)request.Name.Length;
-        Encoding.UTF8.GetBytes(request.Name, bytes[(position + 18)..]);
+        var position = 2 + streamId.Length;
+        BinaryPrimitives.WriteInt32LittleEndian(bytes[position..(position + 4)], request.TopicId ?? 0);
+        BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 4)..(position + 8)], request.PartitionsCount);
+        bytes[position + 8] = (byte)request.CompressionAlgorithm;
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 9)..(position + 17)], request.MessageExpiry);
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 17)..(position + 25)], request.MaxTopicSize);
+        bytes[position + 25] = request.ReplicationFactor;
+        bytes[position + 26] = (byte)request.Name.Length;
+        Encoding.UTF8.GetBytes(request.Name, bytes[(position + 27)..]);
         return bytes.ToArray();
     }
 
@@ -662,6 +664,13 @@ internal static class TcpContracts
 
 
     internal static byte[] DeleteTopic(Identifier streamId, Identifier topicId)
+    {
+        Span<byte> bytes = stackalloc byte[2 + streamId.Length + 2 + topicId.Length];
+        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId , topicId);
+        return bytes.ToArray();
+    }
+    
+    internal static byte[] PurgeTopic(Identifier streamId, Identifier topicId)
     {
         Span<byte> bytes = stackalloc byte[2 + streamId.Length + 2 + topicId.Length];
         bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId , topicId);
