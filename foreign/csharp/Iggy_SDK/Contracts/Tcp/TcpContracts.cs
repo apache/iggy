@@ -40,6 +40,7 @@ internal static class TcpContracts
         Encoding.UTF8.GetBytes(request.Token, bytes[1..(1 + request.Token.Length)]);
         return bytes.ToArray();
     }
+    
     internal static byte[] DeletePersonalRequestToken(DeletePersonalAccessTokenRequest request)
     {
         Span<byte> bytes = stackalloc byte[5 + request.Name.Length];
@@ -47,6 +48,7 @@ internal static class TcpContracts
         Encoding.UTF8.GetBytes(request.Name, bytes[1..(1 + request.Name.Length)]);
         return bytes.ToArray();
     }
+    
     internal static byte[] CreatePersonalAccessToken(CreatePersonalAccessTokenRequest request)
     {
         Span<byte> bytes = stackalloc byte[5 + request.Name.Length];
@@ -55,24 +57,28 @@ internal static class TcpContracts
         BinaryPrimitives.WriteUInt32LittleEndian(bytes[(1 + request.Name.Length)..], request.Expiry ?? 0);
         return bytes.ToArray();
     }
+    
     internal static byte[] GetClient(uint clientId)
     {
         var bytes = new byte[4];
         BinaryPrimitives.WriteUInt32LittleEndian(bytes, clientId);
         return bytes;
     }
+    
     internal static byte[] GetUser(Identifier userId)
     {
         Span<byte> bytes = stackalloc byte[userId.Length + 2];
         bytes.WriteBytesFromIdentifier(userId);
         return bytes.ToArray();
     }
+    
     internal static byte[] DeleteUser(Identifier userId)
     {
         Span<byte> bytes = stackalloc byte[userId.Length + 2];
         bytes.WriteBytesFromIdentifier(userId);
         return bytes.ToArray();
     }
+    
     internal static byte[] LoginUser(LoginUserRequest request)
     {
         List<byte> bytes = new List<byte>();
@@ -91,44 +97,29 @@ internal static class TcpContracts
         if (!string.IsNullOrEmpty(request.Version))
         {
             byte[] versionBytes = Encoding.UTF8.GetBytes(request.Version);
-            bytes.AddRange(BitConverter.GetBytes(versionBytes.Length)); // tamanho da versão (u32, little-endian)
+            bytes.AddRange(BitConverter.GetBytes(versionBytes.Length)); 
             bytes.AddRange(versionBytes);
         }
         else
         {
-            bytes.AddRange(BitConverter.GetBytes(0)); // tamanho 0 para versão ausente
+            bytes.AddRange(BitConverter.GetBytes(0));
         }
 
         // Context (opcional)
         if (!string.IsNullOrEmpty(request.Context))
         {
             byte[] contextBytes = Encoding.UTF8.GetBytes(request.Context);
-            bytes.AddRange(BitConverter.GetBytes(contextBytes.Length)); // tamanho do contexto (u32, little-endian)
+            bytes.AddRange(BitConverter.GetBytes(contextBytes.Length));
             bytes.AddRange(contextBytes);
         }
         else
         {
-            bytes.AddRange(BitConverter.GetBytes(0)); // tamanho 0 para contexto ausente
+            bytes.AddRange(BitConverter.GetBytes(0));
         }
 
         return bytes.ToArray();
-
-        // var length = request.Username.Length + request.Password.Length + 2;
-        // Span<byte> bytes = stackalloc byte[length];
-        //
-        // int position = 0;
-        // bytes[position] = (byte)request.Username.Length;
-        // position += 1;
-        // Encoding.UTF8.GetBytes(request.Username, bytes[position..(position + request.Username.Length)]);
-        // position += request.Username.Length;
-        // bytes[position] = (byte)request.Password.Length;
-        // position += 1;
-        // Encoding.UTF8.GetBytes(request.Password, bytes[position..(position + request.Password.Length)]);
-        // position += request.Password.Length;
-
-        // return bytes.ToArray();
-        //return JsonSerializer.SerializeToUtf8Bytes(request);
     }
+    
     internal static byte[] ChangePassword(ChangePasswordRequest request)
     {
         var length = request.UserId.Length + 2 + request.CurrentPassword.Length + request.NewPassword.Length + 2;
@@ -143,9 +134,9 @@ internal static class TcpContracts
         bytes[position] = (byte)request.NewPassword.Length;
         position += 1;
         Encoding.UTF8.GetBytes(request.NewPassword, bytes[position..(position + request.NewPassword.Length)]);
-        position += request.NewPassword.Length;
         return bytes.ToArray();
     }
+    
     internal static byte[] UpdatePermissions(UpdateUserPermissionsRequest request)
     {
         var length = request.UserId.Length + 2 +
@@ -169,6 +160,7 @@ internal static class TcpContracts
         }
         return bytes.ToArray();
     }
+    
     internal static byte[] UpdateUser(UpdateUserRequest request)
     {
         var length = request.UserId.Length + 2 + (request.Username?.Length ?? 0)
@@ -196,12 +188,7 @@ internal static class TcpContracts
         if (request.UserStatus is not null)
         {
             bytes[position++] = 1;
-            bytes[position++] = request.UserStatus switch
-            {
-                UserStatus.Active => 1,
-                UserStatus.Inactive => 2,
-                _ => throw new ArgumentOutOfRangeException()
-            };
+            bytes[position++] = (byte)request.UserStatus;
         }
         else
         {
@@ -209,6 +196,7 @@ internal static class TcpContracts
         }
         return bytes.ToArray();
     }
+    
     internal static byte[] CreateUser(CreateUserRequest request)
     {
         int capacity = 3 + request.Username.Length + request.Password.Length
@@ -223,12 +211,7 @@ internal static class TcpContracts
         bytes[position++] = (byte)request.Password.Length;
         position += Encoding.UTF8.GetBytes(request.Password, bytes[position..(position + request.Password.Length)]);
 
-        bytes[position++] = request.Status switch
-        {
-            UserStatus.Active => (byte)1,
-            UserStatus.Inactive => (byte)2,
-            _ => throw new ArgumentOutOfRangeException()
-        };
+        bytes[position++] = (byte)request.Status;
 
         if (request.Permissions is not null)
         {
@@ -237,7 +220,6 @@ internal static class TcpContracts
             BinaryPrimitives.WriteInt32LittleEndian(bytes[position..(position + 4)], CalculatePermissionsSize(request.Permissions));
             position += 4;
             permissions.CopyTo(bytes[position..(position + permissions.Length)]);
-            position += permissions.Length;
         }
         else
         {
@@ -246,6 +228,7 @@ internal static class TcpContracts
 
         return bytes.ToArray();
     }
+    
     private static byte[] GetBytesFromPermissions(Permissions data)
     {
         int size = CalculatePermissionsSize(data);
@@ -332,6 +315,7 @@ internal static class TcpContracts
 
         return bytes.ToArray();
     }
+    
     private static int CalculatePermissionsSize(Permissions data)
     {
         int size = 10;
@@ -363,6 +347,7 @@ internal static class TcpContracts
 
         return size;
     }
+    
     internal static void GetMessages(Span<byte> bytes, MessageFetchRequest request)
     {
         bytes[0] = GetConsumerTypeByte(request.Consumer.Type);
@@ -377,6 +362,7 @@ internal static class TcpContracts
 
         bytes[position + 17] = request.AutoCommit ? (byte)1 : (byte)0;
     }
+    
     internal static void CreateMessage(Span<byte> bytes, Identifier streamId, Identifier topicId,
         Kinds.Partitioning partitioning, IList<Message> messages)
     {
@@ -394,6 +380,7 @@ internal static class TcpContracts
             _ => HandleMessagesIList(position, messages, bytes),
         };
     }
+    
     private static Span<byte> HandleMessagesIList(int position, IList<Message> messages, Span<byte> bytes)
     {
         Span<byte> emptyHeaders = stackalloc byte[4];

@@ -702,9 +702,6 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await _stream.SendAsync(payload, token);
         await _stream.FlushAsync(token);
 
-        var buffer = new byte[BufferSizes.ExpectedResponseSize];
-        await _stream.ReadAsync(buffer, token);
-
         var responseBuffer = await GetMessageAsync(token);
         
         if (responseBuffer.Length == 0)
@@ -809,31 +806,15 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
 
         await _stream.SendAsync(payload, token);
         await _stream.FlushAsync(token);
-
-        // TODO: maybe refactor later, for now static 12
-        var buffer = new byte[12];
-        //await _socket.ReceiveAsync(buffer, token);
-        await _stream.ReadAsync(buffer, token);
-
-        var response = TcpMessageStreamHelpers.GetResponseLengthAndStatus(buffer);
-        if (response.Status != 0)
-        {
-            if (response.Length == 0)
-            {
-                throw new InvalidResponseException($"Invalid response status code: {response.Status}");
-            }
-            
-            var errorBuffer = new byte[response.Length];
-            await _stream.ReadAsync(errorBuffer, token);
-            throw new InvalidResponseException(Encoding.UTF8.GetString(errorBuffer));
-        }
-
-        if (response.Length <= 1)
+        
+        var responseBuffer = await GetMessageAsync(token);
+        
+        if (responseBuffer.Length <= 0)
         {
             return null;
         }
 
-        var userId = BinaryPrimitives.ReadInt32LittleEndian(buffer.AsSpan()[8..(8 + response.Length)]);
+        var userId = BinaryPrimitives.ReadInt32LittleEndian(responseBuffer.AsSpan()[..(responseBuffer.Length)]);
 
         //TODO: Figure out how to solve this workaround about default of TokenInfo
         return new AuthResponse(userId, default);

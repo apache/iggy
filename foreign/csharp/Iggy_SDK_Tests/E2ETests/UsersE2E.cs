@@ -126,7 +126,7 @@ public sealed class UsersE2E : IClassFixture<IggyTcpUsersFixture>
     }
     
     [Fact, TestPriority(6)]
-    public async Task ChangePermissions_Should_ChangePermissions_Successfully()
+    public async Task UpdatePermissions_Should_UpdatePermissions_Successfully()
     {
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
@@ -142,12 +142,64 @@ public sealed class UsersE2E : IClassFixture<IggyTcpUsersFixture>
             // assert
             user!.Permissions!.Global.Should().NotBeNull();
             user.Permissions.Should().BeEquivalentTo(UsersFixtureBootstrap.UpdatePermissionsRequest);
+            user.Permissions!.Streams.Should().NotBeNull();
+            user.Permissions.Streams.Should().HaveCount(1);
+            
+            user.Permissions.Global.ManageServers.Should().Be(UsersFixtureBootstrap.UpdatePermissionsRequest.Global!.ManageServers);
+            user.Permissions.Global.ManageUsers.Should().Be(UsersFixtureBootstrap.UpdatePermissionsRequest.Global!.ManageUsers);
+            user.Permissions.Global.ManageStreams.Should().Be(UsersFixtureBootstrap.UpdatePermissionsRequest.Global!.ManageStreams);
+            user.Permissions.Global.ManageTopics.Should().Be(UsersFixtureBootstrap.UpdatePermissionsRequest.Global!.ManageTopics);
+            user.Permissions.Global.PollMessages.Should().Be(UsersFixtureBootstrap.UpdatePermissionsRequest.Global!.PollMessages);
+            user.Permissions.Global.ReadServers.Should().Be(UsersFixtureBootstrap.UpdatePermissionsRequest.Global!.ReadServers);
+            user.Permissions.Global.ReadStreams.Should().Be(UsersFixtureBootstrap.UpdatePermissionsRequest.Global!.ReadStreams);
+            user.Permissions.Global.ReadTopics.Should().Be(UsersFixtureBootstrap.UpdatePermissionsRequest.Global!.ReadTopics);
+            user.Permissions.Global.ReadUsers.Should().Be(UsersFixtureBootstrap.UpdatePermissionsRequest.Global!.ReadUsers);
+            
+            var stream = user.Permissions.Streams!.FirstOrDefault();
+            stream.Should().NotBeNull();
+            stream!.Key.Should().Be(UsersFixtureBootstrap.UpdatePermissionsRequest.Streams!.First().Key);
+            stream.Value.Should().NotBeNull();
+            stream.Value.ManageStream.Should().Be(UsersFixtureBootstrap.UpdatePermissionsRequest.Streams!.First().Value.ManageStream);
+            stream.Value.ManageTopics.Should().Be(UsersFixtureBootstrap.UpdatePermissionsRequest.Streams!.First().Value.ManageTopics);
+            stream.Value.ReadStream.Should().Be(UsersFixtureBootstrap.UpdatePermissionsRequest.Streams!.First().Value.ReadStream);
+            stream.Value.SendMessages.Should().Be(UsersFixtureBootstrap.UpdatePermissionsRequest.Streams!.First().Value.SendMessages);
+            stream.Value.ReadTopics.Should().Be(UsersFixtureBootstrap.UpdatePermissionsRequest.Streams!.First().Value.ReadTopics);
+            stream.Value.PollMessages.Should().Be(UsersFixtureBootstrap.UpdatePermissionsRequest.Streams!.First().Value.PollMessages);
+            stream.Value.Topics.Should().NotBeNull();
+            
+            stream.Value.Topics!.Should().HaveCount(1);
+            stream.Value.Topics!.Should().ContainKey(UsersFixtureBootstrap.UpdatePermissionsRequest.Streams!.First().Value.Topics!.First().Key);
+            stream.Value.Topics!.First().Value.Should().NotBeNull();
+            stream.Value.Topics!.First().Key.Should().Be(UsersFixtureBootstrap.UpdatePermissionsRequest.Streams!.First().Value.Topics!.First().Key);
+            stream.Value.Topics!.First().Value.ManageTopic.Should().Be(UsersFixtureBootstrap.UpdatePermissionsRequest.Streams!.First().Value.Topics!.First().Value.ManageTopic);
+            stream.Value.Topics!.First().Value.PollMessages.Should().Be(UsersFixtureBootstrap.UpdatePermissionsRequest.Streams!.First().Value.Topics!.First().Value.PollMessages);
+            stream.Value.Topics!.First().Value.ReadTopic.Should().Be(UsersFixtureBootstrap.UpdatePermissionsRequest.Streams!.First().Value.Topics!.First().Value.ReadTopic);
+            stream.Value.Topics!.First().Value.SendMessages.Should().Be(UsersFixtureBootstrap.UpdatePermissionsRequest.Streams!.First().Value.Topics!.First().Value.SendMessages);
+            
         })).ToArray();
         
         await Task.WhenAll(tasks);
     }
     
     [Fact, TestPriority(7)]
+    public async Task ChangePassword_Should_ChangePassword_Successfully()
+    {
+        var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
+        {
+            // act
+            await sut.Invoking(async x =>
+                await x.ChangePassword(new ChangePasswordRequest()
+                {
+                    UserId = Identifier.Numeric(2), 
+                    CurrentPassword = "user1",
+                    NewPassword = "user2"
+                })).Should().NotThrowAsync();
+        })).ToArray();
+        
+        await Task.WhenAll(tasks);
+    }
+    
+    [Fact, TestPriority(8)]
     public async Task DeleteUser_Should_DeleteUser_Successfully()
     {
         var task = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>

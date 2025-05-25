@@ -120,6 +120,7 @@ internal static class Extensions
         bytes[position + 1] = (byte)topicId.Length;
         topicId.Value.CopyTo(bytes[(position + 2)..(position + 2 + topicId.Length)]);
     }
+    
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void WriteBytesFromIdentifier(this Span<byte> bytes, Identifier identifier, int startPos = 0)
     {
