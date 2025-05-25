@@ -42,7 +42,7 @@ public sealed class UsersE2E : IClassFixture<IggyTcpUsersFixture>
         // act & assert
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
-            await sut.Invoking(async x =>
+            await sut.Client.Invoking(async x =>
                 await x.CreateUser(UsersFixtureBootstrap.UserRequest)
             )
             .Should()
@@ -58,7 +58,7 @@ public sealed class UsersE2E : IClassFixture<IggyTcpUsersFixture>
         // act & assert
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
-            await sut.Invoking(async x =>
+            await sut.Client.Invoking(async x =>
                 await x.CreateUser(UsersFixtureBootstrap.UserRequest)
             )
             .Should()
@@ -74,7 +74,7 @@ public sealed class UsersE2E : IClassFixture<IggyTcpUsersFixture>
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
             // act
-            var response = await sut.GetUser(Identifier.Numeric(2));
+            var response = await sut.Client.GetUser(Identifier.Numeric(2));
             
             // assert
             response.Should().NotBeNull();
@@ -94,7 +94,7 @@ public sealed class UsersE2E : IClassFixture<IggyTcpUsersFixture>
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
             // act
-            var response = await sut.GetUsers();
+            var response = await sut.Client.GetUsers();
             
             // assert
             response.Should().NotBeEmpty();
@@ -110,13 +110,13 @@ public sealed class UsersE2E : IClassFixture<IggyTcpUsersFixture>
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
             //act
-            await sut.Invoking(async x =>
+            await sut.Client.Invoking(async x =>
                 await x.UpdateUser(new UpdateUserRequest
                 {
                     UserId = Identifier.Numeric(2), Username = UsersFixtureBootstrap.NewUsername, UserStatus = UserStatus.Active
                 })).Should().NotThrowAsync();
             
-            var user = await sut.GetUser(Identifier.Numeric(2));
+            var user = await sut.Client.GetUser(Identifier.Numeric(2));
             
             // assert
             user!.Username.Should().Be(UsersFixtureBootstrap.NewUsername);
@@ -131,13 +131,13 @@ public sealed class UsersE2E : IClassFixture<IggyTcpUsersFixture>
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
             // act
-            await sut.Invoking(async x =>
+            await sut.Client.Invoking(async x =>
                 await x.UpdatePermissions(new UpdateUserPermissionsRequest
                 {
                     UserId = Identifier.Numeric(2), Permissions = UsersFixtureBootstrap.UpdatePermissionsRequest
                 })).Should().NotThrowAsync();
             
-            var user = await sut.GetUser(Identifier.Numeric(2));
+            var user = await sut.Client.GetUser(Identifier.Numeric(2));
             
             // assert
             user!.Permissions!.Global.Should().NotBeNull();
@@ -187,7 +187,7 @@ public sealed class UsersE2E : IClassFixture<IggyTcpUsersFixture>
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
             // act
-            await sut.Invoking(async x =>
+            await sut.Client.Invoking(async x =>
                 await x.ChangePassword(new ChangePasswordRequest()
                 {
                     UserId = Identifier.Numeric(2), 
@@ -205,7 +205,7 @@ public sealed class UsersE2E : IClassFixture<IggyTcpUsersFixture>
         var task = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
             // act & assert
-            await sut.Invoking(async x =>
+            await sut.Client.Invoking(async x =>
                 await x.DeleteUser(Identifier.Numeric(2))).Should().NotThrowAsync();
         })).ToArray();
         
@@ -218,7 +218,7 @@ public sealed class UsersE2E : IClassFixture<IggyTcpUsersFixture>
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
             // act & assert
-            await sut.Invoking(async x =>
+            await sut.Client.Invoking(async x =>
                 await x.LogoutUser()).Should().NotThrowAsync();
         })).ToArray();
         

@@ -706,7 +706,7 @@ internal static class TcpContracts
     internal static byte[] DeletePartitions(DeletePartitionsRequest request)
     {
         Span<byte> bytes = stackalloc byte[2 + request.StreamId.Length + 2 + request.TopicId.Length + sizeof(int)];
-        bytes.WriteBytesFromStreamAndTopicIdentifiers(request.StreamId , request.TopicId);
+        bytes.WriteBytesFromStreamAndTopicIdentifiers(request.StreamId, request.TopicId);
         int position = 2 + request.StreamId.Length + 2 + request.TopicId.Length;
         BinaryPrimitives.WriteInt32LittleEndian(bytes[position..(position + 4)], request.PartitionsCount);
         return bytes.ToArray();

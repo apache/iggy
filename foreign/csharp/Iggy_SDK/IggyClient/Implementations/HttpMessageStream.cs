@@ -473,6 +473,7 @@ public class HttpMessageStream : IIggyClient
         var response = await _httpClient.GetAsync($"/clients", token);
         if (response.IsSuccessStatusCode)
         {
+            var t = await response.Content.ReadAsStringAsync();
             return await response.Content.ReadFromJsonAsync<IReadOnlyList<ClientResponse>>(JsonConverterFactory.SnakeCaseOptions, token)
                    ?? Array.Empty<ClientResponse>();
         }

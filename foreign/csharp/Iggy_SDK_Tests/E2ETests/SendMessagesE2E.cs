@@ -60,7 +60,7 @@ public sealed class SendMessagesE2E : IClassFixture<IggySendMessagesFixture>
     public async Task SendMessages_NoHeaders_Should_SendMessages_Successfully()
     {
         // act & assert
-        await _fixture.HttpSut.Invoking(y => y.SendMessagesAsync(_messageNoHeadersSendRequest))
+        await _fixture.HttpClient.Client.Invoking(y => y.SendMessagesAsync(_messageNoHeadersSendRequest))
             .Should()
             .NotThrowAsync();
         
@@ -79,7 +79,7 @@ public sealed class SendMessagesE2E : IClassFixture<IggySendMessagesFixture>
     public async Task SendMessages_NoHeaders_Should_Throw_InvalidResponse()
     {
         // act & assert
-        await _fixture.HttpSut.Invoking(y => y.SendMessagesAsync(_invalidMessageNoHeadersSendRequest))
+        await _fixture.HttpClient.Client.Invoking(y => y.SendMessagesAsync(_invalidMessageNoHeadersSendRequest))
             .Should()
             .ThrowAsync<InvalidResponseException>();
         
@@ -98,7 +98,7 @@ public sealed class SendMessagesE2E : IClassFixture<IggySendMessagesFixture>
     public async Task SendMessages_WithHeaders_Should_SendMessages_Successfully()
     {
         // act & assert
-        await _fixture.HttpSut.Invoking(y => y.SendMessagesAsync(_messageWithHeadersSendRequest))
+        await _fixture.HttpClient.Client.Invoking(y => y.SendMessagesAsync(_messageWithHeadersSendRequest))
             .Should()
             .NotThrowAsync();
         
@@ -117,7 +117,7 @@ public sealed class SendMessagesE2E : IClassFixture<IggySendMessagesFixture>
     public async Task SendMessages_WithHeaders_Should_Throw_InvalidResponse()
     {
         // act & assert
-        await _fixture.HttpSut.Invoking(y => y.SendMessagesAsync(_invalidMessageWithHeadersSendRequest))
+        await _fixture.HttpClient.Client.Invoking(y => y.SendMessagesAsync(_invalidMessageWithHeadersSendRequest))
             .Should()
             .ThrowAsync<InvalidResponseException>();
         

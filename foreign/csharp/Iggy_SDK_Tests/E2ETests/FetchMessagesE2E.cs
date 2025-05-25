@@ -52,7 +52,7 @@ public sealed class FetchMessagesE2E : IClassFixture<IggyFetchMessagesFixture>
     public async Task PollMessagesTMessage_WithNoHeaders_Should_PollMessages_Successfully()
     {
         // act
-        var response = await _fixture.HttpSut
+        var response = await _fixture.HttpClient.Client
             .FetchMessagesAsync(_messageFetchRequest, MessageFactory.DeserializeDummyMessage);
         
         // assert
@@ -90,7 +90,7 @@ public sealed class FetchMessagesE2E : IClassFixture<IggyFetchMessagesFixture>
     public async Task PollMessagesTMessage_Should_Throw_InvalidResponse()
     {
         // act & assert
-        await _fixture.HttpSut.Invoking(y =>
+        await _fixture.HttpClient.Client.Invoking(y =>
                 y.FetchMessagesAsync(_invalidFetchRequest, MessageFactory.DeserializeDummyMessage)
                 ).Should()
             .ThrowExactlyAsync<InvalidResponseException>();
@@ -110,7 +110,7 @@ public sealed class FetchMessagesE2E : IClassFixture<IggyFetchMessagesFixture>
     public async Task PollMessages_WithNoHeaders_Should_PollMessages_Successfully()
     {
         // act
-        var response = await _fixture.HttpSut.FetchMessagesAsync(_messageFetchRequest);
+        var response = await _fixture.HttpClient.Client.FetchMessagesAsync(_messageFetchRequest);
         
         // assert
         response.PartitionId.Should()
@@ -150,7 +150,7 @@ public sealed class FetchMessagesE2E : IClassFixture<IggyFetchMessagesFixture>
     public async Task PollMessages_Should_Throw_InvalidResponse()
     {
         // act & assert
-        await _fixture.HttpSut.Invoking(y => y.FetchMessagesAsync(_invalidFetchRequest))
+        await _fixture.HttpClient.Client.Invoking(y => y.FetchMessagesAsync(_invalidFetchRequest))
             .Should()
             .ThrowExactlyAsync<InvalidResponseException>();
         
@@ -169,7 +169,7 @@ public sealed class FetchMessagesE2E : IClassFixture<IggyFetchMessagesFixture>
     public async Task PollMessages_WithHeaders_Should_PollMessages_Successfully()
     {
         // act
-        var response = await _fixture.HttpSut.FetchMessagesAsync(_headersMessageFetchRequest);
+        var response = await _fixture.HttpClient.Client.FetchMessagesAsync(_headersMessageFetchRequest);
         
         // assert
         response.PartitionId.Should()
@@ -212,7 +212,7 @@ public sealed class FetchMessagesE2E : IClassFixture<IggyFetchMessagesFixture>
     public async Task PollMessagesTMessage_WithHeaders_Should_PollMessages_Successfully()
     {
         // act
-        var response = await _fixture.HttpSut
+        var response = await _fixture.HttpClient.Client
             .FetchMessagesAsync(_headersMessageFetchRequest, MessageFactory.DeserializeDummyMessage);
         
         // assert

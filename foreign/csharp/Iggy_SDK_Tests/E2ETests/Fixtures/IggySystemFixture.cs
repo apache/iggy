@@ -20,9 +20,9 @@ using Iggy_SDK_Tests.E2ETests.Fixtures.Configs;
 
 namespace Iggy_SDK_Tests.E2ETests.Fixtures;
 
-public sealed class IggyClientsFixture : IggyBaseFixture 
+public sealed class IggySystemFixture : IggyBaseFixture 
 {
-    public IggyClientsFixture() : base(new ClientsFixtureBootstrap(),
+    public IggySystemFixture() : base(new SystemFixtureBootstrap(),
         IggyFixtureClientMessagingSettings.PollingSettings, IggyFixtureClientMessagingSettings.BatchingSettings)
     {
     }

@@ -15,32 +15,31 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Contracts.Http;
+using Iggy_SDK_Tests.E2ETests.Fixtures.Models;
 using Iggy_SDK.Contracts.Http.Auth;
 using Iggy_SDK.Enums;
 using Iggy_SDK.Factory;
-using Iggy_SDK.IggyClient;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Iggy_SDK_Tests.E2ETests.Fixtures.Bootstraps;
 
-public class ClientsFixtureBootstrap : IIggyBootstrap
+public class SystemFixtureBootstrap : IIggyBootstrap
 {
     private const int FRESH_CLIENTS_COUNT = 6;
     
     public const int TotalClientsCount = FRESH_CLIENTS_COUNT + 1;
 
-    public ClientsFixtureBootstrap()
+    public SystemFixtureBootstrap()
     {
     }
     
-    public async Task BootstrapResourcesAsync(int tcpPort, int httpPort, IIggyClient httpClient, IIggyClient tcpClient)
+    public async Task BootstrapResourcesAsync(IggyClientModel httpClient, IggyClientModel tcpClient)
     {
         for (int i = 0; i < FRESH_CLIENTS_COUNT; i++)
         {
             var client = MessageStreamFactory.CreateMessageStream(options =>
             {
-                options.BaseAdress = $"127.0.0.1:{tcpPort}";
+                options.BaseAdress = $"127.0.0.1:{tcpClient.TcpPort}";
                 options.Protocol = Protocol.Tcp;
                 options.MessageBatchingSettings = x =>
                 {

@@ -50,7 +50,7 @@ public sealed class OffsetE2E : IClassFixture<IggyOffsetFixture>
     public async Task StoreOffset_IndividualConsumer_Should_StoreOffset_Successfully()
     {
         // act & assert
-        await _fixture.HttpSut.Invoking(y =>
+        await _fixture.HttpClient.Client.Invoking(y =>
                 y.StoreOffsetAsync(_storeOffsetIndividualConsumer)
             ).Should()
             .NotThrowAsync();
@@ -70,7 +70,7 @@ public sealed class OffsetE2E : IClassFixture<IggyOffsetFixture>
     public async Task GetOffset_IndividualConsumer_Should_GetOffset_Successfully()
     {
         // act
-        var offset = await _fixture.HttpSut.GetOffsetAsync(_offsetIndividualConsumer);
+        var offset = await _fixture.HttpClient.Client.GetOffsetAsync(_offsetIndividualConsumer);
         
         // assert
         offset.Should().NotBeNull();

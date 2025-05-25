@@ -39,7 +39,7 @@ public sealed class TopicsE2E : IClassFixture<IggyTopicFixture>
     {
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
-            var response = await sut.CreateTopicAsync(Identifier.Numeric((int)TopicsFixtureBootstrap.StreamRequest.StreamId!), TopicsFixtureBootstrap.TopicRequest);
+            var response = await sut.Client.CreateTopicAsync(Identifier.Numeric((int)TopicsFixtureBootstrap.StreamRequest.StreamId!), TopicsFixtureBootstrap.TopicRequest);
             
             response.Should().NotBeNull();
             response!.Id.Should().Be(TopicsFixtureBootstrap.TopicRequest.TopicId);
@@ -60,7 +60,7 @@ public sealed class TopicsE2E : IClassFixture<IggyTopicFixture>
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
             await sut.Invoking(async x =>
-                    await x.CreateTopicAsync(Identifier.Numeric((int)TopicsFixtureBootstrap.StreamRequest.StreamId!), TopicsFixtureBootstrap.TopicRequest))
+                    await x.Client.CreateTopicAsync(Identifier.Numeric((int)TopicsFixtureBootstrap.StreamRequest.StreamId!), TopicsFixtureBootstrap.TopicRequest))
                 .Should()
                 .ThrowExactlyAsync<InvalidResponseException>();
         })).ToArray();
@@ -73,7 +73,7 @@ public sealed class TopicsE2E : IClassFixture<IggyTopicFixture>
     {
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
-            var response = await sut.GetTopicByIdAsync(Identifier.Numeric((int)TopicsFixtureBootstrap.StreamRequest.StreamId!),
+            var response = await sut.Client.GetTopicByIdAsync(Identifier.Numeric((int)TopicsFixtureBootstrap.StreamRequest.StreamId!),
                 Identifier.Numeric((int)TopicsFixtureBootstrap.TopicRequest.TopicId!));
             response.Should().NotBeNull();
             response!.Id.Should().Be(TopicsFixtureBootstrap.TopicRequest.TopicId);
@@ -100,7 +100,7 @@ public sealed class TopicsE2E : IClassFixture<IggyTopicFixture>
         var createTasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
             await sut.Invoking(async x =>
-                    await x.CreateTopicAsync(Identifier.Numeric((int)TopicsFixtureBootstrap.StreamRequest.StreamId!), TopicsFixtureBootstrap.TopicRequestSecond))
+                    await x.Client.CreateTopicAsync(Identifier.Numeric((int)TopicsFixtureBootstrap.StreamRequest.StreamId!), TopicsFixtureBootstrap.TopicRequestSecond))
                 .Should()
                 .NotThrowAsync();
         })).ToArray();
@@ -108,7 +108,7 @@ public sealed class TopicsE2E : IClassFixture<IggyTopicFixture>
         
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
-            var response = await sut.GetTopicsAsync(Identifier.Numeric((int)TopicsFixtureBootstrap.StreamRequest.StreamId!));
+            var response = await sut.Client.GetTopicsAsync(Identifier.Numeric((int)TopicsFixtureBootstrap.StreamRequest.StreamId!));
             response.Should().NotBeNull();
             response.Count.Should().Be(2);
             response.Select(x=>x.Id).Should().ContainSingle(x=> x== TopicsFixtureBootstrap.TopicRequest.TopicId);
@@ -125,12 +125,12 @@ public sealed class TopicsE2E : IClassFixture<IggyTopicFixture>
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
             await sut.Invoking(async x =>
-                    await x.UpdateTopicAsync(Identifier.Numeric((int)TopicsFixtureBootstrap.StreamRequest.StreamId!),
+                    await x.Client.UpdateTopicAsync(Identifier.Numeric((int)TopicsFixtureBootstrap.StreamRequest.StreamId!),
                         Identifier.Numeric((int)TopicsFixtureBootstrap.TopicRequest.TopicId!), TopicsFixtureBootstrap.UpdateTopicRequest))
                 .Should()
                 .NotThrowAsync();
         
-            var result = await sut.GetTopicByIdAsync(Identifier.Numeric((int)TopicsFixtureBootstrap.StreamRequest.StreamId!),
+            var result = await sut.Client.GetTopicByIdAsync(Identifier.Numeric((int)TopicsFixtureBootstrap.StreamRequest.StreamId!),
                 Identifier.Numeric((int)TopicsFixtureBootstrap.TopicRequest.TopicId!));
             result.Should().NotBeNull();
             result!.Name.Should().Be(TopicsFixtureBootstrap.UpdateTopicRequest.Name);
@@ -149,7 +149,7 @@ public sealed class TopicsE2E : IClassFixture<IggyTopicFixture>
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
             await sut.Invoking(async x =>
-                    await x.PurgeTopicAsync(Identifier.Numeric((int)TopicsFixtureBootstrap.StreamRequest.StreamId!),
+                    await x.Client.PurgeTopicAsync(Identifier.Numeric((int)TopicsFixtureBootstrap.StreamRequest.StreamId!),
                         Identifier.Numeric((int)TopicsFixtureBootstrap.TopicRequest.TopicId!)))
                 .Should()
                 .NotThrowAsync();
@@ -165,7 +165,7 @@ public sealed class TopicsE2E : IClassFixture<IggyTopicFixture>
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
             await sut.Invoking(async x =>
-                    await x.DeleteTopicAsync(Identifier.Numeric((int)TopicsFixtureBootstrap.StreamRequest.StreamId!),
+                    await x.Client.DeleteTopicAsync(Identifier.Numeric((int)TopicsFixtureBootstrap.StreamRequest.StreamId!),
                         Identifier.Numeric((int)TopicsFixtureBootstrap.TopicRequest.TopicId!)))
                 .Should()
                 .NotThrowAsync();
@@ -182,7 +182,7 @@ public sealed class TopicsE2E : IClassFixture<IggyTopicFixture>
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
             await sut.Invoking(async x =>
-                    await x.DeleteTopicAsync(Identifier.Numeric((int)TopicsFixtureBootstrap.StreamRequest.StreamId!),
+                    await x.Client.DeleteTopicAsync(Identifier.Numeric((int)TopicsFixtureBootstrap.StreamRequest.StreamId!),
                         Identifier.Numeric((int)TopicsFixtureBootstrap.TopicRequest.TopicId!)))
                 .Should()
                 .ThrowExactlyAsync<InvalidResponseException>();
@@ -199,7 +199,7 @@ public sealed class TopicsE2E : IClassFixture<IggyTopicFixture>
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
             await sut.Invoking(async x =>
-                    await x.GetTopicByIdAsync(Identifier.Numeric((int)TopicsFixtureBootstrap.StreamRequest.StreamId!),
+                    await x.Client.GetTopicByIdAsync(Identifier.Numeric((int)TopicsFixtureBootstrap.StreamRequest.StreamId!),
                         Identifier.Numeric((int)TopicsFixtureBootstrap.TopicRequest.TopicId!)))
                 .Should()
                 .ThrowExactlyAsync<InvalidResponseException>();

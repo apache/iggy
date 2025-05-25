@@ -48,7 +48,7 @@ public sealed class PollMessagesE2E(IggyPollMessagesFixture fixture) : IClassFix
         
         // act
         var messagesCount = 0;
-        await foreach (var msgResponse in fixture.HttpSut.PollMessagesAsync(
+        await foreach (var msgResponse in fixture.HttpClient.Client.PollMessagesAsync(
                            pollMessageRequest,
                            MessageFactory.DeserializeDummyMessage)
                       )

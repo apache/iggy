@@ -42,7 +42,7 @@ public sealed class PATE2E : IClassFixture<IggyPATFixture>
     public async Task CreatePersonalAccessToken_HappyPath_Should_CreatePersonalAccessToken_Successfully()
     {
         // act & assert
-        await _fixture.HttpSut.Invoking(y =>
+        await _fixture.HttpClient.Client.Invoking(y =>
                 y.CreatePersonalAccessTokenAsync(PATFixtureBootstrap.CreatePersonalAccessTokenRequest)
             ).Should()
             .NotThrowAsync();
@@ -62,7 +62,7 @@ public sealed class PATE2E : IClassFixture<IggyPATFixture>
     public async Task CreatePersonalAccessToken_Duplicate_Should_Throw_InvalidResponse()
     {
         // act & assert
-        await _fixture.HttpSut.Invoking(y =>
+        await _fixture.HttpClient.Client.Invoking(y =>
                 y.CreatePersonalAccessTokenAsync(PATFixtureBootstrap.CreatePersonalAccessTokenRequest)
             ).Should()
             .ThrowExactlyAsync<InvalidResponseException>();
@@ -86,7 +86,7 @@ public sealed class PATE2E : IClassFixture<IggyPATFixture>
         var expectedPersonalTokenName = PATFixtureBootstrap.CreatePersonalAccessTokenRequest.Name;
         
         // act
-        var response = await _fixture.HttpSut.GetPersonalAccessTokensAsync();
+        var response = await _fixture.HttpClient.Client.GetPersonalAccessTokensAsync();
         
         // assert
         response.Should()
@@ -116,16 +116,16 @@ public sealed class PATE2E : IClassFixture<IggyPATFixture>
     public async Task LoginWithPersonalAccessToken_Should_Be_Successfull()
     {
         // act
-        var response = await _fixture.HttpSut.CreatePersonalAccessTokenAsync(new CreatePersonalAccessTokenRequest
+        var response = await _fixture.HttpClient.Client.CreatePersonalAccessTokenAsync(new CreatePersonalAccessTokenRequest
         {
             Name = "test-login",
             Expiry = 1726574121
         });
 
-        await _fixture.HttpSut.LogoutUser();
+        await _fixture.HttpClient.Client.LogoutUser();
         
         // assert
-        await _fixture.HttpSut.Invoking(x => x.LoginWithPersonalAccessToken(new LoginWithPersonalAccessToken
+        await _fixture.HttpClient.Client.Invoking(x => x.LoginWithPersonalAccessToken(new LoginWithPersonalAccessToken
         {
             Token = response!.Token
         }))
@@ -154,7 +154,7 @@ public sealed class PATE2E : IClassFixture<IggyPATFixture>
     public async Task DeletePersonalAccessToken_Should_DeletePersonalAccessToken_Successfully()
     {
         // act & assert
-        await _fixture.HttpSut.Invoking(x => x.DeletePersonalAccessTokenAsync(new DeletePersonalAccessTokenRequest
+        await _fixture.HttpClient.Client.Invoking(x => x.DeletePersonalAccessTokenAsync(new DeletePersonalAccessTokenRequest
             {
                 Name = PATFixtureBootstrap.CreatePersonalAccessTokenRequest.Name
             }))

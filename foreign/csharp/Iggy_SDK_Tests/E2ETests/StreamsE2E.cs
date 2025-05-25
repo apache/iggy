@@ -41,7 +41,7 @@ public sealed class StreamsE2E : IClassFixture<IggyStreamFixture>
         // act & assert
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
-            var response = await sut.CreateStreamAsync(StreamsFixtureBootstrap.StreamRequest);
+            var response = await sut.Client.CreateStreamAsync(StreamsFixtureBootstrap.StreamRequest);
             
             response.Should().NotBeNull();
             response!.Id.Should().Be(StreamsFixtureBootstrap.StreamRequest.StreamId);
@@ -61,7 +61,7 @@ public sealed class StreamsE2E : IClassFixture<IggyStreamFixture>
         // act & assert
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
-            await sut.Invoking(async x => await x.CreateStreamAsync(StreamsFixtureBootstrap.StreamRequest))
+            await sut.Invoking(async x => await x.Client.CreateStreamAsync(StreamsFixtureBootstrap.StreamRequest))
                 .Should()
                 .ThrowExactlyAsync<InvalidResponseException>();
         })).ToArray();
@@ -74,7 +74,7 @@ public sealed class StreamsE2E : IClassFixture<IggyStreamFixture>
         // act
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
-            var response = await sut.GetStreamByIdAsync(Identifier.Numeric((int)StreamsFixtureBootstrap.StreamRequest.StreamId!));
+            var response = await sut.Client.GetStreamByIdAsync(Identifier.Numeric((int)StreamsFixtureBootstrap.StreamRequest.StreamId!));
             response.Should().NotBeNull();
             response!.Id.Should().Be(StreamsFixtureBootstrap.StreamRequest.StreamId);
             response.Name.Should().Be(StreamsFixtureBootstrap.StreamRequest.Name);
@@ -88,11 +88,11 @@ public sealed class StreamsE2E : IClassFixture<IggyStreamFixture>
         // act
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
-            await sut.Invoking(async x => await x.UpdateStreamAsync(Identifier.Numeric((int)StreamsFixtureBootstrap.StreamRequest.StreamId!), StreamsFixtureBootstrap.UpdateStreamRequest))
+            await sut.Invoking(async x => await x.Client.UpdateStreamAsync(Identifier.Numeric((int)StreamsFixtureBootstrap.StreamRequest.StreamId!), StreamsFixtureBootstrap.UpdateStreamRequest))
                 .Should()
                 .NotThrowAsync();
             
-            var result = await sut.GetStreamByIdAsync(Identifier.Numeric((int)StreamsFixtureBootstrap.StreamRequest.StreamId!));
+            var result = await sut.Client.GetStreamByIdAsync(Identifier.Numeric((int)StreamsFixtureBootstrap.StreamRequest.StreamId!));
             result.Should().NotBeNull();
             result!.Name.Should().Be(StreamsFixtureBootstrap.UpdateStreamRequest.Name);
         })).ToArray();
@@ -106,7 +106,7 @@ public sealed class StreamsE2E : IClassFixture<IggyStreamFixture>
         // TODO: Check if the stream is empty after purging
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
-            await sut.Invoking(async x => await x.PurgeStreamAsync(Identifier.Numeric((int)StreamsFixtureBootstrap.StreamRequest.StreamId!)))
+            await sut.Invoking(async x => await x.Client.PurgeStreamAsync(Identifier.Numeric((int)StreamsFixtureBootstrap.StreamRequest.StreamId!)))
                 .Should()
                 .NotThrowAsync();
         })).ToArray();
@@ -119,7 +119,7 @@ public sealed class StreamsE2E : IClassFixture<IggyStreamFixture>
         // act
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
-            await sut.Invoking(async x => await x.DeleteStreamAsync(Identifier.Numeric((int)StreamsFixtureBootstrap.StreamRequest.StreamId!)))
+            await sut.Invoking(async x => await x.Client.DeleteStreamAsync(Identifier.Numeric((int)StreamsFixtureBootstrap.StreamRequest.StreamId!)))
                 .Should()
                 .NotThrowAsync();
         })).ToArray();
@@ -132,7 +132,7 @@ public sealed class StreamsE2E : IClassFixture<IggyStreamFixture>
         // act
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
-            await sut.Invoking(async x => await x.DeleteStreamAsync(Identifier.Numeric((int)StreamsFixtureBootstrap.StreamRequest.StreamId!)))
+            await sut.Invoking(async x => await x.Client.DeleteStreamAsync(Identifier.Numeric((int)StreamsFixtureBootstrap.StreamRequest.StreamId!)))
                 .Should()
                 .ThrowExactlyAsync<InvalidResponseException>();
         })).ToArray();
@@ -146,7 +146,7 @@ public sealed class StreamsE2E : IClassFixture<IggyStreamFixture>
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
             await sut.Invoking(async x =>
-                await x.GetStreamByIdAsync(Identifier.Numeric((int)StreamsFixtureBootstrap.StreamRequest.StreamId!)))
+                await x.Client.GetStreamByIdAsync(Identifier.Numeric((int)StreamsFixtureBootstrap.StreamRequest.StreamId!)))
             .Should()
             .ThrowExactlyAsync<InvalidResponseException>();
         })).ToArray();

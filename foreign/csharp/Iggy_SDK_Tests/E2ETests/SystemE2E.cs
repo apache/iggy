@@ -17,43 +17,46 @@
 
 using FluentAssertions;
 using Iggy_SDK_Tests.E2ETests.Fixtures;
-using Iggy_SDK_Tests.E2ETests.Fixtures.Bootstraps;
 using Iggy_SDK_Tests.Utils;
+using Iggy_SDK_Tests.E2ETests.Fixtures.Bootstraps;
 
 namespace Iggy_SDK_Tests.E2ETests;
 
-//TODO(numinex): The clients query doesn't work for http in this test case, but works in general, figure that shit out.
 [TestCaseOrderer("Iggy_SDK_Tests.Utils.PriorityOrderer", "Iggy_SDK_Tests")]
-public sealed class ClientsE2E : IClassFixture<IggyClientsFixture>
+public sealed class SystemE2E : IClassFixture<IggySystemFixture>
 {
-    private const string SkipMessage = "TCP implementation needs to be aligned with Iggyrs core changes";
-    
-    private const int sutByTcp = 0;
-    
-    private readonly IggyClientsFixture _fixture;
+    private readonly IggySystemFixture _fixture;
 
-    public ClientsE2E(IggyClientsFixture fixture)
+    public SystemE2E(IggySystemFixture fixture)
     {
         _fixture = fixture;
     }
-
-    [Fact(Skip = SkipMessage), TestPriority(1)]
+    
+    [Fact, TestPriority(1)]
     public async Task GetClients_Should_Return_CorrectClientsCount()
     {
-        var sut = _fixture.SubjectsUnderTest[sutByTcp];
-        var clients = await sut.GetClientsAsync();
-        clients.Count.Should().Be(ClientsFixtureBootstrap.TotalClientsCount);
+        var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
+        {
+            var clients = await sut.Client.GetClientsAsync();
+            clients.Count.Should().Be(SystemFixtureBootstrap.TotalClientsCount);
+        })).ToArray();
+        
+        await Task.WhenAll(tasks);
     }
         
-    [Fact(Skip = SkipMessage), TestPriority(2)]
+    [Fact, TestPriority(2)]
     public async Task GetClient_Should_Return_CorrectClient()
     {
-        var sut = _fixture.SubjectsUnderTest[sutByTcp];
-        var clients = await sut.GetClientsAsync();
-        clients.Count.Should().Be(ClientsFixtureBootstrap.TotalClientsCount);
-        uint id = clients[0].ClientId;
-        var response = await sut.GetClientByIdAsync(id);
-        response!.ClientId.Should().Be(id);
+        var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
+        {
+            var clients = await sut.Client.GetClientsAsync();
+            clients.Count.Should().Be(SystemFixtureBootstrap.TotalClientsCount);
+            uint id = clients[0].ClientId;
+            var response = await sut.Client.GetClientByIdAsync(id);
+            response!.ClientId.Should().Be(id);
+        })).ToArray();
+        
+        await Task.WhenAll(tasks);
     }
     
     // [Fact, TestPriority(3)]
@@ -66,4 +69,21 @@ public sealed class ClientsE2E : IClassFixture<IggyClientsFixture>
     //     var response = await sut.GetClientByIdAsync(id);
     //     response!.ClientId.Should().Be(id);
     // }
+
+    [Fact, TestPriority(3)]
+    public async Task GetStats_Should_ReturnValidResponse()
+    {
+        // act
+        var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
+        {
+            var response = await sut.Client.GetStatsAsync();
+            response.Should().NotBeNull();
+            response!.MessagesCount.Should().Be(0);
+            response.PartitionsCount.Should().Be(0);
+            response.StreamsCount.Should().Be(0);
+            response.TopicsCount.Should().Be(0);
+        })).ToArray();
+        
+        await Task.WhenAll(tasks);
+    }
 }
