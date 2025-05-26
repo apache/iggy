@@ -15,22 +15,62 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::state::benchmark::{BenchmarkAction, use_benchmark};
 use crate::state::ui::{UiAction, ViewMode, use_ui};
 use yew::prelude::*;
 
 #[function_component(ViewModeSelector)]
 pub fn view_mode_toggle() -> Html {
     let ui_state = use_ui();
-    let is_trend_view = matches!(ui_state.view_mode, ViewMode::GitrefTrend);
+    let benchmark_ctx = use_benchmark();
+    let current_mode = &ui_state.view_mode;
 
-    let onclick = {
+    let single_onclick: Callback<MouseEvent> =
+        {
+            let ui_state = ui_state.clone();
+            let benchmark_ctx = benchmark_ctx.clone();
+            Callback::from(move |_| {
+                if let Some(selected_benchmark) = &benchmark_ctx.state.selected_benchmark {
+                    let kind = selected_benchmark.params.benchmark_kind;
+
+                    ui_state.dispatch(UiAction::SetViewMode(ViewMode::SingleGitref));
+
+                    if benchmark_ctx.state.selected_kind != kind {
+                        benchmark_ctx
+                            .dispatch
+                            .emit(BenchmarkAction::SelectBenchmarkKind(kind));
+                        gloo::console::log!(format!(
+                            "Selected benchmark kind {:?} when switching to Single view",
+                            kind
+                        ));
+                    }
+
+                    let params_identifier = selected_benchmark.params.params_identifier.clone();
+                    benchmark_ctx.dispatch.emit(
+                        BenchmarkAction::SelectBenchmarkByParamsIdentifier(params_identifier),
+                    );
+                    gloo::console::log!(format!(
+                        "Maintaining selection of benchmark with params_identifier: {}",
+                        selected_benchmark.params.params_identifier
+                    ));
+                } else {
+                    ui_state.dispatch(UiAction::SetViewMode(ViewMode::SingleGitref));
+                }
+            })
+        };
+
+    // TODO(hubcio): Trend is not used anywhere yet, because we don't have a regression ongoing.
+    // let trend_onclick = {
+    //     let ui_state = ui_state.clone();
+    //     Callback::from(move |_| {
+    //         ui_state.dispatch(UiAction::SetViewMode(ViewMode::GitrefTrend));
+    //     })
+    // };
+
+    let recent_onclick = {
         let ui_state = ui_state.clone();
         Callback::from(move |_| {
-            ui_state.dispatch(UiAction::SetViewMode(if is_trend_view {
-                ViewMode::SingleGitref
-            } else {
-                ViewMode::GitrefTrend
-            }));
+            ui_state.dispatch(UiAction::SetViewMode(ViewMode::RecentBenchmarks));
         })
     };
 
@@ -39,16 +79,23 @@ pub fn view_mode_toggle() -> Html {
             <h3>{"View Mode"}</h3>
             <div class="segmented-control">
                 <button
-                    class={if !is_trend_view { "segment active" } else { "segment" }}
-                    onclick={onclick.clone()}
+                    class={if matches!(current_mode, ViewMode::SingleGitref) { "segment active" } else { "segment" }}
+                    onclick={single_onclick}
                 >
                     {"Single"}
                 </button>
+                // TODO(hubcio): Trend is not used anywhere yet, because we don't have a regression ongoing.
+                // <button
+                //     class={if matches!(current_mode, ViewMode::GitrefTrend) { "segment active" } else { "segment" }}
+                //     onclick={trend_onclick}
+                // >
+                //     {"Trend"}
+                // </button>
                 <button
-                    class={if is_trend_view { "segment active" } else { "segment" }}
-                    {onclick}
+                    class={if matches!(current_mode, ViewMode::RecentBenchmarks) { "segment active" } else { "segment" }}
+                    onclick={recent_onclick}
                 >
-                    {"Trend"}
+                    {"Recent"}
                 </button>
             </div>
         </div>

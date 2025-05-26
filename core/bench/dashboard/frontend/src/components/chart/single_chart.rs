@@ -22,6 +22,7 @@ use bench_report::report::BenchmarkReport;
 use charming::theme::Theme;
 use charming::{Echarts, WasmRenderer};
 use gloo::console::log;
+use gloo::history::{BrowserHistory, History};
 use uuid::Uuid;
 use yew::platform::spawn_local;
 use yew::prelude::*;
@@ -52,6 +53,17 @@ pub fn single_chart(props: &SingleChartProps) -> Html {
         use_effect_with(benchmark_uuid, move |benchmark_uuid| {
             let benchmark_uuid = *benchmark_uuid;
             is_loading.set(true);
+
+            let current_location = web_sys::window()
+                .and_then(|w| w.location().pathname().ok())
+                .unwrap_or_default();
+
+            let expected_path = format!("/benchmarks/{}", benchmark_uuid);
+
+            if current_location != expected_path {
+                let history = BrowserHistory::new();
+                history.push(expected_path);
+            }
 
             spawn_local(async move {
                 match fetch_benchmark_report_full(&benchmark_uuid).await {

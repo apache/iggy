@@ -15,41 +15,47 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::state::hardware::{HardwareAction, use_hardware};
-use web_sys::HtmlSelectElement;
+use crate::state::hardware::use_hardware;
+use gloo::console::log;
 use yew::prelude::*;
 
 #[derive(Properties, PartialEq)]
-pub struct HardwareSelectorProps {}
+pub struct HardwareSelectorProps {
+    pub on_hardware_select: Callback<String>,
+}
 
 #[function_component(HardwareSelector)]
-pub fn hardware_selector(_props: &HardwareSelectorProps) -> Html {
+pub fn hardware_selector(props: &HardwareSelectorProps) -> Html {
     let hardware_ctx = use_hardware();
 
-    let onchange = {
-        let dispatch = hardware_ctx.dispatch.clone();
-        Callback::from(move |e: Event| {
-            if let Some(target) = e.target_dyn_into::<HtmlSelectElement>() {
-                dispatch.emit(HardwareAction::SelectHardware(target.value().parse().ok()));
-            }
-        })
-    };
+    let on_hardware_change = create_on_hardware_change_callback(props.on_hardware_select.clone());
 
     html! {
-        <div class="hardware-select">
+        <div class="hardware-selector">
             <h3>{"Hardware"}</h3>
-            <select onchange={onchange}>
-                {hardware_ctx.state.hardware_list.iter().map(|hardware| {
-                    html! {
-                        <option
-                            value={hardware.identifier.clone().unwrap_or_else(|| "Unknown".to_string())}
-                            selected={hardware_ctx.state.selected_hardware == Some(hardware.identifier.clone().unwrap_or_else(|| "Unknown".to_string()))}
-                        >
-                            {format!("{} @ {}", hardware.identifier.clone().unwrap_or_else(|| "Unknown".to_string()), &hardware.cpu_name)}
-                        </option>
-                    }
-                }).collect::<Html>()}
+            <select
+                onchange={on_hardware_change.clone()}
+            >
+                { for hardware_ctx.state.hardware_list.iter().map(|hardware| html! {
+                    <option
+                        value={hardware.identifier.clone().unwrap_or_else(|| "Unknown".to_string())}
+                        selected={hardware_ctx.state.selected_hardware == Some(hardware.identifier.clone().unwrap_or_else(|| "Unknown".to_string()))}
+                    >
+                        {format!("{} @ {}", hardware.identifier.clone().unwrap_or_else(|| "Unknown".to_string()), &hardware.cpu_name)}
+                    </option>
+                }) }
             </select>
         </div>
     }
+}
+
+fn create_on_hardware_change_callback(on_hardware_select: Callback<String>) -> Callback<Event> {
+    Callback::from(move |e: Event| {
+        let target = e.target_dyn_into::<web_sys::HtmlSelectElement>();
+        if let Some(select) = target {
+            let value = select.value();
+            log!(format!("Hardware selected via dropdown: {}", value));
+            on_hardware_select.emit(value);
+        }
+    })
 }

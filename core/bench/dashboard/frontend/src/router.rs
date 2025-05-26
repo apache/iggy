@@ -21,8 +21,8 @@ use yew_router::prelude::*;
 pub enum AppRoute {
     #[at("/")]
     Home,
-    #[at("/single")]
-    Single,
+    #[at("/benchmarks/:uuid")]
+    Benchmark { uuid: String },
     #[not_found]
     #[at("/404")]
     NotFound,

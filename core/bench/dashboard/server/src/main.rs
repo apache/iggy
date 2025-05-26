@@ -154,6 +154,7 @@ async fn main() -> Result<(), std::io::Error> {
             .service(handlers::health_check)
             .service(handlers::list_hardware)
             .service(handlers::list_gitrefs_for_hardware)
+            .service(handlers::get_recent_benchmarks) // Register this before the generic gitref endpoint
             .service(handlers::list_benchmarks_for_gitref)
             .service(handlers::list_benchmarks_for_hardware_and_gitref)
             .service(handlers::get_benchmark_report_full)
