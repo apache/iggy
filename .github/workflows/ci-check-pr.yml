@@ -48,6 +48,10 @@ on:
       - master
     types: [ opened, synchronize, reopened ]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   pr-file-changes:
     name: pr-file-changes
@@ -140,7 +144,7 @@ jobs:
     if: ${{ needs.pr-file-changes.outputs.trigger-node-sdk == 'true' }}
     uses: ./.github/workflows/ci-check-node-sdk.yml
 
-  finalize-pr:
+  finalize_pr:
     runs-on: ubuntu-latest
     needs:
       - pr-file-changes
