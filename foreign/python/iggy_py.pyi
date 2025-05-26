@@ -60,31 +60,31 @@ class IggyClient:
         
         Returns Ok(()) on successful stream creation or a PyRuntimeError on failure.
         """
-    def get_stream(self, stream_id:PyIdentifier) -> typing.Any:
+    def get_stream(self, stream_id:builtins.str | builtins.int) -> typing.Any:
         r"""
         Gets stream by id.
         
         Returns Option of stream details or a PyRuntimeError on failure.
         """
-    def create_topic(self, stream:PyIdentifier, name:builtins.str, partitions_count:builtins.int, compression_algorithm:typing.Optional[builtins.str]=None, topic_id:typing.Optional[builtins.int]=None, replication_factor:typing.Optional[builtins.int]=None) -> typing.Any:
+    def create_topic(self, stream:builtins.str | builtins.int, name:builtins.str, partitions_count:builtins.int, compression_algorithm:typing.Optional[builtins.str]=None, topic_id:typing.Optional[builtins.int]=None, replication_factor:typing.Optional[builtins.int]=None) -> typing.Any:
         r"""
         Creates a new topic with the given parameters.
         
         Returns Ok(()) on successful topic creation or a PyRuntimeError on failure.
         """
-    def get_topic(self, stream_id:PyIdentifier, topic_id:PyIdentifier) -> typing.Any:
+    def get_topic(self, stream_id:builtins.str | builtins.int, topic_id:builtins.str | builtins.int) -> typing.Any:
         r"""
         Gets topic by stream and id.
         
         Returns Option of topic details or a PyRuntimeError on failure.
         """
-    def send_messages(self, stream:PyIdentifier, topic:PyIdentifier, partitioning:builtins.int, messages:list) -> typing.Any:
+    def send_messages(self, stream:builtins.str | builtins.int, topic:builtins.str | builtins.int, partitioning:builtins.int, messages:list) -> typing.Any:
         r"""
         Sends a list of messages to the specified topic.
         
         Returns Ok(()) on successful sending or a PyRuntimeError on failure.
         """
-    def poll_messages(self, stream:PyIdentifier, topic:PyIdentifier, partition_id:builtins.int, polling_strategy:PollingStrategy, count:builtins.int, auto_commit:builtins.bool) -> typing.Any:
+    def poll_messages(self, stream:builtins.str | builtins.int, topic:builtins.str | builtins.int, partition_id:builtins.int, polling_strategy:PollingStrategy, count:builtins.int, auto_commit:builtins.bool) -> typing.Any:
         r"""
         Polls for messages from the specified topic and partition.
         
@@ -179,8 +179,4 @@ class PollingStrategy(Enum):
     First = ...
     Last = ...
     Next = ...
-
-class PyIdentifier(Enum):
-    String = ...
-    Int = ...
 
