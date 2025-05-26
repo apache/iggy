@@ -20,16 +20,16 @@
 package org.apache.iggy.message;
 
 import java.math.BigInteger;
-import java.util.Map;
-import java.util.Optional;
 
-public record PolledMessage(
-        BigInteger offset,
-        MessageState state,
-        BigInteger timestamp,
-        MessageId id,
-        Long checksum,
-        Optional<Map<String, HeaderValue>> headers,
-        byte[] payload
+public record MessageHeader(
+    BigInteger checksum,
+    MessageId id,
+    BigInteger offset,
+    BigInteger timestamp,
+    BigInteger originTimestamp,
+    Long userHeadersLength,
+    Long payloadLength
 ) {
+
+  public static final int SIZE = 8 + 16 + 8 + 8 + 8 + 4 + 4;
 }
