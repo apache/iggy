@@ -28,7 +28,7 @@ class IggyClient:
     It wraps the RustIggyClient and provides asynchronous functionality
     through the contained runtime.
     """
-    def new(self, conn:typing.Optional[builtins.str]) -> IggyClient:
+    def __new__(cls, conn:typing.Optional[builtins.str]=None) -> IggyClient:
         r"""
         Constructs a new IggyClient.
         
@@ -54,7 +54,7 @@ class IggyClient:
         
         Returns Ok(()) on successful connection or a PyRuntimeError on failure.
         """
-    def create_stream(self, name:builtins.str, stream_id:typing.Optional[builtins.int]) -> typing.Any:
+    def create_stream(self, name:builtins.str, stream_id:typing.Optional[builtins.int]=None) -> typing.Any:
         r"""
         Creates a new stream with the provided ID and name.
         
@@ -66,7 +66,7 @@ class IggyClient:
         
         Returns Option of stream details or a PyRuntimeError on failure.
         """
-    def create_topic(self, stream:PyIdentifier, name:builtins.str, partitions_count:builtins.int, compression_algorithm:typing.Optional[builtins.str], topic_id:typing.Optional[builtins.int], replication_factor:typing.Optional[builtins.int]) -> typing.Any:
+    def create_topic(self, stream:PyIdentifier, name:builtins.str, partitions_count:builtins.int, compression_algorithm:typing.Optional[builtins.str]=None, topic_id:typing.Optional[builtins.int]=None, replication_factor:typing.Optional[builtins.int]=None) -> typing.Any:
         r"""
         Creates a new topic with the given parameters.
         

@@ -68,8 +68,8 @@ impl From<PyIdentifier> for Identifier {
     }
 }
 
-#[pymethods]
 #[gen_stub_pymethods]
+#[pymethods]
 impl IggyClient {
     /// Constructs a new IggyClient.
     ///
