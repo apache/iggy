@@ -1,4 +1,4 @@
-// Licensed to the Apache Software Foundation (ASF) under one
+﻿// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -15,12 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Contracts.Http;
-namespace Iggy_SDK.IggyClient;
+namespace Iggy_SDK.Enums;
 
-public interface IIggyUtils
+/// <summary>
+/// Enum representing the various compression methods available for snapshots
+/// </summary>
+public enum SnapshotCompression
 {
-    public Task<Stats?> GetStatsAsync(CancellationToken token = default);
-    public Task<IReadOnlyList<ClientResponse>> GetClientsAsync(CancellationToken token = default);
-    public Task<ClientResponse?> GetClientByIdAsync(uint clientId, CancellationToken token = default);
+    /// Store the file as is
+    Stored,
+    /// Compress the file using Deflate
+    Deflated,
+    /// Compress the file using BZIP2
+    Bzip2,
+    /// Compress the file using ZStandard
+    Zstd,
+    /// Compress the file using LZMA
+    Lzma,
+    /// Compress the file using XZ
+    Xz,
 }

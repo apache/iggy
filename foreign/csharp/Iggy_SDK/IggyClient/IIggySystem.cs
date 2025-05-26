@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK.Contracts.Http;
+using Iggy_SDK.Contracts.Http;
+namespace Iggy_SDK.IggyClient;
 
-public sealed class ClientResponse
+public interface IIggySystem
 {
-    public required uint ClientId { get; init; }
-    public required string Address { get; init; }
-    public required uint UserId { get; init; }
-    public required string Transport { get; init; }
-    public required int ConsumerGroupsCount { get; init; }
-    public IEnumerable<ConsumerGroupInfo>? ConsumerGroups { get; init; }
+    public Task<IReadOnlyList<ClientResponse>> GetClientsAsync(CancellationToken token = default);
+    public Task<ClientResponse?> GetClientByIdAsync(uint clientId, CancellationToken token = default);
+    public Task<ClientResponse?> GetMeAsync(CancellationToken token = default);
+    public Task<Stats?> GetStatsAsync(CancellationToken token = default);
+    public Task PingAsync(CancellationToken token = default);
 }

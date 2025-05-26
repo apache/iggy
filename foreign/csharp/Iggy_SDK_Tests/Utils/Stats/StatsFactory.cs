@@ -46,6 +46,7 @@ public static class StatsFactory
             MessagesSizeBytes = 1234567890,
             Hostname = "localhost",
             ClientsCount = 69,
+            IggyServerVersion = "1234"
         };
 
     }

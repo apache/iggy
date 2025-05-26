@@ -1,4 +1,4 @@
-// Licensed to the Apache Software Foundation (ASF) under one
+﻿// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -15,14 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK.Contracts.Http;
+namespace Iggy_SDK.Enums;
 
-public sealed class ClientResponse
+/// <summary>
+/// Enum representing the different types of system snapshots that can be taken
+/// </summary>
+public enum SystemSnapshotType
 {
-    public required uint ClientId { get; init; }
-    public required string Address { get; init; }
-    public required uint UserId { get; init; }
-    public required string Transport { get; init; }
-    public required int ConsumerGroupsCount { get; init; }
-    public IEnumerable<ConsumerGroupInfo>? ConsumerGroups { get; init; }
+    /// Overview of the filesystem.
+    FilesystemOverview,
+    /// List of currently running processes.
+    ProcessList,
+    /// Resource usage statistics of the system.
+    ResourceUsage,
+    /// Test snapshot type for development purposes.
+    Test,
+    /// Server logs
+    ServerLogs,
+    /// Server configuration
+    ServerConfig,
+    /// Everything
+    All,
 }

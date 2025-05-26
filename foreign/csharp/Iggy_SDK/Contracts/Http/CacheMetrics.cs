@@ -1,4 +1,4 @@
-// Licensed to the Apache Software Foundation (ASF) under one
+﻿// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -17,12 +17,12 @@
 
 namespace Iggy_SDK.Contracts.Http;
 
-public sealed class ClientResponse
+public class CacheMetrics
 {
-    public required uint ClientId { get; init; }
-    public required string Address { get; init; }
-    public required uint UserId { get; init; }
-    public required string Transport { get; init; }
-    public required int ConsumerGroupsCount { get; init; }
-    public IEnumerable<ConsumerGroupInfo>? ConsumerGroups { get; init; }
+    public uint StreamId { get; set; }
+    public uint TopicId { get; set; }
+    public uint PartitionId { get; set; }
+    public ulong Hits { get; set; }
+    public ulong Misses { get; set; }
+    public float HitRatio { get; set; }
 }

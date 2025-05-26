@@ -245,7 +245,7 @@ internal static class BinaryMapper
         }
         return new ClientResponse
         {
-            Adress = response.Adress,
+            Address = response.Address,
             ClientId = response.ClientId,
             UserId = response.UserId,
             Transport = response.Transport,
@@ -296,7 +296,7 @@ internal static class BinaryMapper
             ClientId = id,
             UserId = userId,
             Transport = transport,
-            Adress = address,
+            Address = address,
             ConsumerGroupsCount = consumerGroupsCount
         }, readBytes);
     }
@@ -757,7 +757,32 @@ internal static class BinaryMapper
         position += 4 + osVersionLength;
         int kernelVersionLength = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
         string kernelVersion = Encoding.UTF8.GetString(payload[(position + 4)..(position + 4 + kernelVersionLength)]);
+        position += 4 + kernelVersionLength;
+        int iggyVersionLength = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
+        string iggyVersion = Encoding.UTF8.GetString(payload[(position + 4)..(position + 4 + iggyVersionLength)]);
+        position += 4 + iggyVersionLength;
+        uint iggySemVersion = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
+        position += 4;
+        
+        var cacheMetricsLength = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
+        position += 4;
 
+        var cacheMetricsList = new List<CacheMetrics>(cacheMetricsLength);
+        for (var i = 0; i < cacheMetricsLength; i++)
+        {
+            var cacheMetrics = new CacheMetrics()
+            {
+                StreamId = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]),
+                TopicId = BinaryPrimitives.ReadUInt32LittleEndian(payload[(position + 4)..(position + 8)]),
+                PartitionId = BinaryPrimitives.ReadUInt32LittleEndian(payload[(position + 8)..(position + 12)]),
+                Hits = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 12)..(position + 20)]),
+                Misses = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 20)..(position + 28)]),
+                HitRatio = BinaryPrimitives.ReadSingleLittleEndian(payload[(position + 28)..(position + 36)])
+            };
+            cacheMetricsList.Add(cacheMetrics);
+        }
+        
+        
         return new Stats
         {
             ProcessId = processId,
@@ -769,7 +794,7 @@ internal static class BinaryMapper
             TotalMemory = totalMemory,
             AvailableMemory = availableMemory,
             RunTime = runTime,
-            StartTime = DateTimeOffset.FromUnixTimeSeconds((long)startTime),
+            StartTime = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(startTime),
             ReadBytes = readBytes,
             WrittenBytes = writtenBytes,
             StreamsCount = streamsCount,
@@ -781,7 +806,10 @@ internal static class BinaryMapper
             OsName = osName,
             OsVersion = osVersion,
             ConsumerGroupsCount = consumerGroupsCount,
-            MessagesSizeBytes = totalSizeBytes
+            MessagesSizeBytes = totalSizeBytes,
+            IggyServerVersion = iggyVersion,
+            IggyServerSemver = iggySemVersion,
+            CacheMetrics = cacheMetricsList,
         };
     }
 

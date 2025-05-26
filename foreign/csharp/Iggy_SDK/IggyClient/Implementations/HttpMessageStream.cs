@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-﻿using Iggy_SDK.Configuration;
+using Iggy_SDK.Configuration;
 using Iggy_SDK.Contracts.Http;
 using Iggy_SDK.Contracts.Http.Auth;
 using Iggy_SDK.Enums;
@@ -455,7 +455,12 @@ public class HttpMessageStream : IIggyClient
         var response = await _httpClient.DeleteAsync($"/streams/{request.StreamId}/topics/{request.TopicId}/consumer-groups/{request.ConsumerGroupId}", token);
         await HandleResponseAsync(response);
     }
-    
+
+    public Task<ClientResponse?> GetMeAsync(CancellationToken token = default)
+    {
+        throw new NotImplementedException();
+    }
+
     public async Task<Stats?> GetStatsAsync(CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync($"/stats", token);
@@ -467,13 +472,22 @@ public class HttpMessageStream : IIggyClient
         await HandleResponseAsync(response);
         return null;
     }
-    
+
+    public async Task PingAsync(CancellationToken token = default)
+    {
+        var response = await _httpClient.GetAsync("/ping", token);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            await HandleResponseAsync(response);
+        }
+    }
+
     public async Task<IReadOnlyList<ClientResponse>> GetClientsAsync(CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync($"/clients", token);
         if (response.IsSuccessStatusCode)
         {
-            var t = await response.Content.ReadAsStringAsync();
             return await response.Content.ReadFromJsonAsync<IReadOnlyList<ClientResponse>>(JsonConverterFactory.SnakeCaseOptions, token)
                    ?? Array.Empty<ClientResponse>();
         }

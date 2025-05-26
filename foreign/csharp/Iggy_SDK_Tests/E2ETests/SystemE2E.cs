@@ -39,6 +39,13 @@ public sealed class SystemE2E : IClassFixture<IggySystemFixture>
         {
             var clients = await sut.Client.GetClientsAsync();
             clients.Count.Should().Be(SystemFixtureBootstrap.TotalClientsCount);
+            foreach (var client in clients)
+            {
+                client.ClientId.Should().NotBe(0);
+                client.UserId.Should().Be(1);
+                client.Address.Should().NotBeNullOrEmpty();
+                client.Transport.Should().Be("TCP");
+            }
         })).ToArray();
         
         await Task.WhenAll(tasks);
@@ -54,23 +61,31 @@ public sealed class SystemE2E : IClassFixture<IggySystemFixture>
             uint id = clients[0].ClientId;
             var response = await sut.Client.GetClientByIdAsync(id);
             response!.ClientId.Should().Be(id);
+            response.UserId.Should().Be(1);
+            response.Address.Should().NotBeNullOrEmpty();
+            response.Transport.Should().Be("TCP");
         })).ToArray();
         
         await Task.WhenAll(tasks);
     }
     
-    // [Fact, TestPriority(3)]
-    // public async Task HTTPGetClient_Should_Return_CorrectClient()
-    // {
-    //     var sut = _fixture.SubjectsUnderTest[sutByHttp];
-    //     var clients = await sut.GetClientsAsync();
-    //     clients.Count.Should().Be(ClientsFixtureBootstrap.TotalClientsCount);
-    //     uint id = clients[0].ClientId;
-    //     var response = await sut.GetClientByIdAsync(id);
-    //     response!.ClientId.Should().Be(id);
-    // }
-
     [Fact, TestPriority(3)]
+    public async Task GetMe_Should_Return_MyClient()
+    {
+        await _fixture.Invoking(x=>x.HttpClient.Client.GetMeAsync())
+            .Should()
+            .ThrowAsync<NotImplementedException>();
+
+
+        var me = await _fixture.TcpClient.Client.GetMeAsync();
+        me.Should().NotBeNull();
+        me.ClientId.Should().NotBe(0);
+        me.UserId.Should().Be(1);
+        me.Address.Should().NotBeNullOrEmpty();
+        me.Transport.Should().Be("TCP");
+    }
+
+    [Fact, TestPriority(4)]
     public async Task GetStats_Should_ReturnValidResponse()
     {
         // act
@@ -82,6 +97,21 @@ public sealed class SystemE2E : IClassFixture<IggySystemFixture>
             response.PartitionsCount.Should().Be(0);
             response.StreamsCount.Should().Be(0);
             response.TopicsCount.Should().Be(0);
+        })).ToArray();
+        
+        await Task.WhenAll(tasks);
+    }
+    
+    [Fact, TestPriority(5)]
+    public async Task Ping_Should_Pong()
+    {
+        // act
+        var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
+        {
+            await sut.Invoking(async x => await x.Client.PingAsync())
+                .Should()
+                .NotThrowAsync();
+            
         })).ToArray();
         
         await Task.WhenAll(tasks);

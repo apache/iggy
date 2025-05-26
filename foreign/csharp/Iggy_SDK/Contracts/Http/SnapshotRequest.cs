@@ -1,4 +1,4 @@
-// Licensed to the Apache Software Foundation (ASF) under one
+﻿// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -15,14 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Iggy_SDK.Enums;
+
 namespace Iggy_SDK.Contracts.Http;
 
-public sealed class ClientResponse
-{
-    public required uint ClientId { get; init; }
-    public required string Address { get; init; }
-    public required uint UserId { get; init; }
-    public required string Transport { get; init; }
-    public required int ConsumerGroupsCount { get; init; }
-    public IEnumerable<ConsumerGroupInfo>? ConsumerGroups { get; init; }
-}
+public record SnapshotRequest(SystemSnapshotType SnapshotType, SnapshotCompression Compression);

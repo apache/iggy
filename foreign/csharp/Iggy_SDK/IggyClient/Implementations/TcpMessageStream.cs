@@ -652,7 +652,26 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
 
         await CheckResponseAsync(token);
     }
-    
+
+    public async Task<ClientResponse?> GetMeAsync(CancellationToken token = default)
+    {
+        var message = Array.Empty<byte>();
+        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_ME_CODE);
+        
+        await _stream.SendAsync(payload, token);
+        await _stream.FlushAsync(token);
+
+        var responseBuffer = await GetMessageAsync(token);
+        
+        if (responseBuffer.Length == 0)
+        {
+            return null;
+        }
+
+        return BinaryMapper.MapClient(responseBuffer);
+    }
+
     public async Task<Stats?> GetStatsAsync(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
@@ -671,6 +690,19 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
 
         return BinaryMapper.MapStats(responseBuffer);
     }
+
+    public async Task PingAsync(CancellationToken token = default)
+    {
+        var message = Array.Empty<byte>();
+        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.PING_CODE);
+
+        await _stream.SendAsync(payload, token);
+        await _stream.FlushAsync(token);
+
+        await CheckResponseAsync(token);
+    }
+
     public async Task<IReadOnlyList<ClientResponse>> GetClientsAsync(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
@@ -697,9 +729,6 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
 
         await _stream.SendAsync(payload, token);
         await _stream.FlushAsync(token);
-
-        var buffer = new byte[BufferSizes.ExpectedResponseSize];
-        await _stream.ReadAsync(buffer, token);
 
         var responseBuffer = await GetMessageAsync(token);
         

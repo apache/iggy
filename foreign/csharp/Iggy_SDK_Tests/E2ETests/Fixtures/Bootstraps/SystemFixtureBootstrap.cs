@@ -28,10 +28,6 @@ public class SystemFixtureBootstrap : IIggyBootstrap
     private const int FRESH_CLIENTS_COUNT = 6;
     
     public const int TotalClientsCount = FRESH_CLIENTS_COUNT + 1;
-
-    public SystemFixtureBootstrap()
-    {
-    }
     
     public async Task BootstrapResourcesAsync(IggyClientModel httpClient, IggyClientModel tcpClient)
     {
@@ -40,6 +36,25 @@ public class SystemFixtureBootstrap : IIggyBootstrap
             var client = MessageStreamFactory.CreateMessageStream(options =>
             {
                 options.BaseAdress = $"127.0.0.1:{tcpClient.TcpPort}";
+                options.Protocol = Protocol.Tcp;
+                options.MessageBatchingSettings = x =>
+                {
+                    x.MaxMessagesPerBatch = 1000;
+                    x.Interval = TimeSpan.FromMilliseconds(100);
+                };
+            }, NullLoggerFactory.Instance);
+            await client.LoginUser(new LoginUserRequest
+            {
+                Password = "iggy",
+                Username = "iggy"
+            });
+        }
+
+        for (int i = 0; i < TotalClientsCount; i++)
+        {
+            var client = MessageStreamFactory.CreateMessageStream(options =>
+            {
+                options.BaseAdress = $"127.0.0.1:{httpClient.TcpPort}";
                 options.Protocol = Protocol.Tcp;
                 options.MessageBatchingSettings = x =>
                 {
