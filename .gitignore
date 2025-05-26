@@ -13,6 +13,7 @@ bench_*
 /iggy_release_tmp
 /**/obj
 /**/bin
+!/foreign/python/src/bin
 *.iml
 foreign/cpp/build
 foreign/java/**/build
