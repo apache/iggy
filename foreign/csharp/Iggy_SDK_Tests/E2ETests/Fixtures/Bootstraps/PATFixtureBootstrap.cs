@@ -25,7 +25,7 @@ public class PATFixtureBootstrap : IIggyBootstrap
     public static readonly CreatePersonalAccessTokenRequest CreatePersonalAccessTokenRequest = new()
     {
         Name = "test",
-        Expiry = 69420
+        Expiry = 694200000
     };
     public Task BootstrapResourcesAsync(IggyClientModel httpClient, IggyClientModel tcpClient)
     {

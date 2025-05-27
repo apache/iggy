@@ -76,8 +76,8 @@ public sealed class PATE2E : IClassFixture<IggyPATFixture>
             response.Should().NotBeNull();
             response.Count.Should().Be(1);
             response[0].Name.Should().Be(PATFixtureBootstrap.CreatePersonalAccessTokenRequest.Name);
-            var tokenExpiryDateTimeOffset = DateTime.UtcNow.AddSeconds((double)PATFixtureBootstrap.CreatePersonalAccessTokenRequest.Expiry!).ToDateTimeOffset();
-            response[0].ExpiryAt!.Value.Date.Should().Be(tokenExpiryDateTimeOffset.Date);
+            var tokenExpiryDateTimeOffset = DateTime.UtcNow.AddMicroseconds((double)PATFixtureBootstrap.CreatePersonalAccessTokenRequest.Expiry!).ToDateTimeOffset();
+            response[0].ExpiryAt!.Value.Date.Should().Be(tokenExpiryDateTimeOffset.LocalDateTime.Date);
         })).ToArray();
         
         await Task.WhenAll(tasks);

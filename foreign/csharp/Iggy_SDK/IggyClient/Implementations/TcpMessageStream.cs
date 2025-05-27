@@ -909,8 +909,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
 
         var responseBuffer = await GetMessageAsync(token);
         
-        // TODO: check it why 1 bit
-        if (responseBuffer.Length <= 1)
+        if (responseBuffer.Length == 0)
         {
             return null;
         }

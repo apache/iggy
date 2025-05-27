@@ -20,5 +20,5 @@ namespace Iggy_SDK.Contracts.Http.Auth;
 public sealed class CreatePersonalAccessTokenRequest
 {
     public required string Name { get; init; }  
-    public uint? Expiry { get; init; } 
+    public ulong? Expiry { get; init; } 
 }

@@ -51,10 +51,10 @@ internal static class TcpContracts
     
     internal static byte[] CreatePersonalAccessToken(CreatePersonalAccessTokenRequest request)
     {
-        Span<byte> bytes = stackalloc byte[5 + request.Name.Length];
+        Span<byte> bytes = stackalloc byte[1 + request.Name.Length+8];
         bytes[0] = (byte)request.Name.Length;
         Encoding.UTF8.GetBytes(request.Name, bytes[1..(1 + request.Name.Length)]);
-        BinaryPrimitives.WriteUInt32LittleEndian(bytes[(1 + request.Name.Length)..], request.Expiry ?? 0);
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(1 + request.Name.Length)..], request.Expiry ?? 0);
         return bytes.ToArray();
     }
     
