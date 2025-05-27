@@ -50,40 +50,27 @@ public sealed class OffsetE2E : IClassFixture<IggyOffsetFixture>
     public async Task StoreOffset_IndividualConsumer_Should_StoreOffset_Successfully()
     {
         // act & assert
-        await _fixture.HttpClient.Client.Invoking(y =>
-                y.StoreOffsetAsync(_storeOffsetIndividualConsumer)
-            ).Should()
-            .NotThrowAsync();
+        var tasks = _fixture.SubjectsUnderTest.Select( sut => Task.Run(async () =>
+        {
+            await sut.Invoking(x => x.Client.StoreOffsetAsync(_storeOffsetIndividualConsumer))
+                .Should()
+                .NotThrowAsync();
+        })).ToArray();
         
-        // TODO: This code block is commmented bacause TCP implementation is not working properly.
-        // var tasks = _fixture.SubjectsUnderTest.Select( sut => Task.Run(async () =>
-        // {
-        //     await sut.Invoking(x => x.StoreOffsetAsync(_storeOffsetIndividualConsumer))
-        //         .Should()
-        //         .NotThrowAsync();
-        // })).ToArray();
-        //
-        // await Task.WhenAll(tasks);
+        await Task.WhenAll(tasks);
     }
 
     [Fact, TestPriority(2)]
     public async Task GetOffset_IndividualConsumer_Should_GetOffset_Successfully()
     {
         // act
-        var offset = await _fixture.HttpClient.Client.GetOffsetAsync(_offsetIndividualConsumer);
+        var tasks = _fixture.SubjectsUnderTest.Select( sut => Task.Run(async () =>
+        {
+            var offset = await sut.Client.GetOffsetAsync(_offsetIndividualConsumer);
+            offset.Should().NotBeNull();
+            offset!.StoredOffset.Should().Be(_storeOffsetIndividualConsumer.Offset);
+        })).ToArray();
         
-        // assert
-        offset.Should().NotBeNull();
-        offset!.StoredOffset.Should().Be(_storeOffsetIndividualConsumer.Offset);
-        
-        // TODO: This code block is commmented bacause TCP implementation is not working properly.
-        // var tasks = _fixture.SubjectsUnderTest.Select( sut => Task.Run(async () =>
-        // {
-        //     var offset = await sut.GetOffsetAsync(_offsetIndividualConsumer);
-        //     offset.Should().NotBeNull();
-        //     offset!.StoredOffset.Should().Be(_storeOffsetIndividualConsumer.Offset);
-        // })).ToArray();
-        //
-        // await Task.WhenAll(tasks);
+        await Task.WhenAll(tasks);
     }
 }
