@@ -543,7 +543,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     {
         var message = TcpContracts.GetGroups(streamId, topicId);
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
-        TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_CONSUMER_GROUP_CODE);
+        TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_CONSUMER_GROUPS_CODE);
 
         await _stream.SendAsync(payload, token);
         await _stream.FlushAsync(token);
@@ -578,7 +578,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapConsumerGroup(responseBuffer);
     }
 
-    public async Task CreateConsumerGroupAsync(CreateConsumerGroupRequest request, CancellationToken token = default)
+    public async Task<ConsumerGroupResponse> CreateConsumerGroupAsync(CreateConsumerGroupRequest request, CancellationToken token = default)
     {
         var message = TcpContracts.CreateGroup(request);
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
@@ -587,11 +587,17 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await _stream.SendAsync(payload, token);
         await _stream.FlushAsync(token);
 
-        await CheckResponseAsync(token);
+        var responseBuffer = await GetMessageAsync(token);
+        
+        if (responseBuffer.Length == 0)
+        {
+            return null;
+        }
+
+        return BinaryMapper.MapConsumerGroup(responseBuffer);
     }
 
     public async Task DeleteConsumerGroupAsync(DeleteConsumerGroupRequest request, CancellationToken token = default)
-
     {
         var message = TcpContracts.DeleteGroup(request.StreamId, request.TopicId, request.ConsumerGroupId);
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
@@ -601,7 +607,6 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await _stream.FlushAsync(token);
 
         await CheckResponseAsync(token);
-
     }
 
     public async Task JoinConsumerGroupAsync(JoinConsumerGroupRequest request, CancellationToken token = default)
@@ -627,6 +632,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
 
         await CheckResponseAsync(token);
     }
+    
     public async Task DeletePartitionsAsync(DeletePartitionsRequest request,
         CancellationToken token = default)
     {

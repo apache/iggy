@@ -68,7 +68,12 @@ public sealed class ConsumerGroupE2E : IClassFixture<IggyConsumerGroupFixture>
         // act & assert
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
-            await sut.Client.CreateConsumerGroupAsync(_createConsumerGroupRequest);
+            var consumerGroup = await sut.Client.CreateConsumerGroupAsync(_createConsumerGroupRequest);
+            consumerGroup.Should().NotBeNull();
+            consumerGroup!.Id.Should().Be(GROUP_ID);
+            consumerGroup.PartitionsCount.Should().Be(ConsumerGroupFixtureBootstrap.TopicRequest.PartitionsCount);
+            consumerGroup.MembersCount.Should().Be(0);
+            consumerGroup.Name.Should().Be(_createConsumerGroupRequest.Name);
         })).ToArray();
         
         await Task.WhenAll(tasks);
@@ -87,7 +92,7 @@ public sealed class ConsumerGroupE2E : IClassFixture<IggyConsumerGroupFixture>
         
         await Task.WhenAll(tasks);
     }
-
+    
     [Fact, TestPriority(3)]
     public async Task GetConsumerGroupById_Should_Return_ValidResponse()
     {
@@ -106,8 +111,28 @@ public sealed class ConsumerGroupE2E : IClassFixture<IggyConsumerGroupFixture>
         
         await Task.WhenAll(tasks);
     }
-
+    
     [Fact, TestPriority(4)]
+    public async Task GetConsumerGroups_Should_Return_ValidResponse()
+    {
+        // act
+        var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
+        {
+            var response = await sut.Client.GetConsumerGroupsAsync(
+                Identifier.Numeric((int)ConsumerGroupFixtureBootstrap.StreamRequest.StreamId!), Identifier.Numeric((int)ConsumerGroupFixtureBootstrap.TopicRequest.TopicId!));
+        
+            response.Should().NotBeNull();
+            response.Count.Should().Be(1);
+            var group = response.FirstOrDefault();
+            group!.Id.Should().Be(GROUP_ID);
+            group.PartitionsCount.Should().Be(ConsumerGroupFixtureBootstrap.TopicRequest.PartitionsCount);
+            group.MembersCount.Should().Be(0);
+        })).ToArray();
+        
+        await Task.WhenAll(tasks);
+    }
+    
+    [Fact, TestPriority(5)]
     public async Task JoinConsumerGroup_Should_JoinConsumerGroup_Successfully()
     {
         // act & assert
@@ -121,20 +146,20 @@ public sealed class ConsumerGroupE2E : IClassFixture<IggyConsumerGroupFixture>
             .NotThrowAsync();
     }
 
-    [Fact, TestPriority(5)]
+    [Fact, TestPriority(6)]
     public async Task LeaveConsumerGroup_Should_LeaveConsumerGroup_Successfully()
     {
         // act & assert
         await _fixture.HttpClient.Client.Invoking(x => x.LeaveConsumerGroupAsync(_leaveConsumerGroupRequest))
             .Should()
             .ThrowAsync<FeatureUnavailableException>();
-        
+
         await _fixture.TcpClient.Client.Invoking(x => x.LeaveConsumerGroupAsync(_leaveConsumerGroupRequest))
             .Should()
-            .ThrowAsync<FeatureUnavailableException>();
+            .NotThrowAsync();
     }
 
-    [Fact, TestPriority(6)]
+    [Fact, TestPriority(7)]
     public async Task DeleteConsumerGroup_Should_DeleteConsumerGroup_Successfully()
     {
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
@@ -146,7 +171,7 @@ public sealed class ConsumerGroupE2E : IClassFixture<IggyConsumerGroupFixture>
         await Task.WhenAll(tasks);
     }
 
-    [Fact, TestPriority(7)]
+    [Fact, TestPriority(8)]
     public async Task JoinConsumerGroup_Should_Throw_InvalidResponse()
     {
         // act & assert
@@ -156,10 +181,10 @@ public sealed class ConsumerGroupE2E : IClassFixture<IggyConsumerGroupFixture>
         
         await _fixture.TcpClient.Client.Invoking(x => x.JoinConsumerGroupAsync(_joinConsumerGroupRequest))
             .Should()
-            .ThrowExactlyAsync<FeatureUnavailableException>();
+            .ThrowExactlyAsync<InvalidResponseException>();
     }
 
-    [Fact, TestPriority(8)]
+    [Fact, TestPriority(9)]
     public async Task DeleteConsumerGroup_Should_Throw_InvalidResponse()
     {
         // act & assert

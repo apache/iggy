@@ -438,16 +438,19 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
     
-    public async Task CreateConsumerGroupAsync(CreateConsumerGroupRequest request, CancellationToken token = default)
+    public async Task<ConsumerGroupResponse?> CreateConsumerGroupAsync(CreateConsumerGroupRequest request, CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(request, JsonConverterFactory.SnakeCaseOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
         var response = await _httpClient.PostAsync($"/streams/{request.StreamId}/topics/{request.TopicId}/consumer-groups", data, token);
-        if (!response.IsSuccessStatusCode)
+        if (response.IsSuccessStatusCode)
         {
-            await HandleResponseAsync(response);
+            return await response.Content.ReadFromJsonAsync<ConsumerGroupResponse>(JsonConverterFactory.SnakeCaseOptions, cancellationToken: token);
         }
+
+        await HandleResponseAsync(response);
+        return null;
     }
     
     public async Task DeleteConsumerGroupAsync(DeleteConsumerGroupRequest request, CancellationToken token = default)
