@@ -184,8 +184,10 @@ Access the development version at <http://localhost:8060>
 
 ### Building the Image
 
+Call this from the root of the repository:
+
 ```bash
-docker build -t apache/iggy-bench-dashboard .
+docker build -t iggy-bench-dashboard -f core/bench/dashboard/server/Dockerfile .
 ```
 
 ### Running the Container
