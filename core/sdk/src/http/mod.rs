@@ -28,5 +28,4 @@ pub mod binary_topics;
 pub mod binary_users;
 #[allow(deprecated)]
 pub mod http_client;
-pub mod http_config;
 mod http_transport;

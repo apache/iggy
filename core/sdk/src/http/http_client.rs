@@ -16,16 +16,15 @@
  * under the License.
  */
 
-use crate::http::http_config::HttpClientConfig;
 use crate::http::http_transport::HttpTransport;
-use crate::prelude::Client;
-use crate::prelude::IggyDuration;
-use crate::prelude::IggyError;
+use crate::prelude::{Client, HttpClientConfig, IggyDuration, IggyError};
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
-use iggy_common::DiagnosticEvent;
-use iggy_common::IdentityInfo;
 use iggy_common::locking::{IggySharedMut, IggySharedMutFn};
+use iggy_common::{
+    ConnectionString, ConnectionStringUtils, DiagnosticEvent, HttpConnectionStringOptions,
+    IdentityInfo, TransportProtocol,
+};
 use reqwest::{Response, StatusCode, Url};
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware};
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
@@ -286,6 +285,17 @@ impl HttpClient {
         })
     }
 
+    /// Create a new HttpClient from a connection string.
+    pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
+        if ConnectionStringUtils::parse_protocol(connection_string)? != TransportProtocol::Http {
+            return Err(IggyError::InvalidConnectionString);
+        }
+
+        Self::create(Arc::new(
+            ConnectionString::<HttpConnectionStringOptions>::from_str(connection_string)?.into(),
+        ))
+    }
+
     async fn handle_response(response: Response) -> Result<Response, IggyError> {
         let status = response.status();
         match status.is_success() {
@@ -324,4 +334,204 @@ impl HttpClient {
 #[derive(Debug, Serialize)]
 struct RefreshToken {
     token: String,
+}
+
+/// Unit tests for HttpClient.
+/// Currently only tests for "from_connection_string()" are implemented.
+/// TODO: Add complete unit tests for HttpClient.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_fail_with_empty_connection_string() {
+        let value = "";
+        let http_client = HttpClient::from_connection_string(value);
+        assert!(http_client.is_err());
+    }
+
+    #[test]
+    fn should_fail_without_username() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Http;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let http_client = HttpClient::from_connection_string(&value);
+        assert!(http_client.is_err());
+    }
+
+    #[test]
+    fn should_fail_without_password() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Http;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let http_client = HttpClient::from_connection_string(&value);
+        assert!(http_client.is_err());
+    }
+
+    #[test]
+    fn should_fail_without_server_address() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Http;
+        let server_address = "";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let http_client = HttpClient::from_connection_string(&value);
+        assert!(http_client.is_err());
+    }
+
+    #[test]
+    fn should_fail_without_port() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Http;
+        let server_address = "127.0.0.1";
+        let port = "";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let http_client = HttpClient::from_connection_string(&value);
+        assert!(http_client.is_err());
+    }
+
+    #[test]
+    fn should_fail_with_invalid_prefix() {
+        let connection_string_prefix = "invalid+";
+        let protocol = TransportProtocol::Http;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let http_client = HttpClient::from_connection_string(&value);
+        assert!(http_client.is_err());
+    }
+
+    #[test]
+    fn should_fail_with_unmatch_protocol() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Quic;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let http_client = HttpClient::from_connection_string(&value);
+        assert!(http_client.is_err());
+    }
+
+    #[test]
+    fn should_fail_with_default_prefix() {
+        let default_connection_string_prefix = "iggy://";
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{default_connection_string_prefix}{username}:{password}@{server_address}:{port}"
+        );
+        let http_client = HttpClient::from_connection_string(&value);
+        assert!(http_client.is_err());
+    }
+
+    #[test]
+    fn should_fail_with_invalid_options() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Http;
+        let server_address = "127.0.0.1";
+        let port = "";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}?invalid_option=invalid"
+        );
+        let http_client = HttpClient::from_connection_string(&value);
+        assert!(http_client.is_err());
+    }
+
+    #[test]
+    fn should_succeed_without_options() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Http;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let http_client = HttpClient::from_connection_string(&value);
+        assert!(http_client.is_ok());
+
+        assert_eq!(
+            http_client.as_ref().unwrap().api_url.to_string(),
+            format!("{protocol}://{server_address}:{port}/")
+        );
+        assert_eq!(
+            http_client.as_ref().unwrap().heartbeat_interval,
+            IggyDuration::from_str("5s").unwrap()
+        );
+    }
+
+    #[test]
+    fn should_succeed_with_options() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Http;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let retries = "10";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}?retries={retries}"
+        );
+        let http_client = HttpClient::from_connection_string(&value);
+        assert!(http_client.is_ok());
+
+        assert_eq!(
+            http_client.as_ref().unwrap().api_url.to_string(),
+            format!("{protocol}://{server_address}:{port}/")
+        );
+    }
+
+    #[test]
+    fn should_succeed_with_pat() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Http;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let pat = "iggypat-1234567890abcdef";
+        let value = format!("{connection_string_prefix}{protocol}://{pat}@{server_address}:{port}");
+        let http_client = HttpClient::from_connection_string(&value);
+        assert!(http_client.is_ok());
+
+        assert_eq!(
+            http_client.as_ref().unwrap().api_url.to_string(),
+            format!("{protocol}://{server_address}:{port}/")
+        );
+        assert_eq!(
+            http_client.as_ref().unwrap().heartbeat_interval,
+            IggyDuration::from_str("5s").unwrap()
+        );
+    }
 }

@@ -26,8 +26,9 @@ use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_binary_protocol::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
 use iggy_common::{
-    AutoLogin, ClientState, Command, ConnectionString, Credentials, DiagnosticEvent, IggyDuration,
-    IggyError, IggyErrorDiscriminants, IggyTimestamp,
+    AutoLogin, ClientState, Command, ConnectionString, ConnectionStringUtils, Credentials,
+    DiagnosticEvent, IggyDuration, IggyError, IggyErrorDiscriminants, IggyTimestamp,
+    TcpConnectionStringOptions, TransportProtocol,
 };
 use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
 use std::net::SocketAddr;
@@ -178,8 +179,12 @@ impl TcpClient {
     }
 
     pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
+        if ConnectionStringUtils::parse_protocol(connection_string)? != TransportProtocol::Tcp {
+            return Err(IggyError::InvalidConnectionString);
+        }
+
         Self::create(Arc::new(
-            ConnectionString::from_str(connection_string)?.into(),
+            ConnectionString::<TcpConnectionStringOptions>::from_str(connection_string)?.into(),
         ))
     }
 
@@ -524,5 +529,279 @@ impl TcpClient {
         } else {
             "unknown".to_string()
         }
+    }
+}
+
+/// Unit tests for TcpClient.
+/// Currently only tests for "from_connection_string()" are implemented.
+/// TODO: Add complete unit tests for TcpClient.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_fail_with_empty_connection_string() {
+        let value = "";
+        let tcp_client = TcpClient::from_connection_string(value);
+        assert!(tcp_client.is_err());
+    }
+
+    #[test]
+    fn should_fail_without_username() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let tcp_client = TcpClient::from_connection_string(&value);
+        assert!(tcp_client.is_err());
+    }
+
+    #[test]
+    fn should_fail_without_password() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let tcp_client = TcpClient::from_connection_string(&value);
+        assert!(tcp_client.is_err());
+    }
+
+    #[test]
+    fn should_fail_without_server_address() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let tcp_client = TcpClient::from_connection_string(&value);
+        assert!(tcp_client.is_err());
+    }
+
+    #[test]
+    fn should_fail_without_port() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let tcp_client = TcpClient::from_connection_string(&value);
+        assert!(tcp_client.is_err());
+    }
+
+    #[test]
+    fn should_fail_with_invalid_prefix() {
+        let connection_string_prefix = "invalid+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let tcp_client = TcpClient::from_connection_string(&value);
+        assert!(tcp_client.is_err());
+    }
+
+    #[test]
+    fn should_fail_with_unmatch_protocol() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Quic;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let tcp_client = TcpClient::from_connection_string(&value);
+        assert!(tcp_client.is_err());
+    }
+
+    #[test]
+    fn should_succeed_with_default_prefix() {
+        let default_connection_string_prefix = "iggy://";
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{default_connection_string_prefix}{username}:{password}@{server_address}:{port}"
+        );
+        let tcp_client = TcpClient::from_connection_string(&value);
+        assert!(tcp_client.is_ok());
+    }
+
+    #[test]
+    fn should_fail_with_invalid_options() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}?invalid_option=invalid"
+        );
+        let tcp_client = TcpClient::from_connection_string(&value);
+        assert!(tcp_client.is_err());
+    }
+
+    #[test]
+    fn should_succeed_without_options() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let tcp_client = TcpClient::from_connection_string(&value);
+        assert!(tcp_client.is_ok());
+
+        let tcp_client_config = tcp_client.unwrap().config;
+        assert_eq!(
+            tcp_client_config.server_address,
+            format!("{server_address}:{port}")
+        );
+        assert_eq!(
+            tcp_client_config.auto_login,
+            AutoLogin::Enabled(Credentials::UsernamePassword(
+                username.to_string(),
+                password.to_string()
+            ))
+        );
+
+        assert!(!tcp_client_config.tls_enabled);
+        assert!(tcp_client_config.tls_domain.is_empty());
+        assert!(tcp_client_config.tls_ca_file.is_none());
+        assert_eq!(
+            tcp_client_config.heartbeat_interval,
+            IggyDuration::from_str("5s").unwrap()
+        );
+
+        assert!(tcp_client_config.reconnection.enabled);
+        assert!(tcp_client_config.reconnection.max_retries.is_none());
+        assert_eq!(
+            tcp_client_config.reconnection.interval,
+            IggyDuration::from_str("1s").unwrap()
+        );
+        assert_eq!(
+            tcp_client_config.reconnection.reestablish_after,
+            IggyDuration::from_str("5s").unwrap()
+        );
+    }
+
+    #[test]
+    fn should_succeed_with_options() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let heartbeat_interval = "10s";
+        let reconnection_retries = "10";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}?heartbeat_interval={heartbeat_interval}&reconnection_retries={reconnection_retries}"
+        );
+        let tcp_client = TcpClient::from_connection_string(&value);
+        assert!(tcp_client.is_ok());
+
+        let tcp_client_config = tcp_client.unwrap().config;
+        assert_eq!(
+            tcp_client_config.server_address,
+            format!("{server_address}:{port}")
+        );
+        assert_eq!(
+            tcp_client_config.auto_login,
+            AutoLogin::Enabled(Credentials::UsernamePassword(
+                username.to_string(),
+                password.to_string()
+            ))
+        );
+
+        assert!(!tcp_client_config.tls_enabled);
+        assert!(tcp_client_config.tls_domain.is_empty());
+        assert!(tcp_client_config.tls_ca_file.is_none());
+        assert_eq!(
+            tcp_client_config.heartbeat_interval,
+            IggyDuration::from_str(heartbeat_interval).unwrap()
+        );
+
+        assert!(tcp_client_config.reconnection.enabled);
+        assert_eq!(
+            tcp_client_config.reconnection.max_retries.unwrap(),
+            reconnection_retries.parse::<u32>().unwrap()
+        );
+        assert_eq!(
+            tcp_client_config.reconnection.interval,
+            IggyDuration::from_str("1s").unwrap()
+        );
+        assert_eq!(
+            tcp_client_config.reconnection.reestablish_after,
+            IggyDuration::from_str("5s").unwrap()
+        );
+    }
+
+    #[test]
+    fn should_succeed_with_pat() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let pat = "iggypat-1234567890abcdef";
+        let value = format!("{connection_string_prefix}{protocol}://{pat}@{server_address}:{port}");
+        let tcp_client = TcpClient::from_connection_string(&value);
+        assert!(tcp_client.is_ok());
+
+        let tcp_client_config = tcp_client.unwrap().config;
+        assert_eq!(
+            tcp_client_config.server_address,
+            format!("{server_address}:{port}")
+        );
+        assert_eq!(
+            tcp_client_config.auto_login,
+            AutoLogin::Enabled(Credentials::PersonalAccessToken(pat.to_string()))
+        );
+
+        assert!(!tcp_client_config.tls_enabled);
+        assert!(tcp_client_config.tls_domain.is_empty());
+        assert!(tcp_client_config.tls_ca_file.is_none());
+        assert_eq!(
+            tcp_client_config.heartbeat_interval,
+            IggyDuration::from_str("5s").unwrap()
+        );
+
+        assert!(tcp_client_config.reconnection.enabled);
+        assert!(tcp_client_config.reconnection.max_retries.is_none());
+        assert_eq!(
+            tcp_client_config.reconnection.interval,
+            IggyDuration::from_str("1s").unwrap()
+        );
+        assert_eq!(
+            tcp_client_config.reconnection.reestablish_after,
+            IggyDuration::from_str("5s").unwrap()
+        );
     }
 }
