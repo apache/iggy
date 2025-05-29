@@ -84,7 +84,12 @@ impl Partition {
 
     // Retrieves the first messages (up to a specified count).
     pub async fn get_first_messages(&self, count: u32) -> Result<IggyMessagesBatchSet, IggyError> {
-        self.get_messages_by_offset(0, count).await
+        if self.segments.is_empty() {
+            return Ok(IggyMessagesBatchSet::empty());
+        }
+        let oldest_available_offset = self.segments[0].start_offset();
+        self.get_messages_by_offset(oldest_available_offset, count)
+            .await
     }
 
     // Retrieves the last messages (up to a specified count).

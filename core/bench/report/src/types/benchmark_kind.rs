@@ -34,12 +34,12 @@ use serde::{Deserialize, Serialize};
     Ord,
 )]
 pub enum BenchmarkKind {
-    #[default]
     #[display("Pinned Producer")]
     #[serde(rename = "pinned_producer")]
     PinnedProducer,
     #[display("Pinned Consumer")]
     #[serde(rename = "pinned_consumer")]
+    #[default]
     PinnedConsumer,
     #[display("Pinned Producer And Consumer")]
     #[serde(rename = "pinned_producer_and_consumer")]

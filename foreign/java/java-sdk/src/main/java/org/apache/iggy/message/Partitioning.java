@@ -45,4 +45,9 @@ public record Partitioning(
         }
         return new Partitioning(PartitioningKind.MessagesKey, key.getBytes());
     }
+
+    public int getSize() {
+        // kind, 1 byte + length, 1 byte + value.length()
+        return 2 + value.length;
+    }
 }

@@ -1,8 +1,8 @@
 {
-  "name": "@iggy.rs/sdk",
+  "name": "@apache-iggy/node-sdk",
   "type": "module",
-  "version": "1.0.6",
-  "description": "Official nodejs iggy.rs binary client",
+  "version": "0.5.0",
+  "description": "Official apache iggy nodejs binary client",
   "keywords": [
     "iggy",
     "iggy-rs",
@@ -12,7 +12,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/iggy-rs/iggy-node-client.git"
+    "url": "git+https://github.com/apache/iggy.git"
   },
   "publishConfig": {
     "access": "public",

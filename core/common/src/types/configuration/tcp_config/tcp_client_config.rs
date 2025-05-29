@@ -16,6 +16,8 @@
  * under the License.
  */
 use crate::types::configuration::auth_config::connection_string::ConnectionString;
+use crate::types::configuration::auth_config::connection_string_options::ConnectionStringOptions;
+use crate::types::configuration::tcp_config::tcp_connection_string_options::TcpConnectionStringOptions;
 use crate::{AutoLogin, IggyDuration, TcpClientReconnectionConfig};
 use std::str::FromStr;
 
@@ -55,8 +57,8 @@ impl Default for TcpClientConfig {
     }
 }
 
-impl From<ConnectionString> for TcpClientConfig {
-    fn from(connection_string: ConnectionString) -> Self {
+impl From<ConnectionString<TcpConnectionStringOptions>> for TcpClientConfig {
+    fn from(connection_string: ConnectionString<TcpConnectionStringOptions>) -> Self {
         TcpClientConfig {
             server_address: connection_string.server_address().into(),
             auto_login: connection_string.auto_login().to_owned(),

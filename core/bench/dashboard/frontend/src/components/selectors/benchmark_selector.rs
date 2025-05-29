@@ -125,6 +125,7 @@ pub fn benchmark_selector(props: &BenchmarkSelectorProps) -> Html {
                             on_benchmark_select.emit(pretty_name.clone());
                         })
                     };
+                    let pretty_name = pretty_name.split("(").next().unwrap().to_string();
 
                     html! {
                         <div
@@ -134,8 +135,34 @@ pub fn benchmark_selector(props: &BenchmarkSelectorProps) -> Html {
                             )}
                             onclick={on_click}
                         >
-                            <span class="benchmark-list-item-dot" />
-                            {pretty_name}
+                            <div class="benchmark-list-item-content">
+                                <div class="benchmark-list-item-title">
+                                    <span class="benchmark-list-item-dot" />
+                                    {pretty_name}
+                                </div>
+
+                                <div class="benchmark-list-item-details">
+                                    {if let Some(remark) = benchmark.params.remark.as_deref() {
+                                        if !remark.is_empty() {
+                                            let truncated_remark = if remark.len() > 30 {
+                                                format!("{}..", &remark[0..28])
+                                            } else {
+                                                remark.to_string()
+                                            };
+                                            html! {
+                                                <div class="benchmark-list-item-subtitle">
+                                                    <span class="benchmark-list-item-label">{"Remark:"}</span>
+                                                    <span>{truncated_remark}</span>
+                                                </div>
+                                            }
+                                        } else {
+                                            html! {}
+                                        }
+                                    } else {
+                                        html! {}
+                                    }}
+                                </div>
+                            </div>
                         </div>
                     }
                 }).collect::<Html>()}

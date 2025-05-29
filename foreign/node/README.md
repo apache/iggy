@@ -4,21 +4,20 @@ iggy node.js client for [iggy-rs](https://iggy.rs/)'s binary protocol, written i
 
 diclaimer: although all iggy commands & basic client/stream are implemented this is still a WIP, provided as is, and has still a long way to go to be considered "battle tested".
 
-note: This lib started as _iggy-bin_ ( [github](https://github.com/T1B0/iggy-bin) / [npm](https://www.npmjs.com/package/iggy-bin)) before migrating under iggy-rs org. package iggy-bin@v1.3.4 is equivalent to @iggy.rs/sdk@v1.0.3
-
+note: This lib started as _iggy-bin_ ( [github](https://github.com/T1B0/iggy-bin) / [npm](https://www.npmjs.com/package/iggy-bin)) before migrating under iggy-rs org. package iggy-bin@v1.3.4 is equivalent to @iggy.rs/sdk@v1.0.3 and migrating again under apache iggy monorepo ( [github](https://github.com/apache/iggy/tree/master/foreign/node) and is now published on npmjs as @apache-iggy/node-sdk
 
 note: previous works on node.js http client has been moved to [iggy-node-http-client](<https://github.com/iggy-rs/iggy-node-http-client) (moved on 04 July 2024)
 
 ## install
 
 ```
-$ npm i @iggy.rs/sdk
+$ npm i @apache-iggy/node-sdk
 ```
 
 ## basic usage
 
 ```ts
-import { Client } from "@iggy.rs/sdk";
+import { Client } from "@apache-iggy/node-sdk";
 
 const credentials = { username: "iggy", password: "iggy" };
 
