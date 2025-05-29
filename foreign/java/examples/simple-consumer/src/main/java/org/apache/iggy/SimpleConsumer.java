@@ -19,6 +19,7 @@
 
 package org.apache.iggy;
 
+import org.apache.iggy.message.Message;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.apache.iggy.client.blocking.IggyBaseClient;
@@ -28,7 +29,6 @@ import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
-import org.apache.iggy.message.PolledMessage;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.stream.StreamDetails;
 import org.apache.iggy.topic.CompressionAlgorithm;
@@ -57,7 +57,7 @@ public class SimpleConsumer {
         createConsumerGroup(client);
         client.consumerGroups().joinConsumerGroup(STREAM_ID, TOPIC_ID, GROUP_ID);
 
-        var messages = new ArrayList<PolledMessage>();
+        var messages = new ArrayList<Message>();
         while (messages.size() < 1000) {
             var polledMessages = client.messages()
                     .pollMessages(STREAM_ID,

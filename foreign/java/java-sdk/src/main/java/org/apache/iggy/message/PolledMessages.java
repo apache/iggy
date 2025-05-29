@@ -25,6 +25,7 @@ import java.util.List;
 public record PolledMessages(
         Long partitionId,
         BigInteger currentOffset,
-        List<PolledMessage> messages
+        Long count,
+        List<Message> messages
 ) {
 }

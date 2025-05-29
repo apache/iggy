@@ -16,22 +16,21 @@
  * under the License.
  */
 
-use crate::{
-    AutoLogin, ConnectionStringOptions, Credentials, IggyDuration, IggyError,
-    TcpClientReconnectionConfig,
-};
+use crate::{AutoLogin, ConnectionStringOptions, Credentials, IggyError};
 use std::str::FromStr;
+use strum::{Display, EnumString, IntoStaticStr};
 
-const CONNECTION_STRING_PREFIX: &str = "iggy://";
+const DEFAULT_CONNECTION_STRING_PREFIX: &str = "iggy://";
+const CONNECTION_STRING_PREFIX: &str = "iggy+";
 
 #[derive(Debug)]
-pub struct ConnectionString {
+pub struct ConnectionString<T: ConnectionStringOptions + Default> {
     server_address: String,
     auto_login: AutoLogin,
-    options: ConnectionStringOptions,
+    options: T,
 }
 
-impl ConnectionString {
+impl<T: ConnectionStringOptions + Default> ConnectionString<T> {
     pub fn server_address(&self) -> &str {
         &self.server_address
     }
@@ -40,36 +39,32 @@ impl ConnectionString {
         &self.auto_login
     }
 
-    pub fn options(&self) -> &ConnectionStringOptions {
+    pub fn options(&self) -> &T {
         &self.options
     }
-}
 
-impl ConnectionString {
     pub fn new(connection_string: &str) -> Result<Self, IggyError> {
-        if connection_string.is_empty() {
-            return Err(IggyError::InvalidConnectionString);
-        }
-
-        if !connection_string.starts_with(CONNECTION_STRING_PREFIX) {
-            return Err(IggyError::InvalidConnectionString);
-        }
-
-        let connection_string = connection_string.replace(CONNECTION_STRING_PREFIX, "");
+        let connection_string = connection_string.split("://").collect::<Vec<&str>>()[1];
         let parts = connection_string.split('@').collect::<Vec<&str>>();
+        let mut username = "";
+        let mut password = "";
+        let mut pat_token = "";
 
         if parts.len() != 2 {
             return Err(IggyError::InvalidConnectionString);
         }
 
         let credentials = parts[0].split(':').collect::<Vec<&str>>();
-        if credentials.len() != 2 {
-            return Err(IggyError::InvalidConnectionString);
-        }
+        if credentials.len() == 1 {
+            pat_token = credentials[0];
+        } else if credentials.len() == 2 {
+            username = credentials[0];
+            password = credentials[1];
 
-        let username = credentials[0];
-        let password = credentials[1];
-        if username.is_empty() || password.is_empty() {
+            if username.is_empty() || password.is_empty() {
+                return Err(IggyError::InvalidConnectionString);
+            }
+        } else {
             return Err(IggyError::InvalidConnectionString);
         }
 
@@ -83,7 +78,7 @@ impl ConnectionString {
             return Err(IggyError::InvalidConnectionString);
         }
 
-        if !server_address.contains(':') {
+        if !server_address.contains(':') || server_address.starts_with(':') {
             return Err(IggyError::InvalidConnectionString);
         }
 
@@ -98,9 +93,19 @@ impl ConnectionString {
 
         let connection_string_options;
         if let Some(options) = server_and_options.get(1) {
-            connection_string_options = ConnectionString::parse_options(options)?;
+            connection_string_options = T::parse_options(options)?;
         } else {
-            connection_string_options = ConnectionStringOptions::default();
+            connection_string_options = T::default();
+        }
+
+        if credentials.len() == 1 {
+            return Ok(ConnectionString {
+                server_address: server_address.to_owned(),
+                auto_login: AutoLogin::Enabled(Credentials::PersonalAccessToken(
+                    pat_token.to_owned(),
+                )),
+                options: connection_string_options,
+            });
         }
 
         Ok(ConnectionString {
@@ -112,89 +117,219 @@ impl ConnectionString {
             options: connection_string_options,
         })
     }
+}
 
-    fn parse_options(options: &str) -> Result<ConnectionStringOptions, IggyError> {
-        let options = options.split('&').collect::<Vec<&str>>();
-        let mut tls_enabled = false;
-        let mut tls_domain = "localhost".to_string();
-        let mut tls_ca_file = None;
-        let mut reconnection_retries = "unlimited".to_owned();
-        let mut reconnection_interval = "1s".to_owned();
-        let mut reestablish_after = "5s".to_owned();
-        let mut heartbeat_interval = "5s".to_owned();
-        let mut nodelay = false;
-
-        for option in options {
-            let option_parts = option.split('=').collect::<Vec<&str>>();
-            if option_parts.len() != 2 {
-                return Err(IggyError::InvalidConnectionString);
-            }
-            match option_parts[0] {
-                "tls" => {
-                    tls_enabled = option_parts[1] == "true";
-                }
-                "tls_domain" => {
-                    tls_domain = option_parts[1].to_string();
-                }
-                "tls_ca_file" => {
-                    tls_ca_file = Some(option_parts[1].to_string());
-                }
-                "reconnection_retries" => {
-                    reconnection_retries = option_parts[1].to_string();
-                }
-                "reconnection_interval" => {
-                    reconnection_interval = option_parts[1].to_string();
-                }
-                "reestablish_after" => {
-                    reestablish_after = option_parts[1].to_string();
-                }
-                "heartbeat_interval" => {
-                    heartbeat_interval = option_parts[1].to_string();
-                }
-                "nodelay" => {
-                    nodelay = option_parts[1] == "true";
-                }
-                _ => {
-                    return Err(IggyError::InvalidConnectionString);
-                }
-            }
-        }
-
-        let reconnection = TcpClientReconnectionConfig {
-            enabled: true,
-            max_retries: match reconnection_retries.as_str() {
-                "unlimited" => None,
-                _ => Some(
-                    reconnection_retries
-                        .parse()
-                        .map_err(|_| IggyError::InvalidNumberValue)?,
-                ),
-            },
-            interval: IggyDuration::from_str(reconnection_interval.as_str())
-                .map_err(|_| IggyError::InvalidConnectionString)?,
-            reestablish_after: IggyDuration::from_str(reestablish_after.as_str())
-                .map_err(|_| IggyError::InvalidConnectionString)?,
-        };
-
-        let heartbeat_interval = IggyDuration::from_str(heartbeat_interval.as_str())
-            .map_err(|_| IggyError::InvalidConnectionString)?;
-
-        let connection_string_options = ConnectionStringOptions::new(
-            tls_enabled,
-            tls_domain,
-            tls_ca_file,
-            reconnection,
-            heartbeat_interval,
-            nodelay,
-        );
-
-        Ok(connection_string_options)
+impl<T: ConnectionStringOptions + Default> FromStr for ConnectionString<T> {
+    type Err = IggyError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        ConnectionString::<T>::new(s)
     }
 }
 
-impl FromStr for ConnectionString {
-    type Err = IggyError;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        ConnectionString::new(s)
+/// ConnectionStringUtils is a utility struct for connection strings.
+pub struct ConnectionStringUtils;
+
+#[derive(Clone, Copy, Debug, Default, Display, PartialEq, EnumString, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub enum TransportProtocol {
+    #[default]
+    #[strum(to_string = "tcp")]
+    Tcp,
+    #[strum(to_string = "quic")]
+    Quic,
+    #[strum(to_string = "http")]
+    Http,
+}
+
+impl TransportProtocol {
+    pub fn as_str(&self) -> &'static str {
+        self.into()
+    }
+}
+
+impl ConnectionStringUtils {
+    pub fn parse_protocol(connection_string: &str) -> Result<TransportProtocol, IggyError> {
+        if connection_string.is_empty() {
+            return Err(IggyError::InvalidConnectionString);
+        }
+
+        if connection_string.starts_with(DEFAULT_CONNECTION_STRING_PREFIX) {
+            return Ok(TransportProtocol::Tcp);
+        }
+
+        if !connection_string.starts_with(CONNECTION_STRING_PREFIX) {
+            return Err(IggyError::InvalidConnectionString);
+        }
+
+        let connection_string = connection_string.replace(CONNECTION_STRING_PREFIX, "");
+        TransportProtocol::from_str(connection_string.split("://").collect::<Vec<&str>>()[0])
+            .map_err(|_| IggyError::InvalidConnectionString)
+    }
+}
+
+/// Unit tests for ConnectionString and ConnectionStringUtils,
+/// common behavior which isn't type-specific will use TcpConnectionStringOptions
+/// as default.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::IggyDuration;
+    use crate::TcpConnectionStringOptions;
+
+    #[test]
+    fn should_fail_without_username() {
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "";
+        let password = "secret";
+        let value = format!(
+            "{DEFAULT_CONNECTION_STRING_PREFIX}{username}:{password}@{server_address}:{port}"
+        );
+        let connection_string = ConnectionString::<TcpConnectionStringOptions>::new(&value);
+        assert!(connection_string.is_err());
+    }
+
+    #[test]
+    fn should_fail_without_password() {
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "";
+        let value = format!(
+            "{DEFAULT_CONNECTION_STRING_PREFIX}{username}:{password}@{server_address}:{port}"
+        );
+        let connection_string = ConnectionString::<TcpConnectionStringOptions>::new(&value);
+        assert!(connection_string.is_err());
+    }
+
+    #[test]
+    fn should_fail_without_server_address() {
+        let server_address = "";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{DEFAULT_CONNECTION_STRING_PREFIX}{username}:{password}@{server_address}:{port}"
+        );
+        let connection_string = ConnectionString::<TcpConnectionStringOptions>::new(&value);
+        assert!(connection_string.is_err());
+    }
+
+    #[test]
+    fn should_fail_without_port() {
+        let server_address = "127.0.0.1";
+        let port = "";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{DEFAULT_CONNECTION_STRING_PREFIX}{username}:{password}@{server_address}:{port}"
+        );
+        let connection_string = ConnectionString::<TcpConnectionStringOptions>::new(&value);
+        assert!(connection_string.is_err());
+    }
+
+    #[test]
+    fn should_fail_with_invalid_options() {
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{DEFAULT_CONNECTION_STRING_PREFIX}{username}:{password}@{server_address}:{port}?invalid_option=invalid"
+        );
+        let connection_string = ConnectionString::<TcpConnectionStringOptions>::new(&value);
+        assert!(connection_string.is_err());
+    }
+
+    #[test]
+    fn should_succeed_without_options() {
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{DEFAULT_CONNECTION_STRING_PREFIX}{username}:{password}@{server_address}:{port}"
+        );
+        let connection_string = ConnectionString::<TcpConnectionStringOptions>::new(&value);
+        assert!(connection_string.is_ok());
+
+        let connection_string = connection_string.unwrap();
+        assert_eq!(
+            connection_string.server_address,
+            format!("{server_address}:{port}")
+        );
+        assert_eq!(
+            connection_string.auto_login,
+            AutoLogin::Enabled(Credentials::UsernamePassword(
+                username.to_string(),
+                password.to_string()
+            ))
+        );
+
+        assert!(connection_string.options.retries().is_none());
+        assert_eq!(
+            connection_string.options.heartbeat_interval(),
+            IggyDuration::from_str("5s").unwrap()
+        );
+    }
+
+    #[test]
+    fn should_succeed_with_options() {
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let retries = "3";
+        let heartbeat_interval = "10s";
+        let value = format!(
+            "{DEFAULT_CONNECTION_STRING_PREFIX}{username}:{password}@{server_address}:{port}?reconnection_retries={retries}&heartbeat_interval={heartbeat_interval}"
+        );
+        let connection_string = ConnectionString::<TcpConnectionStringOptions>::new(&value);
+        assert!(connection_string.is_ok());
+
+        let connection_string = connection_string.unwrap();
+        assert_eq!(
+            connection_string.server_address,
+            format!("{server_address}:{port}")
+        );
+        assert_eq!(
+            connection_string.auto_login,
+            AutoLogin::Enabled(Credentials::UsernamePassword(
+                username.to_string(),
+                password.to_string()
+            ))
+        );
+
+        assert_eq!(connection_string.options.retries().unwrap(), 3);
+        assert_eq!(
+            connection_string.options.heartbeat_interval(),
+            IggyDuration::from_str("10s").unwrap()
+        );
+    }
+
+    #[test]
+    fn should_succeed_with_pat() {
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let pat = "iggypat-1234567890abcdef";
+        let value = format!("{DEFAULT_CONNECTION_STRING_PREFIX}{pat}@{server_address}:{port}");
+        let connection_string = ConnectionString::<TcpConnectionStringOptions>::new(&value);
+        assert!(connection_string.is_ok());
+
+        let connection_string = connection_string.unwrap();
+        assert_eq!(
+            connection_string.server_address,
+            format!("{server_address}:{port}")
+        );
+        assert_eq!(
+            connection_string.auto_login,
+            AutoLogin::Enabled(Credentials::PersonalAccessToken(pat.to_string()))
+        );
+
+        assert!(connection_string.options.retries().is_none());
+        assert_eq!(
+            connection_string.options.heartbeat_interval(),
+            IggyDuration::from_str("5s").unwrap()
+        );
     }
 }
