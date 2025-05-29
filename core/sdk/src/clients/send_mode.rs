@@ -1,6 +1,6 @@
 use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
 
-use iggy_common::{Identifier, IggyDuration, IggyError, IggyMessage, Partitioning};
+use iggy_common::{Identifier, IggyByteSize, IggyDuration, IggyError, IggyMessage, Partitioning};
 use tokio::task::JoinHandle;
 use tracing::error;
 
@@ -30,6 +30,7 @@ pub struct BackgroundConfig {
     pub in_flight_timeout: Option<IggyDuration>,
     pub batch_size: Option<usize>,
     pub failure_mode: BackpressureMode,
+    pub buffer_size: Option<IggyByteSize>, // rename: maximum_buffer_size
 }
 
 pub struct shardMessage {

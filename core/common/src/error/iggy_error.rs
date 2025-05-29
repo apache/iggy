@@ -369,6 +369,8 @@ pub enum IggyError {
     BackgroundSendBufferFull = 4053,
     #[error("Background worker disconnected")]
     BackgroundWorkerDisconnected = 4054,
+    #[error("Background send buffer overflow")]
+    BackgroundSendBufferOverflow = 4055,
     #[error("Invalid offset: {0}")]
     InvalidOffset(u64) = 4100,
     #[error("Consumer group with ID: {0} for topic with ID: {1} was not found.")]
