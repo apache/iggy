@@ -20,7 +20,7 @@
 
 import builtins
 import typing
-from enum import Enum, auto
+from enum import Enum
 
 class IggyClient:
     r"""
@@ -28,15 +28,13 @@ class IggyClient:
     It wraps the RustIggyClient and provides asynchronous functionality
     through the contained runtime.
     """
-    def new(self, conn:typing.Optional[builtins.str]) -> IggyClient:
+    def __new__(cls, conn:typing.Optional[builtins.str]=None) -> IggyClient:
         r"""
         Constructs a new IggyClient.
         
         This initializes a new runtime for asynchronous operations.
         Future versions might utilize asyncio for more Pythonic async.
         """
-        ...
-
     def ping(self) -> typing.Any:
         r"""
         Sends a ping request to the server to check connectivity.
@@ -44,72 +42,54 @@ class IggyClient:
         Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
         if the connection fails.
         """
-        ...
-
     def login_user(self, username:builtins.str, password:builtins.str) -> typing.Any:
         r"""
         Logs in the user with the given credentials.
         
         Returns `Ok(())` on success, or a PyRuntimeError on failure.
         """
-        ...
-
     def connect(self) -> typing.Any:
         r"""
         Connects the IggyClient to its service.
         
         Returns Ok(()) on successful connection or a PyRuntimeError on failure.
         """
-        ...
-
-    def create_stream(self, name:builtins.str, stream_id:typing.Optional[builtins.int]) -> typing.Any:
+    def create_stream(self, name:builtins.str, stream_id:typing.Optional[builtins.int]=None) -> typing.Any:
         r"""
         Creates a new stream with the provided ID and name.
         
         Returns Ok(()) on successful stream creation or a PyRuntimeError on failure.
         """
-        ...
-
-    def get_stream(self, stream_id:PyIdentifier) -> typing.Any:
+    def get_stream(self, stream_id:builtins.str | builtins.int) -> typing.Any:
         r"""
         Gets stream by id.
         
         Returns Option of stream details or a PyRuntimeError on failure.
         """
-        ...
-
-    def create_topic(self, stream:PyIdentifier, name:builtins.str, partitions_count:builtins.int, compression_algorithm:typing.Optional[builtins.str], topic_id:typing.Optional[builtins.int], replication_factor:typing.Optional[builtins.int]) -> typing.Any:
+    def create_topic(self, stream:builtins.str | builtins.int, name:builtins.str, partitions_count:builtins.int, compression_algorithm:typing.Optional[builtins.str]=None, topic_id:typing.Optional[builtins.int]=None, replication_factor:typing.Optional[builtins.int]=None) -> typing.Any:
         r"""
         Creates a new topic with the given parameters.
         
         Returns Ok(()) on successful topic creation or a PyRuntimeError on failure.
         """
-        ...
-
-    def get_topic(self, stream_id:PyIdentifier, topic_id:PyIdentifier) -> typing.Any:
+    def get_topic(self, stream_id:builtins.str | builtins.int, topic_id:builtins.str | builtins.int) -> typing.Any:
         r"""
         Gets topic by stream and id.
         
         Returns Option of topic details or a PyRuntimeError on failure.
         """
-        ...
-
-    def send_messages(self, stream:PyIdentifier, topic:PyIdentifier, partitioning:builtins.int, messages:list) -> typing.Any:
+    def send_messages(self, stream:builtins.str | builtins.int, topic:builtins.str | builtins.int, partitioning:builtins.int, messages:list) -> typing.Any:
         r"""
         Sends a list of messages to the specified topic.
         
         Returns Ok(()) on successful sending or a PyRuntimeError on failure.
         """
-        ...
-
-    def poll_messages(self, stream:PyIdentifier, topic:PyIdentifier, partition_id:builtins.int, polling_strategy:PollingStrategy, count:builtins.int, auto_commit:builtins.bool) -> typing.Any:
+    def poll_messages(self, stream:builtins.str | builtins.int, topic:builtins.str | builtins.int, partition_id:builtins.int, polling_strategy:PollingStrategy, count:builtins.int, auto_commit:builtins.bool) -> typing.Any:
         r"""
         Polls for messages from the specified topic and partition.
         
         Returns a list of received messages or a PyRuntimeError on failure.
         """
-        ...
-
 
 class ReceiveMessage:
     r"""
@@ -123,56 +103,42 @@ class ReceiveMessage:
         
         The payload is returned as a Python bytes object.
         """
-        ...
-
     def offset(self) -> builtins.int:
         r"""
         Retrieves the offset of the received message.
         
         The offset represents the position of the message within its topic.
         """
-        ...
-
     def timestamp(self) -> builtins.int:
         r"""
         Retrieves the timestamp of the received message.
         
         The timestamp represents the time of the message within its topic.
         """
-        ...
-
     def id(self) -> builtins.int:
         r"""
         Retrieves the id of the received message.
         
         The id represents unique identifier of the message within its topic.
         """
-        ...
-
     def checksum(self) -> builtins.int:
         r"""
         Retrieves the checksum of the received message.
         
         The checksum represents the integrity of the message within its topic.
         """
-        ...
-
     def state(self) -> MessageState:
         r"""
         Retrieves the Message's state of the received message.
         
         State represents the state of the response.
         """
-        ...
-
     def length(self) -> builtins.int:
         r"""
         Retrieves the length of the received message.
         
         The length represents the length of the payload.
         """
-        ...
-
 
 class SendMessage:
     r"""
@@ -181,8 +147,13 @@ class SendMessage:
     This class wraps a Rust message meant for sending, facilitating
     the creation of such messages from Python and their subsequent use in Rust.
     """
-    def __new__(cls,data:builtins.str): ...
-    ...
+    def __new__(cls, data:builtins.str) -> SendMessage:
+        r"""
+        Constructs a new `SendMessage` instance from a string.
+        
+        This method allows for the creation of a `SendMessage` instance
+        directly from Python using the provided string data.
+        """
 
 class StreamDetails:
     id: builtins.int
@@ -197,19 +168,15 @@ class TopicDetails:
     partitions_count: builtins.int
 
 class MessageState(Enum):
-    Available = auto()
-    Unavailable = auto()
-    Poisoned = auto()
-    MarkedForDeletion = auto()
+    Available = ...
+    Unavailable = ...
+    Poisoned = ...
+    MarkedForDeletion = ...
 
 class PollingStrategy(Enum):
-    Offset = auto()
-    Timestamp = auto()
-    First = auto()
-    Last = auto()
-    Next = auto()
-
-class PyIdentifier(Enum):
-    String = auto()
-    Int = auto()
+    Offset = ...
+    Timestamp = ...
+    First = ...
+    Last = ...
+    Next = ...
 

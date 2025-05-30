@@ -33,8 +33,8 @@ use iggy::utils::topic_size::MaxTopicSize;
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 use pyo3_async_runtimes::tokio::future_into_py;
-use pyo3_stub_gen::define_stub_info_gatherer;
-use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_enum, gen_stub_pymethods};
+use pyo3_stub_gen::{define_stub_info_gatherer, impl_stub_type};
+use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::SendMessage;
@@ -50,7 +50,6 @@ pub struct IggyClient {
     inner: Arc<RustIggyClient>,
 }
 
-#[gen_stub_pyclass_enum]
 #[derive(FromPyObject)]
 enum PyIdentifier {
     #[pyo3(transparent, annotation = "str")]
@@ -58,6 +57,7 @@ enum PyIdentifier {
     #[pyo3(transparent, annotation = "int")]
     Int(u32),
 }
+impl_stub_type!(PyIdentifier = String | isize);
 
 impl From<PyIdentifier> for Identifier {
     fn from(py_identifier: PyIdentifier) -> Self {
@@ -68,8 +68,8 @@ impl From<PyIdentifier> for Identifier {
     }
 }
 
-#[pymethods]
 #[gen_stub_pymethods]
+#[pymethods]
 impl IggyClient {
     /// Constructs a new IggyClient.
     ///
