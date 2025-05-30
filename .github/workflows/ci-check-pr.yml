@@ -48,6 +48,10 @@ on:
       - master
     types: [ opened, synchronize, reopened ]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   pr-file-changes:
     name: pr-file-changes
