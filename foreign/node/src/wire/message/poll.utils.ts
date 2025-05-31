@@ -158,7 +158,7 @@ export type PollMessagesResponse = {
   messages: Message[]
 };
 
-export const deserializeMessagesCount = (b: Buffer, count: number) => {
+export const deserializeMessages = (b: Buffer) => {
   const messages: Message[] = [];
   let pos = 0;
   const len = b.length;
@@ -172,9 +172,12 @@ export const deserializeMessagesCount = (b: Buffer, count: number) => {
     if(plEnd > len)
       break;
     const payload = b.subarray(pos, plEnd);
+    pos += headers.payloadLength;
     let userHeaders: HeadersMap = {};
-    if(headers.userHeadersLength > 0 && plEnd + headers.userHeadersLength <= len)
+    if(headers.userHeadersLength > 0 && plEnd + headers.userHeadersLength <= len) {
       userHeaders = deserializeHeaders(b.subarray(plEnd, plEnd + headers.userHeadersLength));
+      pos += headers.userHeadersLength;
+    }
     messages.push({
       headers,
       payload,
@@ -188,7 +191,7 @@ export const deserializePollMessages = (r: Buffer, pos = 0) => {
   const partitionId = r.readUInt32LE(pos);
   const currentOffset = r.readBigUInt64LE(pos + 4);
   const count = r.readUInt32LE(pos + 12);
-  const messages = deserializeMessagesCount(r.subarray(16), count);
+  const messages = deserializeMessages(r.subarray(16));
 
   return {
     partitionId,
@@ -205,7 +208,7 @@ export const deserializePollMessagesTransform = () => new Transform({
     try {
       return cb(null, deserializePollMessages(chunk));
     } catch (err: unknown) {
-      cb(new Error('deserializePollMessage::transform error', {cause: err}), null);
+      cb(new Error('deserializePollMessage::transform error', { cause: err }), null);
     }
   }
 })

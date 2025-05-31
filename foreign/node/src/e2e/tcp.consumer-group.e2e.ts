@@ -85,7 +85,7 @@ describe('e2e -> consumer-group', async () => {
       assert.ok(await c.message.send({
         streamId, topicId,
         messages: generateMessages(mn),
-        partition: Partitioning.MessageKey(`key-${ i % 400 }`)
+        partition: Partitioning.MessageKey(`key-${ i % 300 }`)
       }));
     }
     payloadLength = ct;
@@ -102,14 +102,14 @@ describe('e2e -> consumer-group', async () => {
       consumer: { kind: ConsumerKind.Group, id: groupId },
       partitionId: 0,
       pollingStrategy: PollingStrategy.Next,
-      count: 1,
+      count: 100,
       autocommit: true
     };
     let ct = 0;
     while (ct < payloadLength) {
-      const { messages /** , ...resp*/ } = await c.message.poll(pollReq);
+      const { messages, ...resp } = await c.message.poll(pollReq);
       // console.log('POLL', messages.length, 'R/C', resp.count, messages, resp, ct);
-      // assert.equal(messages.length, resp.count);
+      assert.equal(messages.length, resp.count);
       ct += messages.length;
     }
     assert.equal(ct, payloadLength);
