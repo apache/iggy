@@ -30,7 +30,6 @@ members = [
     "core/binary_protocol",
     "core/cli",
     "core/common",
-    "core/connectors/data_producer",
     "core/connectors/runtime",
     "core/connectors/sdk",
     "core/connectors/sinks/quickwit_sink",

@@ -50,7 +50,7 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
     }
 
     /// # Safety
-    /// This is safe
+    /// Do not copy the configuration pointer
     pub unsafe fn open<F, C>(
         &mut self,
         id: u32,
@@ -83,17 +83,17 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
     }
 
     /// # Safety
-    /// This is safe
+    /// This is safe to invoke
     pub unsafe fn close(&mut self) -> i32 {
         let Some(mut sink) = self.sink.take() else {
             error!(
-                "Sink with ID: {} is not initialized - cannot close.",
+                "Sink connector with ID: {} is not initialized - cannot close.",
                 self.id
             );
             return -1;
         };
 
-        info!("Closing sink with ID: {}...", self.id);
+        info!("Closing sink connector with ID: {}...", self.id);
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
@@ -104,12 +104,12 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
                 error!("Failed to close sink connector with ID: {}. {err}", self.id);
             }
         });
-        info!("Closed sink with ID: {}", self.id);
+        info!("Closed sink connector with ID: {}", self.id);
         0
     }
 
     /// # Safety
-    /// This is safe
+    /// Do not copy the pointers to the topic metadata, messages metadata, or messages.
     pub unsafe fn consume(
         &self,
         topic_meta_ptr: *const u8,
@@ -122,7 +122,7 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
         unsafe {
             let Some(sink) = self.sink.as_ref() else {
                 error!(
-                    "Sink with ID: {} is not initialized - cannot consume.",
+                    "Sink connector with ID: {} is not initialized - cannot consume messages.",
                     self.id
                 );
                 return -1;
@@ -136,19 +136,28 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
 
             let Ok(topic_metadata) = postcard::from_bytes::<TopicMetadata>(&topic_meta_slice)
             else {
-                error!("Failed to decode topic metadata");
+                error!(
+                    "Failed to decode topic metadata by sink connector with ID: {}",
+                    self.id
+                );
                 return -1;
             };
 
             let Ok(messages_metadata) =
                 postcard::from_bytes::<MessagesMetadata>(&messages_meta_slice)
             else {
-                error!("Failed to decode messages metadata");
+                error!(
+                    "Failed to decode messages metadata by sink connector with ID: {} from stream: {}, topic: {}",
+                    self.id, topic_metadata.stream, topic_metadata.topic
+                );
                 return -1;
             };
 
             let Ok(raw_messages) = postcard::from_bytes::<RawMessages>(&messages_slice) else {
-                error!("Failed to decode raw messages");
+                error!(
+                    "Failed to decode raw messages by sink connector with ID: {} from stream: {}, topic: {}",
+                    self.id, topic_metadata.stream, topic_metadata.topic
+                );
                 return -1;
             };
 
@@ -158,14 +167,20 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
                     None
                 } else {
                     let Ok(headers) = postcard::from_bytes(&message.headers) else {
-                        error!("Failed to decode message headers");
+                        error!(
+                            "Failed to decode message headers by sink connector with ID: {} from stream: {}, topic: {}",
+                            self.id, topic_metadata.stream, topic_metadata.topic
+                        );
                         continue;
                     };
                     Some(headers)
                 };
 
                 let Ok(payload) = messages_metadata.schema.try_into_payload(message.payload) else {
-                    error!("Failed to decode message payload");
+                    error!(
+                        "Failed to decode message payload by sink connector with ID: {} from stream: {}, topic: {}",
+                        self.id, topic_metadata.stream, topic_metadata.topic
+                    );
                     continue;
                 };
 
@@ -220,7 +235,7 @@ macro_rules! sink_connector {
         ) -> i32 {
             let Some(instance) = INSTANCES.get(&id) else {
                 tracing::error!(
-                    "Sink connector with ID: {id} was not found and consume cannot be invoked."
+                    "Sink connector with ID: {id} was not found and consume messages cannot be invoked."
                 );
                 return -1;
             };

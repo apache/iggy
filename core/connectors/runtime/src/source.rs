@@ -154,11 +154,14 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>) {
                 flume::unbounded();
             SOURCE_SENDERS.insert(plugin_id, sender);
             tokio::spawn(async move {
-                info!("Source {plugin_id} started");
-                let producer = &plugin.producer.expect("Producer not initialized");
+                info!("Source connector with ID: {plugin_id} started.");
+                let Some(producer) = &plugin.producer else {
+                    error!("Producer not initialized for source connector with ID: {plugin_id}");
+                    return;
+                };
                 let encoder = producer.encoder.clone();
                 let producer = &producer.producer;
-                let mut number = 1;
+                let mut number = 1u64;
 
                 let topic_metadata = TopicMetadata {
                     stream: producer.stream().to_string(),
@@ -167,20 +170,20 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>) {
 
                 while let Ok(received_messages) = receiver.recv_async().await {
                     let count = received_messages.messages.len();
-                    info!("[Source connector with ID: {plugin_id} received {count} messages",);
+                    info!("Source connector with ID: {plugin_id} received {count} messages",);
                     let schema = received_messages.schema;
                     let mut messages: Vec<DecodedMessage> = Vec::with_capacity(count);
                     for message in received_messages.messages {
                         let Ok(payload) = schema.try_into_payload(message.payload) else {
                             error!(
-                                "Failed to decode message payload with schema: {}",
+                                "Failed to decode message payload with schema: {} for source connector with ID: {plugin_id}",
                                 received_messages.schema
                             );
                             continue;
                         };
 
                         debug!(
-                            "[Source {plugin_id}] Message: {number} | Schema: {schema} | Payload: {payload}"
+                            "Source connector with ID: {plugin_id}] received message: {number} | schema: {schema} | payload: {payload}"
                         );
                         messages.push(DecodedMessage {
                             id: message.id,
@@ -194,11 +197,15 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>) {
                         number += 1;
                     }
 
-                    let Ok(iggy_messages) =
-                        process_messages(&encoder, &topic_metadata, messages, &plugin.transforms)
-                    else {
+                    let Ok(iggy_messages) = process_messages(
+                        plugin_id,
+                        &encoder,
+                        &topic_metadata,
+                        messages,
+                        &plugin.transforms,
+                    ) else {
                         error!(
-                            "Failed to process {count} messages for source connector with ID: {plugin_id} before sending them to stream: {}, topic: {}.",
+                            "Failed to process {count} messages by source connector with ID: {plugin_id} before sending them to stream: {}, topic: {}.",
                             producer.stream(),
                             producer.topic()
                         );
@@ -207,7 +214,7 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>) {
 
                     if let Err(error) = producer.send(iggy_messages).await {
                         error!(
-                            "Failed to send {count} messages to stream: {}, topic: {} for source connector with ID: {plugin_id}. {error}",
+                            "Failed to send {count} messages to stream: {}, topic: {} by source connector with ID: {plugin_id}. {error}",
                             producer.stream(),
                             producer.topic(),
                         );
@@ -226,6 +233,7 @@ pub fn handle(sources: Vec<SourceConnectorWrapper>) {
 }
 
 fn process_messages(
+    id: u32,
     encoder: &Arc<dyn StreamEncoder>,
     topic_metadata: &TopicMetadata,
     messages: Vec<DecodedMessage>,
@@ -248,12 +256,18 @@ fn process_messages(
         };
 
         let Ok(payload) = encoder.encode(message.payload) else {
-            error!("Failed to encode message payload");
+            error!(
+                "Failed to encode message payload for source connector with ID: {id}, stream: {}, topic: {}",
+                topic_metadata.stream, topic_metadata.topic
+            );
             continue;
         };
 
         let Ok(iggy_message) = build_iggy_message(payload, message.id, message.headers) else {
-            error!("Failed to build Iggy message");
+            error!(
+                "Failed to build Iggy message for source connector with ID: {id}, stream: {}, topic: {}",
+                topic_metadata.stream, topic_metadata.topic
+            );
             continue;
         };
 

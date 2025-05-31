@@ -55,7 +55,7 @@ impl<T: Source + std::fmt::Debug + 'static> SourceContainer<T> {
     }
 
     /// # Safety
-    /// This is safe
+    /// Do not copy the configuration pointer
     pub unsafe fn open<F, C>(
         &mut self,
         id: u32,
@@ -88,17 +88,17 @@ impl<T: Source + std::fmt::Debug + 'static> SourceContainer<T> {
     }
 
     /// # Safety
-    /// This is safe
+    /// This is safe to invoke
     pub unsafe fn close(&mut self) -> i32 {
         let Some(source) = self.source.take() else {
             error!(
-                "Source with ID: {} is not initialized - cannot close.",
+                "Source connector with ID: {} is not initialized - cannot close.",
                 self.id
             );
             return -1;
         };
 
-        info!("Closing source with ID: {}...", self.id);
+        info!("Closing source connector with ID: {}...", self.id);
         if let Some(sender) = self.shutdown.take() {
             let _ = sender.send(());
         }
@@ -109,7 +109,7 @@ impl<T: Source + std::fmt::Debug + 'static> SourceContainer<T> {
         }
 
         let Ok(mut source) = Arc::try_unwrap(source) else {
-            error!("Source with ID: {} was already closed.", self.id);
+            error!("Source connector with ID: {} was already closed.", self.id);
             return -1;
         };
 
@@ -121,16 +121,16 @@ impl<T: Source + std::fmt::Debug + 'static> SourceContainer<T> {
                 );
             }
         });
-        info!("Closed source with ID: {}", self.id);
+        info!("Closed source connector with ID: {}", self.id);
         0
     }
 
     /// # Safety
-    /// This is safe
+    /// Do not copy the pointer to the messages.
     pub unsafe fn handle(&mut self, callback: SendCallback) -> i32 {
         let Some(source) = self.source.as_ref() else {
             error!(
-                "Source with ID: {} is not initialized - cannot handle.",
+                "Source connector with ID: {} is not initialized - cannot handle.",
                 self.id
             );
             return -1;
@@ -159,17 +159,17 @@ async fn handle_messages<T: Source>(
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
-                info!("Shutting down source container with ID: {plugin_id}");
+                info!("Shutting down source connector with ID: {plugin_id}");
                 break;
             }
             messages = source.poll() => {
                 let Ok(messages) = messages else {
-                    error!("Failed to poll messages for source container with ID: {plugin_id}");
+                    error!("Failed to poll messages for source connector with ID: {plugin_id}");
                     continue;
                 };
 
                 let Ok(messages) = postcard::to_allocvec(&messages) else {
-                    error!("Failed to serialize messages for source container with ID: {plugin_id}");
+                    error!("Failed to serialize messages for source connector with ID: {plugin_id}");
                     continue;
                 };
 

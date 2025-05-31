@@ -16,15 +16,13 @@ The highly performant and modular runtime for statically typed, yet dynamically 
 
 ## Quick Start
 
-1. Uncomment the `crate-type = ["cdylib"]` in `Cargo.toml` for the connectors under `core/connectors/sources` and `core/connectors/sinks` to compile them as dynamic libraries (`.so`, `.dylib`, `.dll`).
+1. Build the project in release mode, and make sure that the plugins specified in `core/connectors/config.toml` under `path` are available. You can use either of `toml`, `json` or `yaml` formats for the configuration file.
 
-2. Build the project in release mode, and make sure that the plugins specified in `core/connectors/config.toml` under `path` are available. You can use either of `toml`, `json` or `yaml` formats for the configuration file.
+2. Run `docker compose up -d` from `/core/examples/sink-data-producer` which will start the Quickwit server to be used by an example sink connector. At this point, you can access the Quickwit UI at [http://localhost:7280](http://localhost:7280) - check this dashboard again later on, after the `events` index will be created.
 
-3. Run `docker compose up -d` from `/core/connectors` which will start the Quickwit server to be used by an example sink connector. At this point, you can access the Quickwit UI at [http://localhost:7280](http://localhost:7280) - check this dashboard again later on, after the `events` index will be created.
+3. Set environment variable `IGGY_CONNECTORS_RUNTIME_CONFIG_PATH=core/connectors/runtime/config` (adjust the path as needed) pointing to the runtime configuration file.
 
-4. Set environment variable `IGGY_CONNECTORS_RUNTIME_CONFIG_PATH=core/connectors/runtime/config` (adjust the path as needed) pointing to the runtime configuration file.
-
-5. Start the Iggy server and invoke the following commands via Iggy CLI to create the example streams and topics used by the sample connectors.
+4. Start the Iggy server and invoke the following commands via Iggy CLI to create the example streams and topics used by the sample connectors.
 
 ```
 iggy --username iggy --password iggy stream create example
@@ -32,9 +30,9 @@ iggy --username iggy --password iggy stream create qw
 iggy --username iggy --password iggy topic create qw records 1 none 1d
 ```
 
-6. Execute `cargo r --bin iggy_connector_data_producer -r` which will start the example data producer application, sending the messages to previously created `qw` stream and `records` topic (this will be used by the Quickwit sink connector).
+5. Execute `cargo r --example sink-data-producer -r` which will start the example data producer application, sending the messages to previously created `qw` stream and `records` topic (this will be used by the Quickwit sink connector).
 
-7. Start the connector runtime `cargo r --bin iggy_connector_runtime -r` - you should be able to browse Quickwit UI with records being constantly added to the `events` index. At the same time, you should see the new messages being added to the `example` stream and `topic1` topic by the test source connector - you can use Iggy Web UI to browse the data. The messages will have applied the basic fields transformations.
+6. Start the connector runtime `cargo r --bin iggy_connector_runtime -r` - you should be able to browse Quickwit UI with records being constantly added to the `events` index. At the same time, you should see the new messages being added to the `example` stream and `topic1` topic by the test source connector - you can use Iggy Web UI to browse the data. The messages will have applied the basic fields transformations.
 
 ## Building the connectors
 

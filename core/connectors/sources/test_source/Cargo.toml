@@ -29,7 +29,6 @@ repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 
 [lib]
-# Uncomment the following line to build the dynamic library
 crate-type = ["cdylib", "lib"]
 
 [dependencies]

@@ -3672,21 +3672,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "iggy_connector_data_producer"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "iggy",
- "rand 0.9.1",
- "serde",
- "serde_json",
- "thiserror 2.0.12",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "iggy_connector_quickwit_sink"
 version = "0.1.0"
 dependencies = [
@@ -3780,12 +3765,14 @@ dependencies = [
  "ahash 0.8.12",
  "anyhow",
  "bytes",
+ "chrono",
  "clap",
  "futures-util",
  "iggy",
  "rand 0.9.1",
  "serde",
  "serde_json",
+ "thiserror 2.0.12",
  "tokio",
  "tracing",
  "tracing-subscriber",
