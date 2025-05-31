@@ -25,12 +25,14 @@ license = "Apache-2.0"
 ahash = { workspace = true }
 anyhow = { workspace = true }
 bytes = { workspace = true }
+chrono = { workspace = true }
 clap = { workspace = true }
 futures-util = { workspace = true }
 iggy = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -102,3 +104,7 @@ path = "src/stream-builder/stream-producer/main.rs"
 [[example]]
 name = "stream-producer-config"
 path = "src/stream-builder/stream-producer-config/main.rs"
+
+[[example]]
+name = "sink-data-producer"
+path = "src/sink-data-producer/main.rs"

@@ -1,6 +1,7 @@
 target*
 .idea/
 .vscode/
+.zed/
 .DS_Store
 .gradle
 local_data*

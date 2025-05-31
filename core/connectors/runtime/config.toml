@@ -1,0 +1,131 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+[iggy]
+address = "localhost:8090"
+username = "iggy"
+password = "iggy"
+# token = "secret" # Personal Access Token (PAT) can be used instead of username and password
+
+[sources.test1]
+enabled = true
+name = "Test source"
+path = "target/release/libiggy_connector_test_source"
+
+[[sources.test1.streams]]
+stream = "example"
+topic = "topic1"
+schema = "json"
+batch_size = 1000
+send_interval = "5ms"
+
+[sources.test1.config]
+interval = "100ms"
+# max_count = 1000
+messages_range = [10, 50]
+payload_size = 200
+
+[sources.test1.transforms.add_fields]
+enabled = true
+
+[[sources.test1.transforms.add_fields.fields]]
+key = "test_field"
+value.static = "hello!"
+
+[sinks.quickwit]
+enabled = true
+name = "Quickwit sink 1"
+path = "target/release/libiggy_connector_quickwit_sink"
+
+[[sinks.quickwit.streams]]
+stream = "qw"
+topics = ["records"]
+schema = "json"
+batch_size = 1000
+poll_interval = "5ms"
+consumer_group = "qw_sink_connector"
+
+[sinks.quickwit.transforms.add_fields]
+enabled = true
+
+[[sinks.quickwit.transforms.add_fields.fields]]
+key = "service_name"
+value.static = "qw_connector"
+
+[[sinks.quickwit.transforms.add_fields.fields]]
+key = "timestamp"
+value.computed = "timestamp_millis"
+
+[[sinks.quickwit.transforms.add_fields.fields]]
+key = "random_id"
+value.computed = "uuid_v7"
+
+[sinks.quickwit.transforms.delete_fields]
+enabled = true
+fields = ["email", "created_at"]
+
+[sinks.quickwit.config]
+url = "http://localhost:7280"
+index = """
+version: 0.9
+
+index_id: events
+
+doc_mapping:
+  mode: strict
+  field_mappings:
+    - name: timestamp
+      type: datetime
+      input_formats: [unix_timestamp]
+      output_format: unix_timestamp_nanos
+      indexed: false
+      fast: true
+      fast_precision: milliseconds
+    - name: service_name
+      type: text
+      tokenizer: raw
+      fast: true
+    - name: random_id
+      type: text
+      tokenizer: raw
+      fast: true
+    - name: user_id
+      type: text
+      tokenizer: raw
+      fast: true
+    - name: user_type
+      type: u64
+      fast: true
+    - name: source
+      type: text
+      tokenizer: default
+    - name: state
+      type: text
+      tokenizer: default
+    - name: message
+      type: text
+      tokenizer: default
+
+  timestamp_field: timestamp
+
+indexing_settings:
+  commit_timeout_secs: 10
+
+retention:
+  period: 7 days
+  schedule: daily
+"""
