@@ -66,5 +66,15 @@ public abstract class Identifier {
         return name;
     }
 
+    public int getSize() {
+        if (id != null) {
+            // kind, 1 byte + length, 1 byte + id, 4 bytes
+            return 6;
+        } else {
+            // kind, 1 byte + length, 1 byte + name.length()
+            return 2 + name.length();
+        }
+    }
+
 }
 

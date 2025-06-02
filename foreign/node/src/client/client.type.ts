@@ -19,8 +19,11 @@
 
 
 import type { Readable } from 'stream';
-import type { TcpOption } from './tcp.client.js';
-import type { TlsOption } from './tls.client.js';
+import { type TcpSocketConnectOpts } from 'node:net';
+import { type ConnectionOptions } from 'node:tls';
+
+export type TcpOption = TcpSocketConnectOpts;
+export type TlsOption = { port: number } & ConnectionOptions;
 
 export type CommandResponse = {
   status: number,
@@ -29,12 +32,14 @@ export type CommandResponse = {
 };
 
 export type RawClient = {
-  sendCommand: (code: number, payload: Buffer, handleResponse?: boolean) => Promise<CommandResponse>,
+  sendCommand: (
+    code: number, payload: Buffer, handleResponse?: boolean
+  ) => Promise<CommandResponse>,
   destroy: () => void,
   isAuthenticated: boolean
   authenticate: (c: ClientCredentials) => Promise<boolean>
-  on: (ev: string, cb: () => void) => void
-  once: (ev: string, cb: () => void) => void
+  on: (ev: string, cb: (e?: unknown) => void) => void
+  once: (ev: string, cb: (e?: unknown) => void) => void
   getReadStream: () => Readable
 }
 
@@ -43,7 +48,13 @@ export type ClientProvider = () => Promise<RawClient>;
 export const Transports = ['TCP', 'TLS' /**, 'QUIC' */] as const;
 export type TransportType = typeof Transports[number];
 
-type TransportOption = TcpOption | TlsOption;
+export type ReconnectOption = {
+  enabled: boolean,
+  interval: number,
+  maxRetries: number
+}
+
+export type TransportOption = TcpOption | TlsOption;
 
 export type TokenCredentials = {
   token: string
@@ -65,5 +76,7 @@ export type ClientConfig = {
   transport: TransportType,
   options: TransportOption,
   credentials: ClientCredentials,
-  poolSize?: PoolSizeOption
+  poolSize?: PoolSizeOption,
+  reconnect?: ReconnectOption,
+  heartbeatInterval?: number
 }

@@ -50,9 +50,7 @@ struct ServerState {
 }
 
 async fn index() -> actix_web::Result<NamedFile> {
-    Ok(NamedFile::open(
-        "core/bench/dashboard/frontend/dist/index.html",
-    )?)
+    Ok(NamedFile::open("frontend/dist/index.html")?)
 }
 
 #[actix_web::main]
@@ -162,7 +160,7 @@ async fn main() -> Result<(), std::io::Error> {
             .service(handlers::get_benchmark_trend)
             .service(handlers::get_test_artifacts_zip)
             .service(
-                fs::Files::new("/", "core/bench/dashboard/frontend/dist")
+                fs::Files::new("/", "frontend/dist")
                     .index_file("index.html")
                     .use_last_modified(true),
             )

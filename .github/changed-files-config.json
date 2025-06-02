@@ -31,5 +31,11 @@
     "foreign/python/pyproject.toml",
     "foreign/python/Cargo.toml",
     ".github/workflows/ci-check-python-sdk.yml"
+  ],
+  "node-sdk": [
+    "foreign/node/.*\\.ts",
+    "foreign/node/.*\\.js",
+    "foreign/node/.*\\.json",
+    ".github/workflows/ci-check-node-sdk.yml"
   ]
 }

@@ -26,6 +26,7 @@ import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.Identifier;
 import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Message;
+import org.apache.iggy.message.MessageHeader;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PollingStrategy;
 import org.apache.iggy.user.GlobalPermissions;
@@ -81,15 +82,21 @@ public final class BytesSerializer {
     }
 
     static ByteBuf toBytes(Message message) {
-        var buffer = Unpooled.buffer();
-        buffer.writeBytes(message.id().toBytes());
-        message.headers().ifPresentOrElse((headers) -> {
-            var headersBytes = toBytes(headers);
-            buffer.writeIntLE(headersBytes.readableBytes());
-            buffer.writeBytes(headersBytes);
-        }, () -> buffer.writeIntLE(0));
-        buffer.writeIntLE(message.payload().length);
+        var buffer = Unpooled.buffer(MessageHeader.SIZE + message.payload().length);
+        buffer.writeBytes(toBytes(message.header()));
         buffer.writeBytes(message.payload());
+        return buffer;
+    }
+
+    static ByteBuf toBytes(MessageHeader header) {
+        var buffer = Unpooled.buffer(MessageHeader.SIZE);
+        buffer.writeBytes(toBytesAsU64(header.checksum()));
+        buffer.writeBytes(header.id().toBytes());
+        buffer.writeBytes(toBytesAsU64(header.offset()));
+        buffer.writeBytes(toBytesAsU64(header.timestamp()));
+        buffer.writeBytes(toBytesAsU64(header.originTimestamp()));
+        buffer.writeIntLE(header.userHeadersLength().intValue());
+        buffer.writeIntLE(header.payloadLength().intValue());
         return buffer;
     }
 

@@ -15,74 +15,14 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::{IggyDuration, TcpClientReconnectionConfig};
-use std::str::FromStr;
+use crate::{IggyDuration, IggyError};
 
-#[derive(Debug)]
-pub struct ConnectionStringOptions {
-    tls_enabled: bool,
-    tls_domain: String,
-    tls_ca_file: Option<String>,
-    reconnection: TcpClientReconnectionConfig,
-    heartbeat_interval: IggyDuration,
-    nodelay: bool,
-}
+pub trait ConnectionStringOptions {
+    fn retries(&self) -> Option<u32>;
 
-impl ConnectionStringOptions {
-    pub fn new(
-        tls_enabled: bool,
-        tls_domain: String,
-        tls_ca_file: Option<String>,
-        reconnection: TcpClientReconnectionConfig,
-        heartbeat_interval: IggyDuration,
-        nodelay: bool,
-    ) -> Self {
-        Self {
-            tls_enabled,
-            tls_domain,
-            tls_ca_file,
-            reconnection,
-            heartbeat_interval,
-            nodelay,
-        }
-    }
-}
+    fn heartbeat_interval(&self) -> IggyDuration;
 
-impl ConnectionStringOptions {
-    pub fn tls_enabled(&self) -> bool {
-        self.tls_enabled
-    }
-
-    pub fn tls_domain(&self) -> &str {
-        &self.tls_domain
-    }
-
-    pub fn tls_ca_file(&self) -> &Option<String> {
-        &self.tls_ca_file
-    }
-
-    pub fn reconnection(&self) -> &TcpClientReconnectionConfig {
-        &self.reconnection
-    }
-
-    pub fn heartbeat_interval(&self) -> IggyDuration {
-        self.heartbeat_interval
-    }
-
-    pub fn nodelay(&self) -> bool {
-        self.nodelay
-    }
-}
-
-impl Default for ConnectionStringOptions {
-    fn default() -> Self {
-        ConnectionStringOptions {
-            tls_enabled: false,
-            tls_domain: "".to_string(),
-            tls_ca_file: None,
-            reconnection: Default::default(),
-            heartbeat_interval: IggyDuration::from_str("5s").unwrap(),
-            nodelay: false,
-        }
-    }
+    fn parse_options(options: &str) -> Result<Self, IggyError>
+    where
+        Self: Sized;
 }

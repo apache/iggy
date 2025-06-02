@@ -48,6 +48,10 @@ on:
       - master
     types: [ opened, synchronize, reopened ]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   pr-file-changes:
     name: pr-file-changes
@@ -56,7 +60,8 @@ jobs:
       trigger-rust: ${{ steps.changed-files.outputs.RUST_FILES_CHANGED }}
       trigger-shell: ${{ steps.changed-files.outputs.SHELL_FILES_CHANGED }}
       trigger-java-sdk: ${{ steps.changed-files.outputs.JAVA-SDK_FILES_CHANGED }}
-      trigger-python-sdk: ${{ steps.changed-files.outputs.PYTHON-SDK_FILES_CHANGED }}
+      trigger-python-sdk: ${{ steps.changed-files.outputs.PYTHON-SDK_FILES_CHANGED }},
+      trigger-node-sdk: ${{ steps.changed-files.outputs.NODE-SDK_FILES_CHANGED }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -133,7 +138,13 @@ jobs:
     if: ${{ needs.pr-file-changes.outputs.trigger-python-sdk == 'true' }}
     uses: ./.github/workflows/ci-check-python-sdk.yml
 
-  finalize-pr:
+  ci-check-node-sdk:
+    name: ci-check-node-sdk
+    needs: pr-file-changes
+    if: ${{ needs.pr-file-changes.outputs.trigger-node-sdk == 'true' }}
+    uses: ./.github/workflows/ci-check-node-sdk.yml
+
+  finalize_pr:
     runs-on: ubuntu-latest
     needs:
       - pr-file-changes
@@ -144,6 +155,7 @@ jobs:
       - ci-check-shell
       - ci-check-java-sdk
       - ci-check-python-sdk
+      - ci-check-node-sdk
     if: always()
     steps:
       - name: Everything is fine

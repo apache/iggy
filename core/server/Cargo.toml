@@ -128,3 +128,6 @@ serial_test = { workspace = true }
 [[bin]]
 name = "iggy-server"
 path = "src/main.rs"
+
+[package.metadata.cargo-machete]
+ignored = ["rust-s3"]

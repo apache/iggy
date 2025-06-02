@@ -44,7 +44,7 @@ describe('SendMessages', () => {
     it('serialize SendMessages into a buffer', () => {
       assert.deepEqual(
         SEND_MESSAGES.serialize(t1).length,
-        6 + 6 + 2 + 25 * 5
+        387
       );
     });
 
