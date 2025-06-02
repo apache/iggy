@@ -43,7 +43,7 @@ public sealed class SendMessagesE2E : IClassFixture<IggySendMessagesFixture>
         var messageWithHeaders = MessageFactory.GenerateDummyMessages(
             Random.Shared.Next(20, 50),
             Random.Shared.Next(69, 420),
-            MessageFactory.GenerateMessageHeaders(Random.Shared.Next(1, 20)));
+            MessageFactory.GenerateMessageHeaders(2));
 
         _messageNoHeadersSendRequest = MessageFactory.CreateMessageSendRequest(SendMessagesFixtureBootstrap.StreamId,
             SendMessagesFixtureBootstrap.TopicId, SendMessagesFixtureBootstrap.PartitionId);

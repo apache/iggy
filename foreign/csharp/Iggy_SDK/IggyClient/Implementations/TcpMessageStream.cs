@@ -31,6 +31,7 @@ using Iggy_SDK.Utils;
 using Microsoft.Extensions.Logging;
 using System.Buffers;
 using System.Buffers.Binary;
+using System.IO.Hashing;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading.Channels;
@@ -271,7 +272,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     
     public async Task SendMessagesAsync<TMessage>(MessageSendRequest<TMessage> request,
         Func<TMessage, byte[]> serializer,
-        Func<byte[], byte[]>? encryptor = null, Dictionary<HeaderKey, HeaderValue>? headers = null,
+        Func<byte[], byte[]>? encryptor = null, 
+        Dictionary<HeaderKey, HeaderValue>? headers = null,
         CancellationToken token = default)
     {
         var messages = request.Messages;
@@ -284,11 +286,23 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         var messagesBuffer = new Message[messages.Count];
         for (var i = 0; i < messages.Count || token.IsCancellationRequested; i++)
         {
+            var payload = encryptor is not null ? encryptor(serializer(messages[i])) : serializer(messages[i]);
+            var checksum = BitConverter.ToUInt64(Crc64.Hash(payload));
+            
             messagesBuffer[i] = new Message
             {
-                Payload = encryptor is not null ? encryptor(serializer(messages[i])) : serializer(messages[i]),
-                Headers = headers,
-                Id = Guid.NewGuid()
+                Payload = payload,
+                Headers = new MessageHeader()
+                {
+                    Id = 0,
+                    Checksum = checksum,
+                    Offset = 0,
+                    OriginTimestamp = DateTimeOffset.UtcNow,
+                    Timestamp  = DateTimeOffset.UtcNow, 
+                    PayloadLength = payload.Length,
+                    UserHeadersLength = 0
+                },
+                UserHeaders = headers
             };
         }
 

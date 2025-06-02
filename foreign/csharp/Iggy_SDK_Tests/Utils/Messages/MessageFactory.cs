@@ -103,15 +103,21 @@ internal static class MessageFactory
             {
                 new()
                 {
-                    Id = Guid.NewGuid(),
+                    Headers = new MessageHeader()
+                    {
+                        Id = (UInt128)Random.Shared.Next(1, 100000),
+                    },
                     Payload = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(DummyObjFactory.CreateDummyObject())),
-                    Headers = null,
+                    UserHeaders = null,
                 },
                 new()
                 {
-                    Id = Guid.NewGuid(),
+                    Headers = new MessageHeader()
+                    {
+                        Id = (UInt128)Random.Shared.Next(1, 100000),
+                    },
                     Payload =  Encoding.UTF8.GetBytes(JsonSerializer.Serialize(DummyObjFactory.CreateDummyObject())),
-                    Headers = null,
+                    UserHeaders = null,
                 }
 
             },
@@ -121,7 +127,6 @@ internal static class MessageFactory
     {
         return new MessageSendRequest
         {
-
             StreamId = Identifier.Numeric(streamId),
             TopicId = Identifier.Numeric(topicId),
             Partitioning = Iggy_SDK.Kinds.Partitioning.PartitionId(partitionId),
@@ -157,21 +162,36 @@ internal static class MessageFactory
     
     internal static IList<Message> GenerateMessages(int count, Dictionary<HeaderKey, HeaderValue>? Headers = null)
     {
-        return Enumerable.Range(1, count).Select(i => new Message
+        return Enumerable.Range(1, count).Select(i =>
         {
-            Id = Guid.NewGuid(),
-            Headers = Headers,
-            Payload = SerializeDummyMessage(new DummyMessage { Id = Random.Shared.Next(1, 69), Text = Utility.RandomString(Random.Shared.Next(20, 69)) })
+            var payload = SerializeDummyMessage(new DummyMessage { Id = Random.Shared.Next(1, 69), Text = Utility.RandomString(Random.Shared.Next(20, 69)) });
+            return new Message
+            {
+                Headers = new MessageHeader()
+                {
+                    Id = (UInt128)Random.Shared.Next(1, 100000),
+                },
+                UserHeaders = Headers,
+                Payload = payload 
+            };
         }).ToList();
     }
     
     internal static IList<Message> GenerateDummyMessages(int count, int payloadLen, Dictionary<HeaderKey, HeaderValue>? Headers = null)
     {
-        return Enumerable.Range(1, count).Select(i => new Message
+        return Enumerable.Range(1, count).Select(i =>
         {
-            Id = Guid.NewGuid(),
-            Headers = Headers,
-            Payload = Enumerable.Range(1, payloadLen).Select(x => (byte)x).ToArray()
+            var payload = Enumerable.Range(1, payloadLen).Select(x => (byte)x).ToArray();
+            return new Message
+            {
+                Headers =new MessageHeader()
+                {
+                    Id = (UInt128)Random.Shared.Next(1, 100000),
+                    PayloadLength = payload.Length
+                },
+                UserHeaders = Headers,
+                Payload = payload
+            };
         }).ToList();
     }
     

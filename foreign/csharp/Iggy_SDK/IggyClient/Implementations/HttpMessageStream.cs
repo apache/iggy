@@ -240,11 +240,18 @@ public class HttpMessageStream : IIggyClient
             StreamId = request.StreamId,
             TopicId = request.TopicId,
             Partitioning = request.Partitioning,
-            Messages = messages.Select(message => new Message
+            Messages = messages.Select(message =>
             {
-                Id = Guid.NewGuid(),
-                Headers = headers,
-                Payload = encryptor is not null ? encryptor(serializer(message)) : serializer(message),
+                return new Message
+                {
+                    // TODO: message id
+                    Headers = new MessageHeader()
+                    {
+                        Id = 0,
+                    },
+                    UserHeaders = headers,
+                    Payload = encryptor is not null ? encryptor(serializer(message)) : serializer(message),
+                };
             }).ToArray()
         };
         

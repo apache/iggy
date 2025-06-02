@@ -128,6 +128,14 @@ internal static class Extensions
         bytes[startPos + 1] = (byte)identifier.Length;
         identifier.Value.CopyTo(bytes[(startPos + 2)..]);
     }
+    
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void WriteBytesFromPartitioning(this Span<byte> bytes, Kinds.Partitioning identifier, int startPos = 0)
+    {
+        bytes[startPos + 0] = identifier.Kind.GetByte();
+        bytes[startPos + 1] = (byte)identifier.Length;
+        identifier.Value.CopyTo(bytes[(startPos + 2)..]);
+    }
 }
 
 internal static class DateTimeOffsetUtils
