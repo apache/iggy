@@ -60,8 +60,8 @@ public sealed class FetchMessagesE2E : IClassFixture<IggyFetchMessagesFixture>
             response.CurrentOffset.Should().Be(19);
             foreach (var responseMessage in response.Messages)
             {
-                responseMessage.Headers.Should().BeNull();
-                responseMessage.State.Should().Be(MessageState.Available);
+                responseMessage.UserHeaders.Should().BeNull();
+                responseMessage.Message.Text.Should().NotBeNullOrEmpty();
             }
         })).ToArray();
         
@@ -94,8 +94,9 @@ public sealed class FetchMessagesE2E : IClassFixture<IggyFetchMessagesFixture>
             response.CurrentOffset.Should().Be(19);
             foreach (var responseMessage in response.Messages)
             {
-                responseMessage.Headers.Should().BeNull();
-                responseMessage.State.Should().Be(MessageState.Available);
+                responseMessage.UserHeaders.Should().BeNull();
+                responseMessage.Payload.Should().NotBeNull();
+                responseMessage.Payload.Length.Should().BeGreaterThan(0);
             }
         })).ToArray();
         
@@ -128,9 +129,8 @@ public sealed class FetchMessagesE2E : IClassFixture<IggyFetchMessagesFixture>
             response.CurrentOffset.Should().Be(19);
             foreach (var responseMessage in response.Messages)
             {
-                responseMessage.Headers.Should().NotBeNull();
-                responseMessage.State.Should().Be(MessageState.Available);
-                responseMessage.Headers!.Count.Should().Be(3);
+                responseMessage.UserHeaders.Should().NotBeNull();
+                responseMessage.UserHeaders!.Count.Should().Be(3);
             }
         })).ToArray();
         
@@ -149,9 +149,8 @@ public sealed class FetchMessagesE2E : IClassFixture<IggyFetchMessagesFixture>
             response.CurrentOffset.Should().Be(19);
             foreach (var responseMessage in response.Messages)
             {
-                responseMessage.Headers.Should().NotBeNull();
-                responseMessage.State.Should().Be(MessageState.Available);
-                responseMessage.Headers!.Count.Should().Be(3);
+                responseMessage.UserHeaders.Should().NotBeNull();
+                responseMessage.UserHeaders!.Count.Should().Be(3);
             }
         })).ToArray();
         

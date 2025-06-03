@@ -21,12 +21,13 @@ namespace Iggy_SDK.Messages;
 
 public readonly struct Message
 {
-    public required MessageHeader Headers { get; init; }
+    public required MessageHeader Header { get; init; }
     public required byte[] Payload { get; init; }
     public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; init; }
     
     public int GetSize()
     {
-        return 56 + Payload.Length + (UserHeaders?.Count ?? 0);
+        //return 56 + Payload.Length + (UserHeaders?.Count ?? 0);
+        return 56 + Payload.Length;
     }
 }

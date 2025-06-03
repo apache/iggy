@@ -245,7 +245,7 @@ public class HttpMessageStream : IIggyClient
                 return new Message
                 {
                     // TODO: message id
-                    Headers = new MessageHeader()
+                    Header = new MessageHeader()
                     {
                         Id = 0,
                     },
@@ -281,6 +281,7 @@ public class HttpMessageStream : IIggyClient
         var response = await _httpClient.GetAsync(url, token);
         if (response.IsSuccessStatusCode)
         {
+            var t = await response.Content.ReadAsStringAsync();
             return await response.Content.ReadFromJsonAsync<PolledMessages>(JsonConverterFactory.MessageResponseOptions(decryptor), cancellationToken: token)
                    ?? PolledMessages.Empty;
 
@@ -335,7 +336,7 @@ public class HttpMessageStream : IIggyClient
         {
             yield return messageResponse;
             
-            var currentOffset = messageResponse.Offset;
+            var currentOffset = messageResponse.Header.Offset;
             if (_messagePollingSettings.StoreOffsetStrategy is StoreOffset.AfterProcessingEachMessage)
             {
                 var storeOffsetRequest = new StoreOffsetRequest

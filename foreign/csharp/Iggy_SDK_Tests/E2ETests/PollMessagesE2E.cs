@@ -30,7 +30,6 @@ namespace Iggy_SDK_Tests.E2ETests;
 [TestCaseOrderer("Iggy_SDK_Tests.Utils.PriorityOrderer", "Iggy_SDK_Tests")]
 public sealed class PollMessagesE2E(IggyPollMessagesFixture fixture) : IClassFixture<IggyPollMessagesFixture>
 {
-    private const string SkipMessage = "TCP implementation needs to be aligned with Iggyrs core changes";
 
     [Fact, TestPriority(1)]
     public async Task PollMessagesTMessage_Should_PollMessages_Successfully()
@@ -49,9 +48,8 @@ public sealed class PollMessagesE2E(IggyPollMessagesFixture fixture) : IClassFix
                                TopicId = Identifier.Numeric(PollMessagesFixtureBootstrap.TopicId)
                            }, MessageFactory.DeserializeDummyMessage))
             {
-                msgResponse.Headers.Should().NotBeNull();
-                msgResponse.Headers.Should().HaveCount(PollMessagesFixtureBootstrap.HeadersCount);
-                msgResponse.State.Should().Be(MessageState.Available);
+                msgResponse.UserHeaders.Should().NotBeNull();
+                msgResponse.UserHeaders.Should().HaveCount(PollMessagesFixtureBootstrap.HeadersCount);
                 i++;
                 if (i == PollMessagesFixtureBootstrap.MessageCount)
                 {

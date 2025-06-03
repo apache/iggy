@@ -103,7 +103,7 @@ internal static class MessageFactory
             {
                 new()
                 {
-                    Headers = new MessageHeader()
+                    Header = new MessageHeader()
                     {
                         Id = (UInt128)Random.Shared.Next(1, 100000),
                     },
@@ -112,7 +112,7 @@ internal static class MessageFactory
                 },
                 new()
                 {
-                    Headers = new MessageHeader()
+                    Header = new MessageHeader()
                     {
                         Id = (UInt128)Random.Shared.Next(1, 100000),
                     },
@@ -167,9 +167,10 @@ internal static class MessageFactory
             var payload = SerializeDummyMessage(new DummyMessage { Id = Random.Shared.Next(1, 69), Text = Utility.RandomString(Random.Shared.Next(20, 69)) });
             return new Message
             {
-                Headers = new MessageHeader()
+                Header = new MessageHeader()
                 {
                     Id = (UInt128)Random.Shared.Next(1, 100000),
+                    PayloadLength = payload.Length
                 },
                 UserHeaders = Headers,
                 Payload = payload 
@@ -184,7 +185,7 @@ internal static class MessageFactory
             var payload = Enumerable.Range(1, payloadLen).Select(x => (byte)x).ToArray();
             return new Message
             {
-                Headers =new MessageHeader()
+                Header =new MessageHeader()
                 {
                     Id = (UInt128)Random.Shared.Next(1, 100000),
                     PayloadLength = payload.Length

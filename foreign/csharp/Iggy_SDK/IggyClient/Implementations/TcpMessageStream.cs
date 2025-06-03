@@ -292,12 +292,12 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
             messagesBuffer[i] = new Message
             {
                 Payload = payload,
-                Headers = new MessageHeader()
+                Header = new MessageHeader()
                 {
                     Id = 0,
                     Checksum = checksum,
                     Offset = 0,
-                    OriginTimestamp = DateTimeOffset.UtcNow,
+                    OriginTimestamp = 0,
                     Timestamp  = DateTimeOffset.UtcNow, 
                     PayloadLength = payload.Length,
                     UserHeadersLength = 0
@@ -333,6 +333,11 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
             var response = TcpMessageStreamHelpers.GetResponseLengthAndStatus(buffer.Memory.Span);
             if (response.Status != 0)
             {
+                if (response.Length == 0)
+                {
+                    throw new InvalidResponseException($"Invalid response status code: {response.Status}");
+                }
+            
                 var errorBuffer = new byte[response.Length];
                 await _stream.ReadAsync(errorBuffer, token);
                 throw new InvalidResponseException(Encoding.UTF8.GetString(errorBuffer));
@@ -391,7 +396,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         {
             yield return messageResponse;
 
-            var currentOffset = messageResponse.Offset;
+            var currentOffset = messageResponse.Header.Offset;
             if (_messagePollingSettings.StoreOffsetStrategy is StoreOffset.AfterProcessingEachMessage)
             {
                 var storeOffsetRequest = new StoreOffsetRequest
@@ -462,6 +467,11 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
             var response = TcpMessageStreamHelpers.GetResponseLengthAndStatus(buffer);
             if (response.Status != 0)
             {
+                if (response.Length == 0)
+                {
+                    throw new InvalidResponseException($"Invalid response status code: {response.Status}");
+                }
+            
                 var errorBuffer = new byte[response.Length];
                 await _stream.ReadAsync(errorBuffer, token);
                 throw new InvalidResponseException(Encoding.UTF8.GetString(errorBuffer));

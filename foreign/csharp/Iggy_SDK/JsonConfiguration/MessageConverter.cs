@@ -36,8 +36,8 @@ internal sealed class MessageConverter : JsonConverter<Message>
         var jsonOptions = new JsonSerializerOptions();
         jsonOptions.Converters.Add(new UInt128Converter());
 
-        writer.WritePropertyName(nameof(value.Headers.Id).ToSnakeCase());
-        var idJson = JsonSerializer.Serialize(value.Headers.Id, jsonOptions);
+        writer.WritePropertyName(nameof(value.Header.Id).ToSnakeCase());
+        var idJson = JsonSerializer.Serialize(value.Header.Id, jsonOptions);
         using (JsonDocument doc = JsonDocument.Parse(idJson))
         {
             doc.RootElement.WriteTo(writer);

@@ -387,23 +387,23 @@ internal static class TcpContracts
         foreach (var message in messages)
         {
             var headersBytes = GetHeadersBytes(message.UserHeaders);
-            BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position)..(position + 8)], message.Headers.Checksum);
-            BinaryPrimitives.WriteUInt128LittleEndian(bytes[(position + 8)..(position + 24)], message.Headers.Id);
-            BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 24)..(position + 32)], message.Headers.Offset);
-            BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 32)..(position + 40)], (ulong)message.Headers.Timestamp.ToUnixTimeMilliseconds());
-            BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 40)..(position + 48)], (ulong)message.Headers.OriginTimestamp.ToUnixTimeMilliseconds());
+            BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position)..(position + 8)], message.Header.Checksum);
+            BinaryPrimitives.WriteUInt128LittleEndian(bytes[(position + 8)..(position + 24)], message.Header.Id);
+            BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 24)..(position + 32)], message.Header.Offset);
+            BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 32)..(position + 40)], (ulong)message.Header.Timestamp.ToUnixTimeMilliseconds());
+            BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 40)..(position + 48)], message.Header.OriginTimestamp);
             BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 48)..(position + 52)], headersBytes.Length);
-            BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 52)..(position + 56)], message.Headers.PayloadLength);
+            BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 52)..(position + 56)], message.Header.PayloadLength);
 
-            message.Payload.CopyTo(bytes[(position + 56)..(position + 56 + message.Headers.PayloadLength)]);
+            message.Payload.CopyTo(bytes[(position + 56)..(position + 56 + message.Header.PayloadLength)]);
             if (headersBytes.Length > 0)
             {
                 headersBytes
-                    .CopyTo(bytes[(position + 56 + message.Headers.PayloadLength)..(position + 56 + message.Headers.PayloadLength + headersBytes.Length)]);
+                    .CopyTo(bytes[(position + 56 + message.Header.PayloadLength)..(position + 56 + message.Header.PayloadLength + headersBytes.Length)]);
             }
-            position += 56 + message.Headers.PayloadLength + headersBytes.Length;
+            position += 56 + message.Header.PayloadLength + headersBytes.Length;
 
-            msgSize += message.GetSize();
+            msgSize += message.GetSize() + headersBytes.Length;
             
             BinaryPrimitives.WriteInt32LittleEndian(bytes[(indexPosition +4)..(indexPosition+8)], msgSize);
             indexPosition += 16;
