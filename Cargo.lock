@@ -3687,6 +3687,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy_connector_random_source"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "dashmap",
+ "humantime",
+ "iggy_connector_sdk",
+ "once_cell",
+ "rand 0.9.1",
+ "serde",
+ "simd-json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "iggy_connector_runtime"
 version = "0.1.0"
 dependencies = [
@@ -3738,24 +3755,8 @@ dependencies = [
  "iggy_connector_sdk",
  "once_cell",
  "serde",
- "tracing",
-]
-
-[[package]]
-name = "iggy_connector_test_source"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "dashmap",
- "humantime",
- "iggy_connector_sdk",
- "once_cell",
- "rand 0.9.1",
- "serde",
- "simd-json",
  "tokio",
  "tracing",
- "uuid",
 ]
 
 [[package]]

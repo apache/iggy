@@ -16,7 +16,7 @@
 # under the License.
 
 [package]
-name = "iggy_connector_test_source"
+name = "iggy_connector_random_source"
 version = "0.1.0"
 description = "Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
 edition = "2024"

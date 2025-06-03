@@ -34,58 +34,31 @@ iggy --username iggy --password iggy topic create qw records 1 none 1d
 
 6. Start the connector runtime `cargo r --bin iggy_connector_runtime -r` - you should be able to browse Quickwit UI with records being constantly added to the `events` index. At the same time, you should see the new messages being added to the `example` stream and `topic1` topic by the test source connector - you can use Iggy Web UI to browse the data. The messages will have applied the basic fields transformations.
 
-## Building the connectors
+## Runtime
 
-New connector can be built simply by implementing either `Sink` or `Source` trait. Please check the existing examples under `core/connectors/sinks` and `core/connectors/sources` directories.
+All the connectors are implemented as Rust libraries and can be used as a part of the connector runtime. The runtime is responsible for managing the lifecycle of the connectors and providing the necessary infrastructure for the connectors to run. For more information, please refer to the **[runtime documentation](https://github.com/apache/iggy/tree/master/core/connectors/runtime)**.
 
-### Sink
+## Sink
 
 Sinks are responsible for consuming the messages from the configured stream(s) and topic(s) and sending them further to the specified destination. For example, the Quickwit sink connector is responsible for sending the messages to the Quickwit indexer.
 
-```rust
-#[async_trait]
-pub trait Sink: Send + Sync {
-    /// Invoked when the sink is initialized, allowing it to perform any necessary setup.
-    async fn open(&mut self) -> Result<(), Error>;
-
-    /// Invoked every time a batch of messages is received from the configured stream(s) and topic(s).
-    async fn consume(
-        &self,
-        topic_metadata: &TopicMetadata,
-        messages_metadata: MessagesMetadata,
-        messages: Vec<ConsumedMessage>,
-    ) -> Result<(), Error>;
-
-    /// Invoked when the sink is closed, allowing it to perform any necessary cleanup.
-    async fn close(&mut self) -> Result<(), Error>;
-}
-```
+Please refer to the **[Sink documentation](https://github.com/apache/iggy/tree/master/core/connectors/sinks)** for the details about the configuration and the sample implementation.
 
 When implementing `Sink`, make sure to use the `sink_connector!` macro to expose the FFI interface and allow the connector runtime to register the sink with the runtime.
 Each sink should have its own, custom configuration, which is passed along with the unique plugin ID via expected `new()` method.
 
-### Source
+## Source
 
 Sources are responsible for producing the messages to the configured stream(s) and topic(s). For example, the Test source connector will generate the random messages that will be then sent to the configured stream and topic.
 
-```rust
-#[async_trait]
-pub trait Source: Send + Sync {
-    /// Invoked when the source is initialized, allowing it to perform any necessary setup.
-    async fn open(&mut self) -> Result<(), Error>;
+Please refer to the **[Source documentation](https://github.com/apache/iggy/tree/master/core/connectors/sources)** for the details about the configuration and the sample implementation.
 
-    /// Invoked every time a batch of messages is produced to the configured stream and topic.
-    async fn poll(&self) -> Result<ProducedMessages, Error>;
+## Building the connectors
 
-    /// Invoked when the source is closed, allowing it to perform any necessary cleanup.
-    async fn close(&mut self) -> Result<(), Error>;
-}
-```
-
-When implementing `Source`, make sure to use the `source_connector!` macro to expose the FFI interface and allow the connector runtime to register the source with the runtime.
-Each source should have its own, custom configuration, which is passed along with the unique plugin ID via expected `new()` method.
-
+New connector can be built simply by implementing either `Sink` or `Source` trait. Please check the **[sink](https://github.com/apache/iggy/tree/master/core/connectors/sinks)** or **[source](https://github.com/apache/iggy/tree/master/core/connectors/sources)** documentation, as well as the existing examples under `/sinks` and `/sources` directories.
 
 ## Transformations
 
 Field transformations (depending on the supported payload formats) can be applied to the messages either before they are sent to the specified topic (e.g. when produced by the source connectors), or before consumed by the sink connectors. To add the new transformation, simply implement the `Transform` trait and extend the existing `load` function. Each transform may have its own, custom configuration.
+
+To find out more about the transforms, stream decoders or encoders, please refer to the **[SDK documentation](https://github.com/apache/iggy/tree/master/core/connectors/sdk)**.

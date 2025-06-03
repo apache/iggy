@@ -83,7 +83,7 @@ async fn main() -> Result<(), RuntimeError> {
     info!("Starting Iggy Connector Runtime, loading configuration from: {config_path}...");
     let builder = Config::builder()
         .add_source(File::with_name(&config_path))
-        .add_source(Environment::with_prefix("IGGY").separator("_"));
+        .add_source(Environment::with_prefix("IGGY_CONNECTORS").separator("_"));
 
     let config: RuntimeConfig = builder
         .build()

@@ -37,6 +37,7 @@ dashmap = { workspace = true }
 iggy_connector_sdk = { workspace = true }
 once_cell = { workspace = true }
 serde = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 
 [package.metadata.cargo-machete]

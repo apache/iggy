@@ -34,7 +34,7 @@ members = [
     "core/connectors/sdk",
     "core/connectors/sinks/quickwit_sink",
     "core/connectors/sinks/stdout_sink",
-    "core/connectors/sources/test_source",
+    "core/connectors/sources/random_source",
     "core/examples",
     "core/integration",
     "core/sdk",
