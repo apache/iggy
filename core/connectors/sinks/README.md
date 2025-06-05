@@ -4,7 +4,7 @@
 
 Sink connectors are responsible for writing data from Iggy streams to external systems or destinations. They provide a way to integrate Apache Iggy with various data sources and destinations, enabling seamless data flow and processing.
 
-The sink is represented by the single `Sink` trait, which defines the basic interface for all sink connectors. It provides methods for initializing the sink, writing data to external destonation, and closing the sink.
+The sink is represented by the single `Sink` trait, which defines the basic interface for all sink connectors. It provides methods for initializing the sink, writing data to external destination, and closing the sink.
 
 ```rust
 #[async_trait]
@@ -120,7 +120,7 @@ impl StdoutSink {
 }
 ```
 
-And we can invoke the expected macro to expose the FFI interface and allow the connector runtime to register the sink within the runtime.
+We can invoke the expected macro to expose the FFI interface and allow the connector runtime to register the sink within the runtime.
 
 ```rust
 sink_connector!(StdoutSink);

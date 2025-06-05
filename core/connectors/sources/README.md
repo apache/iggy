@@ -117,7 +117,7 @@ impl RandomSource {
 }
 ```
 
-And we can invoke the expected macro to expose the FFI interface and allow the connector runtime to register the source within the runtime.
+We can invoke the expected macro to expose the FFI interface and allow the connector runtime to register the source within the runtime.
 
 ```rust
 source_connector!(TestSource);
@@ -206,7 +206,7 @@ As you can see, the `ProducedMessage` can be customized to fit your needs, as al
 
 It's also important to note, that the supported format(s) might vary depending on the connector implementation. For example, you might use `JSON` as the payload format, which can be then easily parsed and processed by downstream components such as data transforms, but at the same time, you could support the other formats and let the user decide which one to use.
 
-While the final schema of messages (that will be appended to the Iggy stream), can be controlled with the the built-in configuration (the particular `StreamEncoder` will be used), keep in mind, that it might be sometimes difficult/impossible e.g. to transform one format to another e.g. JSON to SBE or so, and in such a case, the produced messages will be ignored.
+While the final schema of messages (that will be appended to the Iggy stream), can be controlled with the built-in configuration (the particular `StreamEncoder` will be used), keep in mind, that it might be sometimes difficult/impossible e.g. to transform one format to another e.g. JSON to SBE or so, and in such a case, the produced messages will be ignored.
 
 Eventually, compile the source code and update the runtime configuration file using the example config above (`config.toml` file by default, unless you prefer `yaml` or `json` format instead - just make sure that `path` points to the existing plugin).
 
