@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-﻿using Benchmarks;
+using Benchmarks;
 using Iggy_SDK;
 using Iggy_SDK.Contracts.Http;
 using Iggy_SDK.Enums;

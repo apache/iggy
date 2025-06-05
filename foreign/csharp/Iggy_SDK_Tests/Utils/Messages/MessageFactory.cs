@@ -26,6 +26,7 @@ using Iggy_SDK_Tests.Utils.DummyObj;
 using System.Buffers.Binary;
 using System.Text;
 using System.Text.Json;
+using FluentAssertions.Extensions;
 using Partitioning = Iggy_SDK.Enums.Partitioning;
 
 namespace Iggy_SDK_Tests.Utils.Messages;
@@ -88,9 +89,13 @@ internal static class MessageFactory
         var streamId = Identifier.Numeric(1);
         var topicId = Identifier.Numeric(1);
         BinaryPrimitives.WriteInt32LittleEndian(valBytes, Random.Shared.Next(1, 69));
+        var message1 = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(DummyObjFactory.CreateDummyObject()));
+        var message2 = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(DummyObjFactory.CreateDummyObject()));
+        var date = DateTimeOffset.UtcNow;
+        date = date.AddMicroseconds(-date.Microsecond);
+        date = date.AddNanoseconds(-date.Nanosecond);
         return new MessageSendRequest
         {
-
             StreamId = streamId,
             TopicId = topicId,
             Partitioning = new Iggy_SDK.Kinds.Partitioning
@@ -106,8 +111,10 @@ internal static class MessageFactory
                     Header = new MessageHeader()
                     {
                         Id = (UInt128)Random.Shared.Next(1, 100000),
+                        PayloadLength = message1.Length,
+                        Timestamp = date
                     },
-                    Payload = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(DummyObjFactory.CreateDummyObject())),
+                    Payload = message1,
                     UserHeaders = null,
                 },
                 new()
@@ -115,8 +122,10 @@ internal static class MessageFactory
                     Header = new MessageHeader()
                     {
                         Id = (UInt128)Random.Shared.Next(1, 100000),
+                        PayloadLength = message2.Length,
+                        Timestamp = date
                     },
-                    Payload =  Encoding.UTF8.GetBytes(JsonSerializer.Serialize(DummyObjFactory.CreateDummyObject())),
+                    Payload =  message2,
                     UserHeaders = null,
                 }
 

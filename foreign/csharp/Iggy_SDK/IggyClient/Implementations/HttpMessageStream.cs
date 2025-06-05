@@ -272,6 +272,18 @@ public class HttpMessageStream : IIggyClient
         await _channel!.Writer.WriteAsync(sendRequest, token);
     }
 
+    public async Task FlushUnsavedBufferAsync(FlushUnsavedBufferRequest request, CancellationToken token = default)
+    {
+        var url = CreateUrl($"/streams/{request.StreamId}/topics/{request.TopicId}/messages/flush/{request.PartitionId}/{request.Fsync}");
+        
+        var response = await _httpClient.GetAsync(url, token);
+        
+        if (!response.IsSuccessStatusCode)
+        {
+            await HandleResponseAsync(response);
+        }
+    }
+
     public async Task<PolledMessages> FetchMessagesAsync(MessageFetchRequest request,
         Func<byte[], byte[]>? decryptor = null, CancellationToken token = default)
     {
@@ -281,7 +293,6 @@ public class HttpMessageStream : IIggyClient
         var response = await _httpClient.GetAsync(url, token);
         if (response.IsSuccessStatusCode)
         {
-            var t = await response.Content.ReadAsStringAsync();
             return await response.Content.ReadFromJsonAsync<PolledMessages>(JsonConverterFactory.MessageResponseOptions(decryptor), cancellationToken: token)
                    ?? PolledMessages.Empty;
 

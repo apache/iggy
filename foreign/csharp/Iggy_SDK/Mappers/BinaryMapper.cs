@@ -29,7 +29,7 @@ namespace Iggy_SDK.Mappers;
 //TODO - write unit tests for all the users related mappers
 internal static class BinaryMapper
 {
-    private const int PROPERTIES_SIZE = 45;
+    private const int PROPERTIES_SIZE = 56;
     internal static RawPersonalAccessToken MapRawPersonalAccessToken(ReadOnlySpan<byte> payload)
     {
         var tokenLength = payload[0];
@@ -346,12 +346,12 @@ internal static class BinaryMapper
         while (position < length)
         {
             var checksum = BinaryPrimitives.ReadUInt64LittleEndian(payload[position..(position + 8)]);
-            var id =BinaryPrimitives.ReadUInt128LittleEndian(payload[(position + 8)..(position + 24)]);
-            var offset =BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 24)..(position + 32)]);
-            var timestamp =BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 32)..(position + 40)]);
-            var originTimestamp=BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 40)..(position + 48)]);
-            var headersLength=BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 48)..(position + 52)]);
-            var payloadLength=BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 52)..(position + 56)]);
+            var id = BinaryPrimitives.ReadUInt128LittleEndian(payload[(position + 8)..(position + 24)]);
+            var offset = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 24)..(position + 32)]);
+            var timestamp = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 32)..(position + 40)]);
+            var originTimestamp = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 40)..(position + 48)]);
+            var headersLength = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 48)..(position + 52)]);
+            var payloadLength = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 52)..(position + 56)]);
 
             var headers = headersLength switch
             {
@@ -669,7 +669,7 @@ internal static class BinaryMapper
         ulong createdAt = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 4)..(position + 12)]);
         int partitionsCount = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 12)..(position + 16)]);
         ulong messageExpiry = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 16)..(position + 24)]);
-        byte complessionAlgoritm = payload[24];
+        byte complessionAlgoritm = payload[position + 24];
         ulong maxTopicSize = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 25)..(position + 33)]);
         byte replicationFactor = payload[position + 33];
         ulong sizeBytes = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 34)..(position + 42)]);

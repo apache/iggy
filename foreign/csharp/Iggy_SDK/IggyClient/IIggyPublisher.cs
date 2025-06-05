@@ -27,4 +27,6 @@ public interface IIggyPublisher
          Func<TMessage, byte[]> serializer,
         Func<byte[], byte[]>? encryptor = null, Dictionary<HeaderKey, HeaderValue>? headers = null,
         CancellationToken token = default);
+
+    Task FlushUnsavedBufferAsync(FlushUnsavedBufferRequest request, CancellationToken token = default);
 }

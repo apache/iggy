@@ -40,6 +40,7 @@ internal static class CommandCodes
     internal const int LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE = 44;
     internal const int POLL_MESSAGES_CODE = 100;
     internal const int SEND_MESSAGES_CODE = 101;
+    internal const int FLUSH_UNSAVED_BUFFER_CODE = 102;
     internal const int GET_CONSUMER_OFFSET_CODE = 120;
     internal const int STORE_CONSUMER_OFFSET_CODE = 121;
     internal const int GET_STREAM_CODE = 200;

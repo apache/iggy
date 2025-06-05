@@ -322,6 +322,18 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await _channel!.Writer.WriteAsync(sendRequest, token);
     }
 
+    public async Task FlushUnsavedBufferAsync(FlushUnsavedBufferRequest request, CancellationToken token = default)
+    {
+        var message = TcpContracts.FlushUnsavedBuffer(request);
+        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.FLUSH_UNSAVED_BUFFER_CODE);
+
+        await _stream.SendAsync(payload, token);
+        await _stream.FlushAsync(token);
+
+        await CheckResponseAsync(token);
+    }
+
     public async Task<PolledMessages<TMessage>> FetchMessagesAsync<TMessage>(MessageFetchRequest request,
         Func<byte[], TMessage> serializer, Func<byte[], byte[]>? decryptor = null, CancellationToken token = default)
     {

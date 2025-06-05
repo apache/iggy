@@ -1,4 +1,4 @@
-// Licensed to the Apache Software Foundation (ASF) under one
+﻿// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -15,18 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK_Tests.Utils.Messages;
+using Iggy_SDK_Tests.E2ETests.Fixtures.Bootstraps;
+using Iggy_SDK_Tests.E2ETests.Fixtures.Configs;
 
-namespace Iggy_SDK_Tests.Utils.DummyObj;
+namespace Iggy_SDK_Tests.E2ETests.Fixtures;
 
-internal static class DummyObjFactory
+public sealed class IggyFlushMessagesFixture : IggyBaseFixture
 {
-    internal static DummyObject CreateDummyObject()
+    public IggyFlushMessagesFixture() : base(new FlushMessagesFixtureBootstrap(),
+        IggyFixtureClientMessagingSettings.PollingSettings, IggyFixtureClientMessagingSettings.BatchingSettingsFetchFixture)
     {
-        return new DummyObject
-        {
-            Id = Random.Shared.Next(1, 9),
-            Text = "TROLOLOLO" + Random.Shared.Next(1, 5)
-        };
     }
 }

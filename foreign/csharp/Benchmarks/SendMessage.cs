@@ -67,11 +67,7 @@ public static class SendMessage
         var messages = new Message[messagesCount];
         for (int i = 0; i < messagesCount; i++)
         {
-            messages[i] = new Message
-            {
-                Id = Guid.NewGuid(),
-                Payload = CreatePayload(messageSize)
-            };
+            messages[i] = new Message(Guid.NewGuid(), CreatePayload(messageSize));
         }
 
         return messages;

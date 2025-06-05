@@ -142,6 +142,11 @@ internal static class DateTimeOffsetUtils
 {
     internal static DateTimeOffset FromUnixTimeMicroSeconds(ulong microSeconds)
     {
-        return DateTimeOffset.FromUnixTimeSeconds((long)(microSeconds / 1e+6));
+        return DateTimeOffset.FromUnixTimeMilliseconds((long)(microSeconds / 1000));
+    }
+    
+    internal static ulong ToUnixTimeMicroSeconds(DateTimeOffset date)
+    {
+        return (ulong)(date.ToUnixTimeMilliseconds() * 1000);
     }
 }

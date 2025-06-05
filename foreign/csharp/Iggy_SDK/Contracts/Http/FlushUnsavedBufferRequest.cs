@@ -1,4 +1,4 @@
-// Licensed to the Apache Software Foundation (ASF) under one
+﻿// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -15,18 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK_Tests.Utils.Messages;
+namespace Iggy_SDK.Contracts.Http;
 
-namespace Iggy_SDK_Tests.Utils.DummyObj;
-
-internal static class DummyObjFactory
+public sealed class FlushUnsavedBufferRequest
 {
-    internal static DummyObject CreateDummyObject()
-    {
-        return new DummyObject
-        {
-            Id = Random.Shared.Next(1, 9),
-            Text = "TROLOLOLO" + Random.Shared.Next(1, 5)
-        };
-    }
+    public required Identifier StreamId { get; init; }
+    public required Identifier TopicId { get; init; }
+    public required uint PartitionId { get; init; }
+    public bool Fsync { get; init; } = false;
 }

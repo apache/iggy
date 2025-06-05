@@ -51,7 +51,7 @@ internal static class TcpContracts
     
     internal static byte[] CreatePersonalAccessToken(CreatePersonalAccessTokenRequest request)
     {
-        Span<byte> bytes = stackalloc byte[1 + request.Name.Length+8];
+        Span<byte> bytes = stackalloc byte[1 + request.Name.Length + 8];
         bytes[0] = (byte)request.Name.Length;
         Encoding.UTF8.GetBytes(request.Name, bytes[1..(1 + request.Name.Length)]);
         BinaryPrimitives.WriteUInt64LittleEndian(bytes[(1 + request.Name.Length)..], request.Expiry ?? 0);
@@ -200,7 +200,7 @@ internal static class TcpContracts
     internal static byte[] CreateUser(CreateUserRequest request)
     {
         int capacity = 3 + request.Username.Length + request.Password.Length
-            + (request.Permissions is not null ? 1 + 4 + CalculatePermissionsSize(request.Permissions) : 0);
+            + (request.Permissions is not null ? 1 + 4 + CalculatePermissionsSize(request.Permissions) : 1);
 
         Span<byte> bytes = stackalloc byte[capacity];
         int position = 0;
@@ -348,6 +348,18 @@ internal static class TcpContracts
         return size;
     }
     
+    public static byte[] FlushUnsavedBuffer(FlushUnsavedBufferRequest request)
+    {
+        var length = request.StreamId.Length + 2 + request.TopicId.Length + 2 + 4 + 1;
+        Span<byte> bytes = stackalloc byte[length];
+        bytes.WriteBytesFromStreamAndTopicIdentifiers(request.StreamId, request.TopicId);
+        int position = request.StreamId.Length + 2 + request.TopicId.Length + 2;
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes[position..(position + 4)], request.PartitionId);
+        bytes[position + 4] = request.Fsync ? (byte)1 : (byte)0;
+
+        return bytes.ToArray();
+    }
+    
     internal static void GetMessages(Span<byte> bytes, MessageFetchRequest request)
     {
         bytes[0] = GetConsumerTypeByte(request.Consumer.Type);
@@ -366,11 +378,6 @@ internal static class TcpContracts
     internal static void CreateMessage(Span<byte> bytes, Identifier streamId, Identifier topicId,
         Kinds.Partitioning partitioning, IList<Message> messages)
     {
-        for (int i = 0; i < bytes.Length; i++)
-        {
-            bytes[i] = 0;
-        }
-        
         var metadataLength = 2 + streamId.Length + 2 + topicId.Length + 2 + partitioning.Length + 4;
         BinaryPrimitives.WriteInt32LittleEndian(bytes[..4], metadataLength);
         bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId, 4);
@@ -390,10 +397,10 @@ internal static class TcpContracts
             BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position)..(position + 8)], message.Header.Checksum);
             BinaryPrimitives.WriteUInt128LittleEndian(bytes[(position + 8)..(position + 24)], message.Header.Id);
             BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 24)..(position + 32)], message.Header.Offset);
-            BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 32)..(position + 40)], (ulong)message.Header.Timestamp.ToUnixTimeMilliseconds());
+            BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 32)..(position + 40)], DateTimeOffsetUtils.ToUnixTimeMicroSeconds(message.Header.Timestamp));
             BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 40)..(position + 48)], message.Header.OriginTimestamp);
             BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 48)..(position + 52)], headersBytes.Length);
-            BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 52)..(position + 56)], message.Header.PayloadLength);
+            BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 52)..(position + 56)], message.Payload.Length);
 
             message.Payload.CopyTo(bytes[(position + 56)..(position + 56 + message.Header.PayloadLength)]);
             if (headersBytes.Length > 0)
@@ -405,7 +412,9 @@ internal static class TcpContracts
 
             msgSize += message.GetSize() + headersBytes.Length;
             
-            BinaryPrimitives.WriteInt32LittleEndian(bytes[(indexPosition +4)..(indexPosition+8)], msgSize);
+            BinaryPrimitives.WriteInt32LittleEndian(bytes[(indexPosition)..(indexPosition + 4)], 0);
+            BinaryPrimitives.WriteInt32LittleEndian(bytes[(indexPosition + 4)..(indexPosition + 8)], msgSize);
+            BinaryPrimitives.WriteInt64LittleEndian(bytes[(indexPosition + 8)..(indexPosition + 16)], 0);
             indexPosition += 16;
         }
 
