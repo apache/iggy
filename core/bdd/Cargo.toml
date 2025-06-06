@@ -16,29 +16,28 @@
 # under the License.
 
 [package]
-name = "iggy_connector_stdout_sink"
-version = "0.1.0"
-description = "Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
+description = "Behavior-Driven Development (BDD) tests for Apache Iggy"
+name = "bdd"
+version = "0.0.1"
 edition = "2024"
 license = "Apache-2.0"
-keywords = ["iggy", "messaging", "streaming"]
-categories = ["command-line-utilities", "database", "network-programming"]
-homepage = "https://iggy.apache.org"
-documentation = "https://iggy.apache.org/docs"
-repository = "https://github.com/apache/iggy"
-readme = "../../README.md"
 
-[package.metadata.cargo-machete]
-ignored = ["dashmap", "once_cell"]
-
-[dependencies]
-async-trait = { workspace = true }
-dashmap = { workspace = true }
-iggy_connector_sdk = { workspace = true }
-once_cell = { workspace = true }
-serde = { workspace = true }
+[dev-dependencies]
+bytes = { workspace = true }
+cucumber = "0.21"
+iggy = { workspace = true }
+integration = { path = "../integration" }
 tokio = { workspace = true }
-tracing = { workspace = true }
 
-[lib]
-crate-type = ["cdylib", "lib"]
+[[test]]
+name = "basic_messaging"
+harness = false
+
+# Future test scenarios can be added here:
+# [[test]]
+# name = "user_management"
+# harness = false
+#
+# [[test]]
+# name = "consumer_groups"
+# harness = false

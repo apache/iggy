@@ -28,8 +28,8 @@ documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 
-[lib]
-crate-type = ["cdylib", "lib"]
+[package.metadata.cargo-machete]
+ignored = ["dashmap", "once_cell"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -44,5 +44,5 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
-[package.metadata.cargo-machete]
-ignored = ["dashmap", "once_cell"]
+[lib]
+crate-type = ["cdylib", "lib"]
