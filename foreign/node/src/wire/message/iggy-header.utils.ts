@@ -60,8 +60,8 @@ export const deserializeIggyMessageHeaders = (b: Buffer) => {
     offset: b.readBigUInt64LE(24),
     timestamp: toDate(b.readBigUInt64LE(32)),
     originTimestamp: toDate(b.readBigUInt64LE(40)),
-    userHeadersLength: b.readUint32LE(48),
-    payloadLength: b.readUint32LE(52)
+    userHeadersLength: b.readUInt32LE(48),
+    payloadLength: b.readUInt32LE(52)
   }
   return headers;
 };

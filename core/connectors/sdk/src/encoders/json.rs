@@ -1,5 +1,4 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one
+/* Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -17,19 +16,24 @@
  * under the License.
  */
 
-package org.apache.iggy.message;
+use crate::{Error, Payload, Schema, StreamEncoder};
 
-import java.math.BigInteger;
-import java.util.Map;
-import java.util.Optional;
+pub struct JsonStreamEncoder;
 
-public record PolledMessage(
-        BigInteger offset,
-        MessageState state,
-        BigInteger timestamp,
-        MessageId id,
-        Long checksum,
-        Optional<Map<String, HeaderValue>> headers,
-        byte[] payload
-) {
+impl StreamEncoder for JsonStreamEncoder {
+    fn schema(&self) -> Schema {
+        Schema::Json
+    }
+
+    fn encode(&self, payload: Payload) -> Result<Vec<u8>, Error> {
+        match payload {
+            Payload::Text(value) => {
+                Ok(simd_json::to_vec(&value).map_err(|_| Error::InvalidJsonPayload)?)
+            }
+            Payload::Json(value) => {
+                Ok(simd_json::to_vec(&value).map_err(|_| Error::InvalidJsonPayload)?)
+            }
+            _ => Err(Error::InvalidPayloadType),
+        }
+    }
 }

@@ -26,10 +26,8 @@ import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.consumergroup.ConsumerGroupMember;
 import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
 import org.apache.iggy.message.BytesMessageId;
-import org.apache.iggy.message.HeaderKind;
-import org.apache.iggy.message.HeaderValue;
-import org.apache.iggy.message.MessageState;
-import org.apache.iggy.message.PolledMessage;
+import org.apache.iggy.message.Message;
+import org.apache.iggy.message.MessageHeader;
 import org.apache.iggy.message.PolledMessages;
 import org.apache.iggy.user.GlobalPermissions;
 import org.apache.iggy.user.Permissions;
@@ -167,41 +165,28 @@ final class BytesDeserializer {
     public static PolledMessages readPolledMessages(ByteBuf response) {
         var partitionId = response.readUnsignedIntLE();
         var currentOffset = readU64AsBigInteger(response);
-        var _messagesCount = response.readUnsignedIntLE();
-        var messages = new ArrayList<PolledMessage>();
+        var messagesCount = response.readUnsignedIntLE();
+        var messages = new ArrayList<Message>();
         while (response.isReadable()) {
             messages.add(readPolledMessage(response));
         }
-        return new PolledMessages(partitionId, currentOffset, messages);
+        return new PolledMessages(partitionId, currentOffset, messagesCount, messages);
     }
 
-    static PolledMessage readPolledMessage(ByteBuf response) {
-        var offset = readU64AsBigInteger(response);
-        var stateCode = response.readByte();
-        var state = MessageState.fromCode(stateCode);
-        var timestamp = readU64AsBigInteger(response);
+    static Message readPolledMessage(ByteBuf response) {
+        var checksum = readU64AsBigInteger(response);
         var id = readBytesMessageId(response);
-        var checksum = response.readUnsignedIntLE();
-        var headersLength = response.readUnsignedIntLE();
-        var headers = Optional.<Map<String, HeaderValue>>empty();
-        if (headersLength > 0) {
-            var headersMap = new HashMap<String, HeaderValue>();
-            ByteBuf headersBytes = response.readBytes(toInt(headersLength));
-            while (headersBytes.isReadable()) {
-                var keyLength = headersBytes.readUnsignedIntLE();
-                var key = headersBytes.readCharSequence(toInt(keyLength), StandardCharsets.UTF_8).toString();
-                var kindCode = headersBytes.readByte();
-                var kind = HeaderKind.fromCode(kindCode);
-                var valueLength = headersBytes.readUnsignedIntLE();
-                var value = headersBytes.readCharSequence(toInt(valueLength), StandardCharsets.UTF_8);
-                headersMap.put(key, new HeaderValue(kind, String.valueOf(value)));
-            }
-            headers = Optional.of(headersMap);
-        }
+        var offset = readU64AsBigInteger(response);
+        var timestamp = readU64AsBigInteger(response);
+        var originTimestamp = readU64AsBigInteger(response);
+        var userHeadersLength = response.readUnsignedIntLE();
         var payloadLength = response.readUnsignedIntLE();
+        var header = new MessageHeader(checksum, id, offset, timestamp, originTimestamp,
+            userHeadersLength, payloadLength);
         var payload = newByteArray(payloadLength);
         response.readBytes(payload);
-        return new PolledMessage(offset, state, timestamp, id, checksum, headers, payload);
+        // TODO: Add support for user headers.
+        return new Message(header, payload, Optional.empty());
     }
 
     static Stats readStats(ByteBuf response) {
@@ -394,7 +379,7 @@ final class BytesDeserializer {
     }
 
     private static BigInteger readU64AsBigInteger(ByteBuf buffer) {
-        var bytesArray = new byte[9];
+        var bytesArray = new byte[8];
         buffer.readBytes(bytesArray, 0, 8);
         ArrayUtils.reverse(bytesArray);
         return new BigInteger(bytesArray);

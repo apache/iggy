@@ -1,5 +1,4 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
+/* Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -17,21 +16,22 @@
  * under the License.
  */
 
+use crate::{Error, Payload, Schema, StreamDecoder};
+use tracing::error;
 
-import { connect, type ConnectionOptions } from 'node:tls';
-import type { RawClient } from './client.type.js';
-import { wrapSocket, type CommandResponseStream } from './client.socket.js';
+pub struct TextStreamDecoder;
 
-export const createTlsSocket = (
-  port: number, options: ConnectionOptions
-): Promise<CommandResponseStream> => {
-  const socket = connect(port, options);
-  socket.setEncoding('utf8');
-  return wrapSocket(socket);
+impl StreamDecoder for TextStreamDecoder {
+    fn schema(&self) -> Schema {
+        Schema::Text
+    }
+
+    fn decode(&self, payload: Vec<u8>) -> Result<Payload, Error> {
+        Ok(Payload::Text(String::from_utf8(payload).map_err(
+            |error| {
+                error!("Failed to decode text payload: {error}");
+                Error::CannotDecode(self.schema())
+            },
+        )?))
+    }
 }
-
-export type TlsOption = { port: number } & ConnectionOptions;
-
-export const TlsClient = ({ port, ...options }: TlsOption): Promise<RawClient> => {
-  return createTlsSocket(port, options);
-};

@@ -65,6 +65,7 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 - Additional features such as **server side message deduplication**
 - **Multi-tenant** support via abstraction of **streams** whch group **topics**
 - **TLS** support for all transport protocols (TCP, QUIC, HTTPS)
+- **[Connectors](https://github.com/apache/iggy/tree/master/core/connectors)** - sinks, sources and data transformations based on the **custom Rust plugins**
 - Optional server-side as well as client-side **data encryption** using AES-256-GCM
 - Optional metadata support in the form of **message headers**
 - Optional **data backups & archivization** on disk and/or the **S3** compatible cloud storage (e.g. AWS S3)
@@ -78,6 +79,7 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 
 ![files structure](assets/files_structure.png)
 
+
 ---
 
 ## Architecture
@@ -86,6 +88,13 @@ This is the high-level architecture of the Iggy message streaming server, where 
 
 ![server](assets/iggy_architecture.png)
 
+---
+
+## Version
+
+The latest released version is `0.4.300` for Iggy server, which is compatible with `0.6` Rust client SDK and the others.
+
+The recent improvements based on the zero-copy (de)serialization, along with updated SDKs etc. will be available in the upcoming release with Iggy server `0.5.0`, Rust SDK `0.7` and all the other SDKs.
 
 ---
 
@@ -93,23 +102,22 @@ This is the high-level architecture of the Iggy message streaming server, where 
 
 - **Shared-nothing** design and **io_uring** support (PoC on experimental branch, WiP on the main branch)
 - **Clustering** & data replication based on **[VSR](https://pmg.csail.mit.edu/papers/vr-revisited.pdf)** (on sandbox project using Raft, will be implemented after shared-nothing design is completed)
-- Plugins & extensions support (design and PoC as discussed [here](https://github.com/apache/iggy/discussions/1670), WiP)
-
 
 ---
 
 ## Supported languages SDK (work in progress)
 
-We're in the process of migrating all the remaining SDKs and other tooling from [iggy-rs](https://github.com/iggy-rs/) organization to this monorepo (WiP).
+- Rust
+- C#
+- Java
+- Go
+- Python
+- Node
+- C++
+- Elixir
 
-- [Rust](https://crates.io/crates/iggy)
-- [C#](https://github.com/iggy-rs/iggy-dotnet-client)
-- [Go](https://github.com/iggy-rs/iggy-go-client)
-- [Node](https://github.com/iggy-rs/iggy-node-client)
-- [Python](https://github.com/iggy-rs/iggy-python-client)
-- [Java](https://github.com/iggy-rs/iggy-java-client)
-- [C++](https://github.com/iggy-rs/iggy-cpp-client)
-- [Elixir](https://github.com/iggy-rs/iggy-elixir-client)
+
+Almost all the tooling has been migrated from [iggy-rs](https://github.com/iggy-rs/) organization to this monorepo. There's no an ongoing work to support the zero-copy (de)serialization for all the SDKs.
 
 ---
 

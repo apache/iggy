@@ -15,12 +15,24 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: test
-on:
-  push:
-    branches:
-      - master
+services:
+  quickwit:
+    image: quickwit/quickwit:edge
+    container_name: quickwit
+    restart: unless-stopped
+    volumes:
+      - quickwit:/quickwit/qwdata
+    ports:
+      - 7280:7280
+      - 7281:7281
+    command: run
+    environment:
+      - QW_ENABLE_OTLP_ENDPOINT=true
+      - QW_ENABLE_JAEGER_ENDPOINT=true
+      - QW_ENABLE_OPENTELEMETRY_OTLP_EXPORTER=true
+      - QW_ENABLE_INGEST_V2=true
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:7281
+      - RUST_LOG=info,quickwit_actors=error,indexing_split_store=error,tantivy=error,quickwit_serve=warn,quickwit_indexing=warn,quickwit=warn
 
-jobs:
-  test:
-    uses: ./.github/workflows/test_pr.yml
+volumes:
+  quickwit:

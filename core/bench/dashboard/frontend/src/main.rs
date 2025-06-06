@@ -43,7 +43,7 @@ pub fn app() -> Html {
 
 fn switch(routes: AppRoute) -> Html {
     match routes {
-        AppRoute::Single | AppRoute::Home => html! {
+        AppRoute::Benchmark { .. } | AppRoute::Home => html! {
             <ThemeProvider>
                 <UiProvider>
                     <div class="app-container">

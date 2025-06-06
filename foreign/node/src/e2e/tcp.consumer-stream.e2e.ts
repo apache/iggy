@@ -56,9 +56,9 @@ describe('e2e -> consumer-stream', async () => {
   const ct = 1000;
 
   it('e2e -> consumer-stream::send-messages', async () => {
-    for (let i = 0; i <= ct; i += 100) {
+    for (let i = 0; i < ct; i += 100) {
       await sendSomeMessages(c.clientProvider)(
-        streamId, topicId, Partitioning.MessageKey(`k-${i % 400}`)
+        streamId, topicId, Partitioning.MessageKey(`k-${i % 300}`)
       );
     }
   });
@@ -79,9 +79,11 @@ describe('e2e -> consumer-stream', async () => {
     const s2 = await pollStream(pollReq);
     let recv = 0;
     const dataCb = (str: Readable) => (d: PollMessagesResponse) => {      
-      recv += d.count;
-      if (recv === ct)
+      recv += d.messages.length;
+      assert.equal(d.messages.length, d.count);
+      if (recv === ct) {
         str.destroy();
+      }
     };
 
     s.on('data', dataCb(s));

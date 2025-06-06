@@ -19,7 +19,7 @@ use super::BenchmarkCache;
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_report::hardware::BenchmarkHardware;
 use chrono::{self, DateTime, FixedOffset};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 impl BenchmarkCache {
     pub fn get_hardware_configurations(&self) -> Vec<BenchmarkHardware> {
@@ -35,11 +35,17 @@ impl BenchmarkCache {
         hardware_map.into_values().collect()
     }
 
-    pub fn get_gitrefs_for_hardware(&self, hardware: &str) -> HashSet<String> {
-        self.hardware_to_gitref
+    pub fn get_gitrefs_for_hardware(&self, hardware: &str) -> Vec<String> {
+        let gitref_set = self
+            .hardware_to_gitref
             .get(hardware)
-            .map(|set| set.iter().map(|s| s.to_string()).collect())
-            .unwrap_or_default()
+            .map(|set| set.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        let mut sorted_gitrefs = gitref_set;
+        sorted_gitrefs.sort();
+
+        sorted_gitrefs
     }
 
     pub fn get_benchmarks_for_hardware_and_gitref(
@@ -117,5 +123,29 @@ impl BenchmarkCache {
     fn parse_date(date_str: &str) -> DateTime<FixedOffset> {
         DateTime::parse_from_rfc3339(date_str)
             .unwrap_or_else(|_| DateTime::parse_from_rfc3339("1970-01-01T00:00:00Z").unwrap())
+    }
+
+    /// Get the most recently added benchmarks, sorted by creation timestamp (newest first)
+    pub fn get_recent_benchmarks(&self, limit: usize) -> Vec<BenchmarkReportLight> {
+        let mut recent_benchmarks: Vec<BenchmarkReportLight> = self
+            .benchmarks
+            .iter()
+            .map(|entry| entry.value().0.clone())
+            .collect();
+
+        recent_benchmarks.sort_by(|a, b| {
+            let parse_a = DateTime::parse_from_rfc3339(&a.timestamp);
+            let parse_b = DateTime::parse_from_rfc3339(&b.timestamp);
+            match (parse_a, parse_b) {
+                (Ok(time_a), Ok(time_b)) => time_b.cmp(&time_a),
+                _ => std::cmp::Ordering::Equal,
+            }
+        });
+
+        if recent_benchmarks.len() > limit {
+            recent_benchmarks.truncate(limit);
+        }
+
+        recent_benchmarks
     }
 }

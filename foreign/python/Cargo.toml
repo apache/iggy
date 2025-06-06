@@ -19,7 +19,7 @@ crate-type = ["cdylib", "rlib"]
 pyo3 = "0.25.0"
 iggy = "0.6.201"
 pyo3-async-runtimes = { version = "0.25.0", features = ["attributes", "tokio-runtime"] }
-pyo3-stub-gen = "0.7.0"
+pyo3-stub-gen = "0.8.2"
 
 [[bin]]
 name = "stub_gen"

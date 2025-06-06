@@ -1,5 +1,4 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
+/* Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -17,19 +16,19 @@
  * under the License.
  */
 
+use crate::{Error, Payload, Schema, StreamEncoder};
 
-import { createConnection, type TcpSocketConnectOpts } from 'node:net';
-import type { RawClient } from './client.type.js';
-import { wrapSocket, type CommandResponseStream } from './client.socket.js';
+pub struct RawStreamEncoder;
 
-export const createTcpSocket =
-  (options: TcpSocketConnectOpts): Promise<CommandResponseStream> => {
-    const socket = createConnection(options);
-    return wrapSocket(socket);
-  };
+impl StreamEncoder for RawStreamEncoder {
+    fn schema(&self) -> Schema {
+        Schema::Raw
+    }
 
-
-export type TcpOption = TcpSocketConnectOpts;
-
-export const TcpClient = ({ host, port, keepAlive = true }: TcpOption): Promise<RawClient> =>
-  createTcpSocket({ host, port, keepAlive });
+    fn encode(&self, payload: Payload) -> Result<Vec<u8>, Error> {
+        match payload {
+            Payload::Raw(value) => Ok(value),
+            _ => Err(Error::InvalidPayloadType),
+        }
+    }
+}
