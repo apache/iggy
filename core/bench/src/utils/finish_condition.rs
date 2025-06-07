@@ -28,7 +28,7 @@ use std::{
 const MINIMUM_MSG_PAYLOAD_SIZE: usize = 20;
 
 /// Determines how to calculate the finish condition's workload division
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BenchmarkFinishConditionMode {
     /// Global condition shares work across all actors
     Shared,
@@ -68,9 +68,9 @@ impl BenchmarkFinishCondition {
     ///
     /// The mode parameter automatically determines the appropriate workload division factor:
     /// - Global: factor = 1 (total workload is shared across all actors)
-    /// - PerProducer: factor = number of producers
-    /// - PerConsumer: factor = number of consumers
-    /// - PerProducingConsumer: factor = number of producing consumers * 2
+    /// - `PerProducer`: factor = number of producers
+    /// - `PerConsumer`: factor = number of consumers
+    /// - `PerProducingConsumer`: factor = number of producing consumers * 2
     pub fn new(args: &IggyBenchArgs, mode: BenchmarkFinishConditionMode) -> Arc<Self> {
         let total_data = args.total_data();
         let batches_count = args.message_batches();
@@ -84,17 +84,17 @@ impl BenchmarkFinishCondition {
         };
 
         let total_data_multiplier = match args.benchmark_kind {
-            BenchmarkKindCommand::PinnedProducer(_) => args.producers(),
-            BenchmarkKindCommand::PinnedConsumer(_) => args.consumers(),
+            BenchmarkKindCommand::PinnedProducer(_)
+            | BenchmarkKindCommand::BalancedProducer(_)
+            | BenchmarkKindCommand::BalancedProducerAndConsumerGroup(_) => args.producers(),
+            BenchmarkKindCommand::PinnedConsumer(_)
+            | BenchmarkKindCommand::BalancedConsumerGroup(_) => args.consumers(),
             BenchmarkKindCommand::PinnedProducerAndConsumer(_) => {
                 args.producers() + args.consumers()
             }
-            BenchmarkKindCommand::BalancedProducer(_) => args.producers(),
-            BenchmarkKindCommand::BalancedConsumerGroup(_) => args.consumers(),
-            BenchmarkKindCommand::BalancedProducerAndConsumerGroup(_) => args.producers(),
-            BenchmarkKindCommand::EndToEndProducingConsumer(_) => args.producers() * 2,
-            BenchmarkKindCommand::EndToEndProducingConsumerGroup(_) => args.producers() * 2,
-            _ => unreachable!(),
+            BenchmarkKindCommand::EndToEndProducingConsumer(_)
+            | BenchmarkKindCommand::EndToEndProducingConsumerGroup(_) => args.producers() * 2,
+            BenchmarkKindCommand::Examples => unreachable!(),
         };
 
         Arc::new(match (total_data, batches_count) {
@@ -103,18 +103,20 @@ impl BenchmarkFinishCondition {
 
                 Self {
                     kind: BenchmarkFinishConditionType::ByMessageBatchesCount,
-                    total: count_per_actor as u64,
-                    left_total: Arc::new(AtomicI64::new(count_per_actor as i64)),
+                    total: u64::from(count_per_actor),
+                    left_total: Arc::new(AtomicI64::new(i64::from(count_per_actor))),
                     mode,
                 }
             }
             (Some(size), None) => {
-                let bytes_per_actor = size.as_bytes_u64() / total_data_factor as u64;
+                let bytes_per_actor = size.as_bytes_u64() / u64::from(total_data_factor);
 
                 Self {
                     kind: BenchmarkFinishConditionType::ByTotalData,
                     total: bytes_per_actor,
-                    left_total: Arc::new(AtomicI64::new(bytes_per_actor as i64)),
+                    left_total: Arc::new(AtomicI64::new(
+                        i64::try_from(bytes_per_actor).unwrap_or(i64::MAX),
+                    )),
                     mode,
                 }
             }
@@ -136,8 +138,10 @@ impl BenchmarkFinishCondition {
     pub fn account_and_check(&self, size_to_subtract: u64) -> bool {
         match self.kind {
             BenchmarkFinishConditionType::ByTotalData => {
-                self.left_total
-                    .fetch_sub(size_to_subtract as i64, Ordering::AcqRel);
+                self.left_total.fetch_sub(
+                    i64::try_from(size_to_subtract).unwrap_or(i64::MAX),
+                    Ordering::AcqRel,
+                );
             }
             BenchmarkFinishConditionType::ByMessageBatchesCount => {
                 self.left_total.fetch_sub(1, Ordering::AcqRel);
@@ -150,7 +154,7 @@ impl BenchmarkFinishCondition {
         self.left() <= 0
     }
 
-    pub fn total(&self) -> u64 {
+    pub const fn total(&self) -> u64 {
         self.total
     }
 
@@ -175,8 +179,8 @@ impl BenchmarkFinishCondition {
     }
 
     pub fn status(&self) -> String {
-        let done = self.total() as i64 - self.left();
-        let total = self.total() as i64;
+        let done = i64::try_from(self.total()).unwrap_or(i64::MAX) - self.left();
+        let total = i64::try_from(self.total()).unwrap_or(i64::MAX);
         match self.kind {
             BenchmarkFinishConditionType::ByTotalData => {
                 format!(
@@ -200,9 +204,9 @@ impl BenchmarkFinishCondition {
     pub fn max_capacity(&self) -> usize {
         let value = self.left_total.load(Ordering::Relaxed);
         if self.kind == BenchmarkFinishConditionType::ByTotalData {
-            value as usize / MINIMUM_MSG_PAYLOAD_SIZE
+            usize::try_from(value).unwrap_or(0) / MINIMUM_MSG_PAYLOAD_SIZE
         } else {
-            value as usize
+            usize::try_from(value).unwrap_or(0)
         }
     }
 }
@@ -210,11 +214,11 @@ impl BenchmarkFinishCondition {
 impl Display for BenchmarkFinishConditionMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BenchmarkFinishConditionMode::Shared => write!(f, "shared"),
-            BenchmarkFinishConditionMode::SharedHalf => write!(f, "shared-half"),
-            BenchmarkFinishConditionMode::PerProducer => write!(f, "per-producer"),
-            BenchmarkFinishConditionMode::PerConsumer => write!(f, "per-consumer"),
-            BenchmarkFinishConditionMode::PerProducingConsumer => {
+            Self::Shared => write!(f, "shared"),
+            Self::SharedHalf => write!(f, "shared-half"),
+            Self::PerProducer => write!(f, "per-producer"),
+            Self::PerConsumer => write!(f, "per-consumer"),
+            Self::PerProducingConsumer => {
                 write!(f, "per-producing-consumer")
             }
         }

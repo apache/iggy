@@ -50,3 +50,8 @@ uuid = { workspace = true }
 [[bin]]
 name = "iggy-bench"
 path = "src/main.rs"
+
+[lints.clippy]
+enum_glob_use = "deny"
+pedantic = "deny"
+nursery = "deny"

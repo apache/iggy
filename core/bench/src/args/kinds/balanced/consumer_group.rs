@@ -17,7 +17,12 @@
  */
 
 use crate::args::{
-    common::IggyBenchArgs, defaults::*, props::BenchmarkKindProps,
+    common::IggyBenchArgs,
+    defaults::{
+        DEFAULT_BALANCED_NUMBER_OF_STREAMS, DEFAULT_NUMBER_OF_CONSUMER_GROUPS,
+        DEFAULT_NUMBER_OF_CONSUMERS,
+    },
+    props::BenchmarkKindProps,
     transport::BenchmarkTransportCommand,
 };
 use clap::{CommandFactory, Parser, error::ErrorKind};
@@ -77,8 +82,7 @@ impl BenchmarkKindProps for BalancedConsumerGroupArgs {
             cmd.error(
                 ErrorKind::ArgumentConflict,
                 format!(
-                    "In balanced consumer group, consumer groups number ({}) must be less than the number of streams ({})",
-                    cg_number, streams
+                    "In balanced consumer group, consumer groups number ({cg_number}) must be less than the number of streams ({streams})"
                 ),
             )
             .exit();

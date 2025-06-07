@@ -36,78 +36,22 @@ struct ConfigAddress {
     address: String,
 }
 
-pub async fn start_server_if_needed(args: &mut IggyBenchArgs) -> Option<TestServer> {
+pub async fn start_server_if_needed(args: &IggyBenchArgs) -> Option<TestServer> {
     if args.skip_server_start {
         info!("Skipping iggy-server start");
         return None;
     }
 
-    let default_config: ServerConfig =
-        toml::from_str(include_str!("../../../configs/server.toml")).unwrap();
-    let (should_start, mut envs) = match &args.transport() {
-        Transport::Http => {
-            let args_http_address = args.server_address().parse::<SocketAddr>().unwrap();
-            let config_http_address = default_config.http.address.parse::<SocketAddr>().unwrap();
-            let envs = HashMap::from([
-                (
-                    "IGGY_HTTP_ADDRESS".to_owned(),
-                    default_config.http.address.to_owned(),
-                ),
-                ("IGGY_TCP_ENABLED".to_owned(), "false".to_owned()),
-                ("IGGY_QUIC_ENABLED".to_owned(), "false".to_owned()),
-            ]);
-            (
-                addresses_are_equivalent(&args_http_address, &config_http_address)
-                    && !is_tcp_addr_in_use(&args_http_address).await,
-                envs,
-            )
-        }
-        Transport::Tcp => {
-            let args_tcp_address = args.server_address().parse::<SocketAddr>().unwrap();
-            let config_tcp_address = default_config.tcp.address.parse::<SocketAddr>().unwrap();
-
-            let envs = HashMap::from([
-                (
-                    "IGGY_TCP_ADDRESS".to_owned(),
-                    default_config.tcp.address.to_owned(),
-                ),
-                ("IGGY_HTTP_ENABLED".to_owned(), "false".to_owned()),
-                ("IGGY_QUIC_ENABLED".to_owned(), "false".to_owned()),
-            ]);
-            (
-                addresses_are_equivalent(&args_tcp_address, &config_tcp_address)
-                    && !is_tcp_addr_in_use(&args_tcp_address).await,
-                envs,
-            )
-        }
-        Transport::Quic => {
-            let args_quic_address = args.server_address().parse::<SocketAddr>().unwrap();
-            let config_quic_address = default_config.quic.address.parse::<SocketAddr>().unwrap();
-            let envs = HashMap::from([
-                (
-                    "IGGY_QUIC_ADDRESS".to_owned(),
-                    default_config.quic.address.to_owned(),
-                ),
-                ("IGGY_HTTP_ENABLED".to_owned(), "false".to_owned()),
-                ("IGGY_TCP_ENABLED".to_owned(), "false".to_owned()),
-            ]);
-
-            (
-                addresses_are_equivalent(&args_quic_address, &config_quic_address)
-                    && !is_udp_addr_in_use(&args_quic_address).await,
-                envs,
-            )
-        }
-    };
+    let (should_start, mut envs) = evaluate_server_start_condition(args).await;
 
     if should_start {
         envs.insert(SYSTEM_PATH_ENV_VAR.to_owned(), "local_data".to_owned());
 
         if args.verbose {
             envs.insert("IGGY_TEST_VERBOSE".to_owned(), "true".to_owned());
-            info!("Enabling verbose output - iggy-server will logs print to stdout")
+            info!("Enabling verbose output - iggy-server will logs print to stdout");
         } else {
-            info!("Disabling verbose output - iggy-server will print logs to files")
+            info!("Disabling verbose output - iggy-server will print logs to files");
         }
 
         info!(
@@ -136,13 +80,74 @@ pub async fn start_server_if_needed(args: &mut IggyBenchArgs) -> Option<TestServ
                 "Test iggy-server started, pid: {}, startup time: {} ms",
                 test_server.pid(),
                 elapsed.as_millis()
-            )
+            );
         }
 
         Some(test_server)
     } else {
         info!("Skipping iggy-server start");
         None
+    }
+}
+
+async fn evaluate_server_start_condition(args: &IggyBenchArgs) -> (bool, HashMap<String, String>) {
+    let default_config: ServerConfig =
+        toml::from_str(include_str!("../../../configs/server.toml")).unwrap();
+
+    match &args.transport() {
+        Transport::Http => {
+            let args_http_address = args.server_address().parse::<SocketAddr>().unwrap();
+            let config_http_address = default_config.http.address.parse::<SocketAddr>().unwrap();
+            let envs = HashMap::from([
+                (
+                    "IGGY_HTTP_ADDRESS".to_owned(),
+                    default_config.http.address.clone(),
+                ),
+                ("IGGY_TCP_ENABLED".to_owned(), "false".to_owned()),
+                ("IGGY_QUIC_ENABLED".to_owned(), "false".to_owned()),
+            ]);
+            (
+                addresses_are_equivalent(&args_http_address, &config_http_address)
+                    && !is_tcp_addr_in_use(&args_http_address).await,
+                envs,
+            )
+        }
+        Transport::Tcp => {
+            let args_tcp_address = args.server_address().parse::<SocketAddr>().unwrap();
+            let config_tcp_address = default_config.tcp.address.parse::<SocketAddr>().unwrap();
+
+            let envs = HashMap::from([
+                (
+                    "IGGY_TCP_ADDRESS".to_owned(),
+                    default_config.tcp.address.clone(),
+                ),
+                ("IGGY_HTTP_ENABLED".to_owned(), "false".to_owned()),
+                ("IGGY_QUIC_ENABLED".to_owned(), "false".to_owned()),
+            ]);
+            (
+                addresses_are_equivalent(&args_tcp_address, &config_tcp_address)
+                    && !is_tcp_addr_in_use(&args_tcp_address).await,
+                envs,
+            )
+        }
+        Transport::Quic => {
+            let args_quic_address = args.server_address().parse::<SocketAddr>().unwrap();
+            let config_quic_address = default_config.quic.address.parse::<SocketAddr>().unwrap();
+            let envs = HashMap::from([
+                (
+                    "IGGY_QUIC_ADDRESS".to_owned(),
+                    default_config.quic.address.clone(),
+                ),
+                ("IGGY_HTTP_ENABLED".to_owned(), "false".to_owned()),
+                ("IGGY_TCP_ENABLED".to_owned(), "false".to_owned()),
+            ]);
+
+            (
+                addresses_are_equivalent(&args_quic_address, &config_quic_address)
+                    && !is_udp_addr_in_use(&args_quic_address).await,
+                envs,
+            )
+        }
     }
 }
 

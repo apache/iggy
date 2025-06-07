@@ -16,6 +16,8 @@
  * under the License.
  */
 
+#![allow(clippy::cast_precision_loss)]
+
 use super::calculators::{
     LatencyTimeSeriesCalculator, MBThroughputCalculator, MessageThroughputCalculator,
     ThroughputTimeSeriesCalculator, TimeSeriesCalculation,
@@ -29,34 +31,22 @@ use tracing::warn;
 pub struct TimeSeriesCalculator;
 
 impl TimeSeriesCalculator {
-    pub fn new() -> Self {
-        Self
-    }
-
-    pub fn throughput_mb(
-        &self,
-        records: &[BenchmarkRecord],
-        bucket_size: IggyDuration,
-    ) -> TimeSeries {
+    pub fn throughput_mb(records: &[BenchmarkRecord], bucket_size: IggyDuration) -> TimeSeries {
         let calculator = ThroughputTimeSeriesCalculator::new(MBThroughputCalculator);
         calculator.calculate(records, bucket_size)
     }
 
-    pub fn throughput_msg(
-        &self,
-        records: &[BenchmarkRecord],
-        bucket_size: IggyDuration,
-    ) -> TimeSeries {
+    pub fn throughput_msg(records: &[BenchmarkRecord], bucket_size: IggyDuration) -> TimeSeries {
         let calculator = ThroughputTimeSeriesCalculator::new(MessageThroughputCalculator);
         calculator.calculate(records, bucket_size)
     }
 
-    pub fn latency(&self, records: &[BenchmarkRecord], bucket_size: IggyDuration) -> TimeSeries {
+    pub fn latency(records: &[BenchmarkRecord], bucket_size: IggyDuration) -> TimeSeries {
         let calculator = LatencyTimeSeriesCalculator;
         calculator.calculate(records, bucket_size)
     }
 
-    pub fn aggregate_sum(&self, series: &[TimeSeries]) -> TimeSeries {
+    pub fn aggregate_sum(series: &[TimeSeries]) -> TimeSeries {
         if series.is_empty() {
             warn!("Attempting to aggregate empty series");
             return TimeSeries {
@@ -92,7 +82,7 @@ impl TimeSeriesCalculator {
         TimeSeries { points, kind }
     }
 
-    pub fn aggregate_avg(&self, series: &[TimeSeries]) -> TimeSeries {
+    pub fn aggregate_avg(series: &[TimeSeries]) -> TimeSeries {
         if series.is_empty() {
             warn!("Attempting to aggregate empty series");
             return TimeSeries {

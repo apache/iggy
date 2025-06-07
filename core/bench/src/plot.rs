@@ -31,28 +31,28 @@ pub enum ChartType {
 }
 
 impl ChartType {
-    fn name(&self) -> &'static str {
+    const fn name(&self) -> &'static str {
         match self {
-            ChartType::Throughput => "throughput",
-            ChartType::Latency => "latency",
+            Self::Throughput => "throughput",
+            Self::Latency => "latency",
         }
     }
 
     fn create_chart(&self) -> fn(&BenchmarkReport, bool, bool) -> Chart {
         match self {
-            ChartType::Throughput => bench_report::create_throughput_chart,
-            ChartType::Latency => bench_report::create_latency_chart,
+            Self::Throughput => bench_report::create_throughput_chart,
+            Self::Latency => bench_report::create_latency_chart,
         }
     }
 
     fn get_samples(&self, report: &BenchmarkReport) -> usize {
         match self {
-            ChartType::Throughput => report
+            Self::Throughput => report
                 .individual_metrics
                 .iter()
                 .map(|m| m.throughput_mb_ts.points.len())
                 .sum(),
-            ChartType::Latency => report
+            Self::Latency => report
                 .individual_metrics
                 .iter()
                 .filter(|m| !m.latency_ts.points.is_empty())
@@ -85,7 +85,7 @@ fn open_in_browser(path: &str) -> std::io::Result<()> {
 pub fn plot_chart(
     report: &BenchmarkReport,
     output_directory: &str,
-    chart_type: ChartType,
+    chart_type: &ChartType,
     should_open_in_browser: bool,
 ) -> std::io::Result<()> {
     let data_processing_start = Instant::now();
@@ -97,12 +97,12 @@ pub fn plot_chart(
     save_chart(&chart, file_name, output_directory, 1600, 1200)?;
 
     if should_open_in_browser {
-        let chart_path = format!("{}/{}.html", output_directory, file_name);
+        let chart_path = format!("{output_directory}/{file_name}.html");
         open_in_browser(&chart_path)?;
     }
 
     let total_samples = chart_type.get_samples(report);
-    let report_path = format!("{}/report.json", output_directory);
+    let report_path = format!("{output_directory}/report.json");
     let report_size = IggyByteSize::from(std::fs::metadata(&report_path)?.len());
 
     let chart_render_time = chart_render_start.elapsed();
@@ -129,10 +129,10 @@ fn save_chart(
 ) -> std::io::Result<()> {
     let parent = Path::new(output_directory).parent().unwrap();
     std::fs::create_dir_all(parent)?;
-    let full_output_path = Path::new(output_directory).join(format!("{}.html", file_name));
+    let full_output_path = Path::new(output_directory).join(format!("{file_name}.html"));
 
     let mut renderer = HtmlRenderer::new(file_name, width, height).theme(Theme::Dark);
     renderer
         .save(chart, &full_output_path)
-        .map_err(|e| std::io::Error::other(format!("Failed to save HTML plot: {}", e)))
+        .map_err(|e| std::io::Error::other(format!("Failed to save HTML plot: {e}")))
 }

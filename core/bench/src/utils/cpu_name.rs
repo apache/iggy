@@ -25,8 +25,10 @@ pub fn append_cpu_name_lowercase(to: &mut String) {
     let cpu = sys
         .cpus()
         .first()
-        .map(|cpu| (cpu.brand().to_string(), cpu.frequency()))
-        .unwrap_or_else(|| (String::from("unknown"), 0))
+        .map_or_else(
+            || (String::from("unknown"), 0),
+            |cpu| (cpu.brand().to_string(), cpu.frequency()),
+        )
         .0
         .to_lowercase()
         .replace(' ', "_");

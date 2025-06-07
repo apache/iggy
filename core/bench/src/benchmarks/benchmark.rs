@@ -43,43 +43,46 @@ impl From<IggyBenchArgs> for Box<dyn Benchmarkable> {
 
         match args.benchmark_kind {
             BenchmarkKindCommand::PinnedProducer(_) => {
-                PinnedProducerBenchmark::new(Arc::new(args), client_factory)
+                Box::new(PinnedProducerBenchmark::new(Arc::new(args), client_factory))
             }
 
             BenchmarkKindCommand::PinnedConsumer(_) => {
-                PinnedConsumerBenchmark::new(Arc::new(args), client_factory)
+                Box::new(PinnedConsumerBenchmark::new(Arc::new(args), client_factory))
             }
 
-            BenchmarkKindCommand::PinnedProducerAndConsumer(_) => {
-                PinnedProducerAndConsumerBenchmark::new(Arc::new(args), client_factory)
-            }
+            BenchmarkKindCommand::PinnedProducerAndConsumer(_) => Box::new(
+                PinnedProducerAndConsumerBenchmark::new(Arc::new(args), client_factory),
+            ),
 
-            BenchmarkKindCommand::BalancedProducer(_) => {
-                BalancedProducerBenchmark::new(Arc::new(args), client_factory)
-            }
+            BenchmarkKindCommand::BalancedProducer(_) => Box::new(BalancedProducerBenchmark::new(
+                Arc::new(args),
+                client_factory,
+            )),
 
-            BenchmarkKindCommand::BalancedConsumerGroup(_) => {
-                BalancedConsumerGroupBenchmark::new(Arc::new(args), client_factory)
-            }
+            BenchmarkKindCommand::BalancedConsumerGroup(_) => Box::new(
+                BalancedConsumerGroupBenchmark::new(Arc::new(args), client_factory),
+            ),
 
-            BenchmarkKindCommand::BalancedProducerAndConsumerGroup(_) => {
-                BalancedProducerAndConsumerGroupBenchmark::new(Arc::new(args), client_factory)
-            }
+            BenchmarkKindCommand::BalancedProducerAndConsumerGroup(_) => Box::new(
+                BalancedProducerAndConsumerGroupBenchmark::new(Arc::new(args), client_factory),
+            ),
 
-            BenchmarkKindCommand::EndToEndProducingConsumer(_) => {
-                EndToEndProducingConsumerBenchmark::new(Arc::new(args), client_factory)
-            }
+            BenchmarkKindCommand::EndToEndProducingConsumer(_) => Box::new(
+                EndToEndProducingConsumerBenchmark::new(Arc::new(args), client_factory),
+            ),
 
-            BenchmarkKindCommand::EndToEndProducingConsumerGroup(_) => {
-                EndToEndProducingConsumerGroupBenchmark::new(Arc::new(args), client_factory)
+            BenchmarkKindCommand::EndToEndProducingConsumerGroup(_) => Box::new(
+                EndToEndProducingConsumerGroupBenchmark::new(Arc::new(args), client_factory),
+            ),
+            BenchmarkKindCommand::Examples => {
+                unreachable!("Examples should be handled before this point")
             }
-            _ => todo!(),
         }
     }
 }
 
 #[async_trait]
-pub trait Benchmarkable {
+pub trait Benchmarkable: Send {
     async fn run(
         &mut self,
     ) -> Result<JoinSet<Result<BenchmarkIndividualMetrics, IggyError>>, IggyError>;
@@ -104,13 +107,13 @@ pub trait Benchmarkable {
             let stream_id = start_stream_id + i;
             if streams.iter().all(|s| s.id != stream_id) {
                 info!("Creating the test stream {}", stream_id);
-                let name = format!("stream {}", stream_id);
+                let name = format!("stream {stream_id}");
                 client.create_stream(&name, Some(stream_id)).await?;
-                let name = format!("topic {}", topic_id);
-                let max_topic_size = match self.args().max_topic_size() {
-                    Some(size) => MaxTopicSize::Custom(size),
-                    None => MaxTopicSize::Unlimited,
-                };
+                let name = format!("topic {topic_id}");
+                let max_topic_size = self
+                    .args()
+                    .max_topic_size()
+                    .map_or(MaxTopicSize::Unlimited, MaxTopicSize::Custom);
 
                 info!(
                     "Creating the test topic {} for stream {} with max topic size: {:?}",
@@ -145,8 +148,7 @@ pub trait Benchmarkable {
             let stream_id = start_stream_id + i;
             if streams.iter().all(|s| s.id != stream_id) {
                 return Err(IggyError::ResourceNotFound(format!(
-                    "Streams for testing are not properly initialized. Stream with id: {} is missing.",
-                    stream_id
+                    "Streams for testing are not properly initialized. Stream with id: {stream_id} is missing."
                 )));
             }
         }
@@ -159,23 +161,21 @@ pub trait Benchmarkable {
             " messages per batch: {} b,",
             self.args().messages_per_batch()
         );
-        let data = if let Some(data) = self.args().total_data() {
-            format!(" total data to send: {},", data)
-        } else {
-            format!(
-                " total batches to send: {},",
-                self.args().message_batches().unwrap()
-            )
-        };
+        let data = self.args().total_data().map_or_else(
+            || {
+                format!(
+                    " total batches to send: {},",
+                    self.args().message_batches().unwrap()
+                )
+            },
+            |data| format!(" total data to send: {data},"),
+        );
         let rate_limit = self
             .args()
             .rate_limit()
             .map(|rl| format!(" global rate limit: {rl}/s"))
             .unwrap_or_default();
 
-        format!(
-            "{}{}{}{}",
-            message_size, messages_per_batch, data, rate_limit,
-        )
+        format!("{message_size}{messages_per_batch}{data}{rate_limit}",)
     }
 }

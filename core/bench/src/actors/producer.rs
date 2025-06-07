@@ -64,7 +64,7 @@ impl BenchmarkProducer {
         moving_average_window: u32,
         limit_bytes_per_second: Option<IggyByteSize>,
     ) -> Self {
-        BenchmarkProducer {
+        Self {
             client_factory,
             benchmark_kind,
             producer_id,
@@ -134,7 +134,6 @@ impl BenchmarkProducer {
         );
 
         let max_capacity = self.finish_condition.max_capacity();
-        let mut latencies: Vec<Duration> = Vec::with_capacity(max_capacity);
         let mut records: Vec<BenchmarkRecord> = Vec::with_capacity(max_capacity);
         let mut messages_processed = 0;
         let mut batches_processed = 0;
@@ -158,10 +157,10 @@ impl BenchmarkProducer {
             user_data_bytes_processed += batch.user_data_bytes;
             total_bytes_processed += batch.total_bytes;
 
-            latencies.push(latency);
             records.push(BenchmarkRecord {
-                elapsed_time_us: start_timestamp.elapsed().as_micros() as u64,
-                latency_us: latency.as_micros() as u64,
+                elapsed_time_us: u64::try_from(start_timestamp.elapsed().as_micros())
+                    .unwrap_or(u64::MAX),
+                latency_us: u64::try_from(latency.as_micros()).unwrap_or(u64::MAX),
                 messages: messages_processed,
                 message_batches: batches_processed,
                 user_data_bytes: user_data_bytes_processed,
@@ -183,7 +182,7 @@ impl BenchmarkProducer {
         }
 
         let metrics = from_records(
-            records,
+            &records,
             self.benchmark_kind,
             ActorKind::Producer,
             self.producer_id,

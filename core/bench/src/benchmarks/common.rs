@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use super::*;
+use super::{CONSUMER_GROUP_BASE_ID, CONSUMER_GROUP_NAME_PREFIX};
 use crate::{
     actors::{
         consumer::BenchmarkConsumer, producer::BenchmarkProducer,
@@ -33,7 +33,7 @@ use tracing::{error, info};
 
 pub async fn create_consumer(
     client: &IggyClient,
-    consumer_group_id: &Option<u32>,
+    consumer_group_id: Option<&u32>,
     stream_id: &Identifier,
     topic_id: &Identifier,
     consumer_id: u32,
@@ -56,7 +56,14 @@ pub async fn create_consumer(
 }
 
 pub fn rate_limit_per_actor(total_rate: Option<IggyByteSize>, actors: u32) -> Option<IggyByteSize> {
-    total_rate.map(|rl| (rl.as_bytes_u64() / (actors as u64)).into())
+    total_rate.and_then(|rl| {
+        let per_actor = rl.as_bytes_u64() / u64::from(actors);
+        if per_actor > 0 {
+            Some(per_actor.into())
+        } else {
+            None
+        }
+    })
 }
 
 pub async fn init_consumer_groups(
@@ -73,7 +80,7 @@ pub async fn init_consumer_groups(
     for i in 1..=cg_count {
         let consumer_group_id = CONSUMER_GROUP_BASE_ID + i;
         let stream_id = start_stream_id + i;
-        let consumer_group_name = format!("{}-{}", CONSUMER_GROUP_NAME_PREFIX, consumer_group_id);
+        let consumer_group_name = format!("{CONSUMER_GROUP_NAME_PREFIX}-{consumer_group_id}");
         info!(
             "Creating test consumer group: name={}, id={}, stream={}, topic={}",
             consumer_group_name, consumer_group_id, stream_id, topic_id
@@ -105,10 +112,7 @@ pub async fn init_consumer_groups(
 pub fn build_producer_futures(
     client_factory: &Arc<dyn ClientFactory>,
     args: &IggyBenchArgs,
-) -> Result<
-    Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send + use<>>,
-    IggyError,
-> {
+) -> Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send + use<>> {
     let streams = args.streams();
     let partitions = args.number_of_partitions();
     let start_stream_id = args.start_stream_id();
@@ -124,7 +128,7 @@ pub fn build_producer_futures(
         BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::Shared);
     let rate_limit = rate_limit_per_actor(args.rate_limit(), actors);
 
-    let futures = (1..=producers)
+    (1..=producers)
         .map(|producer_id| {
             let client_factory = client_factory.clone();
 
@@ -154,18 +158,13 @@ pub fn build_producer_futures(
                 producer.run().await
             }
         })
-        .collect();
-
-    Ok(futures)
+        .collect()
 }
 
 pub fn build_consumer_futures(
     client_factory: &Arc<dyn ClientFactory>,
     args: &IggyBenchArgs,
-) -> Result<
-    Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send + use<>>,
-    IggyError,
-> {
+) -> Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send + use<>> {
     let start_stream_id = args.start_stream_id();
     let cg_count = args.number_of_consumer_groups();
     let consumers = args.consumers();
@@ -181,9 +180,9 @@ pub fn build_consumer_futures(
         PollingKind::Offset
     };
     let origin_timestamp_latency_calculation = match args.kind() {
-        BenchmarkKind::PinnedConsumer => false,
-        BenchmarkKind::PinnedProducerAndConsumer => false, // TODO(hubcio): in future, it can also be true
-        BenchmarkKind::BalancedConsumerGroup => false,
+        BenchmarkKind::PinnedConsumer
+        | BenchmarkKind::PinnedProducerAndConsumer
+        | BenchmarkKind::BalancedConsumerGroup => false, // TODO(hubcio): in future, PinnedProducerAndConsumer can also be true
         BenchmarkKind::BalancedProducerAndConsumerGroup => true,
         _ => unreachable!(),
     };
@@ -192,7 +191,7 @@ pub fn build_consumer_futures(
         BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::Shared);
     let rate_limit = rate_limit_per_actor(args.rate_limit(), actors);
 
-    let futures = (1..=consumers)
+    (1..=consumers)
         .map(|consumer_id| {
             let client_factory = client_factory.clone();
             let finish_condition = if cg_count > 0 {
@@ -230,19 +229,14 @@ pub fn build_consumer_futures(
                 consumer.run().await
             }
         })
-        .collect();
-
-    Ok(futures)
+        .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_pass_by_value)]
 pub fn build_producing_consumers_futures(
     client_factory: Arc<dyn ClientFactory>,
     args: Arc<IggyBenchArgs>,
-) -> Result<
-    Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send>,
-    IggyError,
-> {
+) -> Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send> {
     let producing_consumers = args.producers();
     let streams = args.streams();
     let partitions = args.number_of_partitions();
@@ -252,7 +246,7 @@ pub fn build_producing_consumers_futures(
     let start_stream_id = args.start_stream_id();
     let polling_kind = PollingKind::Offset;
 
-    let futures = (1..=producing_consumers)
+    (1..=producing_consumers)
         .map(|actor_id| {
             let client_factory_clone = client_factory.clone();
             let args_clone = args.clone();
@@ -294,18 +288,14 @@ pub fn build_producing_consumers_futures(
                 actor.run().await
             }
         })
-        .collect();
-
-    Ok(futures)
+        .collect()
 }
 
+#[allow(clippy::needless_pass_by_value)]
 pub fn build_producing_consumer_groups_futures(
     client_factory: Arc<dyn ClientFactory>,
     args: Arc<IggyBenchArgs>,
-) -> Result<
-    Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send>,
-    IggyError,
-> {
+) -> Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send> {
     let producers = args.producers();
     let consumers = args.consumers();
     let total_actors = producers.max(consumers);
@@ -324,7 +314,7 @@ pub fn build_producing_consumer_groups_futures(
     let shared_poll_finish_condition =
         BenchmarkFinishCondition::new(&args, BenchmarkFinishConditionMode::SharedHalf);
 
-    let futures = (1..=total_actors)
+    (1..=total_actors)
         .map(|actor_id| {
             let client_factory_clone = client_factory.clone();
             let args_clone = args.clone();
@@ -371,7 +361,7 @@ pub fn build_producing_consumer_groups_futures(
                     if should_consume {
                         format!(" in group={}", consumer_group_id.unwrap())
                     } else {
-                        "".to_string()
+                        String::new()
                     },
                     stream_id,
                     actor_type
@@ -396,7 +386,5 @@ pub fn build_producing_consumer_groups_futures(
                 actor.run().await
             }
         })
-        .collect();
-
-    Ok(futures)
+        .collect()
 }

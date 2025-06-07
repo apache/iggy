@@ -93,12 +93,65 @@ impl BenchmarkProducingConsumer {
     }
 
     pub async fn run(self) -> Result<BenchmarkIndividualMetrics, IggyError> {
+        let (
+            client,
+            stream_id,
+            topic_id,
+            partitioning,
+            partition_id,
+            consumer,
+            mut batch_generator,
+            rate_limiter,
+        ) = self.setup_client().await?;
+
+        if self.warmup_time.get_duration() != Duration::from_millis(0) {
+            self.run_warmup(
+                &client,
+                &stream_id,
+                &topic_id,
+                &partitioning,
+                partition_id,
+                &consumer,
+                &mut batch_generator,
+            )
+            .await?;
+        }
+
+        let metrics = self
+            .run_benchmark(
+                client,
+                stream_id,
+                topic_id,
+                partitioning,
+                partition_id,
+                consumer,
+                batch_generator,
+                rate_limiter,
+            )
+            .await?;
+        Ok(metrics)
+    }
+
+    async fn setup_client(
+        &self,
+    ) -> Result<
+        (
+            IggyClient,
+            Identifier,
+            Identifier,
+            Partitioning,
+            Option<u32>,
+            Consumer,
+            BenchmarkBatchGenerator,
+            Option<BenchmarkRateLimiter>,
+        ),
+        IggyError,
+    > {
         let topic_id: u32 = 1;
         let default_partition_id: u32 = 1;
 
         let client = self.client_factory.create_client().await;
         let client = IggyClient::create(client, None, None);
-
         login_root(&client).await;
 
         let stream_id = self.stream_id.try_into()?;
@@ -116,91 +169,116 @@ impl BenchmarkProducingConsumer {
 
         let consumer = create_consumer(
             &client,
-            &self.consumer_group_id,
+            self.consumer_group_id.as_ref(),
             &stream_id,
             &topic_id,
             self.actor_id,
         )
         .await;
 
-        let mut batch_generator =
+        let batch_generator =
             BenchmarkBatchGenerator::new(self.message_size, self.messages_per_batch);
-
         let rate_limiter = self.limit_bytes_per_second.map(BenchmarkRateLimiter::new);
 
-        // -----------------------
-        // WARM-UP
-        // -----------------------
+        Ok((
+            client,
+            stream_id,
+            topic_id,
+            partitioning,
+            partition_id,
+            consumer,
+            batch_generator,
+            rate_limiter,
+        ))
+    }
 
-        if self.warmup_time.get_duration() != Duration::from_millis(0) {
-            let warmup_end = Instant::now() + self.warmup_time.get_duration();
-            let mut offset: u64 = 0;
-            let mut last_warning_time: Option<Instant> = None;
-            let mut skipped_warnings_count: u32 = 0;
+    #[allow(clippy::too_many_arguments)]
+    async fn run_warmup(
+        &self,
+        client: &IggyClient,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partitioning: &Partitioning,
+        partition_id: Option<u32>,
+        consumer: &Consumer,
+        batch_generator: &mut BenchmarkBatchGenerator,
+    ) -> Result<(), IggyError> {
+        let warmup_end = Instant::now() + self.warmup_time.get_duration();
+        let mut offset: u64 = 0;
+        let mut last_warning_time: Option<Instant> = None;
+        let mut skipped_warnings_count: u32 = 0;
 
-            if let Some(cg_id) = self.consumer_group_id {
-                info!(
-                    "ProducingConsumer #{}, part of consumer group #{}, → warming up for {}...",
-                    self.actor_id, cg_id, self.warmup_time
-                );
-            } else {
-                info!(
-                    "ProducingConsumer #{} → warming up for {}...",
-                    self.actor_id, self.warmup_time
-                );
-            }
-            while Instant::now() < warmup_end {
-                let batch = batch_generator.generate_batch();
-                client
-                    .send_messages(&stream_id, &topic_id, &partitioning, &mut batch.messages)
-                    .await?;
-
-                let (strategy, auto_commit) = match self.polling_kind {
-                    PollingKind::Offset => (PollingStrategy::offset(offset), false),
-                    PollingKind::Next => (PollingStrategy::next(), true),
-                    other => panic!("Unsupported polling kind for warmup: {:?}", other),
-                };
-
-                let polled_messages = client
-                    .poll_messages(
-                        &stream_id,
-                        &topic_id,
-                        partition_id,
-                        &consumer,
-                        &strategy,
-                        batch.messages.len() as u32,
-                        auto_commit,
-                    )
-                    .await?;
-
-                if polled_messages.messages.is_empty() {
-                    let should_warn = last_warning_time
-                        .map(|t| t.elapsed() >= Duration::from_secs(1))
-                        .unwrap_or(true);
-
-                    if should_warn {
-                        warn!(
-                            "ProducingConsumer #{} (warmup) → expected {} messages but got {}, retrying... ({} warnings skipped)",
-                            self.actor_id,
-                            self.messages_per_batch,
-                            polled_messages.messages.len(),
-                            skipped_warnings_count
-                        );
-                        last_warning_time = Some(Instant::now());
-                        skipped_warnings_count = 0;
-                    } else {
-                        skipped_warnings_count += 1;
-                    }
-                    continue;
-                }
-
-                offset += batch.messages.len() as u64;
-            }
+        if let Some(cg_id) = self.consumer_group_id {
+            info!(
+                "ProducingConsumer #{}, part of consumer group #{}, → warming up for {}...",
+                self.actor_id, cg_id, self.warmup_time
+            );
+        } else {
+            info!(
+                "ProducingConsumer #{} → warming up for {}...",
+                self.actor_id, self.warmup_time
+            );
         }
+        while Instant::now() < warmup_end {
+            let batch = batch_generator.generate_batch();
+            client
+                .send_messages(stream_id, topic_id, partitioning, &mut batch.messages)
+                .await?;
 
-        // --------------------------------
-        // MAIN BENCHMARK LOOP
-        // --------------------------------
+            let (strategy, auto_commit) = match self.polling_kind {
+                PollingKind::Offset => (PollingStrategy::offset(offset), false),
+                PollingKind::Next => (PollingStrategy::next(), true),
+                other => panic!("Unsupported polling kind for warmup: {other:?}"),
+            };
+
+            let polled_messages = client
+                .poll_messages(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    consumer,
+                    &strategy,
+                    u32::try_from(batch.messages.len()).unwrap_or(u32::MAX),
+                    auto_commit,
+                )
+                .await?;
+
+            if polled_messages.messages.is_empty() {
+                let should_warn =
+                    last_warning_time.is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
+
+                if should_warn {
+                    warn!(
+                        "ProducingConsumer #{actor_id} (warmup) → expected {messages_per_batch} messages but got {actual_count}, retrying... ({skipped_warnings_count} warnings skipped)",
+                        actor_id = self.actor_id,
+                        messages_per_batch = self.messages_per_batch,
+                        actual_count = polled_messages.messages.len()
+                    );
+                    last_warning_time = Some(Instant::now());
+                    skipped_warnings_count = 0;
+                } else {
+                    skipped_warnings_count += 1;
+                }
+                continue;
+            }
+
+            offset += u64::try_from(batch.messages.len()).unwrap_or(u64::MAX);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn run_benchmark(
+        self,
+        client: IggyClient,
+        stream_id: Identifier,
+        topic_id: Identifier,
+        partitioning: Partitioning,
+        partition_id: Option<u32>,
+        consumer: Consumer,
+        mut batch_generator: BenchmarkBatchGenerator,
+        rate_limiter: Option<BenchmarkRateLimiter>,
+    ) -> Result<BenchmarkIndividualMetrics, IggyError> {
         info!(
             "ProducingConsumer #{} → sending {} and polling {} ({} msgs/batch) on stream {}, rate limit: {:?}",
             self.actor_id,
@@ -215,7 +293,6 @@ impl BenchmarkProducingConsumer {
             .send_finish_condition
             .max_capacity()
             .max(self.poll_finish_condition.max_capacity());
-        let mut latencies: Vec<Duration> = Vec::with_capacity(max_capacity);
         let mut records: Vec<BenchmarkRecord> = Vec::with_capacity(max_capacity);
         let mut offset = 0;
         let mut last_warning_time: Option<Instant> = None;
@@ -243,7 +320,7 @@ impl BenchmarkProducingConsumer {
         let is_consumer = self.poll_finish_condition.total() > 0;
 
         let require_reply = is_producer && is_consumer && self.consumer_group_id.is_none();
-        let mut awaiting_reply = false; // meaningful only if require_reply == true
+        let mut awaiting_reply = false;
 
         let start_timestamp = Instant::now();
 
@@ -262,7 +339,7 @@ impl BenchmarkProducingConsumer {
 
                 sent_total_bytes_processed += batch.total_bytes;
                 sent_user_bytes_processed += batch.user_data_bytes;
-                sent_messages += batch.messages.len() as u32;
+                sent_messages += u32::try_from(batch.messages.len()).unwrap_or(u32::MAX);
                 sent_batches += 1;
 
                 awaiting_reply = is_consumer;
@@ -272,14 +349,14 @@ impl BenchmarkProducingConsumer {
                     .account_and_check(batch.user_data_bytes)
                 {
                     info!(
-                        "ProducingConsumer #{} → finished sending {} messages in {} batches ({} bytes of user data, {} bytes of total data), send finish condition: {}, poll finish condition: {}",
-                        self.actor_id,
-                        sent_messages.human_count_bare(),
-                        sent_batches.human_count_bare(),
-                        sent_user_bytes_processed.human_count_bytes(),
-                        sent_total_bytes_processed.human_count_bytes(),
-                        self.send_finish_condition.status(),
-                        self.poll_finish_condition.status()
+                        "ProducingConsumer #{actor_id} → finished sending {sent_messages} messages in {sent_batches} batches ({sent_user_bytes_processed} bytes of user data, {sent_total_bytes_processed} bytes of total data), send finish condition: {send_status}, poll finish condition: {poll_status}",
+                        actor_id = self.actor_id,
+                        sent_messages = sent_messages.human_count_bare(),
+                        sent_batches = sent_batches.human_count_bare(),
+                        sent_user_bytes_processed = sent_user_bytes_processed.human_count_bytes(),
+                        sent_total_bytes_processed = sent_total_bytes_processed.human_count_bytes(),
+                        send_status = self.send_finish_condition.status(),
+                        poll_status = self.poll_finish_condition.status()
                     );
                 }
             }
@@ -288,7 +365,7 @@ impl BenchmarkProducingConsumer {
                 let (strategy, auto_commit) = match self.polling_kind {
                     PollingKind::Offset => (PollingStrategy::offset(offset), false),
                     PollingKind::Next => (PollingStrategy::next(), true),
-                    other => panic!("Unsupported polling kind for benchmark: {:?}", other),
+                    other => panic!("Unsupported polling kind for benchmark: {other:?}"),
                 };
 
                 let polled_messages = client
@@ -304,18 +381,16 @@ impl BenchmarkProducingConsumer {
                     .await?;
 
                 if polled_messages.messages.is_empty() {
-                    let should_warn = last_warning_time
-                        .map(|t| t.elapsed() >= Duration::from_secs(1))
-                        .unwrap_or(true);
+                    let should_warn =
+                        last_warning_time.is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
 
                     if should_warn {
                         warn!(
-                            "ProducingConsumer #{} → received empty batch, sent: {}, polled: {}, polling kind: {:?}, retrying... ({} warnings skipped in last second)",
-                            self.actor_id,
-                            self.send_finish_condition.status(),
-                            self.poll_finish_condition.status(),
-                            self.polling_kind,
-                            skipped_warnings_count
+                            "ProducingConsumer #{actor_id} → received empty batch, sent: {send_status}, polled: {poll_status}, polling kind: {polling_kind:?}, retrying... ({skipped_warnings_count} warnings skipped in last second)",
+                            actor_id = self.actor_id,
+                            send_status = self.send_finish_condition.status(),
+                            poll_status = self.poll_finish_condition.status(),
+                            polling_kind = self.polling_kind
                         );
                         last_warning_time = Some(Instant::now());
                         skipped_warnings_count = 0;
@@ -330,17 +405,17 @@ impl BenchmarkProducingConsumer {
                 let latency = Duration::from_micros(
                     now - polled_messages.messages[0].header.origin_timestamp,
                 );
-                latencies.push(latency);
 
                 last_received_batch_user_data_bytes = batch_user_size_bytes(&polled_messages);
                 rl_value += last_received_batch_user_data_bytes;
 
                 received_user_bytes_processed += last_received_batch_user_data_bytes;
                 received_total_bytes_processed += batch_total_size_bytes(&polled_messages);
-                received_messages += polled_messages.messages.len() as u32;
+                received_messages +=
+                    u32::try_from(polled_messages.messages.len()).unwrap_or(u32::MAX);
                 received_batches += 1;
 
-                offset += polled_messages.messages.len() as u64;
+                offset += u64::try_from(polled_messages.messages.len()).unwrap_or(u64::MAX);
 
                 total_user_data_bytes_processed =
                     received_user_bytes_processed + sent_user_bytes_processed;
@@ -349,9 +424,10 @@ impl BenchmarkProducingConsumer {
                 total_batches_processed = received_batches + sent_batches;
 
                 records.push(BenchmarkRecord {
-                    elapsed_time_us: start_timestamp.elapsed().as_micros() as u64,
-                    latency_us: latency.as_micros() as u64,
-                    messages: total_messages_processed as u64,
+                    elapsed_time_us: u64::try_from(start_timestamp.elapsed().as_micros())
+                        .unwrap_or(u64::MAX),
+                    latency_us: u64::try_from(latency.as_micros()).unwrap_or(u64::MAX),
+                    messages: u64::from(total_messages_processed),
                     message_batches: total_batches_processed,
                     user_data_bytes: total_user_data_bytes_processed,
                     total_bytes: total_bytes_processed,
@@ -372,7 +448,7 @@ impl BenchmarkProducingConsumer {
         }
 
         let metrics = from_records(
-            records,
+            &records,
             self.benchmark_kind,
             ActorKind::ProducingConsumer,
             self.actor_id,
@@ -382,7 +458,7 @@ impl BenchmarkProducingConsumer {
 
         Self::log_statistics(
             self.actor_id,
-            total_messages_processed as u64,
+            u64::from(total_messages_processed),
             total_batches_processed,
             &self.messages_per_batch,
             &metrics,

@@ -17,7 +17,10 @@
  */
 
 use super::benchmark::Benchmarkable;
-use crate::{args::common::IggyBenchArgs, benchmarks::common::*};
+use crate::{
+    args::common::IggyBenchArgs,
+    benchmarks::common::{build_consumer_futures, build_producer_futures, init_consumer_groups},
+};
 use async_trait::async_trait;
 use bench_report::{benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics};
 use iggy::prelude::*;
@@ -32,11 +35,11 @@ pub struct BalancedProducerAndConsumerGroupBenchmark {
 }
 
 impl BalancedProducerAndConsumerGroupBenchmark {
-    pub fn new(args: Arc<IggyBenchArgs>, client_factory: Arc<dyn ClientFactory>) -> Box<Self> {
-        Box::new(Self {
+    pub fn new(args: Arc<IggyBenchArgs>, client_factory: Arc<dyn ClientFactory>) -> Self {
+        Self {
             args,
             client_factory,
-        })
+        }
     }
 }
 
@@ -52,8 +55,8 @@ impl Benchmarkable for BalancedProducerAndConsumerGroupBenchmark {
 
         init_consumer_groups(cf, &args).await?;
 
-        let producer_futures = build_producer_futures(cf, &args)?;
-        let consumer_futures = build_consumer_futures(cf, &args)?;
+        let producer_futures = build_producer_futures(cf, &args);
+        let consumer_futures = build_consumer_futures(cf, &args);
 
         for fut in producer_futures {
             tasks.spawn(fut);
@@ -84,10 +87,10 @@ impl Benchmarkable for BalancedProducerAndConsumerGroupBenchmark {
         let producers = format!("producers: {}", self.args.producers());
         let consumers = format!("consumers: {}", self.args.consumers());
         let cg_count = format!("consumer groups: {}", self.args.number_of_consumer_groups());
-        let max_topic_size = match self.args.max_topic_size() {
-            Some(size) => format!(" max topic size: {}", size),
-            None => format!(" max topic size: {}", MaxTopicSize::ServerDefault),
-        };
+        let max_topic_size = self.args.max_topic_size().map_or_else(
+            || format!(" max topic size: {}", MaxTopicSize::ServerDefault),
+            |size| format!(" max topic size: {size}"),
+        );
         let common_params = self.common_params_str();
 
         info!(

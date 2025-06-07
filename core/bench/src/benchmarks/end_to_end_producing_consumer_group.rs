@@ -17,7 +17,7 @@
  */
 
 use crate::args::common::IggyBenchArgs;
-use crate::benchmarks::common::*;
+use crate::benchmarks::common::{build_producing_consumer_groups_futures, init_consumer_groups};
 use async_trait::async_trait;
 use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::individual_metrics::BenchmarkIndividualMetrics;
@@ -35,11 +35,11 @@ pub struct EndToEndProducingConsumerGroupBenchmark {
 }
 
 impl EndToEndProducingConsumerGroupBenchmark {
-    pub fn new(args: Arc<IggyBenchArgs>, client_factory: Arc<dyn ClientFactory>) -> Box<Self> {
-        Box::new(Self {
+    pub fn new(args: Arc<IggyBenchArgs>, client_factory: Arc<dyn ClientFactory>) -> Self {
+        Self {
             args,
             client_factory,
-        })
+        }
     }
 }
 
@@ -55,7 +55,7 @@ impl Benchmarkable for EndToEndProducingConsumerGroupBenchmark {
 
         init_consumer_groups(&cf, &args).await?;
 
-        let futures = build_producing_consumer_groups_futures(cf, args)?;
+        let futures = build_producing_consumer_groups_futures(cf, args);
         for fut in futures {
             tasks.spawn(fut);
         }
