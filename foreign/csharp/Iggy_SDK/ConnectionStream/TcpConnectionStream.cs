@@ -31,7 +31,9 @@ public sealed class TcpConnectionStream : IConnectionStream
         => _stream.WriteAsync(payload, cancellationToken);
 
     public ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
-        => _stream.ReadAsync(buffer, cancellationToken);
+    {
+        return _stream.ReadAsync(buffer, cancellationToken);
+    }
 
     public Task FlushAsync(CancellationToken cancellationToken = default)
         => _stream.FlushAsync(cancellationToken);

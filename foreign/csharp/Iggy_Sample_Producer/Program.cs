@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-﻿using Iggy_Sample_Producer;
+using Iggy_Sample_Producer;
 using Iggy_SDK;
 using Iggy_SDK.Contracts.Http;
 using Iggy_SDK.Contracts.Http.Auth;
@@ -155,7 +155,7 @@ catch
         Name: "producer-topic",
         CompressionAlgorithm: CompressionAlgorithm.None,
         MessageExpiry: 0,
-        MaxTopicSize: 1_000_000_000,
+        MaxTopicSize: 0,
         ReplicationFactor: 3,
         PartitionsCount: 3));
 }
@@ -209,7 +209,7 @@ async Task ProduceMessages(IIggyClient bus, StreamResponse? stream, TopicRespons
     headers.Add(new HeaderKey { Value = "key_4".ToLower() }, HeaderValue.FromBool(true));
     headers.Add(new HeaderKey { Value = "key_5".ToLower() }, HeaderValue.FromBytes(byteArray));
     headers.Add(new HeaderKey { Value = "key_6".ToLower() }, HeaderValue.FromInt128(new Int128(6969696969, 420420420)));
-    headers.Add(new HeaderKey { Value = "key7".ToLower() }, HeaderValue.FromGuid(Guid.NewGuid()));
+    headers.Add(new HeaderKey { Value = "key_7".ToLower() }, HeaderValue.FromGuid(Guid.NewGuid()));
 
     while (true)
     {
@@ -228,12 +228,7 @@ async Task ProduceMessages(IIggyClient bus, StreamResponse? stream, TopicRespons
         var messagesSerialized = new List<Message>();
         foreach (var message in messages)
         {
-            messagesSerialized.Add(new Message
-            {
-                Id = Guid.NewGuid(),
-                Headers = headers,
-                Payload = encryptor(serializer(message))
-            });
+            messagesSerialized.Add(new Message(Guid.NewGuid(), encryptor(serializer(message)), headers));
         }
         try
         {

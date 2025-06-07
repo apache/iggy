@@ -19,7 +19,7 @@ using Iggy_SDK;
 using Iggy_SDK.Contracts.Http;
 using Iggy_SDK.Kinds;
 
-namespace Iggy_SDK_Tests.Utils.Offset;
+namespace Iggy_SDK_Tests.Utils.Offsets;
 
 internal static class OffsetFactory
 {

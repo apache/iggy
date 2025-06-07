@@ -23,31 +23,32 @@ using System.Text.Json.Serialization;
 
 namespace Iggy_SDK.JsonConfiguration;
 
-internal sealed class MessageConverter : JsonConverter<HttpMessage>
+internal sealed class MessageConverter : JsonConverter<Message>
 {
-    public override HttpMessage Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    public override Message Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
         throw new NotImplementedException();
     }
 
-    public override void Write(Utf8JsonWriter writer, HttpMessage value, JsonSerializerOptions options)
+    public override void Write(Utf8JsonWriter writer, Message value, JsonSerializerOptions options)
     {
         writer.WriteStartObject();
         var jsonOptions = new JsonSerializerOptions();
         jsonOptions.Converters.Add(new UInt128Converter());
 
-        writer.WritePropertyName(nameof(value.Id).ToSnakeCase());
-        var idJson = JsonSerializer.Serialize(value.Id, jsonOptions);
+        writer.WritePropertyName(nameof(value.Header.Id).ToSnakeCase());
+        var idJson = JsonSerializer.Serialize(value.Header.Id, jsonOptions);
         using (JsonDocument doc = JsonDocument.Parse(idJson))
         {
             doc.RootElement.WriteTo(writer);
         }
-
-        writer.WriteString(nameof(value.Payload).ToSnakeCase(), value.Payload);
-        if (value.Headers is not null)
+        
+        writer.WriteString(nameof(value.Payload).ToSnakeCase(), Convert.ToBase64String(value.Payload));
+        
+        if (value.UserHeaders is not null)
         {
             writer.WriteStartObject("headers");
-            foreach (var (headerKey, headerValue) in value.Headers)
+            foreach (var (headerKey, headerValue) in value.UserHeaders)
             {
                 writer.WriteStartObject(headerKey.Value.ToSnakeCase());
                 var headerKind = headerValue.Kind switch
@@ -70,8 +71,13 @@ internal sealed class MessageConverter : JsonConverter<HttpMessage>
                 writer.WriteEndObject();
             }
             writer.WriteEndObject();
-
         }
+        else
+        {
+            writer.WriteNull("headers");
+        }
+        
+        
         writer.WriteEndObject();
     }
 }

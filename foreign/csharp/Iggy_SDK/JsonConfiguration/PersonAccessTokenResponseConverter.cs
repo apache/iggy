@@ -19,6 +19,8 @@ using Iggy_SDK.Contracts.Http;
 using Iggy_SDK.Extensions;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Iggy_SDK.Contracts.Http.Auth;
+
 namespace Iggy_SDK.JsonConfiguration;
 
 public sealed class PersonalAccessTokenResponseConverter : JsonConverter<PersonalAccessTokenResponse>

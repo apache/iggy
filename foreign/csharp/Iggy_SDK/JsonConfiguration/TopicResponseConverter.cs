@@ -20,6 +20,7 @@ using Iggy_SDK.Extensions;
 using System.ComponentModel;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Iggy_SDK.Enums;
 
 namespace Iggy_SDK.JsonConfiguration;
 
@@ -39,6 +40,7 @@ internal sealed class TopicResponseConverter : JsonConverter<TopicResponse>
         var id = root.GetProperty(nameof(TopicResponse.Id).ToSnakeCase()).GetInt32();
         var createdAt = root.GetProperty(nameof(TopicResponse.CreatedAt).ToSnakeCase()).GetUInt64();
         var name = root.GetProperty(nameof(TopicResponse.Name).ToSnakeCase()).GetString();
+        var compressionAlgorithm = Enum.Parse<CompressionAlgorithm>(root.GetProperty(nameof(TopicResponse.CompressionAlgorithm).ToSnakeCase()).GetString()!, true);
         var sizeBytesString = root.GetProperty(nameof(TopicResponse.Size).ToSnakeCase()).GetString();
         var sizeBytesStringSplit = sizeBytesString.Split(' ');
         var (sizeBytesVal, Unit) = (ulong.Parse(sizeBytesStringSplit[0]), sizeBytesStringSplit[1]);
@@ -73,8 +75,8 @@ internal sealed class TopicResponseConverter : JsonConverter<TopicResponse>
         var messageExpiryProperty = root.GetProperty(nameof(TopicResponse.MessageExpiry).ToSnakeCase());
         var messageExpiry = messageExpiryProperty.ValueKind switch
         {
-            JsonValueKind.Null => 0,
-            JsonValueKind.Number => messageExpiryProperty.GetInt32(),
+            JsonValueKind.Null => (ulong)0,
+            JsonValueKind.Number => messageExpiryProperty.GetUInt64(),
             _ => throw new InvalidEnumArgumentException("Error Wrong JsonValueKind when deserializing MessageExpiry")
         };
         var messagesCount = root.GetProperty(nameof(TopicResponse.MessagesCount).ToSnakeCase()).GetUInt64();
@@ -93,6 +95,7 @@ internal sealed class TopicResponseConverter : JsonConverter<TopicResponse>
             Name = name!,
             Size = sizeBytes,
             MessageExpiry = messageExpiry,
+            CompressionAlgorithm = compressionAlgorithm,
             CreatedAt = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(createdAt).LocalDateTime,
             MessagesCount = messagesCount,
             PartitionsCount = partitionsCount,

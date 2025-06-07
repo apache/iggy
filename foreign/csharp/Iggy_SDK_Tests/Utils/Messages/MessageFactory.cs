@@ -26,6 +26,7 @@ using Iggy_SDK_Tests.Utils.DummyObj;
 using System.Buffers.Binary;
 using System.Text;
 using System.Text.Json;
+using FluentAssertions.Extensions;
 using Partitioning = Iggy_SDK.Enums.Partitioning;
 
 namespace Iggy_SDK_Tests.Utils.Messages;
@@ -88,9 +89,13 @@ internal static class MessageFactory
         var streamId = Identifier.Numeric(1);
         var topicId = Identifier.Numeric(1);
         BinaryPrimitives.WriteInt32LittleEndian(valBytes, Random.Shared.Next(1, 69));
+        var message1 = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(DummyObjFactory.CreateDummyObject()));
+        var message2 = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(DummyObjFactory.CreateDummyObject()));
+        var date = DateTimeOffset.UtcNow;
+        date = date.AddMicroseconds(-date.Microsecond);
+        date = date.AddNanoseconds(-date.Nanosecond);
         return new MessageSendRequest
         {
-
             StreamId = streamId,
             TopicId = topicId,
             Partitioning = new Iggy_SDK.Kinds.Partitioning
@@ -103,15 +108,25 @@ internal static class MessageFactory
             {
                 new()
                 {
-                    Id = Guid.NewGuid(),
-                    Payload = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(DummyObjFactory.CreateDummyObject())),
-                    Headers = null,
+                    Header = new MessageHeader()
+                    {
+                        Id = (UInt128)Random.Shared.Next(1, 100000),
+                        PayloadLength = message1.Length,
+                        Timestamp = date
+                    },
+                    Payload = message1,
+                    UserHeaders = null,
                 },
                 new()
                 {
-                    Id = Guid.NewGuid(),
-                    Payload =  Encoding.UTF8.GetBytes(JsonSerializer.Serialize(DummyObjFactory.CreateDummyObject())),
-                    Headers = null,
+                    Header = new MessageHeader()
+                    {
+                        Id = (UInt128)Random.Shared.Next(1, 100000),
+                        PayloadLength = message2.Length,
+                        Timestamp = date
+                    },
+                    Payload =  message2,
+                    UserHeaders = null,
                 }
 
             },
@@ -121,7 +136,6 @@ internal static class MessageFactory
     {
         return new MessageSendRequest
         {
-
             StreamId = Identifier.Numeric(streamId),
             TopicId = Identifier.Numeric(topicId),
             Partitioning = Iggy_SDK.Kinds.Partitioning.PartitionId(partitionId),
@@ -157,21 +171,37 @@ internal static class MessageFactory
     
     internal static IList<Message> GenerateMessages(int count, Dictionary<HeaderKey, HeaderValue>? Headers = null)
     {
-        return Enumerable.Range(1, count).Select(i => new Message
+        return Enumerable.Range(1, count).Select(i =>
         {
-            Id = Guid.NewGuid(),
-            Headers = Headers,
-            Payload = SerializeDummyMessage(new DummyMessage { Id = Random.Shared.Next(1, 69), Text = Utility.RandomString(Random.Shared.Next(20, 69)) })
+            var payload = SerializeDummyMessage(new DummyMessage { Id = Random.Shared.Next(1, 69), Text = Utility.RandomString(Random.Shared.Next(20, 69)) });
+            return new Message
+            {
+                Header = new MessageHeader()
+                {
+                    Id = (UInt128)Random.Shared.Next(1, 100000),
+                    PayloadLength = payload.Length
+                },
+                UserHeaders = Headers,
+                Payload = payload 
+            };
         }).ToList();
     }
     
     internal static IList<Message> GenerateDummyMessages(int count, int payloadLen, Dictionary<HeaderKey, HeaderValue>? Headers = null)
     {
-        return Enumerable.Range(1, count).Select(i => new Message
+        return Enumerable.Range(1, count).Select(i =>
         {
-            Id = Guid.NewGuid(),
-            Headers = Headers,
-            Payload = Enumerable.Range(1, payloadLen).Select(x => (byte)x).ToArray()
+            var payload = Enumerable.Range(1, payloadLen).Select(x => (byte)x).ToArray();
+            return new Message
+            {
+                Header =new MessageHeader()
+                {
+                    Id = (UInt128)Random.Shared.Next(1, 100000),
+                    PayloadLength = payload.Length
+                },
+                UserHeaders = Headers,
+                Payload = payload
+            };
         }).ToList();
     }
     

@@ -1,4 +1,4 @@
-// Licensed to the Apache Software Foundation (ASF) under one
+﻿// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -15,14 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Headers;
+namespace Iggy_SDK.Enums;
 
-namespace Iggy_SDK.Messages;
-
-//[JsonConverter(typeof(MessageConverter))]
-public struct HttpMessage
+/// <summary>
+/// Enum representing the various compression methods available for snapshots
+/// </summary>
+public enum SnapshotCompression
 {
-    public required UInt128 Id { get; init; }
-    public required string Payload { get; init; }
-    public Dictionary<HeaderKey, HeaderValue>? Headers { get; init; }
+    /// Store the file as is
+    Stored,
+    /// Compress the file using Deflate
+    Deflated,
+    /// Compress the file using BZIP2
+    Bzip2,
+    /// Compress the file using ZStandard
+    Zstd,
+    /// Compress the file using LZMA
+    Lzma,
+    /// Compress the file using XZ
+    Xz,
 }

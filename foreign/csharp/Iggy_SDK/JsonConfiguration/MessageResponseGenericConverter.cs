@@ -16,11 +16,11 @@
 // under the License.
 
 using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Enums;
 using Iggy_SDK.Extensions;
 using Iggy_SDK.Headers;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Iggy_SDK.Messages;
 
 namespace Iggy_SDK.JsonConfiguration;
 
@@ -48,23 +48,22 @@ internal sealed class MessageResponseGenericConverter<TMessage> : JsonConverter<
         var messageResponses = new List<MessageResponse<TMessage>>();
         foreach (var element in messages.EnumerateArray())
         {
-            var offset = element.GetProperty(nameof(MessageResponse.Offset).ToSnakeCase()).GetUInt64();
-            var timestamp = element.GetProperty(nameof(MessageResponse.Timestamp).ToSnakeCase()).GetUInt64();
-            var id = element.GetProperty(nameof(MessageResponse.Id).ToSnakeCase()).GetUInt128();
+            var headerElement = element.GetProperty(nameof(Message.Header).ToSnakeCase());
+            
+            var checksum = headerElement.GetProperty(nameof(MessageHeader.Checksum).ToSnakeCase()).GetUInt64();
+            var id = headerElement.GetProperty(nameof(MessageHeader.Id).ToSnakeCase()).GetUInt128();
+            var offset = headerElement.GetProperty(nameof(MessageHeader.Offset).ToSnakeCase()).GetUInt64();
+            var timestamp = headerElement.GetProperty(nameof(MessageHeader.Timestamp).ToSnakeCase()).GetUInt64();
+            var originTimestamp = headerElement.GetProperty(nameof(MessageHeader.OriginTimestamp).ToSnakeCase()).GetUInt64();
+            var headerLength = headerElement.GetProperty(nameof(MessageHeader.UserHeadersLength).ToSnakeCase()).GetInt32();
+            var payloadLength = headerElement.GetProperty(nameof(MessageHeader.PayloadLength).ToSnakeCase()).GetInt32();
+            
+            element.TryGetProperty(nameof(MessageResponse.UserHeaders).ToSnakeCase(), out var headersElement);
+
             var payload = element.GetProperty(nameof(MessageResponse.Payload).ToSnakeCase()).GetBytesFromBase64();
-            var checksum = element.GetProperty(nameof(MessageResponse.Checksum).ToSnakeCase()).GetUInt32();
-            var state = element.GetProperty(nameof(MessageResponse.State).ToSnakeCase()).GetString() switch
-            {
-                "available" => MessageState.Available,
-                "unavailable" => MessageState.Unavailable,
-                "poisoned" => MessageState.Poisoned,
-                "marked_for_deletion" => MessageState.MarkedForDeletion,
-                _ => throw new ArgumentOutOfRangeException()
-            };
-            var headersElement = element.GetProperty(nameof(MessageResponse.Headers).ToSnakeCase());
 
             var headers = new Dictionary<HeaderKey, HeaderValue>();
-            if (headersElement.ValueKind != JsonValueKind.Null)
+            if (headersElement.ValueKind != JsonValueKind.Null && headersElement.ValueKind != JsonValueKind.Undefined)
             {
                 var headersJsonArray = headersElement.EnumerateObject();
                 foreach (var header in headersJsonArray)
@@ -97,12 +96,17 @@ internal sealed class MessageResponseGenericConverter<TMessage> : JsonConverter<
             }
             messageResponses.Add(new MessageResponse<TMessage>
             {
-                Id = new Guid(id.GetBytesFromUInt128()),
-                Offset = offset,
-                Timestamp = timestamp,
-                Checksum = checksum,
-                Headers = headers.Count > 0 ? headers : null,
-                State = state,
+                Header = new MessageHeader()
+                {
+                    UserHeadersLength = headerLength,
+                    PayloadLength = payloadLength,
+                    Checksum = checksum,
+                    Id = id,
+                    Offset = offset,
+                    Timestamp = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(timestamp),
+                    OriginTimestamp = originTimestamp
+                },
+                UserHeaders = headers.Any() ? headers : null,
                 Message = _decryptor is not null ? _serializer(_decryptor(payload)) : _serializer(payload)
             });
         }

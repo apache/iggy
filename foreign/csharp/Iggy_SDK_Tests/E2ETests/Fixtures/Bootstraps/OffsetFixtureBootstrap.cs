@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Iggy_SDK_Tests.E2ETests.Fixtures.Models;
 using Iggy_SDK;
 using Iggy_SDK_Tests.Utils.Streams;
 using Iggy_SDK_Tests.Utils.Topics;
 using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.IggyClient;
 
 namespace Iggy_SDK_Tests.E2ETests.Fixtures.Bootstraps;
 
@@ -27,12 +27,12 @@ public class OffsetFixtureBootstrap : IIggyBootstrap
 {
     public static readonly StreamRequest StreamRequest = StreamFactory.CreateStreamRequest();
     public static readonly TopicRequest TopicRequest = TopicFactory.CreateTopicRequest();
-    public async Task BootstrapResourcesAsync(int tcpPort, int httpPort, IIggyClient httpClient, IIggyClient tcpClient)
+    public async Task BootstrapResourcesAsync(IggyClientModel httpClient, IggyClientModel tcpClient)
     {
-        await tcpClient.CreateStreamAsync(StreamRequest);
-        await tcpClient.CreateTopicAsync(Identifier.Numeric((int)StreamRequest.StreamId!), TopicRequest);
+        await tcpClient.Client.CreateStreamAsync(StreamRequest);
+        await tcpClient.Client.CreateTopicAsync(Identifier.Numeric((int)StreamRequest.StreamId!), TopicRequest);
         
-        await httpClient.CreateStreamAsync(StreamRequest);
-        await httpClient.CreateTopicAsync(Identifier.Numeric((int)StreamRequest.StreamId!), TopicRequest);
+        await httpClient.Client.CreateStreamAsync(StreamRequest);
+        await httpClient.Client.CreateTopicAsync(Identifier.Numeric((int)StreamRequest.StreamId!), TopicRequest);
     }
 }

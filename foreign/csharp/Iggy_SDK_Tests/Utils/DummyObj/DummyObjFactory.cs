@@ -25,8 +25,8 @@ internal static class DummyObjFactory
     {
         return new DummyObject
         {
-            Id = Random.Shared.Next(1, 10),
-            Text = "TROLOLOLO" + Random.Shared.Next(1, 69)
+            Id = Random.Shared.Next(1, 9),
+            Text = "TROLOLOLO" + Random.Shared.Next(1, 5)
         };
     }
 }
