@@ -63,6 +63,7 @@ jobs:
       trigger-python-sdk: ${{ steps.changed-files.outputs.PYTHON-SDK_FILES_CHANGED }}
       trigger-node-sdk: ${{ steps.changed-files.outputs.NODE-SDK_FILES_CHANGED }}
       trigger-csharp-sdk: ${{ steps.changed-files.outputs.CSHARP-SDK_FILES_CHANGED }}
+      trigger-bdd: ${{ steps.changed-files.outputs.BDD_FILES_CHANGED }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -151,6 +152,12 @@ jobs:
     if: ${{ needs.pr-file-changes.outputs.trigger-csharp-sdk == 'true' }}
     uses: ./.github/workflows/ci-check-csharp-sdk.yml
 
+  ci-test-bdd:
+    name: ci-test-bdd
+    needs: pr-file-changes
+    if: ${{ needs.pr-file-changes.outputs.trigger-bdd == 'true' }}
+    uses: ./.github/workflows/ci-test-bdd.yml
+
   finalize_pr:
     runs-on: ubuntu-latest
     needs:
@@ -164,6 +171,7 @@ jobs:
       - ci-check-python-sdk
       - ci-check-node-sdk
       - ci-check-csharp-sdk
+      - ci-test-bdd
     if: always()
     steps:
       - name: Everything is fine

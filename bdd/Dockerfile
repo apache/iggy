@@ -15,19 +15,34 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Debug/test build for faster compilation during development and testing
-FROM rust:latest AS builder
-WORKDIR /build
-COPY . /build
-# Build in debug mode for faster compilation times during testing
+FROM rust:1.87 AS builder
+
+WORKDIR /app
+COPY . .
+
+# Build server in debug mode for faster compilation
 RUN cargo build --bin iggy-server
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    liblzma5 \
-    && rm -rf /var/lib/apt/lists/*
-COPY ./core/configs ./configs
-COPY --from=builder /build/target/debug/iggy-server .
 
-CMD ["/iggy-server"]
+# Install curl for healthcheck
+RUN apt-get update && \
+    apt-get install -y curl && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy server binary
+COPY --from=builder /app/target/debug/iggy-server /usr/local/bin/
+
+# Copy configs directory
+COPY core/configs ./configs
+
+# Create directory for data
+RUN mkdir -p /app/local_data
+
+WORKDIR /app
+
+# Expose ports
+EXPOSE 8090 3000 8080
+
+# Start server with --fresh flag to clean local data on startup
+CMD ["iggy-server", "--fresh"]

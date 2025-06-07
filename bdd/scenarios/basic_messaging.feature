@@ -29,15 +29,15 @@ Feature: Basic Messaging Operations
     When I create a stream with ID 1 and name "test-stream"
     Then the stream should be created successfully
     And the stream should have ID 1 and name "test-stream"
-    
+
     When I create a topic with ID 1 and name "test-topic" in stream 1 with 3 partitions
     Then the topic should be created successfully
     And the topic should have ID 1 and name "test-topic" 
     And the topic should have 3 partitions
-    
+
     When I send 10 messages to stream 1, topic 1, partition 1
     Then all messages should be sent successfully
-    
+
     When I poll messages from stream 1, topic 1, partition 1 starting from offset 0
     Then I should receive 10 messages
     And the messages should have sequential offsets from 0 to 9

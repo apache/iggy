@@ -15,19 +15,34 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Debug/test build for faster compilation during development and testing
-FROM rust:latest AS builder
-WORKDIR /build
-COPY . /build
-# Build in debug mode for faster compilation times during testing
-RUN cargo build --bin iggy-server
+name: Cross-SDK BDD Tests
 
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    liblzma5 \
-    && rm -rf /var/lib/apt/lists/*
-COPY ./core/configs ./configs
-COPY --from=builder /build/target/debug/iggy-server .
+on:
+  workflow_call:
 
-CMD ["/iggy-server"]
+jobs:
+  bdd-tests:
+    name: BDD tests (${{ matrix.sdk }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        sdk: [rust, python]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            foreign/python -> target
+          cache-on-failure: true
+          key: bdd-${{ matrix.sdk }}
+
+      - name: Run BDD tests for ${{ matrix.sdk }}
+        run: ./scripts/run-bdd-tests.sh ${{ matrix.sdk }}
+
+      - name: Clean up Docker resources
+        if: always()
+        run: ./scripts/run-bdd-tests.sh clean

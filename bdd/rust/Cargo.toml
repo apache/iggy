@@ -22,16 +22,24 @@ version = "0.0.1"
 edition = "2024"
 license = "Apache-2.0"
 
+[features]
+iggy-server-in-docker = []
+bdd = []
+
 [dev-dependencies]
 bytes = { workspace = true }
 cucumber = "0.21"
 iggy = { workspace = true }
-integration = { path = "../integration" }
+integration = { workspace = true }
 tokio = { workspace = true }
 
+# `test` is set to false because cucumber uses its own test harness, which
+# prevents running specific tests with commands like `cargo test some_test`.
+# Besides that, those tests are executed in the CI pipeline.
 [[test]]
 name = "basic_messaging"
 harness = false
+required-features = ["bdd"]
 
 # Future test scenarios can be added here:
 # [[test]]
