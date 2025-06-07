@@ -38,7 +38,7 @@
 #
 # The workflow fails if any mandatory job fails.
 # Workflow can be triggered manually or on pull request events.
-#
+
 name: ci-check-pr
 
 on:
