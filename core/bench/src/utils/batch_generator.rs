@@ -73,6 +73,10 @@ impl BenchmarkBatchGenerator {
             for msg in &mut self.batch.messages {
                 msg.header.origin_timestamp = now;
             }
+            assert!(
+                !self.batch.messages.is_empty(),
+                "Benchmark batch should contain at least one message"
+            );
             return &mut self.batch;
         }
 
@@ -102,6 +106,10 @@ impl BenchmarkBatchGenerator {
             total_bytes,
         };
 
+        assert!(
+            !self.batch.messages.is_empty(),
+            "Benchmark batch should contain at least one message"
+        );
         &mut self.batch
     }
 

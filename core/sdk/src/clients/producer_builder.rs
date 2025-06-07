@@ -15,27 +15,234 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::MAX_BATCH_SIZE;
+use super::MAX_BATCH_LENGTH;
+use crate::clients::producer_config::{BackgroundConfig, BackpressureMode, SyncConfig};
+use crate::clients::producer_error_callback::ErrorCallback;
+use crate::clients::producer_error_callback::LogErrorCallback;
+use crate::clients::producer_sharding::{BalancedSharding, Sharding};
 use crate::prelude::IggyProducer;
 use iggy_binary_protocol::Client;
 use iggy_common::locking::IggySharedMut;
 use iggy_common::{
-    EncryptorKind, Identifier, IggyDuration, IggyExpiry, MaxTopicSize, Partitioner, Partitioning,
+    EncryptorKind, Identifier, IggyByteSize, IggyDuration, IggyExpiry, MaxTopicSize, Partitioner,
+    Partitioning,
 };
 use std::sync::Arc;
 
-#[derive(Debug)]
+pub struct BackgroundBuilder {
+    num_shards: Option<usize>,
+    batch_size: Option<usize>,
+    batch_length: Option<usize>,
+    failure_mode: Option<BackpressureMode>,
+    max_buffer_size: Option<IggyByteSize>,
+    linger_time: Option<IggyDuration>,
+    max_in_flight: Option<usize>,
+
+    error_callback: Box<dyn ErrorCallback>,
+    sharding: Box<dyn Sharding>,
+}
+
+impl Default for BackgroundBuilder {
+    fn default() -> Self {
+        let num_shards = default_shard_count();
+        BackgroundBuilder {
+            num_shards: Some(num_shards),
+            sharding: Box::new(BalancedSharding::default()),
+            error_callback: Box::new(LogErrorCallback),
+            batch_size: Some(1_048_576),
+            batch_length: Some(1000),
+            failure_mode: Some(BackpressureMode::Block),
+            max_buffer_size: Some(IggyByteSize::from(32 * 1_048_576)),
+            linger_time: Some(IggyDuration::from(1000)),
+            max_in_flight: Some(num_shards * num_shards),
+        }
+    }
+}
+
+impl BackgroundBuilder {
+    /// Sets the number of messages to batch before sending them, can be combined with `interval`.
+    pub fn batch_length(self, batch_length: u32) -> Self {
+        Self {
+            batch_length: if batch_length == 0 {
+                None
+            } else {
+                Some(batch_length.min(MAX_BATCH_LENGTH as u32) as usize)
+            },
+            ..self
+        }
+    }
+
+    /// Clears the batch size.
+    pub fn without_batch_length(self) -> Self {
+        Self {
+            batch_length: None,
+            ..self
+        }
+    }
+
+    /// Sets the interval between sending the messages, can be combined with `batch_length`.
+    pub fn linger_time(self, interval: IggyDuration) -> Self {
+        Self {
+            linger_time: Some(interval),
+            ..self
+        }
+    }
+
+    /// Clears the interval.
+    pub fn without_linger_time(self) -> Self {
+        Self {
+            linger_time: None,
+            ..self
+        }
+    }
+
+    /// Sets the number of shards (background workers).
+    pub fn num_shards(self, value: usize) -> Self {
+        Self {
+            num_shards: Some(value),
+            ..self
+        }
+    }
+
+    /// Sets the maximum size of a batch in bytes.
+    pub fn batch_size(self, value: usize) -> Self {
+        Self {
+            batch_size: Some(value),
+            ..self
+        }
+    }
+
+    /// Sets the sharding strategy.
+    /// You can pass a custom implementation that implements the `Sharding` trait.
+    pub fn sharding(self, sharding: Box<dyn Sharding>) -> Self {
+        Self { sharding, ..self }
+    }
+
+    /// Sets the maximum buffer size for all in-flight messages (in bytes).
+    pub fn max_buffer_size(self, value: IggyByteSize) -> Self {
+        Self {
+            max_buffer_size: Some(value),
+            ..self
+        }
+    }
+
+    /// Sets the failure mode behavior (e.g., block, fail immediately, timeout).
+    pub fn failure_mode(self, mode: BackpressureMode) -> Self {
+        Self {
+            failure_mode: Some(mode),
+            ..self
+        }
+    }
+
+    /// Sets the error callback for handling background sending errors.
+    pub fn error_callback(self, callback: Box<dyn ErrorCallback>) -> Self {
+        Self {
+            error_callback: callback,
+            ..self
+        }
+    }
+
+    /// Sets the maximum number of in-flight batches/messages.
+    pub fn max_in_flight(self, value: usize) -> Self {
+        Self {
+            max_in_flight: Some(value),
+            ..self
+        }
+    }
+
+    pub fn build(self) -> BackgroundConfig {
+        BackgroundConfig {
+            num_shards: self.num_shards.unwrap_or(8),
+            batch_size: self.batch_size,
+            batch_length: self.batch_length,
+            failure_mode: self.failure_mode.unwrap_or(BackpressureMode::Block),
+            max_buffer_size: self.max_buffer_size,
+            linger_time: self.linger_time.unwrap_or(IggyDuration::from(1000)),
+            error_callback: Arc::new(self.error_callback),
+            sharding: self.sharding,
+            max_in_flight: self.max_in_flight,
+        }
+    }
+}
+
+pub struct SyncBuilder {
+    batch_length: Option<usize>,
+    linger_time: Option<IggyDuration>,
+}
+
+impl Default for SyncBuilder {
+    fn default() -> Self {
+        Self {
+            batch_length: Some(1000),
+            linger_time: Some(IggyDuration::from(1000)),
+        }
+    }
+}
+
+impl SyncBuilder {
+    /// Sets the number of messages to batch before sending them, can be combined with `interval`.
+    pub fn batch_length(self, batch_length: u32) -> Self {
+        Self {
+            batch_length: if batch_length == 0 {
+                None
+            } else {
+                Some(batch_length.min(MAX_BATCH_LENGTH as u32) as usize)
+            },
+            ..self
+        }
+    }
+
+    /// Clears the batch size.
+    pub fn without_batch_length(self) -> Self {
+        Self {
+            batch_length: None,
+            ..self
+        }
+    }
+
+    /// Sets the interval between sending the messages, can be combined with `batch_length`.
+    pub fn linger_time(self, interval: IggyDuration) -> Self {
+        Self {
+            linger_time: Some(interval),
+            ..self
+        }
+    }
+
+    /// Clears the interval.
+    pub fn without_linger_time(self) -> Self {
+        Self {
+            linger_time: None,
+            ..self
+        }
+    }
+
+    pub fn build(self) -> SyncConfig {
+        SyncConfig {
+            batch_length: self.batch_length.unwrap_or(MAX_BATCH_LENGTH),
+            linger_time: self.linger_time,
+        }
+    }
+}
+
+pub enum SendMode {
+    Sync(SyncConfig),
+    Background(BackgroundConfig),
+}
+
+impl Default for SendMode {
+    fn default() -> Self {
+        SendMode::Sync(SyncBuilder::default().build())
+    }
+}
+
 pub struct IggyProducerBuilder {
     client: IggySharedMut<Box<dyn Client>>,
     stream: Identifier,
     stream_name: String,
     topic: Identifier,
     topic_name: String,
-    batch_size: Option<usize>,
-    partitioning: Option<Partitioning>,
     encryptor: Option<Arc<EncryptorKind>>,
     partitioner: Option<Arc<dyn Partitioner>>,
-    send_interval: Option<IggyDuration>,
     create_stream_if_not_exists: bool,
     create_topic_if_not_exists: bool,
     topic_partitions_count: u32,
@@ -44,6 +251,8 @@ pub struct IggyProducerBuilder {
     send_retries_interval: Option<IggyDuration>,
     topic_message_expiry: IggyExpiry,
     topic_max_size: MaxTopicSize,
+    partitioning: Option<Partitioning>,
+    mode: SendMode,
 }
 
 impl IggyProducerBuilder {
@@ -63,11 +272,9 @@ impl IggyProducerBuilder {
             stream_name,
             topic,
             topic_name,
-            batch_size: Some(1000),
             partitioning: None,
             encryptor,
             partitioner,
-            send_interval: Some(IggyDuration::from(1000)),
             create_stream_if_not_exists: true,
             create_topic_if_not_exists: true,
             topic_partitions_count: 1,
@@ -76,6 +283,7 @@ impl IggyProducerBuilder {
             topic_max_size: MaxTopicSize::ServerDefault,
             send_retries_count: Some(3),
             send_retries_interval: Some(IggyDuration::ONE_SECOND),
+            mode: SendMode::default(),
         }
     }
 
@@ -87,42 +295,6 @@ impl IggyProducerBuilder {
     /// Sets the stream name.
     pub fn topic(self, topic: Identifier) -> Self {
         Self { topic, ..self }
-    }
-
-    /// Sets the number of messages to batch before sending them, can be combined with `interval`.
-    pub fn batch_size(self, batch_size: u32) -> Self {
-        Self {
-            batch_size: if batch_size == 0 {
-                None
-            } else {
-                Some(batch_size.min(MAX_BATCH_SIZE as u32) as usize)
-            },
-            ..self
-        }
-    }
-
-    /// Clears the batch size.
-    pub fn without_batch_size(self) -> Self {
-        Self {
-            batch_size: None,
-            ..self
-        }
-    }
-
-    /// Sets the interval between sending the messages, can be combined with `batch_size`.
-    pub fn send_interval(self, interval: IggyDuration) -> Self {
-        Self {
-            send_interval: Some(interval),
-            ..self
-        }
-    }
-
-    /// Clears the interval.
-    pub fn without_send_interval(self) -> Self {
-        Self {
-            send_interval: None,
-            ..self
-        }
     }
 
     /// Sets the encryptor for encrypting the messages' payloads.
@@ -226,9 +398,36 @@ impl IggyProducerBuilder {
         }
     }
 
-    /// Builds the producer.
+    /// Configures the producer to use synchronous (immediate) sending mode.
     ///
-    /// Note: After building the producer, `init()` must be invoked before producing messages.
+    /// In sync mode, messages are sent immediately on `.send()` without background buffering.
+    ///
+    /// # Arguments
+    /// * `f` - A closure that modifies the `SyncBuilder` configuration.
+    pub fn sync<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(SyncBuilder) -> SyncBuilder,
+    {
+        let cfg = f(SyncBuilder::default()).build();
+        self.mode = SendMode::Sync(cfg);
+        self
+    }
+
+    /// Configures the producer to use background (asynchronous) sending mode.
+    ///
+    /// In background mode, messages are buffered and sent in batches via background tasks.
+    ///
+    /// # Arguments
+    /// * `f` - A closure that modifies the `BackgroundBuilder` configuration.
+    pub fn background<F>(mut self, f: F) -> Self
+    where
+        F: FnOnce(BackgroundBuilder) -> BackgroundBuilder,
+    {
+        let cfg = f(BackgroundBuilder::default()).build();
+        self.mode = SendMode::Background(cfg);
+        self
+    }
+
     pub fn build(self) -> IggyProducer {
         IggyProducer::new(
             self.client,
@@ -236,11 +435,9 @@ impl IggyProducerBuilder {
             self.stream_name,
             self.topic,
             self.topic_name,
-            self.batch_size,
             self.partitioning,
             self.encryptor,
             self.partitioner,
-            self.send_interval,
             self.create_stream_if_not_exists,
             self.create_topic_if_not_exists,
             self.topic_partitions_count,
@@ -249,6 +446,12 @@ impl IggyProducerBuilder {
             self.topic_max_size,
             self.send_retries_count,
             self.send_retries_interval,
+            self.mode,
         )
     }
+}
+
+fn default_shard_count() -> usize {
+    let cpus = num_cpus::get();
+    cpus.clamp(2, 16)
 }

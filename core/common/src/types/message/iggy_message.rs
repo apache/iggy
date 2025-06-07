@@ -105,7 +105,7 @@ pub const MAX_USER_HEADERS_SIZE: u32 = 100 * 1000;
 ///     .build()
 ///     .unwrap();
 /// ```
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Default)]
 pub struct IggyMessage {
     /// Message metadata
     pub header: IggyMessageHeader,

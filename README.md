@@ -256,8 +256,8 @@ let client = IggyClient::from_connection_string("iggy://user:secret@localhost:80
 // Create a producer for the given stream and one of its topics
 let mut producer = client
     .producer("dev01", "events")?
-    .batch_size(1000)
-    .send_interval(IggyDuration::from_str("1ms")?)
+    .batch_length(1000)
+    .linger_time(IggyDuration::from_str("1ms")?)
     .partitioning(Partitioning::balanced())
     .build();
 
@@ -278,7 +278,7 @@ let mut consumer = client
     .auto_join_consumer_group()
     .polling_strategy(PollingStrategy::next())
     .poll_interval(IggyDuration::from_str("1ms")?)
-    .batch_size(1000)
+    .batch_length(1000)
     .build();
 
 consumer.init().await?;

@@ -37,9 +37,9 @@ pub struct IggyConsumerConfig {
     topic_name: String,
     /// The auto-commit configuration for storing the message offset on the server. See  `AutoCommit` for details.
     auto_commit: AutoCommit,
-    /// The max number of messages to send in a batch. The greater the batch size, the higher the throughput for bulk data.
+    /// The max number of messages to send in a batch. The greater the batch length, the higher the throughput for bulk data.
     /// Note, there is a tradeoff between batch size and latency, so you want to benchmark your setup.
-    batch_size: u32,
+    batch_length: u32,
     /// Create the stream if it doesn't exist.
     create_stream_if_not_exists: bool,
     /// Create the topic if it doesn't exist.
@@ -78,7 +78,7 @@ impl Default for IggyConsumerConfig {
             topic_id,
             topic_name: "test_topic".to_string(),
             auto_commit: AutoCommit::When(AutoCommitWhen::PollingMessages),
-            batch_size: 100,
+            batch_length: 100,
             create_stream_if_not_exists: false,
             create_topic_if_not_exists: false,
             consumer_name: "test_consumer".to_string(),
@@ -105,7 +105,7 @@ impl IggyConsumerConfig {
     /// * `topic_id` - The topic id.
     /// * `topic_name` - The topic name.
     /// * `auto_commit` - The auto commit config.
-    /// * `batch_size` - The max number of messages to send in a batch.
+    /// * `batch_length` - The max number of messages to send in a batch.
     /// * `create_stream_if_not_exists` - Whether to create the stream if it does not exists.
     /// * `create_topic_if_not_exists` - Whether to create the topic if it does not exists.
     /// * `consumer_name` - The consumer name.
@@ -130,7 +130,7 @@ impl IggyConsumerConfig {
         topic_id: Identifier,
         topic_name: String,
         auto_commit: AutoCommit,
-        batch_size: u32,
+        batch_length: u32,
         create_stream_if_not_exists: bool,
         create_topic_if_not_exists: bool,
         consumer_name: String,
@@ -150,7 +150,7 @@ impl IggyConsumerConfig {
             topic_id,
             topic_name,
             auto_commit,
-            batch_size,
+            batch_length,
             create_stream_if_not_exists,
             create_topic_if_not_exists,
             consumer_name,
@@ -172,7 +172,7 @@ impl IggyConsumerConfig {
     ///
     /// * `stream` - The stream name.
     /// * `topic` - The topic name.
-    /// * `batch_size` - The max number of messages to send in a batch.
+    /// * `batch_length` - The max number of messages to send in a batch.
     /// * `polling_interval` - The interval between polling for new messages.
     ///
     /// Returns:
@@ -181,7 +181,7 @@ impl IggyConsumerConfig {
     pub fn from_stream_topic(
         stream: &str,
         topic: &str,
-        batch_size: u32,
+        batch_length: u32,
         polling_interval: IggyDuration,
     ) -> Result<Self, IggyError> {
         let stream_id = Identifier::from_str_value(stream)?;
@@ -193,7 +193,7 @@ impl IggyConsumerConfig {
             topic_id,
             topic_name: topic.to_string(),
             auto_commit: AutoCommit::When(AutoCommitWhen::PollingMessages),
-            batch_size,
+            batch_length,
             create_stream_if_not_exists: false,
             create_topic_if_not_exists: false,
             consumer_name: format!("consumer-{}-{}", stream, topic),
@@ -231,8 +231,8 @@ impl IggyConsumerConfig {
         self.auto_commit
     }
 
-    pub fn batch_size(&self) -> u32 {
-        self.batch_size
+    pub fn batch_length(&self) -> u32 {
+        self.batch_length
     }
     pub fn create_stream_if_not_exists(&self) -> bool {
         self.create_stream_if_not_exists
@@ -299,7 +299,7 @@ mod tests {
             .topic_id(topic_id)
             .topic_name("test_topic".to_string())
             .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
-            .batch_size(100)
+            .batch_length(100)
             .create_stream_if_not_exists(true)
             .create_topic_if_not_exists(true)
             .consumer_name("test_consumer".to_string())
@@ -326,7 +326,7 @@ mod tests {
             config.auto_commit(),
             AutoCommit::When(AutoCommitWhen::PollingMessages)
         );
-        assert_eq!(config.batch_size(), 100);
+        assert_eq!(config.batch_length(), 100);
         assert!(config.create_stream_if_not_exists());
         assert!(config.create_topic_if_not_exists());
         assert_eq!(config.consumer_name(), "test_consumer");
@@ -361,7 +361,7 @@ mod tests {
             config.auto_commit(),
             AutoCommit::When(AutoCommitWhen::PollingMessages)
         );
-        assert_eq!(config.batch_size(), 100);
+        assert_eq!(config.batch_length(), 100);
         assert!(!config.create_stream_if_not_exists());
         assert!(!config.create_topic_if_not_exists());
         assert_eq!(config.consumer_name(), "test_consumer");
@@ -415,7 +415,7 @@ mod tests {
             config.auto_commit(),
             AutoCommit::When(AutoCommitWhen::PollingMessages)
         );
-        assert_eq!(config.batch_size(), 100);
+        assert_eq!(config.batch_length(), 100);
         assert!(!config.create_stream_if_not_exists());
         assert!(!config.create_topic_if_not_exists());
         assert_eq!(config.consumer_name(), "test_consumer");
@@ -449,7 +449,7 @@ mod tests {
 
         assert_eq!(config.stream_name(), "test_stream");
         assert_eq!(config.topic_name(), "test_topic");
-        assert_eq!(config.batch_size(), 100);
+        assert_eq!(config.batch_length(), 100);
         assert!(!config.create_stream_if_not_exists());
         assert!(!config.create_topic_if_not_exists());
         assert_eq!(config.consumer_name(), "consumer-test_stream-test_topic");

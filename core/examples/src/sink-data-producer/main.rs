@@ -55,10 +55,12 @@ async fn main() -> Result<(), DataProducerError> {
     let stream = env::var("IGGY_STREAM").unwrap_or("qw".to_owned());
     let topic = env::var("IGGY_TOPIC").unwrap_or("records".to_owned());
     let client = create_client(&address, &username, &password).await?;
-    let mut producer = client
+    let producer = client
         .producer(&stream, &topic)?
-        .batch_size(1000)
-        .send_interval(IggyDuration::from_str("5ms").unwrap())
+        .sync(|b| {
+            b.batch_length(1000)
+                .linger_time(IggyDuration::from_str("5ms").unwrap())
+        })
         .partitioning(Partitioning::balanced())
         .build();
     producer.init().await?;

@@ -37,9 +37,9 @@ pub struct IggyProducerConfig {
     /// Set the topic replication factor
     topic_replication_factor: Option<u8>,
     /// The max number of messages to send in a batch. Must be greater than 0.
-    batch_size: u32,
-    /// Sets the interval between sending the messages, can be combined with `batch_size`.
-    send_interval: IggyDuration,
+    batch_length: u32,
+    /// Sets the interval between sending the messages, can be combined with `batch_length`.
+    linger_time: IggyDuration,
     /// Specifies to which partition the messages should be sent.
     partitioning: Partitioning,
     /// Sets the maximum number of send retries in case of a message sending failure.
@@ -61,8 +61,8 @@ impl Default for IggyProducerConfig {
             stream_name: "test_stream".to_string(),
             topic_id,
             topic_name: "test_topic".to_string(),
-            batch_size: 100,
-            send_interval: IggyDuration::from_str("5ms").unwrap(),
+            batch_length: 100,
+            linger_time: IggyDuration::from_str("5ms").unwrap(),
             partitioning: Partitioning::balanced(),
             topic_partitions_count: 1,
             topic_replication_factor: None,
@@ -84,8 +84,8 @@ impl IggyProducerConfig {
     /// * `topic_name` - The topic name.
     /// * `topic_partitions_count` - The number of partitions to create.
     /// * `topic_replication_factor` - The replication factor to use.
-    /// * `batch_size` - The max number of messages to send in a batch.
-    /// * `send_interval` - The interval between messages sent.
+    /// * `batch_length` - The max number of messages to send in a batch.
+    /// * `linger_time` - The interval between messages sent.
     /// * `partitioning` - The partitioning strategy to use.
     /// * `encryptor` - The encryptor to use.
     /// * `send_retries_count` - The number of retries to send messages.
@@ -102,8 +102,8 @@ impl IggyProducerConfig {
         topic_name: String,
         topic_partitions_count: u32,
         topic_replication_factor: Option<u8>,
-        batch_size: u32,
-        send_interval: IggyDuration,
+        batch_length: u32,
+        linger_time: IggyDuration,
         partitioning: Partitioning,
         encryptor: Option<Arc<EncryptorKind>>,
         send_retries_count: Option<u32>,
@@ -116,8 +116,8 @@ impl IggyProducerConfig {
             topic_name,
             topic_partitions_count,
             topic_replication_factor,
-            batch_size,
-            send_interval,
+            batch_length,
+            linger_time,
             partitioning,
             encryptor,
             send_retries_count,
@@ -132,8 +132,8 @@ impl IggyProducerConfig {
     ///
     /// * `stream` - The stream name.
     /// * `topic` - The topic name.
-    /// * `batch_size` - The max number of messages to send in a batch.
-    /// * `send_interval` - The interval between messages sent.
+    /// * `batch_length` - The max number of messages to send in a batch.
+    /// * `linger_time` - The interval between messages sent.
     ///
     /// Returns:
     /// A new `IggyProducerConfig`.
@@ -141,8 +141,8 @@ impl IggyProducerConfig {
     pub fn from_stream_topic(
         stream: &str,
         topic: &str,
-        batch_size: u32,
-        send_interval: IggyDuration,
+        batch_length: u32,
+        linger_time: IggyDuration,
     ) -> Result<Self, IggyError> {
         let stream_id = Identifier::from_str_value(stream)?;
         let topic_id = Identifier::from_str_value(topic)?;
@@ -152,8 +152,8 @@ impl IggyProducerConfig {
             stream_name: stream.to_string(),
             topic_id,
             topic_name: topic.to_string(),
-            batch_size,
-            send_interval,
+            batch_length,
+            linger_time,
             partitioning: Partitioning::balanced(),
             topic_partitions_count: 1,
             topic_replication_factor: None,
@@ -181,12 +181,12 @@ impl IggyProducerConfig {
         &self.topic_name
     }
 
-    pub fn batch_size(&self) -> u32 {
-        self.batch_size
+    pub fn batch_length(&self) -> u32 {
+        self.batch_length
     }
 
-    pub fn send_interval(&self) -> IggyDuration {
-        self.send_interval
+    pub fn linger_time(&self) -> IggyDuration {
+        self.linger_time
     }
 
     pub fn partitioning(&self) -> &Partitioning {
@@ -230,8 +230,8 @@ mod tests {
             .topic_id(Identifier::from_str_value(topic).unwrap())
             .topic_name(topic)
             .topic_partitions_count(3)
-            .batch_size(100)
-            .send_interval(IggyDuration::from_str("5ms").unwrap())
+            .batch_length(100)
+            .linger_time(IggyDuration::from_str("5ms").unwrap())
             .partitioning(Partitioning::balanced())
             .send_retries_count(3)
             .send_retries_interval(IggyDuration::new_from_secs(1))
@@ -247,11 +247,8 @@ mod tests {
             &Identifier::from_str_value("test_topic").unwrap()
         );
         assert_eq!(config.topic_name(), "test_topic");
-        assert_eq!(config.batch_size(), 100);
-        assert_eq!(
-            config.send_interval(),
-            IggyDuration::from_str("5ms").unwrap()
-        );
+        assert_eq!(config.batch_length(), 100);
+        assert_eq!(config.linger_time(), IggyDuration::from_str("5ms").unwrap());
         assert_eq!(config.partitioning(), &Partitioning::balanced());
         assert_eq!(config.topic_partitions_count(), 3);
         assert_eq!(config.topic_replication_factor(), None);
@@ -272,11 +269,8 @@ mod tests {
         assert_eq!(config.stream_name(), "test_stream");
         assert_eq!(config.topic_id(), &topic_id);
         assert_eq!(config.topic_name(), "test_topic");
-        assert_eq!(config.batch_size(), 100);
-        assert_eq!(
-            config.send_interval(),
-            IggyDuration::from_str("5ms").unwrap()
-        );
+        assert_eq!(config.batch_length(), 100);
+        assert_eq!(config.linger_time(), IggyDuration::from_str("5ms").unwrap());
         assert_eq!(config.partitioning(), &Partitioning::balanced());
         assert_eq!(config.topic_partitions_count(), 1);
         assert_eq!(config.topic_replication_factor(), None);
@@ -310,11 +304,8 @@ mod tests {
         assert_eq!(config.stream_name(), "test_stream");
         assert_eq!(config.topic_id(), &topic_id);
         assert_eq!(config.topic_name(), "test_topic");
-        assert_eq!(config.batch_size(), 100);
-        assert_eq!(
-            config.send_interval(),
-            IggyDuration::from_str("5ms").unwrap()
-        );
+        assert_eq!(config.batch_length(), 100);
+        assert_eq!(config.linger_time(), IggyDuration::from_str("5ms").unwrap());
         assert_eq!(config.partitioning(), &Partitioning::balanced());
         assert_eq!(config.topic_partitions_count(), 3);
         assert_eq!(config.topic_replication_factor(), None);
@@ -341,11 +332,8 @@ mod tests {
         assert_eq!(config.stream_name(), "test_stream");
         assert_eq!(config.topic_id(), &topic_id);
         assert_eq!(config.topic_name(), "test_topic");
-        assert_eq!(config.batch_size(), 100);
-        assert_eq!(
-            config.send_interval(),
-            IggyDuration::from_str("5ms").unwrap()
-        );
+        assert_eq!(config.batch_length(), 100);
+        assert_eq!(config.linger_time(), IggyDuration::from_str("5ms").unwrap());
         assert_eq!(config.partitioning(), &Partitioning::balanced());
         assert_eq!(config.topic_partitions_count(), 1);
         assert_eq!(config.topic_replication_factor(), None);

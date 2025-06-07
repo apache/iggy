@@ -48,7 +48,7 @@ pub(crate) async fn build_iggy_consumer(
     let auto_commit = config.auto_commit();
     let consumer_kind = config.consumer_kind();
     let consumer_name = config.consumer_name();
-    let batch_size = config.batch_size();
+    let batch_length = config.batch_length();
     let polling_interval = config.polling_interval();
     let polling_strategy = config.polling_strategy();
     let partition = config.partitions_count();
@@ -64,7 +64,7 @@ pub(crate) async fn build_iggy_consumer(
     .auto_join_consumer_group()
     .polling_strategy(polling_strategy)
     .poll_interval(polling_interval)
-    .batch_size(batch_size)
+    .batch_length(batch_length)
     .polling_retry_interval(polling_retry_interval);
 
     if let Some(encryptor) = config.encryptor() {
