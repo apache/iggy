@@ -38,7 +38,7 @@
 #
 # The workflow fails if any mandatory job fails.
 # Workflow can be triggered manually or on pull request events.
-#
+
 name: ci-check-pr
 
 on:
@@ -60,7 +60,7 @@ jobs:
       trigger-rust: ${{ steps.changed-files.outputs.RUST_FILES_CHANGED }}
       trigger-shell: ${{ steps.changed-files.outputs.SHELL_FILES_CHANGED }}
       trigger-java-sdk: ${{ steps.changed-files.outputs.JAVA-SDK_FILES_CHANGED }}
-      trigger-python-sdk: ${{ steps.changed-files.outputs.PYTHON-SDK_FILES_CHANGED }},
+      trigger-python-sdk: ${{ steps.changed-files.outputs.PYTHON-SDK_FILES_CHANGED }}
       trigger-node-sdk: ${{ steps.changed-files.outputs.NODE-SDK_FILES_CHANGED }}
     steps:
       - name: Checkout code

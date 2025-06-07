@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use iggy::messages::send_messages::Message as RustSendMessage;
+use iggy::prelude::{IggyMessage as RustIggyMessage, IggyMessageHeader};
 use pyo3::prelude::*;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 use std::str::FromStr;
@@ -28,17 +28,25 @@ use std::str::FromStr;
 #[pyclass]
 #[gen_stub_pyclass]
 pub struct SendMessage {
-    pub(crate) inner: RustSendMessage,
+    pub(crate) inner: RustIggyMessage,
 }
 
-/// Provides the capability to clone a SendMessage.
-///
-/// This implementation creates a new `RustSendMessage` instance from
-/// the string representation of the original `RustSendMessage`.
 impl Clone for SendMessage {
     fn clone(&self) -> Self {
         Self {
-            inner: self.inner.clone(),
+            inner: RustIggyMessage {
+                header: IggyMessageHeader {
+                    checksum: self.inner.header.checksum,
+                    id: self.inner.header.id,
+                    offset: self.inner.header.offset,
+                    timestamp: self.inner.header.timestamp,
+                    origin_timestamp: self.inner.header.origin_timestamp,
+                    user_headers_length: self.inner.header.user_headers_length,
+                    payload_length: self.inner.header.payload_length,
+                },
+                payload: self.inner.payload.clone(),
+                user_headers: self.inner.user_headers.clone(),
+            },
         }
     }
 }
@@ -53,7 +61,7 @@ impl SendMessage {
     #[new]
     pub fn new(data: String) -> Self {
         // TODO: handle errors
-        let inner = RustSendMessage::from_str(&data).unwrap();
+        let inner = RustIggyMessage::from_str(&data).unwrap();
         Self { inner }
     }
 }
