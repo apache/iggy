@@ -6,23 +6,95 @@ build-backend = "maturin"
 name = "iggy_py"
 requires-python = ">=3.7"
 version = "0.4.0"
+description = "Apache Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Dario Lencina Talarico", email = "darioalessandrolencina@gmail.com" },
+]
+keywords = ["streaming", "messaging", "pubsub", "iggy", "rust", "performance"]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Networking",
+    "Topic :: System :: Distributed Computing",
 ]
-description= "Apache Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
+
+[project.urls]
+"Homepage" = "https://iggy.rs"
+"Documentation" = "https://docs.iggy.rs"
+"Repository" = "https://github.com/iggy-rs/iggy"
+"Bug Tracker" = "https://github.com/iggy-rs/iggy/issues"
+"Discord" = "https://iggy.rs/discord"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
 
 [project.optional-dependencies]
+# Core testing dependencies
 testing = [
-    "pytest",
-    "pytest-asyncio",
-    "testcontainers[docker]",
-    "maturin"
+    "pytest>=7.0,<9.0",
+    "pytest-asyncio>=0.21.0,<1.0",
+    "pytest-xdist>=3.0,<4.0",
+    "pytest-timeout>=2.0,<3.0",
+]
+
+# For examples and demos
+examples = ["loguru>=0.7.0,<1.0"]
+
+# For containerized testing (CI/CD)
+testing-docker = ["testcontainers[docker]>=3.7.0,<5.0"]
+
+# Development tools
+dev = [
+    "maturin>=1.2,<2.0",
+    "black>=23.0,<25.0",
+    "isort>=5.12.0,<6.0",
+    "mypy>=1.5.0,<2.0",
+    "ruff>=0.1.0,<1.0",
+]
+
+# All dependencies for full development setup
+all = [
+    "pytest>=7.0,<9.0",
+    "pytest-asyncio>=0.21.0,<1.0",
+    "pytest-xdist>=3.0,<4.0",
+    "pytest-timeout>=2.0,<3.0",
+    "loguru>=0.7.0,<1.0",
+    "testcontainers[docker]>=3.7.0,<5.0",
+    "maturin>=1.2,<2.0",
+    "black>=23.0,<25.0",
+    "isort>=5.12.0,<6.0",
+    "mypy>=1.5.0,<2.0",
+    "ruff>=0.1.0,<1.0",
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = ["-v", "--strict-markers", "--tb=short", "--disable-warnings"]
+markers = [
+    "integration: Integration tests that require a running server",
+    "unit: Fast unit tests",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+]

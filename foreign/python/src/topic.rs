@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use iggy::models::topic::TopicDetails as RustTopicDetails;
+use iggy::prelude::TopicDetails as RustTopicDetails;
 use pyo3::prelude::*;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 

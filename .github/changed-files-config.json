@@ -32,6 +32,11 @@
     "foreign/python/.*\\.rs",
     "foreign/python/pyproject.toml",
     "foreign/python/Cargo.toml",
+    "foreign/python/docker-compose.test.yml",
+    "foreign/python/Dockerfile.test",
+    "foreign/python/.*\\.toml",
+    "foreign/python/.*\\.ini",
+    "foreign/python/.*\\.md",
     ".github/workflows/ci-check-python-sdk.yml"
   ],
   "node-sdk": [
