@@ -64,6 +64,7 @@ impl SemanticVersion {
         Err(IggyError::InvalidVersion(VERSION.into()))
     }
 
+    #[must_use]
     pub fn is_equal_to(&self, other: &SemanticVersion) -> bool {
         self.major == other.major && self.minor == other.minor && self.patch == other.patch
     }

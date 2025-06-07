@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Iggy_SDK_Tests.E2ETests.Fixtures.Models;
 using Iggy_SDK;
 using Iggy_SDK_Tests.Utils.DummyObj;
 using Iggy_SDK_Tests.Utils.Messages;
 using Iggy_SDK_Tests.Utils.Streams;
 using Iggy_SDK_Tests.Utils.Topics;
 using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.IggyClient;
 using Iggy_SDK.Kinds;
 
 namespace Iggy_SDK_Tests.E2ETests.Fixtures.Bootstraps;
@@ -40,12 +40,12 @@ public class PollMessagesFixtureBootstrap : IIggyBootstrap
     public const int PartitionId = 1;
     public const int HeadersCount = 3;
 
-    public async Task BootstrapResourcesAsync(int tcpPort, int httpPort, IIggyClient httpClient, IIggyClient tcpClient)
+    public async Task BootstrapResourcesAsync(IggyClientModel httpClient, IggyClientModel tcpClient)
     {
-        await tcpClient.CreateStreamAsync(StreamRequest);
-        await tcpClient.CreateTopicAsync(Identifier.Numeric((int)StreamRequest.StreamId!), TopicRequest);
-        await tcpClient.CreateTopicAsync(Identifier.Numeric((int)StreamRequest.StreamId), HeadersTopicRequest);
-        await tcpClient.SendMessagesAsync(new MessageSendRequest<DummyMessage>
+        await tcpClient.Client.CreateStreamAsync(StreamRequest);
+        await tcpClient.Client.CreateTopicAsync(Identifier.Numeric((int)StreamRequest.StreamId!), TopicRequest);
+        await tcpClient.Client.CreateTopicAsync(Identifier.Numeric((int)StreamRequest.StreamId), HeadersTopicRequest);
+        await tcpClient.Client.SendMessagesAsync(new MessageSendRequest<DummyMessage>
             {
                 Messages = MessageFactory.GenerateDummyMessages(MessageCount),
                 Partitioning = Partitioning.PartitionId(PartitionId),
@@ -55,10 +55,10 @@ public class PollMessagesFixtureBootstrap : IIggyBootstrap
             MessageFactory.Serializer,
             headers: MessageFactory.GenerateMessageHeaders(HeadersCount));
 
-        await httpClient.CreateStreamAsync(StreamRequest);
-        await httpClient.CreateTopicAsync(Identifier.Numeric((int)StreamRequest.StreamId!), TopicRequest);
-        await httpClient.CreateTopicAsync(Identifier.Numeric((int)StreamRequest.StreamId), HeadersTopicRequest);
-        await httpClient.SendMessagesAsync(new MessageSendRequest<DummyMessage>
+        await httpClient.Client.CreateStreamAsync(StreamRequest);
+        await httpClient.Client.CreateTopicAsync(Identifier.Numeric((int)StreamRequest.StreamId!), TopicRequest);
+        await httpClient.Client.CreateTopicAsync(Identifier.Numeric((int)StreamRequest.StreamId), HeadersTopicRequest);
+        await httpClient.Client.SendMessagesAsync(new MessageSendRequest<DummyMessage>
             {
                 Messages = MessageFactory.GenerateDummyMessages(MessageCount),
                 Partitioning = Partitioning.PartitionId(PartitionId),

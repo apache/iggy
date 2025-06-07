@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-﻿using Iggy_SDK;
+using Iggy_SDK;
 using Iggy_SDK.Contracts.Http;
 using Iggy_SDK.Contracts.Http.Auth;
 using Iggy_SDK.Enums;
@@ -137,7 +137,7 @@ async Task ConsumeMessages()
 void HandleMessage(MessageResponse<Envelope> messageResponse)
 {
     Console.Write(
-        $"Handling message type: {messageResponse.Message.MessageType} with state {messageResponse.State.ToString()}, checksum: {messageResponse.Checksum}, at offset: {messageResponse.Offset} with message Id:{messageResponse.Id.ToString()} ");
+        $"Handling message type: {messageResponse.Message.MessageType} with checksum: {messageResponse.Header.Checksum}, at offset: {messageResponse.Header.Offset} with message Id:{messageResponse.Header.Id.ToString()} ");
     Console.WriteLine();
     Console.WriteLine("---------------------------MESSAGE-----------------------------------");
     Console.WriteLine();
@@ -166,12 +166,12 @@ void HandleMessage(MessageResponse<Envelope> messageResponse)
     }
 
 
-    if (messageResponse.Headers is not null)
+    if (messageResponse.UserHeaders is not null)
     {
         Console.WriteLine();
         Console.WriteLine("---------------------------HEADERS-----------------------------------");
         Console.WriteLine();
-        foreach (var (headerKey, headerValue) in messageResponse.Headers)
+        foreach (var (headerKey, headerValue) in messageResponse.UserHeaders)
         {
             Console.WriteLine("Found Header: {0} with value: {1}, ", headerKey.ToString(), headerValue.ToString());
                 }

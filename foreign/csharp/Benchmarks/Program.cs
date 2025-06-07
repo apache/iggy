@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-﻿using Benchmarks;
+using Benchmarks;
 using Iggy_SDK;
 using Iggy_SDK.Contracts.Http;
+using Iggy_SDK.Contracts.Http.Auth;
 using Iggy_SDK.Enums;
 using Iggy_SDK.Factory;
 using Iggy_SDK.IggyClient;
@@ -60,6 +61,12 @@ for (int i = 0; i < producerCount; i++)
 		options.SendBufferSize = 7280*1024;
 #endif
     }, loggerFactory);
+
+    await bus.LoginUser(new LoginUserRequest()
+    {
+        Username = "iggy",
+        Password = "iggy"
+    });
     clients[i] = bus;
 }
 
@@ -78,7 +85,7 @@ try
             Name: $"Test bench topic_{i}",
             CompressionAlgorithm: CompressionAlgorithm.None,
             MessageExpiry: 0,
-            MaxTopicSize: 1_000_000_000,
+            MaxTopicSize: 2_000_000_000,
             ReplicationFactor: 3,
             PartitionsCount: 1));
     }

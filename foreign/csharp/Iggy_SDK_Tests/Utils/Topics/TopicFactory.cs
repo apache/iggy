@@ -43,8 +43,8 @@ internal static class TopicFactory
         return new TopicRequest(
             TopicId: Random.Shared.Next(1, 9999),
             Name: "test_topic" + Random.Shared.Next(1, 69) + Utility.RandomString(12).ToLower(),
-            CompressionAlgorithm: CompressionAlgorithm.None,
-            MessageExpiry: Random.Shared.Next(1, 69),
+            CompressionAlgorithm: CompressionAlgorithm.Gzip,
+            MessageExpiry: (ulong)Random.Shared.Next(1, 69),
             MaxTopicSize: (ulong)Random.Shared.NextInt64(1_000_000_000, 10_000_000_000),
             ReplicationFactor: (byte)Random.Shared.Next(1, 8),
             PartitionsCount: Random.Shared.Next(5, 25));
@@ -54,10 +54,10 @@ internal static class TopicFactory
     {
         return new UpdateTopicRequest(
             Name: "updated_topic" + Random.Shared.Next(1, 69),
-            CompressionAlgorithm: CompressionAlgorithm.None,
+            CompressionAlgorithm: CompressionAlgorithm.Gzip,
             MaxTopicSize: (ulong)Random.Shared.NextInt64(1_000_000_000, 10_000_000_000),
-            MessageExpiry: Random.Shared.Next(1, 69),
-            ReplicationFactor: (byte)Random.Shared.Next(1,8));
+            MessageExpiry: (ulong)Random.Shared.Next(1, 69),
+            ReplicationFactor: (byte)Random.Shared.Next(1, 8));
     }
 
     internal static TopicRequest CreateTopicRequest(int topicId)
@@ -66,7 +66,7 @@ internal static class TopicFactory
             TopicId: topicId,
             Name: "test_topic" + Random.Shared.Next(1, 69) + Utility.RandomString(12).ToLower(),
             CompressionAlgorithm: CompressionAlgorithm.None,
-            MessageExpiry: Random.Shared.Next(1, 69),
+            MessageExpiry: (ulong)Random.Shared.Next(1, 69),
             MaxTopicSize: (ulong)Random.Shared.NextInt64(1_000_000_000, 10_000_000_000),
             ReplicationFactor: (byte)Random.Shared.Next(1, 8),
             PartitionsCount: Random.Shared.Next(5, 25));
@@ -80,7 +80,7 @@ internal static class TopicFactory
             Id = Random.Shared.Next(1, 10),
             Name = "Test Topic" + Random.Shared.Next(1, 69),
             MessagesCount = (ulong)Random.Shared.Next(1, 10),
-            MessageExpiry = Random.Shared.Next(1, 69),
+            MessageExpiry = (ulong)Random.Shared.Next(1, 69),
             ReplicationFactor = (byte)Random.Shared.Next(1,8),
             PartitionsCount = Random.Shared.Next(1, 10),
             Size = (ulong)Random.Shared.Next(1, 10),

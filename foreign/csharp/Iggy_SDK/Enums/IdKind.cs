@@ -37,4 +37,16 @@ internal static class Extensions
             _ => throw new ArgumentOutOfRangeException()
         };
     }
+    
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static byte GetByte(this Partitioning kind)
+    {
+        return kind switch
+        {
+            Partitioning.Balanced => 1,
+            Partitioning.PartitionId => 2,
+            Partitioning.MessageKey => 3,
+            _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, null)
+        };
+    }
 }

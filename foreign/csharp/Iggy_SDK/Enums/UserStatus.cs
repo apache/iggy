@@ -19,6 +19,6 @@ namespace Iggy_SDK.Enums;
 
 public enum UserStatus
 {
-    Active,
-    Inactive
+    Active = 1,
+    Inactive = 2
 }

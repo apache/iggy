@@ -17,6 +17,8 @@
 
 using Iggy_SDK.Contracts.Http;
 using System.Buffers.Binary;
+using Iggy_SDK.Contracts.Http.Auth;
+
 namespace Iggy_SDK_Tests.Utils.Users;
 
 internal static class PermissionsFactory

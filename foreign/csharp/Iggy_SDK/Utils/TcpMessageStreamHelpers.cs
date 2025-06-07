@@ -37,15 +37,11 @@ internal static class TcpMessageStreamHelpers
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static (int Status, int Length) GetResponseLengthAndStatus(Span<byte> buffer)
     {
-        var status = GetResponseStatus(buffer);
+        var status = BinaryPrimitives.ReadInt32LittleEndian(buffer[..4]);
         var length = BinaryPrimitives.ReadInt32LittleEndian(buffer[4..]);
 
         return (status, length);
     }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static int GetResponseStatus(Span<byte> buffer) =>
-        BinaryPrimitives.ReadInt32LittleEndian(buffer[..4]);
 
     internal static int CalculateMessageBytesCount(IList<Message> messages)
     {
@@ -53,8 +49,8 @@ internal static class TcpMessageStreamHelpers
         {
             Message[] messagesArray => CalculateMessageBytesCountArray(messagesArray),
             List<Message> messagesList => CalculateMessageBytesCountList(messagesList),
-            _ => messages.Sum(msg => 16 + 4 + msg.Payload.Length + 4 +
-                                     (msg.Headers?.Sum(header =>
+            _ => messages.Sum(msg => 16 + 56 + msg.Payload.Length + 4 +
+                                     (msg.UserHeaders?.Sum(header =>
                                          4 + header.Key.Value.Length + 1 + 4 + header.Value.Value.Length) ?? 0)
             )
         };
@@ -86,17 +82,17 @@ internal static class TcpMessageStreamHelpers
         int msgBytesSum = 0;
         while (Unsafe.IsAddressLessThan(ref start, ref end))
         {
-            if (start.Headers is not null)
+            if (start.UserHeaders is not null)
             {
-                msgBytesSum += start.Payload.Length + 16 + 4 + 4;
-                foreach (var (headerKey, headerValue) in start.Headers)
+                msgBytesSum += start.Payload.Length + 16 + 56;
+                foreach (var (headerKey, headerValue) in start.UserHeaders)
                 {
                     msgBytesSum += 4 + headerKey.Value.Length + 1 + 4 + headerValue.Value.Length;
                 }
             }
             else
             {
-                msgBytesSum += start.Payload.Length + 16 + 4 + 4;
+                msgBytesSum += start.Payload.Length +16 + 56;
             }
 
             start = ref Unsafe.Add(ref start, 1);
@@ -113,17 +109,17 @@ internal static class TcpMessageStreamHelpers
         var msgBytesSum = 0;
         while (Unsafe.IsAddressLessThan(ref start, ref end))
         {
-            if (start.Headers is not null)
+            if (start.UserHeaders is not null)
             {
-                msgBytesSum += start.Payload.Length + 16 + 4 + 4;
-                foreach (var (headerKey, headerValue) in start.Headers)
+                msgBytesSum += start.Payload.Length + 16 + 56;
+                foreach (var (headerKey, headerValue) in start.UserHeaders)
                 {
                     msgBytesSum += 4 + headerKey.Value.Length + 1 + 4 + headerValue.Value.Length;
                 }
             }
             else
             {
-                msgBytesSum += start.Payload.Length + 16 + 4 + 4;
+                msgBytesSum += start.Payload.Length + 16 + 56;
             }
 
             start = ref Unsafe.Add(ref start, 1);

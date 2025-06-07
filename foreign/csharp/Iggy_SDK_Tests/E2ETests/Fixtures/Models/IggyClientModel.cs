@@ -1,4 +1,4 @@
-// Licensed to the Apache Software Foundation (ASF) under one
+﻿// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -15,15 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK_Tests.E2ETests.Fixtures.Bootstraps;
-using Iggy_SDK_Tests.E2ETests.Fixtures.Configs;
+using Iggy_SDK.IggyClient;
 
-namespace Iggy_SDK_Tests.E2ETests.Fixtures;
+namespace Iggy_SDK_Tests.E2ETests.Fixtures.Models;
 
-public sealed class IggyClientsFixture : IggyBaseFixture 
+public class IggyClientModel
 {
-    public IggyClientsFixture() : base(new ClientsFixtureBootstrap(),
-        IggyFixtureClientMessagingSettings.PollingSettings, IggyFixtureClientMessagingSettings.BatchingSettings)
-    {
-    }
+    public string Name { get; set; }
+    public IIggyClient Client { get; set; }
+    public int HttpPort { get; set; }
+    public int TcpPort { get; set; }
 }

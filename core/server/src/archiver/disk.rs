@@ -30,8 +30,9 @@ pub struct DiskArchiver {
 }
 
 impl DiskArchiver {
-    pub fn new(config: DiskArchiverConfig) -> Self {
-        DiskArchiver { config }
+    #[must_use]
+    pub const fn new(config: DiskArchiverConfig) -> Self {
+        Self { config }
     }
 }
 
@@ -75,14 +76,14 @@ impl Archiver for DiskArchiver {
             let source = Path::new(file);
             if !source.exists() {
                 return Err(ArchiverError::FileToArchiveNotFound {
-                    file_path: file.to_string(),
+                    file_path: (*file).to_string(),
                 });
             }
 
             let base_directory = base_directory.as_deref().unwrap_or_default();
             let destination = Path::new(&self.config.path).join(base_directory).join(file);
             let destination_path = destination.to_str().unwrap_or_default().to_owned();
-            fs::create_dir_all(destination.parent().unwrap())
+            fs::create_dir_all(destination.parent().expect("Path should have a parent directory"))
                 .await
                 .with_error_context(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to create file: {file} at path: {destination_path}",)

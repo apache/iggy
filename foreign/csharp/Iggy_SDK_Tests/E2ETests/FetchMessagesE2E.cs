@@ -52,203 +52,108 @@ public sealed class FetchMessagesE2E : IClassFixture<IggyFetchMessagesFixture>
     public async Task PollMessagesTMessage_WithNoHeaders_Should_PollMessages_Successfully()
     {
         // act
-        var response = await _fixture.HttpSut
-            .FetchMessagesAsync(_messageFetchRequest, MessageFactory.DeserializeDummyMessage);
+        var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
+        {
+            var response = await sut.Client.FetchMessagesAsync(_messageFetchRequest, MessageFactory.DeserializeDummyMessage);
+            response.Messages.Count.Should().Be(10);
+            response.PartitionId.Should().Be(FetchMessagesFixtureBootstrap.PartitionId);
+            response.CurrentOffset.Should().Be(19);
+            foreach (var responseMessage in response.Messages)
+            {
+                responseMessage.UserHeaders.Should().BeNull();
+                responseMessage.Message.Text.Should().NotBeNullOrEmpty();
+            }
+        })).ToArray();
         
-        // assert
-        response.PartitionId.Should()
-            .Be(FetchMessagesFixtureBootstrap.PartitionId);
-        
-        response.CurrentOffset.Should().Be(19);
-        
-        response.Messages.Should()
-            .NotBeEmpty()
-            .And
-            .HaveCount(10);
-        
-        response.Messages.Should()
-            .OnlyContain(x => x.State == MessageState.Available);
-        
-        // TODO: This code block is commmented bacause TCP implementation is not working properly.
-        // var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
-        // {
-        //     var response = await sut.FetchMessagesAsync(_messageFetchRequest, MessageFactory.DeserializeDummyMessage);
-        //     response.Messages.Count.Should().Be(10);
-        //     response.PartitionId.Should().Be(FetchMessagesFixtureBootstrap.PartitionId);
-        //     response.CurrentOffset.Should().Be(19);
-        //     foreach (var responseMessage in response.Messages)
-        //     {
-        //         responseMessage.Headers.Should().BeNull();
-        //         responseMessage.State.Should().Be(MessageState.Available);
-        //     }
-        // })).ToArray();
-        //
-        // await Task.WhenAll(tasks);
+        await Task.WhenAll(tasks);
     }
     
     [Fact, TestPriority(2)]
     public async Task PollMessagesTMessage_Should_Throw_InvalidResponse()
     {
         // act & assert
-        await _fixture.HttpSut.Invoking(y =>
-                y.FetchMessagesAsync(_invalidFetchRequest, MessageFactory.DeserializeDummyMessage)
-                ).Should()
-            .ThrowExactlyAsync<InvalidResponseException>();
+        var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
+        {
+            await sut.Invoking(x => x.Client.FetchMessagesAsync(_invalidFetchRequest, MessageFactory.DeserializeDummyMessage))
+                .Should()
+                .ThrowExactlyAsync<InvalidResponseException>();
+        })).ToArray();
         
-        // TODO: This code block is commmented bacause TCP implementation is not working properly.
-        // var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
-        // {
-        //     await sut.Invoking(x => x.FetchMessagesAsync(_invalidFetchRequest, MessageFactory.DeserializeDummyMessage))
-        //         .Should()
-        //         .ThrowExactlyAsync<InvalidResponseException>();
-        // })).ToArray();
-        //
-        // await Task.WhenAll(tasks);
+        await Task.WhenAll(tasks);
     }
 
     [Fact, TestPriority(3)]
     public async Task PollMessages_WithNoHeaders_Should_PollMessages_Successfully()
     {
         // act
-        var response = await _fixture.HttpSut.FetchMessagesAsync(_messageFetchRequest);
+        var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
+        {
+            var response = await sut.Client.FetchMessagesAsync(_messageFetchRequest);
+            response.Messages.Count.Should().Be(10);
+            response.PartitionId.Should().Be(FetchMessagesFixtureBootstrap.PartitionId);
+            response.CurrentOffset.Should().Be(19);
+            foreach (var responseMessage in response.Messages)
+            {
+                responseMessage.UserHeaders.Should().BeNull();
+                responseMessage.Payload.Should().NotBeNull();
+                responseMessage.Payload.Length.Should().BeGreaterThan(0);
+            }
+        })).ToArray();
         
-        // assert
-        response.PartitionId.Should()
-            .Be(FetchMessagesFixtureBootstrap.PartitionId);
-        
-        response.CurrentOffset.Should().Be(19);
-        
-        response.Messages.Should()
-            .NotBeNull()
-            .And
-            .NotBeEmpty()
-            .And
-            .HaveCount(10)
-            .And
-            .OnlyContain(x =>
-                x.State == MessageState.Available &&
-                x.Headers == null);
-        
-        // TODO: This code block is commmented bacause TCP implementation is not working properly.
-        // var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
-        // {
-        //     var response = await sut.FetchMessagesAsync(_messageFetchRequest);
-        //     response.Messages.Count.Should().Be(10);
-        //     response.PartitionId.Should().Be(FetchMessagesFixtureBootstrap.PartitionId);
-        //     response.CurrentOffset.Should().Be(19);
-        //     foreach (var responseMessage in response.Messages)
-        //     {
-        //         responseMessage.Headers.Should().BeNull();
-        //         responseMessage.State.Should().Be(MessageState.Available);
-        //     }
-        // })).ToArray();
-        //
-        // await Task.WhenAll(tasks);
+        await Task.WhenAll(tasks);
     }
 
     [Fact, TestPriority(4)]
     public async Task PollMessages_Should_Throw_InvalidResponse()
     {
         // act & assert
-        await _fixture.HttpSut.Invoking(y => y.FetchMessagesAsync(_invalidFetchRequest))
-            .Should()
-            .ThrowExactlyAsync<InvalidResponseException>();
+        var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
+        {
+            await sut.Invoking(x => x.Client.FetchMessagesAsync(_invalidFetchRequest))
+                .Should()
+                .ThrowExactlyAsync<InvalidResponseException>();
+        })).ToArray();
         
-        // TODO: This code block is commmented bacause TCP implementation is not working properly.
-        // var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
-        // {
-        //     await sut.Invoking(x => x.FetchMessagesAsync(_invalidFetchRequest))
-        //         .Should()
-        //         .ThrowExactlyAsync<InvalidResponseException>();
-        // })).ToArray();
-        //
-        // await Task.WhenAll(tasks);
+        await Task.WhenAll(tasks);
     }
 
     [Fact, TestPriority(5)]
     public async Task PollMessages_WithHeaders_Should_PollMessages_Successfully()
     {
         // act
-        var response = await _fixture.HttpSut.FetchMessagesAsync(_headersMessageFetchRequest);
+        var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
+        {
+            var response = await sut.Client.FetchMessagesAsync(_headersMessageFetchRequest);
+            response.Messages.Count.Should().Be(10);
+            response.PartitionId.Should().Be(FetchMessagesFixtureBootstrap.PartitionId);
+            response.CurrentOffset.Should().Be(19);
+            foreach (var responseMessage in response.Messages)
+            {
+                responseMessage.UserHeaders.Should().NotBeNull();
+                responseMessage.UserHeaders!.Count.Should().Be(3);
+            }
+        })).ToArray();
         
-        // assert
-        response.PartitionId.Should()
-            .Be(FetchMessagesFixtureBootstrap.PartitionId);
-        
-        response.CurrentOffset.Should().Be(19);
-        
-        response.Messages
-            .Should()
-            .NotBeNull()
-            .And
-            .NotBeEmpty()
-            .And
-            .HaveCount(10)
-            .And
-            .OnlyContain(x =>
-                x.State == MessageState.Available &&
-                x.Headers != null &&
-                x.Headers.Count == 3);
-        
-        // TODO: This code block is commmented bacause TCP implementation is not working properly.
-        // var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
-        // {
-        //     var response = await sut.FetchMessagesAsync(_headersMessageFetchRequest);
-        //     response.Messages.Count.Should().Be(10);
-        //     response.PartitionId.Should().Be(FetchMessagesFixtureBootstrap.PartitionId);
-        //     response.CurrentOffset.Should().Be(19);
-        //     foreach (var responseMessage in response.Messages)
-        //     {
-        //         responseMessage.Headers.Should().NotBeNull();
-        //         responseMessage.State.Should().Be(MessageState.Available);
-        //         responseMessage.Headers!.Count.Should().Be(3);
-        //     }
-        // })).ToArray();
-        //
-        // await Task.WhenAll(tasks);
+        await Task.WhenAll(tasks);
     }
 
     [Fact, TestPriority(6)]
     public async Task PollMessagesTMessage_WithHeaders_Should_PollMessages_Successfully()
     {
         // act
-        var response = await _fixture.HttpSut
-            .FetchMessagesAsync(_headersMessageFetchRequest, MessageFactory.DeserializeDummyMessage);
+        var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
+        {
+            var response = await sut.Client.FetchMessagesAsync(_headersMessageFetchRequest, MessageFactory.DeserializeDummyMessage);
+            response.Messages.Count.Should().Be(10);
+            response.PartitionId.Should().Be(FetchMessagesFixtureBootstrap.PartitionId);
+            response.CurrentOffset.Should().Be(19);
+            foreach (var responseMessage in response.Messages)
+            {
+                responseMessage.UserHeaders.Should().NotBeNull();
+                responseMessage.UserHeaders!.Count.Should().Be(3);
+            }
+        })).ToArray();
         
-        // assert
-        response.PartitionId.Should()
-            .Be(FetchMessagesFixtureBootstrap.PartitionId);
-        
-        response.CurrentOffset.Should().Be(19);
-        
-        response.Messages
-            .Should()
-            .NotBeNull()
-            .And
-            .NotBeEmpty()
-            .And
-            .HaveCount(10)
-            .And
-            .OnlyContain(x =>
-                x.State == MessageState.Available &&
-                x.Headers != null &&
-                x.Headers.Count == 3);
-        
-        // TODO: This code block is commmented bacause TCP implementation is not working properly.
-        // var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
-        // {
-        //     var response = await sut.FetchMessagesAsync(_headersMessageFetchRequest, MessageFactory.DeserializeDummyMessage);
-        //     response.Messages.Count.Should().Be(10);
-        //     response.PartitionId.Should().Be(FetchMessagesFixtureBootstrap.PartitionId);
-        //     response.CurrentOffset.Should().Be(19);
-        //     foreach (var responseMessage in response.Messages)
-        //     {
-        //         responseMessage.Headers.Should().NotBeNull();
-        //         responseMessage.State.Should().Be(MessageState.Available);
-        //         responseMessage.Headers!.Count.Should().Be(3);
-        //     }
-        // })).ToArray();
-        //
-        // await Task.WhenAll(tasks);
+        await Task.WhenAll(tasks);
     }
 }

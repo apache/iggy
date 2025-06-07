@@ -16,7 +16,8 @@
 // under the License.
 
 using Iggy_SDK.Enums;
-namespace Iggy_SDK.Contracts.Http;
+
+namespace Iggy_SDK.Contracts.Http.Auth;
 
 public sealed class UserResponse
 {
