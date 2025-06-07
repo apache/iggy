@@ -34,6 +34,11 @@ pub struct S3Archiver {
 }
 
 impl S3Archiver {
+    /// Creates a new S3 archiver.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the S3 client cannot be initialized or credentials are invalid.
     pub fn new(config: S3ArchiverConfig) -> Result<Self, ArchiverError> {
         let credentials = Credentials::new(
             Some(&config.key_id),
@@ -47,16 +52,8 @@ impl S3Archiver {
         let bucket = Bucket::new(
             &config.bucket,
             Region::Custom {
-                endpoint: config
-                    .endpoint
-                    .map(|e| e.to_owned())
-                    .unwrap_or("".to_owned())
-                    .to_owned(),
-                region: config
-                    .region
-                    .map(|r| r.to_owned())
-                    .unwrap_or("".to_owned())
-                    .to_owned(),
+                endpoint: config.endpoint.map_or_else(String::new, |e| e),
+                region: config.region.map_or_else(String::new, |r| r),
             },
             credentials,
         )
@@ -76,7 +73,7 @@ impl S3Archiver {
         let destination = Path::new(&self.tmp_upload_dir).join(path);
         let destination_path = destination.to_str().unwrap_or_default().to_owned();
         debug!("Creating temporary S3 upload directory: {destination_path}");
-        fs::create_dir_all(destination.parent().unwrap())
+        fs::create_dir_all(destination.parent().expect("Path should have a parent directory"))
             .await
             .with_error_context(|error| {
                 format!(
@@ -130,7 +127,7 @@ impl Archiver for S3Archiver {
             return Ok(false);
         }
 
-        let (_, status) = response.unwrap();
+        let (_, status) = response.expect("Response should be valid if not an error");
         if status == 200 {
             debug!("File: {file} is archived on S3.");
             return Ok(true);
@@ -148,7 +145,7 @@ impl Archiver for S3Archiver {
         for path in files {
             if !Path::new(path).exists() {
                 return Err(ArchiverError::FileToArchiveNotFound {
-                    file_path: path.to_string(),
+                    file_path: (*path).to_string(),
                 });
             }
 
@@ -170,11 +167,11 @@ impl Archiver for S3Archiver {
                     format!("{COMPONENT} (error: {error}) - failed to remove temporary file: {source} after S3 failure")
                 })?;
                 return Err(ArchiverError::CannotArchiveFile {
-                    file_path: path.to_string(),
+                    file_path: (*path).to_string(),
                 });
             }
 
-            let response = response.unwrap();
+            let response = response.expect("Response should be valid if not an error");
             let status = response.status_code();
             if status == 200 {
                 debug!("Archived file: {path} on S3.");
@@ -189,7 +186,7 @@ impl Archiver for S3Archiver {
                 format!("{COMPONENT} (error: {error}) - failed to remove temporary file: {source} after invalid status code")
             })?;
             return Err(ArchiverError::CannotArchiveFile {
-                file_path: path.to_string(),
+                file_path: (*path).to_string(),
             });
         }
         Ok(())
