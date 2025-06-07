@@ -251,6 +251,13 @@ impl IggyConsumer {
         .await
     }
 
+    /// Retrieves the last consumed offset for the specified partition ID.
+    /// To get the current partition ID use `partition_id()`
+    pub fn get_last_consumed_offset(&self, partition_id: u32) -> Option<u64> {
+        let offset = self.last_consumed_offsets.get(&partition_id)?;
+        Some(offset.load(ORDERING))
+    }
+
     /// Deletes the consumer offset on the server either for the current partition or the provided partition ID.
     pub async fn delete_offset(&self, partition_id: Option<u32>) -> Result<(), IggyError> {
         let client = self.client.read().await;

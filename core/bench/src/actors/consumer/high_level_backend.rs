@@ -21,7 +21,7 @@ use futures_util::StreamExt;
 use iggy::prelude::*;
 use integration::test_server::login_root;
 use tokio::time::Instant;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 impl BenchmarkConsumerBackend for HighLevelBackend {
     type Consumer = IggyConsumer;
@@ -95,11 +95,20 @@ impl BenchmarkConsumerBackend for HighLevelBackend {
                         batch_total_bytes +=
                             received_message.message.get_size_bytes().as_bytes_u64();
 
+                        let offset = received_message.message.header.offset;
                         if batch_messages >= self.config.messages_per_batch.get() {
                             info!(
-                                "Batch of {} messages consumed, last_offset: {}",
-                                batch_messages, received_message.message.header.offset
+                                "Batch of {} messages consumed, last_offset: {}, current_offset: {}",
+                                batch_messages,
+                                received_message.message.header.offset,
+                                received_message.current_offset
                             );
+
+                            if let Err(error) = consumer.store_offset(offset, None).await {
+                                error!("Failed to store offset: {offset}. {error}");
+                                continue;
+                            }
+                            debug!("Offset: {offset} stored successfully");
                             break;
                         }
                     }
