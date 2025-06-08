@@ -23,7 +23,7 @@ on:
 
 jobs:
   build:
-    name: charp build
+    name: csharp build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -33,9 +33,11 @@ jobs:
         with:
           dotnet-version: '8.0.x'
       - name: Restore dependencies
+        working-directory: foreign/csharp
         run: dotnet restore
       - name: Build
-        run: dotnet build foreign/csharp/ --no-restore
+        working-directory: foreign/csharp
+        run: dotnet build --no-restore
 
   test:
     name: Unit test
@@ -49,8 +51,11 @@ jobs:
         with:
           dotnet-version: '8.0.x'
       - name: Restore dependencies
+        working-directory: foreign/csharp
         run: dotnet restore
       - name: Build
-        run: dotnet build foreign/csharp/ --no-restore
+        working-directory: foreign/csharp
+        run: dotnet build --no-restore
       - name: Test
-        run: dotnet test foreign/csharp/ --no-build --verbosity normaldot
+        working-directory: foreign/csharp
+        run: dotnet test --no-build --verbosity normal

@@ -58,15 +58,34 @@ jobs:
           echo "tag_name=$tag" >> "$GITHUB_OUTPUT"
           echo "::notice ::Tag that triggered the workflow: $tag"
 
-      - name: Extract csharp sdk version from package.json
+      - name: Extract csharp sdk version from csproj
         id: extract_version
+        working-directory: foreign/csharp/Iggy_SDK
         run: |
-          version=`grep -n '"version": ' package.json | sed -E 's/^.* "([^"]*)",/\1/' | tr -d '\n'`
-          echo "csharp_sdk_version=$version" >> "$GITHUB_OUTPUT"
-          echo "::notice ::Version csharp sdk package.json version is $version"
+          # Check if Version property exists in csproj
+          if grep -q "<Version>" Iggy_SDK.csproj; then
+            version=$(grep -oP '(?<=<Version>)[^<]*' Iggy_SDK.csproj)
+            echo "csharp_sdk_version=$version" >> "$GITHUB_OUTPUT"
+            echo "::notice ::Version csharp sdk csproj version is $version"
+          else
+            echo "::error ::No Version property found in csproj. Please add <Version>X.Y.Z</Version> to Iggy_SDK.csproj"
+            exit 1
+          fi
+
+      - name: Check if version from csproj is the same as the tag
+        id: check_git_tag
+        run: |
+          if [[ "csharp-sdk-${{ steps.extract_version.outputs.csharp_sdk_version }}" == "${{ steps.extract_tag.outputs.tag_name }}" ]];
+          then
+            echo "::notice ::Tag ${{ steps.extract_tag.outputs.tag_name }} matches the version in csproj"
+            echo "tag_matches=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning ::Tag ${{ steps.extract_tag.outputs.tag_name }} does not match the version from csproj"
+            echo "tag_matches=false" >> "$GITHUB_OUTPUT"
+          fi
 
     outputs:
-      node_sdk_version: ${{ steps.extract_tag.outputs.tag_name }}
+      csharp_sdk_version: ${{ steps.extract_tag.outputs.tag_name }}
       tag_created: ${{ steps.check_git_tag.outputs.tag_matches }}
 
   publish:
@@ -81,9 +100,16 @@ jobs:
         with:
           dotnet-version: '8.0.x'
       - name: Restore dependencies
+        working-directory: foreign/csharp
         run: dotnet restore
       - name: Pack nuget
-        run: dotnet pack -c release /p:PackageVersion=$version --no-restore -o .
+        working-directory: foreign/csharp
+        run: |
+          # Extract version from tag (remove csharp-sdk- prefix)
+          version="${{ needs.tag.outputs.csharp_sdk_version }}"
+          version="${version#csharp-sdk-}"
+          dotnet pack -c release /p:PackageVersion="$version" --no-restore -o .
       - name: Publish nuget
+        working-directory: foreign/csharp
         run: dotnet nuget push *.nupkg -k "${{ secrets.NUGET_API_KEY }}" -s https://api.nuget.org/v3/index.json
 
