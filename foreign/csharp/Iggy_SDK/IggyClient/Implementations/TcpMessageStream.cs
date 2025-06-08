@@ -191,28 +191,21 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
 
     public async Task<TopicResponse?> CreateTopicAsync(Identifier streamId, TopicRequest topic, CancellationToken token = default)
     {
-        try
-        {
-            var message = TcpContracts.CreateTopic(streamId, topic);
-            var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
-            TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CREATE_TOPIC_CODE);
+        var message = TcpContracts.CreateTopic(streamId, topic);
+        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CREATE_TOPIC_CODE);
 
-            await _stream.SendAsync(payload, token);
-            await _stream.FlushAsync(token);
+        await _stream.SendAsync(payload, token);
+        await _stream.FlushAsync(token);
 
-            var responseBuffer = await GetMessageAsync(token);
-            
-            if (responseBuffer.Length == 0)
-            {
-                return null;
-            }
-            
-            return BinaryMapper.MapTopic(responseBuffer);
-        }
-        catch (Exception e)
+        var responseBuffer = await GetMessageAsync(token);
+        
+        if (responseBuffer.Length == 0)
         {
-            throw new InvalidResponseException($"Failed to create topic. {JsonSerializer.Serialize(topic)}");
+            return null;
         }
+        
+        return BinaryMapper.MapTopic(responseBuffer);
     }
 
     public async Task UpdateTopicAsync(Identifier streamId, Identifier topicId, UpdateTopicRequest request, CancellationToken token = default)
