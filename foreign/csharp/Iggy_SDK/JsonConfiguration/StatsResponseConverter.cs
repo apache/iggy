@@ -115,7 +115,7 @@ public class StatsResponseConverter : JsonConverter<StatsResponse>
             "MiB" => memoryUsageBytesVal * (ulong)1e06,
             "GiB" => memoryUsageBytesVal * (ulong)1e09,
             "TiB" => memoryUsageBytesVal * (ulong)1e12,
-            _ => throw new InvalidEnumArgumentException("Error Wrong Unit when deserializing MemoryUsage")
+            _ => throw new InvalidEnumArgumentException($"Error Wrong Unit when deserializing MemoryUsage: {memoryUnit}")
         };
         return (ulong)memoryUsage;
     }

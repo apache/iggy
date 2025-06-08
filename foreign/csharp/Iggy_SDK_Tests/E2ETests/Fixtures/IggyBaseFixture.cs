@@ -39,8 +39,8 @@ public abstract class IggyBaseFixture : IAsyncLifetime
         .WithPortBinding(8090, true)
         .WithOutputConsumer(Consume.RedirectStdoutAndStderrToConsole())
         .WithWaitStrategy(Wait.ForUnixContainer().UntilPortIsAvailable(8090))
-        .WithEnvironment("IGGY_SYSTEM_LOGGING_LEVEL", "debug")
-        .WithEnvironment("RUST_LOG", "trace")
+        //.WithEnvironment("IGGY_SYSTEM_LOGGING_LEVEL", "debug")
+        //.WithEnvironment("RUST_LOG", "trace")
         .WithCleanUp(true)
         .Build();
     
@@ -51,8 +51,8 @@ public abstract class IggyBaseFixture : IAsyncLifetime
         .WithPortBinding(8090, true)
         .WithOutputConsumer(Consume.RedirectStdoutAndStderrToConsole())
         .WithWaitStrategy(Wait.ForUnixContainer().UntilPortIsAvailable(3000))
-        .WithEnvironment("IGGY_SYSTEM_LOGGING_LEVEL", "debug")
-        .WithEnvironment("RUST_LOG", "trace")
+        //.WithEnvironment("IGGY_SYSTEM_LOGGING_LEVEL", "debug")
+        //.WithEnvironment("RUST_LOG", "trace")
         .WithCleanUp(true)
         .Build();
     
