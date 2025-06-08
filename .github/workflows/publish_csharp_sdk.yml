@@ -105,10 +105,7 @@ jobs:
       - name: Pack nuget
         working-directory: foreign/csharp
         run: |
-          # Extract version from tag (remove csharp-sdk- prefix)
-          version="${{ needs.tag.outputs.csharp_sdk_version }}"
-          version="${version#csharp-sdk-}"
-          dotnet pack -c release /p:PackageVersion="$version" --no-restore -o .
+          dotnet pack -c release --no-restore -o .
       - name: Publish nuget
         working-directory: foreign/csharp
         run: dotnet nuget push *.nupkg -k "${{ secrets.NUGET_API_KEY }}" -s https://api.nuget.org/v3/index.json
