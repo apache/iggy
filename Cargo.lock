@@ -870,6 +870,7 @@ dependencies = [
  "chrono",
  "clap",
  "figlet-rs",
+ "futures-util",
  "governor",
  "hostname",
  "human-repr",

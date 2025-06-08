@@ -41,6 +41,7 @@ use std::str::FromStr;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct IggyBenchArgs {
     /// Benchmark kind
     #[command(subcommand)]
@@ -103,6 +104,10 @@ pub struct IggyBenchArgs {
     /// Only applicable to local benchmarks.
     #[arg(long, short = 'k', default_value_t = DEFAULT_SKIP_SERVER_START, verbatim_doc_comment)]
     pub skip_server_start: bool,
+
+    /// Use high-level API for actors
+    #[arg(long, short = 'H', default_value_t = false)]
+    pub high_level_api: bool,
 }
 
 fn validate_server_executable_path(v: &str) -> Result<String, String> {
@@ -180,6 +185,15 @@ impl IggyBenchArgs {
                     )
                     .exit();
             }
+        }
+
+        if self.high_level_api && !self.messages_per_batch.is_fixed() {
+            Self::command()
+                .error(
+                    ErrorKind::ArgumentConflict,
+                    "High-level consumer API (--high-level-api) requires fixed batch size, but random batch size was specified. Use a single value instead of a range for --messages-per-batch.",
+                )
+                .exit();
         }
 
         self.benchmark_kind.inner().validate();
@@ -328,6 +342,10 @@ impl IggyBenchArgs {
 
     pub fn max_topic_size(&self) -> Option<IggyByteSize> {
         self.benchmark_kind.inner().max_topic_size()
+    }
+
+    pub const fn high_level_api(&self) -> bool {
+        self.high_level_api
     }
 
     /// Generates the output directory name based on benchmark parameters.
