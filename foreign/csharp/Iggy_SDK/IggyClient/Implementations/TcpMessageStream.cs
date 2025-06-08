@@ -34,6 +34,7 @@ using System.Buffers.Binary;
 using System.IO.Hashing;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Text.Json;
 using System.Threading.Channels;
 namespace Iggy_SDK.IggyClient.Implementations;
 
@@ -190,22 +191,28 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
 
     public async Task<TopicResponse?> CreateTopicAsync(Identifier streamId, TopicRequest topic, CancellationToken token = default)
     {
-        var message = TcpContracts.CreateTopic(streamId, topic);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
-        TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CREATE_TOPIC_CODE);
-
-        await _stream.SendAsync(payload, token);
-        await _stream.FlushAsync(token);
-
-        var responseBuffer = await GetMessageAsync(token);
-        
-        if (responseBuffer.Length == 0)
+        try
         {
-            return null;
+            var message = TcpContracts.CreateTopic(streamId, topic);
+            var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+            TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CREATE_TOPIC_CODE);
+
+            await _stream.SendAsync(payload, token);
+            await _stream.FlushAsync(token);
+
+            var responseBuffer = await GetMessageAsync(token);
+            
+            if (responseBuffer.Length == 0)
+            {
+                return null;
+            }
+            
+            return BinaryMapper.MapTopic(responseBuffer);
         }
-        
-        return BinaryMapper.MapTopic(responseBuffer);
-        
+        catch (Exception e)
+        {
+            throw new InvalidResponseException($"Failed to create topic. {JsonSerializer.Serialize(topic)}");
+        }
     }
 
     public async Task UpdateTopicAsync(Identifier streamId, Identifier topicId, UpdateTopicRequest request, CancellationToken token = default)

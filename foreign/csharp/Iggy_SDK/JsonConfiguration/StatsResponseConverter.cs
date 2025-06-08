@@ -111,10 +111,14 @@ public class StatsResponseConverter : JsonConverter<StatsResponse>
         float memoryUsage = memoryUnit switch
         {
             "B" => memoryUsageBytesVal,
-            "KiB" => memoryUsageBytesVal * (ulong)1e03,
-            "MiB" => memoryUsageBytesVal * (ulong)1e06,
-            "GiB" => memoryUsageBytesVal * (ulong)1e09,
-            "TiB" => memoryUsageBytesVal * (ulong)1e12,
+            "KiB" => memoryUsageBytesVal * (ulong)1024,
+            "KB" => memoryUsageBytesVal * (ulong)1e03,
+            "MiB" => memoryUsageBytesVal * (ulong)1024 * 1024,
+            "MB" => memoryUsageBytesVal * (ulong)1e06,
+            "GiB" => memoryUsageBytesVal * (ulong)1024 * 1024 * 1024,
+            "GB" => memoryUsageBytesVal * (ulong)1e09,
+            "TiB" => memoryUsageBytesVal * (ulong)1024 * 1024 * 1024 * 1024,
+            "TB" => memoryUsageBytesVal * (ulong)1e12,
             _ => throw new InvalidEnumArgumentException($"Error Wrong Unit when deserializing MemoryUsage: {memoryUnit}")
         };
         return (ulong)memoryUsage;
