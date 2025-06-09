@@ -25,8 +25,8 @@ use iggy::prelude::*;
 const STREAM_ID: u32 = 1;
 const TOPIC_ID: u32 = 1;
 const PARTITION_ID: u32 = 1;
-const STREAM_NAME: &str = "test-stream";
-const TOPIC_NAME: &str = "test-topic";
+const STREAM_NAME: &str = "test-stream-producer";
+const TOPIC_NAME: &str = "test-topic-producer";
 const PARTITIONS_COUNT: u32 = 3;
 
 fn create_message_payload(offset: u64) -> Bytes {
