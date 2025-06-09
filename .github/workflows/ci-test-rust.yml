@@ -59,11 +59,10 @@ jobs:
           rm -f $HOME/.local/share/keyrings/*
           echo -n "test" | gnome-keyring-daemon --unlock
       - name: Prepare ${{ matrix.target }} toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-          target: ${{ matrix.target }}
+        run: |
+           rustup toolchain add --profile=minimal stable
+           rustup target add --toolchain=stable ${{ matrix.target }}
+           rustup override set stable
       - name: Set verbose flag
         shell: bash
         run: echo "VERBOSE_FLAG=$([[ "${RUNNER_DEBUG}" = "1" ]] && echo "--verbose" || echo "")" >> $GITHUB_ENV
@@ -88,11 +87,10 @@ jobs:
         with:
           key: "x86_64-pc-windows-msvc"
       - name: Prepare x86_64-pc-windows-msvc toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-          target: x86_64-pc-windows-msvc
+        run: |
+           rustup toolchain add --profile=minimal stable
+           rustup target add --toolchain=stable x86_64-pc-windows-msvc
+           rustup override set stable
       - name: Set verbose flag
         shell: pwsh
         run: |

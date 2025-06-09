@@ -45,11 +45,10 @@ jobs:
         run: sudo apt-get update --yes && sudo apt-get install --yes musl-tools
 
       - name: Prepare x86_64-unknown-linux-musl toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-          target: x86_64-unknown-linux-musl
+        run: |
+           rustup toolchain add --profile=minimal stable
+           rustup target add --toolchain=stable x86_64-unknown-linux-musl
+           rustup override set stable
 
       - name: Install cross
         uses: taiki-e/install-action@v2
@@ -65,11 +64,10 @@ jobs:
           cp target_x86/x86_64-unknown-linux-musl/release/iggy-server all_artifacts/Linux-x86_64/
 
       - name: Prepare aarch64-unknown-linux-musl toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-          target: aarch64-unknown-linux-musl
+        run: |
+           rustup toolchain add --profile=minimal stable
+           rustup target add --toolchain=stable aarch64-unknown-linux-musl
+           rustup override set stable
 
       - name: Build iggy-server release binary for aarch64-unknown-linux-musl
         run: cross +stable build --verbose --target aarch64-unknown-linux-musl --release --bin iggy-server --target-dir target_aarch64
