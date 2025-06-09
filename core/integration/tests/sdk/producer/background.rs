@@ -371,7 +371,7 @@ async fn background_many_parallel_producers() {
                 .unwrap();
 
             producer.send(vec![msg]).await.unwrap();
-            sleep(Duration::from_millis(100)).await;
+            sleep(Duration::from_millis(1000)).await;
             producer.shutdown().await;
         });
         handles.push(handle);
