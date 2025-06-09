@@ -190,6 +190,7 @@ pub fn build_consumer_futures(
     let global_finish_condition =
         BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::Shared);
     let rate_limit = rate_limit_per_actor(args.rate_limit(), actors);
+    let use_high_level_api = args.high_level_api();
 
     (1..=consumers)
         .map(|consumer_id| {
@@ -225,6 +226,7 @@ pub fn build_consumer_futures(
                     polling_kind,
                     rate_limit,
                     origin_timestamp_latency_calculation,
+                    use_high_level_api,
                 );
                 consumer.run().await
             }
