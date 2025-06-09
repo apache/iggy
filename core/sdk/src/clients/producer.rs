@@ -16,7 +16,7 @@
  * under the License.
  */
 use super::ORDERING;
-
+use crate::clients::MAX_BATCH_LENGTH;
 use crate::clients::producer_builder::SendMode;
 use crate::clients::producer_config::SyncConfig;
 use crate::clients::producer_dispatcher::ProducerDispatcher;
@@ -378,16 +378,17 @@ impl ProducerCoreBackend for ProducerCore {
 
         match &self.sync_config {
             Some(cfg) => {
-                let linger_time_micros = match cfg.linger_time {
-                    Some(t) => t.as_micros(),
-                    None => 0,
-                };
+                let linger_time_micros = cfg.linger_time.as_micros();
                 if linger_time_micros > 0 {
                     Self::wait_before_sending(linger_time_micros, self.last_sent_at.load(ORDERING))
                         .await;
                 }
 
-                let max = cfg.batch_length;
+                let max = if cfg.batch_length == 0 {
+                    MAX_BATCH_LENGTH
+                } else {
+                    cfg.batch_length as usize
+                };
                 let mut index = 0;
                 while index < msgs.len() {
                     let end = (index + max).min(msgs.len());

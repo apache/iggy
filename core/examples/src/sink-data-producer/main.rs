@@ -21,6 +21,7 @@ use std::{env, str::FromStr, time::Duration};
 use chrono::{DateTime, Days, Utc};
 use iggy::prelude::{
     Client, IggyClient, IggyClientBuilder, IggyDuration, IggyError, IggyMessage, Partitioning,
+    SyncConfig,
 };
 use rand::{
     Rng,
@@ -57,10 +58,12 @@ async fn main() -> Result<(), DataProducerError> {
     let client = create_client(&address, &username, &password).await?;
     let producer = client
         .producer(&stream, &topic)?
-        .sync(|b| {
-            b.batch_length(1000)
+        .sync(
+            SyncConfig::builder()
+                .batch_length(1000)
                 .linger_time(IggyDuration::from_str("5ms").unwrap())
-        })
+                .build(),
+        )
         .partitioning(Partitioning::balanced())
         .build();
     producer.init().await?;

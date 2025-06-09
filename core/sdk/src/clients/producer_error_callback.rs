@@ -15,11 +15,10 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use iggy_common::{Identifier, IggyMessage, Partitioning};
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::Arc;
-
-use iggy_common::{Identifier, IggyMessage, Partitioning};
 use tracing::error;
 
 #[derive(Debug)]

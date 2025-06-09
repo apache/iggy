@@ -18,6 +18,7 @@
 
 use crate::clients::client::IggyClient;
 use crate::clients::producer::IggyProducer;
+use crate::clients::producer_config::SyncConfig;
 use crate::prelude::{IggyError, IggyExpiry, MaxTopicSize};
 use crate::stream_builder::IggyProducerConfig;
 use tracing::{error, trace};
@@ -65,7 +66,12 @@ pub(crate) async fn build_iggy_producer(
             IggyExpiry::ServerDefault,
             MaxTopicSize::ServerDefault,
         )
-        .sync(|b| b.batch_length(batch_length).linger_time(linger_time));
+        .sync(
+            SyncConfig::builder()
+                .batch_length(batch_length)
+                .linger_time(linger_time)
+                .build(),
+        );
 
     if let Some(encryptor) = config.encryptor() {
         builder = builder.encryptor(encryptor);

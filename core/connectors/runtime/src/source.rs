@@ -19,7 +19,9 @@
 use dashmap::DashMap;
 use dlopen2::wrapper::Container;
 use flume::{Receiver, Sender};
-use iggy::prelude::{HeaderKey, HeaderValue, IggyClient, IggyDuration, IggyError, IggyMessage};
+use iggy::prelude::{
+    HeaderKey, HeaderValue, IggyClient, IggyDuration, IggyError, IggyMessage, SyncConfig,
+};
 use iggy_connector_sdk::{
     DecodedMessage, Error, ProducedMessages, StreamEncoder, TopicMetadata, transforms::Transform,
 };
@@ -118,7 +120,12 @@ pub async fn init(
             let batch_length = stream.batch_length.unwrap_or(1000);
             let producer = iggy_client
                 .producer(&stream.stream, &stream.topic)?
-                .sync(|b| b.batch_length(batch_length).linger_time(linger_time))
+                .sync(
+                    SyncConfig::builder()
+                        .batch_length(batch_length)
+                        .linger_time(linger_time)
+                        .build(),
+                )
                 .build();
 
             producer.init().await?;

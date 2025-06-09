@@ -23,9 +23,8 @@ use futures::FutureExt;
 use iggy_common::{Identifier, IggyError, IggyMessage, Partitioning, Sizeable};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::Semaphore;
-
-use tokio::{sync::Notify, task::JoinHandle};
+use tokio::sync::{Semaphore, broadcast};
+use tokio::task::JoinHandle;
 
 pub struct ProducerDispatcher {
     shards: Vec<Shard>,
@@ -33,7 +32,7 @@ pub struct ProducerDispatcher {
     closed: AtomicBool,
     slots_permit: Arc<Semaphore>,
     bytes_permit: Arc<Semaphore>,
-    shutdown_notify: Arc<Notify>,
+    stop_tx: broadcast::Sender<()>,
     _join_handle: JoinHandle<()>,
 }
 
@@ -41,11 +40,12 @@ impl ProducerDispatcher {
     pub fn new(core: Arc<impl ProducerCoreBackend>, config: BackgroundConfig) -> Self {
         let mut shards = Vec::with_capacity(config.num_shards);
         let config = Arc::new(config);
-        let shutdown_notify = Arc::new(Notify::new());
 
         let (err_tx, err_rx) = flume::unbounded::<ErrorCtx>();
         let err_callback = config.error_callback.clone();
-        let shutdown_notify_clone = shutdown_notify.clone();
+        let (stop_tx, _) = broadcast::channel::<()>(1);
+
+        let mut stop_rx = stop_tx.subscribe();
         let handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -62,7 +62,7 @@ impl ProducerDispatcher {
                             Err(_) => break
                         }
                     }
-                    _ = shutdown_notify_clone.notified() => {
+                    _ = stop_rx.recv() => {
                         tracing::debug!("error-callback worker finished");
                         break
                     }
@@ -71,16 +71,24 @@ impl ProducerDispatcher {
         });
 
         for _ in 0..config.num_shards {
-            shards.push(Shard::new(core.clone(), config.clone(), err_tx.clone()));
+            let stop_rx = stop_tx.subscribe();
+            shards.push(Shard::new(
+                core.clone(),
+                config.clone(),
+                err_tx.clone(),
+                stop_rx,
+            ));
         }
 
-        let bytes_permit = match config.max_buffer_size {
-            Some(val) => val.as_bytes_u32() as usize,
-            None => usize::MAX,
+        let bytes_permit = {
+            let bytes = config.max_buffer_size.as_bytes_usize();
+            if bytes == 0 { usize::MAX } else { bytes }
         };
-        let slot_permit = match config.max_in_flight {
-            Some(val) => val,
-            None => usize::MAX,
+
+        let slot_permit = if config.max_in_flight == 0 {
+            usize::MAX
+        } else {
+            config.max_in_flight
         };
 
         Self {
@@ -89,7 +97,7 @@ impl ProducerDispatcher {
             closed: AtomicBool::new(false),
             bytes_permit: Arc::new(Semaphore::new(bytes_permit)),
             slots_permit: Arc::new(Semaphore::new(slot_permit)),
-            shutdown_notify,
+            stop_tx,
             _join_handle: handle,
         }
     }
@@ -112,6 +120,10 @@ impl ProducerDispatcher {
             partitioning,
         };
         let batch_bytes = shard_message.get_size_bytes();
+
+        if batch_bytes > self.config.max_buffer_size {
+            return Err(IggyError::BackgroundSendBufferOverflow);
+        }
 
         let permit_bytes = match self
             .bytes_permit
@@ -199,16 +211,22 @@ impl ProducerDispatcher {
             .await
     }
 
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(mut self) {
         if self.closed.swap(true, Ordering::Relaxed) {
             return;
         }
 
-        for shard in &self.shards {
-            shard.shutdown().await;
+        let _ = self.stop_tx.send(());
+
+        for shard in self.shards.drain(..) {
+            if let Err(e) = shard._handle.await {
+                tracing::error!("shard panicked: {e:?}");
+            }
         }
 
-        self.shutdown_notify.notify_waiters();
+        if let Err(e) = self._join_handle.await {
+            tracing::error!("error-worker panicked: {e:?}");
+        }
     }
 }
 
@@ -222,7 +240,6 @@ mod tests {
     use tokio::time::sleep;
 
     use crate::clients::producer::MockProducerCoreBackend;
-    use crate::clients::producer_builder::BackgroundBuilder;
     use crate::clients::producer_error_callback::ErrorCallback;
     use crate::clients::producer_sharding::Sharding;
 
@@ -247,7 +264,7 @@ mod tests {
             .returning(|_, _, _, _| Box::pin(async { Ok(()) }));
 
         let msg = dummy_message(5);
-        let config = BackgroundBuilder::default()
+        let config = BackgroundConfig::builder()
             .max_buffer_size(100.into())
             .max_in_flight(10)
             .num_shards(1)
@@ -268,7 +285,7 @@ mod tests {
         let mock = MockProducerCoreBackend::new();
 
         let msg = dummy_message(200);
-        let config = BackgroundBuilder::default()
+        let config = BackgroundConfig::builder()
             .max_buffer_size(100.into())
             .failure_mode(BackpressureMode::FailImmediately)
             .num_shards(1)
@@ -291,8 +308,8 @@ mod tests {
         let mock = MockProducerCoreBackend::new();
 
         let msg = dummy_message(200);
-        let config = BackgroundBuilder::default()
-            .max_buffer_size(100.into())
+        let config = BackgroundConfig::builder()
+            .max_buffer_size(msg.get_size_bytes() + 100.into())
             .max_in_flight(1)
             .failure_mode(BackpressureMode::BlockWithTimeout(
                 Duration::from_millis(50).into(),
@@ -302,10 +319,10 @@ mod tests {
 
         let dispatcher = ProducerDispatcher::new(Arc::new(mock), config);
 
-        let _ = dispatcher
+        let _keep = dispatcher
             .bytes_permit
             .clone()
-            .acquire_many_owned(100)
+            .acquire_many_owned(msg.get_size_bytes().as_bytes_u32() + 100)
             .await;
 
         let result = dispatcher
@@ -329,7 +346,7 @@ mod tests {
             partitioning: None,
         };
 
-        let config = BackgroundBuilder::default()
+        let config = BackgroundConfig::builder()
             .max_buffer_size(msg.get_size_bytes())
             .max_in_flight(1)
             .failure_mode(BackpressureMode::Block)
@@ -417,11 +434,11 @@ mod tests {
         let sharding_called = Arc::new(AtomicUsize::new(0));
         let error_called = Arc::new(AtomicUsize::new(0));
 
-        let config = BackgroundBuilder::default()
+        let config = BackgroundConfig::builder()
             .num_shards(1)
-            .error_callback(Box::new(TestErrorCallback {
+            .error_callback(Arc::new(Box::new(TestErrorCallback {
                 called: error_called.clone(),
-            }))
+            })))
             .sharding(Box::new(TestSharding {
                 called: sharding_called.clone(),
             }))

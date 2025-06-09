@@ -15,17 +15,15 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-use iggy_common::{Identifier, IggyByteSize, IggyError, IggyMessage, Partitioning, Sizeable};
-use tokio::sync::{Notify, OwnedSemaphorePermit};
-use tokio::task::JoinHandle;
-use tracing::error;
-
 use crate::clients::producer::ProducerCoreBackend;
 use crate::clients::producer_config::BackgroundConfig;
 use crate::clients::producer_error_callback::ErrorCtx;
+use iggy_common::{Identifier, IggyByteSize, IggyError, IggyMessage, Partitioning, Sizeable};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tokio::sync::{OwnedSemaphorePermit, broadcast};
+use tokio::task::JoinHandle;
+use tracing::error;
 
 /// A strategy for distributing messages across shards.
 ///
@@ -104,9 +102,8 @@ impl ShardMessageWithPermits {
 
 pub struct Shard {
     tx: flume::Sender<ShardMessageWithPermits>,
-    shutdown_notify: Arc<Notify>,
     closed: Arc<AtomicBool>,
-    _handle: JoinHandle<()>,
+    pub(crate) _handle: JoinHandle<()>,
 }
 
 impl Shard {
@@ -114,12 +111,11 @@ impl Shard {
         core: Arc<impl ProducerCoreBackend>,
         config: Arc<BackgroundConfig>,
         err_sender: flume::Sender<ErrorCtx>,
+        mut stop_rx: broadcast::Receiver<()>,
     ) -> Self {
         let (tx, rx) = flume::bounded::<ShardMessageWithPermits>(256);
-        let shutdown_notify = Arc::new(Notify::new());
         let closed = Arc::new(AtomicBool::new(false));
 
-        let shutdown_notify_clone = shutdown_notify.clone();
         let closed_clone = closed.clone();
         let handle = tokio::spawn(async move {
             let mut buffer = Vec::new();
@@ -135,8 +131,8 @@ impl Shard {
                                 buffer_bytes += msg.inner.get_size_bytes().as_bytes_usize();
                                 buffer.push(msg);
 
-                                let exceed_batch_len = config.batch_length.is_some_and(|len| buffer.len() >= len);
-                                let exceed_batch_size = config.batch_size.is_some_and(|size| buffer_bytes >= size);
+                                let exceed_batch_len = config.batch_length != 0 && buffer.len() >= config.batch_length;
+                                let exceed_batch_size = config.batch_size != 0 && buffer_bytes >= config.batch_size;
 
                                 if exceed_batch_len || exceed_batch_size {
                                     Self::flush_buffer(&core, &mut buffer, &mut buffer_bytes, &err_sender).await;
@@ -152,7 +148,7 @@ impl Shard {
                             last_flush = tokio::time::Instant::now();
                         }
                     }
-                    _ = shutdown_notify_clone.notified() => {
+                    _ = stop_rx.recv() => {
                         closed_clone.store(true, Ordering::Release);
                         if !buffer.is_empty() {
                             Self::flush_buffer(&core, &mut buffer, &mut buffer_bytes, &err_sender).await;
@@ -165,7 +161,6 @@ impl Shard {
 
         Self {
             tx,
-            shutdown_notify,
             closed,
             _handle: handle,
         }
@@ -215,25 +210,16 @@ impl Shard {
             IggyError::BackgroundSendError
         })
     }
-
-    pub(crate) async fn shutdown(&self) {
-        self.shutdown_notify.notify_waiters();
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
+    use super::*;
+    use crate::clients::producer::MockProducerCoreBackend;
     use bytes::Bytes;
     use iggy_common::IggyDuration;
-    use tokio::{
-        sync::{Notify, Semaphore},
-        time::sleep,
-    };
-
-    use super::*;
-    use crate::clients::{producer::MockProducerCoreBackend, producer_builder::BackgroundBuilder};
+    use std::time::Duration;
+    use tokio::{sync::Semaphore, time::sleep};
 
     fn dummy_identifier() -> Arc<Identifier> {
         Arc::new(Identifier::numeric(1).unwrap())
@@ -253,7 +239,7 @@ mod tests {
             .times(10)
             .returning(|_, _, _, _| Box::pin(async { Ok(()) }));
 
-        let bb = BackgroundBuilder::default()
+        let bb = BackgroundConfig::builder()
             .batch_length(10)
             .linger_time(IggyDuration::new_from_secs(1))
             .batch_size(10_000);
@@ -264,7 +250,12 @@ mod tests {
             Arc::new(Semaphore::new(100)),
         );
 
-        let shard = Shard::new(Arc::new(mock), config, flume::unbounded().0);
+        let shard = Shard::new(
+            Arc::new(mock),
+            config,
+            flume::unbounded().0,
+            broadcast::channel(1).1,
+        );
 
         for _ in 0..10 {
             let message = ShardMessage {
@@ -281,7 +272,7 @@ mod tests {
             shard.send(wrapped).await.unwrap();
         }
 
-        sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(500)).await;
     }
 
     #[tokio::test]
@@ -291,7 +282,7 @@ mod tests {
             .times(1)
             .returning(|_, _, _, _| Box::pin(async { Ok(()) }));
 
-        let bb = BackgroundBuilder::default()
+        let bb = BackgroundConfig::builder()
             .batch_length(1000)
             .linger_time(IggyDuration::new_from_secs(1))
             .batch_size(10_000);
@@ -302,7 +293,8 @@ mod tests {
             Arc::new(Semaphore::new(100)),
         );
 
-        let shard = Shard::new(Arc::new(mock), config, flume::unbounded().0);
+        let (_stop_tx, stop_rx) = broadcast::channel(1);
+        let shard = Shard::new(Arc::new(mock), config, flume::unbounded().0, stop_rx);
 
         let message = ShardMessage {
             stream: dummy_identifier(),
@@ -331,7 +323,7 @@ mod tests {
             .times(1)
             .returning(|_, _, _, _| Box::pin(async { Ok(()) }));
 
-        let bb = BackgroundBuilder::default()
+        let bb = BackgroundConfig::builder()
             .batch_length(10)
             .linger_time(IggyDuration::new(Duration::from_millis(50)))
             .batch_size(10_000);
@@ -342,7 +334,8 @@ mod tests {
             Arc::new(Semaphore::new(100)),
         );
 
-        let shard = Shard::new(Arc::new(mock), config, flume::unbounded().0);
+        let (_stop_tx, stop_rx) = broadcast::channel(1);
+        let shard = Shard::new(Arc::new(mock), config, flume::unbounded().0, stop_rx);
 
         let message = ShardMessage {
             stream: dummy_identifier(),
@@ -374,7 +367,7 @@ mod tests {
         });
 
         let (err_tx, err_rx) = flume::unbounded();
-        let bb = BackgroundBuilder::default();
+        let bb = BackgroundConfig::builder();
         let config = Arc::new(bb.build());
 
         let (permit_bytes, permit_slot) = (
@@ -382,7 +375,8 @@ mod tests {
             Arc::new(Semaphore::new(100)),
         );
 
-        let shard = Shard::new(Arc::new(mock), config, err_tx);
+        let (_stop_tx, stop_rx) = broadcast::channel(1);
+        let shard = Shard::new(Arc::new(mock), config, err_tx, stop_rx);
 
         let message = ShardMessage {
             stream: dummy_identifier(),
@@ -409,7 +403,6 @@ mod tests {
 
         let shard = Shard {
             tx,
-            shutdown_notify: Arc::new(Notify::new()),
             closed: Arc::new(AtomicBool::new(false)),
             _handle: tokio::spawn(async {}),
         };

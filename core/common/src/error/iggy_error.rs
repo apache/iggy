@@ -16,11 +16,9 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
 use crate::utils::topic_size::MaxTopicSize;
 use crate::{IggyMessage, utils::byte_size::IggyByteSize};
-
+use std::sync::Arc;
 use strum::{EnumDiscriminants, FromRepr, IntoStaticStr};
 use thiserror::Error;
 
