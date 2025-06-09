@@ -15,11 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Debug/test build for faster compilation during development and testing
 FROM rust:latest as builder
 WORKDIR /build
 COPY . /build
-RUN cargo build --bin iggy --release
-RUN cargo build --bin iggy-server --release
+# Build in debug mode for faster compilation times during testing
+RUN cargo build --bin iggy-server
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y \
@@ -27,7 +28,6 @@ RUN apt-get update && apt-get install -y \
     liblzma5 \
     && rm -rf /var/lib/apt/lists/*
 COPY ./core/configs ./configs
-COPY --from=builder /build/target/release/iggy .
-COPY --from=builder /build/target/release/iggy-server .
+COPY --from=builder /build/target/debug/iggy-server .
 
 CMD ["/iggy-server"]
