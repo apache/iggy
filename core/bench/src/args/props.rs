@@ -42,7 +42,7 @@ pub trait BenchmarkTransportProps {
     fn server_address(&self) -> &str;
     fn client_address(&self) -> &str;
     fn validate_certificate(&self) -> bool;
-    fn output_command(&self) -> &Option<BenchmarkOutputCommand>;
+    fn output_command(&self) -> Option<&BenchmarkOutputCommand>;
     fn nodelay(&self) -> bool;
     fn inner(&self) -> &dyn BenchmarkTransportProps
     where

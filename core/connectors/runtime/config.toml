@@ -21,28 +21,48 @@ username = "iggy"
 password = "iggy"
 # token = "secret" # Personal Access Token (PAT) can be used instead of username and password
 
-[sources.test1]
+[sinks.stdout]
 enabled = true
-name = "Test source"
-path = "target/release/libiggy_connector_test_source"
+name = "Stdout sink"
+path = "target/release/libiggy_connector_stdout_sink"
 
-[[sources.test1.streams]]
+[[sinks.stdout.streams]]
+stream = "example_stream"
+topics = ["example_topic"]
+schema = "json"
+batch_size = 100
+poll_interval = "5ms"
+consumer_group = "qw_sink_connector"
+
+[sinks.stdout.transforms.add_fields]
+enabled = true
+
+[[sinks.stdout.transforms.add_fields.fields]]
+key = "message"
+value.static = "hello"
+
+[sources.random]
+enabled = true
+name = "Random source"
+path = "target/release/libiggy_connector_random_source"
+
+[[sources.random.streams]]
 stream = "example"
 topic = "topic1"
 schema = "json"
 batch_size = 1000
 send_interval = "5ms"
 
-[sources.test1.config]
+[sources.random.config]
 interval = "100ms"
 # max_count = 1000
 messages_range = [10, 50]
 payload_size = 200
 
-[sources.test1.transforms.add_fields]
+[sources.random.transforms.add_fields]
 enabled = true
 
-[[sources.test1.transforms.add_fields.fields]]
+[[sources.random.transforms.add_fields.fields]]
 key = "test_field"
 value.static = "hello!"
 

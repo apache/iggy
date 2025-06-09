@@ -16,7 +16,7 @@
  * under the License.
  */
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BenchmarkRecord {
     pub elapsed_time_us: u64,
     pub latency_us: u64,

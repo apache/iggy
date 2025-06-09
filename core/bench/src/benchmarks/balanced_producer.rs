@@ -18,7 +18,7 @@
 
 use super::benchmark::Benchmarkable;
 use crate::args::common::IggyBenchArgs;
-use crate::benchmarks::common::*;
+use crate::benchmarks::common::build_producer_futures;
 use async_trait::async_trait;
 use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::individual_metrics::BenchmarkIndividualMetrics;
@@ -34,11 +34,11 @@ pub struct BalancedProducerBenchmark {
 }
 
 impl BalancedProducerBenchmark {
-    pub fn new(args: Arc<IggyBenchArgs>, client_factory: Arc<dyn ClientFactory>) -> Box<Self> {
-        Box::new(Self {
+    pub fn new(args: Arc<IggyBenchArgs>, client_factory: Arc<dyn ClientFactory>) -> Self {
+        Self {
             args,
             client_factory,
-        })
+        }
     }
 }
 
@@ -50,7 +50,7 @@ impl Benchmarkable for BalancedProducerBenchmark {
         self.init_streams().await?;
         let cf = &self.client_factory;
         let args = self.args.clone();
-        let producer_futures = build_producer_futures(cf, &args)?;
+        let producer_futures = build_producer_futures(cf, &args);
         let mut tasks = JoinSet::new();
 
         for fut in producer_futures {
@@ -76,10 +76,10 @@ impl Benchmarkable for BalancedProducerBenchmark {
         let streams = format!("streams: {}", self.args.streams());
         let partitions = format!("partitions: {}", self.args.number_of_partitions());
         let producers = format!("producers: {}", self.args.producers());
-        let max_topic_size = match self.args.max_topic_size() {
-            Some(size) => format!(" max topic size: {}", size),
-            None => format!(" max topic size: {}", MaxTopicSize::ServerDefault),
-        };
+        let max_topic_size = self.args.max_topic_size().map_or_else(
+            || format!(" max topic size: {}", MaxTopicSize::ServerDefault),
+            |size| format!(" max topic size: {size}"),
+        );
         let common_params = self.common_params_str();
 
         info!(

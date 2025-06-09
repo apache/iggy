@@ -66,151 +66,135 @@ public sealed class ConsumerGroupE2E : IClassFixture<IggyConsumerGroupFixture>
     public async Task CreateConsumerGroup_HappyPath_Should_CreateConsumerGroup_Successfully()
     {
         // act & assert
-        await _fixture.HttpSut.Invoking(y =>
-                y.CreateConsumerGroupAsync(_createConsumerGroupRequest)
-            ).Should()
-            .NotThrowAsync();
+        var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
+        {
+            var consumerGroup = await sut.Client.CreateConsumerGroupAsync(_createConsumerGroupRequest);
+            consumerGroup.Should().NotBeNull();
+            consumerGroup!.Id.Should().Be(GROUP_ID);
+            consumerGroup.PartitionsCount.Should().Be(ConsumerGroupFixtureBootstrap.TopicRequest.PartitionsCount);
+            consumerGroup.MembersCount.Should().Be(0);
+            consumerGroup.Name.Should().Be(_createConsumerGroupRequest.Name);
+        })).ToArray();
         
-        // TODO: This code block is commented because TCP implementation is not working properly.
-        // var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
-        // {
-        //     await sut.CreateConsumerGroupAsync(_createConsumerGroupRequest);
-        // })).ToArray();
-        //
-        // await Task.WhenAll(tasks);
+        await Task.WhenAll(tasks);
     }
 
     [Fact, TestPriority(2)]
     public async Task CreateConsumerGroup_Should_Throw_InvalidResponse()
     {
         // act & assert
-        await _fixture.HttpSut.Invoking(y =>
-                y.CreateConsumerGroupAsync(_createConsumerGroupRequest)
-            ).Should()
-            .ThrowExactlyAsync<InvalidResponseException>();
+        var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
+        {
+            await sut.Invoking(x => x.Client.CreateConsumerGroupAsync(_createConsumerGroupRequest))
+                .Should()
+                .ThrowExactlyAsync<InvalidResponseException>();
+        })).ToArray();
         
-        // TODO: This code block is commented because TCP implementation is not working properly.
-        // var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
-        // {
-        //     await sut.Invoking(x => x.CreateConsumerGroupAsync(_createConsumerGroupRequest))
-        //         .Should()
-        //         .ThrowExactlyAsync<InvalidResponseException>();
-        // })).ToArray();
-        //
-        // await Task.WhenAll(tasks);
+        await Task.WhenAll(tasks);
     }
-
+    
     [Fact, TestPriority(3)]
     public async Task GetConsumerGroupById_Should_Return_ValidResponse()
     {
         // act
-        var response = await _fixture.HttpSut
-                .GetConsumerGroupByIdAsync(
-                    Identifier.Numeric((int)ConsumerGroupFixtureBootstrap.StreamRequest.StreamId!),
-                    Identifier.Numeric((int)ConsumerGroupFixtureBootstrap.TopicRequest.TopicId!),
-                    ConsumerGroupId);
+        var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
+        {
+            var response = await sut.Client.GetConsumerGroupByIdAsync(
+                Identifier.Numeric((int)ConsumerGroupFixtureBootstrap.StreamRequest.StreamId!), Identifier.Numeric((int)ConsumerGroupFixtureBootstrap.TopicRequest.TopicId!),
+                ConsumerGroupId);
         
-        // assert
-        response.Should().NotBeNull();
+            response.Should().NotBeNull();
+            response!.Id.Should().Be(GROUP_ID);
+            response.PartitionsCount.Should().Be(ConsumerGroupFixtureBootstrap.TopicRequest.PartitionsCount);
+            response.MembersCount.Should().Be(0);
+        })).ToArray();
         
-        response!.Id.Should().Be(GROUP_ID);
-        
-        response.PartitionsCount
-            .Should()
-            .Be(ConsumerGroupFixtureBootstrap.TopicRequest.PartitionsCount);
-        
-        response.MembersCount.Should().Be(0);
-        
-        // TODO: This code block is commented because TCP implementation is not working properly.
-        // var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
-        // {
-        //     var response = await sut.GetConsumerGroupByIdAsync(
-        //         Identifier.Numeric((int)ConsumerGroupFixtureBootstrap.StreamRequest.StreamId!), Identifier.Numeric((int)ConsumerGroupFixtureBootstrap.TopicRequest.TopicId!),
-        //         ConsumerGroupId);
-        //
-        //     response.Should().NotBeNull();
-        //     response!.Id.Should().Be(GROUP_ID);
-        //     response.PartitionsCount.Should().Be(ConsumerGroupFixtureBootstrap.TopicRequest.PartitionsCount);
-        //     response.MembersCount.Should().Be(0);
-        // })).ToArray();
-        //
-        // await Task.WhenAll(tasks);
+        await Task.WhenAll(tasks);
     }
-
+    
     [Fact, TestPriority(4)]
+    public async Task GetConsumerGroups_Should_Return_ValidResponse()
+    {
+        // act
+        var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
+        {
+            var response = await sut.Client.GetConsumerGroupsAsync(
+                Identifier.Numeric((int)ConsumerGroupFixtureBootstrap.StreamRequest.StreamId!), Identifier.Numeric((int)ConsumerGroupFixtureBootstrap.TopicRequest.TopicId!));
+        
+            response.Should().NotBeNull();
+            response.Count.Should().Be(1);
+            var group = response.FirstOrDefault();
+            group!.Id.Should().Be(GROUP_ID);
+            group.PartitionsCount.Should().Be(ConsumerGroupFixtureBootstrap.TopicRequest.PartitionsCount);
+            group.MembersCount.Should().Be(0);
+        })).ToArray();
+        
+        await Task.WhenAll(tasks);
+    }
+    
+    [Fact, TestPriority(5)]
     public async Task JoinConsumerGroup_Should_JoinConsumerGroup_Successfully()
     {
         // act & assert
-        await _fixture.HttpSut.Invoking(y =>
+        await _fixture.HttpClient.Client.Invoking(y =>
                 y.JoinConsumerGroupAsync(_joinConsumerGroupRequest)
             ).Should()
             .ThrowExactlyAsync<FeatureUnavailableException>();
         
-        // TODO: This code block is commented because TCP implementation is not working properly.
-        // var sut = _fixture.SubjectsUnderTest[0];
-        // await sut.Invoking(x => x.JoinConsumerGroupAsync(_joinConsumerGroupRequest))
-        //     .Should()
-        //     .NotThrowAsync();
-    }
-
-    [Fact, TestPriority(5)]
-    public async Task LeaveConsumerGroup_Should_LeaveConsumerGroup_Successfully()
-    {
-        // act & assert
-        await _fixture.HttpSut.Invoking(x => x.LeaveConsumerGroupAsync(_leaveConsumerGroupRequest))
+        await _fixture.TcpClient.Client.Invoking(x => x.JoinConsumerGroupAsync(_joinConsumerGroupRequest))
             .Should()
-            .ThrowAsync<FeatureUnavailableException>();
-        
-        // TODO: This code block is commented because TCP implementation is not working properly.
-        // var sut = _fixture.SubjectsUnderTest[0];
-        // await sut.Invoking(x => x.LeaveConsumerGroupAsync(_leaveConsumerGroupRequest))
-        //     .Should()
-        //     .ThrowAsync<FeatureUnavailableException>();
+            .NotThrowAsync();
     }
 
     [Fact, TestPriority(6)]
+    public async Task LeaveConsumerGroup_Should_LeaveConsumerGroup_Successfully()
+    {
+        // act & assert
+        await _fixture.HttpClient.Client.Invoking(x => x.LeaveConsumerGroupAsync(_leaveConsumerGroupRequest))
+            .Should()
+            .ThrowAsync<FeatureUnavailableException>();
+
+        await _fixture.TcpClient.Client.Invoking(x => x.LeaveConsumerGroupAsync(_leaveConsumerGroupRequest))
+            .Should()
+            .NotThrowAsync();
+    }
+
+    [Fact, TestPriority(7)]
     public async Task DeleteConsumerGroup_Should_DeleteConsumerGroup_Successfully()
     {
         var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
         {
-            await sut.Invoking(x => x.DeleteConsumerGroupAsync(_deleteConsumerGroupRequest))
+            await sut.Invoking(x => x.Client.DeleteConsumerGroupAsync(_deleteConsumerGroupRequest))
                 .Should()
                 .NotThrowAsync();
         })).ToArray();
         await Task.WhenAll(tasks);
     }
 
-    [Fact, TestPriority(7)]
+    [Fact, TestPriority(8)]
     public async Task JoinConsumerGroup_Should_Throw_InvalidResponse()
     {
         // act & assert
-        await _fixture.HttpSut.Invoking(x => x.LeaveConsumerGroupAsync(_leaveConsumerGroupRequest))
+        await _fixture.HttpClient.Client.Invoking(x => x.LeaveConsumerGroupAsync(_leaveConsumerGroupRequest))
             .Should()
             .ThrowAsync<FeatureUnavailableException>();
         
-        // TODO: This code block is commented because TCP implementation is not working properly.
-        // var sut = _fixture.SubjectsUnderTest[0];
-        // await sut.Invoking(x => x.JoinConsumerGroupAsync(_joinConsumerGroupRequest))
-        //     .Should()
-        //     .ThrowExactlyAsync<FeatureUnavailableException>();
+        await _fixture.TcpClient.Client.Invoking(x => x.JoinConsumerGroupAsync(_joinConsumerGroupRequest))
+            .Should()
+            .ThrowExactlyAsync<InvalidResponseException>();
     }
 
-    [Fact, TestPriority(8)]
+    [Fact, TestPriority(9)]
     public async Task DeleteConsumerGroup_Should_Throw_InvalidResponse()
     {
         // act & assert
-        await _fixture.HttpSut.Invoking(x => x.DeleteConsumerGroupAsync(_deleteConsumerGroupRequest))
-            .Should()
-            .ThrowExactlyAsync<InvalidResponseException>();
+        var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
+        {
+            await sut.Invoking(x => x.Client.DeleteConsumerGroupAsync(_deleteConsumerGroupRequest))
+                .Should()
+                .ThrowExactlyAsync<InvalidResponseException>();
+        })).ToArray();
         
-        // TODO: This code block is commented because TCP implementation is not working properly.
-        // var tasks = _fixture.SubjectsUnderTest.Select(sut => Task.Run(async () =>
-        // {
-        //     await sut.Invoking(x => x.DeleteConsumerGroupAsync(_deleteConsumerGroupRequest))
-        //         .Should()
-        //         .ThrowExactlyAsync<InvalidResponseException>();
-        // })).ToArray();
-        //
-        // await Task.WhenAll(tasks);
+        await Task.WhenAll(tasks);
     }
 }

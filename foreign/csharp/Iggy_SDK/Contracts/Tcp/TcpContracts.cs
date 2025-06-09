@@ -40,6 +40,7 @@ internal static class TcpContracts
         Encoding.UTF8.GetBytes(request.Token, bytes[1..(1 + request.Token.Length)]);
         return bytes.ToArray();
     }
+    
     internal static byte[] DeletePersonalRequestToken(DeletePersonalAccessTokenRequest request)
     {
         Span<byte> bytes = stackalloc byte[5 + request.Name.Length];
@@ -47,32 +48,37 @@ internal static class TcpContracts
         Encoding.UTF8.GetBytes(request.Name, bytes[1..(1 + request.Name.Length)]);
         return bytes.ToArray();
     }
+    
     internal static byte[] CreatePersonalAccessToken(CreatePersonalAccessTokenRequest request)
     {
-        Span<byte> bytes = stackalloc byte[5 + request.Name.Length];
+        Span<byte> bytes = stackalloc byte[1 + request.Name.Length + 8];
         bytes[0] = (byte)request.Name.Length;
         Encoding.UTF8.GetBytes(request.Name, bytes[1..(1 + request.Name.Length)]);
-        BinaryPrimitives.WriteUInt32LittleEndian(bytes[(1 + request.Name.Length)..], request.Expiry ?? 0);
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(1 + request.Name.Length)..], request.Expiry ?? 0);
         return bytes.ToArray();
     }
+    
     internal static byte[] GetClient(uint clientId)
     {
         var bytes = new byte[4];
         BinaryPrimitives.WriteUInt32LittleEndian(bytes, clientId);
         return bytes;
     }
+    
     internal static byte[] GetUser(Identifier userId)
     {
         Span<byte> bytes = stackalloc byte[userId.Length + 2];
         bytes.WriteBytesFromIdentifier(userId);
         return bytes.ToArray();
     }
+    
     internal static byte[] DeleteUser(Identifier userId)
     {
         Span<byte> bytes = stackalloc byte[userId.Length + 2];
         bytes.WriteBytesFromIdentifier(userId);
         return bytes.ToArray();
     }
+    
     internal static byte[] LoginUser(LoginUserRequest request)
     {
         List<byte> bytes = new List<byte>();
@@ -91,44 +97,29 @@ internal static class TcpContracts
         if (!string.IsNullOrEmpty(request.Version))
         {
             byte[] versionBytes = Encoding.UTF8.GetBytes(request.Version);
-            bytes.AddRange(BitConverter.GetBytes(versionBytes.Length)); // tamanho da versão (u32, little-endian)
+            bytes.AddRange(BitConverter.GetBytes(versionBytes.Length)); 
             bytes.AddRange(versionBytes);
         }
         else
         {
-            bytes.AddRange(BitConverter.GetBytes(0)); // tamanho 0 para versão ausente
+            bytes.AddRange(BitConverter.GetBytes(0));
         }
 
         // Context (opcional)
         if (!string.IsNullOrEmpty(request.Context))
         {
             byte[] contextBytes = Encoding.UTF8.GetBytes(request.Context);
-            bytes.AddRange(BitConverter.GetBytes(contextBytes.Length)); // tamanho do contexto (u32, little-endian)
+            bytes.AddRange(BitConverter.GetBytes(contextBytes.Length));
             bytes.AddRange(contextBytes);
         }
         else
         {
-            bytes.AddRange(BitConverter.GetBytes(0)); // tamanho 0 para contexto ausente
+            bytes.AddRange(BitConverter.GetBytes(0));
         }
 
         return bytes.ToArray();
-
-        // var length = request.Username.Length + request.Password.Length + 2;
-        // Span<byte> bytes = stackalloc byte[length];
-        //
-        // int position = 0;
-        // bytes[position] = (byte)request.Username.Length;
-        // position += 1;
-        // Encoding.UTF8.GetBytes(request.Username, bytes[position..(position + request.Username.Length)]);
-        // position += request.Username.Length;
-        // bytes[position] = (byte)request.Password.Length;
-        // position += 1;
-        // Encoding.UTF8.GetBytes(request.Password, bytes[position..(position + request.Password.Length)]);
-        // position += request.Password.Length;
-
-        // return bytes.ToArray();
-        //return JsonSerializer.SerializeToUtf8Bytes(request);
     }
+    
     internal static byte[] ChangePassword(ChangePasswordRequest request)
     {
         var length = request.UserId.Length + 2 + request.CurrentPassword.Length + request.NewPassword.Length + 2;
@@ -143,9 +134,9 @@ internal static class TcpContracts
         bytes[position] = (byte)request.NewPassword.Length;
         position += 1;
         Encoding.UTF8.GetBytes(request.NewPassword, bytes[position..(position + request.NewPassword.Length)]);
-        position += request.NewPassword.Length;
         return bytes.ToArray();
     }
+    
     internal static byte[] UpdatePermissions(UpdateUserPermissionsRequest request)
     {
         var length = request.UserId.Length + 2 +
@@ -169,6 +160,7 @@ internal static class TcpContracts
         }
         return bytes.ToArray();
     }
+    
     internal static byte[] UpdateUser(UpdateUserRequest request)
     {
         var length = request.UserId.Length + 2 + (request.Username?.Length ?? 0)
@@ -196,12 +188,7 @@ internal static class TcpContracts
         if (request.UserStatus is not null)
         {
             bytes[position++] = 1;
-            bytes[position++] = request.UserStatus switch
-            {
-                UserStatus.Active => 1,
-                UserStatus.Inactive => 2,
-                _ => throw new ArgumentOutOfRangeException()
-            };
+            bytes[position++] = (byte)request.UserStatus;
         }
         else
         {
@@ -209,10 +196,11 @@ internal static class TcpContracts
         }
         return bytes.ToArray();
     }
+    
     internal static byte[] CreateUser(CreateUserRequest request)
     {
         int capacity = 3 + request.Username.Length + request.Password.Length
-            + (request.Permissions is not null ? 1 + 4 + CalculatePermissionsSize(request.Permissions) : 0);
+            + (request.Permissions is not null ? 1 + 4 + CalculatePermissionsSize(request.Permissions) : 1);
 
         Span<byte> bytes = stackalloc byte[capacity];
         int position = 0;
@@ -223,12 +211,7 @@ internal static class TcpContracts
         bytes[position++] = (byte)request.Password.Length;
         position += Encoding.UTF8.GetBytes(request.Password, bytes[position..(position + request.Password.Length)]);
 
-        bytes[position++] = request.Status switch
-        {
-            UserStatus.Active => (byte)1,
-            UserStatus.Inactive => (byte)2,
-            _ => throw new ArgumentOutOfRangeException()
-        };
+        bytes[position++] = (byte)request.Status;
 
         if (request.Permissions is not null)
         {
@@ -237,7 +220,6 @@ internal static class TcpContracts
             BinaryPrimitives.WriteInt32LittleEndian(bytes[position..(position + 4)], CalculatePermissionsSize(request.Permissions));
             position += 4;
             permissions.CopyTo(bytes[position..(position + permissions.Length)]);
-            position += permissions.Length;
         }
         else
         {
@@ -246,6 +228,7 @@ internal static class TcpContracts
 
         return bytes.ToArray();
     }
+    
     private static byte[] GetBytesFromPermissions(Permissions data)
     {
         int size = CalculatePermissionsSize(data);
@@ -332,6 +315,7 @@ internal static class TcpContracts
 
         return bytes.ToArray();
     }
+    
     private static int CalculatePermissionsSize(Permissions data)
     {
         int size = 10;
@@ -363,6 +347,19 @@ internal static class TcpContracts
 
         return size;
     }
+    
+    public static byte[] FlushUnsavedBuffer(FlushUnsavedBufferRequest request)
+    {
+        var length = request.StreamId.Length + 2 + request.TopicId.Length + 2 + 4 + 1;
+        Span<byte> bytes = stackalloc byte[length];
+        bytes.WriteBytesFromStreamAndTopicIdentifiers(request.StreamId, request.TopicId);
+        int position = request.StreamId.Length + 2 + request.TopicId.Length + 2;
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes[position..(position + 4)], request.PartitionId);
+        bytes[position + 4] = request.Fsync ? (byte)1 : (byte)0;
+
+        return bytes.ToArray();
+    }
+    
     internal static void GetMessages(Span<byte> bytes, MessageFetchRequest request)
     {
         bytes[0] = GetConsumerTypeByte(request.Consumer.Type);
@@ -377,130 +374,165 @@ internal static class TcpContracts
 
         bytes[position + 17] = request.AutoCommit ? (byte)1 : (byte)0;
     }
+    
     internal static void CreateMessage(Span<byte> bytes, Identifier streamId, Identifier topicId,
         Kinds.Partitioning partitioning, IList<Message> messages)
     {
-        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId);
-        int streamTopicIdPosition = 2 + streamId.Length + 2 + topicId.Length;
-        bytes[streamTopicIdPosition] = GetPartitioningKindByte(partitioning.Kind);
-        bytes[streamTopicIdPosition + 1] = (byte)partitioning.Length;
-        partitioning.Value.CopyTo(bytes[(streamTopicIdPosition + 2)..(streamTopicIdPosition + partitioning.Length + 2)]);
+        var metadataLength = 2 + streamId.Length + 2 + topicId.Length + 2 + partitioning.Length + 4;
+        BinaryPrimitives.WriteInt32LittleEndian(bytes[..4], metadataLength);
+        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId, 4);
+        int position = 2 + streamId.Length + 2 + topicId.Length + 4;
+        bytes.WriteBytesFromPartitioning(partitioning, position);
+        position += 2 + partitioning.Length;
+        BinaryPrimitives.WriteInt32LittleEndian(bytes[(position)..(position + 4)], messages.Count);
+        position += 4;
 
-        var position = 2 + partitioning.Length + streamTopicIdPosition;
-        bytes = messages switch
-        {
-            Message[] messagesArray => HandleMessagesArray(position, messagesArray, bytes),
-            List<Message> messagesList => HandleMessagesList(position, messagesList, bytes),
-            _ => HandleMessagesIList(position, messages, bytes),
-        };
-    }
-    private static Span<byte> HandleMessagesIList(int position, IList<Message> messages, Span<byte> bytes)
-    {
-        Span<byte> emptyHeaders = stackalloc byte[4];
+        var indexPosition = position;
+        position += 16 * messages.Count;
 
+        var msgSize = 0;
         foreach (var message in messages)
         {
-            var idSlice = bytes[position..(position + 16)];
-            //TODO - this required testing on different cpu architectures
-            Unsafe.WriteUnaligned(ref MemoryMarshal.GetReference(idSlice), message.Id);
+            var headersBytes = GetHeadersBytes(message.UserHeaders);
+            BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position)..(position + 8)], message.Header.Checksum);
+            BinaryPrimitives.WriteUInt128LittleEndian(bytes[(position + 8)..(position + 24)], message.Header.Id);
+            BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 24)..(position + 32)], message.Header.Offset);
+            BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 32)..(position + 40)], DateTimeOffsetUtils.ToUnixTimeMicroSeconds(message.Header.Timestamp));
+            BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 40)..(position + 48)], message.Header.OriginTimestamp);
+            BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 48)..(position + 52)], headersBytes.Length);
+            BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 52)..(position + 56)], message.Payload.Length);
 
-            if (message.Headers is not null)
+            message.Payload.CopyTo(bytes[(position + 56)..(position + 56 + message.Header.PayloadLength)]);
+            if (headersBytes.Length > 0)
             {
-                var headersBytes = GetHeadersBytes(message.Headers);
-                BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 16)..(position + 20)], headersBytes.Length);
-                headersBytes.CopyTo(bytes[(position + 20)..(position + 20 + headersBytes.Length)]);
-                position += headersBytes.Length + 20;
+                headersBytes
+                    .CopyTo(bytes[(position + 56 + message.Header.PayloadLength)..(position + 56 + message.Header.PayloadLength + headersBytes.Length)]);
             }
-            else
-            {
-                emptyHeaders.CopyTo(bytes[(position + 16)..(position + 16 + emptyHeaders.Length)]);
-                position += 20;
-            }
+            position += 56 + message.Header.PayloadLength + headersBytes.Length;
 
-            BinaryPrimitives.WriteInt32LittleEndian(bytes[(position)..(position + 4)], message.Payload.Length);
-            var payloadBytes = message.Payload;
-            var slice = bytes[(position + 4)..];
-            payloadBytes.CopyTo(slice);
-            position += payloadBytes.Length + 4;
+            msgSize += message.GetSize() + headersBytes.Length;
+            
+            BinaryPrimitives.WriteInt32LittleEndian(bytes[(indexPosition)..(indexPosition + 4)], 0);
+            BinaryPrimitives.WriteInt32LittleEndian(bytes[(indexPosition + 4)..(indexPosition + 8)], msgSize);
+            BinaryPrimitives.WriteInt64LittleEndian(bytes[(indexPosition + 8)..(indexPosition + 16)], 0);
+            indexPosition += 16;
         }
 
-        return bytes;
     }
-    private static Span<byte> HandleMessagesArray(int position, Message[] messages, Span<byte> bytes)
+    
+    // private static Span<byte> HandleMessagesIList(int position, IList<Message> messages, Span<byte> bytes)
+    // {
+    //     Span<byte> emptyHeaders = stackalloc byte[4];
+    //
+    //     foreach (var message in messages)
+    //     {
+    //         var idSlice = bytes[position..(position + 16)];
+    //         //TODO - this required testing on different cpu architectures
+    //         Unsafe.WriteUnaligned(ref MemoryMarshal.GetReference(idSlice), message.Id);
+    //
+    //         if (message.Headers is not null)
+    //         {
+    //             var headersBytes = GetHeadersBytes(message.Headers);
+    //             BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 16)..(position + 20)], headersBytes.Length);
+    //             headersBytes.CopyTo(bytes[(position + 20)..(position + 20 + headersBytes.Length)]);
+    //             position += headersBytes.Length + 20;
+    //         }
+    //         else
+    //         {
+    //             emptyHeaders.CopyTo(bytes[(position + 16)..(position + 16 + emptyHeaders.Length)]);
+    //             position += 20;
+    //         }
+    //
+    //         BinaryPrimitives.WriteInt32LittleEndian(bytes[(position)..(position + 4)], message.Payload.Length);
+    //         var payloadBytes = message.Payload;
+    //         var slice = bytes[(position + 4)..];
+    //         payloadBytes.CopyTo(slice);
+    //         position += payloadBytes.Length + 4;
+    //     }
+    //
+    //     return bytes;
+    // }
+    // private static Span<byte> HandleMessagesArray(int position, Message[] messages, Span<byte> bytes)
+    // {
+    //     Span<byte> emptyHeaders = stackalloc byte[4];
+    //
+    //     ref var start = ref MemoryMarshal.GetArrayDataReference(messages);
+    //     ref var end = ref Unsafe.Add(ref start, messages.Length);
+    //     while (Unsafe.IsAddressLessThan(ref start, ref end))
+    //     {
+    //         var idSlice = bytes[position..(position + 16)];
+    //         //TODO - this required testing on different cpu architectures
+    //         Unsafe.WriteUnaligned(ref MemoryMarshal.GetReference(idSlice), start.Id);
+    //
+    //         if (start.Headers is not null)
+    //         {
+    //             var headersBytes = GetHeadersBytes(start.Headers);
+    //             BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 16)..(position + 20)], headersBytes.Length);
+    //             headersBytes.CopyTo(bytes[(position + 20)..(position + 20 + headersBytes.Length)]);
+    //             position += headersBytes.Length + 20;
+    //         }
+    //         else
+    //         {
+    //             emptyHeaders.CopyTo(bytes[(position + 16)..(position + 16 + emptyHeaders.Length)]);
+    //             position += 20;
+    //         }
+    //
+    //         BinaryPrimitives.WriteInt32LittleEndian(bytes[(position)..(position + 4)], start.Payload.Length);
+    //         var payloadBytes = start.Payload;
+    //         var slice = bytes[(position + 4)..];
+    //         payloadBytes.CopyTo(slice);
+    //         position += payloadBytes.Length + 4;
+    //
+    //         start = ref Unsafe.Add(ref start, 1);
+    //     }
+    //
+    //     return bytes;
+    // }
+    // private static Span<byte> HandleMessagesList(int position, List<Message> messages, Span<byte> bytes)
+    // {
+    //     Span<byte> emptyHeaders = stackalloc byte[4];
+    //
+    //     Span<Message> listAsSpan = CollectionsMarshal.AsSpan(messages);
+    //     ref var start = ref MemoryMarshal.GetReference(listAsSpan);
+    //     ref var end = ref Unsafe.Add(ref start, listAsSpan.Length);
+    //     while (Unsafe.IsAddressLessThan(ref start, ref end))
+    //     {
+    //         var idSlice = bytes[position..(position + 16)];
+    //         //TODO - this required testing on different cpu architectures
+    //         Unsafe.WriteUnaligned(ref MemoryMarshal.GetReference(idSlice), start.Id);
+    //
+    //         if (start.Headers is not null)
+    //         {
+    //             var headersBytes = GetHeadersBytes(start.Headers);
+    //             BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 16)..(position + 20)], headersBytes.Length);
+    //             headersBytes.CopyTo(bytes[(position + 20)..(position + 20 + headersBytes.Length)]);
+    //             position += headersBytes.Length + 20;
+    //         }
+    //         else
+    //         {
+    //             emptyHeaders.CopyTo(bytes[(position + 16)..(position + 16 + emptyHeaders.Length)]);
+    //             position += 20;
+    //         }
+    //
+    //         BinaryPrimitives.WriteInt32LittleEndian(bytes[(position)..(position + 4)], start.Payload.Length);
+    //         var payloadBytes = start.Payload;
+    //         var slice = bytes[(position + 4)..];
+    //         payloadBytes.CopyTo(slice);
+    //         position += payloadBytes.Length + 4;
+    //
+    //         start = ref Unsafe.Add(ref start, 1);
+    //     }
+    //
+    //     return bytes;
+    // }
+    
+    private static byte[] GetHeadersBytes(Dictionary<HeaderKey, HeaderValue>? headers)
     {
-        Span<byte> emptyHeaders = stackalloc byte[4];
-
-        ref var start = ref MemoryMarshal.GetArrayDataReference(messages);
-        ref var end = ref Unsafe.Add(ref start, messages.Length);
-        while (Unsafe.IsAddressLessThan(ref start, ref end))
+        if (headers == null)
         {
-            var idSlice = bytes[position..(position + 16)];
-            //TODO - this required testing on different cpu architectures
-            Unsafe.WriteUnaligned(ref MemoryMarshal.GetReference(idSlice), start.Id);
-
-            if (start.Headers is not null)
-            {
-                var headersBytes = GetHeadersBytes(start.Headers);
-                BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 16)..(position + 20)], headersBytes.Length);
-                headersBytes.CopyTo(bytes[(position + 20)..(position + 20 + headersBytes.Length)]);
-                position += headersBytes.Length + 20;
-            }
-            else
-            {
-                emptyHeaders.CopyTo(bytes[(position + 16)..(position + 16 + emptyHeaders.Length)]);
-                position += 20;
-            }
-
-            BinaryPrimitives.WriteInt32LittleEndian(bytes[(position)..(position + 4)], start.Payload.Length);
-            var payloadBytes = start.Payload;
-            var slice = bytes[(position + 4)..];
-            payloadBytes.CopyTo(slice);
-            position += payloadBytes.Length + 4;
-
-            start = ref Unsafe.Add(ref start, 1);
+            return [];
         }
-
-        return bytes;
-    }
-    private static Span<byte> HandleMessagesList(int position, List<Message> messages, Span<byte> bytes)
-    {
-        Span<byte> emptyHeaders = stackalloc byte[4];
-
-        Span<Message> listAsSpan = CollectionsMarshal.AsSpan(messages);
-        ref var start = ref MemoryMarshal.GetReference(listAsSpan);
-        ref var end = ref Unsafe.Add(ref start, listAsSpan.Length);
-        while (Unsafe.IsAddressLessThan(ref start, ref end))
-        {
-            var idSlice = bytes[position..(position + 16)];
-            //TODO - this required testing on different cpu architectures
-            Unsafe.WriteUnaligned(ref MemoryMarshal.GetReference(idSlice), start.Id);
-
-            if (start.Headers is not null)
-            {
-                var headersBytes = GetHeadersBytes(start.Headers);
-                BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 16)..(position + 20)], headersBytes.Length);
-                headersBytes.CopyTo(bytes[(position + 20)..(position + 20 + headersBytes.Length)]);
-                position += headersBytes.Length + 20;
-            }
-            else
-            {
-                emptyHeaders.CopyTo(bytes[(position + 16)..(position + 16 + emptyHeaders.Length)]);
-                position += 20;
-            }
-
-            BinaryPrimitives.WriteInt32LittleEndian(bytes[(position)..(position + 4)], start.Payload.Length);
-            var payloadBytes = start.Payload;
-            var slice = bytes[(position + 4)..];
-            payloadBytes.CopyTo(slice);
-            position += payloadBytes.Length + 4;
-
-            start = ref Unsafe.Add(ref start, 1);
-        }
-
-        return bytes;
-    }
-    private static byte[] GetHeadersBytes(Dictionary<HeaderKey, HeaderValue> headers)
-    {
+        
         var headersLength = headers.Sum(header => 4 + header.Key.Value.Length + 1 + 4 + header.Value.Value.Length);
         Span<byte> headersBytes = stackalloc byte[headersLength];
         int position = 0;
@@ -533,6 +565,7 @@ internal static class TcpContracts
             _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, null)
         };
     }
+    
     private static byte[] GetBytesFromHeader(HeaderKey headerKey, HeaderValue headerValue)
     {
         var headerBytesLength = 4 + headerKey.Value.Length + 1 + 4 + headerValue.Value.Length;
@@ -551,6 +584,7 @@ internal static class TcpContracts
 
         return headerBytes.ToArray();
     }
+    
     internal static byte[] CreateStream(StreamRequest request)
     {
         Span<byte> bytes = stackalloc byte[4 + request.Name.Length + 1];
@@ -559,6 +593,7 @@ internal static class TcpContracts
         Encoding.UTF8.GetBytes(request.Name, bytes[5..]);
         return bytes.ToArray();
     }
+    
     internal static byte[] UpdateStream(Identifier streamId, UpdateStreamRequest request)
     {
         Span<byte> bytes = stackalloc byte[streamId.Length + request.Name.Length + 3];
@@ -624,32 +659,34 @@ internal static class TcpContracts
 
     internal static byte[] UpdateTopic(Identifier streamId, Identifier topicId, UpdateTopicRequest request)
     {
-        Span<byte> bytes = stackalloc byte[streamId.Length + topicId.Length + 18 + request.Name.Length];
-        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId , topicId);
+        Span<byte> bytes = stackalloc byte[4+streamId.Length + topicId.Length + 19 + request.Name.Length];
+        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId);
         var position = 4 + streamId.Length + topicId.Length;
-        BinaryPrimitives.WriteInt32LittleEndian(bytes[position..(position + 4)],
+        bytes[position] = (byte)request.CompressionAlgorithm;
+        position+= 1;
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes[position..(position + 8)],
             request.MessageExpiry);
-        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 4)..(position + 12)],
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 8)..(position + 16)],
             request.MaxTopicSize);
-        bytes[position + 12] = request.ReplicationFactor;
-        bytes[position + 13] = (byte)request.Name.Length;
-        Encoding.UTF8.GetBytes(request.Name, bytes[(position + 14)..]);
+        bytes[position + 16] = request.ReplicationFactor;
+        bytes[position + 17] = (byte)request.Name.Length;
+        Encoding.UTF8.GetBytes(request.Name, bytes[(position + 18)..]);
         return bytes.ToArray();
     }
 
     internal static byte[] CreateTopic(Identifier streamId, TopicRequest request)
     {
-        Span<byte> bytes = stackalloc byte[2 + streamId.Length + 22 + request.Name.Length];
+        Span<byte> bytes = stackalloc byte[2 + streamId.Length + 27 + request.Name.Length];
         bytes.WriteBytesFromIdentifier(streamId);
-        var streamIdBytesLength = 2 + streamId.Length;
-        BinaryPrimitives.WriteInt32LittleEndian(bytes[streamIdBytesLength..(streamIdBytesLength + 4)], request.TopicId ?? 0);
-        int position = 4 + streamIdBytesLength;
-        BinaryPrimitives.WriteInt32LittleEndian(bytes[position..(position + 4)], request.PartitionsCount);
-        BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 4)..(position + 8)], request.MessageExpiry);
-        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 8)..(position + 16)], request.MaxTopicSize);
-        bytes[position + 16] = request.ReplicationFactor;
-        bytes[position + 17] = (byte)request.Name.Length;
-        Encoding.UTF8.GetBytes(request.Name, bytes[(position + 18)..]);
+        var position = 2 + streamId.Length;
+        BinaryPrimitives.WriteInt32LittleEndian(bytes[position..(position + 4)], request.TopicId ?? 0);
+        BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 4)..(position + 8)], request.PartitionsCount);
+        bytes[position + 8] = (byte)request.CompressionAlgorithm;
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 9)..(position + 17)], request.MessageExpiry);
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 17)..(position + 25)], request.MaxTopicSize);
+        bytes[position + 25] = request.ReplicationFactor;
+        bytes[position + 26] = (byte)request.Name.Length;
+        Encoding.UTF8.GetBytes(request.Name, bytes[(position + 27)..]);
         return bytes.ToArray();
     }
 
@@ -662,6 +699,13 @@ internal static class TcpContracts
 
 
     internal static byte[] DeleteTopic(Identifier streamId, Identifier topicId)
+    {
+        Span<byte> bytes = stackalloc byte[2 + streamId.Length + 2 + topicId.Length];
+        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId , topicId);
+        return bytes.ToArray();
+    }
+    
+    internal static byte[] PurgeTopic(Identifier streamId, Identifier topicId)
     {
         Span<byte> bytes = stackalloc byte[2 + streamId.Length + 2 + topicId.Length];
         bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId , topicId);
@@ -707,7 +751,7 @@ internal static class TcpContracts
     internal static byte[] DeletePartitions(DeletePartitionsRequest request)
     {
         Span<byte> bytes = stackalloc byte[2 + request.StreamId.Length + 2 + request.TopicId.Length + sizeof(int)];
-        bytes.WriteBytesFromStreamAndTopicIdentifiers(request.StreamId , request.TopicId);
+        bytes.WriteBytesFromStreamAndTopicIdentifiers(request.StreamId, request.TopicId);
         int position = 2 + request.StreamId.Length + 2 + request.TopicId.Length;
         BinaryPrimitives.WriteInt32LittleEndian(bytes[position..(position + 4)], request.PartitionsCount);
         return bytes.ToArray();

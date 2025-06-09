@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-﻿using Iggy_SDK.Configuration;
+using Iggy_SDK.Configuration;
 using Iggy_SDK.Contracts.Http;
 using Iggy_SDK.Contracts.Http.Auth;
 using Iggy_SDK.Enums;
@@ -60,17 +60,32 @@ public class HttpMessageStream : IIggyClient
         _logger = loggerFactory.CreateLogger<HttpMessageStream>();
     }
     
-    public async Task CreateStreamAsync(StreamRequest request, CancellationToken token = default)
+    public async Task<StreamResponse?> CreateStreamAsync(StreamRequest request, CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(request, JsonConverterFactory.SnakeCaseOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
         var response = await _httpClient.PostAsync("/streams", data, token);
+        
+        if (response.IsSuccessStatusCode)
+        {
+            return await response.Content.ReadFromJsonAsync<StreamResponse>(JsonConverterFactory.StreamResponseOptions, cancellationToken: token);
+        }
+        
+        await HandleResponseAsync(response);
+        
+        return null;
+    }
+    
+    public async Task PurgeStreamAsync(Identifier streamId, CancellationToken token = default)
+    {
+        var response = await _httpClient.DeleteAsync($"/streams/{streamId}/purge", token);
         if (!response.IsSuccessStatusCode)
         {
             await HandleResponseAsync(response);
         }
     }
+    
     public async Task DeleteStreamAsync(Identifier streamId, CancellationToken token = default)
     {
         var response = await _httpClient.DeleteAsync($"/streams/{streamId}", token);
@@ -79,6 +94,7 @@ public class HttpMessageStream : IIggyClient
             await HandleResponseAsync(response);
         }
     }
+    
     public async Task<StreamResponse?> GetStreamByIdAsync(Identifier streamId, CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync($"/streams/{streamId}", token);
@@ -116,16 +132,22 @@ public class HttpMessageStream : IIggyClient
         await HandleResponseAsync(response);
         return Array.Empty<StreamResponse>();
     }
-    public async Task CreateTopicAsync(Identifier streamId, TopicRequest topic, CancellationToken token = default)
+    
+    public async Task<TopicResponse?> CreateTopicAsync(Identifier streamId, TopicRequest topic, CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(topic, JsonConverterFactory.CreateTopicOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
         var response = await _httpClient.PostAsync($"/streams/{streamId}/topics", data, token);
-        if (!response.IsSuccessStatusCode)
+        
+        if (response.IsSuccessStatusCode)
         {
-            await HandleResponseAsync(response);
+            return await response.Content.ReadFromJsonAsync<TopicResponse>(JsonConverterFactory.TopicResponseOptions, cancellationToken: token);
         }
+        
+        await HandleResponseAsync(response);
+        
+        return null;
     }
 
     public async Task UpdateTopicAsync(Identifier streamId, Identifier topicId, UpdateTopicRequest request, CancellationToken token = default)
@@ -147,6 +169,19 @@ public class HttpMessageStream : IIggyClient
             await HandleResponseAsync(response);
         }
     }
+
+    public Task PurgeTopicAsync(Identifier streamId, Identifier topicId, CancellationToken token = default)
+    {
+        return _httpClient.DeleteAsync($"/streams/{streamId}/topics/{topicId}/purge", token)
+            .ContinueWith(async response =>
+            {
+                if (!response.Result.IsSuccessStatusCode)
+                {
+                    await HandleResponseAsync(response.Result);
+                }
+            }, token);
+    }
+
     public async Task<IReadOnlyList<TopicResponse>> GetTopicsAsync(Identifier streamId, CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync($"/streams/{streamId}/topics", token);
@@ -205,11 +240,18 @@ public class HttpMessageStream : IIggyClient
             StreamId = request.StreamId,
             TopicId = request.TopicId,
             Partitioning = request.Partitioning,
-            Messages = messages.Select(message => new Message
+            Messages = messages.Select(message =>
             {
-                Id = Guid.NewGuid(),
-                Headers = headers,
-                Payload = encryptor is not null ? encryptor(serializer(message)) : serializer(message),
+                return new Message
+                {
+                    // TODO: message id
+                    Header = new MessageHeader()
+                    {
+                        Id = 0,
+                    },
+                    UserHeaders = headers,
+                    Payload = encryptor is not null ? encryptor(serializer(message)) : serializer(message),
+                };
             }).ToArray()
         };
         
@@ -228,6 +270,18 @@ public class HttpMessageStream : IIggyClient
             return;
         }
         await _channel!.Writer.WriteAsync(sendRequest, token);
+    }
+
+    public async Task FlushUnsavedBufferAsync(FlushUnsavedBufferRequest request, CancellationToken token = default)
+    {
+        var url = CreateUrl($"/streams/{request.StreamId}/topics/{request.TopicId}/messages/flush/{request.PartitionId}/{request.Fsync}");
+        
+        var response = await _httpClient.GetAsync(url, token);
+        
+        if (!response.IsSuccessStatusCode)
+        {
+            await HandleResponseAsync(response);
+        }
     }
 
     public async Task<PolledMessages> FetchMessagesAsync(MessageFetchRequest request,
@@ -293,7 +347,7 @@ public class HttpMessageStream : IIggyClient
         {
             yield return messageResponse;
             
-            var currentOffset = messageResponse.Offset;
+            var currentOffset = messageResponse.Header.Offset;
             if (_messagePollingSettings.StoreOffsetStrategy is StoreOffset.AfterProcessingEachMessage)
             {
                 var storeOffsetRequest = new StoreOffsetRequest
@@ -375,6 +429,7 @@ public class HttpMessageStream : IIggyClient
         await HandleResponseAsync(response);
         return null;
     }
+    
     public async Task<IReadOnlyList<ConsumerGroupResponse>> GetConsumerGroupsAsync(Identifier streamId, Identifier topicId, CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync($"/streams/{streamId}/topics/{topicId}/consumer-groups", token);
@@ -387,6 +442,7 @@ public class HttpMessageStream : IIggyClient
         await HandleResponseAsync(response);
         return Array.Empty<ConsumerGroupResponse>();
     }
+    
     public async Task<ConsumerGroupResponse?> GetConsumerGroupByIdAsync(Identifier streamId, Identifier topicId,
         Identifier groupId, CancellationToken token = default)
     {
@@ -401,16 +457,19 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
     
-    public async Task CreateConsumerGroupAsync(CreateConsumerGroupRequest request, CancellationToken token = default)
+    public async Task<ConsumerGroupResponse?> CreateConsumerGroupAsync(CreateConsumerGroupRequest request, CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(request, JsonConverterFactory.SnakeCaseOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
         var response = await _httpClient.PostAsync($"/streams/{request.StreamId}/topics/{request.TopicId}/consumer-groups", data, token);
-        if (!response.IsSuccessStatusCode)
+        if (response.IsSuccessStatusCode)
         {
-            await HandleResponseAsync(response);
+            return await response.Content.ReadFromJsonAsync<ConsumerGroupResponse>(JsonConverterFactory.SnakeCaseOptions, cancellationToken: token);
         }
+
+        await HandleResponseAsync(response);
+        return null;
     }
     
     public async Task DeleteConsumerGroupAsync(DeleteConsumerGroupRequest request, CancellationToken token = default)
@@ -418,6 +477,12 @@ public class HttpMessageStream : IIggyClient
         var response = await _httpClient.DeleteAsync($"/streams/{request.StreamId}/topics/{request.TopicId}/consumer-groups/{request.ConsumerGroupId}", token);
         await HandleResponseAsync(response);
     }
+
+    public Task<ClientResponse?> GetMeAsync(CancellationToken token = default)
+    {
+        throw new NotImplementedException();
+    }
+
     public async Task<Stats?> GetStatsAsync(CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync($"/stats", token);
@@ -429,6 +494,17 @@ public class HttpMessageStream : IIggyClient
         await HandleResponseAsync(response);
         return null;
     }
+
+    public async Task PingAsync(CancellationToken token = default)
+    {
+        var response = await _httpClient.GetAsync("/ping", token);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            await HandleResponseAsync(response);
+        }
+    }
+
     public async Task<IReadOnlyList<ClientResponse>> GetClientsAsync(CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync($"/clients", token);
@@ -440,6 +516,7 @@ public class HttpMessageStream : IIggyClient
         await HandleResponseAsync(response);
         return Array.Empty<ClientResponse>();
     }
+    
     public async Task<ClientResponse?> GetClientByIdAsync(uint clientId, CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync($"/clients/{clientId}", token);
@@ -512,6 +589,7 @@ public class HttpMessageStream : IIggyClient
         await HandleResponseAsync(response);
         return null;
     }
+    
     public async Task<IReadOnlyList<UserResponse>> GetUsers(CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync("/users", token);
@@ -523,16 +601,20 @@ public class HttpMessageStream : IIggyClient
         await HandleResponseAsync(response);
         return Array.Empty<UserResponse>();
     }
-    public async Task CreateUser(CreateUserRequest request, CancellationToken token = default)
+    
+    public async Task<UserResponse?> CreateUser(CreateUserRequest request, CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(request, JsonConverterFactory.SnakeCaseOptions);
         var content = new StringContent(json, Encoding.UTF8, "application/json"); 
         var response = await _httpClient.PostAsync("/users", content, token);
-        if (!response.IsSuccessStatusCode)
+        if (response.IsSuccessStatusCode)
         {
-            await HandleResponseAsync(response);
+            return await response.Content.ReadFromJsonAsync<UserResponse>(JsonConverterFactory.SnakeCaseOptions, token);
         }
+        await HandleResponseAsync(response);
+        return null;
     }
+    
     public async Task DeleteUser(Identifier userId, CancellationToken token = default)
     {
         var response = await _httpClient.DeleteAsync($"/users/{userId}", token);
@@ -541,6 +623,7 @@ public class HttpMessageStream : IIggyClient
             await HandleResponseAsync(response);
         }
     }
+    
     public async Task UpdateUser(UpdateUserRequest request, CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(request, JsonConverterFactory.SnakeCaseOptions);
@@ -551,6 +634,7 @@ public class HttpMessageStream : IIggyClient
             await HandleResponseAsync(response);
         }
     }
+    
     public async Task UpdatePermissions(UpdateUserPermissionsRequest request, CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(request, JsonConverterFactory.SnakeCaseOptions);
@@ -561,6 +645,7 @@ public class HttpMessageStream : IIggyClient
             await HandleResponseAsync(response);
         }
     }
+    
     public async Task ChangePassword(ChangePasswordRequest request, CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(request, JsonConverterFactory.SnakeCaseOptions);
@@ -571,6 +656,7 @@ public class HttpMessageStream : IIggyClient
             await HandleResponseAsync(response);
         }
     }
+    
     public async Task<AuthResponse?> LoginUser(LoginUserRequest request, CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(request, JsonConverterFactory.SnakeCaseOptions);
@@ -595,6 +681,7 @@ public class HttpMessageStream : IIggyClient
         await HandleResponseAsync(response);
         return null;
     }
+    
     public async Task LogoutUser(CancellationToken token = default)
     {
         // var json = JsonSerializer.Serialize(new
@@ -608,6 +695,7 @@ public class HttpMessageStream : IIggyClient
         }
         _httpClient.DefaultRequestHeaders.Authorization = null;
     }
+    
     public async Task<IReadOnlyList<PersonalAccessTokenResponse>> GetPersonalAccessTokensAsync(CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync("/personal-access-tokens", token);
@@ -619,6 +707,7 @@ public class HttpMessageStream : IIggyClient
         await HandleResponseAsync(response);
         return Array.Empty<PersonalAccessTokenResponse>();
     }
+    
     public async Task<RawPersonalAccessToken?> CreatePersonalAccessTokenAsync(CreatePersonalAccessTokenRequest request, CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(request, JsonConverterFactory.SnakeCaseOptions);
@@ -630,6 +719,7 @@ public class HttpMessageStream : IIggyClient
         }
         return await response.Content.ReadFromJsonAsync<RawPersonalAccessToken>(JsonConverterFactory.SnakeCaseOptions, token);
     }
+    
     public async Task DeletePersonalAccessTokenAsync(DeletePersonalAccessTokenRequest request, CancellationToken token = default)
     {
         var response = await _httpClient.DeleteAsync($"/personal-access-tokens/{request.Name}", token);
@@ -638,6 +728,7 @@ public class HttpMessageStream : IIggyClient
             await HandleResponseAsync(response);
         }
     }
+    
     public async Task<AuthResponse?> LoginWithPersonalAccessToken(LoginWithPersonalAccessToken request, CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(request, JsonConverterFactory.SnakeCaseOptions); 

@@ -16,7 +16,10 @@
  * under the License.
  */
 
-use super::defaults::*;
+use super::defaults::{
+    DEFAULT_HTTP_SERVER_ADDRESS, DEFAULT_QUIC_CLIENT_ADDRESS, DEFAULT_QUIC_SERVER_ADDRESS,
+    DEFAULT_QUIC_SERVER_NAME, DEFAULT_QUIC_VALIDATE_CERTIFICATE, DEFAULT_TCP_SERVER_ADDRESS,
+};
 use super::{output::BenchmarkOutputCommand, props::BenchmarkTransportProps};
 use clap::{Parser, Subcommand};
 use integration::test_server::Transport;
@@ -35,9 +38,9 @@ impl Serialize for BenchmarkTransportCommand {
         S: Serializer,
     {
         let variant_str = match self {
-            BenchmarkTransportCommand::Http(_) => "http",
-            BenchmarkTransportCommand::Tcp(_) => "tcp",
-            BenchmarkTransportCommand::Quic(_) => "quic",
+            Self::Http(_) => "http",
+            Self::Tcp(_) => "tcp",
+            Self::Quic(_) => "quic",
         };
         serializer.serialize_str(variant_str)
     }
@@ -66,13 +69,13 @@ impl BenchmarkTransportProps for BenchmarkTransportCommand {
 
     fn inner(&self) -> &dyn BenchmarkTransportProps {
         match self {
-            BenchmarkTransportCommand::Http(args) => args,
-            BenchmarkTransportCommand::Tcp(args) => args,
-            BenchmarkTransportCommand::Quic(args) => args,
+            Self::Http(args) => args,
+            Self::Tcp(args) => args,
+            Self::Quic(args) => args,
         }
     }
 
-    fn output_command(&self) -> &Option<BenchmarkOutputCommand> {
+    fn output_command(&self) -> Option<&BenchmarkOutputCommand> {
         self.inner().output_command()
     }
 }
@@ -109,8 +112,8 @@ impl BenchmarkTransportProps for HttpArgs {
         panic!("Setting nodelay for HTTP transport is not supported!")
     }
 
-    fn output_command(&self) -> &Option<BenchmarkOutputCommand> {
-        &self.output
+    fn output_command(&self) -> Option<&BenchmarkOutputCommand> {
+        self.output.as_ref()
     }
 }
 
@@ -150,8 +153,8 @@ impl BenchmarkTransportProps for TcpArgs {
         self.nodelay
     }
 
-    fn output_command(&self) -> &Option<BenchmarkOutputCommand> {
-        &self.output
+    fn output_command(&self) -> Option<&BenchmarkOutputCommand> {
+        self.output.as_ref()
     }
 }
 
@@ -199,7 +202,7 @@ impl BenchmarkTransportProps for QuicArgs {
         panic!("Setting nodelay for QUIC transport is not supported!")
     }
 
-    fn output_command(&self) -> &Option<BenchmarkOutputCommand> {
-        &self.output
+    fn output_command(&self) -> Option<&BenchmarkOutputCommand> {
+        self.output.as_ref()
     }
 }

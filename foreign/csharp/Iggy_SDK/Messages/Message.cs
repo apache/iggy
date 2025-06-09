@@ -15,13 +15,44 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.IO.Hashing;
+using Iggy_SDK.Extensions;
 using Iggy_SDK.Headers;
 
 namespace Iggy_SDK.Messages;
 
 public readonly struct Message
 {
-    public required Guid Id { get; init; }
+    public required MessageHeader Header { get; init; }
     public required byte[] Payload { get; init; }
-    public Dictionary<HeaderKey, HeaderValue>? Headers { get; init; }
+    public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; init; }
+    
+    public Message()
+    {
+
+    }
+    
+    [System.Diagnostics.CodeAnalysis.SetsRequiredMembersAttribute]
+    public Message(Guid id, byte[] payload, Dictionary<HeaderKey, HeaderValue>? userHeaders = null)
+    {
+        Header = new MessageHeader()
+        {
+            PayloadLength = payload.Length,
+            Id = id.ToUInt128(),
+            Checksum = CalculateChecksum(payload)
+        };
+        Payload = payload;
+        UserHeaders = userHeaders;
+    }
+    
+    public int GetSize()
+    {
+        //return 56 + Payload.Length + (UserHeaders?.Count ?? 0);
+        return 56 + Payload.Length;
+    }
+
+    private ulong CalculateChecksum(byte[] bytes)
+    {
+        return BitConverter.ToUInt64(Crc64.Hash(bytes));
+    }
 }

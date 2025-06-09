@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
             workspace_root
                 .join("configs")
                 .canonicalize()
-                .unwrap()
+                .unwrap_or_else(|e| panic!("Failed to canonicalize path, error: {e}"))
                 .display()
         );
     } else {

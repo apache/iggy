@@ -35,6 +35,7 @@ use iggy::prelude::{CacheMetrics, CacheMetricsKey, IggyTimestamp, Stats};
 pub struct BenchmarkReportBuilder;
 
 impl BenchmarkReportBuilder {
+    #[allow(clippy::cast_possible_wrap)]
     pub async fn build(
         hardware: BenchmarkHardware,
         mut params: BenchmarkParams,
@@ -45,8 +46,7 @@ impl BenchmarkReportBuilder {
 
         let timestamp =
             DateTime::<Utc>::from_timestamp_micros(IggyTimestamp::now().as_micros() as i64)
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_else(|| String::from("unknown"));
+                .map_or_else(|| String::from("unknown"), |dt| dt.to_rfc3339());
 
         let transport = params.transport;
         let server_addr = params.server_address.clone();
@@ -57,7 +57,7 @@ impl BenchmarkReportBuilder {
 
         if params.gitref.is_none() {
             params.gitref = Some(server_stats.iggy_server_version.clone());
-        };
+        }
 
         if params.gitref_date.is_none() {
             params.gitref_date = Some(timestamp.clone());
@@ -134,7 +134,7 @@ impl BenchmarkReportBuilder {
 }
 
 /// This function is a workaround.
-/// See server_stats.rs in `bench_report` crate for more details.
+/// See `server_stats.rs` in `bench_report` crate for more details.
 fn stats_to_benchmark_server_stats(stats: Stats) -> BenchmarkServerStats {
     BenchmarkServerStats {
         process_id: stats.process_id,
@@ -166,7 +166,7 @@ fn stats_to_benchmark_server_stats(stats: Stats) -> BenchmarkServerStats {
 }
 
 /// This function is a workaround.
-/// See server_stats.rs in `bench_report` crate for more details.
+/// See `server_stats.rs` in `bench_report` crate for more details.
 fn cache_metrics_to_benchmark_cache_metrics(
     cache_metrics: HashMap<CacheMetricsKey, CacheMetrics>,
 ) -> HashMap<BenchmarkCacheMetricsKey, BenchmarkCacheMetrics> {

@@ -17,7 +17,7 @@
  */
 
 use crate::args::{
-    common::IggyBenchArgs, defaults::*, props::BenchmarkKindProps,
+    common::IggyBenchArgs, defaults::DEFAULT_NUMBER_OF_PRODUCERS, props::BenchmarkKindProps,
     transport::BenchmarkTransportCommand,
 };
 use clap::{CommandFactory, Parser, error::ErrorKind};

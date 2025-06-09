@@ -16,7 +16,7 @@
 # under the License.
 
 [package]
-name = "iggy_connector_test_source"
+name = "iggy_connector_random_source"
 version = "0.1.0"
 description = "Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
 edition = "2024"
@@ -28,8 +28,8 @@ documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 
-[lib]
-crate-type = ["cdylib", "lib"]
+[package.metadata.cargo-machete]
+ignored = ["dashmap", "once_cell"]
 
 [dependencies]
 async-trait = { workspace = true }
@@ -44,5 +44,5 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
-[package.metadata.cargo-machete]
-ignored = ["dashmap", "once_cell"]
+[lib]
+crate-type = ["cdylib", "lib"]

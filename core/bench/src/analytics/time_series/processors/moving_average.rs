@@ -16,6 +16,8 @@
  * under the License.
  */
 
+#![allow(clippy::cast_precision_loss)]
+
 use super::TimeSeriesProcessor;
 use bench_report::time_series::{TimePoint, TimeSeries};
 use std::collections::VecDeque;
@@ -27,7 +29,7 @@ pub struct MovingAverageProcessor {
 }
 
 impl MovingAverageProcessor {
-    pub fn new(window_size: usize) -> Self {
+    pub const fn new(window_size: usize) -> Self {
         Self { window_size }
     }
 }

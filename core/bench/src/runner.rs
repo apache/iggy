@@ -37,17 +37,17 @@ pub struct BenchmarkRunner {
 }
 
 impl BenchmarkRunner {
-    pub fn new(args: IggyBenchArgs) -> Self {
+    pub const fn new(args: IggyBenchArgs) -> Self {
         Self {
             args: Some(args),
             test_server: None,
         }
     }
 
-    pub async fn run(&mut self) -> Result<(), IggyError> {
-        let mut args = self.args.take().unwrap();
+    pub async fn run(mut self) -> Result<(), IggyError> {
+        let args = self.args.take().unwrap();
         let should_open_charts = args.open_charts();
-        self.test_server = start_server_if_needed(&mut args).await;
+        self.test_server = start_server_if_needed(&args).await;
 
         let transport = args.transport();
         let server_addr = args.server_address();
@@ -113,7 +113,7 @@ impl BenchmarkRunner {
             plot_chart(
                 &report,
                 &full_output_path,
-                ChartType::Throughput,
+                &ChartType::Throughput,
                 should_open_charts,
             )
             .map_err(|e| {
@@ -123,7 +123,7 @@ impl BenchmarkRunner {
             plot_chart(
                 &report,
                 &full_output_path,
-                ChartType::Latency,
+                &ChartType::Latency,
                 should_open_charts,
             )
             .map_err(|e| {

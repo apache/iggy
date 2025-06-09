@@ -17,7 +17,10 @@
  */
 
 use super::benchmark::Benchmarkable;
-use crate::{args::common::IggyBenchArgs, benchmarks::common::*};
+use crate::{
+    args::common::IggyBenchArgs,
+    benchmarks::common::{build_consumer_futures, init_consumer_groups},
+};
 use async_trait::async_trait;
 use bench_report::{benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics};
 use iggy::prelude::*;
@@ -32,11 +35,11 @@ pub struct BalancedConsumerGroupBenchmark {
 }
 
 impl BalancedConsumerGroupBenchmark {
-    pub fn new(args: Arc<IggyBenchArgs>, client_factory: Arc<dyn ClientFactory>) -> Box<Self> {
-        Box::new(Self {
+    pub fn new(args: Arc<IggyBenchArgs>, client_factory: Arc<dyn ClientFactory>) -> Self {
+        Self {
             args,
             client_factory,
-        })
+        }
     }
 }
 
@@ -52,7 +55,7 @@ impl Benchmarkable for BalancedConsumerGroupBenchmark {
 
         init_consumer_groups(cf, &args).await?;
 
-        let consumer_futures = build_consumer_futures(cf, &args)?;
+        let consumer_futures = build_consumer_futures(cf, &args);
         for fut in consumer_futures {
             tasks.spawn(fut);
         }

@@ -36,9 +36,11 @@ internal class TcpMessageInvoker : IMessageInvoker
         CancellationToken token = default)
     {
         var messages = request.Messages;
-        var streamTopicIdLength = 2 + request.StreamId.Length + 2 + request.TopicId.Length;
+        // StreamId, TopicId, Partitioning, message count, metadata field
+        var metadataLength = 2 + request.StreamId.Length + 2 + request.TopicId.Length 
+                             + 2 + request.Partitioning.Length + 4 + 4;
         var messageBufferSize = TcpMessageStreamHelpers.CalculateMessageBytesCount(messages)
-                       + request.Partitioning.Length + streamTopicIdLength + 2;
+                       +  metadataLength ;
         var payloadBufferSize = messageBufferSize + 4 + BufferSizes.InitialBytesLength;
 
         var messageBuffer = MemoryPool<byte>.Shared.Rent(messageBufferSize);
@@ -47,18 +49,28 @@ internal class TcpMessageInvoker : IMessageInvoker
         try
         {
             TcpContracts.CreateMessage(messageBuffer.Memory.Span[..messageBufferSize], request.StreamId, request.TopicId,
-                request.Partitioning,
-                messages);
+                request.Partitioning, messages);
+            
             TcpMessageStreamHelpers.CreatePayload(payloadBuffer.Memory.Span[..payloadBufferSize], 
                 messageBuffer.Memory.Span[..messageBufferSize], CommandCodes.SEND_MESSAGES_CODE);
 
             await _stream.SendAsync(payloadBuffer.Memory[..payloadBufferSize], token);
             await _stream.FlushAsync(token);
-            await _stream.ReadAsync(responseBuffer.Memory, token);
+            var readed = await _stream.ReadAsync(responseBuffer.Memory, token);
 
+            if(readed == 0)
+            {
+                throw new InvalidResponseException("No response received from the server.");
+            }
+            
             var response = TcpMessageStreamHelpers.GetResponseLengthAndStatus(responseBuffer.Memory.Span);
             if (response.Status != 0)
             {
+                if (response.Length == 0)
+                {
+                    throw new InvalidResponseException($"Invalid response status code: {response.Status}");
+                }
+            
                 var errorBuffer = new byte[response.Length];
                 await _stream.ReadAsync(errorBuffer, token);
                 throw new InvalidResponseException(Encoding.UTF8.GetString(errorBuffer));

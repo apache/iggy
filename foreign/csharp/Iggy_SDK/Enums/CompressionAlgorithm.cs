@@ -26,7 +26,7 @@ namespace Iggy_SDK.Enums;
 public enum CompressionAlgorithm
 {
     // No compression
-    None,
+    None = 1,
     // Gzip compression algorithm
-    Gzip,
+    Gzip = 2,
 }

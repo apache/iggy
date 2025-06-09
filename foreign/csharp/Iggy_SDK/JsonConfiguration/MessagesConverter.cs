@@ -36,18 +36,7 @@ internal sealed class MessagesConverter : JsonConverter<MessageSendRequest>
     {
         if (value.Messages.Any())
         {
-            var msgList = new List<HttpMessage>();
-            foreach (var message in value.Messages)
-            {
-                var base64 = Convert.ToBase64String(message.Payload);
-                msgList.Add(new HttpMessage
-                {
-                    Id = message.Id.ToUInt128(),
-                    Payload = base64,
-                    Headers = message.Headers,
-                });
-            }
-
+            
             writer.WriteStartObject();
             writer.WriteStartObject("partitioning");
 
@@ -62,7 +51,7 @@ internal sealed class MessagesConverter : JsonConverter<MessageSendRequest>
             writer.WriteEndObject();
 
             writer.WriteStartArray("messages");
-            foreach (var msg in msgList)
+            foreach (var msg in value.Messages)
             {
                 JsonSerializer.Serialize(writer, msg, JsonConverterFactory.HttpMessageOptions);
             }

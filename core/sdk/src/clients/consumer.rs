@@ -251,6 +251,13 @@ impl IggyConsumer {
         .await
     }
 
+    /// Retrieves the last consumed offset for the specified partition ID.
+    /// To get the current partition ID use `partition_id()`
+    pub fn get_last_consumed_offset(&self, partition_id: u32) -> Option<u64> {
+        let offset = self.last_consumed_offsets.get(&partition_id)?;
+        Some(offset.load(ORDERING))
+    }
+
     /// Deletes the consumer offset on the server either for the current partition or the provided partition ID.
     pub async fn delete_offset(&self, partition_id: Option<u32>) -> Result<(), IggyError> {
         let client = self.client.read().await;
@@ -262,6 +269,13 @@ impl IggyConsumer {
                 partition_id,
             )
             .await
+    }
+
+    /// Retrieves the last stored offset (on the server) for the specified partition ID.
+    /// To get the current partition ID use `partition_id()`
+    pub fn get_last_stored_offset(&self, partition_id: u32) -> Option<u64> {
+        let offset = self.last_stored_offsets.get(&partition_id)?;
+        Some(offset.load(ORDERING))
     }
 
     /// Initializes the consumer by subscribing to diagnostic events, initializing the consumer group if needed, storing the offsets in the background etc.
@@ -805,9 +819,19 @@ impl IggyConsumer {
             info!(
                 "Creating consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}"
             );
-            client
+            match client
                 .create_consumer_group(&stream_id, &topic_id, &name, id)
-                .await?;
+                .await
+            {
+                Ok(_) => {}
+                Err(IggyError::ConsumerGroupNameAlreadyExists(_, _)) => {}
+                Err(error) => {
+                    error!(
+                        "Failed to create consumer group {consumer_group_id} for topic: {topic_id}, stream: {stream_id}: {error}"
+                    );
+                    return Err(error);
+                }
+            }
         }
 
         info!(

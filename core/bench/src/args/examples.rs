@@ -169,5 +169,5 @@ const EXAMPLES: &str = r#"EXAMPLES:
 "#;
 
 pub fn print_examples() {
-    println!("{}", EXAMPLES);
+    println!("{EXAMPLES}");
 }

@@ -23,7 +23,6 @@ using Iggy_SDK.Contracts.Tcp;
 using Iggy_SDK.Enums;
 using Iggy_SDK_Tests.Utils.Groups;
 using Iggy_SDK_Tests.Utils.Messages;
-using Iggy_SDK_Tests.Utils.Offset;
 using Iggy_SDK_Tests.Utils.Partitions;
 using Iggy_SDK_Tests.Utils.Streams;
 using Iggy_SDK_Tests.Utils.Topics;
@@ -31,6 +30,8 @@ using Iggy_SDK_Tests.Utils.Users;
 using Iggy_SDK.Contracts.Http.Auth;
 using System.Buffers.Binary;
 using System.Text;
+using Iggy_SDK_Tests.Utils.Offsets;
+using Iggy_SDK.Extensions;
 
 namespace Iggy_SDK_Tests.ContractTests;
 
@@ -68,7 +69,7 @@ public sealed class TcpContract
         byte[] result = TcpContracts.CreatePersonalAccessToken(request);
 
         // Assert
-        Assert.Equal(5 + request.Name.Length, result.Length); // The expected length
+        Assert.Equal(9 + request.Name.Length, result.Length); // The expected length
         Assert.Equal(Encoding.UTF8.GetBytes(request.Name), result[1..(1 + request.Name.Length)]); // The expected length of the name
         Assert.Equal((uint)3600, BinaryPrimitives.ReadUInt32LittleEndian(result[(1 + request.Name.Length)..]));
     }
@@ -87,10 +88,11 @@ public sealed class TcpContract
         byte[] result = TcpContracts.CreatePersonalAccessToken(request);
 
         // Assert
-        Assert.Equal(5 + request.Name.Length, result.Length); // The expected length
+        Assert.Equal(9 + request.Name.Length, result.Length); // The expected length
         Assert.Equal(Encoding.UTF8.GetBytes(request.Name), result[1..(1 + request.Name.Length)]); // The expected length of the name
-        Assert.Equal((uint)0, BinaryPrimitives.ReadUInt32LittleEndian(result[(1 + request.Name.Length)..]));
+        Assert.Equal((uint)0, BinaryPrimitives.ReadUInt64LittleEndian(result[(1 + request.Name.Length)..]));
     }
+    
     [Fact]
     public void TcpContracts_LoginUser_HasCorrectBytes()
     {
@@ -105,7 +107,7 @@ public sealed class TcpContract
         var result = TcpContracts.LoginUser(request);
 
         // Assert
-        var expectedLength = request.Username.Length + request.Password.Length + 2;
+        var expectedLength = request.Username.Length + request.Password.Length + 2 + 4 + 4;
         Assert.Equal(expectedLength, result.Length);
 
         var position = 0;
@@ -123,6 +125,54 @@ public sealed class TcpContract
         Assert.Equal(request.Username, decodedUsername);
         Assert.Equal(request.Password, decodedPassword);
     }
+    
+    [Fact]
+    public void TcpContracts_LoginUserWithOptional_HasCorrectBytes()
+    {
+        // Arrange
+        var request = new LoginUserRequest
+        {
+            Username = "testuser",
+            Password = "testpassword",
+            Context = "optional context",
+            Version = "1.0.0"
+        };
+
+        // Act
+        var result = TcpContracts.LoginUser(request);
+
+        // Assert
+        var expectedLength = 51;
+        Assert.Equal(expectedLength, result.Length);
+
+        var position = 0;
+        var usernameLength = result[position];
+        position += 1;
+        var usernameBytes = result[position..(position + usernameLength)];
+        position += usernameLength;
+        var passwordLength = result[position];
+        position += 1;
+        var passwordBytes = result[position..(position + passwordLength)];
+        position += passwordLength;
+        var versionLength = BinaryPrimitives.ReadInt32LittleEndian(result[position..(position + 4)]);
+        position += 4;
+        var versionBytes = result[position..(position + versionLength)];
+        position += versionLength;
+        var contextLength = BinaryPrimitives.ReadInt32LittleEndian(result[position..(position + 4)]);
+        position += 4;
+        var contextBytes = result[position..(position + contextLength)];
+
+        var decodedUsername = Encoding.UTF8.GetString(usernameBytes);
+        var decodedPassword = Encoding.UTF8.GetString(passwordBytes);
+        var decodedVersion = Encoding.UTF8.GetString(versionBytes);
+        var decodedContext = Encoding.UTF8.GetString(contextBytes);
+
+        Assert.Equal(request.Username, decodedUsername);
+        Assert.Equal(request.Password, decodedPassword);
+        Assert.Equal(request.Version, decodedVersion);
+        Assert.Equal(request.Context, decodedContext);
+    }
+    
     [Fact]
     public void TcpContracts_UpdateUser_HasCorrectBytes()
     {
@@ -546,8 +596,8 @@ public sealed class TcpContract
         var streamId = Identifier.Numeric(1);
         var topicId = Identifier.Numeric(1);
         var request = MessageFactory.CreateMessageSendRequest();
-        var messageBufferSize = request.Messages.Sum(message => 16 + 4 + 4 + message.Payload.Length)
-                                + request.Partitioning.Length + 14;
+        var messageBufferSize = request.Messages.Sum(message => 56 + 16 + message.Payload.Length)
+                                + request.Partitioning.Length + 22;
         var result = new byte[messageBufferSize];
 
 
@@ -555,33 +605,37 @@ public sealed class TcpContract
         TcpContracts.CreateMessage(result, streamId, topicId, request.Partitioning, request.Messages);
 
         //Assert
-        Assert.Equal(streamId.Value, BytesToIdentifierNumeric(result, 0).Value);
-        Assert.Equal(topicId.Value, BytesToIdentifierNumeric(result, 6).Value);
-        Assert.Equal(streamId.Length, BytesToIdentifierNumeric(result, 0).Length);
-        Assert.Equal(topicId.Length, BytesToIdentifierNumeric(result, 6).Length);
-        Assert.Equal(streamId.Kind, BytesToIdentifierNumeric(result, 0).Kind);
-        Assert.Equal(topicId.Kind, BytesToIdentifierNumeric(result, 6).Kind);
-        Assert.Equal(request.Partitioning.Kind, result[12] switch
+        Assert.Equal(22, BitConverter.ToInt32(result[..4])); // metadata
+        Assert.Equal(streamId.Value, BytesToIdentifierNumeric(result, 4).Value);
+        Assert.Equal(topicId.Value, BytesToIdentifierNumeric(result, 10).Value);
+        Assert.Equal(streamId.Length, BytesToIdentifierNumeric(result, 4).Length);
+        Assert.Equal(topicId.Length, BytesToIdentifierNumeric(result, 10).Length);
+        Assert.Equal(streamId.Kind, BytesToIdentifierNumeric(result, 4).Kind);
+        Assert.Equal(topicId.Kind, BytesToIdentifierNumeric(result, 10).Kind);
+        Assert.Equal(request.Partitioning.Kind, result[16] switch
         {
             1 => Partitioning.Balanced,
             2 => Partitioning.PartitionId,
             3 => Partitioning.MessageKey,
             _ => throw new ArgumentOutOfRangeException()
         });
-        Assert.Equal(request.Partitioning.Length, result[13]);
-        Assert.Equal(request.Partitioning.Value.Length, result[14..(14 + request.Partitioning.Length)].Length);
+        Assert.Equal(request.Partitioning.Length, result[17]);
+        Assert.Equal(request.Partitioning.Value.Length, result[18..(18 + request.Partitioning.Length)].Length);
 
-        int currentIndex = 14 + request.Partitioning.Length;
+        int currentIndex = 26 + (16 * 2);
         foreach (var message in request.Messages)
         {
-            // Assert
-            Assert.Equal(message.Id, new Guid(result[currentIndex..(currentIndex + 16)]));
-            Assert.Equal(result[(currentIndex + 16)..(currentIndex + 20)], new byte[] { 0, 0, 0, 0 });
-            currentIndex += 20;
+            Assert.Equal(message.Header.Checksum, BitConverter.ToUInt64(result[currentIndex..(currentIndex + 8)]));
+            Assert.Equal(message.Header.Id, BinaryPrimitives.ReadUInt128LittleEndian(result[(currentIndex + 8)..(currentIndex + 24)]));
+            Assert.Equal(message.Header.Offset, BitConverter.ToUInt64(result[(currentIndex + 24)..(currentIndex + 32)]));
+            Assert.Equal(message.Header.Timestamp, DateTimeOffsetUtils.FromUnixTimeMicroSeconds(BitConverter.ToUInt64(result[(currentIndex + 32)..(currentIndex + 40)])));
+            Assert.Equal(message.Header.OriginTimestamp, BitConverter.ToUInt64(result[(currentIndex + 40)..(currentIndex + 48)]));
+            var userHeadersLength = BitConverter.ToInt32(result[(currentIndex + 48)..(currentIndex + 52)]);
+            Assert.Equal(message.Header.UserHeadersLength, userHeadersLength);
+            var payloadLength = BitConverter.ToInt32(result[(currentIndex + 52)..(currentIndex + 56)]);
+            Assert.Equal(message.Header.PayloadLength, payloadLength);
 
-            int payloadLength = BitConverter.ToInt32(result[currentIndex..(currentIndex + 4)]);
-            currentIndex += 4;
-
+            currentIndex += 56;
             byte[] payload = result[currentIndex..(currentIndex + payloadLength)].ToArray();
             currentIndex += payloadLength;
 
@@ -753,7 +807,7 @@ public sealed class TcpContract
         var result = TcpContracts.CreateTopic(streamId, request).AsSpan();
 
         // Assert
-        int expectedBytesLength = 2 + streamId.Length + 22 + request.Name.Length; 
+        int expectedBytesLength = 2 + streamId.Length + 27 + request.Name.Length; 
         
         Assert.Equal(expectedBytesLength, result.Length);
         Assert.Equal(streamId.Value, BytesToIdentifierNumeric(result, 0).Value);
@@ -761,11 +815,12 @@ public sealed class TcpContract
         Assert.Equal(streamId.Kind, BytesToIdentifierNumeric(result, 0).Kind);
         Assert.Equal(request.TopicId, BitConverter.ToInt32(result[6..10]));
         Assert.Equal(request.PartitionsCount, BitConverter.ToInt32(result[10..14]));
-        Assert.Equal(request.MessageExpiry, BitConverter.ToInt32(result[14..18]));
-        Assert.Equal(request.MaxTopicSize, BitConverter.ToUInt64(result[18..26]));
-        Assert.Equal(request.ReplicationFactor, (int)result[26]);
-        Assert.Equal(request.Name.Length, (int)result[27]);
-        Assert.Equal(request.Name, Encoding.UTF8.GetString(result[28..]));
+        Assert.Equal((int)request.CompressionAlgorithm, result[14]);
+        Assert.Equal(request.MessageExpiry, BitConverter.ToUInt64(result[15..23]));
+        Assert.Equal(request.MaxTopicSize, BitConverter.ToUInt64(result[23..31]));
+        Assert.Equal(request.ReplicationFactor, (int)result[31]);
+        Assert.Equal(request.Name.Length, (int)result[32]);
+        Assert.Equal(request.Name, Encoding.UTF8.GetString(result[33..]));
     }
 
 

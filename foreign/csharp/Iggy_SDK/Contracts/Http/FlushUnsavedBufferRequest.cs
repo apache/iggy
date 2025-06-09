@@ -1,4 +1,4 @@
-// Licensed to the Apache Software Foundation (ASF) under one
+﻿// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Contracts.Http;
-namespace Iggy_SDK.IggyClient;
+namespace Iggy_SDK.Contracts.Http;
 
-public interface IIggyUtils
+public sealed class FlushUnsavedBufferRequest
 {
-    public Task<Stats?> GetStatsAsync(CancellationToken token = default);
-    public Task<IReadOnlyList<ClientResponse>> GetClientsAsync(CancellationToken token = default);
-    public Task<ClientResponse?> GetClientByIdAsync(uint clientId, CancellationToken token = default);
+    public required Identifier StreamId { get; init; }
+    public required Identifier TopicId { get; init; }
+    public required uint PartitionId { get; init; }
+    public bool Fsync { get; init; } = false;
 }

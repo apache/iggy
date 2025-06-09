@@ -31,6 +31,7 @@ charming = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 figlet-rs = { workspace = true }
+futures-util = { workspace = true }
 governor = "0.10.0"
 hostname = "0.4.1"
 human-repr = { workspace = true }
@@ -50,3 +51,8 @@ uuid = { workspace = true }
 [[bin]]
 name = "iggy-bench"
 path = "src/main.rs"
+
+[lints.clippy]
+enum_glob_use = "deny"
+pedantic = "deny"
+nursery = "deny"

@@ -17,7 +17,12 @@
  */
 
 use crate::args::{
-    common::IggyBenchArgs, defaults::*, props::BenchmarkKindProps,
+    common::IggyBenchArgs,
+    defaults::{
+        DEFAULT_BALANCED_NUMBER_OF_PARTITIONS, DEFAULT_BALANCED_NUMBER_OF_STREAMS,
+        DEFAULT_NUMBER_OF_PRODUCERS,
+    },
+    props::BenchmarkKindProps,
     transport::BenchmarkTransportCommand,
 };
 use clap::{CommandFactory, Parser, error::ErrorKind};

@@ -23,7 +23,7 @@ public record TopicRequest(
     int? TopicId, // If not provided, the Iggy server will generate one automatically
     string Name,
     CompressionAlgorithm CompressionAlgorithm,
-    int MessageExpiry,
+    ulong MessageExpiry,
     int PartitionsCount,
     byte ReplicationFactor,
     ulong MaxTopicSize);

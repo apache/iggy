@@ -17,7 +17,13 @@
  */
 
 use crate::args::{
-    common::IggyBenchArgs, defaults::*, props::BenchmarkKindProps,
+    common::IggyBenchArgs,
+    defaults::{
+        DEFAULT_BALANCED_NUMBER_OF_PARTITIONS, DEFAULT_BALANCED_NUMBER_OF_STREAMS,
+        DEFAULT_NUMBER_OF_CONSUMER_GROUPS, DEFAULT_NUMBER_OF_CONSUMERS,
+        DEFAULT_NUMBER_OF_PRODUCERS,
+    },
+    props::BenchmarkKindProps,
     transport::BenchmarkTransportCommand,
 };
 use clap::{CommandFactory, Parser, error::ErrorKind};
@@ -100,8 +106,7 @@ impl BenchmarkKindProps for EndToEndProducingConsumerGroupArgs {
             cmd.error(
                 ErrorKind::ArgumentConflict,
                 format!(
-                    "For producing consumer group benchmark, consumer groups number ({}) must be less than the number of streams ({})",
-                    cg_number, streams
+                    "For producing consumer group benchmark, consumer groups number ({cg_number}) must be less than the number of streams ({streams})"
                 ),
             )
             .exit();

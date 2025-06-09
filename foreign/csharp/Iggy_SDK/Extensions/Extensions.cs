@@ -120,8 +120,17 @@ internal static class Extensions
         bytes[position + 1] = (byte)topicId.Length;
         topicId.Value.CopyTo(bytes[(position + 2)..(position + 2 + topicId.Length)]);
     }
+    
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void WriteBytesFromIdentifier(this Span<byte> bytes, Identifier identifier, int startPos = 0)
+    {
+        bytes[startPos + 0] = identifier.Kind.GetByte();
+        bytes[startPos + 1] = (byte)identifier.Length;
+        identifier.Value.CopyTo(bytes[(startPos + 2)..]);
+    }
+    
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static void WriteBytesFromPartitioning(this Span<byte> bytes, Kinds.Partitioning identifier, int startPos = 0)
     {
         bytes[startPos + 0] = identifier.Kind.GetByte();
         bytes[startPos + 1] = (byte)identifier.Length;
@@ -133,6 +142,11 @@ internal static class DateTimeOffsetUtils
 {
     internal static DateTimeOffset FromUnixTimeMicroSeconds(ulong microSeconds)
     {
-        return DateTimeOffset.FromUnixTimeSeconds((long)(microSeconds / 1e+6));
+        return DateTimeOffset.FromUnixTimeMilliseconds((long)(microSeconds / 1000));
+    }
+    
+    internal static ulong ToUnixTimeMicroSeconds(DateTimeOffset date)
+    {
+        return (ulong)(date.ToUnixTimeMilliseconds() * 1000);
     }
 }

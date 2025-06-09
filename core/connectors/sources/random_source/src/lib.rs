@@ -28,13 +28,13 @@ use rand::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::{sync::Mutex, time::sleep};
-use tracing::info;
+use tracing::{error, info};
 use uuid::Uuid;
 
-source_connector!(TestSource);
+source_connector!(RandomSource);
 
 #[derive(Debug)]
-pub struct TestSource {
+pub struct RandomSource {
     id: u32,
     max_count: Option<usize>,
     interval: Duration,
@@ -44,7 +44,7 @@ pub struct TestSource {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct TestSourceConfig {
+pub struct RandomSourceConfig {
     interval: Option<String>,
     max_count: Option<usize>,
     messages_range: Option<(u32, u32)>,
@@ -56,12 +56,12 @@ struct State {
     current_number: usize,
 }
 
-impl TestSource {
-    pub fn new(id: u32, config: TestSourceConfig) -> Self {
+impl RandomSource {
+    pub fn new(id: u32, config: RandomSourceConfig) -> Self {
         let interval = config.interval.unwrap_or("1s".to_string());
         let interval = humantime::Duration::from_str(&interval)
             .unwrap_or(humantime::Duration::from_str("1s").unwrap());
-        TestSource {
+        RandomSource {
             id,
             max_count: config.max_count,
             interval: *interval,
@@ -84,7 +84,11 @@ impl TestSource {
                 text: self.generate_random_text(),
             };
             let Ok(payload) = simd_json::to_vec(&record) else {
-                panic!("Failed to serialize record");
+                error!(
+                    "Failed to serialize record by random source connector with ID: {}",
+                    self.id
+                );
+                continue;
             };
 
             let message = ProducedMessage {
@@ -110,10 +114,10 @@ impl TestSource {
 }
 
 #[async_trait]
-impl Source for TestSource {
+impl Source for RandomSource {
     async fn open(&mut self) -> Result<(), iggy_connector_sdk::Error> {
         info!(
-            "Initialized test source with ID {}. Interval: {:#?}, max offset: {:#?}, messages range: {} - {}, payload size: {}",
+            "Initialized random source connector with ID: {}. Interval: {:#?}, max offset: {:#?}, messages range: {} - {}, payload size: {}",
             self.id,
             self.interval,
             self.max_count,
@@ -130,7 +134,7 @@ impl Source for TestSource {
         if let Some(max_count) = self.max_count {
             if state.current_number >= max_count {
                 info!(
-                    "Reached max number of {max_count} messages for test source with ID {}",
+                    "Reached max number of {max_count} messages for random source connector with ID: {}",
                     self.id
                 );
                 return Ok(ProducedMessages {
@@ -143,7 +147,7 @@ impl Source for TestSource {
         let messages = self.generate_messages();
         state.current_number += messages.len();
         info!(
-            "Generated {} messages by test source with ID {}",
+            "Generated {} messages by random source connector with ID: {}",
             messages.len(),
             self.id
         );
@@ -154,7 +158,10 @@ impl Source for TestSource {
     }
 
     async fn close(&mut self) -> Result<(), Error> {
-        info!("Test source with ID {} is shutting down", self.id);
+        info!(
+            "Random source connector with ID: {} is shutting down",
+            self.id
+        );
         Ok(())
     }
 }

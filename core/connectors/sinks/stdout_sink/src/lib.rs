@@ -21,14 +21,21 @@ use iggy_connector_sdk::{
     ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, sink_connector,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use tracing::info;
 
 sink_connector!(StdoutSink);
 
 #[derive(Debug)]
+struct State {
+    invocations_count: usize,
+}
+
+#[derive(Debug)]
 pub struct StdoutSink {
     id: u32,
     print_payload: bool,
+    state: Mutex<State>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -41,6 +48,9 @@ impl StdoutSink {
         StdoutSink {
             id,
             print_payload: config.print_payload.unwrap_or(false),
+            state: Mutex::new(State {
+                invocations_count: 0,
+            }),
         }
     }
 }
@@ -49,7 +59,7 @@ impl StdoutSink {
 impl Sink for StdoutSink {
     async fn open(&mut self) -> Result<(), Error> {
         info!(
-            "Initialized stdout sink with ID: {}. Print payload: {}",
+            "Opened stdout sink connector with ID: {}, print payload: {}",
             self.id, self.print_payload
         );
         Ok(())
@@ -61,15 +71,21 @@ impl Sink for StdoutSink {
         messages_metadata: MessagesMetadata,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), Error> {
+        let mut state = self.state.lock().await;
+        state.invocations_count += 1;
+        let invocation = state.invocations_count;
+        drop(state);
+
         info!(
-            "Stdout sink with ID: {} received: {} messages, schema: {}, stream: {}, topic: {}, partition: {}, offset: {}",
+            "Stdout sink with ID: {} received: {} messages, schema: {}, stream: {}, topic: {}, partition: {}, offset: {}, invocation: {}",
             self.id,
             messages.len(),
             messages_metadata.schema,
             topic_metadata.stream,
-            topic_metadata.stream,
+            topic_metadata.topic,
             messages_metadata.partition_id,
-            messages_metadata.current_offset
+            messages_metadata.current_offset,
+            invocation
         );
         if self.print_payload {
             for message in messages {
@@ -83,7 +99,7 @@ impl Sink for StdoutSink {
     }
 
     async fn close(&mut self) -> Result<(), Error> {
-        info!("Stdout sink with ID: {} is shutting down", self.id);
+        info!("Stdout sink connector with ID: {} is closed.", self.id);
         Ok(())
     }
 }

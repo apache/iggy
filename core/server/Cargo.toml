@@ -25,6 +25,9 @@ license = "Apache-2.0"
 [package.metadata.cargo-udeps.ignore]
 normal = ["tracing-appender"]
 
+[package.metadata.cargo-machete]
+ignored = ["rust-s3"]
+
 [features]
 default = ["mimalloc"]
 tokio-console = ["dep:console-subscriber", "tokio/tracing"]
@@ -128,6 +131,3 @@ serial_test = { workspace = true }
 [[bin]]
 name = "iggy-server"
 path = "src/main.rs"
-
-[package.metadata.cargo-machete]
-ignored = ["rust-s3"]

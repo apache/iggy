@@ -18,7 +18,7 @@
 
 use crate::args::common::IggyBenchArgs;
 use crate::benchmarks::benchmark::Benchmarkable;
-use crate::benchmarks::common::*;
+use crate::benchmarks::common::build_consumer_futures;
 use async_trait::async_trait;
 use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::individual_metrics::BenchmarkIndividualMetrics;
@@ -34,11 +34,11 @@ pub struct PinnedConsumerBenchmark {
 }
 
 impl PinnedConsumerBenchmark {
-    pub fn new(args: Arc<IggyBenchArgs>, client_factory: Arc<dyn ClientFactory>) -> Box<Self> {
-        Box::new(Self {
+    pub fn new(args: Arc<IggyBenchArgs>, client_factory: Arc<dyn ClientFactory>) -> Self {
+        Self {
             args,
             client_factory,
-        })
+        }
     }
 }
 
@@ -52,7 +52,7 @@ impl Benchmarkable for PinnedConsumerBenchmark {
         let args = self.args.clone();
         let mut tasks: JoinSet<_> = JoinSet::new();
 
-        let futures = build_consumer_futures(cf, &args)?;
+        let futures = build_consumer_futures(cf, &args);
         for fut in futures {
             tasks.spawn(fut);
         }

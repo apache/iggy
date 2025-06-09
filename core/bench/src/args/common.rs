@@ -19,7 +19,15 @@
 use super::kind::BenchmarkKindCommand;
 use super::output::BenchmarkOutputCommand;
 use super::props::{BenchmarkKindProps, BenchmarkTransportProps};
-use super::{defaults::*, transport::BenchmarkTransportCommand};
+use super::{
+    defaults::{
+        DEFAULT_MESSAGE_BATCHES, DEFAULT_MESSAGE_SIZE, DEFAULT_MESSAGES_PER_BATCH,
+        DEFAULT_MOVING_AVERAGE_WINDOW, DEFAULT_PERFORM_CLEANUP, DEFAULT_SAMPLING_TIME,
+        DEFAULT_SERVER_STDOUT_VISIBILITY, DEFAULT_SKIP_SERVER_START, DEFAULT_START_STREAM_ID,
+        DEFAULT_WARMUP_TIME,
+    },
+    transport::BenchmarkTransportCommand,
+};
 use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use clap::error::ErrorKind;
@@ -33,6 +41,7 @@ use std::str::FromStr;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct IggyBenchArgs {
     /// Benchmark kind
     #[command(subcommand)]
@@ -81,7 +90,7 @@ pub struct IggyBenchArgs {
     #[arg(long, short = 'W', default_value_t = DEFAULT_MOVING_AVERAGE_WINDOW)]
     pub moving_average_window: u32,
 
-    /// Shutdown iggy-server and remove server local_data directory after the benchmark is finished.
+    /// Shutdown iggy-server and remove server `local_data` directory after the benchmark is finished.
     /// Only applicable to local benchmarks.
     #[arg(long, default_value_t = DEFAULT_PERFORM_CLEANUP, verbatim_doc_comment)]
     pub cleanup: bool,
@@ -95,6 +104,10 @@ pub struct IggyBenchArgs {
     /// Only applicable to local benchmarks.
     #[arg(long, short = 'k', default_value_t = DEFAULT_SKIP_SERVER_START, verbatim_doc_comment)]
     pub skip_server_start: bool,
+
+    /// Use high-level API for actors
+    #[arg(long, short = 'H', default_value_t = false)]
+    pub high_level_api: bool,
 }
 
 fn validate_server_executable_path(v: &str) -> Result<String, String> {
@@ -125,14 +138,14 @@ impl IggyBenchArgs {
             .server_address()
     }
 
-    pub fn start_stream_id(&self) -> u32 {
+    pub const fn start_stream_id(&self) -> u32 {
         self.start_stream_id.get()
     }
 
     pub fn validate(&mut self) {
         let server_address = self.server_address().parse::<SocketAddr>().unwrap();
         if (self.cleanup || self.verbose) && !server_address.ip().is_loopback() {
-            IggyBenchArgs::command()
+            Self::command()
                 .error(
                     ErrorKind::ArgumentConflict,
                     format!(
@@ -150,7 +163,7 @@ impl IggyBenchArgs {
                 || self.extra_info().is_some()
                 || self.gitref_date().is_some())
         {
-            IggyBenchArgs::command()
+            Self::command()
                 .error(
                     ErrorKind::ArgumentConflict,
                     "--git-ref, --git-ref-date, --identifier, --remark, --extra-info can only be used with --output-dir",
@@ -158,14 +171,14 @@ impl IggyBenchArgs {
                 .exit();
         }
 
-        if let (None, None) = (self.message_batches, self.total_data) {
+        if (self.message_batches, self.total_data) == (None, None) {
             self.message_batches = Some(DEFAULT_MESSAGE_BATCHES);
         }
 
         if let Some(total_data) = self.total_data {
-            let samples = total_data.as_bytes_u64() / self.message_size().min() as u64;
+            let samples = total_data.as_bytes_u64() / u64::from(self.message_size().min());
             if samples <= 1 {
-                IggyBenchArgs::command()
+                Self::command()
                     .error(
                         ErrorKind::ArgumentConflict,
                         "--total-messages-size must be at least 2x greater than --message-size",
@@ -174,32 +187,40 @@ impl IggyBenchArgs {
             }
         }
 
-        self.benchmark_kind.inner().validate()
+        if self.high_level_api && !self.messages_per_batch.is_fixed() {
+            Self::command()
+                .error(
+                    ErrorKind::ArgumentConflict,
+                    "High-level consumer API (--high-level-api) requires fixed batch size, but random batch size was specified. Use a single value instead of a range for --messages-per-batch.",
+                )
+                .exit();
+        }
+
+        self.benchmark_kind.inner().validate();
     }
 
-    pub fn messages_per_batch(&self) -> BenchmarkNumericParameter {
+    pub const fn messages_per_batch(&self) -> BenchmarkNumericParameter {
         self.messages_per_batch
     }
 
-    pub fn message_batches(&self) -> Option<NonZeroU32> {
+    pub const fn message_batches(&self) -> Option<NonZeroU32> {
         self.message_batches
     }
 
-    pub fn message_size(&self) -> BenchmarkNumericParameter {
+    pub const fn message_size(&self) -> BenchmarkNumericParameter {
         self.message_size
     }
 
-    pub fn total_data(&self) -> Option<IggyByteSize> {
+    pub const fn total_data(&self) -> Option<IggyByteSize> {
         self.total_data
     }
 
     // Used only for generation of unique directory name
     pub fn data_volume_identifier(&self) -> String {
-        if let Some(total_messages_size) = self.total_data() {
-            format!("{}B", total_messages_size.as_bytes_u64())
-        } else {
-            self.message_batches().unwrap().to_string()
-        }
+        self.total_data().map_or_else(
+            || self.message_batches().unwrap().to_string(),
+            |total_messages_size| format!("{}B", total_messages_size.as_bytes_u64()),
+        )
     }
 
     pub fn streams(&self) -> u32 {
@@ -226,19 +247,19 @@ impl IggyBenchArgs {
         self.benchmark_kind.inner().number_of_consumer_groups()
     }
 
-    pub fn warmup_time(&self) -> IggyDuration {
+    pub const fn warmup_time(&self) -> IggyDuration {
         self.warmup_time
     }
 
-    pub fn sampling_time(&self) -> IggyDuration {
+    pub const fn sampling_time(&self) -> IggyDuration {
         self.sampling_time
     }
 
-    pub fn moving_average_window(&self) -> u32 {
+    pub const fn moving_average_window(&self) -> u32 {
         self.moving_average_window
     }
 
-    pub fn rate_limit(&self) -> Option<IggyByteSize> {
+    pub const fn rate_limit(&self) -> Option<IggyByteSize> {
         self.rate_limit
     }
 
@@ -323,6 +344,10 @@ impl IggyBenchArgs {
         self.benchmark_kind.inner().max_topic_size()
     }
 
+    pub const fn high_level_api(&self) -> bool {
+        self.high_level_api
+    }
+
     /// Generates the output directory name based on benchmark parameters.
     pub fn generate_dir_name(&self) -> String {
         let benchmark_kind = match &self.benchmark_kind {
@@ -348,24 +373,22 @@ impl IggyBenchArgs {
         };
 
         let actors = match &self.benchmark_kind {
-            BenchmarkKindCommand::PinnedProducer(_) => self.producers(),
-            BenchmarkKindCommand::PinnedConsumer(_) => self.consumers(),
-            BenchmarkKindCommand::PinnedProducerAndConsumer(_) => {
+            BenchmarkKindCommand::PinnedProducer(_)
+            | BenchmarkKindCommand::BalancedProducer(_)
+            | BenchmarkKindCommand::EndToEndProducingConsumer(_)
+            | BenchmarkKindCommand::EndToEndProducingConsumerGroup(_) => self.producers(),
+            BenchmarkKindCommand::PinnedConsumer(_)
+            | BenchmarkKindCommand::BalancedConsumerGroup(_) => self.consumers(),
+            BenchmarkKindCommand::PinnedProducerAndConsumer(_)
+            | BenchmarkKindCommand::BalancedProducerAndConsumerGroup(_) => {
                 self.producers() + self.consumers()
             }
-            BenchmarkKindCommand::BalancedProducer(_) => self.producers(),
-            BenchmarkKindCommand::BalancedConsumerGroup(_) => self.consumers(),
-            BenchmarkKindCommand::BalancedProducerAndConsumerGroup(_) => {
-                self.producers() + self.consumers()
-            }
-            BenchmarkKindCommand::EndToEndProducingConsumer(_) => self.producers(),
-            BenchmarkKindCommand::EndToEndProducingConsumerGroup(_) => self.producers(),
             BenchmarkKindCommand::Examples => unreachable!(),
         };
 
         let data_volume_arg = match (self.total_data, self.message_batches) {
-            (Some(total), None) => format!("{}", total),
-            (None, Some(batches)) => format!("{}", batches),
+            (Some(total), None) => format!("{total}"),
+            (None, Some(batches)) => format!("{batches}"),
             _ => unreachable!(),
         };
 
@@ -430,7 +453,7 @@ impl IggyBenchArgs {
         );
 
         if let Some(remark) = &self.remark() {
-            name.push_str(&format!(" ({})", remark));
+            name = format!("{name} ({remark})");
         }
 
         name
