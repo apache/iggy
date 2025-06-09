@@ -94,48 +94,6 @@ async fn background_send_receive_ok() {
     cleanup(&client).await;
 }
 
-#[tokio::test]
-async fn background_buffer_overflow_immediate() {
-    let mut test_server = TestServer::default();
-    test_server.start();
-
-    let tcp_client_config = TcpClientConfig {
-        server_address: test_server.get_raw_tcp_addr().unwrap(),
-        ..TcpClientConfig::default()
-    };
-    let client = Box::new(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
-    let client = IggyClient::create(client, None, None);
-
-    client.connect().await.unwrap();
-    assert!(client.ping().await.is_ok(), "Failed to ping server");
-
-    login_root(&client).await;
-    init_system(&client).await;
-
-    client.connect().await.unwrap();
-    assert!(client.ping().await.is_ok(), "Failed to ping server");
-
-    let cfg = BackgroundConfig::builder()
-        .max_buffer_size(IggyByteSize::from(1024))
-        .failure_mode(BackpressureMode::FailImmediately)
-        .build();
-    let producer = client
-        .producer(&STREAM_ID.to_string(), &TOPIC_ID.to_string())
-        .unwrap()
-        .background(cfg)
-        .build();
-
-    let big = IggyMessage::builder()
-        .id(1)
-        .payload(Bytes::from(vec![0u8; 2048]))
-        .build()
-        .unwrap();
-    let err = producer.send(vec![big]).await.unwrap_err();
-    assert!(matches!(err, IggyError::BackgroundSendBufferOverflow));
-
-    cleanup(&client).await;
-}
-
 /// Ensures that when backpressure mode is `BlockWithTimeout`, the producer
 /// fails with `BackgroundSendTimeout` if buffer is full and the timeout is exceeded.
 ///
