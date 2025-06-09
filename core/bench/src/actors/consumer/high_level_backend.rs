@@ -41,7 +41,7 @@ impl BenchmarkConsumerBackend for HighLevelBackend {
             // Consumer groups use auto-commit (matching PollingKind::Next behavior from low-level API)
             client
                 .consumer_group(&consumer_group_name, &stream_id_str, &topic_id_str)?
-                .batch_size(self.config.messages_per_batch.get())
+                .batch_length(self.config.messages_per_batch.get())
                 .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
                 .create_consumer_group_if_not_exists()
                 .auto_join_consumer_group()
@@ -57,7 +57,7 @@ impl BenchmarkConsumerBackend for HighLevelBackend {
                     &topic_id_str,
                     1,
                 )?
-                .batch_size(self.config.messages_per_batch.get())
+                .batch_length(self.config.messages_per_batch.get())
                 .auto_commit(AutoCommit::Disabled)
                 .build()
         };
