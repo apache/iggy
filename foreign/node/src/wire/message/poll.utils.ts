@@ -20,11 +20,14 @@
 
 import { type Id } from '../identifier.utils.js';
 import { type ValueOf, reverseRecord } from '../../type.utils.js';
-import { deserializeUUID, toDate } from '../serialize.utils.js';
 import { serializeGetOffset, type Consumer } from '../offset/offset.utils.js';
 import { deserializeHeaders, type HeadersMap } from './header.utils.js';
 import { Transform, type TransformCallback } from 'node:stream';
-import { deserializeIggyMessageHeaders, IGGY_MESSAGE_HEADER_SIZE, IggyMessageHeader } from './iggy-header.utils.js';
+import {
+  deserializeIggyMessageHeaders,
+  IGGY_MESSAGE_HEADER_SIZE,
+  IggyMessageHeader
+} from './iggy-header.utils.js';
 
 export const PollingStrategyKind = {
   Offset: 1,
