@@ -15,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK;
-using Iggy_SDK.Kinds;
+using Apache.Iggy.Kinds;
 
-namespace Iggy_SDK_Tests.UtilityTests;
+namespace Apache.Iggy.Tests.UtilityTests;
 
 public sealed class IdentifiersByteSerializationTests
 {

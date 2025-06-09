@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Extensions;
 using System.Collections;
+using Apache.Iggy.Extensions;
 
-namespace Iggy_SDK_Tests.UtilityTests;
+namespace Apache.Iggy.Tests.UtilityTests;
 
 public sealed class ToSnakeCaseMessagePolicyTests
 {

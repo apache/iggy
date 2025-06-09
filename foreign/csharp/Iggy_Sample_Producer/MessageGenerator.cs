@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Shared;
+using Apache.Iggy.Shared;
 
-namespace Iggy_Sample_Producer;
+namespace Apache.Iggy.Producer;
 
 public static class MessageGenerator
 {

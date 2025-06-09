@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Kinds;
+using Apache.Iggy.Kinds;
 
-namespace Iggy_SDK.Contracts.Http;
+namespace Apache.Iggy.Contracts.Http;
 
 public sealed class MessageFetchRequest
 {

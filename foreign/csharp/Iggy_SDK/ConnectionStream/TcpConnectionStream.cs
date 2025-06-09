@@ -17,7 +17,7 @@
 
 using System.Net.Sockets;
 
-namespace Iggy_SDK.ConnectionStream;
+namespace Apache.Iggy.ConnectionStream;
 
 public sealed class TcpConnectionStream : IConnectionStream 
 {

@@ -1,10 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
-        <PackageId>Apache Iggy</PackageId>
+        <PackageId>Apache.Iggy</PackageId>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
         <TargetFramework>net8.0</TargetFramework>
+        <AssemblyName>Apache.Iggy</AssemblyName>
+        <RootNamespace>Apache.Iggy</RootNamespace>
     </PropertyGroup>
     
     <PropertyGroup>

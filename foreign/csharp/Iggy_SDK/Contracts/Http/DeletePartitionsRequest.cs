@@ -17,7 +17,7 @@
 
 using System.Text.Json.Serialization;
 
-namespace Iggy_SDK.Contracts.Http;
+namespace Apache.Iggy.Contracts.Http;
 
 public sealed class DeletePartitionsRequest
 {

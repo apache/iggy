@@ -15,21 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_Sample_Producer;
-using Iggy_SDK;
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Contracts.Http.Auth;
-using Iggy_SDK.Enums;
-using Iggy_SDK.Factory;
-using Iggy_SDK.Headers;
-using Iggy_SDK.IggyClient;
-using Iggy_SDK.Messages;
-using Microsoft.Extensions.Logging;
-using Shared;
 using System.Buffers.Binary;
 using System.Security.Cryptography;
 using System.Text;
-using Partitioning = Iggy_SDK.Kinds.Partitioning;
+using Apache.Iggy;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Enums;
+using Apache.Iggy.Factory;
+using Apache.Iggy.Headers;
+using Apache.Iggy.IggyClient;
+using Apache.Iggy.Messages;
+using Apache.Iggy.Producer;
+using Apache.Iggy.Shared;
+using Microsoft.Extensions.Logging;
+using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 var protocol = Protocol.Tcp;
 var loggerFactory = LoggerFactory.Create(builder =>
@@ -255,19 +255,22 @@ async Task ProduceMessages(IIggyClient bus, StreamResponse? stream, TopicRespons
 }
 
 
-public static class EncryptorData
+namespace Apache.Iggy.Producer
 {
-    private static byte[] key = {
-        0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
-        0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c,
-        0xa8, 0x8d, 0x2d, 0x0a, 0x9f, 0x9d, 0xea, 0x43,
-        0x6c, 0x25, 0x17, 0x13, 0x20, 0x45, 0x78, 0xc8
-    };
-    private static byte[] iv = {
-        0x5f, 0x8a, 0xe4, 0x78, 0x9c, 0x3d, 0x2b, 0x0f,
-        0x12, 0x6a, 0x7e, 0x45, 0x91, 0xba, 0xdf, 0x33
-    };
-    public static byte[] GetKey() => key;
-    public static byte[] GetIv() => iv;
+    public static class EncryptorData
+    {
+        private static byte[] key = {
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
+            0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c,
+            0xa8, 0x8d, 0x2d, 0x0a, 0x9f, 0x9d, 0xea, 0x43,
+            0x6c, 0x25, 0x17, 0x13, 0x20, 0x45, 0x78, 0xc8
+        };
+        private static byte[] iv = {
+            0x5f, 0x8a, 0xe4, 0x78, 0x9c, 0x3d, 0x2b, 0x0f,
+            0x12, 0x6a, 0x7e, 0x45, 0x91, 0xba, 0xdf, 0x33
+        };
+        public static byte[] GetKey() => key;
+        public static byte[] GetIv() => iv;
 
+    }
 }

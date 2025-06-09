@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK.Enums;
+namespace Apache.Iggy.Enums;
 
 /// <summary>
 /// Supported compression algorithms.

@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Enums;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Enums;
 
-namespace Iggy_SDK_Tests.Utils.Topics;
+namespace Apache.Iggy.Tests.Utils.Topics;
 
 internal static class TopicFactory
 {

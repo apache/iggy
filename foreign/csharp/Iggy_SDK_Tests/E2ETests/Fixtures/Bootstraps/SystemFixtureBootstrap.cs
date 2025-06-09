@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK_Tests.E2ETests.Fixtures.Models;
-using Iggy_SDK.Contracts.Http.Auth;
-using Iggy_SDK.Enums;
-using Iggy_SDK.Factory;
+using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Enums;
+using Apache.Iggy.Factory;
+using Apache.Iggy.Tests.E2ETests.Fixtures.Models;
 using Microsoft.Extensions.Logging.Abstractions;
 
-namespace Iggy_SDK_Tests.E2ETests.Fixtures.Bootstraps;
+namespace Apache.Iggy.Tests.E2ETests.Fixtures.Bootstraps;
 
 public class SystemFixtureBootstrap : IIggyBootstrap
 {

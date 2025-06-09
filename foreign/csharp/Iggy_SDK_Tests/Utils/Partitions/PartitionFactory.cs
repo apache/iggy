@@ -15,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK;
-using Iggy_SDK.Contracts.Http;
+using Apache.Iggy.Contracts.Http;
 
-namespace Iggy_SDK_Tests.Utils.Partitions;
+namespace Apache.Iggy.Tests.Utils.Partitions;
 
 public static class PartitionFactory
 {

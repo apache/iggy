@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Enums;
+using Apache.Iggy.Enums;
 
-namespace Iggy_SDK.Configuration;
+namespace Apache.Iggy.Configuration;
 
 public sealed class MessageStreamConfigurator : IMessageStreamConfigurator
 {

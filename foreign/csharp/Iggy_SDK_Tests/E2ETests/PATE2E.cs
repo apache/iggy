@@ -15,19 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Exceptions;
+using Apache.Iggy.Tests.E2ETests.Fixtures;
+using Apache.Iggy.Tests.E2ETests.Fixtures.Bootstraps;
+using Apache.Iggy.Tests.Utils;
 using FluentAssertions;
 using FluentAssertions.Common;
-using Iggy_SDK_Tests.E2ETests.Fixtures;
-using Iggy_SDK_Tests.E2ETests.Fixtures.Bootstraps;
-using Iggy_SDK_Tests.Utils;
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Contracts.Http.Auth;
-using Iggy_SDK.Exceptions;
 
-namespace Iggy_SDK_Tests.E2ETests;
+namespace Apache.Iggy.Tests.E2ETests;
 
 
-[TestCaseOrderer("Iggy_SDK_Tests.Utils.PriorityOrderer", "Iggy_SDK_Tests")]
+[TestCaseOrderer("Apache.Iggy.Tests.Utils.PriorityOrderer", "Apache.Iggy.Tests")]
 public sealed class PATE2E : IClassFixture<IggyPATFixture>
 {
     private const string SkipMessage = "TCP implementation needs to be aligned with Iggyrs core changes";

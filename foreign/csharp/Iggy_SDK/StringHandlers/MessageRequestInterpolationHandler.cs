@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Enums;
 using System.Runtime.CompilerServices;
+using Apache.Iggy.Enums;
 
-namespace Iggy_SDK.StringHandlers;
+namespace Apache.Iggy.StringHandlers;
 
 [InterpolatedStringHandler]
 internal ref struct MessageRequestInterpolationHandler

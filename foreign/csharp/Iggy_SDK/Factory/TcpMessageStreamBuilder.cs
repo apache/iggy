@@ -15,15 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Configuration;
-using Iggy_SDK.ConnectionStream;
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.IggyClient.Implementations;
-using Iggy_SDK.MessagesDispatcher;
-using Microsoft.Extensions.Logging;
-using System.Net.Sockets;
 using System.Threading.Channels;
-namespace Iggy_SDK.Factory;
+using Apache.Iggy.Configuration;
+using Apache.Iggy.ConnectionStream;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.IggyClient.Implementations;
+using Apache.Iggy.MessagesDispatcher;
+using Microsoft.Extensions.Logging;
+
+namespace Apache.Iggy.Factory;
 
 internal class TcpMessageStreamBuilder
 {

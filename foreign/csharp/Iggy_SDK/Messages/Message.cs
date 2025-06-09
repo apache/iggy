@@ -16,10 +16,10 @@
 // under the License.
 
 using System.IO.Hashing;
-using Iggy_SDK.Extensions;
-using Iggy_SDK.Headers;
+using Apache.Iggy.Extensions;
+using Apache.Iggy.Headers;
 
-namespace Iggy_SDK.Messages;
+namespace Apache.Iggy.Messages;
 
 public readonly struct Message
 {

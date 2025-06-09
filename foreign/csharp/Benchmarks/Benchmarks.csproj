@@ -5,6 +5,8 @@
         <TargetFramework>net8.0</TargetFramework>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
+        <AssemblyName>Apache.Iggy.Benchmarks</AssemblyName>
+        <RootNamespace>Apache.Iggy.Benchmarks</RootNamespace>
     </PropertyGroup>
 
     <ItemGroup>

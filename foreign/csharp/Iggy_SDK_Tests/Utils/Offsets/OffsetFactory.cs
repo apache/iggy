@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK;
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Kinds;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Kinds;
 
-namespace Iggy_SDK_Tests.Utils.Offsets;
+namespace Apache.Iggy.Tests.Utils.Offsets;
 
 internal static class OffsetFactory
 {

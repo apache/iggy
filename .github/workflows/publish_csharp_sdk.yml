@@ -100,13 +100,13 @@ jobs:
         with:
           dotnet-version: '8.0.x'
       - name: Restore dependencies
-        working-directory: foreign/csharp
+        working-directory: foreign/csharp/Iggy_SDK
         run: dotnet restore
       - name: Pack nuget
-        working-directory: foreign/csharp
+        working-directory: foreign/csharp/Iggy_SDK
         run: |
           dotnet pack -c release --no-restore -o .
       - name: Publish nuget
-        working-directory: foreign/csharp
+        working-directory: foreign/csharp/Iggy_SDK
         run: dotnet nuget push *.nupkg -k "${{ secrets.NUGET_API_KEY }}" -s https://api.nuget.org/v3/index.json
 

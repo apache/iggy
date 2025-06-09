@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Extensions;
-using Iggy_SDK.Headers;
-using Iggy_SDK.Messages;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Apache.Iggy.Extensions;
+using Apache.Iggy.Headers;
+using Apache.Iggy.Messages;
 
-namespace Iggy_SDK.JsonConfiguration;
+namespace Apache.Iggy.JsonConfiguration;
 
 internal sealed class MessageConverter : JsonConverter<Message>
 {

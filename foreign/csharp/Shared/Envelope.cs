@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.JsonConfiguration;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Apache.Iggy.JsonConfiguration;
 
-namespace Shared;
+namespace Apache.Iggy.Shared;
 
 public sealed class Envelope
 {

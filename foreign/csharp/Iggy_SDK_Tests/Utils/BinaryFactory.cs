@@ -17,9 +17,9 @@
 
 using System.Buffers.Binary;
 using System.Text;
-using Iggy_SDK.Extensions;
+using Apache.Iggy.Extensions;
 
-namespace Iggy_SDK_Tests.Utils;
+namespace Apache.Iggy.Tests.Utils;
 
 internal sealed class BinaryFactory
 {
@@ -126,7 +126,7 @@ internal sealed class BinaryFactory
         return payload;
     }
 
-    internal static byte[] CreateStatsPayload(Iggy_SDK.Contracts.Http.Stats stats)
+    internal static byte[] CreateStatsPayload(Contracts.Http.Stats stats)
     {
         byte[] bytes = new byte[1024];
         BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(0, 4), stats.ProcessId);

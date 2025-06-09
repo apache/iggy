@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Extensions;
 using System.Buffers.Binary;
 using System.Globalization;
 using System.Text;
+using Apache.Iggy.Extensions;
 
-namespace Iggy_SDK.Headers;
+namespace Apache.Iggy.Headers;
 
 public readonly struct HeaderValue
 {

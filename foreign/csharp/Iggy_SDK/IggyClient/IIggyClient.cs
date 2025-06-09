@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK.IggyClient;
+namespace Apache.Iggy.IggyClient;
 
 public interface IIggyClient : IIggyPublisher, IIggyStream, IIggyTopic, IIggyConsumer, IIggyOffset, IIggyConsumerGroup,
     IIggySystem, IIggyPartition, IIggyUsers, IIggyPersonalAccessToken

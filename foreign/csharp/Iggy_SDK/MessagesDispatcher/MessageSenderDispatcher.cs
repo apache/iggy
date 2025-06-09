@@ -15,16 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Configuration;
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Enums;
-using Iggy_SDK.Messages;
-using Microsoft.Extensions.Logging;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Threading.Channels;
+using Apache.Iggy.Configuration;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Enums;
+using Apache.Iggy.Messages;
+using Microsoft.Extensions.Logging;
 
-namespace Iggy_SDK.MessagesDispatcher;
+namespace Apache.Iggy.MessagesDispatcher;
 
 internal sealed class MessageSenderDispatcher
 {

@@ -15,16 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Configuration;
+using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Enums;
+using Apache.Iggy.Factory;
+using Apache.Iggy.Tests.E2ETests.Fixtures.Models;
 using DotNet.Testcontainers.Builders;
 using DotNet.Testcontainers.Containers;
-using Iggy_SDK_Tests.E2ETests.Fixtures.Models;
-using Iggy_SDK.Configuration;
-using Iggy_SDK.Contracts.Http.Auth;
-using Iggy_SDK.Enums;
-using Iggy_SDK.Factory;
 using Microsoft.Extensions.Logging.Abstractions;
 
-namespace Iggy_SDK_Tests.E2ETests.Fixtures;
+namespace Apache.Iggy.Tests.E2ETests.Fixtures;
 
 public abstract class IggyBaseFixture : IAsyncLifetime
 {

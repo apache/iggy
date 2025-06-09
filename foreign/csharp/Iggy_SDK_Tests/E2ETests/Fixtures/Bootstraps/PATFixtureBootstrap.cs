@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK_Tests.E2ETests.Fixtures.Models;
-using Iggy_SDK.Contracts.Http.Auth;
+using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Tests.E2ETests.Fixtures.Models;
 
-namespace Iggy_SDK_Tests.E2ETests.Fixtures.Bootstraps;
+namespace Apache.Iggy.Tests.E2ETests.Fixtures.Bootstraps;
 
 public class PATFixtureBootstrap : IIggyBootstrap
 {

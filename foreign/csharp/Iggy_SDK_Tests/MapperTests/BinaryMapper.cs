@@ -15,20 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK_Tests.Utils;
-using Iggy_SDK_Tests.Utils.DummyObj;
-using Iggy_SDK_Tests.Utils.Groups;
-using Iggy_SDK_Tests.Utils.Messages;
-using Iggy_SDK_Tests.Utils.Stats;
-using Iggy_SDK_Tests.Utils.Topics;
-using Iggy_SDK.Extensions;
 using System.Buffers.Binary;
 using System.Text;
-using Iggy_SDK.Enums;
-using StreamFactory = Iggy_SDK_Tests.Utils.Streams.StreamFactory;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Enums;
+using Apache.Iggy.Extensions;
+using Apache.Iggy.Tests.Utils;
+using Apache.Iggy.Tests.Utils.DummyObj;
+using Apache.Iggy.Tests.Utils.Groups;
+using Apache.Iggy.Tests.Utils.Messages;
+using Apache.Iggy.Tests.Utils.Stats;
+using Apache.Iggy.Tests.Utils.Topics;
+using StreamFactory = Apache.Iggy.Tests.Utils.Streams.StreamFactory;
 
-namespace Iggy_SDK_Tests.MapperTests;
+namespace Apache.Iggy.Tests.MapperTests;
 
 public sealed class BinaryMapper
 {
@@ -42,7 +42,7 @@ public sealed class BinaryMapper
         var payload = BinaryFactory.CreatePersonalAccessTokensPayload(name, expiry);
         
         // Act
-        var response = Iggy_SDK.Mappers.BinaryMapper.MapPersonalAccessTokens(payload);
+        var response = Mappers.BinaryMapper.MapPersonalAccessTokens(payload);
         
         // Assert
         Assert.NotNull(response);
@@ -59,7 +59,7 @@ public sealed class BinaryMapper
         byte[] payload = BinaryFactory.CreateOffsetPayload(partitionId, currentOffset, storedOffset);
 
         // Act
-        OffsetResponse response = Iggy_SDK.Mappers.BinaryMapper.MapOffsets(payload);
+        OffsetResponse response = Mappers.BinaryMapper.MapOffsets(payload);
 
         // Assert
         Assert.NotNull(response);
@@ -93,7 +93,7 @@ public sealed class BinaryMapper
         msgTwoPayload.CopyTo(combinedPayload.AsSpan(16 + msgOnePayload.Length));
         
         //Act
-        var response = Iggy_SDK.Mappers.BinaryMapper.MapMessages<DummyMessage>(combinedPayload, bytes =>
+        var response = Mappers.BinaryMapper.MapMessages<DummyMessage>(combinedPayload, bytes =>
         {
             var id = BitConverter.ToInt32(bytes[..4]);
             var txtLength = BitConverter.ToInt32(bytes[4..8]);
@@ -132,7 +132,7 @@ public sealed class BinaryMapper
         msgTwoPayload.CopyTo(combinedPayload.AsSpan(16 + msgOnePayload.Length));
 
         // Act
-        var responses = Iggy_SDK.Mappers.BinaryMapper.MapMessages(combinedPayload);
+        var responses = Mappers.BinaryMapper.MapMessages(combinedPayload);
 
         // Assert
         Assert.NotNull(responses);
@@ -158,7 +158,7 @@ public sealed class BinaryMapper
         payload2.CopyTo(combinedPayload.AsSpan(payload1.Length));
 
         // Act
-        IEnumerable<StreamResponse> responses = Iggy_SDK.Mappers.BinaryMapper.MapStreams(combinedPayload).ToList();
+        IEnumerable<StreamResponse> responses = Mappers.BinaryMapper.MapStreams(combinedPayload).ToList();
 
         // Assert
         Assert.NotNull(responses);
@@ -206,7 +206,7 @@ public sealed class BinaryMapper
         topicCombinedPayload.CopyTo(streamCombinedPayload.AsSpan(streamPayload.Length));
 
         // Act
-        var response = Iggy_SDK.Mappers.BinaryMapper.MapStream(streamCombinedPayload);
+        var response = Mappers.BinaryMapper.MapStream(streamCombinedPayload);
 
         // Assert
         Assert.NotNull(response);
@@ -246,7 +246,7 @@ public sealed class BinaryMapper
         payload2.CopyTo(combinedPayload.AsSpan(payload1.Length));
 
         // Act
-        var responses = Iggy_SDK.Mappers.BinaryMapper.MapTopics(combinedPayload);
+        var responses = Mappers.BinaryMapper.MapTopics(combinedPayload);
 
         // Assert
         Assert.NotNull(responses);
@@ -280,7 +280,7 @@ public sealed class BinaryMapper
         topicPayload.CopyTo(combinedPayload.AsSpan());
 
         // Act
-        TopicResponse response = Iggy_SDK.Mappers.BinaryMapper.MapTopic(combinedPayload);
+        TopicResponse response = Mappers.BinaryMapper.MapTopic(combinedPayload);
 
         // Assert
         Assert.NotNull(response);
@@ -306,7 +306,7 @@ public sealed class BinaryMapper
         payload2.CopyTo(combinedPayload.AsSpan(payload1.Length));
 
         // Act
-        List<ConsumerGroupResponse> responses = Iggy_SDK.Mappers.BinaryMapper.MapConsumerGroups(combinedPayload);
+        List<ConsumerGroupResponse> responses = Mappers.BinaryMapper.MapConsumerGroups(combinedPayload);
 
         // Assert
         Assert.NotNull(responses);
@@ -332,7 +332,7 @@ public sealed class BinaryMapper
         byte[] groupPayload = BinaryFactory.CreateGroupPayload(groupId, membersCount, partitionsCount, name, memberPartitions);
 
         // Act
-        ConsumerGroupResponse response = Iggy_SDK.Mappers.BinaryMapper.MapConsumerGroup(groupPayload);
+        ConsumerGroupResponse response = Mappers.BinaryMapper.MapConsumerGroup(groupPayload);
 
         // Assert
         Assert.NotNull(response);
@@ -351,7 +351,7 @@ public sealed class BinaryMapper
         var payload = BinaryFactory.CreateStatsPayload(stats);
 
         //Act
-        var response = Iggy_SDK.Mappers.BinaryMapper.MapStats(payload);
+        var response = Mappers.BinaryMapper.MapStats(payload);
 
         //Assert
         Assert.Equal(stats.ProcessId, response.ProcessId);

@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Kinds;
-using Iggy_SDK.Messages;
+using Apache.Iggy.Kinds;
+using Apache.Iggy.Messages;
 
-namespace Iggy_SDK.Contracts.Http;
+namespace Apache.Iggy.Contracts.Http;
 
 //[JsonConverter(typeof(MessagesConverter))]
 public sealed class MessageSendRequest

@@ -16,9 +16,9 @@
 // under the License.
 
 
-using Iggy_SDK.Enums;
+using Apache.Iggy.Enums;
 
-namespace Iggy_SDK.Contracts.Http;
+namespace Apache.Iggy.Contracts.Http;
 
 //[JsonConverter(typeof(TopicResponseConverter))]
 public sealed class TopicResponse

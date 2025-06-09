@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Extensions;
 using System.ComponentModel;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using Iggy_SDK.Enums;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Enums;
+using Apache.Iggy.Extensions;
 
-namespace Iggy_SDK.JsonConfiguration;
+namespace Apache.Iggy.JsonConfiguration;
 
 internal sealed class TopicResponseConverter : JsonConverter<TopicResponse>
 {

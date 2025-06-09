@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Extensions;
 using System.ComponentModel;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Extensions;
 
-namespace Iggy_SDK.JsonConfiguration;
+namespace Apache.Iggy.JsonConfiguration;
 public sealed class StreamResponseConverter : JsonConverter<StreamResponse>
 {
     public override StreamResponse? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)

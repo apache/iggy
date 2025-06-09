@@ -15,12 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Contracts.Http;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using Iggy_SDK.Contracts.Http.Auth;
+using Apache.Iggy.Contracts.Http.Auth;
 
-namespace Iggy_SDK.JsonConfiguration;
+namespace Apache.Iggy.JsonConfiguration;
 
 public sealed class UserResponseConverter : JsonConverter<UserResponse>
 {

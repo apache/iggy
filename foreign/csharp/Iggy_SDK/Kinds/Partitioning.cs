@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Enums;
 using System.Buffers.Binary;
 using System.Text;
 
-namespace Iggy_SDK.Kinds;
+namespace Apache.Iggy.Kinds;
 
 public readonly struct Partitioning
 {

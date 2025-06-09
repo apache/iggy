@@ -17,7 +17,8 @@
 
 
 using System.Runtime.CompilerServices;
-namespace Iggy_SDK.Enums;
+
+namespace Apache.Iggy.Enums;
 
 public enum IdKind
 {
