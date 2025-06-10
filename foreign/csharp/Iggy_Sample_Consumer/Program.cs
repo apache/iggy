@@ -15,18 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK;
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Contracts.Http.Auth;
-using Iggy_SDK.Enums;
-using Iggy_SDK.Factory;
-using Iggy_SDK.JsonConfiguration;
-using Iggy_SDK.Kinds;
 using Microsoft.Extensions.Logging;
-using Shared;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Apache.Iggy;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Enums;
+using Apache.Iggy.Factory;
+using Apache.Iggy.JsonConfiguration;
+using Apache.Iggy.Kinds;
+using Apache.Iggy.Shared;
 
 var jsonOptions = new JsonSerializerOptions();
 jsonOptions.PropertyNamingPolicy = new ToSnakeCaseNamingPolicy();

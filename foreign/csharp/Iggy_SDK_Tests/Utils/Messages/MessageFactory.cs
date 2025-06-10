@@ -15,21 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK;
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Enums;
-using Iggy_SDK.Extensions;
-using Iggy_SDK.Headers;
-using Iggy_SDK.Kinds;
-using Iggy_SDK.Messages;
-using Iggy_SDK_Tests.Utils.DummyObj;
 using System.Buffers.Binary;
 using System.Text;
 using System.Text.Json;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Enums;
+using Apache.Iggy.Extensions;
+using Apache.Iggy.Headers;
+using Apache.Iggy.Kinds;
+using Apache.Iggy.Messages;
+using Apache.Iggy.Tests.Utils.DummyObj;
 using FluentAssertions.Extensions;
-using Partitioning = Iggy_SDK.Enums.Partitioning;
+using Partitioning = Apache.Iggy.Enums.Partitioning;
 
-namespace Iggy_SDK_Tests.Utils.Messages;
+namespace Apache.Iggy.Tests.Utils.Messages;
 
 internal static class MessageFactory
 {
@@ -98,7 +97,7 @@ internal static class MessageFactory
         {
             StreamId = streamId,
             TopicId = topicId,
-            Partitioning = new Iggy_SDK.Kinds.Partitioning
+            Partitioning = new Kinds.Partitioning
             {
                 Kind = Partitioning.PartitionId,
                 Length = 4,
@@ -138,7 +137,7 @@ internal static class MessageFactory
         {
             StreamId = Identifier.Numeric(streamId),
             TopicId = Identifier.Numeric(topicId),
-            Partitioning = Iggy_SDK.Kinds.Partitioning.PartitionId(partitionId),
+            Partitioning = Kinds.Partitioning.PartitionId(partitionId),
             Messages = messages ?? GenerateDummyMessages(Random.Shared.Next(1, 69), Random.Shared.Next(69, 420))
         };
     }

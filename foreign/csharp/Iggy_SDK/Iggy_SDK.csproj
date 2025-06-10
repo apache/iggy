@@ -1,10 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
-        <PackageId>Apache Iggy</PackageId>
+        <PackageId>Apache.Iggy</PackageId>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
         <TargetFramework>net8.0</TargetFramework>
+        <AssemblyName>Apache.Iggy</AssemblyName>
+        <RootNamespace>Apache.Iggy</RootNamespace>
     </PropertyGroup>
     
     <PropertyGroup>
@@ -12,7 +14,7 @@
         <Authors>Apache Iggy</Authors>
         <IsPackable>true</IsPackable>
         <PackageTags>SDK Iggy Messaging</PackageTags>
-        <RepositoryUrl>https://github.com/iggy-rs/iggy-dotnet-client</RepositoryUrl>
+        <RepositoryUrl>https://github.com/apache/iggy</RepositoryUrl>
         <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
         <PackageReadmeFile>README.md</PackageReadmeFile>
     </PropertyGroup>

@@ -15,15 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK;
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.IggyClient;
-using Iggy_SDK.Kinds;
-using Iggy_SDK.Messages;
 using System.Diagnostics;
 using System.Text;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.IggyClient;
+using Apache.Iggy.Kinds;
+using Apache.Iggy.Messages;
 
-namespace Benchmarks;
+namespace Apache.Iggy.Benchmarks;
 
 
 public static class SendMessage

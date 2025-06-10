@@ -38,4 +38,10 @@
     "foreign/node/.*\\.json",
     ".github/workflows/ci-check-node-sdk.yml"
   ]
+  ,
+  "csharp-sdk": [
+    "foreign/csharp/.*\\.cs",
+    "foreign/csharp/.*\\.csproj",
+    ".github/workflows/ci-check-csharp-sdk.yml"
+  ]
 }

@@ -15,27 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Configuration;
-using Iggy_SDK.ConnectionStream;
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Contracts.Http.Auth;
-using Iggy_SDK.Contracts.Tcp;
-using Iggy_SDK.Enums;
-using Iggy_SDK.Exceptions;
-using Iggy_SDK.Headers;
-using Iggy_SDK.Kinds;
-using Iggy_SDK.Mappers;
-using Iggy_SDK.Messages;
-using Iggy_SDK.MessagesDispatcher;
-using Iggy_SDK.Utils;
-using Microsoft.Extensions.Logging;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.IO.Hashing;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading.Channels;
-namespace Iggy_SDK.IggyClient.Implementations;
+using Apache.Iggy.Configuration;
+using Apache.Iggy.ConnectionStream;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Contracts.Tcp;
+using Apache.Iggy.Enums;
+using Apache.Iggy.Exceptions;
+using Apache.Iggy.Headers;
+using Apache.Iggy.Kinds;
+using Apache.Iggy.Mappers;
+using Apache.Iggy.Messages;
+using Apache.Iggy.MessagesDispatcher;
+using Apache.Iggy.Utils;
+using Microsoft.Extensions.Logging;
+
+namespace Apache.Iggy.IggyClient.Implementations;
 
 public sealed class TcpMessageStream : IIggyClient, IDisposable
 {
@@ -205,7 +206,6 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         }
         
         return BinaryMapper.MapTopic(responseBuffer);
-        
     }
 
     public async Task UpdateTopicAsync(Identifier streamId, Identifier topicId, UpdateTopicRequest request, CancellationToken token = default)

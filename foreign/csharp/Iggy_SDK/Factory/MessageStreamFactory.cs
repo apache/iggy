@@ -15,21 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Configuration;
-using Iggy_SDK.ConnectionStream;
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Contracts.Tcp;
-using Iggy_SDK.Enums;
-using Iggy_SDK.Exceptions;
-using Iggy_SDK.IggyClient;
-using Iggy_SDK.IggyClient.Implementations;
-using Iggy_SDK.Utils;
-using Microsoft.Extensions.Logging;
 using System.ComponentModel;
 using System.Net.Security;
 using System.Net.Sockets;
+using Apache.Iggy.Configuration;
+using Apache.Iggy.ConnectionStream;
+using Apache.Iggy.Enums;
+using Apache.Iggy.Exceptions;
+using Apache.Iggy.IggyClient;
+using Apache.Iggy.IggyClient.Implementations;
+using Microsoft.Extensions.Logging;
 
-namespace Iggy_SDK.Factory;
+namespace Apache.Iggy.Factory;
 
 public static class MessageStreamFactory
 {

@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK_Tests.E2ETests.Fixtures.Bootstraps;
-using Iggy_SDK_Tests.E2ETests.Fixtures.Configs;
+using Apache.Iggy.Tests.E2ETests.Fixtures.Bootstraps;
+using Apache.Iggy.Tests.E2ETests.Fixtures.Configs;
 
-namespace Iggy_SDK_Tests.E2ETests.Fixtures;
+namespace Apache.Iggy.Tests.E2ETests.Fixtures;
 
 public sealed class IggyPartitionFixture : IggyBaseFixture
 {

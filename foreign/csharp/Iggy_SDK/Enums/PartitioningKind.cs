@@ -16,7 +16,7 @@
 // under the License.
 
 
-namespace Iggy_SDK.Enums;
+namespace Apache.Iggy.Enums;
 
 public enum Partitioning
 {

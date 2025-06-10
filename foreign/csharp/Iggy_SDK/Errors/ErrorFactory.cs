@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK.Errors;
+namespace Apache.Iggy.Errors;
 
 //TODO - refactor whole error system, once the contract is set and stone.
 //currently in tcp the error message is just a server side status

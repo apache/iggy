@@ -15,13 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Extensions;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using Iggy_SDK.Contracts.Http.Auth;
+using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Extensions;
 
-namespace Iggy_SDK.JsonConfiguration;
+namespace Apache.Iggy.JsonConfiguration;
 
 public sealed class PersonalAccessTokenResponseConverter : JsonConverter<PersonalAccessTokenResponse>
 {

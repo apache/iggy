@@ -15,20 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Contracts.Http.Auth;
-using Iggy_SDK.Enums;
-using Iggy_SDK.Extensions;
-using Iggy_SDK.Headers;
-using Iggy_SDK.Messages;
 using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using System.Text;
-using System.Text.Json;
-using Partitioning = Iggy_SDK.Enums.Partitioning;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Enums;
+using Apache.Iggy.Extensions;
+using Apache.Iggy.Headers;
+using Apache.Iggy.Messages;
+using Partitioning = Apache.Iggy.Enums.Partitioning;
 
-namespace Iggy_SDK.Contracts.Tcp;
+namespace Apache.Iggy.Contracts.Tcp;
 
 //TODO - write unit tests for all the user related contracts
 internal static class TcpContracts

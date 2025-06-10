@@ -7,6 +7,8 @@
         <IsPackable>false</IsPackable>
         <IsTestProject>true</IsTestProject>
         <TargetFramework>net8.0</TargetFramework>
+        <AssemblyName>Apache.Iggy.Tests</AssemblyName>
+        <RootNamespace>Apache.Iggy.Tests</RootNamespace>
     </PropertyGroup>
 
     <ItemGroup>

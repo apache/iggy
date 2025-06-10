@@ -16,10 +16,10 @@
 // under the License.
 
 
-using Iggy_SDK.Headers;
-using Iggy_SDK.Messages;
+using Apache.Iggy.Headers;
+using Apache.Iggy.Messages;
 
-namespace Iggy_SDK.Contracts.Http;
+namespace Apache.Iggy.Contracts.Http;
 
 public sealed class MessageResponse<T>
 {

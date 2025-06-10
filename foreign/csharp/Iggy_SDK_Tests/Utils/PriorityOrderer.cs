@@ -18,7 +18,7 @@
 using Xunit.Abstractions;
 using Xunit.Sdk;
 
-namespace Iggy_SDK_Tests.Utils;
+namespace Apache.Iggy.Tests.Utils;
 
 public class PriorityOrderer : ITestCaseOrderer
 {

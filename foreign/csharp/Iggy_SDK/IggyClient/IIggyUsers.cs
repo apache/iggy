@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Contracts.Http.Auth;
+using Apache.Iggy.Contracts.Http.Auth;
 
-namespace Iggy_SDK.IggyClient;
+namespace Apache.Iggy.IggyClient;
 
 public interface IIggyUsers
 {

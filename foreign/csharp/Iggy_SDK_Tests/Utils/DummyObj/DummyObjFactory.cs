@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK_Tests.Utils.Messages;
+using Apache.Iggy.Tests.Utils.Messages;
 
-namespace Iggy_SDK_Tests.Utils.DummyObj;
+namespace Apache.Iggy.Tests.Utils.DummyObj;
 
 internal static class DummyObjFactory
 {

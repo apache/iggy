@@ -15,17 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Enums;
-using Iggy_SDK.Extensions;
-using Iggy_SDK.Headers;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Text;
-using Iggy_SDK.Contracts.Http.Auth;
-using Iggy_SDK.Messages;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Enums;
+using Apache.Iggy.Extensions;
+using Apache.Iggy.Headers;
+using Apache.Iggy.Messages;
 
-namespace Iggy_SDK.Mappers;
+namespace Apache.Iggy.Mappers;
 //TODO - write unit tests for all the users related mappers
 internal static class BinaryMapper
 {

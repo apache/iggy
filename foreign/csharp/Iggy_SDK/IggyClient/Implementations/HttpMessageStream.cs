@@ -15,18 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Configuration;
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Contracts.Http.Auth;
-using Iggy_SDK.Enums;
-using Iggy_SDK.Exceptions;
-using Iggy_SDK.Headers;
-using Iggy_SDK.JsonConfiguration;
-using Iggy_SDK.Kinds;
-using Iggy_SDK.Messages;
-using Iggy_SDK.MessagesDispatcher;
-using Iggy_SDK.StringHandlers;
-using Microsoft.Extensions.Logging;
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.Http.Headers;
@@ -35,7 +23,20 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
-namespace Iggy_SDK.IggyClient.Implementations;
+using Apache.Iggy.Configuration;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Enums;
+using Apache.Iggy.Exceptions;
+using Apache.Iggy.Headers;
+using Apache.Iggy.JsonConfiguration;
+using Apache.Iggy.Kinds;
+using Apache.Iggy.Messages;
+using Apache.Iggy.MessagesDispatcher;
+using Apache.Iggy.StringHandlers;
+using Microsoft.Extensions.Logging;
+
+namespace Apache.Iggy.IggyClient.Implementations;
 
 
 public class HttpMessageStream : IIggyClient

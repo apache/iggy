@@ -90,10 +90,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+      - run: |
+           rustup toolchain add --profile=minimal stable
+           rustup override set stable
 
       - name: publish
         run: |

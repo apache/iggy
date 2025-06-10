@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Enums;
 using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using Apache.Iggy.Enums;
 
-namespace Iggy_SDK.Extensions;
+namespace Apache.Iggy.Extensions;
 
 internal static class Extensions
 {

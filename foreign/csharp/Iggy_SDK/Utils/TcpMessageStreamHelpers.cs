@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Enums;
-using Iggy_SDK.Messages;
 using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using Apache.Iggy.Enums;
+using Apache.Iggy.Messages;
 
-namespace Iggy_SDK.Utils;
+namespace Apache.Iggy.Utils;
 
 internal static class TcpMessageStreamHelpers
 {

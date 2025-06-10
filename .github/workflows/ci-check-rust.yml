@@ -48,14 +48,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Install toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+        run: |
+           rustup toolchain add --profile=minimal stable
+           rustup override set stable
       - name: Run cargo check
-        uses: actions-rs/cargo@v1
-        with:
-          command: check
+        run: |
+          cargo check
 
   fmt:
     name: cargo fmt
@@ -64,15 +62,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Install toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+        run: |
+           rustup toolchain add --profile=minimal stable
+           rustup override set stable
       - name: Run cargo fmt
-        uses: actions-rs/cargo@v1
-        with:
-          command: fmt
-          args: --all -- --check
+        run: |
+          cargo fmt --all -- --check
 
   clippy:
     name: cargo clippy
@@ -81,15 +76,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Install toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+        run: |
+           rustup toolchain add --profile=minimal stable
+           rustup override set stable
       - name: Run cargo clippy
-        uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: --all-targets --all-features -- -D warnings
+        run: |
+          cargo clippy --all-targets --all-features -- -D warnings
 
   clippy-macos:
     name: cargo clippy macos
@@ -98,15 +90,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Install toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+        run: |
+           rustup toolchain add --profile=minimal stable
+           rustup override set stable
       - name: Run cargo clippy (macos)
-        uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: --all-targets --all-features -- -D warnings
+        run: |
+          cargo clippy --all-targets --all-features -- -D warnings
 
   clippy-windows:
     name: cargo clippy windows
@@ -115,20 +104,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Install toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+        run: |
+           rustup toolchain add --profile=minimal stable
+           rustup override set stable
       - name: Run cargo clippy (windows/sdk)
-        uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: --package iggy --all-features -- -D warnings
+        run: |
+          cargo clippy --package iggy --all-features -- -D warnings
       - name: Run cargo clippy (windows/cli)
-        uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: --bin iggy --all-features -- -D warnings
+        run: |
+          cargo clippy --bin iggy --all-features -- -D warnings
 
   sort:
     name: cargo sort
@@ -137,19 +121,16 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Install toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+        run: |
+           rustup toolchain add --profile=minimal stable
+           rustup override set stable
       - name: Install cargo-sort
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-sort
       - name: Run cargo sort
-        uses: actions-rs/cargo@v1
-        with:
-          command: sort
-          args: --check --workspace
+        run: |
+          cargo sort --check --workspace
 
   doctest:
     name: cargo test docs
@@ -158,15 +139,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Install toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+        run: |
+           rustup toolchain add --profile=minimal stable
+           rustup override set stable
       - name: Run cargo test (doc)
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --doc
+        run: |
+          cargo test --doc
 
   unused_dependencies:
     name: cargo machete
@@ -175,16 +153,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Install toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
+        run: |
+           rustup toolchain add --profile=minimal stable
+           rustup override set stable
       - name: Install cargo-machete
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-machete
       - name: Run cargo machete
-        uses: actions-rs/cargo@v1
-        with:
-          command: machete
-          args: --with-metadata
+        run: |
+          cargo machete --with-metadata

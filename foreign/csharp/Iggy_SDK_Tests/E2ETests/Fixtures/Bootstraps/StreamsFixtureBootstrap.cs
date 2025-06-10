@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK_Tests.E2ETests.Fixtures.Models;
-using Iggy_SDK_Tests.Utils.Streams;
-using Iggy_SDK.Contracts.Http;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Tests.E2ETests.Fixtures.Models;
+using Apache.Iggy.Tests.Utils.Streams;
 
-namespace Iggy_SDK_Tests.E2ETests.Fixtures.Bootstraps;
+namespace Apache.Iggy.Tests.E2ETests.Fixtures.Bootstraps;
 
 public class StreamsFixtureBootstrap : IIggyBootstrap
 {

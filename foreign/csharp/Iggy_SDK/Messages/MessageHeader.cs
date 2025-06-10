@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK.Messages;
+namespace Apache.Iggy.Messages;
 
 public readonly struct MessageHeader
 {

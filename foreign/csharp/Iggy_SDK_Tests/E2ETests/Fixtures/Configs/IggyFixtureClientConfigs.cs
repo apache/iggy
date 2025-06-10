@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Configuration;
-using Iggy_SDK.Enums;
+using Apache.Iggy.Configuration;
+using Apache.Iggy.Enums;
 
-namespace Iggy_SDK_Tests.E2ETests.Fixtures.Configs;
+namespace Apache.Iggy.Tests.E2ETests.Fixtures.Configs;
 
 public static class IggyFixtureClientMessagingSettings
 {

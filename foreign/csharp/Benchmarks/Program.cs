@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Benchmarks;
-using Iggy_SDK;
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Contracts.Http.Auth;
-using Iggy_SDK.Enums;
-using Iggy_SDK.Factory;
-using Iggy_SDK.IggyClient;
+using Apache.Iggy;
+using Apache.Iggy.Benchmarks;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Enums;
+using Apache.Iggy.Factory;
+using Apache.Iggy.IggyClient;
 using Microsoft.Extensions.Logging;
 
 const int messagesCount = 1000;

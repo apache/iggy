@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Enums;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Enums;
 
-namespace Iggy_SDK_Tests.Utils.Topics;
+namespace Apache.Iggy.Tests.Utils.Topics;
 
 internal static class TopicFactory
 {
@@ -33,7 +33,7 @@ internal static class TopicFactory
         ulong sizeBytes = (ulong)Random.Shared.Next(1, 69);
         ulong messagesCount = (ulong)Random.Shared.Next(69, 42069);
         ulong createdAt = (ulong)Random.Shared.Next(69, 42069);
-        ulong maxTopicSize = (ulong)Random.Shared.NextInt64(1_000_000_000, 10_000_000_000);
+        ulong maxTopicSize = (ulong)Random.Shared.NextInt64(2_000_000_000, 10_000_000_000);
         byte replicationFactor = (byte)Random.Shared.Next(1, 8);
         return (topicId, partitionsCount, topicName, messageExpiry, sizeBytes, messagesCount, createdAt, replicationFactor, maxTopicSize);
     }
@@ -45,7 +45,7 @@ internal static class TopicFactory
             Name: "test_topic" + Random.Shared.Next(1, 69) + Utility.RandomString(12).ToLower(),
             CompressionAlgorithm: CompressionAlgorithm.Gzip,
             MessageExpiry: (ulong)Random.Shared.Next(1, 69),
-            MaxTopicSize: (ulong)Random.Shared.NextInt64(1_000_000_000, 10_000_000_000),
+            MaxTopicSize: (ulong)Random.Shared.NextInt64(2_000_000_000, 10_000_000_000),
             ReplicationFactor: (byte)Random.Shared.Next(1, 8),
             PartitionsCount: Random.Shared.Next(5, 25));
     }
@@ -55,7 +55,7 @@ internal static class TopicFactory
         return new UpdateTopicRequest(
             Name: "updated_topic" + Random.Shared.Next(1, 69),
             CompressionAlgorithm: CompressionAlgorithm.Gzip,
-            MaxTopicSize: (ulong)Random.Shared.NextInt64(1_000_000_000, 10_000_000_000),
+            MaxTopicSize: (ulong)Random.Shared.NextInt64(2_000_000_000, 10_000_000_000),
             MessageExpiry: (ulong)Random.Shared.Next(1, 69),
             ReplicationFactor: (byte)Random.Shared.Next(1, 8));
     }
@@ -67,7 +67,7 @@ internal static class TopicFactory
             Name: "test_topic" + Random.Shared.Next(1, 69) + Utility.RandomString(12).ToLower(),
             CompressionAlgorithm: CompressionAlgorithm.None,
             MessageExpiry: (ulong)Random.Shared.Next(1, 69),
-            MaxTopicSize: (ulong)Random.Shared.NextInt64(1_000_000_000, 10_000_000_000),
+            MaxTopicSize: (ulong)Random.Shared.NextInt64(2_000_000_000, 10_000_000_000),
             ReplicationFactor: (byte)Random.Shared.Next(1, 8),
             PartitionsCount: Random.Shared.Next(5, 25));
     }

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK.ConnectionStream;
+namespace Apache.Iggy.ConnectionStream;
 
 public interface IConnectionStream : IDisposable
 {

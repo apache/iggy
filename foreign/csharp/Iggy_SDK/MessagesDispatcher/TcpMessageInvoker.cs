@@ -15,15 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.ConnectionStream;
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Contracts.Tcp;
-using Iggy_SDK.Exceptions;
-using Iggy_SDK.Utils;
 using System.Buffers;
 using System.Text;
+using Apache.Iggy.ConnectionStream;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts.Tcp;
+using Apache.Iggy.Exceptions;
+using Apache.Iggy.Utils;
 
-namespace Iggy_SDK.MessagesDispatcher;
+namespace Apache.Iggy.MessagesDispatcher;
 
 internal class TcpMessageInvoker : IMessageInvoker
 {

@@ -19,7 +19,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
-namespace Iggy_SDK.JsonConfiguration;
+namespace Apache.Iggy.JsonConfiguration;
 
 internal sealed class UInt128Converter : JsonConverter<UInt128>
 {

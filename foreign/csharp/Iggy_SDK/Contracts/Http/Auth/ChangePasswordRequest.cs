@@ -17,7 +17,7 @@
 
 using System.Text.Json.Serialization;
 
-namespace Iggy_SDK.Contracts.Http.Auth;
+namespace Apache.Iggy.Contracts.Http.Auth;
 
 public sealed class ChangePasswordRequest
 {

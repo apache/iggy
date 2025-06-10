@@ -41,12 +41,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          components: clippy
-          override: true
+        run: |
+          rustup toolchain add --profile minimal --components clippy stable 
+          rustup override set stable
 
       - name: Install clippy-sarif sarif-fmt
         run: cargo install clippy-sarif sarif-fmt

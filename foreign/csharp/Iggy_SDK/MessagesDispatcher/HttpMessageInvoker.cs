@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Exceptions;
 using System.Net;
 using System.Text;
 using System.Text.Json;
-using JsonConverterFactory = Iggy_SDK.JsonConfiguration.JsonConverterFactory;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Exceptions;
+using JsonConverterFactory = Apache.Iggy.JsonConfiguration.JsonConverterFactory;
 
-namespace Iggy_SDK.MessagesDispatcher;
+namespace Apache.Iggy.MessagesDispatcher;
 
 internal sealed class HttpMessageInvoker : IMessageInvoker
 {

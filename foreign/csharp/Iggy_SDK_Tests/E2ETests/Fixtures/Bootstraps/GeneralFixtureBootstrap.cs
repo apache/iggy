@@ -15,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK_Tests.E2ETests.Fixtures.Models;
-using Iggy_SDK.IggyClient;
+using Apache.Iggy.Tests.E2ETests.Fixtures.Models;
 
-namespace Iggy_SDK_Tests.E2ETests.Fixtures.Bootstraps;
+namespace Apache.Iggy.Tests.E2ETests.Fixtures.Bootstraps;
 
 public class GeneralFixtureBootstrap : IIggyBootstrap
 {

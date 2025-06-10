@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Contracts.Http;
 using System.Buffers.Binary;
-using Iggy_SDK.Contracts.Http.Auth;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts.Http.Auth;
 
-namespace Iggy_SDK_Tests.Utils.Users;
+namespace Apache.Iggy.Tests.Utils.Users;
 
 internal static class PermissionsFactory
 {
@@ -43,7 +43,7 @@ internal static class PermissionsFactory
             Streams = new Dictionary<int, StreamPermissions>
             {
                 {
-                    Random.Shared.Next(1,69),
+                    Random.Shared.Next(1,30),
                     new StreamPermissions
                     {
                         ManageStream = Random.Shared.Next() % 2 == 0,
@@ -55,7 +55,7 @@ internal static class PermissionsFactory
                         Topics = new Dictionary<int, TopicPermissions>
                         {
                             {
-                                Random.Shared.Next(1,69),
+                                Random.Shared.Next(1,30),
                                 new TopicPermissions
                                 {
                                     ManageTopic = Random.Shared.Next() % 2 == 0,
@@ -65,7 +65,7 @@ internal static class PermissionsFactory
                                 }
                             },
                             {
-                                Random.Shared.Next(1,69),
+                                Random.Shared.Next(31,69),
                                 new TopicPermissions
                                 {
                                     ManageTopic = Random.Shared.Next() % 2 == 0,
@@ -78,7 +78,7 @@ internal static class PermissionsFactory
                     }
                 },
                 {
-                    Random.Shared.Next(1,69),
+                    Random.Shared.Next(31,69),
                     new StreamPermissions
                     {
                         ManageStream = Random.Shared.Next() % 2 == 0,

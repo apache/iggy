@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Extensions;
-using Iggy_SDK.Headers;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using Iggy_SDK.Messages;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Extensions;
+using Apache.Iggy.Headers;
+using Apache.Iggy.Messages;
 
-namespace Iggy_SDK.JsonConfiguration;
+namespace Apache.Iggy.JsonConfiguration;
 
 internal sealed class MessageResponseGenericConverter<TMessage> : JsonConverter<PolledMessages<TMessage>>
 {

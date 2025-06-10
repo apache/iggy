@@ -17,7 +17,7 @@
 
 using System.Net.Security;
 
-namespace Iggy_SDK.ConnectionStream;
+namespace Apache.Iggy.ConnectionStream;
 
 public sealed class TcpTlsConnectionStream : IConnectionStream
 {

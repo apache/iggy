@@ -16,9 +16,9 @@
 // under the License.
 
 
-using Iggy_SDK.Extensions;
+using Apache.Iggy.Extensions;
 
-namespace Iggy_SDK.Contracts.Http;
+namespace Apache.Iggy.Contracts.Http;
 
 public sealed class StatsResponse
 {

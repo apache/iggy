@@ -132,11 +132,10 @@ jobs:
         if: contains(matrix.platform.name, 'musl')
 
       - name: Prepare ${{ matrix.platform.target }} toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-          target: ${{ matrix.platform.target }}
+        run: |
+           rustup toolchain add --profile=minimal stable
+           rustup target add --toolchain=stable ${{ matrix.platform.target }}
+           rustup override set stable
 
       - name: Install cross
         uses: taiki-e/install-action@v2

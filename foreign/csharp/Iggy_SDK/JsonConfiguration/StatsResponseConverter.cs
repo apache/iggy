@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Extensions;
 using System.ComponentModel;
 using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Extensions;
 
-namespace Iggy_SDK.JsonConfiguration;
+namespace Apache.Iggy.JsonConfiguration;
 
 public class StatsResponseConverter : JsonConverter<StatsResponse>
 {
@@ -111,11 +111,15 @@ public class StatsResponseConverter : JsonConverter<StatsResponse>
         float memoryUsage = memoryUnit switch
         {
             "B" => memoryUsageBytesVal,
-            "KiB" => memoryUsageBytesVal * (ulong)1e03,
-            "MiB" => memoryUsageBytesVal * (ulong)1e06,
-            "GiB" => memoryUsageBytesVal * (ulong)1e09,
-            "TiB" => memoryUsageBytesVal * (ulong)1e12,
-            _ => throw new InvalidEnumArgumentException("Error Wrong Unit when deserializing MemoryUsage")
+            "KiB" => memoryUsageBytesVal * (ulong)1024,
+            "KB" => memoryUsageBytesVal * (ulong)1e03,
+            "MiB" => memoryUsageBytesVal * (ulong)1024 * 1024,
+            "MB" => memoryUsageBytesVal * (ulong)1e06,
+            "GiB" => memoryUsageBytesVal * (ulong)1024 * 1024 * 1024,
+            "GB" => memoryUsageBytesVal * (ulong)1e09,
+            "TiB" => memoryUsageBytesVal * (ulong)1024 * 1024 * 1024 * 1024,
+            "TB" => memoryUsageBytesVal * (ulong)1e12,
+            _ => throw new InvalidEnumArgumentException($"Error Wrong Unit when deserializing MemoryUsage: {memoryUnit}")
         };
         return (ulong)memoryUsage;
     }

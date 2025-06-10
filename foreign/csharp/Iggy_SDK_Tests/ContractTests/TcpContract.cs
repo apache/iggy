@@ -15,25 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using FluentAssertions;
-using Iggy_SDK;
-using Iggy_SDK_Tests.Utils;
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Contracts.Tcp;
-using Iggy_SDK.Enums;
-using Iggy_SDK_Tests.Utils.Groups;
-using Iggy_SDK_Tests.Utils.Messages;
-using Iggy_SDK_Tests.Utils.Partitions;
-using Iggy_SDK_Tests.Utils.Streams;
-using Iggy_SDK_Tests.Utils.Topics;
-using Iggy_SDK_Tests.Utils.Users;
-using Iggy_SDK.Contracts.Http.Auth;
 using System.Buffers.Binary;
 using System.Text;
-using Iggy_SDK_Tests.Utils.Offsets;
-using Iggy_SDK.Extensions;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Contracts.Tcp;
+using Apache.Iggy.Enums;
+using Apache.Iggy.Extensions;
+using Apache.Iggy.Tests.Utils;
+using Apache.Iggy.Tests.Utils.Groups;
+using Apache.Iggy.Tests.Utils.Messages;
+using Apache.Iggy.Tests.Utils.Offsets;
+using Apache.Iggy.Tests.Utils.Partitions;
+using Apache.Iggy.Tests.Utils.Streams;
+using Apache.Iggy.Tests.Utils.Topics;
+using Apache.Iggy.Tests.Utils.Users;
+using FluentAssertions;
 
-namespace Iggy_SDK_Tests.ContractTests;
+namespace Apache.Iggy.Tests.ContractTests;
 
 public sealed class TcpContract
 {

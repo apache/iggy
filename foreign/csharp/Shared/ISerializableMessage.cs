@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Shared;
+namespace Apache.Iggy.Shared;
 
 public interface ISerializableMessage
 {

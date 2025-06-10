@@ -61,7 +61,8 @@ jobs:
       trigger-shell: ${{ steps.changed-files.outputs.SHELL_FILES_CHANGED }}
       trigger-java-sdk: ${{ steps.changed-files.outputs.JAVA-SDK_FILES_CHANGED }}
       trigger-python-sdk: ${{ steps.changed-files.outputs.PYTHON-SDK_FILES_CHANGED }},
-      trigger-node-sdk: ${{ steps.changed-files.outputs.NODE-SDK_FILES_CHANGED }}
+      trigger-node-sdk: ${{ steps.changed-files.outputs.NODE-SDK_FILES_CHANGED }},
+      trigger-csharp-sdk: ${{ steps.changed-files.outputs.CSHARP-SDK_FILES_CHANGED }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -144,6 +145,12 @@ jobs:
     if: ${{ needs.pr-file-changes.outputs.trigger-node-sdk == 'true' }}
     uses: ./.github/workflows/ci-check-node-sdk.yml
 
+  ci-check-csharp-sdk:
+    name: ci-check-csharp-sdk
+    needs: pr-file-changes
+    if: ${{ needs.pr-file-changes.outputs.trigger-csharp-sdk == 'true' }}
+    uses: ./.github/workflows/ci-check-csharp-sdk.yml
+
   finalize_pr:
     runs-on: ubuntu-latest
     needs:
@@ -156,6 +163,7 @@ jobs:
       - ci-check-java-sdk
       - ci-check-python-sdk
       - ci-check-node-sdk
+      - ci-check-csharp-sdk
     if: always()
     steps:
       - name: Everything is fine

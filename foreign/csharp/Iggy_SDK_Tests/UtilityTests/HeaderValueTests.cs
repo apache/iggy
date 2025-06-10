@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Extensions;
-using Iggy_SDK.Headers;
 using System.Buffers.Binary;
 using System.Text;
+using Apache.Iggy.Extensions;
+using Apache.Iggy.Headers;
 
-namespace Iggy_SDK_Tests.UtilityTests;
+namespace Apache.Iggy.Tests.UtilityTests;
 
 public sealed class HeaderValueTests
 {
