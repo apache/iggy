@@ -25,11 +25,13 @@ use iggy::prelude::*;
 use iggy::{clients::client::IggyClient, prelude::TcpClient};
 use iggy_common::TcpClientConfig;
 use integration::test_server::{TestServer, login_root};
+use serial_test::parallel;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{Instant, sleep};
 
 #[tokio::test]
+#[parallel]
 async fn background_send_receive_ok() {
     let mut test_server = TestServer::default();
     test_server.start();
@@ -202,6 +204,7 @@ async fn background_send_receive_ok() {
 // }
 
 #[tokio::test]
+#[parallel]
 async fn background_block_waits_then_succeeds() {
     let mut test_server = TestServer::default();
     test_server.start();
@@ -332,6 +335,7 @@ async fn background_block_waits_then_succeeds() {
 // }
 
 #[tokio::test]
+#[parallel]
 async fn background_many_parallel_producers() {
     const PARALLEL_PRODUCERS: usize = 10;
 
