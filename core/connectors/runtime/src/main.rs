@@ -17,7 +17,7 @@
  */
 
 use config::{Config, Environment, File};
-use configs::RuntimeConfig;
+use configs::{ConfigFormat, RuntimeConfig};
 use dlopen2::wrapper::{Container, WrapperApi};
 use error::RuntimeError;
 use iggy::prelude::{Client, IggyClient, IggyClientBuilder, IggyConsumer, IggyProducer};
@@ -36,8 +36,11 @@ use std::{
 use tracing::{debug, error, info};
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
+mod api;
 pub(crate) mod configs;
+pub(crate) mod context;
 pub(crate) mod error;
+mod manager;
 mod sink;
 mod source;
 mod transform;
@@ -91,10 +94,11 @@ async fn main() -> Result<(), RuntimeError> {
         .try_deserialize()
         .expect("Failed to deserialize runtime config");
 
-    let iggy_address = config.iggy.address;
-    let iggy_username = config.iggy.username;
-    let iggy_password = config.iggy.password;
-    let iggy_token = config.iggy.token;
+    let iggy_config = config.iggy.clone();
+    let iggy_address = iggy_config.address;
+    let iggy_username = iggy_config.username;
+    let iggy_password = iggy_config.password;
+    let iggy_token = iggy_config.token;
     let consumer_client = create_iggy_client(
         &iggy_address,
         iggy_username.as_deref(),
@@ -112,8 +116,8 @@ async fn main() -> Result<(), RuntimeError> {
     .await?;
     producer_client.connect().await?;
 
-    let sources = source::init(config.sources, &producer_client).await?;
-    let sinks = sink::init(config.sinks, &consumer_client).await?;
+    let sources = source::init(config.sources.clone(), &producer_client).await?;
+    let sinks = sink::init(config.sinks.clone(), &consumer_client).await?;
 
     let mut sink_wrappers = vec![];
     let mut sink_with_plugins = HashMap::new();
@@ -148,6 +152,10 @@ async fn main() -> Result<(), RuntimeError> {
             },
         );
     }
+
+    let context = context::init(&config, &sink_wrappers, &source_wrappers);
+    let context = Arc::new(context);
+    api::init(&config.http_api, context).await;
 
     source::handle(source_wrappers);
     sink::consume(sink_wrappers);
@@ -261,6 +269,10 @@ struct SinkConnector {
 
 struct SinkConnectorPlugin {
     id: u32,
+    key: String,
+    name: String,
+    path: String,
+    config_format: Option<ConfigFormat>,
     consumers: Vec<SinkConnectorConsumer>,
 }
 
@@ -288,6 +300,10 @@ struct SourceConnector {
 
 struct SourceConnectorPlugin {
     id: u32,
+    key: String,
+    name: String,
+    path: String,
+    config_format: Option<ConfigFormat>,
     transforms: Vec<Arc<dyn Transform>>,
     producer: Option<SourceConnectorProducer>,
 }

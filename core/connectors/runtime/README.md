@@ -23,3 +23,41 @@ password = "iggy"
 All the other config sections start either with `sources` or `sinks` depending on the connector type.
 
 Keep in mind that either of `toml`, `yaml`, or `json` formats are supported for the configuration file. The path to the configuration can be overriden by `IGGY_CONNECTORS_RUNTIME_CONFIG_PATH` environment variable. Each configuration section can be also additionally updated by using the following convention `IGGY_CONNECTORS_SECTION_NAME.KEY_NAME` e.g. `IGGY_CONNECTORS_IGGY_USERNAME` and so on.
+
+## HTTP API
+
+Connector runtime has an optional HTTP API that can be enabled by setting the `enabled` flag to `true` in the `[http_api]` section.
+
+```toml
+[http_api] # Optional HTTP API configuration
+enabled = true
+address = "127.0.0.1:8081"
+# api_key = "secret" # Optional API key for authentication to be passed as `api-key` header
+
+[http_api.cors] # Optional CORS configuration for HTTP API
+enabled = false
+allowed_methods = ["GET", "POST", "PUT", "DELETE"]
+allowed_origins = ["*"]
+allowed_headers = ["content-type"]
+exposed_headers = [""]
+allow_credentials = false
+allow_private_network = false
+
+[http_api.tls] # Optional TLS configuration for HTTP API
+enabled = false
+cert_file = "certs/iggy_cert.pem"
+key_file = "certs/iggy_key.pem"
+```
+
+Currently, it does expose the following endpoints:
+
+- `GET /`: welcome message.
+- `GET /health`: health status of the runtime.
+- `GET /sinks`: list of sinks.
+- `GET /sinks/{key}`: sink details.
+- `GET /sinks/{key}/config`: sink config, including the optional `format` query parameter to specify the config format.
+- `GET /sinks/{key}/transforms`: sink transforms to be applied to the fields.
+- `GET /sources`: list of sources.
+- `GET /sources/{key}`: source details.
+- `GET /sources/{key}/config`: source config, including the optional `format` query parameter to specify the config format.
+- `GET /sources/{key}/transforms`: source transforms to be applied to the fields.

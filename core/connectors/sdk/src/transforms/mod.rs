@@ -53,10 +53,15 @@ pub enum TransformType {
     DeleteFields,
 }
 
-pub fn load(r#type: TransformType, config: serde_json::Value) -> Result<Arc<dyn Transform>, Error> {
+pub fn load(
+    r#type: TransformType,
+    config: &serde_json::Value,
+) -> Result<Arc<dyn Transform>, Error> {
     Ok(match r#type {
-        TransformType::AddFields => Arc::new(AddFields::new(as_config(r#type, config)?)),
-        TransformType::DeleteFields => Arc::new(DeleteFields::new(as_config(r#type, config)?)),
+        TransformType::AddFields => Arc::new(AddFields::new(as_config(r#type, config.to_owned())?)),
+        TransformType::DeleteFields => {
+            Arc::new(DeleteFields::new(as_config(r#type, config.to_owned())?))
+        }
     })
 }
 

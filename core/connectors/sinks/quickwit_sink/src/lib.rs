@@ -163,7 +163,7 @@ impl QuickwitSink {
 impl Sink for QuickwitSink {
     async fn open(&mut self) -> Result<(), Error> {
         info!(
-            "Initialized QuickwitSink with ID: {} for URL: {}",
+            "Opened Quickwit sink connector with ID: {} for URL: {}",
             self.id, self.config.url
         );
         if !self.has_index().await? {
@@ -204,7 +204,7 @@ impl Sink for QuickwitSink {
     }
 
     async fn close(&mut self) -> Result<(), Error> {
-        info!("Quickwit sink with ID: {} is shutting down", self.id);
+        info!("Quickwit sink connector with ID: {} is closed.", self.id);
         Ok(())
     }
 }

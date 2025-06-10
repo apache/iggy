@@ -31,6 +31,7 @@ pub struct SourceConfig {
     pub path: String,
     pub transforms: Option<TransformsConfig>,
     pub streams: Vec<StreamProducerConfig>,
+    pub config_format: ConfigFormat,
     pub config: Option<serde_json::Value>,
 }
 ```
@@ -43,14 +44,15 @@ Below is the example configuration for a source connector, using `random` as it'
 enabled = true # Toggle source on/off
 name = "Random source" # Name of the source
 path = "libiggy_connector_random_source" # Path to the source connector
+config_format = "toml"
 
 # Collection of the streams to which the produced messages are sent
 [[sources.random.streams]]
 stream = "example_stream"
 topic = "example_topic"
 schema = "json"
-batch_size = 100
-send_interval = "5ms"
+batch_length = 100
+linger_time = "5ms"
 
 # Custom configuration for the source connector, deserialized to type T from `config` field
 [sources.random.config]

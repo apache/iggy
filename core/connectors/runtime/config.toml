@@ -15,6 +15,25 @@
 # specific language governing permissions and limitations
 # under the License.
 
+[http_api] # Optional HTTP API configuration
+enabled = true
+address = "127.0.0.1:8081"
+# api_key = "secret" # Optional API key for authentication to be passed as `api-key` header
+
+[http_api.cors] # Optional CORS configuration for HTTP API
+enabled = false
+allowed_methods = ["GET", "POST", "PUT", "DELETE"]
+allowed_origins = ["*"]
+allowed_headers = ["content-type"]
+exposed_headers = [""]
+allow_credentials = false
+allow_private_network = false
+
+[http_api.tls] # Optional TLS configuration for HTTP API
+enabled = false
+cert_file = "certs/iggy_cert.pem"
+key_file = "certs/iggy_key.pem"
+
 [iggy]
 address = "localhost:8090"
 username = "iggy"
@@ -30,9 +49,12 @@ path = "target/release/libiggy_connector_stdout_sink"
 stream = "example_stream"
 topics = ["example_topic"]
 schema = "json"
-batch_size = 100
+batch_length = 100
 poll_interval = "5ms"
-consumer_group = "qw_sink_connector"
+consumer_group = "stdout_sink_connector"
+
+[sinks.stdout.config]
+print_payload = false
 
 [sinks.stdout.transforms.add_fields]
 enabled = true
@@ -45,13 +67,14 @@ value.static = "hello"
 enabled = true
 name = "Random source"
 path = "target/release/libiggy_connector_random_source"
+config_format = "json"
 
 [[sources.random.streams]]
-stream = "example"
-topic = "topic1"
+stream = "example_stream"
+topic = "example_topic"
 schema = "json"
-batch_size = 1000
-send_interval = "5ms"
+batch_length = 1000
+linger_time = "5ms"
 
 [sources.random.config]
 interval = "100ms"
@@ -70,12 +93,13 @@ value.static = "hello!"
 enabled = true
 name = "Quickwit sink 1"
 path = "target/release/libiggy_connector_quickwit_sink"
+config_format = "yaml"
 
 [[sinks.quickwit.streams]]
 stream = "qw"
 topics = ["records"]
 schema = "json"
-batch_size = 1000
+batch_length = 1000
 poll_interval = "5ms"
 consumer_group = "qw_sink_connector"
 
