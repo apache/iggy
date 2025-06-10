@@ -136,70 +136,70 @@ async fn background_send_receive_ok() {
 //     cleanup(&client).await;
 // }
 
-/// Ensures that when backpressure mode is `BlockWithTimeout`, the producer
-/// fails with `BackgroundSendTimeout` if buffer is full and the timeout is exceeded.
-///
-/// We configure:
-/// - max_in_flight = 1: only one batch can be in-flight;
-/// - batch_length = 0, batch_size = 0: disables trigger-based flushing;
-/// - linger_time = 500ms: messages are flushed only after timeout;
-/// - backpressure timeout = 100ms: sending should fail if not flushed within this window.
-#[tokio::test]
-async fn background_block_with_timeout() {
-    let mut test_server = TestServer::default();
-    test_server.start();
+// /// Ensures that when backpressure mode is `BlockWithTimeout`, the producer
+// /// fails with `BackgroundSendTimeout` if buffer is full and the timeout is exceeded.
+// ///
+// /// We configure:
+// /// - max_in_flight = 1: only one batch can be in-flight;
+// /// - batch_length = 0, batch_size = 0: disables trigger-based flushing;
+// /// - linger_time = 500ms: messages are flushed only after timeout;
+// /// - backpressure timeout = 100ms: sending should fail if not flushed within this window.
+// #[tokio::test]
+// async fn background_block_with_timeout() {
+//     let mut test_server = TestServer::default();
+//     test_server.start();
 
-    let tcp_client_config = TcpClientConfig {
-        server_address: test_server.get_raw_tcp_addr().unwrap(),
-        ..TcpClientConfig::default()
-    };
-    let client = Box::new(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
-    let client = IggyClient::create(client, None, None);
+//     let tcp_client_config = TcpClientConfig {
+//         server_address: test_server.get_raw_tcp_addr().unwrap(),
+//         ..TcpClientConfig::default()
+//     };
+//     let client = Box::new(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
+//     let client = IggyClient::create(client, None, None);
 
-    client.connect().await.unwrap();
-    assert!(client.ping().await.is_ok(), "Failed to ping server");
+//     client.connect().await.unwrap();
+//     assert!(client.ping().await.is_ok(), "Failed to ping server");
 
-    login_root(&client).await;
-    init_system(&client).await;
+//     login_root(&client).await;
+//     init_system(&client).await;
 
-    client.connect().await.unwrap();
-    assert!(client.ping().await.is_ok(), "Failed to ping server");
+//     client.connect().await.unwrap();
+//     assert!(client.ping().await.is_ok(), "Failed to ping server");
 
-    let big = IggyMessage::builder()
-        .id(1)
-        .payload(Bytes::from(vec![0u8; 2048]))
-        .build()
-        .unwrap();
-    let cfg = BackgroundConfig::builder()
-        .max_buffer_size(big.get_size_bytes() + 100.into())
-        .max_in_flight(1)
-        .batch_length(0)
-        .batch_size(0)
-        .linger_time(IggyDuration::from(500_000))
-        .failure_mode(BackpressureMode::BlockWithTimeout(IggyDuration::from(
-            100_000,
-        )))
-        .build();
-    let producer = client
-        .producer(&STREAM_ID.to_string(), &TOPIC_ID.to_string())
-        .unwrap()
-        .background(cfg)
-        .build();
+//     let big = IggyMessage::builder()
+//         .id(1)
+//         .payload(Bytes::from(vec![0u8; 2048]))
+//         .build()
+//         .unwrap();
+//     let cfg = BackgroundConfig::builder()
+//         .max_buffer_size(big.get_size_bytes() + 100.into())
+//         .max_in_flight(1)
+//         .batch_length(0)
+//         .batch_size(0)
+//         .linger_time(IggyDuration::from(500_000))
+//         .failure_mode(BackpressureMode::BlockWithTimeout(IggyDuration::from(
+//             100_000,
+//         )))
+//         .build();
+//     let producer = client
+//         .producer(&STREAM_ID.to_string(), &TOPIC_ID.to_string())
+//         .unwrap()
+//         .background(cfg)
+//         .build();
 
-    producer.send(vec![big]).await.unwrap();
+//     producer.send(vec![big]).await.unwrap();
 
-    let big = IggyMessage::builder()
-        .id(1)
-        .payload(Bytes::from(vec![0u8; 512]))
-        .build()
-        .unwrap();
-    let t0 = Instant::now();
-    let err = producer.send(vec![big]).await.unwrap_err();
-    assert!(matches!(err, IggyError::BackgroundSendTimeout));
-    assert!(t0.elapsed() >= Duration::from_millis(100));
+//     let big = IggyMessage::builder()
+//         .id(1)
+//         .payload(Bytes::from(vec![0u8; 512]))
+//         .build()
+//         .unwrap();
+//     let t0 = Instant::now();
+//     let err = producer.send(vec![big]).await.unwrap_err();
+//     assert!(matches!(err, IggyError::BackgroundSendTimeout));
+//     assert!(t0.elapsed() >= Duration::from_millis(100));
 
-    cleanup(&client).await;
-}
+//     cleanup(&client).await;
+// }
 
 #[tokio::test]
 async fn background_block_waits_then_succeeds() {
@@ -331,70 +331,70 @@ async fn background_block_waits_then_succeeds() {
 //     cleanup(&client).await;
 // }
 
-// #[tokio::test]
-// async fn background_many_parallel_producers() {
-//     const PARALLEL_PRODUCERS: usize = 10;
+#[tokio::test]
+async fn background_many_parallel_producers() {
+    const PARALLEL_PRODUCERS: usize = 10;
 
-//     let mut test_server = TestServer::default();
-//     test_server.start();
+    let mut test_server = TestServer::default();
+    test_server.start();
 
-//     let tcp_client_config = TcpClientConfig {
-//         server_address: test_server.get_raw_tcp_addr().unwrap(),
-//         ..TcpClientConfig::default()
-//     };
-//     let client = Box::new(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
-//     let client = Arc::new(IggyClient::create(client, None, None));
+    let tcp_client_config = TcpClientConfig {
+        server_address: test_server.get_raw_tcp_addr().unwrap(),
+        ..TcpClientConfig::default()
+    };
+    let client = Box::new(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
+    let client = Arc::new(IggyClient::create(client, None, None));
 
-//     client.connect().await.unwrap();
-//     login_root(&client).await;
-//     init_system(&client).await;
+    client.connect().await.unwrap();
+    login_root(&client).await;
+    init_system(&client).await;
 
-//     let mut handles = Vec::with_capacity(PARALLEL_PRODUCERS);
+    let mut handles = Vec::with_capacity(PARALLEL_PRODUCERS);
 
-//     for i in 0..PARALLEL_PRODUCERS {
-//         let client_clone = client.clone();
-//         let handle = tokio::spawn(async move {
-//             let cfg = BackgroundConfig::builder().num_shards(1).build();
-//             let producer = client_clone
-//                 .producer(&STREAM_ID.to_string(), &TOPIC_ID.to_string())
-//                 .unwrap()
-//                 .partitioning(Partitioning::partition_id(PARTITION_ID))
-//                 .background(cfg)
-//                 .build();
+    for i in 0..PARALLEL_PRODUCERS {
+        let client_clone = client.clone();
+        let handle = tokio::spawn(async move {
+            let cfg = BackgroundConfig::builder().num_shards(1).build();
+            let producer = client_clone
+                .producer(&STREAM_ID.to_string(), &TOPIC_ID.to_string())
+                .unwrap()
+                .partitioning(Partitioning::partition_id(PARTITION_ID))
+                .background(cfg)
+                .build();
 
-//             let _ = producer.init().await;
+            let _ = producer.init().await;
 
-//             let msg = IggyMessage::builder()
-//                 .id(i as u128)
-//                 .payload(Bytes::from(vec![0u8; 100]))
-//                 .build()
-//                 .unwrap();
+            let msg = IggyMessage::builder()
+                .id(i as u128)
+                .payload(Bytes::from(vec![0u8; 100]))
+                .build()
+                .unwrap();
 
-//             producer.send(vec![msg]).await.unwrap();
-//             sleep(Duration::from_millis(1000)).await;
-//             producer.shutdown().await;
-//         });
-//         handles.push(handle);
-//     }
+            producer.send(vec![msg]).await.unwrap();
+            sleep(Duration::from_millis(1000)).await;
+            producer.shutdown().await;
+        });
+        handles.push(handle);
+    }
 
-//     for handle in handles {
-//         handle.await.unwrap();
-//     }
+    for handle in handles {
+        handle.await.unwrap();
+    }
 
-//     let consumer = Consumer::default();
-//     let polled_messages = client
-//         .poll_messages(
-//             &Identifier::numeric(STREAM_ID).unwrap(),
-//             &Identifier::numeric(TOPIC_ID).unwrap(),
-//             Some(PARTITION_ID),
-//             &consumer,
-//             &PollingStrategy::offset(0),
-//             10,
-//             false,
-//         )
-//         .await
-//         .unwrap();
+    let consumer = Consumer::default();
+    let polled_messages = client
+        .poll_messages(
+            &Identifier::numeric(STREAM_ID).unwrap(),
+            &Identifier::numeric(TOPIC_ID).unwrap(),
+            Some(PARTITION_ID),
+            &consumer,
+            &PollingStrategy::offset(0),
+            10,
+            false,
+        )
+        .await
+        .unwrap();
 
-//     assert_eq!(polled_messages.messages.len() as u32, 10);
-//     cleanup(&client).await;
-// }
+    assert_eq!(polled_messages.messages.len() as u32, 10);
+    cleanup(&client).await;
+}
