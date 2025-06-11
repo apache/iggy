@@ -125,7 +125,7 @@ pub async fn init(
                     .auto_join_consumer_group()
                     .polling_strategy(PollingStrategy::next())
                     .poll_interval(poll_interval)
-                    .batch_size(batch_size)
+                    .batch_length(batch_size)
                     .build();
 
                 consumer.init().await?;

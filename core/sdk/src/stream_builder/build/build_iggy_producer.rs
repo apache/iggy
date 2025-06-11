@@ -18,6 +18,7 @@
 
 use crate::clients::client::IggyClient;
 use crate::clients::producer::IggyProducer;
+use crate::clients::producer_config::SyncConfig;
 use crate::prelude::{IggyError, IggyExpiry, MaxTopicSize};
 use crate::stream_builder::IggyProducerConfig;
 use tracing::{error, trace};
@@ -47,8 +48,8 @@ pub(crate) async fn build_iggy_producer(
     let topic = config.topic_name();
     let topic_partitions_count = config.topic_partitions_count();
     let topic_replication_factor = config.topic_replication_factor();
-    let batch_size = config.batch_size();
-    let send_interval = config.send_interval();
+    let batch_length = config.batch_length();
+    let linger_time = config.linger_time();
     let partitioning = config.partitioning().to_owned();
     let send_retries = config.send_retries_count();
     let send_retries_interval = config.send_retries_interval();
@@ -56,8 +57,6 @@ pub(crate) async fn build_iggy_producer(
     trace!("Build iggy producer");
     let mut builder = client
         .producer(stream, topic)?
-        .batch_size(batch_size)
-        .send_interval(send_interval)
         .partitioning(partitioning)
         .create_stream_if_not_exists()
         .send_retries(send_retries, send_retries_interval)
@@ -66,6 +65,12 @@ pub(crate) async fn build_iggy_producer(
             topic_replication_factor,
             IggyExpiry::ServerDefault,
             MaxTopicSize::ServerDefault,
+        )
+        .sync(
+            SyncConfig::builder()
+                .batch_length(batch_length)
+                .linger_time(linger_time)
+                .build(),
         );
 
     if let Some(encryptor) = config.encryptor() {
@@ -73,7 +78,7 @@ pub(crate) async fn build_iggy_producer(
     }
 
     trace!("Initialize iggy producer");
-    let mut producer = builder.build();
+    let producer = builder.build();
     producer.init().await.map_err(|err| {
         error!("Failed to initialize consumer: {err}");
         err

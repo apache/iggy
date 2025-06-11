@@ -15,8 +15,11 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use super::{MAX_BATCH_SIZE, ORDERING};
-
+use super::ORDERING;
+use crate::clients::MAX_BATCH_LENGTH;
+use crate::clients::producer_builder::SendMode;
+use crate::clients::producer_config::SyncConfig;
+use crate::clients::producer_dispatcher::ProducerDispatcher;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use iggy_binary_protocol::Client;
@@ -26,27 +29,37 @@ use iggy_common::{
     IggyError, IggyExpiry, IggyMessage, IggyTimestamp, MaxTopicSize, Partitioner, Partitioning,
 };
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::Duration;
 use tokio::time::{Interval, sleep};
 use tracing::{error, info, trace, warn};
 
-unsafe impl Send for IggyProducer {}
-unsafe impl Sync for IggyProducer {}
+#[cfg(test)]
+use mockall::automock;
 
-pub struct IggyProducer {
-    initialized: bool,
+#[cfg_attr(test, automock)]
+pub trait ProducerCoreBackend: Send + Sync + 'static {
+    fn send_internal(
+        &self,
+        stream: &Identifier,
+        topic: &Identifier,
+        msgs: Vec<IggyMessage>,
+        partitioning: Option<Arc<Partitioning>>,
+    ) -> impl Future<Output = Result<(), IggyError>> + Send;
+}
+
+pub struct ProducerCore {
+    initialized: AtomicBool,
     can_send: Arc<AtomicBool>,
     client: Arc<IggySharedMut<Box<dyn Client>>>,
     stream_id: Arc<Identifier>,
     stream_name: String,
     topic_id: Arc<Identifier>,
     topic_name: String,
-    batch_size: Option<usize>,
     partitioning: Option<Arc<Partitioning>>,
     encryptor: Option<Arc<EncryptorKind>>,
     partitioner: Option<Arc<dyn Partitioner>>,
-    send_interval_micros: u64,
     create_stream_if_not_exists: bool,
     create_topic_if_not_exists: bool,
     topic_partitions_count: u32,
@@ -54,74 +67,15 @@ pub struct IggyProducer {
     topic_message_expiry: IggyExpiry,
     topic_max_size: MaxTopicSize,
     default_partitioning: Arc<Partitioning>,
-    can_send_immediately: bool,
     last_sent_at: Arc<AtomicU64>,
     send_retries_count: Option<u32>,
     send_retries_interval: Option<IggyDuration>,
+    sync_config: Option<SyncConfig>,
 }
 
-impl IggyProducer {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        client: IggySharedMut<Box<dyn Client>>,
-        stream: Identifier,
-        stream_name: String,
-        topic: Identifier,
-        topic_name: String,
-        batch_size: Option<usize>,
-        partitioning: Option<Partitioning>,
-        encryptor: Option<Arc<EncryptorKind>>,
-        partitioner: Option<Arc<dyn Partitioner>>,
-        interval: Option<IggyDuration>,
-        create_stream_if_not_exists: bool,
-        create_topic_if_not_exists: bool,
-        topic_partitions_count: u32,
-        topic_replication_factor: Option<u8>,
-        topic_message_expiry: IggyExpiry,
-        topic_max_size: MaxTopicSize,
-        send_retries_count: Option<u32>,
-        send_retries_interval: Option<IggyDuration>,
-    ) -> Self {
-        Self {
-            initialized: false,
-            client: Arc::new(client),
-            can_send: Arc::new(AtomicBool::new(true)),
-            stream_id: Arc::new(stream),
-            stream_name,
-            topic_id: Arc::new(topic),
-            topic_name,
-            batch_size,
-            partitioning: partitioning.map(Arc::new),
-            encryptor,
-            partitioner,
-            send_interval_micros: interval.map_or(0, |i| i.as_micros()),
-            create_stream_if_not_exists,
-            create_topic_if_not_exists,
-            topic_partitions_count,
-            topic_replication_factor,
-            topic_message_expiry,
-            topic_max_size,
-            default_partitioning: Arc::new(Partitioning::balanced()),
-            can_send_immediately: interval.is_none(),
-            last_sent_at: Arc::new(AtomicU64::new(0)),
-            send_retries_count,
-            send_retries_interval,
-        }
-    }
-
-    pub fn stream(&self) -> &Identifier {
-        &self.stream_id
-    }
-
-    pub fn topic(&self) -> &Identifier {
-        &self.topic_id
-    }
-
-    /// Initializes the producer by subscribing to diagnostic events, creating the stream and topic if they do not exist etc.
-    ///
-    /// Note: This method must be invoked before producing messages.
-    pub async fn init(&mut self) -> Result<(), IggyError> {
-        if self.initialized {
+impl ProducerCore {
+    pub async fn init(&self) -> Result<(), IggyError> {
+        if self.initialized.load(Ordering::SeqCst) {
             return Ok(());
         }
 
@@ -179,7 +133,9 @@ impl IggyProducer {
                 .await?;
         }
 
-        self.initialized = true;
+        let _ = self
+            .initialized
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
         info!("Producer has been initialized for stream: {stream_id} and topic: {topic_id}.");
         Ok(())
     }
@@ -219,171 +175,6 @@ impl IggyProducer {
                 }
             }
         });
-    }
-
-    pub async fn send(&self, messages: Vec<IggyMessage>) -> Result<(), IggyError> {
-        if messages.is_empty() {
-            trace!("No messages to send.");
-            return Ok(());
-        }
-
-        if self.can_send_immediately {
-            return self
-                .send_immediately(&self.stream_id, &self.topic_id, messages, None)
-                .await;
-        }
-
-        self.send_buffered(
-            self.stream_id.clone(),
-            self.topic_id.clone(),
-            messages,
-            None,
-        )
-        .await
-    }
-
-    pub async fn send_one(&self, message: IggyMessage) -> Result<(), IggyError> {
-        self.send(vec![message]).await
-    }
-
-    pub async fn send_with_partitioning(
-        &self,
-        messages: Vec<IggyMessage>,
-        partitioning: Option<Arc<Partitioning>>,
-    ) -> Result<(), IggyError> {
-        if messages.is_empty() {
-            trace!("No messages to send.");
-            return Ok(());
-        }
-
-        if self.can_send_immediately {
-            return self
-                .send_immediately(&self.stream_id, &self.topic_id, messages, partitioning)
-                .await;
-        }
-
-        self.send_buffered(
-            self.stream_id.clone(),
-            self.topic_id.clone(),
-            messages,
-            partitioning,
-        )
-        .await
-    }
-
-    pub async fn send_to(
-        &self,
-        stream: Arc<Identifier>,
-        topic: Arc<Identifier>,
-        messages: Vec<IggyMessage>,
-        partitioning: Option<Arc<Partitioning>>,
-    ) -> Result<(), IggyError> {
-        if messages.is_empty() {
-            trace!("No messages to send.");
-            return Ok(());
-        }
-
-        if self.can_send_immediately {
-            return self
-                .send_immediately(&self.stream_id, &self.topic_id, messages, partitioning)
-                .await;
-        }
-
-        self.send_buffered(stream, topic, messages, partitioning)
-            .await
-    }
-
-    async fn send_buffered(
-        &self,
-        stream: Arc<Identifier>,
-        topic: Arc<Identifier>,
-        mut messages: Vec<IggyMessage>,
-        partitioning: Option<Arc<Partitioning>>,
-    ) -> Result<(), IggyError> {
-        self.encrypt_messages(&mut messages)?;
-        let partitioning = self.get_partitioning(&stream, &topic, &messages, partitioning)?;
-        let batch_size = self.batch_size.unwrap_or(MAX_BATCH_SIZE);
-        let batches = messages.chunks_mut(batch_size);
-        let mut current_batch = 1;
-        let batches_count = batches.len();
-        for batch in batches {
-            if self.send_interval_micros > 0 {
-                Self::wait_before_sending(
-                    self.send_interval_micros,
-                    self.last_sent_at.load(ORDERING),
-                )
-                .await;
-            }
-
-            let messages_count = batch.len();
-            trace!(
-                "Sending {messages_count} messages ({current_batch}/{batches_count} batch(es))..."
-            );
-            self.last_sent_at
-                .store(IggyTimestamp::now().into(), ORDERING);
-            self.try_send_messages(&self.stream_id, &self.topic_id, &partitioning, batch)
-                .await?;
-            trace!("Sent {messages_count} messages ({current_batch}/{batches_count} batch(es)).");
-            current_batch += 1;
-        }
-        Ok(())
-    }
-
-    async fn send_immediately(
-        &self,
-        stream: &Identifier,
-        topic: &Identifier,
-        mut messages: Vec<IggyMessage>,
-        partitioning: Option<Arc<Partitioning>>,
-    ) -> Result<(), IggyError> {
-        trace!("No batch size specified, sending messages immediately.");
-        self.encrypt_messages(&mut messages)?;
-        let partitioning = self.get_partitioning(stream, topic, &messages, partitioning)?;
-        let batch_size = self.batch_size.unwrap_or(MAX_BATCH_SIZE);
-        if messages.len() <= batch_size {
-            self.last_sent_at
-                .store(IggyTimestamp::now().into(), ORDERING);
-            self.try_send_messages(stream, topic, &partitioning, &mut messages)
-                .await?;
-            return Ok(());
-        }
-
-        for batch in messages.chunks_mut(batch_size) {
-            self.last_sent_at
-                .store(IggyTimestamp::now().into(), ORDERING);
-            self.try_send_messages(stream, topic, &partitioning, batch)
-                .await?;
-        }
-        Ok(())
-    }
-
-    async fn wait_before_sending(interval: u64, last_sent_at: u64) {
-        if interval == 0 {
-            return;
-        }
-
-        let now: u64 = IggyTimestamp::now().into();
-        let elapsed = now - last_sent_at;
-        if elapsed >= interval {
-            trace!("No need to wait before sending messages. {now} - {last_sent_at} = {elapsed}");
-            return;
-        }
-
-        let remaining = interval - elapsed;
-        trace!(
-            "Waiting for {remaining} microseconds before sending messages... {interval} - {elapsed} = {remaining}"
-        );
-        sleep(Duration::from_micros(remaining)).await;
-    }
-
-    fn encrypt_messages(&self, messages: &mut [IggyMessage]) -> Result<(), IggyError> {
-        if let Some(encryptor) = &self.encryptor {
-            for message in messages {
-                message.payload = Bytes::from(encryptor.encrypt(&message.payload)?);
-                message.header.payload_length = message.payload.len() as u32;
-            }
-        }
-        Ok(())
     }
 
     async fn try_send_messages(
@@ -505,6 +296,16 @@ impl IggyProducer {
         }
     }
 
+    fn encrypt_messages(&self, messages: &mut [IggyMessage]) -> Result<(), IggyError> {
+        if let Some(encryptor) = &self.encryptor {
+            for message in messages {
+                message.payload = Bytes::from(encryptor.encrypt(&message.payload)?);
+                message.header.payload_length = message.payload.len() as u32;
+            }
+        }
+        Ok(())
+    }
+
     fn get_partitioning(
         &self,
         stream: &Identifier,
@@ -523,6 +324,257 @@ impl IggyProducer {
                     .clone()
                     .unwrap_or_else(|| self.default_partitioning.clone())
             }))
+        }
+    }
+
+    async fn wait_before_sending(interval: u64, last_sent_at: u64) {
+        if interval == 0 {
+            return;
+        }
+
+        let now: u64 = IggyTimestamp::now().into();
+        let elapsed = now - last_sent_at;
+        if elapsed >= interval {
+            trace!("No need to wait before sending messages. {now} - {last_sent_at} = {elapsed}");
+            return;
+        }
+
+        let remaining = interval - elapsed;
+        trace!(
+            "Waiting for {remaining} microseconds before sending messages... {interval} - {elapsed} = {remaining}"
+        );
+        sleep(Duration::from_micros(remaining)).await;
+    }
+}
+
+impl ProducerCoreBackend for ProducerCore {
+    async fn send_internal(
+        &self,
+        stream: &Identifier,
+        topic: &Identifier,
+        mut msgs: Vec<IggyMessage>,
+        partitioning: Option<Arc<Partitioning>>,
+    ) -> Result<(), IggyError> {
+        if msgs.is_empty() {
+            return Ok(());
+        }
+
+        if let Err(err) = self.encrypt_messages(&mut msgs) {
+            return Err(IggyError::ProducerSendFailed {
+                cause: err.to_string(),
+                failed: Arc::new(msgs),
+            });
+        }
+
+        let part = match self.get_partitioning(stream, topic, &msgs, partitioning.clone()) {
+            Ok(p) => p,
+            Err(err) => {
+                return Err(IggyError::ProducerSendFailed {
+                    cause: err.to_string(),
+                    failed: Arc::new(msgs),
+                });
+            }
+        };
+
+        match &self.sync_config {
+            Some(cfg) => {
+                let linger_time_micros = cfg.linger_time.as_micros();
+                if linger_time_micros > 0 {
+                    Self::wait_before_sending(linger_time_micros, self.last_sent_at.load(ORDERING))
+                        .await;
+                }
+
+                let max = if cfg.batch_length == 0 {
+                    MAX_BATCH_LENGTH
+                } else {
+                    cfg.batch_length as usize
+                };
+                let mut index = 0;
+                while index < msgs.len() {
+                    let end = (index + max).min(msgs.len());
+                    let chunk = &mut msgs[index..end];
+
+                    if let Err(err) = self.try_send_messages(stream, topic, &part, chunk).await {
+                        let failed_tail = msgs.split_off(index);
+                        return Err(IggyError::ProducerSendFailed {
+                            cause: err.to_string(),
+                            failed: Arc::new(failed_tail),
+                        });
+                    }
+                    self.last_sent_at
+                        .store(IggyTimestamp::now().into(), ORDERING);
+                    index = end;
+                }
+            }
+            // background send on
+            _ => {
+                self.try_send_messages(stream, topic, &part, &mut msgs)
+                    .await
+                    .map_err(|err| IggyError::ProducerSendFailed {
+                        cause: err.to_string(),
+                        failed: Arc::new(msgs),
+                    })?;
+                self.last_sent_at
+                    .store(IggyTimestamp::now().into(), ORDERING);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+unsafe impl Send for IggyProducer {}
+unsafe impl Sync for IggyProducer {}
+
+pub struct IggyProducer {
+    core: Arc<ProducerCore>,
+    dispatcher: Option<ProducerDispatcher>,
+}
+
+impl IggyProducer {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        client: IggySharedMut<Box<dyn Client>>,
+        stream: Identifier,
+        stream_name: String,
+        topic: Identifier,
+        topic_name: String,
+        partitioning: Option<Partitioning>,
+        encryptor: Option<Arc<EncryptorKind>>,
+        partitioner: Option<Arc<dyn Partitioner>>,
+        create_stream_if_not_exists: bool,
+        create_topic_if_not_exists: bool,
+        topic_partitions_count: u32,
+        topic_replication_factor: Option<u8>,
+        topic_message_expiry: IggyExpiry,
+        topic_max_size: MaxTopicSize,
+        send_retries_count: Option<u32>,
+        send_retries_interval: Option<IggyDuration>,
+        mode: SendMode,
+    ) -> Self {
+        let core = Arc::new(ProducerCore {
+            initialized: AtomicBool::new(true),
+            client: Arc::new(client),
+            can_send: Arc::new(AtomicBool::new(true)),
+            stream_id: Arc::new(stream),
+            stream_name,
+            topic_id: Arc::new(topic),
+            topic_name,
+            partitioning: partitioning.map(Arc::new),
+            encryptor,
+            partitioner,
+            create_stream_if_not_exists,
+            create_topic_if_not_exists,
+            topic_partitions_count,
+            topic_replication_factor,
+            topic_message_expiry,
+            topic_max_size,
+            default_partitioning: Arc::new(Partitioning::balanced()),
+            last_sent_at: Arc::new(AtomicU64::new(0)),
+            send_retries_count,
+            send_retries_interval,
+            sync_config: match mode {
+                SendMode::Sync(ref cfg) => Some(cfg.clone()),
+                _ => None,
+            },
+        });
+        let dispatcher = match mode {
+            SendMode::Background(cfg) => Some(ProducerDispatcher::new(core.clone(), cfg)),
+            _ => None,
+        };
+
+        Self { core, dispatcher }
+    }
+
+    pub fn stream(&self) -> &Identifier {
+        &self.core.stream_id
+    }
+
+    pub fn topic(&self) -> &Identifier {
+        &self.core.topic_id
+    }
+
+    /// Initializes the producer by subscribing to diagnostic events, creating the stream and topic if they do not exist etc.
+    ///
+    /// Note: This method must be invoked before producing messages.
+    pub async fn init(&self) -> Result<(), IggyError> {
+        self.core.init().await
+    }
+
+    pub async fn send(&self, messages: Vec<IggyMessage>) -> Result<(), IggyError> {
+        if messages.is_empty() {
+            trace!("No messages to send.");
+            return Ok(());
+        }
+
+        let stream_id = self.core.stream_id.clone();
+        let topic_id = self.core.topic_id.clone();
+
+        match &self.dispatcher {
+            Some(disp) => disp.dispatch(messages, stream_id, topic_id, None).await,
+            None => {
+                self.core
+                    .send_internal(&stream_id, &topic_id, messages, None)
+                    .await
+            }
+        }
+    }
+
+    pub async fn send_one(&self, message: IggyMessage) -> Result<(), IggyError> {
+        self.send(vec![message]).await
+    }
+
+    pub async fn send_with_partitioning(
+        &self,
+        messages: Vec<IggyMessage>,
+        partitioning: Option<Arc<Partitioning>>,
+    ) -> Result<(), IggyError> {
+        if messages.is_empty() {
+            trace!("No messages to send.");
+            return Ok(());
+        }
+
+        let stream_id = self.core.stream_id.clone();
+        let topic_id = self.core.topic_id.clone();
+
+        match &self.dispatcher {
+            Some(disp) => {
+                disp.dispatch(messages, stream_id, topic_id, partitioning)
+                    .await
+            }
+            None => {
+                self.core
+                    .send_internal(&stream_id, &topic_id, messages, partitioning)
+                    .await
+            }
+        }
+    }
+
+    pub async fn send_to(
+        &self,
+        stream: Arc<Identifier>,
+        topic: Arc<Identifier>,
+        messages: Vec<IggyMessage>,
+        partitioning: Option<Arc<Partitioning>>,
+    ) -> Result<(), IggyError> {
+        if messages.is_empty() {
+            trace!("No messages to send.");
+            return Ok(());
+        }
+
+        match &self.dispatcher {
+            Some(disp) => disp.dispatch(messages, stream, topic, partitioning).await,
+            None => {
+                self.core
+                    .send_internal(&stream, &topic, messages, partitioning)
+                    .await
+            }
+        }
+    }
+
+    pub async fn shutdown(self) {
+        if let Some(disp) = self.dispatcher {
+            disp.shutdown().await;
         }
     }
 }

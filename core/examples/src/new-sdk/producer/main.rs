@@ -43,10 +43,15 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     let client = client_provider::get_raw_client(client_provider_config, false).await?;
     let client = IggyClient::builder().with_client(client).build()?;
     client.connect().await?;
-    let mut producer = client
+    let interval = IggyDuration::from_str(&args.interval)?;
+    let producer = client
         .producer(&args.stream_id, &args.topic_id)?
-        .batch_size(args.messages_per_batch)
-        .send_interval(IggyDuration::from_str(&args.interval)?)
+        .sync(
+            SyncConfig::builder()
+                .batch_length(args.messages_per_batch)
+                .linger_time(interval)
+                .build(),
+        )
         .partitioning(Partitioning::balanced())
         .create_topic_if_not_exists(
             3,

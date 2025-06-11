@@ -276,7 +276,7 @@ async fn create_consumers(
     consumers_count: u32,
     stream: &str,
     topics: &[&str],
-    batch_size: u32,
+    batch_length: u32,
     interval: &str,
 ) -> Result<Vec<TenantConsumer>, IggyError> {
     let mut consumers = Vec::new();
@@ -284,7 +284,7 @@ async fn create_consumers(
         for id in 1..=consumers_count {
             let mut consumer = client
                 .consumer_group(CONSUMER_GROUP, stream, topic)?
-                .batch_size(batch_size)
+                .batch_length(batch_length)
                 .poll_interval(IggyDuration::from_str(interval).expect("Invalid duration"))
                 .polling_strategy(PollingStrategy::next())
                 .auto_join_consumer_group()

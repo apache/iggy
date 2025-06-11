@@ -189,7 +189,7 @@ fn start_producers(
     tenant_id: u32,
     producers: Vec<TenantProducer>,
     batches_count: u64,
-    batch_size: u32,
+    batch_length: u32,
 ) -> Vec<JoinHandle<()>> {
     let mut tasks = Vec::new();
     let topics_count = producers
@@ -221,8 +221,8 @@ fn start_producers(
                     _ => panic!("Invalid topic"),
                 };
 
-                let mut messages = Vec::with_capacity(batch_size as usize);
-                for _ in 1..=batch_size {
+                let mut messages = Vec::with_capacity(batch_length as usize);
+                for _ in 1..=batch_length {
                     let payload = format!("{message}-{producer_id}-{message_id}");
                     let message = IggyMessage::from_str(&payload).expect("Invalid message");
                     messages.push(message);
@@ -230,7 +230,7 @@ fn start_producers(
 
                 if let Err(error) = producer.producer.send(messages).await {
                     error!(
-                        "Failed to send: {batch_size} message(s) to: {} -> {} by tenant: {tenant_id}, producer: {producer_id} with error: {error}",
+                        "Failed to send: {batch_length} message(s) to: {} -> {} by tenant: {tenant_id}, producer: {producer_id} with error: {error}",
                         producer.stream, producer.topic,
                     );
                     continue;
@@ -238,7 +238,7 @@ fn start_producers(
 
                 counter += 1;
                 info!(
-                    "Sent: {batch_size} message(s) by tenant: {tenant_id}, producer: {producer_id}, to: {} -> {}",
+                    "Sent: {batch_length} message(s) by tenant: {tenant_id}, producer: {producer_id}, to: {} -> {}",
                     producer.stream, producer.topic
                 );
             }
@@ -254,16 +254,20 @@ async fn create_producers(
     partitions_count: u32,
     stream: &str,
     topics: &[&str],
-    batch_size: u32,
+    batch_length: u32,
     interval: &str,
 ) -> Result<Vec<TenantProducer>, IggyError> {
     let mut producers = Vec::new();
     for topic in topics {
         for id in 1..=producers_count {
-            let mut producer = client
+            let producer = client
                 .producer(stream, topic)?
-                .batch_size(batch_size)
-                .send_interval(IggyDuration::from_str(interval).expect("Invalid duration"))
+                .sync(
+                    SyncConfig::builder()
+                        .batch_length(batch_length)
+                        .linger_time(IggyDuration::from_str(interval).expect("Invalid duration"))
+                        .build(),
+                )
                 .partitioning(Partitioning::balanced())
                 .create_topic_if_not_exists(
                     partitions_count,

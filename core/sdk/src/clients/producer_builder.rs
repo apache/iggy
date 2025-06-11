@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::MAX_BATCH_SIZE;
+use crate::clients::producer_config::{BackgroundConfig, SyncConfig};
 use crate::prelude::IggyProducer;
 use iggy_binary_protocol::Client;
 use iggy_common::locking::IggySharedMut;
@@ -24,18 +24,25 @@ use iggy_common::{
 };
 use std::sync::Arc;
 
-#[derive(Debug)]
+pub enum SendMode {
+    Sync(SyncConfig),
+    Background(BackgroundConfig),
+}
+
+impl Default for SendMode {
+    fn default() -> Self {
+        SendMode::Sync(SyncConfig::builder().build())
+    }
+}
+
 pub struct IggyProducerBuilder {
     client: IggySharedMut<Box<dyn Client>>,
     stream: Identifier,
     stream_name: String,
     topic: Identifier,
     topic_name: String,
-    batch_size: Option<usize>,
-    partitioning: Option<Partitioning>,
     encryptor: Option<Arc<EncryptorKind>>,
     partitioner: Option<Arc<dyn Partitioner>>,
-    send_interval: Option<IggyDuration>,
     create_stream_if_not_exists: bool,
     create_topic_if_not_exists: bool,
     topic_partitions_count: u32,
@@ -44,6 +51,8 @@ pub struct IggyProducerBuilder {
     send_retries_interval: Option<IggyDuration>,
     topic_message_expiry: IggyExpiry,
     topic_max_size: MaxTopicSize,
+    partitioning: Option<Partitioning>,
+    mode: SendMode,
 }
 
 impl IggyProducerBuilder {
@@ -63,11 +72,9 @@ impl IggyProducerBuilder {
             stream_name,
             topic,
             topic_name,
-            batch_size: Some(1000),
             partitioning: None,
             encryptor,
             partitioner,
-            send_interval: Some(IggyDuration::from(1000)),
             create_stream_if_not_exists: true,
             create_topic_if_not_exists: true,
             topic_partitions_count: 1,
@@ -76,6 +83,7 @@ impl IggyProducerBuilder {
             topic_max_size: MaxTopicSize::ServerDefault,
             send_retries_count: Some(3),
             send_retries_interval: Some(IggyDuration::ONE_SECOND),
+            mode: SendMode::default(),
         }
     }
 
@@ -87,42 +95,6 @@ impl IggyProducerBuilder {
     /// Sets the stream name.
     pub fn topic(self, topic: Identifier) -> Self {
         Self { topic, ..self }
-    }
-
-    /// Sets the number of messages to batch before sending them, can be combined with `interval`.
-    pub fn batch_size(self, batch_size: u32) -> Self {
-        Self {
-            batch_size: if batch_size == 0 {
-                None
-            } else {
-                Some(batch_size.min(MAX_BATCH_SIZE as u32) as usize)
-            },
-            ..self
-        }
-    }
-
-    /// Clears the batch size.
-    pub fn without_batch_size(self) -> Self {
-        Self {
-            batch_size: None,
-            ..self
-        }
-    }
-
-    /// Sets the interval between sending the messages, can be combined with `batch_size`.
-    pub fn send_interval(self, interval: IggyDuration) -> Self {
-        Self {
-            send_interval: Some(interval),
-            ..self
-        }
-    }
-
-    /// Clears the interval.
-    pub fn without_send_interval(self) -> Self {
-        Self {
-            send_interval: None,
-            ..self
-        }
     }
 
     /// Sets the encryptor for encrypting the messages' payloads.
@@ -226,9 +198,21 @@ impl IggyProducerBuilder {
         }
     }
 
-    /// Builds the producer.
-    ///
-    /// Note: After building the producer, `init()` must be invoked before producing messages.
+    /// Sets the producer to use synchronous (direct) message sending.
+    /// This mode ensures that messages are sent immediately to the server
+    /// without being buffered or delayed.
+    pub fn sync(mut self, config: SyncConfig) -> Self {
+        self.mode = SendMode::Sync(config);
+        self
+    }
+
+    /// Sets the producer to use asynchronous (background) message sending.
+    /// This mode buffers messages and sends them in the background.
+    pub fn background(mut self, config: BackgroundConfig) -> Self {
+        self.mode = SendMode::Background(config);
+        self
+    }
+
     pub fn build(self) -> IggyProducer {
         IggyProducer::new(
             self.client,
@@ -236,11 +220,9 @@ impl IggyProducerBuilder {
             self.stream_name,
             self.topic,
             self.topic_name,
-            self.batch_size,
             self.partitioning,
             self.encryptor,
             self.partitioner,
-            self.send_interval,
             self.create_stream_if_not_exists,
             self.create_topic_if_not_exists,
             self.topic_partitions_count,
@@ -249,6 +231,7 @@ impl IggyProducerBuilder {
             self.topic_max_size,
             self.send_retries_count,
             self.send_retries_interval,
+            self.mode,
         )
     }
 }

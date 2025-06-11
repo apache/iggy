@@ -19,7 +19,9 @@
 use dashmap::DashMap;
 use dlopen2::wrapper::Container;
 use flume::{Receiver, Sender};
-use iggy::prelude::{HeaderKey, HeaderValue, IggyClient, IggyDuration, IggyError, IggyMessage};
+use iggy::prelude::{
+    HeaderKey, HeaderValue, IggyClient, IggyDuration, IggyError, IggyMessage, SyncConfig,
+};
 use iggy_connector_sdk::{
     DecodedMessage, Error, ProducedMessages, StreamEncoder, TopicMetadata, transforms::Transform,
 };
@@ -112,14 +114,18 @@ pub async fn init(
             .expect("Failed to get source plugin");
 
         for stream in config.streams {
-            let send_interval =
-                IggyDuration::from_str(&stream.send_interval.unwrap_or("5ms".to_owned()))
+            let linger_time =
+                IggyDuration::from_str(&stream.linger_time.unwrap_or("5ms".to_owned()))
                     .expect("Invalid send interval");
-            let batch_size = stream.batch_size.unwrap_or(1000);
-            let mut producer = iggy_client
+            let batch_length = stream.batch_length.unwrap_or(1000);
+            let producer = iggy_client
                 .producer(&stream.stream, &stream.topic)?
-                .send_interval(send_interval)
-                .batch_size(batch_size)
+                .sync(
+                    SyncConfig::builder()
+                        .batch_length(batch_length)
+                        .linger_time(linger_time)
+                        .build(),
+                )
                 .build();
 
             producer.init().await?;

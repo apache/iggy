@@ -48,6 +48,7 @@ futures = { workspace = true }
 futures-util = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
+num_cpus = "1.16.0"
 quinn = { workspace = true }
 reqwest = { workspace = true }
 reqwest-middleware = { workspace = true }
@@ -59,3 +60,6 @@ tokio-rustls = { workspace = true }
 tracing = { workspace = true }
 trait-variant = { workspace = true }
 webpki-roots = { workspace = true }
+
+[dev-dependencies]
+mockall = { workspace = true }

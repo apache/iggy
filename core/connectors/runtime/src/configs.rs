@@ -60,8 +60,8 @@ pub struct StreamProducerConfig {
     pub stream: String,
     pub topic: String,
     pub schema: Schema,
-    pub batch_size: Option<u32>,
-    pub send_interval: Option<String>,
+    pub batch_length: Option<u32>,
+    pub linger_time: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
