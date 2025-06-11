@@ -1,0 +1,13 @@
+{
+  "default": {
+    "loader": [
+      "@swc-node/register/esm-register"
+    ],
+    "import": [
+      "src/bdd/**/*.ts"
+    ],
+    "paths": [
+      "../../bdd/**/*.feature"
+    ]
+  }
+}

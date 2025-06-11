@@ -31,7 +31,7 @@ const debug = Debug('iggy:client');
 /** index size per messages in bit */
 const INDEX_SIZE = 16;
 
-export type MessageIdKind = 0 | 0n | string;
+export type MessageIdKind = 0 | 0n | number | bigint | string;
 
 export type CreateMessage = {
   id?: MessageIdKind, 
@@ -40,23 +40,46 @@ export type CreateMessage = {
 };
 
 export const isValidMessageId = (x?: unknown): x is MessageIdKind =>
-  x === undefined || x === 0 || x === 0n || 'string' === typeof x;
+  x === undefined || x === 0 || x === 0n ||
+  'string' === typeof x ||
+  'bigint' === typeof x ||
+  'number' === typeof x;
 
 export const serializeMessageId = (id?: unknown) => {
 
   if(!isValidMessageId(id))
-    throw new Error(`invalid message id: '${id}' (use uuid string or 0)`)
+    throw new Error(`invalid message id: '${id}' (use uuid string | number | bigint >= 0)`)
 
-  if(id === undefined || id === 0 || id === 0n) {
+  if(id === undefined)
     return Buffer.alloc(16, 0); // 0u128
+
+  if ('bigint' === typeof id || 'number' === typeof id) {
+    if (id < 0)
+      throw new Error(`invalid message id: '${id}' (numeric id must be >= 0)`)
+
+    if ('number' === typeof id) {
+      const b = Buffer.alloc(16, 0);
+      b.writeUInt32LE(id)
+      return b; // id_u32 + 0u96
+    }
+
+    if ('bigint' === typeof id) {
+      const b = Buffer.alloc(16, 0);
+      b.writeBigUInt64LE(id)
+      return b; // id_u64 + 0u64
+    }
   }
 
   try {
     const uuid = parseUUID(id);
     return Buffer.from(uuid.toHex(), 'hex');
   } catch (err) {
-    throw new Error(`invalid message id: '${id}' (use uuid string or 0)`, { cause: err })
+    throw new Error(
+      `invalid message id: '${id}' (use uuid string | number | bigint >= 0)`,
+      { cause: err }
+    )
   }
+
 }
 
 export const serializeMessage = (msg: CreateMessage) => {

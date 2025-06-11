@@ -30,6 +30,7 @@
   "scripts": {
     "test": "node --import @swc-node/register/esm-register --test --experimental-test-coverage './src/**/*.test.ts'",
     "test:e2e": "node --import @swc-node/register/esm-register --test --experimental-test-coverage --test-force-exit './src/e2e/*.e2e.ts'",
+    "test:bdd": "cucumber-js --exit",
     "clean": "rm -Rf dist/",
     "lint": "eslint src/**/*.ts",
     "commitlint": "commitlint --edit",
@@ -47,6 +48,7 @@
   "devDependencies": {
     "@commitlint/cli": "19.6.1",
     "@commitlint/config-conventional": "19.6.0",
+    "@cucumber/cucumber": "11.3.0",
     "@semantic-release/changelog": "6.0.3",
     "@semantic-release/exec": "6.0.3",
     "@semantic-release/git": "10.0.1",

@@ -26,13 +26,13 @@ Feature: Basic Messaging Operations
 
   Scenario: Create stream and send messages
     Given I have no streams in the system
-    When I create a stream with ID 1 and name test-stream
+    When I create a stream with ID 1 and name "test-stream"
     Then the stream should be created successfully
-    And the stream should have ID 1 and name test-stream
+    And the stream should have ID 1 and name "test-stream"
     
-    When I create a topic with ID 1 and name test-topic in stream 1 with 3 partitions
+    When I create a topic with ID 1 and name "test-topic" in stream 1 with 3 partitions
     Then the topic should be created successfully
-    And the topic should have ID 1 and name test-topic 
+    And the topic should have ID 1 and name "test-topic" 
     And the topic should have 3 partitions
     
     When I send 10 messages to stream 1, topic 1, partition 1

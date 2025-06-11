@@ -55,16 +55,16 @@ describe('SendMessages', () => {
     });
 
     
-    it('throw on invalid number message id', () => {
+    it('does not throw on number message id', () => {
       const t = { ...t1, messages: [{ id: 42 as MessageIdKind, payload: 'm' }] };
-      assert.throws(
+      assert.doesNotThrow(
         () => SEND_MESSAGES.serialize(t)
       );
     });
 
-    it('throw on invalid bigint message id', () => {
+    it('does not throw on bigint message id', () => {
       const t = { ...t1, messages: [{ id: 123n as MessageIdKind, payload: 'm' }] };
-      assert.throws(
+      assert.doesNotThrow(
         () => SEND_MESSAGES.serialize(t)
       );
     });
@@ -76,6 +76,21 @@ describe('SendMessages', () => {
       );
     });
 
+    it('throw on invalid number message id', () => {
+      const t = { ...t1, messages: [{ id: -12, payload: 'n' }] };
+      assert.throws(
+        () => SEND_MESSAGES.serialize(t)
+      );
+    });
+
+    it('throw on invalid bigint message id', () => {
+      const t = { ...t1, messages: [{ id: -12n, payload: 'bn' }] };
+      assert.throws(
+        () => SEND_MESSAGES.serialize(t)
+      );
+    });
+
+    
     it('serialize message with headers', () => {
       const t: SendMessages = {
         streamId: 911,
