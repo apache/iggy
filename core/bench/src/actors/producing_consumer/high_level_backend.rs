@@ -16,18 +16,24 @@
  * under the License.
  */
 
-use super::backend::{BenchmarkConsumerBackend, ConsumedBatch, HighLevelBackend};
+use std::time::Duration;
+
 use futures_util::StreamExt;
 use iggy::prelude::*;
 use integration::test_server::login_root;
-use std::time::Duration;
 use tokio::time::{Instant, timeout};
 use tracing::{debug, error, info, warn};
 
-impl BenchmarkConsumerBackend for HighLevelBackend {
-    type Consumer = IggyConsumer;
+use crate::actors::{
+    consumer::backend::ConsumedBatch,
+    producer::backend::ProducedBatch,
+    producing_consumer::backend::{BenchmarkProducingConsumerBackend, HighLevelBackend},
+};
 
-    async fn setup(&self) -> Result<Self::Consumer, IggyError> {
+impl BenchmarkProducingConsumerBackend for HighLevelBackend {
+    type MessagingContext = (IggyConsumer, IggyProducer);
+
+    async fn setup(&self) -> Result<Self::MessagingContext, iggy::prelude::IggyError> {
         let topic_id: u32 = 1;
         let client = self.client_factory.create_client().await;
         let client = IggyClient::create(client, None, None);
@@ -36,9 +42,22 @@ impl BenchmarkConsumerBackend for HighLevelBackend {
         let stream_id_str = self.config.stream_id.to_string();
         let topic_id_str = topic_id.to_string();
 
+        // Setup producer
+        let iggy_producer = client
+            .producer(&stream_id_str, &topic_id_str)?
+            .create_stream_if_not_exists()
+            .create_topic_if_not_exists(
+                self.config.partitions_count,
+                Some(1),
+                IggyExpiry::NeverExpire,
+                MaxTopicSize::ServerDefault,
+            )
+            .build();
+        iggy_producer.init().await?;
+
+        // Setup consumer
         let mut iggy_consumer = if let Some(cg_id) = self.config.consumer_group_id {
             let consumer_group_name = format!("cg_{cg_id}");
-            // Consumer groups use auto-commit (matching PollingKind::Next behavior from low-level API)
             client
                 .consumer_group(&consumer_group_name, &stream_id_str, &topic_id_str)?
                 .batch_length(self.config.messages_per_batch.get())
@@ -47,12 +66,9 @@ impl BenchmarkConsumerBackend for HighLevelBackend {
                 .auto_join_consumer_group()
                 .build()
         } else {
-            // TODO(hubcio): as of now, there is no way to mimic the behavior of
-            // PollingKind::Offset, because high level API doesn't provide method
-            // to commit local offset manually, only auto-commit on server.
             client
                 .consumer(
-                    &format!("hl_consumer_{}", self.config.consumer_id),
+                    &format!("hl_consumer_{}", self.config.actor_id),
                     &stream_id_str,
                     &topic_id_str,
                     1,
@@ -62,28 +78,107 @@ impl BenchmarkConsumerBackend for HighLevelBackend {
                 .auto_commit(AutoCommit::Disabled)
                 .build()
         };
-
         iggy_consumer.init().await?;
-        Ok(iggy_consumer)
+
+        Ok((iggy_consumer, iggy_producer))
     }
 
-    async fn warmup(&self, consumer: &mut Self::Consumer) -> Result<(), IggyError> {
+    #[allow(clippy::cognitive_complexity)]
+    async fn warmup(
+        &self,
+        messaging_context: &mut Self::MessagingContext,
+        batch_generator: &mut crate::utils::batch_generator::BenchmarkBatchGenerator,
+    ) -> Result<(), iggy::prelude::IggyError> {
+        let (consumer, producer) = messaging_context;
         let warmup_end = Instant::now() + self.config.warmup_time.get_duration();
+        let mut last_warning_time: Option<Instant> = None;
+        let mut skipped_warnings_count: u32 = 0;
+
+        if let Some(cg_id) = self.config.consumer_group_id {
+            info!(
+                "ProducingConsumer #{}, part of consumer group #{}, → warming up for {}...",
+                self.config.actor_id, cg_id, self.config.warmup_time
+            );
+        } else {
+            info!(
+                "ProducingConsumer #{} → warming up for {}...",
+                self.config.actor_id, self.config.warmup_time
+            );
+        }
+
         while Instant::now() < warmup_end {
-            if let Some(message) = consumer.next().await {
-                if message.is_err() {
+            let batch = batch_generator.generate_owned_batch();
+            if batch.messages.is_empty() {
+                continue;
+            }
+
+            producer.send(batch.messages).await?;
+
+            match consumer.next().await {
+                Some(Ok(_message)) => {}
+                Some(Err(err)) => {
+                    warn!(
+                        "ProducingConsumer #{} (warmup) → got error while polling message: {err}, aborting...",
+                        self.config.actor_id
+                    );
                     break;
+                }
+                None => {
+                    let should_warn =
+                        last_warning_time.is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
+
+                    if should_warn {
+                        warn!(
+                            "ProducingConsumer #{} (warmup) → no message received, retrying... ({} warnings skipped)",
+                            self.config.actor_id, skipped_warnings_count
+                        );
+                        last_warning_time = Some(Instant::now());
+                        skipped_warnings_count = 0;
+                    } else {
+                        skipped_warnings_count += 1;
+                    }
                 }
             }
         }
         Ok(())
     }
 
+    async fn produce_batch(
+        &self,
+        messaging_context: &mut Self::MessagingContext,
+        batch_generator: &mut crate::utils::batch_generator::BenchmarkBatchGenerator,
+    ) -> Result<Option<crate::actors::producer::backend::ProducedBatch>, iggy::prelude::IggyError>
+    {
+        let (_consumer, producer) = messaging_context;
+        let batch = batch_generator.generate_owned_batch();
+        if batch.messages.is_empty() {
+            return Ok(None);
+        }
+        let message_count = u32::try_from(batch.messages.len()).unwrap();
+        let user_data_bytes = batch.user_data_bytes;
+        let total_bytes = batch.total_bytes;
+
+        let before_send = Instant::now();
+
+        producer.send(batch.messages).await?;
+
+        let latency = before_send.elapsed();
+
+        Ok(Some(ProducedBatch {
+            messages: message_count,
+            user_data_bytes,
+            total_bytes,
+            latency,
+        }))
+    }
+
     #[allow(clippy::cognitive_complexity)]
     async fn consume_batch(
         &self,
-        consumer: &mut Self::Consumer,
-    ) -> Result<Option<ConsumedBatch>, IggyError> {
+        messaging_context: &mut Self::MessagingContext,
+    ) -> Result<Option<crate::actors::consumer::backend::ConsumedBatch>, iggy::prelude::IggyError>
+    {
+        let (consumer, _) = messaging_context;
         let batch_start = Instant::now();
         let mut batch_messages = 0;
         let mut batch_user_bytes = 0;
@@ -149,18 +244,21 @@ impl BenchmarkConsumerBackend for HighLevelBackend {
     }
 
     fn log_setup_info(&self) {
+        let actor_id = self.config.actor_id;
+        let stream_id = self.config.stream_id;
+        let partitions = self.config.partitions_count;
+        let batch_size = self.config.messages_per_batch;
+        let message_size = self.config.message_size;
+
         if let Some(cg_id) = self.config.consumer_group_id {
             info!(
-                "Consumer #{}, part of consumer group #{} → polling in {} messages per batch from stream {}, using high-level API...",
-                self.config.consumer_id,
-                cg_id,
-                self.config.messages_per_batch,
-                self.config.stream_id,
+                "ProducingConsumer #{} → sending & polling {} messages per batch (each {} bytes) on stream {} across {} partition(s), as part of consumer group #{} using high-level API...",
+                actor_id, batch_size, message_size, stream_id, partitions, cg_id,
             );
         } else {
             info!(
-                "Consumer #{} → polling in {} messages per batch from stream {}, using high-level API...",
-                self.config.consumer_id, self.config.messages_per_batch, self.config.stream_id,
+                "ProducingConsumer #{} → sending & polling {} messages per batch (each {} bytes) on stream {} across {} partition(s), using high-level API...",
+                actor_id, batch_size, message_size, stream_id, partitions,
             );
         }
     }
@@ -168,13 +266,13 @@ impl BenchmarkConsumerBackend for HighLevelBackend {
     fn log_warmup_info(&self) {
         if let Some(cg_id) = self.config.consumer_group_id {
             info!(
-                "Consumer #{}, part of consumer group #{}, → warming up for {}...",
-                self.config.consumer_id, cg_id, self.config.warmup_time
+                "ProducingConsumer #{}, part of consumer group #{} → warming up for {}...",
+                self.config.actor_id, cg_id, self.config.warmup_time
             );
         } else {
             info!(
-                "Consumer #{} → warming up for {}...",
-                self.config.consumer_id, self.config.warmup_time
+                "ProducingConsumer #{} → warming up for {}...",
+                self.config.actor_id, self.config.warmup_time
             );
         }
     }

@@ -19,3 +19,6 @@
 pub mod consumer;
 pub mod producer;
 pub mod producing_consumer;
+
+pub struct LowLevelApiMarker;
+pub struct HighLevelApiMarker;
