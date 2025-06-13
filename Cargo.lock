@@ -3859,6 +3859,8 @@ dependencies = [
 name = "iggy_connector_runtime"
 version = "0.1.0"
 dependencies = [
+ "axum 0.8.4",
+ "axum-server",
  "config",
  "dashmap",
  "dlopen2",
@@ -3871,8 +3873,12 @@ dependencies = [
  "postcard",
  "serde",
  "serde_json",
+ "serde_yml",
+ "strum",
  "thiserror 2.0.12",
  "tokio",
+ "toml",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
 ]

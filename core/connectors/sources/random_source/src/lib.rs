@@ -117,7 +117,7 @@ impl RandomSource {
 impl Source for RandomSource {
     async fn open(&mut self) -> Result<(), iggy_connector_sdk::Error> {
         info!(
-            "Initialized random source connector with ID: {}. Interval: {:#?}, max offset: {:#?}, messages range: {} - {}, payload size: {}",
+            "Opened random source connector with ID: {}. Interval: {:#?}, max offset: {:#?}, messages range: {} - {}, payload size: {}",
             self.id,
             self.interval,
             self.max_count,
@@ -158,10 +158,7 @@ impl Source for RandomSource {
     }
 
     async fn close(&mut self) -> Result<(), Error> {
-        info!(
-            "Random source connector with ID: {} is shutting down",
-            self.id
-        );
+        info!("Random source connector with ID: {} is closed.", self.id);
         Ok(())
     }
 }
