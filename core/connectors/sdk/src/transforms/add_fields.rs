@@ -18,11 +18,19 @@
 
 use serde::{Deserialize, Serialize};
 use simd_json::OwnedValue;
-use strum_macros::{Display, IntoStaticStr};
 
 use crate::{DecodedMessage, Error, Payload, TopicMetadata};
 
-use super::{Transform, TransformType};
+use super::{
+    Transform, TransformType,
+    common::{FieldValue, compute_value},
+};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Field {
+    key: String,
+    value: FieldValue,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AddFieldsConfig {
@@ -33,43 +41,9 @@ pub struct AddFields {
     fields: Vec<Field>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Field {
-    key: String,
-    value: FieldValue,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum FieldValue {
-    Static(simd_json::OwnedValue),
-    Computed(ComputedValue),
-}
-
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize, Display, IntoStaticStr)]
-#[serde(rename_all = "snake_case")]
-enum ComputedValue {
-    #[strum(to_string = "date_time")]
-    DateTime,
-    #[strum(to_string = "timestamp_nanos")]
-    TimestampNanos,
-    #[strum(to_string = "timestamp_micros")]
-    TimestampMicros,
-    #[strum(to_string = "timestamp_millis")]
-    TimestampMillis,
-    #[strum(to_string = "timestamp_seconds")]
-    TimestampSeconds,
-    #[strum(to_string = "uuid_v4")]
-    UuidV4,
-    #[strum(to_string = "uuid_v7")]
-    UuidV7,
-}
-
 impl AddFields {
-    pub fn new(config: AddFieldsConfig) -> Self {
-        Self {
-            fields: config.fields,
-        }
+    pub fn new(cfg: AddFieldsConfig) -> Self {
+        Self { fields: cfg.fields }
     }
 }
 
@@ -80,49 +54,163 @@ impl Transform for AddFields {
 
     fn transform(
         &self,
-        _metadata: &TopicMetadata,
-        mut message: DecodedMessage,
+        _meta: &TopicMetadata,
+        mut msg: DecodedMessage,
     ) -> Result<Option<DecodedMessage>, Error> {
         if self.fields.is_empty() {
-            return Ok(Some(message));
+            return Ok(Some(msg));
         }
 
-        let Payload::Json(OwnedValue::Object(ref mut map)) = message.payload else {
-            return Ok(Some(message));
+        let Payload::Json(OwnedValue::Object(ref mut map)) = msg.payload else {
+            return Ok(Some(msg));
         };
 
         for field in &self.fields {
-            match &field.value {
-                FieldValue::Static(value) => map.insert(field.key.clone(), value.clone()),
-                FieldValue::Computed(value) => match value {
-                    ComputedValue::DateTime => {
-                        map.insert(field.key.clone(), chrono::Utc::now().to_rfc3339().into())
-                    }
-                    ComputedValue::TimestampMillis => map.insert(
-                        field.key.clone(),
-                        chrono::Utc::now().timestamp_millis().into(),
-                    ),
-                    ComputedValue::TimestampMicros => map.insert(
-                        field.key.clone(),
-                        chrono::Utc::now().timestamp_micros().into(),
-                    ),
-                    ComputedValue::TimestampNanos => map.insert(
-                        field.key.clone(),
-                        chrono::Utc::now().timestamp_nanos_opt().into(),
-                    ),
-                    ComputedValue::TimestampSeconds => {
-                        map.insert(field.key.clone(), chrono::Utc::now().timestamp().into())
-                    }
-                    ComputedValue::UuidV4 => {
-                        map.insert(field.key.clone(), uuid::Uuid::new_v4().to_string().into())
-                    }
-                    ComputedValue::UuidV7 => {
-                        map.insert(field.key.clone(), uuid::Uuid::now_v7().to_string().into())
-                    }
-                },
+            let new_val = match &field.value {
+                FieldValue::Static(v) => v.clone(),
+                FieldValue::Computed(c) => compute_value(c),
             };
+            map.insert(field.key.clone(), new_val);
         }
 
-        Ok(Some(message))
+        Ok(Some(msg))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transforms::common::{ComputedValue, FieldValue};
+    use crate::transforms::test_utils::{
+        assert_is_number, assert_is_uuid, create_raw_test_message, create_test_message,
+        create_test_topic_metadata, extract_json_object,
+    };
+    use simd_json::OwnedValue;
+
+    #[test]
+    fn test_empty_fields() {
+        let transform = AddFields { fields: vec![] };
+        let msg = create_test_message(r#"{"existing": "field"}"#);
+        let result = transform
+            .transform(&create_test_topic_metadata(), msg)
+            .unwrap()
+            .unwrap();
+        let json_obj = extract_json_object(&result).unwrap();
+        assert_eq!(json_obj.len(), 1);
+        assert_eq!(json_obj["existing"], "field");
+    }
+
+    #[test]
+    fn test_add_static_field() {
+        let transform = AddFields {
+            fields: vec![Field {
+                key: "new_field".to_string(),
+                value: FieldValue::Static(OwnedValue::from("new_value")),
+            }],
+        };
+        let msg = create_test_message(r#"{"existing": "field"}"#);
+        let result = transform
+            .transform(&create_test_topic_metadata(), msg)
+            .unwrap()
+            .unwrap();
+        let json_obj = extract_json_object(&result).unwrap();
+        assert_eq!(json_obj.len(), 2);
+        assert_eq!(json_obj["existing"], "field");
+        assert_eq!(json_obj["new_field"], "new_value");
+    }
+
+    #[test]
+    fn test_add_multiple_static_fields() {
+        let transform = AddFields {
+            fields: vec![
+                Field {
+                    key: "string_field".to_string(),
+                    value: FieldValue::Static(OwnedValue::from("string_value")),
+                },
+                Field {
+                    key: "number_field".to_string(),
+                    value: FieldValue::Static(OwnedValue::from(42)),
+                },
+                Field {
+                    key: "boolean_field".to_string(),
+                    value: FieldValue::Static(OwnedValue::from(true)),
+                },
+            ],
+        };
+        let msg = create_test_message(r#"{"existing": "field"}"#);
+        let result = transform
+            .transform(&create_test_topic_metadata(), msg)
+            .unwrap()
+            .unwrap();
+        let json_obj = extract_json_object(&result).unwrap();
+        assert_eq!(json_obj.len(), 4);
+        assert_eq!(json_obj["existing"], "field");
+        assert_eq!(json_obj["string_field"], "string_value");
+        assert_eq!(json_obj["number_field"], 42);
+        assert_eq!(json_obj["boolean_field"], true);
+    }
+
+    #[test]
+    fn test_add_computed_fields() {
+        let transform = AddFields {
+            fields: vec![
+                Field {
+                    key: "timestamp_ms".to_string(),
+                    value: FieldValue::Computed(ComputedValue::TimestampMillis),
+                },
+                Field {
+                    key: "uuid".to_string(),
+                    value: FieldValue::Computed(ComputedValue::UuidV4),
+                },
+            ],
+        };
+        let msg = create_test_message(r#"{"existing": "field"}"#);
+        let result = transform
+            .transform(&create_test_topic_metadata(), msg)
+            .unwrap()
+            .unwrap();
+        let json_obj = extract_json_object(&result).unwrap();
+        assert_eq!(json_obj.len(), 3);
+        assert_eq!(json_obj["existing"], "field");
+        assert_is_number(&json_obj["timestamp_ms"], "timestamp_ms");
+        assert_is_uuid(&json_obj["uuid"], "uuid");
+    }
+
+    #[test]
+    fn test_overwrite_existing_field() {
+        let transform = AddFields {
+            fields: vec![Field {
+                key: "existing".to_string(),
+                value: FieldValue::Static(OwnedValue::from("new_value")),
+            }],
+        };
+        let msg = create_test_message(r#"{"existing": "field"}"#);
+        let result = transform
+            .transform(&create_test_topic_metadata(), msg)
+            .unwrap()
+            .unwrap();
+        let json_obj = extract_json_object(&result).unwrap();
+        assert_eq!(json_obj.len(), 1);
+        assert_eq!(json_obj["existing"], "new_value");
+    }
+
+    #[test]
+    fn test_non_json_payload() {
+        let transform = AddFields {
+            fields: vec![Field {
+                key: "new_field".to_string(),
+                value: FieldValue::Static(OwnedValue::from("new_value")),
+            }],
+        };
+        let msg = create_raw_test_message(vec![1, 2, 3, 4]);
+        let result = transform
+            .transform(&create_test_topic_metadata(), msg)
+            .unwrap()
+            .unwrap();
+        if let Payload::Raw(bytes) = &result.payload {
+            assert_eq!(bytes, &vec![1, 2, 3, 4]);
+        } else {
+            panic!("Expected Raw payload");
+        }
     }
 }

@@ -3887,6 +3887,7 @@ dependencies = [
  "iggy",
  "once_cell",
  "postcard",
+ "regex",
  "serde",
  "serde_json",
  "simd-json",
