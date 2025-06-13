@@ -46,8 +46,8 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     let interval = IggyDuration::from_str(&args.interval)?;
     let producer = client
         .producer(&args.stream_id, &args.topic_id)?
-        .sync(
-            SyncConfig::builder()
+        .direct(
+            DirectConfig::builder()
                 .batch_length(args.messages_per_batch)
                 .linger_time(interval)
                 .build(),

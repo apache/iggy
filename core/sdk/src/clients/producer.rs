@@ -18,7 +18,7 @@
 use super::ORDERING;
 use crate::clients::MAX_BATCH_LENGTH;
 use crate::clients::producer_builder::SendMode;
-use crate::clients::producer_config::SyncConfig;
+use crate::clients::producer_config::DirectConfig;
 use crate::clients::producer_dispatcher::ProducerDispatcher;
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -70,7 +70,7 @@ pub struct ProducerCore {
     last_sent_at: Arc<AtomicU64>,
     send_retries_count: Option<u32>,
     send_retries_interval: Option<IggyDuration>,
-    sync_config: Option<SyncConfig>,
+    direct_config: Option<DirectConfig>,
 }
 
 impl ProducerCore {
@@ -345,6 +345,15 @@ impl ProducerCore {
         );
         sleep(Duration::from_micros(remaining)).await;
     }
+
+    fn make_failed_error(&self, cause: IggyError, failed: Vec<IggyMessage>) -> IggyError {
+        IggyError::ProducerSendFailed {
+            cause: Box::new(cause),
+            failed: Arc::new(failed),
+            stream_name: self.stream_name.clone(),
+            topic_name: self.topic_name.clone(),
+        }
+    }
 }
 
 impl ProducerCoreBackend for ProducerCore {
@@ -360,23 +369,17 @@ impl ProducerCoreBackend for ProducerCore {
         }
 
         if let Err(err) = self.encrypt_messages(&mut msgs) {
-            return Err(IggyError::ProducerSendFailed {
-                cause: err.to_string(),
-                failed: Arc::new(msgs),
-            });
+            return Err(self.make_failed_error(err, msgs));
         }
 
         let part = match self.get_partitioning(stream, topic, &msgs, partitioning.clone()) {
             Ok(p) => p,
             Err(err) => {
-                return Err(IggyError::ProducerSendFailed {
-                    cause: err.to_string(),
-                    failed: Arc::new(msgs),
-                });
+                return Err(self.make_failed_error(err, msgs));
             }
         };
 
-        match &self.sync_config {
+        match &self.direct_config {
             Some(cfg) => {
                 let linger_time_micros = cfg.linger_time.as_micros();
                 if linger_time_micros > 0 {
@@ -396,10 +399,7 @@ impl ProducerCoreBackend for ProducerCore {
 
                     if let Err(err) = self.try_send_messages(stream, topic, &part, chunk).await {
                         let failed_tail = msgs.split_off(index);
-                        return Err(IggyError::ProducerSendFailed {
-                            cause: err.to_string(),
-                            failed: Arc::new(failed_tail),
-                        });
+                        return Err(self.make_failed_error(err, failed_tail));
                     }
                     self.last_sent_at
                         .store(IggyTimestamp::now().into(), ORDERING);
@@ -410,10 +410,7 @@ impl ProducerCoreBackend for ProducerCore {
             _ => {
                 self.try_send_messages(stream, topic, &part, &mut msgs)
                     .await
-                    .map_err(|err| IggyError::ProducerSendFailed {
-                        cause: err.to_string(),
-                        failed: Arc::new(msgs),
-                    })?;
+                    .map_err(|err| self.make_failed_error(err, msgs))?;
                 self.last_sent_at
                     .store(IggyTimestamp::now().into(), ORDERING);
             }
@@ -473,8 +470,8 @@ impl IggyProducer {
             last_sent_at: Arc::new(AtomicU64::new(0)),
             send_retries_count,
             send_retries_interval,
-            sync_config: match mode {
-                SendMode::Sync(ref cfg) => Some(cfg.clone()),
+            direct_config: match mode {
+                SendMode::Direct(ref cfg) => Some(cfg.clone()),
                 _ => None,
             },
         });

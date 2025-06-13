@@ -39,3 +39,4 @@ pub mod producer_sharding;
 
 const ORDERING: std::sync::atomic::Ordering = std::sync::atomic::Ordering::SeqCst;
 const MAX_BATCH_LENGTH: usize = 1000000;
+const MIB: usize = 1_048_576;

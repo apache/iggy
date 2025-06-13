@@ -425,8 +425,10 @@ mod tests {
             .returning(|_, _, _, _| {
                 Box::pin(async {
                     Err(IggyError::ProducerSendFailed {
-                        cause: "some_error".to_string(),
+                        cause: Box::new(IggyError::Error),
                         failed: Arc::new(vec![dummy_message(10)]),
+                        stream_name: "1".to_string(),
+                        topic_name: "1".to_string(),
                     })
                 })
             });

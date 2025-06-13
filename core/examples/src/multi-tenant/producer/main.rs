@@ -262,8 +262,8 @@ async fn create_producers(
         for id in 1..=producers_count {
             let producer = client
                 .producer(stream, topic)?
-                .sync(
-                    SyncConfig::builder()
+                .direct(
+                    DirectConfig::builder()
                         .batch_length(batch_length)
                         .linger_time(IggyDuration::from_str(interval).expect("Invalid duration"))
                         .build(),

@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::{OwnedSemaphorePermit, broadcast};
 use tokio::task::JoinHandle;
-use tracing::error;
+use tracing::{debug, error};
 
 /// A strategy for distributing messages across shards.
 ///
@@ -130,12 +130,31 @@ impl Shard {
                             Ok(msg) => {
                                 buffer_bytes += msg.inner.get_size_bytes().as_bytes_usize();
                                 buffer.push(msg);
+                                debug!(
+                                    buffer_len = buffer.len(),
+                                    buffer_bytes,
+                                    "Added message to buffer"
+                                );
 
                                 let exceed_batch_len = config.batch_length != 0 && buffer.len() >= config.batch_length;
                                 let exceed_batch_size = config.batch_size != 0 && buffer_bytes >= config.batch_size;
 
                                 if exceed_batch_len || exceed_batch_size {
+                                    debug!(
+                                        exceed_batch_len,
+                                        exceed_batch_size,
+                                        "Flushing buffer (trigger: batch_len={}, batch_size={})",
+                                        exceed_batch_len,
+                                        exceed_batch_size,
+                                    );
+
                                     Self::flush_buffer(&core, &mut buffer, &mut buffer_bytes, &err_sender).await;
+                                    debug!(
+                                        new_buffer_len = buffer.len(),
+                                        new_buffer_bytes = buffer_bytes,
+                                        "Buffer flushed"
+                                    );
+
                                     last_flush = tokio::time::Instant::now();
                                 }
                             }
@@ -183,11 +202,19 @@ impl Shard {
                 .await;
 
             if let Err(err) = result {
-                if let IggyError::ProducerSendFailed { failed, cause } = &err {
+                if let IggyError::ProducerSendFailed {
+                    failed,
+                    cause,
+                    stream_name,
+                    topic_name,
+                } = &err
+                {
                     let ctx = ErrorCtx {
-                        cause: cause.clone(),
+                        cause: cause.to_owned(),
                         stream: msg.inner.stream,
+                        stream_name: stream_name.clone(),
                         topic: msg.inner.topic,
+                        topic_name: topic_name.clone(),
                         partitioning: msg.inner.partitioning,
                         messages: failed.clone(),
                     };
@@ -250,12 +277,8 @@ mod tests {
             Arc::new(Semaphore::new(100)),
         );
 
-        let shard = Shard::new(
-            Arc::new(mock),
-            config,
-            flume::unbounded().0,
-            broadcast::channel(1).1,
-        );
+        let (_stop_tx, stop_rx) = broadcast::channel(1);
+        let shard = Shard::new(Arc::new(mock), config, flume::unbounded().0, stop_rx);
 
         for _ in 0..10 {
             let message = ShardMessage {
@@ -358,7 +381,9 @@ mod tests {
         let mut mock = MockProducerCoreBackend::new();
         let error = IggyError::ProducerSendFailed {
             failed: Arc::new(vec![dummy_message(1)]),
-            cause: "test error".into(),
+            cause: Box::new(IggyError::Error),
+            stream_name: "1".to_string(),
+            topic_name: "1".to_string(),
         };
 
         mock.expect_send_internal().returning(move |_, _, _, _| {
@@ -392,7 +417,7 @@ mod tests {
         shard.send(wrapped).await.unwrap();
 
         let err_ctx = err_rx.recv_async().await.unwrap();
-        assert_eq!(err_ctx.cause, "test error");
+        assert_eq!(err_ctx.cause, Box::new(IggyError::Error));
         assert_eq!(err_ctx.messages.len(), 1);
     }
 
