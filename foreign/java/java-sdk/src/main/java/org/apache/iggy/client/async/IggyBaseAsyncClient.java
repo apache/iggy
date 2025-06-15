@@ -17,32 +17,21 @@
  * under the License.
  */
 
-package org.apache.iggy;
+package org.apache.iggy.client.async;
 
-import org.apache.iggy.client.async.IggyAsyncClientBuilder;
-import org.apache.iggy.client.blocking.IggyClientBuilder;
-
-public final class Iggy {
-
-    private Iggy() {
-    }
+/**
+ * Base interface for asynchronous Iggy clients.
+ * This interface provides access to various asynchronous client components.
+ */
+public interface IggyBaseAsyncClient {
 
     /**
-     * Creates a new blocking client builder.
+     * Gets the asynchronous messages client.
      *
-     * @return a new IggyClientBuilder
+     * @return the messages async client
      */
-    public static IggyClientBuilder clientBuilder() {
-        return new IggyClientBuilder();
-    }
+    MessagesAsyncClient messages();
 
-    /**
-     * Creates a new asynchronous client builder.
-     *
-     * @return a new IggyAsyncClientBuilder
-     */
-    public static IggyAsyncClientBuilder asyncClientBuilder() {
-        return new IggyAsyncClientBuilder();
-    }
-
+    // Other async client interfaces can be added here as needed
+    // For now, we're focusing on the message streaming functionality
 }

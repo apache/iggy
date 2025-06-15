@@ -17,29 +17,23 @@
  * under the License.
  */
 
-package org.apache.iggy.client.blocking.tcp;
-
+package org.apache.iggy.client.common.serialization;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.apache.commons.lang3.ArrayUtils;
 import org.apache.iggy.consumergroup.Consumer;
 import org.apache.iggy.identifier.Identifier;
-import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.Message;
 import org.apache.iggy.message.MessageHeader;
 import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.message.PollingStrategy;
-import org.apache.iggy.user.GlobalPermissions;
-import org.apache.iggy.user.Permissions;
-import org.apache.iggy.user.StreamPermissions;
-import org.apache.iggy.user.TopicPermissions;
+
 import java.math.BigInteger;
-import java.util.Map;
 
 /**
  * Utility class for serializing objects to ByteBuf.
- * This class provides serialization methods for the blocking TCP client.
+ * This class provides common serialization methods used by both blocking and async clients.
  */
 public final class BytesSerializer {
 
@@ -52,14 +46,20 @@ public final class BytesSerializer {
      * @param consumer the consumer
      * @return the serialized ByteBuf
      */
-    static ByteBuf toBytes(Consumer consumer) {
+    public static ByteBuf toBytes(Consumer consumer) {
         ByteBuf buffer = Unpooled.buffer();
         buffer.writeByte(consumer.kind().asCode());
         buffer.writeBytes(toBytes(consumer.id()));
         return buffer;
     }
 
-    static ByteBuf toBytes(Identifier identifier) {
+    /**
+     * Serializes an Identifier to a ByteBuf.
+     *
+     * @param identifier the identifier
+     * @return the serialized ByteBuf
+     */
+    public static ByteBuf toBytes(Identifier identifier) {
         if (identifier.getKind() == 1) {
             ByteBuf buffer = Unpooled.buffer(6);
             buffer.writeByte(1);
@@ -77,14 +77,26 @@ public final class BytesSerializer {
         }
     }
 
-    static ByteBuf nameToBytes(String name) {
+    /**
+     * Serializes a name to a ByteBuf.
+     *
+     * @param name the name
+     * @return the serialized ByteBuf
+     */
+    public static ByteBuf nameToBytes(String name) {
         ByteBuf buffer = Unpooled.buffer(1 + name.length());
         buffer.writeByte(name.length());
         buffer.writeBytes(name.getBytes());
         return buffer;
     }
 
-    static ByteBuf toBytes(Partitioning partitioning) {
+    /**
+     * Serializes a Partitioning to a ByteBuf.
+     *
+     * @param partitioning the partitioning
+     * @return the serialized ByteBuf
+     */
+    public static ByteBuf toBytes(Partitioning partitioning) {
         ByteBuf buffer = Unpooled.buffer(2 + partitioning.value().length);
         buffer.writeByte(partitioning.kind().asCode());
         buffer.writeByte(partitioning.value().length);
@@ -92,14 +104,26 @@ public final class BytesSerializer {
         return buffer;
     }
 
-    static ByteBuf toBytes(Message message) {
+    /**
+     * Serializes a Message to a ByteBuf.
+     *
+     * @param message the message
+     * @return the serialized ByteBuf
+     */
+    public static ByteBuf toBytes(Message message) {
         var buffer = Unpooled.buffer(MessageHeader.SIZE + message.payload().length);
         buffer.writeBytes(toBytes(message.header()));
         buffer.writeBytes(message.payload());
         return buffer;
     }
 
-    static ByteBuf toBytes(MessageHeader header) {
+    /**
+     * Serializes a MessageHeader to a ByteBuf.
+     *
+     * @param header the message header
+     * @return the serialized ByteBuf
+     */
+    public static ByteBuf toBytes(MessageHeader header) {
         var buffer = Unpooled.buffer(MessageHeader.SIZE);
         buffer.writeBytes(toBytesAsU64(header.checksum()));
         buffer.writeBytes(header.id().toBytes());
@@ -111,103 +135,33 @@ public final class BytesSerializer {
         return buffer;
     }
 
-    static ByteBuf toBytes(PollingStrategy strategy) {
+    /**
+     * Serializes a PollingStrategy to a ByteBuf.
+     *
+     * @param strategy the polling strategy
+     * @return the serialized ByteBuf
+     */
+    public static ByteBuf toBytes(PollingStrategy strategy) {
         var buffer = Unpooled.buffer(9);
         buffer.writeByte(strategy.kind().asCode());
         buffer.writeBytes(toBytesAsU64(strategy.value()));
         return buffer;
     }
 
-    static ByteBuf toBytes(Map<String, HeaderValue> headers) {
-        if (headers.isEmpty()) {
-            return Unpooled.EMPTY_BUFFER;
-        }
-        var buffer = Unpooled.buffer();
-        for (Map.Entry<String, HeaderValue> entry : headers.entrySet()) {
-            String key = entry.getKey();
-            buffer.writeIntLE(key.length());
-            buffer.writeBytes(key.getBytes());
-
-            HeaderValue value = entry.getValue();
-            buffer.writeByte(value.kind().asCode());
-            buffer.writeIntLE(value.value().length());
-            buffer.writeBytes(value.value().getBytes());
-        }
-        return buffer;
-    }
-
-    static ByteBuf toBytes(Permissions permissions) {
-        var buffer = Unpooled.buffer();
-        buffer.writeBytes(toBytes(permissions.global()));
-        if (permissions.streams().isEmpty()) {
-            buffer.writeByte(0);
-        } else {
-            for (Map.Entry<Long, StreamPermissions> entry : permissions.streams().entrySet()) {
-                buffer.writeByte(1);
-                buffer.writeIntLE(entry.getKey().intValue());
-                buffer.writeBytes(toBytes(entry.getValue()));
-            }
-            buffer.writeByte(0);
-        }
-
-        return buffer;
-    }
-
-    static ByteBuf toBytes(GlobalPermissions permissions) {
-        var buffer = Unpooled.buffer();
-        buffer.writeBoolean(permissions.manageServers());
-        buffer.writeBoolean(permissions.readServers());
-        buffer.writeBoolean(permissions.manageUsers());
-        buffer.writeBoolean(permissions.readUsers());
-        buffer.writeBoolean(permissions.manageStreams());
-        buffer.writeBoolean(permissions.readStreams());
-        buffer.writeBoolean(permissions.manageTopics());
-        buffer.writeBoolean(permissions.readTopics());
-        buffer.writeBoolean(permissions.pollMessages());
-        buffer.writeBoolean(permissions.sendMessages());
-        return buffer;
-    }
-
-    static ByteBuf toBytes(StreamPermissions permissions) {
-        var buffer = Unpooled.buffer();
-        buffer.writeBoolean(permissions.manageStream());
-        buffer.writeBoolean(permissions.readStream());
-        buffer.writeBoolean(permissions.manageTopics());
-        buffer.writeBoolean(permissions.readTopics());
-        buffer.writeBoolean(permissions.pollMessages());
-        buffer.writeBoolean(permissions.sendMessages());
-
-        if (permissions.topics().isEmpty()) {
-            buffer.writeByte(0);
-        } else {
-            for (Map.Entry<Long, TopicPermissions> entry : permissions.topics().entrySet()) {
-                buffer.writeByte(1);
-                buffer.writeIntLE(entry.getKey().intValue());
-                buffer.writeBytes(toBytes(entry.getValue()));
-            }
-            buffer.writeByte(0);
-        }
-
-        return buffer;
-    }
-
-    static ByteBuf toBytes(TopicPermissions permissions) {
-        var buffer = Unpooled.buffer();
-        buffer.writeBoolean(permissions.manageTopic());
-        buffer.writeBoolean(permissions.readTopic());
-        buffer.writeBoolean(permissions.pollMessages());
-        buffer.writeBoolean(permissions.sendMessages());
-        return buffer;
-    }
-
-    static ByteBuf toBytesAsU64(BigInteger value) {
+    /**
+     * Serializes a BigInteger to a ByteBuf as an unsigned 64-bit integer.
+     *
+     * @param value the value
+     * @return the serialized ByteBuf
+     */
+    public static ByteBuf toBytesAsU64(BigInteger value) {
         if (value.signum() == -1) {
             throw new IllegalArgumentException("Negative value cannot be serialized to unsigned 64: " + value);
         }
         ByteBuf buffer = Unpooled.buffer(8, 8);
         byte[] valueAsBytes = value.toByteArray();
         if (valueAsBytes.length > 9) {
-            throw new IllegalArgumentException();
+            throw new IllegalArgumentException("Value too large for unsigned 64: " + value);
         }
         ArrayUtils.reverse(valueAsBytes);
         buffer.writeBytes(valueAsBytes, 0, Math.min(8, valueAsBytes.length));
@@ -217,6 +171,12 @@ public final class BytesSerializer {
         return buffer;
     }
 
+    /**
+     * Serializes a BigInteger to a ByteBuf as an unsigned 128-bit integer.
+     *
+     * @param value the value
+     * @return the serialized ByteBuf
+     */
     public static ByteBuf toBytesAsU128(BigInteger value) {
         if (value.signum() == -1) {
             throw new IllegalArgumentException("Negative value cannot be serialized to unsigned 128: " + value);
@@ -224,7 +184,7 @@ public final class BytesSerializer {
         ByteBuf buffer = Unpooled.buffer(16, 16);
         byte[] valueAsBytes = value.toByteArray();
         if (valueAsBytes.length > 17) {
-            throw new IllegalArgumentException();
+            throw new IllegalArgumentException("Value too large for unsigned 128: " + value);
         }
         ArrayUtils.reverse(valueAsBytes);
         buffer.writeBytes(valueAsBytes, 0, Math.min(16, valueAsBytes.length));
@@ -233,5 +193,4 @@ public final class BytesSerializer {
         }
         return buffer;
     }
-
 }
