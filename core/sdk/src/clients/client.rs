@@ -62,7 +62,7 @@ impl IggyClient {
         IggyClientBuilder::new()
     }
 
-    /// Creates a new `IggyClientBuilder`.
+    /// Creates a new `IggyClientBuilder` from the given connection string.
     pub fn builder_from_connection_string(
         connection_string: &str,
     ) -> Result<IggyClientBuilder, IggyError> {
@@ -79,6 +79,8 @@ impl IggyClient {
         }
     }
 
+    /// Creates a new `IggyClient` with the provided connection string.
+    /// Currently only support TCP transport by default, more transports will be supported in the future.
     pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
         match ConnectionStringUtils::parse_protocol(connection_string)? {
             TransportProtocol::Tcp => Ok(IggyClient::new(Box::new(
