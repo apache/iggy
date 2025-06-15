@@ -16,25 +16,31 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
-use add_fields::AddFields;
-use delete_fields::DeleteFields;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use strum_macros::{Display, IntoStaticStr};
-use tracing::error;
-
+mod add_fields;
+mod delete_fields;
+mod filter_fields;
+pub mod json;
+mod update_fields;
 use crate::{DecodedMessage, Error, TopicMetadata};
+pub use add_fields::{
+    AddFields, AddFieldsConfig, ComputedValue as AddComputedValue, Field as AddField,
+    FieldValue as AddFieldValue,
+};
+pub use delete_fields::{DeleteFields, DeleteFieldsConfig};
+pub use filter_fields::{
+    FilterFields, FilterFieldsConfig, FilterPattern, KeyPattern as FilterKeyPattern,
+    ValuePattern as FilterValuePattern,
+};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use strum_macros::{Display, IntoStaticStr};
+pub use update_fields::{
+    ComputedValue as UpdateComputedValue, Field as UpdateField, FieldValue as UpdateFieldValue,
+    UpdateCondition, UpdateFields, UpdateFieldsConfig,
+};
 
-pub mod add_fields;
-pub mod delete_fields;
-
-/// Fields transformation trait.
 pub trait Transform: Send + Sync {
-    /// Returns the type of the transform.
     fn r#type(&self) -> TransformType;
-
-    /// Transforms the message, given the format is supported and the transform is applicable.
     fn transform(
         &self,
         metadata: &TopicMetadata,
@@ -47,25 +53,33 @@ pub trait Transform: Send + Sync {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum TransformType {
-    #[strum(to_string = "add_fields")]
     AddFields,
-    #[strum(to_string = "delete_fields")]
     DeleteFields,
+    FilterFields,
+    UpdateFields,
 }
 
-pub fn load(r#type: TransformType, config: serde_json::Value) -> Result<Arc<dyn Transform>, Error> {
-    Ok(match r#type {
-        TransformType::AddFields => Arc::new(AddFields::new(as_config(r#type, config)?)),
-        TransformType::DeleteFields => Arc::new(DeleteFields::new(as_config(r#type, config)?)),
-    })
-}
-
-fn as_config<T: DeserializeOwned>(
-    r#type: TransformType,
-    config: serde_json::Value,
-) -> Result<T, Error> {
-    serde_json::from_value::<T>(config).map_err(|error| {
-        error!("Failed to deserialize config for transform: {type}. {error}");
-        Error::InvalidConfig
-    })
+pub fn from_config(t: TransformType, raw: &serde_json::Value) -> Result<Arc<dyn Transform>, Error> {
+    match t {
+        TransformType::AddFields => {
+            let cfg: AddFieldsConfig =
+                serde_json::from_value(raw.clone()).map_err(|_| Error::InvalidConfig)?;
+            Ok(Arc::new(AddFields::new(cfg)))
+        }
+        TransformType::DeleteFields => {
+            let cfg: DeleteFieldsConfig =
+                serde_json::from_value(raw.clone()).map_err(|_| Error::InvalidConfig)?;
+            Ok(Arc::new(DeleteFields::new(cfg)))
+        }
+        TransformType::FilterFields => {
+            let cfg: FilterFieldsConfig =
+                serde_json::from_value(raw.clone()).map_err(|_| Error::InvalidConfig)?;
+            Ok(Arc::new(FilterFields::new(cfg)?))
+        }
+        TransformType::UpdateFields => {
+            let cfg: UpdateFieldsConfig =
+                serde_json::from_value(raw.clone()).map_err(|_| Error::InvalidConfig)?;
+            Ok(Arc::new(UpdateFields::new(cfg)))
+        }
+    }
 }

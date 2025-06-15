@@ -16,29 +16,33 @@
  * under the License.
  */
 
-use std::collections::HashSet;
-
+use super::{Transform, TransformType};
+use crate::{DecodedMessage, Error, Payload, TopicMetadata};
 use serde::{Deserialize, Serialize};
 use simd_json::OwnedValue;
+use std::collections::HashSet;
 
-use crate::{DecodedMessage, Error, Payload, TopicMetadata};
-
-use super::{Transform, TransformType};
-
+/// Configuration for the DeleteFields transform
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeleteFieldsConfig {
-    fields: Vec<String>,
+    #[serde(default)]
+    pub fields: Vec<String>,
 }
 
+/// Transform that removes specified fields from JSON messages
 pub struct DeleteFields {
-    fields: HashSet<String>,
+    pub fields: HashSet<String>,
 }
 
 impl DeleteFields {
-    pub fn new(config: DeleteFieldsConfig) -> Self {
+    pub fn new(cfg: DeleteFieldsConfig) -> Self {
         Self {
-            fields: config.fields.into_iter().collect(),
+            fields: cfg.fields.into_iter().collect(),
         }
+    }
+
+    pub fn should_remove(&self, k: &str, _v: &OwnedValue) -> bool {
+        self.fields.contains(k)
     }
 }
 
@@ -49,13 +53,16 @@ impl Transform for DeleteFields {
 
     fn transform(
         &self,
-        _metadata: &TopicMetadata,
-        mut message: DecodedMessage,
+        metadata: &TopicMetadata,
+        message: DecodedMessage,
     ) -> Result<Option<DecodedMessage>, Error> {
-        if let Payload::Json(OwnedValue::Object(ref mut map)) = message.payload {
-            map.retain(|key, _| !self.fields.contains(key));
+        if self.fields.is_empty() {
+            return Ok(Some(message));
         }
 
-        Ok(Some(message))
+        match &message.payload {
+            Payload::Json(_) => self.transform_json(metadata, message),
+            _ => Ok(Some(message)),
+        }
     }
 }

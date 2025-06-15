@@ -35,6 +35,7 @@ dashmap = { workspace = true }
 iggy = { workspace = true }
 once_cell = { workspace = true }
 postcard = { workspace = true }
+regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 simd-json = { workspace = true }
