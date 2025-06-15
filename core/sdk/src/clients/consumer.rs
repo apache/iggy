@@ -103,7 +103,7 @@ pub struct IggyConsumer {
     partition_id: Option<u32>,
     polling_strategy: PollingStrategy,
     poll_interval_micros: u64,
-    batch_size: u32,
+    batch_length: u32,
     auto_commit: AutoCommit,
     auto_commit_after_polling: bool,
     auto_join_consumer_group: bool,
@@ -137,7 +137,7 @@ impl IggyConsumer {
         partition_id: Option<u32>,
         polling_interval: Option<IggyDuration>,
         polling_strategy: PollingStrategy,
-        batch_size: u32,
+        batch_length: u32,
         auto_commit: AutoCommit,
         auto_join_consumer_group: bool,
         create_consumer_group_if_not_exists: bool,
@@ -165,7 +165,7 @@ impl IggyConsumer {
             last_consumed_offsets: Arc::new(DashMap::new()),
             current_offsets: Arc::new(DashMap::new()),
             poll_future: None,
-            batch_size,
+            batch_length,
             auto_commit,
             auto_commit_after_polling: matches!(
                 auto_commit,
@@ -623,7 +623,7 @@ impl IggyConsumer {
         let consumer = self.consumer.clone();
         let polling_strategy = self.polling_strategy;
         let client = self.client.clone();
-        let count = self.batch_size;
+        let count = self.batch_length;
         let auto_commit_after_polling = self.auto_commit_after_polling;
         let auto_commit_enabled = self.auto_commit != AutoCommit::Disabled;
         let interval = self.poll_interval_micros;

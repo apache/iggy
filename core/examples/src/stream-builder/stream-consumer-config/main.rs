@@ -48,7 +48,7 @@ async fn main() -> Result<(), IggyError> {
         // The max number of messages to send in a batch. The greater the batch size, the higher the throughput for bulk data.
         // Note, there is a tradeoff between batch size and latency, so you want to benchmark your setup.
         // Note, this only applies to batch send messages. Single messages are sent immediately.
-        .batch_size(100)
+        .batch_length(100)
         // Create the stream if it doesn't exist.
         .create_stream_if_not_exists(true)
         // Create the topic if it doesn't exist.

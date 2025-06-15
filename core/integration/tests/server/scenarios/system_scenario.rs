@@ -255,9 +255,9 @@ pub async fn run(client_factory: &dyn ClientFactory) {
 
     // 19. Messages should be also polled in the smaller batches
     let batches_count = 10;
-    let batch_size = MESSAGES_COUNT / batches_count;
+    let batch_length = MESSAGES_COUNT / batches_count;
     for i in 0..batches_count {
-        let start_offset = (i * batch_size) as u64;
+        let start_offset = (i * batch_length) as u64;
         let polled_messages = client
             .poll_messages(
                 &Identifier::numeric(STREAM_ID).unwrap(),
@@ -265,13 +265,13 @@ pub async fn run(client_factory: &dyn ClientFactory) {
                 Some(PARTITION_ID),
                 &consumer,
                 &PollingStrategy::offset(start_offset),
-                batch_size,
+                batch_length,
                 false,
             )
             .await
             .unwrap();
-        assert_eq!(polled_messages.messages.len() as u32, batch_size);
-        for i in 0..batch_size as u64 {
+        assert_eq!(polled_messages.messages.len() as u32, batch_length);
+        for i in 0..batch_length as u64 {
             let offset = start_offset + i;
             let message = polled_messages.messages.get(i as usize).unwrap();
             assert_message(message, offset);

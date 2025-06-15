@@ -3741,6 +3741,8 @@ dependencies = [
  "futures-util",
  "iggy_binary_protocol",
  "iggy_common",
+ "mockall",
+ "num_cpus",
  "quinn",
  "reqwest",
  "reqwest-middleware",
