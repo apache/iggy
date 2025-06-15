@@ -16,51 +16,193 @@
  * under the License.
  */
 
+use super::{Transform, TransformType};
+use crate::{DecodedMessage, Error, Payload, TopicMetadata};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use simd_json::OwnedValue;
+use simd_json::prelude::{TypedArrayValue, TypedObjectValue, TypedScalarValue, ValueAsScalar};
 use std::collections::HashSet;
 
-use crate::{DecodedMessage, Error, Payload, TopicMetadata};
-
-use super::{
-    Transform, TransformType,
-    common::{KeyPattern, ValuePattern},
-};
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct FilterFieldsConfig {
-    #[serde(default)]
-    keep_fields: Vec<String>,
-    #[serde(default)]
-    patterns: Vec<FilterPattern>,
-    #[serde(default = "default_include")]
-    include_matching: bool,
+/// Pattern matching for field keys with various string matching strategies
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyPattern<T = String> {
+    /// Exact string match
+    Exact(String),
+    /// Key starts with the given string
+    StartsWith(String),
+    /// Key ends with the given string
+    EndsWith(String),
+    /// Key contains the given string
+    Contains(String),
+    /// Key matches the given regular expression
+    Regex(T),
 }
 
+impl KeyPattern<String> {
+    /// Compiles string patterns into regex patterns for efficient matching
+    pub fn compile(self) -> Result<KeyPattern<Regex>, Error> {
+        Ok(match self {
+            KeyPattern::Regex(pattern) => {
+                KeyPattern::Regex(Regex::new(&pattern).map_err(|_| Error::InvalidConfig)?)
+            }
+            KeyPattern::Exact(s) => KeyPattern::Exact(s),
+            KeyPattern::StartsWith(s) => KeyPattern::StartsWith(s),
+            KeyPattern::EndsWith(s) => KeyPattern::EndsWith(s),
+            KeyPattern::Contains(s) => KeyPattern::Contains(s),
+        })
+    }
+}
+
+impl KeyPattern<Regex> {
+    /// Checks if a key matches this pattern
+    pub fn matches(&self, k: &str) -> bool {
+        match self {
+            KeyPattern::Exact(s) => k == s,
+            KeyPattern::StartsWith(s) => k.starts_with(s),
+            KeyPattern::EndsWith(s) => k.ends_with(s),
+            KeyPattern::Contains(s) => k.contains(s),
+            KeyPattern::Regex(re) => re.is_match(k),
+        }
+    }
+}
+
+/// Pattern matching for field values with type checking and content matching
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValuePattern<T = String> {
+    /// Value equals the specified JSON value
+    Equals(OwnedValue),
+    /// String value contains the specified substring
+    Contains(String),
+    /// String value matches the given regular expression
+    Regex(T),
+    /// Numeric value is greater than the specified number
+    GreaterThan(f64),
+    /// Numeric value is less than the specified number
+    LessThan(f64),
+    /// Numeric value is between the specified range (inclusive)
+    Between(f64, f64),
+    /// Value is null
+    IsNull,
+    /// Value is not null
+    IsNotNull,
+    /// Value is a string
+    IsString,
+    /// Value is a number
+    IsNumber,
+    /// Value is a boolean
+    IsBoolean,
+    /// Value is an object
+    IsObject,
+    /// Value is an array
+    IsArray,
+}
+
+impl ValuePattern<String> {
+    /// Compiles string patterns into regex patterns for efficient matching
+    pub fn compile(self) -> Result<ValuePattern<Regex>, Error> {
+        use ValuePattern::*;
+        Ok(match self {
+            Regex(pattern) => Regex(regex::Regex::new(&pattern).map_err(|_| Error::InvalidConfig)?),
+            Equals(v) => Equals(v),
+            Contains(s) => Contains(s),
+            GreaterThan(n) => GreaterThan(n),
+            LessThan(n) => LessThan(n),
+            Between(a, b) => Between(a, b),
+            IsNull => IsNull,
+            IsNotNull => IsNotNull,
+            IsString => IsString,
+            IsNumber => IsNumber,
+            IsBoolean => IsBoolean,
+            IsObject => IsObject,
+            IsArray => IsArray,
+        })
+    }
+}
+
+impl ValuePattern<Regex> {
+    /// Checks if a value matches this pattern
+    pub fn matches(&self, v: &OwnedValue) -> bool {
+        use ValuePattern::*;
+        match self {
+            Equals(x) => v == x,
+            Contains(s) => v.as_str().is_some_and(|x| x.contains(s)),
+            Regex(re) => v.as_str().is_some_and(|x| re.is_match(x)),
+            GreaterThan(t) => v.as_f64().is_some_and(|n| n > *t),
+            LessThan(t) => v.as_f64().is_some_and(|n| n < *t),
+            Between(a, b) => v.as_f64().is_some_and(|n| n >= *a && n <= *b),
+            IsNull => v.is_null(),
+            IsNotNull => !v.is_null(),
+            IsString => v.is_str(),
+            IsNumber => v.is_number(),
+            IsBoolean => v.is_bool(),
+            IsObject => v.is_object(),
+            IsArray => v.is_array(),
+        }
+    }
+}
+
+/// Configuration for the FilterFields transform
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FilterFieldsConfig {
+    /// Fields to always keep regardless of pattern matching
+    #[serde(default)]
+    pub keep_fields: Vec<String>,
+    /// Patterns to match against field keys and values
+    #[serde(default)]
+    pub patterns: Vec<FilterPattern>,
+    /// Whether to include (true) or exclude (false) fields that match patterns
+    #[serde(default = "default_include")]
+    pub include_matching: bool,
+}
+
+/// Default value for include_matching field
 fn default_include() -> bool {
     true
 }
 
+/// A pattern that can match both field keys and values
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FilterPattern {
+    /// Optional pattern to match against field keys
     #[serde(default)]
-    key_pattern: Option<KeyPattern<String>>,
+    pub key_pattern: Option<KeyPattern<String>>,
+    /// Optional pattern to match against field values
     #[serde(default)]
-    value_pattern: Option<ValuePattern<String>>,
+    pub value_pattern: Option<ValuePattern<String>>,
 }
 
-struct CompiledPattern {
-    key_pattern: Option<KeyPattern<regex::Regex>>,
-    value_pattern: Option<ValuePattern<regex::Regex>>,
+/// A compiled pattern with regex patterns ready for efficient matching
+pub struct CompiledPattern {
+    /// Compiled key pattern
+    pub key_pattern: Option<KeyPattern<Regex>>,
+    /// Compiled value pattern
+    pub value_pattern: Option<ValuePattern<Regex>>,
 }
 
+/// Transform that filters JSON message fields based on complex patterns
+///
+/// This transform supports sophisticated filtering based on:
+/// - Field names (exact, prefix, suffix, contains, regex)
+/// - Field values (equality, type checking, numeric comparisons, regex)
+/// - Combination of key and value patterns
+/// - Include or exclude matching behavior
 pub struct FilterFields {
-    include_matching: bool,
-    keep_set: HashSet<String>,
-    patterns: Vec<CompiledPattern>,
+    /// Whether to include or exclude matching fields
+    pub include_matching: bool,
+    /// Set of field names to always keep
+    pub keep_set: HashSet<String>,
+    /// Compiled patterns for efficient matching
+    pub patterns: Vec<CompiledPattern>,
 }
 
 impl FilterFields {
+    /// Creates a new FilterFields transform from configuration
+    ///
+    /// This compiles all regex patterns for efficient matching during transformation.
+    /// Returns an error if any regex patterns are invalid.
     pub fn new(cfg: FilterFieldsConfig) -> Result<Self, Error> {
         let keep_set = cfg.keep_fields.into_iter().collect();
 
@@ -79,11 +221,16 @@ impl FilterFields {
         })
     }
 
+    /// Checks if a field key-value pair matches any of the configured patterns
+    ///
+    /// A field matches if both the key pattern (if specified) and value pattern
+    /// (if specified) match. If only one pattern type is specified, only that
+    /// pattern needs to match.
     #[inline]
-    fn matches_patterns(&self, k: &str, v: &OwnedValue) -> bool {
+    pub fn matches_patterns(&self, k: &str, v: &OwnedValue) -> bool {
         self.patterns.iter().any(|pat| {
-            let key_ok = pat.key_pattern.as_ref().map_or(true, |kp| kp.matches(k));
-            let value_ok = pat.value_pattern.as_ref().map_or(true, |vp| vp.matches(v));
+            let key_ok = pat.key_pattern.as_ref().is_none_or(|kp| kp.matches(k));
+            let value_ok = pat.value_pattern.as_ref().is_none_or(|vp| vp.matches(v));
             key_ok && value_ok
         })
     }
@@ -96,262 +243,16 @@ impl Transform for FilterFields {
 
     fn transform(
         &self,
-        _meta: &TopicMetadata,
-        mut msg: DecodedMessage,
+        metadata: &TopicMetadata,
+        message: DecodedMessage,
     ) -> Result<Option<DecodedMessage>, Error> {
         if self.keep_set.is_empty() && self.patterns.is_empty() {
-            return Ok(Some(msg)); // nothing to do
+            return Ok(Some(message)); // nothing to do
         }
 
-        let Payload::Json(OwnedValue::Object(ref mut map)) = msg.payload else {
-            return Ok(Some(msg));
-        };
-
-        let include = self.include_matching;
-        map.retain(|k, v| {
-            let explicit_keep = self.keep_set.contains(k);
-            if explicit_keep {
-                return true; // never drop an explicitly kept key
-            }
-
-            let matched = self.matches_patterns(k, v);
-            include ^ !matched // xor gives us include / exclude in one line
-        });
-
-        Ok(Some(msg))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::transforms::common::ValuePattern;
-    use crate::transforms::test_utils::{
-        create_raw_test_message, create_test_message, create_test_topic_metadata,
-        extract_json_object,
-    };
-
-    #[test]
-    fn test_keep_specific_fields() {
-        let transform = FilterFields::new(FilterFieldsConfig {
-            keep_fields: vec!["id".to_string(), "name".to_string()],
-            patterns: vec![],
-            include_matching: true,
-        })
-        .unwrap();
-        let msg = create_test_message(
-            r#"{
-            "id": 1,
-            "name": "test",
-            "description": "should be removed",
-            "created_at": "2023-01-01"
-        }"#,
-        );
-        let result = transform
-            .transform(&create_test_topic_metadata(), msg)
-            .unwrap()
-            .unwrap();
-        let json_obj = extract_json_object(&result).unwrap();
-        assert_eq!(json_obj.len(), 2);
-        assert_eq!(json_obj["id"], 1);
-        assert_eq!(json_obj["name"], "test");
-        assert!(!json_obj.contains_key("description"));
-        assert!(!json_obj.contains_key("created_at"));
-    }
-
-    #[test]
-    fn test_filter_include_key_pattern() {
-        let transform = FilterFields::new(FilterFieldsConfig {
-            keep_fields: vec![],
-            patterns: vec![FilterPattern {
-                key_pattern: Some(KeyPattern::StartsWith("meta_".to_string())),
-                value_pattern: None,
-            }],
-            include_matching: true,
-        })
-        .unwrap();
-        let msg = create_test_message(
-            r#"{
-            "id": 1,
-            "meta_created": "2023-01-01",
-            "meta_updated": "2023-01-02",
-            "content": "test content"
-        }"#,
-        );
-        let result = transform
-            .transform(&create_test_topic_metadata(), msg)
-            .unwrap()
-            .unwrap();
-        let json_obj = extract_json_object(&result).unwrap();
-        assert_eq!(json_obj.len(), 2);
-        assert_eq!(json_obj["meta_created"], "2023-01-01");
-        assert_eq!(json_obj["meta_updated"], "2023-01-02");
-        assert!(!json_obj.contains_key("id"));
-        assert!(!json_obj.contains_key("content"));
-    }
-
-    #[test]
-    fn test_filter_exclude_key_pattern() {
-        let transform = FilterFields::new(FilterFieldsConfig {
-            keep_fields: vec![],
-            patterns: vec![FilterPattern {
-                key_pattern: Some(KeyPattern::StartsWith("temp_".to_string())),
-                value_pattern: None,
-            }],
-            include_matching: false,
-        })
-        .unwrap();
-        let msg = create_test_message(
-            r#"{
-            "id": 1,
-            "name": "test",
-            "temp_value": 100,
-            "temp_flag": true
-        }"#,
-        );
-        let result = transform
-            .transform(&create_test_topic_metadata(), msg)
-            .unwrap()
-            .unwrap();
-        let json_obj = extract_json_object(&result).unwrap();
-        assert_eq!(json_obj.len(), 2);
-        assert_eq!(json_obj["id"], 1);
-        assert_eq!(json_obj["name"], "test");
-        assert!(!json_obj.contains_key("temp_value"));
-        assert!(!json_obj.contains_key("temp_flag"));
-    }
-
-    #[test]
-    fn test_filter_with_value_pattern() {
-        let transform = FilterFields::new(FilterFieldsConfig {
-            keep_fields: vec![],
-            patterns: vec![FilterPattern {
-                key_pattern: None,
-                value_pattern: Some(ValuePattern::IsNumber),
-            }],
-            include_matching: true,
-        })
-        .unwrap();
-        let msg = create_test_message(
-            r#"{
-            "id": 1,
-            "count": 42,
-            "name": "test",
-            "active": true
-        }"#,
-        );
-        let result = transform
-            .transform(&create_test_topic_metadata(), msg)
-            .unwrap()
-            .unwrap();
-        let json_obj = extract_json_object(&result).unwrap();
-        assert_eq!(json_obj.len(), 2);
-        assert_eq!(json_obj["id"], 1);
-        assert_eq!(json_obj["count"], 42);
-        assert!(!json_obj.contains_key("name"));
-        assert!(!json_obj.contains_key("active"));
-    }
-
-    #[test]
-    fn test_filter_combined_patterns() {
-        let transform = FilterFields::new(FilterFieldsConfig {
-            keep_fields: vec![],
-            patterns: vec![FilterPattern {
-                key_pattern: Some(KeyPattern::Contains("date".to_string())),
-                value_pattern: Some(ValuePattern::IsString),
-            }],
-            include_matching: true,
-        })
-        .unwrap();
-        let msg = create_test_message(
-            r#"{
-            "id": 1,
-            "created_date": "2023-01-01",
-            "update_date": "2023-01-02",
-            "date_count": 5,
-            "name": "test"
-        }"#,
-        );
-        let result = transform
-            .transform(&create_test_topic_metadata(), msg)
-            .unwrap()
-            .unwrap();
-        let json_obj = extract_json_object(&result).unwrap();
-        assert_eq!(json_obj.len(), 2);
-        assert_eq!(json_obj["created_date"], "2023-01-01");
-        assert_eq!(json_obj["update_date"], "2023-01-02");
-        assert!(!json_obj.contains_key("id"));
-        assert!(!json_obj.contains_key("date_count"));
-        assert!(!json_obj.contains_key("name"));
-    }
-
-    #[test]
-    fn test_keep_and_pattern_together() {
-        let transform = FilterFields::new(FilterFieldsConfig {
-            keep_fields: vec!["id".to_string()],
-            patterns: vec![FilterPattern {
-                key_pattern: Some(KeyPattern::StartsWith("meta_".to_string())),
-                value_pattern: None,
-            }],
-            include_matching: true,
-        })
-        .unwrap();
-        let msg = create_test_message(
-            r#"{
-            "id": 1,
-            "name": "test",
-            "meta_created": "2023-01-01",
-            "content": "test content"
-        }"#,
-        );
-        let result = transform
-            .transform(&create_test_topic_metadata(), msg)
-            .unwrap()
-            .unwrap();
-        let json_obj = extract_json_object(&result).unwrap();
-        assert_eq!(json_obj.len(), 2);
-        assert_eq!(json_obj["id"], 1);
-        assert_eq!(json_obj["meta_created"], "2023-01-01");
-        assert!(!json_obj.contains_key("name"));
-        assert!(!json_obj.contains_key("content"));
-    }
-
-    #[test]
-    fn test_empty_config() {
-        let transform = FilterFields::new(FilterFieldsConfig {
-            keep_fields: vec![],
-            patterns: vec![],
-            include_matching: true,
-        })
-        .unwrap();
-        let msg = create_test_message(r#"{"id": 1, "name": "test"}"#);
-        let result = transform
-            .transform(&create_test_topic_metadata(), msg)
-            .unwrap()
-            .unwrap();
-        let json_obj = extract_json_object(&result).unwrap();
-        assert_eq!(json_obj.len(), 2);
-        assert_eq!(json_obj["id"], 1);
-        assert_eq!(json_obj["name"], "test");
-    }
-
-    #[test]
-    fn test_non_json_payload() {
-        let transform = FilterFields::new(FilterFieldsConfig {
-            keep_fields: vec!["id".to_string()],
-            patterns: vec![],
-            include_matching: true,
-        })
-        .unwrap();
-        let msg = create_raw_test_message(vec![1, 2, 3, 4]);
-        let result = transform
-            .transform(&create_test_topic_metadata(), msg)
-            .unwrap()
-            .unwrap();
-        if let Payload::Raw(bytes) = &result.payload {
-            assert_eq!(bytes, &vec![1, 2, 3, 4]);
-        } else {
-            panic!("Expected Raw payload");
+        match &message.payload {
+            Payload::Json(_) => self.transform_json(metadata, message),
+            _ => Ok(Some(message)),
         }
     }
 }

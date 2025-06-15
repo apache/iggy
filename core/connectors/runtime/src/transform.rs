@@ -42,7 +42,7 @@ pub fn load(config: TransformsConfig) -> Result<Vec<Arc<dyn Transform>>, Runtime
             continue;
         }
 
-        let transform = iggy_connector_sdk::transforms::load(r#type, transform_config)?;
+        let transform = iggy_connector_sdk::transforms::from_config(r#type, &transform_config)?;
         transforms.push(transform);
     }
 

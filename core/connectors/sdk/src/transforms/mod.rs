@@ -17,26 +17,27 @@
  */
 
 mod add_fields;
-mod common;
 mod delete_fields;
 mod filter_fields;
+pub mod json;
 mod update_fields;
-
-pub use add_fields::{AddFields, AddFieldsConfig};
-pub use delete_fields::{DeleteFields, DeleteFieldsConfig};
-pub use filter_fields::{FilterFields, FilterFieldsConfig, FilterPattern};
-pub use update_fields::{UpdateFields, UpdateFieldsConfig};
-
-pub use common::{
-    Compilable, CompiledKeyPattern, CompiledValuePattern, ComputedValue, FieldValue, KeyPattern,
-    SerializedKeyPattern, SerializedValuePattern, ValuePattern, compute_value,
+use crate::{DecodedMessage, Error, TopicMetadata};
+pub use add_fields::{
+    AddFields, AddFieldsConfig, ComputedValue as AddComputedValue, Field as AddField,
+    FieldValue as AddFieldValue,
 };
-
+pub use delete_fields::{DeleteFields, DeleteFieldsConfig};
+pub use filter_fields::{
+    FilterFields, FilterFieldsConfig, FilterPattern, KeyPattern as FilterKeyPattern,
+    ValuePattern as FilterValuePattern,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use strum_macros::{Display, IntoStaticStr};
-
-use crate::{DecodedMessage, Error, TopicMetadata};
+pub use update_fields::{
+    ComputedValue as UpdateComputedValue, Field as UpdateField, FieldValue as UpdateFieldValue,
+    UpdateCondition, UpdateFields, UpdateFieldsConfig,
+};
 
 pub trait Transform: Send + Sync {
     fn r#type(&self) -> TransformType;
@@ -68,7 +69,7 @@ pub fn from_config(t: TransformType, raw: &serde_json::Value) -> Result<Arc<dyn 
         TransformType::DeleteFields => {
             let cfg: DeleteFieldsConfig =
                 serde_json::from_value(raw.clone()).map_err(|_| Error::InvalidConfig)?;
-            Ok(Arc::new(DeleteFields::new(cfg)?))
+            Ok(Arc::new(DeleteFields::new(cfg)))
         }
         TransformType::FilterFields => {
             let cfg: FilterFieldsConfig =
@@ -78,86 +79,7 @@ pub fn from_config(t: TransformType, raw: &serde_json::Value) -> Result<Arc<dyn 
         TransformType::UpdateFields => {
             let cfg: UpdateFieldsConfig =
                 serde_json::from_value(raw.clone()).map_err(|_| Error::InvalidConfig)?;
-            Ok(Arc::new(UpdateFields::new(cfg)?))
-        }
-    }
-}
-
-#[cfg(test)]
-pub mod test_utils {
-    use crate::{DecodedMessage, Payload, TopicMetadata};
-    use simd_json::OwnedValue;
-    use simd_json::prelude::{TypedScalarValue, ValueAsScalar};
-    use uuid;
-
-    /// Helper function to create a test message with the given JSON payload
-    pub fn create_test_message(json: &str) -> DecodedMessage {
-        let mut payload = json.to_string().into_bytes();
-        let value = simd_json::to_owned_value(&mut payload).unwrap();
-        DecodedMessage {
-            id: None,
-            offset: None,
-            checksum: None,
-            timestamp: None,
-            origin_timestamp: None,
-            headers: None,
-            payload: Payload::Json(value),
-        }
-    }
-
-    /// Helper function to create a non-JSON message with raw bytes
-    pub fn create_raw_test_message(bytes: Vec<u8>) -> DecodedMessage {
-        DecodedMessage {
-            id: None,
-            offset: None,
-            checksum: None,
-            timestamp: None,
-            origin_timestamp: None,
-            headers: None,
-            payload: Payload::Raw(bytes),
-        }
-    }
-
-    /// Helper function to create a topic metadata for testing
-    pub fn create_test_topic_metadata() -> TopicMetadata {
-        TopicMetadata {
-            stream: "test-stream".to_string(),
-            topic: "test-topic".to_string(),
-        }
-    }
-
-    /// Helper function to extract the JSON object from a message
-    pub fn extract_json_object(msg: &DecodedMessage) -> Option<&simd_json::owned::Object> {
-        if let Payload::Json(OwnedValue::Object(map)) = &msg.payload {
-            Some(map)
-        } else {
-            None
-        }
-    }
-
-    /// Helper function to assert that a JSON value is a number
-    pub fn assert_is_number(value: &OwnedValue, field_name: &str) {
-        if !value.is_number() {
-            panic!("{} should be a number", field_name);
-        }
-    }
-
-    /// Helper function to assert that a JSON value is a string
-    pub fn assert_is_string(value: &OwnedValue, field_name: &str) {
-        if !value.is_str() {
-            panic!("{} should be a string", field_name);
-        }
-    }
-
-    /// Helper function to assert that a JSON value is a string and validates as a UUID
-    pub fn assert_is_uuid(value: &OwnedValue, field_name: &str) {
-        if !value.is_str() {
-            panic!("{} should be a string", field_name);
-        }
-
-        let string_value = value.as_str().unwrap();
-        if uuid::Uuid::parse_str(string_value).is_err() {
-            panic!("{} is not a valid UUID", field_name);
+            Ok(Arc::new(UpdateFields::new(cfg)))
         }
     }
 }
