@@ -65,7 +65,7 @@ mod tests {
     };
 
     #[test]
-    fn test_keep_specific_fields() {
+    fn should_keep_only_specified_fields_when_keep_list_provided() {
         let transform = FilterFields::new(FilterFieldsConfig {
             keep_fields: vec!["id".to_string(), "name".to_string()],
             patterns: vec![],
@@ -93,7 +93,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_include_key_pattern() {
+    fn should_include_fields_matching_key_pattern() {
         let transform = FilterFields::new(FilterFieldsConfig {
             keep_fields: vec![],
             patterns: vec![FilterPattern {
@@ -124,7 +124,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_exclude_key_pattern() {
+    fn should_exclude_fields_matching_pattern_when_include_false() {
         let transform = FilterFields::new(FilterFieldsConfig {
             keep_fields: vec![],
             patterns: vec![FilterPattern {
@@ -155,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_with_value_pattern() {
+    fn should_filter_fields_based_on_value_pattern_matching() {
         let transform = FilterFields::new(FilterFieldsConfig {
             keep_fields: vec![],
             patterns: vec![FilterPattern {
@@ -186,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_combined_patterns() {
+    fn should_filter_using_combined_key_and_value_patterns() {
         let transform = FilterFields::new(FilterFieldsConfig {
             keep_fields: vec![],
             patterns: vec![FilterPattern {
@@ -219,7 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn test_keep_and_pattern_together() {
+    fn should_combine_keep_fields_list_with_pattern_filtering() {
         let transform = FilterFields::new(FilterFieldsConfig {
             keep_fields: vec!["id".to_string()],
             patterns: vec![FilterPattern {
@@ -250,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_config() {
+    fn should_return_message_unchanged_when_no_filters() {
         let transform = FilterFields::new(FilterFieldsConfig {
             keep_fields: vec![],
             patterns: vec![],
@@ -269,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn test_non_json_payload() {
+    fn should_pass_through_non_json_payload_unchanged() {
         let transform = FilterFields::new(FilterFieldsConfig {
             keep_fields: vec!["field1".to_string()],
             patterns: vec![],

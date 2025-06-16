@@ -59,7 +59,7 @@ mod tests {
     use simd_json::OwnedValue;
 
     #[test]
-    fn test_empty_fields() {
+    fn should_return_message_unchanged_when_no_fields() {
         let transform = AddFields { fields: vec![] };
         let msg = create_test_message(r#"{"existing": "field"}"#);
         let result = transform
@@ -72,7 +72,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_static_field() {
+    fn should_add_static_field_to_json_message() {
         let transform = AddFields {
             fields: vec![Field {
                 key: "new_field".to_string(),
@@ -91,7 +91,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_multiple_static_fields() {
+    fn should_add_multiple_static_fields_with_different_types() {
         let transform = AddFields {
             fields: vec![
                 Field {
@@ -122,7 +122,7 @@ mod tests {
     }
 
     #[test]
-    fn test_add_computed_fields() {
+    fn should_add_computed_fields_with_dynamic_values() {
         let transform = AddFields {
             fields: vec![
                 Field {
@@ -148,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn test_overwrite_existing_field() {
+    fn should_overwrite_existing_field_when_same_key_specified() {
         let transform = AddFields {
             fields: vec![Field {
                 key: "existing".to_string(),
@@ -166,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn test_non_json_payload() {
+    fn should_pass_through_non_json_payload_unchanged() {
         let transform = AddFields {
             fields: vec![Field {
                 key: "new_field".to_string(),

@@ -49,7 +49,7 @@ mod tests {
     };
 
     #[test]
-    fn test_delete_direct_fields() {
+    fn should_remove_specified_fields_from_json_message() {
         let transform = DeleteFields::new(DeleteFieldsConfig {
             fields: vec!["field1".to_string(), "field3".to_string()],
         });
@@ -69,7 +69,7 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_multiple_fields() {
+    fn should_remove_multiple_fields_while_preserving_others() {
         let transform = DeleteFields::new(DeleteFieldsConfig {
             fields: vec![
                 "remove1".to_string(),
@@ -100,7 +100,7 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_nonexistent_fields() {
+    fn should_ignore_nonexistent_fields_when_deleting() {
         let transform = DeleteFields::new(DeleteFieldsConfig {
             fields: vec!["nonexistent1".to_string(), "field2".to_string()],
         });
@@ -117,7 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_fields_list() {
+    fn should_return_message_unchanged_when_no_fields() {
         let transform = DeleteFields::new(DeleteFieldsConfig { fields: vec![] });
         let msg = create_test_message(r#"{"field1": "value1", "field2": "value2"}"#);
         let result = transform
@@ -131,7 +131,7 @@ mod tests {
     }
 
     #[test]
-    fn test_non_json_payload() {
+    fn should_pass_through_non_json_payload_unchanged() {
         let transform = DeleteFields::new(DeleteFieldsConfig {
             fields: vec!["field1".to_string()],
         });

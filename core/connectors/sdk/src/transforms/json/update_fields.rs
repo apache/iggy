@@ -33,19 +33,19 @@ impl UpdateFields {
             return Ok(Some(message));
         };
 
-        for f in &self.fields {
-            let present = map.contains_key(&f.key);
-            let pass = match &f.condition {
+        for field in &self.fields {
+            let present = map.contains_key(&field.key);
+            let pass = match &field.condition {
                 None | Some(UpdateCondition::Always) => true,
                 Some(UpdateCondition::KeyExists) => present,
                 Some(UpdateCondition::KeyNotExists) => !present,
             };
             if pass {
-                let val = match &f.value {
+                let val = match &field.value {
                     FieldValue::Static(v) => v.clone(),
                     FieldValue::Computed(c) => compute_value(c),
                 };
-                map.insert(f.key.clone(), val);
+                map.insert(field.key.clone(), val);
             }
         }
 
@@ -68,7 +68,7 @@ mod tests {
     use simd_json::prelude::TypedScalarValue;
 
     #[test]
-    fn test_basic_update() {
+    fn should_always_update_field_when_no_condition() {
         let transform = UpdateFields::new(UpdateFieldsConfig {
             fields: vec![Field {
                 key: "status".to_string(),
@@ -88,7 +88,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_key_exists() {
+    fn should_update_only_existing_keys_when_key_exists() {
         let transform = UpdateFields::new(UpdateFieldsConfig {
             fields: vec![
                 Field {
@@ -116,7 +116,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_key_not_exists() {
+    fn should_conditionally_add_fields_when_key_not_exists() {
         let transform = UpdateFields::new(UpdateFieldsConfig {
             fields: vec![
                 Field {
@@ -144,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_always() {
+    fn should_update_or_add_fields_when_always_condition() {
         let transform = UpdateFields::new(UpdateFieldsConfig {
             fields: vec![
                 Field {
@@ -172,7 +172,7 @@ mod tests {
     }
 
     #[test]
-    fn test_computed_values() {
+    fn should_update_fields_with_dynamically_computed_values() {
         let transform = UpdateFields::new(UpdateFieldsConfig {
             fields: vec![
                 Field {
@@ -202,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn test_non_json_payload() {
+    fn should_pass_through_non_json_payload_unchanged() {
         let transform = UpdateFields::new(UpdateFieldsConfig {
             fields: vec![Field {
                 key: "new_field".to_string(),
