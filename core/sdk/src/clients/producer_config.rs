@@ -15,6 +15,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::clients::MIB;
 use crate::clients::producer_error_callback::{ErrorCallback, LogErrorCallback};
 use crate::clients::producer_sharding::{BalancedSharding, Sharding};
 use bon::Builder;
@@ -87,7 +88,7 @@ pub struct BackgroundConfig {
     pub sharding: Box<dyn Sharding + Send + Sync>,
     /// Maximum **total size in bytes** of a batch.  
     /// `0` ⇒ unlimited (size-based batching disabled).
-    #[builder(default = 1_048_576)]
+    #[builder(default = MIB)]
     pub batch_size: usize,
     /// Maximum **number of messages** per batch.  
     /// `0` ⇒ unlimited (length-based batching disabled).
@@ -98,7 +99,7 @@ pub struct BackgroundConfig {
     pub failure_mode: BackpressureMode,
     /// Upper bound for the **bytes held in memory** across *all* shards.  
     /// `IggyByteSize::from(0)` ⇒ unlimited.
-    #[builder(default = IggyByteSize::from(32 * 1_048_576))]
+    #[builder(default = IggyByteSize::from(32 * MIB as u64))]
     pub max_buffer_size: IggyByteSize,
     /// Maximum number of **in-flight requests** (batches being sent).  
     /// `0` ⇒ unlimited.
@@ -114,20 +115,20 @@ pub struct BackgroundConfig {
 /// use iggy_common::IggyDuration;
 ///
 /// // Send messages one-by-one (max latency, min memory per request)
-/// let cfg = SyncConfig::builder()
+/// let cfg = DirectConfig::builder()
 ///     .batch_length(1)
 ///     .linger_time(IggyDuration::from(0))
 ///     .build();
 ///
 /// // Send in chunks of up to 500 messages,
 /// // with a delay of at least 200 ms between consecutive sends.
-/// let cfg = SyncConfig::builder()
+/// let cfg = DirectConfig::builder()
 ///     .batch_length(500)
 ///     .linger_time(IggyDuration::from(200))
 ///     .build();
 /// ```
 #[derive(Clone, Builder)]
-pub struct SyncConfig {
+pub struct DirectConfig {
     /// Maximum number of messages to pack into **one** synchronous request.
     /// `0` ⇒ MAX_BATCH_LENTH().
     #[builder(default = 1000)]
@@ -139,5 +140,5 @@ pub struct SyncConfig {
 
 fn default_shard_count() -> usize {
     let cpus = num_cpus::get();
-    cpus.clamp(2, 16)
+    cpus.clamp(2, 64)
 }

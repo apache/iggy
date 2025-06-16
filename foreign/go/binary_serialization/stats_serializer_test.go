@@ -25,6 +25,7 @@ func TestDeserialize(t *testing.T) {
 	payload2 := []byte{
 		240, 68, 0, 0, //"process_id": 17648,
 		124, 202, 146, 58, //"cpu_usage": 0.0011199261,
+		124, 202, 146, 58, //"total_cpu_usage": 0.0011199261,
 		0, 224, 66, 3, 0, 0, 0, 0, //"memory_usage": 54714368,
 		0, 32, 123, 208, 7, 0, 0, 0, //"total_memory": 33562501120,
 		0, 224, 28, 253, 4, 0, 0, 0, //"available_memory": 21426397184,

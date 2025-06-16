@@ -22,7 +22,7 @@ use std::sync::Arc;
 use strum::{EnumDiscriminants, FromRepr, IntoStaticStr};
 use thiserror::Error;
 
-#[derive(Clone, Debug, Error, EnumDiscriminants, IntoStaticStr, FromRepr)]
+#[derive(Clone, Debug, Error, EnumDiscriminants, IntoStaticStr, FromRepr, Default)]
 #[repr(u32)]
 #[strum(serialize_all = "snake_case")]
 #[strum_discriminants(
@@ -31,6 +31,7 @@ use thiserror::Error;
     strum(serialize_all = "snake_case")
 )]
 pub enum IggyError {
+    #[default]
     #[error("Error")]
     Error = 1,
     #[error("Invalid configuration")]
@@ -375,8 +376,10 @@ pub enum IggyError {
     BackgroundSendBufferOverflow = 4055,
     #[error("Producer send failed")]
     ProducerSendFailed {
-        cause: String,
+        cause: Box<IggyError>,
         failed: Arc<Vec<IggyMessage>>,
+        stream_name: String,
+        topic_name: String,
     } = 4056,
     #[error("Producer closed")]
     ProducerClosed = 4057,

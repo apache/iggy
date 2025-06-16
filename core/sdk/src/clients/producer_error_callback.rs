@@ -15,7 +15,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use iggy_common::{Identifier, IggyMessage, Partitioning};
+use iggy_common::{Identifier, IggyError, IggyMessage, Partitioning};
 use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -23,9 +23,11 @@ use tracing::error;
 
 #[derive(Debug)]
 pub struct ErrorCtx {
-    pub cause: String,
+    pub cause: Box<IggyError>,
     pub stream: Arc<Identifier>,
+    pub stream_name: String,
     pub topic: Arc<Identifier>,
+    pub topic_name: String,
     pub partitioning: Option<Arc<Partitioning>>,
     pub messages: Arc<Vec<IggyMessage>>,
 }
@@ -54,9 +56,11 @@ impl ErrorCallback for LogErrorCallback {
                 .unwrap_or_else(|| "None".to_string());
 
             error!(
-                cause = ctx.cause,
+                cause = %ctx.cause,
                 stream = %ctx.stream,
+                stream_name = ctx.stream_name,
                 topic = %ctx.topic,
+                topic_name = ctx.topic_name,
                 partitioning = %partitioning,
                 num_messages = ctx.messages.len(),
                 "Failed to send messages in background task",

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::clients::producer_config::{BackgroundConfig, SyncConfig};
+use crate::clients::producer_config::{BackgroundConfig, DirectConfig};
 use crate::prelude::IggyProducer;
 use iggy_binary_protocol::Client;
 use iggy_common::locking::IggySharedMut;
@@ -25,13 +25,13 @@ use iggy_common::{
 use std::sync::Arc;
 
 pub enum SendMode {
-    Sync(SyncConfig),
+    Direct(DirectConfig),
     Background(BackgroundConfig),
 }
 
 impl Default for SendMode {
     fn default() -> Self {
-        SendMode::Sync(SyncConfig::builder().build())
+        SendMode::Direct(DirectConfig::builder().build())
     }
 }
 
@@ -198,15 +198,15 @@ impl IggyProducerBuilder {
         }
     }
 
-    /// Sets the producer to use synchronous (direct) message sending.
+    /// Sets the producer to use direct message sending.
     /// This mode ensures that messages are sent immediately to the server
     /// without being buffered or delayed.
-    pub fn sync(mut self, config: SyncConfig) -> Self {
-        self.mode = SendMode::Sync(config);
+    pub fn direct(mut self, config: DirectConfig) -> Self {
+        self.mode = SendMode::Direct(config);
         self
     }
 
-    /// Sets the producer to use asynchronous (background) message sending.
+    /// Sets the producer to use background message sending.
     /// This mode buffers messages and sends them in the background.
     pub fn background(mut self, config: BackgroundConfig) -> Self {
         self.mode = SendMode::Background(config);
