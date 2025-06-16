@@ -18,10 +18,25 @@
  */
 
 
-export * from './poll-messages.command.js';
-export * from './send-messages.command.js';
-export * from './message.utils.js';
-export * from "./poll.utils.js";
+import assert from 'node:assert/strict';
+import { Client } from '../client/index.js';
+import { Given } from "@cucumber/cucumber";
+import type { TestWorld } from './world.js';
 
-export { Partitioning } from './partitioning.utils.js';
-export { HeaderValue } from './header.utils.js';
+const credentials = { username: 'iggy', password: 'iggy' };
+const opt = {
+  transport: 'TCP' as const,
+  options: { port: 8090, host: '127.0.0.1' },
+  credentials
+};
+
+Given('I have a running Iggy server', function () {
+  return true;
+});
+
+
+Given('I am authenticated as the root user', async function(this: TestWorld) {
+  this.client = new Client(opt);
+  assert.deepEqual({ userId: 1 }, await this.client.session.login(credentials));
+  assert.equal(true, await this.client.system.ping());
+});

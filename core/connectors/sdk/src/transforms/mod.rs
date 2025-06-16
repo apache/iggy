@@ -16,25 +16,54 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
-use add_fields::AddFields;
-use delete_fields::DeleteFields;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use strum_macros::{Display, IntoStaticStr};
-use tracing::error;
-
+mod add_fields;
+mod delete_fields;
+mod filter_fields;
+pub mod json;
+mod update_fields;
 use crate::{DecodedMessage, Error, TopicMetadata};
+pub use add_fields::{AddFields, AddFieldsConfig, Field as AddField};
+pub use delete_fields::{DeleteFields, DeleteFieldsConfig};
+pub use filter_fields::{
+    FilterFields, FilterFieldsConfig, FilterPattern, KeyPattern as FilterKeyPattern,
+    ValuePattern as FilterValuePattern,
+};
+use serde::{Deserialize, Serialize};
+use simd_json::OwnedValue;
+use std::sync::Arc;
+use strum_macros::{Display, IntoStaticStr};
+pub use update_fields::{Field as UpdateField, UpdateCondition, UpdateFields, UpdateFieldsConfig};
 
-pub mod add_fields;
-pub mod delete_fields;
+/// The value of a field, either static or computed at runtime
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldValue {
+    Static(OwnedValue),
+    Computed(ComputedValue),
+}
 
-/// Fields transformation trait.
+/// Types of computed values that can be generated at runtime
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize, Display, IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputedValue {
+    #[strum(to_string = "date_time")]
+    DateTime,
+    #[strum(to_string = "timestamp_nanos")]
+    TimestampNanos,
+    #[strum(to_string = "timestamp_micros")]
+    TimestampMicros,
+    #[strum(to_string = "timestamp_millis")]
+    TimestampMillis,
+    #[strum(to_string = "timestamp_seconds")]
+    TimestampSeconds,
+    #[strum(to_string = "uuid_v4")]
+    UuidV4,
+    #[strum(to_string = "uuid_v7")]
+    UuidV7,
+}
+
 pub trait Transform: Send + Sync {
-    /// Returns the type of the transform.
     fn r#type(&self) -> TransformType;
-
-    /// Transforms the message, given the format is supported and the transform is applicable.
     fn transform(
         &self,
         metadata: &TopicMetadata,
@@ -47,30 +76,36 @@ pub trait Transform: Send + Sync {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum TransformType {
-    #[strum(to_string = "add_fields")]
     AddFields,
-    #[strum(to_string = "delete_fields")]
     DeleteFields,
+    FilterFields,
+    UpdateFields,
 }
 
-pub fn load(
-    r#type: TransformType,
-    config: &serde_json::Value,
+pub fn from_config(
+    transform: TransformType,
+    raw: &serde_json::Value,
 ) -> Result<Arc<dyn Transform>, Error> {
-    Ok(match r#type {
-        TransformType::AddFields => Arc::new(AddFields::new(as_config(r#type, config.to_owned())?)),
-        TransformType::DeleteFields => {
-            Arc::new(DeleteFields::new(as_config(r#type, config.to_owned())?))
+    match transform {
+        TransformType::AddFields => {
+            let cfg: AddFieldsConfig =
+                serde_json::from_value(raw.clone()).map_err(|_| Error::InvalidConfig)?;
+            Ok(Arc::new(AddFields::new(cfg)))
         }
-    })
-}
-
-fn as_config<T: DeserializeOwned>(
-    r#type: TransformType,
-    config: serde_json::Value,
-) -> Result<T, Error> {
-    serde_json::from_value::<T>(config).map_err(|error| {
-        error!("Failed to deserialize config for transform: {type}. {error}");
-        Error::InvalidConfig
-    })
+        TransformType::DeleteFields => {
+            let cfg: DeleteFieldsConfig =
+                serde_json::from_value(raw.clone()).map_err(|_| Error::InvalidConfig)?;
+            Ok(Arc::new(DeleteFields::new(cfg)))
+        }
+        TransformType::FilterFields => {
+            let cfg: FilterFieldsConfig =
+                serde_json::from_value(raw.clone()).map_err(|_| Error::InvalidConfig)?;
+            Ok(Arc::new(FilterFields::new(cfg)?))
+        }
+        TransformType::UpdateFields => {
+            let cfg: UpdateFieldsConfig =
+                serde_json::from_value(raw.clone()).map_err(|_| Error::InvalidConfig)?;
+            Ok(Arc::new(UpdateFields::new(cfg)))
+        }
+    }
 }

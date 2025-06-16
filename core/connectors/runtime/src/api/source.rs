@@ -104,9 +104,9 @@ async fn get_source_transforms(
         transforms
             .transforms
             .iter()
-            .map(|transform| TransformResponse {
-                r#type: *transform.0,
-                config: transform.1.clone(),
+            .map(|(r#type, config)| TransformResponse {
+                r#type: *r#type,
+                config: config.clone(),
             })
             .collect(),
     ))

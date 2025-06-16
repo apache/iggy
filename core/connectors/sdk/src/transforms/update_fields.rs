@@ -16,39 +16,49 @@
  * under the License.
  */
 
-use super::{Transform, TransformType};
+use super::{FieldValue, Transform, TransformType};
 use crate::{DecodedMessage, Error, Payload, TopicMetadata};
 use serde::{Deserialize, Serialize};
-use simd_json::OwnedValue;
-use std::collections::HashSet;
 
-/// Configuration for the DeleteFields transform
+/// A field to be updated in messages
 #[derive(Debug, Serialize, Deserialize)]
-pub struct DeleteFieldsConfig {
+pub struct Field {
+    pub key: String,
+    pub value: FieldValue,
     #[serde(default)]
-    pub fields: Vec<String>,
+    pub condition: Option<UpdateCondition>,
 }
 
-/// Transform that removes specified fields from JSON messages
-pub struct DeleteFields {
-    pub fields: HashSet<String>,
+/// Configuration for the UpdateFields transform
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UpdateFieldsConfig {
+    #[serde(default)]
+    pub fields: Vec<Field>,
 }
 
-impl DeleteFields {
-    pub fn new(cfg: DeleteFieldsConfig) -> Self {
-        Self {
-            fields: cfg.fields.into_iter().collect(),
-        }
+/// Conditions that determine when a field should be updated
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateCondition {
+    Always,
+    KeyExists,
+    KeyNotExists,
+}
+
+/// Transform that updates fields in JSON messages based on conditions
+pub struct UpdateFields {
+    pub fields: Vec<Field>,
+}
+
+impl UpdateFields {
+    pub fn new(cfg: UpdateFieldsConfig) -> Self {
+        Self { fields: cfg.fields }
     }
-
-    pub fn should_remove(&self, k: &str, _v: &OwnedValue) -> bool {
-        self.fields.contains(k)
-    }
 }
 
-impl Transform for DeleteFields {
+impl Transform for UpdateFields {
     fn r#type(&self) -> TransformType {
-        TransformType::DeleteFields
+        TransformType::UpdateFields
     }
 
     fn transform(

@@ -18,10 +18,15 @@
  */
 
 
-export * from './poll-messages.command.js';
-export * from './send-messages.command.js';
-export * from './message.utils.js';
-export * from "./poll.utils.js";
+import type { Stream } from '../wire/stream/stream.utils.js';
+import type { Topic } from '../wire/topic/topic.utils.js';
+import type { CreateMessage, Message } from 'src/wire/index.js';
+import type { Client } from '../client/index.js';
 
-export { Partitioning } from './partitioning.utils.js';
-export { HeaderValue } from './header.utils.js';
+export interface TestWorld {
+  client: Client
+  stream: Stream,
+  topic: Topic,
+  sendMessages: CreateMessage[],
+  polledMessages: Message[]
+};
