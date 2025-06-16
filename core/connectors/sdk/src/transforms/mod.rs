@@ -23,7 +23,6 @@ pub mod json;
 mod update_fields;
 use crate::{DecodedMessage, Error, TopicMetadata};
 pub use add_fields::{AddFields, AddFieldsConfig, Field as AddField};
-use chrono::Utc;
 pub use delete_fields::{DeleteFields, DeleteFieldsConfig};
 pub use filter_fields::{
     FilterFields, FilterFieldsConfig, FilterPattern, KeyPattern as FilterKeyPattern,
@@ -61,20 +60,6 @@ pub enum ComputedValue {
     UuidV4,
     #[strum(to_string = "uuid_v7")]
     UuidV7,
-}
-
-/// Computes a value based on the specified computed value type
-pub fn compute_value(kind: &ComputedValue) -> OwnedValue {
-    let now = Utc::now();
-    match kind {
-        ComputedValue::DateTime => now.to_rfc3339().into(),
-        ComputedValue::TimestampNanos => now.timestamp_nanos_opt().unwrap().into(),
-        ComputedValue::TimestampMicros => now.timestamp_micros().into(),
-        ComputedValue::TimestampMillis => now.timestamp_millis().into(),
-        ComputedValue::TimestampSeconds => now.timestamp().into(),
-        ComputedValue::UuidV4 => uuid::Uuid::new_v4().to_string().into(),
-        ComputedValue::UuidV7 => uuid::Uuid::now_v7().to_string().into(),
-    }
 }
 
 pub trait Transform: Send + Sync {

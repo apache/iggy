@@ -16,9 +16,10 @@
  * under the License.
  */
 
+use super::compute_value;
 use crate::{
     DecodedMessage, Error, Payload, TopicMetadata,
-    transforms::{FieldValue, UpdateFields, compute_value, update_fields::UpdateCondition},
+    transforms::{FieldValue, UpdateFields, update_fields::UpdateCondition},
 };
 use simd_json::OwnedValue;
 
