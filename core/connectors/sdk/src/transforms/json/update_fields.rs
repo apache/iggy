@@ -18,7 +18,7 @@
 
 use crate::{
     DecodedMessage, Error, Payload, TopicMetadata,
-    transforms::update_fields::{FieldValue, UpdateCondition, UpdateFields, compute_value},
+    transforms::{FieldValue, UpdateFields, compute_value, update_fields::UpdateCondition},
 };
 use simd_json::OwnedValue;
 
@@ -60,10 +60,8 @@ mod tests {
         extract_json_object,
     };
     use crate::transforms::{
-        Transform,
-        update_fields::{
-            ComputedValue, Field, FieldValue, UpdateCondition, UpdateFields, UpdateFieldsConfig,
-        },
+        ComputedValue, FieldValue, Transform,
+        update_fields::{Field, UpdateCondition, UpdateFields, UpdateFieldsConfig},
     };
     use simd_json::OwnedValue;
     use simd_json::prelude::TypedScalarValue;

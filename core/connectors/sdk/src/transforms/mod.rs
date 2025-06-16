@@ -22,22 +22,60 @@ mod filter_fields;
 pub mod json;
 mod update_fields;
 use crate::{DecodedMessage, Error, TopicMetadata};
-pub use add_fields::{
-    AddFields, AddFieldsConfig, ComputedValue as AddComputedValue, Field as AddField,
-    FieldValue as AddFieldValue,
-};
+pub use add_fields::{AddFields, AddFieldsConfig, Field as AddField};
+use chrono::Utc;
 pub use delete_fields::{DeleteFields, DeleteFieldsConfig};
 pub use filter_fields::{
     FilterFields, FilterFieldsConfig, FilterPattern, KeyPattern as FilterKeyPattern,
     ValuePattern as FilterValuePattern,
 };
 use serde::{Deserialize, Serialize};
+use simd_json::OwnedValue;
 use std::sync::Arc;
 use strum_macros::{Display, IntoStaticStr};
-pub use update_fields::{
-    ComputedValue as UpdateComputedValue, Field as UpdateField, FieldValue as UpdateFieldValue,
-    UpdateCondition, UpdateFields, UpdateFieldsConfig,
-};
+pub use update_fields::{Field as UpdateField, UpdateCondition, UpdateFields, UpdateFieldsConfig};
+
+/// The value of a field, either static or computed at runtime
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldValue {
+    Static(OwnedValue),
+    Computed(ComputedValue),
+}
+
+/// Types of computed values that can be generated at runtime
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize, Display, IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputedValue {
+    #[strum(to_string = "date_time")]
+    DateTime,
+    #[strum(to_string = "timestamp_nanos")]
+    TimestampNanos,
+    #[strum(to_string = "timestamp_micros")]
+    TimestampMicros,
+    #[strum(to_string = "timestamp_millis")]
+    TimestampMillis,
+    #[strum(to_string = "timestamp_seconds")]
+    TimestampSeconds,
+    #[strum(to_string = "uuid_v4")]
+    UuidV4,
+    #[strum(to_string = "uuid_v7")]
+    UuidV7,
+}
+
+/// Computes a value based on the specified computed value type
+pub fn compute_value(kind: &ComputedValue) -> OwnedValue {
+    let now = Utc::now();
+    match kind {
+        ComputedValue::DateTime => now.to_rfc3339().into(),
+        ComputedValue::TimestampNanos => now.timestamp_nanos_opt().unwrap().into(),
+        ComputedValue::TimestampMicros => now.timestamp_micros().into(),
+        ComputedValue::TimestampMillis => now.timestamp_millis().into(),
+        ComputedValue::TimestampSeconds => now.timestamp().into(),
+        ComputedValue::UuidV4 => uuid::Uuid::new_v4().to_string().into(),
+        ComputedValue::UuidV7 => uuid::Uuid::now_v7().to_string().into(),
+    }
+}
 
 pub trait Transform: Send + Sync {
     fn r#type(&self) -> TransformType;
