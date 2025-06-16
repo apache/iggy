@@ -42,10 +42,10 @@ const messages = [
   { payload: 'yolo msg 4', Headers: h2 },
 ];
 
-const someContent = () => messages[Math.floor(Math.random() * messages.length)]
+export const someMessageContent = () => messages[Math.floor(Math.random() * messages.length)]
 
 export const generateMessages = (count = 1) => {
-  return [...Array(count)].map(() => ({ id: v7(), ...someContent() }));
+  return [...Array(count)].map(() => ({ id: v7(), ...someMessageContent() }));
 }
 
 
