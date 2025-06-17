@@ -16,6 +16,10 @@
  * under the License.
  */
 
+use crate::{
+    PLUGIN_ID, RuntimeError, SinkApi, SinkConnector, SinkConnectorConsumer, SinkConnectorPlugin,
+    SinkConnectorWrapper, configs::SinkConfig, resolve_plugin_path, transform,
+};
 use dlopen2::wrapper::Container;
 use futures::StreamExt;
 use iggy::prelude::{
@@ -33,11 +37,6 @@ use std::{
     time::Instant,
 };
 use tracing::{error, info, warn};
-
-use crate::{
-    PLUGIN_ID, RuntimeError, SinkApi, SinkConnector, SinkConnectorConsumer, SinkConnectorPlugin,
-    SinkConnectorWrapper, configs::SinkConfig, resolve_plugin_path, transform,
-};
 
 pub async fn init(
     sink_configs: HashMap<String, SinkConfig>,

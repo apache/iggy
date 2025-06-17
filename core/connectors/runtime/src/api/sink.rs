@@ -47,7 +47,8 @@ async fn get_sinks(
     let sinks = context
         .sinks
         .get_all()
-        .into_values()
+        .await
+        .into_iter()
         .map(|sink| sink.into())
         .collect::<Vec<_>>();
     Ok(Json(sinks))
@@ -57,10 +58,14 @@ async fn get_sink(
     State(context): State<Arc<RuntimeContext>>,
     Path(key): Path<String>,
 ) -> Result<Json<SinkDetailsResponse>, ApiError> {
-    let Some(sink) = context.sinks.get(&key) else {
+    let Some(sink) = context.sinks.get(&key).await else {
         return Err(ApiError::Error(RuntimeError::SinkNotFound(key)));
     };
-    Ok(Json(sink.into()))
+    let sink = sink.lock().await;
+    Ok(Json(SinkDetailsResponse {
+        info: sink.info.clone().into(),
+        streams: sink.streams.to_vec(),
+    }))
 }
 
 async fn get_sink_config(
@@ -68,17 +73,18 @@ async fn get_sink_config(
     Path(key): Path<String>,
     Query(query): Query<GetSinkConfig>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let Some(sink) = context.sinks.get(&key) else {
+    let Some(sink) = context.sinks.get(&key).await else {
         return Err(ApiError::Error(RuntimeError::SinkNotFound(key)));
     };
-    let Some(config) = sink.config.clone() else {
+    let sink = sink.lock().await;
+    let Some(config) = sink.config.as_ref() else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
 
     let format = query
         .format
         .unwrap_or(sink.info.config_format.unwrap_or_default());
-    let (content_type, config) = map_connector_config(&config, format)?;
+    let (content_type, config) = map_connector_config(config, format)?;
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, content_type);
     Ok((headers, config).into_response())
@@ -93,10 +99,11 @@ async fn get_sink_transforms(
     State(context): State<Arc<RuntimeContext>>,
     Path(key): Path<String>,
 ) -> Result<Json<Vec<TransformResponse>>, ApiError> {
-    let Some(sink) = context.sinks.get(&key) else {
+    let Some(sink) = context.sinks.get(&key).await else {
         return Err(ApiError::Error(RuntimeError::SinkNotFound(key)));
     };
-    let Some(transforms) = sink.transforms.clone() else {
+    let sink = sink.lock().await;
+    let Some(transforms) = sink.transforms.as_ref() else {
         return Ok(Json(vec![]));
     };
 

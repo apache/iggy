@@ -16,18 +16,12 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
-use iggy_connector_sdk::transforms::TransformType;
-use serde::{Deserialize, Serialize};
-
 use crate::{
     configs::{ConfigFormat, StreamConsumerConfig, StreamProducerConfig},
-    manager::{
-        sink::{SinkDetails, SinkInfo},
-        source::{SourceDetails, SourceInfo},
-    },
+    manager::{sink::SinkInfo, source::SourceInfo},
 };
+use iggy_connector_sdk::transforms::TransformType;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SinkInfoResponse {
@@ -44,7 +38,7 @@ pub struct SinkInfoResponse {
 pub struct SinkDetailsResponse {
     #[serde(flatten)]
     pub info: SinkInfoResponse,
-    pub streams: Arc<Vec<StreamConsumerConfig>>,
+    pub streams: Vec<StreamConsumerConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -62,22 +56,22 @@ pub struct SourceInfoResponse {
 pub struct SourceDetailsResponse {
     #[serde(flatten)]
     pub info: SourceInfoResponse,
-    pub streams: Arc<Vec<StreamProducerConfig>>,
+    pub streams: Vec<StreamProducerConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TransformResponse {
     pub r#type: TransformType,
-    pub config: Arc<serde_json::Value>,
+    pub config: serde_json::Value,
 }
 
-impl From<&SinkInfo> for SinkInfoResponse {
-    fn from(sink: &SinkInfo) -> Self {
+impl From<SinkInfo> for SinkInfoResponse {
+    fn from(sink: SinkInfo) -> Self {
         SinkInfoResponse {
             id: sink.id,
-            key: sink.key.to_owned(),
-            name: sink.name.to_owned(),
-            path: sink.path.to_owned(),
+            key: sink.key,
+            name: sink.name,
+            path: sink.path,
             enabled: sink.enabled,
             running: sink.running,
             config_format: sink.config_format,
@@ -85,36 +79,16 @@ impl From<&SinkInfo> for SinkInfoResponse {
     }
 }
 
-impl From<&SinkDetails> for SinkDetailsResponse {
-    fn from(sink: &SinkDetails) -> Self {
-        let info = &sink.info;
-        SinkDetailsResponse {
-            info: info.into(),
-            streams: sink.streams.clone(),
-        }
-    }
-}
-
-impl From<&SourceInfo> for SourceInfoResponse {
-    fn from(source: &SourceInfo) -> Self {
+impl From<SourceInfo> for SourceInfoResponse {
+    fn from(source: SourceInfo) -> Self {
         SourceInfoResponse {
             id: source.id,
-            key: source.key.to_owned(),
-            name: source.name.to_owned(),
-            path: source.path.to_owned(),
+            key: source.key,
+            name: source.name,
+            path: source.path,
             enabled: source.enabled,
             running: source.running,
             config_format: source.config_format,
-        }
-    }
-}
-
-impl From<&SourceDetails> for SourceDetailsResponse {
-    fn from(source: &SourceDetails) -> Self {
-        let info = &source.info;
-        SourceDetailsResponse {
-            info: info.into(),
-            streams: source.streams.clone(),
         }
     }
 }

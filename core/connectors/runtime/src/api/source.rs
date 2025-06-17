@@ -47,7 +47,8 @@ async fn get_sources(
     let sources = context
         .sources
         .get_all()
-        .into_values()
+        .await
+        .into_iter()
         .map(|source| source.into())
         .collect::<Vec<_>>();
     Ok(Json(sources))
@@ -57,10 +58,14 @@ async fn get_source(
     State(context): State<Arc<RuntimeContext>>,
     Path(key): Path<String>,
 ) -> Result<Json<SourceDetailsResponse>, ApiError> {
-    let Some(source) = context.sources.get(&key) else {
+    let Some(source) = context.sources.get(&key).await else {
         return Err(ApiError::Error(RuntimeError::SourceNotFound(key)));
     };
-    Ok(Json(source.into()))
+    let source = source.lock().await;
+    Ok(Json(SourceDetailsResponse {
+        info: source.info.clone().into(),
+        streams: source.streams.to_vec(),
+    }))
 }
 
 async fn get_source_config(
@@ -68,17 +73,18 @@ async fn get_source_config(
     Path(key): Path<String>,
     Query(query): Query<GetSourceConfig>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let Some(source) = context.sources.get(&key) else {
+    let Some(source) = context.sources.get(&key).await else {
         return Err(ApiError::Error(RuntimeError::SourceNotFound(key)));
     };
-    let Some(config) = source.config.clone() else {
+    let source = source.lock().await;
+    let Some(config) = source.config.as_ref() else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
 
     let format = query
         .format
         .unwrap_or(source.info.config_format.unwrap_or_default());
-    let (content_type, config) = map_connector_config(&config, format)?;
+    let (content_type, config) = map_connector_config(config, format)?;
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, content_type);
     Ok((headers, config).into_response())
@@ -93,10 +99,11 @@ async fn get_source_transforms(
     State(context): State<Arc<RuntimeContext>>,
     Path(key): Path<String>,
 ) -> Result<Json<Vec<TransformResponse>>, ApiError> {
-    let Some(source) = context.sources.get(&key) else {
+    let Some(source) = context.sources.get(&key).await else {
         return Err(ApiError::Error(RuntimeError::SourceNotFound(key)));
     };
-    let Some(transforms) = source.transforms.clone() else {
+    let source = source.lock().await;
+    let Some(transforms) = source.transforms.as_ref() else {
         return Ok(Json(vec![]));
     };
 

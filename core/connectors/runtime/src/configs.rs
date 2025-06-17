@@ -16,12 +16,11 @@
  * under the License.
  */
 
+use crate::api::config::HttpApiConfig;
 use iggy_connector_sdk::{Schema, transforms::TransformType};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 use strum::Display;
-
-use crate::api::config::HttpApiConfig;
 
 #[derive(
     Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Display,
@@ -60,10 +59,10 @@ pub struct SinkConfig {
     pub enabled: bool,
     pub name: String,
     pub path: String,
-    pub transforms: Option<Arc<TransformsConfig>>,
-    pub streams: Arc<Vec<StreamConsumerConfig>>,
+    pub transforms: Option<TransformsConfig>,
+    pub streams: Vec<StreamConsumerConfig>,
     pub config_format: Option<ConfigFormat>,
-    pub config: Option<Arc<serde_json::Value>>,
+    pub config: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,16 +89,16 @@ pub struct SourceConfig {
     pub enabled: bool,
     pub name: String,
     pub path: String,
-    pub transforms: Option<Arc<TransformsConfig>>,
-    pub streams: Arc<Vec<StreamProducerConfig>>,
+    pub transforms: Option<TransformsConfig>,
+    pub streams: Vec<StreamProducerConfig>,
     pub config_format: Option<ConfigFormat>,
-    pub config: Option<Arc<serde_json::Value>>,
+    pub config: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TransformsConfig {
     #[serde(flatten)]
-    pub transforms: HashMap<TransformType, Arc<serde_json::Value>>,
+    pub transforms: HashMap<TransformType, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

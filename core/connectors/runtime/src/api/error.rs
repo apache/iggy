@@ -16,12 +16,11 @@
  * under the License.
  */
 
+use crate::error::RuntimeError;
 use axum::{Json, http::StatusCode, response::IntoResponse};
 use serde::Serialize;
 use thiserror::Error;
 use tracing::error;
-
-use crate::error::RuntimeError;
 
 #[derive(Debug, Error)]
 pub enum ApiError {

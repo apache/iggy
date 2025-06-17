@@ -30,7 +30,7 @@ pub fn load(config: &TransformsConfig) -> Result<Vec<Arc<dyn Transform>>, Runtim
         let shared_config = if transform_config.is_null() {
             SharedTransformConfig::default()
         } else {
-            SharedTransformConfig::deserialize(transform_config.as_ref()).map_err(|error| {
+            SharedTransformConfig::deserialize(transform_config).map_err(|error| {
                 RuntimeError::InvalidConfiguration(format!(
                     "Failed to parse transform config. {error}",
                 ))

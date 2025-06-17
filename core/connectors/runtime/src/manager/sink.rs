@@ -16,38 +16,44 @@
  * under the License.
  */
 
-use std::{collections::HashMap, sync::Arc};
-
 use crate::configs::{ConfigFormat, StreamConsumerConfig, TransformsConfig};
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::Mutex;
 
 #[derive(Debug)]
 pub struct SinkManager {
-    sinks: HashMap<String, SinkDetails>,
+    sinks: Mutex<HashMap<String, Arc<Mutex<SinkDetails>>>>,
 }
 
 impl SinkManager {
     pub fn new(sinks: Vec<SinkDetails>) -> Self {
         Self {
-            sinks: sinks
-                .into_iter()
-                .map(|sink| (sink.info.key.to_owned(), sink))
-                .collect(),
+            sinks: Mutex::new(
+                sinks
+                    .into_iter()
+                    .map(|sink| (sink.info.key.to_owned(), Arc::new(Mutex::new(sink))))
+                    .collect(),
+            ),
         }
     }
 
-    pub fn get(&self, key: &str) -> Option<&SinkDetails> {
-        self.sinks.get(key)
+    pub async fn get(&self, key: &str) -> Option<Arc<Mutex<SinkDetails>>> {
+        let sinks = self.sinks.lock().await;
+        sinks.get(key).cloned()
     }
 
-    pub fn get_all(&self) -> HashMap<&String, &SinkInfo> {
-        self.sinks
-            .iter()
-            .map(|(key, sink)| (key, &sink.info))
-            .collect()
+    pub async fn get_all(&self) -> Vec<SinkInfo> {
+        let sinks = self.sinks.lock().await;
+        let mut results = Vec::with_capacity(sinks.len());
+        for sink in sinks.values() {
+            let sink = sink.lock().await;
+            results.push(sink.info.clone());
+        }
+        results
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SinkInfo {
     pub id: u32,
     pub key: String,
@@ -61,7 +67,7 @@ pub struct SinkInfo {
 #[derive(Debug)]
 pub struct SinkDetails {
     pub info: SinkInfo,
-    pub transforms: Option<Arc<TransformsConfig>>,
-    pub streams: Arc<Vec<StreamConsumerConfig>>,
-    pub config: Option<Arc<serde_json::Value>>,
+    pub transforms: Option<TransformsConfig>,
+    pub streams: Vec<StreamConsumerConfig>,
+    pub config: Option<serde_json::Value>,
 }

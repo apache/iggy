@@ -16,38 +16,44 @@
  * under the License.
  */
 
-use std::{collections::HashMap, sync::Arc};
-
 use crate::configs::{ConfigFormat, StreamProducerConfig, TransformsConfig};
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::Mutex;
 
 #[derive(Debug)]
 pub struct SourceManager {
-    sources: HashMap<String, SourceDetails>,
+    sources: Mutex<HashMap<String, Arc<Mutex<SourceDetails>>>>,
 }
 
 impl SourceManager {
     pub fn new(sources: Vec<SourceDetails>) -> Self {
         Self {
-            sources: sources
-                .into_iter()
-                .map(|source| (source.info.key.to_owned(), source))
-                .collect(),
+            sources: Mutex::new(
+                sources
+                    .into_iter()
+                    .map(|source| (source.info.key.to_owned(), Arc::new(Mutex::new(source))))
+                    .collect(),
+            ),
         }
     }
 
-    pub fn get(&self, key: &str) -> Option<&SourceDetails> {
-        self.sources.get(key)
+    pub async fn get(&self, key: &str) -> Option<Arc<Mutex<SourceDetails>>> {
+        let sources = self.sources.lock().await;
+        sources.get(key).cloned()
     }
 
-    pub fn get_all(&self) -> HashMap<&String, &SourceInfo> {
-        self.sources
-            .iter()
-            .map(|(key, source)| (key, &source.info))
-            .collect()
+    pub async fn get_all(&self) -> Vec<SourceInfo> {
+        let sources = self.sources.lock().await;
+        let mut results = Vec::with_capacity(sources.len());
+        for source in sources.values() {
+            let source = source.lock().await;
+            results.push(source.info.clone());
+        }
+        results
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SourceInfo {
     pub id: u32,
     pub key: String,
@@ -61,7 +67,7 @@ pub struct SourceInfo {
 #[derive(Debug)]
 pub struct SourceDetails {
     pub info: SourceInfo,
-    pub transforms: Option<Arc<TransformsConfig>>,
-    pub streams: Arc<Vec<StreamProducerConfig>>,
-    pub config: Option<Arc<serde_json::Value>>,
+    pub transforms: Option<TransformsConfig>,
+    pub streams: Vec<StreamProducerConfig>,
+    pub config: Option<serde_json::Value>,
 }
