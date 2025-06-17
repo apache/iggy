@@ -1,7 +1,6 @@
 use crate::common::{ConnectorError, ConnectorResult, ElasticsearchClientManager, ElasticsearchDocument, ProcessingStats};  
 use crate::sink::{ElasticsearchSinkConfig, writer::ElasticsearchBulkWriter};  
 use iggy::prelude::*;  
-use std::collections::HashMap;  
 use std::sync::Arc;  
 use std::time::Duration;  
 use tokio::sync::{mpsc, Mutex};  
@@ -31,7 +30,7 @@ impl ElasticsearchSink {
         let es_client_manager = ElasticsearchClientManager::new(&config.elasticsearch_url).await?;  
         let writer = ElasticsearchBulkWriter::new(es_client_manager.client(), config.clone());  
           
-        // Create Iggy consumer with auto-commit configuration  
+        // Create Iggy consumer with proper configuration  
         let consumer = iggy_client  
             .consumer_group(consumer_group_name, stream_name, topic_name)?  
             .auto_commit(AutoCommit::IntervalOrWhen(  
@@ -62,7 +61,7 @@ impl ElasticsearchSink {
         self.consumer.init().await?;  
           
         // Create index template if configured  
-        if let Some(mapping_config) = &self.config.mapping_config {  
+        if self.config.mapping_config.is_some() {  
             self.writer.create_index_template(&self.config.index_pattern).await?;  
         }  
           
@@ -109,6 +108,7 @@ impl ElasticsearchSink {
                 }  
                 Ok(None) => {  
                     debug!("No messages available, continuing...");  
+                    tokio::time::sleep(Duration::from_millis(100)).await;  
                 }  
                 Err(_) => {  
                     warn!("Message polling timeout, continuing...");  
@@ -117,7 +117,7 @@ impl ElasticsearchSink {
         }  
     }  
       
-    async fn process_message(&self, message: Message) -> ConnectorResult<()> {  
+    async fn process_message(&self, message: IggyMessage) -> ConnectorResult<()> {  
         let document = self.convert_message_to_document(message)?;  
           
         let mut buffer = self.batch_buffer.lock().await;  
@@ -134,7 +134,7 @@ impl ElasticsearchSink {
         Ok(())  
     }  
       
-    fn convert_message_to_document(&self, message: Message) -> ConnectorResult<ElasticsearchDocument> {  
+    fn convert_message_to_document(&self, message: IggyMessage) -> ConnectorResult<ElasticsearchDocument> {  
         let payload_str = String::from_utf8(message.payload.to_vec())  
             .map_err(|e| ConnectorError::Processing {  
                 message: format!("Failed to convert payload to string: {}", e),  
@@ -183,7 +183,6 @@ impl ElasticsearchSink {
                     if attempts < max_attempts {  
                         tokio::time::sleep(self.config.retry_interval).await;  
                     } else {  
-                        // Send to DLQ if enabled  
                         if self.config.enable_dlq {  
                             self.send_to_dlq(documents).await?;  
                         }  
@@ -199,8 +198,7 @@ impl ElasticsearchSink {
     async fn send_to_dlq(&self, documents: Vec<ElasticsearchDocument>) -> ConnectorResult<()> {  
         if let Some(dlq_topic) = &self.config.dlq_topic {  
             warn!("Sending {} documents to DLQ topic: {}", documents.len(), dlq_topic);  
-            // Implementation would depend on how DLQ is set up in your system  
-            // This is a placeholder for DLQ functionality  
+            // DLQ implementation would go here  
         }  
         Ok(())  
     }  
@@ -245,24 +243,13 @@ impl ElasticsearchSink {
     pub async fn shutdown(&mut self) -> ConnectorResult<()> {  
         info!("Shutting down Elasticsearch Sink connector");  
           
-        // Signal shutdown to flush timer  
         if let Some(tx) = self.shutdown_tx.take() {  
             let _ = tx.send(()).await;  
         }  
           
-        // Flush remaining messages  
         Self::flush_batch(&self.batch_buffer, &self.writer, &self.stats).await?;  
           
         info!("Elasticsearch Sink connector shutdown complete");  
         Ok(())  
-    }  
-}  
-  
-impl Clone for ElasticsearchBulkWriter {  
-    fn clone(&self) -> Self {  
-        Self {  
-            client: self.client.clone(),  
-            config: self.config.clone(),  
-        }  
     }  
 }

@@ -31,12 +31,14 @@ impl ElasticsearchSource {
         // Load previous state  
         reader.load_state().await?;  
           
-        // Create Iggy producer  
+        // Create Iggy producer with proper configuration  
         let producer = iggy_client  
             .producer(stream_name, topic_name)?  
             .create_stream_if_not_exists()  
             .create_topic_if_not_exists()  
-            .batch_size(config.batch_size)  
+            .batch_size(config.batch_size as u32)  
+            .send_interval(IggyDuration::from_str("1ms")?)  
+            .partitioning(Partitioning::balanced())  
             .build();  
           
         Ok(Self {  
@@ -91,23 +93,22 @@ impl ElasticsearchSource {
           
         info!("Found {} new documents to send", documents.len());  
           
-        // Convert documents to Iggy messages and send  
+        // Convert documents to Iggy messages and send in batches  
+        let mut messages = Vec::new();  
         for document in documents {  
             let message = self.convert_document_to_message(document)?;  
+            messages.push(message);  
               
-            match timeout(Duration::from_secs(30), self.producer.send(message)).await {  
-                Ok(Ok(_)) => {  
-                    self.update_processed_stats().await;  
-                }  
-                Ok(Err(e)) => {  
-                    error!("Failed to send message: {}", e);  
-                    self.update_error_stats().await;  
-                }  
-                Err(_) => {  
-                    error!("Timeout sending message");  
-                    self.update_error_stats().await;  
-                }  
+            // Send in batches to avoid memory issues  
+            if messages.len() >= self.config.batch_size {  
+                self.send_message_batch(messages.clone()).await?;  
+                messages.clear();  
             }  
+        }  
+          
+        // Send remaining messages  
+        if !messages.is_empty() {  
+            self.send_message_batch(messages).await?;  
         }  
           
         // Save state after successful processing  
@@ -116,7 +117,35 @@ impl ElasticsearchSource {
         Ok(())  
     }  
       
-    fn convert_document_to_message(&self, document: crate::common::ElasticsearchDocument) -> ConnectorResult<Message> {  
+    async fn send_message_batch(&self, messages: Vec<IggyMessage>) -> ConnectorResult<()> {  
+        match timeout(Duration::from_secs(30), self.producer.send(messages.clone())).await {  
+            Ok(Ok(_)) => {  
+                debug!("Successfully sent batch of {} messages", messages.len());  
+                for _ in &messages {  
+                    self.update_processed_stats().await;  
+                }  
+                Ok(())  
+            }  
+            Ok(Err(e)) => {  
+                error!("Failed to send message batch: {}", e);  
+                for _ in &messages {  
+                    self.update_error_stats().await;  
+                }  
+                Err(ConnectorError::Iggy(e))  
+            }  
+            Err(_) => {  
+                error!("Timeout sending message batch");  
+                for _ in &messages {  
+                    self.update_error_stats().await;  
+                }  
+                Err(ConnectorError::Processing {  
+                    message: "Timeout sending message batch".to_string(),  
+                })  
+            }  
+        }  
+    }  
+      
+    fn convert_document_to_message(&self, document: crate::common::ElasticsearchDocument) -> ConnectorResult<IggyMessage> {  
         let payload = serde_json::to_vec(&document.source)?;  
           
         let mut headers = std::collections::HashMap::new();  
@@ -130,12 +159,17 @@ impl ElasticsearchSource {
             headers.insert("source_timestamp".to_string(), timestamp.to_rfc3339());  
         }  
           
-        Ok(Message {  
-            id: uuid::Uuid::new_v4().as_u128(),  
-            timestamp: chrono::Utc::now().timestamp_micros() as u64,  
-            payload: payload.into(),  
-            headers: Some(headers),  
-        })  
+        // Create IggyMessage using the builder pattern  
+        let message = IggyMessage::builder()  
+            .id(uuid::Uuid::new_v4().as_u128())  
+            .payload(payload.into())  
+            .user_headers(headers)  
+            .build()  
+            .map_err(|e| ConnectorError::Processing {  
+                message: format!("Failed to create IggyMessage: {}", e),  
+            })?;  
+          
+        Ok(message)  
     }  
       
     async fn update_processed_stats(&self) {  
