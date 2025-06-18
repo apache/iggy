@@ -30,11 +30,14 @@ readme = "../../README.md"
 
 [dependencies]
 async-trait = { workspace = true }
+base64 = "0.22.1"
 chrono = { workspace = true }
 dashmap = { workspace = true }
 iggy = { workspace = true }
 once_cell = { workspace = true }
 postcard = { workspace = true }
+prost = "0.13.5"
+prost-types = "0.13.5"
 serde = { workspace = true }
 serde_json = { workspace = true }
 simd-json = { workspace = true }
@@ -44,3 +47,6 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+
+[build-dependencies]
+prost-build = "0.13.5"

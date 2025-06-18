@@ -19,3 +19,4 @@
 pub mod json;
 pub mod raw;
 pub mod text;
+pub mod proto;

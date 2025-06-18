@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use add_fields::AddFields;
 use delete_fields::DeleteFields;
+use proto_convert::ProtoConvert;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use strum_macros::{Display, IntoStaticStr};
 use tracing::error;
@@ -28,6 +29,7 @@ use crate::{DecodedMessage, Error, TopicMetadata};
 
 pub mod add_fields;
 pub mod delete_fields;
+pub mod proto_convert;
 
 /// Fields transformation trait.
 pub trait Transform: Send + Sync {
@@ -51,12 +53,15 @@ pub enum TransformType {
     AddFields,
     #[strum(to_string = "delete_fields")]
     DeleteFields,
+    #[strum(to_string = "proto_convert")]
+    ProtoConvert,
 }
 
 pub fn load(r#type: TransformType, config: serde_json::Value) -> Result<Arc<dyn Transform>, Error> {
     Ok(match r#type {
         TransformType::AddFields => Arc::new(AddFields::new(as_config(r#type, config)?)),
         TransformType::DeleteFields => Arc::new(DeleteFields::new(as_config(r#type, config)?)),
+        TransformType::ProtoConvert => Arc::new(ProtoConvert::new(as_config(r#type, config)?)),
     })
 }
 

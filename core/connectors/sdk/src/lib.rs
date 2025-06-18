@@ -17,11 +17,15 @@
  */
 
 use async_trait::async_trait;
-use decoders::{json::JsonStreamDecoder, raw::RawStreamDecoder, text::TextStreamDecoder};
-use encoders::{json::JsonStreamEncoder, raw::RawStreamEncoder, text::TextStreamEncoder};
+use base64::{self, Engine};
+use decoders::{json::JsonStreamDecoder, raw::RawStreamDecoder, text::TextStreamDecoder, proto::{ProtoStreamDecoder}};
+use encoders::{json::JsonStreamEncoder, raw::RawStreamEncoder, text::TextStreamEncoder, proto::ProtoStreamEncoder};
 use iggy::prelude::{HeaderKey, HeaderValue};
 use once_cell::sync::OnceCell;
+use prost::Message;
+use prost_types;
 use serde::{Deserialize, Serialize};
+use simd_json;
 use std::{collections::HashMap, sync::Arc};
 use strum_macros::{Display, IntoStaticStr};
 use thiserror::Error;
@@ -77,6 +81,7 @@ pub enum Payload {
     Json(simd_json::OwnedValue),
     Raw(Vec<u8>),
     Text(String),
+    Proto(String),
 }
 
 impl Payload {
@@ -87,6 +92,7 @@ impl Payload {
             }
             Payload::Raw(value) => Ok(value),
             Payload::Text(text) => Ok(text.into_bytes()),
+            Payload::Proto(text) => Ok(text.into_bytes()),
         }
     }
 }
@@ -101,6 +107,7 @@ impl std::fmt::Display for Payload {
             ),
             Payload::Raw(value) => write!(f, "Raw({:#?})", value),
             Payload::Text(text) => write!(f, "Text({})", text),
+            Payload::Proto(text) => write!(f, "Proto({})", text),
         }
     }
 }
@@ -117,6 +124,8 @@ pub enum Schema {
     Raw,
     #[strum(to_string = "text")]
     Text,
+    #[strum(to_string = "proto")]
+    Proto,
 }
 
 impl Schema {
@@ -129,6 +138,20 @@ impl Schema {
             Schema::Text => Ok(Payload::Text(
                 String::from_utf8(value).map_err(|_| Error::InvalidTextPayload)?,
             )),
+            Schema::Proto => {
+                match prost_types::Any::decode(value.as_slice()) {
+                    Ok(any) => {
+                        let json_value = simd_json::json!({
+                            "type_url": any.type_url,
+                            "value": base64::engine::general_purpose::STANDARD.encode(&any.value),
+                        });
+                        Ok(Payload::Json(json_value))
+                    }
+                    Err(_) => {
+                        Ok(Payload::Raw(value))
+                    }
+                }
+            }
         }
     }
 
@@ -137,6 +160,7 @@ impl Schema {
             Schema::Json => Arc::new(JsonStreamDecoder),
             Schema::Raw => Arc::new(RawStreamDecoder),
             Schema::Text => Arc::new(TextStreamDecoder),
+            Schema::Proto => Arc::new(ProtoStreamDecoder::new_default()),
         }
     }
 
@@ -145,6 +169,7 @@ impl Schema {
             Schema::Json => Arc::new(JsonStreamEncoder),
             Schema::Raw => Arc::new(RawStreamEncoder),
             Schema::Text => Arc::new(TextStreamEncoder),
+            Schema::Proto => Arc::new(ProtoStreamEncoder::new()),
         }
     }
 }
@@ -257,6 +282,8 @@ pub enum Error {
     InvalidJsonPayload,
     #[error("Invalid text payload.")]
     InvalidTextPayload,
+    #[error("Invalid protobuf payload.")]
+    InvalidProtobufPayload,
     #[error("Cannot decode schema {0}")]
     CannotDecode(Schema),
 }
