@@ -65,6 +65,10 @@ pub async fn init(
             );
             container.plugins.push(SourceConnectorPlugin {
                 id: plugin_id,
+                key: key.to_owned(),
+                name: name.to_owned(),
+                path: path.to_owned(),
+                config_format: config.config_format,
                 producer: None,
                 transforms: vec![],
             });
@@ -79,6 +83,10 @@ pub async fn init(
                     container,
                     plugins: vec![SourceConnectorPlugin {
                         id: plugin_id,
+                        key: key.to_owned(),
+                        name: name.to_owned(),
+                        path: path.to_owned(),
+                        config_format: config.config_format,
                         producer: None,
                         transforms: vec![],
                     }],
@@ -92,7 +100,8 @@ pub async fn init(
         PLUGIN_ID.fetch_add(1, Ordering::Relaxed);
 
         let transforms = if let Some(transforms_config) = config.transforms {
-            let transforms = transform::load(transforms_config).expect("Failed to load transforms");
+            let transforms =
+                transform::load(&transforms_config).expect("Failed to load transforms");
             let types = transforms
                 .iter()
                 .map(|t| t.r#type().into())
@@ -113,9 +122,9 @@ pub async fn init(
             .find(|p| p.id == plugin_id)
             .expect("Failed to get source plugin");
 
-        for stream in config.streams {
+        for stream in config.streams.iter() {
             let linger_time =
-                IggyDuration::from_str(&stream.linger_time.unwrap_or("5ms".to_owned()))
+                IggyDuration::from_str(stream.linger_time.as_deref().unwrap_or("5ms"))
                     .expect("Invalid send interval");
             let batch_length = stream.batch_length.unwrap_or(1000);
             let producer = iggy_client

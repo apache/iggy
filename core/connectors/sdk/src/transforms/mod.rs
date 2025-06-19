@@ -82,8 +82,11 @@ pub enum TransformType {
     UpdateFields,
 }
 
-pub fn from_config(t: TransformType, raw: &serde_json::Value) -> Result<Arc<dyn Transform>, Error> {
-    match t {
+pub fn from_config(
+    transform: TransformType,
+    raw: &serde_json::Value,
+) -> Result<Arc<dyn Transform>, Error> {
+    match transform {
         TransformType::AddFields => {
             let cfg: AddFieldsConfig =
                 serde_json::from_value(raw.clone()).map_err(|_| Error::InvalidConfig)?;

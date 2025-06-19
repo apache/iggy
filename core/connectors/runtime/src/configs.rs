@@ -16,18 +16,37 @@
  * under the License.
  */
 
+use crate::api::config::HttpApiConfig;
 use iggy_connector_sdk::{Schema, transforms::TransformType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use strum::Display;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, Display,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfigFormat {
+    #[strum(to_string = "json")]
+    Json,
+    #[strum(to_string = "yaml")]
+    Yaml,
+    #[strum(to_string = "toml")]
+    Toml,
+    #[default]
+    #[strum(to_string = "text")]
+    Text,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RuntimeConfig {
+    pub http_api: HttpApiConfig,
     pub iggy: IggyConfig,
     pub sinks: HashMap<String, SinkConfig>,
     pub sources: HashMap<String, SourceConfig>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IggyConfig {
     pub address: String,
     pub username: Option<String>,
@@ -35,27 +54,28 @@ pub struct IggyConfig {
     pub token: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SinkConfig {
     pub enabled: bool,
     pub name: String,
     pub path: String,
     pub transforms: Option<TransformsConfig>,
     pub streams: Vec<StreamConsumerConfig>,
+    pub config_format: Option<ConfigFormat>,
     pub config: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamConsumerConfig {
     pub stream: String,
     pub topics: Vec<String>,
     pub schema: Schema,
-    pub batch_size: Option<u32>,
+    pub batch_length: Option<u32>,
     pub poll_interval: Option<String>,
     pub consumer_group: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamProducerConfig {
     pub stream: String,
     pub topic: String,
@@ -64,23 +84,24 @@ pub struct StreamProducerConfig {
     pub linger_time: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceConfig {
     pub enabled: bool,
     pub name: String,
     pub path: String,
     pub transforms: Option<TransformsConfig>,
     pub streams: Vec<StreamProducerConfig>,
+    pub config_format: Option<ConfigFormat>,
     pub config: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TransformsConfig {
     #[serde(flatten)]
     pub transforms: HashMap<TransformType, serde_json::Value>,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SharedTransformConfig {
     pub enabled: bool,
 }

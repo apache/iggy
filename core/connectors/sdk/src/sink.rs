@@ -66,10 +66,12 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
             _ = fmt::try_init();
             let slice = std::slice::from_raw_parts(config_ptr, config_len);
             let Ok(config_str) = std::str::from_utf8(slice) else {
+                error!("Failed to read configuration for sink connector with ID: {id}",);
                 return -1;
             };
 
             let Ok(config) = serde_json::from_str(config_str) else {
+                error!("Failed to parse configuration for sink connector with ID: {id}",);
                 return -1;
             };
 

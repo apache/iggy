@@ -21,28 +21,27 @@ use crate::{
     configs::{SharedTransformConfig, TransformsConfig},
 };
 use iggy_connector_sdk::transforms::Transform;
+use serde::Deserialize;
 use std::sync::Arc;
 
-pub fn load(config: TransformsConfig) -> Result<Vec<Arc<dyn Transform>>, RuntimeError> {
+pub fn load(config: &TransformsConfig) -> Result<Vec<Arc<dyn Transform>>, RuntimeError> {
     let mut transforms: Vec<Arc<dyn Transform>> = vec![];
-    for (r#type, transform_config) in config.transforms {
+    for (r#type, transform_config) in config.transforms.iter() {
         let shared_config = if transform_config.is_null() {
             SharedTransformConfig::default()
         } else {
-            serde_json::from_value::<SharedTransformConfig>(transform_config.clone()).map_err(
-                |err| {
-                    RuntimeError::InvalidConfiguration(format!(
-                        "Failed to parse transform config: {err}",
-                    ))
-                },
-            )?
+            SharedTransformConfig::deserialize(transform_config).map_err(|error| {
+                RuntimeError::InvalidConfiguration(format!(
+                    "Failed to parse transform config. {error}",
+                ))
+            })?
         };
 
         if !shared_config.enabled {
             continue;
         }
 
-        let transform = iggy_connector_sdk::transforms::from_config(r#type, &transform_config)?;
+        let transform = iggy_connector_sdk::transforms::from_config(*r#type, transform_config)?;
         transforms.push(transform);
     }
 

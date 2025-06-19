@@ -37,6 +37,7 @@ pub struct SinkConfig {
     pub path: String,
     pub transforms: Option<TransformsConfig>,
     pub streams: Vec<StreamConsumerConfig>,
+    pub config_format: ConfigFormat,
     pub config: Option<serde_json::Value>,
 }
 ```
@@ -49,13 +50,14 @@ Below is the example configuration for a sink connector, using `stdout` as it's 
 enabled = true
 name = "Stdout sink"
 path = "target/release/libiggy_connector_stdout_sink"
+config_format = "toml"
 
 # Collection of the streams from which messages are consumed
 [[sinks.stdout.streams]]
 stream = "example_stream"
 topics = ["example_topic"]
 schema = "json"
-batch_size = 100
+batch_length = 100
 poll_interval = "5ms"
 consumer_group = "stdout_sink_connector"
 

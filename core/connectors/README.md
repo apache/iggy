@@ -25,7 +25,8 @@ The highly performant and modular runtime for statically typed, yet dynamically 
 4. Start the Iggy server and invoke the following commands via Iggy CLI to create the example streams and topics used by the sample connectors.
 
 ```
-iggy --username iggy --password iggy stream create example
+iggy --username iggy --password iggy stream create example_stream
+iggy --username iggy --password iggy topic create example_stream example_topic 1 none 1d
 iggy --username iggy --password iggy stream create qw
 iggy --username iggy --password iggy topic create qw records 1 none 1d
 ```
