@@ -15,10 +15,10 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use futures::{task::AtomicWaker, Stream};
+use futures::{Stream, task::AtomicWaker};
 use sharded_queue::ShardedQueue;
 use std::{
-    sync::{atomic::AtomicUsize, Arc},
+    sync::{Arc, atomic::AtomicUsize},
     task::Poll,
 };
 

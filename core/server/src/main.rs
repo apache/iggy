@@ -23,11 +23,9 @@ use clap::Parser;
 use dotenvy::dotenv;
 use error_set::ErrContext;
 use figlet_rs::FIGfont;
-use monoio::Buildable;
 use server::args::Args;
 use server::bootstrap::{
-    create_default_executor, create_directories, create_root_user, create_shard_connections,
-    load_config,
+    create_default_executor, create_directories, create_root_user, create_shard_connections, create_shard_executor, load_config
 };
 use server::channels::commands::archive_state::ArchiveStateExecutor;
 use server::channels::commands::clean_personal_access_tokens::CleanPersonalAccessTokensExecutor;
@@ -112,7 +110,7 @@ fn main() -> Result<(), ServerError> {
                         }
                     }
 
-                    // Create directories. 
+                    // Create directories.
                     create_directories(&config.system).await?;
                     Ok::<(), ServerError>(())
                 })
@@ -146,16 +144,7 @@ fn main() -> Result<(), ServerError> {
                 monoio::utils::bind_to_cpu_set(Some(shard_id))
                     .expect(format!("Failed to set CPU affinity for shard-{id}").as_str());
 
-                // TODO: Figure out what else we could tweak there
-                // We for sure want to disable the userspace interrupts on new cq entry (set_coop_taskrun)
-                // let urb = io_uring::IoUring::builder();
-                // TODO: Shall we make the size of ring be configureable ?
-                let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-                    //.uring_builder(urb.setup_coop_taskrun()) // broken shit.
-                    .with_entries(1024) // Default size
-                    .enable_timer()
-                    .build()
-                    .expect(format!("Failed to build monoio runtime for shard-{id}").as_str());
+                let mut rt = create_shard_executor();
                 rt.block_on(async move {
                     let builder = IggyShard::builder();
                     let mut shard = builder
@@ -165,7 +154,11 @@ fn main() -> Result<(), ServerError> {
                         .build()
                         .await;
 
-                    shard.init().await;
+                    if let Err(e) = shard.init().await {
+                        //TODO: If one of the shards fails to initialize, we should crash the whole program;
+                        panic!("Failed to initialize shard-{id}: {e}");
+                    }
+                    //TODO: If one of the shards fails to initialize, we should crash the whole program;
                     shard.assert_init();
                 })
             })

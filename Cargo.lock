@@ -143,6 +143,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "mio 1.0.4",
+ "mio 1.0.4",
  "socket2",
  "tokio",
  "tracing",
@@ -4918,6 +4919,18 @@ dependencies = [
 
 [[package]]
 name = "mio"
+version = "0.8.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4a650543ca06a924e8b371db273b2756685faae30f8487da1b56505a8f78b0c"
+dependencies = [
+ "libc",
+ "log",
+ "wasi 0.11.1+wasi-snapshot-preview1",
+ "windows-sys 0.48.0",
+]
+
+[[package]]
+name = "mio"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78bed444cc8a2160f01cbcf811ef18cac863ad68ae8ca62092e8db51d51c761c"
@@ -7984,6 +7997,7 @@ dependencies = [
  "backtrace",
  "bytes",
  "libc",
+ "mio 1.0.4",
  "mio 1.0.4",
  "parking_lot 0.12.4",
  "pin-project-lite",

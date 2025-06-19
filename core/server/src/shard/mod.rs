@@ -25,10 +25,19 @@ use ahash::HashMap;
 use builder::IggyShardBuilder;
 use connector::{Receiver, ShardConnector, StopReceiver, StopSender};
 use frame::ShardFrame;
+use iggy_common::IggyError;
 use namespace::IggyNamespace;
-use std::{cell::{Cell, RefCell}, rc::Rc, sync::Arc};
+use tracing::info;
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+    sync::Arc, time::Instant,
+};
 
-use crate::{bootstrap::create_root_user, configs::server::ServerConfig, state::file::FileState, streaming::storage::SystemStorage};
+use crate::{
+    bootstrap::create_root_user, configs::server::ServerConfig, state::{file::FileState, StateKind},
+    streaming::storage::SystemStorage,
+};
 pub(crate) struct Shard {
     id: u16,
     connection: ShardConnector<ShardFrame>,
@@ -57,10 +66,10 @@ pub struct IggyShard {
     //pub(crate) streams_ids: RefCell<HashMap<String, u32>>,
     //pub(crate) users: RefCell<HashMap<UserId, User>>,
     // TODO: Refactor.
-    pub(crate) storage: Arc<SystemStorage>,
+    pub(crate) storage: Rc<SystemStorage>,
 
     // TODO - get rid of this dynamic dispatch.
-    pub(crate) state: Rc<FileState>,
+    pub(crate) state: Rc<StateKind>,
     //pub(crate) encryptor: Option<Rc<dyn Encryptor>>,
     config: ServerConfig,
     //pub(crate) client_manager: RefCell<ClientManager>,
@@ -76,14 +85,27 @@ impl IggyShard {
         Default::default()
     }
 
-    pub async fn init(&mut self) {
-        let user = create_root_user();
+    pub async fn init(&mut self) -> Result<(), IggyError> {
+        let now = Instant::now();
+        //TODO: Fix this either by moving it to main function, or by using `run_once` barrier.
+        //let state_entries = self.state.init().await?;
+        //let system_state = SystemState::init(state_entries).await?;
+        //let user = create_root_user();
         self.load_state().await;
         self.load_users().await;
         // Add default root user.
-        todo!();
         self.load_streams().await;
-
+        //TODO: Fix the archiver.
+        /*
+        if let Some(archiver) = self.archiver.as_ref() {
+            archiver
+                .init()
+                .await
+                .expect("Failed to initialize archiver");
+        }
+        */
+        info!("Initialized system in {} ms.", now.elapsed().as_millis());
+        Ok(())
     }
 
     async fn load_state(&self) {
