@@ -16,13 +16,18 @@
  * under the License.
  */
 
+use std::collections::HashMap;
+
 use crate::server::scenarios::{
     consumer_group_join_scenario, consumer_group_with_multiple_clients_polling_messages_scenario,
     consumer_group_with_single_client_polling_messages_scenario, create_message_payload,
-    message_headers_scenario, message_size_scenario, stream_size_validation_scenario,
-    system_scenario, user_scenario,
+    delete_segments_scenario::test_delete_segments_scenario, message_headers_scenario,
+    message_size_scenario, stream_size_validation_scenario, system_scenario, user_scenario,
 };
-use integration::{tcp_client::TcpClientFactory, test_server::TestServer};
+use integration::{
+    tcp_client::TcpClientFactory,
+    test_server::{IpAddrKind, TestServer},
+};
 use serial_test::parallel;
 
 #[tokio::test]
@@ -140,4 +145,22 @@ async fn message_size_scenario_should_be_valid() {
         ..Default::default()
     };
     message_size_scenario::run(&client_factory).await;
+}
+
+#[tokio::test]
+#[parallel]
+async fn should_delete_segments_via_tcp_binary_protocol() {
+    let mut extra_envs = HashMap::new();
+    extra_envs.insert("IGGY_SYSTEM_SEGMENT_SIZE".to_string(), "1MiB".to_string());
+
+    let mut test_server = TestServer::new(Some(extra_envs), true, None, IpAddrKind::V4);
+    test_server.start();
+
+    let server_addr = test_server.get_raw_tcp_addr().unwrap();
+    let client_factory = TcpClientFactory {
+        server_addr,
+        ..Default::default()
+    };
+
+    test_delete_segments_scenario(&client_factory, &test_server).await;
 }

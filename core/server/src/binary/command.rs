@@ -33,6 +33,7 @@ use iggy_common::delete_consumer_group::DeleteConsumerGroup;
 use iggy_common::delete_consumer_offset::DeleteConsumerOffset;
 use iggy_common::delete_partitions::DeletePartitions;
 use iggy_common::delete_personal_access_token::DeletePersonalAccessToken;
+use iggy_common::delete_segments::DeleteSegments;
 use iggy_common::delete_stream::DeleteStream;
 use iggy_common::delete_topic::DeleteTopic;
 use iggy_common::delete_user::DeleteUser;
@@ -108,6 +109,7 @@ define_server_command_enum! {
     PurgeTopic(PurgeTopic), PURGE_TOPIC_CODE, PURGE_TOPIC, true;
     CreatePartitions(CreatePartitions), CREATE_PARTITIONS_CODE, CREATE_PARTITIONS, true;
     DeletePartitions(DeletePartitions), DELETE_PARTITIONS_CODE, DELETE_PARTITIONS, true;
+    DeleteSegments(DeleteSegments), DELETE_SEGMENTS_CODE, DELETE_SEGMENTS, true;
     GetConsumerGroup(GetConsumerGroup), GET_CONSUMER_GROUP_CODE, GET_CONSUMER_GROUP, true;
     GetConsumerGroups(GetConsumerGroups), GET_CONSUMER_GROUPS_CODE, GET_CONSUMER_GROUPS, false;
     CreateConsumerGroup(CreateConsumerGroup), CREATE_CONSUMER_GROUP_CODE, CREATE_CONSUMER_GROUP, true;
@@ -332,6 +334,11 @@ mod tests {
             &ServerCommand::DeletePartitions(DeletePartitions::default()),
             DELETE_PARTITIONS_CODE,
             &DeletePartitions::default(),
+        );
+        assert_serialized_as_bytes_and_deserialized_from_bytes(
+            &ServerCommand::DeleteSegments(DeleteSegments::default()),
+            DELETE_SEGMENTS_CODE,
+            &DeleteSegments::default(),
         );
         assert_serialized_as_bytes_and_deserialized_from_bytes(
             &ServerCommand::GetConsumerGroup(GetConsumerGroup::default()),

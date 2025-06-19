@@ -44,12 +44,10 @@ pub use crate::stream_builder::IggyStreamConsumer;
 pub use crate::stream_builder::{IggyProducerConfig, IggyStreamProducer};
 pub use crate::stream_builder::{IggyStream, IggyStreamConfig};
 pub use crate::tcp::tcp_client::TcpClient;
-//
 pub use iggy_binary_protocol::{
     Client, ConsumerGroupClient, ConsumerOffsetClient, MessageClient, PartitionClient,
-    PersonalAccessTokenClient, StreamClient, SystemClient, TopicClient, UserClient,
+    PersonalAccessTokenClient, SegmentClient, StreamClient, SystemClient, TopicClient, UserClient,
 };
-//
 pub use iggy_common::{
     Aes256GcmEncryptor, Args, ArgsOptional, AutoLogin, BytesSerializable, CacheMetrics,
     CacheMetricsKey, ClientError, ClientInfoDetails, CompressionAlgorithm, Confirmation, Consumer,
