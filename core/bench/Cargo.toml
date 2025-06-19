@@ -16,10 +16,15 @@
 # under the License.
 
 [package]
-name = "bench"
+name = "iggy-bench"
 version = "0.2.4"
 edition = "2024"
 license = "Apache-2.0"
+repository = "https://github.com/apache/iggy"
+homepage = "https://iggy.apache.org"
+description = "Benchmarking CLI for Iggy message streaming platform"
+keywords = ["iggy", "cli", "messaging", "streaming"]
+readme = "../../README.md"
 # Due to dependency to integration, which has a dependency to server, setting
 # mimalloc on server is also setting it on bench.
 
