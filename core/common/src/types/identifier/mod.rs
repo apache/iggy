@@ -111,7 +111,7 @@ impl Identifier {
         self.get_cow_str_value().map(|cow| cow.to_string())
     }
 
-    /// Returns the Cow<str> value of the identifier.
+    /// Returns the `Cow<str>` value of the identifier.
     pub fn get_cow_str_value(&self) -> Result<Cow<str>, IggyError> {
         if self.kind != IdKind::String {
             return Err(IggyError::InvalidIdentifier);

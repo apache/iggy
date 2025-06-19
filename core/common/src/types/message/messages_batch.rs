@@ -364,7 +364,7 @@ impl From<&[IggyMessage]> for IggyMessagesBatch {
     }
 }
 
-/// Converts a reference to Vec<IggyMessage> into an IggyMessagesBatch.
+/// Converts a reference to `Vec<IggyMessage>` into an IggyMessagesBatch.
 ///
 /// This implementation delegates to the slice implementation via `as_slice()`.
 /// It's provided for convenience so it's possible to use `&messages` without
@@ -375,7 +375,7 @@ impl From<&Vec<IggyMessage>> for IggyMessagesBatch {
     }
 }
 
-/// Converts a Vec<IggyMessage> into an IggyMessagesBatch.
+/// Converts a `Vec<IggyMessage>` into an IggyMessagesBatch.
 impl From<Vec<IggyMessage>> for IggyMessagesBatch {
     fn from(messages: Vec<IggyMessage>) -> Self {
         Self::from(messages.as_slice())

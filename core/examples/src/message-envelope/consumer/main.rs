@@ -17,7 +17,6 @@
  */
 
 use anyhow::Result;
-use clap::Parser;
 use iggy::prelude::*;
 use iggy_examples::shared::args::Args;
 use iggy_examples::shared::messages::*;
@@ -31,7 +30,7 @@ use tracing_subscriber::{EnvFilter, Registry};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let args = Args::parse();
+    let args = Args::parse_with_defaults("message-envelope-consumer");
     Registry::default()
         .with(tracing_subscriber::fmt::layer())
         .with(EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("INFO")))

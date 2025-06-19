@@ -4104,7 +4104,6 @@ dependencies = [
  "libc",
  "log",
  "predicates",
- "regex",
  "serial_test",
  "server",
  "tempfile",

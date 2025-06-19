@@ -45,7 +45,6 @@ lazy_static = { workspace = true }
 libc = "0.2.174"
 log = { workspace = true }
 predicates = { workspace = true }
-regex = { workspace = true }
 serial_test = { workspace = true }
 server = { workspace = true }
 tempfile = { workspace = true }

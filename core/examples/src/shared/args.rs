@@ -57,6 +57,9 @@ pub struct Args {
     #[arg(long, default_value = "1")]
     pub consumer_id: u32,
 
+    #[arg(long, default_value = "false")]
+    pub balanced_producer: bool,
+
     #[arg(long, default_value = "1")]
     pub messages_per_batch: u32,
 
@@ -182,6 +185,7 @@ impl Default for Args {
             compression_algorithm: 1,
             consumer_kind: 1,
             consumer_id: 1,
+            balanced_producer: false,
             messages_per_batch: 1,
             offset: 0,
             auto_commit: false,
@@ -220,6 +224,59 @@ impl Default for Args {
 }
 
 impl Args {
+    /// Parse command line arguments and apply example-specific defaults if not overridden
+    pub fn parse_with_defaults(example_name: &str) -> Self {
+        let mut args = Self::parse();
+
+        // If stream_id was not explicitly provided (still has default value)
+        if args.stream_id == "example-stream" {
+            args.stream_id = Self::get_default_stream_id(example_name);
+        }
+
+        // If topic_id was not explicitly provided (still has default value)
+        if args.topic_id == "example-topic" {
+            args.topic_id = Self::get_default_topic_id(example_name);
+        }
+
+        args
+    }
+
+    /// Get default stream ID based on example name
+    fn get_default_stream_id(example_name: &str) -> String {
+        match example_name {
+            "basic-producer" | "basic-consumer" => "basic-stream",
+            "getting-started-producer" | "getting-started-consumer" => "getting-started",
+            "message-envelope-producer" | "message-envelope-consumer" => "envelope-stream",
+            "message-headers-producer" | "message-headers-consumer" => "headers-stream",
+            "multi-tenant-producer" | "multi-tenant-consumer" => "tenant-stream",
+            "new-sdk-producer" | "new-sdk-consumer" => "new-sdk-stream",
+            "sink-data-producer" => "sink-stream",
+            "stream-basic" => "stream-basic",
+            "stream-producer" | "stream-consumer" => "stream-example",
+            "stream-producer-config" | "stream-consumer-config" => "stream-config",
+            _ => "example-stream",
+        }
+        .to_string()
+    }
+
+    /// Get default topic ID based on example name
+    fn get_default_topic_id(example_name: &str) -> String {
+        match example_name {
+            "basic-producer" | "basic-consumer" => "basic-topic",
+            "getting-started-producer" | "getting-started-consumer" => "getting-started-topic",
+            "message-envelope-producer" | "message-envelope-consumer" => "orders",
+            "message-headers-producer" | "message-headers-consumer" => "orders",
+            "multi-tenant-producer" | "multi-tenant-consumer" => "events",
+            "new-sdk-producer" | "new-sdk-consumer" => "new-sdk-topic",
+            "sink-data-producer" => "users",
+            "stream-basic" => "stream-topic",
+            "stream-producer" | "stream-consumer" => "stream-topic",
+            "stream-producer-config" | "stream-consumer-config" => "config-topic",
+            _ => "example-topic",
+        }
+        .to_string()
+    }
+
     pub fn to_sdk_args(&self) -> iggy::prelude::Args {
         iggy::prelude::Args {
             transport: self.transport.clone(),

@@ -17,7 +17,6 @@
  */
 
 use ahash::AHashMap;
-use clap::Parser;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
 use iggy::prelude::*;
@@ -80,7 +79,7 @@ impl TenantConsumer {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<(), Box<dyn Error>> {
-    let args = Args::parse();
+    let args = Args::parse_with_defaults("multi-tenant-consumer");
     Registry::default()
         .with(tracing_subscriber::fmt::layer())
         .with(EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("INFO")))
@@ -173,7 +172,8 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     ));
     let mut tasks = Vec::new();
     for tenant in tenants.into_iter() {
-        let consumer_tasks = start_consumers(tenant.id, tenant.consumers);
+        let consumer_tasks =
+            start_consumers(tenant.id, tenant.consumers, args.message_batches_limit);
         tasks.extend(consumer_tasks);
     }
 
@@ -233,14 +233,25 @@ async fn create_user(
     Ok(())
 }
 
-fn start_consumers(tenant_id: u32, consumers: Vec<TenantConsumer>) -> Vec<JoinHandle<()>> {
+fn start_consumers(
+    tenant_id: u32,
+    consumers: Vec<TenantConsumer>,
+    message_batches_limit: u64,
+) -> Vec<JoinHandle<()>> {
     let mut tasks = Vec::new();
     for mut consumer in consumers {
         let task = tokio::spawn(async move {
             let consumer_id = consumer.id;
             let stream = consumer.stream;
             let topic = consumer.topic;
+            let mut batches_processed = 0u64;
             while let Some(message) = consumer.consumer.next().await {
+                if batches_processed >= message_batches_limit {
+                    info!(
+                        "Tenant: {tenant_id} consumer: {consumer_id} reached message batches limit: {message_batches_limit}, stopping."
+                    );
+                    break;
+                }
                 if let Ok(message) = message {
                     let current_offset = message.current_offset;
                     let partition_id = message.partition_id;
@@ -258,6 +269,7 @@ fn start_consumers(tenant_id: u32, consumers: Vec<TenantConsumer>) -> Vec<JoinHa
                     info!(
                         "Tenant: {tenant_id} consumer: {consumer_id} received: {payload} from partition: {partition_id}, topic: {topic}, stream: {stream}, at offset: {offset}, current offset: {current_offset}"
                     );
+                    batches_processed += 1;
                 } else if let Err(error) = message {
                     error!(
                         "Error while handling message: {error} by tenant: {tenant_id} consumer: {consumer_id}, topic: {topic}, stream: {stream}"

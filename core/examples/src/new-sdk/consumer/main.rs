@@ -16,7 +16,6 @@
  * under the License.
  */
 
-use clap::Parser;
 use futures_util::StreamExt;
 use iggy::prelude::*;
 use iggy_examples::shared::args::Args;
@@ -34,7 +33,7 @@ use tracing_subscriber::{EnvFilter, Registry};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<(), Box<dyn Error>> {
-    let args = Args::parse();
+    let args = Args::parse_with_defaults("new-sdk-consumer");
     Registry::default()
         .with(tracing_subscriber::fmt::layer())
         .with(EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("INFO")))
@@ -76,7 +75,7 @@ pub async fn consume_messages(
     consumer: &mut IggyConsumer,
 ) -> Result<(), Box<dyn Error>> {
     let interval = args.get_interval();
-    let mut consumed_batches = 0;
+    let mut consumed_messages = 0;
 
     info!(
         "Messages will be polled by consumer: {} from stream: {}, topic: {}, partition: {} with interval {}.",
@@ -87,20 +86,30 @@ pub async fn consume_messages(
         interval.map_or("none".to_string(), |i| i.as_human_time_string())
     );
 
-    while let Some(message) = consumer.next().await {
-        if args.message_batches_limit > 0 && consumed_batches == args.message_batches_limit {
-            info!("Consumed {consumed_batches} batches of messages, exiting.");
-            return Ok(());
-        }
+    let total_messages_to_consume = args.message_batches_limit * args.messages_per_batch as u64;
 
+    while let Some(message) = consumer.next().await {
         if let Ok(message) = message {
             handle_message(&message)?;
-            consumed_batches += 1;
+            consumed_messages += 1;
+
+            if args.message_batches_limit > 0 && consumed_messages >= total_messages_to_consume {
+                info!(
+                    "Consumed {} messages ({} batches of {} messages each), exiting.",
+                    consumed_messages, args.message_batches_limit, args.messages_per_batch
+                );
+                return Ok(());
+            }
         } else if let Err(error) = message {
             error!("Error while handling message: {error}");
             continue;
         }
     }
+
+    info!(
+        "No more messages to consume, consumed {} messages total.",
+        consumed_messages
+    );
     Ok(())
 }
 
