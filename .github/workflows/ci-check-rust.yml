@@ -26,6 +26,7 @@
 # - linting using `cargo clippy`
 # - sorted dependencies check using `cargo sort`
 # - documentation tests using `cargo test --doc`
+# - documentation generation using `cargo doc`
 # - unused dependencies check using `cargo machete`
 #
 # This workflow can be triggered manually or by other workflows.

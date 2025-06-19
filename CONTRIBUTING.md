@@ -63,7 +63,7 @@ For Linux or macOS, use the following command:
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-For Windows, download `rustup-init.exe` from [here](https://win.rustup.rs/x86_64) instead.
+For Windows, download `rustup-init.exe` from [the Windows installer](https://win.rustup.rs/x86_64) instead.
 
 Rustup will read Iggy's `Cargo.toml` and set up everything else automatically. To ensure that everything works correctly, run `cargo version` under Iggy's root directory:
 

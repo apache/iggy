@@ -5,6 +5,7 @@ The highly performant and modular runtime for statically typed, yet dynamically 
 **This is still WiP, and the runtime can be started only after compilation from the source code (no installable package yet).**
 
 ## Features
+
 - **High Performance**: Utilizes Rust's performance characteristics to ensure fast data ingestion and egress.
 - **Low memory footprint**: Designed with memory efficiency in mind, minimizing the memory footprint of the connectors.
 - **Modular Design**: Designed with modularity in mind, allowing for easy extension and customization.
@@ -24,14 +25,14 @@ The highly performant and modular runtime for statically typed, yet dynamically 
 
 4. Start the Iggy server and invoke the following commands via Iggy CLI to create the example streams and topics used by the sample connectors.
 
-```
-iggy --username iggy --password iggy stream create example_stream
-iggy --username iggy --password iggy topic create example_stream example_topic 1 none 1d
-iggy --username iggy --password iggy stream create qw
-iggy --username iggy --password iggy topic create qw records 1 none 1d
-```
+    ```bash
+    iggy --username iggy --password iggy stream create example_stream
+    iggy --username iggy --password iggy topic create example_stream example_topic 1 none 1d
+    iggy --username iggy --password iggy stream create qw
+    iggy --username iggy --password iggy topic create qw records 1 none 1d
+    ```
 
-5. Execute `cargo run--example sink-data-producer -r` which will start the example data producer application, sending the messages to previously created `qw` stream and `records` topic (this will be used by the Quickwit sink connector).
+5. Execute `cargo run --example sink-data-producer -r` which will start the example data producer application, sending the messages to previously created `qw` stream and `records` topic (this will be used by the Quickwit sink connector).
 
 6. Start the connector runtime `cargo run --bin iggy-connectors -r` - you should be able to browse Quickwit UI with records being constantly added to the `events` index. At the same time, you should see the new messages being added to the `example` stream and `topic1` topic by the test source connector - you can use Iggy Web UI to browse the data. The messages will have applied the basic fields transformations.
 

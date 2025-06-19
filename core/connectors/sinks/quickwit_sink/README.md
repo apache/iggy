@@ -5,7 +5,7 @@ The Quickwit connector allows you to send data to the Quickwit API using HTTP. T
 ## Configuration
 
 - `url`: The URL of the Quickwit server.
-- `index`: The index configuration using YAML, as described [here](https://quickwit.io/docs/configuration/index-config)
+- `index`: The index configuration using YAML, as described in the [Quickwit index configuration docs](https://quickwit.io/docs/configuration/index-config)
 
 ```toml
 [sinks.quickwit.config]

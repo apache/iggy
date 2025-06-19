@@ -4,7 +4,6 @@
 
 Apache Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second.
 
-
 ## Installation
 
 To install `iggy`, use pip:
@@ -17,27 +16,27 @@ pip install iggy-py
 
 - Python 3.7+
 
-## Usage and Examples:
+## Usage and Examples
 
 All examples rely on a running iggy server. To start the server, execute:
 
-```
+```bash
 docker run --rm -p 8080:8080 -p 3000:3000 -p 8090:8090 iggyrs/iggy:0.4.21
 ```
 
 ## Generating Stub Files
+
 To generate a stub file, execute the following command:
 
-```
+```bash
 cargo run --bin stub_gen
 ```
 
 Refer to the python_examples directory for examples on how to use the iggy library.
 
-## Running the Examples:
+## Running the Examples
 
 Go to [python_examples/README.md](python_examples/README.md) for instructions on running the examples.
-
 
 ## API Reference
 

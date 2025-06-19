@@ -1,4 +1,4 @@
-## Samples
+# Samples
 
 Check out our sample projects below:
 

@@ -1,3 +1,5 @@
+# Dependencies
+
 FluentAssertions: "6.12.0", "Apache-2.0",
 Microsoft.NET.Test.Sdk: "17.14.1", "MIT",
 Moq: "4.20.72", "BSD-3-Clause",
