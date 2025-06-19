@@ -1,22 +1,19 @@
 use iggy_common::{
+    IggyError,
     defaults::{
         DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH,
         MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
     },
-    IggyError,
 };
-use monoio::{
-    fs::create_dir_all,
-    Buildable, Driver, Runtime,
-};
+use monoio::{fs::create_dir_all, time::TimeDriver, Buildable, Driver, Runtime};
 use tracing::info;
 
 use crate::{
+    IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV,
     configs::{config_provider::ConfigProviderKind, server::ServerConfig, system::SystemConfig},
     server_error::ServerError,
     shard::{connector::ShardConnector, frame::ShardFrame},
     streaming::users::user::User,
-    IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV,
 };
 use std::{env, fs::remove_dir_all, ops::Range, path::Path};
 
@@ -109,7 +106,9 @@ pub fn create_root_user() -> User {
     let username = env::var(IGGY_ROOT_USERNAME_ENV);
     let password = env::var(IGGY_ROOT_PASSWORD_ENV);
     if (username.is_ok() && password.is_err()) || (username.is_err() && password.is_ok()) {
-        panic!("When providing the custom root user credentials, both username and password must be set.");
+        panic!(
+            "When providing the custom root user credentials, both username and password must be set."
+        );
     }
     if username.is_ok() && password.is_ok() {
         info!("Using the custom root user credentials.");
@@ -143,6 +142,20 @@ where
     D: Driver + Buildable,
 {
     let builder = monoio::RuntimeBuilder::<D>::new();
+    let rt = Buildable::build(builder).expect("Failed to create default runtime");
+    rt
+}
+
+pub fn create_shard_executor() -> Runtime<TimeDriver<monoio::IoUringDriver>>
+{
+    // TODO: Figure out what else we could tweak there
+    // We for sure want to disable the userspace interrupts on new cq entry (set_coop_taskrun)
+    // let urb = io_uring::IoUring::builder();
+    // TODO: Shall we make the size of ring be configureable ?
+    let builder = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+        //.uring_builder(urb.setup_coop_taskrun()) // broken shit.
+        .with_entries(1024) // Default size
+        .enable_timer();
     let rt = Buildable::build(builder).expect("Failed to create default runtime");
     rt
 }
