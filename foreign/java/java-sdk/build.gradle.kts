@@ -108,7 +108,6 @@ publishing {
             url = uri(if ((version as String).endsWith("SNAPSHOT")) snapshotsRepoUrl else releasesRepoUrl)
 
             credentials {
-                // Assumes 'apacheUserName' and 'apachePassWord' are available as properties
                 username = System.getenv("secrets.NEXUS_USER")
                 password = System.getenv("secrets.NEXUS_PASSWORD")
             }

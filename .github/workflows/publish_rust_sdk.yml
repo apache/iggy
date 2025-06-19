@@ -15,11 +15,11 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: publish_sdk
+name: publish_rust_sdk
 on:
   push:
     tags:
-      - 'iggy-*'
+      - "iggy-*"
 
 env:
   GITHUB_TOKEN: ${{ github.token }}
@@ -91,8 +91,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - run: |
-           rustup toolchain add --profile=minimal stable
-           rustup override set stable
+          rustup toolchain add --profile=minimal stable
+          rustup override set stable
 
       - name: publish
         run: |
