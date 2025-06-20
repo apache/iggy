@@ -16,19 +16,19 @@
  * under the License.
  */
 
-use std::collections::HashMap;
-
 use crate::server::scenarios::{
     consumer_group_join_scenario, consumer_group_with_multiple_clients_polling_messages_scenario,
     consumer_group_with_single_client_polling_messages_scenario, create_message_payload,
     delete_segments_scenario::test_delete_segments_scenario, message_headers_scenario,
-    message_size_scenario, stream_size_validation_scenario, system_scenario, user_scenario,
+    message_size_scenario, server_restart_scenario, stream_size_validation_scenario,
+    system_scenario, user_scenario,
 };
 use integration::{
     tcp_client::TcpClientFactory,
     test_server::{IpAddrKind, TestServer},
 };
 use serial_test::parallel;
+use std::{collections::HashMap, thread::sleep};
 
 #[tokio::test]
 #[parallel]
@@ -163,4 +163,48 @@ async fn should_delete_segments_via_tcp_binary_protocol() {
     };
 
     test_delete_segments_scenario(&client_factory, &test_server).await;
+}
+
+#[tokio::test]
+#[parallel]
+async fn should_verify_data_integrity_after_server_restart() {
+    let data_dir = format!("local_data_restart_test_{}", uuid::Uuid::new_v4().simple());
+
+    let mut extra_env = HashMap::new();
+    extra_env.insert("IGGY_SYSTEM_SEGMENT_SIZE".to_string(), "250KiB".to_string());
+    extra_env.insert("IGGY_SYSTEM_PATH".to_string(), data_dir.clone());
+    extra_env.insert(
+        "IGGY_SYSTEM_SEGMENT_CACHE_INDEXES".to_string(),
+        "open_segment".to_string(),
+    );
+
+    let mut test_server = TestServer::new(Some(extra_env.clone()), false, None, IpAddrKind::V4);
+    test_server.start();
+
+    let server_addr = test_server.get_raw_tcp_addr().unwrap();
+    let client_factory = TcpClientFactory {
+        server_addr,
+        ..Default::default()
+    };
+
+    server_restart_scenario::run(&client_factory, 0).await;
+
+    sleep(std::time::Duration::from_secs(2));
+
+    test_server.stop();
+    drop(test_server);
+
+    let mut test_server = TestServer::new(Some(extra_env), false, None, IpAddrKind::V4);
+    test_server.start();
+
+    let server_addr = test_server.get_raw_tcp_addr().unwrap();
+    let client_factory = TcpClientFactory {
+        server_addr,
+        ..Default::default()
+    };
+
+    server_restart_scenario::run(&client_factory, 12).await;
+
+    test_server.stop();
+    drop(test_server);
 }

@@ -169,6 +169,15 @@ impl TestServer {
     pub fn start(&mut self) {
         self.set_server_addrs_from_env();
         self.cleanup();
+
+        // Remove the config file if it exists from a previous run.
+        // Without this, starting the server on existing data will not work, because
+        // port detection mechanism will use port from previous runtime.
+        let config_path = format!("{}/runtime/current_config.toml", self.local_data_path);
+        if Path::new(&config_path).exists() {
+            fs::remove_file(&config_path).ok();
+        }
+
         let files_path = self.local_data_path.clone();
         let mut command = if let Some(server_executable_path) = &self.server_executable_path {
             Command::new(server_executable_path)

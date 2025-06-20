@@ -186,7 +186,6 @@ impl MemoryPool {
                 if let Some(mut buf) = self.buckets[idx].pop() {
                     buf.clear();
                     self.inc_bucket_in_use(idx);
-                    trace!("Reused buffer, capacity: {}", BUCKET_SIZES[idx]);
                     return buf;
                 }
 
