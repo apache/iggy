@@ -56,6 +56,7 @@ error_set = { version = "0.8.5", features = ["tracing"] }
 figlet-rs = { workspace = true }
 figment = { version = "0.10.19", features = ["toml", "env"] }
 flume = { workspace = true }
+async-channel = { workspace = true }
 futures = { workspace = true }
 human-repr = { workspace = true }
 iggy_common = { workspace = true }

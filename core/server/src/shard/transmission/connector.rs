@@ -22,10 +22,9 @@ use std::{
     task::Poll,
 };
 
-pub type StopSender = flume::Sender<()>;
-pub type StopReceiver = flume::Receiver<()>;
+pub type StopSender = async_channel::Sender<()>;
+pub type StopReceiver = async_channel::Receiver<()>;
 
-#[derive(Clone)]
 pub struct ShardConnector<T> {
     pub id: u16,
     pub sender: Sender<T>,
@@ -34,12 +33,25 @@ pub struct ShardConnector<T> {
     pub stop_sender: StopSender,
 }
 
-// TODO(numinex) - replace flume with async_channel
-impl<T: Clone> ShardConnector<T> {
+impl<T> Clone for ShardConnector<T> {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            sender: self.sender.clone(),
+            receiver: self.receiver.clone(),
+            stop_receiver: self.stop_receiver.clone(),
+            stop_sender: self.stop_sender.clone(),
+        }
+    }
+}
+
+// TODO(numinex) - replace async_channel with some other form of one shot async channel.
+// !!!!!IMPORTANT!!!! the one shot channel Sender/Receiver has to be Cloneable!!!!!
+impl<T> ShardConnector<T> {
     pub fn new(id: u16, max_concurrent_thread_count: usize) -> Self {
         let channel = Arc::new(ShardedChannel::new(max_concurrent_thread_count));
         let (sender, receiver) = channel.unbounded();
-        let (stop_sender, stop_receiver) = flume::bounded(1);
+        let (stop_sender, stop_receiver) = async_channel::bounded(1);
         Self {
             id,
             receiver,
@@ -55,15 +67,30 @@ impl<T: Clone> ShardConnector<T> {
 }
 
 // TODO: I think those Arcs can be replaced with 'static lifetimes...
-// Those shards will live for the entire duration of the application.
-#[derive(Clone)]
+// Those connectors will live for the duration of the shard itself
+// and the shard lives for the duration of the entire application.
 pub struct Receiver<T> {
     channel: Arc<ShardedChannel<T>>,
 }
 
-#[derive(Clone)]
+impl<T> Clone for Receiver<T> {
+    fn clone(&self) -> Self {
+        Self {
+            channel: self.channel.clone(),
+        }
+    }
+}
+
 pub struct Sender<T> {
     channel: Arc<ShardedChannel<T>>,
+}
+
+impl<T> Clone for Sender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            channel: self.channel.clone(),
+        }
+    }
 }
 
 impl<T> Sender<T> {
@@ -94,13 +121,13 @@ impl<T> ShardedChannel<T> {
     }
 }
 
-pub trait ShardedChannelsSplit<T: Clone> {
+pub trait ShardedChannelsSplit<T> {
     fn unbounded(&self) -> (Sender<T>, Receiver<T>);
 
     fn sender(&self) -> Sender<T>;
 }
 
-impl<T: Clone> ShardedChannelsSplit<T> for Arc<ShardedChannel<T>> {
+impl<T> ShardedChannelsSplit<T> for Arc<ShardedChannel<T>> {
     fn unbounded(&self) -> (Sender<T>, Receiver<T>) {
         let tx = self.sender();
         let rx = Receiver {

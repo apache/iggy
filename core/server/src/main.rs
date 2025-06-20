@@ -25,7 +25,8 @@ use error_set::ErrContext;
 use figlet_rs::FIGfont;
 use server::args::Args;
 use server::bootstrap::{
-    create_default_executor, create_directories, create_root_user, create_shard_connections, create_shard_executor, load_config
+    create_default_executor, create_directories, create_root_user, create_shard_connections,
+    create_shard_executor, load_config,
 };
 use server::channels::commands::archive_state::ArchiveStateExecutor;
 use server::channels::commands::clean_personal_access_tokens::CleanPersonalAccessTokensExecutor;
@@ -126,14 +127,10 @@ fn main() -> Result<(), ServerError> {
 
     // TODO: Make this configurable from config as a range
     // for example this instance of Iggy will use cores from 0..4
-    let available_cpus = available_parallelism()
-        .expect("Failed to get num of cores")
-        .into();
-    let shards_count = available_cpus;
+    let available_cpus = available_parallelism().expect("Failed to get num of cores");
+    let shards_count = available_cpus.into();
     let shards_set = 0..shards_count;
-
     let connections = create_shard_connections(shards_set.clone());
-
     for shard_id in shards_set {
         let id = shard_id as u16;
         let connections = connections.clone();

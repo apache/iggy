@@ -33,7 +33,7 @@ use crate::{
     versioning::SemanticVersion,
 };
 
-use super::{IggyShard, connector::ShardConnector, frame::ShardFrame};
+use super::{IggyShard, transmission::connector::ShardConnector, transmission::frame::ShardFrame};
 
 #[derive(Default)]
 pub struct IggyShardBuilder {
@@ -76,6 +76,7 @@ impl IggyShardBuilder {
             .next()
             .expect("Failed to find connection with the specified ID");
         let shards = connections.into_iter().map(Shard::new).collect();
+
         //TODO: This can be discrete step in the builder bootstrapped from main function.
         let version = SemanticVersion::current().expect("Invalid version");
 
@@ -102,7 +103,10 @@ impl IggyShardBuilder {
 
         //TODO: This can be discrete step in the builder bootstrapped from main function.
         let partition_persister = Self::resolve_persister(config.system.partition.enforce_fsync);
-        let storage = Rc::new(SystemStorage::new(config.system.clone(), partition_persister));
+        let storage = Rc::new(SystemStorage::new(
+            config.system.clone(),
+            partition_persister,
+        ));
 
         IggyShard {
             id: id,
