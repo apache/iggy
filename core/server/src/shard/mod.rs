@@ -17,25 +17,27 @@
  */
 
 pub mod builder;
-pub mod connector;
-pub mod frame;
 pub mod namespace;
+pub mod transmission;
 
 use ahash::HashMap;
 use builder::IggyShardBuilder;
-use connector::{Receiver, ShardConnector, StopReceiver, StopSender};
-use frame::ShardFrame;
 use iggy_common::IggyError;
 use namespace::IggyNamespace;
-use tracing::info;
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
-    sync::Arc, time::Instant,
+    sync::Arc,
+    time::Instant,
 };
+use tracing::info;
+use transmission::connector::{Receiver, ShardConnector, StopReceiver, StopSender};
 
 use crate::{
-    bootstrap::create_root_user, configs::server::ServerConfig, state::{file::FileState, StateKind},
+    bootstrap::create_root_user,
+    configs::server::ServerConfig,
+    shard::transmission::frame::ShardFrame,
+    state::{StateKind, file::FileState},
     streaming::storage::SystemStorage,
 };
 pub(crate) struct Shard {
@@ -68,7 +70,6 @@ pub struct IggyShard {
     // TODO: Refactor.
     pub(crate) storage: Rc<SystemStorage>,
 
-    // TODO - get rid of this dynamic dispatch.
     pub(crate) state: Rc<StateKind>,
     //pub(crate) encryptor: Option<Rc<dyn Encryptor>>,
     config: ServerConfig,
