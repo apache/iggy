@@ -1,5 +1,6 @@
-## [1.0.6](https://github.com/iggy-rs/iggy-node-client/compare/v1.0.5...v1.0.6) (2025-01-14)
+# Changelog
 
+## [1.0.6](https://github.com/iggy-rs/iggy-node-client/compare/v1.0.5...v1.0.6) (2025-01-14)
 
 ### Bug Fixes
 
@@ -7,13 +8,11 @@
 
 ## [1.0.5](https://github.com/iggy-rs/iggy-node-client/compare/v1.0.4...v1.0.5) (2025-01-14)
 
-
 ### Bug Fixes
 
 * set package.json license to Apache-2.0 as well ([#24](https://github.com/iggy-rs/iggy-node-client/issues/24)) ([2523c0f](https://github.com/iggy-rs/iggy-node-client/commit/2523c0fde82958e8a13bb95b2c2d0babe0d1d290))
 
 ## [1.0.4](https://github.com/iggy-rs/iggy-node-client/compare/v1.0.3...v1.0.4) (2024-12-16)
-
 
 ### Bug Fixes
 
@@ -21,13 +20,11 @@
 
 ## [1.0.3](https://github.com/iggy-rs/iggy-node-client/compare/v1.0.2...v1.0.3) (2024-11-24)
 
-
 ### Bug Fixes
 
 * upgrade dependencies ([#19](https://github.com/iggy-rs/iggy-node-client/issues/19)) ([a05d5c2](https://github.com/iggy-rs/iggy-node-client/commit/a05d5c2484f8711f72a23c4ee1222d29e323a5ba))
 
 ## [1.0.2](https://github.com/iggy-rs/iggy-node-client/compare/v1.0.1...v1.0.2) (2024-11-24)
-
 
 ### Bug Fixes
 
@@ -35,13 +32,11 @@
 
 ## [1.0.1](https://github.com/iggy-rs/iggy-node-client/compare/v1.0.0...v1.0.1) (2024-11-24)
 
-
 ### Bug Fixes
 
 * **npm:** publish package ([#17](https://github.com/iggy-rs/iggy-node-client/issues/17)) ([6e2f60e](https://github.com/iggy-rs/iggy-node-client/commit/6e2f60e2f4484b57596285ff79d76ea647962595))
 
-# 1.0.0 (2024-11-24)
-
+## 1.0.0 (2024-11-24)
 
 ### Bug Fixes
 
@@ -73,7 +68,6 @@
 * update readme ([263f271](https://github.com/iggy-rs/iggy-node-client/commit/263f271fed2c529b89329e88d83fc4100b04c639))
 * use debug lib, make poolsize configurable ([2f66e89](https://github.com/iggy-rs/iggy-node-client/commit/2f66e89220b30b3e33aa773b6471b1669658f37f))
 * use pat as token for semantic release ([#10](https://github.com/iggy-rs/iggy-node-client/issues/10)) ([5eccfd2](https://github.com/iggy-rs/iggy-node-client/commit/5eccfd281763773140ce9be39a2c022b2de803b6))
-
 
 ### Features
 

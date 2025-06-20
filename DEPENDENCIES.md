@@ -1,3 +1,5 @@
+# Dependencies
+
 actix-codec: 0.5.2, "Apache-2.0 OR MIT",
 actix-cors: 0.7.1, "Apache-2.0 OR MIT",
 actix-files: 0.6.6, "Apache-2.0 OR MIT",

@@ -1,4 +1,5 @@
-<!-- ABOUT THE PROJECT -->
+# Consumer Sample
+
 ## About The Project
 
 Sample message consumer written using the `iggy-go` sdk.
@@ -16,17 +17,23 @@ In order to use this SDK you need to install golang on your enviroment. Here's a
 ## Usage
 
 In order to successfully launch the consumer app follow these steps:
+
 1. Clone iggy repo and run it in background
+
     ```sh
     git clone https://github.com/iggy-rs/iggy.git
     cd iggy
-    cargo run--bin server -r
+    cargo run --bin iggy-server -r
     ```
-1. Open new terminal instance and enter `iggy-go` root folder
+
+2. Open new terminal instance and enter `iggy-go` root folder
+
     ```sh
     cd iggy-go
     ```
-2. Run the consumer
+
+3. Run the consumer
+
     ```sh
     go run ./samples/consumer
     ```

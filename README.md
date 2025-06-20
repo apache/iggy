@@ -171,49 +171,49 @@ Run the tests:
 
 Start the server:
 
-`cargo run--bin iggy-server`
+`cargo run --bin iggy-server`
 
 To quickly generate the sample data:
 
-`cargo run--bin data-seeder-tool`
+`cargo run --bin data-seeder-tool`
 
 *Please note that all commands below are using `iggy` binary, which is part of release (`cli` sub-crate).*
 
 Create a stream with name `dev` (numerical ID will be assigned by server automatically) using default credentials and `tcp` transport (available transports: `quic`, `tcp`, `http`, default `tcp`):
 
-`cargo run--bin iggy -- --transport tcp --username iggy --password iggy stream create dev`
+`cargo run --bin iggy -- --transport tcp --username iggy --password iggy stream create dev`
 
 List available streams:
 
-`cargo run--bin iggy -- --username iggy --password iggy stream list`
+`cargo run --bin iggy -- --username iggy --password iggy stream list`
 
 Get `dev` stream details:
 
-`cargo run--bin iggy -- -u iggy -p iggy stream get dev`
+`cargo run --bin iggy -- -u iggy -p iggy stream get dev`
 
 Create a topic named `sample` (numerical ID will be assigned by server automatically) for stream `dev`, with 2 partitions (IDs 1 and 2), disabled compression (`none`) and disabled message expiry (skipped optional parameter):
 
-`cargo run--bin iggy -- -u iggy -p iggy topic create dev sample 2 none`
+`cargo run --bin iggy -- -u iggy -p iggy topic create dev sample 2 none`
 
 List available topics for stream `dev`:
 
-`cargo run--bin iggy -- -u iggy -p iggy topic list dev`
+`cargo run --bin iggy -- -u iggy -p iggy topic list dev`
 
 Get topic details for topic `sample` in stream `dev`:
 
-`cargo run--bin iggy -- -u iggy -p iggy topic get dev sample`
+`cargo run --bin iggy -- -u iggy -p iggy topic get dev sample`
 
 Send a message 'hello world' (message ID 1) to the stream `dev` to topic `sample` and partition 1:
 
-`cargo run--bin iggy -- -u iggy -p iggy message send --partition-id 1 dev sample "hello world"`
+`cargo run --bin iggy -- -u iggy -p iggy message send --partition-id 1 dev sample "hello world"`
 
 Send another message 'lorem ipsum' (message ID 2) to the same stream, topic and partition:
 
-`cargo run--bin iggy -- -u iggy -p iggy message send --partition-id 1 dev sample "lorem ipsum"`
+`cargo run --bin iggy -- -u iggy -p iggy message send --partition-id 1 dev sample "lorem ipsum"`
 
 Poll messages by a regular consumer with ID 1 from the stream `dev` for topic `sample` and partition with ID 1, starting with offset 0, messages count 2, without auto commit (storing consumer offset on server):
 
-`cargo run--bin iggy -- -u iggy -p iggy message poll --consumer 1 --offset 0 --message-count 2 --auto-commit dev sample 1`
+`cargo run --bin iggy -- -u iggy -p iggy message poll --consumer 1 --offset 0 --message-count 2 --auto-commit dev sample 1`
 
 Finally, restart the server to see it is able to load the persisted data.
 
@@ -305,43 +305,43 @@ Then, run the benchmarking app with the desired options:
 1. Sending (writing) benchmark
 
    ```bash
-   cargo run--bin iggy-bench -r -- -v pinned-producer tcp
+   cargo run --bin iggy-bench -r -- -v pinned-producer tcp
    ```
 
 2. Polling (reading) benchmark
 
    ```bash
-   cargo run--bin iggy-bench -r -- -v pinned-consumer tcp
+   cargo run --bin iggy-bench -r -- -v pinned-consumer tcp
    ```
 
 3. Parallel sending and polling benchmark
 
    ```bash
-   cargo run--bin iggy-bench -r -- -v pinned-producer-and-consumer tcp
+   cargo run --bin iggy-bench -r -- -v pinned-producer-and-consumer tcp
    ```
 
 4. Balanced sending to multiple partitions benchmark
 
    ```bash
-   cargo run--bin iggy-bench -r -- -v balanced-producer tcp
+   cargo run --bin iggy-bench -r -- -v balanced-producer tcp
    ```
 
 5. Consumer group polling benchmark:
 
    ```bash
-   cargo run--bin iggy-bench -r -- -v balanced-consumer-group tcp
+   cargo run --bin iggy-bench -r -- -v balanced-consumer-group tcp
    ```
 
 6. Parallel balanced sending and polling from consumer group benchmark:
 
    ```bash
-   cargo run--bin iggy-bench -r -- -v balanced-producer-and-consumer-group tcp
+   cargo run --bin iggy-bench -r -- -v balanced-producer-and-consumer-group tcp
    ```
 
 7. End to end producing and consuming benchmark (single task produces and consumes messages in sequence):
 
    ```bash
-   cargo run--bin iggy-bench -r -- -v end-to-end-producing-consumer tcp
+   cargo run --bin iggy-bench -r -- -v end-to-end-producing-consumer tcp
    ```
 
 These benchmarks would start the server with the default configuration, create a stream, topic and partition, and then send or poll the messages. The default configuration is optimized for the best performance, so you might want to tweak it for your needs. If you need more options, please refer to `iggy-bench` subcommands `help` and `examples`.

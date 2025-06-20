@@ -2,11 +2,33 @@
 
 ## Introduction
 
-This is a collection of tips for developers of `iggy-cpp-client`. The initial code is being built with the latest Visual Studio Code and its C++ dev container, under `.devcontainer`. If you are using CLion, XCode or other toolchains it may not have been tested, so please report issues and we will fix them. We are also currently using [vcpkg](https://vcpkg.io) in [manifest mode](https://learn.microsoft.com/en-us/vcpkg/users/manifests) for dependency management. The appropriate packages are downloaded and compiled locally as part of the CMake build, but if you add a new dependency extra steps are required to update the manifest and CMake configuration.
+This is a collection of tips for developers of `iggy-cpp-client`. The initial code is being
+built with the latest Visual Studio Code and its C++ dev container, under `.devcontainer`.
+If you are using CLion, XCode or other toolchains it may not have been tested, so please
+report issues and we will fix them. We are also currently using [vcpkg](https://vcpkg.io)
+in [manifest mode](https://learn.microsoft.com/en-us/vcpkg/users/manifests) for dependency
+management. The appropriate packages are downloaded and compiled locally as part of the
+CMake build, but if you add a new dependency extra steps are required to update the
+manifest and CMake configuration.
 
 ## Philosophy: code quality
 
-In VS Code the dev container automatically installs [pre-commit](https://pre-commit.com), sets up the `.git` hooks directory and installs all necessary tools for pre-commit checks. The relevant linters from [super-linter](https://github.com/super-linter/super-linter) -- which runs in CI automatically -- as well as the build, unit tests ad E2E tests are all run for you on any changed files before any local Git commit, _before_ it gets pushed. This is in line with the general project philosophy to do as many quality checks and fixes left-of-merge, meaning we aim to catch problems first in the IDE, then in pre-commit checks, and finally in mandatory checks run in CI before the developer ever merges a code change to the `main` branch. This is born of hard experience that quality problems, once merged in, are much harder to repair. Not only is the problem out of context ("which of the last 20 commits caused this E2E test regression?") but accountability is lost: the person who has broken a test, introduced a warning or violated coding standards _must_ be the one to fix the problem. "Quality control is everyone's problem" is not enough: applied literally, quality is nobody's problem, so this is better understood as a requirement that everyone own the impact of the changes they themselves make to the codebase to the maximum extent possible.
+In VS Code the dev container automatically installs [pre-commit](https://pre-commit.com),
+sets up the `.git` hooks directory and installs all necessary tools for pre-commit checks.
+The relevant linters from [super-linter](https://github.com/super-linter/super-linter) --
+which runs in CI automatically -- as well as the build, unit tests ad E2E tests are all
+run for you on any changed files before any local Git commit, _before_ it gets pushed.
+This is in line with the general project philosophy to do as many quality checks and fixes
+left-of-merge, meaning we aim to catch problems first in the IDE, then in pre-commit checks,
+and finally in mandatory checks run in CI before the developer ever merges a code change to
+the `main` branch. This is born of hard experience that quality problems, once merged in,
+are much harder to repair. Not only is the problem out of context ("which of the last 20
+commits caused this E2E test regression?") but accountability is lost: the person who has
+broken a test, introduced a warning or violated coding standards _must_ be the one to fix
+the problem. "Quality control is everyone's problem" is not enough: applied literally,
+quality is nobody's problem, so this is better understood as a requirement that everyone
+own the impact of the changes they themselves make to the codebase to the maximum extent
+possible.
 
 ## Tested configurations
 

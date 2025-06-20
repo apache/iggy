@@ -6,12 +6,12 @@ diclaimer: although all iggy commands & basic client/stream are implemented this
 
 note: This lib started as _iggy-bin_ ( [github](https://github.com/T1B0/iggy-bin) / [npm](https://www.npmjs.com/package/iggy-bin)) before migrating under iggy-rs org. package iggy-bin@v1.3.4 is equivalent to @iggy.rs/sdk@v1.0.3 and migrating again under apache iggy monorepo ( [github](https://github.com/apache/iggy/tree/master/foreign/node) and is now published on npmjs as @apache-iggy/node-sdk
 
-note: previous works on node.js http client has been moved to [iggy-node-http-client](<https://github.com/iggy-rs/iggy-node-http-client) (moved on 04 July 2024)
+note: previous works on node.js http client has been moved to [iggy-node-http-client](<https://github.com/iggy-rs/iggy-node-http-client>) (moved on 04 July 2024)
 
 ## install
 
-```
-$ npm i @apache-iggy/node-sdk
+```bash
+npm i @apache-iggy/node-sdk
 ```
 
 ## basic usage
@@ -34,32 +34,34 @@ const stats = await c.system.getStats();
 
 ### Install
 
-```
-$ npm ci
+```bash
+npm ci
 ```
 
 ### build
 
-```
-$ npm run build
+```bash
+npm run build
 ```
 
 ### test
 
 #### unit tests
-```
-$ npm run test
+
+```bash
+npm run test
 ```
 
 #### e2e tests
 
-e2e test expect an iggy-server at tcp://127.0.0.1:8090 
-```
-$ npm run test:e2e
+e2e test expect an iggy-server at tcp://127.0.0.1:8090
+
+```bash
+npm run test:e2e
 ```
 
 ### lint
 
-```
-$ npm run lint
+```bash
+npm run lint
 ```
