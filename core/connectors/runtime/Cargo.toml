@@ -16,9 +16,9 @@
 # under the License.
 
 [package]
-name = "iggy_connector_runtime"
+name = "iggy-connectors"
 version = "0.1.0"
-description = "Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
+description = "Connectors runtime for Iggy message streaming platform"
 edition = "2024"
 license = "Apache-2.0"
 keywords = ["iggy", "messaging", "streaming"]
@@ -26,7 +26,7 @@ categories = ["command-line-utilities", "database", "network-programming"]
 homepage = "https://iggy.apache.org"
 documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
-readme = "../../README.md"
+readme = "README.md"
 
 [dependencies]
 axum = { workspace = true }

@@ -860,35 +860,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bench"
-version = "0.2.4"
-dependencies = [
- "async-trait",
- "bench-report",
- "bytes",
- "charming",
- "chrono",
- "clap",
- "figlet-rs",
- "futures-util",
- "governor",
- "hostname",
- "human-repr",
- "iggy",
- "integration",
- "nonzero_lit",
- "rand 0.9.1",
- "serde",
- "sysinfo 0.35.2",
- "tokio",
- "toml",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "bench-dashboard-frontend"
 version = "0.4.1"
 dependencies = [
@@ -3778,6 +3749,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy-bench"
+version = "0.2.4"
+dependencies = [
+ "async-trait",
+ "bench-report",
+ "bytes",
+ "charming",
+ "chrono",
+ "clap",
+ "figlet-rs",
+ "futures-util",
+ "governor",
+ "hostname",
+ "human-repr",
+ "iggy",
+ "integration",
+ "nonzero_lit",
+ "rand 0.9.1",
+ "serde",
+ "sysinfo 0.35.2",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "iggy-cli"
 version = "0.9.0"
 dependencies = [
@@ -3794,6 +3794,34 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-appender",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "iggy-connectors"
+version = "0.1.0"
+dependencies = [
+ "axum 0.8.4",
+ "axum-server",
+ "config",
+ "dashmap",
+ "dlopen2",
+ "flume",
+ "futures",
+ "iggy",
+ "iggy_connector_sdk",
+ "mimalloc",
+ "once_cell",
+ "postcard",
+ "serde",
+ "serde_json",
+ "serde_yml",
+ "strum",
+ "thiserror 2.0.12",
+ "tokio",
+ "toml",
+ "tower-http",
+ "tracing",
  "tracing-subscriber",
 ]
 
@@ -3874,34 +3902,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "iggy_connector_runtime"
-version = "0.1.0"
-dependencies = [
- "axum 0.8.4",
- "axum-server",
- "config",
- "dashmap",
- "dlopen2",
- "flume",
- "futures",
- "iggy",
- "iggy_connector_sdk",
- "mimalloc",
- "once_cell",
- "postcard",
- "serde",
- "serde_json",
- "serde_yml",
- "strum",
- "thiserror 2.0.12",
- "tokio",
- "toml",
- "tower-http",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
