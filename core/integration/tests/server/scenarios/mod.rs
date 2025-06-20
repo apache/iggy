@@ -30,6 +30,7 @@ pub mod create_message_payload;
 pub mod delete_segments_scenario;
 pub mod message_headers_scenario;
 pub mod message_size_scenario;
+pub mod server_restart_scenario;
 pub mod stream_size_validation_scenario;
 pub mod system_scenario;
 pub mod user_scenario;

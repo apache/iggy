@@ -308,7 +308,8 @@ impl Segment {
         count: u32,
     ) -> Result<IggyMessagesBatchSet, IggyError> {
         tracing::trace!(
-            "Loading {count} messages from disk, start_offset: {start_offset}, end_offset: {}...",
+            "Loading {count} messages from disk, start_offset: {start_offset}, segment start_offset: {}, segment end_offset: {}...",
+            self.start_offset,
             self.end_offset
         );
         let relative_start_offset = (start_offset - self.start_offset) as u32;
