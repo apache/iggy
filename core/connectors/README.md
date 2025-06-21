@@ -19,7 +19,7 @@ The highly performant and modular runtime for statically typed, yet dynamically 
 
 1. Build the project in release mode, and make sure that the plugins specified in `core/connectors/config.toml` under `path` are available. You can use either of `toml`, `json` or `yaml` formats for the configuration file.
 
-2. Run `docker compose up -d` from `/core/examples/sink-data-producer` which will start the Quickwit server to be used by an example sink connector. At this point, you can access the Quickwit UI at [http://localhost:7280](http://localhost:7280) - check this dashboard again later on, after the `events` index will be created.
+2. Run `docker compose up -d` from `/examples/rust/src/sink-data-producer` which will start the Quickwit server to be used by an example sink connector. At this point, you can access the Quickwit UI at [http://localhost:7280](http://localhost:7280) - check this dashboard again later on, after the `events` index will be created.
 
 3. Set environment variable `IGGY_CONNECTORS_RUNTIME_CONFIG_PATH=core/connectors/runtime/config` (adjust the path as needed) pointing to the runtime configuration file.
 

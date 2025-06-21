@@ -71,7 +71,7 @@ jobs:
       - name: Run tests ${{ matrix.target }}
         run: cargo test ${{ env.VERBOSE_FLAG }} --target ${{ matrix.target }}
       - name: Check CLI examples from README
-        run: ./scripts/run-examples-from-readme.sh
+        run: ./scripts/run-rust-examples-from-readme.sh
       - name: Check if workspace is clean
         run: git status --porcelain
 
