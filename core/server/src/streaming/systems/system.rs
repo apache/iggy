@@ -102,10 +102,10 @@ impl System {
             map_toggle_str(config.encryption.enabled)
         );
 
-        let encryptor: Option<Arc<EncryptorKind>> = match config.encryption.enabled {
-            true => Some(Arc::new(EncryptorKind::Aes256Gcm(
+        let encryptor: Option<EncryptorKind> = match config.encryption.enabled {
+            true => Some(EncryptorKind::Aes256Gcm(
                 Aes256GcmEncryptor::from_base64_key(&config.encryption.key).unwrap(),
-            ))),
+            )),
             false => None,
         };
 
@@ -116,13 +116,21 @@ impl System {
             &config.get_state_messages_file_path(),
             &version,
             state_persister,
-            encryptor.clone(),
+            encryptor,
         )));
+
+        //TODO: Just shut the fuck up rust-analyzer.
+        let encryptor: Option<EncryptorKind> = match config.encryption.enabled {
+            true => Some(EncryptorKind::Aes256Gcm(
+                Aes256GcmEncryptor::from_base64_key(&config.encryption.key).unwrap(),
+            )),
+            false => None,
+        };
         Self::create(
             config.clone(),
             SystemStorage::new(config, partition_persister),
             state,
-            encryptor,
+            encryptor.map(Arc::new),
             data_maintenance_config,
             pat_config,
         )
@@ -224,9 +232,12 @@ impl System {
                 format!("{COMPONENT} (error: {error}) - failed to initialize system state")
             })?;
         let now = Instant::now();
+        //DONE
+        /*
         self.load_version().await.with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to load version")
         })?;
+        */
         self.load_users(system_state.users.into_values().collect())
             .await
             .with_error_context(|error| {

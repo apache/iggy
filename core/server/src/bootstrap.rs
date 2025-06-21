@@ -12,10 +12,13 @@ use crate::{
     IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV,
     configs::{config_provider::ConfigProviderKind, server::ServerConfig, system::SystemConfig},
     server_error::ServerError,
-    shard::{transmission::connector::ShardConnector, transmission::frame::ShardFrame},
-    streaming::users::user::User,
+    shard::transmission::{connector::ShardConnector, frame::ShardFrame},
+    streaming::{
+        persistence::persister::{FilePersister, FileWithSyncPersister, PersisterKind},
+        users::user::User,
+    },
 };
-use std::{env, fs::remove_dir_all, ops::Range, path::Path};
+use std::{env, fs::remove_dir_all, ops::Range, path::Path, sync::Arc};
 
 pub fn create_shard_connections(shards_set: Range<usize>) -> Vec<ShardConnector<ShardFrame>> {
     let shards_count = shards_set.len();
@@ -68,37 +71,7 @@ pub async fn create_directories(config: &SystemConfig) -> Result<(), IggyError> 
 
     // TODO: Move this to individual shard level
     /*
-    let state_entries = self.state.init().await.with_error_context(|error| {
-        format!("{COMPONENT} (error: {error}) - failed to initialize state entries")
-    })?;
-    let system_state = SystemState::init(state_entries)
-        .await
-        .with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to initialize system state")
-        })?;
-    let now = Instant::now();
-    self.load_version().await.with_error_context(|error| {
-        format!("{COMPONENT} (error: {error}) - failed to load version")
-    })?;
-    self.load_users(system_state.users.into_values().collect())
-        .await
-        .with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to load users")
-        })?;
-    self.load_streams(system_state.streams.into_values().collect())
-        .await
-        .with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to load streams")
-        })?;
-    if let Some(archiver) = self.archiver.as_ref() {
-        archiver
-            .init()
-            .await
-            .expect("Failed to initialize archiver");
-    }
-    info!("Initialized system in {} ms.", now.elapsed().as_millis());
-    Ok(())
-    */
+     */
 }
 
 pub fn create_root_user() -> User {
@@ -157,4 +130,11 @@ pub fn create_shard_executor() -> Runtime<TimeDriver<monoio::IoUringDriver>> {
         .enable_timer();
     let rt = Buildable::build(builder).expect("Failed to create default runtime");
     rt
+}
+
+pub fn resolve_persister(enforce_fsync: bool) -> Arc<PersisterKind> {
+    match enforce_fsync {
+        true => Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister)),
+        false => Arc::new(PersisterKind::File(FilePersister)),
+    }
 }
