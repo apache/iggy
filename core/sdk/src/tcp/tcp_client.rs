@@ -349,6 +349,8 @@ impl TcpClient {
                 break;
             }
 
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
             let mut root_cert_store = rustls::RootCertStore::empty();
             if let Some(certificate_path) = &self.config.tls_ca_file {
                 for cert in CertificateDer::pem_file_iter(certificate_path).map_err(|error| {
@@ -376,10 +378,6 @@ impl TcpClient {
                 .with_root_certificates(root_cert_store)
                 .with_no_client_auth();
             let connector = TlsConnector::from(Arc::new(config));
-            let stream = TcpStream::connect(client_address).await.map_err(|error| {
-                error!("Failed to establish TCP connection to the server: {error}",);
-                IggyError::CannotEstablishConnection
-            })?;
             let tls_domain = self.config.tls_domain.to_owned();
             let domain = ServerName::try_from(tls_domain).map_err(|error| {
                 error!("Failed to create a server name from the domain. {error}",);

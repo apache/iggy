@@ -153,8 +153,8 @@ impl Default for TcpTlsConfig {
     fn default() -> TcpTlsConfig {
         TcpTlsConfig {
             enabled: SERVER_CONFIG.tcp.tls.enabled,
-            certificate: SERVER_CONFIG.tcp.tls.certificate.parse().unwrap(),
-            password: SERVER_CONFIG.tcp.tls.password.parse().unwrap(),
+            cert_file: SERVER_CONFIG.tcp.tls.cert_file.parse().unwrap(),
+            key_file: SERVER_CONFIG.tcp.tls.key_file.parse().unwrap(),
         }
     }
 }

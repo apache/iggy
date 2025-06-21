@@ -23,7 +23,7 @@ use error_set::ErrContext;
 use iggy_common::IggyError;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio_native_tls::TlsStream;
+use tokio_rustls::server::TlsStream;
 
 #[derive(Debug)]
 pub struct TcpTlsSender {

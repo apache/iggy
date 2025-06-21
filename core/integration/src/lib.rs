@@ -25,3 +25,4 @@ pub mod quic_client;
 pub mod tcp_client;
 #[allow(deprecated)]
 pub mod test_server;
+pub mod test_tls_utils;

@@ -8,7 +8,9 @@ edition = "2024"
 anyhow = { workspace = true }
 clap = { workspace = true }
 dircpy = "0.3.19"
-git2 = "0.20.2"
+git2 = { version = "0.20.2", default-features = false, features = [
+    "vendored-libgit2",
+] }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

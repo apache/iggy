@@ -25,7 +25,7 @@ use crate::{quic::quic_sender::QuicSender, server_error::ServerError};
 use iggy_common::IggyError;
 use quinn::{RecvStream, SendStream};
 use tokio::net::TcpStream;
-use tokio_native_tls::TlsStream;
+use tokio_rustls::server::TlsStream;
 
 macro_rules! forward_async_methods {
     (
@@ -66,6 +66,7 @@ pub trait Sender {
     fn shutdown(&mut self) -> impl Future<Output = Result<(), ServerError>> + Send;
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum SenderKind {
     Tcp(TcpSender),
     TcpTls(TcpTlsSender),
