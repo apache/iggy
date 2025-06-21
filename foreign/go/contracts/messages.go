@@ -32,10 +32,10 @@ type FetchMessagesRequest struct {
 }
 
 type FetchMessagesResponse struct {
-	PartitionId   int
+	PartitionId   uint32
 	CurrentOffset uint64
-	Messages      []MessageResponse
-	MessageCount  int
+	MessageCount  uint32
+	Messages      []IggyMessage
 }
 
 type MessageResponse struct {
@@ -76,4 +76,16 @@ func NewMessage(payload []byte, headers map[HeaderKey]HeaderValue) Message {
 		Payload: payload,
 		Headers: headers,
 	}
+}
+
+type ReceivedMessage struct {
+	Message       IggyMessage
+	CurrentOffset uint64
+	PartitionId   uint32
+}
+
+type IggyMessage struct {
+	Header      MessageHeader
+	Payload     []byte
+	UserHeaders []byte
 }

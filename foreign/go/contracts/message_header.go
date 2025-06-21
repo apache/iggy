@@ -17,7 +17,63 @@
 
 package iggcon
 
-import "errors"
+import (
+	"encoding/binary"
+	"errors"
+
+	"github.com/google/uuid"
+)
+
+const MessageHeaderSize = 8 + 16 + 8 + 8 + 8 + 4 + 4
+
+type MessageHeader struct {
+	Checksum         uint64
+	Id               uuid.UUID
+	Offset           uint64
+	Timestamp        uint64
+	OriginTimestamp  uint64
+	UserHeaderLength uint32
+	PayloadLength    uint32
+}
+
+func NewMessageHeader(data []byte) (*MessageHeader, error) {
+
+	if len(data) != MessageHeaderSize {
+		return nil, errors.New("data has incorrect size, must be 56")
+	}
+	checksum := binary.LittleEndian.Uint64(data[0:8])
+	id, _ := uuid.FromBytes(data[8:24])
+	timestamp := binary.LittleEndian.Uint64(data[24:32])
+	origin_timestamp := binary.LittleEndian.Uint64(data[32:40])
+	offset := binary.LittleEndian.Uint64(data[40:48])
+	user_header_length := binary.LittleEndian.Uint32(data[48:52])
+	payload_length := binary.LittleEndian.Uint32(data[52:56])
+
+	return &MessageHeader{
+		Checksum:         checksum,
+		Id:               id,
+		Offset:           offset,
+		Timestamp:        timestamp,
+		OriginTimestamp:  origin_timestamp,
+		UserHeaderLength: user_header_length,
+		PayloadLength:    payload_length,
+	}, nil
+}
+
+func (mh *MessageHeader) ToBytes() []byte {
+	bytes := make([]byte, MessageHeaderSize)
+
+	binary.LittleEndian.AppendUint64(bytes, mh.Checksum)
+	idBytes, _ := uuid.UUID.MarshalBinary(mh.Id)
+	bytes = append(bytes, idBytes...)
+	binary.LittleEndian.AppendUint64(bytes, mh.Offset)
+	binary.LittleEndian.AppendUint64(bytes, mh.Timestamp)
+	binary.LittleEndian.AppendUint64(bytes, mh.OriginTimestamp)
+	binary.LittleEndian.AppendUint32(bytes, mh.UserHeaderLength)
+	binary.LittleEndian.AppendUint32(bytes, mh.PayloadLength)
+
+	return bytes
+}
 
 type HeaderValue struct {
 	Kind  HeaderKind
@@ -30,7 +86,7 @@ type HeaderKey struct {
 
 func NewHeaderKey(val string) (HeaderKey, error) {
 	if len(val) == 0 || len(val) > 255 {
-		return HeaderKey{}, errors.New("Value has incorrect size, must be between 1 and 255")
+		return HeaderKey{}, errors.New("value has incorrect size, must be between 1 and 255")
 	}
 	return HeaderKey{Value: val}, nil
 }
