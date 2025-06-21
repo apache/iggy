@@ -18,11 +18,12 @@
 package tcp_test
 
 import (
-	. "github.com/iggy-rs/iggy-go-client"
-	. "github.com/iggy-rs/iggy-go-client/contracts"
 	"math/rand"
 	"strings"
 	"time"
+
+	. "github.com/iggy-rs/iggy-go-client"
+	. "github.com/iggy-rs/iggy-go-client/contracts"
 )
 
 func createAuthorizedConnection() MessageStream {

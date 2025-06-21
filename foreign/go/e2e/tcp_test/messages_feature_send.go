@@ -95,7 +95,7 @@ var _ = Describe("SEND MESSAGES:", func() {
 				StreamId:     iggcon.NewIdentifier(streamId),
 				TopicId:      iggcon.NewIdentifier(topicId),
 				Partitioning: iggcon.PartitionId(int(createRandomUInt32())),
-				Messages:     []iggcon.Message{},
+				Messages:     []iggcon.IggyMessage{},
 			}
 			err := client.SendMessages(request)
 			itShouldReturnSpecificError(err, "messages_count_should_be_greater_than_zero")

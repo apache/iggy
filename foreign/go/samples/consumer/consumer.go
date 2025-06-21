@@ -138,7 +138,7 @@ func ConsumeMessages(messageStream MessageStream) error {
 	}
 }
 
-func HandleMessage(messageResponse MessageResponse) error {
+func HandleMessage(messageResponse IggyMessage) error {
 	length := (len(messageResponse.Payload) * 3) / 4
 	bytes := make([]byte, length)
 
@@ -167,7 +167,7 @@ func HandleMessage(messageResponse MessageResponse) error {
 		}
 	}
 
-	fmt.Printf("Handling message type: %s at offset: %d with message Id: %s ", envelope.MessageType, messageResponse.Offset, messageResponse.Id)
+	fmt.Printf("Handling message type: %s at offset: %d with message Id: %s ", envelope.MessageType, messageResponse.Header.Offset, messageResponse.Header.Id)
 
 	switch envelope.MessageType {
 	case "order_created":

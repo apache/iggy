@@ -22,7 +22,7 @@ type PollingStrategy struct {
 	Value uint64
 }
 
-type MessagePolling int
+type MessagePolling byte
 
 const (
 	POLLING_OFFSET    MessagePolling = 1

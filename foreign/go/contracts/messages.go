@@ -32,10 +32,10 @@ type FetchMessagesRequest struct {
 }
 
 type FetchMessagesResponse struct {
-	PartitionId   int
+	PartitionId   uint32
 	CurrentOffset uint64
-	Messages      []MessageResponse
-	MessageCount  int
+	MessageCount  uint32
+	Messages      []IggyMessage
 }
 
 type MessageResponse struct {
@@ -58,10 +58,10 @@ const (
 )
 
 type SendMessagesRequest struct {
-	StreamId     Identifier   `json:"streamId"`
-	TopicId      Identifier   `json:"topicId"`
-	Partitioning Partitioning `json:"partitioning"`
-	Messages     []Message    `json:"messages"`
+	StreamId     Identifier    `json:"streamId"`
+	TopicId      Identifier    `json:"topicId"`
+	Partitioning Partitioning  `json:"partitioning"`
+	Messages     []IggyMessage `json:"messages"`
 }
 
 type Message struct {
@@ -76,4 +76,35 @@ func NewMessage(payload []byte, headers map[HeaderKey]HeaderValue) Message {
 		Payload: payload,
 		Headers: headers,
 	}
+}
+
+type ReceivedMessage struct {
+	Message       IggyMessage
+	CurrentOffset uint64
+	PartitionId   uint32
+}
+
+type IggyMessage struct {
+	Header      MessageHeader
+	Payload     []byte
+	UserHeaders []byte
+}
+
+func NewIggyMessage(id uuid.UUID, payload []byte) IggyMessage {
+	return IggyMessage{
+		Header:  NewMessageHeader(id, uint32(len(payload)), 0),
+		Payload: payload,
+	}
+}
+
+func NewIggyMessageWithHeaders(id uuid.UUID, payload []byte, userHeaders map[HeaderKey]HeaderValue) IggyMessage {
+	userHeaderBytes := getHeadersBytes(userHeaders)
+	messageHeader := NewMessageHeader(id, uint32(len(payload)), 0)
+	messageHeader.UserHeaderLength = uint32(len(userHeaderBytes))
+	iggyMessage := IggyMessage{
+		Header:      messageHeader,
+		Payload:     payload,
+		UserHeaders: userHeaderBytes,
+	}
+	return iggyMessage
 }
