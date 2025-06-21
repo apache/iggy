@@ -23,7 +23,7 @@ use aes_gcm::aead::{Aead, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, KeyInit};
 use std::fmt::Debug;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum EncryptorKind {
     Aes256Gcm(Aes256GcmEncryptor),
 }
@@ -46,6 +46,7 @@ pub trait Encryptor {
     fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, IggyError>;
 }
 
+#[derive(Clone)]
 pub struct Aes256GcmEncryptor {
     cipher: Aes256Gcm,
 }

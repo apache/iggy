@@ -22,14 +22,12 @@ use iggy_common::{Aes256GcmEncryptor, EncryptorKind};
 use tracing::info;
 
 use crate::{
+    bootstrap::resolve_persister,
     configs::server::ServerConfig,
     map_toggle_str,
     shard::Shard,
     state::{StateKind, file::FileState},
-    streaming::{
-        persistence::persister::{FilePersister, FileWithSyncPersister, PersisterKind},
-        storage::SystemStorage,
-    },
+    streaming::storage::SystemStorage,
     versioning::SemanticVersion,
 };
 
@@ -40,6 +38,9 @@ pub struct IggyShardBuilder {
     id: Option<u16>,
     connections: Option<Vec<ShardConnector<ShardFrame>>>,
     config: Option<ServerConfig>,
+    encryptor: Option<EncryptorKind>,
+    version: Option<SemanticVersion>,
+    state: Option<StateKind>,
 }
 
 impl IggyShardBuilder {
@@ -53,8 +54,23 @@ impl IggyShardBuilder {
         self
     }
 
-    pub fn server_config(mut self, config: ServerConfig) -> Self {
+    pub fn config(mut self, config: ServerConfig) -> Self {
         self.config = Some(config);
+        self
+    }
+
+    pub fn encryptor(mut self, encryptor: Option<EncryptorKind>) -> Self {
+        self.encryptor = encryptor;
+        self
+    }
+
+    pub fn version(mut self, version: SemanticVersion) -> Self {
+        self.version = Some(version);
+        self
+    }
+
+    pub fn state(mut self, state: StateKind) -> Self {
+        self.state = Some(state);
         self
     }
 
@@ -63,6 +79,8 @@ impl IggyShardBuilder {
         let id = self.id.unwrap();
         let config = self.config.unwrap();
         let connections = self.connections.unwrap();
+        let state = self.state.unwrap();
+        let version = self.version.unwrap();
         let (stop_sender, stop_receiver, frame_receiver) = connections
             .iter()
             .filter(|c| c.id == id)
@@ -76,33 +94,8 @@ impl IggyShardBuilder {
             .next()
             .expect("Failed to find connection with the specified ID");
         let shards = connections.into_iter().map(Shard::new).collect();
-
-        //TODO: This can be discrete step in the builder bootstrapped from main function.
-        let version = SemanticVersion::current().expect("Invalid version");
-
-        //TODO: This can be discrete step in the builder bootstrapped from main function.
-        info!(
-            "Server-side encryption is {}.",
-            map_toggle_str(config.system.encryption.enabled)
-        );
-        let encryptor: Option<Arc<EncryptorKind>> = match config.system.encryption.enabled {
-            true => Some(Arc::new(EncryptorKind::Aes256Gcm(
-                Aes256GcmEncryptor::from_base64_key(&config.system.encryption.key).unwrap(),
-            ))),
-            false => None,
-        };
-
-        //TODO: This can be discrete step in the builder bootstrapped from main function.
-        let state_persister = Self::resolve_persister(config.system.state.enforce_fsync);
-        let state = Rc::new(StateKind::File(FileState::new(
-            &config.system.get_state_messages_file_path(),
-            &version,
-            state_persister,
-            encryptor.clone(),
-        )));
-
-        //TODO: This can be discrete step in the builder bootstrapped from main function.
-        let partition_persister = Self::resolve_persister(config.system.partition.enforce_fsync);
+        //TODO: Eghhhh.......
+        let partition_persister = resolve_persister(config.system.partition.enforce_fsync);
         let storage = Rc::new(SystemStorage::new(
             config.system.clone(),
             partition_persister,
@@ -115,16 +108,10 @@ impl IggyShardBuilder {
             storage: storage,
             state: state,
             config: config,
+            version: version,
             stop_receiver: stop_receiver,
             stop_sender: stop_sender,
             frame_receiver: Cell::new(Some(frame_receiver)),
-        }
-    }
-
-    fn resolve_persister(enforce_fsync: bool) -> Arc<PersisterKind> {
-        match enforce_fsync {
-            true => Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister)),
-            false => Arc::new(PersisterKind::File(FilePersister)),
         }
     }
 }

@@ -16,15 +16,11 @@
  * under the License.
  */
 
-use crate::streaming::systems::system::System;
 use crate::versioning::SemanticVersion;
-use iggy_common::IggyError;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::fmt::Display;
 use std::hash::{Hash, Hasher};
-use std::str::FromStr;
-use tracing::info;
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct SystemInfo {
@@ -44,57 +40,6 @@ pub struct Migration {
     pub name: String,
     pub hash: String,
     pub applied_at: u64,
-}
-
-impl System {
-    pub(crate) async fn load_version(&mut self) -> Result<(), IggyError> {
-        let current_version = SemanticVersion::current()?;
-        let mut system_info;
-        let load_system_info = self.storage.info.load().await;
-        if load_system_info.is_err() {
-            let error = load_system_info.err().unwrap();
-            if let IggyError::ResourceNotFound(_) = error {
-                info!("System info not found, creating...");
-                system_info = SystemInfo::default();
-                self.update_system_info(&mut system_info, &current_version)
-                    .await?;
-            } else {
-                return Err(error);
-            }
-        } else {
-            system_info = load_system_info.unwrap();
-        }
-
-        info!("Loaded {system_info}.");
-        let loaded_version = SemanticVersion::from_str(&system_info.version.version)?;
-        if current_version.is_equal_to(&loaded_version) {
-            info!("System version {current_version} is up to date.");
-        } else if current_version.is_greater_than(&loaded_version) {
-            info!(
-                "System version {current_version} is greater than {loaded_version}, checking the available migrations..."
-            );
-            self.update_system_info(&mut system_info, &current_version)
-                .await?;
-        } else {
-            info!(
-                "System version {current_version} is lower than {loaded_version}, possible downgrade."
-            );
-            self.update_system_info(&mut system_info, &current_version)
-                .await?;
-        }
-
-        Ok(())
-    }
-
-    async fn update_system_info(
-        &self,
-        system_info: &mut SystemInfo,
-        version: &SemanticVersion,
-    ) -> Result<(), IggyError> {
-        system_info.update_version(version);
-        self.storage.info.save(system_info).await?;
-        Ok(())
-    }
 }
 
 impl SystemInfo {

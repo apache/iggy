@@ -47,7 +47,7 @@ pub struct FileState {
     version: u32,
     path: String,
     persister: Arc<PersisterKind>,
-    encryptor: Option<Arc<EncryptorKind>>,
+    encryptor: Option<EncryptorKind>,
 }
 
 impl FileState {
@@ -55,7 +55,7 @@ impl FileState {
         path: &str,
         version: &SemanticVersion,
         persister: Arc<PersisterKind>,
-        encryptor: Option<Arc<EncryptorKind>>,
+        encryptor: Option<EncryptorKind>,
     ) -> Self {
         Self {
             current_index: AtomicU64::new(0),
