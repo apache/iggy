@@ -326,8 +326,8 @@ impl Display for TcpTlsConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ enabled: {}, certificate: {} }}",
-            self.enabled, self.certificate
+            "{{ enabled: {}, cert_file: {}, key_file: {} }}",
+            self.enabled, self.cert_file, self.key_file
         )
     }
 }

@@ -21,8 +21,9 @@ use crate::server::scenarios::{
     consumer_group_with_single_client_polling_messages_scenario, create_message_payload,
     delete_segments_scenario::test_delete_segments_scenario, message_headers_scenario,
     message_size_scenario, server_restart_scenario, stream_size_validation_scenario,
-    system_scenario, user_scenario,
+    system_scenario, tcp_tls_scenario, user_scenario,
 };
+use iggy::prelude::*;
 use integration::{
     tcp_client::TcpClientFactory,
     test_server::{IpAddrKind, TestServer},
@@ -207,4 +208,54 @@ async fn should_verify_data_integrity_after_server_restart() {
 
     test_server.stop();
     drop(test_server);
+}
+
+#[tokio::test]
+#[parallel]
+async fn tcp_tls_scenario_should_be_valid() {
+    use iggy::clients::client_builder::IggyClientBuilder;
+    use integration::test_tls_utils::generate_test_certificates;
+
+    let temp_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
+    let cert_dir = temp_dir.path();
+    let cert_dir_str = cert_dir.to_str().unwrap();
+
+    generate_test_certificates(cert_dir_str).expect("Failed to generate test certificates");
+
+    let mut extra_envs = HashMap::new();
+    extra_envs.insert("IGGY_TCP_TLS_ENABLED".to_string(), "true".to_string());
+    extra_envs.insert(
+        "IGGY_TCP_TLS_CERT_FILE".to_string(),
+        cert_dir.join("test_cert.pem").to_str().unwrap().to_string(),
+    );
+    extra_envs.insert(
+        "IGGY_TCP_TLS_KEY_FILE".to_string(),
+        cert_dir.join("test_key.pem").to_str().unwrap().to_string(),
+    );
+
+    let mut test_server = TestServer::new(Some(extra_envs), true, None, IpAddrKind::V4);
+    test_server.start();
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+    let server_addr = test_server.get_raw_tcp_addr().unwrap();
+    let cert_path = cert_dir.join("test_cert.pem").to_str().unwrap().to_string();
+
+    let client = IggyClientBuilder::new()
+        .with_tcp()
+        .with_server_address(server_addr)
+        .with_tls_enabled(true)
+        .with_tls_domain("localhost".to_string())
+        .with_tls_ca_file(cert_path)
+        .build()
+        .expect("Failed to create TLS client");
+
+    client
+        .connect()
+        .await
+        .expect("Failed to connect TLS client");
+
+    let client = iggy::clients::client::IggyClient::create(Box::new(client), None, None);
+
+    tcp_tls_scenario::run(&client).await;
 }

@@ -194,11 +194,11 @@ ipv6 = false
 # `false` leaves TCP connections unencrypted.
 enabled = false
 
-# Path to the TLS certificate for TCP.
-certificate = "certs/iggy.pfx"
+# Path to the TLS certificate file.
+cert_file = "certs/iggy_cert.pem"
 
-# Password for the TLS certificate, required for accessing the private key.
-password = "iggy123"
+# Path to the TLS key file.
+key_file = "certs/iggy_key.pem"
 
 # Configuration for the TCP socket
 [tcp.socket]

@@ -33,6 +33,7 @@ pub mod message_size_scenario;
 pub mod server_restart_scenario;
 pub mod stream_size_validation_scenario;
 pub mod system_scenario;
+pub mod tcp_tls_scenario;
 pub mod user_scenario;
 
 const STREAM_ID: u32 = 1;
