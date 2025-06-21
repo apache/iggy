@@ -1,0 +1,30 @@
+[elasticsearch]  
+url = "http://localhost:9200"  
+index_pattern = "iggy-messages-{date}"  
+batch_size = 1000  
+flush_interval_secs = 5  
+retry_attempts = 3  
+retry_interval_secs = 1  
+  
+[elasticsearch.mapping]  
+config = '''  
+{  
+  "properties": {  
+    "@timestamp": {"type": "date"},  
+    "message": {"type": "text"},  
+    "level": {"type": "keyword"},  
+    "service": {"type": "keyword"}  
+  }  
+}  
+'''  
+  
+[iggy]  
+stream = "logs"  
+topic = "application-logs"  
+consumer_group = "elasticsearch-sink"  
+  
+[processing]  
+document_id_field = "id"  
+timestamp_field = "@timestamp"  
+enable_dlq = true  
+dlq_topic = "failed-messages"
