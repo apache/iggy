@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package tcp_test_test
+package tcp_test
 
 import (
 	"testing"

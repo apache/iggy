@@ -128,7 +128,7 @@ func DeserializeFetchMessagesResponse(payload []byte, compression IggyMessageCom
 			// body needs to be at least 1 byte
 			break
 		}
-		header, err := NewMessageHeader(payload[position : position+MessageHeaderSize])
+		header, err := MessageHeaderFromBytes(payload[position : position+MessageHeaderSize])
 		position += MessageHeaderSize
 		payload_end := position + int(header.PayloadLength)
 		if int(payload_end) > length {
