@@ -42,7 +42,7 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain add --profile minimal --components clippy stable 
+          rustup toolchain add --profile=minimal --component=clippy stable
           rustup override set stable
 
       - name: Install clippy-sarif sarif-fmt

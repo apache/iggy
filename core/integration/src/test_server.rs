@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -204,16 +204,6 @@ impl TestServer {
 
         let child = command.spawn().unwrap();
         self.child_handle = Some(child);
-
-        if self.child_handle.as_ref().unwrap().stdout.is_some() {
-            let child_stdout = self.child_handle.as_mut().unwrap().stdout.take().unwrap();
-            std::thread::spawn(move || {
-                let reader = BufReader::new(child_stdout);
-                for line in reader.lines() {
-                    println!("{}", line.unwrap());
-                }
-            });
-        }
         self.wait_until_server_has_bound();
     }
 
