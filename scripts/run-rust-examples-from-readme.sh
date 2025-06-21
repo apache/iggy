@@ -19,10 +19,10 @@
 
 set -euo pipefail
 
-# Script to run examples from README.md and core/examples/README.md files
-# Usage: ./scripts/run-examples-from-readme.sh
+# Script to run Rust examples from README.md and examples/rust/README.md files
+# Usage: ./scripts/run-rust-examples-from-readme.sh
 #
-# This script will run all the commands from both README.md and core/examples/README.md files 
+# This script will run all the commands from both README.md and examples/rust/README.md files 
 # and check if they pass or fail.
 # If any command fails, it will print the command and exit with non-zero status.
 # If all commands pass, it will remove the log file and exit with zero status.
@@ -88,8 +88,8 @@ while IFS= read -r command; do
 
 done < <(grep -E "^\`cargo r --bin iggy -- " README.md)
 
-# Execute all example commands from README.md and core/examples/README.md and check if they pass or fail
-for readme_file in README.md core/examples/README.md; do
+# Execute all example commands from README.md and examples/rust/README.md and check if they pass or fail
+for readme_file in README.md examples/rust/README.md; do
     if [ ! -f "${readme_file}" ]; then
         continue
     fi

@@ -225,9 +225,9 @@ To see the detailed logs from the CLI/server, run it with `RUST_LOG=trace` envir
 
 ## Examples
 
-You can find comprehensive sample applications under the `core/examples` directory. These examples showcase various usage patterns of the Iggy client SDK, from basic operations to advanced multi-tenant scenarios.
+You can find comprehensive sample applications under the `examples/rust` directory. These examples showcase various usage patterns of the Iggy client SDK, from basic operations to advanced multi-tenant scenarios.
 
-For detailed information about available examples and how to run them, please see the [Examples README](core/examples/README.md).
+For detailed information about available examples and how to run them, please see the [Examples README](examples/rust/README.md).
 
 ---
 

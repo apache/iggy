@@ -36,11 +36,11 @@ members = [
     "core/connectors/sinks/quickwit_sink",
     "core/connectors/sinks/stdout_sink",
     "core/connectors/sources/random_source",
-    "core/examples",
     "core/integration",
     "core/sdk",
     "core/server",
     "core/tools",
+    "examples/rust",
 ]
 resolver = "2"
 

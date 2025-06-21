@@ -6,7 +6,7 @@ This directory contains comprehensive sample applications that showcase various 
 
 To run any example, first start the server with `cargo run --bin iggy-server` and then run the desired example using `cargo run --example EXAMPLE_NAME`.
 
-You can run multiple producers and consumers simultaneously to observe how messages are distributed across clients. Most examples support configurable options via the [Args](https://github.com/apache/iggy/blob/master/core/examples/src/shared/args.rs) struct, including transport protocol, stream/topic/partition settings, consumer ID, message size, and more.
+You can run multiple producers and consumers simultaneously to observe how messages are distributed across clients. Most examples support configurable options via the [Args](https://github.com/apache/iggy/blob/master/examples/rust/src/shared/args.rs) struct, including transport protocol, stream/topic/partition settings, consumer ID, message size, and more.
 
 ![sample](../../assets/sample.png)
 
@@ -123,11 +123,11 @@ All examples can be executed directly from the repository. Follow these steps:
 2. **Run desired example**: `cargo run --example EXAMPLE_NAME`
 3. **Check source code**: Examples include detailed comments explaining concepts and usage patterns
 
-Most examples use shared utilities from `core/examples/src/shared/` including:
+Most examples use shared utilities from `examples/rust/src/shared/` including:
 
 - Message type definitions (orders, events)
 - Message generation utilities
 - Common argument parsing
 - Client setup helpers
 
-The examples are automatically tested via `scripts/run-examples-from-readme.sh` to ensure they remain functional and up-to-date with the latest API changes.
+The examples are automatically tested via `scripts/run-rust-examples-from-readme.sh` to ensure they remain functional and up-to-date with the latest API changes.
