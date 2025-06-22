@@ -185,69 +185,6 @@ func mapMessageState(state byte) (MessageState, error) {
 	}
 }
 
-func deserializeHeaders(payload []byte) (map[HeaderKey]HeaderValue, error) {
-	headers := make(map[HeaderKey]HeaderValue)
-	position := 0
-
-	for position < len(payload) {
-		if len(payload) <= position+4 {
-			return nil, errors.New("Invalid header key length")
-		}
-
-		keyLength := binary.LittleEndian.Uint32(payload[position : position+4])
-		if keyLength == 0 || 255 < keyLength {
-			return nil, errors.New("Key has incorrect size, must be between 1 and 255")
-		}
-		position += 4
-
-		if len(payload) < position+int(keyLength) {
-			return nil, errors.New("Invalid header key")
-		}
-
-		key := string(payload[position : position+int(keyLength)])
-		position += int(keyLength)
-
-		headerKind, err := deserializeHeaderKind(payload, position)
-		if err != nil {
-			return nil, err
-		}
-		position++
-
-		if len(payload) <= position+4 {
-			return nil, errors.New("Invalid header value length")
-		}
-
-		valueLength := binary.LittleEndian.Uint32(payload[position : position+4])
-		position += 4
-
-		if valueLength == 0 || 255 < valueLength {
-			return nil, errors.New("Value has incorrect size, must be between 1 and 255")
-		}
-
-		if len(payload) < position+int(valueLength) {
-			return nil, errors.New("Invalid header value")
-		}
-
-		value := payload[position : position+int(valueLength)]
-		position += int(valueLength)
-
-		headers[HeaderKey{Value: key}] = HeaderValue{
-			Kind:  headerKind,
-			Value: value,
-		}
-	}
-
-	return headers, nil
-}
-
-func deserializeHeaderKind(payload []byte, position int) (HeaderKind, error) {
-	if position >= len(payload) {
-		return 0, errors.New("Invalid header kind position")
-	}
-
-	return HeaderKind(payload[position]), nil
-}
-
 func DeserializeTopics(payload []byte) ([]TopicResponse, error) {
 	topics := make([]TopicResponse, 0)
 	length := len(payload)

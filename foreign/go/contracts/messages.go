@@ -64,20 +64,6 @@ type SendMessagesRequest struct {
 	Messages     []IggyMessage `json:"messages"`
 }
 
-type Message struct {
-	Id      uuid.UUID
-	Payload []byte
-	Headers map[HeaderKey]HeaderValue
-}
-
-func NewMessage(payload []byte, headers map[HeaderKey]HeaderValue) Message {
-	return Message{
-		Id:      uuid.New(),
-		Payload: payload,
-		Headers: headers,
-	}
-}
-
 type ReceivedMessage struct {
 	Message       IggyMessage
 	CurrentOffset uint64
@@ -98,7 +84,7 @@ func NewIggyMessage(id uuid.UUID, payload []byte) IggyMessage {
 }
 
 func NewIggyMessageWithHeaders(id uuid.UUID, payload []byte, userHeaders map[HeaderKey]HeaderValue) IggyMessage {
-	userHeaderBytes := getHeadersBytes(userHeaders)
+	userHeaderBytes := GetHeadersBytes(userHeaders)
 	messageHeader := NewMessageHeader(id, uint32(len(payload)), 0)
 	messageHeader.UserHeaderLength = uint32(len(userHeaderBytes))
 	iggyMessage := IggyMessage{

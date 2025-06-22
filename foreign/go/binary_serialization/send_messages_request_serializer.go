@@ -94,7 +94,7 @@ func (request *TcpSendMessagesRequest) Serialize(compression iggcon.IggyMessageC
 	binary.LittleEndian.PutUint32(bytes[position:position+4], uint32(messageCount))
 	position += 4
 
-	currentPosition := position
+	currentIndexPosition := position
 	for i := 0; i < indexesSize; i++ {
 		bytes[position+i] = 0
 	}
@@ -110,10 +110,10 @@ func (request *TcpSendMessagesRequest) Serialize(compression iggcon.IggyMessageC
 
 		msgSize += iggcon.MessageHeaderSize + message.Header.PayloadLength + message.Header.UserHeaderLength
 
-		binary.LittleEndian.PutUint32(bytes[currentPosition:currentPosition+4], 0)
-		binary.LittleEndian.PutUint32(bytes[currentPosition+4:currentPosition+8], uint32(msgSize))
-		binary.LittleEndian.PutUint32(bytes[currentPosition+8:currentPosition+12], 0)
-		currentPosition += indexSize
+		binary.LittleEndian.PutUint32(bytes[currentIndexPosition:currentIndexPosition+4], 0)
+		binary.LittleEndian.PutUint32(bytes[currentIndexPosition+4:currentIndexPosition+8], uint32(msgSize))
+		binary.LittleEndian.PutUint32(bytes[currentIndexPosition+8:currentIndexPosition+12], 0)
+		currentIndexPosition += indexSize
 	}
 
 	return bytes
@@ -125,34 +125,4 @@ func calculateMessageBytesCount(messages []iggcon.IggyMessage) int {
 		count += iggcon.MessageHeaderSize + len(msg.Payload) + len(msg.UserHeaders)
 	}
 	return count
-}
-
-func getHeadersBytes(headers map[iggcon.HeaderKey]iggcon.HeaderValue) []byte {
-	headersLength := 0
-	for key, header := range headers {
-		headersLength += 4 + len(key.Value) + 1 + 4 + len(header.Value)
-	}
-	headersBytes := make([]byte, headersLength)
-	position := 0
-	for key, value := range headers {
-		headerBytes := getBytesFromHeader(key, value)
-		copy(headersBytes[position:position+len(headerBytes)], headerBytes)
-		position += len(headerBytes)
-	}
-	return headersBytes
-}
-
-func getBytesFromHeader(key iggcon.HeaderKey, value iggcon.HeaderValue) []byte {
-	headerBytesLength := 4 + len(key.Value) + 1 + 4 + len(value.Value)
-	headerBytes := make([]byte, headerBytesLength)
-
-	binary.LittleEndian.PutUint32(headerBytes[:4], uint32(len(key.Value)))
-	copy(headerBytes[4:4+len(key.Value)], key.Value)
-
-	headerBytes[4+len(key.Value)] = byte(value.Kind)
-
-	binary.LittleEndian.PutUint32(headerBytes[4+len(key.Value)+1:4+len(key.Value)+1+4], uint32(len(value.Value)))
-	copy(headerBytes[4+len(key.Value)+1+4:], value.Value)
-
-	return headerBytes
 }

@@ -28,13 +28,13 @@ import (
 const MessageHeaderSize = 8 + 16 + 8 + 8 + 8 + 4 + 4
 
 type MessageHeader struct {
-	Checksum         uint64
-	Id               uuid.UUID
-	Offset           uint64
-	Timestamp        uint64
-	OriginTimestamp  uint64
-	UserHeaderLength uint32
-	PayloadLength    uint32
+	Checksum         uint64    `json:"checksum"`
+	Id               uuid.UUID `json:"id"`
+	Offset           uint64    `json:"offset"`
+	Timestamp        uint64    `json:"timestamp"`
+	OriginTimestamp  uint64    `json:"origin_timestamp"`
+	UserHeaderLength uint32    `json:"user_header_length"`
+	PayloadLength    uint32    `json:"payload_length"`
 }
 
 func NewMessageHeader(id uuid.UUID, payloadLength uint32, userHeaderLength uint32) MessageHeader {

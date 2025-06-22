@@ -41,7 +41,7 @@ const (
 	Double  HeaderKind = 15
 )
 
-func getHeadersBytes(headers map[HeaderKey]HeaderValue) []byte {
+func GetHeadersBytes(headers map[HeaderKey]HeaderValue) []byte {
 	headersLength := 0
 	for key, header := range headers {
 		headersLength += 4 + len(key.Value) + 1 + 4 + len(header.Value)
@@ -69,4 +69,67 @@ func getBytesFromHeader(key HeaderKey, value HeaderValue) []byte {
 	copy(headerBytes[4+len(key.Value)+1+4:], value.Value)
 
 	return headerBytes
+}
+
+func DeserializeHeaders(userHeadersBytes []byte) (map[HeaderKey]HeaderValue, error) {
+	headers := make(map[HeaderKey]HeaderValue)
+	position := 0
+
+	for position < len(userHeadersBytes) {
+		if len(userHeadersBytes) <= position+4 {
+			return nil, errors.New("invalid header key length")
+		}
+
+		keyLength := binary.LittleEndian.Uint32(userHeadersBytes[position : position+4])
+		if keyLength == 0 || 255 < keyLength {
+			return nil, errors.New("key has incorrect size, must be between 1 and 255")
+		}
+		position += 4
+
+		if len(userHeadersBytes) < position+int(keyLength) {
+			return nil, errors.New("invalid header key")
+		}
+
+		key := string(userHeadersBytes[position : position+int(keyLength)])
+		position += int(keyLength)
+
+		headerKind, err := deserializeHeaderKind(userHeadersBytes, position)
+		if err != nil {
+			return nil, err
+		}
+		position++
+
+		if len(userHeadersBytes) <= position+4 {
+			return nil, errors.New("invalid header value length")
+		}
+
+		valueLength := binary.LittleEndian.Uint32(userHeadersBytes[position : position+4])
+		position += 4
+
+		if valueLength == 0 || 255 < valueLength {
+			return nil, errors.New("value has incorrect size, must be between 1 and 255")
+		}
+
+		if len(userHeadersBytes) < position+int(valueLength) {
+			return nil, errors.New("invalid header value")
+		}
+
+		value := userHeadersBytes[position : position+int(valueLength)]
+		position += int(valueLength)
+
+		headers[HeaderKey{Value: key}] = HeaderValue{
+			Kind:  headerKind,
+			Value: value,
+		}
+	}
+
+	return headers, nil
+}
+
+func deserializeHeaderKind(payload []byte, position int) (HeaderKind, error) {
+	if position >= len(payload) {
+		return 0, errors.New("invalid header kind position")
+	}
+
+	return HeaderKind(payload[position]), nil
 }
