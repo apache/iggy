@@ -109,15 +109,20 @@ func PublishMessages(messageStream MessageStream) error {
 
 	for {
 		var debugMessages []sharedDemoContracts.ISerializableMessage
-		var messages []Message
+		var messages []IggyMessage
 
 		for i := 0; i < MessageBatchCount; i++ {
 			message := messageGenerator.GenerateMessage()
 			json := message.ToBytes()
 
 			debugMessages = append(debugMessages, message)
-			messages = append(messages, Message{
-				Id:      uuid.New(),
+			messages = append(messages, IggyMessage{
+				Header: MessageHeader{
+					Id:               uuid.New(),
+					OriginTimestamp:  uint64(time.Now().UnixMicro()),
+					UserHeaderLength: 0,
+					PayloadLength:    uint32(len(json)),
+				},
 				Payload: json,
 			})
 		}
@@ -129,6 +134,7 @@ func PublishMessages(messageStream MessageStream) error {
 			Partitioning: PartitionId(Partition),
 		})
 		if err != nil {
+			fmt.Printf("%s", err)
 			return nil
 		}
 

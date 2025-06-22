@@ -28,6 +28,8 @@ type TcpSendMessagesRequest struct {
 	iggcon.SendMessagesRequest
 }
 
+const indexSize = 16
+
 func (request *TcpSendMessagesRequest) Serialize(compression iggcon.IggyMessageCompression) []byte {
 	for i, message := range request.Messages {
 		switch compression {
@@ -36,94 +38,91 @@ func (request *TcpSendMessagesRequest) Serialize(compression iggcon.IggyMessageC
 				break
 			}
 			request.Messages[i].Payload = s2.Encode(nil, message.Payload)
+			message.Header.PayloadLength = uint32(len(message.Payload))
 		case iggcon.MESSAGE_COMPRESSION_S2_BETTER:
 			if len(message.Payload) < 32 {
 				break
 			}
 			request.Messages[i].Payload = s2.EncodeBetter(nil, message.Payload)
+			message.Header.PayloadLength = uint32(len(message.Payload))
 		case iggcon.MESSAGE_COMPRESSION_S2_BEST:
 			if len(message.Payload) < 32 {
 				break
 			}
 			request.Messages[i].Payload = s2.EncodeBest(nil, message.Payload)
+			message.Header.PayloadLength = uint32(len(message.Payload))
 		}
 	}
 
-	streamTopicIdLength := 2 + request.StreamId.Length + 2 + request.TopicId.Length
+	streamIdFieldSize := 2 + request.StreamId.Length
+	topicIdFieldSize := 2 + request.TopicId.Length
+	partitioningFieldSize := 2 + request.Partitioning.Length
+	metadataLenFieldSize := 4 // uint32
+	messageCount := len(request.Messages)
+	messagesCountFieldSize := 4 // uint32
+	metadataLen := streamIdFieldSize +
+		topicIdFieldSize +
+		partitioningFieldSize +
+		messagesCountFieldSize
+	indexesSize := messageCount * indexSize
 	messageBytesCount := calculateMessageBytesCount(request.Messages)
-	totalSize := streamTopicIdLength + messageBytesCount + request.Partitioning.Length + 2
+	totalSize := metadataLenFieldSize +
+		streamIdFieldSize +
+		topicIdFieldSize +
+		partitioningFieldSize +
+		messagesCountFieldSize +
+		indexesSize +
+		messageBytesCount
+
 	bytes := make([]byte, totalSize)
+
 	position := 0
+
+	//metadata
+	binary.LittleEndian.PutUint32(bytes[:4], uint32(metadataLen))
+	position = 4
 	//ids
-	copy(bytes[position:2+request.StreamId.Length], SerializeIdentifier(request.StreamId))
-	copy(bytes[position+2+request.StreamId.Length:streamTopicIdLength], SerializeIdentifier(request.TopicId))
-	position = streamTopicIdLength
+	copy(bytes[position:position+streamIdFieldSize], SerializeIdentifier(request.StreamId))
+	copy(bytes[position+streamIdFieldSize:position+streamIdFieldSize+topicIdFieldSize], SerializeIdentifier(request.TopicId))
+	position += streamIdFieldSize + topicIdFieldSize
 
 	//partitioning
-	bytes[streamTopicIdLength] = byte(request.Partitioning.Kind)
-	bytes[streamTopicIdLength+1] = byte(request.Partitioning.Length)
-	copy(bytes[streamTopicIdLength+2:streamTopicIdLength+2+request.Partitioning.Length], []byte(request.Partitioning.Value))
-	position = streamTopicIdLength + 2 + request.Partitioning.Length
+	bytes[position] = byte(request.Partitioning.Kind)
+	bytes[position+1] = byte(request.Partitioning.Length)
+	copy(bytes[position+2:position+partitioningFieldSize], []byte(request.Partitioning.Value))
+	position += partitioningFieldSize
+	binary.LittleEndian.PutUint32(bytes[position:position+4], uint32(messageCount))
+	position += 4
 
-	emptyHeaders := make([]byte, 4)
+	currentIndexPosition := position
+	for i := 0; i < indexesSize; i++ {
+		bytes[position+i] = 0
+	}
+	position += indexesSize
 
+	msgSize := uint32(0)
 	for _, message := range request.Messages {
-		copy(bytes[position:position+16], message.Id[:])
-		if message.Headers != nil {
-			headersBytes := getHeadersBytes(message.Headers)
-			binary.LittleEndian.PutUint32(bytes[position+16:position+20], uint32(len(headersBytes)))
-			copy(bytes[position+20:position+20+len(headersBytes)], headersBytes)
-			position += len(headersBytes) + 20
-		} else {
-			copy(bytes[position+16:position+16+len(emptyHeaders)], emptyHeaders)
-			position += 20
-		}
+		copy(bytes[position:position+iggcon.MessageHeaderSize], message.Header.ToBytes())
+		copy(bytes[position+iggcon.MessageHeaderSize:position+iggcon.MessageHeaderSize+int(message.Header.PayloadLength)], message.Payload)
+		position += iggcon.MessageHeaderSize + int(message.Header.PayloadLength)
+		copy(bytes[position:position+int(message.Header.UserHeaderLength)], message.UserHeaders)
+		position += int(message.Header.UserHeaderLength)
 
-		binary.LittleEndian.PutUint32(bytes[position:position+4], uint32(len(message.Payload)))
-		copy(bytes[position+4:position+4+len(message.Payload)], message.Payload)
-		position += len(message.Payload) + 4
+		msgSize += iggcon.MessageHeaderSize + message.Header.PayloadLength + message.Header.UserHeaderLength
+
+		binary.LittleEndian.PutUint32(bytes[currentIndexPosition:currentIndexPosition+4], 0)
+		binary.LittleEndian.PutUint32(bytes[currentIndexPosition+4:currentIndexPosition+8], uint32(msgSize))
+		binary.LittleEndian.PutUint32(bytes[currentIndexPosition+8:currentIndexPosition+12], 0)
+		currentIndexPosition += indexSize
 	}
 
 	return bytes
 }
 
-func calculateMessageBytesCount(messages []iggcon.Message) int {
+func calculateMessageBytesCount(messages []iggcon.IggyMessage) int {
 	count := 0
 	for _, msg := range messages {
-		count += 16 + 4 + len(msg.Payload) + 4
-		for key, header := range msg.Headers {
-			count += 4 + len(key.Value) + 1 + 4 + len(header.Value)
-		}
+		count += iggcon.MessageHeaderSize + len(msg.Payload) + len(msg.UserHeaders)
 	}
 	return count
-}
-
-func getHeadersBytes(headers map[iggcon.HeaderKey]iggcon.HeaderValue) []byte {
-	headersLength := 0
-	for key, header := range headers {
-		headersLength += 4 + len(key.Value) + 1 + 4 + len(header.Value)
-	}
-	headersBytes := make([]byte, headersLength)
-	position := 0
-	for key, value := range headers {
-		headerBytes := getBytesFromHeader(key, value)
-		copy(headersBytes[position:position+len(headerBytes)], headerBytes)
-		position += len(headerBytes)
-	}
-	return headersBytes
-}
-
-func getBytesFromHeader(key iggcon.HeaderKey, value iggcon.HeaderValue) []byte {
-	headerBytesLength := 4 + len(key.Value) + 1 + 4 + len(value.Value)
-	headerBytes := make([]byte, headerBytesLength)
-
-	binary.LittleEndian.PutUint32(headerBytes[:4], uint32(len(key.Value)))
-	copy(headerBytes[4:4+len(key.Value)], key.Value)
-
-	headerBytes[4+len(key.Value)] = byte(value.Kind)
-
-	binary.LittleEndian.PutUint32(headerBytes[4+len(key.Value)+1:4+len(key.Value)+1+4], uint32(len(value.Value)))
-	copy(headerBytes[4+len(key.Value)+1+4:], value.Value)
-
-	return headerBytes
 }

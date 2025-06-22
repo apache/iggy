@@ -19,6 +19,7 @@ package binaryserialization
 
 import (
 	"encoding/binary"
+
 	iggcon "github.com/iggy-rs/iggy-go-client/contracts"
 )
 

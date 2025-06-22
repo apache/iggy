@@ -23,9 +23,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/google/uuid"
 	. "github.com/iggy-rs/iggy-go-client/contracts"
-	iggcon "github.com/iggy-rs/iggy-go-client/contracts"
 	ierror "github.com/iggy-rs/iggy-go-client/errors"
 	"github.com/klauspost/compress/s2"
 )
@@ -114,44 +112,42 @@ func DeserializeFetchMessagesResponse(payload []byte, compression IggyMessageCom
 		return &FetchMessagesResponse{
 			PartitionId:   0,
 			CurrentOffset: 0,
-			Messages:      make([]MessageResponse, 0),
+			Messages:      make([]IggyMessage, 0),
 		}, nil
 	}
 
-	propertiesSize := 45
 	length := len(payload)
-	partitionId := int(binary.LittleEndian.Uint32(payload[0:4]))
+	partitionId := binary.LittleEndian.Uint32(payload[0:4])
 	currentOffset := binary.LittleEndian.Uint64(payload[4:12])
-	messagesCount := int(binary.LittleEndian.Uint32(payload[12:16]))
+	messagesCount := binary.LittleEndian.Uint32(payload[12:16])
 	position := 16
-	var messages = make([]MessageResponse, 0)
+	var messages = make([]IggyMessage, 0)
 	for position < length {
-		offset := binary.LittleEndian.Uint64(payload[position : position+8])
-		state, err := mapMessageState(payload[position+8])
-		timestamp := binary.LittleEndian.Uint64(payload[position+9 : position+17])
-		id, err := uuid.FromBytes(payload[position+17 : position+33])
-		checksum := binary.LittleEndian.Uint32(payload[position+33 : position+37])
-		headersLength := int(binary.LittleEndian.Uint32(payload[position+37 : position+41]))
-		headers, err := deserializeHeaders(payload[position+41 : position+41+headersLength])
+		if position+MessageHeaderSize >= length {
+			// body needs to be at least 1 byte
+			break
+		}
+		header, err := MessageHeaderFromBytes(payload[position : position+MessageHeaderSize])
 		if err != nil {
 			return nil, err
 		}
-		position += headersLength
-		messageLength := binary.LittleEndian.Uint32(payload[position+41 : position+45])
-
-		payloadRangeStart := position + propertiesSize
-		payloadRangeEnd := payloadRangeStart + int(messageLength)
-		if payloadRangeStart > length || payloadRangeEnd > length {
+		position += MessageHeaderSize
+		payload_end := position + int(header.PayloadLength)
+		if int(payload_end) > length {
 			break
 		}
+		payloadSlice := payload[position:payload_end]
+		position = int(payload_end)
 
-		payloadSlice := payload[payloadRangeStart:payloadRangeEnd]
-		totalSize := propertiesSize + int(messageLength)
-		position += totalSize
+		var user_headers []byte = nil
+		if header.UserHeaderLength > 0 {
+			user_headers = payload[position : position+int(header.UserHeaderLength)]
+		}
+		position += int(header.UserHeaderLength)
 
 		switch compression {
-		case iggcon.MESSAGE_COMPRESSION_S2, iggcon.MESSAGE_COMPRESSION_S2_BETTER, iggcon.MESSAGE_COMPRESSION_S2_BEST:
-			if messageLength < 32 {
+		case MESSAGE_COMPRESSION_S2, MESSAGE_COMPRESSION_S2_BETTER, MESSAGE_COMPRESSION_S2_BEST:
+			if length < 32 {
 				break
 			}
 			payloadSlice, err = s2.Decode(nil, payloadSlice)
@@ -160,19 +156,11 @@ func DeserializeFetchMessagesResponse(payload []byte, compression IggyMessageCom
 			}
 		}
 
-		messages = append(messages, MessageResponse{
-			Id:        id,
-			Payload:   payloadSlice,
-			Offset:    offset,
-			Timestamp: timestamp,
-			Checksum:  checksum,
-			State:     state,
-			Headers:   headers,
+		messages = append(messages, IggyMessage{
+			Header:      *header,
+			Payload:     payloadSlice,
+			UserHeaders: user_headers,
 		})
-
-		if position+propertiesSize >= length {
-			break
-		}
 	}
 
 	// !TODO: Add message offset ordering
@@ -182,84 +170,6 @@ func DeserializeFetchMessagesResponse(payload []byte, compression IggyMessageCom
 		Messages:      messages,
 		MessageCount:  messagesCount,
 	}, nil
-}
-
-func mapMessageState(state byte) (MessageState, error) {
-	switch state {
-	case 1:
-		return MessageStateAvailable, nil
-	case 10:
-		return MessageStateUnavailable, nil
-	case 20:
-		return MessageStatePoisoned, nil
-	case 30:
-		return MessageStateMarkedForDeletion, nil
-	default:
-		return 0, errors.New("Invalid message state")
-	}
-}
-
-func deserializeHeaders(payload []byte) (map[HeaderKey]HeaderValue, error) {
-	headers := make(map[HeaderKey]HeaderValue)
-	position := 0
-
-	for position < len(payload) {
-		if len(payload) <= position+4 {
-			return nil, errors.New("Invalid header key length")
-		}
-
-		keyLength := binary.LittleEndian.Uint32(payload[position : position+4])
-		if keyLength == 0 || 255 < keyLength {
-			return nil, errors.New("Key has incorrect size, must be between 1 and 255")
-		}
-		position += 4
-
-		if len(payload) < position+int(keyLength) {
-			return nil, errors.New("Invalid header key")
-		}
-
-		key := string(payload[position : position+int(keyLength)])
-		position += int(keyLength)
-
-		headerKind, err := deserializeHeaderKind(payload, position)
-		if err != nil {
-			return nil, err
-		}
-		position++
-
-		if len(payload) <= position+4 {
-			return nil, errors.New("Invalid header value length")
-		}
-
-		valueLength := binary.LittleEndian.Uint32(payload[position : position+4])
-		position += 4
-
-		if valueLength == 0 || 255 < valueLength {
-			return nil, errors.New("Value has incorrect size, must be between 1 and 255")
-		}
-
-		if len(payload) < position+int(valueLength) {
-			return nil, errors.New("Invalid header value")
-		}
-
-		value := payload[position : position+int(valueLength)]
-		position += int(valueLength)
-
-		headers[HeaderKey{Value: key}] = HeaderValue{
-			Kind:  headerKind,
-			Value: value,
-		}
-	}
-
-	return headers, nil
-}
-
-func deserializeHeaderKind(payload []byte, position int) (HeaderKind, error) {
-	if position >= len(payload) {
-		return 0, errors.New("Invalid header kind position")
-	}
-
-	return HeaderKind(payload[position]), nil
 }
 
 func DeserializeTopics(payload []byte) ([]TopicResponse, error) {
@@ -383,7 +293,7 @@ func DeserializeToConsumerGroup(payload []byte, position int) (*ConsumerGroupRes
 
 func DeserializeUsers(payload []byte) ([]*UserResponse, error) {
 	if len(payload) == 0 {
-		return nil, errors.New("Empty payload")
+		return nil, errors.New("empty payload")
 	}
 
 	var result []*UserResponse

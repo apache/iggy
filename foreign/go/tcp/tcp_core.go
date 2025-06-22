@@ -135,6 +135,7 @@ func (tms *IggyTcpClient) sendAndFetchResponse(message []byte, command CommandCo
 			responseCode == 51 ||
 			responseCode == 5001 ||
 			responseCode == 5004 {
+			// do nothing
 		} else {
 			return nil, ierror.MapFromCode(responseCode)
 		}

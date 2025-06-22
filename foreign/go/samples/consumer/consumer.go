@@ -138,11 +138,11 @@ func ConsumeMessages(messageStream MessageStream) error {
 	}
 }
 
-func HandleMessage(messageResponse MessageResponse) error {
-	length := (len(messageResponse.Payload) * 3) / 4
+func HandleMessage(iggyMessage IggyMessage) error {
+	length := (len(iggyMessage.Payload) * 3) / 4
 	bytes := make([]byte, length)
 
-	str := string(messageResponse.Payload)
+	str := string(iggyMessage.Payload)
 	isBase64 := false
 
 	if _, err := base64.StdEncoding.Decode(bytes, []byte(str)); err == nil {
@@ -162,12 +162,12 @@ func HandleMessage(messageResponse MessageResponse) error {
 			return err
 		}
 	} else {
-		if err := json.Unmarshal([]byte(messageResponse.Payload), &envelope); err != nil {
+		if err := json.Unmarshal([]byte(iggyMessage.Payload), &envelope); err != nil {
 			return err
 		}
 	}
 
-	fmt.Printf("Handling message type: %s at offset: %d with message Id: %s ", envelope.MessageType, messageResponse.Offset, messageResponse.Id)
+	fmt.Printf("Handling message type: %s at offset: %d with message Id: %s ", envelope.MessageType, iggyMessage.Header.Offset, iggyMessage.Header.Id)
 
 	switch envelope.MessageType {
 	case "order_created":

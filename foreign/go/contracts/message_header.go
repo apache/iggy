@@ -17,40 +17,70 @@
 
 package iggcon
 
-import "errors"
+import (
+	"encoding/binary"
+	"errors"
+	"time"
 
-type HeaderValue struct {
-	Kind  HeaderKind
-	Value []byte
-}
-
-type HeaderKey struct {
-	Value string
-}
-
-func NewHeaderKey(val string) (HeaderKey, error) {
-	if len(val) == 0 || len(val) > 255 {
-		return HeaderKey{}, errors.New("Value has incorrect size, must be between 1 and 255")
-	}
-	return HeaderKey{Value: val}, nil
-}
-
-type HeaderKind int
-
-const (
-	Raw     HeaderKind = 1
-	String  HeaderKind = 2
-	Bool    HeaderKind = 3
-	Int8    HeaderKind = 4
-	Int16   HeaderKind = 5
-	Int32   HeaderKind = 6
-	Int64   HeaderKind = 7
-	Int128  HeaderKind = 8
-	Uint8   HeaderKind = 9
-	Uint16  HeaderKind = 10
-	Uint32  HeaderKind = 11
-	Uint64  HeaderKind = 12
-	Uint128 HeaderKind = 13
-	Float   HeaderKind = 14
-	Double  HeaderKind = 15
+	"github.com/google/uuid"
 )
+
+const MessageHeaderSize = 8 + 16 + 8 + 8 + 8 + 4 + 4
+
+type MessageHeader struct {
+	Checksum         uint64    `json:"checksum"`
+	Id               uuid.UUID `json:"id"`
+	Offset           uint64    `json:"offset"`
+	Timestamp        uint64    `json:"timestamp"`
+	OriginTimestamp  uint64    `json:"origin_timestamp"`
+	UserHeaderLength uint32    `json:"user_header_length"`
+	PayloadLength    uint32    `json:"payload_length"`
+}
+
+func NewMessageHeader(id uuid.UUID, payloadLength uint32, userHeaderLength uint32) MessageHeader {
+	return MessageHeader{
+		Id:               id,
+		OriginTimestamp:  uint64(time.Now().UnixMicro()),
+		PayloadLength:    payloadLength,
+		UserHeaderLength: userHeaderLength,
+	}
+}
+
+func MessageHeaderFromBytes(data []byte) (*MessageHeader, error) {
+
+	if len(data) != MessageHeaderSize {
+		return nil, errors.New("data has incorrect size, must be 56")
+	}
+	checksum := binary.LittleEndian.Uint64(data[0:8])
+	id, _ := uuid.FromBytes(data[8:24])
+	timestamp := binary.LittleEndian.Uint64(data[24:32])
+	origin_timestamp := binary.LittleEndian.Uint64(data[32:40])
+	offset := binary.LittleEndian.Uint64(data[40:48])
+	user_header_length := binary.LittleEndian.Uint32(data[48:52])
+	payload_length := binary.LittleEndian.Uint32(data[52:56])
+
+	return &MessageHeader{
+		Checksum:         checksum,
+		Id:               id,
+		Offset:           offset,
+		Timestamp:        timestamp,
+		OriginTimestamp:  origin_timestamp,
+		UserHeaderLength: user_header_length,
+		PayloadLength:    payload_length,
+	}, nil
+}
+
+func (mh *MessageHeader) ToBytes() []byte {
+	bytes := make([]byte, 0, MessageHeaderSize)
+
+	bytes = binary.LittleEndian.AppendUint64(bytes, mh.Checksum)
+	idBytes, _ := uuid.UUID.MarshalBinary(mh.Id)
+	bytes = append(bytes, idBytes...)
+	bytes = binary.LittleEndian.AppendUint64(bytes, mh.Offset)
+	bytes = binary.LittleEndian.AppendUint64(bytes, mh.Timestamp)
+	bytes = binary.LittleEndian.AppendUint64(bytes, mh.OriginTimestamp)
+	bytes = binary.LittleEndian.AppendUint32(bytes, mh.UserHeaderLength)
+	bytes = binary.LittleEndian.AppendUint32(bytes, mh.PayloadLength)
+
+	return bytes
+}
