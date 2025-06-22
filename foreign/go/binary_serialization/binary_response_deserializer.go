@@ -24,7 +24,6 @@ import (
 	"time"
 
 	. "github.com/iggy-rs/iggy-go-client/contracts"
-	iggcon "github.com/iggy-rs/iggy-go-client/contracts"
 	ierror "github.com/iggy-rs/iggy-go-client/errors"
 	"github.com/klauspost/compress/s2"
 )
@@ -129,6 +128,9 @@ func DeserializeFetchMessagesResponse(payload []byte, compression IggyMessageCom
 			break
 		}
 		header, err := MessageHeaderFromBytes(payload[position : position+MessageHeaderSize])
+		if err != nil {
+			return nil, err
+		}
 		position += MessageHeaderSize
 		payload_end := position + int(header.PayloadLength)
 		if int(payload_end) > length {
@@ -144,7 +146,7 @@ func DeserializeFetchMessagesResponse(payload []byte, compression IggyMessageCom
 		position += int(header.UserHeaderLength)
 
 		switch compression {
-		case iggcon.MESSAGE_COMPRESSION_S2, iggcon.MESSAGE_COMPRESSION_S2_BETTER, iggcon.MESSAGE_COMPRESSION_S2_BEST:
+		case MESSAGE_COMPRESSION_S2, MESSAGE_COMPRESSION_S2_BETTER, MESSAGE_COMPRESSION_S2_BEST:
 			if length < 32 {
 				break
 			}
@@ -168,21 +170,6 @@ func DeserializeFetchMessagesResponse(payload []byte, compression IggyMessageCom
 		Messages:      messages,
 		MessageCount:  messagesCount,
 	}, nil
-}
-
-func mapMessageState(state byte) (MessageState, error) {
-	switch state {
-	case 1:
-		return MessageStateAvailable, nil
-	case 10:
-		return MessageStateUnavailable, nil
-	case 20:
-		return MessageStatePoisoned, nil
-	case 30:
-		return MessageStateMarkedForDeletion, nil
-	default:
-		return 0, errors.New("Invalid message state")
-	}
 }
 
 func DeserializeTopics(payload []byte) ([]TopicResponse, error) {
@@ -306,7 +293,7 @@ func DeserializeToConsumerGroup(payload []byte, position int) (*ConsumerGroupRes
 
 func DeserializeUsers(payload []byte) ([]*UserResponse, error) {
 	if len(payload) == 0 {
-		return nil, errors.New("Empty payload")
+		return nil, errors.New("empty payload")
 	}
 
 	var result []*UserResponse
