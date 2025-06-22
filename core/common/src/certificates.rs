@@ -16,12 +16,16 @@
  * under the License.
  */
 
-pub mod common;
-pub mod defaults;
-pub mod kind;
-pub mod kinds;
-pub mod transport;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-mod examples;
-mod output;
-mod props;
+/// Generates a self-signed certificate for the given domain.
+/// Returns a tuple of (certificate chain, private key).
+pub fn generate_self_signed_certificate(
+    domain: &str,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), Box<dyn std::error::Error>> {
+    let cert = rcgen::generate_simple_self_signed(vec![domain.to_string()])?;
+    let cert_der = cert.cert.der();
+    let key_der = cert.key_pair.serialize_der();
+    let key = PrivateKeyDer::try_from(key_der)?;
+    Ok((vec![cert_der.clone()], key))
+}

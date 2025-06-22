@@ -93,6 +93,41 @@ async fn tcp_tls_scenario_should_be_valid() {
     tcp_tls_scenario::run(&client).await;
 }
 
+#[tokio::test]
+#[parallel]
+async fn tcp_tls_self_signed_scenario_should_be_valid() {
+    use iggy::clients::client_builder::IggyClientBuilder;
+
+    let mut extra_envs = HashMap::new();
+    extra_envs.insert("IGGY_TCP_TLS_ENABLED".to_string(), "true".to_string());
+    extra_envs.insert("IGGY_TCP_TLS_SELF_SIGNED".to_string(), "true".to_string());
+
+    let mut test_server = TestServer::new(Some(extra_envs), true, None, IpAddrKind::V4);
+    test_server.start();
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+    let server_addr = test_server.get_raw_tcp_addr().unwrap();
+
+    let client = IggyClientBuilder::new()
+        .with_tcp()
+        .with_server_address(server_addr)
+        .with_tls_enabled(true)
+        .with_tls_domain("localhost".to_string())
+        .with_tls_validate_certificate(false)
+        .build()
+        .expect("Failed to create TLS client");
+
+    client
+        .connect()
+        .await
+        .expect("Failed to connect TLS client with self-signed cert");
+
+    let client = iggy::clients::client::IggyClient::create(Box::new(client), None, None);
+
+    tcp_tls_scenario::run(&client).await;
+}
+
 // Message size scenario is specific to TCP transport to test the behavior around the maximum message size.
 // When run on other transports, it will fail because both QUIC and HTTP have different message size limits.
 #[tokio::test]

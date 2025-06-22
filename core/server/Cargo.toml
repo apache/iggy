@@ -88,7 +88,6 @@ opentelemetry_sdk = { version = "0.30.0", features = [
 ] }
 prometheus-client = "0.23.1"
 quinn = { workspace = true }
-rcgen = "0.13.2"
 reqwest = { workspace = true, features = ["rustls-tls-no-provider"] }
 ring = "0.17.14"
 rust-s3 = { workspace = true }

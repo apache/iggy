@@ -97,16 +97,11 @@ fn configure_quic(config: QuicConfig) -> Result<quinn::ServerConfig, QuicError> 
 
 fn generate_self_signed_cert<'a>() -> Result<(Vec<CertificateDer<'a>>, PrivateKeyDer<'a>), QuicError>
 {
-    let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-    let certificate_der = certificate.cert.der();
-    let private_key = certificate.key_pair.serialize_der();
-    let private_key = PrivateKeyDer::try_from(private_key)
+    iggy_common::generate_self_signed_certificate("localhost")
         .with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to parse private key")
+            format!("{COMPONENT} (error: {error}) - failed to generate self-signed certificate")
         })
-        .map_err(|_| QuicError::CertGenerationError)?;
-    let cert_chain = vec![certificate_der.clone()];
-    Ok((cert_chain, private_key))
+        .map_err(|_| QuicError::CertGenerationError)
 }
 
 fn load_certificates(

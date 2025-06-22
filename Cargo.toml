@@ -157,8 +157,8 @@ tower-http = { version = "0.6.6", features = [
     "trace",
 ] }
 trait-variant = "0.1.2"
-webpki-roots = "1.0.0"
-zip = "4.1.0"
+webpki-roots = "1.0.1"
+zip = "4.2.0"
 
 # Optional dependencies
 mimalloc = "0.1"

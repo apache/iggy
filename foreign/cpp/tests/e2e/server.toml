@@ -104,10 +104,10 @@ endpoint = "/metrics"
 enabled = false
 
 # Path to the TLS certificate file.
-cert_file = "certs/iggy_cert.pem"
+cert_file = "core/certs/iggy_cert.pem"
 
 # Path to the TLS key file.
-key_file = "certs/iggy_key.pem"
+key_file = "core/certs/iggy_key.pem"
 
 # TCP server configuration.
 [tcp]
@@ -173,10 +173,10 @@ max_idle_timeout = "10 s"
 self_signed = true
 
 # Path to the QUIC TLS certificate file.
-cert_file = "certs/iggy_cert.pem"
+cert_file = "core/certs/iggy_cert.pem"
 
 # Path to the QUIC TLS key file.
-key_file = "certs/iggy_key.pem"
+key_file = "core/certs/iggy_key.pem"
 
 # Message cleaner configuration.
 [message_cleaner]
