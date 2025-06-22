@@ -1,2 +1,3 @@
 # Tests
-Use ginkgo to run tests e2e tests
+
+Use ginkgo to run e2e tests.
