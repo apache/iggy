@@ -15,92 +15,91 @@
 # specific language governing permissions and limitations
 # under the License.
 
+"""
+Test configuration and fixtures for the Python SDK test suite.
+
+This module provides pytest fixtures for setting up test environments
+and connecting to Iggy servers in various configurations.
+"""
+
+import asyncio
+import os
 import socket
-import pytest
 import time
-from typing import Generator
-from testcontainers.core.container import DockerContainer
+from typing import Generator, Optional
+
+import pytest
 
 from iggy_py import IggyClient
 
 
-@pytest.fixture(scope="session")
-def iggy_container() -> Generator[DockerContainer, None, None]:
+def get_server_config() -> tuple[str, int]:
     """
-    Creates and starts an Iggy server container using Docker.
+    Get server configuration from environment variables or defaults.
+    
+    Returns:
+        tuple: (host, port) for the Iggy server
     """
-    container = DockerContainer("iggyrs/iggy:0.4.21").with_exposed_ports(
-        8080, 3000, 8090
-    )
-    container.start()
+    host = os.environ.get("IGGY_SERVER_HOST", "127.0.0.1")
+    port = int(os.environ.get("IGGY_SERVER_TCP_PORT", "8090"))
+    
+    # Convert hostname to IP address for the Rust client
+    if host not in ("127.0.0.1", "localhost"):
+        try:
+            # Resolve hostname to IP address
+            host_ip = socket.gethostbyname(host)
+            host = host_ip
+        except socket.gaierror:
+            # If resolution fails, keep the original host
+            pass
+    elif host == "localhost":
+        host = "127.0.0.1"
+    
+    return host, port
 
-    yield container
 
-    container.stop()
-
-
-@pytest.fixture(scope="session")
-async def iggy_client(iggy_container: DockerContainer) -> IggyClient:
+def wait_for_server(host: str, port: int, timeout: int = 60, interval: int = 2) -> None:
     """
-    Initializes and returns an Iggy client connected to the running Iggy server container.
-
-    This fixture ensures that the client is authenticated and ready for use in tests.
-
-    :param iggy_container: The running Iggy container fixture.
-    :return: An instance of IggyClient connected to the server.
-    """
-    host = iggy_container.get_container_host_ip()
-    port = iggy_container.get_exposed_port(8090)
-    wait_for_container(port, host, timeout=30, interval=5)
-
-    client = IggyClient(f"{host}:{port}")
-
-    await client.connect()
-
-    await wait_for_ping(client, timeout=30, interval=5)
-
-    await client.login_user("iggy", "iggy")
-    return client
-
-
-def wait_for_container(port: int, host: str, timeout: int, interval: int) -> None:
-    """
-    Waits for a container to become alive by polling a specified port.
-
-    :param port: The port number to poll.
-    :param host: The hostname or IP address of the container (default is 'localhost').
-    :param timeout: The maximum time in seconds to wait for the container to become available (default is 30).
-    :param interval: The time in seconds between each polling attempt (default is 2).
+    Wait for the server to become available.
+    
+    Args:
+        host: Server hostname or IP
+        port: Server port
+        timeout: Maximum time to wait in seconds
+        interval: Time between connection attempts in seconds
+        
+    Raises:
+        TimeoutError: If server doesn't become available within timeout
     """
     start_time = time.time()
-
+    
     while True:
         try:
             with socket.create_connection((host, port), timeout=interval):
                 return
-        except (socket.timeout, ConnectionRefusedError):
+        except (socket.timeout, ConnectionRefusedError, OSError):
             elapsed_time = time.time() - start_time
             if elapsed_time >= timeout:
                 raise TimeoutError(
-                    f"Timed out after {timeout} seconds waiting for container to become available at {host}:{port}"
+                    f"Server not available at {host}:{port} after {timeout}s"
                 )
-
             time.sleep(interval)
 
 
-async def wait_for_ping(
-    client: IggyClient, timeout: int = 30, interval: int = 5
-) -> None:
+async def wait_for_ping(client: IggyClient, timeout: int = 30, interval: int = 2) -> None:
     """
-    Waits for the Iggy server to respond to ping requests before proceeding.
-
-    :param client: The Iggy client instance.
-    :param timeout: The maximum time in seconds to wait for the server to respond.
-    :param interval: The time in seconds between each ping attempt.
-    :raises TimeoutError: If the server does not respond within the timeout period.
+    Wait for the server to respond to ping requests.
+    
+    Args:
+        client: Iggy client instance
+        timeout: Maximum time to wait in seconds
+        interval: Time between ping attempts in seconds
+        
+    Raises:
+        TimeoutError: If server doesn't respond to ping within timeout
     """
     start_time = time.time()
-
+    
     while True:
         try:
             await client.ping()
@@ -109,7 +108,68 @@ async def wait_for_ping(
             elapsed_time = time.time() - start_time
             if elapsed_time >= timeout:
                 raise TimeoutError(
-                    f"Timed out after {timeout} seconds waiting for Iggy server to respond to ping."
+                    f"Server not responding to ping after {timeout}s"
                 )
+            await asyncio.sleep(interval)
 
-            time.sleep(interval)
+
+@pytest.fixture(scope="session")
+async def iggy_client() -> IggyClient:
+    """
+    Create and configure an Iggy client for testing.
+    
+    This fixture:
+    1. Gets server configuration from environment
+    2. Waits for server to be available
+    3. Creates and connects the client
+    4. Authenticates with default credentials
+    5. Verifies connectivity with ping
+    
+    Returns:
+        IggyClient: Authenticated client ready for testing
+    """
+    host, port = get_server_config()
+    
+    # Wait for server to be ready
+    wait_for_server(host, port)
+    
+    # Create and connect client
+    client = IggyClient(f"{host}:{port}")
+    await client.connect()
+    
+    # Wait for server to be fully ready
+    await wait_for_ping(client)
+    
+    # Authenticate
+    await client.login_user("iggy", "iggy")
+    
+    return client
+
+
+@pytest.fixture(scope="session", autouse=True)
+def configure_asyncio():
+    """Configure asyncio settings for tests."""
+    # Set event loop policy if needed
+    if os.name == 'nt':  # Windows
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+
+# Pytest configuration
+def pytest_configure(config):
+    """Configure pytest with custom markers."""
+    config.addinivalue_line(
+        "markers", 
+        "integration: marks tests as integration tests (may be slow)"
+    )
+    config.addinivalue_line(
+        "markers",
+        "unit: marks tests as unit tests (fast)"
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """Modify test collection to add markers automatically."""
+    for item in items:
+        # Mark all tests in test_iggy_sdk.py as integration tests
+        if "test_iggy_sdk" in item.nodeid:
+            item.add_marker(pytest.mark.integration)

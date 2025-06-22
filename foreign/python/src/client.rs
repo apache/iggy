@@ -19,22 +19,15 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use iggy::client::{Client, MessageClient, StreamClient, UserClient};
-use iggy::client::{SystemClient, TopicClient};
-use iggy::clients::builder::IggyClientBuilder;
-use iggy::clients::client::IggyClient as RustIggyClient;
-use iggy::compression::compression_algorithm::CompressionAlgorithm;
-use iggy::consumer::Consumer as RustConsumer;
-use iggy::identifier::Identifier;
-use iggy::messages::poll_messages::PollingStrategy as RustPollingStrategy;
-use iggy::messages::send_messages::{Message as RustMessage, Partitioning};
-use iggy::utils::expiry::IggyExpiry;
-use iggy::utils::topic_size::MaxTopicSize;
+use iggy::prelude::{
+    Consumer as RustConsumer, IggyClient as RustIggyClient, IggyMessage as RustMessage,
+    PollingStrategy as RustPollingStrategy, *,
+};
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 use pyo3_async_runtimes::tokio::future_into_py;
-use pyo3_stub_gen::{define_stub_info_gatherer, impl_stub_type};
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
+use pyo3_stub_gen::{define_stub_info_gatherer, impl_stub_type};
 
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
 use crate::send_message::SendMessage;

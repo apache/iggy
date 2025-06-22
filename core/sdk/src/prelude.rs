@@ -58,9 +58,9 @@ pub use iggy_common::{
     IggyTimestamp, MaxTopicSize, Partition, Partitioner, Partitioning, Permissions,
     PersonalAccessTokenExpiry, PollMessages, PolledMessages, PollingKind, PollingStrategy,
     QuicClientConfig, QuicClientConfigBuilder, QuicClientReconnectionConfig, SendMessages,
-    Sizeable, SnapshotCompression, Stats, Stream, StreamPermissions, SystemSnapshotType,
-    TcpClientConfig, TcpClientConfigBuilder, TcpClientReconnectionConfig, Topic, TopicPermissions,
-    UserId, UserStatus, Validatable, defaults, locking,
+    Sizeable, SnapshotCompression, Stats, Stream, StreamDetails, StreamPermissions,
+    SystemSnapshotType, TcpClientConfig, TcpClientConfigBuilder, TcpClientReconnectionConfig,
+    Topic, TopicDetails, TopicPermissions, UserId, UserStatus, Validatable, defaults, locking,
 };
 pub use iggy_common::{
     IGGY_MESSAGE_CHECKSUM_OFFSET_RANGE, IGGY_MESSAGE_HEADER_SIZE,
