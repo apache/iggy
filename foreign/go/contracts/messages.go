@@ -38,25 +38,6 @@ type FetchMessagesResponse struct {
 	Messages      []IggyMessage
 }
 
-type MessageResponse struct {
-	Offset    uint64                    `json:"offset"`
-	Timestamp uint64                    `json:"timestamp"`
-	Checksum  uint32                    `json:"checksum"`
-	Id        uuid.UUID                 `json:"id"`
-	Payload   []byte                    `json:"payload"`
-	Headers   map[HeaderKey]HeaderValue `json:"headers,omitempty"`
-	State     MessageState              `json:"state"`
-}
-
-type MessageState int
-
-const (
-	MessageStateAvailable MessageState = iota
-	MessageStateUnavailable
-	MessageStatePoisoned
-	MessageStateMarkedForDeletion
-)
-
 type SendMessagesRequest struct {
 	StreamId     Identifier    `json:"streamId"`
 	TopicId      Identifier    `json:"topicId"`

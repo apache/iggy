@@ -53,7 +53,7 @@ func itShouldSuccessfullyPublishMessages(streamId int, topicId int, messages []i
 			Kind: iggcon.ConsumerSingle,
 			Id:   iggcon.NewIdentifier(int(createRandomUInt32())),
 		},
-		PollingStrategy: iggcon.LastPollingStrategy(),
+		PollingStrategy: iggcon.FirstPollingStrategy(),
 		Count:           len(messages),
 		AutoCommit:      true,
 	})
