@@ -20,9 +20,12 @@
 set -euo pipefail
 
 # Script to run Rust examples from README.md and examples/rust/README.md files
-# Usage: ./scripts/run-rust-examples-from-readme.sh
+# Usage: ./scripts/run-rust-examples-from-readme.sh [TARGET]
 #
-# This script will run all the commands from both README.md and examples/rust/README.md files 
+# TARGET - Optional target architecture (e.g., x86_64-unknown-linux-musl)
+#          If not provided, uses the default target
+#
+# This script will run all the commands from both README.md and examples/rust/README.md files
 # and check if they pass or fail.
 # If any command fails, it will print the command and exit with non-zero status.
 # If all commands pass, it will remove the log file and exit with zero status.
@@ -31,13 +34,21 @@ set -euo pipefail
 #       It will wait until the server is started before running the commands.
 #       It will also terminate the server after running all the commands.
 #       Script executes every command in README files which is enclosed in backticks (`) and starts
-#       with `cargo r --bin iggy -- ` or `cargo run --example`. Other commands are ignored. 
+#       with `cargo r --bin iggy -- ` or `cargo run --example`. Other commands are ignored.
 #       Order of commands in README files is important as script will execute them from top to bottom.
 #
 
 readonly LOG_FILE="iggy-server.log"
 readonly PID_FILE="iggy-server.pid"
 readonly TIMEOUT=300
+
+# Get target architecture from argument or use default
+TARGET="${1:-}"
+if [ -n "${TARGET}" ]; then
+    echo "Using target architecture: ${TARGET}"
+else
+    echo "Using default target architecture"
+fi
 
 # Remove old server data if present
 test -d local_data && rm -fr local_data
@@ -46,10 +57,18 @@ test -e ${PID_FILE} && rm ${PID_FILE}
 
 # Build binaries
 echo "Building binaries..."
-cargo build
+if [ -n "${TARGET}" ]; then
+    cargo build --target "${TARGET}"
+else
+    cargo build
+fi
 
 # Run iggy server and let it run in the background
-cargo run --bin iggy-server &>${LOG_FILE} &
+if [ -n "${TARGET}" ]; then
+    cargo run --target "${TARGET}" --bin iggy-server &>${LOG_FILE} &
+else
+    cargo run --bin iggy-server &>${LOG_FILE} &
+fi
 echo $! >${PID_FILE}
 
 # Wait until "Iggy server has started" string is present inside iggy-server.log
@@ -70,6 +89,10 @@ done
 while IFS= read -r command; do
     # Remove backticks from command
     command=$(echo "${command}" | tr -d '`')
+    # Add target flag if specified
+    if [ -n "${TARGET}" ]; then
+        command=$(echo "${command}" | sed "s/cargo r /cargo r --target ${TARGET} /g" | sed "s/cargo run /cargo run --target ${TARGET} /g")
+    fi
     echo -e "\e[33mChecking CLI command:\e[0m ${command}"
     echo ""
 
@@ -93,13 +116,17 @@ for readme_file in README.md examples/rust/README.md; do
     if [ ! -f "${readme_file}" ]; then
         continue
     fi
-    
+
     while IFS= read -r command; do
         # Remove backticks and comments from command
         command=$(echo "${command}" | tr -d '`' | sed 's/^#.*//')
         # Skip empty lines
         if [ -z "${command}" ]; then
             continue
+        fi
+        # Add target flag if specified
+        if [ -n "${TARGET}" ]; then
+            command="${command//cargo run /cargo run --target ${TARGET} }"
         fi
         echo -e "\e[33mChecking example command from ${readme_file}:\e[0m ${command}"
         echo ""
@@ -114,7 +141,7 @@ for readme_file in README.md examples/rust/README.md; do
             echo ""
             echo -e "\e[31mExample command failed:\e[0m ${command}"
             echo ""
-            break 2  # Break from both loops
+            break 2 # Break from both loops
         fi
         # Add a small delay between examples to avoid potential race conditions
         sleep 2

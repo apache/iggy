@@ -6,10 +6,24 @@ Apache Iggy is the persistent message streaming platform written in Rust, suppor
 
 ## Installation
 
-To install `iggy`, use pip:
+### Basic Installation
 
 ```bash
 pip install iggy-py
+```
+
+### Development Installation
+
+For testing:
+
+```bash
+pip install -e ".[testing]"
+```
+
+For development with all tools:
+
+```bash
+pip install -e ".[dev,testing,examples]"
 ```
 
 ### Supported Python Versions
@@ -21,41 +35,41 @@ pip install iggy-py
 All examples rely on a running iggy server. To start the server, execute:
 
 ```bash
-docker run --rm -p 8080:8080 -p 3000:3000 -p 8090:8090 iggyrs/iggy:0.4.21
+# Using latest version
+docker run --rm -p 8080:8080 -p 3000:3000 -p 8090:8090 apache/iggy:latest
+
+# Or build from source (recommended for development)
+cd ../../ && cargo run --bin iggy-server
 ```
 
-## Generating Stub Files
+## Testing
 
-To generate a stub file, execute the following command:
+### Quick Test
 
 ```bash
-cargo run --bin stub_gen
+# Run tests with Docker (recommended)
+docker compose -f docker-compose.test.yml up --build
 ```
 
-Refer to the python_examples directory for examples on how to use the iggy library.
+### Local Development
 
-## Running the Examples
+```bash
+# Install dependencies and build
+pip install -e ".[testing]"
+maturin develop
 
-Go to [python_examples/README.md](python_examples/README.md) for instructions on running the examples.
+# Run tests (requires iggy-server running)
+pytest tests/ -v
+```
 
-## API Reference
+## Examples
 
-For detailed documentation, visit [Apache Iggy's official Docs](https://docs.iggy.rs/).
+Refer to the [python_examples/](python_examples/) directory for usage examples.
 
 ## Contributing
 
-Contributions are welcome! Please:
-
-1. Fork the repository on GitHub.
-2. Create an issue for any bugs or features you'd like to address.
-3. Submit pull requests following our code style guidelines.
-
-For more details, see the [Developer README](CONTRIBUTING.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
 
 ## License
 
-Apache iggy is distributed under the Apache 2.0 License. See [LICENSE](LICENSE) for terms and conditions.
-
-## Contact Information
-
-For questions, suggestions, or issues, contact the developers at [your email address] or raise an issue on GitHub.
+Licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.

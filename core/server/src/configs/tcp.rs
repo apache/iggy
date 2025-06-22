@@ -33,8 +33,8 @@ pub struct TcpConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct TcpTlsConfig {
     pub enabled: bool,
-    pub certificate: String,
-    pub password: String,
+    pub cert_file: String,
+    pub key_file: String,
 }
 
 #[serde_as]

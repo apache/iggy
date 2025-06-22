@@ -21,11 +21,14 @@ use crate::configs::tcp::TcpTlsConfig;
 use crate::streaming::clients::client_manager::Transport;
 use crate::streaming::systems::system::SharedSystem;
 use crate::tcp::connection_handler::{handle_connection, handle_error};
+use rustls::ServerConfig;
+use rustls_pemfile::{certs, private_key};
+use std::io::BufReader;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::TcpSocket;
 use tokio::sync::oneshot;
-use tokio_native_tls::native_tls;
-use tokio_native_tls::native_tls::Identity;
+use tokio_rustls::{TlsAcceptor, rustls};
 use tracing::{error, info};
 
 pub(crate) async fn start(
@@ -37,44 +40,61 @@ pub(crate) async fn start(
     let address = address.to_string();
     let (tx, rx) = oneshot::channel();
     tokio::spawn(async move {
-        let certificate = std::fs::read(config.certificate.clone());
-        if certificate.is_err() {
-            panic!("Unable to read certificate file.");
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+        let cert_file_path = &config.cert_file;
+        let cert_file = std::fs::File::open(cert_file_path)
+            .unwrap_or_else(|e| panic!("Unable to open certificate file '{cert_file_path}': {e}"));
+        let mut cert_reader = BufReader::new(cert_file);
+
+        let certs: Vec<_> = certs(&mut cert_reader)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_else(|e| {
+                panic!("Unable to parse certificates from '{cert_file_path}': {e}")
+            });
+
+        if certs.is_empty() {
+            panic!("No certificates found in certificate file '{cert_file_path}'");
         }
 
-        let identity = Identity::from_pkcs12(&certificate.unwrap(), &config.password);
-        if identity.is_err() {
-            panic!("Unable to create identity from certificate.");
-        }
+        let key_file_path = &config.key_file;
+        let key_file = std::fs::File::open(key_file_path)
+            .unwrap_or_else(|e| panic!("Unable to open key file '{key_file_path}': {e}"));
+        let mut key_reader = BufReader::new(key_file);
 
-        let acceptor = tokio_native_tls::TlsAcceptor::from(
-            native_tls::TlsAcceptor::builder(identity.unwrap())
-                .build()
-                .unwrap(),
-        );
+        let key = private_key(&mut key_reader)
+            .unwrap_or_else(|e| panic!("Unable to parse private key from '{key_file_path}': {e}"))
+            .unwrap_or_else(|| panic!("No private key found in key file '{key_file_path}'"));
+
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap_or_else(|e| {
+                panic!("Unable to create TLS server config with cert '{cert_file_path}' and key '{key_file_path}': {e}")
+            });
+
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
 
         let addr = address.parse();
         if addr.is_err() {
             panic!("Unable to parse address {:?}", address);
         }
 
+        let addr = addr.unwrap();
         socket
-            .bind(addr.unwrap())
-            .expect("Unable to bind socket to address");
+            .bind(addr)
+            .unwrap_or_else(|e| panic!("Unable to bind socket to address '{addr}': {e}",));
 
         let listener = socket
             .listen(1024)
-            .expect("Unable to start TCP TLS server.");
+            .unwrap_or_else(|e| panic!("Unable to start TCP TLS server on '{address}': {e}",));
 
         let local_addr = listener
             .local_addr()
-            .expect("Failed to get local address for TCP TLS listener");
+            .unwrap_or_else(|e| panic!("Failed to get local address for TCP TLS listener: {e}",));
 
         tx.send(local_addr).unwrap_or_else(|_| {
-            panic!(
-                "Failed to send the local address {:?} for TCP TLS listener",
-                local_addr
-            )
+            panic!("Failed to send the local address '{local_addr}' for TCP TLS listener")
         });
 
         loop {
@@ -89,7 +109,9 @@ pub(crate) async fn start(
 
                     let client_id = session.client_id;
                     let acceptor = acceptor.clone();
-                    let stream = acceptor.accept(stream).await.unwrap();
+                    let stream = acceptor.accept(stream).await.unwrap_or_else(|e| {
+                        panic!("Failed to accept TLS connection from '{address}': {e}",);
+                    });
                     let system = system.clone();
                     let mut sender = SenderKind::get_tcp_tls_sender(stream);
                     tokio::spawn(async move {
