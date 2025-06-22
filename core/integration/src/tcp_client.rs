@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::test_server::ClientFactory;
+use crate::test_server::{ClientFactory, Transport};
 use async_trait::async_trait;
 use iggy::prelude::{Client, TcpClient, TcpClientConfig};
 use std::sync::Arc;
@@ -48,6 +48,14 @@ impl ClientFactory for TcpClientFactory {
             )
         });
         Box::new(client)
+    }
+
+    fn transport(&self) -> Transport {
+        Transport::Tcp
+    }
+
+    fn server_addr(&self) -> String {
+        self.server_addr.clone()
     }
 }
 

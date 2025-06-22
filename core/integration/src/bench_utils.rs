@@ -1,28 +1,23 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-mod http;
-mod quic;
-mod tcp;
-
+use crate::test_server::Transport;
 use assert_cmd::prelude::CommandCargoExt;
-use iggy::prelude::IggyByteSize;
-use integration::test_server::{TEST_VERBOSITY_ENV_VAR, Transport};
+use iggy::prelude::*;
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
@@ -38,7 +33,7 @@ const DEFAULT_NUMBER_OF_STREAMS: u64 = 8;
 
 pub fn run_bench_and_wait_for_finish(
     server_addr: &str,
-    transport: Transport,
+    transport: &Transport,
     bench: &str,
     amount_of_data_to_process: IggyByteSize,
 ) {
@@ -47,7 +42,8 @@ pub fn run_bench_and_wait_for_finish(
     let mut stderr_file_path = None;
     let mut stdout_file_path = None;
 
-    if std::env::var(TEST_VERBOSITY_ENV_VAR).is_err() {
+    let test_verbosity_env_var = "IGGY_TEST_VERBOSE";
+    if std::env::var(test_verbosity_env_var).is_err() {
         let stderr_file = get_random_path();
         let stdout_file = get_random_path();
         stderr_file_path = Some(stderr_file);
@@ -68,7 +64,7 @@ pub fn run_bench_and_wait_for_finish(
         "--message-size",
         &message_size.to_string(),
         bench,
-        &format!("{}", transport),
+        &transport.to_string(),
         "--server-address",
         server_addr,
     ]);
@@ -76,7 +72,7 @@ pub fn run_bench_and_wait_for_finish(
     // By default, all iggy-bench logs are redirected to files,
     // and dumped to stderr when test fails. With IGGY_TEST_VERBOSE=1
     // logs are dumped to stdout during test execution.
-    if std::env::var(TEST_VERBOSITY_ENV_VAR).is_ok() {
+    if std::env::var(test_verbosity_env_var).is_ok() {
         command.stdout(Stdio::inherit());
         command.stderr(Stdio::inherit());
     } else {
@@ -127,7 +123,6 @@ pub fn run_bench_and_wait_for_finish(
         panic!("Failed to get output from iggy-bench");
     }
 
-    // TODO: fix this, it needs to be called in Drop
     if panicking() {
         if let Some(stdout_file_path) = &stdout_file_path {
             eprintln!(

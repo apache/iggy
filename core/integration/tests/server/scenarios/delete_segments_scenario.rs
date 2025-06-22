@@ -27,10 +27,7 @@ const TOPIC_NAME: &str = "test_topic";
 const PARTITION_ID: u32 = 1;
 const LOG_EXTENSION: &str = "log";
 
-pub async fn test_delete_segments_scenario(
-    client_factory: &dyn ClientFactory,
-    test_server: &TestServer,
-) {
+pub async fn run(client_factory: &dyn ClientFactory, test_server: &TestServer) {
     let client = client_factory.create_client().await;
     let client = IggyClient::create(client, None, None);
 

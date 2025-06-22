@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::test_server::ClientFactory;
+use crate::test_server::{ClientFactory, Transport};
 use async_trait::async_trait;
 use iggy::prelude::{Client, QuicClientConfig};
 use iggy::quic::quick_client::QuicClient;
@@ -37,6 +37,14 @@ impl ClientFactory for QuicClientFactory {
         let client = QuicClient::create(Arc::new(config)).unwrap();
         Client::connect(&client).await.unwrap();
         Box::new(client)
+    }
+
+    fn transport(&self) -> Transport {
+        Transport::Quic
+    }
+
+    fn server_addr(&self) -> String {
+        self.server_addr.clone()
     }
 }
 

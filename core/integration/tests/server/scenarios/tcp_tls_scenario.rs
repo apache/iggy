@@ -60,6 +60,7 @@ pub async fn run(client: &IggyClient) {
             .build()
             .unwrap(),
     ];
+
     client
         .send_messages(
             &Identifier::numeric(stream_id).unwrap(),
@@ -90,5 +91,6 @@ pub async fn run(client: &IggyClient) {
         .delete_stream(&Identifier::numeric(stream_id).unwrap())
         .await
         .unwrap();
+
     assert_clean_system(client).await;
 }

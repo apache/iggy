@@ -16,14 +16,14 @@
  * under the License.
  */
 
-pub mod bench_utils;
-pub mod file;
-#[allow(deprecated)]
-pub mod http_client;
-#[allow(deprecated)]
-pub mod quic_client;
-#[allow(deprecated)]
-pub mod tcp_client;
-#[allow(deprecated)]
-pub mod test_server;
-pub mod test_tls_utils;
+use iggy::prelude::*;
+use integration::{bench_utils::run_bench_and_wait_for_finish, test_server::ClientFactory};
+
+pub async fn run(client_factory: &dyn ClientFactory) {
+    let server_addr = client_factory.server_addr();
+    let transport = client_factory.transport();
+    let data_size = IggyByteSize::from(8 * 1024 * 1024);
+
+    run_bench_and_wait_for_finish(&server_addr, &transport, "pinned-producer", data_size);
+    run_bench_and_wait_for_finish(&server_addr, &transport, "pinned-consumer", data_size);
+}
