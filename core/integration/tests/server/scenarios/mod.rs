@@ -16,13 +16,7 @@
  * under the License.
  */
 
-use iggy::clients::client::IggyClient;
-use iggy::prelude::ConsumerGroupDetails;
-use iggy::prelude::ConsumerKind;
-use iggy::prelude::Identifier;
-use iggy::prelude::{ConsumerGroupClient, StreamClient};
-use integration::test_server::{ClientFactory, delete_user};
-
+pub mod bench_scenario;
 pub mod consumer_group_join_scenario;
 pub mod consumer_group_with_multiple_clients_polling_messages_scenario;
 pub mod consumer_group_with_single_client_polling_messages_scenario;
@@ -30,11 +24,13 @@ pub mod create_message_payload;
 pub mod delete_segments_scenario;
 pub mod message_headers_scenario;
 pub mod message_size_scenario;
-pub mod server_restart_scenario;
 pub mod stream_size_validation_scenario;
 pub mod system_scenario;
 pub mod tcp_tls_scenario;
 pub mod user_scenario;
+
+use iggy::prelude::*;
+use integration::test_server::{ClientFactory, delete_user};
 
 const STREAM_ID: u32 = 1;
 const TOPIC_ID: u32 = 1;

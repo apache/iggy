@@ -54,6 +54,8 @@ pub enum IpAddrKind {
 #[async_trait]
 pub trait ClientFactory: Sync + Send {
     async fn create_client(&self) -> Box<dyn Client>;
+    fn transport(&self) -> Transport;
+    fn server_addr(&self) -> String;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Display)]

@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::test_server::ClientFactory;
+use crate::test_server::{ClientFactory, Transport};
 use async_trait::async_trait;
 use iggy::http::http_client::HttpClient;
 use iggy::prelude::{Client, HttpClientConfig};
@@ -36,6 +36,14 @@ impl ClientFactory for HttpClientFactory {
         };
         let client = HttpClient::create(Arc::new(config)).unwrap();
         Box::new(client)
+    }
+
+    fn transport(&self) -> Transport {
+        Transport::Http
+    }
+
+    fn server_addr(&self) -> String {
+        self.server_addr.clone()
     }
 }
 
