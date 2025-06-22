@@ -168,7 +168,23 @@ async fn should_delete_segments_via_tcp_binary_protocol() {
 
 #[tokio::test]
 #[parallel]
-async fn should_verify_data_integrity_after_server_restart() {
+async fn should_verify_data_integrity_after_server_restart_with_open_segment_index_cache() {
+    verify_data_integrity_after_server_restart_with_cache_setting("open_segment").await;
+}
+
+#[tokio::test]
+#[parallel]
+async fn should_verify_data_integrity_after_server_restart_with_all_index_cache() {
+    verify_data_integrity_after_server_restart_with_cache_setting("all").await;
+}
+
+#[tokio::test]
+#[parallel]
+async fn should_verify_data_integrity_after_server_restart_with_no_index_cache() {
+    verify_data_integrity_after_server_restart_with_cache_setting("none").await;
+}
+
+async fn verify_data_integrity_after_server_restart_with_cache_setting(cache_setting: &str) {
     let data_dir = format!("local_data_restart_test_{}", uuid::Uuid::new_v4().simple());
 
     let mut extra_env = HashMap::new();
@@ -176,7 +192,7 @@ async fn should_verify_data_integrity_after_server_restart() {
     extra_env.insert("IGGY_SYSTEM_PATH".to_string(), data_dir.clone());
     extra_env.insert(
         "IGGY_SYSTEM_SEGMENT_CACHE_INDEXES".to_string(),
-        "open_segment".to_string(),
+        cache_setting.to_string(),
     );
 
     let mut test_server = TestServer::new(Some(extra_env.clone()), false, None, IpAddrKind::V4);
