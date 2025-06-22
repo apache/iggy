@@ -20,7 +20,7 @@
 
 import assert from 'node:assert/strict';
 import { v7 } from './wire/uuid.utils.js';
-import { sendMessages, type Partitioning, HeaderValue } from './wire/index.js';
+import { sendMessages, type Partitioning, HeaderValue, type Message } from './wire/index.js';
 import type { ClientProvider } from './client/client.type.js';
 import type { Id } from './wire/identifier.utils.js';
 
@@ -48,7 +48,6 @@ export const generateMessages = (count = 1) => {
   return [...Array(count)].map(() => ({ id: v7(), ...someMessageContent() }));
 }
 
-
 export const sendSomeMessages = (s: ClientProvider) =>
   async (streamId: Id, topicId: Id, partition: Partitioning) => {
     const rSend = await sendMessages(s)({
@@ -57,3 +56,17 @@ export const sendSomeMessages = (s: ClientProvider) =>
     assert.ok(rSend);
     return rSend;
   };
+
+
+export const formatPolledMessages = (msgs: Message[]) =>
+  msgs.map(m => {
+    const { headers: { id, offset, timestamp, checksum }, payload, userHeaders } = m;
+    return {
+      id,
+      offset,
+      headers: userHeaders,
+      payload: payload.toString(),
+      timestamp,
+      checksum
+    };
+  });

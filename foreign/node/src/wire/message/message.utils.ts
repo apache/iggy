@@ -19,7 +19,7 @@
 
 
 import Debug from 'debug';
-import { uint32ToBuf } from '../number.utils.js';
+import { uint32ToBuf, u128ToBuf } from '../number.utils.js';
 import { serializeHeaders, type Headers } from './header.utils.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { serializePartitioning, type Partitioning } from './partitioning.utils.js';
@@ -31,7 +31,7 @@ const debug = Debug('iggy:client');
 /** index size per messages in bit */
 const INDEX_SIZE = 16;
 
-export type MessageIdKind = 0 | 0n | number | bigint | string;
+export type MessageIdKind = number | bigint | string;
 
 export type CreateMessage = {
   id?: MessageIdKind, 
@@ -40,7 +40,7 @@ export type CreateMessage = {
 };
 
 export const isValidMessageId = (x?: unknown): x is MessageIdKind =>
-  x === undefined || x === 0 || x === 0n ||
+  x === undefined ||
   'string' === typeof x ||
   'bigint' === typeof x ||
   'number' === typeof x;
@@ -57,17 +57,8 @@ export const serializeMessageId = (id?: unknown) => {
     if (id < 0)
       throw new Error(`invalid message id: '${id}' (numeric id must be >= 0)`)
 
-    if ('number' === typeof id) {
-      const b = Buffer.alloc(16, 0);
-      b.writeUInt32LE(id)
-      return b; // id_u32 + 0u96
-    }
-
-    if ('bigint' === typeof id) {
-      const b = Buffer.alloc(16, 0);
-      b.writeBigUInt64LE(id)
-      return b; // id_u64 + 0u64
-    }
+    const idValue = 'number' === typeof id ? BigInt(id) : id;
+    return u128ToBuf(idValue);
   }
 
   try {
