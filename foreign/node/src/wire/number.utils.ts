@@ -84,6 +84,16 @@ export const doubleToBuf = (v: number) => {
   return b;
 }
 
+// bigint => u128 LE
+export function u128ToBuf(num: bigint, width = 16): Buffer {
+  const hex = num.toString(16);
+  const b = Buffer.from(hex.padStart(width * 2, '0').slice(0, width * 2), 'hex');
+  return b.reverse();
+}
 
-// no js support ... use buffer or dataview or arraybuffer ?
-// const uint128ToBuf = (v: Buffer) => { }
+// u128 LE => Bigint
+export function u128LEBufToBigint(b: Buffer): bigint {
+  const hex = b.reverse().toString('hex');
+  return hex.length === 0 ? BigInt(0) :  BigInt(`0x${hex}`);
+}
+
