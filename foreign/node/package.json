@@ -5,7 +5,6 @@
   "description": "Official apache iggy nodejs binary client",
   "keywords": [
     "iggy",
-    "iggy-rs",
     "driver",
     "client",
     "protocol"
@@ -19,7 +18,7 @@
     "main": "dist/index.js",
     "types": "dist/index.d.ts"
   },
-  "homepage": "https://iggy.rs",
+  "homepage": "https://iggy.apache.org",
   "files": [
     "dist/**/*.js",
     "dist/**/*.d.ts",

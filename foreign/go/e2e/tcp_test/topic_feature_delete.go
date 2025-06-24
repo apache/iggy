@@ -18,8 +18,8 @@
 package tcp_test
 
 import (
-	iggcon "github.com/iggy-rs/iggy-go-client/contracts"
-	ierror "github.com/iggy-rs/iggy-go-client/errors"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	. "github.com/onsi/ginkgo/v2"
 )
 

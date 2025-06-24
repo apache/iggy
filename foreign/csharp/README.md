@@ -2,7 +2,6 @@
 
 <div align="center">
 
-[![.NET](https://github.com/iggy-rs/iggy-dotnet-client/actions/workflows/dotnet.yml/badge.svg)](https://github.com/iggy-rs/iggy-dotnet-client/actions/workflows/dotnet.yml)
 [![Nuget (with prereleases)](https://img.shields.io/nuget/vpre/Iggy)](https://www.nuget.org/packages/Iggy)
 
 </div>
@@ -374,13 +373,11 @@ If you register `IIggyClient` in a dependency injection container, you will have
 that encapsulate smaller parts of the system `IIggyStream` `IIggyTopic` `IIggyPublisher` `IIggyConsumer` `IIggyConsumerGroup` `IIggyOffset`
 `IIggyPartition` `IIggyUsers` `IIggyUtils`
 
-For more information about how Iggy works check its [documentation](https://docs.iggy.rs/)
+For more information about how Iggy works check its [documentation](https://iggy.apache.org/docs/)
 
 ## Producer / Consumer Sample
 
-<https://github.com/iggy-rs/iggy-dotnet-client/assets/112548209/3a89d2f5-d066-40d2-8b82-96c3e338007e>
-
-To run the samples, first get [Iggy](https://github.com/spetz/iggy), Run the server with `cargo run --bin iggy-server`, then get the SDK, cd into `Iggy_SDK`
+To run the samples, first get [Iggy](https://github.com/apache/iggy), Run the server with `cargo run --bin iggy-server`, then get the SDK, cd into `Iggy_SDK`
 and run following commands: `dotnet run -c Release --project Iggy_Sample_Producer` for producer, `dotnet run -c Release --project Iggy_Sample_Consumer`
 for consumer.
 

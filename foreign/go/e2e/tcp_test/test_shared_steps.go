@@ -18,7 +18,7 @@
 package tcp_test
 
 import (
-	ierror "github.com/iggy-rs/iggy-go-client/errors"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )

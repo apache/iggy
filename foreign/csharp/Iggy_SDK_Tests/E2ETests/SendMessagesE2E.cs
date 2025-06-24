@@ -28,7 +28,7 @@ namespace Apache.Iggy.Tests.E2ETests;
 [TestCaseOrderer("Apache.Iggy.Tests.Utils.PriorityOrderer", "Apache.Iggy.Tests")]
 public sealed class SendMessagesE2E : IClassFixture<IggySendMessagesFixture>
 {
-    private const string SkipMessage = "TCP implementation needs to be aligned with Iggyrs core changes";
+    private const string SkipMessage = "TCP implementation needs to be aligned with Iggy core changes";
     private readonly IggySendMessagesFixture _fixture;
 
     private readonly MessageSendRequest _messageNoHeadersSendRequest;
@@ -55,7 +55,7 @@ public sealed class SendMessagesE2E : IClassFixture<IggySendMessagesFixture>
         _invalidMessageWithHeadersSendRequest = MessageFactory.CreateMessageSendRequest(SendMessagesFixtureBootstrap.InvalidStreamId,
             SendMessagesFixtureBootstrap.InvalidTopicId, SendMessagesFixtureBootstrap.PartitionId, messageWithHeaders);
     }
-    
+
     [Fact, TestPriority(1)]
     public async Task SendMessages_NoHeaders_Should_SendMessages_Successfully()
     {
@@ -66,10 +66,10 @@ public sealed class SendMessagesE2E : IClassFixture<IggySendMessagesFixture>
                 .Should()
                 .NotThrowAsync();
         })).ToArray();
-        
+
         await Task.WhenAll(tasks);
     }
-    
+
     [Fact, TestPriority(2)]
     public async Task SendMessages_NoHeaders_Should_Throw_InvalidResponse()
     {
@@ -80,10 +80,10 @@ public sealed class SendMessagesE2E : IClassFixture<IggySendMessagesFixture>
                 .Should()
                 .ThrowAsync<InvalidResponseException>();
         })).ToArray();
-        
+
         await Task.WhenAll(tasks);
     }
-    
+
     [Fact, TestPriority(3)]
     public async Task SendMessages_WithHeaders_Should_SendMessages_Successfully()
     {
@@ -94,10 +94,10 @@ public sealed class SendMessagesE2E : IClassFixture<IggySendMessagesFixture>
                 .Should()
                 .NotThrowAsync();
         })).ToArray();
-        
+
         await Task.WhenAll(tasks);
     }
-    
+
     [Fact, TestPriority(4)]
     public async Task SendMessages_WithHeaders_Should_Throw_InvalidResponse()
     {
@@ -108,7 +108,7 @@ public sealed class SendMessagesE2E : IClassFixture<IggySendMessagesFixture>
                 .Should()
                 .ThrowAsync<InvalidResponseException>();
         })).ToArray();
-        
+
         await Task.WhenAll(tasks);
     }
 }

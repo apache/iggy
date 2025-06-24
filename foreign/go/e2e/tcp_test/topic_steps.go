@@ -21,9 +21,9 @@ import (
 	"math"
 	"strconv"
 
-	"github.com/iggy-rs/iggy-go-client"
-	iggcon "github.com/iggy-rs/iggy-go-client/contracts"
-	ierror "github.com/iggy-rs/iggy-go-client/errors"
+	"github.com/apache/iggy/foreign/go"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )

@@ -28,12 +28,12 @@ namespace Apache.Iggy.Tests.E2ETests;
 [TestCaseOrderer("Apache.Iggy.Tests.Utils.PriorityOrderer", "Apache.Iggy.Tests")]
 public sealed class ConsumerGroupE2E : IClassFixture<IggyConsumerGroupFixture>
 {
-    private const string SkipMessage = "TCP implementation needs to be aligned with Iggyrs core changes";
-    
+    private const string SkipMessage = "TCP implementation needs to be aligned with Iggy core changes";
+
     private readonly IggyConsumerGroupFixture _fixture;
 
     private const int GROUP_ID = 1;
-    
+
     private static readonly CreateConsumerGroupRequest _createConsumerGroupRequest =
         ConsumerGroupFactory.CreateRequest(
             (int)ConsumerGroupFixtureBootstrap.StreamRequest.StreamId!,
@@ -53,7 +53,7 @@ public sealed class ConsumerGroupE2E : IClassFixture<IggyConsumerGroupFixture>
         ConsumerGroupFactory.CreateDeleteGroupRequest(
             (int)ConsumerGroupFixtureBootstrap.StreamRequest.StreamId,
             (int)ConsumerGroupFixtureBootstrap.TopicRequest.TopicId, GROUP_ID);
-    
+
     private Identifier ConsumerGroupId = Identifier.Numeric(GROUP_ID);
 
     public ConsumerGroupE2E(IggyConsumerGroupFixture fixture)
@@ -74,7 +74,7 @@ public sealed class ConsumerGroupE2E : IClassFixture<IggyConsumerGroupFixture>
             consumerGroup.MembersCount.Should().Be(0);
             consumerGroup.Name.Should().Be(_createConsumerGroupRequest.Name);
         })).ToArray();
-        
+
         await Task.WhenAll(tasks);
     }
 
@@ -88,10 +88,10 @@ public sealed class ConsumerGroupE2E : IClassFixture<IggyConsumerGroupFixture>
                 .Should()
                 .ThrowExactlyAsync<InvalidResponseException>();
         })).ToArray();
-        
+
         await Task.WhenAll(tasks);
     }
-    
+
     [Fact, TestPriority(3)]
     public async Task GetConsumerGroupById_Should_Return_ValidResponse()
     {
@@ -101,16 +101,16 @@ public sealed class ConsumerGroupE2E : IClassFixture<IggyConsumerGroupFixture>
             var response = await sut.Client.GetConsumerGroupByIdAsync(
                 Identifier.Numeric((int)ConsumerGroupFixtureBootstrap.StreamRequest.StreamId!), Identifier.Numeric((int)ConsumerGroupFixtureBootstrap.TopicRequest.TopicId!),
                 ConsumerGroupId);
-        
+
             response.Should().NotBeNull();
             response!.Id.Should().Be(GROUP_ID);
             response.PartitionsCount.Should().Be(ConsumerGroupFixtureBootstrap.TopicRequest.PartitionsCount);
             response.MembersCount.Should().Be(0);
         })).ToArray();
-        
+
         await Task.WhenAll(tasks);
     }
-    
+
     [Fact, TestPriority(4)]
     public async Task GetConsumerGroups_Should_Return_ValidResponse()
     {
@@ -119,7 +119,7 @@ public sealed class ConsumerGroupE2E : IClassFixture<IggyConsumerGroupFixture>
         {
             var response = await sut.Client.GetConsumerGroupsAsync(
                 Identifier.Numeric((int)ConsumerGroupFixtureBootstrap.StreamRequest.StreamId!), Identifier.Numeric((int)ConsumerGroupFixtureBootstrap.TopicRequest.TopicId!));
-        
+
             response.Should().NotBeNull();
             response.Count.Should().Be(1);
             var group = response.FirstOrDefault();
@@ -127,10 +127,10 @@ public sealed class ConsumerGroupE2E : IClassFixture<IggyConsumerGroupFixture>
             group.PartitionsCount.Should().Be(ConsumerGroupFixtureBootstrap.TopicRequest.PartitionsCount);
             group.MembersCount.Should().Be(0);
         })).ToArray();
-        
+
         await Task.WhenAll(tasks);
     }
-    
+
     [Fact, TestPriority(5)]
     public async Task JoinConsumerGroup_Should_JoinConsumerGroup_Successfully()
     {
@@ -139,7 +139,7 @@ public sealed class ConsumerGroupE2E : IClassFixture<IggyConsumerGroupFixture>
                 y.JoinConsumerGroupAsync(_joinConsumerGroupRequest)
             ).Should()
             .ThrowExactlyAsync<FeatureUnavailableException>();
-        
+
         await _fixture.TcpClient.Client.Invoking(x => x.JoinConsumerGroupAsync(_joinConsumerGroupRequest))
             .Should()
             .NotThrowAsync();
@@ -177,7 +177,7 @@ public sealed class ConsumerGroupE2E : IClassFixture<IggyConsumerGroupFixture>
         await _fixture.HttpClient.Client.Invoking(x => x.LeaveConsumerGroupAsync(_leaveConsumerGroupRequest))
             .Should()
             .ThrowAsync<FeatureUnavailableException>();
-        
+
         await _fixture.TcpClient.Client.Invoking(x => x.JoinConsumerGroupAsync(_joinConsumerGroupRequest))
             .Should()
             .ThrowExactlyAsync<InvalidResponseException>();
@@ -193,7 +193,7 @@ public sealed class ConsumerGroupE2E : IClassFixture<IggyConsumerGroupFixture>
                 .Should()
                 .ThrowExactlyAsync<InvalidResponseException>();
         })).ToArray();
-        
+
         await Task.WhenAll(tasks);
     }
 }

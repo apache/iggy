@@ -21,7 +21,7 @@ In order to successfully launch the producer app follow these steps:
 1. Clone iggy repo and run it in background
 
     ```sh
-    git clone https://github.com/iggy-rs/iggy.git
+    git clone https://github.com/apache/iggy.git
     cd iggy
     cargo run --bin iggy-server -r
     ```
