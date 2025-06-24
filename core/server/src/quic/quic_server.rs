@@ -31,8 +31,9 @@ use crate::configs::quic::QuicConfig;
 use crate::quic::COMPONENT;
 use crate::quic::listener;
 use crate::server_error::QuicError;
-use crate::streaming::systems::system::SharedSystem;
 
+//TODO: Fixme
+/*
 /// Starts the QUIC server.
 /// Returns the address the server is listening on.
 pub fn start(config: QuicConfig, system: SharedSystem) -> SocketAddr {
@@ -136,3 +137,4 @@ fn load_certificates(
     let key = keys.remove(0);
     Ok((certs, key))
 }
+    */

@@ -16,6 +16,8 @@
  * under the License.
  */
 
+//TODO: Fixme
+/*
 use crate::channels::server_command::BackgroundServerCommand;
 use crate::configs::server::HeartbeatConfig;
 use crate::streaming::systems::system::SharedSystem;
@@ -148,3 +150,4 @@ impl BackgroundServerCommand<VerifyHeartbeatsCommand> for VerifyHeartbeatsExecut
         });
     }
 }
+*/

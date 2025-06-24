@@ -16,22 +16,22 @@
  * under the License.
  */
 
+use crate::shard::IggyShard;
 use crate::streaming::clients::client_manager::{Client, Transport};
 use crate::streaming::session::Session;
-use crate::streaming::systems::COMPONENT;
-use crate::streaming::systems::system::System;
 use error_set::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
 use iggy_common::locking::IggySharedMut;
 use iggy_common::locking::IggySharedMutFn;
 use std::net::SocketAddr;
+use std::rc::Rc;
 use std::sync::Arc;
 use tracing::{error, info};
 
 impl IggyShard {
-    pub async fn add_client(&self, address: &SocketAddr, transport: Transport) -> Arc<Session> {
-        let mut client_manager = self.client_manager.write().await;
+    pub fn add_client(&self, address: &SocketAddr, transport: Transport) -> Rc<Session> {
+        let mut client_manager = self.client_manager.borrow_mut();
         let session = client_manager.add_client(address, transport);
         info!("Added {transport} client with session: {session} for IP address: {address}");
         self.metrics.increment_clients(1);
@@ -42,7 +42,7 @@ impl IggyShard {
         let consumer_groups: Vec<(u32, u32, u32)>;
 
         {
-            let mut client_manager = self.client_manager.write().await;
+            let mut client_manager = self.client_manager.borrow_mut();
             let client = client_manager.delete_client(client_id).await;
             if client.is_none() {
                 error!("Client with ID: {client_id} was not found in the client manager.",);

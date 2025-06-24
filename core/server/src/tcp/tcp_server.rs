@@ -17,9 +17,9 @@
  */
 
 use crate::shard::IggyShard;
-use crate::tcp::{tcp_listener};
-use std::rc::Rc;
+use crate::tcp::tcp_listener;
 use iggy_common::IggyError;
+use std::rc::Rc;
 use tracing::info;
 
 /// Starts the TCP server.

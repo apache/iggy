@@ -16,25 +16,33 @@
  * under the License.
  */
 
+use bytes::BytesMut;
 use iggy_common::IggyError;
-use monoio::io::{AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt};
+use monoio::{
+    buf::IoBufMut,
+    io::{AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt},
+};
+use nix::libc;
 use std::io::IoSlice;
 use tracing::debug;
 
 const STATUS_OK: &[u8] = &[0; 4];
 
-pub(crate) async fn read<T>(stream: &mut T, buffer: &mut [u8]) -> Result<usize, IggyError>
+pub(crate) async fn read<T>(
+    stream: &mut T,
+    buffer: BytesMut,
+) -> (Result<usize, IggyError>, BytesMut)
 where
     T: AsyncReadRent + AsyncWriteRent + Unpin,
 {
     match stream.read_exact(buffer).await {
-        Ok(0) => Err(IggyError::ConnectionClosed),
-        Ok(read_bytes) => Ok(read_bytes),
-        Err(error) => {
+        (Ok(0), buffer) => (Err(IggyError::ConnectionClosed), buffer),
+        (Ok(read_bytes), buffer) => (Ok(read_bytes), buffer),
+        (Err(error), buffer) => {
             if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                Err(IggyError::ConnectionClosed)
+                (Err(IggyError::ConnectionClosed), buffer)
             } else {
-                Err(IggyError::TcpError)
+                (Err(IggyError::TcpError), buffer)
             }
         }
     }
@@ -57,7 +65,7 @@ where
 pub(crate) async fn send_ok_response_vectored<T>(
     stream: &mut T,
     length: &[u8],
-    slices: Vec<IoSlice<'_>>,
+    slices: Vec<libc::iovec>,
 ) -> Result<(), IggyError>
 where
     T: AsyncReadRentExt + AsyncWriteRentExt + Unpin,
@@ -90,8 +98,9 @@ where
     );
     let length = (payload.len() as u32).to_le_bytes();
     stream
-        .write_all(&[status, &length, payload].as_slice().concat())
+        .write_all([status, &length, payload].concat())
         .await
+        .0
         .map_err(|_| IggyError::TcpError)?;
     debug!("Sent response with status: {:?}", status);
     Ok(())
@@ -101,7 +110,7 @@ pub(crate) async fn send_response_vectored<T>(
     stream: &mut T,
     status: &[u8],
     length: &[u8],
-    mut slices: Vec<IoSlice<'_>>,
+    mut slices: Vec<libc::iovec>,
 ) -> Result<(), IggyError>
 where
     T: AsyncReadRentExt + AsyncWriteRentExt + Unpin,
@@ -111,16 +120,22 @@ where
         slices.len(),
         status
     );
-    let prefix = [IoSlice::new(status), IoSlice::new(length)];
+    let prefix = [
+        libc::iovec {
+            iov_base: length.as_ptr() as _,
+            iov_len: length.len(),
+        },
+        libc::iovec {
+            iov_base: status.as_ptr() as _,
+            iov_len: status.len(),
+        },
+    ];
     slices.splice(0..0, prefix);
-    let mut slice_refs = slices.as_mut_slice();
-    while !slice_refs.is_empty() {
-        let bytes_written = stream
-            .write_vectored(slice_refs)
-            .await
-            .map_err(|_| IggyError::TcpError)?;
-        IoSlice::advance_slices(&mut slice_refs, bytes_written);
-    }
+    stream
+        .write_vectored_all(slices)
+        .await
+        .0
+        .map_err(|_| IggyError::TcpError)?;
     debug!("Sent response with status: {:?}", status);
     Ok(())
 }

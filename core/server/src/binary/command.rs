@@ -16,8 +16,11 @@
  * under the License.
  */
 
+use std::rc::Rc;
+
 use crate::binary::sender::SenderKind;
 use crate::define_server_command_enum;
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -130,8 +133,8 @@ pub trait ServerCommandHandler {
         self,
         sender: &mut SenderKind,
         length: u32,
-        session: &Session,
-        system: &SharedSystem,
+        session: &Rc<Session>,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError>;
 }
 

@@ -18,8 +18,11 @@
 
 use crate::quic::COMPONENT;
 use crate::{binary::sender::Sender, server_error::ServerError};
+use bytes::BytesMut;
 use error_set::ErrContext;
 use iggy_common::IggyError;
+use monoio::buf::IoBufMut;
+use nix::libc;
 use quinn::{RecvStream, SendStream};
 use std::io::IoSlice;
 use tracing::{debug, error};
@@ -33,15 +36,18 @@ pub struct QuicSender {
 }
 
 impl Sender for QuicSender {
-    async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, IggyError> {
+    async fn read(&mut self, buffer: BytesMut) -> (Result<usize, IggyError>, BytesMut) {
         // Not-so-nice code because quinn recv stream has different API for read_exact
+        /*
         let read_bytes = buffer.len();
         self.recv.read_exact(buffer).await.map_err(|error| {
             error!("Failed to read from the stream: {:?}", error);
             IggyError::QuicError
         })?;
+        */
 
-        Ok(read_bytes)
+        //Ok(read_bytes)
+        todo!();
     }
 
     async fn send_empty_ok_response(&mut self) -> Result<(), IggyError> {
@@ -64,7 +70,7 @@ impl Sender for QuicSender {
     async fn send_ok_response_vectored(
         &mut self,
         length: &[u8],
-        slices: Vec<IoSlice<'_>>,
+        slices: Vec<libc::iovec>,
     ) -> Result<(), IggyError> {
         debug!("Sending vectored response with status: {:?}...", STATUS_OK);
 
@@ -79,6 +85,8 @@ impl Sender for QuicSender {
 
         let mut total_bytes_written = 0;
 
+        //TODO: Fixme
+        /*
         for slice in slices {
             let slice_data = &*slice;
             if !slice_data.is_empty() {
@@ -93,6 +101,7 @@ impl Sender for QuicSender {
                 total_bytes_written += slice_data.len();
             }
         }
+        */
 
         debug!(
             "Sent vectored response: {} bytes of payload",

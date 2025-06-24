@@ -28,6 +28,7 @@ use iggy_common::IggyExpiry;
 use iggy_common::IggyTimestamp;
 use iggy_common::Sizeable;
 use std::fmt;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -58,8 +59,8 @@ pub struct Partition {
     pub(crate) consumer_offsets: DashMap<u32, ConsumerOffset>,
     pub(crate) consumer_group_offsets: DashMap<u32, ConsumerOffset>,
     pub(crate) segments: Vec<Segment>,
-    pub(crate) config: Arc<SystemConfig>,
-    pub(crate) storage: Arc<SystemStorage>,
+    pub(crate) config: Rc<SystemConfig>,
+    pub(crate) storage: Rc<SystemStorage>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -88,8 +89,8 @@ impl Partition {
         topic_id: u32,
         partition_id: u32,
         with_segment: bool,
-        config: Arc<SystemConfig>,
-        storage: Arc<SystemStorage>,
+        config: Rc<SystemConfig>,
+        storage: Rc<SystemStorage>,
         message_expiry: IggyExpiry,
         messages_count_of_parent_stream: Arc<AtomicU64>,
         messages_count_of_parent_topic: Arc<AtomicU64>,
@@ -209,17 +210,18 @@ mod tests {
     use iggy_common::IggyDuration;
     use iggy_common::IggyExpiry;
     use iggy_common::IggyTimestamp;
+    use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, AtomicU64};
 
     #[tokio::test]
     async fn should_be_created_with_a_single_segment_given_valid_parameters() {
         let tempdir = tempfile::TempDir::new().unwrap();
-        let config = Arc::new(SystemConfig {
+        let config = Rc::new(SystemConfig {
             path: tempdir.path().to_str().unwrap().to_string(),
             ..Default::default()
         });
-        let storage = Arc::new(SystemStorage::new(
+        let storage = Rc::new(SystemStorage::new(
             config.clone(),
             Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister {})),
         ));
@@ -264,11 +266,11 @@ mod tests {
     #[tokio::test]
     async fn should_not_initialize_segments_given_false_with_segment_parameter() {
         let tempdir = tempfile::TempDir::new().unwrap();
-        let config = Arc::new(SystemConfig {
+        let config = Rc::new(SystemConfig {
             path: tempdir.path().to_str().unwrap().to_string(),
             ..Default::default()
         });
-        let storage = Arc::new(SystemStorage::new(
+        let storage = Rc::new(SystemStorage::new(
             config.clone(),
             Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister {})),
         ));
@@ -279,7 +281,7 @@ mod tests {
             topic_id,
             1,
             false,
-            Arc::new(SystemConfig::default()),
+            config,
             storage,
             IggyExpiry::NeverExpire,
             Arc::new(AtomicU64::new(0)),

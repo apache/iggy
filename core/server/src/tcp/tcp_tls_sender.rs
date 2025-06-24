@@ -19,10 +19,13 @@
 use crate::binary::sender::Sender;
 use crate::tcp::COMPONENT;
 use crate::{server_error::ServerError, tcp::sender};
+use bytes::BytesMut;
 use error_set::ErrContext;
 use iggy_common::IggyError;
+use monoio::io::AsyncWriteRent;
 use monoio::net::TcpStream;
 use monoio_native_tls::TlsStream;
+use nix::libc;
 
 #[derive(Debug)]
 pub struct TcpTlsSender {
@@ -30,7 +33,7 @@ pub struct TcpTlsSender {
 }
 
 impl Sender for TcpTlsSender {
-    async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, IggyError> {
+    async fn read(&mut self, buffer: BytesMut) -> (Result<usize, IggyError>, BytesMut) {
         sender::read(&mut self.stream, buffer).await
     }
 
@@ -59,7 +62,7 @@ impl Sender for TcpTlsSender {
     async fn send_ok_response_vectored(
         &mut self,
         length: &[u8],
-        slices: Vec<std::io::IoSlice<'_>>,
+        slices: Vec<libc::iovec>,
     ) -> Result<(), IggyError> {
         sender::send_ok_response_vectored(&mut self.stream, length, slices).await
     }

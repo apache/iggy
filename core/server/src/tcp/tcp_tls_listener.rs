@@ -18,26 +18,30 @@
 
 use crate::binary::sender::SenderKind;
 use crate::configs::tcp::TcpTlsConfig;
+use crate::shard::IggyShard;
 use crate::streaming::clients::client_manager::Transport;
-use crate::streaming::systems::system::SharedSystem;
 use crate::tcp::connection_handler::{handle_connection, handle_error};
+use monoio_native_tls::TlsAcceptor;
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls_pemfile::{certs, private_key};
 use std::io::BufReader;
 use std::net::SocketAddr;
+use std::rc::Rc;
 use std::sync::Arc;
 use tokio::net::TcpSocket;
 use tokio::sync::oneshot;
-use tokio_rustls::{TlsAcceptor, rustls};
 use tracing::{error, info};
 
 pub(crate) async fn start(
     address: &str,
     config: TcpTlsConfig,
     socket: TcpSocket,
-    system: SharedSystem,
+    system: Rc<IggyShard>,
 ) -> SocketAddr {
+    //TODO: Fixme
+    todo!();
+    /*
     let address = address.to_string();
     let (tx, rx) = oneshot::channel();
     tokio::spawn(async move {
@@ -135,6 +139,7 @@ pub(crate) async fn start(
         Ok(addr) => addr,
         Err(_) => panic!("Failed to get the local address for TCP TLS listener."),
     }
+    */
 }
 
 fn generate_self_signed_cert()

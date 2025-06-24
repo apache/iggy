@@ -156,7 +156,7 @@ impl StreamStorage for FileStreamStorage {
         for mut topic in unloaded_topics {
             let loaded_topics = loaded_topics.clone();
             let topic_state = state.topics.remove(&topic.topic_id).unwrap();
-            let load_topic = tokio::spawn(async move {
+            let load_topic = monoio::spawn(async move {
                 match topic.load(topic_state).await {
                     Ok(_) => loaded_topics.lock().await.push(topic),
                     Err(error) => error!(

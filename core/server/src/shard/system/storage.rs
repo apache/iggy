@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use crate::shard::system::info::SystemInfo;
 use crate::streaming::persistence::persister::PersisterKind;
 use crate::streaming::storage::SystemInfoStorage;
 use crate::streaming::utils::PooledBuffer;

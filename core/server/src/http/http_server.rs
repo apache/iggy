@@ -16,6 +16,8 @@
  * under the License.
  */
 
+//TODO: Fixme
+/*
 use crate::configs::http::{HttpConfig, HttpCorsConfig};
 use crate::http::diagnostics::request_diagnostics;
 use crate::http::jwt::cleaner::start_expired_tokens_cleaner;
@@ -191,3 +193,4 @@ fn configure_cors(config: HttpCorsConfig) -> CorsLayer {
         .allow_credentials(config.allow_credentials)
         .allow_private_network(config.allow_private_network)
 }
+*/

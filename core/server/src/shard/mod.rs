@@ -17,9 +17,9 @@
  */
 
 pub mod builder;
-pub mod system;
 pub mod gate;
 pub mod namespace;
+pub mod system;
 pub mod transmission;
 
 use ahash::{AHashMap, AHashSet, HashMap};
@@ -29,18 +29,42 @@ use futures::future::try_join_all;
 use iggy_common::{EncryptorKind, IggyError, UserId};
 use namespace::IggyNamespace;
 use std::{
-    cell::{Cell, RefCell}, pin::Pin, rc::Rc, str::FromStr, sync::{atomic::{AtomicU32, Ordering}, Arc, RwLock}, time::Instant
+    cell::{Cell, RefCell},
+    pin::Pin,
+    rc::Rc,
+    str::FromStr,
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::Instant,
 };
 use tracing::{error, info, instrument, trace, warn};
 use transmission::connector::{Receiver, ShardConnector, StopReceiver, StopSender};
 
 use crate::{
     configs::server::ServerConfig,
-    shard::{system::info::SystemInfo, transmission::frame::ShardFrame},
-    state::{
-        file::FileState, system::{StreamState, SystemState, UserState}, StateKind
+    shard::{
+        system::info::SystemInfo,
+        transmission::{
+            frame::ShardFrame,
+            message::{ShardEvent, ShardMessage},
+        },
     },
-    streaming::{clients::client_manager::ClientManager, diagnostics::metrics::Metrics, personal_access_tokens::personal_access_token::PersonalAccessToken, session::Session, storage::SystemStorage, streams::stream::Stream, users::{permissioner::Permissioner, user::User}},
+    state::{
+        StateKind,
+        file::FileState,
+        system::{StreamState, SystemState, UserState},
+    },
+    streaming::{
+        clients::client_manager::ClientManager,
+        diagnostics::metrics::Metrics,
+        personal_access_tokens::personal_access_token::PersonalAccessToken,
+        session::Session,
+        storage::SystemStorage,
+        streams::stream::Stream,
+        users::{permissioner::Permissioner, user::User},
+    },
     versioning::SemanticVersion,
 };
 
@@ -83,7 +107,7 @@ pub struct IggyShard {
     pub(crate) config: ServerConfig,
     //TODO: This could be shared.
     pub(crate) client_manager: RefCell<ClientManager>,
-    pub(crate) active_sessions: RefCell<Vec<Session>>,
+    pub(crate) active_sessions: RefCell<Vec<Rc<Session>>>,
     pub(crate) permissioner: RefCell<Permissioner>,
     pub(crate) users: RefCell<HashMap<UserId, User>>,
 
@@ -244,8 +268,8 @@ impl IggyShard {
         info!("Loading streams from disk...");
         let mut unloaded_streams = Vec::new();
         // Does mononio has api for that ?
-        let mut dir_entries = std::fs::read_dir(&self.config.system.get_streams_path())
-            .map_err(|error| {
+        let mut dir_entries =
+            std::fs::read_dir(&self.config.system.get_streams_path()).map_err(|error| {
                 error!("Cannot read streams directory: {error}");
                 IggyError::CannotReadStreams
             })?;
@@ -362,16 +386,21 @@ impl IggyShard {
             self.metrics.increment_messages(stream.get_messages_count());
 
             self.streams_ids
-            .borrow_mut()
+                .borrow_mut()
                 .insert(stream.name.clone(), stream.stream_id);
             self.streams.borrow_mut().insert(stream.stream_id, stream);
         }
 
-        info!("Loaded {} stream(s) from disk.", self.streams.borrow().len());
+        info!(
+            "Loaded {} stream(s) from disk.",
+            self.streams.borrow().len()
+        );
         Ok(())
     }
 
-    pub fn assert_init(&self) -> Result<(), IggyError> { Ok(())}
+    pub fn assert_init(&self) -> Result<(), IggyError> {
+        Ok(())
+    }
 
     #[instrument(skip_all, name = "trace_shutdown")]
     pub async fn shutdown(&mut self) -> Result<(), IggyError> {
@@ -397,17 +426,41 @@ impl IggyShard {
         self.shards.len() as u32
     }
 
-    pub fn ensure_authenticated(&self, client_id: u32) -> Result<u32, IggyError> {
-        let active_sessions = self.active_sessions.borrow();
-        let session = active_sessions
+    pub fn broadcast_event_to_all_shards(&self, client_id: u32, event: Rc<ShardEvent>) {
+        self.shards
             .iter()
-            .find(|s| s.client_id == client_id)
-            .ok_or_else(|| IggyError::Unauthenticated)?;
-        if session.is_authenticated() {
-            Ok(session.get_user_id())
-        } else {
-            error!("{COMPONENT} - unauthenticated access attempt, session: {session}");
-            Err(IggyError::Unauthenticated)
-        }
+            .filter_map(|shard| {
+                if shard.id != self.id {
+                    Some(shard.connection.clone())
+                } else {
+                    None
+                }
+            })
+            .map(|conn| {
+                let message = ShardMessage::Event(event.clone());
+                conn.send(ShardFrame::new(client_id, message, None));
+            })
+            .collect::<Vec<_>>();
+    }
+
+    pub fn add_active_session(&self, session: Rc<Session>) {
+        self.active_sessions.borrow_mut().push(session);
+    }
+
+    pub fn ensure_authenticated(&self, session: &Session) -> Result<u32, IggyError> {
+        let active_sessions = self.active_sessions.borrow();
+        let user_id = active_sessions
+            .iter()
+            .find(|s| s.get_user_id() == session.get_user_id())
+            .ok_or_else(|| IggyError::Unauthenticated)
+            .and_then(|session| {
+                if session.is_authenticated() {
+                    Ok(session.get_user_id())
+                } else {
+                    error!("{COMPONENT} - unauthenticated access attempt, session: {session}");
+                    Err(IggyError::Unauthenticated)
+                }
+            })?;
+            Ok(user_id)
     }
 }

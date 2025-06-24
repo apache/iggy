@@ -21,16 +21,16 @@ use iggy_common::IggyError;
 use tokio::sync::RwLock;
 use tracing::trace;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ConsumerGroup {
     pub topic_id: u32,
     pub group_id: u32,
     pub name: String,
     pub partitions_count: u32,
-    members: AHashMap<u32, RwLock<ConsumerGroupMember>>,
+    members: AHashMap<u32, ConsumerGroupMember>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ConsumerGroupMember {
     pub id: u32,
     partitions: AHashMap<u32, u32>,
@@ -49,8 +49,8 @@ impl ConsumerGroup {
         }
     }
 
-    pub fn get_members(&self) -> Vec<&RwLock<ConsumerGroupMember>> {
-        self.members.values().collect()
+    pub fn get_members(&self) -> Vec<ConsumerGroupMember> {
+        self.members.values().cloned().collect()
     }
 
     pub async fn reassign_partitions(&mut self, partitions_count: u32) {
@@ -61,7 +61,7 @@ impl ConsumerGroup {
     pub async fn calculate_partition_id(&self, member_id: u32) -> Result<Option<u32>, IggyError> {
         let member = self.members.get(&member_id);
         if let Some(member) = member {
-            return Ok(member.write().await.calculate_partition_id());
+            return Ok(member.await.calculate_partition_id());
         }
         Err(IggyError::ConsumerGroupMemberNotFound(
             member_id,

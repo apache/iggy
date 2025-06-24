@@ -16,6 +16,9 @@
  * under the License.
  */
 
+//TODO: Fixme
+/*
+
 use crate::archiver::ArchiverKind;
 use crate::channels::server_command::BackgroundServerCommand;
 use crate::configs::server::MessagesMaintenanceConfig;
@@ -553,3 +556,5 @@ async fn delete_segments(
         messages_count,
     })
 }
+
+*/

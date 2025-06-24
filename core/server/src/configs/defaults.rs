@@ -36,6 +36,7 @@ use crate::configs::system::{
 use crate::configs::tcp::{TcpConfig, TcpTlsConfig};
 use iggy_common::IggyByteSize;
 use iggy_common::IggyDuration;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,7 +52,7 @@ impl Default for ServerConfig {
             heartbeat: HeartbeatConfig::default(),
             message_saver: MessageSaverConfig::default(),
             personal_access_token: PersonalAccessTokenConfig::default(),
-            system: Arc::new(SystemConfig::default()),
+            system: Rc::new(SystemConfig::default()),
             quic: QuicConfig::default(),
             tcp: TcpConfig::default(),
             http: HttpConfig::default(),

@@ -16,9 +16,9 @@
  * under the License.
  */
 
-use std::hash::Hasher as _;
-use iggy_common::Identifier;
 use hash32::{Hasher, Murmur3Hasher};
+use iggy_common::Identifier;
+use std::hash::Hasher as _;
 
 //TODO: Will probably want to move it to separate crate so we can share it with sdk.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]

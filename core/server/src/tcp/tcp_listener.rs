@@ -18,39 +18,50 @@
 
 use crate::binary::sender::SenderKind;
 use crate::shard::IggyShard;
+use crate::shard::transmission::message::ShardEvent;
 use crate::streaming::clients::client_manager::Transport;
 use crate::tcp::connection_handler::{handle_connection, handle_error};
+use crate::tcp::tcp_socket;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use monoio::net::TcpListener;
-use rustls::pki_types::Ipv4Addr;
-use tokio::net::TcpSocket;
-use tokio::sync::oneshot;
 use tracing::{error, info};
 
-pub async fn start(server_name: &str, shard: Rc<IggyShard>) {
-    let addr: SocketAddr = if shard.config.tcp.ipv6 {
-        shard.config.tcp.address.parse().expect("Unable to parse IPv6 address")
-    } else {
-        shard.config.tcp.address.parse().expect("Unable to parse IPv4 address")
-    };
+pub async fn start(server_name: &'static str, shard: Rc<IggyShard>) {
+    let ip_v6 = shard.config.tcp.ipv6;
+    let socket_config = &shard.config.tcp.socket;
+    let addr: SocketAddr = shard
+        .config
+        .tcp
+        .address
+        .parse()
+        .expect("Failed to parse TCP address");
+
+    let socket = tcp_socket::build(ip_v6, socket_config);
     monoio::spawn(async move {
-        let listener = TcpListener::bind(addr).expect(format!("Unable to start {server_name}.").as_ref());
+        socket
+            .bind(&addr.into())
+            .expect("Failed to bind eTCP listener");
+        socket.listen(1024);
+        let listener: std::net::TcpListener = socket.into();
+        let listener = monoio::net::TcpListener::from_std(listener).unwrap();
+        info!("{server_name} server has started on: {:?}", addr);
         loop {
             match listener.accept().await {
                 Ok((stream, address)) => {
                     let shard = shard.clone();
                     info!("Accepted new TCP connection: {address}");
-                    let session = shard
-                        .add_client(&address, Transport::Tcp);
+                    let session = shard.add_client(&address, Transport::Tcp);
+                    //TODO: Those can be shared with other shards.
+                    shard.add_active_session(session.clone());
+                    // Broadcast session to all shards.
+                    let event = Rc::new(ShardEvent::NewSession(session.clone()));
+                    shard.broadcast_event_to_all_shards(session.client_id, event);
 
-                    let client_id = session.client_id;
+                    let _client_id = session.client_id;
                     info!("Created new session: {session}");
                     let mut sender = SenderKind::get_tcp_sender(stream);
                     monoio::spawn(async move {
-                        if let Err(error) =
-                            handle_connection(session, &mut sender, shard.clone()).await
-                        {
+                        if let Err(error) = handle_connection(&session, &mut sender, &shard).await {
                             handle_error(error);
                             //TODO: Fixme
                             /*

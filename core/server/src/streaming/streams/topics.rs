@@ -146,8 +146,7 @@ impl Stream {
             topic.name = name.to_owned();
             topic.message_expiry = message_expiry;
             topic.compression_algorithm = compression_algorithm;
-            for partition in topic.partitions.values_mut() {
-                let mut partition = partition.write().await;
+            for partition in topic.partitions.borrow_mut().values_mut() {
                 partition.message_expiry = message_expiry;
                 for segment in partition.segments.iter_mut() {
                     segment.update_message_expiry(message_expiry);
@@ -282,16 +281,16 @@ mod tests {
         },
     };
     use iggy_common::IggyByteSize;
-    use std::sync::Arc;
+    use std::{rc::Rc, sync::Arc};
 
     #[tokio::test]
     async fn should_get_topic_by_id_and_name() {
         let tempdir = tempfile::TempDir::new().unwrap();
-        let config = Arc::new(SystemConfig {
+        let config = Rc::new(SystemConfig {
             path: tempdir.path().to_str().unwrap().to_string(),
             ..Default::default()
         });
-        let storage = Arc::new(SystemStorage::new(
+        let storage = Rc::new(SystemStorage::new(
             config.clone(),
             Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister {})),
         ));

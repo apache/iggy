@@ -16,12 +16,14 @@
  * under the License.
  */
 
+use std::rc::Rc;
+
 use crate::binary::command::{ServerCommand, ServerCommandHandler};
 use crate::binary::sender::SenderKind;
 use crate::server_error::ConnectionError;
+use crate::shard::IggyShard;
 use crate::streaming::clients::client_manager::Transport;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::anyhow;
 use iggy_common::IggyError;
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
@@ -29,6 +31,8 @@ use tracing::{error, info, trace};
 
 const LISTENERS_COUNT: u32 = 10;
 const INITIAL_BYTES_LENGTH: usize = 4;
+//TODO: Fixme
+/*
 
 pub fn start(endpoint: Endpoint, system: SharedSystem) {
     for _ in 0..LISTENERS_COUNT {
@@ -65,7 +69,7 @@ pub fn start(endpoint: Endpoint, system: SharedSystem) {
 
 async fn handle_connection(
     incoming_connection: quinn::Connecting,
-    system: SharedSystem,
+    shard: Rc<IggyShard>,
 ) -> Result<(), ConnectionError> {
     let connection = incoming_connection.await?;
     let address = connection.remote_address();
@@ -179,3 +183,4 @@ async fn handle_stream(
         }
     }
 }
+*/

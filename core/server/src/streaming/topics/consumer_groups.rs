@@ -91,7 +91,7 @@ impl Topic {
         self.get_consumer_group_by_id(*group_id.unwrap())
     }
 
-    pub fn get_consumer_group_by_id(&self, id: u32) -> Result<&RwLock<ConsumerGroup>, IggyError> {
+    pub fn get_consumer_group_by_id(&self, id: u32) -> Result<ConsumerGroup, IggyError> {
         let consumer_group = self.consumer_groups.get(&id);
         if consumer_group.is_none() {
             return Err(IggyError::ConsumerGroupIdNotFound(id, self.topic_id));
@@ -104,7 +104,7 @@ impl Topic {
         &mut self,
         group_id: Option<u32>,
         name: &str,
-    ) -> Result<&RwLock<ConsumerGroup>, IggyError> {
+    ) -> Result<ConsumerGroup, IggyError> {
         if self.consumer_groups_ids.contains_key(name) {
             return Err(IggyError::ConsumerGroupNameAlreadyExists(
                 name.to_owned(),
@@ -138,20 +138,20 @@ impl Topic {
         }
 
         let consumer_group =
-            ConsumerGroup::new(self.topic_id, id, name, self.partitions.len() as u32);
-        self.consumer_groups.insert(id, RwLock::new(consumer_group));
+            ConsumerGroup::new(self.topic_id, id, name, self.partitions.borrow().len() as u32);
+        self.consumer_groups.insert(id, consumer_group.clone());
         self.consumer_groups_ids.insert(name.to_owned(), id);
         info!(
             "Created consumer group with ID: {} for topic with ID: {} and stream with ID: {}.",
             id, self.topic_id, self.stream_id
         );
-        self.get_consumer_group_by_id(id)
+        consumer_group
     }
 
     pub async fn delete_consumer_group(
         &mut self,
         id: &Identifier,
-    ) -> Result<RwLock<ConsumerGroup>, IggyError> {
+    ) -> Result<ConsumerGroup, IggyError> {
         let group_id;
         {
             let consumer_group = self.get_consumer_group(id).with_error_context(|error| {
@@ -167,7 +167,6 @@ impl Topic {
         }
         let consumer_group = consumer_group.unwrap();
         {
-            let consumer_group = consumer_group.read().await;
             let group_id = consumer_group.group_id;
             self.consumer_groups_ids.remove(&consumer_group.name);
             let current_group_id = self.current_consumer_group_id.load(Ordering::SeqCst);
@@ -176,8 +175,7 @@ impl Topic {
                     .store(group_id, Ordering::SeqCst);
             }
 
-            for (_, partition) in self.partitions.iter() {
-                let partition = partition.read().await;
+            for (_, partition) in self.partitions.borrow().iter() {
                 if let Some((_, offset)) = partition.consumer_group_offsets.remove(&group_id) {
                     self.storage
                         .partition

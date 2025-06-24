@@ -23,6 +23,8 @@ use crate::streaming::storage::SystemStorage;
 use crate::streaming::topics::consumer_group::ConsumerGroup;
 use ahash::AHashMap;
 use core::fmt;
+use std::cell::RefCell;
+use std::rc::Rc;
 use iggy_common::locking::IggySharedMut;
 use iggy_common::{
     CompressionAlgorithm, Consumer, ConsumerKind, IggyByteSize, IggyError, IggyExpiry,
@@ -48,10 +50,10 @@ pub struct Topic {
     pub(crate) messages_count_of_parent_stream: Arc<AtomicU64>,
     pub(crate) messages_count: Arc<AtomicU64>,
     pub(crate) segments_count_of_parent_stream: Arc<AtomicU32>,
-    pub(crate) config: Arc<SystemConfig>,
-    pub(crate) partitions: AHashMap<u32, IggySharedMut<Partition>>,
-    pub(crate) storage: Arc<SystemStorage>,
-    pub(crate) consumer_groups: AHashMap<u32, RwLock<ConsumerGroup>>,
+    pub(crate) config: Rc<SystemConfig>,
+    pub(crate) partitions: RefCell<AHashMap<u32, Partition>>,
+    pub(crate) storage: Rc<SystemStorage>,
+    pub(crate) consumer_groups: AHashMap<u32, ConsumerGroup>,
     pub(crate) consumer_groups_ids: AHashMap<String, u32>,
     pub(crate) current_consumer_group_id: AtomicU32,
     pub(crate) current_partition_id: AtomicU32,
@@ -71,8 +73,8 @@ impl Topic {
         size_of_parent_stream: Arc<AtomicU64>,
         messages_count_of_parent_stream: Arc<AtomicU64>,
         segments_count_of_parent_stream: Arc<AtomicU32>,
-        config: Arc<SystemConfig>,
-        storage: Arc<SystemStorage>,
+        config: Rc<SystemConfig>,
+        storage: Rc<SystemStorage>,
     ) -> Topic {
         Topic::create(
             stream_id,
@@ -99,8 +101,8 @@ impl Topic {
         topic_id: u32,
         name: &str,
         partitions_count: u32,
-        config: Arc<SystemConfig>,
-        storage: Arc<SystemStorage>,
+        config: Rc<SystemConfig>,
+        storage: Rc<SystemStorage>,
         size_of_parent_stream: Arc<AtomicU64>,
         messages_count_of_parent_stream: Arc<AtomicU64>,
         segments_count_of_parent_stream: Arc<AtomicU32>,

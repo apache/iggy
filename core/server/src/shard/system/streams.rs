@@ -26,7 +26,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::fs;
 use tracing::{error, info, warn};
 
-
 impl IggyShard {
     pub fn get_streams(&self) -> Vec<&Stream> {
         self.streams.values().collect()

@@ -16,6 +16,8 @@
  * under the License.
  */
 
+//TODO: Fixme
+/*
 use crate::configs::server::ServerConfig;
 use crate::streaming::systems::system::SharedSystem;
 use flume::{Receiver, Sender};
@@ -38,3 +40,5 @@ pub trait BackgroundServerCommand<C> {
         receiver: Receiver<C>,
     );
 }
+
+*/

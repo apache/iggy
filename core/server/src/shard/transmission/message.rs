@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 /* Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -15,16 +17,18 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::binary::command::ServerCommand;
+use crate::{binary::command::ServerCommand, streaming::session::Session};
 
 #[derive(Debug)]
 pub enum ShardMessage {
     Command(ServerCommand),
-    Event(ShardEvent),
+    Event(Rc<ShardEvent>),
 }
 
 #[derive(Debug)]
-pub enum ShardEvent {}
+pub enum ShardEvent {
+    NewSession(Rc<Session>),
+}
 
 impl From<ServerCommand> for ShardMessage {
     fn from(command: ServerCommand) -> Self {
@@ -32,8 +36,8 @@ impl From<ServerCommand> for ShardMessage {
     }
 }
 
-impl From<ShardEvent> for ShardMessage {
-    fn from(event: ShardEvent) -> Self {
+impl From<Rc<ShardEvent>> for ShardMessage {
+    fn from(event: Rc<ShardEvent>) -> Self {
         ShardMessage::Event(event)
     }
 }

@@ -16,16 +16,18 @@
  * under the License.
  */
 
+use socket2::{Domain, Protocol, Socket, Type};
 use std::num::TryFromIntError;
-
 
 use crate::configs::tcp::TcpSocketConfig;
 
-pub fn build(ipv6: bool, config: TcpSocketConfig) -> TcpSocket {
+pub fn build(ipv6: bool, config: &TcpSocketConfig) -> Socket {
     let socket = if ipv6 {
-        TcpSocket::new_v6().expect("Unable to create an ipv6 socket")
+        Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))
+            .expect("Unable to create an ipv6 socket")
     } else {
-        TcpSocket::new_v4().expect("Unable to create an ipv4 socket")
+        Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+            .expect("Unable to create an ipv4 socket")
     };
 
     if config.override_defaults {
@@ -34,7 +36,7 @@ pub fn build(ipv6: bool, config: TcpSocketConfig) -> TcpSocket {
             .as_bytes_u64()
             .try_into()
             .map_err(|e: TryFromIntError| std::io::Error::other(e.to_string()))
-            .and_then(|size: u32| socket.set_recv_buffer_size(size))
+            .and_then(|size| socket.set_recv_buffer_size(size))
             .expect("Unable to set SO_RCVBUF on socket");
         config
             .send_buffer_size
@@ -52,6 +54,12 @@ pub fn build(ipv6: bool, config: TcpSocketConfig) -> TcpSocket {
         socket
             .set_linger(Some(config.linger.get_duration()))
             .expect("Unable to set SO_LINGER on socket");
+        socket
+            .set_reuse_address(true)
+            .expect("Unable to set SO_REUSEADDR on socket");
+        socket
+            .set_reuse_port(true)
+            .expect("Unable to set SO_REUSEPORT on socket");
     }
 
     socket
@@ -77,9 +85,9 @@ mod tests {
             nodelay: true,
             linger: IggyDuration::new(linger_dur),
         };
-        let socket = build(false, config);
-        assert!(socket.recv_buffer_size().unwrap() >= buffer_size as u32);
-        assert!(socket.send_buffer_size().unwrap() >= buffer_size as u32);
+        let socket = build(false, &config);
+        assert!(socket.recv_buffer_size().unwrap() >= buffer_size as usize);
+        assert!(socket.send_buffer_size().unwrap() >= buffer_size as usize);
         assert!(socket.keepalive().unwrap());
         assert!(socket.nodelay().unwrap());
         assert_eq!(socket.linger().unwrap(), Some(linger_dur));

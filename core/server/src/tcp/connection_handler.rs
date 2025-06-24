@@ -19,27 +19,28 @@
 use crate::binary::command::ServerCommandHandler;
 use crate::binary::{command, sender::SenderKind};
 use crate::server_error::ConnectionError;
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use crate::tcp::connection_handler::command::ServerCommand;
+use bytes::BytesMut;
 use iggy_common::IggyError;
 use std::io::ErrorKind;
-use std::sync::Arc;
+use std::rc::Rc;
 use tracing::{debug, error, info};
 
 const INITIAL_BYTES_LENGTH: usize = 4;
 
 pub(crate) async fn handle_connection(
-    session: Arc<Session>,
+    session: &Rc<Session>,
     sender: &mut SenderKind,
-    system: SharedSystem,
+    shard: &Rc<IggyShard>,
 ) -> Result<(), ConnectionError> {
-    let mut length_buffer = [0u8; INITIAL_BYTES_LENGTH];
-    let mut code_buffer = [0u8; INITIAL_BYTES_LENGTH];
+    let length_buffer = BytesMut::with_capacity(INITIAL_BYTES_LENGTH);
+    let code_buffer = BytesMut::with_capacity(INITIAL_BYTES_LENGTH);
     loop {
-        let read_length = match sender.read(&mut length_buffer).await {
-            Ok(read_length) => read_length,
-            Err(error) => {
+        let (read_length, initial_buffer) = match sender.read(length_buffer.clone()).await {
+            (Ok(read_length), initial_buffer) => (read_length, initial_buffer),
+            (Err(error), _) => {
                 if error.as_code() == IggyError::ConnectionClosed.as_code() {
                     return Err(ConnectionError::from(error));
                 } else {
@@ -56,13 +57,18 @@ pub(crate) async fn handle_connection(
             continue;
         }
 
-        let length = u32::from_le_bytes(length_buffer);
-        sender.read(&mut code_buffer).await?;
-        let code = u32::from_le_bytes(code_buffer);
+        let initial_buffer = initial_buffer.freeze();
+        let length =
+            u32::from_le_bytes(initial_buffer[0..INITIAL_BYTES_LENGTH].try_into().unwrap());
+        let (res, code_buffer) = sender.read(code_buffer.clone()).await;
+        let _ = res?;
+        let code_buffer = code_buffer.freeze();
+        let code: u32 =
+            u32::from_le_bytes(code_buffer[0..INITIAL_BYTES_LENGTH].try_into().unwrap());
         debug!("Received a TCP request, length: {length}, code: {code}");
         let command = ServerCommand::from_code_and_reader(code, sender, length - 4).await?;
         debug!("Received a TCP command: {command}, payload size: {length}");
-        match command.handle(sender, length, &session, &system).await {
+        match command.handle(sender, length, session, shard).await {
             Ok(_) => {
                 debug!(
                     "Command was handled successfully, session: {session}. TCP response was sent."

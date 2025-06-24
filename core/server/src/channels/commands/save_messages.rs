@@ -16,6 +16,8 @@
  * under the License.
  */
 
+//Todo: Fixme
+/*
 use crate::channels::server_command::BackgroundServerCommand;
 use crate::configs::server::MessageSaverConfig;
 use crate::configs::server::ServerConfig;
@@ -116,3 +118,5 @@ impl BackgroundServerCommand<SaveMessagesCommand> for SaveMessagesExecutor {
         });
     }
 }
+
+*/

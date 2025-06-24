@@ -20,7 +20,6 @@ mod procdump;
 
 use crate::configs::system::SystemConfig;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::System;
 use async_zip::tokio::write::ZipFileWriter;
 use async_zip::{Compression, ZipEntryBuilder};
 use iggy_common::{IggyDuration, IggyError, Snapshot, SnapshotCompression, SystemSnapshotType};

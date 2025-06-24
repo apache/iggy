@@ -19,13 +19,16 @@
 use iggy_common::{AtomicUserId, UserId};
 use std::fmt::Display;
 use std::net::SocketAddr;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // This might be extended with more fields in the future e.g. custom name, permissions etc.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Session {
-    user_id: AtomicUserId,
-    active: AtomicBool,
+    // TODO: Fixme, those don't have to be atomics anymore, simple integers will suffice
+    // Once the atomics are removed, we can impl Copy trait aswell.
+    user_id: Rc<AtomicUserId>,
+    active: Rc<AtomicBool>,
     pub client_id: u32,
     pub ip_address: SocketAddr,
 }
@@ -34,8 +37,8 @@ impl Session {
     pub fn new(client_id: u32, user_id: UserId, ip_address: SocketAddr) -> Self {
         Self {
             client_id,
-            active: AtomicBool::new(true),
-            user_id: AtomicUserId::new(user_id),
+            active: Rc::new(AtomicBool::new(true)),
+            user_id: Rc::new(AtomicUserId::new(user_id)),
             ip_address,
         }
     }
@@ -49,15 +52,15 @@ impl Session {
     }
 
     pub fn get_user_id(&self) -> UserId {
-        self.user_id.load(Ordering::Acquire)
+        self.user_id.load(Ordering::Relaxed)
     }
 
     pub fn set_user_id(&self, user_id: UserId) {
-        self.user_id.store(user_id, Ordering::Release)
+        self.user_id.store(user_id, Ordering::Relaxed)
     }
 
     pub fn set_stale(&self) {
-        self.active.store(false, Ordering::Release)
+        self.active.store(false, Ordering::Relaxed)
     }
 
     pub fn clear_user_id(&self) {
@@ -65,7 +68,7 @@ impl Session {
     }
 
     pub fn is_active(&self) -> bool {
-        self.active.load(Ordering::Acquire)
+        self.active.load(Ordering::Relaxed)
     }
 
     pub fn is_authenticated(&self) -> bool {

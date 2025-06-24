@@ -40,8 +40,8 @@ pub struct Stream {
     pub segments_count: Arc<AtomicU32>,
     pub(crate) topics: AHashMap<u32, Topic>,
     pub(crate) topics_ids: AHashMap<String, u32>,
-    pub(crate) config: Arc<SystemConfig>,
-    pub(crate) storage: Arc<SystemStorage>,
+    pub(crate) config: Rc<SystemConfig>,
+    pub(crate) storage: Rc<SystemStorage>,
 }
 
 impl Stream {
@@ -106,18 +106,18 @@ mod tests {
     #[test]
     fn should_be_created_given_valid_parameters() {
         let tempdir = tempfile::TempDir::new().unwrap();
-        let config = Arc::new(SystemConfig {
+        let config = Rc::new(SystemConfig {
             path: tempdir.path().to_str().unwrap().to_string(),
             ..Default::default()
         });
-        let storage = Arc::new(SystemStorage::new(
+        let storage = Rc::new(SystemStorage::new(
             config.clone(),
             Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister {})),
         ));
         MemoryPool::init_pool(config.clone());
         let id = 1;
         let name = "test";
-        let config = Arc::new(SystemConfig::default());
+        let config = Rc::new(SystemConfig::default());
         let path = config.get_stream_path(id);
         let topics_path = config.get_topics_path(id);
 

@@ -368,6 +368,7 @@ mod tests {
     use crate::streaming::utils::MemoryPool;
     use bytes::Bytes;
     use iggy_common::{IggyExpiry, IggyMessage};
+    use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, AtomicU64};
     use tempfile::TempDir;
@@ -710,7 +711,7 @@ mod tests {
         let partition_id = 3;
         let with_segment = true;
         let temp_dir = TempDir::new().unwrap();
-        let config = Arc::new(SystemConfig {
+        let config = Rc::new(SystemConfig {
             path: temp_dir.path().to_path_buf().to_str().unwrap().to_string(),
             message_deduplication: MessageDeduplicationConfig {
                 enabled: deduplication_enabled,
@@ -718,7 +719,7 @@ mod tests {
             },
             ..Default::default()
         });
-        let storage = Arc::new(SystemStorage::new(
+        let storage = Rc::new(SystemStorage::new(
             config.clone(),
             Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister {})),
         ));

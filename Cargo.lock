@@ -7279,6 +7279,7 @@ dependencies = [
  "serde_with",
  "serial_test",
  "sharded_queue",
+ "socket2",
  "static-toml",
  "strum",
  "sysinfo 0.35.2",

@@ -26,7 +26,7 @@ use crate::{
     configs::server::ServerConfig,
     map_toggle_str,
     shard::Shard,
-    state::{file::FileState, StateKind},
+    state::{StateKind, file::FileState},
     streaming::{diagnostics::metrics::Metrics, storage::SystemStorage},
     versioning::SemanticVersion,
 };

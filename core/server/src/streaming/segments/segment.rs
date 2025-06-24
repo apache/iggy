@@ -27,6 +27,7 @@ use iggy_common::IggyByteSize;
 use iggy_common::IggyError;
 use iggy_common::IggyExpiry;
 use iggy_common::IggyTimestamp;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::fs::remove_file;
@@ -60,7 +61,7 @@ pub struct Segment {
     pub(super) index_reader: Option<IndexReader>,
     pub(super) message_expiry: IggyExpiry,
     pub(super) accumulator: MessagesAccumulator,
-    pub(super) config: Arc<SystemConfig>,
+    pub(super) config: Rc<SystemConfig>,
     pub(super) indexes: IggyIndexesMut,
     pub(super) messages_size: Arc<AtomicU64>,
     pub(super) indexes_size: Arc<AtomicU64>,
@@ -73,7 +74,7 @@ impl Segment {
         topic_id: u32,
         partition_id: u32,
         start_offset: u64,
-        config: Arc<SystemConfig>,
+        config: Rc<SystemConfig>,
         message_expiry: IggyExpiry,
         size_of_parent_stream: Arc<AtomicU64>,
         size_of_parent_topic: Arc<AtomicU64>,
@@ -450,7 +451,7 @@ mod tests {
         let topic_id = 2;
         let partition_id = 3;
         let start_offset = 0;
-        let config = Arc::new(SystemConfig::default());
+        let config = Rc::new(SystemConfig::default());
         let path = config.get_segment_path(stream_id, topic_id, partition_id, start_offset);
         let messages_file_path = Segment::get_messages_file_path(&path);
         let index_path = Segment::get_index_path(&path);
@@ -499,7 +500,7 @@ mod tests {
         let topic_id = 2;
         let partition_id = 3;
         let start_offset = 0;
-        let config = Arc::new(SystemConfig {
+        let config = Rc::new(SystemConfig {
             segment: SegmentConfig {
                 cache_indexes: CacheIndexesConfig::None,
                 ..Default::default()

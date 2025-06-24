@@ -16,6 +16,8 @@
  * under the License.
  */
 
+//TODO: Fixme
+/*
 use super::server_command::BackgroundServerCommand;
 use crate::configs::server::ServerConfig;
 use crate::streaming::systems::system::SharedSystem;
@@ -44,3 +46,5 @@ impl<'a> BackgroundServerCommandHandler<'a> {
         }
     }
 }
+
+*/
