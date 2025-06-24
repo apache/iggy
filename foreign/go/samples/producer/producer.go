@@ -118,7 +118,7 @@ func PublishMessages(messageStream MessageStream) error {
 			debugMessages = append(debugMessages, message)
 			messages = append(messages, IggyMessage{
 				Header: MessageHeader{
-					Id:               uuid.New(),
+					Id:               MessageID(uuid.New()),
 					OriginTimestamp:  uint64(time.Now().UnixMicro()),
 					UserHeaderLength: 0,
 					PayloadLength:    uint32(len(json)),

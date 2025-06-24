@@ -18,6 +18,10 @@
 package ierror
 
 var (
+	ResourceNotFound = &IggyError{
+		Code:    20,
+		Message: "resource_not_found",
+	}
 	StreamIdNotFound = &IggyError{
 		Code:    1009,
 		Message: "stream_id_not_found",
@@ -26,12 +30,20 @@ var (
 		Code:    2010,
 		Message: "topic_id_not_found",
 	}
+	InvalidMessagePayloadLength = &IggyError{
+		Code:    4025,
+		Message: "invalid_message_payload_length",
+	}
+	TooBigUserMessagePayload = &IggyError{
+		Code:    4022,
+		Message: "too_big_message_payload",
+	}
+	TooBigUserHeaders = &IggyError{
+		Code:    4017,
+		Message: "too_big_headers_payload",
+	}
 	ConsumerGroupIdNotFound = &IggyError{
 		Code:    5000,
 		Message: "consumer_group_not_found",
-	}
-	ResourceNotFound = &IggyError{
-		Code:    20,
-		Message: "resource_not_found",
 	}
 )

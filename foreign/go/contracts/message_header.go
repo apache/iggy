@@ -21,15 +21,15 @@ import (
 	"encoding/binary"
 	"errors"
 	"time"
-
-	"github.com/google/uuid"
 )
 
 const MessageHeaderSize = 8 + 16 + 8 + 8 + 8 + 4 + 4
 
+type MessageID [16]byte
+
 type MessageHeader struct {
 	Checksum         uint64    `json:"checksum"`
-	Id               uuid.UUID `json:"id"`
+	Id               MessageID `json:"id"`
 	Offset           uint64    `json:"offset"`
 	Timestamp        uint64    `json:"timestamp"`
 	OriginTimestamp  uint64    `json:"origin_timestamp"`
@@ -37,7 +37,7 @@ type MessageHeader struct {
 	PayloadLength    uint32    `json:"payload_length"`
 }
 
-func NewMessageHeader(id uuid.UUID, payloadLength uint32, userHeaderLength uint32) MessageHeader {
+func NewMessageHeader(id MessageID, payloadLength uint32, userHeaderLength uint32) MessageHeader {
 	return MessageHeader{
 		Id:               id,
 		OriginTimestamp:  uint64(time.Now().UnixMicro()),
@@ -52,21 +52,21 @@ func MessageHeaderFromBytes(data []byte) (*MessageHeader, error) {
 		return nil, errors.New("data has incorrect size, must be 56")
 	}
 	checksum := binary.LittleEndian.Uint64(data[0:8])
-	id, _ := uuid.FromBytes(data[8:24])
+	id := data[8:24]
 	timestamp := binary.LittleEndian.Uint64(data[24:32])
-	origin_timestamp := binary.LittleEndian.Uint64(data[32:40])
+	originTimestamp := binary.LittleEndian.Uint64(data[32:40])
 	offset := binary.LittleEndian.Uint64(data[40:48])
-	user_header_length := binary.LittleEndian.Uint32(data[48:52])
-	payload_length := binary.LittleEndian.Uint32(data[52:56])
+	userHeaderLength := binary.LittleEndian.Uint32(data[48:52])
+	payloadLength := binary.LittleEndian.Uint32(data[52:56])
 
 	return &MessageHeader{
 		Checksum:         checksum,
-		Id:               id,
+		Id:               MessageID(id),
 		Offset:           offset,
 		Timestamp:        timestamp,
-		OriginTimestamp:  origin_timestamp,
-		UserHeaderLength: user_header_length,
-		PayloadLength:    payload_length,
+		OriginTimestamp:  originTimestamp,
+		UserHeaderLength: userHeaderLength,
+		PayloadLength:    payloadLength,
 	}, nil
 }
 
@@ -74,7 +74,7 @@ func (mh *MessageHeader) ToBytes() []byte {
 	bytes := make([]byte, 0, MessageHeaderSize)
 
 	bytes = binary.LittleEndian.AppendUint64(bytes, mh.Checksum)
-	idBytes, _ := uuid.UUID.MarshalBinary(mh.Id)
+	idBytes := mh.Id[:]
 	bytes = append(bytes, idBytes...)
 	bytes = binary.LittleEndian.AppendUint64(bytes, mh.Offset)
 	bytes = binary.LittleEndian.AppendUint64(bytes, mh.Timestamp)

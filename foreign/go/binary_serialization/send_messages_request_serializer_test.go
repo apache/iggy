@@ -74,9 +74,9 @@ func createDefaultMessageHeaders() map[iggcon.HeaderKey]iggcon.HeaderValue {
 }
 
 func generateTestMessage(payload string) iggcon.IggyMessage {
-	return iggcon.NewIggyMessageWithHeaders(
-		uuid.New(),
+	msg, _ := iggcon.NewIggyMessage(
 		[]byte(payload),
-		createDefaultMessageHeaders(),
-	)
+		iggcon.WithID(uuid.New()),
+		iggcon.WithUserHeaders(createDefaultMessageHeaders()))
+	return msg
 }

@@ -148,7 +148,11 @@ func CreateMessages(messagesCount, messageSize int) []iggcon.IggyMessage {
 		}
 		id, _ := uuid.NewUUID()
 
-		messages[i] = iggcon.NewIggyMessage(id, payload)
+		var err error
+		messages[i], err = iggcon.NewIggyMessage(payload, iggcon.WithID(id))
+		if err != nil {
+			panic(err)
+		}
 	}
 	return messages
 }
