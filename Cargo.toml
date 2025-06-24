@@ -84,6 +84,7 @@ derive_more = { version = "2.0.1", features = ["full"] }
 derive-new = "0.7.0"
 dirs = "6.0.0"
 dlopen2 = "0.8.0"
+dotenvy = "0.15.7"
 enum_dispatch = "0.3.13"
 figlet-rs = "0.1.5"
 flume = "0.11.1"
