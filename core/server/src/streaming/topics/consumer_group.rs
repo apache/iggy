@@ -18,7 +18,6 @@
 
 use ahash::AHashMap;
 use iggy_common::IggyError;
-use tokio::sync::RwLock;
 use tracing::trace;
 
 #[derive(Debug, Clone)]
@@ -58,10 +57,13 @@ impl ConsumerGroup {
         self.assign_partitions().await;
     }
 
-    pub async fn calculate_partition_id(&self, member_id: u32) -> Result<Option<u32>, IggyError> {
-        let member = self.members.get(&member_id);
+    pub async fn calculate_partition_id(
+        &mut self,
+        member_id: u32,
+    ) -> Result<Option<u32>, IggyError> {
+        let member = self.members.get_mut(&member_id);
         if let Some(member) = member {
-            return Ok(member.await.calculate_partition_id());
+            return Ok(member.calculate_partition_id());
         }
         Err(IggyError::ConsumerGroupMemberNotFound(
             member_id,
@@ -73,7 +75,7 @@ impl ConsumerGroup {
     pub async fn get_current_partition_id(&self, member_id: u32) -> Result<Option<u32>, IggyError> {
         let member = self.members.get(&member_id);
         if let Some(member) = member {
-            return Ok(member.read().await.current_partition_id);
+            return Ok(member.current_partition_id);
         }
         Err(IggyError::ConsumerGroupMemberNotFound(
             member_id,
@@ -85,12 +87,12 @@ impl ConsumerGroup {
     pub async fn add_member(&mut self, member_id: u32) {
         self.members.insert(
             member_id,
-            RwLock::new(ConsumerGroupMember {
+            ConsumerGroupMember {
                 id: member_id,
                 partitions: AHashMap::new(),
                 current_partition_index: None,
                 current_partition_id: None,
-            }),
+            },
         );
         trace!(
             "Added member with ID: {} to consumer group: {} for topic with ID: {}",
@@ -117,7 +119,6 @@ impl ConsumerGroup {
 
         let members_count = members.len() as u32;
         for member in members.iter_mut() {
-            let mut member = member.write().await;
             member.current_partition_index = None;
             member.current_partition_id = None;
             member.partitions.clear();
@@ -126,8 +127,7 @@ impl ConsumerGroup {
         for partition_index in 0..self.partitions_count {
             let partition_id = partition_index + 1;
             let member_index = partition_index % members_count;
-            let member = members.get(member_index as usize).unwrap();
-            let mut member = member.write().await;
+            let member = members.get_mut(member_index as usize).unwrap();
             let member_partition_index = member.partitions.len() as u32;
             member
                 .partitions
@@ -213,7 +213,6 @@ mod tests {
 
         consumer_group.add_member(member_id).await;
         let member = consumer_group.members.get(&member_id).unwrap();
-        let member = member.read().await;
         assert_eq!(
             member.partitions.len() as u32,
             consumer_group.partitions_count
@@ -240,8 +239,6 @@ mod tests {
         consumer_group.add_member(member2_id).await;
         let member1 = consumer_group.members.get(&member1_id).unwrap();
         let member2 = consumer_group.members.get(&member2_id).unwrap();
-        let member1 = member1.read().await;
-        let member2 = member2.read().await;
         assert_eq!(
             member1.partitions.len() + member2.partitions.len(),
             consumer_group.partitions_count as usize
@@ -277,8 +274,6 @@ mod tests {
         consumer_group.add_member(member2_id).await;
         let member1 = consumer_group.members.get(&member1_id).unwrap();
         let member2 = consumer_group.members.get(&member2_id).unwrap();
-        let member1 = member1.read().await;
-        let member2 = member2.read().await;
         if member1.partitions.len() == 1 {
             assert_eq!(member2.partitions.len(), 0);
         } else {
