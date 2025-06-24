@@ -71,14 +71,13 @@ impl BenchmarkRunner {
         let hardware =
             BenchmarkHardware::get_system_info_with_identifier(benchmark.args().identifier());
         let params = params_from_args_and_metrics(benchmark.args(), &individual_metrics);
-        let transport = params.transport;
-        let server_addr = params.server_address.clone();
 
         let report = BenchmarkReportBuilder::build(
             hardware,
             params,
             individual_metrics,
             benchmark.args().moving_average_window(),
+            benchmark.client_factory(),
         )
         .await;
 
@@ -100,8 +99,7 @@ impl BenchmarkRunner {
             report.dump_to_json(&full_output_path);
 
             if let Err(e) = collect_server_logs_and_save_to_file(
-                &transport,
-                &server_addr,
+                benchmark.client_factory(),
                 Path::new(&full_output_path),
             )
             .await

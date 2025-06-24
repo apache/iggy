@@ -351,32 +351,42 @@ impl TcpClient {
 
             let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-            let mut root_cert_store = rustls::RootCertStore::empty();
-            if let Some(certificate_path) = &self.config.tls_ca_file {
-                for cert in CertificateDer::pem_file_iter(certificate_path).map_err(|error| {
-                    error!("Failed to read the CA file: {certificate_path}. {error}",);
-                    IggyError::InvalidTlsCertificatePath
-                })? {
-                    let certificate = cert.map_err(|error| {
-                        error!(
-                            "Failed to read a certificate from the CA file: {certificate_path}. {error}",
-                        );
-                        IggyError::InvalidTlsCertificate
-                    })?;
-                    root_cert_store.add(certificate).map_err(|error| {
-                        error!(
-                            "Failed to add a certificate to the root certificate store. {error}",
-                        );
-                        IggyError::InvalidTlsCertificate
-                    })?;
+            let config = if self.config.tls_validate_certificate {
+                let mut root_cert_store = rustls::RootCertStore::empty();
+                if let Some(certificate_path) = &self.config.tls_ca_file {
+                    for cert in
+                        CertificateDer::pem_file_iter(certificate_path).map_err(|error| {
+                            error!("Failed to read the CA file: {certificate_path}. {error}",);
+                            IggyError::InvalidTlsCertificatePath
+                        })?
+                    {
+                        let certificate = cert.map_err(|error| {
+                            error!(
+                                "Failed to read a certificate from the CA file: {certificate_path}. {error}",
+                            );
+                            IggyError::InvalidTlsCertificate
+                        })?;
+                        root_cert_store.add(certificate).map_err(|error| {
+                            error!(
+                                "Failed to add a certificate to the root certificate store. {error}",
+                            );
+                            IggyError::InvalidTlsCertificate
+                        })?;
+                    }
+                } else {
+                    root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
                 }
-            } else {
-                root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            }
 
-            let config = rustls::ClientConfig::builder()
-                .with_root_certificates(root_cert_store)
-                .with_no_client_auth();
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(root_cert_store)
+                    .with_no_client_auth()
+            } else {
+                use crate::tcp::tcp_tls_verifier::NoServerVerification;
+                rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(NoServerVerification))
+                    .with_no_client_auth()
+            };
             let connector = TlsConnector::from(Arc::new(config));
             let tls_domain = self.config.tls_domain.to_owned();
             let domain = ServerName::try_from(tls_domain).map_err(|error| {

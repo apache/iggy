@@ -25,6 +25,10 @@ use std::sync::Arc;
 pub struct TcpClientFactory {
     pub server_addr: String,
     pub nodelay: bool,
+    pub tls_enabled: bool,
+    pub tls_domain: String,
+    pub tls_ca_file: Option<String>,
+    pub tls_validate_certificate: bool,
 }
 
 #[async_trait]
@@ -33,6 +37,10 @@ impl ClientFactory for TcpClientFactory {
         let config = TcpClientConfig {
             server_address: self.server_addr.clone(),
             nodelay: self.nodelay,
+            tls_enabled: self.tls_enabled,
+            tls_domain: self.tls_domain.clone(),
+            tls_ca_file: self.tls_ca_file.clone(),
+            tls_validate_certificate: self.tls_validate_certificate,
             ..TcpClientConfig::default()
         };
         let client = TcpClient::create(Arc::new(config)).unwrap_or_else(|e| {
@@ -42,10 +50,20 @@ impl ClientFactory for TcpClientFactory {
             )
         });
         Client::connect(&client).await.unwrap_or_else(|e| {
-            panic!(
-                "Failed to connect to iggy-server at {}, error: {:?}",
-                self.server_addr, e
-            )
+            if self.tls_enabled {
+                panic!(
+                    "Failed to connect to iggy-server at {} with TLS enabled, error: {:?}\n\
+                    Hint: Make sure the server is started with TLS enabled and self-signed certificate:\n\
+                    IGGY_TCP_TLS_ENABLED=true IGGY_TCP_TLS_SELF_SIGNED=true\n
+                    or start iggy-bench with relevant tcp tls arguments: --tls --tls-domain <domain> --tls-ca-file <ca_file>\n",
+                    self.server_addr, e
+                )
+            } else {
+                panic!(
+                    "Failed to connect to iggy-server at {}, error: {:?}",
+                    self.server_addr, e
+                )
+            }
         });
         Box::new(client)
     }

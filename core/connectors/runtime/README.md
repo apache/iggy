@@ -45,8 +45,8 @@ allow_private_network = false
 
 [http_api.tls] # Optional TLS configuration for HTTP API
 enabled = false
-cert_file = "certs/iggy_cert.pem"
-key_file = "certs/iggy_key.pem"
+cert_file = "core/certs/iggy_cert.pem"
+key_file = "core/certs/iggy_key.pem"
 ```
 
 Currently, it does expose the following endpoints:

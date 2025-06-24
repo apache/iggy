@@ -3827,6 +3827,8 @@ dependencies = [
  "derive_more 2.0.1",
  "fast-async-mutex",
  "humantime",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "serde_with",
@@ -4366,9 +4368,9 @@ dependencies = [
 
 [[package]]
 name = "libgit2-sys"
-version = "0.18.1+1.9.0"
+version = "0.18.2+1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1dcb20f84ffcdd825c7a311ae347cce604a6f084a767dec4a4929829645290e"
+checksum = "1c42fe03df2bd3c53a3a9c7317ad91d80c81cd1fb0caec8d7cc4cd2bfa10c222"
 dependencies = [
  "cc",
  "libc",
@@ -6747,7 +6749,6 @@ dependencies = [
  "opentelemetry_sdk",
  "prometheus-client",
  "quinn",
- "rcgen",
  "reqwest",
  "ring",
  "rust-s3",
@@ -8909,9 +8910,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "4.1.0"
+version = "4.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af7dcdb4229c0e79c2531a24de7726a0e980417a74fb4d030a35f535665439a0"
+checksum = "95ab361742de920c5535880f89bbd611ee62002bf11341d16a5f057bb8ba6899"
 dependencies = [
  "aes",
  "arbitrary",

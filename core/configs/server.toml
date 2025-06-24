@@ -168,10 +168,10 @@ endpoint = "/metrics"
 enabled = false
 
 # Path to the TLS certificate file.
-cert_file = "certs/iggy_cert.pem"
+cert_file = "core/certs/iggy_cert.pem"
 
 # Path to the TLS key file.
-key_file = "certs/iggy_key.pem"
+key_file = "core/certs/iggy_key.pem"
 
 # TCP server configuration.
 [tcp]
@@ -194,11 +194,16 @@ ipv6 = false
 # `false` leaves TCP connections unencrypted.
 enabled = false
 
+# Enables or disables self-signed certificate generation.
+# `true` generates a self-signed certificate if cert files don't exist.
+# `false` requires certificate files to exist at the specified paths.
+self_signed = true
+
 # Path to the TLS certificate file.
-cert_file = "certs/iggy_cert.pem"
+cert_file = "core/certs/iggy_cert.pem"
 
 # Path to the TLS key file.
-key_file = "certs/iggy_key.pem"
+key_file = "core/certs/iggy_key.pem"
 
 # Configuration for the TCP socket
 [tcp.socket]
@@ -261,10 +266,10 @@ max_idle_timeout = "10 s"
 self_signed = true
 
 # Path to the QUIC TLS certificate file.
-cert_file = "certs/iggy_cert.pem"
+cert_file = "core/certs/iggy_cert.pem"
 
 # Path to the QUIC TLS key file.
-key_file = "certs/iggy_key.pem"
+key_file = "core/certs/iggy_key.pem"
 
 # Message cleaner configuration.
 [message_cleaner]

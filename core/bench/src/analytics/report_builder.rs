@@ -31,6 +31,8 @@ use bench_report::{
 };
 use chrono::{DateTime, Utc};
 use iggy::prelude::{CacheMetrics, CacheMetricsKey, IggyTimestamp, Stats};
+use integration::test_server::ClientFactory;
+use std::sync::Arc;
 
 pub struct BenchmarkReportBuilder;
 
@@ -41,6 +43,7 @@ impl BenchmarkReportBuilder {
         mut params: BenchmarkParams,
         mut individual_metrics: Vec<BenchmarkIndividualMetrics>,
         moving_average_window: u32,
+        client_factory: &Arc<dyn ClientFactory>,
     ) -> BenchmarkReport {
         let uuid = uuid::Uuid::new_v4();
 
@@ -48,10 +51,7 @@ impl BenchmarkReportBuilder {
             DateTime::<Utc>::from_timestamp_micros(IggyTimestamp::now().as_micros() as i64)
                 .map_or_else(|| String::from("unknown"), |dt| dt.to_rfc3339());
 
-        let transport = params.transport;
-        let server_addr = params.server_address.clone();
-
-        let server_stats = get_server_stats(&transport, &server_addr)
+        let server_stats = get_server_stats(client_factory)
             .await
             .expect("Failed to get server stats");
 

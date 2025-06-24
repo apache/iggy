@@ -83,6 +83,12 @@ impl TcpClientConfigBuilder {
         self
     }
 
+    /// Sets whether to validate the TLS certificate.
+    pub fn with_tls_validate_certificate(mut self, tls_validate_certificate: bool) -> Self {
+        self.config.tls_validate_certificate = tls_validate_certificate;
+        self
+    }
+
     /// Sets the nodelay option for the TCP socket.
     pub fn with_no_delay(mut self) -> Self {
         self.config.nodelay = true;
