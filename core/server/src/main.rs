@@ -235,7 +235,7 @@ fn main() -> Result<(), ServerError> {
                     .await;
 
                     let builder = IggyShard::builder();
-                    let mut shard = builder
+                    let shard: Rc<IggyShard> = builder
                         .id(id)
                         .connections(connections)
                         .config(config)
@@ -243,13 +243,13 @@ fn main() -> Result<(), ServerError> {
                         .version(version)
                         .state(state)
                         .build()
-                        .await;
+                        .into();
 
                     //TODO: If one of the shards fails to initialize, we should crash the whole program;
-                    shard.init().await.expect("Failed to initialize shard-{id}: {e}");
-                    info!("Initiated shard with ID: {id}");
+                    shard.run().await.expect("Failed to run shard");
                     //TODO: If one of the shards fails to initialize, we should crash the whole program;
                     shard.assert_init();
+                    let shard = Rc::new(shard);
                 })
             })
             .expect(format!("Failed to spawn thread for shard-{id}").as_str())

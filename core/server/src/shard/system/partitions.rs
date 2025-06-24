@@ -23,7 +23,7 @@ use error_set::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
 
-impl System {
+impl IggyShard {
     pub async fn create_partitions(
         &mut self,
         session: &Session,

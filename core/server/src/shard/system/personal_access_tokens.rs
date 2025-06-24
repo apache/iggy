@@ -27,7 +27,7 @@ use iggy_common::IggyExpiry;
 use iggy_common::IggyTimestamp;
 use tracing::{error, info};
 
-impl System {
+impl IggyShard {
     pub async fn get_personal_access_tokens(
         &self,
         session: &Session,

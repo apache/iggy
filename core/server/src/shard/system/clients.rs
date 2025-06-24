@@ -29,7 +29,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{error, info};
 
-impl System {
+impl IggyShard {
     pub async fn add_client(&self, address: &SocketAddr, transport: Transport) -> Arc<Session> {
         let mut client_manager = self.client_manager.write().await;
         let session = client_manager.add_client(address, transport);

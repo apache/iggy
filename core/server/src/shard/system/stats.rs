@@ -34,7 +34,7 @@ fn sysinfo() -> &'static Mutex<SysinfoSystem> {
     })
 }
 
-impl System {
+impl IggyShard {
     pub async fn get_stats(&self) -> Result<Stats, IggyError> {
         let mut sys = sysinfo().lock().await;
         let process_id = std::process::id();

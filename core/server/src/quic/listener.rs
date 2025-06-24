@@ -34,6 +34,8 @@ pub fn start(endpoint: Endpoint, system: SharedSystem) {
     for _ in 0..LISTENERS_COUNT {
         let endpoint = endpoint.clone();
         let system = system.clone();
+        //TODO: Fixme
+        /*
         tokio::spawn(async move {
             while let Some(incoming_connection) = endpoint.accept().await {
                 info!(
@@ -57,6 +59,7 @@ pub fn start(endpoint: Endpoint, system: SharedSystem) {
                 });
             }
         });
+        */
     }
 }
 

@@ -1,4 +1,4 @@
-use std::sync::{Condvar, Mutex};
+use std::sync::Mutex;
 
 #[derive(Default)]
 pub struct Gate<T> {

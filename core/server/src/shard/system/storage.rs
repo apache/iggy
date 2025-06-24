@@ -18,8 +18,6 @@
 
 use crate::streaming::persistence::persister::PersisterKind;
 use crate::streaming::storage::SystemInfoStorage;
-use crate::streaming::systems::COMPONENT;
-use crate::streaming::systems::info::SystemInfo;
 use crate::streaming::utils::PooledBuffer;
 use crate::streaming::utils::file;
 use anyhow::Context;

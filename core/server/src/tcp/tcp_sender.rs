@@ -21,7 +21,8 @@ use crate::tcp::COMPONENT;
 use crate::{server_error::ServerError, tcp::sender};
 use error_set::ErrContext;
 use iggy_common::IggyError;
-use tokio::{io::AsyncWriteExt, net::TcpStream};
+use tokio::{io::AsyncWriteExt};
+use monoio::net::TcpStream;
 
 #[derive(Debug)]
 pub struct TcpSender {

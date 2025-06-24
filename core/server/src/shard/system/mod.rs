@@ -32,4 +32,4 @@ pub mod system;
 pub mod topics;
 pub mod users;
 
-pub const COMPONENT: &str = "STREAMING_SYSTEMS";
+pub const COMPONENT: &str = "SYSTEM";

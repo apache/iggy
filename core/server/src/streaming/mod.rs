@@ -28,7 +28,6 @@ pub mod segments;
 pub mod session;
 pub mod storage;
 pub mod streams;
-pub mod systems;
 pub mod topics;
 pub mod users;
 pub mod utils;

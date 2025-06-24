@@ -23,6 +23,7 @@ use ahash::AHashMap;
 use iggy_common::IggyByteSize;
 use iggy_common::IggyTimestamp;
 use std::fmt::Display;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -47,8 +48,8 @@ impl Stream {
     pub fn empty(
         id: u32,
         name: &str,
-        config: Arc<SystemConfig>,
-        storage: Arc<SystemStorage>,
+        config: Rc<SystemConfig>,
+        storage: Rc<SystemStorage>,
     ) -> Self {
         Stream::create(id, name, config, storage)
     }
@@ -56,8 +57,8 @@ impl Stream {
     pub fn create(
         id: u32,
         name: &str,
-        config: Arc<SystemConfig>,
-        storage: Arc<SystemStorage>,
+        config: Rc<SystemConfig>,
+        storage: Rc<SystemStorage>,
     ) -> Self {
         let path = config.get_stream_path(id);
         let topics_path = config.get_topics_path(id);

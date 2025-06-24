@@ -23,7 +23,7 @@ use iggy_common::Identifier;
 use iggy_common::IggyError;
 use iggy_common::locking::IggySharedMutFn;
 
-impl System {
+impl IggyShard {
     pub async fn delete_segments(
         &mut self,
         session: &Session,

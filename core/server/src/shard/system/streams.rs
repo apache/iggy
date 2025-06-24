@@ -16,156 +16,18 @@
  * under the License.
  */
 
-use crate::state::system::StreamState;
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use crate::streaming::streams::stream::Stream;
-use crate::streaming::systems::COMPONENT;
-use crate::streaming::systems::system::System;
-use ahash::{AHashMap, AHashSet};
 use error_set::ErrContext;
 use futures::future::try_join_all;
-use iggy_common::locking::IggySharedMutFn;
-use iggy_common::{IdKind, Identifier, IggyError};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::fs;
-use tokio::fs::read_dir;
 use tracing::{error, info, warn};
 
-static CURRENT_STREAM_ID: AtomicU32 = AtomicU32::new(1);
 
-impl System {
-    pub(crate) async fn load_streams(
-        &mut self,
-        streams: Vec<StreamState>,
-    ) -> Result<(), IggyError> {
-        info!("Loading streams from disk...");
-        let mut unloaded_streams = Vec::new();
-        let mut dir_entries = read_dir(&self.config.get_streams_path())
-            .await
-            .map_err(|error| {
-                error!("Cannot read streams directory: {error}");
-                IggyError::CannotReadStreams
-            })?;
-
-        while let Some(dir_entry) = dir_entries.next_entry().await.unwrap_or(None) {
-            let name = dir_entry.file_name().into_string().unwrap();
-            let stream_id = name.parse::<u32>().map_err(|_| {
-                error!("Invalid stream ID file with name: '{name}'.");
-                IggyError::InvalidNumberValue
-            })?;
-            let stream_state = streams.iter().find(|s| s.id == stream_id);
-            if stream_state.is_none() {
-                error!(
-                    "Stream with ID: '{stream_id}' was not found in state, but exists on disk and will be removed."
-                );
-                if let Err(error) = fs::remove_dir_all(&dir_entry.path()).await {
-                    error!("Cannot remove stream directory: {error}");
-                } else {
-                    warn!("Stream with ID: '{stream_id}' was removed.");
-                }
-                continue;
-            }
-
-            let stream_state = stream_state.unwrap();
-            let mut stream = Stream::empty(
-                stream_id,
-                &stream_state.name,
-                self.config.clone(),
-                self.storage.clone(),
-            );
-            stream.created_at = stream_state.created_at;
-            unloaded_streams.push(stream);
-        }
-
-        let state_stream_ids = streams
-            .iter()
-            .map(|stream| stream.id)
-            .collect::<AHashSet<u32>>();
-        let unloaded_stream_ids = unloaded_streams
-            .iter()
-            .map(|stream| stream.stream_id)
-            .collect::<AHashSet<u32>>();
-        let mut missing_ids = state_stream_ids
-            .difference(&unloaded_stream_ids)
-            .copied()
-            .collect::<AHashSet<u32>>();
-        if missing_ids.is_empty() {
-            info!("All streams found on disk were found in state.");
-        } else {
-            warn!("Streams with IDs: '{missing_ids:?}' were not found on disk.");
-            if self.config.recovery.recreate_missing_state {
-                info!(
-                    "Recreating missing state in recovery config is enabled, missing streams will be created."
-                );
-                for stream_id in missing_ids.iter() {
-                    let stream_id = *stream_id;
-                    let stream_state = streams.iter().find(|s| s.id == stream_id).unwrap();
-                    let stream = Stream::create(
-                        stream_id,
-                        &stream_state.name,
-                        self.config.clone(),
-                        self.storage.clone(),
-                    );
-                    stream.persist().await?;
-                    unloaded_streams.push(stream);
-                    info!(
-                        "Missing stream with ID: '{stream_id}', name: {} was recreated.",
-                        stream_state.name
-                    );
-                }
-                missing_ids.clear();
-            } else {
-                warn!(
-                    "Recreating missing state in recovery config is disabled, missing streams will not be created."
-                );
-            }
-        }
-
-        let mut streams_states = streams
-            .into_iter()
-            .filter(|s| !missing_ids.contains(&s.id))
-            .map(|s| (s.id, s))
-            .collect::<AHashMap<_, _>>();
-        let loaded_streams = RefCell::new(Vec::new());
-        let load_stream_tasks = unloaded_streams.into_iter().map(|mut stream| {
-            let state = streams_states.remove(&stream.stream_id).unwrap();
-
-            async {
-                stream.load(state).await?;
-                loaded_streams.borrow_mut().push(stream);
-                Result::<(), IggyError>::Ok(())
-            }
-        });
-        try_join_all(load_stream_tasks).await?;
-
-        for stream in loaded_streams.take() {
-            if self.streams.contains_key(&stream.stream_id) {
-                error!("Stream with ID: '{}' already exists.", &stream.stream_id);
-                continue;
-            }
-
-            if self.streams_ids.contains_key(&stream.name) {
-                error!("Stream with name: '{}' already exists.", &stream.name);
-                continue;
-            }
-
-            self.metrics.increment_streams(1);
-            self.metrics.increment_topics(stream.get_topics_count());
-            self.metrics
-                .increment_partitions(stream.get_partitions_count());
-            self.metrics.increment_segments(stream.get_segments_count());
-            self.metrics.increment_messages(stream.get_messages_count());
-
-            self.streams_ids
-                .insert(stream.name.clone(), stream.stream_id);
-            self.streams.insert(stream.stream_id, stream);
-        }
-
-        info!("Loaded {} stream(s) from disk.", self.streams.len());
-        Ok(())
-    }
-
+impl IggyShard {
     pub fn get_streams(&self) -> Vec<&Stream> {
         self.streams.values().collect()
     }

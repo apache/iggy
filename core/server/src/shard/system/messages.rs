@@ -17,10 +17,9 @@
  */
 
 use crate::binary::handlers::messages::poll_messages_handler::IggyPollMetadata;
+use crate::shard::IggyShard;
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet};
 use crate::streaming::session::Session;
-use crate::streaming::systems::COMPONENT;
-use crate::streaming::systems::system::System;
 use crate::streaming::utils::PooledBuffer;
 use error_set::ErrContext;
 use iggy_common::{
@@ -29,7 +28,7 @@ use iggy_common::{
 };
 use tracing::{error, trace};
 
-impl System {
+impl IggyShard {
     pub async fn poll_messages(
         &self,
         session: &Session,

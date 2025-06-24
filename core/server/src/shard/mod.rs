@@ -17,39 +17,37 @@
  */
 
 pub mod builder;
+pub mod system;
 pub mod gate;
 pub mod namespace;
 pub mod transmission;
 
-use ahash::HashMap;
+use ahash::{AHashMap, AHashSet, HashMap};
 use builder::IggyShardBuilder;
 use error_set::ErrContext;
-use iggy_common::IggyError;
+use futures::future::try_join_all;
+use iggy_common::{EncryptorKind, IggyError, UserId};
 use namespace::IggyNamespace;
 use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
-    str::FromStr,
-    sync::Arc,
-    time::Instant,
+    cell::{Cell, RefCell}, pin::Pin, rc::Rc, str::FromStr, sync::{atomic::{AtomicU32, Ordering}, Arc, RwLock}, time::Instant
 };
-use tracing::info;
+use tracing::{error, info, instrument, trace, warn};
 use transmission::connector::{Receiver, ShardConnector, StopReceiver, StopSender};
 
 use crate::{
-    bootstrap::create_root_user,
     configs::server::ServerConfig,
-    shard::transmission::frame::ShardFrame,
+    shard::{system::info::SystemInfo, transmission::frame::ShardFrame},
     state::{
-        StateKind,
-        file::FileState,
-        system::{SystemState, UserState},
+        file::FileState, system::{StreamState, SystemState, UserState}, StateKind
     },
-    streaming::{storage::SystemStorage, systems::info::SystemInfo},
+    streaming::{clients::client_manager::ClientManager, diagnostics::metrics::Metrics, personal_access_tokens::personal_access_token::PersonalAccessToken, session::Session, storage::SystemStorage, streams::stream::Stream, users::{permissioner::Permissioner, user::User}},
     versioning::SemanticVersion,
 };
 
 pub const COMPONENT: &str = "SHARD";
+static USER_ID: AtomicU32 = AtomicU32::new(1);
+
+type Task = Pin<Box<dyn Future<Output = Result<(), IggyError>>>>;
 
 pub(crate) struct Shard {
     id: u16,
@@ -75,19 +73,21 @@ pub struct IggyShard {
     shards_table: RefCell<HashMap<IggyNamespace, ShardInfo>>,
     version: SemanticVersion,
 
-    //pub(crate) permissioner: RefCell<Permissioner>,
-    //pub(crate) streams: RwLock<HashMap<u32, Stream>>,
-    //pub(crate) streams_ids: RefCell<HashMap<String, u32>>,
-    //pub(crate) users: RefCell<HashMap<UserId, User>>,
+    pub(crate) streams: RefCell<HashMap<u32, Stream>>,
+    pub(crate) streams_ids: RefCell<HashMap<String, u32>>,
     // TODO: Refactor.
     pub(crate) storage: Rc<SystemStorage>,
 
     pub(crate) state: StateKind,
-    //pub(crate) encryptor: Option<Rc<dyn Encryptor>>,
-    config: ServerConfig,
-    //pub(crate) client_manager: RefCell<ClientManager>,
-    //pub(crate) active_sessions: RefCell<Vec<Session>>,
-    //pub(crate) metrics: Metrics,
+    pub(crate) encryptor: Option<EncryptorKind>,
+    pub(crate) config: ServerConfig,
+    //TODO: This could be shared.
+    pub(crate) client_manager: RefCell<ClientManager>,
+    pub(crate) active_sessions: RefCell<Vec<Session>>,
+    pub(crate) permissioner: RefCell<Permissioner>,
+    pub(crate) users: RefCell<HashMap<UserId, User>>,
+
+    pub(crate) metrics: Metrics,
     pub frame_receiver: Cell<Option<Receiver<ShardFrame>>>,
     stop_receiver: StopReceiver,
     stop_sender: StopSender,
@@ -98,16 +98,12 @@ impl IggyShard {
         Default::default()
     }
 
-    pub async fn init(&mut self) -> Result<(), IggyError> {
+    pub async fn init(&self) -> Result<(), IggyError> {
         let now = Instant::now();
-        //TODO: Fix this either by moving it to main function, or by using `run_once` barrier.
-        //let state_entries = self.state.init().await?;
-        //let system_state = SystemState::init(state_entries).await?;
-        //let user = create_root_user();
+
         self.load_version().await?;
         let SystemState { users, streams } = self.load_state().await?;
         self.load_users(users.into_values().collect()).await;
-        // Add default root user.
         self.load_streams(streams.into_values().collect()).await;
 
         //TODO: Fix the archiver.
@@ -120,6 +116,27 @@ impl IggyShard {
         }
         */
         info!("Initialized system in {} ms.", now.elapsed().as_millis());
+        Ok(())
+    }
+
+    pub async fn run(self: &Rc<Self>) -> Result<(), IggyError> {
+        // Workaround to ensure that the statistics are initialized before the server
+        // loads streams and starts accepting connections. This is necessary to
+        // have the correct statistics when the server starts.
+        //self.get_stats().await?;
+        self.init().await?;
+        self.assert_init();
+        info!("Initiated shard with ID: {}", self.id);
+        // Create all tasks (tcp listener, http listener, command processor, in the future also the background jobs).
+        /*
+        let mut tasks: Vec<Task> = vec![Box::pin(spawn_shard_message_task(shard.clone()))];
+        if self.config.tcp.enabled {
+            tasks.push(Box::pin(spawn_tcp_server(self.clone())));
+        }
+        let result = try_join_all(tasks).await;
+        result?;
+        */
+
         Ok(())
     }
 
@@ -181,10 +198,8 @@ impl IggyShard {
         Ok(system_state)
     }
 
-    async fn load_users(&mut self, users: Vec<UserState>) -> Result<(), IggyError> {
+    async fn load_users(&self, users: Vec<UserState>) -> Result<(), IggyError> {
         info!("Loading users...");
-        /*
-
         for user_state in users.into_iter() {
             let mut user = User::with_password(
                 user_state.id,
@@ -210,32 +225,34 @@ impl IggyShard {
                     )
                 })
                 .collect();
-            self.users.insert(user_state.id, user);
+            self.users.borrow_mut().insert(user_state.id, user);
         }
 
-        let users_count = self.users.len();
-        let current_user_id = self.users.keys().max().unwrap_or(&1);
+        let users = self.users.borrow();
+        let users_count = users.len();
+        let current_user_id = users.keys().max().unwrap_or(&1);
         USER_ID.store(current_user_id + 1, Ordering::SeqCst);
         self.permissioner
-            .init(&self.users.values().collect::<Vec<&User>>());
+            .borrow_mut()
+            .init(&users.values().collect::<Vec<_>>());
         self.metrics.increment_users(users_count as u32);
         info!("Initialized {users_count} user(s).");
-        */
         Ok(())
     }
 
-    async fn load_streams(&mut self, streams: Vec<StreamState>) -> Result<(), IggyError> {
-        todo!();
+    async fn load_streams(&self, streams: Vec<StreamState>) -> Result<(), IggyError> {
         info!("Loading streams from disk...");
         let mut unloaded_streams = Vec::new();
-        let mut dir_entries = read_dir(&self.config.get_streams_path())
-            .await
+        // Does mononio has api for that ?
+        let mut dir_entries = std::fs::read_dir(&self.config.system.get_streams_path())
             .map_err(|error| {
                 error!("Cannot read streams directory: {error}");
                 IggyError::CannotReadStreams
             })?;
 
-        while let Some(dir_entry) = dir_entries.next_entry().await.unwrap_or(None) {
+        //TODO: User the dir walk impl from main function, once implemented.
+        while let Some(dir_entry) = dir_entries.next() {
+            let dir_entry = dir_entry.unwrap();
             let name = dir_entry.file_name().into_string().unwrap();
             let stream_id = name.parse::<u32>().map_err(|_| {
                 error!("Invalid stream ID file with name: '{name}'.");
@@ -246,7 +263,7 @@ impl IggyShard {
                 error!(
                     "Stream with ID: '{stream_id}' was not found in state, but exists on disk and will be removed."
                 );
-                if let Err(error) = fs::remove_dir_all(&dir_entry.path()).await {
+                if let Err(error) = std::fs::remove_dir_all(&dir_entry.path()) {
                     error!("Cannot remove stream directory: {error}");
                 } else {
                     warn!("Stream with ID: '{stream_id}' was removed.");
@@ -258,7 +275,7 @@ impl IggyShard {
             let mut stream = Stream::empty(
                 stream_id,
                 &stream_state.name,
-                self.config.clone(),
+                self.config.system.clone(),
                 self.storage.clone(),
             );
             stream.created_at = stream_state.created_at;
@@ -281,7 +298,7 @@ impl IggyShard {
             info!("All streams found on disk were found in state.");
         } else {
             warn!("Streams with IDs: '{missing_ids:?}' were not found on disk.");
-            if self.config.recovery.recreate_missing_state {
+            if self.config.system.recovery.recreate_missing_state {
                 info!(
                     "Recreating missing state in recovery config is enabled, missing streams will be created."
                 );
@@ -291,7 +308,7 @@ impl IggyShard {
                     let stream = Stream::create(
                         stream_id,
                         &stream_state.name,
-                        self.config.clone(),
+                        self.config.system.clone(),
                         self.storage.clone(),
                     );
                     stream.persist().await?;
@@ -327,12 +344,12 @@ impl IggyShard {
         try_join_all(load_stream_tasks).await?;
 
         for stream in loaded_streams.take() {
-            if self.streams.contains_key(&stream.stream_id) {
+            if self.streams.borrow().contains_key(&stream.stream_id) {
                 error!("Stream with ID: '{}' already exists.", &stream.stream_id);
                 continue;
             }
 
-            if self.streams_ids.contains_key(&stream.name) {
+            if self.streams_ids.borrow().contains_key(&stream.name) {
                 error!("Stream with name: '{}' already exists.", &stream.name);
                 continue;
             }
@@ -345,13 +362,52 @@ impl IggyShard {
             self.metrics.increment_messages(stream.get_messages_count());
 
             self.streams_ids
+            .borrow_mut()
                 .insert(stream.name.clone(), stream.stream_id);
-            self.streams.insert(stream.stream_id, stream);
+            self.streams.borrow_mut().insert(stream.stream_id, stream);
         }
 
-        info!("Loaded {} stream(s) from disk.", self.streams.len());
+        info!("Loaded {} stream(s) from disk.", self.streams.borrow().len());
         Ok(())
     }
 
-    pub fn assert_init(&self) {}
+    pub fn assert_init(&self) -> Result<(), IggyError> { Ok(())}
+
+    #[instrument(skip_all, name = "trace_shutdown")]
+    pub async fn shutdown(&mut self) -> Result<(), IggyError> {
+        self.persist_messages().await?;
+        Ok(())
+    }
+
+    #[instrument(skip_all, name = "trace_persist_messages")]
+    pub async fn persist_messages(&self) -> Result<usize, IggyError> {
+        trace!("Saving buffered messages on disk...");
+        let mut saved_messages_number = 0;
+        //TODO: Fixme
+        /*
+        for stream in self.streams.values() {
+            saved_messages_number += stream.persist_messages().await?;
+        }
+        */
+
+        Ok(saved_messages_number)
+    }
+
+    pub fn get_available_shards_count(&self) -> u32 {
+        self.shards.len() as u32
+    }
+
+    pub fn ensure_authenticated(&self, client_id: u32) -> Result<u32, IggyError> {
+        let active_sessions = self.active_sessions.borrow();
+        let session = active_sessions
+            .iter()
+            .find(|s| s.client_id == client_id)
+            .ok_or_else(|| IggyError::Unauthenticated)?;
+        if session.is_authenticated() {
+            Ok(session.get_user_id())
+        } else {
+            error!("{COMPONENT} - unauthenticated access attempt, session: {session}");
+            Err(IggyError::Unauthenticated)
+        }
+    }
 }

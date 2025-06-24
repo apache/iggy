@@ -17,15 +17,15 @@
  */
 
 use iggy_common::IggyError;
+use monoio::io::{AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt};
 use std::io::IoSlice;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
 const STATUS_OK: &[u8] = &[0; 4];
 
 pub(crate) async fn read<T>(stream: &mut T, buffer: &mut [u8]) -> Result<usize, IggyError>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncReadRent + AsyncWriteRent + Unpin,
 {
     match stream.read_exact(buffer).await {
         Ok(0) => Err(IggyError::ConnectionClosed),
@@ -42,14 +42,14 @@ where
 
 pub(crate) async fn send_empty_ok_response<T>(stream: &mut T) -> Result<(), IggyError>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncReadRent + AsyncWriteRent + Unpin,
 {
     send_ok_response(stream, &[]).await
 }
 
 pub(crate) async fn send_ok_response<T>(stream: &mut T, payload: &[u8]) -> Result<(), IggyError>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncReadRent + AsyncWriteRent + Unpin,
 {
     send_response(stream, STATUS_OK, payload).await
 }
@@ -60,7 +60,7 @@ pub(crate) async fn send_ok_response_vectored<T>(
     slices: Vec<IoSlice<'_>>,
 ) -> Result<(), IggyError>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncReadRentExt + AsyncWriteRentExt + Unpin,
 {
     send_response_vectored(stream, STATUS_OK, length, slices).await
 }
@@ -70,7 +70,7 @@ pub(crate) async fn send_error_response<T>(
     error: IggyError,
 ) -> Result<(), IggyError>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncReadRent + AsyncWriteRent + Unpin,
 {
     send_response(stream, &error.as_code().to_le_bytes(), &[]).await
 }
@@ -81,7 +81,7 @@ pub(crate) async fn send_response<T>(
     payload: &[u8],
 ) -> Result<(), IggyError>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncReadRent + AsyncWriteRent + Unpin,
 {
     debug!(
         "Sending response of len: {} with status: {:?}...",
@@ -104,7 +104,7 @@ pub(crate) async fn send_response_vectored<T>(
     mut slices: Vec<IoSlice<'_>>,
 ) -> Result<(), IggyError>
 where
-    T: AsyncReadExt + AsyncWriteExt + Unpin,
+    T: AsyncReadRentExt + AsyncWriteRentExt + Unpin,
 {
     debug!(
         "Sending vectored response of len: {} with status: {:?}...",

@@ -26,7 +26,7 @@ use iggy_common::IggyError;
 use iggy_common::locking::IggySharedMutFn;
 use tokio::sync::RwLock;
 
-impl System {
+impl IggyShard {
     pub fn get_consumer_group(
         &self,
         session: &Session,

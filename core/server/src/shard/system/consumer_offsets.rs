@@ -22,7 +22,7 @@ use crate::streaming::systems::system::System;
 use error_set::ErrContext;
 use iggy_common::{Consumer, ConsumerOffsetInfo, Identifier, IggyError};
 
-impl System {
+impl IggyShard {
     pub async fn store_consumer_offset(
         &self,
         session: &Session,

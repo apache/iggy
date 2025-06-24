@@ -24,8 +24,8 @@ use crate::tcp::tcp_tls_sender::TcpTlsSender;
 use crate::{quic::quic_sender::QuicSender, server_error::ServerError};
 use iggy_common::IggyError;
 use quinn::{RecvStream, SendStream};
-use tokio::net::TcpStream;
-use tokio_rustls::server::TlsStream;
+use monoio::net::TcpStream;
+use tokio_native_tls::TlsStream;
 
 macro_rules! forward_async_methods {
     (
@@ -48,22 +48,22 @@ macro_rules! forward_async_methods {
 }
 
 pub trait Sender {
-    fn read(&mut self, buffer: &mut [u8]) -> impl Future<Output = Result<usize, IggyError>> + Send;
-    fn send_empty_ok_response(&mut self) -> impl Future<Output = Result<(), IggyError>> + Send;
+    fn read(&mut self, buffer: &mut [u8]) -> impl Future<Output = Result<usize, IggyError>>;
+    fn send_empty_ok_response(&mut self) -> impl Future<Output = Result<(), IggyError>>; 
     fn send_ok_response(
         &mut self,
         payload: &[u8],
-    ) -> impl Future<Output = Result<(), IggyError>> + Send;
+    ) -> impl Future<Output = Result<(), IggyError>>; 
     fn send_ok_response_vectored(
         &mut self,
         length: &[u8],
         slices: Vec<IoSlice<'_>>,
-    ) -> impl Future<Output = Result<(), IggyError>> + Send;
+    ) -> impl Future<Output = Result<(), IggyError>>;
     fn send_error_response(
         &mut self,
         error: IggyError,
-    ) -> impl Future<Output = Result<(), IggyError>> + Send;
-    fn shutdown(&mut self) -> impl Future<Output = Result<(), ServerError>> + Send;
+    ) -> impl Future<Output = Result<(), IggyError>>; 
+    fn shutdown(&mut self) -> impl Future<Output = Result<(), ServerError>>; 
 }
 
 #[allow(clippy::large_enum_variant)]

@@ -26,8 +26,8 @@ use crate::{
     configs::server::ServerConfig,
     map_toggle_str,
     shard::Shard,
-    state::{StateKind, file::FileState},
-    streaming::storage::SystemStorage,
+    state::{file::FileState, StateKind},
+    streaming::{diagnostics::metrics::Metrics, storage::SystemStorage},
     versioning::SemanticVersion,
 };
 
@@ -75,11 +75,12 @@ impl IggyShardBuilder {
     }
 
     // TODO: Too much happens in there, some of those bootstrapping logic should be moved outside.
-    pub async fn build(self) -> IggyShard {
+    pub fn build(self) -> IggyShard {
         let id = self.id.unwrap();
         let config = self.config.unwrap();
         let connections = self.connections.unwrap();
         let state = self.state.unwrap();
+        let encryptor = self.encryptor;
         let version = self.version.unwrap();
         let (stop_sender, stop_receiver, frame_receiver) = connections
             .iter()
@@ -106,12 +107,21 @@ impl IggyShardBuilder {
             shards: shards,
             shards_table: Default::default(),
             storage: storage,
+            encryptor: encryptor,
             state: state,
             config: config,
             version: version,
             stop_receiver: stop_receiver,
             stop_sender: stop_sender,
             frame_receiver: Cell::new(Some(frame_receiver)),
+            metrics: Metrics::init(),
+
+            users: Default::default(),
+            permissioner: Default::default(),
+            streams: Default::default(),
+            streams_ids: Default::default(),
+            client_manager: Default::default(),
+            active_sessions: Default::default(),
         }
     }
 }

@@ -16,13 +16,12 @@
  * under the License.
  */
 
+use crate::shard::IggyShard;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateUserWithId;
 use crate::state::system::UserState;
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::session::Session;
-use crate::streaming::systems::COMPONENT;
-use crate::streaming::systems::system::System;
 use crate::streaming::users::user::User;
 use crate::streaming::utils::crypto;
 use crate::{IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV};
@@ -42,108 +41,7 @@ use tracing::{error, info, warn};
 static USER_ID: AtomicU32 = AtomicU32::new(1);
 const MAX_USERS: usize = u32::MAX as usize;
 
-impl System {
-    pub(crate) async fn load_users(&mut self, users: Vec<UserState>) -> Result<(), IggyError> {
-        info!("Loading users...");
-        if users.is_empty() {
-            info!("No users found, creating the root user...");
-            let root = Self::create_root_user();
-            let command = CreateUser {
-                username: root.username.clone(),
-                password: root.password.clone(),
-                status: root.status,
-                permissions: root.permissions.clone(),
-            };
-            self.state
-                .apply(0, &EntryCommand::CreateUser(CreateUserWithId {
-                    user_id: root.id,
-                    command
-                }))
-                .await
-                .with_error_context(|error| {
-                    format!(
-                        "{COMPONENT} (error: {error}) - failed to apply create user command, username: {}",
-                        root.username
-                    )
-                })?;
-
-            self.users.insert(root.id, root);
-            info!("Created the root user.");
-        }
-
-        for user_state in users.into_iter() {
-            let mut user = User::with_password(
-                user_state.id,
-                &user_state.username,
-                user_state.password_hash,
-                user_state.status,
-                user_state.permissions,
-            );
-
-            user.created_at = user_state.created_at;
-            user.personal_access_tokens = user_state
-                .personal_access_tokens
-                .into_values()
-                .map(|token| {
-                    (
-                        Arc::new(token.token_hash.clone()),
-                        PersonalAccessToken::raw(
-                            user_state.id,
-                            &token.name,
-                            &token.token_hash,
-                            token.expiry_at,
-                        ),
-                    )
-                })
-                .collect();
-            self.users.insert(user_state.id, user);
-        }
-
-        let users_count = self.users.len();
-        let current_user_id = self.users.keys().max().unwrap_or(&1);
-        USER_ID.store(current_user_id + 1, Ordering::SeqCst);
-        self.permissioner
-            .init(&self.users.values().collect::<Vec<&User>>());
-        self.metrics.increment_users(users_count as u32);
-        info!("Initialized {users_count} user(s).");
-        Ok(())
-    }
-
-    fn create_root_user() -> User {
-        let username = env::var(IGGY_ROOT_USERNAME_ENV);
-        let password = env::var(IGGY_ROOT_PASSWORD_ENV);
-        if (username.is_ok() && password.is_err()) || (username.is_err() && password.is_ok()) {
-            panic!(
-                "When providing the custom root user credentials, both username and password must be set."
-            );
-        }
-        if username.is_ok() && password.is_ok() {
-            info!("Using the custom root user credentials.");
-        } else {
-            info!("Using the default root user credentials.");
-        }
-
-        let username = username.unwrap_or(DEFAULT_ROOT_USERNAME.to_string());
-        let password = password.unwrap_or(DEFAULT_ROOT_PASSWORD.to_string());
-        if username.is_empty() || password.is_empty() {
-            panic!("Root user credentials are not set.");
-        }
-        if username.len() < MIN_USERNAME_LENGTH {
-            panic!("Root username is too short.");
-        }
-        if username.len() > MAX_USERNAME_LENGTH {
-            panic!("Root username is too long.");
-        }
-        if password.len() < MIN_PASSWORD_LENGTH {
-            panic!("Root password is too short.");
-        }
-        if password.len() > MAX_PASSWORD_LENGTH {
-            panic!("Root password is too long.");
-        }
-
-        User::root(&username, &password)
-    }
-
+impl IggyShard {
     pub fn find_user(
         &self,
         session: &Session,

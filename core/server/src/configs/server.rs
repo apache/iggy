@@ -31,6 +31,7 @@ use iggy_common::Validatable;
 use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
+use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -40,7 +41,7 @@ pub struct ServerConfig {
     pub message_saver: MessageSaverConfig,
     pub personal_access_token: PersonalAccessTokenConfig,
     pub heartbeat: HeartbeatConfig,
-    pub system: Arc<SystemConfig>,
+    pub system: Rc<SystemConfig>,
     pub quic: QuicConfig,
     pub tcp: TcpConfig,
     pub http: HttpConfig,
