@@ -238,7 +238,7 @@ internal static class BinaryMapper
                 {
                     StreamId = streamId,
                     TopicId = topicId,
-                    ConsumerGroupId = consumerGroupId
+                    GroupId = consumerGroupId
                 };
                 consumerGroups.Add(consumerGroup);
                 position += 12;
@@ -258,7 +258,7 @@ internal static class BinaryMapper
     {
         if (payload.Length == 0)
         {
-            return Array.Empty<ClientResponse>();
+            return [];
         }
 
         var response = new List<ClientResponse>();
@@ -314,19 +314,6 @@ internal static class BinaryMapper
             StoredOffset = offset,
             PartitionId = partitionId
         };
-    }
-    
-    private static MessageState MapMessageState(ReadOnlySpan<byte> payload, int position)
-    {
-        var state = payload[position + 8] switch
-        {
-            1 => MessageState.Available,
-            10 => MessageState.Unavailable,
-            20 => MessageState.Poisoned,
-            30 => MessageState.MarkedForDeletion,
-            _ => throw new ArgumentOutOfRangeException()
-        };
-        return state;
     }
     
     internal static PolledMessages MapMessages(ReadOnlySpan<byte> payload,
@@ -669,7 +656,7 @@ internal static class BinaryMapper
         ulong createdAt = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 4)..(position + 12)]);
         int partitionsCount = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 12)..(position + 16)]);
         ulong messageExpiry = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 16)..(position + 24)]);
-        byte complessionAlgoritm = payload[position + 24];
+        byte compressionAlgorithm = payload[position + 24];
         ulong maxTopicSize = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 25)..(position + 33)]);
         byte replicationFactor = payload[position + 33];
         ulong sizeBytes = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 34)..(position + 42)]);
@@ -684,7 +671,7 @@ internal static class BinaryMapper
                 Id = id,
                 PartitionsCount = partitionsCount,
                 Name = name,
-                CompressionAlgorithm = (CompressionAlgorithm)complessionAlgoritm,
+                CompressionAlgorithm = (CompressionAlgorithm)compressionAlgorithm,
                 MessagesCount = messagesCount,
                 Size = sizeBytes,
                 CreatedAt = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(createdAt).LocalDateTime,
@@ -842,7 +829,7 @@ internal static class BinaryMapper
     
     private static (ConsumerGroupMember, int readBytes) MapToMember(ReadOnlySpan<byte> payload, int position)
     {
-        var id = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
+        var id = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
         var partitionsCount = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 4)..(position + 8)]);
         var partitions = new List<int>();
         for (int i = 0; i < partitionsCount; i++)

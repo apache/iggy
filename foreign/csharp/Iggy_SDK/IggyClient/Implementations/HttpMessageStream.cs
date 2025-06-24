@@ -399,7 +399,7 @@ public class HttpMessageStream : IIggyClient
             }
             catch(Exception e)
             {
-                _logger.LogError("Error encountered while polling messages - Stream ID: {streamId}, Topic ID: {topicId}, Partition ID: {partitionId}",
+                _logger.LogError(e, "Error encountered while polling messages - Stream ID: {StreamId}, Topic ID: {TopicId}, Partition ID: {PartitionId}",
                     request.StreamId, request.TopicId, request.PartitionId);
             }
             
@@ -451,6 +451,7 @@ public class HttpMessageStream : IIggyClient
 
         if (response.IsSuccessStatusCode)
         {
+            var t = await response.Content.ReadAsStringAsync(token);
             return await response.Content.ReadFromJsonAsync<ConsumerGroupResponse>(JsonConverterFactory.SnakeCaseOptions, cancellationToken: token);
         }
 
@@ -481,7 +482,7 @@ public class HttpMessageStream : IIggyClient
 
     public Task<ClientResponse?> GetMeAsync(CancellationToken token = default)
     {
-        throw new NotImplementedException();
+        throw new FeatureUnavailableException();
     }
 
     public async Task<Stats?> GetStatsAsync(CancellationToken token = default)

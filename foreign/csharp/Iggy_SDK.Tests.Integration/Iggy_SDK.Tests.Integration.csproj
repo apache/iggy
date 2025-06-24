@@ -1,0 +1,29 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net8.0</TargetFramework>
+        <AssemblyName>Apache.Iggy.Tests.Integrations</AssemblyName>
+        <RootNamespace>Apache.Iggy.Tests.Integrations</RootNamespace>
+        <IsTestingPlatformApplication>true</IsTestingPlatformApplication>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="coverlet.collector" Version="6.0.4">
+            <PrivateAssets>all</PrivateAssets>
+            <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+        </PackageReference>
+        <PackageReference Include="Microsoft.Testing.Extensions.CodeCoverage" Version="17.14.2"/>
+        <PackageReference Include="Microsoft.Testing.Extensions.TrxReport" Version="1.7.3"/>
+        <PackageReference Include="Shouldly" Version="4.3.0"/>
+        <PackageReference Include="Testcontainers" Version="4.6.0"/>
+        <PackageReference Include="TUnit" Version="0.25.21"/>
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\Iggy_SDK\Iggy_SDK.csproj"/>
+    </ItemGroup>
+
+</Project>

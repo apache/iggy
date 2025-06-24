@@ -81,13 +81,13 @@ try
         });
         
         await clients[0].CreateTopicAsync(Identifier.Numeric(startingStreamId + i), new TopicRequest(
-            TopicId: topicId,
-            Name: $"Test bench topic_{i}",
-            CompressionAlgorithm: CompressionAlgorithm.None,
-            MessageExpiry: 0,
-            MaxTopicSize: 2_000_000_000,
-            ReplicationFactor: 3,
-            PartitionsCount: 1));
+            topicId: topicId,
+            name: $"Test bench topic_{i}",
+            compressionAlgorithm: CompressionAlgorithm.None,
+            messageExpiry: 0,
+            maxTopicSize: 2_000_000_000,
+            replicationFactor: 3,
+            partitionsCount: 1));
     }
 }
 catch
