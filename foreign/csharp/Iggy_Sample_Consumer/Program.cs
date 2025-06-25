@@ -189,7 +189,7 @@ async Task ValidateSystem(Identifier streamId, Identifier topicId, int partition
         
         var result = await bus.GetStreamByIdAsync(streamId);
         
-        Console.WriteLine(result.Name);
+        Console.WriteLine(result!.Name);
         
         Console.WriteLine($"Validating if topic exists.. {topicId}");
         

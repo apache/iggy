@@ -898,7 +898,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         var userId = BinaryPrimitives.ReadInt32LittleEndian(responseBuffer.AsSpan()[..(responseBuffer.Length)]);
 
         //TODO: Figure out how to solve this workaround about default of TokenInfo
-        return new AuthResponse(userId, default);
+        return new AuthResponse(userId, null);
     }
     
     public async Task LogoutUser(CancellationToken token = default)

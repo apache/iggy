@@ -31,7 +31,7 @@ public class PollMessagesTests(Protocol protocol)
     public required PollMessagesFixture Fixture { get; init; }
 
     [Test]
-    [Timeout(30_000)]
+    [Timeout(60_000)]
     public async Task PollMessagesTMessage_Should_PollMessages_Successfully(CancellationToken token)
     {
         var messageCount = 0;

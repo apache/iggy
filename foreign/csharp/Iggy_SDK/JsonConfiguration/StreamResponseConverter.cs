@@ -33,17 +33,22 @@ public sealed class StreamResponseConverter : JsonConverter<StreamResponse>
         var createdAt = root.GetProperty(nameof(StreamResponse.CreatedAt).ToSnakeCase()).GetUInt64();
         var name = root.GetProperty(nameof(StreamResponse.Name).ToSnakeCase()).GetString();
         var sizeBytesString = root.GetProperty(nameof(StreamResponse.Size).ToSnakeCase()).GetString();
-        var sizeBytesStringSplit = sizeBytesString.Split(' ');
-        var (sizeBytesVal, Unit) = (ulong.Parse(sizeBytesStringSplit[0]), sizeBytesStringSplit[1]);
-        var sizeBytes = Unit switch
+        ulong sizeBytes = 0;
+        if (sizeBytesString is not null)
         {
-            "B" => sizeBytesVal,
-            "KB" => sizeBytesVal * (ulong)1e03,
-            "MB" => sizeBytesVal * (ulong)1e06,
-            "GB" => sizeBytesVal * (ulong)1e09,
-            "TB" => sizeBytesVal * (ulong)1e12,
-            _ => throw new InvalidEnumArgumentException("Error Wrong Unit when deserializing SizeBytes")
-        };
+            var sizeBytesStringSplit = sizeBytesString.Split(' ');
+            var (sizeBytesVal, unit) = (ulong.Parse(sizeBytesStringSplit[0]), sizeBytesStringSplit[1]);
+            sizeBytes = unit switch
+            {
+                "B" => sizeBytesVal,
+                "KB" => sizeBytesVal * (ulong)1e03,
+                "MB" => sizeBytesVal * (ulong)1e06,
+                "GB" => sizeBytesVal * (ulong)1e09,
+                "TB" => sizeBytesVal * (ulong)1e12,
+                _ => throw new InvalidEnumArgumentException("Error Wrong Unit when deserializing SizeBytes")
+            };
+        }
+
         var messagesCount = root.GetProperty(nameof(StreamResponse.MessagesCount).ToSnakeCase()).GetUInt64();
         var topicsCount = root.GetProperty(nameof(StreamResponse.TopicsCount).ToSnakeCase()).GetInt32();
         root.TryGetProperty(nameof(StreamResponse.Topics).ToSnakeCase(), out var topicsProperty);
@@ -63,7 +68,7 @@ public sealed class StreamResponseConverter : JsonConverter<StreamResponse>
             CreatedAt = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(createdAt).LocalDateTime,
             MessagesCount = messagesCount,
             TopicsCount = topicsCount,
-            Topics = topics
+            Topics = topics ?? []
         };
     }
 
