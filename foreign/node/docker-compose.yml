@@ -17,7 +17,7 @@
 
 services:
   iggy-server:
-    image: iggyrs/iggy:latest
+    image: apache/iggy:latest
     container_name: iggy-server
     restart: unless-stopped
     networks:

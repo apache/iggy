@@ -25,8 +25,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/iggy-rs/iggy-go-client"
-	iggcon "github.com/iggy-rs/iggy-go-client/contracts"
+	"github.com/apache/iggy/foreign/go"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
 const (

@@ -17,7 +17,7 @@
 
 package iggy
 
-import . "github.com/iggy-rs/iggy-go-client/contracts"
+import . "github.com/apache/iggy/foreign/go/contracts"
 
 type MessageStream interface {
 	GetStreamById(request GetStreamRequest) (*StreamResponse, error)

@@ -18,7 +18,7 @@
 package iggcon
 
 import (
-	ierror "github.com/iggy-rs/iggy-go-client/errors"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
 const (

@@ -52,16 +52,16 @@ allow_private_network = false
 algorithm = "HS256"
 
 # The issuer of the JWT, typically a URL or an identifier of the issuing entity.
-issuer = "iggy.rs"
+issuer = "iggy.apache.org"
 
 # Intended audience for the JWT, usually the recipient or system intended to process the token.
-audience = "iggy.rs"
+audience = "iggy.apache.org"
 
 # Lists valid issuers for JWT validation to ensure tokens are from trusted sources.
-valid_issuers = ["iggy.rs"]
+valid_issuers = ["iggy.apache.org"]
 
 # Lists valid audiences for JWT validation to confirm tokens are for the intended recipient.
-valid_audiences = ["iggy.rs"]
+valid_audiences = ["iggy.apache.org"]
 
 # Expiry time for access tokens.
 access_token_expiry = "1 h"
@@ -76,10 +76,10 @@ clock_skew = "5 s"
 not_before = "0 s"
 
 # Secret key for encoding JWTs.
-encoding_secret = "top_secret$iggy.rs$_jwt_HS256_key#!"
+encoding_secret = "top_secret$iggy.apache.org$_jwt_HS256_key#!"
 
 # Secret key for decoding JWTs.
-decoding_secret = "top_secret$iggy.rs$_jwt_HS256_key#!"
+decoding_secret = "top_secret$iggy.apache.org$_jwt_HS256_key#!"
 
 # Indicates if the secret key is base64 encoded.
 # `true` means the secret is base64 encoded.

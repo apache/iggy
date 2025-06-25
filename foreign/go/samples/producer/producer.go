@@ -23,9 +23,9 @@ import (
 
 	"github.com/google/uuid"
 
-	. "github.com/iggy-rs/iggy-go-client"
-	. "github.com/iggy-rs/iggy-go-client/contracts"
-	sharedDemoContracts "github.com/iggy-rs/iggy-go-client/samples/shared"
+	. "github.com/apache/iggy/foreign/go"
+	. "github.com/apache/iggy/foreign/go/contracts"
+	sharedDemoContracts "github.com/apache/iggy/foreign/go/samples/shared"
 )
 
 const (

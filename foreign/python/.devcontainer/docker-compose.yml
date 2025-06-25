@@ -26,5 +26,5 @@ services:
     command: sleep infinity
 
   iggy:
-    image: iggyrs/iggy:latest
+    image: apache/iggy:latest
     restart: unless-stopped

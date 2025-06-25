@@ -18,7 +18,7 @@
 package tcp_test
 
 import (
-	. "github.com/iggy-rs/iggy-go-client/contracts"
+	. "github.com/apache/iggy/foreign/go/contracts"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )

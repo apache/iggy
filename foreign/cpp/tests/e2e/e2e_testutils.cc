@@ -23,7 +23,7 @@
 
 IggyRunner::IggyRunner() {
     // start the Docker process with stdout redirected to parent process
-    std::vector<std::string> arguments = {"docker", "run", "-d", "--name", "iggy_test", "iggyrs/iggy:latest"};
+    std::vector<std::string> arguments = {"docker", "run", "-d", "--name", "iggy_test", "apache/iggy:latest"};
     reproc::options options;
     options.redirect.parent = true;
     auto err = process.start(arguments, options);

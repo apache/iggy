@@ -9,7 +9,7 @@
 
   [![crates.io](https://img.shields.io/crates/v/iggy.svg)](https://crates.io/crates/iggy)
   [![crates.io](https://img.shields.io/crates/d/iggy.svg)](https://crates.io/crates/iggy)
-  [![coverage](https://coveralls.io/repos/github/iggy-rs/iggy/badge.svg?branch=master)](https://coveralls.io/github/iggy-rs/iggy?branch=master)
+  [![coverage](https://coveralls.io/repos/github/apache/iggy/badge.svg?branch=master)](https://coveralls.io/github/apache/iggy?branch=master)
   [![dependency](https://deps.rs/repo/github/apache/iggy/status.svg)](https://deps.rs/repo/github/apache/iggy)
   [![x](https://img.shields.io/twitter/follow/ApacheIggy?style=social)](https://twitter.com/ApacheIggy)
   [![discord-badge](https://img.shields.io/discord/1144142576266530928)](https://discord.gg/C5Sux5NcRa)
@@ -112,8 +112,6 @@ The recent improvements based on the zero-copy (de)serialization, along with upd
 - Node
 - C++
 - Elixir
-
-Almost all the tooling has been migrated from [iggy-rs](https://github.com/iggy-rs/) organization to this monorepo. There's no an ongoing work to support the zero-copy (de)serialization for all the SDKs.
 
 ---
 

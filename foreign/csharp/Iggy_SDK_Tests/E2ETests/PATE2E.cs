@@ -29,14 +29,14 @@ namespace Apache.Iggy.Tests.E2ETests;
 [TestCaseOrderer("Apache.Iggy.Tests.Utils.PriorityOrderer", "Apache.Iggy.Tests")]
 public sealed class PATE2E : IClassFixture<IggyPATFixture>
 {
-    private const string SkipMessage = "TCP implementation needs to be aligned with Iggyrs core changes";
+    private const string SkipMessage = "TCP implementation needs to be aligned with Iggy core changes";
     private readonly IggyPATFixture _fixture;
-    
+
     public PATE2E(IggyPATFixture fixture)
     {
         _fixture = fixture;
     }
-    
+
     [Fact, TestPriority(1)]
     public async Task CreatePersonalAccessToken_HappyPath_Should_CreatePersonalAccessToken_Successfully()
     {
@@ -47,10 +47,10 @@ public sealed class PATE2E : IClassFixture<IggyPATFixture>
                 .Should()
                 .NotThrowAsync();
         })).ToArray();
-        
+
         await Task.WhenAll(tasks);
     }
-    
+
     [Fact, TestPriority(2)]
     public async Task CreatePersonalAccessToken_Duplicate_Should_Throw_InvalidResponse()
     {
@@ -61,10 +61,10 @@ public sealed class PATE2E : IClassFixture<IggyPATFixture>
                 .Should()
                 .ThrowExactlyAsync<InvalidResponseException>();
         })).ToArray();
-        
+
         await Task.WhenAll(tasks);
     }
-    
+
     [Fact, TestPriority(3)]
     public async Task GetPersonalAccessTokens_Should_ReturnValidResponse()
     {
@@ -78,10 +78,10 @@ public sealed class PATE2E : IClassFixture<IggyPATFixture>
             var tokenExpiryDateTimeOffset = DateTime.UtcNow.AddMicroseconds((double)PATFixtureBootstrap.CreatePersonalAccessTokenRequest.Expiry!).ToDateTimeOffset();
             response[0].ExpiryAt!.Value.Date.Should().Be(tokenExpiryDateTimeOffset.LocalDateTime.Date);
         })).ToArray();
-        
+
         await Task.WhenAll(tasks);
     }
-    
+
     [Fact, TestPriority(4)]
     public async Task LoginWithPersonalAccessToken_Should_Be_Successfull()
     {
@@ -99,10 +99,10 @@ public sealed class PATE2E : IClassFixture<IggyPATFixture>
                 Token = response!.Token
             })).Should().NotThrowAsync();
         })).ToArray();
-        
+
         await Task.WhenAll(tasks);
     }
-    
+
     [Fact, TestPriority(5)]
     public async Task DeletePersonalAccessToken_Should_DeletePersonalAccessToken_Successfully()
     {
@@ -116,7 +116,7 @@ public sealed class PATE2E : IClassFixture<IggyPATFixture>
             .Should()
             .NotThrowAsync();
         })).ToArray();
-        
+
         await Task.WhenAll(tasks);
     }
 }

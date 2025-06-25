@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["Dario Lencina Talarico <darioalessandrolencina@gmail.com>"]
 license = "Apache-2.0"
 description = "Apache Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
-documentation = "https://docs.iggy.rs"
+documentation = "https://iggy.apache.org/docs/"
 repository = "https://github.com/apache/iggy"
 
 [dependencies]

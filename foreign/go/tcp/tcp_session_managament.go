@@ -18,9 +18,9 @@
 package tcp
 
 import (
-	binaryserialization "github.com/iggy-rs/iggy-go-client/binary_serialization"
+	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
 
-	. "github.com/iggy-rs/iggy-go-client/contracts"
+	. "github.com/apache/iggy/foreign/go/contracts"
 )
 
 func (tms *IggyTcpClient) LogIn(request LogInRequest) (*LogInResponse, error) {

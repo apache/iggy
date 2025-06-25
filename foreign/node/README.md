@@ -1,6 +1,6 @@
-# iggy node.js client
+# Apache Iggy Node.js Client
 
-iggy node.js client for [iggy-rs](https://iggy.rs/)'s binary protocol, written in typescript. it currently only support tcp & tls transports.
+Apache Iggy Node.js client written in typescript, it currently only supports tcp & tls transports.
 
 diclaimer: although all iggy commands & basic client/stream are implemented this is still a WIP, provided as is, and has still a long way to go to be considered "battle tested".
 

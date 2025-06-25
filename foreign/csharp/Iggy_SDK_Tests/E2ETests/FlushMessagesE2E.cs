@@ -27,7 +27,7 @@ namespace Apache.Iggy.Tests.E2ETests;
 [TestCaseOrderer("Apache.Iggy.Tests.Utils.PriorityOrderer", "Apache.Iggy.Tests")]
 public sealed class FlushMessagesE2E : IClassFixture<IggyFlushMessagesFixture>
 {
-    private const string SkipMessage = "TCP implementation needs to be aligned with Iggyrs core changes";
+    private const string SkipMessage = "TCP implementation needs to be aligned with Iggy core changes";
     private readonly IggyFlushMessagesFixture _fixture;
 
     private static readonly FlushUnsavedBufferRequest _flushRequestFsync = new()
@@ -37,7 +37,7 @@ public sealed class FlushMessagesE2E : IClassFixture<IggyFlushMessagesFixture>
         PartitionId = FlushMessagesFixtureBootstrap.PartitionId,
         Fsync = true
     };
-      
+
     private static readonly FlushUnsavedBufferRequest _flushRequest = new()
     {
         StreamId = Identifier.Numeric(FlushMessagesFixtureBootstrap.StreamId),
@@ -45,7 +45,7 @@ public sealed class FlushMessagesE2E : IClassFixture<IggyFlushMessagesFixture>
         PartitionId = FlushMessagesFixtureBootstrap.PartitionId,
         Fsync = false
     };
-    
+
     private static readonly FlushUnsavedBufferRequest _flushInvalidStreamRequest = new()
     {
         StreamId = Identifier.Numeric(FlushMessagesFixtureBootstrap.InvalidStreamId),
@@ -53,13 +53,13 @@ public sealed class FlushMessagesE2E : IClassFixture<IggyFlushMessagesFixture>
         PartitionId = FlushMessagesFixtureBootstrap.PartitionId,
         Fsync = false
     };
-    
+
 
     public FlushMessagesE2E(IggyFlushMessagesFixture fixture)
     {
         _fixture = fixture;
     }
-    
+
     [Fact, TestPriority(1)]
     public async Task FlushUnsavedBuffer_WithFsync_Should_Flush_Successfully()
     {
@@ -70,10 +70,10 @@ public sealed class FlushMessagesE2E : IClassFixture<IggyFlushMessagesFixture>
                 .Should()
                 .NotThrowAsync();
         })).ToArray();
-        
+
         await Task.WhenAll(tasks);
     }
-    
+
     [Fact, TestPriority(2)]
     public async Task FlushUnsavedBuffer_WithOutFsync_Should_Flush_Successfully()
     {
@@ -83,12 +83,12 @@ public sealed class FlushMessagesE2E : IClassFixture<IggyFlushMessagesFixture>
             await sut.Invoking(x => x.Client.FlushUnsavedBufferAsync(_flushRequest))
                 .Should()
                 .NotThrowAsync();
-            
+
         })).ToArray();
-        
+
         await Task.WhenAll(tasks);
     }
-    
+
     [Fact, TestPriority(3)]
     public async Task FlushUnsavedBuffer_Should_Throw_WhenStream_DoesNotExist()
     {
@@ -98,9 +98,9 @@ public sealed class FlushMessagesE2E : IClassFixture<IggyFlushMessagesFixture>
             await sut.Invoking(x => x.Client.FlushUnsavedBufferAsync(_flushInvalidStreamRequest))
                 .Should()
                 .ThrowAsync<InvalidResponseException>();
-            
+
         })).ToArray();
-        
+
         await Task.WhenAll(tasks);
     }
 }

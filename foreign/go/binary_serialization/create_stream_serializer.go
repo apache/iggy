@@ -20,7 +20,7 @@ package binaryserialization
 import (
 	"encoding/binary"
 
-	iggcon "github.com/iggy-rs/iggy-go-client/contracts"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
 type TcpCreateStreamRequest struct {

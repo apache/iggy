@@ -31,7 +31,7 @@ use tokio::fs::read_dir;
 use tracing::{info, trace};
 use zip::ZipArchive;
 
-const OWNER: &str = "iggy-rs";
+const OWNER: &str = "apache";
 const REPO: &str = "iggy";
 const WORKFLOW_FILE: &str = "performance.yml";
 

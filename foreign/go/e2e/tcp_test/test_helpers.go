@@ -22,8 +22,8 @@ import (
 	"strings"
 	"time"
 
-	. "github.com/iggy-rs/iggy-go-client"
-	. "github.com/iggy-rs/iggy-go-client/contracts"
+	. "github.com/apache/iggy/foreign/go"
+	. "github.com/apache/iggy/foreign/go/contracts"
 )
 
 func createAuthorizedConnection() MessageStream {

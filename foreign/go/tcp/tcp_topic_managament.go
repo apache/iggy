@@ -18,9 +18,9 @@
 package tcp
 
 import (
-	binaryserialization "github.com/iggy-rs/iggy-go-client/binary_serialization"
-	. "github.com/iggy-rs/iggy-go-client/contracts"
-	ierror "github.com/iggy-rs/iggy-go-client/errors"
+	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
+	. "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
 func (tms *IggyTcpClient) GetTopics(streamId Identifier) ([]TopicResponse, error) {

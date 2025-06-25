@@ -18,8 +18,8 @@
 package tcp
 
 import (
-	binaryserialization "github.com/iggy-rs/iggy-go-client/binary_serialization"
-	. "github.com/iggy-rs/iggy-go-client/contracts"
+	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
+	. "github.com/apache/iggy/foreign/go/contracts"
 )
 
 func (tms *IggyTcpClient) GetOffset(request GetOffsetRequest) (*OffsetResponse, error) {

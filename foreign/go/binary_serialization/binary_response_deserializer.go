@@ -23,8 +23,8 @@ import (
 	"fmt"
 	"time"
 
-	. "github.com/iggy-rs/iggy-go-client/contracts"
-	ierror "github.com/iggy-rs/iggy-go-client/errors"
+	. "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/klauspost/compress/s2"
 )
 

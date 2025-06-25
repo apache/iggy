@@ -20,7 +20,7 @@ package binaryserialization
 import (
 	"testing"
 
-	iggcon "github.com/iggy-rs/iggy-go-client/contracts"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
 func TestSerializeIdentifier_StringId(t *testing.T) {

@@ -1,4 +1,4 @@
-module github.com/iggy-rs/iggy-go-client
+module github.com/apache/iggy/foreign/go
 
 go 1.23.0
 

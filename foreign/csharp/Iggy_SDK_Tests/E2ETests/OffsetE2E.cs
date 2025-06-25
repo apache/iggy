@@ -27,7 +27,7 @@ namespace Apache.Iggy.Tests.E2ETests;
 [TestCaseOrderer("Apache.Iggy.Tests.Utils.PriorityOrderer", "Apache.Iggy.Tests")]
 public sealed class OffsetE2E : IClassFixture<IggyOffsetFixture>
 {
-    private const string SkipMessage = "TCP implementation needs to be aligned with Iggyrs core changes";
+    private const string SkipMessage = "TCP implementation needs to be aligned with Iggy core changes";
     private readonly IggyOffsetFixture _fixture;
     private readonly StoreOffsetRequest _storeOffsetIndividualConsumer;
     private readonly OffsetRequest _offsetIndividualConsumer;
@@ -56,7 +56,7 @@ public sealed class OffsetE2E : IClassFixture<IggyOffsetFixture>
                 .Should()
                 .NotThrowAsync();
         })).ToArray();
-        
+
         await Task.WhenAll(tasks);
     }
 
@@ -70,7 +70,7 @@ public sealed class OffsetE2E : IClassFixture<IggyOffsetFixture>
             offset.Should().NotBeNull();
             offset!.StoredOffset.Should().Be(_storeOffsetIndividualConsumer.Offset);
         })).ToArray();
-        
+
         await Task.WhenAll(tasks);
     }
 }

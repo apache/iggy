@@ -1,6 +1,6 @@
 # Apache Iggy (Incubating) Web UI
 
-This repository hosts the web user interface for [Iggy](https://github.com/iggy-rs/iggy), a persistent message streaming platform written in Rust. The web UI is built using SvelteKit.
+This proejcts hosts the web user interface for Apache Iggy. The web UI is built using SvelteKit.
 
 ![iggy](static/signIn.png)
 ![iggy](static/stats.png)
@@ -17,17 +17,17 @@ The Iggy Web UI provides a user-friendly panel for managing various aspects of t
 1. **Run Iggy server first**
 
    ```sh
-   docker pull iggyrs/iggy:latest
+   docker pull apache/iggy:latest
    ```
 
    ```sh
-   docker run -p 3000:3000 -p 8090:8090 iggyrs/iggy:latest
+   docker run -p 3000:3000 -p 8090:8090 apache/iggy:latest
    ```
 
 1. **Clone the repository:**
 
    ```sh
-   git clone https://github.com/iggy-rs/iggy-web-ui.git
+   git clone https://github.com/apache/iggy.git
    ```
 
 1. **Build the project:**

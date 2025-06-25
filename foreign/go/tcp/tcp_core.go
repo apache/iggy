@@ -24,9 +24,9 @@ import (
 	"sync"
 	"time"
 
-	. "github.com/iggy-rs/iggy-go-client/contracts"
-	iggcon "github.com/iggy-rs/iggy-go-client/contracts"
-	ierror "github.com/iggy-rs/iggy-go-client/errors"
+	. "github.com/apache/iggy/foreign/go/contracts"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
 type IggyTcpClient struct {
@@ -125,8 +125,8 @@ func (tms *IggyTcpClient) sendAndFetchResponse(message []byte, command CommandCo
 
 	length := int(binary.LittleEndian.Uint32(buffer[4:]))
 	if responseCode := getResponseCode(buffer); responseCode != 0 {
-		// TEMP: See https://github.com/iggy-rs/iggy/pull/604 for context.
-		// from: https://github.com/iggy-rs/iggy/blob/master/sdk/src/tcp/client.rs#L326
+		// TEMP: See https://github.com/apache/iggy/pull/604 for context.
+		// from: https://github.com/apache/iggy/blob/master/sdk/src/tcp/client.rs#L326
 		if responseCode == 2012 ||
 			responseCode == 2013 ||
 			responseCode == 1011 ||
