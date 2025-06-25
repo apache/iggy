@@ -34,8 +34,7 @@
     "lint": "eslint src/**/*.ts",
     "commitlint": "commitlint --edit",
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js",
-    "prepare": "husky"
+    "start": "node dist/index.js"
   },
   "author": "github.com/T1B0",
   "license": "Apache-2.0",
@@ -55,7 +54,6 @@
     "@swc-node/register": "1.10.9",
     "@types/debug": "4.1.12",
     "@types/node": "22.9.3",
-    "husky": "9.1.7",
     "semantic-release": "24.2.0",
     "typescript": "5.7.2",
     "typescript-eslint": "8.16.0"
