@@ -95,7 +95,7 @@ public class OffsetTests(Protocol protocol)
             TopicId = Identifier.Numeric(1),
             PartitionId = 1
         });
-        
+
         offset.ShouldNotBeNull();
         offset.StoredOffset.ShouldBe(SetOffset);
         offset.PartitionId.ShouldBe(1);

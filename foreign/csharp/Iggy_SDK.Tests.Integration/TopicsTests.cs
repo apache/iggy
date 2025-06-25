@@ -124,21 +124,21 @@ public class TopicsTests(Protocol protocol)
         secondTopic.MaxTopicSize.ShouldBe(TopicRequestSecond.MaxTopicSize);
         secondTopic.MessagesCount.ShouldBe(0u);
     }
-    
+
     [Test]
     [DependsOn(nameof(Get_ExistingTopics_Should_ReturnValidResponse))]
     public async Task Get_Topic_WithPartitions_Should_ReturnValidResponse()
     {
-        await Fixture.Clients[protocol].CreatePartitionsAsync(new CreatePartitionsRequest()
+        await Fixture.Clients[protocol].CreatePartitionsAsync(new CreatePartitionsRequest
         {
             PartitionsCount = 2,
             StreamId = Identifier.Numeric(1),
             TopicId = Identifier.Numeric(1)
         });
 
-        for (int i = 0; i < 3; i++)
+        for (var i = 0; i < 3; i++)
         {
-            await Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest()
+            await Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest
             {
                 StreamId = Identifier.Numeric(1),
                 TopicId = Identifier.Numeric(1),
@@ -163,7 +163,7 @@ public class TopicsTests(Protocol protocol)
         response.MessagesCount.ShouldBe(9u);
         response.Partitions.ShouldNotBeNull();
         response.Partitions!.ShouldAllBe(x => x.MessagesCount > 0);
-        response.Partitions.ShouldAllBe(x=>x.CreatedAt > DateTimeOffset.UtcNow.AddMinutes(-5));
+        response.Partitions.ShouldAllBe(x => x.CreatedAt > DateTimeOffset.UtcNow.AddMinutes(-5));
         response.Partitions.ShouldAllBe(x => x.SegmentsCount > 0);
         response.Partitions.ShouldAllBe(x => x.CurrentOffset > 0);
         response.Partitions.ShouldAllBe(x => x.Size > 0);
@@ -173,9 +173,9 @@ public class TopicsTests(Protocol protocol)
     private static List<Message> GetMessages(int count)
     {
         var messages = new List<Message>();
-        for (int i = 0; i < count; i++)
+        for (var i = 0; i < count; i++)
         {
-            messages.Add(new(Guid.NewGuid(), Encoding.UTF8.GetBytes($"Test message {i + 1}")));
+            messages.Add(new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes($"Test message {i + 1}")));
         }
 
         return messages;

@@ -49,7 +49,10 @@ public class PollMessagesTests(Protocol protocol)
             msgResponse.UserHeaders.Count.ShouldBe(2);
             msgResponse.Message.Text.ShouldContain("Dummy message");
             messageCount++;
-            if (messageCount == Fixture.MessageCount) break;
+            if (messageCount == Fixture.MessageCount)
+            {
+                break;
+            }
         }
 
         messageCount.ShouldBe(Fixture.MessageCount);

@@ -26,7 +26,7 @@ public class SystemFixture : IggyServerFixture
     public readonly int TotalClientsCount = 10;
 
     private List<IIggyClient> AdditionalClients { get; } = new();
-    
+
     public override async Task InitializeAsync()
     {
         await base.InitializeAsync();
@@ -38,13 +38,13 @@ public class SystemFixture : IggyServerFixture
     {
         for (var i = 0; i < TotalClientsCount; i++)
         {
-            await Clients[Protocol.Http].CreateUser(new CreateUserRequest()
+            await Clients[Protocol.Http].CreateUser(new CreateUserRequest
             {
                 Username = $"iggy{i}",
                 Password = "iggy",
                 Status = UserStatus.Active
             });
-            
+
             var client = CreateClient(Protocol.Tcp, Protocol.Http);
             AdditionalClients.Add(client);
             var login = await client.LoginUser(new LoginUserRequest
@@ -52,36 +52,37 @@ public class SystemFixture : IggyServerFixture
                 Password = "iggy",
                 Username = $"iggy{i}"
             });
-            
-            if(login!.UserId == 0)
+
+            if (login!.UserId == 0)
             {
                 throw new Exception("Failed to login user 'iggy'.");
             }
 
             await client.PingAsync();
         }
-        
+
         // One client less for tcp due to a default client
         for (var i = 0; i < TotalClientsCount - 1; i++)
         {
-            await Clients[Protocol.Tcp].CreateUser(new CreateUserRequest()
+            await Clients[Protocol.Tcp].CreateUser(new CreateUserRequest
             {
                 Username = $"iggy{i}",
                 Password = "iggy",
                 Status = UserStatus.Active
             });
-            
+
             var client = CreateClient(Protocol.Tcp, Protocol.Tcp);
             AdditionalClients.Add(client);
             var login = await client.LoginUser(new LoginUserRequest
             {
                 Password = "iggy",
-                Username = $"iggy{i}",
+                Username = $"iggy{i}"
             });
-            if(login!.UserId == 0)
+            if (login!.UserId == 0)
             {
                 throw new Exception("Failed to login user 'iggy'.");
             }
+
             await client.PingAsync();
         }
     }

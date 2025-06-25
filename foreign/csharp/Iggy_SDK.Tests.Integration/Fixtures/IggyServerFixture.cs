@@ -71,17 +71,17 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         options.StoreOffsetStrategy = StoreOffset.WhenMessagesAreReceived;
     };
 
-    public virtual async Task InitializeAsync()
-    {
-        await Task.WhenAll(_tcpContainer.StartAsync(), _httpContainer.StartAsync());
-        
-        await CreateTcpClient();
-        await CreateHttpClient();
-    }
-    
     public async ValueTask DisposeAsync()
     {
         await Task.WhenAll(_tcpContainer.StopAsync(), _httpContainer.StopAsync());
+    }
+
+    public virtual async Task InitializeAsync()
+    {
+        await Task.WhenAll(_tcpContainer.StartAsync(), _httpContainer.StartAsync());
+
+        await CreateTcpClient();
+        await CreateHttpClient();
     }
 
     public async Task CreateTcpClient()
@@ -118,9 +118,11 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
 
         if (targetContainer != null
             && targetContainer != protocol)
+        {
             port = targetContainer == Protocol.Tcp
                 ? _tcpContainer.GetMappedPublicPort(3000)
                 : _httpContainer.GetMappedPublicPort(8090);
+        }
 
         var address = protocol == Protocol.Tcp
             ? $"127.0.0.1:{port}"

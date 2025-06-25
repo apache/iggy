@@ -65,7 +65,7 @@ public class ConsumerGroupTests(Protocol protocol)
     [DependsOn(nameof(CreateConsumerGroup_Should_Throw_InvalidResponse))]
     public async Task GetConsumerGroupById_Should_Return_ValidResponse()
     {
-        var response = await Fixture.Clients[protocol].GetConsumerGroupByIdAsync(_createConsumerGroupRequest.StreamId, 
+        var response = await Fixture.Clients[protocol].GetConsumerGroupByIdAsync(_createConsumerGroupRequest.StreamId,
             _createConsumerGroupRequest.TopicId, Identifier.Numeric(1));
 
         response.ShouldNotBeNull();
@@ -144,7 +144,7 @@ public class ConsumerGroupTests(Protocol protocol)
             ConsumerGroupId = Identifier.Numeric(GroupId)
         }));
     }
-    
+
     [Test]
     [DependsOn(nameof(LeaveConsumerGroup_Http_Should_Throw_FeatureUnavailable))]
     [DependsOn(nameof(LeaveConsumerGroup_Tcp_Should_LeaveConsumerGroup_Successfully))]
@@ -156,14 +156,14 @@ public class ConsumerGroupTests(Protocol protocol)
         {
             var client = Fixture.CreateClient(Protocol.Tcp, protocol);
             clients.Add(client);
-            await client.LoginUser(new LoginUserRequest()
+            await client.LoginUser(new LoginUserRequest
             {
                 Username = "iggy",
                 Password = "iggy"
             });
             var me = await client.GetMeAsync();
             clientIds.Add(me!.ClientId);
-            await client.JoinConsumerGroupAsync(new JoinConsumerGroupRequest()
+            await client.JoinConsumerGroupAsync(new JoinConsumerGroupRequest
             {
                 ConsumerGroupId = Identifier.Numeric(_createConsumerGroupRequest.ConsumerGroupId),
                 StreamId = _createConsumerGroupRequest.StreamId,
@@ -171,7 +171,7 @@ public class ConsumerGroupTests(Protocol protocol)
             });
         }
 
-        var response = await Fixture.Clients[protocol].GetConsumerGroupByIdAsync(_createConsumerGroupRequest.StreamId, 
+        var response = await Fixture.Clients[protocol].GetConsumerGroupByIdAsync(_createConsumerGroupRequest.StreamId,
             _createConsumerGroupRequest.TopicId, Identifier.Numeric(1));
 
         response.ShouldNotBeNull();

@@ -39,7 +39,7 @@ public class SystemTests(Protocol protocol)
     public async Task GetClients_Should_Return_CorrectClientsCount()
     {
         IReadOnlyList<ClientResponse> clients = await Fixture.Clients[protocol].GetClientsAsync();
-        
+
         clients.Count.ShouldBe(Fixture.TotalClientsCount);
         foreach (var client in clients)
         {
@@ -55,7 +55,7 @@ public class SystemTests(Protocol protocol)
     public async Task GetClient_Should_Return_CorrectClient()
     {
         IReadOnlyList<ClientResponse> clients = await Fixture.Clients[protocol].GetClientsAsync();
-        
+
         clients.Count.ShouldBe(Fixture.TotalClientsCount);
         var id = clients[0].ClientId;
         var response = await Fixture.Clients[protocol].GetClientByIdAsync(id);
@@ -139,7 +139,7 @@ public class SystemTests(Protocol protocol)
     [DependsOn(nameof(GetClient_WithConsumerGroup_Should_Return_CorrectClient))]
     public async Task GetStats_Should_ReturnValidResponse()
     {
-        await Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest()
+        await Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest
         {
             StreamId = Identifier.Numeric(1),
             TopicId = Identifier.Numeric(1),
@@ -147,7 +147,7 @@ public class SystemTests(Protocol protocol)
             Messages = [new Message(Guid.NewGuid(), "Test message"u8.ToArray())]
         });
 
-        await Fixture.Clients[protocol].FetchMessagesAsync(new MessageFetchRequest()
+        await Fixture.Clients[protocol].FetchMessagesAsync(new MessageFetchRequest
         {
             StreamId = Identifier.Numeric(1),
             TopicId = Identifier.Numeric(1),
@@ -157,7 +157,7 @@ public class SystemTests(Protocol protocol)
             PartitionId = 1,
             PollingStrategy = PollingStrategy.First()
         });
-        
+
         var response = await Fixture.Clients[protocol].GetStatsAsync();
         response.ShouldNotBeNull();
         response.ProcessId.ShouldBeGreaterThanOrEqualTo(0);
@@ -184,7 +184,6 @@ public class SystemTests(Protocol protocol)
         response.KernelVersion.ShouldNotBeNullOrEmpty();
         response.IggyServerVersion.ShouldNotBeNullOrEmpty();
         response.IggyServerSemver.ShouldNotBe(0u);
-        
     }
 
     [Test]

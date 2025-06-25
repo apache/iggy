@@ -112,11 +112,14 @@ public class FetchMessagesFixture : IggyServerFixture
     {
         var messages = new List<DummyMessage>();
         for (var i = 0; i < count; i++)
+        {
             messages.Add(new DummyMessage
             {
                 Text = $"Dummy message {i}",
                 Id = i
             });
+        }
+
         return messages;
     }
 

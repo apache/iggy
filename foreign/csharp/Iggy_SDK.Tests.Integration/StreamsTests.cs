@@ -99,7 +99,7 @@ public class StreamsTests(Protocol protocol)
     [DependsOn(nameof(GetStreamById_Should_ReturnValidResponse))]
     public async Task GetStreamById_WithTopics_Should_ReturnValidResponse()
     {
-        var topicRequest1 = TopicFactory.CreateTopic(1, messageExpiry: 100_000);
+        var topicRequest1 = TopicFactory.CreateTopic(messageExpiry: 100_000);
         var topicRequest2 = TopicFactory.CreateTopic(2, messageExpiry: 100_000);
 
         await Fixture.Clients[protocol].CreateTopicAsync(Identifier.Numeric(StreamRequest.StreamId!.Value), topicRequest1);
