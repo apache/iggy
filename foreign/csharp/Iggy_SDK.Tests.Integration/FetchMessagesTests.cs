@@ -50,11 +50,17 @@ public class FetchMessagesTests(Protocol protocol)
         response.Messages.Count.ShouldBe(10);
         response.PartitionId.ShouldBe(1);
         response.CurrentOffset.ShouldBe(19u);
+        uint offset = 0;
         foreach (MessageResponse<DummyMessage> responseMessage in response.Messages)
         {
             responseMessage.UserHeaders.ShouldBeNull();
             responseMessage.Message.Text.ShouldNotBeNullOrEmpty();
             responseMessage.Message.Text.ShouldContain("Dummy message");
+            responseMessage.Header.Checksum.ShouldNotBe(0u);
+            responseMessage.Header.Id.ShouldNotBe(0u);
+            responseMessage.Header.Offset.ShouldBe(offset++);
+            responseMessage.Header.PayloadLength.ShouldNotBe(0);
+            responseMessage.Header.UserHeadersLength.ShouldBe(0);
         }
     }
 

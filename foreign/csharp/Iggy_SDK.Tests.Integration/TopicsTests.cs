@@ -15,11 +15,13 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
+using System.Text;
 using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Fixtures;
+using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
@@ -38,11 +40,7 @@ public class TopicsTests(Protocol protocol)
     [Test]
     public async Task Create_NewTopic_Should_Return_Successfully()
     {
-        await Fixture.Clients[protocol].CreateStreamAsync(new StreamRequest
-        {
-            Name = "Test Stream",
-            StreamId = 1
-        });
+        await Fixture.Clients[protocol].CreateStreamAsync(StreamFactory.CreateStream());
 
         var response = await Fixture.Clients[protocol].CreateTopicAsync(Identifier.Numeric(1), TopicRequest);
 
@@ -126,9 +124,65 @@ public class TopicsTests(Protocol protocol)
         secondTopic.MaxTopicSize.ShouldBe(TopicRequestSecond.MaxTopicSize);
         secondTopic.MessagesCount.ShouldBe(0u);
     }
-
+    
     [Test]
     [DependsOn(nameof(Get_ExistingTopics_Should_ReturnValidResponse))]
+    public async Task Get_Topic_WithPartitions_Should_ReturnValidResponse()
+    {
+        await Fixture.Clients[protocol].CreatePartitionsAsync(new CreatePartitionsRequest()
+        {
+            PartitionsCount = 2,
+            StreamId = Identifier.Numeric(1),
+            TopicId = Identifier.Numeric(1)
+        });
+
+        for (int i = 0; i < 3; i++)
+        {
+            await Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest()
+            {
+                StreamId = Identifier.Numeric(1),
+                TopicId = Identifier.Numeric(1),
+                Partitioning = Partitioning.None(),
+                Messages = GetMessages(i + 2)
+            });
+        }
+
+        var response = await Fixture.Clients[protocol].GetTopicByIdAsync(Identifier.Numeric(1), Identifier.Numeric(1));
+
+        response.ShouldNotBeNull();
+        response.Id.ShouldBe(TopicRequest.TopicId!.Value);
+        response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromSeconds(10));
+        response.Name.ShouldBe(TopicRequest.Name);
+        response.CompressionAlgorithm.ShouldBe(TopicRequest.CompressionAlgorithm);
+        response.Partitions!.Count().ShouldBe(3);
+        response.MessageExpiry.ShouldBe(TopicRequest.MessageExpiry);
+        response.Size.ShouldBe(630u);
+        response.PartitionsCount.ShouldBe(3);
+        response.ReplicationFactor.ShouldBe(TopicRequest.ReplicationFactor);
+        response.MaxTopicSize.ShouldBe(TopicRequest.MaxTopicSize);
+        response.MessagesCount.ShouldBe(9u);
+        response.Partitions.ShouldNotBeNull();
+        response.Partitions!.ShouldAllBe(x => x.MessagesCount > 0);
+        response.Partitions.ShouldAllBe(x=>x.CreatedAt > DateTimeOffset.UtcNow.AddMinutes(-5));
+        response.Partitions.ShouldAllBe(x => x.SegmentsCount > 0);
+        response.Partitions.ShouldAllBe(x => x.CurrentOffset > 0);
+        response.Partitions.ShouldAllBe(x => x.Size > 0);
+        response.Partitions.ShouldAllBe(x => x.Id > 0);
+    }
+
+    private static List<Message> GetMessages(int count)
+    {
+        var messages = new List<Message>();
+        for (int i = 0; i < count; i++)
+        {
+            messages.Add(new(Guid.NewGuid(), Encoding.UTF8.GetBytes($"Test message {i + 1}")));
+        }
+
+        return messages;
+    }
+
+    [Test]
+    [DependsOn(nameof(Get_Topic_WithPartitions_Should_ReturnValidResponse))]
     public async Task Update_ExistingTopic_Should_UpdateTopic_Successfully()
     {
         await Should.NotThrowAsync(Fixture.Clients[protocol].UpdateTopicAsync(Identifier.Numeric(1),
@@ -148,23 +202,10 @@ public class TopicsTests(Protocol protocol)
     [DependsOn(nameof(Update_ExistingTopic_Should_UpdateTopic_Successfully))]
     public async Task Purge_ExistingTopic_Should_PurgeTopic_Successfully()
     {
-        await Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest
-        {
-            Partitioning = Partitioning.None(),
-            StreamId = Identifier.Numeric(1),
-            TopicId = Identifier.Numeric(TopicRequest.TopicId!.Value),
-            Messages = new List<Message>
-            {
-                new(Guid.NewGuid(), "Test message 1"u8.ToArray()),
-                new(Guid.NewGuid(), "Test message 2"u8.ToArray()),
-                new(Guid.NewGuid(), "Test message 3"u8.ToArray())
-            }
-        });
-
         var beforePurge = await Fixture.Clients[protocol].GetTopicByIdAsync(Identifier.Numeric(1), Identifier.Numeric(TopicRequest.TopicId!.Value));
 
         beforePurge.ShouldNotBeNull();
-        beforePurge!.MessagesCount.ShouldBe(3u);
+        beforePurge.MessagesCount.ShouldBe(9u);
         beforePurge.Size.ShouldBeGreaterThan(0u);
 
         await Should.NotThrowAsync(Fixture.Clients[protocol].PurgeTopicAsync(Identifier.Numeric(1),

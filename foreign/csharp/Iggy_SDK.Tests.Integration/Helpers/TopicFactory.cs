@@ -4,13 +4,14 @@ namespace Apache.Iggy.Tests.Integrations.Helpers;
 
 public static class TopicFactory
 {
-    public static TopicRequest CreateTopic(int topicId = 1, int partitionsCount = 1)
+    public static TopicRequest CreateTopic(int topicId = 1, int partitionsCount = 1, ulong messageExpiry = 0)
     {
         return new TopicRequest
         {
             TopicId = topicId,
             Name = $"TestTopic {topicId}",
-            PartitionsCount = partitionsCount
+            PartitionsCount = partitionsCount,
+            MessageExpiry = messageExpiry
         };
     }
 }

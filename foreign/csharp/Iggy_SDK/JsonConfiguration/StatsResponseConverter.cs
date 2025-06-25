@@ -76,6 +76,8 @@ public class StatsResponseConverter : JsonConverter<StatsResponse>
         string? osVersion = root.GetProperty(nameof(Stats.OsVersion).ToSnakeCase()).GetString();
         string? kernelVersion = root.GetProperty(nameof(Stats.KernelVersion).ToSnakeCase()).GetString();
         string? iggyVersion = root.GetProperty(nameof(Stats.IggyServerVersion).ToSnakeCase()).GetString();
+        uint iggyServerSemver = root.GetProperty(nameof(Stats.IggyServerSemver).ToSnakeCase()).GetUInt32();
+        
         
         return new StatsResponse
         {
@@ -101,7 +103,8 @@ public class StatsResponseConverter : JsonConverter<StatsResponse>
             TotalCpuUsage = totalCpuUsage,
             TotalMemory = totalMemoryUsage,
             WrittenBytes = writtenBytes,
-            IggyVersion = iggyVersion
+            IggyVersion = iggyVersion,
+            IggyServerSemver = iggyServerSemver
         };
 
     }

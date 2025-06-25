@@ -19,9 +19,13 @@ using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Contracts.Http.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.Kinds;
+using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
+using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
+using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.Tests.Integrations;
 
@@ -95,11 +99,7 @@ public class SystemTests(Protocol protocol)
             Password = "iggy",
             Username = "iggy"
         });
-        await client.CreateStreamAsync(new StreamRequest
-        {
-            Name = "test_stream",
-            StreamId = 1
-        });
+        await client.CreateStreamAsync(StreamFactory.CreateStream());
         await client.CreateTopicAsync(Identifier.Numeric(1), new TopicRequest
         {
             Name = "test_topic",
@@ -128,6 +128,9 @@ public class SystemTests(Protocol protocol)
         response.Transport.ShouldBe("TCP");
         response.ConsumerGroupsCount.ShouldBe(1);
         response.ConsumerGroups.ShouldNotBeEmpty();
+        response.ConsumerGroups.ShouldContain(x => x.GroupId == consumerGroup.Id);
+        response.ConsumerGroups.ShouldContain(x => x.TopicId == 1);
+        response.ConsumerGroups.ShouldContain(x => x.StreamId == 1);
     }
 
 
@@ -135,12 +138,52 @@ public class SystemTests(Protocol protocol)
     [DependsOn(nameof(GetClient_WithConsumerGroup_Should_Return_CorrectClient))]
     public async Task GetStats_Should_ReturnValidResponse()
     {
+        await Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest()
+        {
+            StreamId = Identifier.Numeric(1),
+            TopicId = Identifier.Numeric(1),
+            Partitioning = Partitioning.None(),
+            Messages = [new Message(Guid.NewGuid(), "Test message"u8.ToArray())]
+        });
+
+        await Fixture.Clients[protocol].FetchMessagesAsync(new MessageFetchRequest()
+        {
+            StreamId = Identifier.Numeric(1),
+            TopicId = Identifier.Numeric(1),
+            AutoCommit = true,
+            Consumer = Consumer.New(1),
+            Count = 1,
+            PartitionId = 1,
+            PollingStrategy = PollingStrategy.First()
+        });
+        
         var response = await Fixture.Clients[protocol].GetStatsAsync();
         response.ShouldNotBeNull();
-        response.MessagesCount.ShouldBe(0u);
-        response.PartitionsCount.ShouldBe(2);
-        response.StreamsCount.ShouldBe(1);
-        response.TopicsCount.ShouldBe(1);
+        response.ProcessId.ShouldBeGreaterThanOrEqualTo(0);
+        response.CpuUsage.ShouldBeGreaterThanOrEqualTo(0);
+        response.TotalCpuUsage.ShouldBeGreaterThanOrEqualTo(0);
+        response.MemoryUsage.ShouldBeGreaterThanOrEqualTo(0u);
+        response.TotalMemory.ShouldBeGreaterThanOrEqualTo(0u);
+        response.AvailableMemory.ShouldNotBe(0u);
+        response.RunTime.ShouldBeGreaterThanOrEqualTo(0u);
+        response.StartTime.ShouldBe(DateTimeOffset.UtcNow, TimeSpan.FromMinutes(5));
+        response.ReadBytes.ShouldBeGreaterThanOrEqualTo(0u);
+        response.WrittenBytes.ShouldBeGreaterThanOrEqualTo(0u);
+        response.MessagesSizeBytes.ShouldBeGreaterThanOrEqualTo(0u);
+        response.StreamsCount.ShouldNotBe(0);
+        response.TopicsCount.ShouldNotBe(0);
+        response.PartitionsCount.ShouldNotBe(0);
+        response.SegmentsCount.ShouldNotBe(0);
+        response.MessagesCount.ShouldNotBe(0u);
+        response.ClientsCount.ShouldNotBe(0);
+        response.ConsumerGroupsCount.ShouldNotBe(0);
+        response.Hostname.ShouldNotBeNullOrEmpty();
+        response.OsName.ShouldNotBeNullOrEmpty();
+        response.OsVersion.ShouldNotBeNullOrEmpty();
+        response.KernelVersion.ShouldNotBeNullOrEmpty();
+        response.IggyServerVersion.ShouldNotBeNullOrEmpty();
+        response.IggyServerSemver.ShouldNotBe(0u);
+        
     }
 
     [Test]

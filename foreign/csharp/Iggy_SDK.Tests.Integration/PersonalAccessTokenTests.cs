@@ -67,7 +67,7 @@ public class PersonalAccessTokenTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(GetPersonalAccessTokens_Should_ReturnValidResponse))]
-    public async Task LoginWithPersonalAccessToken_Should_Be_Successfull()
+    public async Task LoginWithPersonalAccessToken_Should_Be_Successfully()
     {
         var response = await Fixture.Clients[protocol].CreatePersonalAccessTokenAsync(new CreatePersonalAccessTokenRequest
         {
@@ -87,7 +87,7 @@ public class PersonalAccessTokenTests(Protocol protocol)
     }
 
     [Test]
-    [DependsOn(nameof(LoginWithPersonalAccessToken_Should_Be_Successfull))]
+    [DependsOn(nameof(LoginWithPersonalAccessToken_Should_Be_Successfully))]
     public async Task DeletePersonalAccessToken_Should_DeletePersonalAccessToken_Successfully()
     {
         await Should.NotThrowAsync(() => Fixture.Clients[protocol].DeletePersonalAccessTokenAsync(new DeletePersonalAccessTokenRequest

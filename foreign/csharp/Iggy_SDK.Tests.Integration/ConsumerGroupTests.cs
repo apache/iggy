@@ -179,6 +179,7 @@ public class ConsumerGroupTests(Protocol protocol)
         response.Members.Count.ShouldBe(2);
         response.Members.ShouldAllBe(m => clientIds.Contains(m.Id));
         response.Members.ShouldAllBe(x => x.PartitionsCount == 5);
+        response.Members.ShouldAllBe(x => x.Partitions.Count == 5);
     }
 
     [Test]

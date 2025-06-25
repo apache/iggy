@@ -20,6 +20,7 @@ using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Fixtures;
+using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
@@ -68,11 +69,7 @@ public class StreamsTests(Protocol protocol)
     [DependsOn(nameof(CreateStream_Duplicate_Should_Throw_InvalidResponse))]
     public async Task GetStreams_Should_ReturnValidResponse()
     {
-        var secondStreamRequest = new StreamRequest
-        {
-            Name = "test-stream-2",
-            StreamId = 2
-        };
+        var secondStreamRequest = StreamFactory.CreateStream(2);
         await Fixture.Clients[protocol].CreateStreamAsync(secondStreamRequest);
 
         IReadOnlyList<StreamResponse> response = await Fixture.Clients[protocol].GetStreamsAsync();
@@ -102,18 +99,8 @@ public class StreamsTests(Protocol protocol)
     [DependsOn(nameof(GetStreamById_Should_ReturnValidResponse))]
     public async Task GetStreamById_WithTopics_Should_ReturnValidResponse()
     {
-        var topicRequest1 = new TopicRequest
-        {
-            Name = "test-topic-1",
-            TopicId = 1,
-            MessageExpiry = 100_000
-        };
-        var topicRequest2 = new TopicRequest
-        {
-            Name = "test-topic-2",
-            TopicId = 2,
-            MessageExpiry = 100_000
-        };
+        var topicRequest1 = TopicFactory.CreateTopic(1, messageExpiry: 100_000);
+        var topicRequest2 = TopicFactory.CreateTopic(2, messageExpiry: 100_000);
 
         await Fixture.Clients[protocol].CreateTopicAsync(Identifier.Numeric(StreamRequest.StreamId!.Value), topicRequest1);
         await Fixture.Clients[protocol].CreateTopicAsync(Identifier.Numeric(StreamRequest.StreamId!.Value), topicRequest2);
