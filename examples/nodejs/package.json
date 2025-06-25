@@ -1,0 +1,23 @@
+{
+  "name": "iggy-node-examples",
+  "version": "1.0.0",
+  "description": "Usage examples for the Iggy Node.js client",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node",
+    "start:ts": "ts-node"
+  },
+  "keywords": [],
+  "author": "Iggy",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@iggy.rs/sdk": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.5",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5"
+  }
+}
