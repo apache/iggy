@@ -19,6 +19,7 @@ using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Contracts.Http.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.IggyClient;
 using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Shouldly;
@@ -150,9 +151,11 @@ public class ConsumerGroupTests(Protocol protocol)
     public async Task GetConsumerGroupById_WithMembers_Should_Return_ValidResponse()
     {
         var clientIds = new List<uint>();
+        var clients = new List<IIggyClient>();
         for (var i = 0; i < 2; i++)
         {
             var client = Fixture.CreateClient(Protocol.Tcp, protocol);
+            clients.Add(client);
             await client.LoginUser(new LoginUserRequest()
             {
                 Username = "iggy",

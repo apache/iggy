@@ -37,7 +37,7 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         .WithOutputConsumer(Consume.RedirectStdoutAndStderrToConsole())
         .WithWaitStrategy(Wait.ForUnixContainer().UntilPortIsAvailable(3000))
         .WithName($"HTTP_{Guid.NewGuid()}")
-        //.WithEnvironment("IGGY_SYSTEM_LOGGING_LEVEL", "debug")
+        //.WithEnvironment("IGGY_SYSTEM_LOGGING_LEVEL", "trace")
         //.WithEnvironment("RUST_LOG", "trace")
         .WithCleanUp(true)
         .Build();
@@ -50,8 +50,8 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         .WithOutputConsumer(Consume.RedirectStdoutAndStderrToConsole())
         .WithWaitStrategy(Wait.ForUnixContainer().UntilPortIsAvailable(8090))
         .WithName($"TCP_{Guid.NewGuid()}")
-        // .WithEnvironment("IGGY_SYSTEM_LOGGING_LEVEL", "trace")
-        // .WithEnvironment("RUST_LOG", "trace")
+        //.WithEnvironment("IGGY_SYSTEM_LOGGING_LEVEL", "trace")
+        //.WithEnvironment("RUST_LOG", "trace")
         .WithCleanUp(true)
         .Build();
 
@@ -74,7 +74,7 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     public virtual async Task InitializeAsync()
     {
         await Task.WhenAll(_tcpContainer.StartAsync(), _httpContainer.StartAsync());
-
+        
         await CreateTcpClient();
         await CreateHttpClient();
     }

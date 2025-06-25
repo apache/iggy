@@ -39,12 +39,12 @@ public class SystemTests(Protocol protocol)
     public async Task GetClients_Should_Return_CorrectClientsCount()
     {
         IReadOnlyList<ClientResponse> clients = await Fixture.Clients[protocol].GetClientsAsync();
-
+        
         clients.Count.ShouldBe(Fixture.TotalClientsCount);
         foreach (var client in clients)
         {
             client.ClientId.ShouldNotBe(0u);
-            client.UserId.ShouldBe(1u);
+            client.UserId.ShouldBeGreaterThan(0u);
             client.Address.ShouldNotBeNullOrEmpty();
             client.Transport.ShouldBe("TCP");
         }
@@ -55,12 +55,13 @@ public class SystemTests(Protocol protocol)
     public async Task GetClient_Should_Return_CorrectClient()
     {
         IReadOnlyList<ClientResponse> clients = await Fixture.Clients[protocol].GetClientsAsync();
-
+        
         clients.Count.ShouldBe(Fixture.TotalClientsCount);
         var id = clients[0].ClientId;
         var response = await Fixture.Clients[protocol].GetClientByIdAsync(id);
-        response!.ClientId.ShouldBe(id);
-        response.UserId.ShouldBe(1u);
+        response.ShouldNotBeNull();
+        response.ClientId.ShouldBe(id);
+        response.UserId.ShouldBeGreaterThan(0u);
         response.Address.ShouldNotBeNullOrEmpty();
         response.Transport.ShouldBe("TCP");
         response.ConsumerGroupsCount.ShouldBe(0);

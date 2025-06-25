@@ -17,6 +17,7 @@
 
 using Apache.Iggy.Contracts.Http.Auth;
 using Apache.Iggy.Enums;
+using Apache.Iggy.IggyClient;
 
 namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
@@ -24,6 +25,8 @@ public class SystemFixture : IggyServerFixture
 {
     public readonly int TotalClientsCount = 10;
 
+    private List<IIggyClient> AdditionalClients { get; } = new();
+    
     public override async Task InitializeAsync()
     {
         await base.InitializeAsync();
@@ -33,25 +36,53 @@ public class SystemFixture : IggyServerFixture
 
     private async Task CreateClientsAsync()
     {
+        for (var i = 0; i < TotalClientsCount; i++)
+        {
+            await Clients[Protocol.Http].CreateUser(new CreateUserRequest()
+            {
+                Username = $"iggy{i}",
+                Password = "iggy",
+                Status = UserStatus.Active
+            });
+            
+            var client = CreateClient(Protocol.Tcp, Protocol.Http);
+            AdditionalClients.Add(client);
+            var login = await client.LoginUser(new LoginUserRequest
+            {
+                Password = "iggy",
+                Username = $"iggy{i}"
+            });
+            
+            if(login!.UserId == 0)
+            {
+                throw new Exception("Failed to login user 'iggy'.");
+            }
+
+            await client.PingAsync();
+        }
+        
         // One client less for tcp due to a default client
         for (var i = 0; i < TotalClientsCount - 1; i++)
         {
+            await Clients[Protocol.Tcp].CreateUser(new CreateUserRequest()
+            {
+                Username = $"iggy{i}",
+                Password = "iggy",
+                Status = UserStatus.Active
+            });
+            
             var client = CreateClient(Protocol.Tcp, Protocol.Tcp);
-            await client.LoginUser(new LoginUserRequest
+            AdditionalClients.Add(client);
+            var login = await client.LoginUser(new LoginUserRequest
             {
                 Password = "iggy",
-                Username = "iggy"
+                Username = $"iggy{i}",
             });
-        }
-
-        for (var i = 0; i < TotalClientsCount; i++)
-        {
-            var client = CreateClient(Protocol.Tcp, Protocol.Http);
-            await client.LoginUser(new LoginUserRequest
+            if(login!.UserId == 0)
             {
-                Password = "iggy",
-                Username = "iggy"
-            });
+                throw new Exception("Failed to login user 'iggy'.");
+            }
+            await client.PingAsync();
         }
     }
 }
