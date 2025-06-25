@@ -451,7 +451,6 @@ public class HttpMessageStream : IIggyClient
 
         if (response.IsSuccessStatusCode)
         {
-            var t = await response.Content.ReadAsStringAsync(token);
             return await response.Content.ReadFromJsonAsync<ConsumerGroupResponse>(JsonConverterFactory.SnakeCaseOptions, cancellationToken: token);
         }
 

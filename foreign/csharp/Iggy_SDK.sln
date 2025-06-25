@@ -14,6 +14,15 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Benchmarks", "Benchmarks\Be
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Iggy_SDK.Tests.Integration", "Iggy_SDK.Tests.Integration\Iggy_SDK.Tests.Integration.csproj", "{59661E1B-1D5E-4D58-AE7B-10E8ABB9839A}"
 EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "SolutionFolder", "SolutionFolder", "{3A9B7D3B-EFA9-4652-A647-C72F84616114}"
+	ProjectSection(SolutionItems) = preProject
+		DEPENDENCIES.md = DEPENDENCIES.md
+		Directory.Packages.props = Directory.Packages.props
+		LICENSE = LICENSE
+		NOTICE = NOTICE
+		README.md = README.md
+	EndProjectSection
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU

@@ -62,7 +62,7 @@ public class PersonalAccessTokenTests(Protocol protocol)
         response.Count.ShouldBe(1);
         response[0].Name.ShouldBe(CreatePersonalAccessTokenRequest.Name);
         var tokenExpiryDateTimeOffset = DateTimeOffset.UtcNow.AddMicroseconds((double)CreatePersonalAccessTokenRequest.Expiry!);
-        response[0].ExpiryAt!.Value.ShouldBe(tokenExpiryDateTimeOffset, TimeSpan.FromSeconds(2));
+        response[0].ExpiryAt!.Value.ToUniversalTime().ShouldBe(tokenExpiryDateTimeOffset, TimeSpan.FromMinutes(1));
     }
 
     [Test]

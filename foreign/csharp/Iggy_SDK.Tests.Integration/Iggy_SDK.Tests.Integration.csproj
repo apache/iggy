@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
         <ImplicitUsings>enable</ImplicitUsings>
@@ -11,19 +11,19 @@
     </PropertyGroup>
 
     <ItemGroup>
-        <PackageReference Include="coverlet.collector" Version="6.0.4">
+        <PackageReference Include="coverlet.collector">
             <PrivateAssets>all</PrivateAssets>
             <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
         </PackageReference>
-        <PackageReference Include="Microsoft.Testing.Extensions.CodeCoverage" Version="17.14.2"/>
-        <PackageReference Include="Microsoft.Testing.Extensions.TrxReport" Version="1.7.3"/>
-        <PackageReference Include="Shouldly" Version="4.3.0"/>
-        <PackageReference Include="Testcontainers" Version="4.6.0"/>
-        <PackageReference Include="TUnit" Version="0.25.21"/>
+        <PackageReference Include="Microsoft.Testing.Extensions.CodeCoverage" />
+        <PackageReference Include="Microsoft.Testing.Extensions.TrxReport" />
+        <PackageReference Include="Shouldly" />
+        <PackageReference Include="Testcontainers" />
+        <PackageReference Include="TUnit" />
     </ItemGroup>
 
     <ItemGroup>
-        <ProjectReference Include="..\Iggy_SDK\Iggy_SDK.csproj"/>
+        <ProjectReference Include="..\Iggy_SDK\Iggy_SDK.csproj" />
     </ItemGroup>
 
 </Project>
