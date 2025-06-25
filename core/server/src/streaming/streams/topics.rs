@@ -146,7 +146,8 @@ impl Stream {
             topic.name = name.to_owned();
             topic.message_expiry = message_expiry;
             topic.compression_algorithm = compression_algorithm;
-            for partition in topic.partitions.borrow_mut().values_mut() {
+            for partition in topic.partitions.values_mut() {
+                let mut partition = partition.write().await;
                 partition.message_expiry = message_expiry;
                 for segment in partition.segments.iter_mut() {
                     segment.update_message_expiry(message_expiry);

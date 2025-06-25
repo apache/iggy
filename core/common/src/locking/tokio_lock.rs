@@ -25,8 +25,6 @@ use tokio::sync::{RwLock as TokioRwLock, RwLockReadGuard, RwLockWriteGuard};
 pub struct IggyTokioRwLock<T>(Arc<TokioRwLock<T>>);
 
 impl<T> IggySharedMutFn<T> for IggyTokioRwLock<T>
-where
-    T: Send + Sync,
 {
     type ReadGuard<'a>
         = RwLockReadGuard<'a, T>

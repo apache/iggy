@@ -18,8 +18,6 @@
 
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::session::Session;
-use crate::streaming::systems::COMPONENT;
-use crate::streaming::systems::system::System;
 use crate::streaming::users::user::User;
 use error_set::ErrContext;
 use iggy_common::IggyError;

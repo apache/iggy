@@ -25,7 +25,7 @@ use ahash::AHashMap;
 use core::fmt;
 use std::cell::RefCell;
 use std::rc::Rc;
-use iggy_common::locking::IggySharedMut;
+use iggy_common::locking::IggyRwLock;
 use iggy_common::{
     CompressionAlgorithm, Consumer, ConsumerKind, IggyByteSize, IggyError, IggyExpiry,
     IggyTimestamp, MaxTopicSize, Sizeable,
@@ -33,7 +33,6 @@ use iggy_common::{
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use tokio::sync::RwLock;
 use tracing::info;
 
 const ALMOST_FULL_THRESHOLD: f64 = 0.9;
@@ -51,9 +50,9 @@ pub struct Topic {
     pub(crate) messages_count: Arc<AtomicU64>,
     pub(crate) segments_count_of_parent_stream: Arc<AtomicU32>,
     pub(crate) config: Rc<SystemConfig>,
-    pub(crate) partitions: RefCell<AHashMap<u32, Partition>>,
+    pub(crate) partitions: AHashMap<u32, IggyRwLock<Partition>>,
     pub(crate) storage: Rc<SystemStorage>,
-    pub(crate) consumer_groups: AHashMap<u32, ConsumerGroup>,
+    pub(crate) consumer_groups: RefCell<AHashMap<u32, ConsumerGroup>>,
     pub(crate) consumer_groups_ids: AHashMap<String, u32>,
     pub(crate) current_consumer_group_id: AtomicU32,
     pub(crate) current_partition_id: AtomicU32,
@@ -126,7 +125,7 @@ impl Topic {
             messages_count_of_parent_stream,
             messages_count: Arc::new(AtomicU64::new(0)),
             segments_count_of_parent_stream,
-            consumer_groups: AHashMap::new(),
+            consumer_groups: RefCell::new(AHashMap::new()),
             consumer_groups_ids: AHashMap::new(),
             current_consumer_group_id: AtomicU32::new(1),
             current_partition_id: AtomicU32::new(1),
@@ -172,11 +171,11 @@ impl Topic {
         matches!(self.max_topic_size, MaxTopicSize::Unlimited)
     }
 
-    pub fn get_partitions(&self) -> Vec<IggySharedMut<Partition>> {
+    pub fn get_partitions(&self) -> Vec<IggyRwLock<Partition>> {
         self.partitions.values().cloned().collect()
     }
 
-    pub fn get_partition(&self, partition_id: u32) -> Result<IggySharedMut<Partition>, IggyError> {
+    pub fn get_partition(&self, partition_id: u32) -> Result<IggyRwLock<Partition>, IggyError> {
         match self.partitions.get(&partition_id) {
             Some(partition_arc) => Ok(partition_arc.clone()),
             None => Err(IggyError::PartitionNotFound(
@@ -187,7 +186,7 @@ impl Topic {
         }
     }
 
-    pub async fn resolve_consumer_with_partition_id(
+    pub fn resolve_consumer_with_partition_id(
         &self,
         consumer: &Consumer,
         client_id: u32,
@@ -203,7 +202,7 @@ impl Topic {
                 )))
             }
             ConsumerKind::ConsumerGroup => {
-                let consumer_group = self.get_consumer_group(&consumer.id)?.read().await;
+                let mut consumer_group = self.get_consumer_group_mut(&consumer.id)?;
                 if let Some(partition_id) = partition_id {
                     return Ok(Some((
                         PollingConsumer::consumer_group(consumer_group.group_id, client_id),
@@ -212,9 +211,9 @@ impl Topic {
                 }
 
                 let partition_id = if calculate_partition_id {
-                    consumer_group.calculate_partition_id(client_id).await?
+                    consumer_group.calculate_partition_id(client_id)?
                 } else {
-                    consumer_group.get_current_partition_id(client_id).await?
+                    consumer_group.get_current_partition_id(client_id)?
                 };
                 let Some(partition_id) = partition_id else {
                     return Ok(None);
@@ -291,11 +290,11 @@ mod tests {
     #[tokio::test]
     async fn should_be_created_given_valid_parameters() {
         let tempdir = tempfile::TempDir::new().unwrap();
-        let config = Arc::new(SystemConfig {
+        let config = Rc::new(SystemConfig {
             path: tempdir.path().to_str().unwrap().to_string(),
             ..Default::default()
         });
-        let storage = Arc::new(SystemStorage::new(
+        let storage = Rc::new(SystemStorage::new(
             config.clone(),
             Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister {})),
         ));

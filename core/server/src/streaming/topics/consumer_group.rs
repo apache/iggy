@@ -52,12 +52,12 @@ impl ConsumerGroup {
         self.members.values().cloned().collect()
     }
 
-    pub async fn reassign_partitions(&mut self, partitions_count: u32) {
+    pub fn reassign_partitions(&mut self, partitions_count: u32) {
         self.partitions_count = partitions_count;
-        self.assign_partitions().await;
+        self.assign_partitions();
     }
 
-    pub async fn calculate_partition_id(
+    pub fn calculate_partition_id(
         &mut self,
         member_id: u32,
     ) -> Result<Option<u32>, IggyError> {
@@ -72,7 +72,7 @@ impl ConsumerGroup {
         ))
     }
 
-    pub async fn get_current_partition_id(&self, member_id: u32) -> Result<Option<u32>, IggyError> {
+    pub fn get_current_partition_id(&mut self, member_id: u32) -> Result<Option<u32>, IggyError> {
         let member = self.members.get(&member_id);
         if let Some(member) = member {
             return Ok(member.current_partition_id);
@@ -84,7 +84,7 @@ impl ConsumerGroup {
         ))
     }
 
-    pub async fn add_member(&mut self, member_id: u32) {
+    pub fn add_member(&mut self, member_id: u32) {
         self.members.insert(
             member_id,
             ConsumerGroupMember {
@@ -98,20 +98,20 @@ impl ConsumerGroup {
             "Added member with ID: {} to consumer group: {} for topic with ID: {}",
             member_id, self.group_id, self.topic_id
         );
-        self.assign_partitions().await;
+        self.assign_partitions();
     }
 
-    pub async fn delete_member(&mut self, member_id: u32) {
+    pub fn delete_member(&mut self, member_id: u32) {
         if self.members.remove(&member_id).is_some() {
             trace!(
                 "Deleted member with ID: {} in consumer group: {} for topic with ID: {}",
                 member_id, self.group_id, self.topic_id
             );
-            self.assign_partitions().await;
+            self.assign_partitions();
         }
     }
 
-    async fn assign_partitions(&mut self) {
+    fn assign_partitions(&mut self) {
         let mut members = self.members.values_mut().collect::<Vec<_>>();
         if members.is_empty() {
             return;
@@ -189,11 +189,10 @@ mod tests {
             members: AHashMap::new(),
         };
 
-        consumer_group.add_member(member_id).await;
+        consumer_group.add_member(member_id);
         for i in 0..1000 {
             let partition_id = consumer_group
                 .calculate_partition_id(member_id)
-                .await
                 .unwrap()
                 .expect("Partition ID not found");
             assert_eq!(partition_id, (i % consumer_group.partitions_count) + 1);
@@ -211,7 +210,7 @@ mod tests {
             members: AHashMap::new(),
         };
 
-        consumer_group.add_member(member_id).await;
+        consumer_group.add_member(member_id);
         let member = consumer_group.members.get(&member_id).unwrap();
         assert_eq!(
             member.partitions.len() as u32,
@@ -235,8 +234,8 @@ mod tests {
             members: AHashMap::new(),
         };
 
-        consumer_group.add_member(member1_id).await;
-        consumer_group.add_member(member2_id).await;
+        consumer_group.add_member(member1_id);
+        consumer_group.add_member(member2_id);
         let member1 = consumer_group.members.get(&member1_id).unwrap();
         let member2 = consumer_group.members.get(&member2_id).unwrap();
         assert_eq!(
@@ -270,8 +269,8 @@ mod tests {
             members: AHashMap::new(),
         };
 
-        consumer_group.add_member(member1_id).await;
-        consumer_group.add_member(member2_id).await;
+        consumer_group.add_member(member1_id);
+        consumer_group.add_member(member2_id);
         let member1 = consumer_group.members.get(&member1_id).unwrap();
         let member2 = consumer_group.members.get(&member2_id).unwrap();
         if member1.partitions.len() == 1 {

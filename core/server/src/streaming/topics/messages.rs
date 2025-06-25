@@ -209,6 +209,7 @@ mod tests {
     use bytes::Bytes;
     use iggy_common::CompressionAlgorithm;
     use iggy_common::{IggyMessage, MaxTopicSize};
+    use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU32;
     use std::sync::atomic::AtomicU64;
@@ -321,11 +322,11 @@ mod tests {
 
     async fn init_topic(partitions_count: u32) -> Topic {
         let tempdir = tempfile::TempDir::new().unwrap();
-        let config = Arc::new(SystemConfig {
+        let config = Rc::new(SystemConfig {
             path: tempdir.path().to_str().unwrap().to_string(),
             ..Default::default()
         });
-        let storage = Arc::new(SystemStorage::new(
+        let storage = Rc::new(SystemStorage::new(
             config.clone(),
             Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister {})),
         ));

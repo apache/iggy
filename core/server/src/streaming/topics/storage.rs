@@ -27,7 +27,7 @@ use anyhow::Context;
 use error_set::ErrContext;
 use futures::future::join_all;
 use iggy_common::IggyError;
-use iggy_common::locking::IggySharedMut;
+use iggy_common::locking::IggyRwLock;
 use iggy_common::locking::IggySharedMutFn;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -189,7 +189,7 @@ impl TopicStorage for FileTopicStorage {
         for mut partition in unloaded_partitions {
             let loaded_partitions = loaded_partitions.clone();
             let partition_state = state.partitions.remove(&partition.partition_id).unwrap();
-            let load_partition = tokio::spawn(async move {
+            let load_partition = monoio::spawn(async move {
                 match partition.load(partition_state).await {
                     Ok(_) => {
                         loaded_partitions.lock().await.push(partition);
@@ -209,7 +209,7 @@ impl TopicStorage for FileTopicStorage {
         for partition in loaded_partitions.lock().await.drain(..) {
             topic
                 .partitions
-                .insert(partition.partition_id, IggySharedMut::new(partition));
+                .insert(partition.partition_id, IggyRwLock::new(partition));
         }
 
         for consumer_group in state.consumer_groups.into_values() {
@@ -224,7 +224,8 @@ impl TopicStorage for FileTopicStorage {
                 .insert(consumer_group.name.to_owned(), consumer_group.group_id);
             topic
                 .consumer_groups
-                .insert(consumer_group.group_id, RwLock::new(consumer_group));
+                .borrow_mut()
+                .insert(consumer_group.group_id, consumer_group);
         }
 
         info!("Loaded topic {topic}");

@@ -16,15 +16,14 @@
  * under the License.
  */
 
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::COMPONENT;
-use crate::streaming::systems::system::System;
 use crate::streaming::topics::topic::Topic;
 use error_set::ErrContext;
 use iggy_common::locking::IggySharedMutFn;
 use iggy_common::{CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize};
 
-impl System {
+impl IggyShard {
     pub fn find_topic(
         &self,
         session: &Session,

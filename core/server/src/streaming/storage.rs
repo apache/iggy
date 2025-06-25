@@ -154,7 +154,7 @@ pub struct SystemStorage {
 impl SystemStorage {
     pub fn new(config: Rc<SystemConfig>, persister: Arc<PersisterKind>) -> Self {
         Self {
-            info: Arc::new(SystemInfoStorageKind::File(FileSystemInfoStorage::new(
+            info: Rc::new(SystemInfoStorageKind::File(FileSystemInfoStorage::new(
                 config.get_state_info_path(),
                 persister.clone(),
             ))),

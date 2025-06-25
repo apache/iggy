@@ -16,8 +16,8 @@
  * under the License.
  */
 
+use crate::shard::IggyShard;
 use crate::VERSION;
-use crate::streaming::systems::system::System;
 use crate::versioning::SemanticVersion;
 use iggy_common::locking::IggySharedMutFn;
 use iggy_common::{IggyDuration, IggyError, Stats};

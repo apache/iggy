@@ -16,36 +16,39 @@
  * under the License.
  */
 
-use crate::streaming::topics::COMPONENT;
+use crate::binary::handlers::topics::get_topic_handler;
+use crate::streaming::topics::{consumer_group, COMPONENT};
 use crate::streaming::topics::consumer_group::ConsumerGroup;
 use crate::streaming::topics::topic::Topic;
 use error_set::ErrContext;
+use iggy_common::locking::IggySharedMutFn;
 use iggy_common::IggyError;
 use iggy_common::{IdKind, Identifier};
+use std::cell::{Ref, RefMut};
 use std::sync::atomic::Ordering;
 use tracing::info;
 
 impl Topic {
     pub fn reassign_consumer_groups(&mut self) {
-        if self.consumer_groups.is_empty() {
+        if self.consumer_groups.borrow().is_empty() {
             return;
         }
 
-        let partitions_count = self.partitions.borrow().len() as u32;
+        let partitions_count = self.partitions.len() as u32;
         info!(
             "Reassigning consumer groups for topic with ID: {} for stream with ID with {}, partitions count: {}",
             self.topic_id, self.stream_id, partitions_count
         );
-        for (_, consumer_group) in self.consumer_groups.iter_mut() {
+        for (_, consumer_group) in self.consumer_groups.borrow_mut().iter_mut() {
             consumer_group.reassign_partitions(partitions_count);
         }
     }
 
-    pub fn get_consumer_groups(&self) -> Vec<&ConsumerGroup> {
-        self.consumer_groups.values().collect()
+    pub fn get_consumer_groups(&self) -> Vec<ConsumerGroup> {
+        self.consumer_groups.borrow().values().cloned().collect()
     }
 
-    pub fn get_consumer_group(&self, identifier: &Identifier) -> Result<&ConsumerGroup, IggyError> {
+    pub fn get_consumer_group(&self, identifier: &Identifier) -> Result<Ref<'_, ConsumerGroup>, IggyError> {
         match identifier.kind {
             IdKind::Numeric => self.get_consumer_group_by_id(identifier.get_u32_value().unwrap()),
             IdKind::String => self.get_consumer_group_by_name(&identifier.get_cow_str_value()?),
@@ -55,22 +58,42 @@ impl Topic {
     pub fn try_get_consumer_group(
         &self,
         identifier: &Identifier,
-    ) -> Result<Option<&ConsumerGroup>, IggyError> {
+    ) -> Result<Option<Ref<'_, ConsumerGroup>>, IggyError> {
         match identifier.kind {
-            IdKind::Numeric => Ok(self.consumer_groups.get(&identifier.get_u32_value()?)),
+            IdKind::Numeric => Ok(self.try_get_consumer_group_by_id(&identifier.get_u32_value()?)),
             IdKind::String => {
                 Ok(self.try_get_consumer_group_by_name(&identifier.get_cow_str_value()?))
             }
         }
     }
+    fn try_get_consumer_group_by_id(&self, id: &u32) -> Option<Ref<'_, ConsumerGroup>> {
+        let consumer_groups = self.consumer_groups.borrow();
+        let exists = consumer_groups.contains_key(id);
+        if !exists {
+            return None;
+        }
 
-    fn try_get_consumer_group_by_name(&self, name: &str) -> Option<&ConsumerGroup> {
-        self.consumer_groups_ids
-            .get(name)
-            .and_then(|id| self.consumer_groups.get(id))
+        Some(Ref::map(consumer_groups, |cg| {
+            let consumer_group = cg.get(id);
+            consumer_group.unwrap()
+        }))
     }
 
-    pub fn get_consumer_group_by_name(&self, name: &str) -> Result<&ConsumerGroup, IggyError> {
+    fn try_get_consumer_group_by_name(&self, name: &str) -> Option<Ref<'_, ConsumerGroup>> {
+        let consumer_groups = self.consumer_groups.borrow();
+        let exists = self.consumer_groups_ids.contains_key(name);
+        let id = self.consumer_groups_ids.get(name).unwrap();
+        if !exists {
+            return None;
+        }
+
+        Some(Ref::map(consumer_groups, |cg| {
+            let consumer_group = cg.get(id);
+            consumer_group.unwrap()
+        }))
+    }
+
+    pub fn get_consumer_group_by_name(&self, name: &str) -> Result<Ref<'_, ConsumerGroup>, IggyError> {
         let group_id = self.consumer_groups_ids.get(name);
         if group_id.is_none() {
             return Err(IggyError::ConsumerGroupNameNotFound(
@@ -82,19 +105,24 @@ impl Topic {
         self.get_consumer_group_by_id(*group_id.unwrap())
     }
 
-    pub fn get_consumer_group_by_id(&self, id: u32) -> Result<&ConsumerGroup, IggyError> {
-        let consumer_group = self.consumer_groups.get(&id);
-        if consumer_group.is_none() {
+    pub fn get_consumer_group_by_id(&self, id: u32) -> Result<Ref<'_, ConsumerGroup>, IggyError> {
+        let consumer_groups = self.consumer_groups.borrow();
+        let exists = consumer_groups.contains_key(&id);
+        if !exists {
             return Err(IggyError::ConsumerGroupIdNotFound(id, self.topic_id));
         }
+        let consumer_group = Ref::map(consumer_groups, |cg| {
+            let consumer_group = cg.get(&id);
+            consumer_group.unwrap()
+        });
 
-        Ok(consumer_group.unwrap())
+        Ok(consumer_group)
     }
 
     pub fn get_consumer_group_mut(
-        &mut self,
+        &self,
         identifier: &Identifier,
-    ) -> Result<&mut ConsumerGroup, IggyError> {
+    ) -> Result<RefMut<'_, ConsumerGroup>, IggyError> {
         match identifier.kind {
             IdKind::Numeric => {
                 self.get_consumer_group_by_id_mut(identifier.get_u32_value().unwrap())
@@ -104,21 +132,25 @@ impl Topic {
     }
 
     pub fn get_consumer_group_by_id_mut(
-        &mut self,
+        &self,
         id: u32,
-    ) -> Result<&mut ConsumerGroup, IggyError> {
-        let consumer_group = self.consumer_groups.get_mut(&id);
-        if consumer_group.is_none() {
+    ) -> Result<RefMut<'_, ConsumerGroup>, IggyError> {
+        let consumer_groups = self.consumer_groups.borrow_mut();
+        let exists = consumer_groups.contains_key(&id);
+        if !exists {
             return Err(IggyError::ConsumerGroupIdNotFound(id, self.topic_id));
         }
-
-        Ok(consumer_group.unwrap())
+        let consumer_group = RefMut::map(consumer_groups, |cg| {
+            let consumer_group = cg.get_mut(&id);
+            consumer_group.unwrap()
+        });
+        Ok(consumer_group)
     }
 
     pub fn get_consumer_group_by_name_mut(
-        &mut self,
+        &self,
         name: &str,
-    ) -> Result<&mut ConsumerGroup, IggyError> {
+    ) -> Result<RefMut<'_, ConsumerGroup>, IggyError> {
         let group_id = self.consumer_groups_ids.get(name).copied();
         if group_id.is_none() {
             return Err(IggyError::ConsumerGroupNameNotFound(
@@ -148,7 +180,7 @@ impl Topic {
                 .current_consumer_group_id
                 .fetch_add(1, Ordering::SeqCst);
             loop {
-                if self.consumer_groups.contains_key(&id) {
+                if self.consumer_groups.borrow().contains_key(&id) {
                     if id == u32::MAX {
                         return Err(IggyError::ConsumerGroupIdAlreadyExists(id, self.topic_id));
                     }
@@ -163,7 +195,7 @@ impl Topic {
             id = group_id.unwrap();
         }
 
-        if self.consumer_groups.contains_key(&id) {
+        if self.consumer_groups.borrow().contains_key(&id) {
             return Err(IggyError::ConsumerGroupIdAlreadyExists(id, self.topic_id));
         }
 
@@ -171,11 +203,11 @@ impl Topic {
             self.topic_id,
             id,
             name,
-            self.partitions.borrow().len() as u32,
+            self.partitions.len() as u32,
         );
         self.consumer_groups_ids.insert(name.to_owned(), id);
         let cloned_group = consumer_group.clone();
-        self.consumer_groups.insert(id, consumer_group);
+        self.consumer_groups.borrow_mut().insert(id, consumer_group);
         info!(
             "Created consumer group with ID: {} for topic with ID: {} and stream with ID: {}.",
             id, self.topic_id, self.stream_id
@@ -195,11 +227,14 @@ impl Topic {
             group_id = consumer_group.group_id;
         }
 
-        let consumer_group = self.consumer_groups.remove(&group_id);
+        let mut consumer_groups = self.consumer_groups.borrow_mut();
+        let consumer_group = consumer_groups.remove(&group_id);
         if consumer_group.is_none() {
             return Err(IggyError::ConsumerGroupIdNotFound(group_id, self.topic_id));
         }
         let consumer_group = consumer_group.unwrap();
+        let consumer_group = consumer_group.clone();
+        drop(consumer_groups);
         {
             self.consumer_groups_ids.remove(&consumer_group.name);
             let current_group_id = self.current_consumer_group_id.load(Ordering::SeqCst);
@@ -208,7 +243,8 @@ impl Topic {
                     .store(group_id, Ordering::SeqCst);
             }
 
-            for (_, partition) in self.partitions.borrow().iter() {
+            for (_, partition) in self.partitions.iter() {
+                let partition = partition.read().await;
                 if let Some((_, offset)) = partition.consumer_group_offsets.remove(&group_id) {
                     self.storage
                         .partition
@@ -231,13 +267,15 @@ impl Topic {
         group_id: &Identifier,
         member_id: u32,
     ) -> Result<(), IggyError> {
-        let consumer_group = self.get_consumer_group_mut(group_id).with_error_context(|error| {
+        let topic_id = self.topic_id;
+        let stream_id = self.stream_id;
+        let mut consumer_group = self.get_consumer_group_mut(group_id).with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to get consumer group with id: {group_id}")
         })?;
         consumer_group.add_member(member_id);
         info!(
             "Member with ID: {} has joined consumer group with ID: {} for topic with ID: {} and stream with ID: {}.",
-            member_id, group_id, self.topic_id, self.stream_id
+            member_id, group_id, topic_id, stream_id
         );
         Ok(())
     }
@@ -247,13 +285,15 @@ impl Topic {
         group_id: &Identifier,
         member_id: u32,
     ) -> Result<(), IggyError> {
-        let consumer_group = self.get_consumer_group_mut(group_id).with_error_context(|error| {
+        let topic_id = self.topic_id;
+        let stream_id = self.stream_id;
+        let mut consumer_group = self.get_consumer_group_mut(group_id).with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to get consumer group with id: {group_id}")
         })?;
         consumer_group.delete_member(member_id);
         info!(
             "Member with ID: {} has left consumer group with ID: {} for topic with ID: {} and stream with ID: {}.",
-            member_id, group_id, self.topic_id, self.stream_id
+            member_id, group_id, topic_id, stream_id
         );
         Ok(())
     }
@@ -286,7 +326,7 @@ mod tests {
             assert_eq!(created_consumer_group.topic_id, topic_id);
         }
 
-        assert_eq!(topic.consumer_groups.len(), 1);
+        assert_eq!(topic.consumer_groups.borrow().len(), 1);
         let consumer_group = topic
             .get_consumer_group(&Identifier::numeric(group_id).unwrap())
             .unwrap();
@@ -295,7 +335,7 @@ mod tests {
         assert_eq!(consumer_group.topic_id, topic_id);
         assert_eq!(
             consumer_group.partitions_count,
-            topic.partitions.borrow().len() as u32
+            topic.partitions.len() as u32
         );
     }
 
@@ -306,12 +346,12 @@ mod tests {
         let mut topic = get_topic().await;
         let result = topic.create_consumer_group(Some(group_id), name);
         assert!(result.is_ok());
-        assert_eq!(topic.consumer_groups.len(), 1);
+        assert_eq!(topic.consumer_groups.borrow().len(), 1);
         let result = topic.create_consumer_group(Some(group_id), "test2");
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, IggyError::ConsumerGroupIdAlreadyExists(_, _)));
-        assert_eq!(topic.consumer_groups.len(), 1);
+        assert_eq!(topic.consumer_groups.borrow().len(), 1);
     }
 
     #[tokio::test]
@@ -321,7 +361,7 @@ mod tests {
         let mut topic = get_topic().await;
         let result = topic.create_consumer_group(Some(group_id), name);
         assert!(result.is_ok());
-        assert_eq!(topic.consumer_groups.len(), 1);
+        assert_eq!(topic.consumer_groups.borrow().len(), 1);
         let group_id = group_id + 1;
         let result = topic.create_consumer_group(Some(group_id), name);
         assert!(result.is_err());
@@ -330,7 +370,7 @@ mod tests {
             err,
             IggyError::ConsumerGroupNameAlreadyExists(_, _)
         ));
-        assert_eq!(topic.consumer_groups.len(), 1);
+        assert_eq!(topic.consumer_groups.borrow().len(), 1);
     }
 
     #[tokio::test]
@@ -340,12 +380,12 @@ mod tests {
         let mut topic = get_topic().await;
         let result = topic.create_consumer_group(Some(group_id), name);
         assert!(result.is_ok());
-        assert_eq!(topic.consumer_groups.len(), 1);
+        assert_eq!(topic.consumer_groups.borrow().len(), 1);
         let result = topic
             .delete_consumer_group(&Identifier::numeric(group_id).unwrap())
             .await;
         assert!(result.is_ok());
-        assert!(topic.consumer_groups.is_empty());
+        assert!(topic.consumer_groups.borrow().is_empty());
     }
 
     #[tokio::test]
@@ -355,13 +395,13 @@ mod tests {
         let mut topic = get_topic().await;
         let result = topic.create_consumer_group(Some(group_id), name);
         assert!(result.is_ok());
-        assert_eq!(topic.consumer_groups.len(), 1);
+        assert_eq!(topic.consumer_groups.borrow().len(), 1);
         let group_id = group_id + 1;
         let result = topic
             .delete_consumer_group(&Identifier::numeric(group_id).unwrap())
             .await;
         assert!(result.is_err());
-        assert_eq!(topic.consumer_groups.len(), 1);
+        assert_eq!(topic.consumer_groups.borrow().len(), 1);
     }
 
     #[tokio::test]

@@ -20,7 +20,7 @@ use crate::streaming::partitions::partition::Partition;
 use crate::streaming::topics::COMPONENT;
 use crate::streaming::topics::topic::Topic;
 use error_set::ErrContext;
-use iggy_common::locking::{IggySharedMut, IggySharedMutFn};
+use iggy_common::locking::{IggyRwLock, IggySharedMutFn};
 use iggy_common::{IggyError, IggyTimestamp};
 
 const MAX_PARTITIONS_COUNT: u32 = 100_000;
@@ -63,7 +63,7 @@ impl Topic {
             )
             .await;
             self.partitions
-                .insert(partition_id, IggySharedMut::new(partition));
+                .insert(partition_id, IggyRwLock::new(partition));
             partition_ids.push(partition_id)
         }
 

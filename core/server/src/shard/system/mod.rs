@@ -28,8 +28,7 @@ pub mod snapshot;
 pub mod stats;
 pub mod storage;
 pub mod streams;
-pub mod system;
 pub mod topics;
 pub mod users;
 
-pub const COMPONENT: &str = "SYSTEM";
+pub const COMPONENT: &str = "SHARD_SYSTEM";

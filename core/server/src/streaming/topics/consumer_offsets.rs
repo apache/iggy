@@ -34,7 +34,6 @@ impl Topic {
     ) -> Result<(), IggyError> {
         let Some((polling_consumer, partition_id)) = self
             .resolve_consumer_with_partition_id(&consumer, client_id, partition_id, false)
-            .await
             .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to resolve consumer with partition id, consumer ID: {}, client ID: {}, partition ID: {:?}", consumer.id, client_id, partition_id))? else {
             return Err(IggyError::ConsumerOffsetNotFound(client_id));
         };
@@ -78,8 +77,7 @@ impl Topic {
     ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
         let Some((polling_consumer, partition_id)) = self
             .resolve_consumer_with_partition_id(consumer, client_id, partition_id, false)
-            .await
-            .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to resolve consumer offset for consumer: {consumer}, client ID: {client_id}, partition ID: {partition_id:#?}"))? else {
+            .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to resolve consumer offset for consumer: {consumer}, client ID: {client_id}, partition ID: {:#?}", partition_id))? else {
             return Ok(None);
         };
 
@@ -93,7 +91,6 @@ impl Topic {
         let partition = partition.read().await;
         let offset = partition
             .get_consumer_offset(polling_consumer)
-            .await
             .with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to get consumer offset for consumer: {polling_consumer}"
@@ -118,7 +115,6 @@ impl Topic {
     ) -> Result<(), IggyError> {
         let Some((polling_consumer, partition_id)) = self
             .resolve_consumer_with_partition_id(&consumer, client_id, partition_id, false)
-            .await
             .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to resolve consumer with partition id, consumer ID: {}, client ID: {}, partition ID: {:?}", consumer.id, client_id, partition_id))? else {
             return Err(IggyError::ConsumerOffsetNotFound(client_id));
         };
