@@ -1,0 +1,13 @@
+---
+apiVersion: v2
+name: iggy-ui
+description: A Helm chart for Iggy UI
+type: application
+version: 0.1.0
+appVersion: "latest"
+sources:
+  - https://github.com/iggy-rs/iggy-web-ui
+keywords:
+  - iggy
+  - messages
+  - streaming

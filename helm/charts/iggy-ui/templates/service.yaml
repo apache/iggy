@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "iggy-ui.fullname" . }}
+  labels:
+    {{- include "iggy-ui.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.ui.ports.http }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "iggy-ui.selectorLabels" . | nindent 4 }}
