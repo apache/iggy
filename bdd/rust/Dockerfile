@@ -15,19 +15,17 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Debug/test build for faster compilation during development and testing
-FROM rust:latest AS builder
-WORKDIR /build
-COPY . /build
-# Build in debug mode for faster compilation times during testing
-RUN cargo build --bin iggy-server
+FROM rust:1.87
 
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    liblzma5 \
-    && rm -rf /var/lib/apt/lists/*
-COPY ./core/configs ./configs
-COPY --from=builder /build/target/debug/iggy-server .
+WORKDIR /app
 
-CMD ["/iggy-server"]
+# Copy entire repository (needed for workspace)
+COPY . .
+
+# Create features directory for BDD feature files
+RUN mkdir -p /app/features
+
+RUN cargo fetch
+
+# Default command will be overridden by docker-compose
+CMD ["cargo", "test", "-p", "bdd", "--features", "iggy-server-in-docker", "--features", "bdd"]

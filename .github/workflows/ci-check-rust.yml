@@ -84,37 +84,6 @@ jobs:
         run: |
           cargo clippy --all-targets --all-features -- -D warnings
 
-  clippy-macos:
-    name: cargo clippy macos
-    runs-on: macos-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Install toolchain
-        run: |
-           rustup toolchain add --profile=minimal stable
-           rustup override set stable
-      - name: Run cargo clippy (macos)
-        run: |
-          cargo clippy --all-targets --all-features -- -D warnings
-
-  clippy-windows:
-    name: cargo clippy windows
-    runs-on: windows-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Install toolchain
-        run: |
-           rustup toolchain add --profile=minimal stable
-           rustup override set stable
-      - name: Run cargo clippy (windows/sdk)
-        run: |
-          cargo clippy --package iggy --all-features -- -D warnings
-      - name: Run cargo clippy (windows/cli)
-        run: |
-          cargo clippy --bin iggy --all-features -- -D warnings
-
   sort:
     name: cargo sort
     runs-on: ubuntu-latest

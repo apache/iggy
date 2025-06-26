@@ -19,10 +19,13 @@
 use cucumber::World;
 use iggy::clients::client::IggyClient;
 use iggy::prelude::{IggyMessage, PolledMessages};
+
+#[cfg(not(feature = "iggy-server-in-docker"))]
 use integration::test_server::TestServer;
 
 #[derive(Debug, World, Default)]
 pub struct GlobalContext {
+    #[cfg(not(feature = "iggy-server-in-docker"))]
     pub server: Option<TestServer>,
     pub client: Option<IggyClient>,
     pub server_addr: Option<String>,

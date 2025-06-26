@@ -1,0 +1,68 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+services:
+  iggy-server:
+    image: bdd-iggy-server:latest
+    build:
+      context: ..
+      dockerfile: bdd/Dockerfile
+    ports:
+      - "8090:8090"  # TCP
+      - "3000:3000"  # HTTP
+      - "8080:8080"  # QUIC
+    environment:
+      - RUST_LOG=info
+      - IGGY_SYSTEM_PATH=local_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/stats"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    volumes:
+      - iggy_data:/app/local_data
+
+  rust-bdd:
+    build:
+      context: ..
+      dockerfile: bdd/rust/Dockerfile
+    depends_on:
+      iggy-server:
+        condition: service_healthy
+    environment:
+      - IGGY_TCP_ADDRESS=iggy-server:8090
+    volumes:
+      - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
+    command: ["cargo", "test", "-p", "bdd", "--features", "iggy-server-in-docker", "--features", "bdd"]
+
+  python-bdd:
+    build:
+      context: ..
+      dockerfile: bdd/python/Dockerfile
+    depends_on:
+      iggy-server:
+        condition: service_healthy
+    environment:
+      - IGGY_TCP_ADDRESS=iggy-server:8090
+    volumes:
+      - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
+    working_dir: /app
+    command: ["pytest", "tests/", "-v"]
+
+volumes:
+  iggy_data:

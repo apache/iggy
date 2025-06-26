@@ -21,7 +21,7 @@ codegen-units = 1
 
 [workspace]
 members = [
-    "core/bdd",
+    "bdd/rust",
     "core/bench",
     "core/bench/dashboard/frontend",
     "core/bench/dashboard/server",
