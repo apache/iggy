@@ -144,8 +144,7 @@ impl IggyCmdTestCase for TestConsumerGroupDeleteCmd {
         };
 
         let message = format!(
-            "Executing delete consumer group with ID: {} for topic with ID: {} and stream with ID: {}\nConsumer group with ID: {} deleted for topic with ID: {} and stream with ID: {}\n",
-            group_id, topic_id, stream_id, group_id, topic_id, stream_id
+            "Executing delete consumer group with ID: {group_id} for topic with ID: {topic_id} and stream with ID: {stream_id}\nConsumer group with ID: {group_id} deleted for topic with ID: {topic_id} and stream with ID: {stream_id}\n"
         );
 
         command_state.success().stdout(diff(message));

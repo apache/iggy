@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn parse_key_val_should_parse_string() {
         let expected_value: &str = "value";
-        let result = parse_key_val(&format!("key:String:{}", expected_value));
+        let result = parse_key_val(&format!("key:String:{expected_value}"));
         assert!(result.is_ok());
         let (key, value) = result.unwrap();
         assert_eq!(key, HeaderKey::from_str("key").unwrap());
@@ -248,7 +248,7 @@ mod tests {
     #[test]
     fn parse_key_val_should_parse_uint8() {
         let expected_value: u8 = 4;
-        let result = parse_key_val(&format!("key:uint8:{}", expected_value));
+        let result = parse_key_val(&format!("key:uint8:{expected_value}"));
         assert!(result.is_ok());
         let (key, value) = result.unwrap();
         assert_eq!(key, HeaderKey::from_str("key").unwrap());
@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn parse_key_val_should_parse_float64() {
         let expected_value: f64 = 42.0;
-        let result = parse_key_val(&format!("key:float64:{}", expected_value));
+        let result = parse_key_val(&format!("key:float64:{expected_value}"));
         assert!(result.is_ok());
         let (key, value) = result.unwrap();
         assert_eq!(key, HeaderKey::from_str("key").unwrap());
@@ -268,7 +268,7 @@ mod tests {
     #[test]
     fn parse_key_val_should_parse_bool() {
         let expected_value = true;
-        let result = parse_key_val(&format!("key:bool:{}", expected_value));
+        let result = parse_key_val(&format!("key:bool:{expected_value}"));
         assert!(result.is_ok());
         let (key, value) = result.unwrap();
         assert_eq!(key, HeaderKey::from_str("key").unwrap());

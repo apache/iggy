@@ -99,8 +99,7 @@ impl Validatable<ConfigError> for CompressionConfig {
         if *compression_alg != CompressionAlgorithm::None {
             // TODO(numinex): Change this message once server side compression is fully developed.
             println!(
-                "Server started with server-side compression enabled, using algorithm: {}, this feature is not implemented yet!",
-                compression_alg
+                "Server started with server-side compression enabled, using algorithm: {compression_alg}, this feature is not implemented yet!"
             );
         }
 

@@ -82,10 +82,8 @@ pub async fn run(client_factory: &dyn ClientFactory, test_server: &TestServer) {
 
     // Check initial segment count on filesystem
     let data_path = test_server.get_local_data_path();
-    let partition_path = format!(
-        "{}/streams/{}/topics/{}/partitions/{}",
-        data_path, STREAM_ID, TOPIC_ID, PARTITION_ID
-    );
+    let partition_path =
+        format!("{data_path}/streams/{STREAM_ID}/topics/{TOPIC_ID}/partitions/{PARTITION_ID}");
 
     let initial_segments = get_segment_paths_for_partition(&partition_path);
     println!(
@@ -117,8 +115,7 @@ pub async fn run(client_factory: &dyn ClientFactory, test_server: &TestServer) {
 
     assert!(
         result.is_ok(),
-        "Delete segments command should succeed: {:?}",
-        result
+        "Delete segments command should succeed: {result:?}"
     );
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;

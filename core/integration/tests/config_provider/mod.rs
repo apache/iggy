@@ -28,13 +28,11 @@ async fn scenario_parsing_from_file(extension: &str) {
     let config_provider = FileConfigProvider::new(config_path.clone());
     assert!(
         file_exists(&config_path),
-        "Config file not found: {}",
-        config_path
+        "Config file not found: {config_path}"
     );
     assert!(
         config_provider.load_config().await.is_ok(),
-        "ConfigProvider failed to parse config from {}",
-        config_path
+        "ConfigProvider failed to parse config from {config_path}"
     );
 }
 

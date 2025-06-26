@@ -199,8 +199,7 @@ impl System {
                     .get_consumer_group(consumer_group_id)
                     .with_error_context(|error| {
                         format!(
-                            "{COMPONENT} (error: {error}) - consumer group not found for group_id: {:?}",
-                            consumer_group_id
+                            "{COMPONENT} (error: {error}) - consumer group not found for group_id: {consumer_group_id:?}"
                         )
                     })?;
 
@@ -213,8 +212,7 @@ impl System {
                 .await
                 .with_error_context(|error| {
                     format!(
-                        "{COMPONENT} (error: {error}) - failed to join consumer group for group ID: {}",
-                        group_id
+                        "{COMPONENT} (error: {error}) - failed to join consumer group for group ID: {group_id}"
                     )
                 })?;
         }
@@ -246,8 +244,7 @@ impl System {
                 .find_topic(session, stream_id, topic_id)
                 .with_error_context(|error| {
                     format!(
-                        "{COMPONENT} (error: {error}) - topic not found for stream ID: {:?}, topic_id: {:?}",
-                        stream_id, topic_id
+                        "{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id:?}, topic_id: {topic_id:?}"
                     )
                 })?;
 

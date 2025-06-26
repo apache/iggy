@@ -74,7 +74,7 @@ impl TestConsumerGroupCreateCmd {
 
         if let Some(group_id) = self.group_id {
             command.push("-g".to_string());
-            command.push(format!("{}", group_id));
+            command.push(format!("{group_id}"));
         }
 
         command.push(self.group_name.clone());
@@ -126,7 +126,7 @@ impl IggyCmdTestCase for TestConsumerGroupCreateCmd {
         };
 
         let group_id = match self.group_id {
-            Some(group_id) => format!("ID: {}", group_id),
+            Some(group_id) => format!("ID: {group_id}"),
             None => "ID auto incremented".to_string(),
         };
 

@@ -32,7 +32,7 @@ async fn should_persist_stream_with_topics_directory_and_info_file() {
     setup.create_streams_directory().await;
     let stream_ids = get_stream_ids();
     for stream_id in stream_ids {
-        let name = format!("test-{}", stream_id);
+        let name = format!("test-{stream_id}");
         let stream = Stream::create(
             stream_id,
             &name,
@@ -52,7 +52,7 @@ async fn should_load_existing_stream_from_disk() {
     setup.create_streams_directory().await;
     let stream_ids = get_stream_ids();
     for stream_id in stream_ids {
-        let name = format!("test-{}", stream_id);
+        let name = format!("test-{stream_id}");
         let stream = Stream::create(
             stream_id,
             &name,
@@ -89,7 +89,7 @@ async fn should_delete_existing_stream_from_disk() {
     setup.create_streams_directory().await;
     let stream_ids = get_stream_ids();
     for stream_id in stream_ids {
-        let name = format!("test-{}", stream_id);
+        let name = format!("test-{stream_id}");
         let stream = Stream::create(
             stream_id,
             &name,
@@ -111,7 +111,7 @@ async fn should_purge_existing_stream_on_disk() {
     setup.create_streams_directory().await;
     let stream_ids = get_stream_ids();
     for stream_id in stream_ids {
-        let name = format!("test-{}", stream_id);
+        let name = format!("test-{stream_id}");
         let mut stream = Stream::create(
             stream_id,
             &name,
@@ -179,7 +179,7 @@ async fn should_purge_existing_stream_on_disk() {
 async fn assert_persisted_stream(stream_path: &str, topics_directory: &str) {
     let stream_metadata = fs::metadata(stream_path).await.unwrap();
     assert!(stream_metadata.is_dir());
-    let topics_path = format!("{}/{}", stream_path, topics_directory);
+    let topics_path = format!("{stream_path}/{topics_directory}");
     let topics_metadata = fs::metadata(&topics_path).await.unwrap();
     assert!(topics_metadata.is_dir());
 }

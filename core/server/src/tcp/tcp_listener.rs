@@ -31,7 +31,7 @@ pub async fn start(address: &str, socket: TcpSocket, system: SharedSystem) -> So
     tokio::spawn(async move {
         let addr = address.parse();
         if addr.is_err() {
-            panic!("Unable to parse address {:?}", address);
+            panic!("Unable to parse address {address:?}");
         }
 
         socket
@@ -45,10 +45,7 @@ pub async fn start(address: &str, socket: TcpSocket, system: SharedSystem) -> So
             .expect("Failed to get local address for TCP listener");
 
         tx.send(local_addr).unwrap_or_else(|_| {
-            panic!(
-                "Failed to send the local address {:?} for TCP listener",
-                local_addr
-            )
+            panic!("Failed to send the local address {local_addr:?} for TCP listener")
         });
 
         loop {

@@ -117,7 +117,7 @@ pub fn configure_cors(config: &HttpCorsConfig) -> CorsLayer {
             "CONNECT" => Method::CONNECT,
             "PATCH" => Method::PATCH,
             "TRACE" => Method::TRACE,
-            _ => panic!("Invalid HTTP method: {}", s),
+            _ => panic!("Invalid HTTP method: {s}"),
         })
         .collect::<Vec<_>>();
 

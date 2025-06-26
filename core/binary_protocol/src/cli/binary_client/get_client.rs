@@ -68,7 +68,7 @@ impl CliCommand for GetClientCmd {
         ]);
 
         let user = match client_details.user_id {
-            Some(user_id) => format!("{}", user_id),
+            Some(user_id) => format!("{user_id}"),
             None => String::from("None"),
         };
         table.add_row(vec!["User ID", user.as_str()]);

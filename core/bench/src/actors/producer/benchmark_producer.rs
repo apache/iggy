@@ -80,6 +80,7 @@ impl BenchmarkProducer {
         }
     }
 
+    #[allow(clippy::cognitive_complexity)]
     pub async fn run(self) -> Result<BenchmarkIndividualMetrics, IggyError> {
         let mut batch_generator =
             BenchmarkBatchGenerator::new(self.message_size, self.messages_per_batch);

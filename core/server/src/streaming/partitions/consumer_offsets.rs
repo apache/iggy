@@ -70,12 +70,12 @@ impl Partition {
             PollingConsumer::Consumer(consumer_id, _) => {
                 self.store_offset(ConsumerKind::Consumer, consumer_id, offset)
                     .await
-                    .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset, consumer ID: {}, offset: {}", consumer_id, offset))?;
+                    .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset, consumer ID: {consumer_id}, offset: {offset}"))?;
             }
             PollingConsumer::ConsumerGroup(consumer_id, _) => {
                 self.store_offset(ConsumerKind::ConsumerGroup, consumer_id, offset)
                     .await
-                    .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer group offset, consumer ID: {}, offset: {}", consumer_id, offset))?;
+                    .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer group offset, consumer ID: {consumer_id}, offset: {offset}"))?;
             }
         };
 
@@ -116,8 +116,7 @@ impl Partition {
             .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to save new consumer offset, consumer ID: {}, offset: {}",
-                    consumer_id, offset
+                    "{COMPONENT} (error: {error}) - failed to save new consumer offset, consumer ID: {consumer_id}, offset: {offset}"
                 )
             })?;
         consumer_offsets.insert(consumer_id, consumer_offset);

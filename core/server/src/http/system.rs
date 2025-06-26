@@ -142,7 +142,7 @@ async fn get_snapshot(
     );
     headers.insert(
         header::CONTENT_DISPOSITION,
-        header::HeaderValue::from_str(&format!("attachment; filename=\"{}\"", filename)).unwrap(),
+        header::HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")).unwrap(),
     );
     Ok((headers, Body::from(zip_data)))
 }

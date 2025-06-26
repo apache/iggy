@@ -201,8 +201,7 @@ impl IggyCmdTestCase for TestMessageSendCmd {
         };
 
         let message = format!(
-            "Executing send messages to topic with ID: {} and stream with ID: {}\nSent messages to topic with ID: {} and stream with ID: {}\n",
-            topic_id, stream_id, topic_id, stream_id
+            "Executing send messages to topic with ID: {topic_id} and stream with ID: {stream_id}\nSent messages to topic with ID: {topic_id} and stream with ID: {stream_id}\n"
         );
 
         command_state.success().stdout(diff(message));

@@ -566,7 +566,7 @@ async fn should_delete_persisted_segments() -> Result<(), Box<dyn std::error::Er
 
     let mut initial_offsets = get_segment_offsets(&initial_segments);
     initial_offsets.sort();
-    println!("Initial segment offsets (sorted): {:?}", initial_offsets);
+    println!("Initial segment offsets (sorted): {initial_offsets:?}");
 
     let first_keep_count = 3usize;
     system
@@ -642,8 +642,7 @@ async fn should_delete_persisted_segments() -> Result<(), Box<dyn std::error::Er
     for &offset in &final_offsets {
         assert!(
             highest_initial_offsets.contains(&offset),
-            "Offset {} should not remain after final deletion",
-            offset
+            "Offset {offset} should not remain after final deletion"
         );
     }
 
@@ -665,9 +664,9 @@ fn get_segment_offsets(segments: &[DirEntry]) -> Vec<u64> {
 }
 
 async fn assert_persisted_segment(partition_path: &str, start_offset: u64) {
-    let segment_path = format!("{}/{:0>20}", partition_path, start_offset);
-    let messages_file_path = format!("{}.{}", segment_path, LOG_EXTENSION);
-    let index_path = format!("{}.{}", segment_path, INDEX_EXTENSION);
+    let segment_path = format!("{partition_path}/{start_offset:0>20}");
+    let messages_file_path = format!("{segment_path}.{LOG_EXTENSION}");
+    let index_path = format!("{segment_path}.{INDEX_EXTENSION}");
     assert!(fs::metadata(&messages_file_path).await.is_ok());
     assert!(fs::metadata(&index_path).await.is_ok());
 }

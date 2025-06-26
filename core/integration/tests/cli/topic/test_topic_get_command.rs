@@ -113,10 +113,8 @@ impl IggyCmdTestCase for TestTopicGetCmd {
             TestTopicId::Named => self.topic_name.clone(),
         };
 
-        let start_message = format!(
-            "Executing get topic with ID: {} from stream with ID: {}",
-            topic_id, stream_id
-        );
+        let start_message =
+            format!("Executing get topic with ID: {topic_id} from stream with ID: {stream_id}");
 
         command_state
             .success()

@@ -58,7 +58,7 @@ pub fn single_chart(props: &SingleChartProps) -> Html {
                 .and_then(|w| w.location().pathname().ok())
                 .unwrap_or_default();
 
-            let expected_path = format!("/benchmarks/{}", benchmark_uuid);
+            let expected_path = format!("/benchmarks/{benchmark_uuid}");
 
             if current_location != expected_path {
                 let history = BrowserHistory::new();

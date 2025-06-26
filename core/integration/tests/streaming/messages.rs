@@ -65,7 +65,7 @@ async fn should_persist_messages_and_then_load_them_from_disk() {
     let mut appended_messages = Vec::with_capacity(messages_count as usize);
     for i in 1..=messages_count {
         let id = i as u128;
-        let payload = Bytes::from(format!("message {}", i));
+        let payload = Bytes::from(format!("message {i}"));
         let mut headers = HashMap::new();
         headers.insert(
             HeaderKey::new("key_1").unwrap(),

@@ -99,8 +99,8 @@ impl std::fmt::Display for Payload {
                 "Json({})",
                 simd_json::to_string_pretty(value).unwrap_or_default()
             ),
-            Payload::Raw(value) => write!(f, "Raw({:#?})", value),
-            Payload::Text(text) => write!(f, "Text({})", text),
+            Payload::Raw(value) => write!(f, "Raw({value:#?})"),
+            Payload::Text(text) => write!(f, "Text({text})"),
         }
     }
 }

@@ -170,27 +170,10 @@ impl BenchmarkGroupMetrics {
         );
 
         format!(
-            "{}: Total throughput: {} MB/s, {} messages/s, average throughput per {}: {} MB/s, \
-            p50 latency: {} ms, p90 latency: {} ms, p95 latency: {} ms, \
-            p99 latency: {} ms, p999 latency: {} ms, p9999 latency: {} ms, average latency: {} ms, \
-            median latency: {} ms, min: {} ms, max: {} ms, std dev: {} ms, total time: {} s",
-            prefix,
-            total_mb,
-            total_msg,
-            actor,
-            avg_mb,
-            p50,
-            p90,
-            p95,
-            p99,
-            p999,
-            p9999,
-            avg,
-            median,
-            min,
-            max,
-            std_dev,
-            total_test_time
+            "{prefix}: Total throughput: {total_mb} MB/s, {total_msg} messages/s, average throughput per {actor}: {avg_mb} MB/s, \
+            p50 latency: {p50} ms, p90 latency: {p90} ms, p95 latency: {p95} ms, \
+            p99 latency: {p99} ms, p999 latency: {p999} ms, p9999 latency: {p9999} ms, average latency: {avg} ms, \
+            median latency: {median} ms, min: {min} ms, max: {max} ms, std dev: {std_dev} ms, total time: {total_test_time} s"
         )
         .color(color)
     }

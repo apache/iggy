@@ -130,7 +130,7 @@ async fn build_app_state(config: &HttpConfig, system: SharedSystem) -> Arc<AppSt
 
     let jwt_manager = JwtManager::from_config(persister, &tokens_path, &config.jwt);
     if let Err(error) = jwt_manager {
-        panic!("Failed to initialize JWT manager: {}", error);
+        panic!("Failed to initialize JWT manager: {error}");
     }
 
     let jwt_manager = jwt_manager.unwrap();
@@ -179,7 +179,7 @@ fn configure_cors(config: HttpCorsConfig) -> CorsLayer {
             "CONNECT" => Method::CONNECT,
             "PATCH" => Method::PATCH,
             "TRACE" => Method::TRACE,
-            _ => panic!("Invalid HTTP method: {}", s),
+            _ => panic!("Invalid HTTP method: {s}"),
         })
         .collect::<Vec<_>>();
 

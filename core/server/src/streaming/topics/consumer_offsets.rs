@@ -79,7 +79,7 @@ impl Topic {
         let Some((polling_consumer, partition_id)) = self
             .resolve_consumer_with_partition_id(consumer, client_id, partition_id, false)
             .await
-            .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to resolve consumer offset for consumer: {consumer}, client ID: {client_id}, partition ID: {:#?}", partition_id))? else {
+            .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to resolve consumer offset for consumer: {consumer}, client ID: {client_id}, partition ID: {partition_id:#?}"))? else {
             return Ok(None);
         };
 

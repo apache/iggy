@@ -75,14 +75,14 @@ impl CliCommand for GetUserCmd {
 
         if let Some(permissions) = user.permissions {
             let global_permissions: Table = permissions.global.into();
-            table.add_row(vec!["Global", format!("{}", global_permissions).as_str()]);
+            table.add_row(vec!["Global", format!("{global_permissions}").as_str()]);
 
             if let Some(streams) = permissions.streams {
                 streams.iter().for_each(|(stream_id, stream_permissions)| {
                     let stream_permissions: Table = stream_permissions.into();
                     table.add_row(vec![
-                        format!("Stream: {}", stream_id).as_str(),
-                        format!("{}", stream_permissions).as_str(),
+                        format!("Stream: {stream_id}").as_str(),
+                        format!("{stream_permissions}").as_str(),
                     ]);
                 });
             }

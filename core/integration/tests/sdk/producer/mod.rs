@@ -30,7 +30,7 @@ const TOPIC_NAME: &str = "test-topic-producer";
 const PARTITIONS_COUNT: u32 = 3;
 
 fn create_message_payload(offset: u64) -> Bytes {
-    Bytes::from(format!("message {}", offset))
+    Bytes::from(format!("message {offset}"))
 }
 
 async fn init_system(client: &IggyClient) {

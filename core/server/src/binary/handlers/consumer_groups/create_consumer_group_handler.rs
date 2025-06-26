@@ -82,8 +82,7 @@ impl ServerCommandHandler for CreateConsumerGroup {
             .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to apply create consumer group for stream_id: {}, topic_id: {}, group_id: {:?}, session: {}",
-                    stream_id, topic_id, group_id, session
+                    "{COMPONENT} (error: {error}) - failed to apply create consumer group for stream_id: {stream_id}, topic_id: {topic_id}, group_id: {group_id:?}, session: {session}"
                 )
             })?;
         sender.send_ok_response(&response).await?;

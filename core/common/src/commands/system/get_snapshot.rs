@@ -108,7 +108,7 @@ impl Display for GetSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "GetSnapshotFile {{\n  snapshot_types: [\n")?;
         for snapshot_type in &self.snapshot_types {
-            writeln!(f, "    {}", snapshot_type)?;
+            writeln!(f, "    {snapshot_type}")?;
         }
         write!(f, "  ],\n  Compression: {}\n}}", self.compression)
     }

@@ -63,7 +63,7 @@ impl CreateTopicCmd {
 
     fn get_topic_id_info(&self) -> String {
         match self.create_topic.topic_id {
-            Some(topic_id) => format!("ID: {}", topic_id),
+            Some(topic_id) => format!("ID: {topic_id}"),
             None => "ID auto incremented".to_string(),
         }
     }
@@ -72,7 +72,7 @@ impl CreateTopicCmd {
 #[async_trait]
 impl CliCommand for CreateTopicCmd {
     fn explain(&self) -> String {
-        format!("{}", self)
+        format!("{self}")
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {

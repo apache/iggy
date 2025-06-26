@@ -89,7 +89,7 @@ impl CliCommand for GetClientsCmd {
                     table.add_row(vec![
                         format!("{}", client_info.client_id),
                         match client_info.user_id {
-                            Some(user_id) => format!("{}", user_id),
+                            Some(user_id) => format!("{user_id}"),
                             None => String::from(""),
                         },
                         format!("{}", client_info.address),
@@ -106,7 +106,7 @@ impl CliCommand for GetClientsCmd {
                         "{}|{}|{}|{}|{}",
                         client_info.client_id,
                         match client_info.user_id {
-                            Some(user_id) => format!("{}", user_id),
+                            Some(user_id) => format!("{user_id}"),
                             None => String::from(""),
                         },
                         client_info.address,

@@ -86,7 +86,7 @@ impl CliCommand for GetSnapshotCmd {
 
         let mut file = tokio::fs::File::create(&file_path)
             .await
-            .with_context(|| format!("Failed to create file at {:?}", file_path))?;
+            .with_context(|| format!("Failed to create file at {file_path:?}"))?;
 
         file.write_all(&snapshot_data.0)
             .await

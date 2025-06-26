@@ -40,7 +40,7 @@ pub fn start(config: QuicConfig, system: SharedSystem) -> SocketAddr {
     let address = config.address.parse().unwrap();
     let quic_config = configure_quic(config);
     if let Err(error) = quic_config {
-        panic!("Error when configuring QUIC: {:?}", error);
+        panic!("Error when configuring QUIC: {error:?}");
     }
 
     let endpoint = Endpoint::server(quic_config.unwrap(), address).unwrap();

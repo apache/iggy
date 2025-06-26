@@ -81,7 +81,7 @@ impl System {
             topic
                 .store_consumer_offset_internal(polling_consumer, offset, partition_id)
                 .await
-                .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset internal, polling consumer: {}, offset: {}, partition ID: {}", polling_consumer, offset, partition_id)) ?;
+                .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset internal, polling consumer: {polling_consumer}, offset: {offset}, partition ID: {partition_id}")) ?;
         }
 
         let batch_set = if let Some(encryptor) = &self.encryptor {

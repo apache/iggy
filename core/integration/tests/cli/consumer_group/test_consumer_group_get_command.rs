@@ -144,8 +144,7 @@ impl IggyCmdTestCase for TestConsumerGroupGetCmd {
         };
 
         let start_message = format!(
-            "Executing get consumer group with ID: {} for topic with ID: {} and stream with ID: {}",
-            group_id, topic_id, stream_id
+            "Executing get consumer group with ID: {group_id} for topic with ID: {topic_id} and stream with ID: {stream_id}"
         );
 
         command_state

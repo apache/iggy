@@ -657,7 +657,7 @@ impl BytesSerializable for HashMap<HeaderKey, HeaderValue> {
                     .map_err(|_| IggyError::InvalidNumberEncoding)?,
             ) as usize;
             if value_length == 0 || value_length > 255 {
-                println!("C Invalid header value length: {}", value_length);
+                println!("C Invalid header value length: {value_length}");
                 return Err(IggyError::InvalidHeaderValue);
             }
             position += 4;

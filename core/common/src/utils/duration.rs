@@ -237,7 +237,7 @@ mod tests {
     fn test_display() {
         let duration = Duration::new(3661, 0);
         let iggy_duration = IggyDuration::new(duration);
-        let duration_string = format!("{}", iggy_duration);
+        let duration_string = format!("{iggy_duration}");
         assert_eq!(duration_string, "1h 1m 1s");
     }
 

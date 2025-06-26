@@ -213,9 +213,9 @@ async fn assert_persisted_partition(partition_path: &str, with_segment: bool) {
 
     if with_segment {
         let start_offset = 0u64;
-        let segment_path = format!("{}/{:0>20}", partition_path, start_offset);
-        let messages_file_path = format!("{}.{}", segment_path, LOG_EXTENSION);
-        let index_path = format!("{}.{}", segment_path, INDEX_EXTENSION);
+        let segment_path = format!("{partition_path}/{start_offset:0>20}");
+        let messages_file_path = format!("{segment_path}.{LOG_EXTENSION}");
+        let index_path = format!("{segment_path}.{INDEX_EXTENSION}");
         assert!(fs::metadata(&messages_file_path).await.is_ok());
         assert!(fs::metadata(&index_path).await.is_ok());
     }

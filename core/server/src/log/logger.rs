@@ -340,8 +340,7 @@ impl Logging {
         let level = filtering_level.to_string();
 
         let print = format!(
-            "Logging initialized, logs will be stored at: {:?}. Logs will be rotated hourly. Log level is: {}.",
-            logs_path, level
+            "Logging initialized, logs will be stored at: {logs_path:?}. Logs will be rotated hourly. Log level is: {level}."
         );
 
         match filtering_level {
@@ -363,7 +362,7 @@ impl Logging {
             if let Ok(level) = LevelFilter::from_str(&rust_log.to_uppercase()) {
                 level
             } else {
-                println!("Invalid RUST_LOG value: {}, falling back to info", rust_log);
+                println!("Invalid RUST_LOG value: {rust_log}, falling back to info");
                 LevelFilter::INFO
             }
         } else {

@@ -150,8 +150,7 @@ async fn update_stream(
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to update stream, stream ID: {}",
-                stream_id
+                "{COMPONENT} (error: {error}) - failed to update stream, stream ID: {stream_id}"
             )
         })?;
 
@@ -162,8 +161,7 @@ async fn update_stream(
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply update stream, stream ID: {}",
-                stream_id
+                "{COMPONENT} (error: {error}) - failed to apply update stream, stream ID: {stream_id}"
             )
         })?;
     Ok(StatusCode::NO_CONTENT)
@@ -221,10 +219,7 @@ async fn purge_stream(
         )
         .await
         .with_error_context(|error| {
-            format!(
-                "{COMPONENT} (error: {error}) - failed to purge stream, stream ID: {}",
-                stream_id
-            )
+            format!("{COMPONENT} (error: {error}) - failed to purge stream, stream ID: {stream_id}")
         })?;
     system
         .state
@@ -237,8 +232,7 @@ async fn purge_stream(
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply purge stream, stream ID: {}",
-                stream_id
+                "{COMPONENT} (error: {error}) - failed to apply purge stream, stream ID: {stream_id}"
             )
         })?;
     Ok(StatusCode::NO_CONTENT)

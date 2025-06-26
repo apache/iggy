@@ -62,7 +62,7 @@ pub(crate) async fn start(
 
         let addr = address.parse();
         if addr.is_err() {
-            panic!("Unable to parse address {:?}", address);
+            panic!("Unable to parse address {address:?}");
         }
 
         let addr = addr.unwrap();

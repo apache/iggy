@@ -340,8 +340,7 @@ impl State for FileState {
                 .encrypt(&command_payload)
                 .with_error_context(|error| {
                     format!(
-                        "{COMPONENT} (error: {error}) - failed to encrypt state entry command, index: {}",
-                        index
+                        "{COMPONENT} (error: {error}) - failed to encrypt state entry command, index: {index}"
                     )
                 })?;
             command_length = encrypted_command_payload.len();

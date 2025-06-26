@@ -48,7 +48,7 @@ pub fn get_api_base_url() -> String {
         if let Some(colon_pos) = location.find(':') {
             return format!("https://{}", location.replace(&location[colon_pos..], ""));
         }
-        return format!("https://{}", location);
+        return format!("https://{location}");
     }
 
     // Fallback to production URL
