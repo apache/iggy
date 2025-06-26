@@ -6,7 +6,7 @@ type: application
 version: 0.1.0
 appVersion: "latest"
 sources:
-  - https://github.com/iggy-rs/iggy-web-ui
+  - https://github.com/apache/iggy
 keywords:
   - iggy
   - messages
