@@ -6,7 +6,7 @@ A Helm chart for Iggy UI
 
 ## Source Code
 
-* <https://github.com/iggy-rs/iggy-web-ui>
+* <https://github.com/apache/iggy>
 
 ## Values
 
