@@ -189,7 +189,7 @@ async Task ValidateSystem(Identifier streamId, Identifier topicId, int partition
         
         var result = await bus.GetStreamByIdAsync(streamId);
         
-        Console.WriteLine(result.Name);
+        Console.WriteLine(result!.Name);
         
         Console.WriteLine($"Validating if topic exists.. {topicId}");
         
@@ -214,13 +214,13 @@ async Task ValidateSystem(Identifier streamId, Identifier topicId, int partition
         Console.WriteLine($"Creating topic with {topicId}");
         
         await bus.CreateTopicAsync(streamId, new TopicRequest(
-            TopicId: topicIdVal,
-            Name: "Test Consumer Topic",
-            CompressionAlgorithm: CompressionAlgorithm.None,
-            MessageExpiry: 0,
-            MaxTopicSize: 1_000_000_000,
-            ReplicationFactor: 3,
-            PartitionsCount: 3));
+            topicId: topicIdVal,
+            name: "Test Consumer Topic",
+            compressionAlgorithm: CompressionAlgorithm.None,
+            messageExpiry: 0,
+            maxTopicSize: 1_000_000_000,
+            replicationFactor: 3,
+            partitionsCount: 3));
         
         var topicRes = await bus.GetTopicByIdAsync(streamId, topicId);
         

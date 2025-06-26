@@ -180,7 +180,7 @@ public sealed class TcpContract
         {
             UserId = Identifier.Numeric(1),
             Username = "newusername",
-            UserStatus = UserStatus.Active
+            UserStatus = UserStatus.Inactive
         };
 
         // Act
@@ -214,10 +214,11 @@ public sealed class TcpContract
         position += 1;
         if (statusFlag == 1)
         {
-            var userStatus = statusFlag switch
+            var userStatus = result[position] switch
             {
                 1 => UserStatus.Active,
-                2 => UserStatus.Inactive
+                2 => UserStatus.Inactive,
+                _ => throw new ArgumentOutOfRangeException()
             };
             Assert.Equal(request.UserStatus, userStatus);
         }

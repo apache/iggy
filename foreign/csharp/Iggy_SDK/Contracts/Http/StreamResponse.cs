@@ -26,5 +26,5 @@ public sealed class StreamResponse
     public required DateTimeOffset CreatedAt { get; init; }
     public required ulong MessagesCount { get; init; }
     public required int TopicsCount { get; init; }
-    public IEnumerable<TopicResponse>? Topics { get; init; }
+    public IEnumerable<TopicResponse> Topics { get; init; } = [];
 }

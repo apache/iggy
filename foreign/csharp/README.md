@@ -1,4 +1,4 @@
-# C# SDK for [Iggy](https://github.com/spetz/iggy)
+# C# SDK for [Iggy](https://github.com/apache/iggy)
 
 <div align="center">
 
@@ -228,8 +228,20 @@ The `Message` struct has two fields `Id` and `Payload`.
 ```c#
 struct Message
 {
-    public required Guid Id { get; init; }
+    public required MessageHeader Header { get; init; }
     public required byte[] Payload { get; init; }
+    public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; init; }
+}
+
+public readonly struct MessageHeader
+{
+    public ulong Checksum { get; init; }
+    public UInt128 Id { get; init; }
+    public ulong Offset { get; init; }
+    public DateTimeOffset Timestamp { get; init; }
+    public ulong OriginTimestamp { get; init; }
+    public int UserHeadersLength { get; init; }
+    public int PayloadLength { get; init; }
 }
 ```
 

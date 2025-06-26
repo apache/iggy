@@ -270,6 +270,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await _channel!.Writer.WriteAsync(request, token);
     }
     
+    // TODO: Change TMessage implementation
     public async Task SendMessagesAsync<TMessage>(MessageSendRequest<TMessage> request,
         Func<TMessage, byte[]> serializer,
         Func<byte[], byte[]>? encryptor = null, 
@@ -543,16 +544,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await _stream.SendAsync(payload, token);
         await _stream.FlushAsync(token);
 
-        var buffer = new byte[BufferSizes.ExpectedResponseSize];
-        await _stream.ReadAsync(buffer, token);
-
-        var response = TcpMessageStreamHelpers.GetResponseLengthAndStatus(buffer);
-        if (response.Status != 0)
-        {
-            var errorBuffer = new byte[response.Length];
-            await _stream.ReadAsync(errorBuffer, token);
-            throw new InvalidResponseException(Encoding.UTF8.GetString(errorBuffer));
-        }
+        await CheckResponseAsync(token);
     }
 
     public async Task<OffsetResponse?> GetOffsetAsync(OffsetRequest request, CancellationToken token = default)
@@ -614,7 +606,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapConsumerGroup(responseBuffer);
     }
 
-    public async Task<ConsumerGroupResponse> CreateConsumerGroupAsync(CreateConsumerGroupRequest request, CancellationToken token = default)
+    public async Task<ConsumerGroupResponse?> CreateConsumerGroupAsync(CreateConsumerGroupRequest request, CancellationToken token = default)
     {
         var message = TcpContracts.CreateGroup(request);
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
@@ -906,7 +898,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         var userId = BinaryPrimitives.ReadInt32LittleEndian(responseBuffer.AsSpan()[..(responseBuffer.Length)]);
 
         //TODO: Figure out how to solve this workaround about default of TokenInfo
-        return new AuthResponse(userId, default);
+        return new AuthResponse(userId, null);
     }
     
     public async Task LogoutUser(CancellationToken token = default)

@@ -1,12 +1,16 @@
 # Dependencies
 
+coverlet.collector: "6.0.4", "MIT",
 FluentAssertions: "6.12.0", "Apache-2.0",
+Microsoft.Extensions.Logging: "8.0.1", "MIT",
+Microsoft.Extensions.Logging.Console: "8.0.1", "MIT",
 Microsoft.NET.Test.Sdk: "17.14.1", "MIT",
+Microsoft.Testing.Extensions.CodeCoverage: "17.14.2", "MIT",
+Microsoft.Testing.Extensions.TrxReport: "1.7.3", "MIT",
 Moq: "4.20.72", "BSD-3-Clause",
-Testcontainers: "4.5.0", "MIT",
+Shouldly: "4.3.0", "BSD-3-Clause",
+System.IO.Hashing: "8.0.0", "MIT",
+Testcontainers: "4.6.0", "MIT",
+TUnit: "0.25.21", "MIT",
 xunit: "2.9.3", "Apache-2.0",
-xunit.runner.visualstudio: "3.1.0", "Apache-2.0",
-coverlet.collector: "6.0.4", "MIT" ,
-Microsoft.Extensions.Logging: "8.0.0", "MIT",
-Microsoft.Extensions.Logging.Console:"7.0.0", "MIT"
-System.IO.Hashing: "9.0.5", "MIT",
+xunit.runner.visualstudio: "3.1.1", "Apache-2.0",

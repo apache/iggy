@@ -23,6 +23,6 @@ namespace Apache.Iggy.Contracts.Http;
 public sealed class MessageResponse
 {
     public MessageHeader Header { get; set; }
-    public byte[] Payload { get; set; }
+    public byte[] Payload { get; set; } = [];
     public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; init; }
 }

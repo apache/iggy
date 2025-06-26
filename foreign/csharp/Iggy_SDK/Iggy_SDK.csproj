@@ -18,6 +18,14 @@
         <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
         <PackageReadmeFile>README.md</PackageReadmeFile>
     </PropertyGroup>
+    
+    <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
+      <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    </PropertyGroup>
+    
+    <PropertyGroup Condition=" '$(Configuration)' == 'Release' ">
+      <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    </PropertyGroup>
 
     <ItemGroup>
         <None Include="../README.md" Pack="true" PackagePath="">
@@ -29,8 +37,8 @@
     </ItemGroup>
 
     <ItemGroup>
-      <PackageReference Include="Microsoft.Extensions.Logging" Version="8.0.0" />
-      <PackageReference Include="System.IO.Hashing" Version="9.0.5" />
+      <PackageReference Include="Microsoft.Extensions.Logging" />
+      <PackageReference Include="System.IO.Hashing" />
     </ItemGroup>
 
     <ItemGroup>
@@ -38,4 +46,5 @@
         <Link>Properties\DEPENDENCIES.md</Link>
       </Content>
     </ItemGroup>
+    
 </Project>

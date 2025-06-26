@@ -24,7 +24,6 @@ namespace Apache.Iggy.JsonConfiguration;
 
 public sealed class AuthResponseConverter : JsonConverter<AuthResponse>
 {
-
     public override AuthResponse? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
         using var doc = JsonDocument.ParseValue(ref reader);
@@ -35,6 +34,11 @@ public sealed class AuthResponseConverter : JsonConverter<AuthResponse>
         var token = accessToken.GetProperty(nameof(TokenInfo.Token).ToSnakeCase()).GetString();
         var accessTokenExpiry = accessToken.GetProperty(nameof(TokenInfo.Expiry).ToSnakeCase()).GetInt64();
 
+        if(token is null)
+        {
+            throw new JsonException("Access token is null");
+        }
+        
         return new AuthResponse(
             userId,
             new TokenInfo(token, DateTimeOffset.FromUnixTimeSeconds(accessTokenExpiry).LocalDateTime)

@@ -1,6 +1,7 @@
 target*
 .idea/
 .vscode/
+.vs/
 .zed/
 .DS_Store
 .gradle

@@ -45,7 +45,8 @@ public sealed class StatsResponse
     public required string OsVersion { get; init; }
     public required string KernelVersion { get; init; }
     public required string IggyVersion { get; init; }
-    public List<CacheMetrics> CacheMetrics { get; init; }
+    public uint IggyServerSemver { get; init; }
+    public List<CacheMetrics> CacheMetrics { get; init; } = [];
 
     internal Stats ToStats()
     {
@@ -74,6 +75,7 @@ public sealed class StatsResponse
             OsVersion = OsVersion,
             KernelVersion = KernelVersion,
             IggyServerVersion = IggyVersion,
+            IggyServerSemver = IggyServerSemver,
             CacheMetrics = CacheMetrics
         };
     }
