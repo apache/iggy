@@ -41,7 +41,7 @@ impl GetContextsCmd {
 
     fn format_name(name: &str, active_context_key: &str) -> String {
         if name.eq(active_context_key) {
-            format!("{}*", name)
+            format!("{name}*")
         } else {
             name.to_string()
         }

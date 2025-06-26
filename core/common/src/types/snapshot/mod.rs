@@ -135,7 +135,7 @@ impl FromStr for SystemSnapshotType {
             "server_logs" => Ok(SystemSnapshotType::ServerLogs),
             "server_config" => Ok(SystemSnapshotType::ServerConfig),
             "all" => Ok(SystemSnapshotType::All),
-            _ => Err(format!("Invalid snapshot type: {}", s)),
+            _ => Err(format!("Invalid snapshot type: {s}")),
         }
     }
 }
@@ -176,7 +176,7 @@ impl FromStr for SnapshotCompression {
             "zstd" => Ok(SnapshotCompression::Zstd),
             "lzma" => Ok(SnapshotCompression::Lzma),
             "xz" => Ok(SnapshotCompression::Xz),
-            _ => Err(format!("Invalid compression type: {}", s)),
+            _ => Err(format!("Invalid compression type: {s}")),
         }
     }
 }

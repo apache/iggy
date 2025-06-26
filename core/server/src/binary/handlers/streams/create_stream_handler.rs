@@ -52,8 +52,7 @@ impl ServerCommandHandler for CreateStream {
                 .await
                 .with_error_context(|error| {
                     format!(
-                        "{COMPONENT} (error: {error}) - failed to create stream with id: {:?}, session: {session}",
-                        stream_id
+                        "{COMPONENT} (error: {error}) - failed to create stream with id: {stream_id:?}, session: {session}"
                     )
                 })?;
         let stream_id = stream.stream_id;
@@ -68,8 +67,7 @@ impl ServerCommandHandler for CreateStream {
         }))            .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to apply create stream for id: {:?}, session: {session}",
-                    stream_id
+                    "{COMPONENT} (error: {error}) - failed to apply create stream for id: {stream_id:?}, session: {session}"
                 )
             })?;
         sender.send_ok_response(&response).await?;

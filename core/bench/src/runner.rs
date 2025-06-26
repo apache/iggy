@@ -44,6 +44,7 @@ impl BenchmarkRunner {
         }
     }
 
+    #[allow(clippy::cognitive_complexity)]
     pub async fn run(mut self) -> Result<(), IggyError> {
         let args = self.args.take().unwrap();
         let should_open_charts = args.open_charts();

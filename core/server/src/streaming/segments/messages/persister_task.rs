@@ -182,8 +182,7 @@ impl PersisterTask {
                                     .await
                                     .with_error_context(|error| {
                                         format!(
-                                            "Failed to fsync messages file: {}. {error}",
-                                            file_path
+                                            "Failed to fsync messages file: {file_path}. {error}"
                                         )
                                     })
                                     .expect("Failed to fsync messages file");

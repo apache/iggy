@@ -47,7 +47,7 @@ impl CreateConsumerGroupCmd {
 
     fn get_group_id_info(&self) -> String {
         match self.create_consumer_group.group_id {
-            Some(group_id) => format!("ID: {}", group_id),
+            Some(group_id) => format!("ID: {group_id}"),
             None => "ID auto incremented".to_string(),
         }
     }

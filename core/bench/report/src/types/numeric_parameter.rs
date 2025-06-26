@@ -138,8 +138,8 @@ impl FromStr for BenchmarkNumericParameter {
 impl Display for BenchmarkNumericParameter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Value(v) => write!(f, "{}", v),
-            Self::Range { min, max } => write!(f, "{}..{}", min, max),
+            Self::Value(v) => write!(f, "{v}"),
+            Self::Range { min, max } => write!(f, "{min}..{max}"),
         }
     }
 }

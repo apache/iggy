@@ -95,7 +95,7 @@ impl PartitionStorage for FilePartitionStorage {
                 .file_name()
                 .into_string()
                 .unwrap()
-                .replace(&format!(".{}", LOG_EXTENSION), "");
+                .replace(&format!(".{LOG_EXTENSION}"), "");
 
             let start_offset = log_file_name.parse::<u64>().unwrap();
             let mut segment = Segment::create(
@@ -394,8 +394,7 @@ impl PartitionStorage for FilePartitionStorage {
             .overwrite(path, &offset.to_le_bytes())
             .await
             .with_error_context(|error| format!(
-                "{COMPONENT} (error: {error}) - failed to overwrite consumer offset with value: {}, path: {}",
-                offset, path,
+                "{COMPONENT} (error: {error}) - failed to overwrite consumer offset with value: {offset}, path: {path}",
             ))?;
         trace!("Stored consumer offset value: {}, path: {}", offset, path);
         Ok(())

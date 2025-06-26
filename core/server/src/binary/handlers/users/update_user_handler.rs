@@ -68,8 +68,7 @@ impl ServerCommandHandler for UpdateUser {
             .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to apply update user with user_id: {}, session: {session}",
-                    user_id
+                    "{COMPONENT} (error: {error}) - failed to apply update user with user_id: {user_id}, session: {session}"
                 )
             })?;
         sender.send_empty_ok_response().await?;

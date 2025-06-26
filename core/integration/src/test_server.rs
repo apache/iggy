@@ -318,7 +318,7 @@ impl TestServer {
                     if let Some(exit_status) =
                         self.child_handle.as_mut().unwrap().try_wait().unwrap()
                     {
-                        panic!("Server process has exited with status {}!", exit_status);
+                        panic!("Server process has exited with status {exit_status}!");
                     }
                     sleep(Duration::from_millis(SLEEP_INTERVAL_MS));
                     continue;
@@ -348,8 +348,7 @@ impl TestServer {
             ));
         } else {
             panic!(
-                "Failed to load config from file {} in {} s!",
-                config_path, MAX_PORT_WAIT_DURATION_S
+                "Failed to load config from file {config_path} in {MAX_PORT_WAIT_DURATION_S} s!"
             );
         }
     }

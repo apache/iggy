@@ -372,11 +372,11 @@ impl Segment {
     }
 
     fn get_messages_file_path(path: &str) -> String {
-        format!("{}.{}", path, LOG_EXTENSION)
+        format!("{path}.{LOG_EXTENSION}")
     }
 
     fn get_index_path(path: &str) -> String {
-        format!("{}.{}", path, INDEX_EXTENSION)
+        format!("{path}.{INDEX_EXTENSION}")
     }
 
     pub fn update_message_expiry(&mut self, message_expiry: IggyExpiry) {

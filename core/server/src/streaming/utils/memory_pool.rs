@@ -451,7 +451,7 @@ fn size_str(size: usize) -> String {
     } else if size >= 1024 {
         format!("{}KiB", size / 1024)
     } else {
-        format!("{}B", size)
+        format!("{size}B")
     }
 }
 

@@ -180,8 +180,8 @@ impl IggyCmdTest {
             std::thread::spawn(move || {
                 stdin_input.into_iter().for_each(|line| {
                     stdin
-                        .write_all(format!("{}\n", line).as_bytes())
-                        .unwrap_or_else(|_| panic!("Failed to write to stdin \"{}\"", line,))
+                        .write_all(format!("{line}\n").as_bytes())
+                        .unwrap_or_else(|_| panic!("Failed to write to stdin \"{line}\"",))
                 });
             });
 

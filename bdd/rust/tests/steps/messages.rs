@@ -99,8 +99,7 @@ pub async fn then_should_receive_messages(world: &mut GlobalContext, expected_co
     assert_eq!(
         polled_messages.messages.len() as u32,
         expected_count,
-        "Should receive exactly {} messages",
-        expected_count
+        "Should receive exactly {expected_count} messages",
     );
 }
 
@@ -119,16 +118,14 @@ pub async fn then_messages_have_sequential_offsets(
         let expected_offset = start_offset + index as u64;
         assert_eq!(
             message.header.offset, expected_offset,
-            "Message at index {} should have offset {}",
-            index, expected_offset
+            "Message at index {index} should have offset {expected_offset}",
         );
     }
 
     let last_message = polled_messages.messages.last().unwrap();
     assert_eq!(
         last_message.header.offset, end_offset,
-        "Last message should have offset {}",
-        end_offset
+        "Last message should have offset {end_offset}"
     );
 }
 
@@ -140,13 +137,11 @@ pub async fn then_messages_have_expected_payload(world: &mut GlobalContext) {
         .expect("Should have polled messages");
 
     for (index, message) in polled_messages.messages.iter().enumerate() {
-        let expected_payload = format!("test message {}", index);
+        let expected_payload = format!("test message {index}");
         assert_eq!(
             message.payload,
             Bytes::from(expected_payload.clone()),
-            "Message at offset {} should have payload '{}'",
-            index,
-            expected_payload
+            "Message at offset {index} should have payload '{expected_payload}'"
         );
     }
 }

@@ -207,7 +207,7 @@ impl CliCommand for PollMessagesCmd {
 
         let message_count_message = match polled_messages.messages.len() {
             1 => "1 message".into(),
-            count => format!("{} messages", count),
+            count => format!("{count} messages"),
         };
         event!(target: PRINT_TARGET, Level::INFO, "Polled {message_count_message} of total size {polled_size}, it took {}", elapsed.as_human_time_string());
 

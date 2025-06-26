@@ -84,7 +84,7 @@ impl<'a> IggyCredentials<'a> {
         if let Some(token_name) = &cli_options.token_name {
             return match iggy_args.get_server_address() {
                 Some(server_address) => {
-                    let server_address = format!("iggy:{}", server_address);
+                    let server_address = format!("iggy:{server_address}");
                     event!(target: PRINT_TARGET, Level::DEBUG,"Checking token presence under service: {} and name: {}",
                     server_address, token_name);
                     let entry = Entry::new(&server_address, token_name)?;
@@ -168,7 +168,7 @@ impl<'a> IggyCredentials<'a> {
                             .login_with_personal_access_token(token_value)
                             .await
                             .with_context(|| {
-                                format!("Problem with server login with token: {}", token_value)
+                                format!("Problem with server login with token: {token_value}")
                             })?;
                     }
                     Credentials::SessionWithToken(token_value, server_address) => {

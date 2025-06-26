@@ -35,7 +35,7 @@ impl TestClientGetCmd {
     fn get_client_id(&self) -> String {
         match self.client_id {
             None => String::from(""),
-            Some(client_id) => format!("{}", client_id),
+            Some(client_id) => format!("{client_id}"),
         }
     }
 }

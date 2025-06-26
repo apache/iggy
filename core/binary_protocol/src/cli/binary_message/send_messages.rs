@@ -53,10 +53,7 @@ impl SendMessagesCmd {
             (Some(partition_id), None) => Partitioning::partition_id(partition_id),
             (None, Some(message_key)) => Partitioning::messages_key_str(message_key.as_str())
                 .unwrap_or_else(|_| {
-                    panic!(
-                        "Failed to create Partitioning with {} string message key",
-                        message_key
-                    )
+                    panic!("Failed to create Partitioning with {message_key} string message key")
                 }),
             (None, None) => Partitioning::default(),
         };

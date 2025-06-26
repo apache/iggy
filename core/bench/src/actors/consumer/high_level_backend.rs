@@ -78,6 +78,7 @@ impl BenchmarkConsumerBackend for HighLevelBackend {
         Ok(())
     }
 
+    #[allow(clippy::cognitive_complexity)]
     async fn consume_batch(
         &self,
         consumer: &mut Self::Consumer,

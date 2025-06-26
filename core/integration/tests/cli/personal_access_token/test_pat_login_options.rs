@@ -63,8 +63,7 @@ impl TestLoginOptions {
             )
             .unwrap_or_else(|_| {
                 panic!(
-                    "Failed to get keyring service data for {} service and {} token name",
-                    IGGY_SERVICE, token_name
+                    "Failed to get keyring service data for {IGGY_SERVICE} service and {token_name} token name",
                 )
             }),
         }
@@ -112,7 +111,7 @@ impl IggyCmdTestCase for TestLoginOptions {
         assert!(token.is_ok());
 
         if let Err(e) = self.keyring.delete_credential() {
-            panic!("Failed to delete token from keyring due to {}", e);
+            panic!("Failed to delete token from keyring due to {e}");
         };
     }
 }

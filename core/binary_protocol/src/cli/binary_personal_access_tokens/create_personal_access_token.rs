@@ -61,7 +61,7 @@ impl CreatePersonalAccessTokenCmd {
 impl CliCommand for CreatePersonalAccessTokenCmd {
     fn explain(&self) -> String {
         let expiry_text = match &self.token_expiry {
-            Some(value) => format!("token expire time: {}", value),
+            Some(value) => format!("token expire time: {value}"),
             None => String::from("without token expire time"),
         };
         format!(
@@ -91,7 +91,7 @@ impl CliCommand for CreatePersonalAccessTokenCmd {
                 "Personal access token with name: {} and {} created",
                 self.create_token.name,
                 match &self.token_expiry {
-                    Some(value) => format!("token expire time: {}", value),
+                    Some(value) => format!("token expire time: {value}"),
                     None => String::from("without token expire time"),
                 },
             );
@@ -102,7 +102,7 @@ impl CliCommand for CreatePersonalAccessTokenCmd {
                 "Personal access token with name: {} and {} created",
                 self.create_token.name,
                 match &self.token_expiry {
-                    Some(value) => format!("token expire time: {}", value),
+                    Some(value) => format!("token expire time: {value}"),
                     None => String::from("without token expire time"),
                 },
             );

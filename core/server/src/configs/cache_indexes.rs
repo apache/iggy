@@ -52,8 +52,7 @@ impl<'de> Deserialize<'de> for CacheIndexesConfig {
                 "open_segment" => Ok(CacheIndexesConfig::OpenSegment),
                 "none" | "false" => Ok(CacheIndexesConfig::None),
                 _ => Err(serde::de::Error::custom(format!(
-                    "Invalid CacheIndexesConfig value: {}",
-                    s
+                    "Invalid CacheIndexesConfig value: {s}"
                 ))),
             },
             StringOrBool::Bool(b) => {
@@ -75,7 +74,7 @@ impl FromStr for CacheIndexesConfig {
             "all" | "true" => Ok(CacheIndexesConfig::All),
             "open_segment" => Ok(CacheIndexesConfig::OpenSegment),
             "none" | "false" => Ok(CacheIndexesConfig::None),
-            _ => Err(format!("Invalid CacheIndexesConfig: {}", s)),
+            _ => Err(format!("Invalid CacheIndexesConfig: {s}")),
         }
     }
 }
