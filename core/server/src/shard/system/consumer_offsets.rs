@@ -16,7 +16,8 @@
  * under the License.
  */
 
-use crate::streaming::session::Session;
+use super::COMPONENT;
+use crate::{shard::IggyShard, streaming::session::Session};
 use error_set::ErrContext;
 use iggy_common::{Consumer, ConsumerOffsetInfo, Identifier, IggyError};
 
@@ -31,9 +32,12 @@ impl IggyShard {
         offset: u64,
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
-        let topic = self.find_topic(session, stream_id, topic_id)
+        let stream = self.get_stream(stream_id).with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - stream with ID: {stream_id} was not found")
+        })?;
+        let topic = self.find_topic(session, &stream, topic_id)
             .with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic with ID: {topic_id} was not found in stream with ID: {stream_id}"))?;
-        self.permissioner.store_consumer_offset(
+        self.permissioner.borrow().store_consumer_offset(
             session.get_user_id(),
             topic.stream_id,
             topic.topic_id,
@@ -53,11 +57,14 @@ impl IggyShard {
         partition_id: Option<u32>,
     ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
         self.ensure_authenticated(session)?;
-        let Some(topic) = self.try_find_topic(session, stream_id, topic_id)? else {
+        let stream = self.get_stream(stream_id).with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - stream with ID: {stream_id} was not found")
+        })?;
+        let Some(topic) = self.try_find_topic(session, &stream, topic_id)? else {
             return Ok(None);
         };
 
-        self.permissioner.get_consumer_offset(
+        self.permissioner.borrow().get_consumer_offset(
             session.get_user_id(),
             topic.stream_id,
             topic.topic_id,
@@ -82,9 +89,12 @@ impl IggyShard {
         partition_id: Option<u32>,
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
-        let topic = self.find_topic(session, stream_id, topic_id)
+        let stream = self.get_stream(stream_id).with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - stream with ID: {stream_id} was not found")
+        })?;
+        let topic = self.find_topic(session, &stream, topic_id)
             .with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic with ID: {topic_id} was not found in stream with ID: {stream_id}"))?;
-        self.permissioner.delete_consumer_offset(
+        self.permissioner.borrow().delete_consumer_offset(
             session.get_user_id(),
             topic.stream_id,
             topic.topic_id,

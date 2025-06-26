@@ -16,6 +16,8 @@
  * under the License.
  */
 
+use super::COMPONENT;
+use crate::shard::IggyShard;
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::session::Session;
 use crate::streaming::users::user::User;
@@ -64,7 +66,7 @@ impl IggyShard {
             let user = self.get_user(&identifier).with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get user with id: {user_id}")
             })?;
-            let max_token_per_user = self.personal_access_token.max_tokens_per_user;
+            let max_token_per_user = self.config.personal_access_token.max_tokens_per_user;
             if user.personal_access_tokens.len() as u32 >= max_token_per_user {
                 error!(
                     "User with ID: {user_id} has reached the maximum number of personal access tokens: {max_token_per_user}.",
@@ -76,7 +78,7 @@ impl IggyShard {
             }
         }
 
-        let user = self.get_user(&identifier).with_error_context(|error| {
+        let user = self.get_user_mut(&identifier).with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to get mutable reference to the user with id: {user_id}")
         })?;
 
@@ -102,7 +104,7 @@ impl IggyShard {
     }
 
     pub async fn delete_personal_access_token(
-        &mut self,
+        &self,
         session: &Session,
         name: &str,
     ) -> Result<(), IggyError> {
@@ -137,10 +139,11 @@ impl IggyShard {
         &self,
         token: &str,
         session: Option<&Session>,
-    ) -> Result<&User, IggyError> {
+    ) -> Result<User, IggyError> {
         let token_hash = PersonalAccessToken::hash_token(token);
+        let users = self.users.borrow();
         let mut personal_access_token = None;
-        for user in self.users.values() {
+        for user in users.values() {
             if let Some(pat) = user.personal_access_tokens.get(&token_hash) {
                 personal_access_token = Some(pat);
                 break;
@@ -173,6 +176,5 @@ impl IggyShard {
                 )
             })?;
         self.login_user_with_credentials(&user.username, None, session)
-            .await
     }
 }

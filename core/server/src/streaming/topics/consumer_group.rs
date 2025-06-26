@@ -57,10 +57,7 @@ impl ConsumerGroup {
         self.assign_partitions();
     }
 
-    pub fn calculate_partition_id(
-        &mut self,
-        member_id: u32,
-    ) -> Result<Option<u32>, IggyError> {
+    pub fn calculate_partition_id(&mut self, member_id: u32) -> Result<Option<u32>, IggyError> {
         let member = self.members.get_mut(&member_id);
         if let Some(member) = member {
             return Ok(member.calculate_partition_id());

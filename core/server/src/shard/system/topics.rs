@@ -16,29 +16,31 @@
  * under the License.
  */
 
+use super::COMPONENT;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
+use crate::streaming::streams::stream::Stream;
 use crate::streaming::topics::topic::Topic;
 use error_set::ErrContext;
 use iggy_common::locking::IggySharedMutFn;
 use iggy_common::{CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize};
+use tokio_util::io::StreamReader;
 
 impl IggyShard {
-    pub fn find_topic(
+    pub fn find_topic<'topic, 'stream>(
         &self,
         session: &Session,
-        stream_id: &Identifier,
+        stream: &'stream Stream,
         topic_id: &Identifier,
-    ) -> Result<&Topic, IggyError> {
+    ) -> Result<&'topic Topic, IggyError>
+    where
+        'stream: 'topic,
+    {
         self.ensure_authenticated(session)?;
-        let stream = self
-            .find_stream(session, stream_id)
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to find stream with ID: {stream_id}")
-            })?;
-        let topic = stream.get_topic(topic_id);
-        if let Ok(topic) = topic {
-            self.permissioner
+        let stream_id = stream.stream_id;
+        let topic = stream.get_topic(topic_id)?;
+        self.permissioner
+            .borrow()
                 .get_topic(session.get_user_id(), stream.stream_id, topic.topic_id)
                 .with_error_context(|error| {
                     format!(
@@ -46,22 +48,21 @@ impl IggyShard {
                         session.get_user_id(),
                     )
                 })?;
-            return Ok(topic);
-        }
-
-        topic
+        Ok(topic)
     }
 
-    pub fn find_topics(
+    pub fn find_topics<'stream, 'topic>(
         &self,
         session: &Session,
-        stream_id: &Identifier,
-    ) -> Result<Vec<&Topic>, IggyError> {
+        stream: &'stream Stream,
+    ) -> Result<Vec<&'topic Topic>, IggyError>
+    where
+        'stream: 'topic,
+    {
         self.ensure_authenticated(session)?;
-        let stream = self.get_stream(stream_id).with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
-        })?;
+        let stream_id = stream.stream_id;
         self.permissioner
+        .borrow()
             .get_topics(session.get_user_id(), stream.stream_id)
             .with_error_context(|error| {
                 format!(
@@ -72,28 +73,24 @@ impl IggyShard {
         Ok(stream.get_topics())
     }
 
-    pub fn try_find_topic(
+    pub fn try_find_topic<'stream, 'topic>(
         &self,
         session: &Session,
-        stream_id: &Identifier,
+        stream: &'stream Stream,
         topic_id: &Identifier,
-    ) -> Result<Option<&Topic>, IggyError> {
+    ) -> Result<Option<&'topic Topic>, IggyError>
+    where
+        'stream: 'topic,
+    {
         self.ensure_authenticated(session)?;
-        let Some(stream) = self
-            .try_find_stream(session, stream_id)
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to find stream with ID: {stream_id}")
-            })?
-        else {
-            return Ok(None);
-        };
-
+        let stream_id = stream.stream_id;
         let Some(topic) = stream.try_get_topic(topic_id)? else {
             return Ok(None);
         };
 
         self.permissioner
-            .get_topic(session.get_user_id(), stream.stream_id, topic.topic_id)
+        .borrow()
+            .get_topic(session.get_user_id(), stream_id, topic.topic_id)
             .with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - permission denied to get topic with ID: {topic_id} in stream with ID: {stream_id} for user with ID: {}",
@@ -105,7 +102,7 @@ impl IggyShard {
 
     #[allow(clippy::too_many_arguments)]
     pub async fn create_topic(
-        &mut self,
+        &self,
         session: &Session,
         stream_id: &Identifier,
         topic_id: Option<u32>,
@@ -115,13 +112,14 @@ impl IggyShard {
         compression_algorithm: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,
         replication_factor: Option<u8>,
-    ) -> Result<&Topic, IggyError> {
+    ) -> Result<u32, IggyError> {
         self.ensure_authenticated(session)?;
         {
             let stream = self.get_stream(stream_id).with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
             })?;
             self.permissioner
+            .borrow()
                 .create_topic(session.get_user_id(), stream.stream_id)
                 .with_error_context(|error| {
                     format!(
@@ -131,6 +129,8 @@ impl IggyShard {
                 })?;
         }
 
+        // TODO: Make create topic sync, and extract the storage persister out of it
+        // perform disk i/o outside of the borrow_mut of the stream.
         let created_topic_id = self
             .get_stream_mut(stream_id)?
             .create_topic(
@@ -151,21 +151,12 @@ impl IggyShard {
         self.metrics.increment_partitions(partitions_count);
         self.metrics.increment_segments(partitions_count);
 
-        self.get_stream(stream_id)
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
-            })?
-            .get_topic(&created_topic_id.try_into()?)
-            .with_error_context(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to get created topic with ID: {created_topic_id} in stream with ID: {stream_id}",
-                )
-            })
+        Ok(created_topic_id)
     }
 
     #[allow(clippy::too_many_arguments)]
     pub async fn update_topic(
-        &mut self,
+        &self,
         session: &Session,
         stream_id: &Identifier,
         topic_id: &Identifier,
@@ -174,17 +165,20 @@ impl IggyShard {
         compression_algorithm: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,
         replication_factor: Option<u8>,
-    ) -> Result<&Topic, IggyError> {
+    ) -> Result<u32, IggyError> {
         self.ensure_authenticated(session)?;
         {
+            let stream = self.get_stream(stream_id).with_error_context(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
+            })?;
             let topic = self
-                .find_topic(session, stream_id, topic_id)
+                .find_topic(session, &stream, topic_id)
                 .with_error_context(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - failed to find topic with ID: {topic_id}"
                     )
                 })?;
-            self.permissioner.update_topic(
+            self.permissioner.borrow().update_topic(
                 session.get_user_id(),
                 topic.stream_id,
                 topic.topic_id,
@@ -198,6 +192,8 @@ impl IggyShard {
             })?;
         }
 
+        // TODO: Make update topic sync, and extract the storage persister out of it
+        // perform disk i/o outside of the borrow_mut of the stream.
         self.get_stream_mut(stream_id)?
             .update_topic(
                 topic_id,
@@ -224,11 +220,11 @@ impl IggyShard {
             .get_topic(topic_id)
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get topic with ID: {topic_id} in stream with ID: {stream_id}")
-            })
+            }).map(|topic| topic.topic_id)
     }
 
     pub async fn delete_topic(
-        &mut self,
+        &self,
         session: &Session,
         stream_id: &Identifier,
         topic_id: &Identifier,
@@ -236,12 +232,15 @@ impl IggyShard {
         self.ensure_authenticated(session)?;
         let stream_id_value;
         {
+            let stream = self.get_stream(stream_id).with_error_context(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
+            })?;
             let topic = self
-                .find_topic(session, stream_id, topic_id)
+                .find_topic(session, &stream, topic_id)
                 .with_error_context(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to find topic with ID: {topic_id} in stream with ID: {stream_id}")
                 })?;
-            self.permissioner.delete_topic(
+            self.permissioner.borrow().delete_topic(
                 session.get_user_id(),
                 topic.stream_id,
                 topic.topic_id,
@@ -254,6 +253,8 @@ impl IggyShard {
             stream_id_value = topic.stream_id;
         }
 
+        // TODO: Make delete topic sync, and extract the storage persister out of it
+        // perform disk i/o outside of the borrow_mut of the stream.
         let topic = self
             .get_stream_mut(stream_id)?
             .delete_topic(topic_id)
@@ -266,10 +267,9 @@ impl IggyShard {
         self.metrics.decrement_messages(topic.get_messages_count());
         self.metrics
             .decrement_segments(topic.get_segments_count().await);
-        let client_manager = self.client_manager.read().await;
-        client_manager
-            .delete_consumer_groups_for_topic(stream_id_value, topic.topic_id)
-            .await;
+        self.client_manager
+            .borrow_mut()
+            .delete_consumer_groups_for_topic(stream_id_value, topic.topic_id);
         Ok(())
     }
 
@@ -279,12 +279,16 @@ impl IggyShard {
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<(), IggyError> {
+        let stream = self.get_stream(stream_id).with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
+        })?;
         let topic = self
-            .find_topic(session, stream_id, topic_id)
+            .find_topic(session, &stream, topic_id)
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to find topic with ID: {topic_id} in stream with ID: {stream_id}")
             })?;
         self.permissioner
+            .borrow()
             .purge_topic(session.get_user_id(), topic.stream_id, topic.topic_id)
             .with_error_context(|error| {
                 format!(

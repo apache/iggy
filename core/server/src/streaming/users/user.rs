@@ -24,7 +24,7 @@ use iggy_common::defaults::*;
 use iggy_common::{Permissions, UserId};
 use std::sync::Arc;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct User {
     pub id: UserId,
     pub status: UserStatus,

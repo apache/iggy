@@ -16,6 +16,7 @@ use crate::shard::IggyShard;
  * specific language governing permissions and limitations
  * under the License.
  */
+use super::COMPONENT;
 use crate::streaming::session::Session;
 use error_set::ErrContext;
 use iggy_common::Identifier;
@@ -24,7 +25,7 @@ use iggy_common::locking::IggySharedMutFn;
 
 impl IggyShard {
     pub async fn delete_segments(
-        &mut self,
+        &self,
         session: &Session,
         stream_id: &Identifier,
         topic_id: &Identifier,
@@ -35,9 +36,14 @@ impl IggyShard {
         self.ensure_authenticated(session)?;
 
         {
-            let topic = self.find_topic(session, stream_id, topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream_id: {stream_id}, topic_id: {topic_id}"))?;
+            let stream = self.get_stream(stream_id).with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - stream not found for stream_id: {stream_id}"
+                )
+            })?;
+            let topic = self.find_topic(session, &stream, topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream_id: {stream_id}, topic_id: {topic_id}"))?;
 
-            self.permissioner.delete_segments(
+            self.permissioner.borrow().delete_segments(
                 session.get_user_id(),
                 topic.stream_id,
                 topic.topic_id,
@@ -49,9 +55,11 @@ impl IggyShard {
             ))?;
         }
 
-        let topic = self
-            .get_stream_mut(stream_id)?
-            .get_topic_mut(topic_id)
+        let stream = self.get_stream(stream_id).with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
+        })?;
+        let topic = stream
+            .get_topic(topic_id)
             .with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to get mutable reference to stream with ID: {stream_id}"
@@ -95,7 +103,25 @@ impl IggyShard {
 
             (segments_count, messages_count)
         };
-        topic.reassign_consumer_groups().await;
+        drop(partition);
+        drop(topic);
+        drop(stream);
+
+        let mut stream = self
+            .get_stream_mut(stream_id)
+            .with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - failed to get mutable reference to stream with ID: {stream_id}"
+                )
+            })?;
+        let topic = stream
+            .get_topic_mut(topic_id)
+            .with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - failed to get mutable reference to topic with ID: {topic_id} in stream with ID: {stream_id}"
+                )
+            })?;
+        topic.reassign_consumer_groups();
 
         self.metrics.decrement_segments(deleted_segments_count);
         self.metrics.decrement_messages(deleted_messages_count);

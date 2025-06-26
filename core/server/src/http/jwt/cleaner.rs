@@ -19,12 +19,12 @@
 use crate::http::shared::AppState;
 use iggy_common::IggyTimestamp;
 use std::sync::Arc;
-use std::time::Duration;
+use monoio::time::Duration;
 use tracing::{error, trace};
 
 pub fn start_expired_tokens_cleaner(app_state: Arc<AppState>) {
-    tokio::spawn(async move {
-        let mut interval_timer = tokio::time::interval(Duration::from_secs(300));
+    monoio::spawn(async move {
+        let mut interval_timer = monoio::time::interval(Duration::from_secs(300));
         loop {
             interval_timer.tick().await;
             trace!("Deleting expired tokens...");
@@ -34,7 +34,7 @@ pub fn start_expired_tokens_cleaner(app_state: Arc<AppState>) {
                 .delete_expired_revoked_tokens(now)
                 .await
                 .unwrap_or_else(|err| {
-                    error!("Failed to delete expired revoked access tokens. Error: {err}",);
+                    error!("Failed to delete expired revoked access tokens. Error: {err}");
                 });
         }
     });

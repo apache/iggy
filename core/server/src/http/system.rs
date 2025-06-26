@@ -114,7 +114,7 @@ async fn get_clients(
                 identity.user_id
             )
         })?;
-    let clients = mapper::map_clients(&clients).await;
+    let clients = mapper::map_clients(&clients);
     Ok(Json(clients))
 }
 

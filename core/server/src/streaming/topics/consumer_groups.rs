@@ -17,12 +17,12 @@
  */
 
 use crate::binary::handlers::topics::get_topic_handler;
-use crate::streaming::topics::{consumer_group, COMPONENT};
 use crate::streaming::topics::consumer_group::ConsumerGroup;
 use crate::streaming::topics::topic::Topic;
+use crate::streaming::topics::{COMPONENT, consumer_group};
 use error_set::ErrContext;
-use iggy_common::locking::IggySharedMutFn;
 use iggy_common::IggyError;
+use iggy_common::locking::IggySharedMutFn;
 use iggy_common::{IdKind, Identifier};
 use std::cell::{Ref, RefMut};
 use std::sync::atomic::Ordering;
@@ -48,7 +48,10 @@ impl Topic {
         self.consumer_groups.borrow().values().cloned().collect()
     }
 
-    pub fn get_consumer_group(&self, identifier: &Identifier) -> Result<Ref<'_, ConsumerGroup>, IggyError> {
+    pub fn get_consumer_group(
+        &self,
+        identifier: &Identifier,
+    ) -> Result<Ref<'_, ConsumerGroup>, IggyError> {
         match identifier.kind {
             IdKind::Numeric => self.get_consumer_group_by_id(identifier.get_u32_value().unwrap()),
             IdKind::String => self.get_consumer_group_by_name(&identifier.get_cow_str_value()?),
@@ -93,7 +96,10 @@ impl Topic {
         }))
     }
 
-    pub fn get_consumer_group_by_name(&self, name: &str) -> Result<Ref<'_, ConsumerGroup>, IggyError> {
+    pub fn get_consumer_group_by_name(
+        &self,
+        name: &str,
+    ) -> Result<Ref<'_, ConsumerGroup>, IggyError> {
         let group_id = self.consumer_groups_ids.get(name);
         if group_id.is_none() {
             return Err(IggyError::ConsumerGroupNameNotFound(
@@ -199,12 +205,8 @@ impl Topic {
             return Err(IggyError::ConsumerGroupIdAlreadyExists(id, self.topic_id));
         }
 
-        let consumer_group = ConsumerGroup::new(
-            self.topic_id,
-            id,
-            name,
-            self.partitions.len() as u32,
-        );
+        let consumer_group =
+            ConsumerGroup::new(self.topic_id, id, name, self.partitions.len() as u32);
         self.consumer_groups_ids.insert(name.to_owned(), id);
         let cloned_group = consumer_group.clone();
         self.consumer_groups.borrow_mut().insert(id, consumer_group);

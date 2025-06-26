@@ -16,11 +16,13 @@
  * under the License.
  */
 
+use super::COMPONENT;
 use crate::binary::handlers::messages::poll_messages_handler::IggyPollMetadata;
 use crate::shard::IggyShard;
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet};
 use crate::streaming::session::Session;
 use crate::streaming::utils::PooledBuffer;
+use async_zip::tokio::read::stream;
 use error_set::ErrContext;
 use iggy_common::{
     BytesSerializable, Confirmation, Consumer, EncryptorKind, IGGY_MESSAGE_HEADER_SIZE, Identifier,
@@ -43,8 +45,13 @@ impl IggyShard {
             return Err(IggyError::InvalidMessagesCount);
         }
 
-        let topic = self.find_topic(session, stream_id, topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
+        let stream = self.get_stream(stream_id).with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - stream not found for stream ID: {stream_id}")
+        })?;
+        let stream_id = stream.stream_id;
+        let topic = self.find_topic(session, &stream, topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
         self.permissioner
+            .borrow()
             .poll_messages(session.get_user_id(), topic.stream_id, topic.topic_id)
             .with_error_context(|error| format!(
                 "{COMPONENT} (error: {error}) - permission denied to poll messages for user {} on stream ID: {}, topic ID: {}",
@@ -60,7 +67,6 @@ impl IggyShard {
         // There might be no partition assigned, if it's the consumer group member without any partitions.
         let Some((polling_consumer, partition_id)) = topic
             .resolve_consumer_with_partition_id(consumer, session.client_id, partition_id, true)
-            .await
             .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to resolve consumer with partition id, consumer: {consumer}, client ID: {}, partition ID: {:?}", session.client_id, partition_id))? else {
             return Ok((IggyPollMetadata::new(0, 0), IggyMessagesBatchSet::empty()));
         };
@@ -80,11 +86,15 @@ impl IggyShard {
             topic
                 .store_consumer_offset_internal(polling_consumer, offset, partition_id)
                 .await
+<<<<<<< HEAD
                 .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset internal, polling consumer: {polling_consumer}, offset: {offset}, partition ID: {partition_id}")) ?;
+=======
+                .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset internal, polling consumer: {}, offset: {}, partition ID: {}", polling_consumer, offset, partition_id))?;
+>>>>>>> 48107890 (fix iggy shard errors)
         }
 
         let batch_set = if let Some(encryptor) = &self.encryptor {
-            self.decrypt_messages(batch_set, encryptor.as_ref()).await?
+            self.decrypt_messages(batch_set, encryptor).await?
         } else {
             batch_set
         };
@@ -102,8 +112,12 @@ impl IggyShard {
         confirmation: Option<Confirmation>,
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
-        let topic = self.find_topic(session, stream_id, topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream_id: {stream_id}, topic_id: {topic_id}"))?;
-        self.permissioner.append_messages(
+        let stream = self.get_stream(stream_id).with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - stream not found for stream_id: {stream_id}")
+        })?;
+        let stream_id = stream.stream_id;
+        let topic = self.find_topic(session, &stream, topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream_id: {stream_id}, topic_id: {topic_id}"))?;
+        self.permissioner.borrow().append_messages(
             session.get_user_id(),
             topic.stream_id,
             topic.topic_id
@@ -117,7 +131,7 @@ impl IggyShard {
 
         // Encrypt messages if encryptor is configured
         let messages = if let Some(encryptor) = &self.encryptor {
-            self.encrypt_messages(messages, encryptor.as_ref())?
+            self.encrypt_messages(messages, encryptor)?
         } else {
             messages
         };
@@ -139,8 +153,12 @@ impl IggyShard {
         fsync: bool,
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
-        let topic = self.find_topic(session, &stream_id, &topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
-        self.permissioner.append_messages(
+        let stream = self.get_stream(&stream_id).with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - stream not found for stream ID: {stream_id}")
+        })?;
+        let stream_id = stream.stream_id;
+        let topic = self.find_topic(session, &stream, &topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic ID: {topic_id}"))?;
+        self.permissioner.borrow().append_messages(
             session.get_user_id(),
             topic.stream_id,
             topic.topic_id

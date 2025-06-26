@@ -461,6 +461,6 @@ impl IggyShard {
                     Err(IggyError::Unauthenticated)
                 }
             })?;
-            Ok(user_id)
+        Ok(user_id)
     }
 }

@@ -23,13 +23,13 @@ use crate::streaming::storage::SystemStorage;
 use crate::streaming::topics::consumer_group::ConsumerGroup;
 use ahash::AHashMap;
 use core::fmt;
-use std::cell::RefCell;
-use std::rc::Rc;
 use iggy_common::locking::IggyRwLock;
 use iggy_common::{
     CompressionAlgorithm, Consumer, ConsumerKind, IggyByteSize, IggyError, IggyExpiry,
     IggyTimestamp, MaxTopicSize, Sizeable,
 };
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};

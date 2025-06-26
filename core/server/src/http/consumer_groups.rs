@@ -72,7 +72,7 @@ async fn get_consumer_group(
     };
 
     let consumer_group = consumer_group.read().await;
-    let consumer_group = mapper::map_consumer_group(&consumer_group).await;
+    let consumer_group = mapper::map_consumer_group(&consumer_group);
     Ok(Json(consumer_group))
 }
 
@@ -89,7 +89,7 @@ async fn get_consumer_groups(
         &stream_id,
         &topic_id,
     )?;
-    let consumer_groups = mapper::map_consumer_groups(&consumer_groups).await;
+    let consumer_groups = mapper::map_consumer_groups(&consumer_groups);
     Ok(Json(consumer_groups))
 }
 
@@ -116,7 +116,7 @@ async fn create_consumer_group(
             .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to create consumer group, stream ID: {}, topic ID: {}, group ID: {:?}", stream_id, topic_id, command.group_id))?;
     let consumer_group = consumer_group.read().await;
     let group_id = consumer_group.group_id;
-    let consumer_group_details = mapper::map_consumer_group(&consumer_group).await;
+    let consumer_group_details = mapper::map_consumer_group(&consumer_group);
     drop(consumer_group);
 
     let system = system.downgrade();

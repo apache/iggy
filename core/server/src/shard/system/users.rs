@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use super::COMPONENT;
 use crate::shard::IggyShard;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateUserWithId;
@@ -33,6 +34,7 @@ use iggy_common::create_user::CreateUser;
 use iggy_common::defaults::*;
 use iggy_common::locking::IggySharedMutFn;
 use iggy_common::{IdKind, Identifier};
+use std::cell::RefMut;
 use std::env;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -46,7 +48,7 @@ impl IggyShard {
         &self,
         session: &Session,
         user_id: &Identifier,
-    ) -> Result<Option<&User>, IggyError> {
+    ) -> Result<Option<User>, IggyError> {
         self.ensure_authenticated(session)?;
         let Some(user) = self.try_get_user(user_id)? else {
             return Ok(None);
@@ -54,7 +56,7 @@ impl IggyShard {
 
         let session_user_id = session.get_user_id();
         if user.id != session_user_id {
-            self.permissioner.get_user(session_user_id).with_error_context(|error| {
+            self.permissioner.borrow().get_user(session_user_id).with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - permission denied to get user with ID: {user_id} for current user with ID: {session_user_id}"
                 )
@@ -64,45 +66,73 @@ impl IggyShard {
         Ok(Some(user))
     }
 
-    pub fn get_user(&self, user_id: &Identifier) -> Result<&User, IggyError> {
+    pub fn get_user(&self, user_id: &Identifier) -> Result<User, IggyError> {
         self.try_get_user(user_id)?
             .ok_or(IggyError::ResourceNotFound(user_id.to_string()))
     }
 
-    pub fn try_get_user(&self, user_id: &Identifier) -> Result<Option<&User>, IggyError> {
+    pub fn try_get_user(&self, user_id: &Identifier) -> Result<Option<User>, IggyError> {
         match user_id.kind {
-            IdKind::Numeric => Ok(self.users.get(&user_id.get_u32_value()?)),
+            IdKind::Numeric => {
+                let user = self
+                    .users
+                    .borrow()
+                    .get(&user_id.get_u32_value()?)
+                    .map(|user| user.clone());
+                Ok(user)
+            }
             IdKind::String => {
                 let username = user_id.get_cow_str_value()?;
-                Ok(self
+                let user = self
                     .users
+                    .borrow()
                     .iter()
                     .find(|(_, user)| user.username == username)
-                    .map(|(_, user)| user))
+                    .map(|(_, user)| user.clone());
+                Ok(user)
             }
         }
     }
 
-    pub fn get_user_mut(&mut self, user_id: &Identifier) -> Result<&mut User, IggyError> {
+    pub fn get_user_mut(&self, user_id: &Identifier) -> Result<RefMut<'_, User>, IggyError> {
         match user_id.kind {
-            IdKind::Numeric => self
-                .users
-                .get_mut(&user_id.get_u32_value()?)
-                .ok_or(IggyError::ResourceNotFound(user_id.to_string())),
+            IdKind::Numeric => {
+                let user_id = user_id.get_u32_value()?;
+                let users = self.users.borrow_mut();
+                let exists = users.contains_key(&user_id);
+                if !exists {
+                    return Err(IggyError::ResourceNotFound(user_id.to_string()));
+                }
+                Ok(RefMut::map(users, |u| {
+                    let user = u.get_mut(&user_id);
+                    user.unwrap()
+                }))
+            }
             IdKind::String => {
                 let username = user_id.get_cow_str_value()?;
-                self.users
-                    .iter_mut()
+                let users = self.users.borrow_mut();
+                let exists = users
+                    .iter()
                     .find(|(_, user)| user.username == username)
-                    .map(|(_, user)| user)
-                    .ok_or(IggyError::ResourceNotFound(user_id.to_string()))
+                    .is_some();
+                if !exists {
+                    return Err(IggyError::ResourceNotFound(user_id.to_string()));
+                }
+                Ok(RefMut::map(users, |u| {
+                    let user = u
+                        .iter_mut()
+                        .find(|(_, user)| user.username == username)
+                        .map(|(_, user)| user);
+                    user.unwrap()
+                }))
             }
         }
     }
 
-    pub async fn get_users(&self, session: &Session) -> Result<Vec<&User>, IggyError> {
+    pub async fn get_users(&self, session: &Session) -> Result<Vec<User>, IggyError> {
         self.ensure_authenticated(session)?;
         self.permissioner
+        .borrow()
             .get_users(session.get_user_id())
             .with_error_context(|error| {
                 format!(
@@ -110,19 +140,20 @@ impl IggyShard {
                     session.get_user_id()
                 )
             })?;
-        Ok(self.users.values().collect())
+        Ok(self.users.borrow().values().cloned().collect())
     }
 
     pub async fn create_user(
-        &mut self,
+        &self,
         session: &Session,
         username: &str,
         password: &str,
         status: UserStatus,
         permissions: Option<Permissions>,
-    ) -> Result<&User, IggyError> {
+    ) -> Result<User, IggyError> {
         self.ensure_authenticated(session)?;
         self.permissioner
+        .borrow()
             .create_user(session.get_user_id())
             .with_error_context(|error| {
                 format!(
@@ -131,12 +162,17 @@ impl IggyShard {
                 )
             })?;
 
-        if self.users.iter().any(|(_, user)| user.username == username) {
+        if self
+            .users
+            .borrow()
+            .iter()
+            .any(|(_, user)| user.username == username)
+        {
             error!("User: {username} already exists.");
             return Err(IggyError::UserAlreadyExists);
         }
 
-        if self.users.len() >= MAX_USERS {
+        if self.users.borrow().len() >= MAX_USERS {
             error!("Available users limit reached.");
             return Err(IggyError::UsersLimitReached);
         }
@@ -145,8 +181,9 @@ impl IggyShard {
         info!("Creating user: {username} with ID: {user_id}...");
         let user = User::new(user_id, username, password, status, permissions.clone());
         self.permissioner
+            .borrow_mut()
             .init_permissions_for_user(user_id, permissions);
-        self.users.insert(user.id, user);
+        self.users.borrow_mut().insert(user.id, user);
         info!("Created user: {username} with ID: {user_id}.");
         self.metrics.increment_users(1);
         self.get_user(&user_id.try_into()?)
@@ -155,16 +192,13 @@ impl IggyShard {
             })
     }
 
-    pub async fn delete_user(
-        &mut self,
-        session: &Session,
-        user_id: &Identifier,
-    ) -> Result<User, IggyError> {
+    pub fn delete_user(&self, session: &Session, user_id: &Identifier) -> Result<User, IggyError> {
         self.ensure_authenticated(session)?;
         let existing_user_id;
         let existing_username;
         {
             self.permissioner
+                .borrow()
                 .delete_user(session.get_user_id())
                 .with_error_context(|error| {
                     format!(
@@ -187,14 +221,14 @@ impl IggyShard {
         info!("Deleting user: {existing_username} with ID: {user_id}...");
         let user = self
             .users
+            .borrow_mut()
             .remove(&existing_user_id)
             .ok_or(IggyError::ResourceNotFound(user_id.to_string()))?;
         self.permissioner
+            .borrow_mut()
             .delete_permissions_for_user(existing_user_id);
-        let mut client_manager = self.client_manager.write().await;
-        client_manager
+        self.client_manager.borrow_mut()
             .delete_clients_for_user(existing_user_id)
-            .await
             .with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to delete clients for user with ID: {existing_user_id}"
@@ -205,15 +239,16 @@ impl IggyShard {
         Ok(user)
     }
 
-    pub async fn update_user(
-        &mut self,
+    pub fn update_user(
+        &self,
         session: &Session,
         user_id: &Identifier,
         username: Option<String>,
         status: Option<UserStatus>,
-    ) -> Result<&User, IggyError> {
+    ) -> Result<User, IggyError> {
         self.ensure_authenticated(session)?;
         self.permissioner
+        .borrow()
             .update_user(session.get_user_id())
             .with_error_context(|error| {
                 format!(
@@ -231,7 +266,7 @@ impl IggyShard {
             }
         }
 
-        let user = self.get_user_mut(user_id).with_error_context(|error| {
+        let mut user = self.get_user_mut(user_id).with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to get mutable reference to the user with id: {user_id}")
         })?;
         if let Some(username) = username {
@@ -241,13 +276,18 @@ impl IggyShard {
         if let Some(status) = status {
             user.status = status;
         }
+        let cloned_user = user.clone();
+        drop(user);
 
-        info!("Updated user: {} with ID: {}.", user.username, user.id);
-        Ok(user)
+        info!(
+            "Updated user: {} with ID: {}.",
+            cloned_user.username, cloned_user.id
+        );
+        Ok(cloned_user)
     }
 
-    pub async fn update_permissions(
-        &mut self,
+    pub fn update_permissions(
+        &self,
         session: &Session,
         user_id: &Identifier,
         permissions: Option<Permissions>,
@@ -256,13 +296,14 @@ impl IggyShard {
 
         {
             self.permissioner
+            .borrow()
                 .update_permissions(session.get_user_id())
                 .with_error_context(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - permission denied to update permissions for user with id: {}", session.get_user_id()
                     )
                 })?;
-            let user = self.get_user(user_id).with_error_context(|error| {
+            let user: User = self.get_user(user_id).with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get user with id: {user_id}")
             })?;
             if user.is_root() {
@@ -271,11 +312,12 @@ impl IggyShard {
             }
 
             self.permissioner
+                .borrow_mut()
                 .update_permissions_for_user(user.id, permissions.clone());
         }
 
         {
-            let user = self.get_user_mut(user_id).with_error_context(|error| {
+            let mut user = self.get_user_mut(user_id).with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to get mutable reference to the user with id: {user_id}"
                 )
@@ -290,8 +332,8 @@ impl IggyShard {
         Ok(())
     }
 
-    pub async fn change_password(
-        &mut self,
+    pub fn change_password(
+        &self,
         session: &Session,
         user_id: &Identifier,
         current_password: &str,
@@ -305,11 +347,13 @@ impl IggyShard {
             })?;
             let session_user_id = session.get_user_id();
             if user.id != session_user_id {
-                self.permissioner.change_password(session_user_id)?;
+                self.permissioner
+                    .borrow()
+                    .change_password(session_user_id)?;
             }
         }
 
-        let user = self.get_user_mut(user_id).with_error_context(|error| {
+        let mut user = self.get_user_mut(user_id).with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to get mutable reference to the user with id: {user_id}")
         })?;
         if !crypto::verify_password(current_password, &user.password) {
@@ -328,22 +372,21 @@ impl IggyShard {
         Ok(())
     }
 
-    pub async fn login_user(
+    pub fn login_user(
         &self,
         username: &str,
         password: &str,
         session: Option<&Session>,
-    ) -> Result<&User, IggyError> {
+    ) -> Result<User, IggyError> {
         self.login_user_with_credentials(username, Some(password), session)
-            .await
     }
 
-    pub async fn login_user_with_credentials(
+    pub fn login_user_with_credentials(
         &self,
         username: &str,
         password: Option<&str>,
         session: Option<&Session>,
-    ) -> Result<&User, IggyError> {
+    ) -> Result<User, IggyError> {
         let user = match self.get_user(&username.try_into()?) {
             Ok(user) => user,
             Err(_) => {
@@ -380,14 +423,13 @@ impl IggyShard {
                 user.username,
                 session.get_user_id()
             );
-            self.logout_user(session).await?;
+            self.logout_user(session)?;
         }
 
         session.set_user_id(user.id);
-        let mut client_manager = self.client_manager.write().await;
+        let mut client_manager = self.client_manager.borrow_mut();
         client_manager
             .set_user_id(session.client_id, user.id)
-            .await
             .with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to set user_id to client, client ID: {}, user ID: {}",
@@ -397,7 +439,7 @@ impl IggyShard {
         Ok(user)
     }
 
-    pub async fn logout_user(&self, session: &Session) -> Result<(), IggyError> {
+    pub fn logout_user(&self, session: &Session) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
         let user = self
             .get_user(&Identifier::numeric(session.get_user_id())?)
@@ -412,8 +454,8 @@ impl IggyShard {
             user.username, user.id
         );
         if session.client_id > 0 {
-            let mut client_manager = self.client_manager.write().await;
-            client_manager.clear_user_id(session.client_id).await?;
+            let mut client_manager = self.client_manager.borrow_mut();
+            client_manager.clear_user_id(session.client_id)?;
             info!(
                 "Cleared user ID: {} for client: {}.",
                 user.id, session.client_id

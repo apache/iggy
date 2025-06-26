@@ -37,11 +37,11 @@ pub type IggyRwLock<T> = fast_async_lock::IggyFastAsyncRwLock<T>;
 
 #[allow(async_fn_in_trait)]
 pub trait IggySharedMutFn<T> {
-    type ReadGuard<'a>: Deref<Target = T> 
+    type ReadGuard<'a>: Deref<Target = T>
     where
         T: 'a,
         Self: 'a;
-    type WriteGuard<'a>: DerefMut<Target = T> 
+    type WriteGuard<'a>: DerefMut<Target = T>
     where
         T: 'a,
         Self: 'a;

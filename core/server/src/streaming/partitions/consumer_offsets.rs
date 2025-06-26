@@ -26,10 +26,7 @@ use iggy_common::IggyError;
 use tracing::trace;
 
 impl Partition {
-    pub fn get_consumer_offset(
-        &self,
-        consumer: PollingConsumer,
-    ) -> Result<Option<u64>, IggyError> {
+    pub fn get_consumer_offset(&self, consumer: PollingConsumer) -> Result<Option<u64>, IggyError> {
         trace!(
             "Getting consumer offset for {}, partition: {}, current: {}...",
             consumer, self.partition_id, self.current_offset

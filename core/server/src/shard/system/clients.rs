@@ -16,17 +16,16 @@
  * under the License.
  */
 
+use super::COMPONENT;
 use crate::shard::IggyShard;
 use crate::streaming::clients::client_manager::{Client, Transport};
 use crate::streaming::session::Session;
 use error_set::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
-use iggy_common::locking::IggyRwLock;
 use iggy_common::locking::IggySharedMutFn;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::sync::Arc;
 use tracing::{error, info};
 
 impl IggyShard {
@@ -43,7 +42,7 @@ impl IggyShard {
 
         {
             let mut client_manager = self.client_manager.borrow_mut();
-            let client = client_manager.delete_client(client_id).await;
+            let client = client_manager.delete_client(client_id);
             if client.is_none() {
                 error!("Client with ID: {client_id} was not found in the client manager.",);
                 return;
@@ -51,7 +50,6 @@ impl IggyShard {
 
             self.metrics.decrement_clients(1);
             let client = client.unwrap();
-            let client = client.read().await;
             consumer_groups = client
                 .consumer_groups
                 .iter()
@@ -65,14 +63,12 @@ impl IggyShard {
         }
 
         for (stream_id, topic_id, consumer_group_id) in consumer_groups.into_iter() {
-            _ = self
-                .leave_consumer_group_by_client(
-                    &Identifier::numeric(stream_id).unwrap(),
-                    &Identifier::numeric(topic_id).unwrap(),
-                    &Identifier::numeric(consumer_group_id).unwrap(),
-                    client_id,
-                )
-                .await
+            _ = self.leave_consumer_group_by_client(
+                &Identifier::numeric(stream_id).unwrap(),
+                &Identifier::numeric(topic_id).unwrap(),
+                &Identifier::numeric(consumer_group_id).unwrap(),
+                client_id,
+            )
         }
     }
 
@@ -80,9 +76,10 @@ impl IggyShard {
         &self,
         session: &Session,
         client_id: u32,
-    ) -> Result<Option<IggySharedMut<Client>>, IggyError> {
+    ) -> Result<Option<Client>, IggyError> {
         self.ensure_authenticated(session)?;
         self.permissioner
+        .borrow()
             .get_client(session.get_user_id())
             .with_error_context(|error| {
                 format!(
@@ -91,16 +88,13 @@ impl IggyShard {
                 )
             })?;
 
-        let client_manager = self.client_manager.read().await;
-        Ok(client_manager.try_get_client(client_id))
+        Ok(self.client_manager.borrow().try_get_client(client_id))
     }
 
-    pub async fn get_clients(
-        &self,
-        session: &Session,
-    ) -> Result<Vec<IggySharedMut<Client>>, IggyError> {
+    pub async fn get_clients(&self, session: &Session) -> Result<Vec<Client>, IggyError> {
         self.ensure_authenticated(session)?;
         self.permissioner
+            .borrow()
             .get_clients(session.get_user_id())
             .with_error_context(|error| {
                 format!(
@@ -109,7 +103,6 @@ impl IggyShard {
                 )
             })?;
 
-        let client_manager = self.client_manager.read().await;
-        Ok(client_manager.get_clients())
+        Ok(self.client_manager.borrow().get_clients())
     }
 }

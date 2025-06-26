@@ -87,7 +87,7 @@ pub enum PartitionStorageKind {
 #[cfg_attr(test, automock)]
 pub trait SystemInfoStorage {
     fn load(&self) -> impl Future<Output = Result<SystemInfo, IggyError>>;
-    fn save(&self, system_info: &SystemInfo) -> impl Future<Output = Result<(), IggyError>>; 
+    fn save(&self, system_info: &SystemInfo) -> impl Future<Output = Result<(), IggyError>>;
 }
 
 #[cfg_attr(test, automock)]
@@ -96,8 +96,8 @@ pub trait StreamStorage {
         &self,
         stream: &mut Stream,
         state: StreamState,
-    ) -> impl Future<Output = Result<(), IggyError>>; 
-    fn save(&self, stream: &Stream) -> impl Future<Output = Result<(), IggyError>>; 
+    ) -> impl Future<Output = Result<(), IggyError>>;
+    fn save(&self, stream: &Stream) -> impl Future<Output = Result<(), IggyError>>;
     fn delete(&self, stream: &Stream) -> impl Future<Output = Result<(), IggyError>>;
 }
 
@@ -107,9 +107,9 @@ pub trait TopicStorage {
         &self,
         topic: &mut Topic,
         state: TopicState,
-    ) -> impl Future<Output = Result<(), IggyError>>; 
-    fn save(&self, topic: &Topic) -> impl Future<Output = Result<(), IggyError>>; 
-    fn delete(&self, topic: &Topic) -> impl Future<Output = Result<(), IggyError>>; 
+    ) -> impl Future<Output = Result<(), IggyError>>;
+    fn save(&self, topic: &Topic) -> impl Future<Output = Result<(), IggyError>>;
+    fn delete(&self, topic: &Topic) -> impl Future<Output = Result<(), IggyError>>;
 }
 
 #[cfg_attr(test, automock)]
@@ -119,9 +119,8 @@ pub trait PartitionStorage {
         partition: &mut Partition,
         state: PartitionState,
     ) -> impl Future<Output = Result<(), IggyError>>;
-    fn save(&self, partition: &mut Partition)
-    -> impl Future<Output = Result<(), IggyError>>;
-    fn delete(&self, partition: &Partition) -> impl Future<Output = Result<(), IggyError>>; 
+    fn save(&self, partition: &mut Partition) -> impl Future<Output = Result<(), IggyError>>;
+    fn delete(&self, partition: &Partition) -> impl Future<Output = Result<(), IggyError>>;
     fn save_consumer_offset(
         &self,
         offset: u64,
@@ -131,15 +130,9 @@ pub trait PartitionStorage {
         &self,
         kind: ConsumerKind,
         path: &str,
-    ) -> impl Future<Output = Result<Vec<ConsumerOffset>, IggyError>>; 
-    fn delete_consumer_offsets(
-        &self,
-        path: &str,
-    ) -> impl Future<Output = Result<(), IggyError>>; 
-    fn delete_consumer_offset(
-        &self,
-        path: &str,
-    ) -> impl Future<Output = Result<(), IggyError>>;
+    ) -> impl Future<Output = Result<Vec<ConsumerOffset>, IggyError>>;
+    fn delete_consumer_offsets(&self, path: &str) -> impl Future<Output = Result<(), IggyError>>;
+    fn delete_consumer_offset(&self, path: &str) -> impl Future<Output = Result<(), IggyError>>;
 }
 
 #[derive(Debug)]

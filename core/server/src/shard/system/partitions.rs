@@ -16,16 +16,16 @@
  * under the License.
  */
 
+use super::COMPONENT;
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::COMPONENT;
-use crate::streaming::systems::system::System;
 use error_set::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
 
 impl IggyShard {
     pub async fn create_partitions(
-        &mut self,
+        &self,
         session: &Session,
         stream_id: &Identifier,
         topic_id: &Identifier,
@@ -33,8 +33,13 @@ impl IggyShard {
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
         {
-            let topic = self.find_topic(session, stream_id, topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
-            self.permissioner.create_partitions(
+            let stream = self.get_stream(stream_id).with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - stream not found for stream ID: {stream_id}"
+                )
+            })?;
+            let topic = self.find_topic(session, &stream, topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic ID: {topic_id}"))?;
+            self.permissioner.borrow().create_partitions(
                 session.get_user_id(),
                 topic.stream_id,
                 topic.topic_id,
@@ -46,28 +51,33 @@ impl IggyShard {
             ))?;
         }
 
-        let topic = self
-            .get_stream_mut(stream_id)?
+        let mut stream = self.get_stream_mut(stream_id).with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
+        })?;
+        let topic = stream
             .get_topic_mut(topic_id)
             .with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to get mutable reference to stream with id: {stream_id}"
                 )
             })?;
+
+        // TODO: Make add persisted partitions to topic sync, and extract the storage persister out of it
+        // perform disk i/o outside of the borrow_mut of the stream.
         topic
             .add_persisted_partitions(partitions_count)
             .await
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to add persisted partitions, topic: {topic}")
             })?;
-        topic.reassign_consumer_groups().await;
+        topic.reassign_consumer_groups();
         self.metrics.increment_partitions(partitions_count);
         self.metrics.increment_segments(partitions_count);
         Ok(())
     }
 
     pub async fn delete_partitions(
-        &mut self,
+        &self,
         session: &Session,
         stream_id: &Identifier,
         topic_id: &Identifier,
@@ -75,8 +85,13 @@ impl IggyShard {
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
         {
-            let topic = self.find_topic(session, stream_id, topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
-            self.permissioner.delete_partitions(
+            let stream = self.get_stream(stream_id).with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - stream not found for stream ID: {stream_id}"
+                )
+            })?;
+            let topic = self.find_topic(session, &stream, topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
+            self.permissioner.borrow().delete_partitions(
                 session.get_user_id(),
                 topic.stream_id,
                 topic.topic_id,
@@ -88,21 +103,26 @@ impl IggyShard {
             ))?;
         }
 
-        let topic = self
-            .get_stream_mut(stream_id)?
+        let mut stream = self.get_stream_mut(stream_id).with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
+        })?;
+        let topic = stream
             .get_topic_mut(topic_id)
             .with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to get mutable reference to stream with id: {stream_id}"
                 )
             })?;
+
+        // TODO: Make delete persisted partitions from topic sync, and extract the storage persister out of it
+        // perform disk i/o outside of the borrow_mut of the stream.
         let partitions = topic
             .delete_persisted_partitions(partitions_count)
             .await
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to delete persisted partitions for topic: {topic}")
             })?;
-        topic.reassign_consumer_groups().await;
+        topic.reassign_consumer_groups();
         if let Some(partitions) = partitions {
             self.metrics.decrement_partitions(partitions_count);
             self.metrics.decrement_segments(partitions.segments_count);

@@ -16,29 +16,39 @@
  * under the License.
  */
 
+use std::cell::Ref;
+
+use super::COMPONENT;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
+use crate::streaming::streams::stream::Stream;
 use crate::streaming::topics::consumer_group::ConsumerGroup;
 use error_set::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
 use iggy_common::locking::IggySharedMutFn;
-use tokio::sync::RwLock;
 
 impl IggyShard {
-    pub fn get_consumer_group(
+    pub fn get_consumer_group<'cg, 'stream>(
         &self,
         session: &Session,
-        stream_id: &Identifier,
+        stream: &'stream Stream,
         topic_id: &Identifier,
         group_id: &Identifier,
-    ) -> Result<Option<&RwLock<ConsumerGroup>>, IggyError> {
+    ) -> Result<Option<Ref<'cg, ConsumerGroup>>, IggyError>
+    where
+        'stream: 'cg,
+    {
         self.ensure_authenticated(session)?;
-        let Some(topic) = self.try_find_topic(session, stream_id, topic_id)? else {
-            return Ok(None);
-        };
+        let stream_id = stream.stream_id;
+        let topic = stream.get_topic(topic_id).with_error_context(|error| {
+            format!(
+                "{COMPONENT} (error: {error}) - topic with ID: {topic_id} was not found in stream with ID: {stream_id}",
+            )
+        })?;
 
         self.permissioner
+        .borrow()
             .get_consumer_group(session.get_user_id(), topic.stream_id, topic.topic_id)
             .with_error_context(|error| {
                 format!(
@@ -55,12 +65,16 @@ impl IggyShard {
         session: &Session,
         stream_id: &Identifier,
         topic_id: &Identifier,
-    ) -> Result<Vec<&RwLock<ConsumerGroup>>, IggyError> {
+    ) -> Result<Vec<ConsumerGroup>, IggyError> {
         self.ensure_authenticated(session)?;
-        let topic = self.find_topic(session, stream_id, topic_id)
+        let stream = self.get_stream(stream_id).with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - stream with ID: {stream_id} was not found")
+        })?;
+        let topic = self.find_topic(session, &stream, topic_id)
             .with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic with ID: {topic_id} was not found in stream with ID: {stream_id}"))?;
 
         self.permissioner
+        .borrow()
             .get_consumer_groups(session.get_user_id(), topic.stream_id, topic.topic_id)
             .with_error_context(|error| {
                 format!(
@@ -72,40 +86,45 @@ impl IggyShard {
         Ok(topic.get_consumer_groups())
     }
 
-    pub async fn create_consumer_group(
-        &mut self,
+    pub fn create_consumer_group(
+        &self,
         session: &Session,
         stream_id: &Identifier,
         topic_id: &Identifier,
         group_id: Option<u32>,
         name: &str,
-    ) -> Result<&RwLock<ConsumerGroup>, IggyError> {
+    ) -> Result<u32, IggyError> {
         self.ensure_authenticated(session)?;
         {
-            let topic = self.find_topic(session, stream_id, topic_id)
+            let stream = self.get_stream(stream_id).with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - stream not found for stream ID: {stream_id}"
+                )
+            })?;
+            let topic = self.find_topic(session, &stream, topic_id)
                 .with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
 
-            self.permissioner.create_consumer_group(
+            self.permissioner.borrow().create_consumer_group(
                 session.get_user_id(),
                 topic.stream_id,
                 topic.topic_id,
             ).with_error_context(|error| format!("{COMPONENT} (error: {error}) - permission denied to create consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), topic.stream_id, topic.topic_id))?;
         }
 
-        let topic = self.get_stream_mut(stream_id)?
-            .get_topic_mut(topic_id)
+        let mut stream = self.get_stream_mut(stream_id)
+            .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to get mutable reference to stream with ID: {stream_id}"))?;
+        let topic = stream.get_topic_mut(topic_id)
             .with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
 
         topic
             .create_consumer_group(group_id, name)
-            .await
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to create consumer group with name: {name}")
-            })
+            }).map(|cg| cg.group_id)
     }
 
     pub async fn delete_consumer_group(
-        &mut self,
+        &self,
         session: &Session,
         stream_id: &Identifier,
         topic_id: &Identifier,
@@ -115,10 +134,15 @@ impl IggyShard {
         let stream_id_value;
         let topic_id_value;
         {
-            let topic = self.find_topic(session, stream_id, topic_id)
+            let stream = self.get_stream(stream_id).with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - stream not found for stream ID: {stream_id}"
+                )
+            })?;
+            let topic = self.find_topic(session, &stream, topic_id)
                 .with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
 
-            self.permissioner.delete_consumer_group(
+            self.permissioner.borrow().delete_consumer_group(
                 session.get_user_id(),
                 topic.stream_id,
                 topic.topic_id,
@@ -130,7 +154,7 @@ impl IggyShard {
 
         let consumer_group;
         {
-            let stream = self.get_stream_mut(stream_id).with_error_context(|error| {
+            let mut stream = self.get_stream_mut(stream_id).with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to get mutable reference to stream with id: {stream_id}"
                 )
@@ -142,25 +166,20 @@ impl IggyShard {
                 .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to delete consumer group with ID: {consumer_group_id}"))?
         }
 
-        let client_manager = self.client_manager.read().await;
-        let consumer_group = consumer_group.read().await;
         for member in consumer_group.get_members() {
-            let member = member.read().await;
-            client_manager
-                .leave_consumer_group(
+            self.client_manager.borrow_mut().leave_consumer_group(
                     member.id,
                     stream_id_value,
                     topic_id_value,
                     consumer_group.group_id,
                 )
-                .await
                 .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to make client leave consumer group for client ID: {}, group ID: {}", member.id, consumer_group.group_id))?;
         }
 
         Ok(())
     }
 
-    pub async fn join_consumer_group(
+    pub fn join_consumer_group(
         &self,
         session: &Session,
         stream_id: &Identifier,
@@ -171,15 +190,20 @@ impl IggyShard {
         let stream_id_value;
         let topic_id_value;
         {
+            let stream = self.get_stream(stream_id).with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - stream not found for stream ID: {stream_id}"
+                )
+            })?;
             let topic = self
-                .find_topic(session, stream_id, topic_id)
+                .find_topic(session, &stream, topic_id)
                 .with_error_context(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}",
                     )
                 })?;
 
-            self.permissioner.join_consumer_group(
+            self.permissioner.borrow().join_consumer_group(
                 session.get_user_id(),
                 topic.stream_id,
                 topic.topic_id,
@@ -191,7 +215,14 @@ impl IggyShard {
 
         let group_id;
         {
-            let topic = self.find_topic(session, stream_id, topic_id)?;
+            let mut stream = self.get_stream_mut(stream_id)
+                .with_error_context(|error| {
+                    format!("{COMPONENT} (error: {error}) - failed to get mutable reference to stream with ID: {stream_id}")
+                })?;
+            let topic = stream.get_topic_mut(topic_id)
+                .with_error_context(|error| {
+                    format!("{COMPONENT} (error: {error}) - failed to get mutable reference to topic with ID: {topic_id}")
+                })?;
 
             {
                 let consumer_group = topic
@@ -202,13 +233,11 @@ impl IggyShard {
                         )
                     })?;
 
-                let consumer_group = consumer_group.read().await;
                 group_id = consumer_group.group_id;
             }
 
             topic
                 .join_consumer_group(consumer_group_id, session.client_id)
-                .await
                 .with_error_context(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - failed to join consumer group for group ID: {group_id}"
@@ -216,10 +245,7 @@ impl IggyShard {
                 })?;
         }
 
-        let client_manager = self.client_manager.read().await;
-        client_manager
-            .join_consumer_group(session.client_id, stream_id_value, topic_id_value, group_id)
-            .await
+        self.client_manager.borrow_mut().join_consumer_group(session.client_id, stream_id_value, topic_id_value, group_id)
             .with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to make client join consumer group for client ID: {}",
@@ -239,15 +265,23 @@ impl IggyShard {
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
         {
+            let stream = self.get_stream(stream_id).with_error_context(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
+            })?;
             let topic = self
-                .find_topic(session, stream_id, topic_id)
+                .find_topic(session, &stream, topic_id)
                 .with_error_context(|error| {
                     format!(
+<<<<<<< HEAD
                         "{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id:?}, topic_id: {topic_id:?}"
+=======
+                        "{COMPONENT} (error: {error}) - topic not found for stream ID: {:?}, topic_id: {:?}",
+                        stream.stream_id, topic_id
+>>>>>>> 48107890 (fix iggy shard errors)
                     )
                 })?;
 
-            self.permissioner.leave_consumer_group(
+            self.permissioner.borrow().leave_consumer_group(
                 session.get_user_id(),
                 topic.stream_id,
                 topic.topic_id,
@@ -260,7 +294,6 @@ impl IggyShard {
             consumer_group_id,
             session.client_id,
         )
-        .await
         .with_error_context(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to leave consumer group for client ID: {}",
@@ -269,7 +302,7 @@ impl IggyShard {
         })
     }
 
-    pub async fn leave_consumer_group_by_client(
+    pub fn leave_consumer_group_by_client(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
@@ -281,15 +314,17 @@ impl IggyShard {
         let group_id;
 
         {
-            let stream = self.get_stream(stream_id).with_error_context(|error| {
+            let mut stream = self.get_stream_mut(stream_id).with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
             })?;
-            let topic = stream.get_topic(topic_id)
+            let stream_id = stream.stream_id;
+            let topic = stream.get_topic_mut(topic_id)
                 .with_error_context(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}",
                     )
                 })?;
+            let topic_id = topic.topic_id;
             {
                 let consumer_group = topic
                     .get_consumer_group(consumer_group_id)
@@ -298,23 +333,23 @@ impl IggyShard {
                         "{COMPONENT} (error: {error}) - consumer group not found for group_id: {consumer_group_id}",
                     )
                     })?;
-                let consumer_group = consumer_group.read().await;
                 group_id = consumer_group.group_id;
             }
 
-            stream_id_value = stream.stream_id;
-            topic_id_value = topic.topic_id;
+            stream_id_value = stream_id;
+            topic_id_value = topic_id;
             topic
                 .leave_consumer_group(consumer_group_id, client_id)
-                .await
                 .with_error_context(|error| {
                     format!("{COMPONENT} (error: {error}) - failed leave consumer group, client ID {client_id}",)
                 })?;
         }
 
-        let client_manager = self.client_manager.read().await;
-        client_manager
-            .leave_consumer_group(client_id, stream_id_value, topic_id_value, group_id)
-            .await
+        self.client_manager.borrow_mut().leave_consumer_group(
+            client_id,
+            stream_id_value,
+            topic_id_value,
+            group_id,
+        )
     }
 }

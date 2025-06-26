@@ -24,9 +24,8 @@ use crate::streaming::topics::consumer_group::ConsumerGroup;
 use crate::streaming::topics::topic::Topic;
 use crate::streaming::users::user::User;
 use bytes::{BufMut, Bytes, BytesMut};
-use iggy_common::locking::{IggySharedMut, IggySharedMutFn};
+use iggy_common::locking::IggySharedMutFn;
 use iggy_common::{BytesSerializable, ConsumerOffsetInfo, Sizeable, Stats, UserId};
-use tokio::sync::RwLock;
 
 pub fn map_stats(stats: &Stats) -> Bytes {
     let mut bytes = BytesMut::with_capacity(104);
@@ -95,11 +94,10 @@ pub fn map_client(client: &Client) -> Bytes {
     bytes.freeze()
 }
 
-pub async fn map_clients(clients: &[IggySharedMut<Client>]) -> Bytes {
+pub async fn map_clients(clients: &[Client]) -> Bytes {
     let mut bytes = BytesMut::new();
     for client in clients {
-        let client = client.read().await;
-        extend_client(&client, &mut bytes);
+        extend_client(client, &mut bytes);
     }
     bytes.freeze()
 }
@@ -183,12 +181,11 @@ pub async fn map_topic(topic: &Topic) -> Bytes {
     bytes.freeze()
 }
 
-pub async fn map_consumer_group(consumer_group: &ConsumerGroup) -> Bytes {
+pub fn map_consumer_group(consumer_group: &ConsumerGroup) -> Bytes {
     let mut bytes = BytesMut::new();
     extend_consumer_group(consumer_group, &mut bytes);
     let members = consumer_group.get_members();
     for member in members {
-        let member = member.read().await;
         bytes.put_u32_le(member.id);
         let partitions = member.get_partitions();
         bytes.put_u32_le(partitions.len() as u32);
@@ -199,10 +196,9 @@ pub async fn map_consumer_group(consumer_group: &ConsumerGroup) -> Bytes {
     bytes.freeze()
 }
 
-pub async fn map_consumer_groups(consumer_groups: &[&RwLock<ConsumerGroup>]) -> Bytes {
+pub fn map_consumer_groups(consumer_groups: &[ConsumerGroup]) -> Bytes {
     let mut bytes = BytesMut::new();
     for consumer_group in consumer_groups {
-        let consumer_group = consumer_group.read().await;
         extend_consumer_group(&consumer_group, &mut bytes);
     }
     bytes.freeze()

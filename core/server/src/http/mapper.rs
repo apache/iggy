@@ -28,12 +28,11 @@ use iggy_common::PersonalAccessTokenInfo;
 use iggy_common::Sizeable;
 use iggy_common::StreamDetails;
 use iggy_common::TopicDetails;
-use iggy_common::locking::IggySharedMut;
 use iggy_common::locking::IggySharedMutFn;
 use iggy_common::{ConsumerGroupDetails, ConsumerGroupMember};
 use iggy_common::{IdentityInfo, TokenInfo};
 use iggy_common::{UserInfo, UserInfoDetails};
-use tokio::sync::RwLock;
+
 
 pub fn map_stream(stream: &Stream) -> StreamDetails {
     let topics = map_topics(&stream.get_topics());
@@ -177,10 +176,9 @@ pub fn map_client(client: &Client) -> iggy_common::ClientInfoDetails {
     }
 }
 
-pub async fn map_clients(clients: &[IggySharedMut<Client>]) -> Vec<iggy_common::ClientInfo> {
+pub fn map_clients(clients: &[Client]) -> Vec<iggy_common::ClientInfo> {
     let mut all_clients = Vec::new();
     for client in clients {
-        let client = client.read().await;
         let client = iggy_common::ClientInfo {
             client_id: client.session.client_id,
             user_id: client.user_id,
@@ -195,12 +193,11 @@ pub async fn map_clients(clients: &[IggySharedMut<Client>]) -> Vec<iggy_common::
     all_clients
 }
 
-pub async fn map_consumer_groups(
-    consumer_groups: &[&RwLock<ConsumerGroup>],
+pub fn map_consumer_groups(
+    consumer_groups: &[ConsumerGroup],
 ) -> Vec<iggy_common::ConsumerGroup> {
     let mut groups = Vec::new();
     for consumer_group in consumer_groups {
-        let consumer_group = consumer_group.read().await;
         let consumer_group = iggy_common::ConsumerGroup {
             id: consumer_group.group_id,
             name: consumer_group.name.clone(),
@@ -213,7 +210,7 @@ pub async fn map_consumer_groups(
     groups
 }
 
-pub async fn map_consumer_group(consumer_group: &ConsumerGroup) -> ConsumerGroupDetails {
+pub fn map_consumer_group(consumer_group: &ConsumerGroup) -> ConsumerGroupDetails {
     let mut consumer_group_details = ConsumerGroupDetails {
         id: consumer_group.group_id,
         name: consumer_group.name.clone(),
@@ -223,7 +220,6 @@ pub async fn map_consumer_group(consumer_group: &ConsumerGroup) -> ConsumerGroup
     };
     let members = consumer_group.get_members();
     for member in members {
-        let member = member.read().await;
         let partitions = member.get_partitions();
         consumer_group_details.members.push(ConsumerGroupMember {
             id: member.id,
