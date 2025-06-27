@@ -19,12 +19,13 @@
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::consumer_groups::COMPONENT, sender::SenderKind};
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::join_consumer_group::JoinConsumerGroup;
+use std::rc::Rc;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for JoinConsumerGroup {
@@ -37,19 +38,17 @@ impl ServerCommandHandler for JoinConsumerGroup {
         self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Session,
-        system: &SharedSystem,
+        session: &Rc<Session>,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let system = system.read().await;
-        system
+        shard
             .join_consumer_group(
                 session,
                 &self.stream_id,
                 &self.topic_id,
                 &self.group_id,
             )
-            .await
             .with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to join consumer group for stream_id: {}, topic_id: {}, group_id: {}, session: {}",

@@ -57,7 +57,7 @@ impl IggyShard {
         Ok(self.get_streams())
     }
 
-    pub fn find_stream<'a>(
+    pub fn find_stream(
         &self,
         session: &Session,
         identifier: &Identifier,
@@ -182,7 +182,7 @@ impl IggyShard {
         session: &Session,
         stream_id: Option<u32>,
         name: &str,
-    ) -> Result<u32, IggyError> {
+    ) -> Result<Identifier, IggyError> {
         self.ensure_authenticated(session)?;
         self.permissioner
             .borrow()
@@ -220,7 +220,7 @@ impl IggyShard {
             .insert(name.to_owned(), stream.stream_id);
         self.streams.borrow_mut().insert(stream.stream_id, stream);
         self.metrics.increment_streams(1);
-        Ok(id)
+        Ok(Identifier::numeric(id)?)
     }
 
     pub async fn update_stream(

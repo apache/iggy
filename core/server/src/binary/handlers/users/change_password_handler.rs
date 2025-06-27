@@ -19,14 +19,15 @@
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
+use crate::shard::IggyShard;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use crate::streaming::utils::crypto;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::change_password::ChangePassword;
+use std::rc::Rc;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for ChangePassword {
@@ -38,21 +39,19 @@ impl ServerCommandHandler for ChangePassword {
     async fn handle(
         self,
         sender: &mut SenderKind,
-        _length: u32,
-        session: &Session,
-        system: &SharedSystem,
+        length: u32,
+        session: &Rc<Session>,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        let mut system = system.write().await;
-        system
+        shard
                 .change_password(
                     session,
                     &self.user_id,
                     &self.current_password,
                     &self.new_password,
                 )
-                .await
                 .with_error_context(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - failed to change password for user_id: {}, session: {session}",
@@ -61,8 +60,7 @@ impl ServerCommandHandler for ChangePassword {
                 })?;
 
         // For the security of the system, we hash the password before storing it in metadata.
-        let system = system.downgrade();
-        system
+        shard
             .state
             .apply(
                 session.get_user_id(),

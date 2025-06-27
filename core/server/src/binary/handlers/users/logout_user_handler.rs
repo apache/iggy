@@ -16,11 +16,13 @@
  * under the License.
  */
 
+use std::rc::Rc;
+
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
@@ -36,18 +38,14 @@ impl ServerCommandHandler for LogoutUser {
     async fn handle(
         self,
         sender: &mut SenderKind,
-        _length: u32,
-        session: &Session,
-        system: &SharedSystem,
+        length: u32,
+        session: &Rc<Session>,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let system = system.read().await;
-        system
-            .logout_user(session)
-            .await
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to logout user, session: {session}")
-            })?;
+        shard.logout_user(session).with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to logout user, session: {session}")
+        })?;
         session.clear_user_id();
         sender.send_empty_ok_response().await?;
         Ok(())

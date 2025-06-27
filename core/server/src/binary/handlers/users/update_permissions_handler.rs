@@ -16,12 +16,14 @@
  * under the License.
  */
 
+use std::rc::Rc;
+
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
+use crate::shard::IggyShard;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
@@ -38,21 +40,18 @@ impl ServerCommandHandler for UpdatePermissions {
         self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Session,
-        system: &SharedSystem,
+        session: &Rc<Session>,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        let mut system = system.write().await;
-        system
+        shard
                 .update_permissions(session, &self.user_id, self.permissions.clone())
-                .await
                 .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to update permissions for user_id: {}, session: {session}",
                     self.user_id
                 ))?;
 
-        let system = system.downgrade();
-        system
+        shard
             .state
             .apply(
                 session.get_user_id(),

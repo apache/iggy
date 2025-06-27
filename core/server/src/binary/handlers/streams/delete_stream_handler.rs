@@ -19,13 +19,14 @@
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::streams::COMPONENT, sender::SenderKind};
+use crate::shard::IggyShard;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::delete_stream::DeleteStream;
+use std::rc::Rc;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for DeleteStream {
@@ -38,22 +39,20 @@ impl ServerCommandHandler for DeleteStream {
         self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Session,
-        system: &SharedSystem,
+        session: &Rc<Session>,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
         let stream_id = self.stream_id.clone();
 
-        let mut system = system.write().await;
-        system
+        shard
                 .delete_stream(session, &self.stream_id)
                 .await
                 .with_error_context(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to delete stream with ID: {stream_id}, session: {session}")
                 })?;
 
-        let system = system.downgrade();
-        system
+        shard
             .state
             .apply(session.get_user_id(), &EntryCommand::DeleteStream(self))
             .await

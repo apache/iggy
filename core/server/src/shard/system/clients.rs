@@ -72,7 +72,7 @@ impl IggyShard {
         }
     }
 
-    pub async fn get_client(
+    pub fn get_client(
         &self,
         session: &Session,
         client_id: u32,
@@ -91,7 +91,7 @@ impl IggyShard {
         Ok(self.client_manager.borrow().try_get_client(client_id))
     }
 
-    pub async fn get_clients(&self, session: &Session) -> Result<Vec<Client>, IggyError> {
+    pub fn get_clients(&self, session: &Session) -> Result<Vec<Client>, IggyError> {
         self.ensure_authenticated(session)?;
         self.permissioner
             .borrow()

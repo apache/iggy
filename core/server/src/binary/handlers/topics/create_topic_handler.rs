@@ -20,14 +20,15 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::{handlers::topics::COMPONENT, sender::SenderKind};
+use crate::shard::IggyShard;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateTopicWithId;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::create_topic::CreateTopic;
+use std::rc::Rc;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for CreateTopic {
@@ -40,14 +41,13 @@ impl ServerCommandHandler for CreateTopic {
         mut self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Session,
-        system: &SharedSystem,
+        session: &Rc<Session>,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id;
-        let mut system = system.write().await;
-        let topic = system
+        let created_topic_id = shard
                 .create_topic(
                     session,
                     &self.stream_id,
@@ -62,18 +62,31 @@ impl ServerCommandHandler for CreateTopic {
                 .await
                 .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to create topic for stream_id: {stream_id}, topic_id: {topic_id:?}"
                 ))?;
+        let stream = shard
+            .find_stream(session, &self.stream_id)
+            .with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - failed to get stream for stream_id: {stream_id}"
+                )
+            })?;
+        let topic = shard.find_topic(session, &stream, &created_topic_id)
+            .with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - failed to get topic with ID: {created_topic_id} in stream with ID: {stream_id}"
+                )
+            })?;
         self.message_expiry = topic.message_expiry;
         self.max_topic_size = topic.max_topic_size;
         let topic_id = topic.topic_id;
         let response = mapper::map_topic(topic).await;
 
-        let system = system.downgrade();
-        system
+        shard
             .state
             .apply(session.get_user_id(), &EntryCommand::CreateTopic(CreateTopicWithId {
                 topic_id,
                 command: self
-            }))            .await
+            }))
+            .await
             .with_error_context(|error| {
                 format!(
                 "{COMPONENT} (error: {error}) - failed to apply create topic for stream_id: {stream_id}, topic_id: {topic_id:?}"

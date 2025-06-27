@@ -16,6 +16,8 @@
  * under the License.
  */
 
+use std::cell::Ref;
+
 use crate::streaming::clients::client_manager::{Client, Transport};
 use crate::streaming::partitions::partition::Partition;
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
@@ -94,9 +96,9 @@ pub fn map_client(client: &Client) -> Bytes {
     bytes.freeze()
 }
 
-pub async fn map_clients(clients: &[Client]) -> Bytes {
+pub async fn map_clients(clients: Vec<Client>) -> Bytes {
     let mut bytes = BytesMut::new();
-    for client in clients {
+    for client in clients.iter() {
         extend_client(client, &mut bytes);
     }
     bytes.freeze()
@@ -117,9 +119,9 @@ pub fn map_user(user: &User) -> Bytes {
     bytes.freeze()
 }
 
-pub fn map_users(users: &[&User]) -> Bytes {
+pub fn map_users(users: Vec<User>) -> Bytes {
     let mut bytes = BytesMut::new();
-    for user in users {
+    for user in users.iter() {
         extend_user(user, &mut bytes);
     }
     bytes.freeze()
@@ -138,9 +140,9 @@ pub fn map_raw_pat(token: &str) -> Bytes {
     bytes.freeze()
 }
 
-pub fn map_personal_access_tokens(personal_access_tokens: &[PersonalAccessToken]) -> Bytes {
+pub fn map_personal_access_tokens(personal_access_tokens: Vec<PersonalAccessToken>) -> Bytes {
     let mut bytes = BytesMut::new();
-    for personal_access_token in personal_access_tokens {
+    for personal_access_token in personal_access_tokens.iter() {
         extend_pat(personal_access_token, &mut bytes);
     }
     bytes.freeze()
@@ -155,15 +157,15 @@ pub fn map_stream(stream: &Stream) -> Bytes {
     bytes.freeze()
 }
 
-pub fn map_streams(streams: &[&Stream]) -> Bytes {
+pub fn map_streams(streams: Vec<Ref<'_, Stream>>) -> Bytes {
     let mut bytes = BytesMut::new();
-    for stream in streams {
+    for stream in streams.iter() {
         extend_stream(stream, &mut bytes);
     }
     bytes.freeze()
 }
 
-pub fn map_topics(topics: &[&Topic]) -> Bytes {
+pub fn map_topics(topics: Vec<&Topic>) -> Bytes {
     let mut bytes = BytesMut::new();
     for topic in topics {
         extend_topic(topic, &mut bytes);
@@ -196,7 +198,7 @@ pub fn map_consumer_group(consumer_group: &ConsumerGroup) -> Bytes {
     bytes.freeze()
 }
 
-pub fn map_consumer_groups(consumer_groups: &[ConsumerGroup]) -> Bytes {
+pub fn map_consumer_groups(consumer_groups: Vec<ConsumerGroup>) -> Bytes {
     let mut bytes = BytesMut::new();
     for consumer_group in consumer_groups {
         extend_consumer_group(&consumer_group, &mut bytes);

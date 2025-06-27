@@ -18,15 +18,17 @@
 
 use crate::binary::command::{BinaryServerCommand, ServerCommandHandler};
 use crate::binary::sender::SenderKind;
+use crate::shard::IggyShard;
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use crate::streaming::utils::PooledBuffer;
 use anyhow::Result;
+use bytes::BytesMut;
 use iggy_common::INDEX_SIZE;
 use iggy_common::Identifier;
 use iggy_common::Sizeable;
 use iggy_common::{IggyError, Partitioning, SendMessages, Validatable};
+use std::rc::Rc;
 use tracing::instrument;
 
 impl ServerCommandHandler for SendMessages {
@@ -45,36 +47,40 @@ impl ServerCommandHandler for SendMessages {
         mut self,
         sender: &mut SenderKind,
         length: u32,
-        session: &Session,
-        system: &SharedSystem,
+        session: &Rc<Session>,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         let total_payload_size = length as usize - std::mem::size_of::<u32>();
         let metadata_len_field_size = std::mem::size_of::<u32>();
 
-        let mut metadata_length_buffer = [0u8; 4];
-        sender.read(&mut metadata_length_buffer).await?;
-        let metadata_size = u32::from_le_bytes(metadata_length_buffer);
+        let mut metadata_length_buffer = BytesMut::with_capacity(4);
+        unsafe { metadata_length_buffer.set_len(4) };
+        let (result, metadata_len_buf) = sender.read(metadata_length_buffer).await;
+        result?;
+        let metadata_len_buf = metadata_len_buf.freeze();
+        let metadata_size = u32::from_le_bytes(metadata_len_buf[..].try_into().unwrap());
 
         let mut metadata_buffer = PooledBuffer::with_capacity(metadata_size as usize);
         unsafe { metadata_buffer.set_len(metadata_size as usize) };
-        sender.read(&mut metadata_buffer).await?;
+        let (result, metadata_buf) = sender.read(metadata_buffer).await;
+        result?;
 
         let mut element_size = 0;
 
-        let stream_id = Identifier::from_raw_bytes(&metadata_buffer)?;
+        let stream_id = Identifier::from_raw_bytes(&metadata_buf)?;
         element_size += stream_id.get_size_bytes().as_bytes_usize();
         self.stream_id = stream_id;
 
-        let topic_id = Identifier::from_raw_bytes(&metadata_buffer[element_size..])?;
+        let topic_id = Identifier::from_raw_bytes(&metadata_buf[element_size..])?;
         element_size += topic_id.get_size_bytes().as_bytes_usize();
         self.topic_id = topic_id;
 
-        let partitioning = Partitioning::from_raw_bytes(&metadata_buffer[element_size..])?;
+        let partitioning = Partitioning::from_raw_bytes(&metadata_buf[element_size..])?;
         element_size += partitioning.get_size_bytes().as_bytes_usize();
         self.partitioning = partitioning;
 
         let messages_count = u32::from_le_bytes(
-            metadata_buffer[element_size..element_size + 4]
+            metadata_buf[element_size..element_size + 4]
                 .try_into()
                 .unwrap(),
         );
@@ -82,13 +88,15 @@ impl ServerCommandHandler for SendMessages {
 
         let mut indexes_buffer = PooledBuffer::with_capacity(indexes_size);
         unsafe { indexes_buffer.set_len(indexes_size) };
-        sender.read(&mut indexes_buffer).await?;
+        let (result, indexes_buffer) = sender.read(indexes_buffer).await;
+        result?;
 
         let messages_size =
             total_payload_size - metadata_size as usize - indexes_size - metadata_len_field_size;
         let mut messages_buffer = PooledBuffer::with_capacity(messages_size);
         unsafe { messages_buffer.set_len(messages_size) };
-        sender.read(&mut messages_buffer).await?;
+        let (result, messages_buffer) = sender.read(messages_buffer).await;
+        result?;
 
         let indexes = IggyIndexesMut::from_bytes(indexes_buffer, 0);
         let batch = IggyMessagesBatchMut::from_indexes_and_messages(
@@ -99,8 +107,7 @@ impl ServerCommandHandler for SendMessages {
 
         batch.validate()?;
 
-        let system = system.read().await;
-        system
+        shard
             .append_messages(
                 session,
                 &self.stream_id,
@@ -110,7 +117,6 @@ impl ServerCommandHandler for SendMessages {
                 None,
             )
             .await?;
-        drop(system);
 
         sender.send_empty_ok_response().await?;
         Ok(())

@@ -84,7 +84,7 @@ impl ClientManager {
             return Err(IggyError::ClientNotFound(client_id));
         }
 
-        let mut client = client.unwrap();
+        let client = client.unwrap();
         client.user_id = Some(user_id);
         Ok(())
     }
@@ -95,13 +95,17 @@ impl ClientManager {
             return Err(IggyError::ClientNotFound(client_id));
         }
 
-        let mut client = client.unwrap();
+        let client = client.unwrap();
         client.user_id = None;
         Ok(())
     }
 
     pub fn try_get_client(&self, client_id: u32) -> Option<Client> {
         self.clients.get(&client_id).cloned()
+    }
+
+    pub fn try_get_client_mut(&mut self, client_id: u32) -> Option<&mut Client> {
+        self.clients.get_mut(&client_id)
     }
 
     pub fn get_clients(&self) -> Vec<Client> {

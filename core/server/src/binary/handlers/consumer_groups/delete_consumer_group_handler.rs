@@ -19,13 +19,14 @@
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::consumer_groups::COMPONENT, sender::SenderKind};
+use crate::shard::IggyShard;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::delete_consumer_group::DeleteConsumerGroup;
+use std::rc::Rc;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for DeleteConsumerGroup {
@@ -38,13 +39,12 @@ impl ServerCommandHandler for DeleteConsumerGroup {
         self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Session,
-        system: &SharedSystem,
+        session: &Rc<Session>,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        let mut system = system.write().await;
-        system
+        shard
                 .delete_consumer_group(
                     session,
                     &self.stream_id,
@@ -56,12 +56,11 @@ impl ServerCommandHandler for DeleteConsumerGroup {
                     self.group_id, self.topic_id, self.stream_id, session
                 ))?;
 
-        let system = system.downgrade();
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
         let group_id = self.group_id.clone();
 
-        system
+        shard
             .state
             .apply(
                 session.get_user_id(),

@@ -19,13 +19,14 @@
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::partitions::COMPONENT, sender::SenderKind};
+use crate::shard::IggyShard;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::delete_partitions::DeletePartitions;
+use std::rc::Rc;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for DeletePartitions {
@@ -38,15 +39,14 @@ impl ServerCommandHandler for DeletePartitions {
         self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Session,
-        system: &SharedSystem,
+        session: &Rc<Session>,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
 
-        let mut system = system.write().await;
-        system
+        shard
             .delete_partitions(
                 session,
                 &self.stream_id,
@@ -60,8 +60,7 @@ impl ServerCommandHandler for DeletePartitions {
                 )
             })?;
 
-        let system = system.downgrade();
-        system
+        shard
         .state
         .apply(
             session.get_user_id(),

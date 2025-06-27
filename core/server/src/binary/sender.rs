@@ -33,28 +33,33 @@ use quinn::{RecvStream, SendStream};
 macro_rules! forward_async_methods {
     (
         $(
-            async fn $method_name:ident(
+            async fn $method_name:ident
+            $(<$($generic:ident $(: $bound:path)?),+>)?
+            (
                 &mut self $(, $arg:ident : $arg_ty:ty )*
             ) -> $ret:ty ;
         )*
     ) => {
         $(
-            pub async fn $method_name(&mut self, $( $arg: $arg_ty ),* ) -> $ret {
+            pub async fn $method_name
+            $(<$($generic $(: $bound)?),+>)?
+            (&mut self, $( $arg: $arg_ty ),* ) -> $ret {
                 match self {
-                    Self::Tcp(d) => d.$method_name($( $arg ),*).await,
-                    Self::TcpTls(s) => s.$method_name($( $arg ),*).await,
-                    Self::Quic(s) => s.$method_name($( $arg ),*).await,
+                    Self::Tcp(d) => d.$method_name$(::<$($generic),+>)?($( $arg ),*).await,
+                    Self::TcpTls(s) => s.$method_name$(::<$($generic),+>)?($( $arg ),*).await,
+                    Self::Quic(s) => s.$method_name$(::<$($generic),+>)?($( $arg ),*).await,
                 }
             }
         )*
     }
 }
 
+
 pub trait Sender {
-    fn read(
+    fn read<B: IoBufMut>(
         &mut self,
-        buffer: BytesMut,
-    ) -> impl Future<Output = (Result<usize, IggyError>, BytesMut)>;
+        buffer: B
+    ) -> impl Future<Output = (Result<usize, IggyError>, B)>;
     fn send_empty_ok_response(&mut self) -> impl Future<Output = Result<(), IggyError>>;
     fn send_ok_response(&mut self, payload: &[u8]) -> impl Future<Output = Result<(), IggyError>>;
     fn send_ok_response_vectored(
@@ -92,7 +97,7 @@ impl SenderKind {
     }
 
     forward_async_methods! {
-        async fn read(&mut self, buffer: BytesMut) -> (Result<usize, IggyError>, BytesMut);
+        async fn read<B: IoBufMut>(&mut self, buffer: B) -> (Result<usize, IggyError>, B);
         async fn send_empty_ok_response(&mut self) -> Result<(), IggyError>;
         async fn send_ok_response(&mut self, payload: &[u8]) -> Result<(), IggyError>;
         async fn send_ok_response_vectored(&mut self, length: &[u8], slices: Vec<libc::iovec>) -> Result<(), IggyError>;

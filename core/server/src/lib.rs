@@ -18,6 +18,8 @@
 
 #[cfg(not(feature = "disable-mimalloc"))]
 use mimalloc::MiMalloc;
+use nix::libc::iovec;
+use nix::libc::c_void;
 
 #[cfg(not(feature = "disable-mimalloc"))]
 #[global_allocator]
@@ -51,5 +53,12 @@ pub fn map_toggle_str<'a>(enabled: bool) -> &'a str {
     match enabled {
         true => "enabled",
         false => "disabled",
+    }
+}
+
+pub fn to_iovec<T>(data: &[T]) -> iovec {
+    iovec {
+        iov_base: data.as_ptr() as *mut c_void,
+        iov_len: data.len() * std::mem::size_of::<T>(),
     }
 }

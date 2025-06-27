@@ -20,13 +20,15 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::messages::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::sender::SenderKind;
+use crate::shard::system::messages::PollingArgs;
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::messages::PollingArgs;
-use crate::streaming::systems::system::SharedSystem;
+use crate::to_iovec;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::{IggyError, PollMessages};
 use std::io::IoSlice;
+use std::rc::Rc;
 use tracing::{debug, trace};
 
 #[derive(Debug)]
@@ -53,13 +55,12 @@ impl ServerCommandHandler for PollMessages {
         self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Session,
-        system: &SharedSystem,
+        session: &Rc<Session>,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        let system = system.read().await;
-        let (metadata, messages) = system
+        let (metadata, messages) = shard
             .poll_messages(
                 session,
                 &self.consumer,
@@ -73,7 +74,6 @@ impl ServerCommandHandler for PollMessages {
                 "{COMPONENT} (error: {error}) - failed to poll messages for consumer: {}, stream_id: {}, topic_id: {}, partition_id: {:?}, session: {session}.",
                 self.consumer, self.stream_id, self.topic_id, self.partition_id
             ))?;
-        drop(system);
 
         // Collect all chunks first into a Vec to extend their lifetimes.
         // This ensures the Bytes (in reality Arc<[u8]>) references from each IggyMessagesBatch stay alive
@@ -89,12 +89,11 @@ impl ServerCommandHandler for PollMessages {
         let count = messages.count().to_le_bytes();
 
         let mut io_slices = Vec::with_capacity(messages.containers_count() + 3);
-        io_slices.push(IoSlice::new(&partition_id));
-        io_slices.push(IoSlice::new(&current_offset));
-        io_slices.push(IoSlice::new(&count));
+        io_slices.push(to_iovec(&partition_id));
+        io_slices.push(to_iovec(&current_offset));
+        io_slices.push(to_iovec(&count));
 
-        io_slices.extend(messages.iter().map(|m| IoSlice::new(m)));
-
+        io_slices.extend(messages.iter().map(|m| to_iovec(&m)));
         trace!(
             "Sending {} messages to client ({} bytes) to client",
             messages.count(),

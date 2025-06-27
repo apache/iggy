@@ -16,8 +16,6 @@
  * under the License.
  */
 
-use std::rc::Rc;
-
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
@@ -30,6 +28,7 @@ use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
+use std::rc::Rc;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for CreateConsumerGroup {
@@ -47,7 +46,7 @@ impl ServerCommandHandler for CreateConsumerGroup {
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        let consumer_group = shard
+        let consumer_group_id = shard
                 .create_consumer_group(
                     session,
                     &self.stream_id,
@@ -55,23 +54,34 @@ impl ServerCommandHandler for CreateConsumerGroup {
                     self.group_id,
                     &self.name,
                 )
-                .await
                 .with_error_context(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - failed to create consumer group for stream_id: {}, topic_id: {}, group_id: {:?}, session: {session}",
                         self.stream_id, self.topic_id, self.group_id
                     )
                 })?;
-        let consumer_group = consumer_group.read().await;
+            
+        let stream = shard.find_stream(session, &self.stream_id)
+            .with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - failed to find stream with ID: {} for session: {}",
+                    self.stream_id, session
+                )
+            })?;
+        let consumer_group = shard.get_consumer_group(session, &stream, &self.topic_id, &consumer_group_id)
+            .with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - failed to get consumer group for stream_id: {}, topic_id: {}, group_id: {:?}, session: {session}",
+                    self.stream_id, self.topic_id, consumer_group_id
+                )
+            })?.unwrap();
         let group_id = consumer_group.group_id;
-        let response = mapper::map_consumer_group(&consumer_group).await;
-        drop(consumer_group);
+        let response = mapper::map_consumer_group(&consumer_group);
 
-        let system = system.downgrade();
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
 
-        system
+        shard
             .state
         .apply(
             session.get_user_id(),

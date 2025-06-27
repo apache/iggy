@@ -54,6 +54,11 @@ impl IggyShard {
             snapshot_types
         };
 
+        // TODO: Replace this with
+        // https://github.com/bearcove/rc-zip
+        // and impl the monoio async writer, based on this example:
+        // https://youtu.be/RYHYiXMJdZI?si=d2roKeHn5lJrw2ri&t=1140
+        // and rc-zip-tokio crate.
         let cursor = Cursor::new(Vec::new());
         let mut zip_writer = ZipFileWriter::new(cursor.compat_write());
 

@@ -33,7 +33,7 @@ pub struct TcpSender {
 }
 
 impl Sender for TcpSender {
-    async fn read(&mut self, buffer: BytesMut) -> (Result<usize, IggyError>, BytesMut) {
+    async fn read<B: IoBufMut>(&mut self, buffer: B) -> (Result<usize, IggyError>, B) {
         sender::read(&mut self.stream, buffer).await
     }
 

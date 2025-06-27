@@ -22,6 +22,7 @@ use crate::{server_error::ServerError, tcp::sender};
 use bytes::BytesMut;
 use error_set::ErrContext;
 use iggy_common::IggyError;
+use monoio::buf::IoBufMut;
 use monoio::io::AsyncWriteRent;
 use monoio::net::TcpStream;
 use monoio_native_tls::TlsStream;
@@ -33,7 +34,7 @@ pub struct TcpTlsSender {
 }
 
 impl Sender for TcpTlsSender {
-    async fn read(&mut self, buffer: BytesMut) -> (Result<usize, IggyError>, BytesMut) {
+    async fn read<B: IoBufMut>(&mut self, buffer: B) -> (Result<usize, IggyError>, B) {
         sender::read(&mut self.stream, buffer).await
     }
 

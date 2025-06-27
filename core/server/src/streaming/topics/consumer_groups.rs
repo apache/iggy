@@ -172,7 +172,7 @@ impl Topic {
         &mut self,
         group_id: Option<u32>,
         name: &str,
-    ) -> Result<ConsumerGroup, IggyError> {
+    ) -> Result<Identifier, IggyError> {
         if self.consumer_groups_ids.contains_key(name) {
             return Err(IggyError::ConsumerGroupNameAlreadyExists(
                 name.to_owned(),
@@ -208,13 +208,12 @@ impl Topic {
         let consumer_group =
             ConsumerGroup::new(self.topic_id, id, name, self.partitions.len() as u32);
         self.consumer_groups_ids.insert(name.to_owned(), id);
-        let cloned_group = consumer_group.clone();
         self.consumer_groups.borrow_mut().insert(id, consumer_group);
         info!(
             "Created consumer group with ID: {} for topic with ID: {} and stream with ID: {}.",
             id, self.topic_id, self.stream_id
         );
-        Ok(cloned_group)
+        Ok(Identifier::numeric(id)?)
     }
 
     pub async fn delete_consumer_group(

@@ -36,7 +36,8 @@ pub struct QuicSender {
 }
 
 impl Sender for QuicSender {
-    async fn read(&mut self, buffer: BytesMut) -> (Result<usize, IggyError>, BytesMut) {
+    async fn read<B: IoBufMut>(&mut self, buffer: B) -> (Result<usize, IggyError>, B) {
+        //TODO: Fixme
         // Not-so-nice code because quinn recv stream has different API for read_exact
         /*
         let read_bytes = buffer.len();

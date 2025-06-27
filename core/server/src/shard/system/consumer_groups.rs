@@ -26,7 +26,6 @@ use crate::streaming::topics::consumer_group::ConsumerGroup;
 use error_set::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
-use iggy_common::locking::IggySharedMutFn;
 
 impl IggyShard {
     pub fn get_consumer_group<'cg, 'stream>(
@@ -93,7 +92,7 @@ impl IggyShard {
         topic_id: &Identifier,
         group_id: Option<u32>,
         name: &str,
-    ) -> Result<u32, IggyError> {
+    ) -> Result<Identifier, IggyError> {
         self.ensure_authenticated(session)?;
         {
             let stream = self.get_stream(stream_id).with_error_context(|error| {
@@ -120,7 +119,7 @@ impl IggyShard {
             .create_consumer_group(group_id, name)
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to create consumer group with name: {name}")
-            }).map(|cg| cg.group_id)
+            })
     }
 
     pub async fn delete_consumer_group(
@@ -272,12 +271,7 @@ impl IggyShard {
                 .find_topic(session, &stream, topic_id)
                 .with_error_context(|error| {
                     format!(
-<<<<<<< HEAD
                         "{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id:?}, topic_id: {topic_id:?}"
-=======
-                        "{COMPONENT} (error: {error}) - topic not found for stream ID: {:?}, topic_id: {:?}",
-                        stream.stream_id, topic_id
->>>>>>> 48107890 (fix iggy shard errors)
                     )
                 })?;
 

@@ -16,12 +16,14 @@
  * under the License.
  */
 
+use std::rc::Rc;
+
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
@@ -37,15 +39,13 @@ impl ServerCommandHandler for LoginUser {
     async fn handle(
         self,
         sender: &mut SenderKind,
-        _length: u32,
-        session: &Session,
-        system: &SharedSystem,
+        length: u32,
+        session: &Rc<Session>,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let system = system.read().await;
-        let user = system
+        let user = shard
             .login_user(&self.username, &self.password, Some(session))
-            .await
             .with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to login user with name: {}, session: {session}",

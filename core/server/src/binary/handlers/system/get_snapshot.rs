@@ -19,11 +19,12 @@
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::sender::SenderKind;
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use bytes::Bytes;
 use iggy_common::IggyError;
 use iggy_common::get_snapshot::GetSnapshot;
+use std::rc::Rc;
 use tracing::debug;
 
 impl ServerCommandHandler for GetSnapshot {
@@ -35,13 +36,12 @@ impl ServerCommandHandler for GetSnapshot {
         self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Session,
-        system: &SharedSystem,
+        session: &Rc<Session>,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        let system = system.read().await;
-        let snapshot = system
+        let snapshot = shard
             .get_snapshot(session, self.compression, &self.snapshot_types)
             .await?;
         let bytes = Bytes::copy_from_slice(&snapshot.0);

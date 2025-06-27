@@ -16,12 +16,14 @@
  * under the License.
  */
 
+use std::rc::Rc;
+
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
+use crate::shard::IggyShard;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
@@ -38,20 +40,18 @@ impl ServerCommandHandler for UpdateUser {
         self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Session,
-        system: &SharedSystem,
+        session: &Rc<Session>,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        let mut system = system.write().await;
-        system
+        shard
                 .update_user(
                     session,
                     &self.user_id,
                     self.username.clone(),
                     self.status,
                 )
-                .await
                 .with_error_context(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - failed to update user with user_id: {}, session: {session}",
@@ -59,10 +59,9 @@ impl ServerCommandHandler for UpdateUser {
                     )
                 })?;
 
-        let system = system.downgrade();
         let user_id = self.user_id.clone();
 
-        system
+        shard
             .state
             .apply(session.get_user_id(), &EntryCommand::UpdateUser(self))
             .await

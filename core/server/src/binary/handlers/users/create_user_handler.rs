@@ -16,6 +16,9 @@
  * under the License.
  */
 
+use crate::shard::IggyShard;
+use std::rc::Rc;
+
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
@@ -23,7 +26,6 @@ use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateUserWithId;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use crate::streaming::utils::crypto;
 use anyhow::Result;
 use error_set::ErrContext;
@@ -41,13 +43,12 @@ impl ServerCommandHandler for CreateUser {
         self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Session,
-        system: &SharedSystem,
+        session: &Rc<Session>,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        let mut system = system.write().await;
-        let user = system
+        let user = shard
                 .create_user(
                     session,
                     &self.username,
@@ -63,11 +64,10 @@ impl ServerCommandHandler for CreateUser {
                     )
                 })?;
         let user_id = user.id;
-        let response = mapper::map_user(user);
+        let response = mapper::map_user(&user);
 
         // For the security of the system, we hash the password before storing it in metadata.
-        let system = system.downgrade();
-        system
+        shard
             .state
         .apply(
             session.get_user_id(),

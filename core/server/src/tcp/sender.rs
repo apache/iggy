@@ -28,12 +28,13 @@ use tracing::debug;
 
 const STATUS_OK: &[u8] = &[0; 4];
 
-pub(crate) async fn read<T>(
+pub(crate) async fn read<T, B>(
     stream: &mut T,
-    buffer: BytesMut,
-) -> (Result<usize, IggyError>, BytesMut)
+    buffer: B,
+) -> (Result<usize, IggyError>, B)
 where
     T: AsyncReadRent + AsyncWriteRent + Unpin,
+    B: IoBufMut,
 {
     match stream.read_exact(buffer).await {
         (Ok(0), buffer) => (Err(IggyError::ConnectionClosed), buffer),

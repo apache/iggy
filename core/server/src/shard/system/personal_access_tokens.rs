@@ -28,7 +28,7 @@ use iggy_common::IggyTimestamp;
 use tracing::{error, info};
 
 impl IggyShard {
-    pub async fn get_personal_access_tokens(
+    pub fn get_personal_access_tokens(
         &self,
         session: &Session,
     ) -> Result<Vec<PersonalAccessToken>, IggyError> {
@@ -53,7 +53,7 @@ impl IggyShard {
         Ok(personal_access_tokens)
     }
 
-    pub async fn create_personal_access_token(
+    pub fn create_personal_access_token(
         &self,
         session: &Session,
         name: &str,
@@ -103,7 +103,7 @@ impl IggyShard {
         Ok(token)
     }
 
-    pub async fn delete_personal_access_token(
+    pub fn delete_personal_access_token(
         &self,
         session: &Session,
         name: &str,
@@ -135,7 +135,7 @@ impl IggyShard {
         Ok(())
     }
 
-    pub async fn login_with_personal_access_token(
+    pub fn login_with_personal_access_token(
         &self,
         token: &str,
         session: Option<&Session>,

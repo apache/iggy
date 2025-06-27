@@ -19,13 +19,14 @@
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::topics::COMPONENT, sender::SenderKind};
+use crate::shard::IggyShard;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::update_topic::UpdateTopic;
+use std::rc::Rc;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for UpdateTopic {
@@ -38,14 +39,12 @@ impl ServerCommandHandler for UpdateTopic {
         mut self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Session,
-        system: &SharedSystem,
+        session: &Rc<Session>,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        let mut system = system.write().await;
-
-        let topic = system
+        shard
                 .update_topic(
                     session,
                     &self.stream_id,
@@ -61,14 +60,25 @@ impl ServerCommandHandler for UpdateTopic {
                     "{COMPONENT} (error: {error}) - failed to update topic with id: {}, stream_id: {}, session: {session}",
                     self.topic_id, self.stream_id
                 ))?;
+
+        let stream = shard.find_stream(session, &self.stream_id)
+            .with_error_context(|error| format!(
+                "{COMPONENT} (error: {error}) - failed to find stream, stream_id: {}, session: {session}",
+                self.stream_id
+            ))?;
+        let topic = stream
+            .get_topic(&self.topic_id)
+            .with_error_context(|error| format!(
+                "{COMPONENT} (error: {error}) - failed to find topic, topic_id: {}, stream_id: {}, session: {session}",
+                self.topic_id, self.stream_id
+            ))?;
         self.message_expiry = topic.message_expiry;
         self.max_topic_size = topic.max_topic_size;
 
         let topic_id = self.topic_id.clone();
         let stream_id = self.stream_id.clone();
-        let system = system.downgrade();
 
-        system
+        shard
             .state
             .apply(session.get_user_id(), &EntryCommand::UpdateTopic(self))
             .await

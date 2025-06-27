@@ -112,7 +112,7 @@ impl IggyShard {
         compression_algorithm: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,
         replication_factor: Option<u8>,
-    ) -> Result<u32, IggyError> {
+    ) -> Result<Identifier, IggyError> {
         self.ensure_authenticated(session)?;
         {
             let stream = self.get_stream(stream_id).with_error_context(|error| {
@@ -151,7 +151,7 @@ impl IggyShard {
         self.metrics.increment_partitions(partitions_count);
         self.metrics.increment_segments(partitions_count);
 
-        Ok(created_topic_id)
+        Ok(Identifier::numeric(created_topic_id)?)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -165,7 +165,7 @@ impl IggyShard {
         compression_algorithm: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,
         replication_factor: Option<u8>,
-    ) -> Result<u32, IggyError> {
+    ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
         {
             let stream = self.get_stream(stream_id).with_error_context(|error| {
@@ -213,14 +213,7 @@ impl IggyShard {
         // TODO: if message_expiry is changed, we need to check if we need to purge messages based on the new expiry
         // TODO: if max_size_bytes is changed, we need to check if we need to purge messages based on the new size
         // TODO: if replication_factor is changed, we need to do `something`
-        self.get_stream(stream_id)
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
-            })?
-            .get_topic(topic_id)
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to get topic with ID: {topic_id} in stream with ID: {stream_id}")
-            }).map(|topic| topic.topic_id)
+        Ok(())
     }
 
     pub async fn delete_topic(

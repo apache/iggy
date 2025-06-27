@@ -20,15 +20,16 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::{handlers::personal_access_tokens::COMPONENT, sender::SenderKind};
+use crate::shard::IggyShard;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreatePersonalAccessTokenWithHash;
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::create_personal_access_token::CreatePersonalAccessToken;
+use std::rc::Rc;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for CreatePersonalAccessToken {
@@ -41,15 +42,13 @@ impl ServerCommandHandler for CreatePersonalAccessToken {
         self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Session,
-        system: &SharedSystem,
+        session: &Rc<Session>,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        let system = system.write().await;
-        let token = system
+        let token = shard
                 .create_personal_access_token(session, &self.name, self.expiry)
-                .await
                 .with_error_context(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - failed to create personal access token with name: {}, session: {session}",
@@ -59,8 +58,7 @@ impl ServerCommandHandler for CreatePersonalAccessToken {
         let bytes = mapper::map_raw_pat(&token);
         let token_hash = PersonalAccessToken::hash_token(&token);
 
-        let system = system.downgrade();
-        system
+        shard
             .state
             .apply(
                 session.get_user_id(),

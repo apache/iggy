@@ -19,13 +19,14 @@
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::topics::COMPONENT, sender::SenderKind};
+use crate::shard::IggyShard;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::delete_topic::DeleteTopic;
+use std::rc::Rc;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for DeleteTopic {
@@ -38,23 +39,21 @@ impl ServerCommandHandler for DeleteTopic {
         self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Session,
-        system: &SharedSystem,
+        session: &Rc<Session>,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
 
-        let mut system = system.write().await;
-        system
+        shard
                 .delete_topic(session, &self.stream_id, &self.topic_id)
                 .await
                 .with_error_context(|error| format!(
                     "{COMPONENT} (error: {error}) - failed to delete topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
                 ))?;
 
-        let system = system.downgrade();
-        system
+        shard
             .state
             .apply(session.get_user_id(), &EntryCommand::DeleteTopic(self))
             .await

@@ -21,11 +21,12 @@ use crate::binary::handlers::system::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::get_stats::GetStats;
+use std::rc::Rc;
 use tracing::debug;
 
 impl ServerCommandHandler for GetStats {
@@ -37,13 +38,12 @@ impl ServerCommandHandler for GetStats {
         self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Session,
-        system: &SharedSystem,
+        session: &Rc<Session>,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        let system = system.read().await;
-        let stats = system.get_stats().await.with_error_context(|error| {
+        let stats = shard.get_stats().await.with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to get stats, session: {session}")
         })?;
         let bytes = mapper::map_stats(&stats);

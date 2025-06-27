@@ -18,6 +18,7 @@
 
 use super::memory_pool::{BytesMutExt, memory_pool};
 use bytes::{Buf, BufMut, BytesMut};
+use monoio::buf::IoBufMut;
 use std::ops::{Deref, DerefMut};
 
 #[derive(Debug)]
@@ -213,5 +214,19 @@ impl Buf for PooledBuffer {
 
     fn chunks_vectored<'t>(&'t self, dst: &mut [std::io::IoSlice<'t>]) -> usize {
         self.inner.chunks_vectored(dst)
+    }
+}
+
+unsafe impl IoBufMut for PooledBuffer {
+    fn write_ptr(&mut self) -> *mut u8 {
+        self.inner.write_ptr()
+    }
+
+    fn bytes_total(&mut self) -> usize {
+        self.inner.bytes_total()
+    }
+
+    unsafe fn set_init(&mut self, pos: usize) {
+        unsafe { self.inner.set_init(pos) }
     }
 }

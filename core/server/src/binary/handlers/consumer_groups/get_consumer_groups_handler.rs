@@ -21,12 +21,13 @@ use crate::binary::handlers::consumer_groups::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::get_consumer_groups::GetConsumerGroups;
+use std::rc::Rc;
 use tracing::debug;
 
 impl ServerCommandHandler for GetConsumerGroups {
@@ -38,12 +39,11 @@ impl ServerCommandHandler for GetConsumerGroups {
         self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Session,
-        system: &SharedSystem,
+        session: &Rc<Session>,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let system = system.read().await;
-        let consumer_groups = system
+        let consumer_groups = shard
             .get_consumer_groups(session, &self.stream_id, &self.topic_id)
             .with_error_context(|error| {
                 format!(
@@ -51,7 +51,7 @@ impl ServerCommandHandler for GetConsumerGroups {
                     self.stream_id, self.topic_id, session
                 )
             })?;
-        let consumer_groups = mapper::map_consumer_groups(&consumer_groups).await;
+        let consumer_groups = mapper::map_consumer_groups(consumer_groups);
         sender.send_ok_response(&consumer_groups).await?;
         Ok(())
     }

@@ -19,11 +19,12 @@
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::messages::COMPONENT, sender::SenderKind};
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::{FlushUnsavedBuffer, IggyError};
+use std::rc::Rc;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for FlushUnsavedBuffer {
@@ -36,17 +37,16 @@ impl ServerCommandHandler for FlushUnsavedBuffer {
         self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Session,
-        system: &SharedSystem,
+        session: &Rc<Session>,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        let system = system.read().await;
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
         let partition_id = self.partition_id;
         let fsync = self.fsync;
-        system
+        shard
             .flush_unsaved_buffer(session, stream_id, topic_id, partition_id, fsync)
             .await
             .with_error_context(|error| {

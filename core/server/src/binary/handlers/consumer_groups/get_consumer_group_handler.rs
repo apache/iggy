@@ -20,12 +20,16 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
+use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::get_consumer_group::GetConsumerGroup;
+use std::rc::Rc;
 use tracing::debug;
+
+use super::COMPONENT;
 
 impl ServerCommandHandler for GetConsumerGroup {
     fn code(&self) -> u32 {
@@ -36,14 +40,20 @@ impl ServerCommandHandler for GetConsumerGroup {
         self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Session,
-        system: &SharedSystem,
+        session: &Rc<Session>,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        let system = system.read().await;
+        let stream_id = &self.stream_id;
+        let stream = shard.find_stream(session, &self.stream_id)
+            .with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - failed to get stream for stream_id: {stream_id}"
+                )
+            })?;
         let Ok(consumer_group) =
-            system.get_consumer_group(session, &self.stream_id, &self.topic_id, &self.group_id)
+            shard.get_consumer_group(session, &stream, &self.topic_id, &self.group_id)
         else {
             sender.send_empty_ok_response().await?;
             return Ok(());
@@ -53,8 +63,7 @@ impl ServerCommandHandler for GetConsumerGroup {
             return Ok(());
         };
 
-        let consumer_group = consumer_group.read().await;
-        let consumer_group = mapper::map_consumer_group(&consumer_group).await;
+        let consumer_group = mapper::map_consumer_group(&consumer_group);
         sender.send_ok_response(&consumer_group).await?;
         Ok(())
     }
