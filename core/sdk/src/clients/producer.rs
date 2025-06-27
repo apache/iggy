@@ -23,8 +23,13 @@ use crate::clients::producer_config::DirectConfig;
 use crate::clients::producer_dispatcher::ProducerDispatcher;
 use bytes::Bytes;
 use futures_util::StreamExt;
+<<<<<<< HEAD
 use iggy_binary_protocol::{Client, MessageClient, StreamClient, TopicClient};
 use iggy_common::locking::{IggySharedMut, IggySharedMutFn};
+=======
+use iggy_binary_protocol::Client;
+use iggy_common::locking::{IggyRwLock, IggySharedMutFn};
+>>>>>>> 639a9a88 (fix sdk)
 use iggy_common::{
     CompressionAlgorithm, DiagnosticEvent, EncryptorKind, IdKind, Identifier, IggyDuration,
     IggyError, IggyExpiry, IggyMessage, IggyTimestamp, MaxTopicSize, Partitioner, Partitioning,
@@ -53,7 +58,11 @@ pub trait ProducerCoreBackend: Send + Sync + 'static {
 pub struct ProducerCore {
     initialized: AtomicBool,
     can_send: Arc<AtomicBool>,
+<<<<<<< HEAD
     client: Arc<IggySharedMut<ClientWrapper>>,
+=======
+    client: Arc<IggyRwLock<Box<dyn Client>>>,
+>>>>>>> 639a9a88 (fix sdk)
     stream_id: Arc<Identifier>,
     stream_name: String,
     topic_id: Arc<Identifier>,
@@ -432,7 +441,11 @@ pub struct IggyProducer {
 impl IggyProducer {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+<<<<<<< HEAD
         client: IggySharedMut<ClientWrapper>,
+=======
+        client: IggyRwLock<Box<dyn Client>>,
+>>>>>>> 639a9a88 (fix sdk)
         stream: Identifier,
         stream_name: String,
         topic: Identifier,

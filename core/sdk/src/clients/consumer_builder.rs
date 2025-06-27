@@ -18,13 +18,22 @@
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::prelude::{AutoCommit, AutoCommitWhen, IggyConsumer};
+<<<<<<< HEAD
 use iggy_common::locking::IggySharedMut;
+=======
+use iggy_binary_protocol::Client;
+use iggy_common::locking::IggyRwLock;
+>>>>>>> 639a9a88 (fix sdk)
 use iggy_common::{Consumer, EncryptorKind, Identifier, IggyDuration, PollingStrategy};
 use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct IggyConsumerBuilder {
+<<<<<<< HEAD
     client: IggySharedMut<ClientWrapper>,
+=======
+    client: IggyRwLock<Box<dyn Client>>,
+>>>>>>> 639a9a88 (fix sdk)
     consumer_name: String,
     consumer: Consumer,
     stream: Identifier,
@@ -46,7 +55,11 @@ pub struct IggyConsumerBuilder {
 impl IggyConsumerBuilder {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+<<<<<<< HEAD
         client: IggySharedMut<ClientWrapper>,
+=======
+        client: IggyRwLock<Box<dyn Client>>,
+>>>>>>> 639a9a88 (fix sdk)
         consumer_name: String,
         consumer: Consumer,
         stream_id: Identifier,
