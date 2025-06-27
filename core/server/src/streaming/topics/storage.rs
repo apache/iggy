@@ -34,7 +34,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::fs;
 use tokio::fs::create_dir_all;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex};
 use tracing::{error, info, warn};
 
 #[derive(Debug)]

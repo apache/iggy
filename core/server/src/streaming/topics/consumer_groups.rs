@@ -321,10 +321,8 @@ mod tests {
         let result = topic.create_consumer_group(Some(group_id), name);
         assert!(result.is_ok());
         {
-            let created_consumer_group = result.unwrap();
-            assert_eq!(created_consumer_group.group_id, group_id);
-            assert_eq!(created_consumer_group.name, name);
-            assert_eq!(created_consumer_group.topic_id, topic_id);
+            let created_consumer_group_id = result.unwrap();
+            assert_eq!(created_consumer_group_id.get_u32_value().unwrap(), group_id);
         }
 
         assert_eq!(topic.consumer_groups.borrow().len(), 1);
