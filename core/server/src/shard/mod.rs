@@ -426,7 +426,7 @@ impl IggyShard {
         self.shards.len() as u32
     }
 
-    pub fn broadcast_event_to_all_shards(&self, client_id: u32, event: Rc<ShardEvent>) {
+    pub fn broadcast_event_to_all_shards(&self, client_id: u32, event: ShardEvent) {
         self.shards
             .iter()
             .filter_map(|shard| {
@@ -437,8 +437,12 @@ impl IggyShard {
                 }
             })
             .map(|conn| {
-                let message = ShardMessage::Event(event.clone());
+                //TODO: Fixme
+                /*
+                let message = ShardMessage::Event(event);
                 conn.send(ShardFrame::new(client_id, message, None));
+                */
+                ()
             })
             .collect::<Vec<_>>();
     }

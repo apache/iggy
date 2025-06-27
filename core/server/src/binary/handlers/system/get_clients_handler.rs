@@ -43,11 +43,9 @@ impl ServerCommandHandler for GetClients {
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        let clients = shard
-            .get_clients(session)
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to get clients, session: {session}")
-            })?;
+        let clients = shard.get_clients(session).with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to get clients, session: {session}")
+        })?;
         let clients = mapper::map_clients(clients).await;
         sender.send_ok_response(&clients).await?;
         Ok(())

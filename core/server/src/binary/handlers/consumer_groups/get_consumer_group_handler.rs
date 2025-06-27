@@ -46,7 +46,8 @@ impl ServerCommandHandler for GetConsumerGroup {
         debug!("session: {session}, command: {self}");
 
         let stream_id = &self.stream_id;
-        let stream = shard.find_stream(session, &self.stream_id)
+        let stream = shard
+            .find_stream(session, &self.stream_id)
             .with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to get stream for stream_id: {stream_id}"

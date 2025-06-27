@@ -18,8 +18,8 @@
 
 #[cfg(not(feature = "disable-mimalloc"))]
 use mimalloc::MiMalloc;
-use nix::libc::iovec;
 use nix::libc::c_void;
+use nix::libc::iovec;
 
 #[cfg(not(feature = "disable-mimalloc"))]
 #[global_allocator]

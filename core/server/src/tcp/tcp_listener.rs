@@ -54,8 +54,11 @@ pub async fn start(server_name: &'static str, shard: Rc<IggyShard>) {
                     //TODO: Those can be shared with other shards.
                     shard.add_active_session(session.clone());
                     // Broadcast session to all shards.
+                    //TODO: Fixme
+                    /*
                     let event = Rc::new(ShardEvent::NewSession(session.clone()));
                     shard.broadcast_event_to_all_shards(session.client_id, event);
+                    */
 
                     let _client_id = session.client_id;
                     info!("Created new session: {session}");

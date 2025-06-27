@@ -68,7 +68,6 @@ use iggy_common::update_stream::UpdateStream;
 use iggy_common::update_topic::UpdateTopic;
 use iggy_common::update_user::UpdateUser;
 use iggy_common::*;
-use rustls::crypto::hash::Output;
 use strum::EnumString;
 use tracing::error;
 

@@ -59,7 +59,7 @@ pub struct Partition {
     pub(crate) consumer_offsets: DashMap<u32, ConsumerOffset>,
     pub(crate) consumer_group_offsets: DashMap<u32, ConsumerOffset>,
     pub(crate) segments: Vec<Segment>,
-    pub(crate) config: Rc<SystemConfig>,
+    pub(crate) config: Arc<SystemConfig>,
     pub(crate) storage: Rc<SystemStorage>,
 }
 
@@ -89,7 +89,7 @@ impl Partition {
         topic_id: u32,
         partition_id: u32,
         with_segment: bool,
-        config: Rc<SystemConfig>,
+        config: Arc<SystemConfig>,
         storage: Rc<SystemStorage>,
         message_expiry: IggyExpiry,
         messages_count_of_parent_stream: Arc<AtomicU64>,
@@ -217,7 +217,7 @@ mod tests {
     #[tokio::test]
     async fn should_be_created_with_a_single_segment_given_valid_parameters() {
         let tempdir = tempfile::TempDir::new().unwrap();
-        let config = Rc::new(SystemConfig {
+        let config = Arc::new(SystemConfig {
             path: tempdir.path().to_str().unwrap().to_string(),
             ..Default::default()
         });
@@ -266,7 +266,7 @@ mod tests {
     #[tokio::test]
     async fn should_not_initialize_segments_given_false_with_segment_parameter() {
         let tempdir = tempfile::TempDir::new().unwrap();
-        let config = Rc::new(SystemConfig {
+        let config = Arc::new(SystemConfig {
             path: tempdir.path().to_str().unwrap().to_string(),
             ..Default::default()
         });

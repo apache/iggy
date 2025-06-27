@@ -54,11 +54,10 @@ macro_rules! forward_async_methods {
     }
 }
 
-
 pub trait Sender {
     fn read<B: IoBufMut>(
         &mut self,
-        buffer: B
+        buffer: B,
     ) -> impl Future<Output = (Result<usize, IggyError>, B)>;
     fn send_empty_ok_response(&mut self) -> impl Future<Output = Result<(), IggyError>>;
     fn send_ok_response(&mut self, payload: &[u8]) -> impl Future<Output = Result<(), IggyError>>;

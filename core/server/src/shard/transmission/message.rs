@@ -22,12 +22,12 @@ use crate::{binary::command::ServerCommand, streaming::session::Session};
 #[derive(Debug)]
 pub enum ShardMessage {
     Command(ServerCommand),
-    Event(Rc<ShardEvent>),
+    Event(ShardEvent),
 }
 
 #[derive(Debug)]
 pub enum ShardEvent {
-    NewSession(Rc<Session>),
+    NewSession(),
 }
 
 impl From<ServerCommand> for ShardMessage {
@@ -36,8 +36,8 @@ impl From<ServerCommand> for ShardMessage {
     }
 }
 
-impl From<Rc<ShardEvent>> for ShardMessage {
-    fn from(event: Rc<ShardEvent>) -> Self {
+impl From<ShardEvent> for ShardMessage {
+    fn from(event: ShardEvent) -> Self {
         ShardMessage::Event(event)
     }
 }

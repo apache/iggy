@@ -49,7 +49,7 @@ pub struct Topic {
     pub(crate) messages_count_of_parent_stream: Arc<AtomicU64>,
     pub(crate) messages_count: Arc<AtomicU64>,
     pub(crate) segments_count_of_parent_stream: Arc<AtomicU32>,
-    pub(crate) config: Rc<SystemConfig>,
+    pub(crate) config: Arc<SystemConfig>,
     pub(crate) partitions: AHashMap<u32, IggyRwLock<Partition>>,
     pub(crate) storage: Rc<SystemStorage>,
     pub(crate) consumer_groups: RefCell<AHashMap<u32, ConsumerGroup>>,
@@ -72,7 +72,7 @@ impl Topic {
         size_of_parent_stream: Arc<AtomicU64>,
         messages_count_of_parent_stream: Arc<AtomicU64>,
         segments_count_of_parent_stream: Arc<AtomicU32>,
-        config: Rc<SystemConfig>,
+        config: Arc<SystemConfig>,
         storage: Rc<SystemStorage>,
     ) -> Topic {
         Topic::create(
@@ -100,7 +100,7 @@ impl Topic {
         topic_id: u32,
         name: &str,
         partitions_count: u32,
-        config: Rc<SystemConfig>,
+        config: Arc<SystemConfig>,
         storage: Rc<SystemStorage>,
         size_of_parent_stream: Arc<AtomicU64>,
         messages_count_of_parent_stream: Arc<AtomicU64>,
@@ -290,7 +290,7 @@ mod tests {
     #[tokio::test]
     async fn should_be_created_given_valid_parameters() {
         let tempdir = tempfile::TempDir::new().unwrap();
-        let config = Rc::new(SystemConfig {
+        let config = Arc::new(SystemConfig {
             path: tempdir.path().to_str().unwrap().to_string(),
             ..Default::default()
         });

@@ -27,7 +27,7 @@ use iggy_common::{IggyDuration, IggyError, Snapshot, SnapshotCompression, System
 use monoio::fs::{File, OpenOptions};
 use std::io::Cursor;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -191,7 +191,7 @@ async fn get_test_snapshot() -> Result<NamedTempFile, std::io::Error> {
     write_command_output_to_temp_file(Command::new("echo").arg("test")).await
 }
 
-async fn get_server_logs(config: Rc<SystemConfig>) -> Result<NamedTempFile, std::io::Error> {
+async fn get_server_logs(config: Arc<SystemConfig>) -> Result<NamedTempFile, std::io::Error> {
     let base_directory = PathBuf::from(config.get_system_path());
     let logs_subdirectory = PathBuf::from(&config.logging.path);
     let logs_path = base_directory.join(logs_subdirectory);
@@ -204,7 +204,7 @@ async fn get_server_logs(config: Rc<SystemConfig>) -> Result<NamedTempFile, std:
     write_command_output_to_temp_file(Command::new("sh").args(["-c", &list_and_cat])).await
 }
 
-async fn get_server_config(config: Rc<SystemConfig>) -> Result<NamedTempFile, std::io::Error> {
+async fn get_server_config(config: Arc<SystemConfig>) -> Result<NamedTempFile, std::io::Error> {
     let base_directory = PathBuf::from(config.get_system_path());
     let config_path = base_directory.join("runtime").join("current_config.toml");
 
@@ -213,7 +213,7 @@ async fn get_server_config(config: Rc<SystemConfig>) -> Result<NamedTempFile, st
 
 async fn get_command_result(
     snapshot_type: &SystemSnapshotType,
-    config: Rc<SystemConfig>,
+    config: Arc<SystemConfig>,
 ) -> Result<NamedTempFile, std::io::Error> {
     match snapshot_type {
         SystemSnapshotType::FilesystemOverview => get_filesystem_overview().await,

@@ -711,7 +711,7 @@ mod tests {
         let partition_id = 3;
         let with_segment = true;
         let temp_dir = TempDir::new().unwrap();
-        let config = Rc::new(SystemConfig {
+        let config = Arc::new(SystemConfig {
             path: temp_dir.path().to_path_buf().to_str().unwrap().to_string(),
             message_deduplication: MessageDeduplicationConfig {
                 enabled: deduplication_enabled,

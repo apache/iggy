@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use std::rc::Rc;
 use std::sync::Arc;
 use std::thread::available_parallelism;
 
@@ -32,6 +33,7 @@ use server::bootstrap::{
     create_shard_executor, load_config, resolve_persister,
 };
 use server::configs::config_provider::{self};
+use server::configs::server::ServerConfig;
 #[cfg(not(feature = "tokio-console"))]
 use server::log::logger::Logging;
 #[cfg(feature = "tokio-console")]
@@ -77,53 +79,43 @@ fn main() -> Result<(), ServerError> {
     // TODO: I think we could get rid of config provider, since we support only TOML
     // as config provider.
     let config_provider = config_provider::resolve(&args.config_provider)?;
-    let config = std::thread::scope(|scope| {
-        let config = scope
-            .spawn(move || {
-                let mut rt = create_default_executor::<monoio::IoUringDriver>();
-                rt.block_on(load_config(&config_provider))
-            })
-            .join()
-            .expect("Failed to load config");
-        config
-    })?;
+    // Load config and create directories.
+    // Remove `local_data` directory if run with `--fresh` flag.
+    let mut rt = create_default_executor::<monoio::IoUringDriver>();
+    let config = rt
+        .block_on(async {
+            let config = load_config(&config_provider)
+                .await
+                .with_error_context(|error| {
+                    format!("{COMPONENT} (error: {error}) - failed to load config during bootstrap")
+                })?;
+            if args.fresh {
+                let system_path = config.system.get_system_path();
+                if monoio::fs::metadata(&system_path).await.is_ok() {
+                    println!(
+                        "Removing system path at: {} because `--fresh` flag was set",
+                        system_path
+                    );
+                    //TODO: Impl dir walk and remove the files
+                    /*
+                    if let Err(e) = tokio::fs::remove_dir_all(&system_path).await {
+                        eprintln!("Failed to remove system path at {}: {}", system_path, e);
+                    }
+                    */
+                }
+            }
+
+            // Create directories.
+            create_directories(&config.system).await?;
+            Ok::<ServerConfig, ServerError>(config)
+        })
+        .with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to load config")
+        })?;
 
     // Initialize logging
     let mut logging = Logging::new(config.telemetry.clone());
     logging.early_init();
-
-    // Create directories.
-    // Remove `local_data` directory if run with `--fresh` flag.
-    std::thread::scope(|scope| {
-        scope
-            .spawn(|| {
-                let mut rt = create_default_executor::<monoio::IoUringDriver>();
-                rt.block_on(async {
-                    if args.fresh {
-                        let system_path = config.system.get_system_path();
-                        if monoio::fs::metadata(&system_path).await.is_ok() {
-                            println!(
-                                "Removing system path at: {} because `--fresh` flag was set",
-                                system_path
-                            );
-                            //TODO: Impl dir walk and remove the files
-                            /*
-                            if let Err(e) = tokio::fs::remove_dir_all(&system_path).await {
-                                eprintln!("Failed to remove system path at {}: {}", system_path, e);
-                            }
-                            */
-                        }
-                    }
-
-                    // Create directories.
-                    create_directories(&config.system).await?;
-                    Ok::<(), ServerError>(())
-                })
-            })
-            .join()
-            .expect("Failed join thread")
-    })
-    .with_error_context(|err| format!("Failed to init server: {err}"))?;
 
     // TODO: Make this configurable from config as a range
     // for example this instance of Iggy will use cores from 0..4

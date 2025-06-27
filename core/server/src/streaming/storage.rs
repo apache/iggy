@@ -33,7 +33,6 @@ use iggy_common::IggyError;
 use mockall::automock;
 use std::fmt::Debug;
 use std::future::Future;
-use std::rc::Rc;
 use std::sync::Arc;
 
 macro_rules! forward_async_methods {
@@ -137,7 +136,7 @@ pub trait PartitionStorage {
 
 #[derive(Debug)]
 pub struct SystemStorage {
-    pub info: Rc<SystemInfoStorageKind>,
+    pub info: Arc<SystemInfoStorageKind>,
     pub stream: Arc<StreamStorageKind>,
     pub topic: Arc<TopicStorageKind>,
     pub partition: Arc<PartitionStorageKind>,
@@ -145,9 +144,9 @@ pub struct SystemStorage {
 }
 
 impl SystemStorage {
-    pub fn new(config: Rc<SystemConfig>, persister: Arc<PersisterKind>) -> Self {
+    pub fn new(config: Arc<SystemConfig>, persister: Arc<PersisterKind>) -> Self {
         Self {
-            info: Rc::new(SystemInfoStorageKind::File(FileSystemInfoStorage::new(
+            info: Arc::new(SystemInfoStorageKind::File(FileSystemInfoStorage::new(
                 config.get_state_info_path(),
                 persister.clone(),
             ))),

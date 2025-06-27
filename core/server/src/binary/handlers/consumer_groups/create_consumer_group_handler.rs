@@ -60,7 +60,7 @@ impl ServerCommandHandler for CreateConsumerGroup {
                         self.stream_id, self.topic_id, self.group_id
                     )
                 })?;
-            
+
         let stream = shard.find_stream(session, &self.stream_id)
             .with_error_context(|error| {
                 format!(

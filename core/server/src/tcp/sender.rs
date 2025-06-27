@@ -28,10 +28,7 @@ use tracing::debug;
 
 const STATUS_OK: &[u8] = &[0; 4];
 
-pub(crate) async fn read<T, B>(
-    stream: &mut T,
-    buffer: B,
-) -> (Result<usize, IggyError>, B)
+pub(crate) async fn read<T, B>(stream: &mut T, buffer: B) -> (Result<usize, IggyError>, B)
 where
     T: AsyncReadRent + AsyncWriteRent + Unpin,
     B: IoBufMut,

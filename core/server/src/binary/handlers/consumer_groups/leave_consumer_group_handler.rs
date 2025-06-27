@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use super::COMPONENT;
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::sender::SenderKind;
@@ -27,7 +28,6 @@ use iggy_common::IggyError;
 use iggy_common::leave_consumer_group::LeaveConsumerGroup;
 use std::rc::Rc;
 use tracing::{debug, instrument};
-use super::COMPONENT;
 
 impl ServerCommandHandler for LeaveConsumerGroup {
     fn code(&self) -> u32 {

@@ -154,7 +154,7 @@ impl MemoryPool {
     }
 
     /// Initialize the global pool from the given config.
-    pub fn init_pool(config: Rc<SystemConfig>) {
+    pub fn init_pool(config: Arc<SystemConfig>) {
         let is_enabled = config.memory_pool.enabled;
         let memory_limit = config.memory_pool.size.as_bytes_usize();
         let bucket_capacity = config.memory_pool.bucket_capacity as usize;
@@ -468,7 +468,7 @@ mod tests {
 
     fn initialize_pool_for_tests() {
         TEST_INIT.call_once(|| {
-            let config = Rc::new(SystemConfig {
+            let config = Arc::new(SystemConfig {
                 memory_pool: MemoryPoolConfig {
                     enabled: true,
                     size: IggyByteSize::from_str("4GiB").unwrap(),

@@ -287,7 +287,7 @@ mod tests {
     #[tokio::test]
     async fn should_get_topic_by_id_and_name() {
         let tempdir = tempfile::TempDir::new().unwrap();
-        let config = Rc::new(SystemConfig {
+        let config = Arc::new(SystemConfig {
             path: tempdir.path().to_str().unwrap().to_string(),
             ..Default::default()
         });
