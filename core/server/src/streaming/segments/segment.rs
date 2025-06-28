@@ -224,13 +224,10 @@ impl Segment {
         let log_fsync = self.config.partition.enforce_fsync;
         let index_fsync = self.config.partition.enforce_fsync;
 
-        let server_confirmation = self.config.segment.server_confirmation;
-
         let messages_writer = MessagesWriter::new(
             &self.messages_path,
             self.messages_size.clone(),
             log_fsync,
-            server_confirmation,
             file_exists,
         )
         .await?;
@@ -304,9 +301,9 @@ impl Segment {
 
     pub async fn shutdown_writing(&mut self) {
         if let Some(log_writer) = self.messages_writer.take() {
-            tokio::spawn(async move {
+            //TODO: Fixme not sure whether we should spawn a task here.
+            monoio::spawn(async move {
                 let _ = log_writer.fsync().await;
-                log_writer.shutdown_persister_task().await;
             });
         } else {
             warn!(

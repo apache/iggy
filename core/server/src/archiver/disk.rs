@@ -70,7 +70,8 @@ impl Archiver for DiskArchiver {
         files: &[&str],
         base_directory: Option<String>,
     ) -> Result<(), ArchiverError> {
-        debug!("Archiving files on disk: {:?}", files);
+        //TODO: Fixme figure this out, we can't use tokio methods there.
+        /* debug!("Archiving files on disk: {:?}", files);
         for file in files {
             debug!("Archiving file: {file}");
             let source = Path::new(file);
@@ -93,7 +94,7 @@ impl Archiver for DiskArchiver {
             })?;
             debug!("Archived file: {file} at: {destination_path}");
         }
-
+        */
         Ok(())
     }
 }

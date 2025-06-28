@@ -50,11 +50,8 @@ impl StateSetup {
 
         let version = SemanticVersion::from_str("1.2.3").unwrap();
         let persister = PersisterKind::FileWithSync(FileWithSyncPersister {});
-        let encryptor = encryption_key.map(|key| {
-            Arc::new(EncryptorKind::Aes256Gcm(
-                Aes256GcmEncryptor::new(key).unwrap(),
-            ))
-        });
+        let encryptor = encryption_key
+            .map(|key| EncryptorKind::Aes256Gcm(Aes256GcmEncryptor::new(key).unwrap()));
         let state = FileState::new(
             &messages_file_path,
             &version,

@@ -24,7 +24,6 @@ use strum::{Display, EnumString};
 pub enum Confirmation {
     #[default]
     Wait,
-    NoWait,
 }
 
 #[cfg(test)]

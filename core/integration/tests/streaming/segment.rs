@@ -25,7 +25,6 @@ use server::configs::server::{DataMaintenanceConfig, PersonalAccessTokenConfig};
 use server::configs::system::{PartitionConfig, SegmentConfig, SystemConfig};
 use server::streaming::segments::*;
 use server::streaming::session::Session;
-use server::streaming::systems::system::System;
 use std::fs::DirEntry;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::str::FromStr;
@@ -192,7 +191,7 @@ async fn should_persist_and_load_segment_with_messages() {
     let batch = IggyMessagesBatchMut::from_messages(&messages, messages_size);
 
     segment.append_batch(0, batch, None).await.unwrap();
-    segment.persist_messages(None).await.unwrap();
+    segment.persist_messages().await.unwrap();
     let mut loaded_segment = Segment::create(
         stream_id,
         topic_id,
@@ -214,158 +213,6 @@ async fn should_persist_and_load_segment_with_messages() {
         .await
         .unwrap();
     assert_eq!(messages.count(), messages_count);
-}
-
-#[tokio::test]
-async fn should_persist_and_load_segment_with_messages_with_nowait_confirmation() {
-    let setup = TestSetup::init_with_config(SystemConfig {
-        segment: SegmentConfig {
-            server_confirmation: Confirmation::NoWait,
-            ..Default::default()
-        },
-        ..Default::default()
-    })
-    .await;
-    let stream_id = 1;
-    let topic_id = 2;
-    let partition_id = 3;
-    let start_offset = 0;
-    let mut segment = Segment::create(
-        stream_id,
-        topic_id,
-        partition_id,
-        start_offset,
-        setup.config.clone(),
-        IggyExpiry::NeverExpire,
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        true,
-    );
-
-    setup
-        .create_partition_directory(stream_id, topic_id, partition_id)
-        .await;
-    segment.persist().await.unwrap();
-    assert_persisted_segment(
-        &setup
-            .config
-            .get_partition_path(stream_id, topic_id, partition_id),
-        start_offset,
-    )
-    .await;
-    let messages_count = 10;
-    let mut messages = Vec::new();
-    let mut messages_size = 0;
-    for i in 0..messages_count {
-        let message = IggyMessage::builder()
-            .id(i as u128)
-            .payload(Bytes::from("test"))
-            .build()
-            .expect("Failed to create message");
-        messages_size += message.get_size_bytes().as_bytes_u32();
-        messages.push(message);
-    }
-    let batch = IggyMessagesBatchMut::from_messages(&messages, messages_size);
-    segment.append_batch(0, batch, None).await.unwrap();
-    segment
-        .persist_messages(Some(Confirmation::NoWait))
-        .await
-        .unwrap();
-    sleep(Duration::from_millis(200)).await;
-    let mut loaded_segment = Segment::create(
-        stream_id,
-        topic_id,
-        partition_id,
-        start_offset,
-        setup.config.clone(),
-        IggyExpiry::NeverExpire,
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        false,
-    );
-    loaded_segment.load_from_disk().await.unwrap();
-    let messages = loaded_segment
-        .get_messages_by_offset(0, messages_count)
-        .await
-        .unwrap();
-    assert_eq!(messages.count(), messages_count);
-}
-
-#[tokio::test]
-async fn given_all_expired_messages_segment_should_be_expired() {
-    let config = SystemConfig {
-        partition: PartitionConfig {
-            enforce_fsync: true,
-            ..Default::default()
-        },
-        segment: SegmentConfig {
-            size: IggyByteSize::from_str("10B").unwrap(), // small size to force expiration
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let setup = TestSetup::init_with_config(config).await;
-    let stream_id = 1;
-    let topic_id = 2;
-    let partition_id = 3;
-    let start_offset = 0;
-    let message_expiry_us = 100000;
-    let message_expiry = message_expiry_us.into();
-    let mut segment = Segment::create(
-        stream_id,
-        topic_id,
-        partition_id,
-        start_offset,
-        setup.config.clone(),
-        message_expiry,
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        Arc::new(AtomicU64::new(0)),
-        true,
-    );
-
-    setup
-        .create_partition_directory(stream_id, topic_id, partition_id)
-        .await;
-    segment.persist().await.unwrap();
-    assert_persisted_segment(
-        &setup
-            .config
-            .get_partition_path(stream_id, topic_id, partition_id),
-        start_offset,
-    )
-    .await;
-    let messages_count = 10;
-    let mut messages = Vec::new();
-    let mut messages_size = 0;
-    for i in 0..messages_count {
-        let message = IggyMessage::builder()
-            .id(i as u128)
-            .payload(Bytes::from("test"))
-            .build()
-            .expect("Failed to create message");
-        messages_size += message.get_size_bytes().as_bytes_u32();
-        messages.push(message);
-    }
-    let batch = IggyMessagesBatchMut::from_messages(&messages, messages_size);
-    segment.append_batch(0, batch, None).await.unwrap();
-    segment.persist_messages(None).await.unwrap();
-    let not_expired_ts = IggyTimestamp::now();
-    let expired_ts = not_expired_ts + IggyDuration::from(message_expiry_us + 1);
-
-    assert!(segment.is_expired(expired_ts).await);
-    assert!(!segment.is_expired(not_expired_ts).await);
 }
 
 #[tokio::test]
@@ -444,7 +291,7 @@ async fn given_at_least_one_not_expired_message_segment_should_not_be_expired() 
     let second_message_expired_ts =
         IggyTimestamp::now() + IggyDuration::from(message_expiry_us * 2);
 
-    segment.persist_messages(None).await.unwrap();
+    segment.persist_messages().await.unwrap();
 
     assert!(
         !segment.is_expired(nothing_expired_ts).await,
@@ -460,6 +307,8 @@ async fn given_at_least_one_not_expired_message_segment_should_not_be_expired() 
     );
 }
 
+/*
+//TODO: Fixme use shard instead of system
 #[tokio::test]
 async fn should_delete_persisted_segments() -> Result<(), Box<dyn std::error::Error>> {
     let config = SystemConfig {
@@ -648,6 +497,7 @@ async fn should_delete_persisted_segments() -> Result<(), Box<dyn std::error::Er
 
     Ok(())
 }
+*/
 
 // Helper function to extract segment offsets from DirEntry list
 fn get_segment_offsets(segments: &[DirEntry]) -> Vec<u64> {

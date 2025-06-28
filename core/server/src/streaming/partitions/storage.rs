@@ -18,6 +18,7 @@
 
 use crate::compat::index_rebuilding::index_rebuilder::IndexRebuilder;
 use crate::configs::cache_indexes::CacheIndexesConfig;
+use crate::io::file::IggyFile;
 use crate::state::system::PartitionState;
 use crate::streaming::partitions::COMPONENT;
 use crate::streaming::partitions::partition::{ConsumerOffset, Partition};
@@ -28,12 +29,12 @@ use crate::streaming::utils::file;
 use error_set::ErrContext;
 use iggy_common::ConsumerKind;
 use iggy_common::IggyError;
+use monoio::fs;
+use monoio::fs::create_dir_all;
+use monoio::io::AsyncReadRentExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tokio::fs;
-use tokio::fs::create_dir_all;
-use tokio::io::AsyncReadExt;
 use tracing::{error, info, trace, warn};
 
 #[derive(Debug)]
@@ -61,27 +62,24 @@ impl PartitionStorage for FilePartitionStorage {
             partition.partition_path
         );
         partition.created_at = state.created_at;
-        let dir_entries = fs::read_dir(&partition.partition_path).await;
-        if fs::read_dir(&partition.partition_path)
-                .await
+        // TODO: Replace this with the dir walk impl, that is mentined
+        // in the main function.
+        let mut dir_entries = std::fs::read_dir(&partition.partition_path)
                 .with_error_context(|error| format!(
                     "{COMPONENT} (error: {error}) - failed to read partition with ID: {} for stream with ID: {} and topic with ID: {} and path: {}.",
                     partition.partition_id, partition.stream_id, partition.topic_id, partition.partition_path,
-                )).is_err()
-            {
-                return Err(IggyError::CannotReadPartitions);
-            }
-
-        let mut dir_entries = dir_entries.unwrap();
+                ))
+                .map_err(|_| IggyError::CannotReadPartitions)?;
 
         let mut log_files = Vec::new();
-        while let Some(dir_entry) = dir_entries.next_entry().await.unwrap_or(None) {
+        while let Some(dir_entry) = dir_entries.next() {
+            let dir_entry = dir_entry.unwrap();
             let path = dir_entry.path();
             let extension = path.extension();
             if extension.is_none() || extension.unwrap() != LOG_EXTENSION {
                 continue;
             }
-            let metadata = dir_entry.metadata().await.unwrap();
+            let metadata = dir_entry.metadata().unwrap();
             if metadata.is_dir() {
                 continue;
             }
@@ -368,7 +366,7 @@ impl PartitionStorage for FilePartitionStorage {
             ));
         }
 
-        if fs::remove_dir_all(&partition.partition_path).await.is_err() {
+        if std::fs::remove_dir_all(&partition.partition_path).is_err() {
             error!(
                 "Cannot delete partition directory: {} for partition with ID: {} for topic with ID: {} for stream with ID: {}.",
                 partition.partition_path,
@@ -391,7 +389,7 @@ impl PartitionStorage for FilePartitionStorage {
 
     async fn save_consumer_offset(&self, offset: u64, path: &str) -> Result<(), IggyError> {
         self.persister
-            .overwrite(path, &offset.to_le_bytes())
+            .overwrite(path, Box::new(offset.to_le_bytes()))
             .await
             .with_error_context(|error| format!(
                 "{COMPONENT} (error: {error}) - failed to overwrite consumer offset with value: {offset}, path: {path}",
@@ -406,15 +404,17 @@ impl PartitionStorage for FilePartitionStorage {
         path: &str,
     ) -> Result<Vec<ConsumerOffset>, IggyError> {
         trace!("Loading consumer offsets from path: {path}...");
-        let dir_entries = fs::read_dir(&path).await;
+        //TODO: replace with async once its there
+        let dir_entries = std::fs::read_dir(&path);
         if dir_entries.is_err() {
             return Err(IggyError::CannotReadConsumerOffsets(path.to_owned()));
         }
 
         let mut consumer_offsets = Vec::new();
         let mut dir_entries = dir_entries.unwrap();
-        while let Some(dir_entry) = dir_entries.next_entry().await.unwrap_or(None) {
-            let metadata = dir_entry.metadata().await;
+        while let Some(dir_entry) = dir_entries.next() {
+            let dir_entry = dir_entry.unwrap();
+            let metadata = dir_entry.metadata();
             if metadata.is_err() {
                 break;
             }
@@ -439,7 +439,7 @@ impl PartitionStorage for FilePartitionStorage {
 
             let path = Arc::new(path.unwrap().to_string());
             let consumer_id = consumer_id.unwrap();
-            let mut file = file::open(&path)
+            let file = file::open(&path)
                 .await
                 .with_error_context(|error| {
                     format!(
@@ -447,6 +447,7 @@ impl PartitionStorage for FilePartitionStorage {
                     )
                 })
                 .map_err(|_| IggyError::CannotReadFile)?;
+            let mut file = IggyFile::new(file);
             let offset = file
                 .read_u64_le()
                 .await
@@ -473,7 +474,8 @@ impl PartitionStorage for FilePartitionStorage {
             return Ok(());
         }
 
-        if fs::remove_dir_all(path).await.is_err() {
+        //TODO: replace with async once its there
+        if std::fs::remove_dir_all(path).is_err() {
             error!("Cannot delete consumer offsets directory: {}.", path);
             return Err(IggyError::CannotDeleteConsumerOffsetsDirectory(
                 path.to_owned(),

@@ -146,7 +146,7 @@ async fn should_purge_existing_stream_on_disk() {
             .get_topic(&Identifier::numeric(topic_id).unwrap())
             .unwrap();
         topic
-            .append_messages(&Partitioning::partition_id(1), batch, None)
+            .append_messages(&Partitioning::partition_id(1), batch)
             .await
             .unwrap();
         let (_, loaded_messages) = topic

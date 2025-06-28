@@ -114,7 +114,6 @@ impl ServerCommandHandler for SendMessages {
                 &self.topic_id,
                 &self.partitioning,
                 batch,
-                None,
             )
             .await?;
 

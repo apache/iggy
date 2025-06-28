@@ -54,7 +54,7 @@ impl Topic {
             let mut partition = partition.write().await;
             let partition_id = partition.partition_id;
             for segment in partition.get_segments_mut() {
-                saved_messages_number += segment.persist_messages(None).await.with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to persist messages in segment, partition ID: {partition_id}"))?;
+                saved_messages_number += segment.persist_messages().await.with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to persist messages in segment, partition ID: {partition_id}"))?;
             }
         }
 

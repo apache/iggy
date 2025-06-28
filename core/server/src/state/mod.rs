@@ -40,14 +40,14 @@ pub enum StateKind {
 }
 
 #[cfg_attr(test, automock)]
-pub trait State: Send {
-    fn init(&self) -> impl Future<Output = Result<Vec<StateEntry>, IggyError>> + Send;
-    fn load_entries(&self) -> impl Future<Output = Result<Vec<StateEntry>, IggyError>> + Send;
+pub trait State {
+    fn init(&self) -> impl Future<Output = Result<Vec<StateEntry>, IggyError>>;
+    fn load_entries(&self) -> impl Future<Output = Result<Vec<StateEntry>, IggyError>>;
     fn apply(
         &self,
         user_id: u32,
         command: &EntryCommand,
-    ) -> impl Future<Output = Result<(), IggyError>> + Send;
+    ) -> impl Future<Output = Result<(), IggyError>>;
 }
 
 impl StateKind {

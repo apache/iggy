@@ -105,7 +105,6 @@ impl IggyShard {
         topic_id: &Identifier,
         partitioning: &Partitioning,
         messages: IggyMessagesBatchMut,
-        confirmation: Option<Confirmation>,
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
         let stream = self.get_stream(stream_id).with_error_context(|error| {
@@ -133,7 +132,7 @@ impl IggyShard {
         };
 
         topic
-            .append_messages(partitioning, messages, confirmation)
+            .append_messages(partitioning, messages)
             .await?;
 
         self.metrics.increment_messages(messages_count as u64);

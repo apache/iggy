@@ -36,6 +36,7 @@ pub mod channels;
 pub(crate) mod compat;
 pub mod configs;
 pub mod http;
+pub mod io;
 pub mod log;
 pub mod quic;
 pub mod server_error;

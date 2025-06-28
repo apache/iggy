@@ -195,7 +195,7 @@ async fn test_get_messages_by_offset(
 
         let batch = IggyMessagesBatchMut::from_messages(messages_slice_to_append, messages_size);
         assert_eq!(batch.count(), batch_len);
-        partition.append_messages(batch, None).await.unwrap();
+        partition.append_messages(batch).await.unwrap();
 
         batch_offsets.push(partition.current_offset);
         current_pos += batch_len as usize;

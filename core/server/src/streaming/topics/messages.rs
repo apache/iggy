@@ -80,7 +80,6 @@ impl Topic {
         &self,
         partitioning: &Partitioning,
         messages: IggyMessagesBatchMut,
-        confirmation: Option<Confirmation>,
     ) -> Result<(), IggyError> {
         if !self.has_partitions() {
             return Err(IggyError::NoPartitions(self.topic_id, self.stream_id));
@@ -108,7 +107,7 @@ impl Topic {
             }
         };
 
-        self.append_messages_to_partition(messages, partition_id, confirmation)
+        self.append_messages_to_partition(messages, partition_id)
             .await
     }
 
@@ -134,7 +133,6 @@ impl Topic {
         &self,
         messages: IggyMessagesBatchMut,
         partition_id: u32,
-        confirmation: Option<Confirmation>,
     ) -> Result<(), IggyError> {
         let partition = self.partitions.get(&partition_id);
         partition
@@ -145,7 +143,7 @@ impl Topic {
             ))?
             .write()
             .await
-            .append_messages(messages, confirmation)
+            .append_messages(messages)
             .await
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to append messages")
@@ -230,7 +228,7 @@ mod tests {
                 .expect("Failed to create message with valid payload and headers");
             let messages = IggyMessagesBatchMut::from_messages(&[message], 1);
             topic
-                .append_messages(&partitioning, messages, None)
+                .append_messages(&partitioning, messages)
                 .await
                 .unwrap();
         }
@@ -263,7 +261,7 @@ mod tests {
                 .expect("Failed to create message with valid payload and headers");
             let messages = IggyMessagesBatchMut::from_messages(&[message], 1);
             topic
-                .append_messages(&partitioning, messages, None)
+                .append_messages(&partitioning, messages)
                 .await
                 .unwrap();
         }

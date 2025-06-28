@@ -16,6 +16,8 @@
  * under the License.
  */
 
+use crate::io::file::IggyFile;
+use crate::io::reader::IggyReader;
 use crate::state::command::EntryCommand;
 use crate::state::{COMPONENT, State, StateEntry};
 use crate::streaming::persistence::persister::PersisterKind;
@@ -28,11 +30,11 @@ use iggy_common::EncryptorKind;
 use iggy_common::IggyByteSize;
 use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
+use monoio::io::AsyncReadRentExt;
 use std::fmt::Debug;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use tokio::io::{AsyncReadExt, BufReader};
 use tracing::{debug, error, info};
 
 pub const BUF_READER_CAPACITY_BYTES: usize = 512 * 1000;
@@ -115,6 +117,7 @@ impl State for FileState {
                 )
             })
             .map_err(|_| IggyError::CannotReadFile)?;
+        let file = IggyFile::new(file);
         let file_size = file
             .metadata()
             .await
@@ -137,7 +140,7 @@ impl State for FileState {
         );
         let mut entries = Vec::new();
         let mut total_size: u64 = 0;
-        let mut reader = BufReader::with_capacity(BUF_READER_CAPACITY_BYTES, file);
+        let mut reader = IggyReader::with_capacity(BUF_READER_CAPACITY_BYTES, file);
         let mut current_index = 0;
         let mut entries_count = 0;
         loop {
@@ -215,9 +218,10 @@ impl State for FileState {
             total_size += 4;
             let mut context = BytesMut::with_capacity(context_length);
             context.put_bytes(0, context_length);
-            reader
-                .read_exact(&mut context)
-                .await
+            let (result, context) = reader.read_exact(context).await;
+
+            result
+                .with_error_context(|error| format!("{FILE_STATE_PARSE_ERROR} code. {error}"))
                 .map_err(|_| IggyError::CannotReadFile)?;
             let context = context.freeze();
             total_size += context_length as u64;
@@ -238,9 +242,9 @@ impl State for FileState {
             total_size += 4;
             let mut command = BytesMut::with_capacity(command_length);
             command.put_bytes(0, command_length);
-            reader
-                .read_exact(&mut command)
-                .await
+            let (result, command) = reader.read_exact(command).await;
+            result
+                .with_error_context(|error| format!("{FILE_STATE_PARSE_ERROR} command. {error}"))
                 .map_err(|_| IggyError::CannotReadFile)?;
             total_size += command_length as u64;
             let command_payload;
@@ -353,15 +357,16 @@ impl State for FileState {
             command,
         );
         let bytes = entry.to_bytes();
+        let len = bytes.len();
         self.entries_count.fetch_add(1, Ordering::SeqCst);
         self.persister
-            .append(&self.path, &bytes)
+            .append(&self.path, bytes)
             .await
             .with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to append state entry data to file, path: {}, data size: {}",
                     self.path,
-                    bytes.len()
+                    len
                 )
             })?;
         debug!("Applied state entry: {entry}");

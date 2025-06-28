@@ -21,16 +21,24 @@ use bytes::Bytes;
 use error_set::ErrContext;
 use flume::{Receiver, Sender, unbounded};
 use iggy_common::IggyError;
+use monoio::task;
 use std::{sync::Arc, time::Duration};
-use tokio::task;
 use tracing::error;
 
 use super::persister::PersisterKind;
 
-#[derive(Debug)]
 pub struct LogPersisterTask {
     _sender: Option<Sender<Bytes>>,
     _task_handle: Option<task::JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for LogPersisterTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogPersisterTask")
+            .field("_sender", &self._sender.is_some())
+            .field("_task_handle", &self._task_handle.is_some())
+            .finish()
+    }
 }
 
 impl LogPersisterTask {
@@ -42,7 +50,7 @@ impl LogPersisterTask {
     ) -> Self {
         let (sender, receiver): (Sender<Bytes>, Receiver<Bytes>) = unbounded();
 
-        let task_handle = task::spawn(async move {
+        let task_handle = monoio::spawn(async move {
             loop {
                 match receiver.recv_async().await {
                     Ok(data) => {
@@ -82,7 +90,7 @@ impl LogPersisterTask {
         let mut retries = 0;
 
         while retries < max_retries {
-            match persister.append(path, &data).await {
+            match persister.append(path, data.clone()).await {
                 Ok(_) => return Ok(()),
                 Err(e) => {
                     error!(
@@ -121,13 +129,7 @@ impl Drop for LogPersisterTask {
         self._sender.take();
 
         if let Some(handle) = self._task_handle.take() {
-            tokio::spawn(async move {
-                if let Err(error) = handle.await {
-                    error!(
-                        "{COMPONENT} (error: {error}) - error while shutting down task in Drop.",
-                    );
-                }
-            });
+            monoio::spawn(async move { handle.await });
         }
     }
 }

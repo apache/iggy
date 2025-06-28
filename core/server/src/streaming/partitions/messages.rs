@@ -221,7 +221,6 @@ impl Partition {
     pub async fn append_messages(
         &mut self,
         batch: IggyMessagesBatchMut,
-        confirmation: Option<Confirmation>,
     ) -> Result<(), IggyError> {
         if batch.count() == 0 {
             return Ok(());
@@ -316,7 +315,7 @@ impl Partition {
                 }
             );
 
-            last_segment.persist_messages(confirmation).await.with_error_context(|error| {
+            last_segment.persist_messages().await.with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to persist messages, partition id: {}, start offset: {}",
                     self.partition_id, last_segment.start_offset()
@@ -346,7 +345,7 @@ impl Partition {
             self.partition_id
         );
 
-        last_segment.persist_messages(None).await.with_error_context(|error| {
+        last_segment.persist_messages().await.with_error_context(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to persist messages, partition id: {}, start offset: {}",
                 self.partition_id, last_segment.start_offset()
@@ -384,7 +383,7 @@ mod tests {
             .sum();
         let batch = IggyMessagesBatchMut::from_messages(&messages, messages_size);
 
-        partition.append_messages(batch, None).await.unwrap();
+        partition.append_messages(batch).await.unwrap();
 
         let loaded_messages = partition
             .get_messages_by_offset(0, messages_count)
@@ -406,7 +405,7 @@ mod tests {
         assert_eq!(batch.count(), messages_count);
         let unique_messages_count = 3;
 
-        partition.append_messages(batch, None).await.unwrap();
+        partition.append_messages(batch).await.unwrap();
 
         let loaded_messages = partition
             .get_messages_by_offset(0, messages_count)
@@ -433,7 +432,7 @@ mod tests {
             .sum();
         let batch = IggyMessagesBatchMut::from_messages(&messages, messages_size);
 
-        partition.append_messages(batch, None).await.unwrap();
+        partition.append_messages(batch).await.unwrap();
 
         let loaded_messages = partition.get_messages_by_offset(0, 10).await.unwrap();
 
@@ -464,7 +463,7 @@ mod tests {
             .sum();
         let batch = IggyMessagesBatchMut::from_messages(&messages, messages_size);
 
-        partition.append_messages(batch, None).await.unwrap();
+        partition.append_messages(batch).await.unwrap();
 
         let loaded_messages = partition.get_messages_by_offset(0, 10).await.unwrap();
 
@@ -495,7 +494,7 @@ mod tests {
             .sum();
         let batch = IggyMessagesBatchMut::from_messages(&messages, messages_size);
 
-        partition.append_messages(batch, None).await.unwrap();
+        partition.append_messages(batch).await.unwrap();
 
         let loaded_messages = partition.get_messages_by_offset(0, 10).await.unwrap();
 
@@ -528,7 +527,7 @@ mod tests {
             .sum();
         let batch = IggyMessagesBatchMut::from_messages(&messages, messages_size);
 
-        partition.append_messages(batch, None).await.unwrap();
+        partition.append_messages(batch).await.unwrap();
 
         let loaded_messages = partition.get_messages_by_offset(0, 10).await.unwrap();
 
@@ -566,7 +565,7 @@ mod tests {
             .sum();
         let initial_batch = IggyMessagesBatchMut::from_messages(&initial_messages, initial_size);
         partition
-            .append_messages(initial_batch, None)
+            .append_messages(initial_batch)
             .await
             .unwrap();
 
@@ -584,7 +583,7 @@ mod tests {
         let duplicate_batch =
             IggyMessagesBatchMut::from_messages(&duplicate_messages, duplicate_size);
         partition
-            .append_messages(duplicate_batch, None)
+            .append_messages(duplicate_batch)
             .await
             .unwrap();
 
@@ -614,7 +613,7 @@ mod tests {
             .sum();
         let batch = IggyMessagesBatchMut::from_messages(&messages, messages_size);
 
-        partition.append_messages(batch, None).await.unwrap();
+        partition.append_messages(batch).await.unwrap();
 
         let loaded_messages = partition.get_messages_by_offset(0, 10).await.unwrap();
 
@@ -642,7 +641,7 @@ mod tests {
             .map(|m| m.get_size_bytes().as_bytes_u32())
             .sum();
         let batch1 = IggyMessagesBatchMut::from_messages(&batch1, batch1_size);
-        partition.append_messages(batch1, None).await.unwrap();
+        partition.append_messages(batch1).await.unwrap();
 
         // Second batch with mix of new and duplicate messages
         let batch2 = vec![
@@ -656,7 +655,7 @@ mod tests {
             .map(|m| m.get_size_bytes().as_bytes_u32())
             .sum();
         let batch2 = IggyMessagesBatchMut::from_messages(&batch2, batch2_size);
-        partition.append_messages(batch2, None).await.unwrap();
+        partition.append_messages(batch2).await.unwrap();
 
         let loaded_messages = partition.get_messages_by_offset(0, 10).await.unwrap();
 
@@ -695,7 +694,7 @@ mod tests {
             .sum();
         let batch = IggyMessagesBatchMut::from_messages(&messages, messages_size);
 
-        partition.append_messages(batch, None).await.unwrap();
+        partition.append_messages(batch).await.unwrap();
 
         let loaded_messages = partition.get_messages_by_offset(0, 10).await.unwrap();
 

@@ -17,6 +17,7 @@
  */
 
 use super::COMPONENT;
+use crate::io::file::IggyFile;
 use crate::shard::system::info::SystemInfo;
 use crate::streaming::persistence::persister::PersisterKind;
 use crate::streaming::storage::SystemInfoStorage;
@@ -25,6 +26,7 @@ use crate::streaming::utils::file;
 use anyhow::Context;
 use error_set::ErrContext;
 use iggy_common::IggyError;
+use monoio::io::AsyncReadRentExt;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tracing::info;
@@ -48,7 +50,7 @@ impl SystemInfoStorage for FileSystemInfoStorage {
             return Err(IggyError::ResourceNotFound(self.path.to_owned()));
         }
 
-        let mut file = file.unwrap();
+        let file = file.unwrap();
         let file_size = file
             .metadata()
             .await
@@ -60,13 +62,15 @@ impl SystemInfoStorage for FileSystemInfoStorage {
             })
             .map_err(|_| IggyError::CannotReadFileMetadata)?
             .len() as usize;
+
+        let mut file = IggyFile::new(file);
         let mut buffer = PooledBuffer::with_capacity(file_size);
         buffer.put_bytes(0, file_size);
-        file.read_exact(&mut buffer)
-            .await
+        let (result, buffer) = file.read_exact(buffer).await;
+        result
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to read file content from path: {}",
+                    "{COMPONENT} Failed to read system info from file at path: {} (error: {error})",
                     self.path
                 )
             })
@@ -83,7 +87,7 @@ impl SystemInfoStorage for FileSystemInfoStorage {
             .with_context(|| "Failed to serialize system info")
             .map_err(|_| IggyError::CannotSerializeResource)?;
         self.persister
-            .overwrite(&self.path, &data)
+            .overwrite(&self.path, data)
             .await
             .with_error_context(|error| {
                 format!(

@@ -53,18 +53,18 @@ impl FromStr for ArchiverKindType {
     }
 }
 
-pub trait Archiver: Send {
-    fn init(&self) -> impl Future<Output = Result<(), ArchiverError>> + Send;
+pub trait Archiver {
+    fn init(&self) -> impl Future<Output = Result<(), ArchiverError>>;
     fn is_archived(
         &self,
         file: &str,
         base_directory: Option<String>,
-    ) -> impl Future<Output = Result<bool, ArchiverError>> + Send;
+    ) -> impl Future<Output = Result<bool, ArchiverError>>;
     fn archive(
         &self,
         files: &[&str],
         base_directory: Option<String>,
-    ) -> impl Future<Output = Result<(), ArchiverError>> + Send;
+    ) -> impl Future<Output = Result<(), ArchiverError>>;
 }
 
 #[derive(Debug)]

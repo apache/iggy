@@ -104,7 +104,7 @@ async fn should_persist_messages_and_then_load_them_from_disk() {
         .map(|msg| msg.get_size_bytes().as_bytes_u32())
         .sum::<u32>();
     let batch = IggyMessagesBatchMut::from_messages(&messages, messages_size);
-    partition.append_messages(batch, None).await.unwrap();
+    partition.append_messages(batch).await.unwrap();
     assert_eq!(
         partition.unsaved_messages_count, 0,
         "Expected unsaved messages count to be 0, but got {}",

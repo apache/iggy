@@ -122,7 +122,6 @@ where
 pub fn create_shard_executor() -> Runtime<TimeDriver<monoio::IoUringDriver>> {
     // TODO: Figure out what else we could tweak there
     // We for sure want to disable the userspace interrupts on new cq entry (set_coop_taskrun)
-    // let urb = io_uring::IoUring::builder();
     // TODO: Shall we make the size of ring be configureable ?
     let builder = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
         //.uring_builder(urb.setup_coop_taskrun()) // broken shit.

@@ -63,7 +63,7 @@ async fn assert_polling_messages() {
         .sum::<IggyByteSize>();
     let batch = IggyMessagesBatchMut::from_messages(&messages, batch_size.as_bytes_u32());
     topic
-        .append_messages(&partitioning, batch, None)
+        .append_messages(&partitioning, batch)
         .await
         .unwrap();
 
@@ -110,7 +110,7 @@ async fn given_key_none_messages_should_be_appended_to_the_next_partition_using_
             batch_size.as_bytes_u32(),
         );
         topic
-            .append_messages(&partitioning, messages, None)
+            .append_messages(&partitioning, messages)
             .await
             .unwrap();
     }
@@ -139,7 +139,7 @@ async fn given_key_partition_id_messages_should_be_appended_to_the_chosen_partit
             batch_size.as_bytes_u32(),
         );
         topic
-            .append_messages(&partitioning, messages, None)
+            .append_messages(&partitioning, messages)
             .await
             .unwrap();
     }
@@ -172,7 +172,7 @@ async fn given_key_messages_key_messages_should_be_appended_to_the_calculated_pa
             batch_size.as_bytes_u32(),
         );
         topic
-            .append_messages(&partitioning, messages, None)
+            .append_messages(&partitioning, messages)
             .await
             .unwrap();
     }

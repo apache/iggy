@@ -226,7 +226,7 @@ async fn should_purge_existing_topic_on_disk() {
             .sum::<u32>();
         let batch = IggyMessagesBatchMut::from_messages(&messages, batch_size);
         topic
-            .append_messages(&Partitioning::partition_id(1), batch, None)
+            .append_messages(&Partitioning::partition_id(1), batch)
             .await
             .unwrap();
         let (_, loaded_messages) = topic

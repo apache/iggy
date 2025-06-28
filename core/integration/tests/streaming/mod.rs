@@ -26,9 +26,9 @@ mod get_by_timestamp;
 mod messages;
 mod partition;
 mod segment;
+mod shard;
 mod snapshot;
 mod stream;
-mod system;
 mod topic;
 mod topic_messages;
 

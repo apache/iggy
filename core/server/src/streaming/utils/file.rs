@@ -16,8 +16,12 @@
  * under the License.
  */
 
+use monoio::fs::{File, OpenOptions, remove_file};
 use std::path::Path;
-use tokio::fs::{File, OpenOptions, remove_file};
+
+pub fn open_std(path: &str) -> Result<std::fs::File, std::io::Error> {
+    std::fs::OpenOptions::new().read(true).open(path)
+}
 
 pub async fn open(path: &str) -> Result<File, std::io::Error> {
     OpenOptions::new().read(true).open(path).await
@@ -35,14 +39,16 @@ pub async fn overwrite(path: &str) -> Result<File, std::io::Error> {
         .open(path)
         .await
 }
+
 pub async fn remove(path: &str) -> Result<(), std::io::Error> {
     remove_file(path).await
 }
 
 pub async fn rename(old_path: &str, new_path: &str) -> Result<(), std::io::Error> {
-    tokio::fs::rename(Path::new(old_path), Path::new(new_path)).await
+    monoio::fs::rename(Path::new(old_path), Path::new(new_path)).await
 }
 
 pub async fn exists(path: &str) -> Result<bool, std::io::Error> {
-    tokio::fs::try_exists(path).await
+    //TODO: Does monoio support that ?
+    std::fs::exists(path)
 }

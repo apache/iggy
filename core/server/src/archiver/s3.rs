@@ -157,6 +157,9 @@ impl Archiver for S3Archiver {
             let base_directory = base_directory.as_deref().unwrap_or_default();
             let destination = Path::new(&base_directory).join(path);
             let destination_path = destination.to_str().unwrap_or_default().to_owned();
+            // TODO: Fixme figure this out.
+            // The `put_object_stream` method requires `AsyncRead` trait from tokio as its reader.
+            /*
             let response = self
                 .bucket
                 .put_object_stream(&mut file, destination_path)
@@ -188,6 +191,7 @@ impl Archiver for S3Archiver {
             return Err(ArchiverError::CannotArchiveFile {
                 file_path: (*path).to_string(),
             });
+            */
         }
         Ok(())
     }

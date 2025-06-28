@@ -16,12 +16,13 @@
  * under the License.
  */
 
+use crate::io::file::{IggyFile};
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
-use crate::streaming::utils::PooledBuffer;
+use crate::streaming::utils::{file, PooledBuffer};
 use bytes::BytesMut;
 use error_set::ErrContext;
 use iggy_common::IggyError;
-use std::{fs::File as StdFile, os::unix::prelude::FileExt};
+use monoio::fs::File;
 use std::{
     io::ErrorKind,
     sync::{
@@ -29,15 +30,13 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-use tokio::fs::OpenOptions;
-use tokio::task::spawn_blocking;
 use tracing::{error, trace};
 
 /// A dedicated struct for reading from the messages file.
 #[derive(Debug)]
 pub struct MessagesReader {
     file_path: String,
-    file: Arc<StdFile>,
+    file: IggyFile,
     messages_size_bytes: Arc<AtomicU64>,
 }
 
@@ -47,10 +46,7 @@ impl MessagesReader {
         file_path: &str,
         messages_size_bytes: Arc<AtomicU64>,
     ) -> Result<Self, IggyError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .open(file_path)
-            .await
+        let file = file::open_std(file_path)
             .with_error_context(|error| {
                 format!("Failed to open messages file: {file_path}, error: {error}")
             })
@@ -71,6 +67,7 @@ impl MessagesReader {
                 )
             });
         }
+        let file = File::from_std(file).unwrap();
 
         trace!(
             "Opened messages file for reading: {file_path}, size: {}",
@@ -79,7 +76,7 @@ impl MessagesReader {
 
         Ok(Self {
             file_path: file_path.to_string(),
-            file: Arc::new(file.into_std().await),
+            file: file.into(),
             messages_size_bytes,
         })
     }
@@ -177,20 +174,19 @@ impl MessagesReader {
         len: u32,
         use_pool: bool,
     ) -> Result<PooledBuffer, std::io::Error> {
-        let file = self.file.clone();
-        spawn_blocking(move || {
-            if use_pool {
+           if use_pool {
                 let mut buf = PooledBuffer::with_capacity(len as usize);
                 unsafe { buf.set_len(len as usize) };
-                file.read_exact_at(&mut buf, offset as u64)?;
+                let (result, buf) = self.file.read_exact_at(buf, offset as u64).await;
+                result?;
                 Ok(buf)
+
             } else {
                 let mut buf = BytesMut::with_capacity(len as usize);
                 unsafe { buf.set_len(len as usize) };
-                file.read_exact_at(&mut buf, offset as u64)?;
+                let (result, buf) = self.file.read_exact_at(buf, offset as u64).await;
+                result?;
                 Ok(PooledBuffer::from_existing(buf))
             }
-        })
-        .await?
     }
 }

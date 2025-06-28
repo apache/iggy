@@ -196,7 +196,7 @@ async fn should_purge_existing_partition_on_disk() {
             .map(|msg| msg.get_size_bytes().as_bytes_u32())
             .sum();
         let batch = IggyMessagesBatchMut::from_messages(&messages, messages_size);
-        partition.append_messages(batch, None).await.unwrap();
+        partition.append_messages(batch).await.unwrap();
         let loaded_messages = partition.get_messages_by_offset(0, 100).await.unwrap();
         assert_eq!(loaded_messages.count(), messages_count);
         partition.purge().await.unwrap();

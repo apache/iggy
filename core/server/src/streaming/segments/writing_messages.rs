@@ -23,7 +23,6 @@ use crate::{
     streaming::deduplication::message_deduplicator::MessageDeduplicator,
 };
 use error_set::ErrContext;
-use iggy_common::Confirmation;
 use iggy_common::IggyError;
 use std::sync::atomic::Ordering;
 use tracing::{info, trace};
@@ -66,10 +65,7 @@ impl Segment {
         Ok(())
     }
 
-    pub async fn persist_messages(
-        &mut self,
-        confirmation: Option<Confirmation>,
-    ) -> Result<usize, IggyError> {
+    pub async fn persist_messages(&mut self) -> Result<usize, IggyError> {
         if self.accumulator.is_empty() {
             return Ok(0);
         }
@@ -83,11 +79,6 @@ impl Segment {
         let accumulator = std::mem::take(&mut self.accumulator);
 
         let batches = accumulator.into_batch_set();
-        let confirmation = match confirmation {
-            Some(val) => val,
-            None => self.config.segment.server_confirmation,
-        };
-
         let batch_size = batches.size();
         let batch_count = batches.count();
 
@@ -97,7 +88,7 @@ impl Segment {
             .messages_writer
             .as_mut()
             .expect("Messages writer not initialized")
-            .save_batch_set(batches, confirmation)
+            .save_batch_set(batches)
             .await
             .with_error_context(|error| {
                 format!(
