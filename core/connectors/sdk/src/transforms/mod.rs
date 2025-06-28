@@ -20,18 +20,16 @@ mod add_fields;
 mod delete_fields;
 mod filter_fields;
 pub mod json;
-mod proto_convert;
+pub mod proto_convert;
 mod update_fields;
-use crate::{
-    DecodedMessage, Error, TopicMetadata,
-    transforms::proto_convert::{ProtoConvert, ProtoConvertConfig},
-};
+use crate::{DecodedMessage, Error, TopicMetadata};
 pub use add_fields::{AddFields, AddFieldsConfig, Field as AddField};
 pub use delete_fields::{DeleteFields, DeleteFieldsConfig};
 pub use filter_fields::{
     FilterFields, FilterFieldsConfig, FilterPattern, KeyPattern as FilterKeyPattern,
     ValuePattern as FilterValuePattern,
 };
+pub use proto_convert::{ProtoConvert, ProtoConvertConfig};
 use serde::{Deserialize, Serialize};
 use simd_json::OwnedValue;
 use std::sync::Arc;
@@ -113,9 +111,9 @@ pub fn from_config(
             Ok(Arc::new(UpdateFields::new(cfg)))
         }
         TransformType::ProtoConvert => {
-            let cfg: ProtoConvertConfig =
+            let cfg: proto_convert::ProtoConvertConfig =
                 serde_json::from_value(raw.clone()).map_err(|_| Error::InvalidConfig)?;
-            Ok(Arc::new(ProtoConvert::new(cfg)))
+            Ok(Arc::new(proto_convert::ProtoConvert::new(cfg)))
         }
     }
 }

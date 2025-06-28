@@ -94,8 +94,83 @@ preserve_structure = false
 - **Field Mapping**: Transform field names during format conversion
 - **Any Wrapper**: Support for `google.protobuf.Any` message wrapper
 
+### Programmatic Usage
+
+#### Dynamic Schema Loading
+
+You can load or reload schemas programmatically:
+
+```rust
+use iggy_connector_sdk::decoders::proto::{ProtoStreamDecoder, ProtoConfig};
+use std::path::PathBuf;
+
+let mut decoder = ProtoStreamDecoder::new(ProtoConfig {
+    schema_path: None,
+    use_any_wrapper: true,
+    ..Default::default()
+});
+
+let config_with_schema = ProtoConfig {
+    schema_path: Some(PathBuf::from("schemas/user.proto")),
+    message_type: Some("com.example.User".to_string()),
+    ..Default::default()
+};
+
+match decoder.update_config(config_with_schema, true) {
+    Ok(()) => println!("Schema loaded successfully"),
+    Err(e) => eprintln!("Failed to load schema: {}", e),
+}
+```
+
+#### Schema Registry Integration
+
+```rust
+use iggy_connector_sdk::encoders::proto::{ProtoStreamEncoder, ProtoEncoderConfig};
+
+let mut encoder = ProtoStreamEncoder::new_with_config(ProtoEncoderConfig {
+    schema_registry_url: Some("http://schema-registry:8081".to_string()),
+    message_type: Some("com.example.Event".to_string()),
+    use_any_wrapper: false,
+    ..Default::default()
+});
+
+if let Err(e) = encoder.load_schema() {
+    eprintln!("Schema reload failed: {}", e);
+}
+```
+
+#### Creating Converters with Schema
+
+```rust
+use iggy_connector_sdk::transforms::proto_convert::{ProtoConvert, ProtoConvertConfig};
+use iggy_connector_sdk::Schema;
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+let converter = ProtoConvert::new(ProtoConvertConfig {
+    source_format: Schema::Proto,
+    target_format: Schema::Json,
+    schema_path: Some(PathBuf::from("schemas/user.proto")),
+    message_type: Some("com.example.User".to_string()),
+    field_mappings: Some(HashMap::from([
+        ("user_id".to_string(), "id".to_string()),
+        ("full_name".to_string(), "name".to_string()),
+    ])),
+    ..ProtoConvertConfig::default()
+});
+
+let mut converter_with_manual_loading = ProtoConvert::new(ProtoConvertConfig::default());
+if let Err(e) = converter_with_manual_loading.load_schema() {
+    eprintln!("Manual schema loading failed: {}", e);
+}
+```
+
 ### Usage Notes
 
+- **Automatic Loading**: Schemas are loaded automatically when `schema_path` or `descriptor_set` is provided in config
+- **Manual Loading**: Use `load_schema()` method for dynamic schema loading or reloading
+- **Error Handling**: Schema loading errors are handled gracefully with fallback to Any wrapper mode
+- **Immutable Design**: Converters are created with fixed configuration - create new instances for different schemas
 - When `use_any_wrapper` is enabled, messages are wrapped in `google.protobuf.Any` for better type safety
 - The `proto_convert` transform can be used to convert protobuf messages to JSON for easier processing
 - Field mappings allow you to rename fields during format conversion

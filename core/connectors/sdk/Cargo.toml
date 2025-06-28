@@ -41,6 +41,8 @@ once_cell = { workspace = true }
 postcard = { workspace = true }
 prost = "0.13.5"
 prost-types = "0.13.5"
+protox = "0.8.0"
+protox-parse = "0.8.0"
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

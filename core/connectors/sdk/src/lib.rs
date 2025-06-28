@@ -41,6 +41,8 @@ pub mod sink;
 pub mod source;
 pub mod transforms;
 
+pub use transforms::Transform;
+
 static RUNTIME: OnceCell<Runtime> = OnceCell::new();
 
 pub fn get_runtime() -> &'static Runtime {
@@ -80,7 +82,7 @@ pub trait Sink: Send + Sync {
     async fn close(&mut self) -> Result<(), Error>;
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Payload {
     Json(simd_json::OwnedValue),
     Raw(Vec<u8>),
@@ -169,7 +171,7 @@ impl Schema {
             Schema::Json => Arc::new(JsonStreamEncoder),
             Schema::Raw => Arc::new(RawStreamEncoder),
             Schema::Text => Arc::new(TextStreamEncoder),
-            Schema::Proto => Arc::new(ProtoStreamEncoder),
+            Schema::Proto => Arc::new(ProtoStreamEncoder::default()),
         }
     }
 }
