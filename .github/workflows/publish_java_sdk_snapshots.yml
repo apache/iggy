@@ -56,6 +56,9 @@ jobs:
           fi
 
       - name: Publish Snapshot
+        # To publish we use NEXUS_USER and NEXUS_PASSWORD as credentials
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PW }}
         if: steps.extract_version.outputs.snapshot == 'SNAPSHOT'
-        # To publish we use secrets.NEXUS_USER and secrets.NEXUS_PASSWORD as credentials
         run: foreign/java/dev-support/checks/build.sh build -x test -x checkstyleMain -x checkstyleTest publish

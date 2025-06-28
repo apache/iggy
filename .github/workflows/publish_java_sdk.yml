@@ -106,5 +106,8 @@ jobs:
         run: foreign/java/dev-support/checks/build.sh test
 
       - name: Publish
-        # To publish we use secrets.NEXUS_USER and secrets.NEXUS_PASSWORD as credentials
+        # To publish we use NEXUS_USER and NEXUS_PASSWORD as credentials
+        env:
+          NEXUS_USER: ${{ secrets.NEXUS_USER }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PW }}
         run: foreign/java/dev-support/checks/build.sh build -x test -x checkstyleMain -x checkstyleTest publish
