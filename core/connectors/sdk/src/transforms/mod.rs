@@ -20,8 +20,12 @@ mod add_fields;
 mod delete_fields;
 mod filter_fields;
 pub mod json;
+mod proto_convert;
 mod update_fields;
-use crate::{DecodedMessage, Error, TopicMetadata};
+use crate::{
+    DecodedMessage, Error, TopicMetadata,
+    transforms::proto_convert::{ProtoConvert, ProtoConvertConfig},
+};
 pub use add_fields::{AddFields, AddFieldsConfig, Field as AddField};
 pub use delete_fields::{DeleteFields, DeleteFieldsConfig};
 pub use filter_fields::{
@@ -80,6 +84,7 @@ pub enum TransformType {
     DeleteFields,
     FilterFields,
     UpdateFields,
+    ProtoConvert,
 }
 
 pub fn from_config(
@@ -106,6 +111,11 @@ pub fn from_config(
             let cfg: UpdateFieldsConfig =
                 serde_json::from_value(raw.clone()).map_err(|_| Error::InvalidConfig)?;
             Ok(Arc::new(UpdateFields::new(cfg)))
+        }
+        TransformType::ProtoConvert => {
+            let cfg: ProtoConvertConfig =
+                serde_json::from_value(raw.clone()).map_err(|_| Error::InvalidConfig)?;
+            Ok(Arc::new(ProtoConvert::new(cfg)))
         }
     }
 }
