@@ -75,7 +75,7 @@ jobs:
         run: cd foreign/node/ && npm run build
         
       - name: run unit test
-        run: cd foreign/node/ && npm run test
+        run: cd foreign/node/ && npm run test:unit
 
       ### Integration tests (e2e)
       
