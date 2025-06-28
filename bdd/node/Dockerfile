@@ -15,34 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: Cross-SDK BDD Tests
+FROM node:24-slim
 
-on:
-  workflow_call:
+COPY ./foreign/node .
+COPY ./bdd/scenarios ./bdd/
 
-jobs:
-  bdd-tests:
-    name: BDD tests (${{ matrix.sdk }})
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        sdk: [rust, python, go, node]
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            . -> target
-            foreign/python -> target
-          cache-on-failure: true
-          key: bdd-${{ matrix.sdk }}
+RUN npm ci
 
-      - name: Run BDD tests for ${{ matrix.sdk }}
-        run: ./scripts/run-bdd-tests.sh ${{ matrix.sdk }}
+USER node
 
-      - name: Clean up Docker resources
-        if: always()
-        run: ./scripts/run-bdd-tests.sh clean
+CMD ["npm", "run", "test"]

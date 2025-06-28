@@ -43,6 +43,11 @@ case $SDK in
   docker compose build --no-cache iggy-server go-bdd
   docker compose up --abort-on-container-exit go-bdd
   ;;
+"node")
+  echo "🐢🚀 Running node BDD tests..."
+  docker compose build --no-cache iggy-server node-bdd
+  docker compose up --abort-on-container-exit node-bdd
+  ;;
 "all")
   echo "🚀 Running all SDK BDD tests..."
   echo "🦀 Starting with Rust tests..."
@@ -52,6 +57,8 @@ case $SDK in
   docker compose up --abort-on-container-exit python-bdd
   echo "🐹 Now running Go tests..."
   docker compose up --abort-on-container-exit go-bdd
+  echo "🐢🚀 Now unning node BDD tests..."
+  docker compose up --abort-on-container-exit node-bdd
   ;;
 "clean")
   echo "🧹 Cleaning up Docker resources..."
@@ -65,6 +72,7 @@ case $SDK in
   echo "   $0 rust                    # Run Rust tests only"
   echo "   $0 python                  # Run Python tests only"
   echo "   $0 go                      # Run Go tests only"
+  echo "   $0 node                    # Run Node.js tests only"
   echo "   $0 all                     # Run all SDK tests"
   echo "   $0 clean                   # Clean up Docker resources"
   exit 1
