@@ -16,6 +16,9 @@
  * under the License.
  */
 
+pub mod backend;
 pub mod benchmark_producer;
+pub mod high_level_backend;
+pub mod low_level_backend;
 
 pub use benchmark_producer::BenchmarkProducer;

@@ -15,8 +15,8 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
 use crate::actors::{HighLevelApiMarker, LowLevelApiMarker};
+use crate::utils::batch_generator::BenchmarkBatchGenerator;
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use iggy::prelude::*;
 use integration::test_server::ClientFactory;
@@ -25,14 +25,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Clone)]
-pub struct ConsumerBackendImpl<T> {
+pub struct ProducerBackendImpl<T> {
     pub client_factory: Arc<dyn ClientFactory>,
-    pub config: BenchmarkConsumerConfig,
+    pub config: BenchmarkProducerConfig,
     _phantom: PhantomData<T>,
 }
 
-impl<T> ConsumerBackendImpl<T> {
-    pub fn new(client_factory: Arc<dyn ClientFactory>, config: BenchmarkConsumerConfig) -> Self {
+impl<T> ProducerBackendImpl<T> {
+    pub fn new(client_factory: Arc<dyn ClientFactory>, config: BenchmarkProducerConfig) -> Self {
         Self {
             client_factory,
             config,
@@ -41,16 +41,16 @@ impl<T> ConsumerBackendImpl<T> {
     }
 }
 
-pub type LowLevelBackend = ConsumerBackendImpl<LowLevelApiMarker>;
-pub type HighLevelBackend = ConsumerBackendImpl<HighLevelApiMarker>;
+pub type LowLevelBackend = ProducerBackendImpl<LowLevelApiMarker>;
+pub type HighLevelBackend = ProducerBackendImpl<HighLevelApiMarker>;
 
-pub enum ConsumerBackend {
+pub enum ProducerBackend {
     LowLevel(LowLevelBackend),
     HighLevel(HighLevelBackend),
 }
 
 #[derive(Debug, Clone)]
-pub struct ConsumedBatch {
+pub struct ProducedBatch {
     pub messages: u32,
     pub user_data_bytes: u64,
     pub total_bytes: u64,
@@ -58,25 +58,32 @@ pub struct ConsumedBatch {
 }
 
 #[derive(Debug, Clone)]
-pub struct BenchmarkConsumerConfig {
-    pub consumer_id: u32,
-    pub consumer_group_id: Option<u32>,
+pub struct BenchmarkProducerConfig {
+    pub producer_id: u32,
     pub stream_id: u32,
+    pub partitions: u32,
     pub messages_per_batch: BenchmarkNumericParameter,
+    pub message_size: BenchmarkNumericParameter,
     pub warmup_time: IggyDuration,
-    pub polling_kind: PollingKind,
-    pub origin_timestamp_latency_calculation: bool,
 }
 
-pub trait BenchmarkConsumerBackend {
-    type Consumer;
+pub trait BenchmarkProducerBackend {
+    type Producer;
 
-    async fn setup(&self) -> Result<Self::Consumer, IggyError>;
-    async fn warmup(&self, consumer: &mut Self::Consumer) -> Result<(), IggyError>;
-    async fn consume_batch(
+    async fn setup(&self) -> Result<Self::Producer, IggyError>;
+
+    async fn warmup(
         &self,
-        consumer: &mut Self::Consumer,
-    ) -> Result<Option<ConsumedBatch>, IggyError>;
+        producer: &mut Self::Producer,
+        batch_generator: &mut BenchmarkBatchGenerator,
+    ) -> Result<(), IggyError>;
+
+    async fn produce_batch(
+        &self,
+        producer: &mut Self::Producer,
+        batch_generator: &mut BenchmarkBatchGenerator,
+    ) -> Result<Option<ProducedBatch>, IggyError>;
+
     fn log_setup_info(&self);
     fn log_warmup_info(&self);
 }
