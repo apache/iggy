@@ -31,7 +31,7 @@ func (tms *IggyTcpClient) GetClients() ([]ClientResponse, error) {
 	return binaryserialization.DeserializeClients(buffer)
 }
 
-func (tms *IggyTcpClient) GetClientById(clientId int) (*ClientResponse, error) {
+func (tms *IggyTcpClient) GetClient(clientId int) (*ClientResponse, error) {
 	message := binaryserialization.SerializeInt(clientId)
 	buffer, err := tms.sendAndFetchResponse(message, GetClientCode)
 	if err != nil {

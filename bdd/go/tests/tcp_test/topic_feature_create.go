@@ -130,7 +130,7 @@ var _ = Describe("CREATE TOPIC:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to create topic", func() {
-			client := createConnection()
+			client := createClient()
 			err := client.CreateTopic(iggcon.CreateTopicRequest{
 				TopicId:              1,
 				StreamId:             iggcon.NewIdentifier(10),

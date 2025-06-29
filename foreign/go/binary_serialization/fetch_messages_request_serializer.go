@@ -30,7 +30,7 @@ const (
 )
 
 type TcpFetchMessagesRequest struct {
-	iggcon.FetchMessagesRequest
+	iggcon.PollMessageRequest
 }
 
 func (request *TcpFetchMessagesRequest) Serialize() []byte {

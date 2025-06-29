@@ -22,7 +22,7 @@ import (
 	. "github.com/apache/iggy/foreign/go/contracts"
 )
 
-func (tms *IggyTcpClient) GetOffset(request GetOffsetRequest) (*OffsetResponse, error) {
+func (tms *IggyTcpClient) GetConsumerOffset(request GetConsumerOffsetRequest) (*ConsumerOffsetInfo, error) {
 	message := binaryserialization.GetOffset(request)
 	buffer, err := tms.sendAndFetchResponse(message, GetOffsetCode)
 	if err != nil {
@@ -32,7 +32,7 @@ func (tms *IggyTcpClient) GetOffset(request GetOffsetRequest) (*OffsetResponse, 
 	return binaryserialization.DeserializeOffset(buffer), nil
 }
 
-func (tms *IggyTcpClient) StoreOffset(request StoreOffsetRequest) error {
+func (tms *IggyTcpClient) StoreConsumerOffset(request StoreConsumerOffsetRequest) error {
 	message := binaryserialization.UpdateOffset(request)
 	_, err := tms.sendAndFetchResponse(message, StoreOffsetCode)
 	return err

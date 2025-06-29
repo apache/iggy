@@ -104,7 +104,7 @@ var _ = Describe("SEND MESSAGES:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to update stream", func() {
-			client := createConnection()
+			client := createClient()
 			messages := createDefaultMessages()
 			request := iggcon.SendMessagesRequest{
 				StreamId:     iggcon.NewIdentifier(int(createRandomUInt32())),

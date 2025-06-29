@@ -20,8 +20,8 @@ package binaryserialization
 import (
 	"testing"
 
-	"github.com/google/uuid"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	"github.com/google/uuid"
 )
 
 func TestSerialize_SendMessagesRequest(t *testing.T) {

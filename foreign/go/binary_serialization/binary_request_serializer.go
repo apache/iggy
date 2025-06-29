@@ -33,7 +33,7 @@ func CreateGroup(request CreateConsumerGroupRequest) []byte {
 	return bytes
 }
 
-func UpdateOffset(request StoreOffsetRequest) []byte {
+func UpdateOffset(request StoreConsumerOffsetRequest) []byte {
 	bytes := make([]byte, 6+request.StreamId.Length+request.TopicId.Length+request.Consumer.Id.Length+13)
 	bytes[0] = byte(request.Consumer.Kind)
 	position := 7 + request.StreamId.Length + request.TopicId.Length + request.Consumer.Id.Length
@@ -44,7 +44,7 @@ func UpdateOffset(request StoreOffsetRequest) []byte {
 	return bytes
 }
 
-func GetOffset(request GetOffsetRequest) []byte {
+func GetOffset(request GetConsumerOffsetRequest) []byte {
 	bytes := make([]byte, 6+request.StreamId.Length+request.TopicId.Length+request.Consumer.Id.Length+5)
 	bytes[0] = byte(request.Consumer.Kind)
 	position := 7 + request.StreamId.Length + request.TopicId.Length + request.Consumer.Id.Length
@@ -62,7 +62,7 @@ func CreatePartitions(request CreatePartitionsRequest) []byte {
 	return bytes
 }
 
-func DeletePartitions(request DeletePartitionRequest) []byte {
+func DeletePartitions(request DeletePartitionsRequest) []byte {
 	bytes := make([]byte, 8+request.StreamId.Length+request.TopicId.Length)
 	position := 4 + request.StreamId.Length + request.TopicId.Length
 	copy(bytes[0:position], SerializeIdentifiers(request.StreamId, request.TopicId))
@@ -278,7 +278,7 @@ func SerializeChangePasswordRequest(request ChangePasswordRequest) []byte {
 	return bytes
 }
 
-func SerializeUpdateUserPermissionsRequest(request UpdateUserPermissionsRequest) []byte {
+func SerializeUpdateUserPermissionsRequest(request UpdatePermissionsRequest) []byte {
 	length := request.UserID.Length + 2
 
 	if request.Permissions != nil {
@@ -313,7 +313,7 @@ func SerializeInt(value int) []byte {
 	return bytes
 }
 
-func SerializeLoginWithPersonalAccessToken(request LogInAccessTokenRequest) []byte {
+func SerializeLoginWithPersonalAccessToken(request LoginWithPersonalAccessTokenRequest) []byte {
 	length := 1 + len(request.Token)
 	bytes := make([]byte, length)
 	bytes[0] = byte(len(request.Token))
@@ -321,7 +321,7 @@ func SerializeLoginWithPersonalAccessToken(request LogInAccessTokenRequest) []by
 	return bytes
 }
 
-func SerializeDeletePersonalAccessToken(request DeleteAccessTokenRequest) []byte {
+func SerializeDeletePersonalAccessToken(request DeletePersonalAccessTokenRequest) []byte {
 	length := 1 + len(request.Name)
 	bytes := make([]byte, length)
 	bytes[0] = byte(len(request.Name))
@@ -329,7 +329,7 @@ func SerializeDeletePersonalAccessToken(request DeleteAccessTokenRequest) []byte
 	return bytes
 }
 
-func SerializeCreatePersonalAccessToken(request CreateAccessTokenRequest) []byte {
+func SerializeCreatePersonalAccessToken(request CreatePersonalAccessTokenRequest) []byte {
 	length := 1 + len(request.Name) + 8
 	bytes := make([]byte, length)
 	bytes[0] = byte(len(request.Name))

@@ -99,7 +99,7 @@ var _ = Describe("CREATE STREAM:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to create stream", func() {
-			client := createConnection()
+			client := createClient()
 			err := client.CreateStream(iggcon.CreateStreamRequest{
 				StreamId: int(createRandomUInt32()),
 				Name:     createRandomString(32),

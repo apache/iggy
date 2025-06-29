@@ -22,7 +22,7 @@ import (
 	. "github.com/apache/iggy/foreign/go/contracts"
 )
 
-func (tms *IggyTcpClient) CreateAccessToken(request CreateAccessTokenRequest) (*AccessToken, error) {
+func (tms *IggyTcpClient) CreatePersonalAccessToken(request CreatePersonalAccessTokenRequest) (*AccessToken, error) {
 	message := binaryserialization.SerializeCreatePersonalAccessToken(request)
 	buffer, err := tms.sendAndFetchResponse(message, CreateAccessTokenCode)
 	if err != nil {
@@ -32,13 +32,13 @@ func (tms *IggyTcpClient) CreateAccessToken(request CreateAccessTokenRequest) (*
 	return binaryserialization.DeserializeAccessToken(buffer)
 }
 
-func (tms *IggyTcpClient) DeleteAccessToken(request DeleteAccessTokenRequest) error {
+func (tms *IggyTcpClient) DeletePersonalAccessToken(request DeletePersonalAccessTokenRequest) error {
 	message := binaryserialization.SerializeDeletePersonalAccessToken(request)
 	_, err := tms.sendAndFetchResponse(message, DeleteAccessTokenCode)
 	return err
 }
 
-func (tms *IggyTcpClient) GetAccessTokens() ([]AccessTokenResponse, error) {
+func (tms *IggyTcpClient) GetPersonalAccessTokens() ([]PersonalAccessTokenInfo, error) {
 	buffer, err := tms.sendAndFetchResponse([]byte{}, GetAccessTokensCode)
 	if err != nil {
 		return nil, err

@@ -40,7 +40,7 @@ var _ = Describe("GET ALL CONSUMER GROUPS:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to get all consumer groups", func() {
-			client := createConnection()
+			client := createClient()
 			_, err := client.GetConsumerGroups(iggcon.NewIdentifier(int(createRandomUInt32())), iggcon.NewIdentifier(int(createRandomUInt32())))
 
 			itShouldReturnUnauthenticatedError(err)

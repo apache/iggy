@@ -90,7 +90,7 @@ var _ = Describe("LEAVE CONSUMER GROUP:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to leave to the consumer group", func() {
-			client := createConnection()
+			client := createClient()
 			err := client.LeaveConsumerGroup(iggcon.LeaveConsumerGroupRequest{
 				StreamId:        iggcon.NewIdentifier(int(createRandomUInt32())),
 				TopicId:         iggcon.NewIdentifier(int(createRandomUInt32())),

@@ -29,7 +29,7 @@ var _ = Describe("DELETE PAT:", func() {
 			name := createRandomString(16)
 			token := successfullyCreateAccessToken(name, client)
 
-			err := client.DeleteAccessToken(iggcon.DeleteAccessTokenRequest{
+			err := client.DeletePersonalAccessToken(iggcon.DeletePersonalAccessTokenRequest{
 				Name: name,
 			})
 
@@ -40,8 +40,8 @@ var _ = Describe("DELETE PAT:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to delete PAT", func() {
-			client := createConnection()
-			err := client.DeleteAccessToken(iggcon.DeleteAccessTokenRequest{
+			client := createClient()
+			err := client.DeletePersonalAccessToken(iggcon.DeletePersonalAccessTokenRequest{
 				Name: createRandomString(16),
 			})
 			itShouldReturnUnauthenticatedError(err)

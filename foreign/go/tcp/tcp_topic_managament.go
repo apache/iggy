@@ -23,7 +23,7 @@ import (
 	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
-func (tms *IggyTcpClient) GetTopics(streamId Identifier) ([]TopicResponse, error) {
+func (tms *IggyTcpClient) GetTopics(streamId Identifier) ([]Topic, error) {
 	message := binaryserialization.SerializeIdentifier(streamId)
 	buffer, err := tms.sendAndFetchResponse(message, GetTopicsCode)
 	if err != nil {
@@ -33,7 +33,7 @@ func (tms *IggyTcpClient) GetTopics(streamId Identifier) ([]TopicResponse, error
 	return binaryserialization.DeserializeTopics(buffer)
 }
 
-func (tms *IggyTcpClient) GetTopicById(streamId Identifier, topicId Identifier) (*TopicResponse, error) {
+func (tms *IggyTcpClient) GetTopic(streamId Identifier, topicId Identifier) (*TopicDetails, error) {
 	message := binaryserialization.SerializeIdentifiers(streamId, topicId)
 	buffer, err := tms.sendAndFetchResponse(message, GetTopicCode)
 	if err != nil {

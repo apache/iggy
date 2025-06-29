@@ -89,7 +89,7 @@ var _ = Describe("DELETE CONSUMER GROUP:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to delete consumer group", func() {
-			client := createConnection()
+			client := createClient()
 			err := client.DeleteConsumerGroup(iggcon.DeleteConsumerGroupRequest{
 				StreamId:        iggcon.NewIdentifier(int(createRandomUInt32())),
 				TopicId:         iggcon.NewIdentifier(int(createRandomUInt32())),

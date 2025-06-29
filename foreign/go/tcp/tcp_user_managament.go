@@ -23,7 +23,7 @@ import (
 	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
-func (tms *IggyTcpClient) GetUser(identifier Identifier) (*UserResponse, error) {
+func (tms *IggyTcpClient) GetUser(identifier Identifier) (*UserInfoDetails, error) {
 	message := binaryserialization.SerializeIdentifier(identifier)
 	buffer, err := tms.sendAndFetchResponse(message, GetUserCode)
 	if err != nil {
@@ -36,7 +36,7 @@ func (tms *IggyTcpClient) GetUser(identifier Identifier) (*UserResponse, error) 
 	return binaryserialization.DeserializeUser(buffer)
 }
 
-func (tms *IggyTcpClient) GetUsers() ([]*UserResponse, error) {
+func (tms *IggyTcpClient) GetUsers() ([]*UserInfo, error) {
 	buffer, err := tms.sendAndFetchResponse([]byte{}, GetUsersCode)
 	if err != nil {
 		return nil, err
@@ -63,7 +63,7 @@ func (tms *IggyTcpClient) DeleteUser(identifier Identifier) error {
 	return err
 }
 
-func (tms *IggyTcpClient) UpdateUserPermissions(request UpdateUserPermissionsRequest) error {
+func (tms *IggyTcpClient) UpdatePermissions(request UpdatePermissionsRequest) error {
 	message := binaryserialization.SerializeUpdateUserPermissionsRequest(request)
 	_, err := tms.sendAndFetchResponse(message, UpdatePermissionsCode)
 	return err

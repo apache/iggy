@@ -26,7 +26,7 @@ import (
 func TestSerialize_TcpFetchMessagesRequest(t *testing.T) {
 	// Create a sample TcpFetchMessagesRequest
 	request := TcpFetchMessagesRequest{
-		FetchMessagesRequest: iggcon.FetchMessagesRequest{
+		PollMessageRequest: iggcon.PollMessageRequest{
 			Consumer: iggcon.Consumer{
 				Kind: iggcon.ConsumerSingle,
 				Id:   iggcon.NewIdentifier(42),

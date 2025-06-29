@@ -80,7 +80,7 @@ var _ = Describe("UPDATE STREAM:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to update stream", func() {
-			client := createConnection()
+			client := createClient()
 			err := client.UpdateStream(iggcon.UpdateStreamRequest{
 				StreamId: iggcon.NewIdentifier(int(createRandomUInt32())),
 				Name:     createRandomString(128),

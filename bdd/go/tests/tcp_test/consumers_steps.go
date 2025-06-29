@@ -20,28 +20,28 @@ package tcp_test
 import (
 	"strconv"
 
-	"github.com/apache/iggy/foreign/go"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	"github.com/apache/iggy/foreign/go/iggycli"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
 // operations
-func successfullyCreateConsumer(streamId int, topicId int, client iggy.MessageStream) (int, string) {
+func successfullyCreateConsumer(streamId int, topicId int, cli iggycli.Client) (int, string) {
 	request := iggcon.CreateConsumerGroupRequest{
 		StreamId:        iggcon.NewIdentifier(streamId),
 		TopicId:         iggcon.NewIdentifier(topicId),
 		ConsumerGroupId: int(createRandomUInt32()),
 		Name:            createRandomString(16),
 	}
-	err := client.CreateConsumerGroup(request)
+	err := cli.CreateConsumerGroup(request)
 
-	itShouldSuccessfullyCreateConsumer(streamId, topicId, request.ConsumerGroupId, request.Name, client)
+	itShouldSuccessfullyCreateConsumer(streamId, topicId, request.ConsumerGroupId, request.Name, cli)
 	itShouldNotReturnError(err)
 	return request.ConsumerGroupId, request.Name
 }
 
-func successfullyJoinConsumer(streamId int, topicId int, groupId int, client iggy.MessageStream) {
+func successfullyJoinConsumer(streamId int, topicId int, groupId int, client iggycli.Client) {
 	request := iggcon.JoinConsumerGroupRequest{
 		StreamId:        iggcon.NewIdentifier(streamId),
 		TopicId:         iggcon.NewIdentifier(topicId),
@@ -94,8 +94,8 @@ func itShouldContainSpecificConsumer(id int, name string, consumers []iggcon.Con
 	})
 }
 
-func itShouldSuccessfullyCreateConsumer(streamId int, topicId int, groupId int, expectedName string, client iggy.MessageStream) {
-	consumer, err := client.GetConsumerGroupById(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId), iggcon.NewIdentifier(groupId))
+func itShouldSuccessfullyCreateConsumer(streamId int, topicId int, groupId int, expectedName string, client iggycli.Client) {
+	consumer, err := client.GetConsumerGroup(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId), iggcon.NewIdentifier(groupId))
 
 	It("should create consumer with id "+string(rune(groupId)), func() {
 		Expect(consumer).NotTo(BeNil())
@@ -109,8 +109,8 @@ func itShouldSuccessfullyCreateConsumer(streamId int, topicId int, groupId int, 
 	itShouldNotReturnError(err)
 }
 
-func itShouldSuccessfullyDeletedConsumer(streamId int, topicId int, groupId int, client iggy.MessageStream) {
-	consumer, err := client.GetConsumerGroupById(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId), iggcon.NewIdentifier(groupId))
+func itShouldSuccessfullyDeletedConsumer(streamId int, topicId int, groupId int, client iggycli.Client) {
+	consumer, err := client.GetConsumerGroup(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId), iggcon.NewIdentifier(groupId))
 
 	itShouldReturnSpecificError(err, "consumer_group_not_found")
 	It("should not return consumer", func() {
@@ -118,8 +118,8 @@ func itShouldSuccessfullyDeletedConsumer(streamId int, topicId int, groupId int,
 	})
 }
 
-func itShouldSuccessfullyJoinConsumer(streamId int, topicId int, groupId int, client iggy.MessageStream) {
-	consumer, err := client.GetConsumerGroupById(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId), iggcon.NewIdentifier(groupId))
+func itShouldSuccessfullyJoinConsumer(streamId int, topicId int, groupId int, client iggycli.Client) {
+	consumer, err := client.GetConsumerGroup(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId), iggcon.NewIdentifier(groupId))
 
 	It("should join consumer with id "+string(rune(groupId)), func() {
 		Expect(consumer).NotTo(BeNil())
@@ -129,8 +129,8 @@ func itShouldSuccessfullyJoinConsumer(streamId int, topicId int, groupId int, cl
 	itShouldNotReturnError(err)
 }
 
-func itShouldSuccessfullyLeaveConsumer(streamId int, topicId int, groupId int, client iggy.MessageStream) {
-	consumer, err := client.GetConsumerGroupById(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId), iggcon.NewIdentifier(groupId))
+func itShouldSuccessfullyLeaveConsumer(streamId int, topicId int, groupId int, client iggycli.Client) {
+	consumer, err := client.GetConsumerGroup(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId), iggcon.NewIdentifier(groupId))
 
 	It("should leave consumer with id "+string(rune(groupId)), func() {
 		Expect(consumer).NotTo(BeNil())

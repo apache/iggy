@@ -127,7 +127,7 @@ var _ = Describe("CREATE CONSUMER GROUP:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to create consumer group", func() {
-			client := createConnection()
+			client := createClient()
 			request := iggcon.CreateConsumerGroupRequest{
 				StreamId:        iggcon.NewIdentifier(int(createRandomUInt32())),
 				TopicId:         iggcon.NewIdentifier(int(createRandomUInt32())),

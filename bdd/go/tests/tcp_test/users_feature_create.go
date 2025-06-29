@@ -115,7 +115,7 @@ var _ = Describe("CREATE USER:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to create user", func() {
-			client := createConnection()
+			client := createClient()
 			request := iggcon.CreateUserRequest{
 				Username: createRandomString(16),
 				Password: createRandomString(16),

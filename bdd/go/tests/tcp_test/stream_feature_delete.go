@@ -46,7 +46,7 @@ var _ = Describe("DELETE STREAM:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to delete stream", func() {
-			client := createConnection()
+			client := createClient()
 			err := client.DeleteStream(iggcon.NewIdentifier(int(createRandomUInt32())))
 
 			itShouldReturnUnauthenticatedError(err)

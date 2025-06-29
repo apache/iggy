@@ -88,7 +88,7 @@ var _ = Describe("JOIN CONSUMER GROUP:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to join to the consumer group", func() {
-			client := createConnection()
+			client := createClient()
 			err := client.JoinConsumerGroup(iggcon.JoinConsumerGroupRequest{
 				StreamId:        iggcon.NewIdentifier(int(createRandomUInt32())),
 				TopicId:         iggcon.NewIdentifier(int(createRandomUInt32())),

@@ -29,29 +29,54 @@ import (
 	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
+type Option func(config *Options)
+
+type Options struct {
+	Ctx               context.Context
+	ServerAddress     string
+	HeartbeatInterval time.Duration
+}
+
+func GetDefaultOptions() Options {
+	return Options{
+		Ctx:               context.Background(),
+		ServerAddress:     "127.0.0.1:8090",
+		HeartbeatInterval: time.Second * 5,
+	}
+}
+
 type IggyTcpClient struct {
-	client             *net.TCPConn
+	conn               *net.TCPConn
 	mtx                sync.Mutex
 	MessageCompression iggcon.IggyMessageCompression
 }
 
-const (
-	InitialBytesLength   = 4
-	ExpectedResponseSize = 8
-	MaxStringLength      = 255
-)
+// WithServerAddress Sets the server address for the TCP client.
+func WithServerAddress(address string) Option {
+	return func(opts *Options) {
+		opts.ServerAddress = address
+	}
+}
 
-func NewTcpMessageStream(
-	ctx context.Context,
-	url string,
-	compression iggcon.IggyMessageCompression,
-	heartbeatInterval time.Duration,
-) (*IggyTcpClient, error) {
-	addr, err := net.ResolveTCPAddr("tcp", url)
+// WithContext sets context
+func WithContext(ctx context.Context) Option {
+	return func(opts *Options) {
+		opts.Ctx = ctx
+	}
+}
+
+func NewIggyTcpClient(options ...Option) (*IggyTcpClient, error) {
+	opts := GetDefaultOptions()
+	for _, opt := range options {
+		if opt != nil {
+			opt(&opts)
+		}
+	}
+	addr, err := net.ResolveTCPAddr("tcp", opts.ServerAddress)
 	if err != nil {
 		return nil, err
 	}
-
+	ctx := opts.Ctx
 	var d = net.Dialer{
 		KeepAlive: -1,
 	}
@@ -60,8 +85,11 @@ func NewTcpMessageStream(
 		return nil, err
 	}
 
-	client := &IggyTcpClient{client: conn.(*net.TCPConn), MessageCompression: compression}
+	client := &IggyTcpClient{
+		conn: conn.(*net.TCPConn),
+	}
 
+	heartbeatInterval := opts.HeartbeatInterval
 	if heartbeatInterval > 0 {
 		go func() {
 			ticker := time.NewTicker(heartbeatInterval)
@@ -80,13 +108,19 @@ func NewTcpMessageStream(
 	return client, nil
 }
 
+const (
+	InitialBytesLength   = 4
+	ExpectedResponseSize = 8
+	MaxStringLength      = 255
+)
+
 func (tms *IggyTcpClient) read(expectedSize int) (int, []byte, error) {
 	var totalRead int
 	buffer := make([]byte, expectedSize)
 
 	for totalRead < expectedSize {
 		readSize := expectedSize - totalRead
-		n, err := tms.client.Read(buffer[totalRead : totalRead+readSize])
+		n, err := tms.conn.Read(buffer[totalRead : totalRead+readSize])
 		if err != nil {
 			return totalRead, buffer[:totalRead], err
 		}
@@ -99,7 +133,7 @@ func (tms *IggyTcpClient) read(expectedSize int) (int, []byte, error) {
 func (tms *IggyTcpClient) write(payload []byte) (int, error) {
 	var totalWritten int
 	for totalWritten < len(payload) {
-		n, err := tms.client.Write(payload[totalWritten:])
+		n, err := tms.conn.Write(payload[totalWritten:])
 		if err != nil {
 			return totalWritten, err
 		}

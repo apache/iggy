@@ -23,7 +23,7 @@ type ChangePasswordRequest struct {
 	NewPassword     string     `json:"NewPassword"`
 }
 
-type UpdateUserPermissionsRequest struct {
+type UpdatePermissionsRequest struct {
 	UserID      Identifier   `json:"-"`
 	Permissions *Permissions `json:"Permissions,omitempty"`
 }
@@ -41,11 +41,15 @@ type CreateUserRequest struct {
 	Permissions *Permissions `json:"Permissions,omitempty"`
 }
 
-type UserResponse struct {
-	Id          uint32       `json:"Id"`
-	CreatedAt   uint64       `json:"CreatedAt"`
-	Status      UserStatus   `json:"Status"`
-	Username    string       `json:"Username"`
+type UserInfo struct {
+	Id        uint32     `json:"Id"`
+	CreatedAt uint64     `json:"CreatedAt"`
+	Status    UserStatus `json:"Status"`
+	Username  string     `json:"Username"`
+}
+
+type UserInfoDetails struct {
+	UserInfo
 	Permissions *Permissions `json:"Permissions"`
 }
 

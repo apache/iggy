@@ -33,7 +33,7 @@ func (tms *IggyTcpClient) GetConsumerGroups(streamId, topicId Identifier) ([]Con
 	return binaryserialization.DeserializeConsumerGroups(buffer), err
 }
 
-func (tms *IggyTcpClient) GetConsumerGroupById(streamId, topicId, groupId Identifier) (*ConsumerGroupResponse, error) {
+func (tms *IggyTcpClient) GetConsumerGroup(streamId, topicId, groupId Identifier) (*ConsumerGroupResponse, error) {
 	message := binaryserialization.SerializeIdentifiers(streamId, topicId, groupId)
 	buffer, err := tms.sendAndFetchResponse(message, GetGroupCode)
 	if err != nil {

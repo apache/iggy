@@ -26,12 +26,12 @@ var _ = Describe("CREATE PAT:", func() {
 	When("User is logged in", func() {
 		Context("tries to create PAT with correct data", func() {
 			client := createAuthorizedConnection()
-			request := iggcon.CreateAccessTokenRequest{
+			request := iggcon.CreatePersonalAccessTokenRequest{
 				Name:   createRandomString(16),
 				Expiry: 0,
 			}
 
-			response, err := client.CreateAccessToken(request)
+			response, err := client.CreatePersonalAccessToken(request)
 
 			itShouldNotReturnError(err)
 			itShouldSuccessfullyCreateAccessToken(request.Name, client)
@@ -41,13 +41,13 @@ var _ = Describe("CREATE PAT:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to create PAT", func() {
-			client := createConnection()
-			request := iggcon.CreateAccessTokenRequest{
+			client := createClient()
+			request := iggcon.CreatePersonalAccessTokenRequest{
 				Name:   createRandomString(16),
 				Expiry: 0,
 			}
 
-			_, err := client.CreateAccessToken(request)
+			_, err := client.CreatePersonalAccessToken(request)
 			itShouldReturnUnauthenticatedError(err)
 		})
 	})

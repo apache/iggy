@@ -28,19 +28,19 @@ import (
 	"github.com/klauspost/compress/s2"
 )
 
-func DeserializeLogInResponse(payload []byte) *LogInResponse {
+func DeserializeLogInResponse(payload []byte) *LoginUserResponse {
 	userId := binary.LittleEndian.Uint32(payload[0:4])
-	return &LogInResponse{
+	return &LoginUserResponse{
 		UserId: userId,
 	}
 }
 
-func DeserializeOffset(payload []byte) *OffsetResponse {
+func DeserializeOffset(payload []byte) *ConsumerOffsetInfo {
 	partitionId := int(binary.LittleEndian.Uint32(payload[0:4]))
 	currentOffset := binary.LittleEndian.Uint64(payload[4:12])
 	storedOffset := binary.LittleEndian.Uint64(payload[12:20])
 
-	return &OffsetResponse{
+	return &ConsumerOffsetInfo{
 		PartitionId:   partitionId,
 		CurrentOffset: currentOffset,
 		StoredOffset:  storedOffset,
@@ -64,7 +64,7 @@ func DeserializeStreams(payload []byte) []StreamResponse {
 
 func DeserializerStream(payload []byte) *StreamResponse {
 	stream, position := DeserializeToStream(payload, 0)
-	topics := make([]TopicResponse, 0)
+	topics := make([]Topic, 0)
 	length := len(payload)
 
 	for position < length {
@@ -107,9 +107,9 @@ func DeserializeToStream(payload []byte, position int) (StreamResponse, int) {
 	}, readBytes
 }
 
-func DeserializeFetchMessagesResponse(payload []byte, compression IggyMessageCompression) (*FetchMessagesResponse, error) {
+func DeserializeFetchMessagesResponse(payload []byte, compression IggyMessageCompression) (*PollMessageResponse, error) {
 	if len(payload) == 0 {
-		return &FetchMessagesResponse{
+		return &PollMessageResponse{
 			PartitionId:   0,
 			CurrentOffset: 0,
 			Messages:      make([]IggyMessage, 0),
@@ -164,7 +164,7 @@ func DeserializeFetchMessagesResponse(payload []byte, compression IggyMessageCom
 	}
 
 	// !TODO: Add message offset ordering
-	return &FetchMessagesResponse{
+	return &PollMessageResponse{
 		PartitionId:   partitionId,
 		CurrentOffset: currentOffset,
 		Messages:      messages,
@@ -172,8 +172,8 @@ func DeserializeFetchMessagesResponse(payload []byte, compression IggyMessageCom
 	}, nil
 }
 
-func DeserializeTopics(payload []byte) ([]TopicResponse, error) {
-	topics := make([]TopicResponse, 0)
+func DeserializeTopics(payload []byte) ([]Topic, error) {
+	topics := make([]Topic, 0)
 	length := len(payload)
 	position := 0
 
@@ -189,10 +189,10 @@ func DeserializeTopics(payload []byte) ([]TopicResponse, error) {
 	return topics, nil
 }
 
-func DeserializeTopic(payload []byte) (*TopicResponse, error) {
+func DeserializeTopic(payload []byte) (*TopicDetails, error) {
 	topic, position, err := DeserializeToTopic(payload, 0)
 	if err != nil {
-		return &TopicResponse{}, err
+		return &TopicDetails{}, err
 	}
 
 	partitions := make([]PartitionContract, 0)
@@ -200,20 +200,17 @@ func DeserializeTopic(payload []byte) (*TopicResponse, error) {
 
 	for position < length {
 		partition, readBytes := DeserializePartition(payload, position)
-		if err != nil {
-			return &TopicResponse{}, err
-		}
 		partitions = append(partitions, partition)
 		position += readBytes
 	}
-
-	topic.Partitions = partitions
-
-	return &topic, nil
+	return &TopicDetails{
+		Topic:      topic,
+		Partitions: partitions,
+	}, nil
 }
 
-func DeserializeToTopic(payload []byte, position int) (TopicResponse, int, error) {
-	topic := TopicResponse{}
+func DeserializeToTopic(payload []byte, position int) (Topic, int, error) {
+	topic := Topic{}
 	topic.Id = int(binary.LittleEndian.Uint32(payload[position : position+4]))
 	topic.CreatedAt = int(binary.LittleEndian.Uint64(payload[position+4 : position+12]))
 	topic.PartitionsCount = int(binary.LittleEndian.Uint32(payload[position+12 : position+16]))
@@ -291,12 +288,12 @@ func DeserializeToConsumerGroup(payload []byte, position int) (*ConsumerGroupRes
 	return &consumerGroup, readBytes
 }
 
-func DeserializeUsers(payload []byte) ([]*UserResponse, error) {
+func DeserializeUsers(payload []byte) ([]*UserInfo, error) {
 	if len(payload) == 0 {
 		return nil, errors.New("empty payload")
 	}
 
-	var result []*UserResponse
+	var result []*UserInfo
 	length := len(payload)
 	position := 0
 
@@ -312,26 +309,29 @@ func DeserializeUsers(payload []byte) ([]*UserResponse, error) {
 	return result, nil
 }
 
-func DeserializeUser(payload []byte) (*UserResponse, error) {
+func DeserializeUser(payload []byte) (*UserInfoDetails, error) {
 	response, position, err := deserializeUserResponse(payload, 0)
+	if err != nil {
+		return nil, err
+	}
 	hasPermissions := payload[position]
+	userInfo := UserInfo{
+		Id:        response.Id,
+		CreatedAt: response.CreatedAt,
+		Username:  response.Username,
+		Status:    response.Status,
+	}
 	if hasPermissions == 1 {
 		permissionLength := binary.LittleEndian.Uint32(payload[position+1 : position+5])
 		permissionsPayload := payload[position+5 : position+5+int(permissionLength)]
 		permissions := deserializePermissions(permissionsPayload)
-		return &UserResponse{
+		return &UserInfoDetails{
+			UserInfo:    userInfo,
 			Permissions: permissions,
-			Id:          response.Id,
-			CreatedAt:   response.CreatedAt,
-			Username:    response.Username,
-			Status:      response.Status,
 		}, err
 	}
-	return &UserResponse{
-		Id:          response.Id,
-		CreatedAt:   response.CreatedAt,
-		Username:    response.Username,
-		Status:      response.Status,
+	return &UserInfoDetails{
+		UserInfo:    userInfo,
 		Permissions: nil,
 	}, err
 }
@@ -421,9 +421,9 @@ func deserializePermissions(bytes []byte) *Permissions {
 	}
 }
 
-func deserializeUserResponse(payload []byte, position int) (*UserResponse, int, error) {
+func deserializeUserResponse(payload []byte, position int) (*UserInfo, int, error) {
 	if len(payload) < position+14 {
-		return nil, 0, errors.New("not enough data to map UserResponse")
+		return nil, 0, errors.New("not enough data to map UserInfo")
 	}
 
 	id := binary.LittleEndian.Uint32(payload[position : position+4])
@@ -447,7 +447,7 @@ func deserializeUserResponse(payload []byte, position int) (*UserResponse, int, 
 
 	readBytes := 4 + 8 + 1 + 1 + int(usernameLength)
 
-	return &UserResponse{
+	return &UserInfo{
 		Id:        id,
 		CreatedAt: createdAt,
 		Status:    userStatus,
@@ -534,12 +534,12 @@ func DeserializeAccessToken(payload []byte) (*AccessToken, error) {
 	}, nil
 }
 
-func DeserializeAccessTokens(payload []byte) ([]AccessTokenResponse, error) {
+func DeserializeAccessTokens(payload []byte) ([]PersonalAccessTokenInfo, error) {
 	if len(payload) == 0 {
-		return []AccessTokenResponse{}, ierror.CustomError("Empty payload")
+		return []PersonalAccessTokenInfo{}, ierror.CustomError("Empty payload")
 	}
 
-	var result []AccessTokenResponse
+	var result []PersonalAccessTokenInfo
 	position := 0
 	length := len(payload)
 
@@ -552,7 +552,7 @@ func DeserializeAccessTokens(payload []byte) ([]AccessTokenResponse, error) {
 	return result, nil
 }
 
-func deserializeToPersonalAccessTokenResponse(payload []byte, position int) (AccessTokenResponse, int) {
+func deserializeToPersonalAccessTokenResponse(payload []byte, position int) (PersonalAccessTokenInfo, int) {
 	nameLength := int(payload[position])
 	name := string(payload[position+1 : position+1+nameLength])
 	expiryBytes := payload[position+1+nameLength:]
@@ -566,7 +566,7 @@ func deserializeToPersonalAccessTokenResponse(payload []byte, position int) (Acc
 
 	readBytes := 1 + nameLength + 8
 
-	return AccessTokenResponse{
+	return PersonalAccessTokenInfo{
 		Name:   name,
 		Expiry: expiry,
 	}, readBytes

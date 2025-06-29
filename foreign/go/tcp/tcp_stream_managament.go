@@ -32,7 +32,7 @@ func (tms *IggyTcpClient) GetStreams() ([]StreamResponse, error) {
 	return binaryserialization.DeserializeStreams(buffer), nil
 }
 
-func (tms *IggyTcpClient) GetStreamById(request GetStreamRequest) (*StreamResponse, error) {
+func (tms *IggyTcpClient) GetStream(request GetStreamRequest) (*StreamResponse, error) {
 	message := binaryserialization.SerializeIdentifier(request.StreamID)
 	buffer, err := tms.sendAndFetchResponse(message, GetStreamCode)
 	if err != nil {

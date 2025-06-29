@@ -42,7 +42,7 @@ var _ = Describe("UPDATE USER:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to update user", func() {
-			client := createConnection()
+			client := createClient()
 			request := iggcon.UpdateUserRequest{
 				UserID:   iggcon.NewIdentifier(int(createRandomUInt32())),
 				Username: createRandomString(16),

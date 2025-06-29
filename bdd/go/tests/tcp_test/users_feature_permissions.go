@@ -28,7 +28,7 @@ var _ = Describe("UPDATE USER PERMISSIONS:", func() {
 			client := createAuthorizedConnection()
 			userId := successfullyCreateUser(createRandomString(16), client)
 			defer deleteUserAfterTests(userId, client)
-			request := iggcon.UpdateUserPermissionsRequest{
+			request := iggcon.UpdatePermissionsRequest{
 				UserID: iggcon.NewIdentifier(int(userId)),
 				Permissions: &iggcon.Permissions{
 					Global: iggcon.GlobalPermissions{
@@ -46,7 +46,7 @@ var _ = Describe("UPDATE USER PERMISSIONS:", func() {
 				},
 			}
 
-			err := client.UpdateUserPermissions(request)
+			err := client.UpdatePermissions(request)
 
 			itShouldNotReturnError(err)
 			itShouldSuccessfullyUpdateUserPermissions(userId, client)
@@ -55,7 +55,7 @@ var _ = Describe("UPDATE USER PERMISSIONS:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to change user permissions", func() {
-			client := createConnection()
+			client := createClient()
 			request := iggcon.UpdateUserRequest{
 				UserID:   iggcon.NewIdentifier(int(createRandomUInt32())),
 				Username: createRandomString(16),

@@ -24,7 +24,7 @@ import (
 )
 
 type TcpLogInRequest struct {
-	iggcon.LogInRequest
+	iggcon.LoginUserRequest
 }
 
 func (request *TcpLogInRequest) Serialize() []byte {

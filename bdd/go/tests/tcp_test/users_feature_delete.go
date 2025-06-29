@@ -37,7 +37,7 @@ var _ = Describe("DELETE USER:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to delete user", func() {
-			client := createConnection()
+			client := createClient()
 			err := client.DeleteUser(iggcon.NewIdentifier(int(createRandomUInt32())))
 			itShouldReturnUnauthenticatedError(err)
 		})

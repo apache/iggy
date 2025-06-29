@@ -61,7 +61,7 @@ var _ = Describe("DELETE TOPIC:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to delete topic", func() {
-			client := createConnection()
+			client := createClient()
 			err := client.DeleteTopic(iggcon.NewIdentifier(int(createRandomUInt32())), iggcon.NewIdentifier(int(createRandomUInt32())))
 
 			itShouldReturnUnauthenticatedError(err)
