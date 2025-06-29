@@ -149,3 +149,67 @@ retention:
   period: 7 days
   schedule: daily
 """
+
+# Elasticsearch Source配置
+[sources.elasticsearch]
+enabled = true
+name = "Elasticsearch source"
+path = "target/release/libiggy_connector_elasticsearch_source"
+config_format = "json"
+
+[[sources.elasticsearch.streams]]
+stream = "elasticsearch_stream"
+topic = "documents"
+schema = "json"
+batch_length = 100
+linger_time = "5ms"
+
+[sources.elasticsearch.config]
+url = "http://localhost:9200"
+index = "logs-*"
+polling_interval = "30s"
+batch_size = 100
+timestamp_field = "@timestamp"
+query = {
+"match_all": {}
+}
+
+# Elasticsearch Sink配置
+[sinks.elasticsearch]
+enabled = true
+name = "Elasticsearch sink"
+path = "target/release/libiggy_connector_elasticsearch_sink"
+config_format = "json"
+
+[[sinks.elasticsearch.streams]]
+stream = "data_stream"
+topics = ["events"]
+schema = "json"
+batch_length = 50
+poll_interval = "5ms"
+consumer_group = "elasticsearch_sink_connector"
+
+[sinks.elasticsearch.config]
+url = "http://localhost:9200"
+index = "iggy-events"
+batch_size = 100
+timeout_seconds = 30
+create_index_if_not_exists = true
+index_mapping = {
+  "mappings": {
+    "properties": {
+      "_iggy_offset": { "type": "long" },
+      "_iggy_stream": { "type": "keyword" },
+      "_iggy_topic": { "type": "keyword" },
+      "_iggy_partition": { "type": "integer" },
+      "_iggy_timestamp": { "type": "date" }
+    }
+  }
+}
+
+[sinks.elasticsearch.transforms.add_fields]
+enabled = true
+
+[[sinks.elasticsearch.transforms.add_fields.fields]]
+key = "ingestion_timestamp"
+value.computed = "timestamp_millis"
