@@ -26,6 +26,7 @@ use dotenvy::dotenv;
 use error_set::ErrContext;
 use figlet_rs::FIGfont;
 use iggy_common::create_user::CreateUser;
+use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyError};
 use server::args::Args;
 use server::bootstrap::{
@@ -46,6 +47,7 @@ use server::state::command::EntryCommand;
 use server::state::file::FileState;
 use server::state::models::CreateUserWithId;
 use server::state::system::SystemState;
+use server::streaming::utils::{MemoryPool, crypto};
 use server::versioning::SemanticVersion;
 use server::{IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV, map_toggle_str};
 use tokio::time::Instant;
@@ -117,21 +119,27 @@ fn main() -> Result<(), ServerError> {
     let mut logging = Logging::new(config.telemetry.clone());
     logging.early_init();
 
+    // From this point on, we can use tracing macros to log messages.
+    logging.late_init(config.system.get_system_path(), &config.system.logging)?;
+
     // TODO: Make this configurable from config as a range
     // for example this instance of Iggy will use cores from 0..4
     let available_cpus = available_parallelism().expect("Failed to get num of cores");
     let shards_count = available_cpus.into();
     let shards_set = 0..shards_count;
     let connections = create_shard_connections(shards_set.clone());
+    let gate = Arc::new(Gate::new());
+    let mut handles = Vec::with_capacity(shards_set.len());
     for shard_id in shards_set {
-        let gate: Arc<Gate<()>> = Arc::new(Gate::new());
         let id = shard_id as u16;
+        let gate = gate.clone();
         let connections = connections.clone();
         let config = config.clone();
         let state_persister = resolve_persister(config.system.state.enforce_fsync);
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name(format!("shard-{id}"))
             .spawn(move || {
+                MemoryPool::init_pool(config.system.clone());
                 monoio::utils::bind_to_cpu_set(Some(shard_id))
                     .expect(format!("Failed to set CPU affinity for shard-{id}").as_str());
 
@@ -159,7 +167,6 @@ fn main() -> Result<(), ServerError> {
 
                     // We can't use std::sync::Once because it doesn't support async.
                     // Trait bound on the closure is FnOnce.
-                    let gate = gate.clone();
                     // Peak into the state to check if the root user exists.
                     // If it does not exist, create it.
                     gate.with_async::<Result<(), IggyError>>(async |gate_state| {
@@ -180,9 +187,7 @@ fn main() -> Result<(), ServerError> {
                                 entry
                                     .command()
                                     .and_then(|command| match command {
-                                        EntryCommand::CreateUser(payload)
-                                            if payload.command.username
-                                            == IGGY_ROOT_USERNAME_ENV && payload.command.password == IGGY_ROOT_PASSWORD_ENV =>
+                                        EntryCommand::CreateUser(payload) if payload.user_id == DEFAULT_ROOT_USER_ID =>
                                         {
                                             Ok(true)
                                         }
@@ -238,19 +243,20 @@ fn main() -> Result<(), ServerError> {
                         .into();
 
                     //TODO: If one of the shards fails to initialize, we should crash the whole program;
-                    shard.run().await.expect("Failed to run shard");
+                    if let Err(e) = shard.run().await {
+                        error!("Failed to run shard-{id}: {e}");
+                    } 
                     //TODO: If one of the shards fails to initialize, we should crash the whole program;
-                    shard.assert_init();
-                    let shard = Rc::new(shard);
+                    //shard.assert_init();
                 })
             })
-            .expect(format!("Failed to spawn thread for shard-{id}").as_str())
-            .join()
-            .expect(format!("Failed to join thread for shard-{id}").as_str());
+            .expect(format!("Failed to spawn thread for shard-{id}").as_str());
+        handles.push(handle);
     }
 
-    // From this point on, we can use tracing macros to log messages.
-    logging.late_init(config.system.get_system_path(), &config.system.logging)?;
+    handles.into_iter().for_each(|handle| {
+        handle.join().expect("Failed to join shard thread");
+    });
 
     /*
     #[cfg(feature = "disable-mimalloc")]
@@ -260,7 +266,6 @@ fn main() -> Result<(), ServerError> {
     #[cfg(not(feature = "disable-mimalloc"))]
     info!("Using mimalloc allocator");
 
-    MemoryPool::init_pool(config.system.clone());
 
     let system = SharedSystem::new(System::new(
         config.system.clone(),

@@ -25,8 +25,8 @@ use crate::streaming::utils::PooledBuffer;
 use async_zip::tokio::read::stream;
 use error_set::ErrContext;
 use iggy_common::{
-    BytesSerializable, Consumer, EncryptorKind, IGGY_MESSAGE_HEADER_SIZE, Identifier,
-    IggyError, Partitioning, PollingStrategy,
+    BytesSerializable, Consumer, EncryptorKind, IGGY_MESSAGE_HEADER_SIZE, Identifier, IggyError,
+    Partitioning, PollingStrategy,
 };
 use tracing::{error, trace};
 

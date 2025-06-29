@@ -19,71 +19,35 @@
 mod messages_reader;
 mod messages_writer;
 
-use crate::{io::file::IggyFile, to_iovec};
+use crate::{io::file::IggyFile};
 
 use super::IggyMessagesBatchSet;
 use error_set::ErrContext;
 use iggy_common::IggyError;
-use monoio::io::AsyncWriteRent;
-use std::{io::IoSlice, mem::take};
+use monoio::io::AsyncWriteRentExt;
 
 pub use messages_reader::MessagesReader;
 pub use messages_writer::MessagesWriter;
 
-use nix::libc::iovec;
 
 /// Vectored write a batches of messages to file
 async fn write_batch(
     file: &mut IggyFile,
     file_path: &str,
-    batches: IggyMessagesBatchSet,
+    mut batches: IggyMessagesBatchSet,
 ) -> Result<usize, IggyError> {
-    let mut slices = batches.iter().map(|b| to_iovec(&b)).collect::<Vec<iovec>>();
+    //let mut slices = batches.iter().map(|b| to_iovec(&b)).collect::<Vec<iovec>>();
     let mut total_written = 0;
-
-    loop {
-        let (result, vomited) = file.writev(slices).await;
-        slices = vomited;
-        let bytes_written = result
-            .with_error_context(|error| {
-                format!("Failed to write messages to file: {file_path}, error: {error}",)
-            })
-            .map_err(|_| IggyError::CannotWriteToFile)?;
-
-        total_written += bytes_written;
-        advance_slices(&mut slices.as_mut_slice(), bytes_written);
-        if slices.is_empty() {
-            break;
-        }
+    // TODO: Fork monoio, piece of shit runtime.
+    for batch in batches.iter_mut()  {
+        let messages = batch.take_messages();
+        let writen = file.write_all(messages).await.0.with_error_context(|error| {
+            format!(
+                "Failed to write messages to file: {file_path}, error: {error}",
+            )
+            // TODO: Better error variant.
+        }).map_err(|_| IggyError::CannotAppendMessage)?;
+        total_written += writen;
     }
-
     Ok(total_written)
-}
-
-fn advance_slices(mut bufs: &mut [iovec], n: usize) {
-    // Number of buffers to remove.
-    let mut remove = 0;
-    // Remaining length before reaching n. This prevents overflow
-    // that could happen if the length of slices in `bufs` were instead
-    // accumulated. Those slice may be aliased and, if they are large
-    // enough, their added length may overflow a `usize`.
-    let mut left = n;
-    for buf in bufs.iter() {
-        if let Some(remainder) = left.checked_sub(buf.iov_len as _) {
-            left = remainder;
-            remove += 1;
-        } else {
-            break;
-        }
-    }
-
-    bufs = &mut bufs[remove..];
-    if bufs.is_empty() {
-        assert!(left == 0, "advancing io slices beyond their length");
-    } else {
-        unsafe {
-            bufs[0].iov_len -= n;
-            bufs[0].iov_base = bufs[0].iov_base.add(n);
-        }
-    }
 }

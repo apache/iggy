@@ -29,11 +29,11 @@ use futures::future::join_all;
 use iggy_common::IggyError;
 use iggy_common::locking::IggyRwLock;
 use iggy_common::locking::IggySharedMutFn;
+use monoio::fs::create_dir_all;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
-use tokio::fs;
-use tokio::fs::create_dir_all;
+use monoio::fs;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -61,14 +61,14 @@ impl TopicStorage for FileTopicStorage {
         topic.compression_algorithm = state.compression_algorithm;
         topic.replication_factor = state.replication_factor.unwrap_or(1);
 
-        let mut dir_entries = fs::read_dir(&topic.partitions_path).await
+        let mut dir_entries = std::fs::read_dir(&topic.partitions_path)
             .with_context(|| format!("Failed to read partition with ID: {} for stream with ID: {} for topic with ID: {} and path: {}",
                                      topic.topic_id, topic.stream_id, topic.topic_id, &topic.partitions_path))
             .map_err(|_| IggyError::CannotReadPartitions)?;
 
         let mut unloaded_partitions = Vec::new();
-        while let Some(dir_entry) = dir_entries.next_entry().await.unwrap_or(None) {
-            let metadata = dir_entry.metadata().await;
+        while let Some(dir_entry) = dir_entries.next().transpose().unwrap_or(None) {
+            let metadata = dir_entry.metadata();
             if metadata.is_err() || metadata.unwrap().is_file() {
                 continue;
             }
@@ -88,7 +88,8 @@ impl TopicStorage for FileTopicStorage {
                 error!(
                     "Partition with ID: '{partition_id}' for stream with ID: '{stream_id}' and topic with ID: '{topic_id}' was not found in state, but exists on disk and will be removed."
                 );
-                if let Err(error) = fs::remove_dir_all(&dir_entry.path()).await {
+                // TODO: Replace this with the dir walk impl that is mentioed in main function.
+                if let Err(error) = std::fs::remove_dir_all(&dir_entry.path()) {
                     error!("Cannot remove partition directory: {error}");
                 } else {
                     warn!(
@@ -269,7 +270,7 @@ impl TopicStorage for FileTopicStorage {
 
     async fn delete(&self, topic: &Topic) -> Result<(), IggyError> {
         info!("Deleting topic {topic}...");
-        if fs::remove_dir_all(&topic.path).await.is_err() {
+        if std::fs::remove_dir_all(&topic.path).is_err() {
             return Err(IggyError::CannotDeleteTopicDirectory(
                 topic.topic_id,
                 topic.stream_id,

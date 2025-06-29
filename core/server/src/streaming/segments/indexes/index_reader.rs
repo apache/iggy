@@ -17,7 +17,7 @@
  */
 
 use super::IggyIndexesMut;
-use crate::streaming::utils::PooledBuffer;
+use crate::{io::file::IggyFile, streaming::utils::PooledBuffer};
 use bytes::BytesMut;
 use error_set::ErrContext;
 use iggy_common::{INDEX_SIZE, IggyError, IggyIndex, IggyIndexView};
@@ -30,15 +30,14 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-use tokio::fs::OpenOptions;
-use tokio::task::spawn_blocking;
+use monoio::fs::OpenOptions;
 use tracing::{error, trace};
 
 /// A dedicated struct for reading from the index file.
 #[derive(Debug)]
 pub struct IndexReader {
     file_path: String,
-    file: Arc<StdFile>,
+    file: IggyFile,
     index_size_bytes: Arc<AtomicU64>,
 }
 
@@ -52,13 +51,14 @@ impl IndexReader {
             .with_error_context(|error| format!("Failed to open index file: {file_path}. {error}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
+        let file = IggyFile::new(file);
         trace!(
             "Opened index file for reading: {file_path}, size: {}",
             index_size_bytes.load(Ordering::Acquire)
         );
         Ok(Self {
             file_path: file_path.to_string(),
-            file: Arc::new(file.into_std().await),
+            file,
             index_size_bytes,
         })
     }
@@ -334,21 +334,19 @@ impl IndexReader {
         len: u32,
         use_pool: bool,
     ) -> Result<PooledBuffer, std::io::Error> {
-        let file = self.file.clone();
-        spawn_blocking(move || {
             if use_pool {
                 let mut buf = PooledBuffer::with_capacity(len as usize);
                 unsafe { buf.set_len(len as usize) };
-                file.read_exact_at(&mut buf, offset as u64)?;
+                let (result, buf) = self.file.read_exact_at(buf, offset as u64).await;
+                result?;
                 Ok(buf)
             } else {
                 let mut buf = BytesMut::with_capacity(len as usize);
                 unsafe { buf.set_len(len as usize) };
-                file.read_exact_at(&mut buf, offset as u64)?;
+                let (result, buf) = self.file.read_exact_at(buf, offset as u64).await;
+                result?;
                 Ok(PooledBuffer::from_existing(buf))
             }
-        })
-        .await?
     }
 
     /// Gets the nth index from the index file.

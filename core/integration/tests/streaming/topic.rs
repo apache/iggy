@@ -38,7 +38,7 @@ async fn should_persist_topics_with_partitions_directories_and_info_file() {
     let topic_ids = get_topic_ids();
     for topic_id in topic_ids {
         let name = format!("test-{topic_id}");
-        let topic = Topic::create(
+        let created_topic_info = Topic::create(
             stream_id,
             topic_id,
             &name,
@@ -53,8 +53,8 @@ async fn should_persist_topics_with_partitions_directories_and_info_file() {
             MaxTopicSize::ServerDefault,
             1,
         )
-        .await
         .unwrap();
+        let topic = created_topic_info.topic;
 
         topic.persist().await.unwrap();
 
@@ -76,7 +76,7 @@ async fn should_load_existing_topic_from_disk() {
     let topic_ids = get_topic_ids();
     for topic_id in topic_ids {
         let name = format!("test-{topic_id}");
-        let topic = Topic::create(
+        let created_topic_info = Topic::create(
             stream_id,
             topic_id,
             &name,
@@ -91,8 +91,9 @@ async fn should_load_existing_topic_from_disk() {
             MaxTopicSize::ServerDefault,
             1,
         )
-        .await
         .unwrap();
+        let topic = created_topic_info.topic;
+
         topic.persist().await.unwrap();
         assert_persisted_topic(
             &topic.path,
@@ -102,7 +103,7 @@ async fn should_load_existing_topic_from_disk() {
         .await;
 
         let created_at = IggyTimestamp::now();
-        let mut loaded_topic = Topic::empty(
+        let created_topic_info = Topic::empty(
             stream_id,
             topic_id,
             &name,
@@ -111,8 +112,8 @@ async fn should_load_existing_topic_from_disk() {
             Arc::new(AtomicU32::new(0)),
             setup.config.clone(),
             setup.storage.clone(),
-        )
-        .await;
+        );
+        let mut loaded_topic = created_topic_info.topic;
         let topic_state = TopicState {
             id: topic_id,
             name,
@@ -153,7 +154,7 @@ async fn should_delete_existing_topic_from_disk() {
     let topic_ids = get_topic_ids();
     for topic_id in topic_ids {
         let name = format!("test-{topic_id}");
-        let topic = Topic::create(
+        let created_topic_info = Topic::create(
             stream_id,
             topic_id,
             &name,
@@ -168,8 +169,8 @@ async fn should_delete_existing_topic_from_disk() {
             MaxTopicSize::ServerDefault,
             1,
         )
-        .await
         .unwrap();
+        let topic = created_topic_info.topic;
         topic.persist().await.unwrap();
         assert_persisted_topic(
             &topic.path,
@@ -193,7 +194,7 @@ async fn should_purge_existing_topic_on_disk() {
     let topic_ids = get_topic_ids();
     for topic_id in topic_ids {
         let name = format!("test-{topic_id}");
-        let topic = Topic::create(
+        let created_topic_info = Topic::create(
             stream_id,
             topic_id,
             &name,
@@ -208,8 +209,8 @@ async fn should_purge_existing_topic_on_disk() {
             MaxTopicSize::ServerDefault,
             1,
         )
-        .await
         .unwrap();
+        let topic = created_topic_info.topic;
         topic.persist().await.unwrap();
         assert_persisted_topic(
             &topic.path,
@@ -225,10 +226,10 @@ async fn should_purge_existing_topic_on_disk() {
             .map(|msg| msg.get_size_bytes().as_bytes_u32())
             .sum::<u32>();
         let batch = IggyMessagesBatchMut::from_messages(&messages, batch_size);
-        topic
-            .append_messages(&Partitioning::partition_id(1), batch)
-            .await
+        let partition_id = topic
+            .calculate_partition_id(&Partitioning::partition_id(1))
             .unwrap();
+        topic.append_messages(partition_id, batch).await.unwrap();
         let (_, loaded_messages) = topic
             .get_messages(
                 PollingConsumer::Consumer(1, 1),

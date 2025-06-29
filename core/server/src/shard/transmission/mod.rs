@@ -16,7 +16,7 @@
  * under the License.
  */
 
-pub mod event;
 pub mod connector;
+pub mod event;
 pub mod frame;
 pub mod message;

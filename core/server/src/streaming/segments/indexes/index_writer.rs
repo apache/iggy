@@ -19,21 +19,22 @@
 use error_set::ErrContext;
 use iggy_common::INDEX_SIZE;
 use iggy_common::IggyError;
+use monoio::fs::OpenOptions;
+use monoio::io::AsyncWriteRentExt;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
-use tokio::{
-    fs::{File, OpenOptions},
-    io::AsyncWriteExt,
-};
 use tracing::trace;
+
+use crate::io::file::IggyFile;
+use crate::streaming::utils::PooledBuffer;
 
 /// A dedicated struct for writing to the index file.
 #[derive(Debug)]
 pub struct IndexWriter {
     file_path: String,
-    file: File,
+    file: IggyFile,
     index_size_bytes: Arc<AtomicU64>,
     fsync: bool,
 }
@@ -55,6 +56,7 @@ impl IndexWriter {
             .with_error_context(|error| format!("Failed to open index file: {file_path}. {error}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
+        let file = IggyFile::from(file);
         if file_exists {
             let _ = file.sync_all().await.with_error_context(|error| {
                 format!("Failed to fsync index file after creation: {file_path}. {error}",)
@@ -86,16 +88,18 @@ impl IndexWriter {
     }
 
     /// Appends multiple index buffer to the index file in a single operation.
-    pub async fn save_indexes(&mut self, indexes: &[u8]) -> Result<(), IggyError> {
+    pub async fn save_indexes(&mut self, indexes: PooledBuffer) -> Result<(), IggyError> {
         if indexes.is_empty() {
             return Ok(());
         }
 
         let count = indexes.len() / INDEX_SIZE;
+        let len =  indexes.len();
 
         self.file
             .write_all(indexes)
             .await
+            .0
             .with_error_context(|error| {
                 format!(
                     "Failed to write {} indexes to file: {}. {error}",
@@ -105,7 +109,7 @@ impl IndexWriter {
             .map_err(|_| IggyError::CannotSaveIndexToSegment)?;
 
         self.index_size_bytes
-            .fetch_add(indexes.len() as u64, Ordering::Release);
+            .fetch_add(len  as u64, Ordering::Release);
 
         if self.fsync {
             let _ = self.fsync().await;

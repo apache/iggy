@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::{rc::Rc, sync::Arc};
 
 use iggy_common::PollingStrategy;
 
@@ -19,29 +19,47 @@ use iggy_common::PollingStrategy;
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::{shard::system::messages::PollingArgs, streaming::{polling_consumer::PollingConsumer, segments::IggyMessagesBatchMut, session::Session}};
+use crate::{
+    shard::{system::messages::PollingArgs, transmission::event::ShardEvent},
+    streaming::{polling_consumer::PollingConsumer, segments::IggyMessagesBatchMut},
+};
 
 #[derive(Debug)]
 pub enum ShardMessage {
     Request(ShardRequest),
-    Event(ShardEvent),
+    Event(Arc<ShardEvent>),
 }
 
 #[derive(Debug)]
-pub enum ShardEvent {
-    NewSession(),
+pub struct ShardRequest {
+    pub stream_id: u32,
+    pub topic_id: u32,
+    pub partition_id: u32,
+    pub payload: ShardRequestPayload,
 }
 
-#[derive(Debug)]
-pub enum ShardRequest {
-    SendMessages {
+impl ShardRequest {
+    pub fn new(
         stream_id: u32,
         topic_id: u32,
         partition_id: u32,
+        payload: ShardRequestPayload,
+    ) -> Self {
+        Self {
+            stream_id,
+            topic_id,
+            partition_id,
+            payload,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum ShardRequestPayload {
+    SendMessages {
         batch: IggyMessagesBatchMut,
     },
     PollMessages {
-        partition_id: u32,
         args: PollingArgs,
         consumer: PollingConsumer,
         count: u32,
@@ -54,8 +72,8 @@ impl From<ShardRequest> for ShardMessage {
     }
 }
 
-impl From<ShardEvent> for ShardMessage {
-    fn from(event: ShardEvent) -> Self {
+impl From<Arc<ShardEvent>> for ShardMessage {
+    fn from(event: Arc<ShardEvent>) -> Self {
         ShardMessage::Event(event)
     }
 }

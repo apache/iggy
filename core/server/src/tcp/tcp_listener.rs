@@ -18,15 +18,16 @@
 
 use crate::binary::sender::SenderKind;
 use crate::shard::IggyShard;
-use crate::shard::transmission::message::ShardEvent;
+use crate::shard::transmission::event::ShardEvent;
 use crate::streaming::clients::client_manager::Transport;
 use crate::tcp::connection_handler::{handle_connection, handle_error};
 use crate::tcp::tcp_socket;
+use iggy_common::IggyError;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use tracing::{error, info};
 
-pub async fn start(server_name: &'static str, shard: Rc<IggyShard>) {
+pub async fn start(server_name: &'static str, shard: Rc<IggyShard>) -> Result<(), IggyError> {
     let ip_v6 = shard.config.tcp.ipv6;
     let socket_config = &shard.config.tcp.socket;
     let addr: SocketAddr = shard
@@ -40,8 +41,8 @@ pub async fn start(server_name: &'static str, shard: Rc<IggyShard>) {
     monoio::spawn(async move {
         socket
             .bind(&addr.into())
-            .expect("Failed to bind eTCP listener");
-        socket.listen(1024);
+            .expect("Failed to bind TCP listener");
+        socket.listen(1024).unwrap();
         let listener: std::net::TcpListener = socket.into();
         let listener = monoio::net::TcpListener::from_std(listener).unwrap();
         info!("{server_name} server has started on: {:?}", addr);
@@ -50,15 +51,14 @@ pub async fn start(server_name: &'static str, shard: Rc<IggyShard>) {
                 Ok((stream, address)) => {
                     let shard = shard.clone();
                     info!("Accepted new TCP connection: {address}");
-                    let session = shard.add_client(&address, Transport::Tcp);
+                    let transport = Transport::Tcp;
+                    let session = shard.add_client(&address, transport);
                     //TODO: Those can be shared with other shards.
                     shard.add_active_session(session.clone());
                     // Broadcast session to all shards.
-                    //TODO: Fixme
-                    /*
-                    let event = Rc::new(ShardEvent::NewSession(session.clone()));
-                    shard.broadcast_event_to_all_shards(session.client_id, event);
-                    */
+                    let event = ShardEvent::NewSession { address, transport };
+                    // TODO: Fixme look inside of broadcast_event_to_all_shards method.
+                    let _responses = shard.broadcast_event_to_all_shards(event.into());
 
                     let _client_id = session.client_id;
                     info!("Created new session: {session}");
@@ -85,5 +85,6 @@ pub async fn start(server_name: &'static str, shard: Rc<IggyShard>) {
                 Err(error) => error!("Unable to accept TCP socket. {error}"),
             }
         }
-    });
+    })
+    .await
 }

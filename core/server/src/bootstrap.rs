@@ -16,6 +16,7 @@ use crate::{
     streaming::{
         persistence::persister::{FilePersister, FileWithSyncPersister, PersisterKind},
         users::user::User,
+        utils::file::overwrite,
     },
 };
 use std::{env, fs::remove_dir_all, ops::Range, path::Path, sync::Arc};
@@ -47,6 +48,12 @@ pub async fn create_directories(config: &SystemConfig) -> Result<(), IggyError> 
     if !Path::new(&state_path).exists() && create_dir_all(&state_path).await.is_err() {
         return Err(IggyError::CannotCreateStateDirectory(state_path));
     }
+    let state_log = config.get_state_messages_file_path();
+    if !Path::new(&state_log).exists() {
+        if let Err(_) = overwrite(&state_log).await {
+            return Err(IggyError::CannotCreateStateDirectory(state_log));
+        }
+    }
 
     let streams_path = config.get_streams_path();
     if !Path::new(&streams_path).exists() && create_dir_all(&streams_path).await.is_err() {
@@ -68,10 +75,6 @@ pub async fn create_directories(config: &SystemConfig) -> Result<(), IggyError> 
         config.get_system_path()
     );
     Ok(())
-
-    // TODO: Move this to individual shard level
-    /*
-     */
 }
 
 pub fn create_root_user() -> User {

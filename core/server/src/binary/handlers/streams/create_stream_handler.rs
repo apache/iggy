@@ -21,6 +21,7 @@ use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::{handlers::streams::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
+use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateStreamWithId;
 use crate::streaming::session::Session;
@@ -46,28 +47,31 @@ impl ServerCommandHandler for CreateStream {
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
         let stream_id = self.stream_id;
-
+        let name = self.name.clone();
         let created_stream_id = shard
-                .create_stream(session, self.stream_id, &self.name)
+                .create_stream(session, stream_id, &name)
                 .await
                 .with_error_context(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - failed to create stream with id: {stream_id:?}, session: {session}"
                     )
                 })?;
+        let event = ShardEvent::CreatedStream { stream_id, name };
+        // Broadcast the event to all shards.
+        let _responses = shard.broadcast_event_to_all_shards(event.into());
+
         let stream = shard.find_stream(session, &created_stream_id)
             .with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to find created stream with id: {created_stream_id:?}, session: {session}"
                 )
             })?;
-        let stream_id = stream.stream_id;
         let response = mapper::map_stream(&stream);
 
         shard
             .state
         .apply(session.get_user_id(), &EntryCommand::CreateStream(CreateStreamWithId {
-            stream_id,
+            stream_id: stream.stream_id,
             command: self
         }))            .await
             .with_error_context(|error| {

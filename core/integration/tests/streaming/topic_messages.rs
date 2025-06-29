@@ -62,7 +62,8 @@ async fn assert_polling_messages() {
         .map(|m| m.get_size_bytes())
         .sum::<IggyByteSize>();
     let batch = IggyMessagesBatchMut::from_messages(&messages, batch_size.as_bytes_u32());
-    topic.append_messages(&partitioning, batch).await.unwrap();
+    let partition_id = topic.calculate_partition_id(&partitioning).unwrap();
+    topic.append_messages(partition_id, batch).await.unwrap();
 
     let consumer = PollingConsumer::Consumer(1, partition_id);
     let (_, polled_messages) = topic
@@ -106,10 +107,8 @@ async fn given_key_none_messages_should_be_appended_to_the_next_partition_using_
                 .expect("Failed to create message")],
             batch_size.as_bytes_u32(),
         );
-        topic
-            .append_messages(&partitioning, messages)
-            .await
-            .unwrap();
+        let partition_id = topic.calculate_partition_id(&partitioning).unwrap();
+        topic.append_messages(partition_id, messages).await.unwrap();
     }
     for i in 1..=partitions_count {
         assert_messages(&topic, i, messages_per_partition_count).await;
@@ -135,10 +134,8 @@ async fn given_key_partition_id_messages_should_be_appended_to_the_chosen_partit
                 .expect("Failed to create message")],
             batch_size.as_bytes_u32(),
         );
-        topic
-            .append_messages(&partitioning, messages)
-            .await
-            .unwrap();
+        let partition_id = topic.calculate_partition_id(&partitioning).unwrap();
+        topic.append_messages(partition_id, messages).await.unwrap();
     }
 
     for i in 1..=partitions_count {
@@ -168,10 +165,8 @@ async fn given_key_messages_key_messages_should_be_appended_to_the_calculated_pa
                 .expect("Failed to create message")],
             batch_size.as_bytes_u32(),
         );
-        topic
-            .append_messages(&partitioning, messages)
-            .await
-            .unwrap();
+        let partition_id = topic.calculate_partition_id(&partitioning).unwrap();
+        topic.append_messages(partition_id, messages).await.unwrap();
     }
 
     let mut messages_count_per_partition = HashMap::new();
@@ -212,7 +207,7 @@ async fn init_topic(setup: &TestSetup, partitions_count: u32) -> Topic {
     setup.create_topics_directory(stream_id).await;
     let id = 2;
     let name = "test";
-    let topic = Topic::create(
+    let created_topic_info = Topic::create(
         stream_id,
         id,
         name,
@@ -227,8 +222,8 @@ async fn init_topic(setup: &TestSetup, partitions_count: u32) -> Topic {
         MaxTopicSize::ServerDefault,
         1,
     )
-    .await
     .unwrap();
+    let topic = created_topic_info.topic;
     topic.persist().await.unwrap();
     topic
 }

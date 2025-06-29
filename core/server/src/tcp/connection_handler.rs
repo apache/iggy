@@ -35,8 +35,14 @@ pub(crate) async fn handle_connection(
     sender: &mut SenderKind,
     shard: &Rc<IggyShard>,
 ) -> Result<(), ConnectionError> {
-    let length_buffer = BytesMut::with_capacity(INITIAL_BYTES_LENGTH);
-    let code_buffer = BytesMut::with_capacity(INITIAL_BYTES_LENGTH);
+    let mut length_buffer = BytesMut::with_capacity(INITIAL_BYTES_LENGTH);
+    unsafe {
+        length_buffer.set_len(INITIAL_BYTES_LENGTH);
+    }
+    let mut code_buffer = BytesMut::with_capacity(INITIAL_BYTES_LENGTH);
+    unsafe {
+        code_buffer.set_len(INITIAL_BYTES_LENGTH);
+    }
     loop {
         let (read_length, initial_buffer) = match sender.read(length_buffer.clone()).await {
             (Ok(read_length), initial_buffer) => (read_length, initial_buffer),

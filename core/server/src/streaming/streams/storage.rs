@@ -20,7 +20,6 @@ use crate::state::system::StreamState;
 use crate::streaming::storage::StreamStorage;
 use crate::streaming::streams::COMPONENT;
 use crate::streaming::streams::stream::Stream;
-use crate::streaming::topics::topic::CreatedTopicInfo;
 use crate::streaming::topics::topic::Topic;
 use ahash::AHashSet;
 use error_set::ErrContext;
@@ -28,11 +27,11 @@ use futures::future::join_all;
 use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::fs;
-use tokio::fs::create_dir_all;
-use tokio::sync::Mutex;
+use monoio::fs;
+use monoio::fs::create_dir_all;
 use tracing::{error, info, warn};
 
 #[derive(Debug)]
@@ -52,13 +51,13 @@ impl StreamStorage for FileStreamStorage {
         }
 
         let mut unloaded_topics = Vec::new();
-        let dir_entries = fs::read_dir(&stream.topics_path).await;
+        let dir_entries = std::fs::read_dir(&stream.topics_path);
         if dir_entries.is_err() {
             return Err(IggyError::CannotReadTopics(stream.stream_id));
         }
 
         let mut dir_entries = dir_entries.unwrap();
-        while let Some(dir_entry) = dir_entries.next_entry().await.unwrap_or(None) {
+        while let Some(dir_entry) = dir_entries.next().transpose().unwrap_or(None) {
             let name = dir_entry.file_name().into_string().unwrap();
             let topic_id = name.parse::<u32>();
             if topic_id.is_err() {
@@ -73,7 +72,8 @@ impl StreamStorage for FileStreamStorage {
                 error!(
                     "Topic with ID: '{topic_id}' for stream with ID: '{stream_id}' was not found in state, but exists on disk and will be removed."
                 );
-                if let Err(error) = fs::remove_dir_all(&dir_entry.path()).await {
+                // TODO: Replace this with the dir walk impl that is mentioed in main function.
+                if let Err(error) = std::fs::remove_dir_all(&dir_entry.path()) {
                     error!("Cannot remove topic directory: {error}");
                 } else {
                     warn!(
@@ -151,6 +151,7 @@ impl StreamStorage for FileStreamStorage {
             }
         }
 
+        // TODO: Refactor....
         let loaded_topics = Arc::new(Mutex::new(Vec::new()));
         let mut load_topics = Vec::new();
         for mut topic in unloaded_topics {
@@ -222,7 +223,7 @@ impl StreamStorage for FileStreamStorage {
 
     async fn delete(&self, stream: &Stream) -> Result<(), IggyError> {
         info!("Deleting stream with ID: {}...", stream.stream_id);
-        if fs::remove_dir_all(&stream.path).await.is_err() {
+        if std::fs::remove_dir_all(&stream.path).is_err() {
             return Err(IggyError::CannotDeleteStreamDirectory(stream.stream_id));
         }
         info!("Deleted stream with ID: {}.", stream.stream_id);

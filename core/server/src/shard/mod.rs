@@ -20,13 +20,14 @@ pub mod builder;
 pub mod gate;
 pub mod namespace;
 pub mod system;
+pub mod tasks;
 pub mod transmission;
 
 use ahash::{AHashMap, AHashSet, HashMap};
 use builder::IggyShardBuilder;
 use error_set::ErrContext;
 use futures::future::try_join_all;
-use iggy_common::{EncryptorKind, IggyError, UserId};
+use iggy_common::{EncryptorKind, Identifier, IggyError, UserId};
 use namespace::IggyNamespace;
 use std::{
     cell::{Cell, RefCell},
@@ -46,23 +47,29 @@ use crate::{
     configs::server::ServerConfig,
     shard::{
         system::info::SystemInfo,
+        tasks::messages::spawn_shard_message_task,
         transmission::{
+            event::ShardEvent,
             frame::{ShardFrame, ShardResponse},
-            message::{ShardEvent, ShardMessage, ShardRequest},
+            message::{ShardMessage, ShardRequest, ShardRequestPayload},
         },
     },
     state::{
-        file::FileState, system::{StreamState, SystemState, UserState}, StateKind
+        StateKind,
+        file::FileState,
+        system::{StreamState, SystemState, UserState},
     },
     streaming::{
         clients::client_manager::ClientManager,
         diagnostics::metrics::Metrics,
+        partitions::partition,
         personal_access_tokens::personal_access_token::PersonalAccessToken,
         session::Session,
         storage::SystemStorage,
         streams::stream::Stream,
         users::{permissioner::Permissioner, user::User},
     },
+    tcp::tcp_server::spawn_tcp_server,
     versioning::SemanticVersion,
 };
 
@@ -90,16 +97,15 @@ impl Shard {
             .sender
             .send(ShardFrame::new(message, Some(sender.clone()))); // Apparently sender needs to be cloned, otherwise channel will close...
         //TODO: Fixme
-        let response = receiver.recv().await
-            .map_err(|err| {
-                error!("Failed to receive response from shard: {err}");
-                IggyError::ShardCommunicationError(self.id)
-            })?;
+        let response = receiver.recv().await.map_err(|err| {
+            error!("Failed to receive response from shard: {err}");
+            IggyError::ShardCommunicationError(self.id)
+        })?;
         Ok(response)
     }
 }
 
-struct ShardInfo {
+pub struct ShardInfo {
     id: u16,
 }
 
@@ -135,7 +141,7 @@ pub struct IggyShard {
     pub(crate) users: RefCell<HashMap<UserId, User>>,
 
     pub(crate) metrics: Metrics,
-    pub frame_receiver: Cell<Option<Receiver<ShardFrame>>>,
+    pub messages_receiver: Cell<Option<Receiver<ShardFrame>>>,
     stop_receiver: StopReceiver,
     stop_sender: StopSender,
 }
@@ -172,17 +178,16 @@ impl IggyShard {
         // have the correct statistics when the server starts.
         //self.get_stats().await?;
         self.init().await?;
-        self.assert_init();
+        // TODO: Fixme
+        //self.assert_init();
         info!("Initiated shard with ID: {}", self.id);
         // Create all tasks (tcp listener, http listener, command processor, in the future also the background jobs).
-        /*
-        let mut tasks: Vec<Task> = vec![Box::pin(spawn_shard_message_task(shard.clone()))];
+        let mut tasks: Vec<Task> = vec![Box::pin(spawn_shard_message_task(self.clone()))];
         if self.config.tcp.enabled {
             tasks.push(Box::pin(spawn_tcp_server(self.clone())));
         }
         let result = try_join_all(tasks).await;
         result?;
-        */
 
         Ok(())
     }
@@ -427,6 +432,7 @@ impl IggyShard {
 
     #[instrument(skip_all, name = "trace_shutdown")]
     pub async fn shutdown(&mut self) -> Result<(), IggyError> {
+        //TODO: Fixme, impl cooperative shutdown.
         self.persist_messages().await?;
         Ok(())
     }
@@ -447,6 +453,81 @@ impl IggyShard {
 
     pub fn get_available_shards_count(&self) -> u32 {
         self.shards.len() as u32
+    }
+
+    pub async fn handle_shard_message(&self, message: ShardMessage) -> Option<ShardResponse> {
+        match message {
+            ShardMessage::Request(request) => match self.handle_request(request).await {
+                Ok(response) => Some(response),
+                Err(err) => Some(ShardResponse::ErrorResponse(err)),
+            },
+            ShardMessage::Event(event) => match self.handle_event(event).await {
+                Ok(_) => Some(ShardResponse::Event),
+                Err(err) => Some(ShardResponse::ErrorResponse(err)),
+            },
+        }
+    }
+
+    async fn handle_request(&self, request: ShardRequest) -> Result<ShardResponse, IggyError> {
+        let stream = self.get_stream(&Identifier::numeric(request.stream_id)?)?;
+        let topic = stream.get_topic(&Identifier::numeric(request.topic_id)?)?;
+        let partition_id = request.partition_id;
+        match request.payload {
+            ShardRequestPayload::SendMessages { batch } => {
+                topic.append_messages(partition_id, batch).await?;
+                Ok(ShardResponse::SendMessages)
+            }
+            ShardRequestPayload::PollMessages {
+                args,
+                consumer,
+                count,
+            } => {
+                let (metadata, batch) = topic
+                    .get_messages(consumer, partition_id, args.strategy, count)
+                    .await?;
+                Ok(ShardResponse::PollMessages((metadata, batch)))
+            }
+        }
+    }
+
+    async fn handle_event(&self, event: Arc<ShardEvent>) -> Result<(), IggyError> {
+        match &*event {
+            ShardEvent::CreatedStream { stream_id, name } => {
+                self.create_stream_bypass_auth(*stream_id, name).await
+            }
+            ShardEvent::CreatedTopic {
+                stream_id,
+                topic_id,
+                name,
+                partitions_count,
+                message_expiry,
+                compression_algorithm,
+                max_topic_size,
+                replication_factor,
+            } => {
+                self.create_topic_bypass_auth(
+                    stream_id,
+                    *topic_id,
+                    name,
+                    *partitions_count,
+                    *message_expiry,
+                    *compression_algorithm,
+                    *max_topic_size,
+                    *replication_factor,
+                )
+                .await
+            }
+            ShardEvent::LoginUser {
+                client_id,
+                username,
+                password,
+            } => self.login_user_event(*client_id, username, password),
+            ShardEvent::NewSession { address, transport } => {
+                let session = self.add_client(address, *transport);
+                self.add_active_session(session);
+                Ok(())
+            }
+        }
     }
 
     pub async fn send_request_to_shard(
@@ -479,6 +560,25 @@ impl IggyShard {
         }
     }
 
+    pub fn broadcast_event_to_all_shards(&self, event: Arc<ShardEvent>) -> Vec<ShardResponse> {
+        self.shards
+            .iter()
+            .filter_map(|shard| {
+                if shard.id != self.id {
+                    Some(shard.connection.clone())
+                } else {
+                    None
+                }
+            })
+            .map(|conn| {
+                // TODO: Fixme, maybe we should send response_sender
+                // and propagate errors back.
+                conn.send(ShardFrame::new(event.clone().into(), None));
+                ShardResponse::Event
+            })
+            .collect()
+    }
+
     fn find_shard(&self, namespace: &IggyNamespace) -> Option<&Shard> {
         let shards_table = self.shards_table.borrow();
         shards_table.get(namespace).map(|shard_info| {
@@ -494,27 +594,6 @@ impl IggyShard {
         records: impl Iterator<Item = (IggyNamespace, ShardInfo)>,
     ) {
         self.shards_table.borrow_mut().extend(records);
-    }
-
-    pub fn broadcast_event_to_all_shards(&self, client_id: u32, event: ShardEvent) {
-        self.shards
-            .iter()
-            .filter_map(|shard| {
-                if shard.id != self.id {
-                    Some(shard.connection.clone())
-                } else {
-                    None
-                }
-            })
-            .map(|conn| {
-                //TODO: Fixme
-                /*
-                let message = ShardMessage::Event(event);
-                conn.send(ShardFrame::new(client_id, message, None));
-                */
-                ()
-            })
-            .collect::<Vec<_>>();
     }
 
     pub fn add_active_session(&self, session: Rc<Session>) {

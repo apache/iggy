@@ -18,7 +18,6 @@
 
 use crate::streaming::common::test_setup::TestSetup;
 use bytes::BytesMut;
-use iggy::prelude::Confirmation;
 use iggy::prelude::*;
 use server::configs::cache_indexes::CacheIndexesConfig;
 use server::configs::system::{PartitionConfig, SegmentConfig, SystemConfig};
@@ -129,8 +128,7 @@ async fn test_get_messages_by_timestamp(
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU32::new(0)),
         IggyTimestamp::now(),
-    )
-    .await;
+    );
 
     setup.create_partitions_directory(stream_id, topic_id).await;
     partition.persist().await.unwrap();

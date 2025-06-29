@@ -290,10 +290,7 @@ impl Display for SegmentConfig {
         write!(
             f,
             "{{ size_bytes: {}, cache_indexes: {}, message_expiry: {}, archive_expired: {} }}",
-            self.size,
-            self.cache_indexes,
-            self.message_expiry,
-            self.archive_expired,
+            self.size, self.cache_indexes, self.message_expiry, self.archive_expired,
         )
     }
 }

@@ -23,6 +23,7 @@ use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
+use crate::shard::transmission::event::ShardEvent;
 use crate::streaming::session::Session;
 use anyhow::Result;
 use error_set::ErrContext;
@@ -39,19 +40,30 @@ impl ServerCommandHandler for LoginUser {
     async fn handle(
         self,
         sender: &mut SenderKind,
-        length: u32,
+        _length: u32,
         session: &Rc<Session>,
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
+        let LoginUser {
+            username, password, ..
+        } = self;
         let user = shard
-            .login_user(&self.username, &self.password, Some(session))
+            .login_user(&username, &password, Some(session))
             .with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to login user with name: {}, session: {session}",
-                    self.username
+                    username
                 )
             })?;
+        let event = ShardEvent::LoginUser {
+            client_id: session.client_id,
+            username,
+            password,
+        };
+        // Broadcast the event to all shards.
+        let _responses = shard.broadcast_event_to_all_shards(event.into());
+
         let identity_info = mapper::map_identity_info(user.id);
         sender.send_ok_response(&identity_info).await?;
         Ok(())

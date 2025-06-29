@@ -24,17 +24,18 @@ use tracing::info;
 
 /// Starts the TCP server.
 /// Returns the address the server is listening on.
-pub async fn start(shard: Rc<IggyShard>) -> Result<(), IggyError> {
+pub async fn spawn_tcp_server(shard: Rc<IggyShard>) -> Result<(), IggyError> {
     let server_name = if shard.config.tcp.tls.enabled {
         "Iggy TCP TLS"
     } else {
         "Iggy TCP"
     };
     info!("Initializing {server_name} server...");
-    let addr = match shard.config.tcp.tls.enabled {
+    // TODO: Fixme -- storing addr of the server inside of the config for integration tests...
+    let result = match shard.config.tcp.tls.enabled {
         true => unimplemented!("TLS support is not implemented yet"),
         false => tcp_listener::start(server_name, shard).await,
     };
-    info!("{server_name} server has started on: {:?}", addr);
-    Ok(())
+    //info!("{server_name} server has started on: {:?}", addr);
+    result
 }
