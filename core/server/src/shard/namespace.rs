@@ -17,19 +17,18 @@
  */
 
 use hash32::{Hasher, Murmur3Hasher};
-use iggy_common::Identifier;
 use std::hash::Hasher as _;
 
 //TODO: Will probably want to move it to separate crate so we can share it with sdk.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct IggyNamespace {
-    pub(crate) stream_id: Identifier,
-    pub(crate) topic_id: Identifier,
+    pub(crate) stream_id: u32,
+    pub(crate) topic_id: u32,
     pub(crate) partition_id: u32,
 }
 
 impl IggyNamespace {
-    pub fn new(stream_id: Identifier, topic_id: Identifier, partition_id: u32) -> Self {
+    pub fn new(stream_id: u32, topic_id: u32, partition_id: u32) -> Self {
         Self {
             stream_id,
             topic_id,
@@ -39,8 +38,8 @@ impl IggyNamespace {
 
     pub fn generate_hash(&self) -> u32 {
         let mut hasher = Murmur3Hasher::default();
-        hasher.write(&self.stream_id.value);
-        hasher.write(&self.topic_id.value);
+        hasher.write_u32(self.stream_id);
+        hasher.write_u32(self.topic_id);
         hasher.write_u32(self.partition_id);
         hasher.finish32()
     }

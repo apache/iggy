@@ -20,6 +20,7 @@ use crate::state::system::StreamState;
 use crate::streaming::storage::StreamStorage;
 use crate::streaming::streams::COMPONENT;
 use crate::streaming::streams::stream::Stream;
+use crate::streaming::topics::topic::CreatedTopicInfo;
 use crate::streaming::topics::topic::Topic;
 use ahash::AHashSet;
 use error_set::ErrContext;
@@ -83,7 +84,7 @@ impl StreamStorage for FileStreamStorage {
             }
 
             let topic_state = topic_state.unwrap();
-            let topic = Topic::empty(
+            let topic_info = Topic::empty(
                 stream.stream_id,
                 topic_id,
                 &topic_state.name,
@@ -92,9 +93,8 @@ impl StreamStorage for FileStreamStorage {
                 stream.segments_count.clone(),
                 stream.config.clone(),
                 stream.storage.clone(),
-            )
-            .await;
-            unloaded_topics.push(topic);
+            );
+            unloaded_topics.push(topic_info.topic);
         }
 
         let state_topic_ids = state.topics.keys().copied().collect::<AHashSet<u32>>();
@@ -123,7 +123,7 @@ impl StreamStorage for FileStreamStorage {
                 );
                 for topic_id in missing_ids {
                     let topic_state = state.topics.get(&topic_id).unwrap();
-                    let topic = Topic::empty(
+                    let topic_info = Topic::empty(
                         stream.stream_id,
                         topic_id,
                         &topic_state.name,
@@ -132,8 +132,8 @@ impl StreamStorage for FileStreamStorage {
                         stream.segments_count.clone(),
                         stream.config.clone(),
                         stream.storage.clone(),
-                    )
-                    .await;
+                    );
+                    let topic = topic_info.topic;
                     topic.persist().await.with_error_context(|error| {
                         format!("{COMPONENT} (error: {error}) - failed to persist topic: {topic}")
                     })?;

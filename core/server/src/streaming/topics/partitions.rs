@@ -34,7 +34,7 @@ impl Topic {
         self.partitions.len() as u32
     }
 
-    pub async fn add_partitions(&mut self, count: u32) -> Result<Vec<u32>, IggyError> {
+    pub fn add_partitions(&mut self, count: u32) -> Result<Vec<u32>, IggyError> {
         if count == 0 {
             return Ok(vec![]);
         }
@@ -60,8 +60,7 @@ impl Topic {
                 self.size_bytes.clone(),
                 self.segments_count_of_parent_stream.clone(),
                 IggyTimestamp::now(),
-            )
-            .await;
+            );
             self.partitions
                 .insert(partition_id, IggyRwLock::new(partition));
             partition_ids.push(partition_id)
@@ -71,12 +70,9 @@ impl Topic {
     }
 
     pub async fn add_persisted_partitions(&mut self, count: u32) -> Result<Vec<u32>, IggyError> {
-        let partition_ids = self
-            .add_partitions(count)
-            .await
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to add partitions, count: {count}")
-            })?;
+        let partition_ids = self.add_partitions(count).with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to add partitions, count: {count}")
+        })?;
         for partition_id in &partition_ids {
             let partition = self.partitions.get(partition_id).unwrap();
             let mut partition = partition.write().await;

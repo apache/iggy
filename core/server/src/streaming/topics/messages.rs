@@ -25,7 +25,7 @@ use crate::streaming::utils::hash;
 use ahash::AHashMap;
 use error_set::ErrContext;
 use iggy_common::locking::IggySharedMutFn;
-use iggy_common::{Confirmation, IggyTimestamp, PollingStrategy};
+use iggy_common::{IggyTimestamp, PollingStrategy};
 use iggy_common::{IggyError, IggyExpiry, Partitioning, PartitioningKind, PollingKind};
 use std::sync::atomic::Ordering;
 use tracing::trace;
@@ -78,8 +78,8 @@ impl Topic {
 
     pub async fn append_messages(
         &self,
-        partitioning: &Partitioning,
-        messages: IggyMessagesBatchMut,
+        partition_id: u32,
+        batch: IggyMessagesBatchMut,
     ) -> Result<(), IggyError> {
         if !self.has_partitions() {
             return Err(IggyError::NoPartitions(self.topic_id, self.stream_id));
@@ -91,24 +91,11 @@ impl Topic {
             return Err(IggyError::TopicFull(self.topic_id, self.stream_id));
         }
 
-        if messages.is_empty() {
+        if batch.is_empty() {
             return Ok(());
         }
 
-        let partition_id = match partitioning.kind {
-            PartitioningKind::Balanced => self.get_next_partition_id(),
-            PartitioningKind::PartitionId => u32::from_le_bytes(
-                partitioning.value[..partitioning.length as usize]
-                    .try_into()
-                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
-            ),
-            PartitioningKind::MessagesKey => {
-                self.calculate_partition_id_by_messages_key_hash(&partitioning.value)
-            }
-        };
-
-        self.append_messages_to_partition(messages, partition_id)
-            .await
+        self.append_messages_to_partition(batch, partition_id).await
     }
 
     pub async fn flush_unsaved_buffer(
@@ -150,6 +137,20 @@ impl Topic {
             })?;
 
         Ok(())
+    }
+
+    pub fn calculate_partition_id(&self, partitioning: &Partitioning) -> Result<u32, IggyError> {
+        match partitioning.kind {
+            PartitioningKind::Balanced => Ok(self.get_next_partition_id()),
+            PartitioningKind::PartitionId => Ok(u32::from_le_bytes(
+                partitioning.value[..partitioning.length as usize]
+                    .try_into()
+                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
+            )),
+            PartitioningKind::MessagesKey => {
+                Ok(self.calculate_partition_id_by_messages_key_hash(&partitioning.value))
+            }
+        }
     }
 
     fn get_next_partition_id(&self) -> u32 {
@@ -227,10 +228,8 @@ mod tests {
                 .build()
                 .expect("Failed to create message with valid payload and headers");
             let messages = IggyMessagesBatchMut::from_messages(&[message], 1);
-            topic
-                .append_messages(&partitioning, messages)
-                .await
-                .unwrap();
+            let partition = topic.calculate_partition_id(&partitioning).unwrap();
+            topic.append_messages(partition, messages).await.unwrap();
         }
 
         let partitions = topic.get_partitions();
@@ -260,10 +259,10 @@ mod tests {
                 .build()
                 .expect("Failed to create message with valid payload and headers");
             let messages = IggyMessagesBatchMut::from_messages(&[message], 1);
-            topic
-                .append_messages(&partitioning, messages)
-                .await
-                .unwrap();
+            let partition_id = topic
+                .calculate_partition_id(&partitioning)
+                .expect("Failed to calculate partition ID");
+            topic.append_messages(partition_id, messages).await.unwrap();
         }
 
         let mut read_messages_count = 0;
@@ -337,7 +336,7 @@ mod tests {
         let messages_count_of_parent_stream = Arc::new(AtomicU64::new(0));
         let segments_count_of_parent_stream = Arc::new(AtomicU32::new(0));
 
-        let topic = Topic::create(
+        let created_info = Topic::create(
             stream_id,
             id,
             name,
@@ -352,8 +351,8 @@ mod tests {
             MaxTopicSize::ServerDefault,
             1,
         )
-        .await
         .unwrap();
+        let topic = created_info.topic;
         topic.persist().await.unwrap();
         topic
     }

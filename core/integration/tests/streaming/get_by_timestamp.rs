@@ -202,10 +202,7 @@ async fn test_get_messages_by_timestamp(
 
         let batch = IggyMessagesBatchMut::from_messages(messages_slice_to_append, messages_size);
         assert_eq!(batch.count(), batch_len);
-        partition
-            .append_messages(batch)
-            .await
-            .unwrap();
+        partition.append_messages(batch).await.unwrap();
 
         // Capture the timestamp of this batch
         batch_timestamps.push(IggyTimestamp::now());

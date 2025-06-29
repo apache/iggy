@@ -112,6 +112,15 @@ impl IggyShard {
         }
     }
 
+    pub fn try_get_topic_id(&self, stream_id: &Identifier, name: &str) -> Option<u32> {
+        let stream = self.get_stream(stream_id).ok()?;
+        stream.topics_ids.get(name).and_then(|id| Some(*id))
+    }
+
+    pub fn try_get_stream_id(&self, name: &str) -> Option<u32> {
+        self.streams_ids.borrow().get(name).and_then(|id| Some(*id))
+    }
+
     fn try_get_stream_by_name(&self, name: &str) -> Option<Ref<'_, Stream>> {
         self.streams_ids
             .borrow()

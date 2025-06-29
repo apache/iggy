@@ -47,14 +47,12 @@ use crate::{
     shard::{
         system::info::SystemInfo,
         transmission::{
-            frame::ShardFrame,
-            message::{ShardEvent, ShardMessage},
+            frame::{ShardFrame, ShardResponse},
+            message::{ShardEvent, ShardMessage, ShardRequest},
         },
     },
     state::{
-        StateKind,
-        file::FileState,
-        system::{StreamState, SystemState, UserState},
+        file::FileState, system::{StreamState, SystemState, UserState}, StateKind
     },
     streaming::{
         clients::client_manager::ClientManager,
@@ -85,10 +83,35 @@ impl Shard {
             connection,
         }
     }
+
+    pub async fn send_request(&self, message: ShardMessage) -> Result<ShardResponse, IggyError> {
+        let (sender, receiver) = async_channel::bounded(1);
+        self.connection
+            .sender
+            .send(ShardFrame::new(message, Some(sender.clone()))); // Apparently sender needs to be cloned, otherwise channel will close...
+        //TODO: Fixme
+        let response = receiver.recv().await
+            .map_err(|err| {
+                error!("Failed to receive response from shard: {err}");
+                IggyError::ShardCommunicationError(self.id)
+            })?;
+        Ok(response)
+    }
 }
 
 struct ShardInfo {
     id: u16,
+}
+
+impl ShardInfo {
+    pub fn new(id: u16) -> Self {
+        Self { id }
+    }
+}
+
+pub enum ShardRequestResult<T, E> {
+    SameShard(ShardMessage),
+    Result(Result<T, E>),
 }
 
 pub struct IggyShard {
@@ -424,6 +447,53 @@ impl IggyShard {
 
     pub fn get_available_shards_count(&self) -> u32 {
         self.shards.len() as u32
+    }
+
+    pub async fn send_request_to_shard(
+        &self,
+        namespace: &IggyNamespace,
+        message: ShardMessage,
+    ) -> ShardRequestResult<ShardResponse, IggyError> {
+        if let Some(shard) = self.find_shard(namespace) {
+            if shard.id == self.id {
+                return ShardRequestResult::SameShard(message);
+            }
+
+            let response = match shard.send_request(message).await {
+                Ok(response) => response,
+                Err(err) => {
+                    error!(
+                        "{COMPONENT} - failed to send request to shard with ID: {}, error: {err}",
+                        shard.id
+                    );
+                    return ShardRequestResult::Result(Err(err));
+                }
+            };
+            ShardRequestResult::Result(Ok(response))
+        } else {
+            ShardRequestResult::Result(Err(IggyError::ShardNotFound(
+                namespace.stream_id,
+                namespace.topic_id,
+                namespace.partition_id,
+            )))
+        }
+    }
+
+    fn find_shard(&self, namespace: &IggyNamespace) -> Option<&Shard> {
+        let shards_table = self.shards_table.borrow();
+        shards_table.get(namespace).map(|shard_info| {
+            self.shards
+                .iter()
+                .find(|shard| shard.id == shard_info.id)
+                .expect("Shard not found in the shards table.")
+        })
+    }
+
+    pub fn insert_shard_table_records(
+        &self,
+        records: impl Iterator<Item = (IggyNamespace, ShardInfo)>,
+    ) {
+        self.shards_table.borrow_mut().extend(records);
     }
 
     pub fn broadcast_event_to_all_shards(&self, client_id: u32, event: ShardEvent) {

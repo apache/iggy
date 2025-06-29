@@ -458,7 +458,7 @@ mod tests {
         let messages_count_of_parent_stream = Arc::new(AtomicU64::new(0));
         let segments_count_of_parent_stream = Arc::new(AtomicU32::new(0));
 
-        Topic::create(
+        let topic_info = Topic::create(
             stream_id,
             id,
             name,
@@ -473,7 +473,7 @@ mod tests {
             MaxTopicSize::ServerDefault,
             1,
         )
-        .await
-        .unwrap()
+        .unwrap();
+        topic_info.topic
     }
 }

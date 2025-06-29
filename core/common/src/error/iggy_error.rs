@@ -459,6 +459,11 @@ pub enum IggyError {
     CannotReadIndexPosition = 10011,
     #[error("Cannot read index timestamp")]
     CannotReadIndexTimestamp = 10012,
+
+    #[error("Shard not found for stream ID: {0}, topic ID: {1}, partition ID: {2}")]
+    ShardNotFound(u32, u32, u32) = 11000,
+    #[error("Shard communication error, shard ID: {0}")]
+    ShardCommunicationError(u16) = 11001,
 }
 
 impl IggyError {

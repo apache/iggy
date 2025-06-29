@@ -51,7 +51,7 @@ pub use iggy_binary_protocol::{
 };
 pub use iggy_common::{
     Aes256GcmEncryptor, Args, ArgsOptional, AutoLogin, BytesSerializable, CacheMetrics,
-    CacheMetricsKey, ClientError, ClientInfoDetails, CompressionAlgorithm, Confirmation, Consumer,
+    CacheMetricsKey, ClientError, ClientInfoDetails, CompressionAlgorithm, Consumer,
     ConsumerGroupDetails, ConsumerKind, EncryptorKind, FlushUnsavedBuffer, GlobalPermissions,
     HeaderKey, HeaderValue, HttpClientConfig, HttpClientConfigBuilder, IdKind, Identifier,
     IdentityInfo, IggyByteSize, IggyDuration, IggyError, IggyExpiry, IggyIndexView, IggyMessage,

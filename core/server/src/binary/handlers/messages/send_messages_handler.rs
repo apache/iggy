@@ -16,19 +16,25 @@
  * under the License.
  */
 
+use super::COMPONENT;
 use crate::binary::command::{BinaryServerCommand, ServerCommandHandler};
 use crate::binary::sender::SenderKind;
-use crate::shard::IggyShard;
+use crate::shard::namespace::IggyNamespace;
+use crate::shard::transmission::frame::ShardResponse;
+use crate::shard::transmission::message::{ShardMessage, ShardRequest};
+use crate::shard::{IggyShard, ShardRequestResult};
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use crate::streaming::session::Session;
 use crate::streaming::utils::PooledBuffer;
 use anyhow::Result;
 use bytes::BytesMut;
-use iggy_common::INDEX_SIZE;
+use error_set::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::Sizeable;
+use iggy_common::{INDEX_SIZE, IdKind};
 use iggy_common::{IggyError, Partitioning, SendMessages, Validatable};
 use std::rc::Rc;
+use std::sync::Arc;
 use tracing::instrument;
 
 impl ServerCommandHandler for SendMessages {
@@ -104,19 +110,98 @@ impl ServerCommandHandler for SendMessages {
             indexes,
             messages_buffer,
         );
-
         batch.validate()?;
 
-        shard
-            .append_messages(
-                session,
-                &self.stream_id,
-                &self.topic_id,
-                &self.partitioning,
-                batch,
-            )
-            .await?;
+        let stream = shard
+            .get_stream(&self.stream_id)
+            .with_error_context(|error| {
+                format!(
+                    "Failed to get stream with ID: {} (error: {})",
+                    self.stream_id, error
+                )
+            })?;
+        let topic = stream
+            .get_topic(&self.topic_id)
+            .with_error_context(|error| {
+                format!(
+                    "Failed to get topic with ID: {} (error: {})",
+                    self.topic_id, error
+                )
+            })?;
+        let stream_id = stream.stream_id;
+        let topic_id = topic.topic_id;
+        let partition_id = topic.calculate_partition_id(&self.partitioning)?;
 
+        // Validate permissions for given user on stream and topic.
+        shard.permissioner.borrow().append_messages(
+            session.get_user_id(),
+            stream_id,
+            topic_id
+        ).with_error_context(|error| format!(
+            "{COMPONENT} (error: {error}) - permission denied to append messages for user {} on stream ID: {}, topic ID: {}",
+            session.get_user_id(),
+            stream_id,
+            topic_id
+        ))?;
+        let messages_count = batch.count();
+        shard.metrics.increment_messages(messages_count as u64);
+
+        // Encrypt messages if encryptor is enabled in configuration.
+        let batch = shard.maybe_encrypt_messages(batch)?;
+
+        let namespace = IggyNamespace::new(stream.stream_id, topic.topic_id, partition_id);
+        let request = ShardRequest::SendMessages {
+            stream_id,
+            topic_id,
+            partition_id,
+            batch,
+        };
+        let message = ShardMessage::Request(request);
+        // Egh... I don't like those nested match statements,
+        // Technically there is only two `request` types that will ever be dispatched
+        // to different shards, thus we could get away with generic structs
+        // maybe todo ?
+        // how to make this code reusable, in a sense that we will have exactly the same code inside of
+        // `PollMessages` handler, but with different request....
+        match shard.send_request_to_shard(&namespace, message).await {
+            ShardRequestResult::SameShard(message) => {
+                match message {
+                    ShardMessage::Request(request) => {
+                        match request {
+                            ShardRequest::SendMessages {
+                                stream_id,
+                                topic_id,
+                                partition_id,
+                                batch,
+                            } => {
+                                // Just shut up rust analyzer.
+                                let _stream_id = stream_id;
+                                let _topic_id = topic_id;
+                                topic.append_messages(partition_id, batch).await?
+                            }
+                            _ => unreachable!(
+                                "Expected a SendMessages request inside of SendMessages handler, impossible state"
+                            ),
+                        }
+                    }
+                    _ => unreachable!(
+                        "Expected a request message inside of an command handler, impossible state"
+                    ),
+                }
+            }
+            ShardRequestResult::Result(result) => {
+                match result? {
+                    ShardResponse::SendMessages => {
+                        ()
+                    }
+                    ShardResponse::ErrorResponse(err) => {
+                        return Err(err);
+                    }
+                    _ => unreachable!("Expected a SendMessages response inside of SendMessages handler, impossible state"),
+                }
+
+            }
+        };
         sender.send_empty_ok_response().await?;
         Ok(())
     }

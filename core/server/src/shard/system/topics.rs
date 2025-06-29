@@ -17,7 +17,8 @@
  */
 
 use super::COMPONENT;
-use crate::shard::IggyShard;
+use crate::shard::namespace::IggyNamespace;
+use crate::shard::{IggyShard, ShardInfo};
 use crate::streaming::session::Session;
 use crate::streaming::streams::stream::Stream;
 use crate::streaming::topics::topic::Topic;
@@ -131,8 +132,11 @@ impl IggyShard {
 
         // TODO: Make create topic sync, and extract the storage persister out of it
         // perform disk i/o outside of the borrow_mut of the stream.
-        let created_topic_id = self
-            .get_stream_mut(stream_id)?
+        let mut stream = self.get_stream_mut(stream_id).with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to get mutable reference to stream with ID: {stream_id}")
+        })?;
+        let stream_id = stream.stream_id;
+        let (topic_id, partition_ids) = stream
             .create_topic(
                 topic_id,
                 name,
@@ -146,12 +150,24 @@ impl IggyShard {
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to create topic with name: {name} in stream ID: {stream_id}")
             })?;
+        let records = partition_ids.into_iter().map(|partition_id| {
+            let namespace = IggyNamespace::new(stream_id, topic_id, partition_id);
+            // TODO: This setup isn't deterministic.
+            // Imagine a scenario where client creates partition using `String` identifiers,
+            // but then for poll_messages requests uses numeric ones.
+            // the namespace wouldn't match, therefore we would get miss in the shard table.
+            let hash = namespace.generate_hash();
+            let shard_id = hash % self.get_available_shards_count();
+            let shard_info = ShardInfo::new(shard_id as u16);
+            (namespace, shard_info)
+        });
+        self.insert_shard_table_records(records);
 
         self.metrics.increment_topics(1);
         self.metrics.increment_partitions(partitions_count);
         self.metrics.increment_segments(partitions_count);
 
-        Ok(Identifier::numeric(created_topic_id)?)
+        Ok(Identifier::numeric(topic_id)?)
     }
 
     #[allow(clippy::too_many_arguments)]

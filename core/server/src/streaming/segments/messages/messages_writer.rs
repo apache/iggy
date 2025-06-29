@@ -21,7 +21,7 @@ use crate::{
     streaming::segments::{IggyMessagesBatchSet, messages::write_batch},
 };
 use error_set::ErrContext;
-use iggy_common::{Confirmation, IggyByteSize, IggyError};
+use iggy_common::{IggyByteSize, IggyError};
 use monoio::fs::{File, OpenOptions};
 use std::sync::{
     Arc,

@@ -1,5 +1,7 @@
 use std::rc::Rc;
 
+use iggy_common::PollingStrategy;
+
 /* Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -17,11 +19,11 @@ use std::rc::Rc;
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::{binary::command::ServerCommand, streaming::session::Session};
+use crate::{shard::system::messages::PollingArgs, streaming::{polling_consumer::PollingConsumer, segments::IggyMessagesBatchMut, session::Session}};
 
 #[derive(Debug)]
 pub enum ShardMessage {
-    Command(ServerCommand),
+    Request(ShardRequest),
     Event(ShardEvent),
 }
 
@@ -30,9 +32,25 @@ pub enum ShardEvent {
     NewSession(),
 }
 
-impl From<ServerCommand> for ShardMessage {
-    fn from(command: ServerCommand) -> Self {
-        ShardMessage::Command(command)
+#[derive(Debug)]
+pub enum ShardRequest {
+    SendMessages {
+        stream_id: u32,
+        topic_id: u32,
+        partition_id: u32,
+        batch: IggyMessagesBatchMut,
+    },
+    PollMessages {
+        partition_id: u32,
+        args: PollingArgs,
+        consumer: PollingConsumer,
+        count: u32,
+    },
+}
+
+impl From<ShardRequest> for ShardMessage {
+    fn from(request: ShardRequest) -> Self {
+        ShardMessage::Request(request)
     }
 }
 

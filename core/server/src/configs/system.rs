@@ -17,7 +17,6 @@
  */
 
 use super::cache_indexes::CacheIndexesConfig;
-use iggy_common::Confirmation;
 use iggy_common::IggyByteSize;
 use iggy_common::IggyExpiry;
 use iggy_common::MaxTopicSize;
@@ -141,8 +140,6 @@ pub struct SegmentConfig {
     #[serde_as(as = "DisplayFromStr")]
     pub message_expiry: IggyExpiry,
     pub archive_expired: bool,
-    #[serde_as(as = "DisplayFromStr")]
-    pub server_confirmation: Confirmation,
 }
 
 #[serde_as]

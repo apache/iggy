@@ -18,6 +18,7 @@
 
 use crate::streaming::streams::COMPONENT;
 use crate::streaming::streams::stream::Stream;
+use crate::streaming::topics::topic::CreatedTopicInfo;
 use crate::streaming::topics::topic::Topic;
 use error_set::ErrContext;
 use iggy_common::CompressionAlgorithm;
@@ -44,7 +45,7 @@ impl Stream {
         compression_algorithm: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,
         replication_factor: u8,
-    ) -> Result<u32, IggyError> {
+    ) -> Result<(u32, Vec<u32>), IggyError> {
         let max_topic_size = Topic::get_max_topic_size(max_topic_size, &self.config)?;
         if self.topics_ids.contains_key(name) {
             return Err(IggyError::TopicNameAlreadyExists(
@@ -74,7 +75,10 @@ impl Stream {
             return Err(IggyError::TopicIdAlreadyExists(id, self.stream_id));
         }
 
-        let topic = Topic::create(
+        let CreatedTopicInfo {
+            topic,
+            partition_ids,
+        } = Topic::create(
             self.stream_id,
             id,
             name,
@@ -88,15 +92,15 @@ impl Stream {
             compression_algorithm,
             max_topic_size,
             replication_factor,
-        )
-        .await?;
+        )?;
+
         topic.persist().await.with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to persist topic: {topic}")
         })?;
         info!("Created topic {}", topic);
         self.topics_ids.insert(name.to_owned(), id);
         self.topics.insert(id, topic);
-        Ok(id)
+        Ok((id, partition_ids))
     }
 
     pub async fn update_topic(

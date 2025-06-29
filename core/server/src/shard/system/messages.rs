@@ -25,7 +25,7 @@ use crate::streaming::utils::PooledBuffer;
 use async_zip::tokio::read::stream;
 use error_set::ErrContext;
 use iggy_common::{
-    BytesSerializable, Confirmation, Consumer, EncryptorKind, IGGY_MESSAGE_HEADER_SIZE, Identifier,
+    BytesSerializable, Consumer, EncryptorKind, IGGY_MESSAGE_HEADER_SIZE, Identifier,
     IggyError, Partitioning, PollingStrategy,
 };
 use tracing::{error, trace};
@@ -98,47 +98,6 @@ impl IggyShard {
         Ok((metadata, batch_set))
     }
 
-    pub async fn append_messages(
-        &self,
-        session: &Session,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partitioning: &Partitioning,
-        messages: IggyMessagesBatchMut,
-    ) -> Result<(), IggyError> {
-        self.ensure_authenticated(session)?;
-        let stream = self.get_stream(stream_id).with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - stream not found for stream_id: {stream_id}")
-        })?;
-        let stream_id = stream.stream_id;
-        let topic = self.find_topic(session, &stream, topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream_id: {stream_id}, topic_id: {topic_id}"))?;
-        self.permissioner.borrow().append_messages(
-            session.get_user_id(),
-            topic.stream_id,
-            topic.topic_id
-        ).with_error_context(|error| format!(
-            "{COMPONENT} (error: {error}) - permission denied to append messages for user {} on stream ID: {}, topic ID: {}",
-            session.get_user_id(),
-            topic.stream_id,
-            topic.topic_id
-        ))?;
-        let messages_count = messages.count();
-
-        // Encrypt messages if encryptor is configured
-        let messages = if let Some(encryptor) = &self.encryptor {
-            self.encrypt_messages(messages, encryptor)?
-        } else {
-            messages
-        };
-
-        topic
-            .append_messages(partitioning, messages)
-            .await?;
-
-        self.metrics.increment_messages(messages_count as u64);
-        Ok(())
-    }
-
     pub async fn flush_unsaved_buffer(
         &self,
         session: &Session,
@@ -167,7 +126,7 @@ impl IggyShard {
         Ok(())
     }
 
-    async fn decrypt_messages(
+    pub async fn decrypt_messages(
         &self,
         batches: IggyMessagesBatchSet,
         encryptor: &EncryptorKind,
@@ -206,11 +165,14 @@ impl IggyShard {
         Ok(IggyMessagesBatchSet::from_vec(decrypted_batches))
     }
 
-    fn encrypt_messages(
+    pub fn maybe_encrypt_messages(
         &self,
         batch: IggyMessagesBatchMut,
-        encryptor: &EncryptorKind,
     ) -> Result<IggyMessagesBatchMut, IggyError> {
+        let encryptor = match self.encryptor.as_ref() {
+            Some(encryptor) => encryptor,
+            None => return Ok(batch),
+        };
         let mut encrypted_messages = PooledBuffer::with_capacity(batch.size() as usize * 2);
         let count = batch.count();
         let mut indexes = IggyIndexesMut::with_capacity(batch.count() as usize, 0);

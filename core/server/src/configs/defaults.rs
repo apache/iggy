@@ -451,12 +451,6 @@ impl Default for SegmentConfig {
             cache_indexes: SERVER_CONFIG.system.segment.cache_indexes.parse().unwrap(),
             message_expiry: SERVER_CONFIG.system.segment.message_expiry.parse().unwrap(),
             archive_expired: SERVER_CONFIG.system.segment.archive_expired,
-            server_confirmation: SERVER_CONFIG
-                .system
-                .segment
-                .server_confirmation
-                .parse()
-                .unwrap(),
         }
     }
 }

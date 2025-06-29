@@ -16,9 +16,9 @@
  * under the License.
  */
 
-use crate::io::file::{IggyFile};
+use crate::io::file::IggyFile;
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
-use crate::streaming::utils::{file, PooledBuffer};
+use crate::streaming::utils::{PooledBuffer, file};
 use bytes::BytesMut;
 use error_set::ErrContext;
 use iggy_common::IggyError;
@@ -174,19 +174,18 @@ impl MessagesReader {
         len: u32,
         use_pool: bool,
     ) -> Result<PooledBuffer, std::io::Error> {
-           if use_pool {
-                let mut buf = PooledBuffer::with_capacity(len as usize);
-                unsafe { buf.set_len(len as usize) };
-                let (result, buf) = self.file.read_exact_at(buf, offset as u64).await;
-                result?;
-                Ok(buf)
-
-            } else {
-                let mut buf = BytesMut::with_capacity(len as usize);
-                unsafe { buf.set_len(len as usize) };
-                let (result, buf) = self.file.read_exact_at(buf, offset as u64).await;
-                result?;
-                Ok(PooledBuffer::from_existing(buf))
-            }
+        if use_pool {
+            let mut buf = PooledBuffer::with_capacity(len as usize);
+            unsafe { buf.set_len(len as usize) };
+            let (result, buf) = self.file.read_exact_at(buf, offset as u64).await;
+            result?;
+            Ok(buf)
+        } else {
+            let mut buf = BytesMut::with_capacity(len as usize);
+            unsafe { buf.set_len(len as usize) };
+            let (result, buf) = self.file.read_exact_at(buf, offset as u64).await;
+            result?;
+            Ok(PooledBuffer::from_existing(buf))
+        }
     }
 }

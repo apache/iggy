@@ -18,6 +18,8 @@
 
 use super::COMPONENT;
 use crate::shard::IggyShard;
+use crate::shard::ShardInfo;
+use crate::shard::namespace::IggyNamespace;
 use crate::streaming::session::Session;
 use error_set::ErrContext;
 use iggy_common::Identifier;
@@ -54,6 +56,7 @@ impl IggyShard {
         let mut stream = self.get_stream_mut(stream_id).with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
         })?;
+        let stream_id = stream.stream_id;
         let topic = stream
             .get_topic_mut(topic_id)
             .with_error_context(|error| {
@@ -61,15 +64,25 @@ impl IggyShard {
                     "{COMPONENT} (error: {error}) - failed to get mutable reference to stream with id: {stream_id}"
                 )
             })?;
+        let topic_id = topic.topic_id;
 
         // TODO: Make add persisted partitions to topic sync, and extract the storage persister out of it
         // perform disk i/o outside of the borrow_mut of the stream.
-        topic
+        let partition_ids = topic
             .add_persisted_partitions(partitions_count)
             .await
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to add persisted partitions, topic: {topic}")
             })?;
+        let records = partition_ids.into_iter().map(|partition_id| {
+            let namespace = IggyNamespace::new(stream_id, topic_id, partition_id);
+            let hash = namespace.generate_hash();
+            let shard_id = hash % self.get_available_shards_count();
+            let shard_info = ShardInfo::new(shard_id as u16);
+            (namespace, shard_info)
+        });
+        self.insert_shard_table_records(records);
+
         topic.reassign_consumer_groups();
         self.metrics.increment_partitions(partitions_count);
         self.metrics.increment_segments(partitions_count);

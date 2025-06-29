@@ -62,10 +62,7 @@ async fn assert_polling_messages() {
         .map(|m| m.get_size_bytes())
         .sum::<IggyByteSize>();
     let batch = IggyMessagesBatchMut::from_messages(&messages, batch_size.as_bytes_u32());
-    topic
-        .append_messages(&partitioning, batch)
-        .await
-        .unwrap();
+    topic.append_messages(&partitioning, batch).await.unwrap();
 
     let consumer = PollingConsumer::Consumer(1, partition_id);
     let (_, polled_messages) = topic

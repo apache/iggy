@@ -84,7 +84,7 @@ impl ConsumerOffset {
 
 impl Partition {
     #[allow(clippy::too_many_arguments)]
-    pub async fn create(
+    pub fn create(
         stream_id: u32,
         topic_id: u32,
         partition_id: u32,
@@ -247,8 +247,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU32::new(0)),
             IggyTimestamp::now(),
-        )
-        .await;
+        );
 
         assert_eq!(partition.stream_id, stream_id);
         assert_eq!(partition.topic_id, topic_id);
@@ -290,8 +289,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU32::new(0)),
             IggyTimestamp::now(),
-        )
-        .await;
+        );
         assert!(partition.segments.is_empty());
     }
 }

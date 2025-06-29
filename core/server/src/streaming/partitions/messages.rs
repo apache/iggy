@@ -21,7 +21,7 @@ use crate::streaming::partitions::partition::Partition;
 use crate::streaming::polling_consumer::PollingConsumer;
 use crate::streaming::segments::*;
 use error_set::ErrContext;
-use iggy_common::{Confirmation, IggyError, IggyTimestamp, Sizeable};
+use iggy_common::{IggyError, IggyTimestamp, Sizeable};
 use std::sync::atomic::Ordering;
 use tracing::trace;
 
@@ -218,10 +218,7 @@ impl Partition {
         Ok(batches)
     }
 
-    pub async fn append_messages(
-        &mut self,
-        batch: IggyMessagesBatchMut,
-    ) -> Result<(), IggyError> {
+    pub async fn append_messages(&mut self, batch: IggyMessagesBatchMut) -> Result<(), IggyError> {
         if batch.count() == 0 {
             return Ok(());
         }
@@ -564,10 +561,7 @@ mod tests {
             .map(|m| m.get_size_bytes().as_bytes_u32())
             .sum();
         let initial_batch = IggyMessagesBatchMut::from_messages(&initial_messages, initial_size);
-        partition
-            .append_messages(initial_batch)
-            .await
-            .unwrap();
+        partition.append_messages(initial_batch).await.unwrap();
 
         // Now try to add only duplicates
         let duplicate_messages = vec![
@@ -582,10 +576,7 @@ mod tests {
             .sum();
         let duplicate_batch =
             IggyMessagesBatchMut::from_messages(&duplicate_messages, duplicate_size);
-        partition
-            .append_messages(duplicate_batch)
-            .await
-            .unwrap();
+        partition.append_messages(duplicate_batch).await.unwrap();
 
         let loaded_messages = partition.get_messages_by_offset(0, 10).await.unwrap();
 
@@ -739,8 +730,7 @@ mod tests {
                 Arc::new(AtomicU64::new(0)),
                 Arc::new(AtomicU32::new(0)),
                 IggyTimestamp::now(),
-            )
-            .await,
+            ),
             temp_dir,
         )
     }

@@ -63,9 +63,14 @@ pub struct Topic {
     pub created_at: IggyTimestamp,
 }
 
+pub struct CreatedTopicInfo {
+    pub topic: Topic,
+    pub partition_ids: Vec<u32>,
+}
+
 impl Topic {
     #[allow(clippy::too_many_arguments)]
-    pub async fn empty(
+    pub fn empty(
         stream_id: u32,
         topic_id: u32,
         name: &str,
@@ -74,7 +79,7 @@ impl Topic {
         segments_count_of_parent_stream: Arc<AtomicU32>,
         config: Arc<SystemConfig>,
         storage: Rc<SystemStorage>,
-    ) -> Topic {
+    ) -> CreatedTopicInfo {
         Topic::create(
             stream_id,
             topic_id,
@@ -90,12 +95,11 @@ impl Topic {
             MaxTopicSize::ServerDefault,
             1,
         )
-        .await
         .unwrap()
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn create(
+    pub fn create(
         stream_id: u32,
         topic_id: u32,
         name: &str,
@@ -109,7 +113,7 @@ impl Topic {
         compression_algorithm: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,
         replication_factor: u8,
-    ) -> Result<Topic, IggyError> {
+    ) -> Result<CreatedTopicInfo, IggyError> {
         let path = config.get_topic_path(stream_id, topic_id);
         let partitions_path = config.get_partitions_path(stream_id, topic_id);
         let mut topic = Topic {
@@ -142,8 +146,11 @@ impl Topic {
             message_expiry, topic.message_expiry
         );
 
-        topic.add_partitions(partitions_count).await?;
-        Ok(topic)
+        let partition_ids = topic.add_partitions(partitions_count)?;
+        Ok(CreatedTopicInfo {
+            topic,
+            partition_ids,
+        })
     }
 
     pub fn is_full(&self) -> bool {
@@ -313,7 +320,7 @@ mod tests {
         let messages_count_of_parent_stream = Arc::new(AtomicU64::new(0));
         let segments_count_of_parent_stream = Arc::new(AtomicU32::new(0));
 
-        let topic = Topic::create(
+        let topic_info = Topic::create(
             stream_id,
             topic_id,
             name,
@@ -328,9 +335,8 @@ mod tests {
             max_topic_size,
             replication_factor,
         )
-        .await
         .unwrap();
-
+        let topic = topic_info.topic;
         assert_eq!(topic.stream_id, stream_id);
         assert_eq!(topic.topic_id, topic_id);
         assert_eq!(topic.path, path);

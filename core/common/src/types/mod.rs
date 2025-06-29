@@ -21,7 +21,6 @@ pub(crate) mod client_state;
 pub(crate) mod command;
 pub(crate) mod compression;
 pub(crate) mod configuration;
-pub(crate) mod confirmation;
 pub(crate) mod consumer;
 pub(crate) mod diagnostic;
 pub(crate) mod identifier;

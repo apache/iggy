@@ -16,36 +16,31 @@
  * under the License.
  */
 use async_channel::Sender;
-use bytes::Bytes;
 use iggy_common::IggyError;
 
-use crate::shard::transmission::message::ShardMessage;
+use crate::{binary::handlers::messages::poll_messages_handler::IggyPollMetadata, shard::transmission::message::ShardMessage, streaming::segments::IggyMessagesBatchSet};
+
+#[derive(Debug)]
+pub enum ShardResponse {
+    PollMessages((IggyPollMetadata, IggyMessagesBatchSet)),
+    SendMessages,
+    ShardEvent,
+    ErrorResponse(IggyError),
+}
 
 #[derive(Debug)]
 pub struct ShardFrame {
-    pub client_id: u32,
     pub message: ShardMessage,
     pub response_sender: Option<Sender<ShardResponse>>,
 }
 
 impl ShardFrame {
-    pub fn new(
-        client_id: u32,
-        message: ShardMessage,
-        response_sender: Option<Sender<ShardResponse>>,
-    ) -> Self {
+    pub fn new(message: ShardMessage, response_sender: Option<Sender<ShardResponse>>) -> Self {
         Self {
-            client_id,
             message,
             response_sender,
         }
     }
-}
-
-#[derive(Debug)]
-pub enum ShardResponse {
-    BinaryResponse(Bytes),
-    ErrorResponse(IggyError),
 }
 
 #[macro_export]
