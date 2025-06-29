@@ -2,7 +2,6 @@
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
@@ -16,7 +15,28 @@
  * under the License.
  */
 
-pub mod json;
-pub mod proto;
-pub mod raw;
-pub mod text;
+syntax = "proto3";
+
+package com.example;
+
+message User {
+  int32 id = 1;
+  string name = 2;
+  string email = 3;
+  bool active = 4;
+  int64 created_at = 5;
+  repeated string tags = 6;
+  Address address = 7;
+}
+
+message Address {
+  string street = 1;
+  string city = 2;
+  string country = 3;
+  string postal_code = 4;
+}
+
+message UserList {
+  repeated User users = 1;
+  int32 total_count = 2;
+}
