@@ -14,35 +14,35 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-
-name: Cross-SDK BDD Tests
+name: ci-check-go-sdk
 
 on:
+  workflow_dispatch:
   workflow_call:
 
 jobs:
-  bdd-tests:
-    name: BDD tests (${{ matrix.sdk }})
+  build-and-test:
+    name: Go Build And Test
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        sdk: [rust, python, go]
     steps:
-      - name: Checkout code
+      - name: Checkout Code
         uses: actions/checkout@v4
-      
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
         with:
-          workspaces: |
-            . -> target
-            foreign/python -> target
-          cache-on-failure: true
-          key: bdd-${{ matrix.sdk }}
+          go-version: '1.23.0'
 
-      - name: Run BDD tests for ${{ matrix.sdk }}
-        run: ./scripts/run-bdd-tests.sh ${{ matrix.sdk }}
+      - name: Tidy Check
+        working-directory: foreign/go
+        run: |
+          go mod tidy
+          git diff --exit-code
 
-      - name: Clean up Docker resources
-        if: always()
-        run: ./scripts/run-bdd-tests.sh clean
+      - name: Build Go Modules
+        working-directory: foreign/go
+        run: go build ./...
+
+      - name: Unit Test
+        working-directory: foreign/go
+        run: go test -v ./...

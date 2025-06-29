@@ -21,9 +21,9 @@ import (
 	"bytes"
 	"reflect"
 
-	"github.com/google/uuid"
 	"github.com/apache/iggy/foreign/go"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )

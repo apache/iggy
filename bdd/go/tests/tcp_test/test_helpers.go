@@ -19,6 +19,7 @@ package tcp_test
 
 import (
 	"math/rand"
+	"os"
 	"strings"
 	"time"
 
@@ -39,9 +40,13 @@ func createAuthorizedConnection() MessageStream {
 }
 
 func createConnection() MessageStream {
+	addr := os.Getenv("IGGY_TCP_ADDRESS")
+	if addr == "" {
+		addr = "127.0.0.1:8090"
+	}
 	factory := &IggyClientFactory{}
 	config := IggyConfiguration{
-		BaseAddress: "127.0.0.1:8090",
+		BaseAddress: addr,
 		Protocol:    Tcp,
 	}
 

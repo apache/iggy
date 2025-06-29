@@ -38,13 +38,20 @@ case $SDK in
   docker compose build --no-cache iggy-server python-bdd
   docker compose up --abort-on-container-exit python-bdd
   ;;
+"go")
+  echo "🐹 Running Go BDD tests..."
+  docker compose build --no-cache iggy-server go-bdd
+  docker compose up --abort-on-container-exit go-bdd
+  ;;
 "all")
   echo "🚀 Running all SDK BDD tests..."
   echo "🦀 Starting with Rust tests..."
-  docker compose build --no-cache iggy-server rust-bdd python-bdd
+  docker compose build --no-cache iggy-server rust-bdd python-bdd go-bdd
   docker compose up --abort-on-container-exit rust-bdd
   echo "🐍 Now running Python tests..."
   docker compose up --abort-on-container-exit python-bdd
+  echo "🐹 Now running Go tests..."
+  docker compose up --abort-on-container-exit go-bdd
   ;;
 "clean")
   echo "🧹 Cleaning up Docker resources..."
@@ -53,10 +60,11 @@ case $SDK in
   ;;
 *)
   echo "❌ Unknown SDK: $SDK"
-  echo "📖 Usage: $0 [rust|python|all|clean] [feature_file]"
+  echo "📖 Usage: $0 [rust|python|go|all|clean] [feature_file]"
   echo "📖 Examples:"
   echo "   $0 rust                    # Run Rust tests only"
   echo "   $0 python                  # Run Python tests only"
+  echo "   $0 go                      # Run Go tests only"
   echo "   $0 all                     # Run all SDK tests"
   echo "   $0 clean                   # Clean up Docker resources"
   exit 1

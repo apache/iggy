@@ -15,34 +15,16 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: Cross-SDK BDD Tests
+FROM golang:1.23.10-alpine
 
-on:
-  workflow_call:
+WORKDIR /app
+COPY . .
 
-jobs:
-  bdd-tests:
-    name: BDD tests (${{ matrix.sdk }})
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        sdk: [rust, python, go]
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            . -> target
-            foreign/python -> target
-          cache-on-failure: true
-          key: bdd-${{ matrix.sdk }}
+# Install Ginkgo
+RUN go install github.com/onsi/ginkgo/v2/ginkgo@latest
 
-      - name: Run BDD tests for ${{ matrix.sdk }}
-        run: ./scripts/run-bdd-tests.sh ${{ matrix.sdk }}
+# Change workdir to bdd/go
+WORKDIR /app/bdd/go
 
-      - name: Clean up Docker resources
-        if: always()
-        run: ./scripts/run-bdd-tests.sh clean
+# Default command
+CMD ["ginkgo", "-v", "-r"]

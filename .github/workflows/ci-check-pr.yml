@@ -61,6 +61,7 @@ jobs:
       trigger-shell: ${{ steps.changed-files.outputs.SHELL_FILES_CHANGED }}
       trigger-java-sdk: ${{ steps.changed-files.outputs.JAVA-SDK_FILES_CHANGED }}
       trigger-python-sdk: ${{ steps.changed-files.outputs.PYTHON-SDK_FILES_CHANGED }}
+      trigger-go-sdk: ${{ steps.changed-files.outputs.GO-SDK_FILES_CHANGED  }}
       trigger-node-sdk: ${{ steps.changed-files.outputs.NODE-SDK_FILES_CHANGED }}
       trigger-csharp-sdk: ${{ steps.changed-files.outputs.CSHARP-SDK_FILES_CHANGED }}
       trigger-bdd: ${{ steps.changed-files.outputs.BDD_FILES_CHANGED }}
@@ -140,6 +141,11 @@ jobs:
     if: ${{ needs.pr-file-changes.outputs.trigger-python-sdk == 'true' }}
     uses: ./.github/workflows/ci-check-python-sdk.yml
 
+  ci-check-go-sdk:
+    name: ci-check-go-sdk
+    needs: pr-file-changes
+    if: ${{ needs.pr-file-changes.outputs.trigger-go-sdk == 'true' }}
+    uses: ./.github/workflows/ci-check-go-sdk.yml
   ci-check-node-sdk:
     name: ci-check-node-sdk
     needs: pr-file-changes
@@ -169,6 +175,7 @@ jobs:
       - ci-check-shell
       - ci-check-java-sdk
       - ci-check-python-sdk
+      - ci-check-go-sdk
       - ci-check-node-sdk
       - ci-check-csharp-sdk
       - ci-test-bdd

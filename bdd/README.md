@@ -32,6 +32,7 @@ bdd/
 # Run specific SDK tests
 ../scripts/run-bdd-tests.sh rust
 ../scripts/run-bdd-tests.sh python
+../scripts/run-bdd-tests.sh go
 
 # Clean up Docker resources
 ../scripts/run-bdd-tests.sh clean
