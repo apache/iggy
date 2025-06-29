@@ -18,13 +18,16 @@
 use async_channel::Sender;
 use iggy_common::IggyError;
 
-use crate::{binary::handlers::messages::poll_messages_handler::IggyPollMetadata, shard::transmission::message::ShardMessage, streaming::segments::IggyMessagesBatchSet};
+use crate::{
+    binary::handlers::messages::poll_messages_handler::IggyPollMetadata,
+    shard::transmission::message::ShardMessage, streaming::segments::IggyMessagesBatchSet,
+};
 
 #[derive(Debug)]
 pub enum ShardResponse {
     PollMessages((IggyPollMetadata, IggyMessagesBatchSet)),
     SendMessages,
-    ShardEvent,
+    Event,
     ErrorResponse(IggyError),
 }
 

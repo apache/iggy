@@ -113,7 +113,7 @@ impl IggyShardBuilder {
             version: version,
             stop_receiver: stop_receiver,
             stop_sender: stop_sender,
-            frame_receiver: Cell::new(Some(frame_receiver)),
+            messages_receiver: Cell::new(Some(frame_receiver)),
             metrics: Metrics::init(),
 
             users: Default::default(),

@@ -4795,6 +4795,7 @@ checksum = "3bd0f8bcde87b1949f95338b547543fcab187bc7e7a5024247e359a5e828ba6a"
 dependencies = [
  "auto-const-array",
  "bytes",
+ "flume",
  "fxhash",
  "io-uring",
  "libc",
@@ -4802,8 +4803,10 @@ dependencies = [
  "mio 0.8.11",
  "monoio-macros",
  "nix 0.26.4",
+ "once_cell",
  "pin-project-lite",
  "socket2",
+ "threadpool",
  "windows-sys 0.48.0",
 ]
 
@@ -7433,6 +7436,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "threadpool"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d050e60b33d41c19108b32cea32164033a9013fe3b46cbd4457559bfbf77afaa"
+dependencies = [
+ "num_cpus",
 ]
 
 [[package]]

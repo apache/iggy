@@ -18,7 +18,7 @@
 
 use super::memory_pool::{BytesMutExt, memory_pool};
 use bytes::{Buf, BufMut, BytesMut};
-use monoio::buf::IoBufMut;
+use monoio::buf::{IoBuf, IoBufMut};
 use std::ops::{Deref, DerefMut};
 
 #[derive(Debug)]
@@ -228,5 +228,15 @@ unsafe impl IoBufMut for PooledBuffer {
 
     unsafe fn set_init(&mut self, pos: usize) {
         unsafe { self.inner.set_init(pos) }
+    }
+}
+
+unsafe impl IoBuf for PooledBuffer {
+    fn read_ptr(&self) -> *const u8 {
+        self.inner.read_ptr()
+    }
+
+    fn bytes_init(&self) -> usize {
+        self.inner.bytes_init()
     }
 }

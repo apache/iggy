@@ -30,6 +30,15 @@ pub fn build(ipv6: bool, config: &TcpSocketConfig) -> Socket {
             .expect("Unable to create an ipv4 socket")
     };
 
+    // Required by the thread-per-core model...
+    // We create bunch of sockets on different threads, that bind to exactly the same address and port.
+    socket
+        .set_reuse_address(true)
+        .expect("Unable to set SO_REUSEADDR on socket");
+    socket
+        .set_reuse_port(true)
+        .expect("Unable to set SO_REUSEPORT on socket");
+
     if config.override_defaults {
         config
             .recv_buffer_size
@@ -54,12 +63,6 @@ pub fn build(ipv6: bool, config: &TcpSocketConfig) -> Socket {
         socket
             .set_linger(Some(config.linger.get_duration()))
             .expect("Unable to set SO_LINGER on socket");
-        socket
-            .set_reuse_address(true)
-            .expect("Unable to set SO_REUSEADDR on socket");
-        socket
-            .set_reuse_port(true)
-            .expect("Unable to set SO_REUSEPORT on socket");
     }
 
     socket

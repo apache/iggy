@@ -372,6 +372,21 @@ impl IggyShard {
         Ok(())
     }
 
+    pub fn login_user_event(
+        &self,
+        client_id: u32,
+        username: &str,
+        password: &str,
+    ) -> Result<(), IggyError> {
+        let active_sessions = self.active_sessions.borrow();
+        let session = active_sessions
+            .iter()
+            .find(|s| s.client_id == client_id)
+            .expect(format!("At this point session for {}, should exist.", client_id).as_str());
+        self.login_user_with_credentials(username, Some(password), Some(session))?;
+        Ok(())
+    }
+
     pub fn login_user(
         &self,
         username: &str,

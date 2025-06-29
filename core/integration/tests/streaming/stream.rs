@@ -145,10 +145,10 @@ async fn should_purge_existing_stream_on_disk() {
         let topic = stream
             .get_topic(&Identifier::numeric(topic_id).unwrap())
             .unwrap();
-        topic
-            .append_messages(&Partitioning::partition_id(1), batch)
-            .await
+        let partition_id = topic
+            .calculate_partition_id(&Partitioning::partition_id(1))
             .unwrap();
+        topic.append_messages(partition_id, batch).await.unwrap();
         let (_, loaded_messages) = topic
             .get_messages(
                 PollingConsumer::Consumer(1, 1),

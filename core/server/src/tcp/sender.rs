@@ -120,12 +120,12 @@ where
     );
     let prefix = [
         libc::iovec {
-            iov_base: length.as_ptr() as _,
-            iov_len: length.len(),
-        },
-        libc::iovec {
             iov_base: status.as_ptr() as _,
             iov_len: status.len(),
+        },
+        libc::iovec {
+            iov_base: length.as_ptr() as _,
+            iov_len: length.len(),
         },
     ];
     slices.splice(0..0, prefix);

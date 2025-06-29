@@ -21,10 +21,10 @@ use crate::binary::handlers::messages::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::sender::SenderKind;
 use crate::shard::namespace::IggyNamespace;
-use crate::shard::transmission::frame::ShardResponse;
-use crate::shard::transmission::message::{ShardMessage, ShardRequest};
-use crate::shard::{IggyShard, ShardRequestResult};
 use crate::shard::system::messages::PollingArgs;
+use crate::shard::transmission::frame::ShardResponse;
+use crate::shard::transmission::message::{ShardMessage, ShardRequest, ShardRequestPayload};
+use crate::shard::{IggyShard, ShardRequestResult};
 use crate::streaming::segments::IggyMessagesBatchSet;
 use crate::streaming::session::Session;
 use crate::to_iovec;
@@ -112,52 +112,43 @@ impl ServerCommandHandler for PollMessages {
         };
 
         let namespace = IggyNamespace::new(stream.stream_id, topic.topic_id, partition_id);
-        let request = ShardRequest::PollMessages {
-            consumer,
-            partition_id,
+        let payload = ShardRequestPayload::PollMessages {
+            consumer: consumer.clone(),
             args,
             count,
         };
+        let request = ShardRequest::new(stream.stream_id, topic.topic_id, partition_id, payload);
         let message = ShardMessage::Request(request);
         let (metadata, batch) = match shard.send_request_to_shard(&namespace, message).await {
-            ShardRequestResult::SameShard(message) => {
-                match message {
-                    ShardMessage::Request(request) => {
-                        match request {
-                            ShardRequest::PollMessages {
-                                consumer,
-                                partition_id,
-                                args,
-                                count,
-                            } => {
-                                topic.get_messages(consumer, partition_id, args.strategy, count).await?
-                                
-                            }
-                            _ => unreachable!(
-                                "Expected a SendMessages request inside of SendMessages handler, impossible state"
-                            ),
-                        }
+            ShardRequestResult::SameShard(message) => match message {
+                ShardMessage::Request(request) => match request.payload {
+                    ShardRequestPayload::PollMessages {
+                        consumer,
+                        args,
+                        count,
+                    } => {
+                        topic
+                            .get_messages(consumer, partition_id, args.strategy, count)
+                            .await?
                     }
                     _ => unreachable!(
-                        "Expected a request message inside of an command handler, impossible state"
+                        "Expected a SendMessages request inside of SendMessages handler, impossible state"
                     ),
+                },
+                _ => unreachable!(
+                    "Expected a request message inside of an command handler, impossible state"
+                ),
+            },
+            ShardRequestResult::Result(result) => match result? {
+                ShardResponse::PollMessages(response) => response,
+                ShardResponse::ErrorResponse(err) => {
+                    return Err(err);
                 }
-            }
-            ShardRequestResult::Result(result) => {
-                match result? {
-                    ShardResponse::PollMessages(response) => {
-                        response
-                    }
-                    ShardResponse::ErrorResponse(err) => {
-                        return Err(err);
-                    }
-                    _ => unreachable!(
-                        "Expected a PollMessages response inside of PollMessages handler, impossible state"
-                    ),
-                }
-            }
+                _ => unreachable!(
+                    "Expected a PollMessages response inside of PollMessages handler, impossible state"
+                ),
+            },
         };
-
 
         // Collect all chunks first into a Vec to extend their lifetimes.
         // This ensures the Bytes (in reality Arc<[u8]>) references from each IggyMessagesBatch stay alive

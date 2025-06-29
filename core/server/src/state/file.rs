@@ -117,7 +117,6 @@ impl State for FileState {
                 )
             })
             .map_err(|_| IggyError::CannotReadFile)?;
-        let file = IggyFile::new(file);
         let file_size = file
             .metadata()
             .await
@@ -129,6 +128,8 @@ impl State for FileState {
             })
             .map_err(|_| IggyError::CannotReadFileMetadata)?
             .len();
+
+        let file = IggyFile::new(file);
         if file_size == 0 {
             info!("State file is empty");
             return Ok(Vec::new());
@@ -150,7 +151,8 @@ impl State for FileState {
                 .with_error_context(|error| format!("{FILE_STATE_PARSE_ERROR} index. {error}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 8;
-            if entries_count > 0 && index != current_index + 1 {
+            // Greater than one, because one of the entries after a fresh reboot is the default root user.
+            if entries_count > 1 && index != current_index + 1 {
                 error!(
                     "State file is corrupted, expected index: {}, got: {}",
                     current_index + 1,

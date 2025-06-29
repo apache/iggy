@@ -21,7 +21,7 @@ use crate::binary::command::{BinaryServerCommand, ServerCommandHandler};
 use crate::binary::sender::SenderKind;
 use crate::shard::namespace::IggyNamespace;
 use crate::shard::transmission::frame::ShardResponse;
-use crate::shard::transmission::message::{ShardMessage, ShardRequest};
+use crate::shard::transmission::message::{ShardMessage, ShardRequest, ShardRequestPayload};
 use crate::shard::{IggyShard, ShardRequestResult};
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use crate::streaming::session::Session;
@@ -150,12 +150,8 @@ impl ServerCommandHandler for SendMessages {
         let batch = shard.maybe_encrypt_messages(batch)?;
 
         let namespace = IggyNamespace::new(stream.stream_id, topic.topic_id, partition_id);
-        let request = ShardRequest::SendMessages {
-            stream_id,
-            topic_id,
-            partition_id,
-            batch,
-        };
+        let payload = ShardRequestPayload::SendMessages { batch };
+        let request = ShardRequest::new(stream.stream_id, topic.topic_id, partition_id, payload);
         let message = ShardMessage::Request(request);
         // Egh... I don't like those nested match statements,
         // Technically there is only two `request` types that will ever be dispatched
@@ -164,43 +160,31 @@ impl ServerCommandHandler for SendMessages {
         // how to make this code reusable, in a sense that we will have exactly the same code inside of
         // `PollMessages` handler, but with different request....
         match shard.send_request_to_shard(&namespace, message).await {
-            ShardRequestResult::SameShard(message) => {
-                match message {
-                    ShardMessage::Request(request) => {
-                        match request {
-                            ShardRequest::SendMessages {
-                                stream_id,
-                                topic_id,
-                                partition_id,
-                                batch,
-                            } => {
-                                // Just shut up rust analyzer.
-                                let _stream_id = stream_id;
-                                let _topic_id = topic_id;
-                                topic.append_messages(partition_id, batch).await?
-                            }
-                            _ => unreachable!(
-                                "Expected a SendMessages request inside of SendMessages handler, impossible state"
-                            ),
+            ShardRequestResult::SameShard(message) => match message {
+                ShardMessage::Request(request) => {
+                    let partition_id = request.partition_id;
+                    match request.payload {
+                        ShardRequestPayload::SendMessages { batch } => {
+                            topic.append_messages(partition_id, batch).await?
                         }
+                        _ => unreachable!(
+                            "Expected a SendMessages request inside of SendMessages handler, impossible state"
+                        ),
                     }
-                    _ => unreachable!(
-                        "Expected a request message inside of an command handler, impossible state"
-                    ),
                 }
-            }
-            ShardRequestResult::Result(result) => {
-                match result? {
-                    ShardResponse::SendMessages => {
-                        ()
-                    }
-                    ShardResponse::ErrorResponse(err) => {
-                        return Err(err);
-                    }
-                    _ => unreachable!("Expected a SendMessages response inside of SendMessages handler, impossible state"),
+                _ => unreachable!(
+                    "Expected a request message inside of an command handler, impossible state"
+                ),
+            },
+            ShardRequestResult::Result(result) => match result? {
+                ShardResponse::SendMessages => (),
+                ShardResponse::ErrorResponse(err) => {
+                    return Err(err);
                 }
-
-            }
+                _ => unreachable!(
+                    "Expected a SendMessages response inside of SendMessages handler, impossible state"
+                ),
+            },
         };
         sender.send_empty_ok_response().await?;
         Ok(())

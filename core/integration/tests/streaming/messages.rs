@@ -58,8 +58,7 @@ async fn should_persist_messages_and_then_load_them_from_disk() {
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU32::new(0)),
         IggyTimestamp::now(),
-    )
-    .await;
+    );
 
     let mut messages = Vec::with_capacity(messages_count as usize);
     let mut appended_messages = Vec::with_capacity(messages_count as usize);
@@ -126,8 +125,7 @@ async fn should_persist_messages_and_then_load_them_from_disk() {
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU32::new(0)),
         now,
-    )
-    .await;
+    );
     let partition_state = PartitionState {
         id: partition.partition_id,
         created_at: now,

@@ -99,6 +99,7 @@ impl Segment {
         self.last_index_position += saved_bytes.as_bytes_u64() as u32;
 
         let unsaved_indexes_slice = self.indexes.unsaved_slice();
+        let len = unsaved_indexes_slice.len();
         self.index_writer
             .as_mut()
             .expect("Index writer not initialized")
@@ -107,7 +108,7 @@ impl Segment {
             .with_error_context(|error| {
                 format!(
                     "Failed to save index of {} indexes to {self}. {error}",
-                    unsaved_indexes_slice.len()
+                    len
                 )
             })?;
 

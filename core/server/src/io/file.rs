@@ -94,14 +94,9 @@ impl AsyncWriteRent for IggyFile {
         (Ok(n), buf)
     }
 
+    // This is bait!!!!
     async fn writev<T: IoVecBuf>(&mut self, buf_vec: T) -> BufResult<usize, T> {
-        let slice = match IoVecWrapper::new(buf_vec) {
-            Ok(slice) => slice,
-            Err(buf) => return (Ok(0), buf),
-        };
-
-        let (result, slice) = self.write(slice).await;
-        (result, slice.into_inner())
+        unimplemented!("writev is not implemented for IggyFile");
     }
 
     async fn flush(&mut self) -> std::io::Result<()> {

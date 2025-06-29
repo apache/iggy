@@ -25,8 +25,8 @@ use crate::streaming::utils::hash;
 use ahash::AHashMap;
 use error_set::ErrContext;
 use iggy_common::locking::IggySharedMutFn;
-use iggy_common::{IggyTimestamp, PollingStrategy};
 use iggy_common::{IggyError, IggyExpiry, Partitioning, PartitioningKind, PollingKind};
+use iggy_common::{IggyTimestamp, PollingStrategy};
 use std::sync::atomic::Ordering;
 use tracing::trace;
 

@@ -186,6 +186,19 @@ impl IggyShard {
         }))
     }
 
+    pub async fn create_stream_bypass_auth(
+        &self,
+        stream_id: Option<u32>,
+        name: &str,
+    ) -> Result<(), IggyError> {
+        let stream = self.create_stream_base(stream_id, name)?;
+        let id = stream.stream_id;
+        self.streams_ids.borrow_mut().insert(name.to_owned(), id);
+        self.streams.borrow_mut().insert(id, stream);
+        self.metrics.increment_streams(1);
+        Ok(())
+    }
+
     pub async fn create_stream(
         &self,
         session: &Session,
@@ -196,6 +209,25 @@ impl IggyShard {
         self.permissioner
             .borrow()
             .create_stream(session.get_user_id())?;
+        if self.streams_ids.borrow().contains_key(name) {
+            return Err(IggyError::StreamNameAlreadyExists(name.to_owned()));
+        }
+        let stream = self
+            .create_stream_base(stream_id, name)
+            .with_error_context(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to create stream with name: {name}")
+            })?;
+        let id = stream.stream_id;
+
+        stream.persist().await?;
+        info!("Created stream with ID: {id}, name: '{name}'.");
+        self.streams_ids.borrow_mut().insert(name.to_owned(), id);
+        self.streams.borrow_mut().insert(id, stream);
+        self.metrics.increment_streams(1);
+        Ok(Identifier::numeric(id)?)
+    }
+
+    fn create_stream_base(&self, stream_id: Option<u32>, name: &str) -> Result<Stream, IggyError> {
         if self.streams_ids.borrow().contains_key(name) {
             return Err(IggyError::StreamNameAlreadyExists(name.to_owned()));
         }
@@ -222,14 +254,7 @@ impl IggyShard {
         }
 
         let stream = Stream::create(id, name, self.config.system.clone(), self.storage.clone());
-        stream.persist().await?;
-        info!("Created stream with ID: {id}, name: '{name}'.");
-        self.streams_ids
-            .borrow_mut()
-            .insert(name.to_owned(), stream.stream_id);
-        self.streams.borrow_mut().insert(stream.stream_id, stream);
-        self.metrics.increment_streams(1);
-        Ok(Identifier::numeric(id)?)
+        Ok(stream)
     }
 
     pub async fn update_stream(

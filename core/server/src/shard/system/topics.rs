@@ -101,6 +101,52 @@ impl IggyShard {
         Ok(Some(topic))
     }
 
+    pub async fn create_topic_bypass_auth(
+        &self,
+        stream_id: &Identifier,
+        topic_id: Option<u32>,
+        name: &str,
+        partitions_count: u32,
+        message_expiry: IggyExpiry,
+        compression_algorithm: CompressionAlgorithm,
+        max_topic_size: MaxTopicSize,
+        replication_factor: Option<u8>,
+    ) -> Result<(), IggyError> {
+        let (stream_id, topic_id, partition_ids) = self
+            .create_topic_base(
+                stream_id,
+                topic_id,
+                name,
+                partitions_count,
+                message_expiry,
+                compression_algorithm,
+                max_topic_size,
+                replication_factor,
+            )
+            .await?;
+        // TODO: Figure out a way how to distribute the shards table among different shards,
+        // without the need to do code from below, everytime we handle a `ShardEvent`.
+        // I think we shouldn't be sharing it, maintain a single shard table per shard,
+        // but figure out a way how to distribute it smarter (maybe move the broadcast inside of the `insert_shard_table_records`) method.
+        let records = partition_ids.into_iter().map(|partition_id| {
+            let namespace = IggyNamespace::new(stream_id, topic_id, partition_id);
+            // TODO: This setup isn't deterministic.
+            // Imagine a scenario where client creates partition using `String` identifiers,
+            // but then for poll_messages requests uses numeric ones.
+            // the namespace wouldn't match, therefore we would get miss in the shard table.
+            let hash = namespace.generate_hash();
+            let shard_id = hash % self.get_available_shards_count();
+            let shard_info = ShardInfo::new(shard_id as u16);
+            (namespace, shard_info)
+        });
+        self.insert_shard_table_records(records);
+
+        self.metrics.increment_topics(1);
+        self.metrics.increment_partitions(partitions_count);
+        self.metrics.increment_segments(partitions_count);
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_topic(
         &self,
@@ -130,6 +176,49 @@ impl IggyShard {
                 })?;
         }
 
+        let (stream_id, topic_id, partition_ids) = self
+            .create_topic_base(
+                stream_id,
+                topic_id,
+                name,
+                partitions_count,
+                message_expiry,
+                compression_algorithm,
+                max_topic_size,
+                replication_factor,
+            )
+            .await?;
+        let records = partition_ids.into_iter().map(|partition_id| {
+            let namespace = IggyNamespace::new(stream_id, topic_id, partition_id);
+            // TODO: This setup isn't deterministic.
+            // Imagine a scenario where client creates partition using `String` identifiers,
+            // but then for poll_messages requests uses numeric ones.
+            // the namespace wouldn't match, therefore we would get miss in the shard table.
+            let hash = namespace.generate_hash();
+            let shard_id = hash % self.get_available_shards_count();
+            let shard_info = ShardInfo::new(shard_id as u16);
+            (namespace, shard_info)
+        });
+        self.insert_shard_table_records(records);
+
+        self.metrics.increment_topics(1);
+        self.metrics.increment_partitions(partitions_count);
+        self.metrics.increment_segments(partitions_count);
+
+        Ok(Identifier::numeric(topic_id)?)
+    }
+
+    async fn create_topic_base(
+        &self,
+        stream_id: &Identifier,
+        topic_id: Option<u32>,
+        name: &str,
+        partitions_count: u32,
+        message_expiry: IggyExpiry,
+        compression_algorithm: CompressionAlgorithm,
+        max_topic_size: MaxTopicSize,
+        replication_factor: Option<u8>,
+    ) -> Result<(u32, u32, Vec<u32>), IggyError> {
         // TODO: Make create topic sync, and extract the storage persister out of it
         // perform disk i/o outside of the borrow_mut of the stream.
         let mut stream = self.get_stream_mut(stream_id).with_error_context(|error| {
@@ -150,24 +239,7 @@ impl IggyShard {
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to create topic with name: {name} in stream ID: {stream_id}")
             })?;
-        let records = partition_ids.into_iter().map(|partition_id| {
-            let namespace = IggyNamespace::new(stream_id, topic_id, partition_id);
-            // TODO: This setup isn't deterministic.
-            // Imagine a scenario where client creates partition using `String` identifiers,
-            // but then for poll_messages requests uses numeric ones.
-            // the namespace wouldn't match, therefore we would get miss in the shard table.
-            let hash = namespace.generate_hash();
-            let shard_id = hash % self.get_available_shards_count();
-            let shard_info = ShardInfo::new(shard_id as u16);
-            (namespace, shard_info)
-        });
-        self.insert_shard_table_records(records);
-
-        self.metrics.increment_topics(1);
-        self.metrics.increment_partitions(partitions_count);
-        self.metrics.increment_segments(partitions_count);
-
-        Ok(Identifier::numeric(topic_id)?)
+        Ok((stream_id, topic_id, partition_ids))
     }
 
     #[allow(clippy::too_many_arguments)]

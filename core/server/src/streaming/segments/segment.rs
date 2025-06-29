@@ -313,7 +313,8 @@ impl Segment {
         }
 
         if let Some(index_writer) = self.index_writer.take() {
-            tokio::spawn(async move {
+            //TODO: Fixme not sure whether we should spawn a task here.
+            monoio::spawn(async move {
                 let _ = index_writer.fsync().await;
                 drop(index_writer)
             });

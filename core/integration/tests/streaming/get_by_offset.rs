@@ -127,8 +127,7 @@ async fn test_get_messages_by_offset(
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU32::new(0)),
         IggyTimestamp::now(),
-    )
-    .await;
+    );
 
     setup.create_partitions_directory(stream_id, topic_id).await;
     partition.persist().await.unwrap();
