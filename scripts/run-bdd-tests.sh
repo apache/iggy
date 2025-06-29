@@ -38,13 +38,20 @@ case $SDK in
   docker compose build --no-cache iggy-server python-bdd
   docker compose up --abort-on-container-exit python-bdd
   ;;
+"node")
+  echo "🐢🚀 Running node BDD tests..."
+  docker compose build --no-cache iggy-server node-bdd
+  docker compose up --abort-on-container-exit node-bdd
+  ;;
 "all")
   echo "🚀 Running all SDK BDD tests..."
   echo "🦀 Starting with Rust tests..."
-  docker compose build --no-cache iggy-server rust-bdd python-bdd
+  docker compose build --no-cache iggy-server rust-bdd python-bdd node-bdd
   docker compose up --abort-on-container-exit rust-bdd
   echo "🐍 Now running Python tests..."
   docker compose up --abort-on-container-exit python-bdd
+  echo "🐢🚀 Now unning node BDD tests..."
+  docker compose up --abort-on-container-exit node-bdd
   ;;
 "clean")
   echo "🧹 Cleaning up Docker resources..."
@@ -57,6 +64,7 @@ case $SDK in
   echo "📖 Examples:"
   echo "   $0 rust                    # Run Rust tests only"
   echo "   $0 python                  # Run Python tests only"
+  echo "   $0 node                    # Run Node.js tests only"
   echo "   $0 all                     # Run all SDK tests"
   echo "   $0 clean                   # Clean up Docker resources"
   exit 1

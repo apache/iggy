@@ -17,29 +17,14 @@
  * under the License.
  */
 
-
-import assert from 'node:assert/strict';
-import { Client } from '../client/index.js';
-import { Given } from "@cucumber/cucumber";
-import type { TestWorld } from './world.js';
+import { Client } from '../client/client.js';
 import { getIggyAddress } from '../tcp.sm.utils.js';
 
 const credentials = { username: 'iggy', password: 'iggy' };
 const [host, port] = getIggyAddress();
 
-const opt = {
-  transport: 'TCP' as const,
+export const getTestClient = () => new Client({
+  transport: 'TCP',
   options: { host, port },
   credentials
-};
-
-Given('I have a running Iggy server', function () {
-  return true;
-});
-
-
-Given('I am authenticated as the root user', async function (this: TestWorld) {
-  this.client = new Client(opt);
-  assert.deepEqual({ userId: 1 }, await this.client.session.login(credentials));
-  assert.equal(true, await this.client.system.ping());
 });
