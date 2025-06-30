@@ -22,7 +22,7 @@ defmodule IggyEx.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:rustler, "~> 0.30.0"}
+      {:rustler, "~> 0.36"}
     ]
   end
 
@@ -33,7 +33,7 @@ defmodule IggyEx.MixProject do
                 ),
       licenses: ["Apache-2.0"],
       links: %{
-        "GitHub" => "https://github.com/iggy-rs/iggy-elixir-client",
+        "GitHub" => "https://github.com/apache/iggy",
         "Docs" => "https://hexdocs.pm/iggy_ex"
       }
     ]
