@@ -20,6 +20,7 @@ pub mod builder;
 pub mod gate;
 pub mod namespace;
 pub mod system;
+pub mod task_registry;
 pub mod tasks;
 pub mod transmission;
 
@@ -36,9 +37,9 @@ use std::{
     str::FromStr,
     sync::{
         Arc, RwLock,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tracing::{error, info, instrument, trace, warn};
 use transmission::connector::{Receiver, ShardConnector, StopReceiver, StopSender};
@@ -47,6 +48,7 @@ use crate::{
     configs::server::ServerConfig,
     shard::{
         system::info::SystemInfo,
+        task_registry::TaskRegistry,
         tasks::messages::spawn_shard_message_task,
         transmission::{
             event::ShardEvent,
@@ -74,6 +76,8 @@ use crate::{
 };
 
 pub const COMPONENT: &str = "SHARD";
+pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
 static USER_ID: AtomicU32 = AtomicU32::new(1);
 
 type Task = Pin<Box<dyn Future<Output = Result<(), IggyError>>>>;
@@ -142,8 +146,10 @@ pub struct IggyShard {
 
     pub(crate) metrics: Metrics,
     pub messages_receiver: Cell<Option<Receiver<ShardFrame>>>,
-    stop_receiver: StopReceiver,
-    stop_sender: StopSender,
+    pub(crate) stop_receiver: StopReceiver,
+    pub(crate) stop_sender: StopSender,
+    pub(crate) task_registry: TaskRegistry,
+    pub(crate) is_shutting_down: AtomicBool,
 }
 
 impl IggyShard {
@@ -181,11 +187,31 @@ impl IggyShard {
         // TODO: Fixme
         //self.assert_init();
         info!("Initiated shard with ID: {}", self.id);
+
         // Create all tasks (tcp listener, http listener, command processor, in the future also the background jobs).
         let mut tasks: Vec<Task> = vec![Box::pin(spawn_shard_message_task(self.clone()))];
         if self.config.tcp.enabled {
             tasks.push(Box::pin(spawn_tcp_server(self.clone())));
         }
+
+        let stop_receiver = self.get_stop_receiver();
+        let shard_for_shutdown = self.clone();
+
+        monoio::spawn(async move {
+            let _ = stop_receiver.recv().await;
+            info!("Shard {} received shutdown signal", shard_for_shutdown.id);
+
+            let shutdown_success = shard_for_shutdown.trigger_shutdown().await;
+            if !shutdown_success {
+                error!("Shard {} shutdown timed out", shard_for_shutdown.id);
+            } else {
+                info!(
+                    "Shard {} shutdown completed successfully",
+                    shard_for_shutdown.id
+                );
+            }
+        });
+
         let result = try_join_all(tasks).await;
         result?;
 
@@ -430,25 +456,19 @@ impl IggyShard {
         Ok(())
     }
 
-    #[instrument(skip_all, name = "trace_shutdown")]
-    pub async fn shutdown(&mut self) -> Result<(), IggyError> {
-        //TODO: Fixme, impl cooperative shutdown.
-        self.persist_messages().await?;
-        Ok(())
+    pub fn is_shutting_down(&self) -> bool {
+        self.is_shutting_down.load(Ordering::Relaxed)
     }
 
-    #[instrument(skip_all, name = "trace_persist_messages")]
-    pub async fn persist_messages(&self) -> Result<usize, IggyError> {
-        trace!("Saving buffered messages on disk...");
-        let mut saved_messages_number = 0;
-        //TODO: Fixme
-        /*
-        for stream in self.streams.values() {
-            saved_messages_number += stream.persist_messages().await?;
-        }
-        */
+    pub fn get_stop_receiver(&self) -> StopReceiver {
+        self.stop_receiver.clone()
+    }
 
-        Ok(saved_messages_number)
+    #[instrument(skip_all, name = "trace_shutdown")]
+    pub async fn trigger_shutdown(&self) -> bool {
+        self.is_shutting_down.store(true, Ordering::SeqCst);
+        info!("Shard {} shutdown state set", self.id);
+        self.task_registry.shutdown_all(SHUTDOWN_TIMEOUT).await
     }
 
     pub fn get_available_shards_count(&self) -> u32 {

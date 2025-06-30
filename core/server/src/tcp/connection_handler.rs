@@ -22,7 +22,9 @@ use crate::server_error::ConnectionError;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use crate::tcp::connection_handler::command::ServerCommand;
+use async_channel::Receiver;
 use bytes::BytesMut;
+use futures::FutureExt;
 use iggy_common::IggyError;
 use std::io::ErrorKind;
 use std::rc::Rc;
@@ -34,6 +36,7 @@ pub(crate) async fn handle_connection(
     session: &Rc<Session>,
     sender: &mut SenderKind,
     shard: &Rc<IggyShard>,
+    stop_receiver: Receiver<()>,
 ) -> Result<(), ConnectionError> {
     let mut length_buffer = BytesMut::with_capacity(INITIAL_BYTES_LENGTH);
     unsafe {
@@ -44,14 +47,25 @@ pub(crate) async fn handle_connection(
         code_buffer.set_len(INITIAL_BYTES_LENGTH);
     }
     loop {
-        let (read_length, initial_buffer) = match sender.read(length_buffer.clone()).await {
-            (Ok(read_length), initial_buffer) => (read_length, initial_buffer),
-            (Err(error), _) => {
-                if error.as_code() == IggyError::ConnectionClosed.as_code() {
-                    return Err(ConnectionError::from(error));
-                } else {
-                    sender.send_error_response(error).await?;
-                    continue;
+        let read_future = sender.read(length_buffer.clone());
+
+        let (read_length, initial_buffer) = futures::select! {
+            _ = stop_receiver.recv().fuse() => {
+                info!("Connection stop signal received for session: {}", session);
+                let _ = sender.send_error_response(IggyError::Disconnected).await;
+                return Ok(());
+            }
+            result = read_future.fuse() => {
+                match result {
+                    (Ok(read_length), initial_buffer) => (read_length, initial_buffer),
+                    (Err(error), _) => {
+                        if error.as_code() == IggyError::ConnectionClosed.as_code() {
+                            return Err(ConnectionError::from(error));
+                        } else {
+                            sender.send_error_response(error).await?;
+                            continue;
+                        }
+                    }
                 }
             }
         };

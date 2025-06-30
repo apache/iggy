@@ -22,9 +22,11 @@ use crate::shard::transmission::event::ShardEvent;
 use crate::streaming::clients::client_manager::Transport;
 use crate::tcp::connection_handler::{handle_connection, handle_error};
 use crate::tcp::tcp_socket;
+use futures::FutureExt;
 use iggy_common::IggyError;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::time::Duration;
 use tracing::{error, info};
 
 pub async fn start(server_name: &'static str, shard: Rc<IggyShard>) -> Result<(), IggyError> {
@@ -38,37 +40,61 @@ pub async fn start(server_name: &'static str, shard: Rc<IggyShard>) -> Result<()
         .expect("Failed to parse TCP address");
 
     let socket = tcp_socket::build(ip_v6, socket_config);
-    monoio::spawn(async move {
-        socket
-            .bind(&addr.into())
-            .expect("Failed to bind TCP listener");
-        socket.listen(1024).unwrap();
-        let listener: std::net::TcpListener = socket.into();
-        let listener = monoio::net::TcpListener::from_std(listener).unwrap();
-        info!("{server_name} server has started on: {:?}", addr);
-        loop {
-            match listener.accept().await {
-                Ok((stream, address)) => {
-                    let shard = shard.clone();
-                    info!("Accepted new TCP connection: {address}");
-                    let transport = Transport::Tcp;
-                    let session = shard.add_client(&address, transport);
-                    //TODO: Those can be shared with other shards.
-                    shard.add_active_session(session.clone());
-                    // Broadcast session to all shards.
-                    let event = ShardEvent::NewSession { address, transport };
-                    // TODO: Fixme look inside of broadcast_event_to_all_shards method.
-                    let _responses = shard.broadcast_event_to_all_shards(event.into());
+    socket
+        .bind(&addr.into())
+        .expect("Failed to bind TCP listener");
+    socket.listen(1024).unwrap();
+    let listener: std::net::TcpListener = socket.into();
+    let listener = monoio::net::TcpListener::from_std(listener).unwrap();
+    info!("{server_name} server has started on: {:?}", addr);
 
-                    let _client_id = session.client_id;
-                    info!("Created new session: {session}");
-                    let mut sender = SenderKind::get_tcp_sender(stream);
-                    monoio::spawn(async move {
-                        if let Err(error) = handle_connection(&session, &mut sender, &shard).await {
-                            handle_error(error);
-                            //TODO: Fixme
-                            /*
-                            //system.read().await.delete_client(client_id).await;
+    loop {
+        let shutdown_check = async {
+            loop {
+                if shard.is_shutting_down() {
+                    return;
+                }
+                monoio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+
+        let accept_future = listener.accept();
+        futures::select! {
+            _ = shutdown_check.fuse() => {
+                info!("{server_name} detected shutdown flag, no longer accepting connections");
+                break;
+            }
+            result = accept_future.fuse() => {
+                match result {
+                    Ok((stream, address)) => {
+                        if shard.is_shutting_down() {
+                            info!("Rejecting new connection from {} during shutdown", address);
+                            continue;
+                        }
+                        let shard_clone = shard.clone();
+                        info!("Accepted new TCP connection: {address}");
+                        let transport = Transport::Tcp;
+                        let session = shard_clone.add_client(&address, transport);
+                        //TODO: Those can be shared with other shards.
+                        shard_clone.add_active_session(session.clone());
+                        // Broadcast session to all shards.
+                        let event = ShardEvent::NewSession { address, transport };
+                        // TODO: Fixme look inside of broadcast_event_to_all_shards method.
+                        let _responses = shard_clone.broadcast_event_to_all_shards(event.into());
+
+                        let client_id = session.client_id;
+                        info!("Created new session: {session}");
+                        let mut sender = SenderKind::get_tcp_sender(stream);
+
+                        let conn_stop_receiver = shard_clone.task_registry.add_connection(client_id);
+
+                        let shard_for_conn = shard_clone.clone();
+                        shard_clone.task_registry.spawn_tracked(async move {
+                            if let Err(error) = handle_connection(&session, &mut sender, &shard_for_conn, conn_stop_receiver).await {
+                                handle_error(error);
+                            }
+                            shard_for_conn.task_registry.remove_connection(&client_id);
+
                             if let Err(error) = sender.shutdown().await {
                                 error!(
                                     "Failed to shutdown TCP stream for client: {client_id}, address: {address}. {error}"
@@ -78,13 +104,12 @@ pub async fn start(server_name: &'static str, shard: Rc<IggyShard>) -> Result<()
                                     "Successfully closed TCP stream for client: {client_id}, address: {address}."
                                 );
                             }
-                            */
-                        }
-                    });
+                        });
+                    }
+                    Err(error) => error!("Unable to accept TCP socket. {error}"),
                 }
-                Err(error) => error!("Unable to accept TCP socket. {error}"),
             }
         }
-    })
-    .await
+    }
+    Ok(())
 }

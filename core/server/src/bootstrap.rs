@@ -12,7 +12,10 @@ use crate::{
     IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV,
     configs::{config_provider::ConfigProviderKind, server::ServerConfig, system::SystemConfig},
     server_error::ServerError,
-    shard::transmission::{connector::ShardConnector, frame::ShardFrame},
+    shard::transmission::{
+        connector::{ShardConnector, StopSender},
+        frame::ShardFrame,
+    },
     streaming::{
         persistence::persister::{FilePersister, FileWithSyncPersister, PersisterKind},
         users::user::User,
@@ -21,14 +24,21 @@ use crate::{
 };
 use std::{env, fs::remove_dir_all, ops::Range, path::Path, sync::Arc};
 
-pub fn create_shard_connections(shards_set: Range<usize>) -> Vec<ShardConnector<ShardFrame>> {
+pub fn create_shard_connections(
+    shards_set: Range<usize>,
+) -> (Vec<ShardConnector<ShardFrame>>, Vec<(u16, StopSender)>) {
     let shards_count = shards_set.len();
-    let connectors = shards_set
+    let connectors: Vec<ShardConnector<ShardFrame>> = shards_set
         .into_iter()
         .map(|id| ShardConnector::new(id as u16, shards_count))
         .collect();
 
-    connectors
+    let shutdown_handles = connectors
+        .iter()
+        .map(|conn| (conn.id, conn.stop_sender.clone()))
+        .collect();
+
+    (connectors, shutdown_handles)
 }
 
 pub async fn load_config(

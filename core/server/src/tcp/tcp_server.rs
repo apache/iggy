@@ -32,10 +32,10 @@ pub async fn spawn_tcp_server(shard: Rc<IggyShard>) -> Result<(), IggyError> {
     };
     info!("Initializing {server_name} server...");
     // TODO: Fixme -- storing addr of the server inside of the config for integration tests...
-    let result = match shard.config.tcp.tls.enabled {
+    match shard.config.tcp.tls.enabled {
         true => unimplemented!("TLS support is not implemented yet"),
-        false => tcp_listener::start(server_name, shard).await,
+        false => tcp_listener::start(server_name, shard.clone()).await?,
     };
-    //info!("{server_name} server has started on: {:?}", addr);
-    result
+
+    Ok(())
 }

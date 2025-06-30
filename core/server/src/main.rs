@@ -127,21 +127,23 @@ fn main() -> Result<(), ServerError> {
     let available_cpus = available_parallelism().expect("Failed to get num of cores");
     let shards_count = available_cpus.into();
     let shards_set = 0..shards_count;
-    let connections = create_shard_connections(shards_set.clone());
+    let (connections, shutdown_handles) = create_shard_connections(shards_set.clone());
     let gate = Arc::new(Gate::new());
     let mut handles = Vec::with_capacity(shards_set.len());
+
     for shard_id in shards_set {
         let id = shard_id as u16;
         let gate = gate.clone();
         let connections = connections.clone();
         let config = config.clone();
         let state_persister = resolve_persister(config.system.state.enforce_fsync);
+
         let handle = std::thread::Builder::new()
             .name(format!("shard-{id}"))
             .spawn(move || {
                 MemoryPool::init_pool(config.system.clone());
                 monoio::utils::bind_to_cpu_set(Some(shard_id))
-                    .expect(format!("Failed to set CPU affinity for shard-{id}").as_str());
+                    .unwrap_or_else(|e| panic!("Failed to set CPU affinity for shard-{id}: {e}"));
 
                 let mut rt = create_shard_executor();
                 rt.block_on(async move {
@@ -242,21 +244,40 @@ fn main() -> Result<(), ServerError> {
                         .build()
                         .into();
 
-                    //TODO: If one of the shards fails to initialize, we should crash the whole program;
                     if let Err(e) = shard.run().await {
                         error!("Failed to run shard-{id}: {e}");
                     }
-                    //TODO: If one of the shards fails to initialize, we should crash the whole program;
-                    //shard.assert_init();
+                    info!("Shard {} run completed", id);
                 })
             })
-            .expect(format!("Failed to spawn thread for shard-{id}").as_str());
+            .unwrap_or_else(|e| panic!("Failed to spawn thread for shard-{id}: {e}"));
         handles.push(handle);
     }
 
-    handles.into_iter().for_each(|handle| {
+    let shutdown_handles_for_signal = shutdown_handles.clone();
+    ctrlc::set_handler(move || {
+        info!("Received shutdown signal (SIGTERM/SIGINT), initiating graceful shutdown...");
+
+        for (shard_id, stop_sender) in &shutdown_handles_for_signal {
+            info!("Sending shutdown signal to shard {}", shard_id);
+            if let Err(e) = stop_sender.send_blocking(()) {
+                error!(
+                    "Failed to send shutdown signal to shard {}: {}",
+                    shard_id, e
+                );
+            }
+        }
+    })
+    .expect("Error setting Ctrl-C handler");
+
+    info!("Iggy server is running. Press Ctrl+C or send SIGTERM to shutdown.");
+    for (idx, handle) in handles.into_iter().enumerate() {
+        info!("Waiting for shard thread {} to complete...", idx);
         handle.join().expect("Failed to join shard thread");
-    });
+        info!("Shard thread {} completed", idx);
+    }
+
+    info!("All shards have shut down. Iggy server is exiting.");
 
     /*
     #[cfg(feature = "disable-mimalloc")]

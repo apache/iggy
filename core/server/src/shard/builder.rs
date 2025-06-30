@@ -16,7 +16,11 @@
  * under the License.
  */
 
-use std::{cell::Cell, rc::Rc, sync::Arc};
+use std::{
+    cell::Cell,
+    rc::Rc,
+    sync::{Arc, atomic::AtomicBool},
+};
 
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind};
 use tracing::info;
@@ -25,7 +29,7 @@ use crate::{
     bootstrap::resolve_persister,
     configs::server::ServerConfig,
     map_toggle_str,
-    shard::Shard,
+    shard::{Shard, task_registry::TaskRegistry},
     state::{StateKind, file::FileState},
     streaming::{diagnostics::metrics::Metrics, storage::SystemStorage},
     versioning::SemanticVersion,
@@ -115,6 +119,8 @@ impl IggyShardBuilder {
             stop_sender: stop_sender,
             messages_receiver: Cell::new(Some(frame_receiver)),
             metrics: Metrics::init(),
+            task_registry: TaskRegistry::new(),
+            is_shutting_down: AtomicBool::new(false),
 
             users: Default::default(),
             permissioner: Default::default(),

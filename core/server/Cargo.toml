@@ -48,6 +48,7 @@ chrono = { workspace = true }
 clap = { workspace = true }
 console-subscriber = { workspace = true, optional = true }
 crossbeam = { workspace = true }
+ctrlc = { version = "3.4", features = ["termination"] }
 dashmap = { workspace = true }
 derive_more = { workspace = true }
 dotenvy = "0.15.7"
