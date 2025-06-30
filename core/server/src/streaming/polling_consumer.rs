@@ -48,14 +48,12 @@ impl Display for PollingConsumer {
         match self {
             PollingConsumer::Consumer(consumer_id, partition_id) => write!(
                 f,
-                "consumer ID: {}, partition ID: {}",
-                consumer_id, partition_id
+                "consumer ID: {consumer_id}, partition ID: {partition_id}"
             ),
             PollingConsumer::ConsumerGroup(consumer_group_id, member_id) => {
                 write!(
                     f,
-                    "consumer group ID: {}, member ID: {}",
-                    consumer_group_id, member_id
+                    "consumer group ID: {consumer_group_id}, member ID: {member_id}"
                 )
             }
         }

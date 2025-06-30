@@ -138,8 +138,7 @@ impl IggyCmdTestCase for TestUserGetCmd {
         let assert = command_state
             .success()
             .stdout(starts_with(format!(
-                "Executing get user with ID: {}",
-                user_id
+                "Executing get user with ID: {user_id}"
             )))
             .stdout(is_match(format!("| Username[ ]+| {}", self.username)).unwrap())
             .stdout(is_match(format!("| Status[ ]+| {}", self.status)).unwrap());
@@ -154,11 +153,7 @@ impl IggyCmdTestCase for TestUserGetCmd {
         // Check stream permissions
         let assert = if let Some(stream_id) = self.check_stream_perms {
             assert.stdout(
-                is_match(format!(
-                    "Stream: {}[ ]+|[ ]+Permission[ ]+| Value",
-                    stream_id
-                ))
-                .unwrap(),
+                is_match(format!("Stream: {stream_id}[ ]+|[ ]+Permission[ ]+| Value")).unwrap(),
             )
         } else {
             assert
@@ -167,7 +162,7 @@ impl IggyCmdTestCase for TestUserGetCmd {
         // Check topic permissions
         if let Some(topic_id) = self.check_topic_perms {
             assert.stdout(
-                is_match(format!("Topic: {}[ ]+|[ ]+Permission[ ]+| Value", topic_id)).unwrap(),
+                is_match(format!("Topic: {topic_id}[ ]+|[ ]+Permission[ ]+| Value")).unwrap(),
             );
         }
     }

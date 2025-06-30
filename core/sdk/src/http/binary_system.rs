@@ -48,7 +48,7 @@ impl SystemClient for HttpClient {
     }
 
     async fn get_client(&self, client_id: u32) -> Result<Option<ClientInfoDetails>, IggyError> {
-        let response = self.get(&format!("{}/{}", CLIENTS, client_id)).await;
+        let response = self.get(&format!("{CLIENTS}/{client_id}")).await;
         if let Err(error) = response {
             if matches!(error, IggyError::ResourceNotFound(_)) {
                 return Ok(None);

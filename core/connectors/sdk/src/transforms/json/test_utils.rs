@@ -69,25 +69,25 @@ pub fn extract_json_object(msg: &DecodedMessage) -> Option<&simd_json::owned::Ob
 /// Helper function to assert that a JSON value is a number
 pub fn assert_is_number(value: &OwnedValue, field_name: &str) {
     if !value.is_number() {
-        panic!("{} should be a number", field_name);
+        panic!("{field_name} should be a number");
     }
 }
 
 /// Helper function to assert that a JSON value is a string
 pub fn assert_is_string(value: &OwnedValue, field_name: &str) {
     if !value.is_str() {
-        panic!("{} should be a string", field_name);
+        panic!("{field_name} should be a string");
     }
 }
 
 /// Helper function to assert that a JSON value is a string and validates as a UUID
 pub fn assert_is_uuid(value: &OwnedValue, field_name: &str) {
     if !value.is_str() {
-        panic!("{} should be a string", field_name);
+        panic!("{field_name} should be a string");
     }
 
     let string_value = value.as_str().unwrap();
     if uuid::Uuid::parse_str(string_value).is_err() {
-        panic!("{} is not a valid UUID", field_name);
+        panic!("{field_name} is not a valid UUID");
     }
 }

@@ -37,7 +37,7 @@ async fn should_persist_topics_with_partitions_directories_and_info_file() {
     setup.create_topics_directory(stream_id).await;
     let topic_ids = get_topic_ids();
     for topic_id in topic_ids {
-        let name = format!("test-{}", topic_id);
+        let name = format!("test-{topic_id}");
         let topic = Topic::create(
             stream_id,
             topic_id,
@@ -75,7 +75,7 @@ async fn should_load_existing_topic_from_disk() {
     let partitions_count = 3;
     let topic_ids = get_topic_ids();
     for topic_id in topic_ids {
-        let name = format!("test-{}", topic_id);
+        let name = format!("test-{topic_id}");
         let topic = Topic::create(
             stream_id,
             topic_id,
@@ -152,7 +152,7 @@ async fn should_delete_existing_topic_from_disk() {
     let partitions_count = 3;
     let topic_ids = get_topic_ids();
     for topic_id in topic_ids {
-        let name = format!("test-{}", topic_id);
+        let name = format!("test-{topic_id}");
         let topic = Topic::create(
             stream_id,
             topic_id,
@@ -192,7 +192,7 @@ async fn should_purge_existing_topic_on_disk() {
     let partitions_count = 3;
     let topic_ids = get_topic_ids();
     for topic_id in topic_ids {
-        let name = format!("test-{}", topic_id);
+        let name = format!("test-{topic_id}");
         let topic = Topic::create(
             stream_id,
             topic_id,
@@ -259,7 +259,7 @@ async fn assert_persisted_topic(topic_path: &str, partitions_path: &str, partiti
     let topic_metadata = fs::metadata(topic_path).await.unwrap();
     assert!(topic_metadata.is_dir());
     for partition_id in 1..=partitions_count {
-        let partition_path = format!("{}/{}", partitions_path, partition_id);
+        let partition_path = format!("{partitions_path}/{partition_id}");
         let partition_metadata = fs::metadata(&partition_path).await.unwrap();
         assert!(partition_metadata.is_dir());
     }

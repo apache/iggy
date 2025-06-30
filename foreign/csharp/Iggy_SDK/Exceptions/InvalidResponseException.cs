@@ -17,7 +17,7 @@
 
 namespace Apache.Iggy.Exceptions;
 
-internal sealed class InvalidResponseException : Exception
+public sealed class InvalidResponseException : Exception
 {
     internal InvalidResponseException(string message) : base(message)
     {

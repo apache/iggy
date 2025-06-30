@@ -18,7 +18,7 @@
 package binaryserialization
 
 import (
-	iggcon "github.com/iggy-rs/iggy-go-client/contracts"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"testing"
 )
 

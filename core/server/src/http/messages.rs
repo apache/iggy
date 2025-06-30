@@ -110,8 +110,7 @@ async fn send_messages(
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to append messages, stream ID: {}, topic ID: {}",
-                stream_id, topic_id
+                "{COMPONENT} (error: {error}) - failed to append messages, stream ID: {stream_id}, topic ID: {topic_id}"
             )
         })?;
     Ok(StatusCode::CREATED)

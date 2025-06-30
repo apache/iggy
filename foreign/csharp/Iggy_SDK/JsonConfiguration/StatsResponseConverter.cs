@@ -35,35 +35,15 @@ public class StatsResponseConverter : JsonConverter<StatsResponse>
         float cpuUsage = root.GetProperty(nameof(Stats.CpuUsage).ToSnakeCase()).GetSingle();
         float totalCpuUsage = root.GetProperty(nameof(Stats.TotalCpuUsage).ToSnakeCase()).GetSingle();
         
-        string? memoryUsageString = root.GetProperty(nameof(Stats.MemoryUsage).ToSnakeCase()).GetString();
-        string[] memoryUsageStringSplit = memoryUsageString.Split(' ');
-        (float memoryUsageBytesVal, string memoryUnit) = (ParseFloat(memoryUsageStringSplit[0]), memoryUsageStringSplit[1]);
-        ulong memoryUsage = ConvertStringBytesToUlong(memoryUnit, memoryUsageBytesVal);
-        
-        string? totalMemoryString = root.GetProperty(nameof(Stats.TotalMemory).ToSnakeCase()).GetString();
-        string[] totalMemoryStringSplit = totalMemoryString.Split(' ');
-        (float totalMemoryUsageBytesVal, string totalMemoryUnit) = (ParseFloat(totalMemoryStringSplit[0]), totalMemoryStringSplit[1]);
-        ulong totalMemoryUsage = ConvertStringBytesToUlong(totalMemoryUnit, totalMemoryUsageBytesVal);
-        
-        string? availableMemoryString = root.GetProperty(nameof(Stats.AvailableMemory).ToSnakeCase()).GetString();
-        string[] availableMemoryStringSplit = availableMemoryString.Split(' ');
-        (float availableMemoryBytesVal, string availableMemoryUnit) = (ParseFloat(availableMemoryStringSplit[0]), availableMemoryStringSplit[1]);
-        ulong availableMemory = ConvertStringBytesToUlong(availableMemoryUnit, availableMemoryBytesVal);
+        ulong memoryUsage = ConvertStringToUlong(root.GetProperty(nameof(Stats.MemoryUsage).ToSnakeCase()).GetString());
+        ulong totalMemoryUsage = ConvertStringToUlong(root.GetProperty(nameof(Stats.TotalMemory).ToSnakeCase()).GetString());
+        ulong availableMemory = ConvertStringToUlong(root.GetProperty(nameof(Stats.AvailableMemory).ToSnakeCase()).GetString());
         
         var runtime = root.GetProperty(nameof(Stats.RunTime).ToSnakeCase()).GetUInt64();
         ulong startTime = root.GetProperty(nameof(Stats.StartTime).ToSnakeCase()).GetUInt64();
-        string? readBytesString = root.GetProperty(nameof(Stats.ReadBytes).ToSnakeCase()).GetString();
-        string[] readBytesStringSplit = readBytesString.Split(' ');
-        (float readBytesVal, string readBytesUnit) = (ParseFloat(readBytesStringSplit[0]), readBytesStringSplit[1]);
-        ulong readBytes = ConvertStringBytesToUlong(readBytesUnit, readBytesVal);
-        string? writtenBytesString = root.GetProperty(nameof(Stats.WrittenBytes).ToSnakeCase()).GetString();
-        string[] writtenBytesStringSplit = writtenBytesString.Split(' ');
-        (float writtenBytesVal, string writtenBytesUnit) = (ParseFloat(writtenBytesStringSplit[0]), writtenBytesStringSplit[1]);
-        ulong writtenBytes = ConvertStringBytesToUlong(writtenBytesUnit, writtenBytesVal);
-        string? messageWrittenSizeBytesString = root.GetProperty(nameof(Stats.MessagesSizeBytes).ToSnakeCase()).GetString();
-        string[] messageWrittenSizeBytesStringSplit = messageWrittenSizeBytesString.Split(' ');
-        (float messageWrittenSizeBytesVal, string messageWrittenSizeBytesUnit) = (ParseFloat(messageWrittenSizeBytesStringSplit[0]), messageWrittenSizeBytesStringSplit[1]);
-        ulong messageWrittenSizeBytes = ConvertStringBytesToUlong(messageWrittenSizeBytesUnit, messageWrittenSizeBytesVal);
+        ulong readBytes = ConvertStringToUlong(root.GetProperty(nameof(Stats.ReadBytes).ToSnakeCase()).GetString());
+        ulong writtenBytes = ConvertStringToUlong(root.GetProperty(nameof(Stats.WrittenBytes).ToSnakeCase()).GetString());
+        ulong messageWrittenSizeBytes = ConvertStringToUlong(root.GetProperty(nameof(Stats.MessagesSizeBytes).ToSnakeCase()).GetString());
         int streamsCount = root.GetProperty(nameof(Stats.StreamsCount).ToSnakeCase()).GetInt32();
         int topicsCount = root.GetProperty(nameof(Stats.TopicsCount).ToSnakeCase()).GetInt32();
         int partitionsCount = root.GetProperty(nameof(Stats.PartitionsCount).ToSnakeCase()).GetInt32();
@@ -76,6 +56,8 @@ public class StatsResponseConverter : JsonConverter<StatsResponse>
         string? osVersion = root.GetProperty(nameof(Stats.OsVersion).ToSnakeCase()).GetString();
         string? kernelVersion = root.GetProperty(nameof(Stats.KernelVersion).ToSnakeCase()).GetString();
         string? iggyVersion = root.GetProperty(nameof(Stats.IggyServerVersion).ToSnakeCase()).GetString();
+        uint iggyServerSemver = root.GetProperty(nameof(Stats.IggyServerSemver).ToSnakeCase()).GetUInt32();
+        
         
         return new StatsResponse
         {
@@ -83,13 +65,13 @@ public class StatsResponseConverter : JsonConverter<StatsResponse>
             ClientsCount = clientsCount,
             ConsumerGroupsCount = consumerGroupsCount,
             CpuUsage = cpuUsage,
-            Hostname = hostname,
-            KernelVersion = kernelVersion,
+            Hostname = hostname ?? string.Empty,
+            KernelVersion = kernelVersion ?? string.Empty,
             MemoryUsage = memoryUsage,
             MessagesCount = messagesCount,
             MessagesSizeBytes = messageWrittenSizeBytes,
-            OsName = osName,
-            OsVersion = osVersion,
+            OsName = osName ?? string.Empty,
+            OsVersion = osVersion ?? string.Empty,
             PartitionsCount = partitionsCount,
             ProcessId = processId,
             ReadBytes = readBytes,
@@ -101,11 +83,29 @@ public class StatsResponseConverter : JsonConverter<StatsResponse>
             TotalCpuUsage = totalCpuUsage,
             TotalMemory = totalMemoryUsage,
             WrittenBytes = writtenBytes,
-            IggyVersion = iggyVersion
+            IggyVersion = iggyVersion ?? string.Empty,
+            IggyServerSemver = iggyServerSemver
         };
 
     }
 
+    private ulong ConvertStringToUlong(string? usage)
+    {
+        if(usage is null)
+        {
+            return 0;
+        }
+        
+        var usageStringSplit = usage.Split(' ');
+        if (usageStringSplit.Length != 2)
+        {
+            throw new InvalidEnumArgumentException($"Error Wrong format when deserializing MemoryUsage: {usage}");
+        }
+        
+        var (memoryUsageBytesVal, memoryUnit) = (ParseFloat(usageStringSplit[0]), usageStringSplit[1]);
+        return ConvertStringBytesToUlong(memoryUnit, memoryUsageBytesVal);
+    }
+    
     private static ulong ConvertStringBytesToUlong(string memoryUnit, float memoryUsageBytesVal)
     {
         float memoryUsage = memoryUnit switch

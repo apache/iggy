@@ -173,10 +173,7 @@ async fn update_user(
         )
         .await
         .with_error_context(|error| {
-            format!(
-                "{COMPONENT} (error: {error}) - failed to update user, user ID: {}",
-                user_id
-            )
+            format!("{COMPONENT} (error: {error}) - failed to update user, user ID: {user_id}")
         })?;
 
     let system = system.downgrade();
@@ -186,8 +183,7 @@ async fn update_user(
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply update user, user ID: {}",
-                user_id
+                "{COMPONENT} (error: {error}) - failed to apply update user, user ID: {user_id}"
             )
         })?;
     Ok(StatusCode::NO_CONTENT)
@@ -213,8 +209,7 @@ async fn update_permissions(
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to update permissions, user ID: {}",
-                user_id
+                "{COMPONENT} (error: {error}) - failed to update permissions, user ID: {user_id}"
             )
         })?;
 
@@ -225,8 +220,7 @@ async fn update_permissions(
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply update permissions, user ID: {}",
-                user_id
+                "{COMPONENT} (error: {error}) - failed to apply update permissions, user ID: {user_id}"
             )
         })?;
     Ok(StatusCode::NO_CONTENT)
@@ -252,10 +246,7 @@ async fn change_password(
         )
         .await
         .with_error_context(|error| {
-            format!(
-                "{COMPONENT} (error: {error}) - failed to change password, user ID: {}",
-                user_id
-            )
+            format!("{COMPONENT} (error: {error}) - failed to change password, user ID: {user_id}")
         })?;
 
     // For the security of the system, we hash the password before storing it in metadata.
@@ -273,8 +264,7 @@ async fn change_password(
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply change password, user ID: {}",
-                user_id
+                "{COMPONENT} (error: {error}) - failed to apply change password, user ID: {user_id}"
             )
         })?;
     Ok(StatusCode::NO_CONTENT)

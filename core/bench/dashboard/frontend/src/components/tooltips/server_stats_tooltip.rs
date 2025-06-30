@@ -50,7 +50,7 @@ pub fn server_stats_tooltip(props: &ServerStatsTooltipProps) -> Html {
     let runtime_hours = runtime_secs / 3600;
     let runtime_mins = (runtime_secs % 3600) / 60;
     let runtime_secs = runtime_secs % 60;
-    let runtime_str = format!("{}h {}m {}s", runtime_hours, runtime_mins, runtime_secs);
+    let runtime_str = format!("{runtime_hours}h {runtime_mins}m {runtime_secs}s");
 
     html! {
         <div class="benchmark-info-tooltip server-stats-position">

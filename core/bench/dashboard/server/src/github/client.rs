@@ -31,7 +31,7 @@ use tokio::fs::read_dir;
 use tracing::{info, trace};
 use zip::ZipArchive;
 
-const OWNER: &str = "iggy-rs";
+const OWNER: &str = "apache";
 const REPO: &str = "iggy";
 const WORKFLOW_FILE: &str = "performance.yml";
 
@@ -62,8 +62,7 @@ impl IggyBenchDashboardGithubClient {
 
         runs.iter().find(|run| run.id == run_id).ok_or_else(|| {
             IggyBenchDashboardServerError::NotFound(format!(
-                "Workflow run {} not found in {}",
-                workflow_id, WORKFLOW_FILE
+                "Workflow run {workflow_id} not found in {WORKFLOW_FILE}"
             ))
         })?;
 
@@ -197,8 +196,7 @@ impl IggyBenchDashboardGithubClient {
             .value
             .ok_or_else(|| {
                 IggyBenchDashboardServerError::NotFound(format!(
-                    "No artifacts found for workflow run {}",
-                    run_id
+                    "No artifacts found for workflow run {run_id}"
                 ))
             })?
             .into_iter()

@@ -192,7 +192,7 @@ impl BenchmarkProducingConsumer {
         ))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
     async fn run_warmup(
         &self,
         client: &IggyClient,
@@ -267,7 +267,11 @@ impl BenchmarkProducingConsumer {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        clippy::cognitive_complexity
+    )]
     async fn run_benchmark(
         self,
         client: IggyClient,

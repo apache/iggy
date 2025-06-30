@@ -17,4 +17,4 @@
 
 namespace Apache.Iggy.Contracts.Http.Auth;
 
-public record AuthResponse(int UserId, TokenInfo AccessToken);
+public record AuthResponse(int UserId, TokenInfo? AccessToken);

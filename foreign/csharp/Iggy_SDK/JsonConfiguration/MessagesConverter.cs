@@ -35,13 +35,12 @@ internal sealed class MessagesConverter : JsonConverter<MessageSendRequest>
     {
         if (value.Messages.Any())
         {
-            
             writer.WriteStartObject();
             writer.WriteStartObject("partitioning");
 
             writer.WriteString(nameof(MessageSendRequest.Partitioning.Kind).ToSnakeCase(), value: value.Partitioning.Kind switch
             {
-                Partitioning.Balanced => "none",
+                Partitioning.Balanced => "balanced",
                 Partitioning.MessageKey => "entity_id",
                 Partitioning.PartitionId => "partition_id",
                 _ => throw new InvalidEnumArgumentException()

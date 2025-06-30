@@ -93,8 +93,7 @@ async fn get_topics(
         )
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to find topics for stream with ID: {}",
-                stream_id
+                "{COMPONENT} (error: {error}) - failed to find topics for stream with ID: {stream_id}"
             )
         })?;
     let topics = mapper::map_topics(&topics);
@@ -126,10 +125,7 @@ async fn create_topic(
         )
         .await
         .with_error_context(|error| {
-            format!(
-                "{COMPONENT} (error: {error}) - failed to create topic, stream ID: {}",
-                stream_id
-            )
+            format!("{COMPONENT} (error: {error}) - failed to create topic, stream ID: {stream_id}")
         })?;
     command.message_expiry = topic.message_expiry;
     command.max_topic_size = topic.max_topic_size;
@@ -178,8 +174,7 @@ async fn update_topic(
             .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to update topic, stream ID: {}, topic ID: {}",
-                    stream_id, topic_id
+                    "{COMPONENT} (error: {error}) - failed to update topic, stream ID: {stream_id}, topic ID: {topic_id}"
                 )
             })?;
     command.message_expiry = topic.message_expiry;
@@ -192,8 +187,7 @@ async fn update_topic(
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply update topic, stream ID: {}, topic ID: {}",
-                stream_id, topic_id
+                "{COMPONENT} (error: {error}) - failed to apply update topic, stream ID: {stream_id}, topic ID: {topic_id}"
             )
         })?;
     Ok(StatusCode::NO_CONTENT)
@@ -235,8 +229,7 @@ async fn delete_topic(
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply delete topic, stream ID: {}, topic ID: {}",
-                stream_id, topic_id
+                "{COMPONENT} (error: {error}) - failed to apply delete topic, stream ID: {stream_id}, topic ID: {topic_id}"
             )
         })?;
     Ok(StatusCode::NO_CONTENT)
@@ -260,8 +253,7 @@ async fn purge_topic(
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to purge topic, stream ID: {}, topic ID: {}",
-                stream_id, topic_id
+                "{COMPONENT} (error: {error}) - failed to purge topic, stream ID: {stream_id}, topic ID: {topic_id}"
             )
         })?;
     system
@@ -276,8 +268,7 @@ async fn purge_topic(
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply purge topic, stream ID: {}, topic ID: {}",
-                stream_id, topic_id
+                "{COMPONENT} (error: {error}) - failed to apply purge topic, stream ID: {stream_id}, topic ID: {topic_id}"
             )
         })?;
     Ok(StatusCode::NO_CONTENT)

@@ -168,33 +168,33 @@ impl BytesSerializable for EntryCommand {
 impl Display for EntryCommand {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            EntryCommand::CreateStream(command) => write!(f, "CreateStream({})", command),
-            EntryCommand::UpdateStream(command) => write!(f, "UpdateStream({})", command),
-            EntryCommand::DeleteStream(command) => write!(f, "DeleteStream({})", command),
-            EntryCommand::PurgeStream(command) => write!(f, "PurgeStream({})", command),
-            EntryCommand::CreateTopic(command) => write!(f, "CreateTopic({})", command),
-            EntryCommand::UpdateTopic(command) => write!(f, "UpdateTopic({})", command),
-            EntryCommand::DeleteTopic(command) => write!(f, "DeleteTopic({})", command),
-            EntryCommand::PurgeTopic(command) => write!(f, "PurgeTopic({})", command),
-            EntryCommand::CreatePartitions(command) => write!(f, "CreatePartitions({})", command),
-            EntryCommand::DeletePartitions(command) => write!(f, "DeletePartitions({})", command),
-            EntryCommand::DeleteSegments(command) => write!(f, "DeleteSegments({})", command),
+            EntryCommand::CreateStream(command) => write!(f, "CreateStream({command})"),
+            EntryCommand::UpdateStream(command) => write!(f, "UpdateStream({command})"),
+            EntryCommand::DeleteStream(command) => write!(f, "DeleteStream({command})"),
+            EntryCommand::PurgeStream(command) => write!(f, "PurgeStream({command})"),
+            EntryCommand::CreateTopic(command) => write!(f, "CreateTopic({command})"),
+            EntryCommand::UpdateTopic(command) => write!(f, "UpdateTopic({command})"),
+            EntryCommand::DeleteTopic(command) => write!(f, "DeleteTopic({command})"),
+            EntryCommand::PurgeTopic(command) => write!(f, "PurgeTopic({command})"),
+            EntryCommand::CreatePartitions(command) => write!(f, "CreatePartitions({command})"),
+            EntryCommand::DeletePartitions(command) => write!(f, "DeletePartitions({command})"),
+            EntryCommand::DeleteSegments(command) => write!(f, "DeleteSegments({command})"),
             EntryCommand::CreateConsumerGroup(command) => {
-                write!(f, "CreateConsumerGroup({})", command)
+                write!(f, "CreateConsumerGroup({command})")
             }
             EntryCommand::DeleteConsumerGroup(command) => {
-                write!(f, "DeleteConsumerGroup({})", command)
+                write!(f, "DeleteConsumerGroup({command})")
             }
-            EntryCommand::CreateUser(command) => write!(f, "CreateUser({})", command),
-            EntryCommand::UpdateUser(command) => write!(f, "UpdateUser({})", command),
-            EntryCommand::DeleteUser(command) => write!(f, "DeleteUser({})", command),
-            EntryCommand::ChangePassword(command) => write!(f, "ChangePassword({})", command),
-            EntryCommand::UpdatePermissions(command) => write!(f, "UpdatePermissions({})", command),
+            EntryCommand::CreateUser(command) => write!(f, "CreateUser({command})"),
+            EntryCommand::UpdateUser(command) => write!(f, "UpdateUser({command})"),
+            EntryCommand::DeleteUser(command) => write!(f, "DeleteUser({command})"),
+            EntryCommand::ChangePassword(command) => write!(f, "ChangePassword({command})"),
+            EntryCommand::UpdatePermissions(command) => write!(f, "UpdatePermissions({command})"),
             EntryCommand::CreatePersonalAccessToken(command) => {
-                write!(f, "CreatePersonalAccessToken({})", command)
+                write!(f, "CreatePersonalAccessToken({command})")
             }
             EntryCommand::DeletePersonalAccessToken(command) => {
-                write!(f, "DeletePersonalAccessToken({})", command)
+                write!(f, "DeletePersonalAccessToken({command})")
             }
         }
     }

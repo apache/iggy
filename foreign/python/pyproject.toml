@@ -34,11 +34,11 @@ classifiers = [
 ]
 
 [project.urls]
-"Homepage" = "https://iggy.rs"
-"Documentation" = "https://docs.iggy.rs"
-"Repository" = "https://github.com/iggy-rs/iggy"
-"Bug Tracker" = "https://github.com/iggy-rs/iggy/issues"
-"Discord" = "https://iggy.rs/discord"
+"Homepage" = "https://iggy.apache.org"
+"Documentation" = "https://iggy.apache.org/docs/"
+"Repository" = "https://github.com/apache/iggy"
+"Bug Tracker" = "https://github.com/apache/iggy/issues"
+"Discord" = "https://discord.gg/C5Sux5NcRa"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]

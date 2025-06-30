@@ -46,7 +46,7 @@ impl FromStr for CompressionAlgorithm {
         match s.to_lowercase().as_str() {
             "gzip" => Ok(CompressionAlgorithm::Gzip),
             "none" => Ok(CompressionAlgorithm::None),
-            _ => Err(format!("Unknown compression type: {}", s)),
+            _ => Err(format!("Unknown compression type: {s}")),
         }
     }
 }

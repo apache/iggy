@@ -65,8 +65,7 @@ async fn create_partitions(
             .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to create partitions, stream ID: {}, topic ID: {}",
-                    stream_id, topic_id
+                    "{COMPONENT} (error: {error}) - failed to create partitions, stream ID: {stream_id}, topic ID: {topic_id}"
                 )
             })?;
 
@@ -77,8 +76,7 @@ async fn create_partitions(
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply create partitions, stream ID: {}, topic ID: {}",
-                stream_id, topic_id
+                "{COMPONENT} (error: {error}) - failed to apply create partitions, stream ID: {stream_id}, topic ID: {topic_id}"
             )
         })?;
     Ok(StatusCode::CREATED)
@@ -106,8 +104,7 @@ async fn delete_partitions(
             .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to delete partitions for topic with ID: {} in stream with ID: {}",
-                    stream_id, topic_id
+                    "{COMPONENT} (error: {error}) - failed to delete partitions for topic with ID: {stream_id} in stream with ID: {topic_id}"
                 )
             })?;
 
@@ -125,8 +122,7 @@ async fn delete_partitions(
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply delete partitions, stream ID: {}, topic ID: {}",
-                stream_id, topic_id
+                "{COMPONENT} (error: {error}) - failed to apply delete partitions, stream ID: {stream_id}, topic ID: {topic_id}"
             )
         })?;
     Ok(StatusCode::NO_CONTENT)

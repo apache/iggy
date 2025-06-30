@@ -1,6 +1,7 @@
 {
   "rust": [
     "core/(bench|cli|examples|integration|sdk|server|tools|connectors).*\\.rs",
+    "bdd/rust/.*\\.rs",
     "core/Cargo.toml",
     "Cargo.toml",
     "Cargo.lock",
@@ -15,11 +16,21 @@
   ],
   "rust-prod": [
     "core/(bench|cli|examples|integration|sdk|server|tools|connectors).*\\.rs",
+    "bdd/rust/.*\\.rs",
     "core/Cargo.toml",
     "Cargo.toml",
     "Cargo.lock",
     "Dockerfile.*",
     ".github/workflows/ci-prod-rust.yml"
+  ],
+  "go-sdk": [
+    "foreign/go/.*\\.go",
+    "foreign/go/go.mod",
+    "foreign/go/go.sum",
+    "bdd/go/.*\\.go",
+    "bdd/go/go.mod",
+    "bdd/go/go.sum",
+    ".github/workflows/ci-check-go-sdk.yml"
   ],
   "java-sdk": [
     "foreign/java/.*\\.java",
@@ -30,6 +41,7 @@
   "python-sdk": [
     "foreign/python/.*\\.py",
     "foreign/python/.*\\.rs",
+    "bdd/python/.*\\.py",
     "foreign/python/pyproject.toml",
     "foreign/python/Cargo.toml",
     "foreign/python/docker-compose.test.yml",
@@ -44,11 +56,23 @@
     "foreign/node/.*\\.js",
     "foreign/node/.*\\.json",
     ".github/workflows/ci-check-node-sdk.yml"
-  ]
-  ,
+  ],
   "csharp-sdk": [
     "foreign/csharp/.*\\.cs",
     "foreign/csharp/.*\\.csproj",
     ".github/workflows/ci-check-csharp-sdk.yml"
+  ],
+  "bdd": [
+    "bdd/.*\\.feature",
+    "bdd/.*\\.py",
+    "bdd/.*\\.rs",
+    "bdd/.*\\.go",
+    "bdd/go/go.mod",
+    "bdd/go/go.sum",
+    "bdd/.*Dockerfile",
+    "bdd/docker-compose.yml",
+    "scripts/run-bdd-tests.sh",
+    ".github/workflows/ci-test-bdd.yml",
+    "core/.*\\.rs"
   ]
 }

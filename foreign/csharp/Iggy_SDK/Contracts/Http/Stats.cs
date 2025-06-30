@@ -43,5 +43,5 @@ public sealed class Stats
     public required string KernelVersion { get; init; }
     public required string IggyServerVersion { get; init; }
     public uint IggyServerSemver { get; init; }
-    public List<CacheMetrics> CacheMetrics { get; set; }
+    public List<CacheMetrics> CacheMetrics { get; set; } = [];
 }

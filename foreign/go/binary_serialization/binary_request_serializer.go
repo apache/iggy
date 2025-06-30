@@ -20,7 +20,7 @@ package binaryserialization
 import (
 	"encoding/binary"
 
-	. "github.com/iggy-rs/iggy-go-client/contracts"
+	. "github.com/apache/iggy/foreign/go/contracts"
 )
 
 func CreateGroup(request CreateConsumerGroupRequest) []byte {

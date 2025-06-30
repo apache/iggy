@@ -12,6 +12,17 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Shared", "Shared\Shared.csp
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Benchmarks", "Benchmarks\Benchmarks.csproj", "{466C54AD-A5FA-401C-9300-8FE21D3C355A}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Iggy_SDK.Tests.Integration", "Iggy_SDK.Tests.Integration\Iggy_SDK.Tests.Integration.csproj", "{59661E1B-1D5E-4D58-AE7B-10E8ABB9839A}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "SolutionFolder", "SolutionFolder", "{3A9B7D3B-EFA9-4652-A647-C72F84616114}"
+	ProjectSection(SolutionItems) = preProject
+		DEPENDENCIES.md = DEPENDENCIES.md
+		Directory.Packages.props = Directory.Packages.props
+		LICENSE = LICENSE
+		NOTICE = NOTICE
+		README.md = README.md
+	EndProjectSection
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -42,5 +53,9 @@ Global
 		{466C54AD-A5FA-401C-9300-8FE21D3C355A}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{466C54AD-A5FA-401C-9300-8FE21D3C355A}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{466C54AD-A5FA-401C-9300-8FE21D3C355A}.Release|Any CPU.Build.0 = Release|Any CPU
+		{59661E1B-1D5E-4D58-AE7B-10E8ABB9839A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{59661E1B-1D5E-4D58-AE7B-10E8ABB9839A}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{59661E1B-1D5E-4D58-AE7B-10E8ABB9839A}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{59661E1B-1D5E-4D58-AE7B-10E8ABB9839A}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal
