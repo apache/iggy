@@ -5,19 +5,13 @@ pub mod client;
 
 rustler::init!(
     "Elixir.IggyEx",
-    [
-        client::ping,
-        client::login_user,
-        client::connect,
-        client::create_stream,
-        client::create_topic,
-        client::send_messages,
-        client::send_message,
-    ],
     load = on_load
 );
 
 fn on_load(env: Env, _info: Term) -> bool {
-    resource!(client::IggyResource, env);
+    #[allow(non_local_definitions, unused_must_use)]
+    {
+        let _ = resource!(client::IggyResource, env);
+    }
     true
 }
