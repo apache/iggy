@@ -6,7 +6,7 @@
 replicaCount: 1
 
 image:
-  repository: iggyrs/iggy
+  repository: apache/iggy
   pullPolicy: IfNotPresent
   # Overrides the image tag whose default is the chart appVersion.
   tag: ""
