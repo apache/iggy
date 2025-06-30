@@ -94,7 +94,7 @@ impl IndexWriter {
         }
 
         let count = indexes.len() / INDEX_SIZE;
-        let len =  indexes.len();
+        let len = indexes.len();
 
         self.file
             .write_all(indexes)
@@ -109,7 +109,7 @@ impl IndexWriter {
             .map_err(|_| IggyError::CannotSaveIndexToSegment)?;
 
         self.index_size_bytes
-            .fetch_add(len  as u64, Ordering::Release);
+            .fetch_add(len as u64, Ordering::Release);
 
         if self.fsync {
             let _ = self.fsync().await;
