@@ -1,0 +1,20 @@
+[package]
+authors = []
+name = "iggy_nif"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["dylib"]
+name = "iggy_nif"
+path = "src/lib.rs"
+
+[dependencies]
+iggy = "0.2.0"
+lazy_static = "1.4.0"
+async-std = "1.9"
+rustler = "0.30.0"
+rustler_codegen = "0.30"
+tokio = "1.28.2"
+tracing = "0.1.37"
+tracing-subscriber = "0.3"
