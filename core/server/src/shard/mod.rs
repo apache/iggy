@@ -46,6 +46,7 @@ use transmission::connector::{Receiver, ShardConnector, StopReceiver, StopSender
 
 use crate::{
     configs::server::ServerConfig,
+    io::fs_utils,
     shard::{
         system::info::SystemInfo,
         task_registry::TaskRegistry,
@@ -341,7 +342,7 @@ impl IggyShard {
                 error!(
                     "Stream with ID: '{stream_id}' was not found in state, but exists on disk and will be removed."
                 );
-                if let Err(error) = std::fs::remove_dir_all(&dir_entry.path()) {
+                if let Err(error) = fs_utils::remove_dir_all(&dir_entry.path()).await {
                     error!("Cannot remove stream directory: {error}");
                 } else {
                     warn!("Stream with ID: '{stream_id}' was removed.");

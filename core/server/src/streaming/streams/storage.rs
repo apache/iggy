@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use crate::io::fs_utils;
 use crate::state::system::StreamState;
 use crate::streaming::storage::StreamStorage;
 use crate::streaming::streams::COMPONENT;
@@ -72,8 +73,7 @@ impl StreamStorage for FileStreamStorage {
                 error!(
                     "Topic with ID: '{topic_id}' for stream with ID: '{stream_id}' was not found in state, but exists on disk and will be removed."
                 );
-                // TODO: Replace this with the dir walk impl that is mentioed in main function.
-                if let Err(error) = std::fs::remove_dir_all(&dir_entry.path()) {
+                if let Err(error) = fs_utils::remove_dir_all(&dir_entry.path()).await {
                     error!("Cannot remove topic directory: {error}");
                 } else {
                     warn!(
@@ -223,7 +223,7 @@ impl StreamStorage for FileStreamStorage {
 
     async fn delete(&self, stream: &Stream) -> Result<(), IggyError> {
         info!("Deleting stream with ID: {}...", stream.stream_id);
-        if std::fs::remove_dir_all(&stream.path).is_err() {
+        if fs_utils::remove_dir_all(&stream.path).await.is_err() {
             return Err(IggyError::CannotDeleteStreamDirectory(stream.stream_id));
         }
         info!("Deleted stream with ID: {}.", stream.stream_id);
