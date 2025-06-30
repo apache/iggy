@@ -264,7 +264,7 @@ impl IggyMessagesBatchMut {
         (indexes, messages)
     }
 
-    pub fn take_messages(&mut self) ->  PooledBuffer {
+    pub fn take_messages(&mut self) -> PooledBuffer {
         std::mem::take(&mut self.messages)
     }
 

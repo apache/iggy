@@ -106,10 +106,7 @@ impl Segment {
             .save_indexes(unsaved_indexes_slice)
             .await
             .with_error_context(|error| {
-                format!(
-                    "Failed to save index of {} indexes to {self}. {error}",
-                    len
-                )
+                format!("Failed to save index of {} indexes to {self}. {error}", len)
             })?;
 
         self.indexes.mark_saved();

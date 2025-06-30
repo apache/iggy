@@ -21,6 +21,7 @@ use crate::{io::file::IggyFile, streaming::utils::PooledBuffer};
 use bytes::BytesMut;
 use error_set::ErrContext;
 use iggy_common::{INDEX_SIZE, IggyError, IggyIndex, IggyIndexView};
+use monoio::fs::OpenOptions;
 use std::{
     fs::File as StdFile,
     io::ErrorKind,
@@ -30,7 +31,6 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-use monoio::fs::OpenOptions;
 use tracing::{error, trace};
 
 /// A dedicated struct for reading from the index file.
@@ -334,19 +334,19 @@ impl IndexReader {
         len: u32,
         use_pool: bool,
     ) -> Result<PooledBuffer, std::io::Error> {
-            if use_pool {
-                let mut buf = PooledBuffer::with_capacity(len as usize);
-                unsafe { buf.set_len(len as usize) };
-                let (result, buf) = self.file.read_exact_at(buf, offset as u64).await;
-                result?;
-                Ok(buf)
-            } else {
-                let mut buf = BytesMut::with_capacity(len as usize);
-                unsafe { buf.set_len(len as usize) };
-                let (result, buf) = self.file.read_exact_at(buf, offset as u64).await;
-                result?;
-                Ok(PooledBuffer::from_existing(buf))
-            }
+        if use_pool {
+            let mut buf = PooledBuffer::with_capacity(len as usize);
+            unsafe { buf.set_len(len as usize) };
+            let (result, buf) = self.file.read_exact_at(buf, offset as u64).await;
+            result?;
+            Ok(buf)
+        } else {
+            let mut buf = BytesMut::with_capacity(len as usize);
+            unsafe { buf.set_len(len as usize) };
+            let (result, buf) = self.file.read_exact_at(buf, offset as u64).await;
+            result?;
+            Ok(PooledBuffer::from_existing(buf))
+        }
     }
 
     /// Gets the nth index from the index file.

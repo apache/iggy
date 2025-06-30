@@ -26,12 +26,12 @@ use error_set::ErrContext;
 use futures::future::join_all;
 use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
-use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
-use std::path::Path;
-use std::sync::Arc;
 use monoio::fs;
 use monoio::fs::create_dir_all;
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 #[derive(Debug)]

@@ -245,7 +245,7 @@ fn main() -> Result<(), ServerError> {
                     //TODO: If one of the shards fails to initialize, we should crash the whole program;
                     if let Err(e) = shard.run().await {
                         error!("Failed to run shard-{id}: {e}");
-                    } 
+                    }
                     //TODO: If one of the shards fails to initialize, we should crash the whole program;
                     //shard.assert_init();
                 })
