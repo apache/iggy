@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use crate::io::fs_utils;
 use crate::state::system::TopicState;
 use crate::streaming::partitions::partition::Partition;
 use crate::streaming::storage::TopicStorage;
@@ -88,8 +89,7 @@ impl TopicStorage for FileTopicStorage {
                 error!(
                     "Partition with ID: '{partition_id}' for stream with ID: '{stream_id}' and topic with ID: '{topic_id}' was not found in state, but exists on disk and will be removed."
                 );
-                // TODO: Replace this with the dir walk impl that is mentioed in main function.
-                if let Err(error) = std::fs::remove_dir_all(&dir_entry.path()) {
+                if let Err(error) = fs_utils::remove_dir_all(&dir_entry.path()).await {
                     error!("Cannot remove partition directory: {error}");
                 } else {
                     warn!(
@@ -270,7 +270,7 @@ impl TopicStorage for FileTopicStorage {
 
     async fn delete(&self, topic: &Topic) -> Result<(), IggyError> {
         info!("Deleting topic {topic}...");
-        if std::fs::remove_dir_all(&topic.path).is_err() {
+        if fs_utils::remove_dir_all(&topic.path).await.is_err() {
             return Err(IggyError::CannotDeleteTopicDirectory(
                 topic.topic_id,
                 topic.stream_id,

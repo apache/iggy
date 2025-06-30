@@ -11,6 +11,7 @@ use tracing::info;
 use crate::{
     IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV,
     configs::{config_provider::ConfigProviderKind, server::ServerConfig, system::SystemConfig},
+    io::fs_utils,
     server_error::ServerError,
     shard::transmission::{
         connector::{ShardConnector, StopSender},
@@ -22,7 +23,7 @@ use crate::{
         utils::file::overwrite,
     },
 };
-use std::{env, fs::remove_dir_all, ops::Range, path::Path, sync::Arc};
+use std::{env, ops::Range, path::Path, sync::Arc};
 
 pub fn create_shard_connections(
     shards_set: Range<usize>,
@@ -59,10 +60,8 @@ pub async fn create_directories(config: &SystemConfig) -> Result<(), IggyError> 
         return Err(IggyError::CannotCreateStateDirectory(state_path));
     }
     let state_log = config.get_state_messages_file_path();
-    if !Path::new(&state_log).exists() {
-        if let Err(_) = overwrite(&state_log).await {
-            return Err(IggyError::CannotCreateStateDirectory(state_log));
-        }
+    if !Path::new(&state_log).exists() && (overwrite(&state_log).await).is_err() {
+        return Err(IggyError::CannotCreateStateDirectory(state_log));
     }
 
     let streams_path = config.get_streams_path();
@@ -71,8 +70,7 @@ pub async fn create_directories(config: &SystemConfig) -> Result<(), IggyError> 
     }
 
     let runtime_path = config.get_runtime_path();
-    // TODO: Change remove_dir_all to async version, once we implement the dir walk using monoio `remove_dir` method.
-    if Path::new(&runtime_path).exists() && remove_dir_all(&runtime_path).is_err() {
+    if Path::new(&runtime_path).exists() && fs_utils::remove_dir_all(&runtime_path).await.is_err() {
         return Err(IggyError::CannotRemoveRuntimeDirectory(runtime_path));
     }
 

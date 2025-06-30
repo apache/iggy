@@ -19,6 +19,7 @@
 use crate::compat::index_rebuilding::index_rebuilder::IndexRebuilder;
 use crate::configs::cache_indexes::CacheIndexesConfig;
 use crate::io::file::IggyFile;
+use crate::io::fs_utils;
 use crate::state::system::PartitionState;
 use crate::streaming::partitions::COMPONENT;
 use crate::streaming::partitions::partition::{ConsumerOffset, Partition};
@@ -366,7 +367,10 @@ impl PartitionStorage for FilePartitionStorage {
             ));
         }
 
-        if std::fs::remove_dir_all(&partition.partition_path).is_err() {
+        if fs_utils::remove_dir_all(&partition.partition_path)
+            .await
+            .is_err()
+        {
             error!(
                 "Cannot delete partition directory: {} for partition with ID: {} for topic with ID: {} for stream with ID: {}.",
                 partition.partition_path,
@@ -474,8 +478,7 @@ impl PartitionStorage for FilePartitionStorage {
             return Ok(());
         }
 
-        //TODO: replace with async once its there
-        if std::fs::remove_dir_all(path).is_err() {
+        if fs_utils::remove_dir_all(path).await.is_err() {
             error!("Cannot delete consumer offsets directory: {}.", path);
             return Err(IggyError::CannotDeleteConsumerOffsetsDirectory(
                 path.to_owned(),

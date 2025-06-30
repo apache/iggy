@@ -35,6 +35,7 @@ use server::bootstrap::{
 };
 use server::configs::config_provider::{self};
 use server::configs::server::ServerConfig;
+use server::io::fs_utils;
 #[cfg(not(feature = "tokio-console"))]
 use server::log::logger::Logging;
 #[cfg(feature = "tokio-console")]
@@ -98,12 +99,9 @@ fn main() -> Result<(), ServerError> {
                         "Removing system path at: {} because `--fresh` flag was set",
                         system_path
                     );
-                    //TODO: Impl dir walk and remove the files
-                    /*
-                    if let Err(e) = tokio::fs::remove_dir_all(&system_path).await {
+                    if let Err(e) = fs_utils::remove_dir_all(&system_path).await {
                         eprintln!("Failed to remove system path at {}: {}", system_path, e);
                     }
-                    */
                 }
             }
 
