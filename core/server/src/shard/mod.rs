@@ -54,7 +54,7 @@ use crate::{
         transmission::{
             event::ShardEvent,
             frame::{ShardFrame, ShardResponse},
-            message::{ShardMessage, ShardRequest, ShardRequestPayload},
+            message::{ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult},
         },
     },
     state::{
@@ -118,11 +118,6 @@ impl ShardInfo {
     pub fn new(id: u16) -> Self {
         Self { id }
     }
-}
-
-pub enum ShardRequestResult<T, E> {
-    SameShard(ShardMessage),
-    Result(Result<T, E>),
 }
 
 pub struct IggyShard {
@@ -498,13 +493,9 @@ impl IggyShard {
                 topic.append_messages(partition_id, batch).await?;
                 Ok(ShardResponse::SendMessages)
             }
-            ShardRequestPayload::PollMessages {
-                args,
-                consumer,
-                count,
-            } => {
+            ShardRequestPayload::PollMessages { args, consumer } => {
                 let (metadata, batch) = topic
-                    .get_messages(consumer, partition_id, args.strategy, count)
+                    .get_messages(consumer, partition_id, args.strategy, args.count)
                     .await?;
                 Ok(ShardResponse::PollMessages((metadata, batch)))
             }
@@ -551,14 +542,14 @@ impl IggyShard {
         }
     }
 
-    pub async fn send_request_to_shard(
+    pub async fn send_request_to_shard_or_recoil(
         &self,
         namespace: &IggyNamespace,
         message: ShardMessage,
-    ) -> ShardRequestResult<ShardResponse, IggyError> {
+    ) -> Result<ShardSendRequestResult, IggyError> {
         if let Some(shard) = self.find_shard(namespace) {
             if shard.id == self.id {
-                return ShardRequestResult::SameShard(message);
+                return Ok(ShardSendRequestResult::Recoil(message));
             }
 
             let response = match shard.send_request(message).await {
@@ -568,16 +559,16 @@ impl IggyShard {
                         "{COMPONENT} - failed to send request to shard with ID: {}, error: {err}",
                         shard.id
                     );
-                    return ShardRequestResult::Result(Err(err));
+                    return Err(err);
                 }
             };
-            ShardRequestResult::Result(Ok(response))
+            Ok(ShardSendRequestResult::Response(response))
         } else {
-            ShardRequestResult::Result(Err(IggyError::ShardNotFound(
+            Err(IggyError::ShardNotFound(
                 namespace.stream_id,
                 namespace.topic_id,
                 namespace.partition_id,
-            )))
+            ))
         }
     }
 

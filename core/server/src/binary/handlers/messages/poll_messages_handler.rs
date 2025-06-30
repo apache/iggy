@@ -20,11 +20,11 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::messages::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::sender::SenderKind;
+use crate::shard::IggyShard;
 use crate::shard::namespace::IggyNamespace;
 use crate::shard::system::messages::PollingArgs;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{ShardMessage, ShardRequest, ShardRequestPayload};
-use crate::shard::{IggyShard, ShardRequestResult};
 use crate::streaming::segments::IggyMessagesBatchSet;
 use crate::streaming::session::Session;
 use crate::to_iovec;
@@ -63,93 +63,30 @@ impl ServerCommandHandler for PollMessages {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-
-        let stream = shard
-            .get_stream(&self.stream_id)
-            .with_error_context(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - stream not found for stream ID: {}",
-                    self.stream_id
-                )
-            })?;
-        let topic = stream.get_topic(
-            &self.topic_id,
-        ).with_error_context(|error| format!(
-            "{COMPONENT} (error: {error}) - topic not found for stream ID: {}, topic_id: {}",
-            self.stream_id, self.topic_id
-        ))?;
-
         let PollMessages {
             consumer,
             partition_id,
             strategy,
             count,
             auto_commit,
-            ..
+            stream_id,
+            topic_id,
         } = self;
         let args = PollingArgs::new(strategy, count, auto_commit);
 
-        shard.permissioner
-            .borrow()
-            .poll_messages(session.get_user_id(), topic.stream_id, topic.topic_id)
-            .with_error_context(|error| format!(
-                "{COMPONENT} (error: {error}) - permission denied to poll messages for user {} on stream ID: {}, topic ID: {}",
-                session.get_user_id(),
-                topic.stream_id,
-                topic.topic_id
-            ))?;
-
-        if !topic.has_partitions() {
-            return Err(IggyError::NoPartitions(topic.topic_id, topic.stream_id));
-        }
-
-        // There might be no partition assigned, if it's the consumer group member without any partitions.
-        let Some((consumer, partition_id)) = topic
-            .resolve_consumer_with_partition_id(&consumer, session.client_id, partition_id, true)
-            .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to resolve consumer with partition id, consumer: {consumer}, client ID: {}, partition ID: {:?}", session.client_id, partition_id))? else {
-                todo!("Send early response");
-            //return Ok((IggyPollMetadata::new(0, 0), IggyMessagesBatchSet::empty()));
-        };
-
-        let namespace = IggyNamespace::new(stream.stream_id, topic.topic_id, partition_id);
-        let payload = ShardRequestPayload::PollMessages {
-            consumer: consumer.clone(),
-            args,
-            count,
-        };
-        let request = ShardRequest::new(stream.stream_id, topic.topic_id, partition_id, payload);
-        let message = ShardMessage::Request(request);
-        let (metadata, batch) = match shard.send_request_to_shard(&namespace, message).await {
-            ShardRequestResult::SameShard(message) => match message {
-                ShardMessage::Request(request) => match request.payload {
-                    ShardRequestPayload::PollMessages {
-                        consumer,
-                        args,
-                        count,
-                    } => {
-                        topic
-                            .get_messages(consumer, partition_id, args.strategy, count)
-                            .await?
-                    }
-                    _ => unreachable!(
-                        "Expected a SendMessages request inside of SendMessages handler, impossible state"
-                    ),
-                },
-                _ => unreachable!(
-                    "Expected a request message inside of an command handler, impossible state"
-                ),
-            },
-            ShardRequestResult::Result(result) => match result? {
-                ShardResponse::PollMessages(response) => response,
-                ShardResponse::ErrorResponse(err) => {
-                    return Err(err);
-                }
-                _ => unreachable!(
-                    "Expected a PollMessages response inside of PollMessages handler, impossible state"
-                ),
-            },
-        };
-
+        let user_id = session.get_user_id();
+        let client_id = session.client_id;
+        let (metadata, batch) = shard
+            .poll_messages(
+                client_id,
+                user_id,
+                &stream_id,
+                &topic_id,
+                consumer,
+                partition_id,
+                args,
+            )
+            .await?;
         // Collect all chunks first into a Vec to extend their lifetimes.
         // This ensures the Bytes (in reality Arc<[u8]>) references from each IggyMessagesBatch stay alive
         // throughout the async vectored I/O operation, preventing "borrowed value does not live
