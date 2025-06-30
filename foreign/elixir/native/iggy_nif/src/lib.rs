@@ -1,4 +1,4 @@
-use rustler::{resource, Env, Term};
+use rustler::{Env, Term, resource};
 
 pub mod atom;
 pub mod client;
