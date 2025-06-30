@@ -20,9 +20,18 @@ use iggy_common::PollingStrategy;
  * under the License.
  */
 use crate::{
-    shard::{system::messages::PollingArgs, transmission::event::ShardEvent},
+    shard::{
+        system::messages::PollingArgs,
+        transmission::{event::ShardEvent, frame::ShardResponse},
+    },
     streaming::{polling_consumer::PollingConsumer, segments::IggyMessagesBatchMut},
 };
+
+pub enum ShardSendRequestResult {
+    // TODO: In the future we can add other variants, for example backpressure from the destination shard,
+    Recoil(ShardMessage),
+    Response(ShardResponse),
+}
 
 #[derive(Debug)]
 pub enum ShardMessage {
@@ -60,9 +69,8 @@ pub enum ShardRequestPayload {
         batch: IggyMessagesBatchMut,
     },
     PollMessages {
-        args: PollingArgs,
         consumer: PollingConsumer,
-        count: u32,
+        args: PollingArgs,
     },
 }
 
