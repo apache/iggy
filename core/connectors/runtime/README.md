@@ -10,7 +10,7 @@ Internally, [dlopen2](https://github.com/OpenByteDev/dlopen2) provides a safe an
 
 By default, runtime will look for the configuration file, to decide which connectors to load and how to configure them.
 
-The minimal viable configuration requires at least the Iggy credentials, to create 2 separate instances of producer & consumer connections.
+The minimal viable configuration requires at least the Iggy credentials, to create 2 separate instances of producer & consumer connections and the state directory path where source connectors can store their optional state.
 
 ```toml
 [iggy]
@@ -18,6 +18,9 @@ address = "localhost:8090"
 username = "iggy"
 password = "iggy"
 # token = "secret" # Personal Access Token (PAT) can be used instead of username and password
+
+[state]
+path = "local_state"
 ```
 
 All the other config sections start either with `sources` or `sinks` depending on the connector type.

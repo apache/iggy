@@ -19,7 +19,7 @@
 use serde::de::DeserializeOwned;
 use tokio::sync::watch;
 use tracing::{error, info};
-use tracing_subscriber::fmt;
+use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{ConsumedMessage, MessagesMetadata, RawMessages, Sink, TopicMetadata, get_runtime};
 
@@ -63,7 +63,10 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
         C: DeserializeOwned,
     {
         unsafe {
-            _ = fmt::try_init();
+            _ = Registry::default()
+                .with(tracing_subscriber::fmt::layer())
+                .with(EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("INFO")))
+                .try_init();
             let slice = std::slice::from_raw_parts(config_ptr, config_len);
             let Ok(config_str) = std::str::from_utf8(slice) else {
                 error!("Failed to read configuration for sink connector with ID: {id}",);
@@ -187,7 +190,11 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
                 };
 
                 messages.push(ConsumedMessage {
+                    id: message.id,
                     offset: message.offset,
+                    checksum: message.checksum,
+                    timestamp: message.timestamp,
+                    origin_timestamp: message.origin_timestamp,
                     headers,
                     payload,
                 })

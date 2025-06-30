@@ -1,38 +1,43 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 use iggy::prelude::{Client, IggyClient, IggyClientBuilder};
 use tracing::{error, info};
 
 use crate::{configs::IggyConfig, error::RuntimeError};
 
-pub async fn init(config: IggyConfig) -> Result<(IggyClient, IggyClient), RuntimeError> {
-    let iggy_address = config.address;
-    let iggy_username = config.username;
-    let iggy_password = config.password;
-    let iggy_token = config.token;
-    let consumer_client = create_client(
-        &iggy_address,
-        iggy_username.as_deref(),
-        iggy_password.as_deref(),
-        iggy_token.as_deref(),
-    )
-    .await?;
-    consumer_client.connect().await?;
-    let producer_client = create_client(
-        &iggy_address,
-        iggy_username.as_deref(),
-        iggy_password.as_deref(),
-        iggy_token.as_deref(),
-    )
-    .await?;
-    producer_client.connect().await?;
-    Ok((consumer_client, producer_client))
+pub struct IggyClients {
+    pub producer: IggyClient,
+    pub consumer: IggyClient,
 }
 
-async fn create_client(
-    address: &str,
-    username: Option<&str>,
-    password: Option<&str>,
-    token: Option<&str>,
-) -> Result<IggyClient, RuntimeError> {
+pub async fn init(config: IggyConfig) -> Result<IggyClients, RuntimeError> {
+    let consumer = create_client(&config).await?;
+    let producer = create_client(&config).await?;
+    let iggy_clients = IggyClients { producer, consumer };
+    Ok(iggy_clients)
+}
+
+async fn create_client(config: &IggyConfig) -> Result<IggyClient, RuntimeError> {
+    let address = config.address.to_owned();
+    let username = config.username.to_owned();
+    let password = config.password.to_owned();
+    let token = config.token.to_owned();
+
     let connection_string = if let Some(token) = token {
         if token.is_empty() {
             error!("Iggy token cannot be empty (if username and password are not provided)");

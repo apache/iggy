@@ -16,12 +16,12 @@
  * under the License.
  */
 
-use crate::{Error, Source, get_runtime};
+use crate::{ConnectorState, Error, Source, get_runtime};
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use tokio::{sync::watch, task::JoinHandle};
 use tracing::{error, info};
-use tracing_subscriber::fmt;
+use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[repr(C)]
 pub struct RawMessage {
@@ -61,14 +61,19 @@ impl<T: Source + std::fmt::Debug + 'static> SourceContainer<T> {
         id: u32,
         config_ptr: *const u8,
         config_len: usize,
+        state_ptr: *const u8,
+        state_len: usize,
         factory: F,
     ) -> i32
     where
-        F: FnOnce(u32, C) -> T,
+        F: FnOnce(u32, C, Option<ConnectorState>) -> T,
         C: DeserializeOwned,
     {
         unsafe {
-            _ = fmt::try_init();
+            _ = Registry::default()
+                .with(tracing_subscriber::fmt::layer())
+                .with(EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("INFO")))
+                .try_init();
             let slice = std::slice::from_raw_parts(config_ptr, config_len);
             let Ok(config_str) = std::str::from_utf8(slice) else {
                 error!("Failed to read configuration for source connector with ID: {id}",);
@@ -80,7 +85,15 @@ impl<T: Source + std::fmt::Debug + 'static> SourceContainer<T> {
                 return -1;
             };
 
-            let mut source = factory(id, config);
+            let state = if state_ptr.is_null() {
+                None
+            } else {
+                let state = std::slice::from_raw_parts(state_ptr, state_len);
+                let state = ConnectorState(state.to_vec());
+                Some(state)
+            };
+
+            let mut source = factory(id, config, state);
             let runtime = get_runtime();
             let result = runtime.block_on(source.open());
             self.id = id;
@@ -200,9 +213,22 @@ macro_rules! source_connector {
 
         #[cfg(not(test))]
         #[unsafe(no_mangle)]
-        unsafe extern "C" fn open(id: u32, config_ptr: *const u8, config_len: usize) -> i32 {
+        unsafe extern "C" fn open(
+            id: u32,
+            config_ptr: *const u8,
+            config_len: usize,
+            state_ptr: *const u8,
+            state_len: usize,
+        ) -> i32 {
             let mut container = SourceContainer::new(id);
-            let result = container.open(id, config_ptr, config_len, <$type>::new);
+            let result = container.open(
+                id,
+                config_ptr,
+                config_len,
+                state_ptr,
+                state_len,
+                <$type>::new,
+            );
             INSTANCES.insert(id, container);
             result
         }

@@ -30,6 +30,7 @@ use iggy_connector_sdk::{
     transforms::Transform,
 };
 use mimalloc::MiMalloc;
+use state::StateStorage;
 use std::{
     collections::HashMap,
     env,
@@ -45,6 +46,7 @@ pub(crate) mod error;
 mod manager;
 mod sink;
 mod source;
+mod state;
 mod stream;
 mod transform;
 
@@ -57,7 +59,13 @@ const ALLOWED_PLUGIN_EXTENSIONS: [&str; 3] = ["so", "dylib", "dll"];
 
 #[derive(WrapperApi)]
 struct SourceApi {
-    open: extern "C" fn(id: u32, config_ptr: *const u8, config_len: usize) -> i32,
+    open: extern "C" fn(
+        id: u32,
+        config_ptr: *const u8,
+        config_len: usize,
+        state_ptr: *const u8,
+        state_len: usize,
+    ) -> i32,
     handle: extern "C" fn(id: u32, callback: SendCallback) -> i32,
     close: extern "C" fn(id: u32) -> i32,
 }
@@ -113,9 +121,18 @@ async fn main() -> Result<(), RuntimeError> {
         .try_deserialize()
         .expect("Failed to deserialize runtime config");
 
-    let (stream_consumer, stream_producer) = stream::init(config.iggy.clone()).await?;
-    let sources = source::init(config.sources.clone(), &stream_producer).await?;
-    let sinks = sink::init(config.sinks.clone(), &stream_consumer).await?;
+    std::fs::create_dir_all(&config.state.path).expect("Failed to create state directory");
+
+    info!("State will be stored in: {}", config.state.path);
+
+    let iggy_clients = stream::init(config.iggy.clone()).await?;
+    let sources = source::init(
+        config.sources.clone(),
+        &iggy_clients.producer,
+        &config.state.path,
+    )
+    .await?;
+    let sinks = sink::init(config.sinks.clone(), &iggy_clients.consumer).await?;
 
     let mut sink_wrappers = vec![];
     let mut sink_with_plugins = HashMap::new();
@@ -194,14 +211,14 @@ async fn main() -> Result<(), RuntimeError> {
         }
     }
 
-    stream_producer.shutdown().await?;
-    stream_consumer.shutdown().await?;
+    iggy_clients.producer.shutdown().await?;
+    iggy_clients.consumer.shutdown().await?;
 
     info!("All connectors closed. Runtime shutdown complete.");
     Ok(())
 }
 
-pub fn resolve_plugin_path(path: &str) -> String {
+pub(crate) fn resolve_plugin_path(path: &str) -> String {
     let extension = path.split('.').next_back().unwrap_or_default();
     if ALLOWED_PLUGIN_EXTENSIONS.contains(&extension) {
         path.to_string()
@@ -262,6 +279,7 @@ struct SourceConnectorPlugin {
     config_format: Option<ConfigFormat>,
     transforms: Vec<Arc<dyn Transform>>,
     producer: Option<SourceConnectorProducer>,
+    state_storage: StateStorage,
 }
 
 struct SourceConnectorProducer {
