@@ -18,6 +18,7 @@
 
 use colored::{Color, ColoredString, Colorize};
 use human_repr::HumanCount;
+use serde_json::json;
 use tracing::info;
 
 use crate::{
@@ -64,7 +65,6 @@ impl BenchmarkReport {
         } else {
             format!("{} consumer groups, ", self.params.consumer_groups)
         };
-        println!();
         let params_print = format!("Benchmark: {kind}, {producers}{consumers}{streams}{topics}{partitions}{consumer_groups}{total_messages}{messages_per_batch}{message_batches}{message_size}{total_size}\n",).blue();
 
         info!("{}", params_print);
@@ -144,8 +144,6 @@ impl BenchmarkGroupMetrics {
             GroupMetricsKind::ProducingConsumers => ("Producing Consumer Results", Color::Red),
         };
 
-        let actor = self.summary.kind.actor();
-
         let total_mb = format!("{:.2}", self.summary.total_throughput_megabytes_per_second);
         let total_msg = format!("{:.0}", self.summary.total_throughput_messages_per_second);
         let avg_mb = format!(
@@ -168,13 +166,26 @@ impl BenchmarkGroupMetrics {
             "{:.2}",
             self.avg_throughput_mb_ts.points.last().unwrap().time_s
         );
+        let result_data = json!({
+            "total_throughput": format!("{total_mb} MB/s"),
+            "total_messages": format!("{total_msg} messages/s"),
+            "average_throughput_per_producer": format!("{avg_mb} MB/s"),
+            "latency": {
+                "p50": format!("{p50} ms"),
+                "p90": format!("{p90} ms"),
+                "p95": format!("{p95} ms"),
+                "p99": format!("{p99} ms"),
+                "p999": format!("{p999} ms"),
+                "p9999": format!("{p9999} ms"),
+                "average": format!("{avg} ms"),
+                "median": format!("{median} ms"),
+                "min": format!("{min} ms"),
+                "max": format!("{max} ms"),
+                "std_dev": format!("{std_dev} ms")
+            },
+            "total_time": format!("{total_test_time} s")
+        });
 
-        format!(
-            "{prefix}: Total throughput: {total_mb} MB/s, {total_msg} messages/s, average throughput per {actor}: {avg_mb} MB/s, \
-            p50 latency: {p50} ms, p90 latency: {p90} ms, p95 latency: {p95} ms, \
-            p99 latency: {p99} ms, p999 latency: {p999} ms, p9999 latency: {p9999} ms, average latency: {avg} ms, \
-            median latency: {median} ms, min: {min} ms, max: {max} ms, std dev: {std_dev} ms, total time: {total_test_time} s"
-        )
-        .color(color)
+        format!("{prefix}: {}", result_data.to_string()).color(color)
     }
 }
