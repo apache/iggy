@@ -21,25 +21,15 @@ use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
 use crate::streaming::clients::client_manager::Transport;
 use crate::tcp::connection_handler::{handle_connection, handle_error};
-use crate::tcp::tcp_socket;
 use futures::FutureExt;
 use iggy_common::IggyError;
+use socket2::Socket;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
 use tracing::{error, info};
 
-pub async fn start(server_name: &'static str, shard: Rc<IggyShard>) -> Result<(), IggyError> {
-    let ip_v6 = shard.config.tcp.ipv6;
-    let socket_config = &shard.config.tcp.socket;
-    let addr: SocketAddr = shard
-        .config
-        .tcp
-        .address
-        .parse()
-        .expect("Failed to parse TCP address");
-
-    let socket = tcp_socket::build(ip_v6, socket_config);
+pub async fn start(server_name: &'static str, addr: SocketAddr, socket: Socket, shard: Rc<IggyShard>) -> Result<(), IggyError> {
     socket
         .bind(&addr.into())
         .expect("Failed to bind TCP listener");

@@ -17,8 +17,9 @@
  */
 
 use crate::shard::IggyShard;
-use crate::tcp::tcp_listener;
+use crate::tcp::{tcp_listener, tcp_socket, tcp_tls_listener};
 use iggy_common::IggyError;
+use std::net::SocketAddr;
 use std::rc::Rc;
 use tracing::info;
 
@@ -30,11 +31,20 @@ pub async fn spawn_tcp_server(shard: Rc<IggyShard>) -> Result<(), IggyError> {
     } else {
         "Iggy TCP"
     };
+    let ip_v6 = shard.config.tcp.ipv6;
+    let socket_config = &shard.config.tcp.socket;
+    let addr: SocketAddr = shard
+        .config
+        .tcp
+        .address
+        .parse()
+        .expect("Failed to parse TCP address");
+    let socket = tcp_socket::build(ip_v6, socket_config);
     info!("Initializing {server_name} server...");
     // TODO: Fixme -- storing addr of the server inside of the config for integration tests...
     match shard.config.tcp.tls.enabled {
-        true => unimplemented!("TLS support is not implemented yet"),
-        false => tcp_listener::start(server_name, shard.clone()).await?,
+        true => tcp_tls_listener::start(server_name, addr, socket, shard.clone()).await?,
+        false => tcp_listener::start(server_name, addr, socket, shard.clone()).await?,
     };
 
     Ok(())
