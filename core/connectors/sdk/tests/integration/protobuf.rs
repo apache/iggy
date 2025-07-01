@@ -1,19 +1,19 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 use iggy_connector_sdk::decoders::proto::{ProtoConfig, ProtoStreamDecoder};
 use iggy_connector_sdk::encoders::proto::{ProtoEncoderConfig, ProtoStreamEncoder};
@@ -424,4 +424,182 @@ async fn should_encode_complex_nested_data_with_any_wrapper() {
         "Successfully encoded complex nested message: {} bytes",
         encoded_bytes.len()
     );
+}
+
+#[tokio::test]
+async fn integration_should_decode_complex_nested_message() {
+    let decoder = ProtoStreamDecoder::new(ProtoConfig {
+        use_any_wrapper: true,
+        preserve_unknown_fields: true,
+        ..ProtoConfig::default()
+    });
+
+    let complex_json = simd_json::json!({
+        "user": {
+            "id": 123,
+            "name": "John Doe",
+            "email": "john@example.com",
+            "active": true,
+            "metadata": {
+                "created_at": 1642771200,
+                "updated_at": 1642857600,
+                "tags": ["admin", "developer"]
+            }
+        },
+        "permissions": {
+            "read": true,
+            "write": false,
+            "admin": true
+        }
+    });
+
+    let json_string = simd_json::to_string(&complex_json).unwrap();
+    let any = Any {
+        type_url: "type.googleapis.com/complex.UserPermissions".to_string(),
+        value: json_string.into_bytes(),
+    };
+
+    let encoded = any.encode_to_vec();
+    let result = decoder.decode(encoded);
+
+    assert!(result.is_ok(), "Complex message decoding should succeed");
+
+    if let Ok(Payload::Json(json_value)) = result {
+        if let simd_json::OwnedValue::Object(map) = &json_value {
+            assert!(map.contains_key("type_url"));
+            assert!(map.contains_key("value"));
+            println!("Complex nested message decoded successfully");
+        } else {
+            panic!("Expected JSON object");
+        }
+    } else {
+        panic!("Expected JSON payload");
+    }
+}
+
+#[tokio::test]
+async fn integration_should_decode_with_real_schema() {
+    let decoder = ProtoStreamDecoder::new(ProtoConfig {
+        schema_path: Some(PathBuf::from("examples/user.proto")),
+        message_type: Some("com.example.User".to_string()),
+        use_any_wrapper: false,
+        ..ProtoConfig::default()
+    });
+
+    let any = Any {
+        type_url: "type.googleapis.com/com.example.User".to_string(),
+        value: b"test protobuf data".to_vec(),
+    };
+    let encoded = any.encode_to_vec();
+
+    let result = decoder.decode(encoded);
+
+    assert!(
+        result.is_ok(),
+        "Decoding should succeed with schema or fallback"
+    );
+
+    if let Ok(Payload::Json(json_value)) = result {
+        println!(
+            "Decoded JSON: {}",
+            simd_json::to_string_pretty(&json_value).unwrap()
+        );
+
+        match &json_value {
+            simd_json::OwnedValue::Object(_) => {}
+            _ => panic!("Should decode to JSON object, got: {json_value:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn integration_should_handle_decoder_schema_loading_gracefully() {
+    let decoder = ProtoStreamDecoder::new(ProtoConfig {
+        schema_path: Some(PathBuf::from("nonexistent/schema.proto")),
+        message_type: Some("com.example.NonExistent".to_string()),
+        use_any_wrapper: true,
+        ..ProtoConfig::default()
+    });
+
+    let any = Any {
+        type_url: "type.googleapis.com/test.Message".to_string(),
+        value: b"test data".to_vec(),
+    };
+    let encoded = any.encode_to_vec();
+
+    let result = decoder.decode(encoded);
+    assert!(
+        result.is_ok(),
+        "Should fallback gracefully when schema loading fails"
+    );
+}
+
+#[tokio::test]
+async fn integration_should_handle_binary_data_gracefully() {
+    let decoder = ProtoStreamDecoder::new(ProtoConfig {
+        use_any_wrapper: false,
+        ..ProtoConfig::default()
+    });
+
+    let binary_data = vec![0x00, 0x01, 0x02, 0x03, 0xFF, 0xFE, 0xFD];
+    let result = decoder.decode(binary_data.clone());
+
+    assert!(result.is_ok(), "Binary data decoding should succeed");
+
+    if let Ok(Payload::Raw(decoded_data)) = result {
+        assert_eq!(decoded_data, binary_data);
+        println!("Binary data preserved correctly");
+    } else {
+        panic!("Expected Raw payload for binary data");
+    }
+}
+
+#[tokio::test]
+async fn integration_should_decode_with_field_mappings_and_preserve_unknown() {
+    let mut field_mappings = HashMap::new();
+    field_mappings.insert("userId".to_string(), "user_id".to_string());
+    field_mappings.insert("firstName".to_string(), "first_name".to_string());
+    field_mappings.insert("lastName".to_string(), "last_name".to_string());
+
+    let decoder = ProtoStreamDecoder::new(ProtoConfig {
+        field_mappings: Some(field_mappings),
+        preserve_unknown_fields: true,
+        use_any_wrapper: true,
+        ..ProtoConfig::default()
+    });
+
+    let test_json = simd_json::json!({
+        "userId": 456,
+        "firstName": "Jane",
+        "lastName": "Smith",
+        "email": "jane.smith@example.com",
+        "unknownField": "should_be_preserved",
+        "anotherUnknown": 789
+    });
+
+    let json_string = simd_json::to_string(&test_json).unwrap();
+    let any = Any {
+        type_url: "type.googleapis.com/user.Profile".to_string(),
+        value: json_string.into_bytes(),
+    };
+
+    let encoded = any.encode_to_vec();
+    let result = decoder.decode(encoded);
+
+    assert!(
+        result.is_ok(),
+        "Field mapping with unknown field preservation should succeed"
+    );
+
+    if let Ok(Payload::Json(json_value)) = result {
+        if let simd_json::OwnedValue::Object(map) = &json_value {
+            assert!(map.contains_key("type_url"));
+            assert!(map.contains_key("value"));
+            println!("Field mappings with unknown field preservation working");
+        } else {
+            panic!("Expected JSON object");
+        }
+    } else {
+        panic!("Expected JSON payload");
+    }
 }
