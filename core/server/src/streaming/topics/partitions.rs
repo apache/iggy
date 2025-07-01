@@ -69,29 +69,19 @@ impl Topic {
         Ok(partition_ids)
     }
 
-    pub async fn add_persisted_partitions(&mut self, count: u32) -> Result<Vec<u32>, IggyError> {
+    pub fn add_persisted_partitions(&mut self, count: u32) -> Result<Vec<u32>, IggyError> {
         let partition_ids = self.add_partitions(count).with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to add partitions, count: {count}")
         })?;
-        for partition_id in &partition_ids {
-            let partition = self.partitions.get(partition_id).unwrap();
-            let mut partition = partition.write().await;
-            partition.persist().await.with_error_context(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to persist partition with id: {}",
-                    partition.partition_id
-                )
-            })?;
-        }
         Ok(partition_ids)
     }
 
-    pub async fn delete_persisted_partitions(
+    pub fn delete_persisted_partitions(
         &mut self,
         mut count: u32,
-    ) -> Result<Option<DeletedPartitions>, IggyError> {
+    ) -> Result<Vec<IggyRwLock<Partition>>, IggyError> {
         if count == 0 {
-            return Ok(None);
+            return Ok(vec![]);
         }
 
         let current_partitions_count = self.partitions.len() as u32;
@@ -99,25 +89,12 @@ impl Topic {
             count = current_partitions_count;
         }
 
-        let mut segments_count = 0;
-        let mut messages_count = 0;
+        let mut partitions = Vec::with_capacity(count as usize);
         for partition_id in current_partitions_count - count + 1..=current_partitions_count {
             let partition = self.partitions.remove(&partition_id).unwrap();
-            let mut partition = partition.write().await;
-            let partition_messages_count = partition.get_messages_count();
-            segments_count += partition.get_segments_count();
-            messages_count += partition_messages_count;
-            partition.delete().await.with_error_context(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to delete partition with ID: {partition_id} in topic with ID: {}",
-                    self.topic_id
-                )
-            })?;
+            partitions.push(partition);
         }
-        Ok(Some(DeletedPartitions {
-            segments_count,
-            messages_count,
-        }))
+        Ok(partitions)
     }
 }
 

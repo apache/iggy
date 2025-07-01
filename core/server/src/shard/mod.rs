@@ -400,6 +400,7 @@ impl IggyShard {
             }
         }
 
+        //TODO: Refactor...
         let mut streams_states = streams
             .into_iter()
             .filter(|s| !missing_ids.contains(&s.id))

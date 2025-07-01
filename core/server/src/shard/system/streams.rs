@@ -298,6 +298,13 @@ impl IggyShard {
             })?;
             old_name = stream.name.clone();
             stream.name = name.to_owned();
+            // Drop the exclusive borrow.
+            drop(stream);
+            // Get it again using inclusive borrow
+            let stream = self.get_stream(id).with_error_context(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to get mutable reference to stream with id: {id}")
+            })?;
+            // Persist it.
             stream.persist().await?;
         }
 

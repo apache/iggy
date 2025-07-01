@@ -26,6 +26,7 @@ use error_set::ErrContext;
 use iggy_common::locking::IggySharedMutFn;
 use iggy_common::{CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize};
 use tokio_util::io::StreamReader;
+use tracing::info;
 
 impl IggyShard {
     pub fn find_topic<'topic, 'stream>(
@@ -112,28 +113,35 @@ impl IggyShard {
         max_topic_size: MaxTopicSize,
         replication_factor: Option<u8>,
     ) -> Result<(), IggyError> {
-        let (stream_id, topic_id, partition_ids) = self
-            .create_topic_base(
-                stream_id,
-                topic_id,
-                name,
-                partitions_count,
-                message_expiry,
-                compression_algorithm,
-                max_topic_size,
-                replication_factor,
-            )
-            .await?;
+        let (topic_id, partition_ids) = self.create_topic_base(
+            stream_id,
+            topic_id,
+            name,
+            partitions_count,
+            message_expiry,
+            compression_algorithm,
+            max_topic_size,
+            replication_factor,
+        )?;
+        let stream = self.get_stream(stream_id).with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
+        })?;
+        let stream_id = stream.stream_id;
+        let topic = stream
+            .get_topic(&Identifier::numeric(topic_id)?)
+            .with_error_context(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to get topic with ID: {topic_id} in stream with ID: {stream_id}")
+            })?;
+        topic.persist().await.with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to persist topic: {topic}")
+        })?;
+
         // TODO: Figure out a way how to distribute the shards table among different shards,
         // without the need to do code from below, everytime we handle a `ShardEvent`.
-        // I think we shouldn't be sharing it, maintain a single shard table per shard,
-        // but figure out a way how to distribute it smarter (maybe move the broadcast inside of the `insert_shard_table_records`) method.
+        // I think we shouldn't be sharing it tho and still maintain a single shard table per shard,
+        // but find a way how to distribute it smarter (maybe move the broadcast inside of the `insert_shard_table_records`) method.
         let records = partition_ids.into_iter().map(|partition_id| {
             let namespace = IggyNamespace::new(stream_id, topic_id, partition_id);
-            // TODO: This setup isn't deterministic.
-            // Imagine a scenario where client creates partition using `String` identifiers,
-            // but then for poll_messages requests uses numeric ones.
-            // the namespace wouldn't match, therefore we would get miss in the shard table.
             let hash = namespace.generate_hash();
             let shard_id = hash % self.get_available_shards_count();
             let shard_info = ShardInfo::new(shard_id as u16);
@@ -176,24 +184,32 @@ impl IggyShard {
                 })?;
         }
 
-        let (stream_id, topic_id, partition_ids) = self
-            .create_topic_base(
-                stream_id,
-                topic_id,
-                name,
-                partitions_count,
-                message_expiry,
-                compression_algorithm,
-                max_topic_size,
-                replication_factor,
-            )
-            .await?;
+        let (topic_id, partition_ids) = self.create_topic_base(
+            stream_id,
+            topic_id,
+            name,
+            partitions_count,
+            message_expiry,
+            compression_algorithm,
+            max_topic_size,
+            replication_factor,
+        )?;
+
+        let stream = self.get_stream(stream_id).with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
+        })?;
+        let stream_id = stream.stream_id;
+        let topic = stream
+                .get_topic(&Identifier::numeric(topic_id)?)
+                .with_error_context(|error| {
+                    format!("{COMPONENT} (error: {error}) - failed to get topic with ID: {topic_id} in stream with ID: {stream_id}")
+                })?;
+        topic.persist().await.with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to persist topic: {topic}")
+        })?;
+
         let records = partition_ids.into_iter().map(|partition_id| {
             let namespace = IggyNamespace::new(stream_id, topic_id, partition_id);
-            // TODO: This setup isn't deterministic.
-            // Imagine a scenario where client creates partition using `String` identifiers,
-            // but then for poll_messages requests uses numeric ones.
-            // the namespace wouldn't match, therefore we would get miss in the shard table.
             let hash = namespace.generate_hash();
             let shard_id = hash % self.get_available_shards_count();
             let shard_info = ShardInfo::new(shard_id as u16);
@@ -208,7 +224,7 @@ impl IggyShard {
         Ok(Identifier::numeric(topic_id)?)
     }
 
-    async fn create_topic_base(
+    fn create_topic_base(
         &self,
         stream_id: &Identifier,
         topic_id: Option<u32>,
@@ -218,9 +234,7 @@ impl IggyShard {
         compression_algorithm: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,
         replication_factor: Option<u8>,
-    ) -> Result<(u32, u32, Vec<u32>), IggyError> {
-        // TODO: Make create topic sync, and extract the storage persister out of it
-        // perform disk i/o outside of the borrow_mut of the stream.
+    ) -> Result<(u32, Vec<u32>), IggyError> {
         let mut stream = self.get_stream_mut(stream_id).with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to get mutable reference to stream with ID: {stream_id}")
         })?;
@@ -235,11 +249,10 @@ impl IggyShard {
                 max_topic_size,
                 replication_factor.unwrap_or(1),
             )
-            .await
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to create topic with name: {name} in stream ID: {stream_id}")
             })?;
-        Ok((stream_id, topic_id, partition_ids))
+        Ok((topic_id, partition_ids))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -280,8 +293,6 @@ impl IggyShard {
             })?;
         }
 
-        // TODO: Make update topic sync, and extract the storage persister out of it
-        // perform disk i/o outside of the borrow_mut of the stream.
         self.get_stream_mut(stream_id)?
             .update_topic(
                 topic_id,
@@ -291,12 +302,32 @@ impl IggyShard {
                 max_topic_size,
                 replication_factor.unwrap_or(1),
             )
-            .await
             .with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to update topic with ID: {topic_id} in stream with ID: {stream_id}",
                 )
             })?;
+        let stream = self.get_stream(stream_id).with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
+        })?;
+        let topic = stream
+            .get_topic(topic_id)
+            .with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - failed to get topic with ID: {topic_id} in stream with ID: {stream_id}",
+                )
+            })?;
+        for partition in topic.partitions.values() {
+            let mut partition = partition.write().await;
+            partition.message_expiry = message_expiry;
+            for segment in partition.segments.iter_mut() {
+                segment.update_message_expiry(message_expiry);
+            }
+        }
+        topic.persist().await.with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to persist topic: {topic}")
+        })?;
+        info!("Updated topic: {topic}");
 
         // TODO: if message_expiry is changed, we need to check if we need to purge messages based on the new expiry
         // TODO: if max_size_bytes is changed, we need to check if we need to purge messages based on the new size
@@ -334,13 +365,20 @@ impl IggyShard {
             stream_id_value = topic.stream_id;
         }
 
-        // TODO: Make delete topic sync, and extract the storage persister out of it
-        // perform disk i/o outside of the borrow_mut of the stream.
         let topic = self
             .get_stream_mut(stream_id)?
             .delete_topic(topic_id)
-            .await
             .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to delete topic with ID: {topic_id} in stream with ID: {stream_id}"))?;
+        let stream = self.get_stream(stream_id).with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to get mutable reference to stream with ID: {stream_id}")
+        })?;
+        topic
+            .delete()
+            .await
+            .with_error_context(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to delete topic: {topic}")
+            })
+            .map_err(|_| IggyError::CannotDeleteTopic(topic.topic_id, stream.stream_id))?;
 
         self.metrics.decrement_topics(1);
         self.metrics
