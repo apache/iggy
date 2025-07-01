@@ -132,7 +132,6 @@ async fn should_purge_existing_stream_on_disk() {
                 MaxTopicSize::ServerDefault,
                 1,
             )
-            .await
             .unwrap();
 
         let messages = create_messages();

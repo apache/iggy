@@ -53,12 +53,15 @@ impl IggyShard {
             )
         })?;
         let stream_id = stream.stream_id;
-        let numeric_topic_id = stream.get_topic(topic_id).map(|topic| topic.topic_id).with_error_context(|error| {
-            format!(
-                "Failed to get topic with ID: {} (error: {})",
-                topic_id, error
-            )
-        })?;
+        let numeric_topic_id = stream
+            .get_topic(topic_id)
+            .map(|topic| topic.topic_id)
+            .with_error_context(|error| {
+                format!(
+                    "Failed to get topic with ID: {} (error: {})",
+                    topic_id, error
+                )
+            })?;
         // TODO: We should look into refactoring those permissioners, so they can accept `Identifier` instead of numeric IDs.
         // Validate permissions for given user on stream and topic.
         self.permissioner.borrow().append_messages(

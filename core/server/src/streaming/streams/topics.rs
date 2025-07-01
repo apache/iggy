@@ -36,7 +36,7 @@ impl Stream {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn create_topic(
+    pub fn create_topic(
         &mut self,
         topic_id: Option<u32>,
         name: &str,
@@ -94,16 +94,13 @@ impl Stream {
             replication_factor,
         )?;
 
-        topic.persist().await.with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to persist topic: {topic}")
-        })?;
         info!("Created topic {}", topic);
         self.topics_ids.insert(name.to_owned(), id);
         self.topics.insert(id, topic);
         Ok((id, partition_ids))
     }
 
-    pub async fn update_topic(
+    pub fn update_topic(
         &mut self,
         id: &Identifier,
         name: &str,
@@ -150,21 +147,9 @@ impl Stream {
             topic.name = name.to_owned();
             topic.message_expiry = message_expiry;
             topic.compression_algorithm = compression_algorithm;
-            for partition in topic.partitions.values_mut() {
-                let mut partition = partition.write().await;
-                partition.message_expiry = message_expiry;
-                for segment in partition.segments.iter_mut() {
-                    segment.update_message_expiry(message_expiry);
-                }
-            }
             topic.max_topic_size = max_topic_size;
             topic.replication_factor = replication_factor;
-            topic.persist().await.with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to persist topic: {topic}")
-            })?;
-            info!("Updated topic: {topic}");
         }
-
         Ok(())
     }
 
@@ -253,7 +238,7 @@ impl Stream {
             .ok_or(IggyError::TopicIdNotFound(topic_id, self.stream_id))
     }
 
-    pub async fn delete_topic(&mut self, id: &Identifier) -> Result<Topic, IggyError> {
+    pub fn delete_topic(&mut self, id: &Identifier) -> Result<Topic, IggyError> {
         let topic = self.remove_topic(id).with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to remove topic with id: {id}")
         })?;
@@ -263,13 +248,6 @@ impl Stream {
             self.current_topic_id.store(topic_id, Ordering::SeqCst);
         }
 
-        topic
-            .delete()
-            .await
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to delete topic: {topic}")
-            })
-            .map_err(|_| IggyError::CannotDeleteTopic(topic.topic_id, self.stream_id))?;
         Ok(topic)
     }
 }
@@ -319,7 +297,6 @@ mod tests {
                 max_topic_size,
                 1,
             )
-            .await
             .unwrap();
 
         let topic = stream.get_topic(&Identifier::numeric(topic_id).unwrap());
