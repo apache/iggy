@@ -25,12 +25,13 @@ use iggy_common::IggyError;
 use monoio::buf::IoBufMut;
 use monoio::io::AsyncWriteRent;
 use monoio::net::TcpStream;
-use monoio_native_tls::TlsStream;
+use monoio_rustls::ServerTlsStream;
+//use tokio_rustls::server::TlsStream;
 use nix::libc;
 
 #[derive(Debug)]
 pub struct TcpTlsSender {
-    pub(crate) stream: TlsStream<TcpStream>,
+    pub(crate) stream: ServerTlsStream<TcpStream>,
 }
 
 impl Sender for TcpTlsSender {

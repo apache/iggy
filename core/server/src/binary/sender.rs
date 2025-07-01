@@ -25,10 +25,11 @@ use crate::{quic::quic_sender::QuicSender, server_error::ServerError};
 use bytes::BytesMut;
 use iggy_common::IggyError;
 use monoio::buf::IoBufMut;
+use monoio::io::{AsyncReadRent, AsyncWriteRent};
 use monoio::net::TcpStream;
-use monoio_native_tls::TlsStream;
 use nix::libc;
 use quinn::{RecvStream, SendStream};
+use monoio_rustls::{ServerTlsStream, TlsStream};
 
 macro_rules! forward_async_methods {
     (
@@ -84,7 +85,7 @@ impl SenderKind {
         Self::Tcp(TcpSender { stream })
     }
 
-    pub fn get_tcp_tls_sender(stream: TlsStream<TcpStream>) -> Self {
+    pub fn get_tcp_tls_sender(stream: ServerTlsStream<TcpStream>) -> Self {
         Self::TcpTls(TcpTlsSender { stream })
     }
 
