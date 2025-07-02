@@ -2,7 +2,6 @@
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
@@ -16,8 +15,28 @@
  * under the License.
  */
 
-pub mod flatbuffer;
-pub mod json;
-pub mod proto;
-pub mod raw;
-pub mod text;
+namespace com.example;
+
+table Address {
+  street: string;
+  city: string;
+  country: string;
+  postal_code: string;
+}
+
+table User {
+  id: int32;
+  name: string;
+  email: string;
+  active: bool;
+  created_at: int64;
+  tags: [string];
+  address: Address;
+}
+
+table UserList {
+  users: [User];
+  total_count: int32;
+}
+
+root_type User; 

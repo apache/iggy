@@ -366,6 +366,10 @@ impl ProtoStreamEncoder {
                 }
             }
             Payload::Proto(text) => simd_json::json!({ "proto_text": text }),
+            Payload::FlatBuffer(data) => simd_json::json!({
+                "flatbuffer_size": data.len(),
+                "data": general_purpose::STANDARD.encode(&data)
+            }),
         };
 
         if let simd_json::OwnedValue::Object(json_map) = json_value {
@@ -613,6 +617,13 @@ impl ProtoStreamEncoder {
                 ),
                 text.into_bytes(),
             ),
+            Payload::FlatBuffer(data) => (
+                format!(
+                    "{}/google.protobuf.BytesValue",
+                    self.config.format_options.type_url_prefix
+                ),
+                data,
+            ),
         };
 
         let any = Any {
@@ -631,6 +642,7 @@ impl ProtoStreamEncoder {
             Payload::Text(text) => Ok(text.into_bytes()),
             Payload::Raw(data) => Ok(data),
             Payload::Proto(text) => Ok(text.into_bytes()),
+            Payload::FlatBuffer(data) => Ok(data),
         }
     }
 

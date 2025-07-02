@@ -19,12 +19,12 @@
 use async_trait::async_trait;
 use base64::{self, Engine};
 use decoders::{
-    json::JsonStreamDecoder, proto::ProtoStreamDecoder, raw::RawStreamDecoder,
-    text::TextStreamDecoder,
+    flatbuffer::FlatBufferStreamDecoder, json::JsonStreamDecoder, proto::ProtoStreamDecoder,
+    raw::RawStreamDecoder, text::TextStreamDecoder,
 };
 use encoders::{
-    json::JsonStreamEncoder, proto::ProtoStreamEncoder, raw::RawStreamEncoder,
-    text::TextStreamEncoder,
+    flatbuffer::FlatBufferStreamEncoder, json::JsonStreamEncoder, proto::ProtoStreamEncoder,
+    raw::RawStreamEncoder, text::TextStreamEncoder,
 };
 use iggy::prelude::{HeaderKey, HeaderValue};
 use once_cell::sync::OnceCell;
@@ -88,6 +88,7 @@ pub enum Payload {
     Raw(Vec<u8>),
     Text(String),
     Proto(String),
+    FlatBuffer(Vec<u8>),
 }
 
 impl Payload {
@@ -99,6 +100,7 @@ impl Payload {
             Payload::Raw(value) => Ok(value),
             Payload::Text(text) => Ok(text.into_bytes()),
             Payload::Proto(text) => Ok(text.into_bytes()),
+            Payload::FlatBuffer(value) => Ok(value),
         }
     }
 }
@@ -114,6 +116,7 @@ impl std::fmt::Display for Payload {
             Payload::Raw(value) => write!(f, "Raw({value:#?})"),
             Payload::Text(text) => write!(f, "Text({text})"),
             Payload::Proto(text) => write!(f, "Proto({text})"),
+            Payload::FlatBuffer(value) => write!(f, "FlatBuffer({} bytes)", value.len()),
         }
     }
 }
@@ -132,6 +135,8 @@ pub enum Schema {
     Text,
     #[strum(to_string = "proto")]
     Proto,
+    #[strum(to_string = "flatbuffer")]
+    FlatBuffer,
 }
 
 impl Schema {
@@ -154,6 +159,7 @@ impl Schema {
                 }
                 Err(_) => Ok(Payload::Raw(value)),
             },
+            Schema::FlatBuffer => Ok(Payload::FlatBuffer(value)),
         }
     }
 
@@ -163,6 +169,7 @@ impl Schema {
             Schema::Raw => Arc::new(RawStreamDecoder),
             Schema::Text => Arc::new(TextStreamDecoder),
             Schema::Proto => Arc::new(ProtoStreamDecoder::default()),
+            Schema::FlatBuffer => Arc::new(FlatBufferStreamDecoder::default()),
         }
     }
 
@@ -172,6 +179,7 @@ impl Schema {
             Schema::Raw => Arc::new(RawStreamEncoder),
             Schema::Text => Arc::new(TextStreamEncoder),
             Schema::Proto => Arc::new(ProtoStreamEncoder::default()),
+            Schema::FlatBuffer => Arc::new(FlatBufferStreamEncoder::default()),
         }
     }
 }
@@ -288,4 +296,6 @@ pub enum Error {
     CannotDecode(Schema),
     #[error("Invalid protobuf payload.")]
     InvalidProtobufPayload,
+    #[error("Invalid FlatBuffer payload.")]
+    InvalidFlatBufferPayload,
 }

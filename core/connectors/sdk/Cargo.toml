@@ -36,6 +36,7 @@ async-trait = { workspace = true }
 base64 = "0.22.1"
 chrono = { workspace = true }
 dashmap = { workspace = true }
+flatbuffers = "24.3.25"
 iggy = { workspace = true }
 once_cell = { workspace = true }
 postcard = { workspace = true }
