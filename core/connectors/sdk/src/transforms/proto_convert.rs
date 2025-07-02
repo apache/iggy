@@ -461,6 +461,15 @@ impl ProtoConvert {
             Schema::Text => self.protobuf_to_text(payload),
             Schema::Raw => self.protobuf_to_raw(payload),
             Schema::Proto => Ok(payload),
+            Schema::FlatBuffer => {
+                // Convert protobuf to raw bytes first, then wrap as FlatBuffer
+                let raw_payload = self.protobuf_to_raw(payload)?;
+                if let Payload::Raw(data) = raw_payload {
+                    Ok(Payload::FlatBuffer(data))
+                } else {
+                    Err(Error::InvalidPayloadType)
+                }
+            }
         }
     }
 
@@ -470,6 +479,14 @@ impl ProtoConvert {
             Schema::Text => self.text_to_protobuf(payload),
             Schema::Raw => self.raw_to_protobuf(payload),
             Schema::Proto => Ok(payload),
+            Schema::FlatBuffer => {
+                // Convert FlatBuffer to raw bytes first, then to protobuf
+                if let Payload::FlatBuffer(data) = payload {
+                    self.raw_to_protobuf(Payload::Raw(data))
+                } else {
+                    Err(Error::InvalidPayloadType)
+                }
+            }
         }
     }
 
