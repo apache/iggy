@@ -31,6 +31,7 @@ pub trait StateProvider {
     async fn save(&self, state: ConnectorState) -> Result<(), Error>;
 }
 
+#[non_exhaustive]
 #[derive(Debug, Display)]
 pub enum StateStorage {
     #[strum(to_string = "file")]

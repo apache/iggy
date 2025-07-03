@@ -133,14 +133,12 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
                 return -1;
             };
 
-            let topic_meta_slice =
-                std::slice::from_raw_parts(topic_meta_ptr, topic_meta_len).to_vec();
+            let topic_meta_slice = std::slice::from_raw_parts(topic_meta_ptr, topic_meta_len);
             let messages_meta_slice =
-                std::slice::from_raw_parts(messages_meta_ptr, messages_meta_len).to_vec();
-            let messages_slice = std::slice::from_raw_parts(messages_ptr, messages_len).to_vec();
+                std::slice::from_raw_parts(messages_meta_ptr, messages_meta_len);
+            let messages_slice = std::slice::from_raw_parts(messages_ptr, messages_len);
 
-            let Ok(topic_metadata) = postcard::from_bytes::<TopicMetadata>(&topic_meta_slice)
-            else {
+            let Ok(topic_metadata) = postcard::from_bytes::<TopicMetadata>(topic_meta_slice) else {
                 error!(
                     "Failed to decode topic metadata by sink connector with ID: {}",
                     self.id
@@ -149,7 +147,7 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
             };
 
             let Ok(messages_metadata) =
-                postcard::from_bytes::<MessagesMetadata>(&messages_meta_slice)
+                postcard::from_bytes::<MessagesMetadata>(messages_meta_slice)
             else {
                 error!(
                     "Failed to decode messages metadata by sink connector with ID: {} from stream: {}, topic: {}",
@@ -158,7 +156,7 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
                 return -1;
             };
 
-            let Ok(raw_messages) = postcard::from_bytes::<RawMessages>(&messages_slice) else {
+            let Ok(raw_messages) = postcard::from_bytes::<RawMessages>(messages_slice) else {
                 error!(
                     "Failed to decode raw messages by sink connector with ID: {} from stream: {}, topic: {}",
                     self.id, topic_metadata.stream, topic_metadata.topic
