@@ -48,7 +48,7 @@ impl ServerCommandHandler for CreateTopic {
         debug!("session: {session}, command: {self}");
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id;
-        let created_topic_id = shard
+        let (shards_assignment, created_topic_id) = shard
                 .create_topic(
                     session,
                     &self.stream_id,
@@ -72,6 +72,7 @@ impl ServerCommandHandler for CreateTopic {
             compression_algorithm: self.compression_algorithm,
             max_topic_size: self.max_topic_size,
             replication_factor: self.replication_factor,
+            shards_assignment,
         };
         // Broadcast the event to all shards.
         let _responses = shard.broadcast_event_to_all_shards(event.into());

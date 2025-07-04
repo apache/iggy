@@ -110,6 +110,7 @@ impl Shard {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct ShardInfo {
     id: u16,
 }
@@ -117,6 +118,10 @@ pub struct ShardInfo {
 impl ShardInfo {
     pub fn new(id: u16) -> Self {
         Self { id }
+    }
+
+    pub fn id(&self) -> u16 {
+        self.id
     }
 }
 
@@ -519,6 +524,7 @@ impl IggyShard {
                 compression_algorithm,
                 max_topic_size,
                 replication_factor,
+                shards_assignment,
             } => {
                 self.create_topic_bypass_auth(
                     stream_id,
@@ -529,6 +535,7 @@ impl IggyShard {
                     *compression_algorithm,
                     *max_topic_size,
                     *replication_factor,
+                    shards_assignment.clone()
                 )
                 .await
             }
@@ -606,7 +613,7 @@ impl IggyShard {
 
     pub fn insert_shard_table_records(
         &self,
-        records: impl Iterator<Item = (IggyNamespace, ShardInfo)>,
+        records: impl IntoIterator<Item = (IggyNamespace, ShardInfo)>,
     ) {
         self.shards_table.borrow_mut().extend(records);
     }
