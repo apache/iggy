@@ -19,7 +19,7 @@
 use serde::de::DeserializeOwned;
 use tokio::sync::watch;
 use tracing::{error, info};
-use tracing_subscriber::fmt;
+use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{ConsumedMessage, MessagesMetadata, RawMessages, Sink, TopicMetadata, get_runtime};
 
@@ -63,7 +63,10 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
         C: DeserializeOwned,
     {
         unsafe {
-            _ = fmt::try_init();
+            _ = Registry::default()
+                .with(tracing_subscriber::fmt::layer())
+                .with(EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("INFO")))
+                .try_init();
             let slice = std::slice::from_raw_parts(config_ptr, config_len);
             let Ok(config_str) = std::str::from_utf8(slice) else {
                 error!("Failed to read configuration for sink connector with ID: {id}",);
@@ -130,14 +133,12 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
                 return -1;
             };
 
-            let topic_meta_slice =
-                std::slice::from_raw_parts(topic_meta_ptr, topic_meta_len).to_vec();
+            let topic_meta_slice = std::slice::from_raw_parts(topic_meta_ptr, topic_meta_len);
             let messages_meta_slice =
-                std::slice::from_raw_parts(messages_meta_ptr, messages_meta_len).to_vec();
-            let messages_slice = std::slice::from_raw_parts(messages_ptr, messages_len).to_vec();
+                std::slice::from_raw_parts(messages_meta_ptr, messages_meta_len);
+            let messages_slice = std::slice::from_raw_parts(messages_ptr, messages_len);
 
-            let Ok(topic_metadata) = postcard::from_bytes::<TopicMetadata>(&topic_meta_slice)
-            else {
+            let Ok(topic_metadata) = postcard::from_bytes::<TopicMetadata>(topic_meta_slice) else {
                 error!(
                     "Failed to decode topic metadata by sink connector with ID: {}",
                     self.id
@@ -146,7 +147,7 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
             };
 
             let Ok(messages_metadata) =
-                postcard::from_bytes::<MessagesMetadata>(&messages_meta_slice)
+                postcard::from_bytes::<MessagesMetadata>(messages_meta_slice)
             else {
                 error!(
                     "Failed to decode messages metadata by sink connector with ID: {} from stream: {}, topic: {}",
@@ -155,7 +156,7 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
                 return -1;
             };
 
-            let Ok(raw_messages) = postcard::from_bytes::<RawMessages>(&messages_slice) else {
+            let Ok(raw_messages) = postcard::from_bytes::<RawMessages>(messages_slice) else {
                 error!(
                     "Failed to decode raw messages by sink connector with ID: {} from stream: {}, topic: {}",
                     self.id, topic_metadata.stream, topic_metadata.topic
@@ -187,7 +188,11 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
                 };
 
                 messages.push(ConsumedMessage {
+                    id: message.id,
                     offset: message.offset,
+                    checksum: message.checksum,
+                    timestamp: message.timestamp,
+                    origin_timestamp: message.origin_timestamp,
                     headers,
                     payload,
                 })

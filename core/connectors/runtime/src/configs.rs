@@ -44,6 +44,7 @@ pub struct RuntimeConfig {
     pub iggy: IggyConfig,
     pub sinks: HashMap<String, SinkConfig>,
     pub sources: HashMap<String, SourceConfig>,
+    pub state: StateConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,4 +105,9 @@ pub struct TransformsConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SharedTransformConfig {
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateConfig {
+    pub path: String,
 }

@@ -19,8 +19,10 @@
 use config::{Config, Environment, File};
 use configs::{ConfigFormat, RuntimeConfig};
 use dlopen2::wrapper::{Container, WrapperApi};
+use dotenvy::dotenv;
 use error::RuntimeError;
-use iggy::prelude::{Client, IggyClient, IggyClientBuilder, IggyConsumer, IggyProducer};
+use figlet_rs::FIGfont;
+use iggy::prelude::{Client, IggyConsumer, IggyProducer};
 use iggy_connector_sdk::{
     StreamDecoder, StreamEncoder,
     sink::ConsumeCallback,
@@ -28,12 +30,13 @@ use iggy_connector_sdk::{
     transforms::Transform,
 };
 use mimalloc::MiMalloc;
+use state::StateStorage;
 use std::{
     collections::HashMap,
     env,
     sync::{Arc, atomic::AtomicU32},
 };
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
 mod api;
@@ -43,6 +46,8 @@ pub(crate) mod error;
 mod manager;
 mod sink;
 mod source;
+mod state;
+mod stream;
 mod transform;
 
 #[global_allocator]
@@ -54,7 +59,13 @@ const ALLOWED_PLUGIN_EXTENSIONS: [&str; 3] = ["so", "dylib", "dll"];
 
 #[derive(WrapperApi)]
 struct SourceApi {
-    open: extern "C" fn(id: u32, config_ptr: *const u8, config_len: usize) -> i32,
+    open: extern "C" fn(
+        id: u32,
+        config_ptr: *const u8,
+        config_len: usize,
+        state_ptr: *const u8,
+        state_len: usize,
+    ) -> i32,
     handle: extern "C" fn(id: u32, callback: SendCallback) -> i32,
     close: extern "C" fn(id: u32) -> i32,
 }
@@ -77,13 +88,29 @@ struct SinkApi {
 
 #[tokio::main]
 async fn main() -> Result<(), RuntimeError> {
+    let standard_font = FIGfont::standard().unwrap();
+    let figure = standard_font.convert("Iggy Connectors");
+    println!("{}", figure.unwrap());
+
+    if let Ok(env_path) = std::env::var("IGGY_CONNECTORS_ENV_PATH") {
+        if dotenvy::from_path(&env_path).is_ok() {
+            println!("Loaded environment variables from path: {env_path}");
+        }
+    } else if let Ok(path) = dotenv() {
+        println!(
+            "Loaded environment variables from .env file at path: {}",
+            path.display()
+        );
+    }
+
     Registry::default()
         .with(tracing_subscriber::fmt::layer())
         .with(EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("INFO")))
         .init();
+
     let config_path =
-        env::var("IGGY_CONNECTORS_RUNTIME_CONFIG_PATH").unwrap_or_else(|_| "config".to_string());
-    info!("Starting Iggy Connector Runtime, loading configuration from: {config_path}...");
+        env::var("IGGY_CONNECTORS_CONFIG_PATH").unwrap_or_else(|_| "config".to_string());
+    info!("Starting Iggy Connectors Runtime, loading configuration from: {config_path}...");
     let builder = Config::builder()
         .add_source(File::with_name(&config_path))
         .add_source(Environment::with_prefix("IGGY_CONNECTORS").separator("_"));
@@ -94,30 +121,18 @@ async fn main() -> Result<(), RuntimeError> {
         .try_deserialize()
         .expect("Failed to deserialize runtime config");
 
-    let iggy_config = config.iggy.clone();
-    let iggy_address = iggy_config.address;
-    let iggy_username = iggy_config.username;
-    let iggy_password = iggy_config.password;
-    let iggy_token = iggy_config.token;
-    let consumer_client = create_iggy_client(
-        &iggy_address,
-        iggy_username.as_deref(),
-        iggy_password.as_deref(),
-        iggy_token.as_deref(),
-    )
-    .await?;
-    consumer_client.connect().await?;
-    let producer_client = create_iggy_client(
-        &iggy_address,
-        iggy_username.as_deref(),
-        iggy_password.as_deref(),
-        iggy_token.as_deref(),
-    )
-    .await?;
-    producer_client.connect().await?;
+    std::fs::create_dir_all(&config.state.path).expect("Failed to create state directory");
 
-    let sources = source::init(config.sources.clone(), &producer_client).await?;
-    let sinks = sink::init(config.sinks.clone(), &consumer_client).await?;
+    info!("State will be stored in: {}", config.state.path);
+
+    let iggy_clients = stream::init(config.iggy.clone()).await?;
+    let sources = source::init(
+        config.sources.clone(),
+        &iggy_clients.producer,
+        &config.state.path,
+    )
+    .await?;
+    let sinks = sink::init(config.sinks.clone(), &iggy_clients.consumer).await?;
 
     let mut sink_wrappers = vec![];
     let mut sink_with_plugins = HashMap::new();
@@ -196,14 +211,14 @@ async fn main() -> Result<(), RuntimeError> {
         }
     }
 
-    producer_client.shutdown().await?;
-    consumer_client.shutdown().await?;
+    iggy_clients.producer.shutdown().await?;
+    iggy_clients.consumer.shutdown().await?;
 
     info!("All connectors closed. Runtime shutdown complete.");
     Ok(())
 }
 
-pub fn resolve_plugin_path(path: &str) -> String {
+pub(crate) fn resolve_plugin_path(path: &str) -> String {
     let extension = path.split('.').next_back().unwrap_or_default();
     if ALLOWED_PLUGIN_EXTENSIONS.contains(&extension) {
         path.to_string()
@@ -218,48 +233,6 @@ pub fn resolve_plugin_path(path: &str) -> String {
         debug!("Resolved plugin path: {path}.{os_extension} for detected OS: {os}");
         format!("{path}.{os_extension}")
     }
-}
-
-async fn create_iggy_client(
-    address: &str,
-    username: Option<&str>,
-    password: Option<&str>,
-    token: Option<&str>,
-) -> Result<IggyClient, RuntimeError> {
-    let connection_string = if let Some(token) = token {
-        if token.is_empty() {
-            error!("Iggy token cannot be empty (if username and password are not provided)");
-            return Err(RuntimeError::MissingIggyCredentials);
-        }
-
-        let redacted_token = token.chars().take(3).collect::<String>();
-        info!("Using token: {redacted_token}*** for Iggy authentication");
-        format!("iggy://{token}@{address}")
-    } else {
-        info!("Using username and password for Iggy authentication");
-        let username = username.ok_or(RuntimeError::MissingIggyCredentials)?;
-        if username.is_empty() {
-            error!("Iggy password cannot be empty (if token is not provided)");
-            return Err(RuntimeError::MissingIggyCredentials);
-        }
-
-        let password = password.ok_or(RuntimeError::MissingIggyCredentials)?;
-        if password.is_empty() {
-            error!("Iggy password cannot be empty (if token is not provided)");
-            return Err(RuntimeError::MissingIggyCredentials);
-        }
-
-        let redacted_username = username.chars().take(3).collect::<String>();
-        let redacted_password = password.chars().take(3).collect::<String>();
-        info!(
-            "Using username: {redacted_username}***, password: {redacted_password}*** for Iggy authentication"
-        );
-        format!("iggy://{username}:{password}@{address}")
-    };
-
-    let client = IggyClientBuilder::from_connection_string(&connection_string)?.build()?;
-    client.connect().await?;
-    Ok(client)
 }
 
 struct SinkConnector {
@@ -306,6 +279,7 @@ struct SourceConnectorPlugin {
     config_format: Option<ConfigFormat>,
     transforms: Vec<Arc<dyn Transform>>,
     producer: Option<SourceConnectorProducer>,
+    state_storage: StateStorage,
 }
 
 struct SourceConnectorProducer {

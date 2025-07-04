@@ -49,6 +49,9 @@ pub fn get_runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| Runtime::new().expect("Failed to create Tokio runtime"))
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConnectorState(pub Vec<u8>);
+
 /// The Source trait defines the interface for a source connector, responsible for producing the messages to the configured stream and topic.
 /// Once the messages are produced (e.g. fetched from an external API), they will be sent further to the specified destination.
 #[async_trait]
@@ -216,6 +219,7 @@ pub struct ReceivedMessage {
 pub struct ProducedMessages {
     pub schema: Schema,
     pub messages: Vec<ProducedMessage>,
+    pub state: Option<ConnectorState>,
 }
 
 #[repr(C)]
@@ -251,7 +255,11 @@ pub struct RawMessages {
 #[repr(C)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RawMessage {
+    pub id: u128,
     pub offset: u64,
+    pub checksum: u64,
+    pub timestamp: u64,
+    pub origin_timestamp: u64,
     pub headers: Vec<u8>,
     pub payload: Vec<u8>,
 }
@@ -259,7 +267,11 @@ pub struct RawMessage {
 #[repr(C)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ConsumedMessage {
+    pub id: u128,
     pub offset: u64,
+    pub checksum: u64,
+    pub timestamp: u64,
+    pub origin_timestamp: u64,
     pub headers: Option<HashMap<HeaderKey, HeaderValue>>,
     pub payload: Payload,
 }
@@ -296,6 +308,12 @@ pub enum Error {
     CannotDecode(Schema),
     #[error("Invalid protobuf payload.")]
     InvalidProtobufPayload,
-    #[error("Invalid FlatBuffer payload.")]
-    InvalidFlatBufferPayload,
+    #[error("Cannot open state file")]
+    CannotOpenStateFile,
+    #[error("Cannot read state file")]
+    CannotReadStateFile,
+    #[error("Cannot write state file")]
+    CannotWriteStateFile,
+    #[error("Invalid state")]
+    InvalidState,
 }

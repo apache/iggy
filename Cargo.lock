@@ -3786,6 +3786,8 @@ dependencies = [
  "config",
  "dashmap",
  "dlopen2",
+ "dotenvy",
+ "figlet-rs",
  "flume",
  "futures",
  "iggy",

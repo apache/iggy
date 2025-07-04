@@ -21,7 +21,7 @@ The highly performant and modular runtime for statically typed, yet dynamically 
 
 2. Run `docker compose up -d` from `/examples/rust/src/sink-data-producer` which will start the Quickwit server to be used by an example sink connector. At this point, you can access the Quickwit UI at [http://localhost:7280](http://localhost:7280) - check this dashboard again later on, after the `events` index will be created.
 
-3. Set environment variable `IGGY_CONNECTORS_RUNTIME_CONFIG_PATH=core/connectors/runtime/config` (adjust the path as needed) pointing to the runtime configuration file.
+3. Set environment variable `IGGY_CONNECTORS_CONFIG_PATH=core/connectors/runtime/config` (adjust the path as needed) pointing to the runtime configuration file.
 
 4. Start the Iggy server and invoke the following commands via Iggy CLI to create the example streams and topics used by the sample connectors.
 
