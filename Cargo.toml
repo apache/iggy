@@ -42,7 +42,7 @@ members = [
     "core/tools",
     "examples/rust",
 ]
-exclude = ["foreign/python"]
+exclude = ["foreign/python", "foreign/elixir"]
 resolver = "2"
 
 [workspace.dependencies]
