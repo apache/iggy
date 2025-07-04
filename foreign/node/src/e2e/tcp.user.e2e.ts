@@ -20,15 +20,11 @@
 
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { Client } from '../client/client.js';
+import { getTestClient } from './test-client.utils.js';
 
 describe('e2e -> user', async () => {
 
-  const c = new Client({
-    transport: 'TCP',
-    options: { port: 8090, host: '127.0.0.1' },
-    credentials: { username: 'iggy', password: 'iggy' }
-  });
+  const c = getTestClient();
 
   const userId = 42;
   const username = 'test-user';

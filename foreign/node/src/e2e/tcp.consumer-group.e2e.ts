@@ -23,12 +23,15 @@ import assert from 'node:assert/strict';
 import { SingleClient } from '../client/client.js';
 import { ConsumerKind, PollingStrategy, Partitioning } from '../wire/index.js';
 import { generateMessages } from '../tcp.sm.utils.js';
+import { getIggyAddress } from '../tcp.sm.utils.js';
 
 describe('e2e -> consumer-group', async () => {
 
+  const [host, port] = getIggyAddress();
+
   const c = new SingleClient({
     transport: 'TCP',
-    options: { port: 8090, host: '127.0.0.1' },
+    options: { host, port },
     credentials: { username: 'iggy', password: 'iggy' }
   });
   
