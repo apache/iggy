@@ -149,7 +149,7 @@ fn main() -> Result<(), ServerError> {
                 }
 
                 // TODO: Fix this once this PR gets resolved.
-                // https://github.com/compio-rs/compio/pull/444 
+                // https://github.com/compio-rs/compio/pull/445 
                 /*
                 compio::utils::bind_to_cpu_set(Some(shard_id))
                     .unwrap_or_else(|e| panic!("Failed to set CPU affinity for shard-{id}: {e}"));
