@@ -17,17 +17,28 @@
 
 package iggcon
 
-type ConsumerGroupResponse struct {
+type ConsumerGroup struct {
 	Id              int    `json:"id"`
 	Name            string `json:"name"`
 	PartitionsCount int    `json:"partitionsCount"`
 	MembersCount    int    `json:"membersCount"`
 }
 
+type ConsumerGroupDetails struct {
+	ConsumerGroup
+	Members []ConsumerGroupMember
+}
+
+type ConsumerGroupMember struct {
+	ID              int
+	PartitionsCount int
+	Partitions      []int
+}
+
 type CreateConsumerGroupRequest struct {
 	StreamId        Identifier `json:"streamId"`
 	TopicId         Identifier `json:"topicId"`
-	ConsumerGroupId int        `json:"consumerGroupId"`
+	ConsumerGroupId *uint32    `json:"consumerGroupId"`
 	Name            string     `json:"name"`
 }
 

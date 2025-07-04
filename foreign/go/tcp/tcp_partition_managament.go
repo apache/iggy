@@ -22,14 +22,22 @@ import (
 	. "github.com/apache/iggy/foreign/go/contracts"
 )
 
-func (tms *IggyTcpClient) CreatePartition(request CreatePartitionsRequest) error {
-	message := binaryserialization.CreatePartitions(request)
+func (tms *IggyTcpClient) CreatePartitions(streamId Identifier, topicId Identifier, partitionsCount uint32) error {
+	message := binaryserialization.CreatePartitions(CreatePartitionsRequest{
+		StreamId:        streamId,
+		TopicId:         topicId,
+		PartitionsCount: partitionsCount,
+	})
 	_, err := tms.sendAndFetchResponse(message, CreatePartitionsCode)
 	return err
 }
 
-func (tms *IggyTcpClient) DeletePartition(request DeletePartitionRequest) error {
-	message := binaryserialization.DeletePartitions(request)
+func (tms *IggyTcpClient) DeletePartitions(streamId Identifier, topicId Identifier, partitionsCount uint32) error {
+	message := binaryserialization.DeletePartitions(DeletePartitionsRequest{
+		StreamId:        streamId,
+		TopicId:         topicId,
+		PartitionsCount: partitionsCount,
+	})
 	_, err := tms.sendAndFetchResponse(message, DeletePartitionsCode)
 	return err
 }

@@ -21,9 +21,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/apache/iggy/foreign/go/iggycli"
+	"github.com/apache/iggy/foreign/go/tcp"
 	"github.com/google/uuid"
 
-	. "github.com/apache/iggy/foreign/go"
 	. "github.com/apache/iggy/foreign/go/contracts"
 	sharedDemoContracts "github.com/apache/iggy/foreign/go/samples/shared"
 )
@@ -37,40 +38,32 @@ const (
 )
 
 func main() {
-	factory := &IggyClientFactory{}
-	config := IggyConfiguration{
-		BaseAddress: "127.0.0.1:8090",
-		Protocol:    Tcp,
-	}
-
-	messageStream, err := factory.CreateMessageStream(config)
+	cli, err := iggycli.NewIggyClient(
+		iggycli.WithTcp(
+			tcp.WithServerAddress("127.0.0.1:8090"),
+		),
+	)
 	if err != nil {
 		panic(err)
 	}
-	_, err = messageStream.LogIn(LogInRequest{
-		Username: "iggy",
-		Password: "iggy",
-	})
+	_, err = cli.LoginUser("iggy", "iggy")
 	if err != nil {
 		panic("COULD NOT LOG IN")
 	}
 
-	if err = EnsureInsfrastructureIsInitialized(messageStream); err != nil {
+	if err = EnsureInfrastructureIsInitialized(cli); err != nil {
 		panic(err)
 	}
 
-	if err = PublishMessages(messageStream); err != nil {
+	if err = PublishMessages(cli); err != nil {
 		panic(err)
 	}
 }
 
-func EnsureInsfrastructureIsInitialized(messageStream MessageStream) error {
-	if _, streamErr := messageStream.GetStreamById(GetStreamRequest{
-		StreamID: NewIdentifier(StreamId)}); streamErr != nil {
-		streamErr = messageStream.CreateStream(CreateStreamRequest{
-			StreamId: StreamId,
-			Name:     "Test Producer Stream",
-		})
+func EnsureInfrastructureIsInitialized(cli iggycli.Client) error {
+	if _, streamErr := cli.GetStream(NewIdentifier(StreamId)); streamErr != nil {
+		uint32StreamId := uint32(StreamId)
+		_, streamErr = cli.CreateStream("Test Producer Stream", &uint32StreamId)
 
 		fmt.Println(StreamId)
 
@@ -83,13 +76,17 @@ func EnsureInsfrastructureIsInitialized(messageStream MessageStream) error {
 
 	fmt.Printf("Stream with ID: %d exists.\n", StreamId)
 
-	if _, topicErr := messageStream.GetTopicById(NewIdentifier(StreamId), NewIdentifier(TopicId)); topicErr != nil {
-		topicErr = messageStream.CreateTopic(CreateTopicRequest{
-			TopicId:         TopicId,
-			Name:            "Test Topic From Producer Sample",
-			PartitionsCount: 12,
-			StreamId:        NewIdentifier(StreamId),
-		})
+	if _, topicErr := cli.GetTopic(NewIdentifier(StreamId), NewIdentifier(TopicId)); topicErr != nil {
+		refStreamId := StreamId
+		_, topicErr = cli.CreateTopic(
+			NewIdentifier(StreamId),
+			"Test Topic From Producer Sample",
+			12,
+			0,
+			0,
+			0,
+			nil,
+			&refStreamId)
 
 		if topicErr != nil {
 			panic(topicErr)
@@ -103,7 +100,7 @@ func EnsureInsfrastructureIsInitialized(messageStream MessageStream) error {
 	return nil
 }
 
-func PublishMessages(messageStream MessageStream) error {
+func PublishMessages(messageStream iggycli.Client) error {
 	fmt.Printf("Messages will be sent to stream '%d', topic '%d', partition '%d' with interval %d ms.\n", StreamId, TopicId, Partition, Interval)
 	messageGenerator := NewMessageGenerator()
 
@@ -127,12 +124,12 @@ func PublishMessages(messageStream MessageStream) error {
 			})
 		}
 
-		err := messageStream.SendMessages(SendMessagesRequest{
-			StreamId:     NewIdentifier(StreamId),
-			TopicId:      NewIdentifier(TopicId),
-			Messages:     messages,
-			Partitioning: PartitionId(Partition),
-		})
+		err := messageStream.SendMessages(
+			NewIdentifier(StreamId),
+			NewIdentifier(TopicId),
+			PartitionId(Partition),
+			messages,
+		)
 		if err != nil {
 			fmt.Printf("%s", err)
 			return nil

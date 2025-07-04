@@ -22,7 +22,8 @@ import (
 )
 
 type TcpUpdateStreamRequest struct {
-	iggcon.UpdateStreamRequest
+	StreamId iggcon.Identifier `json:"streamId"`
+	Name     string            `json:"name"`
 }
 
 func (request *TcpUpdateStreamRequest) Serialize() []byte {

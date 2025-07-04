@@ -19,15 +19,30 @@ package binaryserialization
 
 import (
 	"encoding/binary"
+	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
 type TcpCreateTopicRequest struct {
-	iggcon.CreateTopicRequest
+	StreamId             iggcon.Identifier `json:"streamId"`
+	PartitionsCount      int               `json:"partitionsCount"`
+	CompressionAlgorithm uint8             `json:"compressionAlgorithm"`
+	MessageExpiry        time.Duration     `json:"messageExpiry"`
+	MaxTopicSize         uint64            `json:"maxTopicSize"`
+	Name                 string            `json:"name"`
+	ReplicationFactor    *uint8            `json:"replicationFactor"`
+	TopicId              *int              `json:"topicId"`
 }
 
 func (request *TcpCreateTopicRequest) Serialize() []byte {
+	if request.TopicId == nil {
+		request.TopicId = new(int)
+	}
+	if request.ReplicationFactor == nil {
+		request.ReplicationFactor = new(uint8)
+	}
+
 	streamIdBytes := SerializeIdentifier(request.StreamId)
 	nameBytes := []byte(request.Name)
 
@@ -49,7 +64,7 @@ func (request *TcpCreateTopicRequest) Serialize() []byte {
 	position += len(streamIdBytes)
 
 	// TopicId
-	binary.LittleEndian.PutUint32(bytes[position:], uint32(request.TopicId))
+	binary.LittleEndian.PutUint32(bytes[position:], uint32(*request.TopicId))
 	position += 4
 
 	// PartitionsCount
@@ -69,7 +84,7 @@ func (request *TcpCreateTopicRequest) Serialize() []byte {
 	position += 8
 
 	// ReplicationFactor
-	bytes[position] = request.ReplicationFactor
+	bytes[position] = *request.ReplicationFactor
 	position++
 
 	// Name

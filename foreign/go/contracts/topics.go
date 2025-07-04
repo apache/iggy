@@ -40,16 +40,20 @@ type UpdateTopicRequest struct {
 	Name                 string        `json:"name"`
 }
 
-type TopicResponse struct {
-	Id                   int                 `json:"id"`
-	CreatedAt            int                 `json:"createdAt"`
-	Name                 string              `json:"name"`
-	SizeBytes            uint64              `json:"sizeBytes"`
-	MessageExpiry        time.Duration       `json:"messageExpiry"`
-	CompressionAlgorithm uint8               `json:"compressionAlgorithm"`
-	MaxTopicSize         uint64              `json:"maxTopicSize"`
-	ReplicationFactor    uint8               `json:"replicationFactor"`
-	MessagesCount        uint64              `json:"messagesCount"`
-	PartitionsCount      int                 `json:"partitionsCount"`
-	Partitions           []PartitionContract `json:"partitions,omitempty"`
+type Topic struct {
+	Id                   int           `json:"id"`
+	CreatedAt            int           `json:"createdAt"`
+	Name                 string        `json:"name"`
+	SizeBytes            uint64        `json:"sizeBytes"`
+	MessageExpiry        time.Duration `json:"messageExpiry"`
+	CompressionAlgorithm uint8         `json:"compressionAlgorithm"`
+	MaxTopicSize         uint64        `json:"maxTopicSize"`
+	ReplicationFactor    uint8         `json:"replicationFactor"`
+	MessagesCount        uint64        `json:"messagesCount"`
+	PartitionsCount      int           `json:"partitionsCount"`
+}
+
+type TopicDetails struct {
+	Topic
+	Partitions []PartitionContract `json:"partitions,omitempty"`
 }

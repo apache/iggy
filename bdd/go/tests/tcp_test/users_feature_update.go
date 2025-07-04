@@ -28,27 +28,29 @@ var _ = Describe("UPDATE USER:", func() {
 			client := createAuthorizedConnection()
 			userId := successfullyCreateUser(createRandomString(16), client)
 			defer deleteUserAfterTests(userId, client)
-			request := iggcon.UpdateUserRequest{
-				UserID:   iggcon.NewIdentifier(int(userId)),
-				Username: createRandomString(16),
-			}
 
-			err := client.UpdateUser(request)
+			username := createRandomString(16)
+			err := client.UpdateUser(
+				iggcon.NewIdentifier(int(userId)),
+				&username,
+				nil,
+			)
 
 			itShouldNotReturnError(err)
-			itShouldSuccessfullyUpdateUser(userId, request.Username, client)
+			itShouldSuccessfullyUpdateUser(userId, username, client)
 		})
 	})
 
 	When("User is not logged in", func() {
 		Context("and tries to update user", func() {
-			client := createConnection()
-			request := iggcon.UpdateUserRequest{
-				UserID:   iggcon.NewIdentifier(int(createRandomUInt32())),
-				Username: createRandomString(16),
-			}
+			client := createClient()
 
-			err := client.UpdateUser(request)
+			username := createRandomString(16)
+			err := client.UpdateUser(
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+				&username,
+				nil,
+			)
 			itShouldReturnUnauthenticatedError(err)
 		})
 	})

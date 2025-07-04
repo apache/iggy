@@ -17,17 +17,20 @@
 
 package iggcon
 
-type LogInRequest struct {
+type LoginUserRequest struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
 	Version  string `json:"version,omitempty"`
 	Context  string `json:"context,omitempty"`
 }
 
-type LogInAccessTokenRequest struct {
+type LoginWithPersonalAccessTokenRequest struct {
 	Token string `json:"token"`
 }
 
-type LogInResponse struct {
+type IdentityInfo struct {
+	// Unique identifier (numeric) of the user.
 	UserId uint32 `json:"userId"`
+	// The optional tokens, used only by HTTP transport.
+	AccessToken *string `json:"accessToken"`
 }

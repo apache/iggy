@@ -30,10 +30,19 @@ const (
 )
 
 type TcpFetchMessagesRequest struct {
-	iggcon.FetchMessagesRequest
+	StreamId    iggcon.Identifier      `json:"streamId"`
+	TopicId     iggcon.Identifier      `json:"topicId"`
+	Consumer    iggcon.Consumer        `json:"consumer"`
+	PartitionId *uint32                `json:"partitionId"`
+	Strategy    iggcon.PollingStrategy `json:"pollingStrategy"`
+	Count       uint32                 `json:"count"`
+	AutoCommit  bool                   `json:"autoCommit"`
 }
 
 func (request *TcpFetchMessagesRequest) Serialize() []byte {
+	if request.PartitionId == nil {
+		request.PartitionId = new(uint32)
+	}
 	streamTopicIdLength := 2 + request.StreamId.Length + 2 + request.TopicId.Length
 	messageSize := 2 + request.Consumer.Id.Length + streamTopicIdLength + partitionStrategySize + offsetSize + commitFlagSize + 1
 	bytes := make([]byte, messageSize)
@@ -46,12 +55,12 @@ func (request *TcpFetchMessagesRequest) Serialize() []byte {
 	copy(bytes[position:position+streamTopicIdLength], SerializeIdentifiers(request.StreamId, request.TopicId))
 
 	position += streamTopicIdLength
-	binary.LittleEndian.PutUint32(bytes[position:position+4], uint32(request.PartitionId))
-	bytes[position+4] = byte(request.PollingStrategy.Kind)
+	binary.LittleEndian.PutUint32(bytes[position:position+4], *request.PartitionId)
+	bytes[position+4] = byte(request.Strategy.Kind)
 
 	position += partitionStrategySize
-	binary.LittleEndian.PutUint64(bytes[position:position+8], uint64(request.PollingStrategy.Value))
-	binary.LittleEndian.PutUint32(bytes[position+8:position+12], uint32(request.Count))
+	binary.LittleEndian.PutUint64(bytes[position:position+8], request.Strategy.Value)
+	binary.LittleEndian.PutUint32(bytes[position+8:position+12], request.Count)
 
 	position += offsetSize
 

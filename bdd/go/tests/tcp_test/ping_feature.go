@@ -33,7 +33,7 @@ var _ = Describe("PING FEATURE:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to ping server", func() {
-			client := createConnection()
+			client := createClient()
 			err := client.Ping()
 
 			itShouldNotReturnError(err)

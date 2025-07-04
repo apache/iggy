@@ -37,7 +37,7 @@ var _ = Describe("GET ALL STREAMS:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to get all streams", func() {
-			client := createConnection()
+			client := createClient()
 			_, err := client.GetStreams()
 
 			itShouldReturnUnauthenticatedError(err)

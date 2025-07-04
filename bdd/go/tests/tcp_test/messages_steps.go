@@ -21,8 +21,8 @@ import (
 	"bytes"
 	"reflect"
 
-	"github.com/apache/iggy/foreign/go"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	"github.com/apache/iggy/foreign/go/iggycli"
 	"github.com/google/uuid"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -42,18 +42,18 @@ func createDefaultMessages() []iggcon.IggyMessage {
 	return []iggcon.IggyMessage{msg1, msg2}
 }
 
-func itShouldSuccessfullyPublishMessages(streamId int, topicId int, messages []iggcon.IggyMessage, client iggy.MessageStream) {
-	result, err := client.PollMessages(iggcon.FetchMessagesRequest{
-		StreamId: iggcon.NewIdentifier(streamId),
-		TopicId:  iggcon.NewIdentifier(topicId),
-		Consumer: iggcon.Consumer{
-			Kind: iggcon.ConsumerSingle,
+func itShouldSuccessfullyPublishMessages(streamId int, topicId int, messages []iggcon.IggyMessage, client iggycli.Client) {
+	result, err := client.PollMessages(
+		iggcon.NewIdentifier(streamId),
+		iggcon.NewIdentifier(topicId),
+		iggcon.Consumer{
+			Kind: iggcon.ConsumerKindSingle,
 			Id:   iggcon.NewIdentifier(int(createRandomUInt32())),
 		},
-		PollingStrategy: iggcon.FirstPollingStrategy(),
-		Count:           len(messages),
-		AutoCommit:      true,
-	})
+		iggcon.FirstPollingStrategy(),
+		uint32(len(messages)),
+		true,
+		nil)
 
 	It("It should not be nil", func() {
 		Expect(result).NotTo(BeNil())

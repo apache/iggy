@@ -31,11 +31,11 @@ var _ = Describe("JOIN CONSUMER GROUP:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			groupId, _ := successfullyCreateConsumer(streamId, topicId, client)
-			err := client.JoinConsumerGroup(iggcon.JoinConsumerGroupRequest{
-				StreamId:        iggcon.NewIdentifier(streamId),
-				TopicId:         iggcon.NewIdentifier(topicId),
-				ConsumerGroupId: iggcon.NewIdentifier(groupId),
-			})
+			err := client.JoinConsumerGroup(
+				iggcon.NewIdentifier(streamId),
+				iggcon.NewIdentifier(topicId),
+				iggcon.NewIdentifier(groupId),
+			)
 
 			itShouldNotReturnError(err)
 			itShouldSuccessfullyJoinConsumer(streamId, topicId, groupId, client)
@@ -47,11 +47,10 @@ var _ = Describe("JOIN CONSUMER GROUP:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			groupId := int(createRandomUInt32())
-			err := client.JoinConsumerGroup(iggcon.JoinConsumerGroupRequest{
-				StreamId:        iggcon.NewIdentifier(streamId),
-				TopicId:         iggcon.NewIdentifier(topicId),
-				ConsumerGroupId: iggcon.NewIdentifier(groupId),
-			})
+			err := client.JoinConsumerGroup(iggcon.NewIdentifier(streamId),
+				iggcon.NewIdentifier(topicId),
+				iggcon.NewIdentifier(groupId),
+			)
 
 			itShouldReturnSpecificError(err, "consumer_group_not_found")
 		})
@@ -62,11 +61,11 @@ var _ = Describe("JOIN CONSUMER GROUP:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			topicId := int(createRandomUInt32())
 
-			err := client.JoinConsumerGroup(iggcon.JoinConsumerGroupRequest{
-				StreamId:        iggcon.NewIdentifier(streamId),
-				TopicId:         iggcon.NewIdentifier(topicId),
-				ConsumerGroupId: iggcon.NewIdentifier(int(createRandomUInt32())),
-			})
+			err := client.JoinConsumerGroup(
+				iggcon.NewIdentifier(streamId),
+				iggcon.NewIdentifier(topicId),
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+			)
 
 			itShouldReturnSpecificError(err, "topic_id_not_found")
 		})
@@ -76,11 +75,11 @@ var _ = Describe("JOIN CONSUMER GROUP:", func() {
 			streamId := int(createRandomUInt32())
 			topicId := int(createRandomUInt32())
 
-			err := client.JoinConsumerGroup(iggcon.JoinConsumerGroupRequest{
-				StreamId:        iggcon.NewIdentifier(streamId),
-				TopicId:         iggcon.NewIdentifier(topicId),
-				ConsumerGroupId: iggcon.NewIdentifier(int(createRandomUInt32())),
-			})
+			err := client.JoinConsumerGroup(
+				iggcon.NewIdentifier(streamId),
+				iggcon.NewIdentifier(topicId),
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+			)
 
 			itShouldReturnSpecificError(err, "stream_id_not_found")
 		})
@@ -88,12 +87,12 @@ var _ = Describe("JOIN CONSUMER GROUP:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to join to the consumer group", func() {
-			client := createConnection()
-			err := client.JoinConsumerGroup(iggcon.JoinConsumerGroupRequest{
-				StreamId:        iggcon.NewIdentifier(int(createRandomUInt32())),
-				TopicId:         iggcon.NewIdentifier(int(createRandomUInt32())),
-				ConsumerGroupId: iggcon.NewIdentifier(int(createRandomUInt32())),
-			})
+			client := createClient()
+			err := client.JoinConsumerGroup(
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+			)
 
 			itShouldReturnUnauthenticatedError(err)
 		})

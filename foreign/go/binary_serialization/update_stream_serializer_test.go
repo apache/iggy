@@ -18,16 +18,15 @@
 package binaryserialization
 
 import (
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"testing"
+
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
 func TestSerialize_UpdateStream(t *testing.T) {
 	request := TcpUpdateStreamRequest{
-		iggcon.UpdateStreamRequest{
-			StreamId: iggcon.NewIdentifier("stream"),
-			Name:     "update_stream",
-		},
+		StreamId: iggcon.NewIdentifier("stream"),
+		Name:     "update_stream",
 	}
 
 	serialized1 := request.Serialize()

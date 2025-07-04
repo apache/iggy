@@ -23,17 +23,43 @@ import (
 	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
-func (tms *IggyTcpClient) SendMessages(request SendMessagesRequest) error {
-	if len(request.Messages) == 0 {
+func (tms *IggyTcpClient) SendMessages(
+	streamId Identifier,
+	topicId Identifier,
+	partitioning Partitioning,
+	messages []IggyMessage,
+) error {
+	if len(messages) == 0 {
 		return ierror.CustomError("messages_count_should_be_greater_than_zero")
 	}
-	serializedRequest := binaryserialization.TcpSendMessagesRequest{SendMessagesRequest: request}
+	serializedRequest := binaryserialization.TcpSendMessagesRequest{
+		StreamId:     streamId,
+		TopicId:      topicId,
+		Partitioning: partitioning,
+		Messages:     messages,
+	}
 	_, err := tms.sendAndFetchResponse(serializedRequest.Serialize(tms.MessageCompression), SendMessagesCode)
 	return err
 }
 
-func (tms *IggyTcpClient) PollMessages(request FetchMessagesRequest) (*FetchMessagesResponse, error) {
-	serializedRequest := binaryserialization.TcpFetchMessagesRequest{FetchMessagesRequest: request}
+func (tms *IggyTcpClient) PollMessages(
+	streamId Identifier,
+	topicId Identifier,
+	consumer Consumer,
+	strategy PollingStrategy,
+	count uint32,
+	autoCommit bool,
+	partitionId *uint32,
+) (*PolledMessage, error) {
+	serializedRequest := binaryserialization.TcpFetchMessagesRequest{
+		StreamId:    streamId,
+		TopicId:     topicId,
+		Consumer:    consumer,
+		AutoCommit:  autoCommit,
+		Strategy:    strategy,
+		Count:       count,
+		PartitionId: partitionId,
+	}
 	buffer, err := tms.sendAndFetchResponse(serializedRequest.Serialize(), PollMessagesCode)
 	if err != nil {
 		return nil, err

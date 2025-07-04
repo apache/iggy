@@ -41,7 +41,7 @@ var _ = Describe("GET ALL CLIENT FEATURE:", func() {
 
 	When("user is not logged in", func() {
 		Context("and tries get all clients", func() {
-			client := createConnection()
+			client := createClient()
 			clients, err := client.GetClients()
 
 			itShouldReturnUnauthenticatedError(err)

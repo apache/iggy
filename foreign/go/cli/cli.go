@@ -23,8 +23,9 @@ import (
 	"fmt"
 	"os"
 
-	. "github.com/apache/iggy/foreign/go"
 	. "github.com/apache/iggy/foreign/go/contracts"
+	"github.com/apache/iggy/foreign/go/iggycli"
+	"github.com/apache/iggy/foreign/go/tcp"
 )
 
 // CLI commands
@@ -176,11 +177,8 @@ func main() {
 	}
 
 	//this is very temporary
-	ms := CreateMessageStream()
-	_, err := ms.LogIn(LogInRequest{
-		Username: "iggy",
-		Password: "iggy",
-	})
+	cli := CreateClient()
+	_, err := cli.LoginUser("iggy", "iggy")
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
@@ -194,11 +192,8 @@ func main() {
 			createStreamCmd.PrintDefaults()
 			os.Exit(1)
 		}
-
-		err := ms.CreateStream(CreateStreamRequest{
-			StreamId: cs_streamId,
-			Name:     cs_name,
-		})
+		uintStreamId := uint32(cs_streamId)
+		_, err = cli.CreateStream(cs_name, &uintStreamId)
 		if err != nil {
 			HandleError(err)
 		}
@@ -211,10 +206,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		err := ms.UpdateStream(UpdateStreamRequest{
-			StreamId: NewIdentifier(us_streamId),
-			Name:     us_name,
-		})
+		err := cli.UpdateStream(NewIdentifier(us_streamId), us_name)
 		if err != nil {
 			HandleError(err)
 		}
@@ -222,7 +214,7 @@ func main() {
 	case "getstream":
 		_ = getStreamCmd.Parse(os.Args[2:])
 		if gs_streamId == -1 {
-			streams, err := ms.GetStreams()
+			streams, err := cli.GetStreams()
 			if err != nil {
 				HandleError(err)
 			}
@@ -230,10 +222,7 @@ func main() {
 			return
 		}
 
-		stream, err := ms.GetStreamById(
-			GetStreamRequest{
-				StreamID: NewIdentifier(gs_streamId),
-			})
+		stream, err := cli.GetStream(NewIdentifier(gs_streamId))
 		if err != nil {
 			HandleError(err)
 		}
@@ -247,7 +236,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		err := ms.DeleteStream(NewIdentifier(ds_streamId))
+		err := cli.DeleteStream(NewIdentifier(ds_streamId))
 		if err != nil {
 			HandleError(err)
 		}
@@ -260,12 +249,15 @@ func main() {
 			os.Exit(1)
 		}
 
-		err := ms.CreateTopic(CreateTopicRequest{
-			TopicId:         ct_topicId,
-			Name:            ct_name,
-			PartitionsCount: ct_partitionsCount,
-			StreamId:        NewIdentifier(ct_streamId),
-		})
+		_, err := cli.CreateTopic(
+			NewIdentifier(ct_streamId),
+			ct_name,
+			ct_partitionsCount,
+			0,
+			0,
+			0,
+			nil,
+			&ct_topicId)
 		if err != nil {
 			HandleError(err)
 		}
@@ -277,11 +269,15 @@ func main() {
 			os.Exit(1)
 		}
 
-		err := ms.UpdateTopic(UpdateTopicRequest{
-			TopicId:  NewIdentifier(ut_topicId),
-			Name:     ut_name,
-			StreamId: NewIdentifier(ut_streamId),
-		})
+		err := cli.UpdateTopic(
+			NewIdentifier(ut_streamId),
+			NewIdentifier(ut_topicId),
+			ut_name,
+			0,
+			0,
+			0,
+			new(uint8),
+		)
 		if err != nil {
 			HandleError(err)
 		}
@@ -290,14 +286,14 @@ func main() {
 		_ = getTopicCmd.Parse(os.Args[2:])
 
 		if gt_topicId == -1 {
-			topics, err := ms.GetTopics(NewIdentifier(gt_streamId))
+			topics, err := cli.GetTopics(NewIdentifier(gt_streamId))
 			if err != nil {
 				HandleError(err)
 			}
 			SerializeAndPrint(topics)
 			return
 		}
-		topic, err := ms.GetTopicById(NewIdentifier(gt_streamId), NewIdentifier(gt_topicId))
+		topic, err := cli.GetTopic(NewIdentifier(gt_streamId), NewIdentifier(gt_topicId))
 		if err != nil {
 			HandleError(err)
 		}
@@ -317,14 +313,14 @@ func main() {
 			os.Exit(1)
 		}
 
-		err := ms.DeleteTopic(NewIdentifier(dt_streamId), NewIdentifier(dt_topicId))
+		err := cli.DeleteTopic(NewIdentifier(dt_streamId), NewIdentifier(dt_topicId))
 		if err != nil {
 			HandleError(err)
 		}
 
 	case "getstats":
 		_ = getStatsCmd.Parse(os.Args[2:])
-		stats, err := ms.GetStats()
+		stats, err := cli.GetStats()
 		if err != nil {
 			HandleError(err)
 		}
@@ -339,18 +335,12 @@ func main() {
 	}
 }
 
-func CreateMessageStream() MessageStream {
-	factory := &IggyClientFactory{}
-	config := IggyConfiguration{
-		BaseAddress: url + ":" + port,
-		Protocol:    Tcp,
-	}
-
-	ms, err := factory.CreateMessageStream(config)
+func CreateClient() iggycli.Client {
+	cli, err := iggycli.NewIggyClient(iggycli.WithTcp(tcp.WithServerAddress(url + ":" + port)))
 	if err != nil {
 		panic(err)
 	}
-	return ms
+	return cli
 }
 
 func SerializeAndPrint(obj any) {

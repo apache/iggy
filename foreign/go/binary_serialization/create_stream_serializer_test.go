@@ -19,18 +19,16 @@ package binaryserialization
 
 import (
 	"encoding/binary"
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"reflect"
 	"testing"
 )
 
 func TestSerialize_TcpCreateStreamRequest(t *testing.T) {
 	// Create a sample TcpCreateStreamRequest
+	streamId := uint32(123)
 	request := TcpCreateStreamRequest{
-		CreateStreamRequest: iggcon.CreateStreamRequest{
-			StreamId: 123,
-			Name:     "test_stream",
-		},
+		StreamId: &streamId,
+		Name:     "test_stream",
 	}
 
 	// Serialize the request

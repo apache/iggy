@@ -39,7 +39,7 @@ var _ = Describe("GET ALL TOPICS:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to get all topics", func() {
-			client := createConnection()
+			client := createClient()
 			_, err := client.GetTopics(iggcon.NewIdentifier(int(createRandomUInt32())))
 
 			itShouldReturnUnauthenticatedError(err)

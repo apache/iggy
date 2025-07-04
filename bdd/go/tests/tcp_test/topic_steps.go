@@ -21,36 +21,37 @@ import (
 	"math"
 	"strconv"
 
-	"github.com/apache/iggy/foreign/go"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
+	"github.com/apache/iggy/foreign/go/iggycli"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
 //operations
 
-func successfullyCreateTopic(streamId int, client iggy.MessageStream) (int, string) {
-	request := iggcon.CreateTopicRequest{
-		TopicId:              int(createRandomUInt32()),
-		StreamId:             iggcon.NewIdentifier(streamId),
-		Name:                 createRandomString(128),
-		MessageExpiry:        0,
-		PartitionsCount:      2,
-		CompressionAlgorithm: 1,
-		MaxTopicSize:         math.MaxUint64,
-		ReplicationFactor:    1,
-	}
-	err := client.CreateTopic(request)
+func successfullyCreateTopic(streamId int, client iggycli.Client) (int, string) {
+	topicId := int(createRandomUInt32())
+	replicationFactor := uint8(1)
+	name := createRandomString(128)
+	_, err := client.CreateTopic(
+		iggcon.NewIdentifier(streamId),
+		name,
+		2,
+		1,
+		0,
+		math.MaxUint64,
+		&replicationFactor,
+		&topicId)
 
-	itShouldSuccessfullyCreateTopic(streamId, request.TopicId, request.Name, client)
+	itShouldSuccessfullyCreateTopic(streamId, topicId, name, client)
 	itShouldNotReturnError(err)
-	return request.TopicId, request.Name
+	return topicId, name
 }
 
 //assertions
 
-func itShouldReturnSpecificTopic(id int, name string, topic iggcon.TopicResponse) {
+func itShouldReturnSpecificTopic(id int, name string, topic iggcon.TopicDetails) {
 	It("should fetch topic with id "+string(rune(id)), func() {
 		Expect(topic.Id).To(Equal(id))
 	})
@@ -60,12 +61,12 @@ func itShouldReturnSpecificTopic(id int, name string, topic iggcon.TopicResponse
 	})
 }
 
-func itShouldContainSpecificTopic(id int, name string, topics []iggcon.TopicResponse) {
+func itShouldContainSpecificTopic(id int, name string, topics []iggcon.Topic) {
 	It("should fetch at least one topic", func() {
 		Expect(len(topics)).NotTo(Equal(0))
 	})
 
-	var topic iggcon.TopicResponse
+	var topic iggcon.Topic
 	found := false
 
 	for _, s := range topics {
@@ -87,8 +88,8 @@ func itShouldContainSpecificTopic(id int, name string, topics []iggcon.TopicResp
 	})
 }
 
-func itShouldSuccessfullyCreateTopic(streamId int, topicId int, expectedName string, client iggy.MessageStream) {
-	topic, err := client.GetTopicById(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId))
+func itShouldSuccessfullyCreateTopic(streamId int, topicId int, expectedName string, client iggycli.Client) {
+	topic, err := client.GetTopic(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId))
 	It("should create topic with id "+string(rune(topicId)), func() {
 		Expect(topic).NotTo(BeNil())
 		Expect(topic.Id).To(Equal(topicId))
@@ -101,8 +102,8 @@ func itShouldSuccessfullyCreateTopic(streamId int, topicId int, expectedName str
 	itShouldNotReturnError(err)
 }
 
-func itShouldSuccessfullyUpdateTopic(streamId int, topicId int, expectedName string, client iggy.MessageStream) {
-	topic, err := client.GetTopicById(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId))
+func itShouldSuccessfullyUpdateTopic(streamId int, topicId int, expectedName string, client iggycli.Client) {
+	topic, err := client.GetTopic(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId))
 
 	It("should update topic with id "+string(rune(topicId)), func() {
 		Expect(topic).NotTo(BeNil())
@@ -116,8 +117,8 @@ func itShouldSuccessfullyUpdateTopic(streamId int, topicId int, expectedName str
 	itShouldNotReturnError(err)
 }
 
-func itShouldSuccessfullyDeleteTopic(streamId int, topicId int, client iggy.MessageStream) {
-	topic, err := client.GetTopicById(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId))
+func itShouldSuccessfullyDeleteTopic(streamId int, topicId int, client iggycli.Client) {
+	topic, err := client.GetTopic(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId))
 
 	itShouldReturnSpecificIggyError(err, ierror.TopicIdNotFound)
 	It("should not return topic", func() {

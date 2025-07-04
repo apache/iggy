@@ -22,6 +22,10 @@ var (
 		Code:    20,
 		Message: "resource_not_found",
 	}
+	InvalidConfiguration = &IggyError{
+		Code:    2,
+		Message: "invalid_configuration",
+	}
 	StreamIdNotFound = &IggyError{
 		Code:    1009,
 		Message: "stream_id_not_found",
@@ -29,6 +33,10 @@ var (
 	TopicIdNotFound = &IggyError{
 		Code:    2010,
 		Message: "topic_id_not_found",
+	}
+	InvalidMessagesCount = &IggyError{
+		Code:    4009,
+		Message: "invalid_messages_count",
 	}
 	InvalidMessagePayloadLength = &IggyError{
 		Code:    4025,

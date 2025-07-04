@@ -28,7 +28,7 @@ var _ = Describe("GET PAT:", func() {
 			name := createRandomString(16)
 			successfullyCreateAccessToken(name, client)
 
-			tokens, err := client.GetAccessTokens()
+			tokens, err := client.GetPersonalAccessTokens()
 
 			itShouldNotReturnError(err)
 			itShouldContainSpecificAccessToken(name, tokens)
@@ -37,8 +37,8 @@ var _ = Describe("GET PAT:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to all get PAT's", func() {
-			client := createConnection()
-			_, err := client.GetAccessTokens()
+			client := createClient()
+			_, err := client.GetPersonalAccessTokens()
 			itShouldReturnUnauthenticatedError(err)
 		})
 	})

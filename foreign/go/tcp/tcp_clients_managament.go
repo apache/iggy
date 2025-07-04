@@ -22,7 +22,7 @@ import (
 	. "github.com/apache/iggy/foreign/go/contracts"
 )
 
-func (tms *IggyTcpClient) GetClients() ([]ClientResponse, error) {
+func (tms *IggyTcpClient) GetClients() ([]ClientInfo, error) {
 	buffer, err := tms.sendAndFetchResponse([]byte{}, GetClientsCode)
 	if err != nil {
 		return nil, err
@@ -31,7 +31,7 @@ func (tms *IggyTcpClient) GetClients() ([]ClientResponse, error) {
 	return binaryserialization.DeserializeClients(buffer)
 }
 
-func (tms *IggyTcpClient) GetClientById(clientId int) (*ClientResponse, error) {
+func (tms *IggyTcpClient) GetClient(clientId int) (*ClientInfoDetails, error) {
 	message := binaryserialization.SerializeInt(clientId)
 	buffer, err := tms.sendAndFetchResponse(message, GetClientCode)
 	if err != nil {

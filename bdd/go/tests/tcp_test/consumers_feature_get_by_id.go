@@ -24,7 +24,7 @@ import (
 )
 
 var _ = Describe("GET CONSUMER GROUP BY ID:", func() {
-	prefix := "GetConsumerGroupById"
+	prefix := "GetConsumerGroup"
 	When("User is logged in", func() {
 		Context("and tries to get existing consumer group", func() {
 			client := createAuthorizedConnection()
@@ -32,16 +32,16 @@ var _ = Describe("GET CONSUMER GROUP BY ID:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			groupId, name := successfullyCreateConsumer(streamId, topicId, client)
-			group, err := client.GetConsumerGroupById(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId), iggcon.NewIdentifier(groupId))
+			group, err := client.GetConsumerGroup(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId), iggcon.NewIdentifier(groupId))
 
 			itShouldNotReturnError(err)
-			itShouldReturnSpecificConsumer(groupId, name, group)
+			itShouldReturnSpecificConsumer(groupId, name, &group.ConsumerGroup)
 		})
 
 		Context("and tries to get consumer from non-existing stream", func() {
 			client := createAuthorizedConnection()
 
-			_, err := client.GetConsumerGroupById(
+			_, err := client.GetConsumerGroup(
 				iggcon.NewIdentifier(int(createRandomUInt32())),
 				iggcon.NewIdentifier(int(createRandomUInt32())),
 				iggcon.NewIdentifier(int(createRandomUInt32())))
@@ -54,7 +54,7 @@ var _ = Describe("GET CONSUMER GROUP BY ID:", func() {
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 
-			_, err := client.GetConsumerGroupById(
+			_, err := client.GetConsumerGroup(
 				iggcon.NewIdentifier(streamId),
 				iggcon.NewIdentifier(int(createRandomUInt32())),
 				iggcon.NewIdentifier(int(createRandomUInt32())))
@@ -68,7 +68,7 @@ var _ = Describe("GET CONSUMER GROUP BY ID:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
 
-			_, err := client.GetConsumerGroupById(
+			_, err := client.GetConsumerGroup(
 				iggcon.NewIdentifier(streamId),
 				iggcon.NewIdentifier(topicId),
 				iggcon.NewIdentifier(int(createRandomUInt32())))
