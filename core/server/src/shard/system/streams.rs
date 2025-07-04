@@ -186,7 +186,7 @@ impl IggyShard {
         }))
     }
 
-    pub async fn create_stream_bypass_auth(
+    pub fn create_stream_bypass_auth(
         &self,
         stream_id: Option<u32>,
         name: &str,

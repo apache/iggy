@@ -18,7 +18,7 @@
 
 use super::memory_pool::{BytesMutExt, memory_pool};
 use bytes::{Buf, BufMut, BytesMut};
-use monoio::buf::{IoBuf, IoBufMut};
+use compio::buf::{IoBuf, IoBufMut, SetBufInit};
 use std::ops::{Deref, DerefMut};
 
 #[derive(Debug)]
@@ -217,26 +217,32 @@ impl Buf for PooledBuffer {
     }
 }
 
+impl SetBufInit for PooledBuffer {
+    unsafe fn set_buf_init(&mut self, len: usize) {
+        if self.inner.len() <= len {
+            unsafe {
+                self.inner.set_len(len);
+            }
+        }
+    }
+}
+
 unsafe impl IoBufMut for PooledBuffer {
-    fn write_ptr(&mut self) -> *mut u8 {
-        self.inner.write_ptr()
-    }
-
-    fn bytes_total(&mut self) -> usize {
-        self.inner.bytes_total()
-    }
-
-    unsafe fn set_init(&mut self, pos: usize) {
-        unsafe { self.inner.set_init(pos) }
+    fn as_buf_mut_ptr(&mut self) -> *mut u8 {
+        self.inner.as_buf_mut_ptr()
     }
 }
 
 unsafe impl IoBuf for PooledBuffer {
-    fn read_ptr(&self) -> *const u8 {
-        self.inner.read_ptr()
+    fn as_buf_ptr(&self) -> *const u8 {
+        self.inner.as_buf_ptr()
     }
 
-    fn bytes_init(&self) -> usize {
-        self.inner.bytes_init()
+    fn buf_len(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn buf_capacity(&self) -> usize {
+        self.inner.capacity()
     }
 }

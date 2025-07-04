@@ -23,12 +23,12 @@ use crate::streaming::streams::COMPONENT;
 use crate::streaming::streams::stream::Stream;
 use crate::streaming::topics::topic::Topic;
 use ahash::AHashSet;
+use compio::fs;
+use compio::fs::create_dir_all;
 use error_set::ErrContext;
 use futures::future::join_all;
 use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
-use monoio::fs;
-use monoio::fs::create_dir_all;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -157,7 +157,7 @@ impl StreamStorage for FileStreamStorage {
         for mut topic in unloaded_topics {
             let loaded_topics = loaded_topics.clone();
             let topic_state = state.topics.remove(&topic.topic_id).unwrap();
-            let load_topic = monoio::spawn(async move {
+            let load_topic = compio::runtime::spawn(async move {
                 match topic.load(topic_state).await {
                     Ok(_) => loaded_topics.lock().await.push(topic),
                     Err(error) => error!(

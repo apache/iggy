@@ -16,30 +16,37 @@
  * under the License.
  */
 
-use bytes::BytesMut;
-use iggy_common::IggyError;
-use monoio::{
-    buf::IoBufMut,
-    io::{AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt},
+use bytes::{Bytes, BytesMut};
+use compio::{
+    BufResult,
+    buf::{IoBuf, IoBufMut},
+    io::{AsyncRead, AsyncReadAtExt, AsyncReadExt, AsyncWriteExt},
 };
+use iggy_common::IggyError;
 use nix::libc;
 use std::io::IoSlice;
-use tracing::debug;
+use tracing::{debug, error};
+
+use crate::streaming::utils::PooledBuffer;
 
 const STATUS_OK: &[u8] = &[0; 4];
 
 pub(crate) async fn read<T, B>(stream: &mut T, buffer: B) -> (Result<usize, IggyError>, B)
 where
-    T: AsyncReadRent + AsyncWriteRent + Unpin,
+    T: AsyncReadExt + AsyncWriteExt + Unpin,
     B: IoBufMut,
 {
-    match stream.read_exact(buffer).await {
-        (Ok(0), buffer) => (Err(IggyError::ConnectionClosed), buffer),
-        (Ok(read_bytes), buffer) => (Ok(read_bytes), buffer),
+    let BufResult(result, buffer) = stream.read_exact(buffer).await;
+    match (result, buffer) {
+        (Ok(_), buffer) => (Ok(buffer.buf_len()), buffer),
+        // TODO: How to handle this ?(Ok(0), buffer) => (Err(IggyError::ConnectionClosed), buffer),
+        // `read_exact` from compio doesn't return how many bytes it read.
         (Err(error), buffer) => {
             if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                //error!("Got some error tho.. {}", error);
                 (Err(IggyError::ConnectionClosed), buffer)
             } else {
+                //error!("Got some other error tho.. {}", error);
                 (Err(IggyError::TcpError), buffer)
             }
         }
@@ -48,14 +55,14 @@ where
 
 pub(crate) async fn send_empty_ok_response<T>(stream: &mut T) -> Result<(), IggyError>
 where
-    T: AsyncReadRent + AsyncWriteRent + Unpin,
+    T: AsyncReadExt + AsyncWriteExt + Unpin,
 {
     send_ok_response(stream, &[]).await
 }
 
 pub(crate) async fn send_ok_response<T>(stream: &mut T, payload: &[u8]) -> Result<(), IggyError>
 where
-    T: AsyncReadRent + AsyncWriteRent + Unpin,
+    T: AsyncReadExt + AsyncWriteExt + Unpin,
 {
     send_response(stream, STATUS_OK, payload).await
 }
@@ -63,10 +70,10 @@ where
 pub(crate) async fn send_ok_response_vectored<T>(
     stream: &mut T,
     length: &[u8],
-    slices: Vec<libc::iovec>,
+    slices: Vec<PooledBuffer>,
 ) -> Result<(), IggyError>
 where
-    T: AsyncReadRentExt + AsyncWriteRentExt + Unpin,
+    T: AsyncReadExt + AsyncWriteExt + Unpin,
 {
     send_response_vectored(stream, STATUS_OK, length, slices).await
 }
@@ -76,7 +83,7 @@ pub(crate) async fn send_error_response<T>(
     error: IggyError,
 ) -> Result<(), IggyError>
 where
-    T: AsyncReadRent + AsyncWriteRent + Unpin,
+    T: AsyncReadExt + AsyncWriteExt + Unpin,
 {
     send_response(stream, &error.as_code().to_le_bytes(), &[]).await
 }
@@ -87,7 +94,7 @@ pub(crate) async fn send_response<T>(
     payload: &[u8],
 ) -> Result<(), IggyError>
 where
-    T: AsyncReadRent + AsyncWriteRent + Unpin,
+    T: AsyncReadExt + AsyncWriteExt + Unpin,
 {
     debug!(
         "Sending response of len: {} with status: {:?}...",
@@ -108,32 +115,25 @@ pub(crate) async fn send_response_vectored<T>(
     stream: &mut T,
     status: &[u8],
     length: &[u8],
-    mut slices: Vec<libc::iovec>,
+    mut slices: Vec<PooledBuffer>,
 ) -> Result<(), IggyError>
 where
-    T: AsyncReadRentExt + AsyncWriteRentExt + Unpin,
+    T: AsyncReadExt + AsyncWriteExt + Unpin,
 {
+    let resp_status = u32::from_le_bytes(status.try_into().unwrap());
     debug!(
         "Sending vectored response of len: {} with status: {:?}...",
         slices.len(),
-        status
+        resp_status
     );
-    let prefix = [
-        libc::iovec {
-            iov_base: status.as_ptr() as _,
-            iov_len: status.len(),
-        },
-        libc::iovec {
-            iov_base: length.as_ptr() as _,
-            iov_len: length.len(),
-        },
-    ];
-    slices.splice(0..0, prefix);
+    let status = PooledBuffer::from(status);
+    let length = PooledBuffer::from(length);
+    slices.splice(0..0, [status, length]);
     stream
         .write_vectored_all(slices)
         .await
         .0
         .map_err(|_| IggyError::TcpError)?;
-    debug!("Sent response with status: {:?}", status);
+    debug!("Sent response with status: {:?}", resp_status);
     Ok(())
 }

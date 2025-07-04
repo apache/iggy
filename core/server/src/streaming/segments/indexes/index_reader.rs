@@ -17,13 +17,16 @@
  */
 
 use super::IggyIndexesMut;
-use crate::{io::file::IggyFile, streaming::utils::PooledBuffer};
+use crate::streaming::utils::PooledBuffer;
 use bytes::BytesMut;
+use compio::{
+    BufResult,
+    fs::{File, OpenOptions},
+    io::AsyncReadAtExt,
+};
 use error_set::ErrContext;
 use iggy_common::{INDEX_SIZE, IggyError, IggyIndex, IggyIndexView};
-use monoio::fs::OpenOptions;
 use std::{
-    fs::File as StdFile,
     io::ErrorKind,
     os::unix::fs::FileExt,
     sync::{
@@ -37,7 +40,7 @@ use tracing::{error, trace};
 #[derive(Debug)]
 pub struct IndexReader {
     file_path: String,
-    file: IggyFile,
+    file: File,
     index_size_bytes: Arc<AtomicU64>,
 }
 
@@ -51,7 +54,6 @@ impl IndexReader {
             .with_error_context(|error| format!("Failed to open index file: {file_path}. {error}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
-        let file = IggyFile::new(file);
         trace!(
             "Opened index file for reading: {file_path}, size: {}",
             index_size_bytes.load(Ordering::Acquire)
@@ -337,13 +339,13 @@ impl IndexReader {
         if use_pool {
             let mut buf = PooledBuffer::with_capacity(len as usize);
             unsafe { buf.set_len(len as usize) };
-            let (result, buf) = self.file.read_exact_at(buf, offset as u64).await;
+            let (result, buf) = self.file.read_exact_at(buf, offset as u64).await.into();
             result?;
             Ok(buf)
         } else {
             let mut buf = BytesMut::with_capacity(len as usize);
             unsafe { buf.set_len(len as usize) };
-            let (result, buf) = self.file.read_exact_at(buf, offset as u64).await;
+            let (result, buf) = self.file.read_exact_at(buf, offset as u64).await.into();
             result?;
             Ok(PooledBuffer::from_existing(buf))
         }

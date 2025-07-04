@@ -17,11 +17,12 @@
  */
 
 use crate::quic::COMPONENT;
+use crate::streaming::utils::PooledBuffer;
 use crate::{binary::sender::Sender, server_error::ServerError};
 use bytes::BytesMut;
+use compio::buf::{IoBuf, IoBufMut};
 use error_set::ErrContext;
 use iggy_common::IggyError;
-use monoio::buf::IoBufMut;
 use nix::libc;
 use quinn::{RecvStream, SendStream};
 use std::io::IoSlice;
@@ -71,7 +72,7 @@ impl Sender for QuicSender {
     async fn send_ok_response_vectored(
         &mut self,
         length: &[u8],
-        slices: Vec<libc::iovec>,
+        slices: Vec<PooledBuffer>,
     ) -> Result<(), IggyError> {
         debug!("Sending vectored response with status: {:?}...", STATUS_OK);
 

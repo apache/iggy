@@ -19,37 +19,25 @@
 mod messages_reader;
 mod messages_writer;
 
-use crate::io::file::IggyFile;
-
 use super::IggyMessagesBatchSet;
-use error_set::ErrContext;
+use compio::{fs::File, io::AsyncWriteAtExt};
 use iggy_common::IggyError;
-use monoio::io::AsyncWriteRentExt;
 
 pub use messages_reader::MessagesReader;
 pub use messages_writer::MessagesWriter;
 
 /// Vectored write a batches of messages to file
 async fn write_batch(
-    file: &mut IggyFile,
-    file_path: &str,
+    file: &mut File,
+    position: u64,
     mut batches: IggyMessagesBatchSet,
 ) -> Result<usize, IggyError> {
-    //let mut slices = batches.iter().map(|b| to_iovec(&b)).collect::<Vec<iovec>>();
-    let mut total_written = 0;
-    // TODO: Fork monoio, piece of shit runtime.
-    for batch in batches.iter_mut() {
-        let messages = batch.take_messages();
-        let writen = file
-            .write_all(messages)
-            .await
-            .0
-            .with_error_context(|error| {
-                format!("Failed to write messages to file: {file_path}, error: {error}",)
-                // TODO: Better error variant.
-            })
-            .map_err(|_| IggyError::CannotAppendMessage)?;
-        total_written += writen;
-    }
+    let total_written = batches.iter().map(|b| b.size() as usize).sum();
+    let batches = batches
+        .iter_mut()
+        .map(|b| b.take_messages())
+        .collect::<Vec<_>>();
+    let (result, _) = file.write_vectored_all_at(batches, position).await.into();
+    result.map_err(|_| IggyError::CannotWriteToFile)?;
     Ok(total_written)
 }

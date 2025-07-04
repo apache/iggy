@@ -25,13 +25,13 @@ use crate::streaming::topics::consumer_group::ConsumerGroup;
 use crate::streaming::topics::topic::Topic;
 use ahash::AHashSet;
 use anyhow::Context;
+use compio::fs;
+use compio::fs::create_dir_all;
 use error_set::ErrContext;
 use futures::future::join_all;
 use iggy_common::IggyError;
 use iggy_common::locking::IggyRwLock;
 use iggy_common::locking::IggySharedMutFn;
-use monoio::fs;
-use monoio::fs::create_dir_all;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -188,7 +188,7 @@ impl TopicStorage for FileTopicStorage {
         for mut partition in unloaded_partitions {
             let loaded_partitions = loaded_partitions.clone();
             let partition_state = state.partitions.remove(&partition.partition_id).unwrap();
-            let load_partition = monoio::spawn(async move {
+            let load_partition = compio::runtime::spawn(async move {
                 match partition.load(partition_state).await {
                     Ok(_) => {
                         loaded_partitions.lock().await.push(partition);

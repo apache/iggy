@@ -14,7 +14,7 @@ async fn run_shard_messages_receiver(shard: Rc<IggyShard>) -> Result<(), IggyErr
                 if shard.is_shutting_down() {
                     return;
                 }
-                monoio::time::sleep(Duration::from_millis(100)).await;
+                compio::time::sleep(Duration::from_millis(100)).await;
             }
         };
 

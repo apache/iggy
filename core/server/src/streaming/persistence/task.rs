@@ -18,18 +18,18 @@
 
 use crate::streaming::persistence::COMPONENT;
 use bytes::Bytes;
+use compio::runtime::Task;
 use error_set::ErrContext;
 use flume::{Receiver, Sender, unbounded};
 use iggy_common::IggyError;
-use monoio::task;
-use std::{sync::Arc, time::Duration};
+use std::{any::Any, sync::Arc, time::Duration};
 use tracing::error;
 
 use super::persister::PersisterKind;
 
 pub struct LogPersisterTask {
     _sender: Option<Sender<Bytes>>,
-    _task_handle: Option<task::JoinHandle<()>>,
+    _task_handle: Option<Task<Result<(), Box<dyn Any + Send>>>>,
 }
 
 impl std::fmt::Debug for LogPersisterTask {
@@ -50,7 +50,7 @@ impl LogPersisterTask {
     ) -> Self {
         let (sender, receiver): (Sender<Bytes>, Receiver<Bytes>) = unbounded();
 
-        let task_handle = monoio::spawn(async move {
+        let task_handle = compio::runtime::spawn(async move {
             loop {
                 match receiver.recv_async().await {
                     Ok(data) => {
@@ -129,7 +129,7 @@ impl Drop for LogPersisterTask {
         self._sender.take();
 
         if let Some(handle) = self._task_handle.take() {
-            monoio::spawn(async move { handle.await });
+            compio::runtime::spawn(async move { handle.await });
         }
     }
 }

@@ -1,3 +1,4 @@
+use compio::{fs::create_dir_all, runtime::Runtime};
 use iggy_common::{
     IggyError,
     defaults::{
@@ -5,7 +6,6 @@ use iggy_common::{
         MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
     },
 };
-use monoio::{Buildable, Driver, Runtime, fs::create_dir_all, time::TimeDriver};
 use tracing::info;
 
 use crate::{
@@ -121,24 +121,21 @@ pub fn create_root_user() -> User {
     user
 }
 
-pub fn create_default_executor<D>() -> Runtime<D>
-where
-    D: Driver + Buildable,
-{
-    let builder = monoio::RuntimeBuilder::<D>::new();
-    let rt = Buildable::build(builder).expect("Failed to create default runtime");
-    rt
-}
-
-pub fn create_shard_executor() -> Runtime<TimeDriver<monoio::IoUringDriver>> {
-    // TODO: Figure out what else we could tweak there
-    // We for sure want to disable the userspace interrupts on new cq entry (set_coop_taskrun)
-    // TODO: Shall we make the size of ring be configureable ?
-    let builder = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-        //.uring_builder(urb.setup_coop_taskrun()) // broken shit.
-        .with_entries(1024) // Default size
-        .enable_timer();
-    let rt = Buildable::build(builder).expect("Failed to create default runtime");
+pub fn create_shard_executor() -> Runtime {
+    //TODO: The event intererval tick, could be configureed based on the fact
+    // How many clients we expect to have connected.
+    // This roughly estimates the number of tasks we will create.
+    let proactor = compio::driver::ProactorBuilder::new()
+        .capacity(4096)
+        .coop_taskrun(true)
+        .taskrun_flag(false) //TODO: Try enabling this.
+        .thread_pool_limit(0)
+        .to_owned();
+    let rt = compio::runtime::RuntimeBuilder::new()
+        .with_proactor(proactor)
+        .event_interval(69)
+        .build()
+        .unwrap();
     rt
 }
 

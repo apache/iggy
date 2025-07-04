@@ -16,12 +16,14 @@
  * under the License.
  */
 
-use crate::io::file::IggyFile;
-use crate::io::writer::IggyWriter;
+use crate::server_error::CompatError;
 use crate::streaming::utils::file;
-use crate::{io::reader::IggyReader, server_error::CompatError};
+use async_zip::tokio::write;
+use compio::{
+    fs::File,
+    io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
+};
 use iggy_common::{IGGY_MESSAGE_HEADER_SIZE, IggyMessageHeader};
-use monoio::io::{AsyncReadRent, AsyncReadRentExt, AsyncWriteRent, AsyncWriteRentExt};
 use std::io::{Seek, SeekFrom};
 
 pub struct IndexRebuilder {
@@ -40,17 +42,17 @@ impl IndexRebuilder {
     }
 
     async fn read_message_header(
-        reader: &mut IggyReader<IggyFile>,
+        reader: &mut BufReader<std::io::Cursor<File>>,
     ) -> Result<IggyMessageHeader, std::io::Error> {
         let buf = [0u8; IGGY_MESSAGE_HEADER_SIZE];
-        let (result, buf) = reader.read_exact(Box::new(buf)).await;
+        let (result, buf) = reader.read_exact(Box::new(buf)).await.into();
         result?;
         IggyMessageHeader::from_raw_bytes(&*buf)
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))
     }
 
     async fn write_index_entry(
-        writer: &mut IggyWriter<IggyFile>,
+        writer: &mut BufWriter<std::io::Cursor<File>>,
         header: &IggyMessageHeader,
         position: usize,
         start_offset: u64,
@@ -58,26 +60,34 @@ impl IndexRebuilder {
         // Write offset (4 bytes) - base_offset + last_offset_delta - start_offset
         let offset = start_offset - header.offset;
         debug_assert!(offset <= u32::MAX as u64);
-        let (result, _) = writer.write_all(Box::new(offset.to_le_bytes())).await;
+        let (result, _) = writer
+            .write_all(Box::new(offset.to_le_bytes()))
+            .await
+            .into();
         result?;
 
         // Write position (4 bytes)
-        let (result, _) = writer.write_all(Box::new(position.to_le_bytes())).await;
+        let (result, _) = writer
+            .write_all(Box::new(position.to_le_bytes()))
+            .await
+            .into();
         result?;
 
         // Write timestamp (8 bytes)
         let (result, _) = writer
             .write_all(Box::new(header.timestamp.to_le_bytes()))
-            .await;
+            .await
+            .into();
         result?;
 
         Ok(())
     }
 
     pub async fn rebuild(&self) -> Result<(), CompatError> {
-        let mut reader =
-            IggyReader::new(IggyFile::new(file::open(&self.messages_file_path).await?));
-        let mut writer = IggyWriter::new(IggyFile::new(file::overwrite(&self.index_path).await?));
+        let read_cursor = std::io::Cursor::new(file::open(&self.messages_file_path).await?);
+        let write_cursor = std::io::Cursor::new(file::overwrite(&self.index_path).await?);
+        let mut reader = BufReader::new(read_cursor);
+        let mut writer = BufWriter::new(write_cursor);
         let mut position = 0;
         let mut next_position;
 
@@ -93,9 +103,9 @@ impl IndexRebuilder {
                         .await?;
 
                     // Skip message payload and headers
-                    reader.seek(SeekFrom::Current(
-                        header.payload_length as i64 + header.user_headers_length as i64,
-                    ))?;
+                    reader.consume(
+                        header.payload_length as usize + header.user_headers_length as usize,
+                    );
 
                     // Update position for next iteration
                     position = next_position;

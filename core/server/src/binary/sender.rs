@@ -19,17 +19,17 @@
 use std::future::Future;
 use std::io::IoSlice;
 
+use crate::streaming::utils::PooledBuffer;
 use crate::tcp::tcp_sender::TcpSender;
 use crate::tcp::tcp_tls_sender::TcpTlsSender;
 use crate::{quic::quic_sender::QuicSender, server_error::ServerError};
 use bytes::BytesMut;
+use compio::buf::{IoBuf, IoBufMut};
+use compio::io::{AsyncReadExt, AsyncWriteExt};
+use compio::net::TcpStream;
 use iggy_common::IggyError;
-use monoio::buf::IoBufMut;
-use monoio::io::{AsyncReadRent, AsyncWriteRent};
-use monoio::net::TcpStream;
 use nix::libc;
 use quinn::{RecvStream, SendStream};
-use monoio_rustls::{ServerTlsStream, TlsStream};
 
 macro_rules! forward_async_methods {
     (
@@ -65,7 +65,7 @@ pub trait Sender {
     fn send_ok_response_vectored(
         &mut self,
         length: &[u8],
-        slices: Vec<libc::iovec>,
+        slices: Vec<PooledBuffer>,
     ) -> impl Future<Output = Result<(), IggyError>>;
     fn send_error_response(
         &mut self,
@@ -85,8 +85,9 @@ impl SenderKind {
         Self::Tcp(TcpSender { stream })
     }
 
-    pub fn get_tcp_tls_sender(stream: ServerTlsStream<TcpStream>) -> Self {
-        Self::TcpTls(TcpTlsSender { stream })
+    pub fn get_tcp_tls_sender(stream: ()) -> Self {
+        todo!();
+        //Self::TcpTls(TcpTlsSender { stream })
     }
 
     pub fn get_quic_sender(send_stream: SendStream, recv_stream: RecvStream) -> Self {
@@ -100,7 +101,7 @@ impl SenderKind {
         async fn read<B: IoBufMut>(&mut self, buffer: B) -> (Result<usize, IggyError>, B);
         async fn send_empty_ok_response(&mut self) -> Result<(), IggyError>;
         async fn send_ok_response(&mut self, payload: &[u8]) -> Result<(), IggyError>;
-        async fn send_ok_response_vectored(&mut self, length: &[u8], slices: Vec<libc::iovec>) -> Result<(), IggyError>;
+        async fn send_ok_response_vectored(&mut self, length: &[u8], slices: Vec<PooledBuffer>) -> Result<(), IggyError>;
         async fn send_error_response(&mut self, error: IggyError) -> Result<(), IggyError>;
         async fn shutdown(&mut self) -> Result<(), ServerError>;
     }

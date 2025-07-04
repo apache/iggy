@@ -18,7 +18,6 @@
 
 use crate::compat::index_rebuilding::index_rebuilder::IndexRebuilder;
 use crate::configs::cache_indexes::CacheIndexesConfig;
-use crate::io::file::IggyFile;
 use crate::io::fs_utils;
 use crate::state::system::PartitionState;
 use crate::streaming::partitions::COMPONENT;
@@ -27,12 +26,12 @@ use crate::streaming::persistence::persister::PersisterKind;
 use crate::streaming::segments::*;
 use crate::streaming::storage::PartitionStorage;
 use crate::streaming::utils::file;
+use compio::fs;
+use compio::fs::create_dir_all;
+use compio::io::AsyncReadExt;
 use error_set::ErrContext;
 use iggy_common::ConsumerKind;
 use iggy_common::IggyError;
-use monoio::fs;
-use monoio::fs::create_dir_all;
-use monoio::io::AsyncReadRentExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -117,8 +116,18 @@ impl PartitionStorage for FilePartitionStorage {
             let messages_file_path = segment.messages_file_path().to_owned();
             let time_index_path = index_path.replace(INDEX_EXTENSION, "timeindex");
 
-            let index_path_exists = tokio::fs::try_exists(&index_path).await.unwrap();
-            let time_index_path_exists = tokio::fs::try_exists(&time_index_path).await.unwrap();
+            // TODO: Move to fs_utils
+            async fn try_exists(index_path: &str) -> Result<bool, std::io::Error> {
+                match compio::fs::metadata(index_path).await {
+                    Ok(_) => Ok(true),
+                    Err(err) => match err.kind() {
+                        std::io::ErrorKind::NotFound => Ok(false),
+                        _ => Err(err),
+                    },
+                }
+            }
+            let index_path_exists = try_exists(&index_path).await.unwrap();
+            let time_index_path_exists = try_exists(&time_index_path).await.unwrap();
             let index_cache_enabled = matches!(
                 partition.config.segment.cache_indexes,
                 CacheIndexesConfig::All | CacheIndexesConfig::OpenSegment
@@ -416,6 +425,7 @@ impl PartitionStorage for FilePartitionStorage {
 
         let mut consumer_offsets = Vec::new();
         let mut dir_entries = dir_entries.unwrap();
+        // TODO: reimplement using the compio dir walk
         while let Some(dir_entry) = dir_entries.next() {
             let dir_entry = dir_entry.unwrap();
             let metadata = dir_entry.metadata();
@@ -451,8 +461,9 @@ impl PartitionStorage for FilePartitionStorage {
                     )
                 })
                 .map_err(|_| IggyError::CannotReadFile)?;
-            let mut file = IggyFile::new(file);
-            let offset = file
+            // TODO: This is like awfull.
+            let mut cursor = std::io::Cursor::new(file);
+            let offset = cursor
                 .read_u64_le()
                 .await
                 .with_error_context(|error| {

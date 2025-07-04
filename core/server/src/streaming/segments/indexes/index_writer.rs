@@ -16,25 +16,25 @@
  * under the License.
  */
 
+use compio::fs::File;
+use compio::fs::OpenOptions;
+use compio::io::AsyncWriteAtExt;
 use error_set::ErrContext;
 use iggy_common::INDEX_SIZE;
 use iggy_common::IggyError;
-use monoio::fs::OpenOptions;
-use monoio::io::AsyncWriteRentExt;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
 use tracing::trace;
 
-use crate::io::file::IggyFile;
 use crate::streaming::utils::PooledBuffer;
 
 /// A dedicated struct for writing to the index file.
 #[derive(Debug)]
 pub struct IndexWriter {
     file_path: String,
-    file: IggyFile,
+    file: File,
     index_size_bytes: Arc<AtomicU64>,
     fsync: bool,
 }
@@ -48,15 +48,13 @@ impl IndexWriter {
         file_exists: bool,
     ) -> Result<Self, IggyError> {
         let file = OpenOptions::new()
-            .write(true)
-            .append(true)
             .create(true)
+            .write(true)
             .open(file_path)
             .await
             .with_error_context(|error| format!("Failed to open index file: {file_path}. {error}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
-        let file = IggyFile::from(file);
         if file_exists {
             let _ = file.sync_all().await.with_error_context(|error| {
                 format!("Failed to fsync index file after creation: {file_path}. {error}",)
@@ -96,8 +94,9 @@ impl IndexWriter {
         let count = indexes.len() / INDEX_SIZE;
         let len = indexes.len();
 
+        let position = self.index_size_bytes.load(Ordering::Relaxed);
         self.file
-            .write_all(indexes)
+            .write_all_at(indexes, position)
             .await
             .0
             .with_error_context(|error| {

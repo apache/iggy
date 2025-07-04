@@ -18,12 +18,13 @@
 
 use crate::streaming::persistence::COMPONENT;
 use crate::streaming::utils::file;
+use compio::buf::IoBuf;
+use compio::fs::remove_file;
+use compio::io::AsyncWriteAtExt;
 use error_set::ErrContext;
 use iggy_common::IggyError;
-use monoio::buf::IoBuf;
 use std::fmt::Debug;
 use std::future::Future;
-use tokio::fs;
 
 #[cfg(test)]
 use mockall::automock;
@@ -85,13 +86,13 @@ pub struct FileWithSyncPersister;
 
 impl Persister for FilePersister {
     async fn append<B: IoBuf>(&self, path: &str, bytes: B) -> Result<(), IggyError> {
-        let file = file::append(path)
+        let (mut file, position) = file::append(path)
             .await
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to append to file: {path}")
             })
             .map_err(|_| IggyError::CannotAppendToFile)?;
-        file.write_all_at(bytes, 0)
+        file.write_all_at(bytes, position)
             .await
             .0
             .with_error_context(|error| {
@@ -102,7 +103,7 @@ impl Persister for FilePersister {
     }
 
     async fn overwrite<B: IoBuf>(&self, path: &str, bytes: B) -> Result<(), IggyError> {
-        let file = file::overwrite(path)
+        let mut file = file::overwrite(path)
             .await
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to overwrite file: {path}")
@@ -120,7 +121,7 @@ impl Persister for FilePersister {
     }
 
     async fn delete(&self, path: &str) -> Result<(), IggyError> {
-        fs::remove_file(path)
+        remove_file(path)
             .await
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to delete file: {path}")
@@ -132,17 +133,12 @@ impl Persister for FilePersister {
 
 impl Persister for FileWithSyncPersister {
     async fn append<B: IoBuf>(&self, path: &str, bytes: B) -> Result<(), IggyError> {
-        let file = file::append(path)
+        let (mut file, position) = file::append(path)
             .await
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to append to file: {path}")
             })
             .map_err(|_| IggyError::CannotAppendToFile)?;
-        let position = file
-            .metadata()
-            .await
-            .map_err(|_| IggyError::CannotReadFileMetadata)?
-            .len();
         file.write_all_at(bytes, position)
             .await
             .0
@@ -162,7 +158,7 @@ impl Persister for FileWithSyncPersister {
     }
 
     async fn overwrite<B: IoBuf>(&self, path: &str, bytes: B) -> Result<(), IggyError> {
-        let file = file::overwrite(path)
+        let mut file = file::overwrite(path)
             .await
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to overwrite file: {path}")
@@ -188,7 +184,7 @@ impl Persister for FileWithSyncPersister {
     }
 
     async fn delete(&self, path: &str) -> Result<(), IggyError> {
-        fs::remove_file(path)
+        remove_file(path)
             .await
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to delete file: {path}")

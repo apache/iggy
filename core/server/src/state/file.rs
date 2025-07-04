@@ -16,28 +16,27 @@
  * under the License.
  */
 
-use crate::io::file::IggyFile;
-use crate::io::reader::IggyReader;
 use crate::state::command::EntryCommand;
 use crate::state::{COMPONENT, State, StateEntry};
 use crate::streaming::persistence::persister::PersisterKind;
 use crate::streaming::utils::file;
 use crate::versioning::SemanticVersion;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use compio::fs::File;
+use compio::io::{AsyncReadExt, AsyncWriteExt};
 use error_set::ErrContext;
 use iggy_common::BytesSerializable;
 use iggy_common::EncryptorKind;
 use iggy_common::IggyByteSize;
 use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
-use monoio::io::AsyncReadRentExt;
 use std::fmt::Debug;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use tracing::{debug, error, info};
 
-pub const BUF_READER_CAPACITY_BYTES: usize = 512 * 1000;
+pub const BUF_cursor_CAPACITY_BYTES: usize = 512 * 1000;
 const FILE_STATE_PARSE_ERROR: &str = "STATE - failed to parse file state";
 
 #[derive(Debug)]
@@ -129,7 +128,6 @@ impl State for FileState {
             .map_err(|_| IggyError::CannotReadFileMetadata)?
             .len();
 
-        let file = IggyFile::new(file);
         if file_size == 0 {
             info!("State file is empty");
             return Ok(Vec::new());
@@ -141,11 +139,11 @@ impl State for FileState {
         );
         let mut entries = Vec::new();
         let mut total_size: u64 = 0;
-        let mut reader = IggyReader::with_capacity(BUF_READER_CAPACITY_BYTES, file);
+        let mut cursor = std::io::Cursor::new(file);
         let mut current_index = 0;
         let mut entries_count = 0;
         loop {
-            let index = reader
+            let index = cursor
                 .read_u64_le()
                 .await
                 .with_error_context(|error| format!("{FILE_STATE_PARSE_ERROR} index. {error}"))
@@ -163,32 +161,32 @@ impl State for FileState {
 
             current_index = index;
             entries_count += 1;
-            let term = reader
+            let term = cursor
                 .read_u64_le()
                 .await
                 .with_error_context(|error| format!("{FILE_STATE_PARSE_ERROR} term. {error}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 8;
-            let leader_id = reader
+            let leader_id = cursor
                 .read_u32_le()
                 .await
                 .with_error_context(|error| format!("{FILE_STATE_PARSE_ERROR} leader_id. {error}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 4;
-            let version = reader
+            let version = cursor
                 .read_u32_le()
                 .await
                 .with_error_context(|error| format!("{FILE_STATE_PARSE_ERROR} version. {error}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 4;
-            let flags = reader
+            let flags = cursor
                 .read_u64_le()
                 .await
                 .with_error_context(|error| format!("{FILE_STATE_PARSE_ERROR} flags. {error}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 8;
             let timestamp = IggyTimestamp::from(
-                reader
+                cursor
                     .read_u64_le()
                     .await
                     .with_error_context(|error| {
@@ -197,19 +195,19 @@ impl State for FileState {
                     .map_err(|_| IggyError::InvalidNumberEncoding)?,
             );
             total_size += 8;
-            let user_id = reader
+            let user_id = cursor
                 .read_u32_le()
                 .await
                 .with_error_context(|error| format!("{FILE_STATE_PARSE_ERROR} user_id. {error}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 4;
-            let checksum = reader
+            let checksum = cursor
                 .read_u32_le()
                 .await
                 .with_error_context(|error| format!("{FILE_STATE_PARSE_ERROR} checksum. {error}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 4;
-            let context_length = reader
+            let context_length = cursor
                 .read_u32_le()
                 .await
                 .with_error_context(|error| {
@@ -220,20 +218,20 @@ impl State for FileState {
             total_size += 4;
             let mut context = BytesMut::with_capacity(context_length);
             context.put_bytes(0, context_length);
-            let (result, context) = reader.read_exact(context).await;
+            let (result, context) = cursor.read_exact(context).await.into();
 
             result
                 .with_error_context(|error| format!("{FILE_STATE_PARSE_ERROR} code. {error}"))
                 .map_err(|_| IggyError::CannotReadFile)?;
             let context = context.freeze();
             total_size += context_length as u64;
-            let code = reader
+            let code = cursor
                 .read_u32_le()
                 .await
                 .with_error_context(|error| format!("{FILE_STATE_PARSE_ERROR} code. {error}"))
                 .map_err(|_| IggyError::InvalidNumberEncoding)?;
             total_size += 4;
-            let mut command_length = reader
+            let mut command_length = cursor
                 .read_u32_le()
                 .await
                 .with_error_context(|error| {
@@ -244,7 +242,7 @@ impl State for FileState {
             total_size += 4;
             let mut command = BytesMut::with_capacity(command_length);
             command.put_bytes(0, command_length);
-            let (result, command) = reader.read_exact(command).await;
+            let (result, command) = cursor.read_exact(command).await.into();
             result
                 .with_error_context(|error| format!("{FILE_STATE_PARSE_ERROR} command. {error}"))
                 .map_err(|_| IggyError::CannotReadFile)?;

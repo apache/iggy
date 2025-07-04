@@ -17,8 +17,8 @@
  */
 
 use async_channel::{Receiver, Sender, bounded};
+use compio::runtime::JoinHandle;
 use futures::future::join_all;
-use monoio::task::JoinHandle;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
@@ -42,7 +42,7 @@ impl TaskRegistry {
     where
         F: Future<Output = ()> + 'static,
     {
-        let handle = monoio::spawn(future);
+        let handle = compio::runtime::spawn(future);
         self.tasks.borrow_mut().push(handle);
     }
 
@@ -85,8 +85,8 @@ impl TaskRegistry {
             .into_iter()
             .enumerate()
             .map(|(idx, handle)| async move {
-                match monoio::time::timeout(timeout, handle).await {
-                    Ok(()) => (idx, true),
+                match compio::time::timeout(timeout, handle).await {
+                    Ok(_) => (idx, true),
                     Err(_) => {
                         warn!("Task {} did not complete within timeout", idx);
                         (idx, false)

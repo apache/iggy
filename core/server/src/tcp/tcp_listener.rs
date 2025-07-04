@@ -29,13 +29,19 @@ use std::rc::Rc;
 use std::time::Duration;
 use tracing::{error, info};
 
-pub async fn start(server_name: &'static str, addr: SocketAddr, socket: Socket, shard: Rc<IggyShard>) -> Result<(), IggyError> {
+pub async fn start(
+    server_name: &'static str,
+    addr: SocketAddr,
+    socket: Socket,
+    shard: Rc<IggyShard>,
+) -> Result<(), IggyError> {
     socket
         .bind(&addr.into())
         .expect("Failed to bind TCP listener");
     socket.listen(1024).unwrap();
+    //TODO: Fix it later to use `TcpOpts` from compio.
     let listener: std::net::TcpListener = socket.into();
-    let listener = monoio::net::TcpListener::from_std(listener).unwrap();
+    let listener = compio::net::TcpListener::from_std(listener).unwrap();
     info!("{server_name} server has started on: {:?}", addr);
 
     loop {
@@ -44,7 +50,7 @@ pub async fn start(server_name: &'static str, addr: SocketAddr, socket: Socket, 
                 if shard.is_shutting_down() {
                     return;
                 }
-                monoio::time::sleep(Duration::from_millis(100)).await;
+                compio::time::sleep(Duration::from_millis(100)).await;
             }
         };
 

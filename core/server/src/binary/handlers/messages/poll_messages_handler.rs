@@ -27,8 +27,10 @@ use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{ShardMessage, ShardRequest, ShardRequestPayload};
 use crate::streaming::segments::IggyMessagesBatchSet;
 use crate::streaming::session::Session;
+use crate::streaming::utils::PooledBuffer;
 use crate::to_iovec;
 use anyhow::Result;
+use bytes::BytesMut;
 use error_set::ErrContext;
 use iggy_common::{IggyError, PollMessages};
 use std::io::IoSlice;
@@ -76,7 +78,7 @@ impl ServerCommandHandler for PollMessages {
 
         let user_id = session.get_user_id();
         let client_id = session.client_id;
-        let (metadata, batch) = shard
+        let (metadata, mut batch) = shard
             .poll_messages(
                 client_id,
                 user_id,
@@ -96,16 +98,19 @@ impl ServerCommandHandler for PollMessages {
         let response_length = 4 + 8 + 4 + batch.size();
         let response_length_bytes = response_length.to_le_bytes();
 
-        let partition_id = metadata.partition_id.to_le_bytes();
-        let current_offset = metadata.current_offset.to_le_bytes();
-        let count = batch.count().to_le_bytes();
+        let mut bufs = Vec::with_capacity(batch.containers_count() + 5);
+        let mut partition_id_buf = PooledBuffer::with_capacity(4);
+        let mut current_offset_buf = PooledBuffer::with_capacity(8);
+        let mut count_buf = PooledBuffer::with_capacity(4);
+        partition_id_buf.put_u32_le(metadata.partition_id);
+        current_offset_buf.put_u64_le(metadata.current_offset);
+        count_buf.put_u32_le(batch.count());
 
-        let mut iovecs = Vec::with_capacity(batch.containers_count() + 3);
-        iovecs.push(to_iovec(&partition_id));
-        iovecs.push(to_iovec(&current_offset));
-        iovecs.push(to_iovec(&count));
+        bufs.push(partition_id_buf);
+        bufs.push(current_offset_buf);
+        bufs.push(count_buf);
 
-        iovecs.extend(batch.iter().map(|m| to_iovec(&m)));
+        batch.iter_mut().for_each(|m| bufs.push(m.take_messages()));
         trace!(
             "Sending {} messages to client ({} bytes) to client",
             batch.count(),
@@ -113,7 +118,7 @@ impl ServerCommandHandler for PollMessages {
         );
 
         sender
-            .send_ok_response_vectored(&response_length_bytes, iovecs)
+            .send_ok_response_vectored(&response_length_bytes, bufs)
             .await?;
         Ok(())
     }

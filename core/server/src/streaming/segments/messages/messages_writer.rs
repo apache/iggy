@@ -16,13 +16,10 @@
  * under the License.
  */
 
-use crate::{
-    io::file::IggyFile,
-    streaming::segments::{IggyMessagesBatchSet, messages::write_batch},
-};
+use crate::streaming::segments::{IggyMessagesBatchSet, messages::write_batch};
+use compio::fs::{File, OpenOptions};
 use error_set::ErrContext;
 use iggy_common::{IggyByteSize, IggyError};
-use monoio::fs::{File, OpenOptions};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -34,7 +31,7 @@ use tracing::{error, trace};
 pub struct MessagesWriter {
     file_path: String,
     /// Holds the file for synchronous writes; when asynchronous persistence is enabled, this will be None.
-    file: Option<IggyFile>,
+    file: Option<File>,
     /// When set, asynchronous writes are handled by this persister task.
     messages_size_bytes: Arc<AtomicU64>,
     fsync: bool,
@@ -53,11 +50,13 @@ impl MessagesWriter {
         file_exists: bool,
     ) -> Result<Self, IggyError> {
         let file = OpenOptions::new()
-            .write(true)
             .create(true)
-            .append(true)
+            .write(true)
             .open(file_path)
             .await
+            .with_error_context(|err| {
+                format!("Failed to open messages file: {file_path}, error: {err}")
+            })
             .map_err(|_| IggyError::CannotReadFile)?;
 
         if file_exists {
@@ -82,7 +81,7 @@ impl MessagesWriter {
             messages_size_bytes.load(Ordering::Acquire)
         );
 
-        let file = Some(IggyFile::new(file));
+        let file = Some(file);
         Ok(Self {
             file_path: file_path.to_string(),
             file,
@@ -103,16 +102,16 @@ impl MessagesWriter {
             "Saving batch set of size {messages_size} bytes ({containers_count} containers, {messages_count} messages) to messages file: {}",
             self.file_path
         );
+        let position = self.messages_size_bytes.load(Ordering::Relaxed);
         if let Some(ref mut file) = self.file {
-            write_batch(file, &self.file_path, batch_set)
+            write_batch(file, position, batch_set)
                 .await
                 .with_error_context(|error| {
                     format!(
                         "Failed to write batch to messages file: {}. {error}",
                         self.file_path
                     )
-                })
-                .map_err(|_| IggyError::CannotWriteToFile)?;
+                })?;
         } else {
             error!("File handle is not available for synchronous write.");
             return Err(IggyError::CannotWriteToFile);

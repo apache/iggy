@@ -23,14 +23,14 @@ use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use async_zip::tokio::write::ZipFileWriter;
 use async_zip::{Compression, ZipEntryBuilder};
+use compio::fs::{File, OpenOptions};
+use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use iggy_common::{IggyDuration, IggyError, Snapshot, SnapshotCompression, SystemSnapshotType};
-use monoio::fs::{File, OpenOptions};
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tempfile::NamedTempFile;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 use tracing::{error, info};
@@ -59,6 +59,8 @@ impl IggyShard {
         // and impl the monoio async writer, based on this example:
         // https://youtu.be/RYHYiXMJdZI?si=d2roKeHn5lJrw2ri&t=1140
         // and rc-zip-tokio crate.
+
+        /*
         let cursor = Cursor::new(Vec::new());
         let mut zip_writer = ZipFileWriter::new(cursor.compat_write());
 
@@ -80,13 +82,17 @@ impl IggyShard {
                     let filename = format!("{snapshot_type}.txt");
                     let entry = ZipEntryBuilder::new(filename.clone().into(), compression);
 
-                    let file = File::open(temp_file.path()).await.map_err(|e| {
-                        error!("Failed to open temporary file: {}", e);
-                        IggyError::SnapshotFileCompletionFailed
-                    })?;
+                    let file = OpenOptions::new()
+                        .read(true)
+                        .open(temp_file.path())
+                        .await
+                        .map_err(|e| {
+                            error!("Failed to open temporary file: {}", e);
+                            IggyError::SnapshotFileCompletionFailed
+                        })?;
 
                     let content = Vec::new();
-                    let (result, content) = file.read_exact_at(content, 0).await;
+                    let (result, content) = file.read_exact_at(content, 0).await.into();
                     if let Err(e) = result {
                         error!("Failed to read temporary file: {}", e);
                         continue;
@@ -112,7 +118,9 @@ impl IggyShard {
                 }
             }
         }
+        */
 
+        /*
         info!(
             "Snapshot commands {:?} finished in {}",
             snapshot_types,
@@ -128,7 +136,8 @@ impl IggyShard {
         let zip_data = cursor.into_inner();
 
         info!("Final zip size: {} bytes", zip_data.len());
-        Ok(Snapshot::new(zip_data))
+        */
+        Ok(Snapshot::new(vec![]))
     }
 }
 
@@ -137,8 +146,11 @@ async fn write_command_output_to_temp_file(
 ) -> Result<NamedTempFile, std::io::Error> {
     let output = command.output().await?;
     let temp_file = NamedTempFile::new()?;
-    let file = File::from_std(temp_file.as_file().try_clone()?).unwrap();
-    let (result, _) = file.write_all_at(output.stdout, 0).await;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(temp_file.path())
+        .await?;
+    let (result, _) = file.write_all_at(output.stdout, 0).await.into();
     result?;
     file.sync_all().await?;
     Ok(temp_file)
@@ -150,33 +162,39 @@ async fn get_filesystem_overview() -> Result<NamedTempFile, std::io::Error> {
 
 async fn get_process_info() -> Result<NamedTempFile, std::io::Error> {
     let temp_file = NamedTempFile::new()?;
-    let file = File::from_std(temp_file.as_file().try_clone()?).unwrap();
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(temp_file.path())
+        .await?;
 
     let mut position = 0;
     let ps_output = Command::new("ps").arg("aux").output().await?;
     let (result, written) = file
         .write_all_at(b"=== Process List (ps aux) ===\n", 0)
-        .await;
+        .await
+        .into();
     result?;
     position += written.len() as u64;
 
-    let (result, written) = file.write_all_at(ps_output.stdout, position).await;
+    let (result, written) = file.write_all_at(ps_output.stdout, position).await.into();
     result?;
     position += written.len() as u64;
 
-    let (result, written) = file.write_all_at(b"\n\n", position).await;
+    let (result, written) = file.write_all_at(b"\n\n", position).await.into();
     result?;
     position += written.len() as u64;
 
     let (result, written) = file
         .write_all_at(b"=== Detailed Process Information ===\n", position)
-        .await;
+        .await
+        .into();
     result?;
     position += written.len() as u64;
 
     let proc_info = procdump::get_proc_info().await?;
     let bytes = proc_info.as_bytes().to_owned();
-    let (result, _) = file.write_all_at(bytes, position).await;
+    let (result, _) = file.write_all_at(bytes, position).await.into();
     result?;
     file.sync_all().await?;
 

@@ -16,13 +16,13 @@
  * under the License.
  */
 
-use crate::io::file::IggyFile;
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
-use crate::streaming::utils::{PooledBuffer, file};
+use crate::streaming::utils::PooledBuffer;
 use bytes::BytesMut;
+use compio::fs::{File, OpenOptions};
+use compio::io::AsyncReadAtExt;
 use error_set::ErrContext;
 use iggy_common::IggyError;
-use monoio::fs::File;
 use std::{
     io::ErrorKind,
     sync::{
@@ -36,7 +36,7 @@ use tracing::{error, trace};
 #[derive(Debug)]
 pub struct MessagesReader {
     file_path: String,
-    file: IggyFile,
+    file: File,
     messages_size_bytes: Arc<AtomicU64>,
 }
 
@@ -46,9 +46,12 @@ impl MessagesReader {
         file_path: &str,
         messages_size_bytes: Arc<AtomicU64>,
     ) -> Result<Self, IggyError> {
-        let file = file::open_std(file_path)
+        let file = OpenOptions::new()
+            .read(true)
+            .open(file_path)
+            .await
             .with_error_context(|error| {
-                format!("Failed to open messages file: {file_path}, error: {error}")
+                format!("Failed to open messages file: {file_path}. {error}")
             })
             .map_err(|_| IggyError::CannotReadFile)?;
 
@@ -67,7 +70,6 @@ impl MessagesReader {
                 )
             });
         }
-        let file = File::from_std(file).unwrap();
 
         trace!(
             "Opened messages file for reading: {file_path}, size: {}",
@@ -177,13 +179,13 @@ impl MessagesReader {
         if use_pool {
             let mut buf = PooledBuffer::with_capacity(len as usize);
             unsafe { buf.set_len(len as usize) };
-            let (result, buf) = self.file.read_exact_at(buf, offset as u64).await;
+            let (result, buf) = self.file.read_exact_at(buf, offset as u64).await.into();
             result?;
             Ok(buf)
         } else {
             let mut buf = BytesMut::with_capacity(len as usize);
             unsafe { buf.set_len(len as usize) };
-            let (result, buf) = self.file.read_exact_at(buf, offset as u64).await;
+            let (result, buf) = self.file.read_exact_at(buf, offset as u64).await.into();
             result?;
             Ok(PooledBuffer::from_existing(buf))
         }

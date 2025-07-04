@@ -24,7 +24,6 @@ use crate::streaming::clients::client_manager::Transport;
 use crate::tcp::connection_handler::{handle_connection, handle_error};
 use futures::FutureExt;
 use iggy_common::IggyError;
-use monoio_rustls::TlsAcceptor;
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls_pemfile::{certs, private_key};
@@ -42,8 +41,9 @@ pub(crate) async fn start(
     socket: Socket,
     shard: Rc<IggyShard>,
 ) -> Result<(), IggyError> {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let config = &shard.config.tcp.tls;
+    /*
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let config = &shard.config.tcp.tls;
 
         let (certs, key) =
             if config.self_signed && !std::path::Path::new(&config.cert_file).exists() {
@@ -59,93 +59,94 @@ pub(crate) async fn start(
                     .unwrap_or_else(|e| panic!("Failed to load certificates: {e}"))
             };
 
-        let server_config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .unwrap_or_else(|e| panic!("Unable to create TLS server config: {e}"));
+    let server_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap_or_else(|e| panic!("Unable to create TLS server config: {e}"));
 
-        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let acceptor = TlsAcceptor::from(Arc::new(server_config));
 
-        socket
-            .bind(&addr.into())
-            .unwrap_or_else(|e| panic!("Unable to bind socket to address '{addr}': {e}",));
+    socket
+        .bind(&addr.into())
+        .unwrap_or_else(|e| panic!("Unable to bind socket to address '{addr}': {e}",));
 
-        let listener: std::net::TcpListener = socket.into();
-        let listener = monoio::net::TcpListener::from_std(listener).unwrap();
-        info!("{server_name} server has started on: {:?}", addr);
+    let listener: std::net::TcpListener = socket.into();
+    let listener = monoio::net::TcpListener::from_std(listener).unwrap();
+    info!("{server_name} server has started on: {:?}", addr);
 
-        loop {
-            let shutdown_check = async {
-                loop {
-                    if shard.is_shutting_down() {
-                        return;
-                    }
-                    monoio::time::sleep(Duration::from_millis(100)).await;
+    loop {
+        let shutdown_check = async {
+            loop {
+                if shard.is_shutting_down() {
+                    return;
                 }
-            };
+                monoio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
 
-            let accept_future = listener.accept();
-            futures::select! {
-                _ = shutdown_check.fuse() => {
-                    info!("TCP TLS server detected shutdown flag, no longer accepting connections");
-                    break;
-                }
-                result = accept_future.fuse() => {
-                    match result {
-                        Ok((stream, address)) => {
-                            if shard.is_shutting_down() {
-                                info!("Rejecting new TLS connection from {} during shutdown", address);
-                                continue;
-                            }
-                            let shard_clone = shard.clone();
-                            info!("Accepted new TCP TLS connection: {}", address);
-                            let transport = Transport::Tcp;
-                            let session = shard_clone.add_client(&address, transport);
-                            //TODO: Those can be shared with other shards.
-                            shard_clone.add_active_session(session.clone());
-                            // Broadcast session to all shards.
-                            let event = ShardEvent::NewSession { address, transport };
-                            // TODO: Fixme look inside of broadcast_event_to_all_shards method.
-                            let _responses = shard_clone.broadcast_event_to_all_shards(event.into());
+        let accept_future = listener.accept();
+        futures::select! {
+            _ = shutdown_check.fuse() => {
+                info!("TCP TLS server detected shutdown flag, no longer accepting connections");
+                break;
+            }
+            result = accept_future.fuse() => {
+                match result {
+                    Ok((stream, address)) => {
+                        if shard.is_shutting_down() {
+                            info!("Rejecting new TLS connection from {} during shutdown", address);
+                            continue;
+                        }
+                        let shard_clone = shard.clone();
+                        info!("Accepted new TCP TLS connection: {}", address);
+                        let transport = Transport::Tcp;
+                        let session = shard_clone.add_client(&address, transport);
+                        //TODO: Those can be shared with other shards.
+                        shard_clone.add_active_session(session.clone());
+                        // Broadcast session to all shards.
+                        let event = ShardEvent::NewSession { address, transport };
+                        // TODO: Fixme look inside of broadcast_event_to_all_shards method.
+                        let _responses = shard_clone.broadcast_event_to_all_shards(event.into());
 
-                            let client_id = session.client_id;
-                            info!("Created new session: {session}");
-                            let acceptor = acceptor.clone();
-                            
-                            let conn_stop_receiver = shard_clone.task_registry.add_connection(client_id);
+                        let client_id = session.client_id;
+                        info!("Created new session: {session}");
+                        let acceptor = acceptor.clone();
 
-                            let shard_for_conn = shard_clone.clone();
-                            shard_clone.task_registry.spawn_tracked(async move {
-                                match acceptor.accept(stream).await {
-                                    Ok(tls_stream) => {
-                                        let mut sender = SenderKind::get_tcp_tls_sender(tls_stream.into());
-                                        if let Err(error) = handle_connection(&session, &mut sender, &shard_for_conn, conn_stop_receiver).await {
-                                            handle_error(error);
-                                        }
-                                        shard_for_conn.task_registry.remove_connection(&client_id);
+                        let conn_stop_receiver = shard_clone.task_registry.add_connection(client_id);
 
-                                        if let Err(error) = sender.shutdown().await {
-                                            error!(
-                                                "Failed to shutdown TCP TLS stream for client: {client_id}, address: {address}. {error}"
-                                            );
-                                        } else {
-                                            info!(
-                                                "Successfully closed TCP TLS stream for client: {client_id}, address: {address}."
-                                            );
-                                        }
+                        let shard_for_conn = shard_clone.clone();
+                        shard_clone.task_registry.spawn_tracked(async move {
+                            match acceptor.accept(stream).await {
+                                Ok(tls_stream) => {
+                                    let mut sender = SenderKind::get_tcp_tls_sender(tls_stream.into());
+                                    if let Err(error) = handle_connection(&session, &mut sender, &shard_for_conn, conn_stop_receiver).await {
+                                        handle_error(error);
                                     }
-                                    Err(e) => {
-                                        error!("Failed to accept TLS connection from '{address}': {e}");
-                                        shard_for_conn.task_registry.remove_connection(&client_id);
+                                    shard_for_conn.task_registry.remove_connection(&client_id);
+
+                                    if let Err(error) = sender.shutdown().await {
+                                        error!(
+                                            "Failed to shutdown TCP TLS stream for client: {client_id}, address: {address}. {error}"
+                                        );
+                                    } else {
+                                        info!(
+                                            "Successfully closed TCP TLS stream for client: {client_id}, address: {address}."
+                                        );
                                     }
                                 }
-                            });
-                        }
-                        Err(error) => error!("Unable to accept TCP TLS socket. {error}"),
+                                Err(e) => {
+                                    error!("Failed to accept TLS connection from '{address}': {e}");
+                                    shard_for_conn.task_registry.remove_connection(&client_id);
+                                }
+                            }
+                        });
                     }
+                    Err(error) => error!("Unable to accept TCP TLS socket. {error}"),
                 }
             }
         }
+    }
+    */
     Ok(())
 }
 

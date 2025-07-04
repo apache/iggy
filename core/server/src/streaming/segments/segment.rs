@@ -21,6 +21,7 @@ use super::messages::*;
 use super::messages_accumulator::MessagesAccumulator;
 use crate::configs::system::SystemConfig;
 use crate::streaming::segments::*;
+use compio::fs::remove_file;
 use error_set::ErrContext;
 use iggy_common::INDEX_SIZE;
 use iggy_common::IggyByteSize;
@@ -30,7 +31,6 @@ use iggy_common::IggyTimestamp;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::fs::remove_file;
 use tracing::{info, warn};
 
 const SIZE_16MB: usize = 16 * 1024 * 1024;
@@ -302,7 +302,7 @@ impl Segment {
     pub async fn shutdown_writing(&mut self) {
         if let Some(log_writer) = self.messages_writer.take() {
             //TODO: Fixme not sure whether we should spawn a task here.
-            monoio::spawn(async move {
+            compio::runtime::spawn(async move {
                 let _ = log_writer.fsync().await;
             });
         } else {
@@ -314,7 +314,7 @@ impl Segment {
 
         if let Some(index_writer) = self.index_writer.take() {
             //TODO: Fixme not sure whether we should spawn a task here.
-            monoio::spawn(async move {
+            compio::runtime::spawn(async move {
                 let _ = index_writer.fsync().await;
                 drop(index_writer)
             });

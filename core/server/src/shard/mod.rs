@@ -110,6 +110,7 @@ impl Shard {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct ShardInfo {
     id: u16,
 }
@@ -117,6 +118,10 @@ pub struct ShardInfo {
 impl ShardInfo {
     pub fn new(id: u16) -> Self {
         Self { id }
+    }
+
+    pub fn id(&self) -> u16 {
+        self.id
     }
 }
 
@@ -193,7 +198,8 @@ impl IggyShard {
         let stop_receiver = self.get_stop_receiver();
         let shard_for_shutdown = self.clone();
 
-        monoio::spawn(async move {
+        /*
+        compio::runtime::spawn(async move {
             let _ = stop_receiver.recv().await;
             info!("Shard {} received shutdown signal", shard_for_shutdown.id);
 
@@ -207,6 +213,7 @@ impl IggyShard {
                 );
             }
         });
+        */
 
         let result = try_join_all(tasks).await;
         result?;
@@ -506,7 +513,7 @@ impl IggyShard {
     async fn handle_event(&self, event: Arc<ShardEvent>) -> Result<(), IggyError> {
         match &*event {
             ShardEvent::CreatedStream { stream_id, name } => {
-                self.create_stream_bypass_auth(*stream_id, name).await
+                self.create_stream_bypass_auth(*stream_id, name)
             }
             ShardEvent::CreatedTopic {
                 stream_id,
@@ -517,6 +524,7 @@ impl IggyShard {
                 compression_algorithm,
                 max_topic_size,
                 replication_factor,
+                shards_assignment,
             } => {
                 self.create_topic_bypass_auth(
                     stream_id,
@@ -527,6 +535,7 @@ impl IggyShard {
                     *compression_algorithm,
                     *max_topic_size,
                     *replication_factor,
+                    shards_assignment.clone()
                 )
                 .await
             }
@@ -604,7 +613,7 @@ impl IggyShard {
 
     pub fn insert_shard_table_records(
         &self,
-        records: impl Iterator<Item = (IggyNamespace, ShardInfo)>,
+        records: impl IntoIterator<Item = (IggyNamespace, ShardInfo)>,
     ) {
         self.shards_table.borrow_mut().extend(records);
     }

@@ -62,6 +62,7 @@ pub(crate) async fn handle_connection(
                         if error.as_code() == IggyError::ConnectionClosed.as_code() {
                             return Err(ConnectionError::from(error));
                         } else {
+                            error!("got error: {:?}", error);
                             sender.send_error_response(error).await?;
                             continue;
                         }
