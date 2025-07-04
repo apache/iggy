@@ -16,13 +16,15 @@
  * under the License.
  */
 
-#[allow(deprecated)]
-pub mod client_provider;
-pub mod client_wrappers;
-pub mod clients;
-pub mod consumer_ext;
-pub mod http;
-pub mod prelude;
-pub mod quic;
-pub mod stream_builder;
-pub mod tcp;
+mod binary_client;
+mod binary_consumer_group_client;
+mod binary_consumer_offset_client;
+mod binary_message_client;
+mod binary_partition_client;
+mod binary_personal_access_token_client;
+mod binary_segment_client;
+mod binary_stream_client;
+mod binary_system_client;
+mod binary_topic_client;
+mod binary_user_client;
+pub mod client_wrapper;

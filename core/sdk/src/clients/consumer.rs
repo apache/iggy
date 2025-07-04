@@ -16,11 +16,14 @@
  * under the License.
  */
 
+use crate::client_wrappers::client_wrapper::ClientWrapper;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::Stream;
 use futures_util::{FutureExt, StreamExt};
-use iggy_binary_protocol::Client;
+use iggy_binary_protocol::{
+    Client, ConsumerGroupClient, ConsumerOffsetClient, MessageClient, StreamClient, TopicClient,
+};
 use iggy_common::locking::{IggySharedMut, IggySharedMutFn};
 use iggy_common::{
     Consumer, ConsumerKind, DiagnosticEvent, EncryptorKind, IdKind, Identifier, IggyDuration,
@@ -93,7 +96,7 @@ unsafe impl Sync for IggyConsumer {}
 pub struct IggyConsumer {
     initialized: bool,
     can_poll: Arc<AtomicBool>,
-    client: IggySharedMut<Box<dyn Client>>,
+    client: IggySharedMut<ClientWrapper>,
     consumer_name: String,
     consumer: Arc<Consumer>,
     is_consumer_group: bool,
@@ -129,7 +132,7 @@ pub struct IggyConsumer {
 impl IggyConsumer {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        client: IggySharedMut<Box<dyn Client>>,
+        client: IggySharedMut<ClientWrapper>,
         consumer_name: String,
         consumer: Consumer,
         stream_id: Identifier,
@@ -405,7 +408,7 @@ impl IggyConsumer {
 
     #[allow(clippy::too_many_arguments)]
     async fn store_consumer_offset(
-        client: &IggySharedMut<Box<dyn Client>>,
+        client: &IggySharedMut<ClientWrapper>,
         consumer: &Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
@@ -781,7 +784,7 @@ impl IggyConsumer {
     }
 
     async fn initialize_consumer_group(
-        client: IggySharedMut<Box<dyn Client>>,
+        client: IggySharedMut<ClientWrapper>,
         create_consumer_group_if_not_exists: bool,
         stream_id: Arc<Identifier>,
         topic_id: Arc<Identifier>,
