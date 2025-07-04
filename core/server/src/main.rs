@@ -30,8 +30,8 @@ use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyError};
 use server::args::Args;
 use server::bootstrap::{
-    create_directories, create_root_user, create_shard_connections,
-    create_shard_executor, load_config, resolve_persister,
+    create_directories, create_root_user, create_shard_connections, create_shard_executor,
+    load_config, resolve_persister,
 };
 use server::configs::config_provider::{self};
 use server::configs::server::ServerConfig;
@@ -266,21 +266,21 @@ fn main() -> Result<(), ServerError> {
 
     let shutdown_handles_for_signal = shutdown_handles.clone();
     /*
-    ::set_handler(move || {
-        info!("Received shutdown signal (SIGTERM/SIGINT), initiating graceful shutdown...");
+        ::set_handler(move || {
+            info!("Received shutdown signal (SIGTERM/SIGINT), initiating graceful shutdown...");
 
-        for (shard_id, stop_sender) in &shutdown_handles_for_signal {
-            info!("Sending shutdown signal to shard {}", shard_id);
-            if let Err(e) = stop_sender.send_blocking(()) {
-                error!(
-                    "Failed to send shutdown signal to shard {}: {}",
-                    shard_id, e
-                );
+            for (shard_id, stop_sender) in &shutdown_handles_for_signal {
+                info!("Sending shutdown signal to shard {}", shard_id);
+                if let Err(e) = stop_sender.send_blocking(()) {
+                    error!(
+                        "Failed to send shutdown signal to shard {}: {}",
+                        shard_id, e
+                    );
+                }
             }
-        }
-    })
-    .expect("Error setting Ctrl-C handler");
-*/
+        })
+        .expect("Error setting Ctrl-C handler");
+    */
 
     info!("Iggy server is running. Press Ctrl+C or send SIGTERM to shutdown.");
     for (idx, handle) in handles.into_iter().enumerate() {

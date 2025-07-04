@@ -462,7 +462,7 @@ impl PartitionStorage for FilePartitionStorage {
                 })
                 .map_err(|_| IggyError::CannotReadFile)?;
             // TODO: This is like awfull.
-            let mut cursor = std::io::Cursor::new(file);  
+            let mut cursor = std::io::Cursor::new(file);
             let offset = cursor
                 .read_u64_le()
                 .await

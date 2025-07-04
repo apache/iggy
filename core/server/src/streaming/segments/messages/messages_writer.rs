@@ -16,9 +16,7 @@
  * under the License.
  */
 
-use crate::{
-    streaming::segments::{IggyMessagesBatchSet, messages::write_batch},
-};
+use crate::streaming::segments::{IggyMessagesBatchSet, messages::write_batch};
 use compio::fs::{File, OpenOptions};
 use error_set::ErrContext;
 use iggy_common::{IggyByteSize, IggyError};

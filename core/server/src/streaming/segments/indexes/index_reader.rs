@@ -17,7 +17,7 @@
  */
 
 use super::IggyIndexesMut;
-use crate::{streaming::utils::PooledBuffer};
+use crate::streaming::utils::PooledBuffer;
 use bytes::BytesMut;
 use compio::{
     BufResult,

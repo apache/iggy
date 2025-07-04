@@ -18,7 +18,9 @@
 
 use bytes::{Bytes, BytesMut};
 use compio::{
-    buf::{IoBuf, IoBufMut}, io::{AsyncRead, AsyncReadAtExt, AsyncReadExt, AsyncWriteExt}, BufResult
+    BufResult,
+    buf::{IoBuf, IoBufMut},
+    io::{AsyncRead, AsyncReadAtExt, AsyncReadExt, AsyncWriteExt},
 };
 use iggy_common::IggyError;
 use nix::libc;
@@ -126,7 +128,7 @@ where
     );
     let status = PooledBuffer::from(status);
     let length = PooledBuffer::from(length);
-    slices.splice(0..0,  [status, length]);
+    slices.splice(0..0, [status, length]);
     stream
         .write_vectored_all(slices)
         .await

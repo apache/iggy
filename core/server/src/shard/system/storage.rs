@@ -24,10 +24,10 @@ use crate::streaming::utils::PooledBuffer;
 use crate::streaming::utils::file;
 use anyhow::Context;
 use compio::io::AsyncReadAtExt;
+use compio::io::AsyncReadExt;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use std::sync::Arc;
-use compio::io::AsyncReadExt;
 use tracing::info;
 
 #[derive(Debug)]
@@ -62,7 +62,9 @@ impl SystemInfoStorage for FileSystemInfoStorage {
             .map_err(|_| IggyError::CannotReadFileMetadata)?
             .len() as usize;
 
-        let file = file::open(&self.path).await.map_err(|_| IggyError::CannotReadFile)?;
+        let file = file::open(&self.path)
+            .await
+            .map_err(|_| IggyError::CannotReadFile)?;
         let mut buffer = PooledBuffer::with_capacity(file_size);
         buffer.put_bytes(0, file_size);
         let (result, buffer) = file.read_exact_at(buffer, 0).await.into();

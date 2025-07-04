@@ -23,9 +23,9 @@ use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use async_zip::tokio::write::ZipFileWriter;
 use async_zip::{Compression, ZipEntryBuilder};
+use compio::fs::{File, OpenOptions};
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use iggy_common::{IggyDuration, IggyError, Snapshot, SnapshotCompression, SystemSnapshotType};
-use compio::fs::{File, OpenOptions};
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -172,7 +172,8 @@ async fn get_process_info() -> Result<NamedTempFile, std::io::Error> {
     let ps_output = Command::new("ps").arg("aux").output().await?;
     let (result, written) = file
         .write_all_at(b"=== Process List (ps aux) ===\n", 0)
-        .await.into();
+        .await
+        .into();
     result?;
     position += written.len() as u64;
 
@@ -186,7 +187,8 @@ async fn get_process_info() -> Result<NamedTempFile, std::io::Error> {
 
     let (result, written) = file
         .write_all_at(b"=== Detailed Process Information ===\n", position)
-        .await.into();
+        .await
+        .into();
     result?;
     position += written.len() as u64;
 

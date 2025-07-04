@@ -132,9 +132,9 @@ impl IggyShard {
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get topic with ID: {topic_id} in stream with ID: {stream_id}")
             })?;
-            topic.persist().await.with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to persist topic: {topic}")
-            })?;
+        topic.persist().await.with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to persist topic: {topic}")
+        })?;
 
         // TODO: Figure out a way how to distribute the shards table among different shards,
         // without the need to do code from below, everytime we handle a `ShardEvent`.
@@ -204,9 +204,9 @@ impl IggyShard {
                 .with_error_context(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to get topic with ID: {topic_id} in stream with ID: {stream_id}")
                 })?;
-            topic.persist().await.with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to persist topic: {topic}")
-            })?;
+        topic.persist().await.with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to persist topic: {topic}")
+        })?;
 
         let records = partition_ids.into_iter().map(|partition_id| {
             let namespace = IggyNamespace::new(stream_id, topic_id, partition_id);

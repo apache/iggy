@@ -19,7 +19,6 @@
 mod messages_reader;
 mod messages_writer;
 
-
 use super::IggyMessagesBatchSet;
 use compio::{fs::File, io::AsyncWriteAtExt};
 use iggy_common::IggyError;
