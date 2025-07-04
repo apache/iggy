@@ -19,7 +19,7 @@
 use crate::test_server::{ClientFactory, Transport};
 use async_trait::async_trait;
 use iggy::http::http_client::HttpClient;
-use iggy::prelude::{Client, HttpClientConfig};
+use iggy::prelude::{ClientWrapper, HttpClientConfig};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -29,13 +29,13 @@ pub struct HttpClientFactory {
 
 #[async_trait]
 impl ClientFactory for HttpClientFactory {
-    async fn create_client(&self) -> Box<dyn Client> {
+    async fn create_client(&self) -> ClientWrapper {
         let config = HttpClientConfig {
             api_url: format!("http://{}", self.server_addr.clone()),
             ..HttpClientConfig::default()
         };
         let client = HttpClient::create(Arc::new(config)).unwrap();
-        Box::new(client)
+        ClientWrapper::Http(client)
     }
 
     fn transport(&self) -> Transport {

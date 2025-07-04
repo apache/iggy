@@ -18,7 +18,7 @@
 
 use crate::test_server::{ClientFactory, Transport};
 use async_trait::async_trait;
-use iggy::prelude::{Client, TcpClient, TcpClientConfig};
+use iggy::prelude::{Client, ClientWrapper, TcpClient, TcpClientConfig};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Default)]
@@ -33,7 +33,7 @@ pub struct TcpClientFactory {
 
 #[async_trait]
 impl ClientFactory for TcpClientFactory {
-    async fn create_client(&self) -> Box<dyn Client> {
+    async fn create_client(&self) -> ClientWrapper {
         let config = TcpClientConfig {
             server_address: self.server_addr.clone(),
             nodelay: self.nodelay,
@@ -65,7 +65,7 @@ impl ClientFactory for TcpClientFactory {
                 )
             }
         });
-        Box::new(client)
+        ClientWrapper::Tcp(client)
     }
 
     fn transport(&self) -> Transport {

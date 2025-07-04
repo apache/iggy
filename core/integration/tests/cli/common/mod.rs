@@ -24,10 +24,8 @@ use assert_cmd::assert::{Assert, OutputAssertExt};
 use assert_cmd::prelude::CommandCargoExt;
 use async_trait::async_trait;
 use iggy::clients::client::IggyClient;
-use iggy::prelude::TcpClient;
-use iggy::prelude::TcpClientConfig;
 use iggy::prelude::defaults::*;
-use iggy::prelude::{Client, SystemClient, UserClient};
+use iggy::prelude::{Client, ClientWrapper, SystemClient, TcpClient, TcpClientConfig, UserClient};
 use integration::test_server::TestServer;
 use std::fmt::{Display, Formatter, Result};
 use std::io::Write;
@@ -107,7 +105,7 @@ impl IggyCmdTest {
             server_address: server.get_raw_tcp_addr().unwrap(),
             ..TcpClientConfig::default()
         };
-        let client = Box::new(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
+        let client = ClientWrapper::Tcp(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
         let client = IggyClient::create(client, None, None);
 
         Self { server, client }

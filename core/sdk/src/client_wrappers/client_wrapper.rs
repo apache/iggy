@@ -16,13 +16,16 @@
  * under the License.
  */
 
-#[allow(deprecated)]
-pub mod client_provider;
-pub mod client_wrappers;
-pub mod clients;
-pub mod consumer_ext;
-pub mod http;
-pub mod prelude;
-pub mod quic;
-pub mod stream_builder;
-pub mod tcp;
+use crate::clients::client::IggyClient;
+use crate::http::http_client::HttpClient;
+use crate::quic::quick_client::QuicClient;
+use crate::tcp::tcp_client::TcpClient;
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum ClientWrapper {
+    Iggy(IggyClient),
+    Http(HttpClient),
+    Tcp(TcpClient),
+    Quic(QuicClient),
+}
