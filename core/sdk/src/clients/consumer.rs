@@ -17,17 +17,14 @@
  */
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
+use crate::client_wrappers::client_wrapper::ClientWrapper;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::Stream;
 use futures_util::{FutureExt, StreamExt};
-<<<<<<< HEAD
 use iggy_binary_protocol::{
     Client, ConsumerGroupClient, ConsumerOffsetClient, MessageClient, StreamClient, TopicClient,
 };
-use iggy_common::locking::{IggySharedMut, IggySharedMutFn};
-=======
-use iggy_binary_protocol::Client;
 use iggy_common::locking::{IggyRwLock, IggySharedMutFn};
 >>>>>>> 639a9a88 (fix sdk)
 use iggy_common::{
@@ -101,11 +98,7 @@ unsafe impl Sync for IggyConsumer {}
 pub struct IggyConsumer {
     initialized: bool,
     can_poll: Arc<AtomicBool>,
-<<<<<<< HEAD
-    client: IggySharedMut<ClientWrapper>,
-=======
-    client: IggyRwLock<Box<dyn Client>>,
->>>>>>> 639a9a88 (fix sdk)
+    client: IggyRwLock<ClientWrapper>,
     consumer_name: String,
     consumer: Arc<Consumer>,
     is_consumer_group: bool,
@@ -141,11 +134,7 @@ pub struct IggyConsumer {
 impl IggyConsumer {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-<<<<<<< HEAD
-        client: IggySharedMut<ClientWrapper>,
-=======
-        client: IggyRwLock<Box<dyn Client>>,
->>>>>>> 639a9a88 (fix sdk)
+        client: IggyRwLock<ClientWrapper>,
         consumer_name: String,
         consumer: Consumer,
         stream_id: Identifier,
@@ -421,11 +410,7 @@ impl IggyConsumer {
 
     #[allow(clippy::too_many_arguments)]
     async fn store_consumer_offset(
-<<<<<<< HEAD
-        client: &IggySharedMut<ClientWrapper>,
-=======
-        client: &IggyRwLock<Box<dyn Client>>,
->>>>>>> 639a9a88 (fix sdk)
+        client: &IggyRwLock<ClientWrapper>,
         consumer: &Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
@@ -801,11 +786,7 @@ impl IggyConsumer {
     }
 
     async fn initialize_consumer_group(
-<<<<<<< HEAD
-        client: IggySharedMut<ClientWrapper>,
-=======
-        client: IggyRwLock<Box<dyn Client>>,
->>>>>>> 639a9a88 (fix sdk)
+        client: IggyRwLock<ClientWrapper>,
         create_consumer_group_if_not_exists: bool,
         stream_id: Arc<Identifier>,
         topic_id: Arc<Identifier>,

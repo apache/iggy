@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
+use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::clients::producer_config::{BackgroundConfig, DirectConfig};
 use crate::prelude::IggyProducer;
 <<<<<<< HEAD
@@ -41,11 +42,7 @@ impl Default for SendMode {
 }
 
 pub struct IggyProducerBuilder {
-<<<<<<< HEAD
-    client: IggySharedMut<ClientWrapper>,
-=======
-    client: IggyRwLock<Box<dyn Client>>,
->>>>>>> 639a9a88 (fix sdk)
+    client: IggyRwLock<ClientWrapper>,
     stream: Identifier,
     stream_name: String,
     topic: Identifier,
@@ -67,11 +64,7 @@ pub struct IggyProducerBuilder {
 impl IggyProducerBuilder {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-<<<<<<< HEAD
-        client: IggySharedMut<ClientWrapper>,
-=======
-        client: IggyRwLock<Box<dyn Client>>,
->>>>>>> 639a9a88 (fix sdk)
+        client: IggyRwLock<ClientWrapper>,
         stream: Identifier,
         stream_name: String,
         topic: Identifier,

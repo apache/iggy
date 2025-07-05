@@ -53,10 +53,20 @@ case $SDK in
   docker compose build --no-cache iggy-server csharp-bdd
   docker compose up --abort-on-container-exit csharp-bdd
   ;;
+"go")
+  echo "🐹 Running Go BDD tests..."
+  docker compose build --no-cache iggy-server go-bdd
+  docker compose up --abort-on-container-exit go-bdd
+  ;;
+"node")
+  echo "🐢🚀 Running node BDD tests..."
+  docker compose build --no-cache iggy-server node-bdd
+  docker compose up --abort-on-container-exit node-bdd
+  ;;
 "all")
   echo "🚀 Running all SDK BDD tests..."
   echo "🦀 Starting with Rust tests..."
-  #docker compose build --no-cache iggy-server rust-bdd python-bdd go-bdd node-bdd csharp-bdd
+  docker compose build --no-cache iggy-server rust-bdd python-bdd go-bdd
   docker compose up --abort-on-container-exit rust-bdd
   echo "🐍 Now running Python tests..."
   docker compose up --abort-on-container-exit python-bdd
@@ -66,6 +76,10 @@ case $SDK in
   docker compose up --abort-on-container-exit node-bdd
   echo "🔷 Now running csharp BDD tests..."
   docker compose up --abort-on-container-exit csharp-bdd
+  echo "🐹 Now running Go tests..."
+  docker compose up --abort-on-container-exit go-bdd
+  echo "🐢🚀 Now unning node BDD tests..."
+  docker compose up --abort-on-container-exit node-bdd
   ;;
 "clean")
   echo "🧹 Cleaning up Docker resources..."
@@ -74,13 +88,15 @@ case $SDK in
   ;;
 *)
   echo "❌ Unknown SDK: $SDK"
-  echo "📖 Usage: $0 [rust|python|go|all|clean] [feature_file]"
+  echo "📖 Usage: $0 [rust|python|go|go|all|clean] [feature_file]"
   echo "📖 Examples:"
   echo "   $0 rust                    # Run Rust tests only"
   echo "   $0 python                  # Run Python tests only"
   echo "   $0 go                      # Run Go tests only"
   echo "   $0 node                    # Run Node.js tests only"
   echo "   $0 csharp                  # Run csharp tests only"
+  echo "   $0 go                      # Run Go tests only"
+  echo "   $0 node                    # Run Node.js tests only"
   echo "   $0 all                     # Run all SDK tests"
   echo "   $0 clean                   # Clean up Docker resources"
   exit 1

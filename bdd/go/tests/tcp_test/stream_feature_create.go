@@ -32,7 +32,7 @@ var _ = ginkgo.Describe("CREATE STREAM:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 
 			itShouldNotReturnError(err)
-			itShouldSuccessfullyCreateStream(streamId, name, client)
+			itShouldSuccessfullyCreateStream(int(streamId), name, client)
 		})
 
 		ginkgo.Context("and tries to create stream with duplicate stream name", func() {
@@ -44,7 +44,7 @@ var _ = ginkgo.Describe("CREATE STREAM:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 
 			itShouldNotReturnError(err)
-			itShouldSuccessfullyCreateStream(streamId, name, client)
+			itShouldSuccessfullyCreateStream(int(streamId), name, client)
 
 			anotherStreamId := createRandomUInt32()
 			_, err = client.CreateStream(name, &anotherStreamId)
@@ -61,7 +61,7 @@ var _ = ginkgo.Describe("CREATE STREAM:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 
 			itShouldNotReturnError(err)
-			itShouldSuccessfullyCreateStream(streamId, name, client)
+			itShouldSuccessfullyCreateStream(int(streamId), name, client)
 
 			_, err = client.CreateStream(createRandomString(32), &streamId)
 

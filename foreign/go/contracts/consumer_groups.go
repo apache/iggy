@@ -35,6 +35,17 @@ type ConsumerGroupMember struct {
 	Partitions      []uint32
 }
 
+type ConsumerGroupDetails struct {
+	ConsumerGroup
+	Members []ConsumerGroupMember
+}
+
+type ConsumerGroupMember struct {
+	ID              int
+	PartitionsCount int
+	Partitions      []int
+}
+
 type CreateConsumerGroupRequest struct {
 	StreamId        Identifier `json:"streamId"`
 	TopicId         Identifier `json:"topicId"`
