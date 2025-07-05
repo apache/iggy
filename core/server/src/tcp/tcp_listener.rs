@@ -17,33 +17,66 @@
  */
 
 use crate::binary::sender::SenderKind;
+use crate::configs::tcp::TcpSocketConfig;
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
 use crate::streaming::clients::client_manager::Transport;
 use crate::tcp::connection_handler::{handle_connection, handle_error};
+use compio::net::{TcpListener, TcpOpts};
+use error_set::ErrContext;
 use futures::FutureExt;
 use iggy_common::IggyError;
 use socket2::Socket;
 use std::net::SocketAddr;
+use std::num::TryFromIntError;
 use std::rc::Rc;
 use std::time::Duration;
 use tracing::{error, info};
 
+async fn create_listener(
+    addr: SocketAddr,
+    config: &TcpSocketConfig,
+) -> Result<TcpListener, std::io::Error> {
+    // Required by the thread-per-core model...
+    // We create bunch of sockets on different threads, that bind to exactly the same address and port.
+    let opts = TcpOpts::new().set_reuse_address(true).set_reuse_port(true);
+    let opts = if config.override_defaults {
+        let recv_buffer_size = config
+            .recv_buffer_size
+            .as_bytes_u64()
+            .try_into()
+            .expect("Failed to parse recv_buffer_size for TCP socket");
+
+        let send_buffer_size = config
+            .send_buffer_size
+            .as_bytes_u64()
+            .try_into()
+            .expect("Failed to parse send_buffer_size for TCP socket");
+
+        opts.set_recv_buffer_size(recv_buffer_size)
+            .set_send_buffer_size(send_buffer_size)
+            .set_keepalive(config.keepalive)
+            .set_linger(config.linger.get_duration())
+            .set_no_delay(config.nodelay)
+    } else {
+        opts
+    };
+    TcpListener::bind_with_options(addr, opts).await
+}
+
 pub async fn start(
     server_name: &'static str,
     addr: SocketAddr,
-    socket: Socket,
+    config: &TcpSocketConfig,
     shard: Rc<IggyShard>,
 ) -> Result<(), IggyError> {
-    socket
-        .bind(&addr.into())
-        .expect("Failed to bind TCP listener");
-    socket.listen(1024).unwrap();
-    //TODO: Fix it later to use `TcpOpts` from compio.
-    let listener: std::net::TcpListener = socket.into();
-    let listener = compio::net::TcpListener::from_std(listener).unwrap();
+    let listener = create_listener(addr, config)
+        .await
+        .map_err(|_| IggyError::CannotBindToSocket(addr.to_string()))
+        .with_error_context(|err| {
+            format!("Failed to bind {server_name} server to address: {addr}, {err}")
+        })?;
     info!("{server_name} server has started on: {:?}", addr);
-
     loop {
         let shutdown_check = async {
             loop {
