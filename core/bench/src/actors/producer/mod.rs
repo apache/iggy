@@ -17,5 +17,8 @@
  */
 
 pub mod benchmark_producer;
+pub mod client;
+pub mod high_level_client;
+pub mod low_level_client;
 
 pub use benchmark_producer::BenchmarkProducer;
