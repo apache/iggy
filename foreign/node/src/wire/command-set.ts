@@ -60,6 +60,8 @@ import { purgeStream } from './stream/purge-stream.command.js';
 import { createPartition } from './partition/create-partition.command.js';
 import { deletePartition } from './partition/delete-partition.command.js';
 
+import { deleteSegments } from './segment/delete-segments.command.js';
+
 import { getStats } from './system/get-stats.command.js';
 import { ping } from './system/ping.command.js';
 
@@ -142,6 +144,12 @@ const partitionAPI = (c: ClientProvider) => ({
 
 type PartitionAPI = ReturnType<typeof partitionAPI>;
 
+const segmentAPI = (c: ClientProvider) => ({
+  delete: deleteSegments(c),
+});
+
+type SegmentAPI = ReturnType<typeof segmentAPI>;
+
 const groupAPI = (c: ClientProvider) => ({
   get: getGroup(c),
   list: getGroups(c),
@@ -192,6 +200,7 @@ export abstract class CommandAPI extends AbstractAPI{
   stream: StreamAPI = streamAPI(this.clientProvider);
   topic: TopicAPI = topicAPI(this.clientProvider);
   partition: PartitionAPI = partitionAPI(this.clientProvider);
+  segment: SegmentAPI = segmentAPI(this.clientProvider);
   group: GroupAPI = groupAPI(this.clientProvider);
   offset: OffsetAPI = offsetAPI(this.clientProvider);
   message: MessageAPI = messageAPI(this.clientProvider);

@@ -21,20 +21,22 @@
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { uint32ToBuf } from '../number.utils.js';
 
-export const serializePartitionParams = (
-  streamId: Id, topicId: Id, partitionCount = 1,
+export const serializeSegmentsParams = (
+  streamId: Id, topicId: Id, partitionId: number, segmentsCount: number,
 ) => {
 
-  if (partitionCount < 1 || partitionCount > 1000)
+  if (segmentsCount < 1 || segmentsCount > 1000)
     throw new Error('Topic partition_count must be between 1 and 1000');
 
   const streamIdentifier = serializeIdentifier(streamId);
   const topicIdentifier = serializeIdentifier(topicId);
-  const b = uint32ToBuf(partitionCount);
+  const bPartitionId = uint32ToBuf(partitionId);
+  const bSegmentsCount = uint32ToBuf(segmentsCount);
 
   return Buffer.concat([
     streamIdentifier,
     topicIdentifier,
-    b,
+    bPartitionId,
+    bSegmentsCount
   ])
 };

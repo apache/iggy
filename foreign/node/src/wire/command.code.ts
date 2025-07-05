@@ -23,7 +23,7 @@ import { reverseRecord } from '../type.utils.js';
 export const COMMAND_CODE = {
   Ping: 1,
   GetStats: 10,
-  // GetSnapshot: 11,                    // @TODO GET_SNAPSHOT_FILE_CODE: u32 = 11
+  GetSnapshot: 11,                    // @TODO GET_SNAPSHOT_FILE_CODE: u32 = 11
   GetMe: 20,
   GetClient: 21,
   GetClients: 22,
@@ -60,7 +60,7 @@ export const COMMAND_CODE = {
   PurgeTopic: 305,
   CreatePartitions: 402,
   DeletePartitions: 403,
-  // DeleteSegments: 503,            // @TODO  DELETE_SEGMENTS_CODE: u32 = 503;
+  DeleteSegments: 503,
   GetGroup: 600,
   GetGroups: 601,
   CreateGroup: 602,
