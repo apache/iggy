@@ -127,12 +127,6 @@ class ReceiveMessage:
         
         The checksum represents the integrity of the message within its topic.
         """
-    def state(self) -> MessageState:
-        r"""
-        Retrieves the Message's state of the received message.
-        
-        State represents the state of the response.
-        """
     def length(self) -> builtins.int:
         r"""
         Retrieves the length of the received message.
@@ -166,12 +160,6 @@ class TopicDetails:
     name: builtins.str
     messages_count: builtins.int
     partitions_count: builtins.int
-
-class MessageState(Enum):
-    Available = ...
-    Unavailable = ...
-    Poisoned = ...
-    MarkedForDeletion = ...
 
 class PollingStrategy(Enum):
     Offset = ...

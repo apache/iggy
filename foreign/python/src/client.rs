@@ -91,7 +91,7 @@ impl IggyClient {
             inner
                 .ping()
                 .await
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e)))
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))
         })
     }
 
@@ -107,7 +107,7 @@ impl IggyClient {
         let inner = self.inner.clone();
         future_into_py(py, async move {
             inner.login_user(&username, &password).await.map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e))
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}"))
             })?;
             Ok(())
         })
@@ -120,7 +120,7 @@ impl IggyClient {
         let inner = self.inner.clone();
         future_into_py(py, async move {
             inner.connect().await.map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e))
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}"))
             })?;
             Ok(())
         })
@@ -139,7 +139,7 @@ impl IggyClient {
         let inner = self.inner.clone();
         future_into_py(py, async move {
             inner.create_stream(&name, stream_id).await.map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e))
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}"))
             })?;
             Ok(())
         })
@@ -158,7 +158,7 @@ impl IggyClient {
 
         future_into_py(py, async move {
             let stream = inner.get_stream(&stream_id).await.map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e))
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}"))
             })?;
             Ok(stream.map(StreamDetails::from))
         })
@@ -183,7 +183,7 @@ impl IggyClient {
     ) -> PyResult<Bound<'a, PyAny>> {
         let compression_algorithm = match compression_algorithm {
             Some(algo) => CompressionAlgorithm::from_str(&algo).map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e))
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}"))
             })?,
             None => CompressionAlgorithm::default(),
         };
@@ -205,7 +205,7 @@ impl IggyClient {
                 )
                 .await
                 .map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e))
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}"))
                 })?;
             Ok(())
         })
@@ -226,7 +226,7 @@ impl IggyClient {
 
         future_into_py(py, async move {
             let topic = inner.get_topic(&stream_id, &topic_id).await.map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e))
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}"))
             })?;
             Ok(topic.map(TopicDetails::from))
         })
@@ -262,7 +262,7 @@ impl IggyClient {
                 .send_messages(&stream, &topic, &partitioning, messages.as_mut())
                 .await
                 .map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e))
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}"))
                 })?;
             Ok(())
         })
@@ -302,7 +302,7 @@ impl IggyClient {
                 )
                 .await
                 .map_err(|e| {
-                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{:?}", e))
+                    PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}"))
                 })?;
             let messages = polled_messages
                 .messages
