@@ -21,10 +21,13 @@
 import type { CommandResponse } from '../../client/client.type.js';
 import { deserializeClient, type Client } from './client.utils.js';
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 
 export const GET_CLIENTS = {
-  code: 22,
+  code: COMMAND_CODE.GetClients,
+
   serialize: () => Buffer.alloc(0),
+
   deserialize: (r: CommandResponse) => {
     const payloadSize = r.data.length;
     const clients = [];

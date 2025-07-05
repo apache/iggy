@@ -22,6 +22,7 @@ import type { Id } from '../identifier.utils.js';
 import type { CommandResponse } from '../../client/client.type.js';
 import type { Consumer } from '../offset/offset.utils.js';
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 import {
   serializePollMessages, deserializePollMessages,
   type PollingStrategy, type PollMessagesResponse
@@ -39,7 +40,7 @@ export type PollMessages = {
 };
 
 export const POLL_MESSAGES = {
-  code: 100,
+  code: COMMAND_CODE.PollMessages,
 
   serialize: ({
     streamId, topicId, consumer, partitionId, pollingStrategy, count, autocommit

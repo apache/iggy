@@ -21,6 +21,7 @@
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 import {
   type CompressionAlgorithm, CompressionAlgorithmKind, isValidCompressionAlgorithm
 } from './topic.utils.js';
@@ -37,7 +38,7 @@ export type UpdateTopic = {
 };
 
 export const UPDATE_TOPIC = {
-  code: 304,
+  code: COMMAND_CODE.UpdateTopic,
 
   serialize: ({
     streamId,
@@ -74,5 +75,6 @@ export const UPDATE_TOPIC = {
 
   deserialize: deserializeVoidResponse
 };
+
 
 export const updateTopic = wrapCommand<UpdateTopic, boolean>(UPDATE_TOPIC);
