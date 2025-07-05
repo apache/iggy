@@ -19,10 +19,12 @@
 
 
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 import { deserializeVoidResponse } from '../../client/client.utils.js';
 import type { UserStatus } from './user.utils.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { uint8ToBuf } from '../number.utils.js';
+
 
 export type UpdateUser = {
   userId: Id,
@@ -30,11 +32,10 @@ export type UpdateUser = {
   status?: UserStatus
 };
 
-
 export const UPDATE_USER = {
-  code: 35,
+  code: COMMAND_CODE.UpdateUser,
 
-  serialize: ({userId, username, status}: UpdateUser) => {
+  serialize: ({ userId, username, status }: UpdateUser) => {
 
     const bId = serializeIdentifier(userId);
     let bUsername, bStatus;
@@ -58,7 +59,6 @@ export const UPDATE_USER = {
     else
       bStatus = uint8ToBuf(0);
 
-
     return Buffer.concat([
       bId,
       bUsername,
@@ -68,5 +68,6 @@ export const UPDATE_USER = {
 
   deserialize: deserializeVoidResponse
 };
+
 
 export const updateUser = wrapCommand<UpdateUser, boolean>(UPDATE_USER);
