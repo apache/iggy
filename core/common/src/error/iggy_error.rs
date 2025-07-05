@@ -464,6 +464,9 @@ pub enum IggyError {
     ShardNotFound(u32, u32, u32) = 11000,
     #[error("Shard communication error, shard ID: {0}")]
     ShardCommunicationError(u16) = 11001,
+
+    #[error("Cannot bind to socket with addr: {0}")]
+    CannotBindToSocket(String) = 12000,
 }
 
 impl IggyError {

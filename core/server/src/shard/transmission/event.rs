@@ -2,7 +2,10 @@ use std::net::SocketAddr;
 
 use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize};
 
-use crate::{shard::{namespace::IggyNamespace, ShardInfo}, streaming::clients::client_manager::Transport};
+use crate::{
+    shard::{ShardInfo, namespace::IggyNamespace},
+    streaming::clients::client_manager::Transport,
+};
 
 #[derive(Debug)]
 pub enum ShardEvent {

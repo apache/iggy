@@ -535,7 +535,7 @@ impl IggyShard {
                     *compression_algorithm,
                     *max_topic_size,
                     *replication_factor,
-                    shards_assignment.clone()
+                    shards_assignment.clone(),
                 )
                 .await
             }
