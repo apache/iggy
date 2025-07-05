@@ -24,14 +24,14 @@ import (
 )
 
 var _ = Describe("GET TOPIC BY ID:", func() {
-	prefix := "GetTopicById"
+	prefix := "GetTopic"
 	When("User is logged in", func() {
 		Context("and tries to get existing topic", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, name := successfullyCreateTopic(streamId, client)
-			topic, err := client.GetTopicById(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId))
+			topic, err := client.GetTopic(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId))
 
 			itShouldNotReturnError(err)
 			itShouldReturnSpecificTopic(topicId, name, *topic)
@@ -41,7 +41,7 @@ var _ = Describe("GET TOPIC BY ID:", func() {
 			client := createAuthorizedConnection()
 			streamId := int(createRandomUInt32())
 
-			_, err := client.GetTopicById(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(int(createRandomUInt32())))
+			_, err := client.GetTopic(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(int(createRandomUInt32())))
 
 			itShouldReturnSpecificIggyError(err, ierror.TopicIdNotFound)
 		})
@@ -51,7 +51,7 @@ var _ = Describe("GET TOPIC BY ID:", func() {
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 
-			_, err := client.GetTopicById(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(int(createRandomUInt32())))
+			_, err := client.GetTopic(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(int(createRandomUInt32())))
 
 			itShouldReturnSpecificIggyError(err, ierror.TopicIdNotFound)
 		})

@@ -18,20 +18,20 @@
 package tcp_test
 
 import (
-	"github.com/apache/iggy/foreign/go"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	"github.com/apache/iggy/foreign/go/iggycli"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
 // OPERATIONS
 
-func successfullyCreateUser(name string, client iggy.MessageStream) uint32 {
-	request := iggcon.CreateUserRequest{
-		Username: name,
-		Password: createRandomString(16),
-		Status:   iggcon.Active,
-		Permissions: &iggcon.Permissions{
+func successfullyCreateUser(name string, client iggycli.Client) uint32 {
+	_, err := client.CreateUser(
+		name,
+		createRandomString(16),
+		iggcon.Active,
+		&iggcon.Permissions{
 			Global: iggcon.GlobalPermissions{
 				ManageServers: true,
 				ReadServers:   true,
@@ -44,10 +44,7 @@ func successfullyCreateUser(name string, client iggy.MessageStream) uint32 {
 				PollMessages:  true,
 				SendMessages:  true,
 			},
-		},
-	}
-
-	err := client.CreateUser(request)
+		})
 	itShouldNotReturnError(err)
 	user, err := client.GetUser(iggcon.NewIdentifier(name))
 	itShouldNotReturnError(err)
@@ -57,7 +54,7 @@ func successfullyCreateUser(name string, client iggy.MessageStream) uint32 {
 
 // ASSERTIONS
 
-func itShouldSuccessfullyCreateUser(name string, client iggy.MessageStream) {
+func itShouldSuccessfullyCreateUser(name string, client iggycli.Client) {
 	user, err := client.GetUser(iggcon.NewIdentifier(name))
 
 	itShouldNotReturnError(err)
@@ -67,7 +64,7 @@ func itShouldSuccessfullyCreateUser(name string, client iggy.MessageStream) {
 	})
 }
 
-func itShouldSuccessfullyCreateUserWithPermissions(name string, client iggy.MessageStream, permissions map[int]*iggcon.StreamPermissions) {
+func itShouldSuccessfullyCreateUserWithPermissions(name string, client iggycli.Client, permissions map[int]*iggcon.StreamPermissions) {
 	user, err := client.GetUser(iggcon.NewIdentifier(name))
 
 	itShouldNotReturnError(err)
@@ -97,7 +94,7 @@ func itShouldSuccessfullyCreateUserWithPermissions(name string, client iggy.Mess
 	})
 }
 
-func itShouldSuccessfullyUpdateUser(id uint32, name string, client iggy.MessageStream) {
+func itShouldSuccessfullyUpdateUser(id uint32, name string, client iggycli.Client) {
 	user, err := client.GetUser(iggcon.NewIdentifier(name))
 
 	itShouldNotReturnError(err)
@@ -111,7 +108,7 @@ func itShouldSuccessfullyUpdateUser(id uint32, name string, client iggy.MessageS
 	})
 }
 
-func itShouldSuccessfullyDeleteUser(userId int, client iggy.MessageStream) {
+func itShouldSuccessfullyDeleteUser(userId int, client iggycli.Client) {
 	user, err := client.GetUser(iggcon.NewIdentifier(userId))
 
 	itShouldReturnSpecificError(err, "resource_not_found")
@@ -120,7 +117,7 @@ func itShouldSuccessfullyDeleteUser(userId int, client iggy.MessageStream) {
 	})
 }
 
-func itShouldSuccessfullyUpdateUserPermissions(userId uint32, client iggy.MessageStream) {
+func itShouldSuccessfullyUpdateUserPermissions(userId uint32, client iggycli.Client) {
 	user, err := client.GetUser(iggcon.NewIdentifier(int(userId)))
 
 	itShouldNotReturnError(err)
@@ -140,11 +137,8 @@ func itShouldSuccessfullyUpdateUserPermissions(userId uint32, client iggy.Messag
 }
 
 func itShouldBePossibleToLogInWithCredentials(username string, password string) {
-	ms := createConnection()
-	userId, err := ms.LogIn(iggcon.LogInRequest{
-		Username: username,
-		Password: password,
-	})
+	ms := createClient()
+	userId, err := ms.LoginUser(username, password)
 
 	itShouldNotReturnError(err)
 	It("should return userId", func() {
@@ -152,23 +146,23 @@ func itShouldBePossibleToLogInWithCredentials(username string, password string) 
 	})
 }
 
-func itShouldReturnSpecificUser(name string, user iggcon.UserResponse) {
+func itShouldReturnSpecificUser(name string, user iggcon.UserInfo) {
 	It("should fetch user with name "+name, func() {
 		Expect(user.Username).To(Equal(name))
 	})
 }
 
-func itShouldContainSpecificUser(name string, users []*iggcon.UserResponse) {
+func itShouldContainSpecificUser(name string, users []iggcon.UserInfo) {
 	It("should fetch at least one user", func() {
 		Expect(len(users)).NotTo(Equal(0))
 	})
 
-	var user iggcon.UserResponse
+	var user iggcon.UserInfo
 	found := false
 
 	for _, s := range users {
 		if s.Username == name {
-			user = *s
+			user = s
 			found = true
 			break
 		}
@@ -182,6 +176,6 @@ func itShouldContainSpecificUser(name string, users []*iggcon.UserResponse) {
 
 //CLEANUP
 
-func deleteUserAfterTests(name any, client iggy.MessageStream) {
+func deleteUserAfterTests(name any, client iggycli.Client) {
 	_ = client.DeleteUser(iggcon.NewIdentifier(name))
 }

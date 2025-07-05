@@ -24,32 +24,41 @@ import (
 )
 
 func CreateGroup(request CreateConsumerGroupRequest) []byte {
+	if request.ConsumerGroupId == nil {
+		request.ConsumerGroupId = new(uint32)
+	}
 	customIdOffset := 4 + request.StreamId.Length + request.TopicId.Length
 	bytes := make([]byte, 4+request.StreamId.Length+request.TopicId.Length+1+4+len(request.Name))
 	copy(bytes[0:customIdOffset], SerializeIdentifiers(request.StreamId, request.TopicId))
-	binary.LittleEndian.PutUint32(bytes[customIdOffset:customIdOffset+4], uint32(request.ConsumerGroupId))
+	binary.LittleEndian.PutUint32(bytes[customIdOffset:customIdOffset+4], *request.ConsumerGroupId)
 	bytes[customIdOffset+4] = byte(len(request.Name))
-	copy(bytes[customIdOffset+5:], []byte(request.Name))
+	copy(bytes[customIdOffset+5:], request.Name)
 	return bytes
 }
 
-func UpdateOffset(request StoreOffsetRequest) []byte {
+func UpdateOffset(request StoreConsumerOffsetRequest) []byte {
+	if request.PartitionId == nil {
+		request.PartitionId = new(uint32)
+	}
 	bytes := make([]byte, 6+request.StreamId.Length+request.TopicId.Length+request.Consumer.Id.Length+13)
 	bytes[0] = byte(request.Consumer.Kind)
 	position := 7 + request.StreamId.Length + request.TopicId.Length + request.Consumer.Id.Length
 	copy(bytes[1:position], SerializeIdentifiers(request.Consumer.Id, request.StreamId, request.TopicId))
 
-	binary.LittleEndian.PutUint32(bytes[position:position+4], uint32(request.PartitionId))
+	binary.LittleEndian.PutUint32(bytes[position:position+4], *request.PartitionId)
 	binary.LittleEndian.PutUint64(bytes[position+4:position+12], uint64(request.Offset))
 	return bytes
 }
 
-func GetOffset(request GetOffsetRequest) []byte {
+func GetOffset(request GetConsumerOffsetRequest) []byte {
+	if request.PartitionId == nil {
+		request.PartitionId = new(uint32)
+	}
 	bytes := make([]byte, 6+request.StreamId.Length+request.TopicId.Length+request.Consumer.Id.Length+5)
 	bytes[0] = byte(request.Consumer.Kind)
 	position := 7 + request.StreamId.Length + request.TopicId.Length + request.Consumer.Id.Length
 	copy(bytes[1:position], SerializeIdentifiers(request.Consumer.Id, request.StreamId, request.TopicId))
-	binary.LittleEndian.PutUint32(bytes[position:position+4], uint32(request.PartitionId))
+	binary.LittleEndian.PutUint32(bytes[position:position+4], *request.PartitionId)
 	return bytes
 }
 
@@ -62,7 +71,7 @@ func CreatePartitions(request CreatePartitionsRequest) []byte {
 	return bytes
 }
 
-func DeletePartitions(request DeletePartitionRequest) []byte {
+func DeletePartitions(request DeletePartitionsRequest) []byte {
 	bytes := make([]byte, 8+request.StreamId.Length+request.TopicId.Length)
 	position := 4 + request.StreamId.Length + request.TopicId.Length
 	copy(bytes[0:position], SerializeIdentifiers(request.StreamId, request.TopicId))
@@ -214,8 +223,14 @@ func boolToByte(b bool) byte {
 func SerializeUpdateUser(request UpdateUserRequest) []byte {
 	length := request.UserID.Length + 2
 
-	if len(request.Username) != 0 {
-		length += 2 + len(request.Username)
+	if request.Username == nil {
+		request.Username = new(string)
+	}
+
+	username := *request.Username
+
+	if len(username) != 0 {
+		length += 2 + len(username)
 	}
 
 	if request.Status != nil {
@@ -228,13 +243,13 @@ func SerializeUpdateUser(request UpdateUserRequest) []byte {
 	copy(bytes[position:position+request.UserID.Length+2], SerializeIdentifier(request.UserID))
 	position += position + request.UserID.Length + 2
 
-	if len(request.Username) != 0 {
+	if len(username) != 0 {
 		bytes[position] = 1
 		position++
-		bytes[position] = byte(len(request.Username))
+		bytes[position] = byte(len(username))
 		position++
-		copy(bytes[position:position+len(request.Username)], []byte(request.Username))
-		position += len(request.Username)
+		copy(bytes[position:position+len(username)], username)
+		position += len(username)
 	} else {
 		bytes[position] = 0
 		position++
@@ -278,7 +293,7 @@ func SerializeChangePasswordRequest(request ChangePasswordRequest) []byte {
 	return bytes
 }
 
-func SerializeUpdateUserPermissionsRequest(request UpdateUserPermissionsRequest) []byte {
+func SerializeUpdateUserPermissionsRequest(request UpdatePermissionsRequest) []byte {
 	length := request.UserID.Length + 2
 
 	if request.Permissions != nil {
@@ -313,7 +328,7 @@ func SerializeInt(value int) []byte {
 	return bytes
 }
 
-func SerializeLoginWithPersonalAccessToken(request LogInAccessTokenRequest) []byte {
+func SerializeLoginWithPersonalAccessToken(request LoginWithPersonalAccessTokenRequest) []byte {
 	length := 1 + len(request.Token)
 	bytes := make([]byte, length)
 	bytes[0] = byte(len(request.Token))
@@ -321,7 +336,7 @@ func SerializeLoginWithPersonalAccessToken(request LogInAccessTokenRequest) []by
 	return bytes
 }
 
-func SerializeDeletePersonalAccessToken(request DeleteAccessTokenRequest) []byte {
+func SerializeDeletePersonalAccessToken(request DeletePersonalAccessTokenRequest) []byte {
 	length := 1 + len(request.Name)
 	bytes := make([]byte, length)
 	bytes[0] = byte(len(request.Name))
@@ -329,7 +344,7 @@ func SerializeDeletePersonalAccessToken(request DeleteAccessTokenRequest) []byte
 	return bytes
 }
 
-func SerializeCreatePersonalAccessToken(request CreateAccessTokenRequest) []byte {
+func SerializeCreatePersonalAccessToken(request CreatePersonalAccessTokenRequest) []byte {
 	length := 1 + len(request.Name) + 8
 	bytes := make([]byte, length)
 	bytes[0] = byte(len(request.Name))

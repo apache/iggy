@@ -31,10 +31,7 @@ var _ = Describe("UPDATE STREAM:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			newName := createRandomString(128)
 
-			err := client.UpdateStream(iggcon.UpdateStreamRequest{
-				StreamId: iggcon.NewIdentifier(streamId),
-				Name:     newName,
-			})
+			err := client.UpdateStream(iggcon.NewIdentifier(streamId), newName)
 			itShouldNotReturnError(err)
 			itShouldSuccessfullyUpdateStream(streamId, newName, client)
 		})
@@ -46,20 +43,14 @@ var _ = Describe("UPDATE STREAM:", func() {
 			defer deleteStreamAfterTests(stream1Id, client)
 			defer deleteStreamAfterTests(stream2Id, client)
 
-			err := client.UpdateStream(iggcon.UpdateStreamRequest{
-				StreamId: iggcon.NewIdentifier(stream2Id),
-				Name:     stream1Name,
-			})
+			err := client.UpdateStream(iggcon.NewIdentifier(stream2Id), stream1Name)
 
 			itShouldReturnSpecificError(err, "stream_name_already_exists")
 		})
 
 		Context("and tries to update non-existing stream", func() {
 			client := createAuthorizedConnection()
-			err := client.UpdateStream(iggcon.UpdateStreamRequest{
-				StreamId: iggcon.NewIdentifier(int(createRandomUInt32())),
-				Name:     createRandomString(128),
-			})
+			err := client.UpdateStream(iggcon.NewIdentifier(int(createRandomUInt32())), createRandomString(128))
 
 			itShouldReturnSpecificError(err, "stream_id_not_found")
 		})
@@ -69,10 +60,7 @@ var _ = Describe("UPDATE STREAM:", func() {
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, createAuthorizedConnection())
 
-			err := client.UpdateStream(iggcon.UpdateStreamRequest{
-				StreamId: iggcon.NewIdentifier(streamId),
-				Name:     createRandomString(256),
-			})
+			err := client.UpdateStream(iggcon.NewIdentifier(streamId), createRandomString(256))
 
 			itShouldReturnSpecificError(err, "stream_name_too_long")
 		})
@@ -80,11 +68,8 @@ var _ = Describe("UPDATE STREAM:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to update stream", func() {
-			client := createConnection()
-			err := client.UpdateStream(iggcon.UpdateStreamRequest{
-				StreamId: iggcon.NewIdentifier(int(createRandomUInt32())),
-				Name:     createRandomString(128),
-			})
+			client := createClient()
+			err := client.UpdateStream(iggcon.NewIdentifier(int(createRandomUInt32())), createRandomString(128))
 
 			itShouldReturnUnauthenticatedError(err)
 		})

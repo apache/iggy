@@ -20,32 +20,29 @@ package tcp_test
 import (
 	"strconv"
 
-	"github.com/apache/iggy/foreign/go"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
+	"github.com/apache/iggy/foreign/go/iggycli"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
 //operations
 
-func successfullyCreateStream(prefix string, client iggy.MessageStream) (int, string) {
-	streamId := int(createRandomUInt32())
+func successfullyCreateStream(prefix string, client iggycli.Client) (int, string) {
+	streamId := createRandomUInt32()
 	name := createRandomStringWithPrefix(prefix, 128)
 
-	err := client.CreateStream(iggcon.CreateStreamRequest{
-		StreamId: streamId,
-		Name:     name,
-	})
+	_, err := client.CreateStream(name, &streamId)
 
 	itShouldNotReturnError(err)
-	itShouldSuccessfullyCreateStream(streamId, name, client)
-	return streamId, name
+	itShouldSuccessfullyCreateStream(int(streamId), name, client)
+	return int(streamId), name
 }
 
 //assertions
 
-func itShouldReturnSpecificStream(id int, name string, stream iggcon.StreamResponse) {
+func itShouldReturnSpecificStream(id int, name string, stream iggcon.StreamDetails) {
 	It("should fetch stream with id "+string(rune(id)), func() {
 		Expect(stream.Id).To(Equal(id))
 	})
@@ -55,12 +52,12 @@ func itShouldReturnSpecificStream(id int, name string, stream iggcon.StreamRespo
 	})
 }
 
-func itShouldContainSpecificStream(id int, name string, streams []iggcon.StreamResponse) {
+func itShouldContainSpecificStream(id int, name string, streams []iggcon.Stream) {
 	It("should fetch at least one stream", func() {
 		Expect(len(streams)).NotTo(Equal(0))
 	})
 
-	var stream iggcon.StreamResponse
+	var stream iggcon.Stream
 	found := false
 
 	for _, s := range streams {
@@ -82,8 +79,8 @@ func itShouldContainSpecificStream(id int, name string, streams []iggcon.StreamR
 	})
 }
 
-func itShouldSuccessfullyCreateStream(id int, expectedName string, client iggy.MessageStream) {
-	stream, err := client.GetStreamById(iggcon.GetStreamRequest{StreamID: iggcon.NewIdentifier(id)})
+func itShouldSuccessfullyCreateStream(id int, expectedName string, client iggycli.Client) {
+	stream, err := client.GetStream(iggcon.NewIdentifier(id))
 
 	itShouldNotReturnError(err)
 	It("should create stream with id "+string(rune(id)), func() {
@@ -95,8 +92,8 @@ func itShouldSuccessfullyCreateStream(id int, expectedName string, client iggy.M
 	})
 }
 
-func itShouldSuccessfullyUpdateStream(id int, expectedName string, client iggy.MessageStream) {
-	stream, err := client.GetStreamById(iggcon.GetStreamRequest{StreamID: iggcon.NewIdentifier(id)})
+func itShouldSuccessfullyUpdateStream(id int, expectedName string, client iggycli.Client) {
+	stream, err := client.GetStream(iggcon.NewIdentifier(id))
 
 	itShouldNotReturnError(err)
 	It("should update stream with id "+string(rune(id)), func() {
@@ -108,8 +105,8 @@ func itShouldSuccessfullyUpdateStream(id int, expectedName string, client iggy.M
 	})
 }
 
-func itShouldSuccessfullyDeleteStream(id int, client iggy.MessageStream) {
-	stream, err := client.GetStreamById(iggcon.GetStreamRequest{StreamID: iggcon.NewIdentifier(id)})
+func itShouldSuccessfullyDeleteStream(id int, client iggycli.Client) {
+	stream, err := client.GetStream(iggcon.NewIdentifier(id))
 
 	itShouldReturnSpecificIggyError(err, ierror.StreamIdNotFound)
 	It("should not return stream", func() {
@@ -117,6 +114,6 @@ func itShouldSuccessfullyDeleteStream(id int, client iggy.MessageStream) {
 	})
 }
 
-func deleteStreamAfterTests(streamId int, client iggy.MessageStream) {
+func deleteStreamAfterTests(streamId int, client iggycli.Client) {
 	_ = client.DeleteStream(iggcon.NewIdentifier(streamId))
 }

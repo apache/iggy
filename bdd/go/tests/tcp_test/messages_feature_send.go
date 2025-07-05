@@ -31,13 +31,12 @@ var _ = Describe("SEND MESSAGES:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			messages := createDefaultMessages()
-			request := iggcon.SendMessagesRequest{
-				StreamId:     iggcon.NewIdentifier(streamId),
-				TopicId:      iggcon.NewIdentifier(topicId),
-				Partitioning: iggcon.None(),
-				Messages:     messages,
-			}
-			err := client.SendMessages(request)
+			err := client.SendMessages(
+				iggcon.NewIdentifier(streamId),
+				iggcon.NewIdentifier(topicId),
+				iggcon.None(),
+				messages,
+			)
 			itShouldNotReturnError(err)
 			itShouldSuccessfullyPublishMessages(streamId, topicId, messages, client)
 		})
@@ -47,26 +46,24 @@ var _ = Describe("SEND MESSAGES:", func() {
 			streamId, _ := successfullyCreateStream("2"+prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			messages := createDefaultMessages()
-			request := iggcon.SendMessagesRequest{
-				StreamId:     iggcon.NewIdentifier(streamId),
-				TopicId:      iggcon.NewIdentifier(int(createRandomUInt32())),
-				Partitioning: iggcon.None(),
-				Messages:     messages,
-			}
-			err := client.SendMessages(request)
+			err := client.SendMessages(
+				iggcon.NewIdentifier(streamId),
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+				iggcon.None(),
+				messages,
+			)
 			itShouldReturnSpecificError(err, "topic_id_not_found")
 		})
 
 		Context("and tries to send messages to the non existing stream", func() {
 			client := createAuthorizedConnection()
 			messages := createDefaultMessages()
-			request := iggcon.SendMessagesRequest{
-				StreamId:     iggcon.NewIdentifier(int(createRandomUInt32())),
-				TopicId:      iggcon.NewIdentifier(int(createRandomUInt32())),
-				Partitioning: iggcon.None(),
-				Messages:     messages,
-			}
-			err := client.SendMessages(request)
+			err := client.SendMessages(
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+				iggcon.None(),
+				messages,
+			)
 			itShouldReturnSpecificError(err, "stream_id_not_found")
 		})
 
@@ -76,13 +73,12 @@ var _ = Describe("SEND MESSAGES:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			messages := createDefaultMessages()
-			request := iggcon.SendMessagesRequest{
-				StreamId:     iggcon.NewIdentifier(streamId),
-				TopicId:      iggcon.NewIdentifier(topicId),
-				Partitioning: iggcon.PartitionId(int(createRandomUInt32())),
-				Messages:     messages,
-			}
-			err := client.SendMessages(request)
+			err := client.SendMessages(
+				iggcon.NewIdentifier(streamId),
+				iggcon.NewIdentifier(topicId),
+				iggcon.PartitionId(int(createRandomUInt32())),
+				messages,
+			)
 			itShouldReturnSpecificError(err, "partition_not_found")
 		})
 
@@ -91,28 +87,26 @@ var _ = Describe("SEND MESSAGES:", func() {
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, createAuthorizedConnection())
 			topicId, _ := successfullyCreateTopic(streamId, client)
-			request := iggcon.SendMessagesRequest{
-				StreamId:     iggcon.NewIdentifier(streamId),
-				TopicId:      iggcon.NewIdentifier(topicId),
-				Partitioning: iggcon.PartitionId(int(createRandomUInt32())),
-				Messages:     []iggcon.IggyMessage{},
-			}
-			err := client.SendMessages(request)
+			err := client.SendMessages(
+				iggcon.NewIdentifier(streamId),
+				iggcon.NewIdentifier(topicId),
+				iggcon.PartitionId(int(createRandomUInt32())),
+				[]iggcon.IggyMessage{},
+			)
 			itShouldReturnSpecificError(err, "messages_count_should_be_greater_than_zero")
 		})
 	})
 
 	When("User is not logged in", func() {
 		Context("and tries to update stream", func() {
-			client := createConnection()
+			client := createClient()
 			messages := createDefaultMessages()
-			request := iggcon.SendMessagesRequest{
-				StreamId:     iggcon.NewIdentifier(int(createRandomUInt32())),
-				TopicId:      iggcon.NewIdentifier(int(createRandomUInt32())),
-				Partitioning: iggcon.None(),
-				Messages:     messages,
-			}
-			err := client.SendMessages(request)
+			err := client.SendMessages(
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+				iggcon.None(),
+				messages,
+			)
 
 			itShouldReturnUnauthenticatedError(err)
 		})

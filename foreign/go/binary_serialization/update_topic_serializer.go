@@ -19,15 +19,25 @@ package binaryserialization
 
 import (
 	"encoding/binary"
+	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
 type TcpUpdateTopicRequest struct {
-	iggcon.UpdateTopicRequest
+	StreamId             iggcon.Identifier `json:"streamId"`
+	TopicId              iggcon.Identifier `json:"topicId"`
+	CompressionAlgorithm uint8             `json:"compressionAlgorithm"`
+	MessageExpiry        time.Duration     `json:"messageExpiry"`
+	MaxTopicSize         uint64            `json:"maxTopicSize"`
+	ReplicationFactor    *uint8            `json:"replicationFactor"`
+	Name                 string            `json:"name"`
 }
 
 func (request *TcpUpdateTopicRequest) Serialize() []byte {
+	if request.ReplicationFactor == nil {
+		request.ReplicationFactor = new(uint8)
+	}
 	streamIdBytes := SerializeIdentifier(request.StreamId)
 	topicIdBytes := SerializeIdentifier(request.TopicId)
 
@@ -47,7 +57,7 @@ func (request *TcpUpdateTopicRequest) Serialize() []byte {
 	binary.LittleEndian.PutUint64(buffer[offset:], uint64(request.MaxTopicSize))
 	offset += 8
 
-	buffer[offset] = request.ReplicationFactor
+	buffer[offset] = *request.ReplicationFactor
 	offset++
 
 	buffer[offset] = uint8(len(request.Name))

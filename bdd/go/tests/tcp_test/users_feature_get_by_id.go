@@ -33,7 +33,7 @@ var _ = Describe("GET USER:", func() {
 			user, err := client.GetUser(iggcon.NewIdentifier(int(userId)))
 
 			itShouldNotReturnError(err)
-			itShouldReturnSpecificUser(name, *user)
+			itShouldReturnSpecificUser(name, user.UserInfo)
 		})
 	})
 

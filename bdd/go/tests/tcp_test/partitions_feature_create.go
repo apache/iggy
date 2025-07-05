@@ -23,33 +23,30 @@ import (
 )
 
 var _ = Describe("CREATE PARTITION:", func() {
-	prefix := "CreatePartition"
+	prefix := "CreatePartitions"
 	When("User is logged in", func() {
 		Context("and tries to create partitions for existing stream", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
-
-			request := iggcon.CreatePartitionsRequest{
-				StreamId:        iggcon.NewIdentifier(streamId),
-				TopicId:         iggcon.NewIdentifier(topicId),
-				PartitionsCount: 10,
-			}
-			err := client.CreatePartition(request)
+			partitionsCount := 10
+			err := client.CreatePartitions(
+				iggcon.NewIdentifier(streamId),
+				iggcon.NewIdentifier(topicId),
+				uint32(partitionsCount))
 
 			itShouldNotReturnError(err)
-			itShouldHaveExpectedNumberOfPartitions(streamId, topicId, request.PartitionsCount+2, client)
+			itShouldHaveExpectedNumberOfPartitions(streamId, topicId, partitionsCount+2, client)
 		})
 
 		Context("and tries to create partitions for a non existing stream", func() {
 			client := createAuthorizedConnection()
-			request := iggcon.CreatePartitionsRequest{
-				StreamId:        iggcon.NewIdentifier(int(createRandomUInt32())),
-				TopicId:         iggcon.NewIdentifier(int(createRandomUInt32())),
-				PartitionsCount: 10,
-			}
-			err := client.CreatePartition(request)
+			err := client.CreatePartitions(
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+				10,
+			)
 
 			itShouldReturnSpecificError(err, "stream_id_not_found")
 		})
@@ -58,12 +55,11 @@ var _ = Describe("CREATE PARTITION:", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
-			request := iggcon.CreatePartitionsRequest{
-				StreamId:        iggcon.NewIdentifier(streamId),
-				TopicId:         iggcon.NewIdentifier(int(createRandomUInt32())),
-				PartitionsCount: 10,
-			}
-			err := client.CreatePartition(request)
+			err := client.CreatePartitions(
+				iggcon.NewIdentifier(streamId),
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+				10,
+			)
 
 			itShouldReturnSpecificError(err, "topic_id_not_found")
 		})
@@ -71,13 +67,12 @@ var _ = Describe("CREATE PARTITION:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to create partitions", func() {
-			client := createConnection()
-			request := iggcon.CreatePartitionsRequest{
-				StreamId:        iggcon.NewIdentifier(int(createRandomUInt32())),
-				TopicId:         iggcon.NewIdentifier(int(createRandomUInt32())),
-				PartitionsCount: 10,
-			}
-			err := client.CreatePartition(request)
+			client := createClient()
+			err := client.CreatePartitions(
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+				10,
+			)
 
 			itShouldReturnUnauthenticatedError(err)
 		})

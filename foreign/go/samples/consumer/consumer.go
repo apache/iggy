@@ -23,9 +23,10 @@ import (
 	"fmt"
 	"time"
 
-	. "github.com/apache/iggy/foreign/go"
 	. "github.com/apache/iggy/foreign/go/contracts"
+	"github.com/apache/iggy/foreign/go/iggycli"
 	sharedDemoContracts "github.com/apache/iggy/foreign/go/samples/shared"
+	"github.com/apache/iggy/foreign/go/tcp"
 )
 
 // config
@@ -38,42 +39,32 @@ const (
 )
 
 func main() {
-	factory := &IggyClientFactory{}
-	config := IggyConfiguration{
-		BaseAddress: "127.0.0.1:8090",
-		Protocol:    Tcp,
-	}
-
-	messageStream, err := factory.CreateMessageStream(config)
+	cli, err := iggycli.NewIggyClient(
+		iggycli.WithTcp(
+			tcp.WithServerAddress("127.0.0.1:8090"),
+		),
+	)
 	if err != nil {
 		panic(err)
 	}
-
-	_, err = messageStream.LogIn(LogInRequest{
-		Username: "iggy",
-		Password: "iggy",
-	})
+	_, err = cli.LoginUser("iggy", "iggy")
 	if err != nil {
 		panic("COULD NOT LOG IN")
 	}
 
-	if err = EnsureInsfrastructureIsInitialized(messageStream); err != nil {
+	if err = EnsureInfrastructureIsInitialized(cli); err != nil {
 		panic(err)
 	}
 
-	if err := ConsumeMessages(messageStream); err != nil {
+	if err = ConsumeMessages(cli); err != nil {
 		panic(err)
 	}
 }
 
-func EnsureInsfrastructureIsInitialized(messageStream MessageStream) error {
-	if _, streamErr := messageStream.GetStreamById(GetStreamRequest{
-		StreamID: NewIdentifier(DefaultStreamId),
-	}); streamErr != nil {
-		streamErr = messageStream.CreateStream(CreateStreamRequest{
-			StreamId: DefaultStreamId,
-			Name:     "Test Producer Stream",
-		})
+func EnsureInfrastructureIsInitialized(cli iggycli.Client) error {
+	if _, streamErr := cli.GetStream(NewIdentifier(DefaultStreamId)); streamErr != nil {
+		uint32DefaultStreamId := uint32(DefaultStreamId)
+		_, streamErr = cli.CreateStream("Test Producer Stream", &uint32DefaultStreamId)
 
 		if streamErr != nil {
 			panic(streamErr)
@@ -84,13 +75,17 @@ func EnsureInsfrastructureIsInitialized(messageStream MessageStream) error {
 
 	fmt.Printf("Stream with ID: %d exists.\n", DefaultStreamId)
 
-	if _, topicErr := messageStream.GetTopicById(NewIdentifier(DefaultStreamId), NewIdentifier(TopicId)); topicErr != nil {
-		topicErr = messageStream.CreateTopic(CreateTopicRequest{
-			TopicId:         TopicId,
-			Name:            "Test Topic From Producer Sample",
-			PartitionsCount: 12,
-			StreamId:        NewIdentifier(DefaultStreamId),
-		})
+	if _, topicErr := cli.GetTopic(NewIdentifier(DefaultStreamId), NewIdentifier(TopicId)); topicErr != nil {
+		uint32TopicId := TopicId
+		_, topicErr = cli.CreateTopic(
+			NewIdentifier(DefaultStreamId),
+			"Test Topic From Producer Sample",
+			12,
+			0,
+			0,
+			0,
+			nil,
+			&uint32TopicId)
 
 		if topicErr != nil {
 			panic(topicErr)
@@ -104,19 +99,19 @@ func EnsureInsfrastructureIsInitialized(messageStream MessageStream) error {
 	return nil
 }
 
-func ConsumeMessages(messageStream MessageStream) error {
+func ConsumeMessages(cli iggycli.Client) error {
 	fmt.Printf("Messages will be polled from stream '%d', topic '%d', partition '%d' with interval %d ms.\n", DefaultStreamId, TopicId, Partition, Interval)
 
 	for {
-		messagesWrapper, err := messageStream.PollMessages(FetchMessagesRequest{
-			Count:           1,
-			StreamId:        NewIdentifier(DefaultStreamId),
-			TopicId:         NewIdentifier(TopicId),
-			Consumer:        Consumer{Kind: ConsumerSingle, Id: NewIdentifier(ConsumerId)},
-			PartitionId:     Partition,
-			PollingStrategy: NextPollingStrategy(),
-			AutoCommit:      true,
-		})
+		partionId := uint32(Partition)
+		messagesWrapper, err := cli.PollMessages(
+			NewIdentifier(DefaultStreamId),
+			NewIdentifier(TopicId),
+			Consumer{Kind: ConsumerKindSingle, Id: NewIdentifier(ConsumerId)},
+			NextPollingStrategy(),
+			1,
+			true,
+			&partionId)
 		if err != nil {
 			return err
 		}
@@ -162,7 +157,7 @@ func HandleMessage(iggyMessage IggyMessage) error {
 			return err
 		}
 	} else {
-		if err := json.Unmarshal([]byte(iggyMessage.Payload), &envelope); err != nil {
+		if err := json.Unmarshal(iggyMessage.Payload, &envelope); err != nil {
 			return err
 		}
 	}

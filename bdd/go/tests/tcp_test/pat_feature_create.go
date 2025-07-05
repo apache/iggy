@@ -18,7 +18,6 @@
 package tcp_test
 
 import (
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	. "github.com/onsi/ginkgo/v2"
 )
 
@@ -26,28 +25,19 @@ var _ = Describe("CREATE PAT:", func() {
 	When("User is logged in", func() {
 		Context("tries to create PAT with correct data", func() {
 			client := createAuthorizedConnection()
-			request := iggcon.CreateAccessTokenRequest{
-				Name:   createRandomString(16),
-				Expiry: 0,
-			}
-
-			response, err := client.CreateAccessToken(request)
+			name := createRandomString(16)
+			response, err := client.CreatePersonalAccessToken(name, 0)
 
 			itShouldNotReturnError(err)
-			itShouldSuccessfullyCreateAccessToken(request.Name, client)
+			itShouldSuccessfullyCreateAccessToken(name, client)
 			itShouldBePossibleToLogInWithAccessToken(response.Token)
 		})
 	})
 
 	When("User is not logged in", func() {
 		Context("and tries to create PAT", func() {
-			client := createConnection()
-			request := iggcon.CreateAccessTokenRequest{
-				Name:   createRandomString(16),
-				Expiry: 0,
-			}
-
-			_, err := client.CreateAccessToken(request)
+			client := createClient()
+			_, err := client.CreatePersonalAccessToken(createRandomString(16), 0)
 			itShouldReturnUnauthenticatedError(err)
 		})
 	})

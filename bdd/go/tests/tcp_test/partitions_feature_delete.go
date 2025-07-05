@@ -23,7 +23,7 @@ import (
 )
 
 var _ = Describe("DELETE PARTITION:", func() {
-	prefix := "DeletePartition"
+	prefix := "DeletePartitions"
 	When("User is logged in", func() {
 		Context("and tries to delete partitions for existing stream", func() {
 			client := createAuthorizedConnection()
@@ -31,25 +31,24 @@ var _ = Describe("DELETE PARTITION:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
 
-			request := iggcon.DeletePartitionRequest{
-				StreamId:        iggcon.NewIdentifier(streamId),
-				TopicId:         iggcon.NewIdentifier(topicId),
-				PartitionsCount: 1,
-			}
-			err := client.DeletePartition(request)
+			partitionsCount := 1
+			err := client.DeletePartitions(
+				iggcon.NewIdentifier(streamId),
+				iggcon.NewIdentifier(topicId),
+				1,
+			)
 
 			itShouldNotReturnError(err)
-			itShouldHaveExpectedNumberOfPartitions(streamId, topicId, 2-request.PartitionsCount, client)
+			itShouldHaveExpectedNumberOfPartitions(streamId, topicId, 2-partitionsCount, client)
 		})
 
 		Context("and tries to delete partitions for a non existing stream", func() {
 			client := createAuthorizedConnection()
-			request := iggcon.DeletePartitionRequest{
-				StreamId:        iggcon.NewIdentifier(int(createRandomUInt32())),
-				TopicId:         iggcon.NewIdentifier(int(createRandomUInt32())),
-				PartitionsCount: 10,
-			}
-			err := client.DeletePartition(request)
+			err := client.DeletePartitions(
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+				10,
+			)
 
 			itShouldReturnSpecificError(err, "stream_id_not_found")
 		})
@@ -58,12 +57,11 @@ var _ = Describe("DELETE PARTITION:", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
-			request := iggcon.DeletePartitionRequest{
-				StreamId:        iggcon.NewIdentifier(streamId),
-				TopicId:         iggcon.NewIdentifier(int(createRandomUInt32())),
-				PartitionsCount: 10,
-			}
-			err := client.DeletePartition(request)
+			err := client.DeletePartitions(
+				iggcon.NewIdentifier(streamId),
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+				10,
+			)
 
 			itShouldReturnSpecificError(err, "topic_id_not_found")
 		})
@@ -71,13 +69,12 @@ var _ = Describe("DELETE PARTITION:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to delete partitions", func() {
-			client := createConnection()
-			request := iggcon.DeletePartitionRequest{
-				StreamId:        iggcon.NewIdentifier(int(createRandomUInt32())),
-				TopicId:         iggcon.NewIdentifier(int(createRandomUInt32())),
-				PartitionsCount: 10,
-			}
-			err := client.DeletePartition(request)
+			client := createClient()
+			err := client.DeletePartitions(
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+				10,
+			)
 
 			itShouldReturnUnauthenticatedError(err)
 		})

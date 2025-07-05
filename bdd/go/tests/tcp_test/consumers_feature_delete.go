@@ -32,11 +32,11 @@ var _ = Describe("DELETE CONSUMER GROUP:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			groupId, _ := successfullyCreateConsumer(streamId, topicId, client)
-			err := client.DeleteConsumerGroup(iggcon.DeleteConsumerGroupRequest{
-				StreamId:        iggcon.NewIdentifier(streamId),
-				TopicId:         iggcon.NewIdentifier(topicId),
-				ConsumerGroupId: iggcon.NewIdentifier(groupId),
-			})
+			err := client.DeleteConsumerGroup(
+				iggcon.NewIdentifier(streamId),
+				iggcon.NewIdentifier(topicId),
+				iggcon.NewIdentifier(groupId),
+			)
 
 			itShouldNotReturnError(err)
 			itShouldSuccessfullyDeletedConsumer(streamId, topicId, groupId, client)
@@ -48,11 +48,11 @@ var _ = Describe("DELETE CONSUMER GROUP:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			groupId := int(createRandomUInt32())
-			err := client.DeleteConsumerGroup(iggcon.DeleteConsumerGroupRequest{
-				StreamId:        iggcon.NewIdentifier(streamId),
-				TopicId:         iggcon.NewIdentifier(topicId),
-				ConsumerGroupId: iggcon.NewIdentifier(groupId),
-			})
+			err := client.DeleteConsumerGroup(
+				iggcon.NewIdentifier(streamId),
+				iggcon.NewIdentifier(topicId),
+				iggcon.NewIdentifier(groupId),
+			)
 
 			itShouldReturnSpecificIggyError(err, ierror.ConsumerGroupIdNotFound)
 		})
@@ -63,11 +63,11 @@ var _ = Describe("DELETE CONSUMER GROUP:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			topicId := int(createRandomUInt32())
 
-			err := client.DeleteConsumerGroup(iggcon.DeleteConsumerGroupRequest{
-				StreamId:        iggcon.NewIdentifier(streamId),
-				TopicId:         iggcon.NewIdentifier(topicId),
-				ConsumerGroupId: iggcon.NewIdentifier(int(createRandomUInt32())),
-			})
+			err := client.DeleteConsumerGroup(
+				iggcon.NewIdentifier(streamId),
+				iggcon.NewIdentifier(topicId),
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+			)
 
 			itShouldReturnSpecificError(err, "topic_id_not_found")
 		})
@@ -77,11 +77,11 @@ var _ = Describe("DELETE CONSUMER GROUP:", func() {
 			streamId := int(createRandomUInt32())
 			topicId := int(createRandomUInt32())
 
-			err := client.DeleteConsumerGroup(iggcon.DeleteConsumerGroupRequest{
-				StreamId:        iggcon.NewIdentifier(streamId),
-				TopicId:         iggcon.NewIdentifier(topicId),
-				ConsumerGroupId: iggcon.NewIdentifier(int(createRandomUInt32())),
-			})
+			err := client.DeleteConsumerGroup(
+				iggcon.NewIdentifier(streamId),
+				iggcon.NewIdentifier(topicId),
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+			)
 
 			itShouldReturnSpecificError(err, "stream_id_not_found")
 		})
@@ -89,12 +89,12 @@ var _ = Describe("DELETE CONSUMER GROUP:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to delete consumer group", func() {
-			client := createConnection()
-			err := client.DeleteConsumerGroup(iggcon.DeleteConsumerGroupRequest{
-				StreamId:        iggcon.NewIdentifier(int(createRandomUInt32())),
-				TopicId:         iggcon.NewIdentifier(int(createRandomUInt32())),
-				ConsumerGroupId: iggcon.NewIdentifier(int(createRandomUInt32())),
-			})
+			client := createClient()
+			err := client.DeleteConsumerGroup(
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+			)
 
 			itShouldReturnUnauthenticatedError(err)
 		})

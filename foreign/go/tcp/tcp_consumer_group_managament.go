@@ -23,7 +23,7 @@ import (
 	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
-func (tms *IggyTcpClient) GetConsumerGroups(streamId, topicId Identifier) ([]ConsumerGroupResponse, error) {
+func (tms *IggyTcpClient) GetConsumerGroups(streamId, topicId Identifier) ([]ConsumerGroup, error) {
 	message := binaryserialization.SerializeIdentifiers(streamId, topicId)
 	buffer, err := tms.sendAndFetchResponse(message, GetGroupsCode)
 	if err != nil {
@@ -33,7 +33,7 @@ func (tms *IggyTcpClient) GetConsumerGroups(streamId, topicId Identifier) ([]Con
 	return binaryserialization.DeserializeConsumerGroups(buffer), err
 }
 
-func (tms *IggyTcpClient) GetConsumerGroupById(streamId, topicId, groupId Identifier) (*ConsumerGroupResponse, error) {
+func (tms *IggyTcpClient) GetConsumerGroup(streamId, topicId, groupId Identifier) (*ConsumerGroupDetails, error) {
 	message := binaryserialization.SerializeIdentifiers(streamId, topicId, groupId)
 	buffer, err := tms.sendAndFetchResponse(message, GetGroupCode)
 	if err != nil {
@@ -43,32 +43,42 @@ func (tms *IggyTcpClient) GetConsumerGroupById(streamId, topicId, groupId Identi
 		return nil, ierror.ConsumerGroupIdNotFound
 	}
 
-	return binaryserialization.DeserializeConsumerGroup(buffer)
+	consumerGroupDetails := binaryserialization.DeserializeConsumerGroup(buffer)
+	return consumerGroupDetails, err
 }
 
-func (tms *IggyTcpClient) CreateConsumerGroup(request CreateConsumerGroupRequest) error {
-	if MaxStringLength < len(request.Name) {
-		return ierror.TextTooLong("consumer_group_name")
+func (tms *IggyTcpClient) CreateConsumerGroup(streamId Identifier, topicId Identifier, name string, groupId *uint32) (*ConsumerGroupDetails, error) {
+	if MaxStringLength < len(name) {
+		return nil, ierror.TextTooLong("consumer_group_name")
 	}
-	message := binaryserialization.CreateGroup(request)
-	_, err := tms.sendAndFetchResponse(message, CreateGroupCode)
-	return err
+	message := binaryserialization.CreateGroup(CreateConsumerGroupRequest{
+		StreamId:        streamId,
+		TopicId:         topicId,
+		ConsumerGroupId: groupId,
+		Name:            name,
+	})
+	buffer, err := tms.sendAndFetchResponse(message, CreateGroupCode)
+	if err != nil {
+		return nil, err
+	}
+	consumerGroup := binaryserialization.DeserializeConsumerGroup(buffer)
+	return consumerGroup, err
 }
 
-func (tms *IggyTcpClient) DeleteConsumerGroup(request DeleteConsumerGroupRequest) error {
-	message := binaryserialization.SerializeIdentifiers(request.StreamId, request.TopicId, request.ConsumerGroupId)
+func (tms *IggyTcpClient) DeleteConsumerGroup(streamId Identifier, topicId Identifier, groupId Identifier) error {
+	message := binaryserialization.SerializeIdentifiers(streamId, topicId, groupId)
 	_, err := tms.sendAndFetchResponse(message, DeleteGroupCode)
 	return err
 }
 
-func (tms *IggyTcpClient) JoinConsumerGroup(request JoinConsumerGroupRequest) error {
-	message := binaryserialization.SerializeIdentifiers(request.StreamId, request.TopicId, request.ConsumerGroupId)
+func (tms *IggyTcpClient) JoinConsumerGroup(streamId Identifier, topicId Identifier, groupId Identifier) error {
+	message := binaryserialization.SerializeIdentifiers(streamId, topicId, groupId)
 	_, err := tms.sendAndFetchResponse(message, JoinGroupCode)
 	return err
 }
 
-func (tms *IggyTcpClient) LeaveConsumerGroup(request LeaveConsumerGroupRequest) error {
-	message := binaryserialization.SerializeIdentifiers(request.StreamId, request.TopicId, request.ConsumerGroupId)
+func (tms *IggyTcpClient) LeaveConsumerGroup(streamId Identifier, topicId Identifier, groupId Identifier) error {
+	message := binaryserialization.SerializeIdentifiers(streamId, topicId, groupId)
 	_, err := tms.sendAndFetchResponse(message, LeaveGroupCode)
 	return err
 }

@@ -25,7 +25,7 @@ var _ = Describe("LOGOUT FEATURE:", func() {
 	When("User is logged in", func() {
 		Context("and tries to log out", func() {
 			client := createAuthorizedConnection()
-			err := client.LogOut()
+			err := client.LogoutUser()
 
 			itShouldNotReturnError(err)
 		})
@@ -33,8 +33,8 @@ var _ = Describe("LOGOUT FEATURE:", func() {
 
 	When("User is not logged in", func() {
 		Context("and tries to log out", func() {
-			client := createConnection()
-			err := client.LogOut()
+			client := createClient()
+			err := client.LogoutUser()
 
 			itShouldReturnUnauthenticatedError(err)
 		})

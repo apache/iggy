@@ -18,21 +18,16 @@
 package tcp_test
 
 import (
-	"github.com/apache/iggy/foreign/go"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	"github.com/apache/iggy/foreign/go/iggycli"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
 // OPERATIONS
 
-func successfullyCreateAccessToken(name string, client iggy.MessageStream) string {
-	request := iggcon.CreateAccessTokenRequest{
-		Name:   name,
-		Expiry: 0,
-	}
-
-	result, err := client.CreateAccessToken(request)
+func successfullyCreateAccessToken(name string, client iggycli.Client) string {
+	result, err := client.CreatePersonalAccessToken(name, 0)
 	itShouldNotReturnError(err)
 
 	return result.Token
@@ -40,15 +35,15 @@ func successfullyCreateAccessToken(name string, client iggy.MessageStream) strin
 
 // ASSERTIONS
 
-func itShouldSuccessfullyCreateAccessToken(name string, client iggy.MessageStream) {
-	tokens, err := client.GetAccessTokens()
+func itShouldSuccessfullyCreateAccessToken(name string, client iggycli.Client) {
+	tokens, err := client.GetPersonalAccessTokens()
 
 	itShouldNotReturnError(err)
 	itShouldContainSpecificAccessToken(name, tokens)
 }
 
-func itShouldSuccessfullyDeleteAccessToken(name string, client iggy.MessageStream) {
-	tokens, err := client.GetAccessTokens()
+func itShouldSuccessfullyDeleteAccessToken(name string, client iggycli.Client) {
+	tokens, err := client.GetPersonalAccessTokens()
 
 	itShouldNotReturnError(err)
 	found := false
@@ -65,8 +60,8 @@ func itShouldSuccessfullyDeleteAccessToken(name string, client iggy.MessageStrea
 }
 
 func itShouldBePossibleToLogInWithAccessToken(token string) {
-	ms := createConnection()
-	userId, err := ms.LogInWithAccessToken(iggcon.LogInAccessTokenRequest{Token: token})
+	ms := createClient()
+	userId, err := ms.LoginWithPersonalAccessToken(token)
 
 	itShouldNotReturnError(err)
 	It("should return userId", func() {
@@ -74,12 +69,12 @@ func itShouldBePossibleToLogInWithAccessToken(token string) {
 	})
 }
 
-func itShouldContainSpecificAccessToken(name string, tokens []iggcon.AccessTokenResponse) {
+func itShouldContainSpecificAccessToken(name string, tokens []iggcon.PersonalAccessTokenInfo) {
 	It("should fetch at least one user", func() {
 		Expect(len(tokens)).NotTo(Equal(0))
 	})
 
-	var token iggcon.AccessTokenResponse
+	var token iggcon.PersonalAccessTokenInfo
 	found := false
 
 	for _, s := range tokens {
