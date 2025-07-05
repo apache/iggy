@@ -44,9 +44,11 @@ import { deleteTopic } from './topic/delete-topic.command.js';
 
 import { getOffset } from './offset/get-offset.command.js';
 import { storeOffset } from './offset/store-offset.command.js';
+import { deleteOffset } from './offset/delete-offset.command.js';
 
 import { sendMessages } from './message/send-messages.command.js';
 import { pollMessages } from './message/poll-messages.command.js';
+import { flushUnsavedBuffers } from './message/flush-unsaved-buffers.command.js';
 
 import { createStream } from './stream/create-stream.command.js';
 import { updateStream } from './stream/update-stream.command.js';
@@ -153,14 +155,16 @@ type GroupAPI = ReturnType<typeof groupAPI>;
 
 const offsetAPI = (c: ClientProvider) => ({
   get: getOffset(c),
-  store: storeOffset(c)
+  store: storeOffset(c),
+  delete: deleteOffset(c)
 });
 
 type OffsetAPI = ReturnType<typeof offsetAPI>;
 
 const messageAPI = (c: ClientProvider) => ({
   poll: pollMessages(c),
-  send: sendMessages(c)
+  send: sendMessages(c),
+  flushUnsavedBuffers: flushUnsavedBuffers(c)
 });
 
 type MessageAPI = ReturnType<typeof messageAPI>;

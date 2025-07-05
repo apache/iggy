@@ -19,6 +19,7 @@
 
 
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
 
@@ -28,7 +29,7 @@ export type PurgeTopic = {
 };
 
 export const PURGE_TOPIC = {
-  code: 305,
+  code: COMMAND_CODE.PurgeTopic,
 
   serialize: ({ streamId, topicId }: PurgeTopic) => {
     return Buffer.concat([
@@ -39,5 +40,6 @@ export const PURGE_TOPIC = {
 
   deserialize: deserializeVoidResponse
 };
+
 
 export const purgeTopic = wrapCommand<PurgeTopic, boolean>(PURGE_TOPIC);

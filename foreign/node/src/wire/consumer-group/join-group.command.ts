@@ -22,6 +22,7 @@ import { type Id } from '../identifier.utils.js';
 import { serializeTargetGroup } from './group.utils.js';
 import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 
 export type JoinGroup = {
   streamId: Id,
@@ -30,7 +31,7 @@ export type JoinGroup = {
 };
 
 export const JOIN_GROUP = {
-  code: 604,
+  code: COMMAND_CODE.JoinGroup,
 
   serialize: ({ streamId, topicId, groupId }: JoinGroup) => {
     return serializeTargetGroup(streamId, topicId, groupId);
@@ -38,5 +39,6 @@ export const JOIN_GROUP = {
 
   deserialize: deserializeVoidResponse
 };
+
 
 export const joinGroup = wrapCommand<JoinGroup, boolean>(JOIN_GROUP);
