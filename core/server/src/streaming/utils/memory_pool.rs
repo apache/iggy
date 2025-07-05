@@ -155,21 +155,12 @@ impl MemoryPool {
 
     /// Initialize the global pool from the given config.
     pub fn init_pool(config: Arc<SystemConfig>) {
-        // TODO: Fixme (stary napraw).
-        let is_enabled = false;
+        let is_enabled = config.memory_pool.enabled;
         let memory_limit = config.memory_pool.size.as_bytes_usize();
         let bucket_capacity = config.memory_pool.bucket_capacity as usize;
 
-        let pool = MemoryPool::new(is_enabled, memory_limit, bucket_capacity);
-        if MEMORY_POOL.set(pool).is_err() {
-            warn!("Memory pool already initialized.");
-            // This shouldn't ever happen in production code, only in tests
-            // if someone forgets to add #[serial] tag to tests that have different
-            // memory pool limits (different instances are created within same executable).
-            if memory_pool().memory_limit != memory_limit {
-                panic!("Previously initialized memory pool has a different limit.");
-            }
-        }
+        let _ =
+            MEMORY_POOL.get_or_init(|| MemoryPool::new(is_enabled, memory_limit, bucket_capacity));
     }
 
     /// Acquire a `BytesMut` buffer with at least `capacity` bytes.
