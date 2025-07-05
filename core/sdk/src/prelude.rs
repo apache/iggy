@@ -29,6 +29,7 @@
 
 pub use crate::client_provider;
 pub use crate::client_provider::ClientProviderConfig;
+pub use crate::client_wrappers::client_wrapper::ClientWrapper;
 pub use crate::clients::client::IggyClient;
 pub use crate::clients::client_builder::IggyClientBuilder;
 pub use crate::clients::consumer::{

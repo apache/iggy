@@ -21,10 +21,6 @@ services:
     build:
       context: ..
       dockerfile: bdd/Dockerfile
-    ports:
-      - "8090:8090"  # TCP
-      - "3000:3000"  # HTTP
-      - "8080:8080"  # QUIC
     environment:
       - RUST_LOG=info
       - IGGY_SYSTEM_PATH=local_data
@@ -64,5 +60,30 @@ services:
     working_dir: /app
     command: ["pytest", "tests/", "-v"]
 
+  go-bdd:
+    build:
+      context: ..
+      dockerfile: bdd/go/Dockerfile
+    depends_on:
+      iggy-server:
+        condition: service_healthy
+    environment:
+      - IGGY_TCP_ADDRESS=iggy-server:8090
+    volumes:
+      - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
+    command: [ "ginkgo", "-v", "-r" ]
+
+  node-bdd:
+    build:
+      context: ..
+      dockerfile: bdd/node/Dockerfile
+    depends_on:
+      iggy-server:
+        condition: service_healthy
+    environment:
+      - IGGY_TCP_ADDRESS=iggy-server:8090
+    command: ["npm", "run", "test:bdd"]
+
+    
 volumes:
   iggy_data:

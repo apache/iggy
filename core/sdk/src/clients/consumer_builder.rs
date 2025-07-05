@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::prelude::{AutoCommit, AutoCommitWhen, IggyConsumer};
 use iggy_binary_protocol::Client;
 use iggy_common::locking::IggyRwLock;
@@ -24,7 +25,7 @@ use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct IggyConsumerBuilder {
-    client: IggyRwLock<Box<dyn Client>>,
+    client: IggyRwLock<ClientWrapper>,
     consumer_name: String,
     consumer: Consumer,
     stream: Identifier,
@@ -46,7 +47,7 @@ pub struct IggyConsumerBuilder {
 impl IggyConsumerBuilder {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        client: IggyRwLock<Box<dyn Client>>,
+        client: IggyRwLock<ClientWrapper>,
         consumer_name: String,
         consumer: Consumer,
         stream_id: Identifier,

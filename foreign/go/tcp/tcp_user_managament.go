@@ -23,7 +23,7 @@ import (
 	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
-func (tms *IggyTcpClient) GetUser(identifier Identifier) (*UserResponse, error) {
+func (tms *IggyTcpClient) GetUser(identifier Identifier) (*UserInfoDetails, error) {
 	message := binaryserialization.SerializeIdentifier(identifier)
 	buffer, err := tms.sendAndFetchResponse(message, GetUserCode)
 	if err != nil {
@@ -36,7 +36,7 @@ func (tms *IggyTcpClient) GetUser(identifier Identifier) (*UserResponse, error) 
 	return binaryserialization.DeserializeUser(buffer)
 }
 
-func (tms *IggyTcpClient) GetUsers() ([]*UserResponse, error) {
+func (tms *IggyTcpClient) GetUsers() ([]UserInfo, error) {
 	buffer, err := tms.sendAndFetchResponse([]byte{}, GetUsersCode)
 	if err != nil {
 		return nil, err
@@ -45,14 +45,30 @@ func (tms *IggyTcpClient) GetUsers() ([]*UserResponse, error) {
 	return binaryserialization.DeserializeUsers(buffer)
 }
 
-func (tms *IggyTcpClient) CreateUser(request CreateUserRequest) error {
-	message := binaryserialization.SerializeCreateUserRequest(request)
-	_, err := tms.sendAndFetchResponse(message, CreateUserCode)
-	return err
+func (tms *IggyTcpClient) CreateUser(username string, password string, status UserStatus, permissions *Permissions) (*UserInfoDetails, error) {
+	message := binaryserialization.SerializeCreateUserRequest(CreateUserRequest{
+		Username:    username,
+		Password:    password,
+		Status:      status,
+		Permissions: permissions,
+	})
+	buffer, err := tms.sendAndFetchResponse(message, CreateUserCode)
+	if err != nil {
+		return nil, err
+	}
+	userInfo, err := binaryserialization.DeserializeUser(buffer)
+	if err != nil {
+		return nil, err
+	}
+	return userInfo, nil
 }
 
-func (tms *IggyTcpClient) UpdateUser(request UpdateUserRequest) error {
-	message := binaryserialization.SerializeUpdateUser(request)
+func (tms *IggyTcpClient) UpdateUser(userID Identifier, username *string, status *UserStatus) error {
+	message := binaryserialization.SerializeUpdateUser(UpdateUserRequest{
+		UserID:   userID,
+		Username: username,
+		Status:   status,
+	})
 	_, err := tms.sendAndFetchResponse(message, UpdateUserCode)
 	return err
 }
@@ -63,14 +79,21 @@ func (tms *IggyTcpClient) DeleteUser(identifier Identifier) error {
 	return err
 }
 
-func (tms *IggyTcpClient) UpdateUserPermissions(request UpdateUserPermissionsRequest) error {
-	message := binaryserialization.SerializeUpdateUserPermissionsRequest(request)
+func (tms *IggyTcpClient) UpdatePermissions(userID Identifier, permissions *Permissions) error {
+	message := binaryserialization.SerializeUpdateUserPermissionsRequest(UpdatePermissionsRequest{
+		UserID:      userID,
+		Permissions: permissions,
+	})
 	_, err := tms.sendAndFetchResponse(message, UpdatePermissionsCode)
 	return err
 }
 
-func (tms *IggyTcpClient) ChangePassword(request ChangePasswordRequest) error {
-	message := binaryserialization.SerializeChangePasswordRequest(request)
+func (tms *IggyTcpClient) ChangePassword(userID Identifier, currentPassword string, newPassword string) error {
+	message := binaryserialization.SerializeChangePasswordRequest(ChangePasswordRequest{
+		UserID:          userID,
+		CurrentPassword: currentPassword,
+		NewPassword:     newPassword,
+	})
 	_, err := tms.sendAndFetchResponse(message, ChangePasswordCode)
 	return err
 }

@@ -19,6 +19,7 @@
 use crate::clients::client_builder::IggyClientBuilder;
 use iggy_common::locking::{IggyRwLock, IggySharedMutFn};
 
+use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::http::http_client::HttpClient;
 use crate::prelude::EncryptorKind;
 use crate::prelude::IggyConsumerBuilder;
@@ -28,7 +29,7 @@ use crate::quic::quick_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
 use async_broadcast::Receiver;
 use async_trait::async_trait;
-use iggy_binary_protocol::Client;
+use iggy_binary_protocol::{Client, SystemClient};
 use iggy_common::{
     ConnectionStringUtils, Consumer, DiagnosticEvent, Partitioner, TransportProtocol,
 };
@@ -45,14 +46,14 @@ use tracing::{debug, error, info};
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct IggyClient {
-    pub(crate) client: IggyRwLock<Box<dyn Client>>,
+    pub(crate) client: IggyRwLock<ClientWrapper>,
     partitioner: Option<Arc<dyn Partitioner>>,
     pub(crate) encryptor: Option<Arc<EncryptorKind>>,
 }
 
 impl Default for IggyClient {
     fn default() -> Self {
-        IggyClient::new(Box::<TcpClient>::default())
+        IggyClient::new(ClientWrapper::Tcp(TcpClient::default()))
     }
 }
 
@@ -70,7 +71,7 @@ impl IggyClient {
     }
 
     /// Creates a new `IggyClient` with the provided client implementation for the specific transport.
-    pub fn new(client: Box<dyn Client>) -> Self {
+    pub fn new(client: ClientWrapper) -> Self {
         let client = IggyRwLock::new(client);
         IggyClient {
             client,
@@ -81,13 +82,13 @@ impl IggyClient {
 
     pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
         match ConnectionStringUtils::parse_protocol(connection_string)? {
-            TransportProtocol::Tcp => Ok(IggyClient::new(Box::new(
+            TransportProtocol::Tcp => Ok(IggyClient::new(ClientWrapper::Tcp(
                 TcpClient::from_connection_string(connection_string)?,
             ))),
-            TransportProtocol::Quic => Ok(IggyClient::new(Box::new(
+            TransportProtocol::Quic => Ok(IggyClient::new(ClientWrapper::Quic(
                 QuicClient::from_connection_string(connection_string)?,
             ))),
-            TransportProtocol::Http => Ok(IggyClient::new(Box::new(
+            TransportProtocol::Http => Ok(IggyClient::new(ClientWrapper::Http(
                 HttpClient::from_connection_string(connection_string)?,
             ))),
         }
@@ -95,7 +96,7 @@ impl IggyClient {
 
     /// Creates a new `IggyClient` with the provided client implementation for the specific transport and the optional implementations for the `partitioner` and `encryptor`.
     pub fn create(
-        client: Box<dyn Client>,
+        client: ClientWrapper,
         partitioner: Option<Arc<dyn Partitioner>>,
         encryptor: Option<Arc<EncryptorKind>>,
     ) -> Self {
@@ -115,7 +116,7 @@ impl IggyClient {
     }
 
     /// Returns the underlying client implementation for the specific transport.
-    pub fn client(&self) -> IggyRwLock<Box<dyn Client>> {
+    pub fn client(&self) -> IggyRwLock<ClientWrapper> {
         self.client.clone()
     }
 

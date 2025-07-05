@@ -51,7 +51,7 @@ crossbeam = { workspace = true }
 ctrlc = { version = "3.4", features = ["termination"] }
 dashmap = { workspace = true }
 derive_more = { workspace = true }
-dotenvy = "0.15.7"
+dotenvy = { workspace = true }
 enum_dispatch = { workspace = true }
 error_set = { version = "0.8.5", features = ["tracing"] }
 figlet-rs = { workspace = true }

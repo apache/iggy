@@ -171,6 +171,21 @@ Start the server:
 
 `cargo run --bin iggy-server`
 
+For configuration options and detailed help:
+
+`cargo run --bin iggy-server -- --help`
+
+You can also use environment variables to override any configuration setting:
+
+- Override TCP address
+   `IGGY_TCP_ADDRESS=0.0.0.0:8090 cargo run --bin iggy-server`
+
+- Set custom data path
+   `IGGY_SYSTEM_PATH=/data/iggy cargo run --bin iggy-server`
+
+- Enable HTTP transport
+   `IGGY_HTTP_ENABLED=true cargo run --bin iggy-server`
+
 To quickly generate the sample data:
 
 `cargo run --bin data-seeder-tool`

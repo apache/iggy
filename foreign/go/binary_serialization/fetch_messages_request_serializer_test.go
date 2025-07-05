@@ -24,20 +24,19 @@ import (
 )
 
 func TestSerialize_TcpFetchMessagesRequest(t *testing.T) {
+	partitionId := uint32(123)
 	// Create a sample TcpFetchMessagesRequest
 	request := TcpFetchMessagesRequest{
-		FetchMessagesRequest: iggcon.FetchMessagesRequest{
-			Consumer: iggcon.Consumer{
-				Kind: iggcon.ConsumerSingle,
-				Id:   iggcon.NewIdentifier(42),
-			},
-			StreamId:        iggcon.NewIdentifier("test_stream_id"),
-			TopicId:         iggcon.NewIdentifier("test_topic_id"),
-			PartitionId:     123,
-			PollingStrategy: iggcon.FirstPollingStrategy(),
-			Count:           100,
-			AutoCommit:      true,
+		Consumer: iggcon.Consumer{
+			Kind: iggcon.ConsumerKindSingle,
+			Id:   iggcon.NewIdentifier(42),
 		},
+		StreamId:    iggcon.NewIdentifier("test_stream_id"),
+		TopicId:     iggcon.NewIdentifier("test_topic_id"),
+		PartitionId: &partitionId,
+		Strategy:    iggcon.FirstPollingStrategy(),
+		Count:       100,
+		AutoCommit:  true,
 	}
 
 	// Serialize the request

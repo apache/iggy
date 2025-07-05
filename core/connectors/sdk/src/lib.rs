@@ -17,10 +17,18 @@
  */
 
 use async_trait::async_trait;
-use decoders::{json::JsonStreamDecoder, raw::RawStreamDecoder, text::TextStreamDecoder};
-use encoders::{json::JsonStreamEncoder, raw::RawStreamEncoder, text::TextStreamEncoder};
+use base64::{self, Engine};
+use decoders::{
+    flatbuffer::FlatBufferStreamDecoder, json::JsonStreamDecoder, proto::ProtoStreamDecoder,
+    raw::RawStreamDecoder, text::TextStreamDecoder,
+};
+use encoders::{
+    flatbuffer::FlatBufferStreamEncoder, json::JsonStreamEncoder, proto::ProtoStreamEncoder,
+    raw::RawStreamEncoder, text::TextStreamEncoder,
+};
 use iggy::prelude::{HeaderKey, HeaderValue};
 use once_cell::sync::OnceCell;
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 use strum_macros::{Display, IntoStaticStr};
@@ -33,11 +41,16 @@ pub mod sink;
 pub mod source;
 pub mod transforms;
 
+pub use transforms::Transform;
+
 static RUNTIME: OnceCell<Runtime> = OnceCell::new();
 
 pub fn get_runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| Runtime::new().expect("Failed to create Tokio runtime"))
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConnectorState(pub Vec<u8>);
 
 /// The Source trait defines the interface for a source connector, responsible for producing the messages to the configured stream and topic.
 /// Once the messages are produced (e.g. fetched from an external API), they will be sent further to the specified destination.
@@ -72,11 +85,13 @@ pub trait Sink: Send + Sync {
     async fn close(&mut self) -> Result<(), Error>;
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Payload {
     Json(simd_json::OwnedValue),
     Raw(Vec<u8>),
     Text(String),
+    Proto(String),
+    FlatBuffer(Vec<u8>),
 }
 
 impl Payload {
@@ -87,6 +102,8 @@ impl Payload {
             }
             Payload::Raw(value) => Ok(value),
             Payload::Text(text) => Ok(text.into_bytes()),
+            Payload::Proto(text) => Ok(text.into_bytes()),
+            Payload::FlatBuffer(value) => Ok(value),
         }
     }
 }
@@ -101,6 +118,8 @@ impl std::fmt::Display for Payload {
             ),
             Payload::Raw(value) => write!(f, "Raw({value:#?})"),
             Payload::Text(text) => write!(f, "Text({text})"),
+            Payload::Proto(text) => write!(f, "Proto({text})"),
+            Payload::FlatBuffer(value) => write!(f, "FlatBuffer({} bytes)", value.len()),
         }
     }
 }
@@ -117,6 +136,10 @@ pub enum Schema {
     Raw,
     #[strum(to_string = "text")]
     Text,
+    #[strum(to_string = "proto")]
+    Proto,
+    #[strum(to_string = "flatbuffer")]
+    FlatBuffer,
 }
 
 impl Schema {
@@ -129,6 +152,17 @@ impl Schema {
             Schema::Text => Ok(Payload::Text(
                 String::from_utf8(value).map_err(|_| Error::InvalidTextPayload)?,
             )),
+            Schema::Proto => match prost_types::Any::decode(value.as_slice()) {
+                Ok(any) => {
+                    let json_value = simd_json::json!({
+                        "type_url": any.type_url,
+                        "value": base64::engine::general_purpose::STANDARD.encode(&any.value),
+                    });
+                    Ok(Payload::Json(json_value))
+                }
+                Err(_) => Ok(Payload::Raw(value)),
+            },
+            Schema::FlatBuffer => Ok(Payload::FlatBuffer(value)),
         }
     }
 
@@ -137,6 +171,8 @@ impl Schema {
             Schema::Json => Arc::new(JsonStreamDecoder),
             Schema::Raw => Arc::new(RawStreamDecoder),
             Schema::Text => Arc::new(TextStreamDecoder),
+            Schema::Proto => Arc::new(ProtoStreamDecoder::default()),
+            Schema::FlatBuffer => Arc::new(FlatBufferStreamDecoder::default()),
         }
     }
 
@@ -145,6 +181,8 @@ impl Schema {
             Schema::Json => Arc::new(JsonStreamEncoder),
             Schema::Raw => Arc::new(RawStreamEncoder),
             Schema::Text => Arc::new(TextStreamEncoder),
+            Schema::Proto => Arc::new(ProtoStreamEncoder::default()),
+            Schema::FlatBuffer => Arc::new(FlatBufferStreamEncoder::default()),
         }
     }
 }
@@ -181,6 +219,7 @@ pub struct ReceivedMessage {
 pub struct ProducedMessages {
     pub schema: Schema,
     pub messages: Vec<ProducedMessage>,
+    pub state: Option<ConnectorState>,
 }
 
 #[repr(C)]
@@ -216,7 +255,11 @@ pub struct RawMessages {
 #[repr(C)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RawMessage {
+    pub id: u128,
     pub offset: u64,
+    pub checksum: u64,
+    pub timestamp: u64,
+    pub origin_timestamp: u64,
     pub headers: Vec<u8>,
     pub payload: Vec<u8>,
 }
@@ -224,7 +267,11 @@ pub struct RawMessage {
 #[repr(C)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ConsumedMessage {
+    pub id: u128,
     pub offset: u64,
+    pub checksum: u64,
+    pub timestamp: u64,
+    pub origin_timestamp: u64,
     pub headers: Option<HashMap<HeaderKey, HeaderValue>>,
     pub payload: Payload,
 }
@@ -259,4 +306,14 @@ pub enum Error {
     InvalidTextPayload,
     #[error("Cannot decode schema {0}")]
     CannotDecode(Schema),
+    #[error("Invalid protobuf payload.")]
+    InvalidProtobufPayload,
+    #[error("Cannot open state file")]
+    CannotOpenStateFile,
+    #[error("Cannot read state file")]
+    CannotReadStateFile,
+    #[error("Cannot write state file")]
+    CannotWriteStateFile,
+    #[error("Invalid state")]
+    InvalidState,
 }

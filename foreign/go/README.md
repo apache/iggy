@@ -1,3 +1,5 @@
-# Tests
+# Go SDK for Iggy
 
-Use ginkgo to run e2e tests.
+Official Go client SDK for [Apache Iggy](https://iggy.apache.org) message streaming.
+
+The client currently supports TCP protocols with blocking implementation.

@@ -16,6 +16,8 @@ bdd/
 │   ├── Dockerfile              # Python BDD test container
 │   ├── tests/
 │   └── requirements.txt
+├── node/                       # Node SDK BDD implementation
+│   └── Dockerfile              # Node BDD test container
 ├── docker-compose.yml          # Orchestrates server + SDK containers
 ├── Dockerfile                  # Debug build of Iggy server
 └── README.md
@@ -32,6 +34,8 @@ bdd/
 # Run specific SDK tests
 ../scripts/run-bdd-tests.sh rust
 ../scripts/run-bdd-tests.sh python
+../scripts/run-bdd-tests.sh go
+../scripts/run-bdd-tests.sh node
 
 # Clean up Docker resources
 ../scripts/run-bdd-tests.sh clean
@@ -73,6 +77,10 @@ The Rust implementation is located in `core/bdd/` and linked via Docker volumes.
 ### For Python SDK
 
 The Python implementation is in `bdd/python/tests/` and needs to be updated as the Python SDK API evolves.
+
+### For Node SDK
+
+The node.js BDD test are run by cucumber-js, bdd test code is located at [foreign/node/src/bdd](../foreign/node/src/bdd/)
 
 ### Adding New Scenarios
 

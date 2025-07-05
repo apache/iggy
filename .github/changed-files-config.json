@@ -23,6 +23,15 @@
     "Dockerfile.*",
     ".github/workflows/ci-prod-rust.yml"
   ],
+  "go-sdk": [
+    "foreign/go/.*\\.go",
+    "foreign/go/go.mod",
+    "foreign/go/go.sum",
+    "bdd/go/.*\\.go",
+    "bdd/go/go.mod",
+    "bdd/go/go.sum",
+    ".github/workflows/ci-check-go-sdk.yml"
+  ],
   "java-sdk": [
     "foreign/java/.*\\.java",
     "foreign/java/.*\\.kts",
@@ -57,6 +66,9 @@
     "bdd/.*\\.feature",
     "bdd/.*\\.py",
     "bdd/.*\\.rs",
+    "bdd/.*\\.go",
+    "bdd/go/go.mod",
+    "bdd/go/go.sum",
     "bdd/.*Dockerfile",
     "bdd/docker-compose.yml",
     "scripts/run-bdd-tests.sh",

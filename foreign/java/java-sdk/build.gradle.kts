@@ -108,8 +108,8 @@ publishing {
             url = uri(if ((version as String).endsWith("SNAPSHOT")) snapshotsRepoUrl else releasesRepoUrl)
 
             credentials {
-                username = System.getenv("secrets.NEXUS_USER")
-                password = System.getenv("secrets.NEXUS_PASSWORD")
+                username = System.getenv("NEXUS_USER")
+                password = System.getenv("NEXUS_PASSWORD")
             }
         }
     }
