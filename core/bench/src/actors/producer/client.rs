@@ -15,6 +15,26 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+use crate::{actors::BatchMetrics, utils::batch_generator::BenchmarkBatchGenerator};
+use bench_report::numeric_parameter::BenchmarkNumericParameter;
+use iggy::prelude::*;
 
-pub mod benchmark_producing_consumer;
-pub use benchmark_producing_consumer::BenchmarkProducingConsumer;
+#[derive(Debug, Clone)]
+pub struct BenchmarkProducerConfig {
+    pub producer_id: u32,
+    pub stream_id: u32,
+    pub partitions: u32,
+    pub messages_per_batch: BenchmarkNumericParameter,
+    pub message_size: BenchmarkNumericParameter,
+    pub warmup_time: IggyDuration,
+}
+
+#[async_trait::async_trait]
+pub trait ProducerClient: Send + Sync {
+    async fn setup(&mut self) -> Result<(), IggyError>;
+
+    async fn produce_batch(
+        &mut self,
+        batch_generator: &mut BenchmarkBatchGenerator,
+    ) -> Result<Option<BatchMetrics>, IggyError>;
+}

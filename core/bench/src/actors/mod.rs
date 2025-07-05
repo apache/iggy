@@ -16,6 +16,16 @@
  * under the License.
  */
 
+use std::time::Duration;
+
 pub mod consumer;
 pub mod producer;
 pub mod producing_consumer;
+
+#[derive(Debug, Clone)]
+pub struct BatchMetrics {
+    pub messages: u32,
+    pub user_data_bytes: u64,
+    pub total_bytes: u64,
+    pub latency: Duration,
+}
