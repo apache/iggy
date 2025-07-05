@@ -122,21 +122,28 @@ pub fn create_root_user() -> User {
 }
 
 pub fn create_shard_executor() -> Runtime {
-    //TODO: The event intererval tick, could be configureed based on the fact
+    // TODO: The event intererval tick, could be configured based on the fact
     // How many clients we expect to have connected.
     // This roughly estimates the number of tasks we will create.
-    let proactor = compio::driver::ProactorBuilder::new()
+
+    let mut proactor = compio::driver::ProactorBuilder::new();
+
+    proactor
         .capacity(4096)
         .coop_taskrun(true)
-        .taskrun_flag(false) //TODO: Try enabling this.
-        .thread_pool_limit(0)
-        .to_owned();
-    let rt = compio::runtime::RuntimeBuilder::new()
-        .with_proactor(proactor)
+        .taskrun_flag(false); // TODO: Try enabling this.
+
+    // FIXME(hubcio): Only set thread_pool_limit(0) on non-macOS platforms
+    // This causes a freeze on macOS with compio fs operations
+    // see https://github.com/compio-rs/compio/issues/446
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    proactor.thread_pool_limit(0);
+
+    compio::runtime::RuntimeBuilder::new()
+        .with_proactor(proactor.to_owned())
         .event_interval(69)
         .build()
-        .unwrap();
-    rt
+        .unwrap()
 }
 
 pub fn resolve_persister(enforce_fsync: bool) -> Arc<PersisterKind> {
