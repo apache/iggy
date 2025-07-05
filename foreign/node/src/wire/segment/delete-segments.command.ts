@@ -18,23 +18,29 @@
  */
 
 
-import { serializeIdentifier, type Id } from '../identifier.utils.js';
-import { uint32ToBuf } from '../number.utils.js';
+import { deserializeVoidResponse } from '../../client/client.utils.js';
+import { wrapCommand } from '../command.utils.js';
+import type { Id } from '../identifier.utils.js';
+import { serializeSegmentsParams } from './segment.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 
-export const serializePartitionParams = (
-  streamId: Id, topicId: Id, partitionCount = 1,
-) => {
 
-  if (partitionCount < 1 || partitionCount > 1000)
-    throw new Error('Topic partition_count must be between 1 and 1000');
-
-  const streamIdentifier = serializeIdentifier(streamId);
-  const topicIdentifier = serializeIdentifier(topicId);
-  const b = uint32ToBuf(partitionCount);
-
-  return Buffer.concat([
-    streamIdentifier,
-    topicIdentifier,
-    b,
-  ])
+export type DeleteSegments = {
+  streamId: Id,
+  topicId: Id,
+  partitionId: number,
+  segmentsCount: number
 };
+
+export const DELETE_SEGMENTS = {
+  code: COMMAND_CODE.DeleteSegments,
+
+  serialize: ({ streamId, topicId, partitionId, segmentsCount }: DeleteSegments) => {
+    return serializeSegmentsParams(streamId, topicId, partitionId, segmentsCount);
+  },
+
+  deserialize: deserializeVoidResponse
+};
+
+
+export const deleteSegments = wrapCommand<DeleteSegments, boolean>(DELETE_SEGMENTS);

@@ -60,7 +60,7 @@ export const COMMAND_CODE = {
   PurgeTopic: 305,
   CreatePartitions: 402,
   DeletePartitions: 403,
-  // DeleteSegments: 503,            // @TODO  DELETE_SEGMENTS_CODE: u32 = 503;
+  DeleteSegments: 503,
   GetGroup: 600,
   GetGroups: 601,
   CreateGroup: 602,
