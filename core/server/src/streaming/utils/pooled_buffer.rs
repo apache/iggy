@@ -229,7 +229,7 @@ impl SetBufInit for PooledBuffer {
 
 unsafe impl IoBufMut for PooledBuffer {
     fn as_buf_mut_ptr(&mut self) -> *mut u8 {
-        self.inner.as_buf_mut_ptr()
+        self.inner.as_mut_ptr()
     }
 }
 
