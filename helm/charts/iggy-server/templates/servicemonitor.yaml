@@ -1,0 +1,23 @@
+{{- if .Values.serviceMonitor.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  labels:
+    {{- include "iggy-server.labels" . | nindent 4 }}
+    {{- if .Values.serviceMonitor.additionalLabels }}
+    {{ toYaml .Values.serviceMonitor.additionalLabels }}
+    {{- end }}
+  name: {{ template "iggy-server.fullname" .  }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  endpoints:
+  - path: {{ .Values.serviceMonitor.path }}
+    port: http
+  namespaceSelector:
+    matchNames:
+    - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      {{- include "iggy-server.selectorLabels" . | nindent 6 }}
+{{- end }}
