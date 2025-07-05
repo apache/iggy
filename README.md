@@ -51,7 +51,7 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 - **Works directly with binary data**, avoiding enforced schema and serialization/deserialization overhead
 - Custom **zero-copy (de)serialization**, which greatly improves the performance and reduces memory usage.
 - Configurable server features (e.g. caching, segment size, data flush interval, transport protocols etc.)
-- Server-side storage of **consumer offsets** 
+- Server-side storage of **consumer offsets**
 - Multiple ways of polling the messages:
   - By offset (using the indexes)
   - By timestamp (using the time indexes)
