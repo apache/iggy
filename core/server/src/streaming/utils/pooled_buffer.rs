@@ -42,11 +42,15 @@ impl PooledBuffer {
     ///
     /// * `capacity` - The capacity of the buffer
     pub fn with_capacity(capacity: usize) -> Self {
-        let buffer = memory_pool().acquire_buffer(capacity);
+        let (buffer, was_pool_allocated) = memory_pool().acquire_buffer(capacity);
         let original_capacity = buffer.capacity();
-        let original_bucket_idx = memory_pool().best_fit(original_capacity);
+        let original_bucket_idx = if was_pool_allocated {
+            memory_pool().best_fit(original_capacity)
+        } else {
+            None
+        };
         Self {
-            from_pool: true,
+            from_pool: was_pool_allocated,
             original_capacity,
             original_bucket_idx,
             inner: buffer,
@@ -186,7 +190,7 @@ impl Drop for PooledBuffer {
     fn drop(&mut self) {
         if self.from_pool {
             let buf = std::mem::take(&mut self.inner);
-            buf.return_to_pool(self.original_capacity);
+            buf.return_to_pool(self.original_capacity, true);
         }
     }
 }
