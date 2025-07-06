@@ -26,13 +26,13 @@
 
 ---
 
-**Iggy** is the persistent message streaming platform written in Rust, supporting QUIC, TCP (custom binary specification) and HTTP (regular REST API) transport protocols, **capable of processing millions of messages per second at the low latency**.
+**Iggy** is a persistent message streaming platform written in Rust, supporting QUIC, TCP (custom binary specification) and HTTP (regular REST API) transport protocols, **capable of processing millions of messages per second at ultra-low latency**.
 
 Iggy provides **exceptionally high throughput and performance** while utilizing minimal computing resources.
 
-This is **not yet another extension** running on top of the existing infrastructure, such as Kafka or SQL database.
+This is **not yet another extension** running on top of existing infrastructure, such as Kafka or SQL database.
 
-Iggy is the persistent message streaming log **built from the ground up** using the low lvl I/O for speed and efficiency.
+Iggy is a persistent message streaming log **built from the ground up** using low-level I/O for speed and efficiency.
 
 The name is an abbreviation for the Italian Greyhound - small yet extremely fast dogs, the best in their class. See the lovely [Fabio & Cookie](https://www.instagram.com/fabio.and.cookie/) ❤️
 
@@ -40,18 +40,18 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 
 ## Features
 
-- **Highly performant**, persistent append-only log for the message streaming
+- **Highly performant**, persistent append-only log for message streaming
 - **Very high throughput** for both writes and reads
 - **Low latency and predictable resource usage** thanks to the Rust compiled language (no GC)
-- **Users authentication and authorization** with granular permissions and PAT (Personal Access Tokens)
+- **User authentication and authorization** with granular permissions and Personal Access Tokens (PAT)
 - Support for multiple streams, topics and partitions
 - Support for **multiple transport protocols** (QUIC, TCP, HTTP)
 - Fully operational RESTful API which can be optionally enabled
 - Available client SDK in multiple languages
-- **Works directly with the binary data** (lack of enforced schema and serialization/deserialization)
+- **Works directly with binary data**, avoiding enforced schema and serialization/deserialization overhead
 - Custom **zero-copy (de)serialization**, which greatly improves the performance and reduces memory usage.
 - Configurable server features (e.g. caching, segment size, data flush interval, transport protocols etc.)
-- Possibility of storing the **consumer offsets** on the server
+- Server-side storage of **consumer offsets**
 - Multiple ways of polling the messages:
   - By offset (using the indexes)
   - By timestamp (using the time indexes)
@@ -66,7 +66,7 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 - **[Connectors](https://github.com/apache/iggy/tree/master/core/connectors)** - sinks, sources and data transformations based on the **custom Rust plugins**
 - Optional server-side as well as client-side **data encryption** using AES-256-GCM
 - Optional metadata support in the form of **message headers**
-- Optional **data backups & archivization** on disk and/or the **S3** compatible cloud storage (e.g. AWS S3)
+- Optional **data backups and archiving** to disk or **S3** compatible cloud storage (e.g. AWS S3)
 - Support for **OpenTelemetry** logs & traces + Prometheus metrics
 - Built-in **CLI** to manage the streaming server installable via `cargo install iggy-cli`
 - Built-in **benchmarking app** to test the performance
@@ -125,7 +125,7 @@ Iggy CLI can be installed with `cargo install iggy-cli` and then simply accessed
 
 ## Web UI
 
-There's a dedicated Web UI for the server, which allows managing the streams, topics, partitions, browsing the messages and so on. This is an ongoing effort to build the compressive dashboard for the administrative purposes of the Iggy server. Check the Web UI in the `/web` directory. The [docker image for Web UI](https://hub.docker.com/r/iggyrs/iggy-web-ui) is available, and can be fetched via `docker pull iggyrs/iggy-web-ui`.
+There's a dedicated Web UI for the server, which allows managing the streams, topics, partitions, browsing the messages and so on. This is an ongoing effort to build a comprehensive dashboard for administrative purposes of the Iggy server. Check the Web UI in the `/web` directory. The [docker image for Web UI](https://hub.docker.com/r/iggyrs/iggy-web-ui) is available, and can be fetched via `docker pull iggyrs/iggy-web-ui`.
 
 ![Web UI](assets/web_ui.png)
 
