@@ -48,6 +48,11 @@ case $SDK in
   docker compose build --no-cache iggy-server node-bdd
   docker compose up --abort-on-container-exit node-bdd
   ;;
+"csharp")
+  echo "🐢🚀 Running csharp BDD tests..."
+  docker compose build --no-cache iggy-server csharp-bdd
+  docker compose up --abort-on-container-exit csharp-bdd
+  ;;
 "all")
   echo "🚀 Running all SDK BDD tests..."
   echo "🦀 Starting with Rust tests..."
@@ -59,6 +64,8 @@ case $SDK in
   docker compose up --abort-on-container-exit go-bdd
   echo "🐢🚀 Now unning node BDD tests..."
   docker compose up --abort-on-container-exit node-bdd
+  echo "🐢🚀 Now unning csharp BDD tests..."
+  docker compose up --abort-on-container-exit csharp-bdd
   ;;
 "clean")
   echo "🧹 Cleaning up Docker resources..."
