@@ -24,7 +24,7 @@ use once_cell::sync::OnceCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tracing::{info, trace, warn};
+use tracing::{error, info, trace, warn};
 
 /// Global memory pool instance. Use `memory_pool()` to access it.
 pub static MEMORY_POOL: OnceCell<MemoryPool> = OnceCell::new();
@@ -167,9 +167,12 @@ impl MemoryPool {
     ///
     /// - If a bucket can fit `capacity`, try to pop from its free buffer queue; otherwise create a new buffer.
     /// - If `memory_limit` would be exceeded, allocate outside the pool.
-    pub fn acquire_buffer(&self, capacity: usize) -> BytesMut {
+    ///
+    /// Returns a tuple of (buffer, was_pool_allocated) where was_pool_allocated indicates if the buffer
+    /// was allocated from the pool (true) or externally (false).
+    pub fn acquire_buffer(&self, capacity: usize) -> (BytesMut, bool) {
         if !self.is_enabled {
-            return BytesMut::with_capacity(capacity);
+            return (BytesMut::with_capacity(capacity), false);
         }
 
         let current = self.pool_current_size();
@@ -179,7 +182,7 @@ impl MemoryPool {
                 if let Some(mut buf) = self.buckets[idx].pop() {
                     buf.clear();
                     self.inc_bucket_in_use(idx);
-                    return buf;
+                    return (buf, true);
                 }
 
                 let new_size = BUCKET_SIZES[idx];
@@ -190,12 +193,12 @@ impl MemoryPool {
                         new_size, current, self.memory_limit
                     );
                     self.inc_external_allocations();
-                    return BytesMut::with_capacity(new_size);
+                    return (BytesMut::with_capacity(new_size), false);
                 }
 
                 self.inc_bucket_alloc(idx);
                 self.inc_bucket_in_use(idx);
-                BytesMut::with_capacity(new_size)
+                (BytesMut::with_capacity(new_size), true)
             }
             None => {
                 if current + capacity > self.memory_limit {
@@ -204,11 +207,11 @@ impl MemoryPool {
                         capacity, current, self.memory_limit
                     );
                     self.inc_external_allocations();
-                    return BytesMut::with_capacity(capacity);
+                    return (BytesMut::with_capacity(capacity), false);
                 }
 
                 self.inc_external_allocations();
-                BytesMut::with_capacity(capacity)
+                (BytesMut::with_capacity(capacity), false)
             }
         }
     }
@@ -218,7 +221,13 @@ impl MemoryPool {
     /// - If `current_capacity` differs from `original_capacity`, increments `resize_events`.
     /// - If a matching bucket exists, place it back in that bucket's queue (if space is available).
     /// - Otherwise, treat it as an external deallocation.
-    pub fn release_buffer(&self, buffer: BytesMut, original_capacity: usize) {
+    /// - The `was_pool_allocated` flag indicates if this buffer was originally allocated from the pool.
+    pub fn release_buffer(
+        &self,
+        buffer: BytesMut,
+        original_capacity: usize,
+        was_pool_allocated: bool,
+    ) {
         if !self.is_enabled {
             return;
         }
@@ -232,8 +241,10 @@ impl MemoryPool {
             );
         }
 
-        if let Some(orig_idx) = self.best_fit(original_capacity) {
-            self.dec_bucket_in_use(orig_idx);
+        if was_pool_allocated {
+            if let Some(orig_idx) = self.best_fit(original_capacity) {
+                self.dec_bucket_in_use(orig_idx);
+            }
         }
 
         match self.best_fit(current_capacity) {
@@ -426,14 +437,14 @@ impl MemoryPool {
 }
 
 /// Return a buffer to the pool by calling `release_buffer` with the original capacity.
-/// This extension trait makes it easy to do `some_bytes.return_to_pool(orig_cap)`.
+/// This extension trait makes it easy to do `some_bytes.return_to_pool(orig_cap, was_pool_allocated)`.
 pub trait BytesMutExt {
-    fn return_to_pool(self, original_capacity: usize);
+    fn return_to_pool(self, original_capacity: usize, was_pool_allocated: bool);
 }
 
 impl BytesMutExt for BytesMut {
-    fn return_to_pool(self, original_capacity: usize) {
-        memory_pool().release_buffer(self, original_capacity);
+    fn return_to_pool(self, original_capacity: usize, was_pool_allocated: bool) {
+        memory_pool().release_buffer(self, original_capacity, was_pool_allocated);
     }
 }
 
