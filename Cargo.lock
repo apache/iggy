@@ -143,7 +143,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "mio",
- "socket2",
+ "socket2 0.5.10",
  "tokio",
  "tracing",
 ]
@@ -205,7 +205,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "smallvec",
- "socket2",
+ "socket2 0.5.10",
  "time",
  "tracing",
  "url",
@@ -305,15 +305,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8e60d3430d3a69478ad0993f19238d2df97c507009a52b3c10addcd7f6bcb916"
 dependencies = [
  "memchr",
-]
-
-[[package]]
-name = "aligned-array"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e05c92d086290f52938013f6242ac62bf7d401fab8ad36798a609faa65c3fd2c"
-dependencies = [
- "generic-array",
 ]
 
 [[package]]
@@ -1542,27 +1533,23 @@ dependencies = [
 [[package]]
 name = "compio"
 version = "0.15.0"
-source = "git+https://github.com/compio-rs/compio.git?rev=5504e02ec2e821e9b024006224c34c06646410cc#5504e02ec2e821e9b024006224c34c06646410cc"
+source = "git+https://github.com/compio-rs/compio.git?rev=fe4243f0b6811ebc325afd081c9b087b4d9817be#fe4243f0b6811ebc325afd081c9b087b4d9817be"
 dependencies = [
  "compio-buf",
- "compio-dispatcher",
  "compio-driver",
  "compio-fs",
  "compio-io",
  "compio-log",
  "compio-macros",
  "compio-net",
- "compio-process",
- "compio-quic",
  "compio-runtime",
- "compio-signal",
  "compio-tls",
 ]
 
 [[package]]
 name = "compio-buf"
 version = "0.6.0"
-source = "git+https://github.com/compio-rs/compio.git?rev=5504e02ec2e821e9b024006224c34c06646410cc#5504e02ec2e821e9b024006224c34c06646410cc"
+source = "git+https://github.com/compio-rs/compio.git?rev=fe4243f0b6811ebc325afd081c9b087b4d9817be#fe4243f0b6811ebc325afd081c9b087b4d9817be"
 dependencies = [
  "arrayvec",
  "bytes",
@@ -1570,22 +1557,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "compio-dispatcher"
-version = "0.7.0"
-source = "git+https://github.com/compio-rs/compio.git?rev=5504e02ec2e821e9b024006224c34c06646410cc#5504e02ec2e821e9b024006224c34c06646410cc"
-dependencies = [
- "compio-driver",
- "compio-runtime",
- "flume",
- "futures-channel",
-]
-
-[[package]]
 name = "compio-driver"
 version = "0.8.1"
-source = "git+https://github.com/compio-rs/compio.git?rev=5504e02ec2e821e9b024006224c34c06646410cc#5504e02ec2e821e9b024006224c34c06646410cc"
+source = "git+https://github.com/compio-rs/compio.git?rev=fe4243f0b6811ebc325afd081c9b087b4d9817be#fe4243f0b6811ebc325afd081c9b087b4d9817be"
 dependencies = [
- "aligned-array",
  "cfg-if",
  "cfg_aliases",
  "compio-buf",
@@ -1600,14 +1575,14 @@ dependencies = [
  "paste",
  "polling",
  "slab",
- "socket2",
- "windows-sys 0.52.0",
+ "socket2 0.6.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
 name = "compio-fs"
 version = "0.8.0"
-source = "git+https://github.com/compio-rs/compio.git?rev=5504e02ec2e821e9b024006224c34c06646410cc#5504e02ec2e821e9b024006224c34c06646410cc"
+source = "git+https://github.com/compio-rs/compio.git?rev=fe4243f0b6811ebc325afd081c9b087b4d9817be#fe4243f0b6811ebc325afd081c9b087b4d9817be"
 dependencies = [
  "cfg-if",
  "cfg_aliases",
@@ -1618,13 +1593,13 @@ dependencies = [
  "libc",
  "os_pipe",
  "widestring",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
 name = "compio-io"
 version = "0.7.0"
-source = "git+https://github.com/compio-rs/compio.git?rev=5504e02ec2e821e9b024006224c34c06646410cc#5504e02ec2e821e9b024006224c34c06646410cc"
+source = "git+https://github.com/compio-rs/compio.git?rev=fe4243f0b6811ebc325afd081c9b087b4d9817be#fe4243f0b6811ebc325afd081c9b087b4d9817be"
 dependencies = [
  "compio-buf",
  "futures-util",
@@ -1635,7 +1610,7 @@ dependencies = [
 [[package]]
 name = "compio-log"
 version = "0.1.0"
-source = "git+https://github.com/compio-rs/compio.git?rev=5504e02ec2e821e9b024006224c34c06646410cc#5504e02ec2e821e9b024006224c34c06646410cc"
+source = "git+https://github.com/compio-rs/compio.git?rev=fe4243f0b6811ebc325afd081c9b087b4d9817be#fe4243f0b6811ebc325afd081c9b087b4d9817be"
 dependencies = [
  "tracing",
 ]
@@ -1643,7 +1618,7 @@ dependencies = [
 [[package]]
 name = "compio-macros"
 version = "0.1.2"
-source = "git+https://github.com/compio-rs/compio.git?rev=5504e02ec2e821e9b024006224c34c06646410cc#5504e02ec2e821e9b024006224c34c06646410cc"
+source = "git+https://github.com/compio-rs/compio.git?rev=fe4243f0b6811ebc325afd081c9b087b4d9817be#fe4243f0b6811ebc325afd081c9b087b4d9817be"
 dependencies = [
  "proc-macro-crate 3.3.0",
  "proc-macro2",
@@ -1654,7 +1629,7 @@ dependencies = [
 [[package]]
 name = "compio-net"
 version = "0.8.0"
-source = "git+https://github.com/compio-rs/compio.git?rev=5504e02ec2e821e9b024006224c34c06646410cc#5504e02ec2e821e9b024006224c34c06646410cc"
+source = "git+https://github.com/compio-rs/compio.git?rev=fe4243f0b6811ebc325afd081c9b087b4d9817be#fe4243f0b6811ebc325afd081c9b087b4d9817be"
 dependencies = [
  "cfg-if",
  "compio-buf",
@@ -1664,85 +1639,36 @@ dependencies = [
  "either",
  "libc",
  "once_cell",
- "socket2",
+ "socket2 0.6.0",
  "widestring",
- "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "compio-process"
-version = "0.5.0"
-source = "git+https://github.com/compio-rs/compio.git?rev=5504e02ec2e821e9b024006224c34c06646410cc#5504e02ec2e821e9b024006224c34c06646410cc"
-dependencies = [
- "cfg-if",
- "compio-buf",
- "compio-driver",
- "compio-io",
- "compio-runtime",
- "futures-util",
- "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "compio-quic"
-version = "0.4.0"
-source = "git+https://github.com/compio-rs/compio.git?rev=5504e02ec2e821e9b024006224c34c06646410cc#5504e02ec2e821e9b024006224c34c06646410cc"
-dependencies = [
- "cfg_aliases",
- "compio-buf",
- "compio-io",
- "compio-log",
- "compio-net",
- "compio-runtime",
- "flume",
- "futures-util",
- "libc",
- "quinn-proto",
- "rustc-hash 2.1.1",
- "rustls",
- "thiserror 2.0.12",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
 name = "compio-runtime"
 version = "0.8.1"
-source = "git+https://github.com/compio-rs/compio.git?rev=5504e02ec2e821e9b024006224c34c06646410cc#5504e02ec2e821e9b024006224c34c06646410cc"
+source = "git+https://github.com/compio-rs/compio.git?rev=fe4243f0b6811ebc325afd081c9b087b4d9817be#fe4243f0b6811ebc325afd081c9b087b4d9817be"
 dependencies = [
  "async-task",
  "cfg-if",
  "compio-buf",
  "compio-driver",
  "compio-log",
+ "core_affinity",
  "crossbeam-queue",
  "futures-util",
  "libc",
  "once_cell",
  "scoped-tls",
  "slab",
- "socket2",
- "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "compio-signal"
-version = "0.6.0"
-source = "git+https://github.com/compio-rs/compio.git?rev=5504e02ec2e821e9b024006224c34c06646410cc#5504e02ec2e821e9b024006224c34c06646410cc"
-dependencies = [
- "compio-buf",
- "compio-driver",
- "compio-runtime",
- "libc",
- "once_cell",
- "os_pipe",
- "slab",
- "windows-sys 0.52.0",
+ "socket2 0.6.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
 name = "compio-tls"
 version = "0.6.0"
-source = "git+https://github.com/compio-rs/compio.git?rev=5504e02ec2e821e9b024006224c34c06646410cc#5504e02ec2e821e9b024006224c34c06646410cc"
+source = "git+https://github.com/compio-rs/compio.git?rev=fe4243f0b6811ebc325afd081c9b087b4d9817be#fe4243f0b6811ebc325afd081c9b087b4d9817be"
 dependencies = [
  "compio-buf",
  "compio-io",
@@ -3822,7 +3748,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -6199,7 +6125,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls",
- "socket2",
+ "socket2 0.5.10",
  "thiserror 2.0.12",
  "tokio",
  "tracing",
@@ -6238,7 +6164,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.59.0",
 ]
@@ -7158,7 +7084,6 @@ dependencies = [
  "clap",
  "compio",
  "console-subscriber",
- "core_affinity",
  "crossbeam",
  "ctrlc",
  "dashmap",
@@ -7196,7 +7121,7 @@ dependencies = [
  "serde_with",
  "serial_test",
  "sharded_queue",
- "socket2",
+ "socket2 0.5.10",
  "static-toml",
  "strum",
  "sysinfo 0.35.2",
@@ -7375,6 +7300,16 @@ checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
 dependencies = [
  "libc",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "socket2"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "233504af464074f9d066d7b5416c5f9b894a5862a6506e306f7b816cdd6f1807"
+dependencies = [
+ "libc",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7771,7 +7706,7 @@ dependencies = [
  "parking_lot 0.12.4",
  "pin-project-lite",
  "signal-hook-registry",
- "socket2",
+ "socket2 0.5.10",
  "tokio-macros",
  "tracing",
  "windows-sys 0.52.0",
@@ -7896,7 +7831,7 @@ dependencies = [
  "percent-encoding",
  "pin-project",
  "prost",
- "socket2",
+ "socket2 0.5.10",
  "tokio",
  "tokio-stream",
  "tower 0.4.13",

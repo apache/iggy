@@ -26,9 +26,7 @@ use compio::net::{TcpListener, TcpOpts};
 use error_set::ErrContext;
 use futures::FutureExt;
 use iggy_common::IggyError;
-use socket2::Socket;
 use std::net::SocketAddr;
-use std::num::TryFromIntError;
 use std::rc::Rc;
 use std::time::Duration;
 use tracing::{error, info};
@@ -39,7 +37,7 @@ async fn create_listener(
 ) -> Result<TcpListener, std::io::Error> {
     // Required by the thread-per-core model...
     // We create bunch of sockets on different threads, that bind to exactly the same address and port.
-    let opts = TcpOpts::new().set_reuse_address(true).set_reuse_port(true);
+    let opts = TcpOpts::new().reuse_port(true).reuse_port(true);
     let opts = if config.override_defaults {
         let recv_buffer_size = config
             .recv_buffer_size
@@ -53,11 +51,11 @@ async fn create_listener(
             .try_into()
             .expect("Failed to parse send_buffer_size for TCP socket");
 
-        opts.set_recv_buffer_size(recv_buffer_size)
-            .set_send_buffer_size(send_buffer_size)
-            .set_keepalive(config.keepalive)
-            .set_linger(config.linger.get_duration())
-            .set_no_delay(config.nodelay)
+        opts.recv_buffer_size(recv_buffer_size)
+            .send_buffer_size(send_buffer_size)
+            .keepalive(config.keepalive)
+            .linger(config.linger.get_duration())
+            .nodelay(config.nodelay)
     } else {
         opts
     };

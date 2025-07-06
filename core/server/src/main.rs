@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::thread::available_parallelism;
@@ -85,7 +86,7 @@ fn main() -> Result<(), ServerError> {
     // Load config and create directories.
     // Remove `local_data` directory if run with `--fresh` flag.
     // TODO: Replace this once we use `monoio::main` macro.
-    let rt = create_shard_executor();
+    let rt = create_shard_executor(Default::default());
     let config = rt
         .block_on(async {
             let config = load_config(&config_provider)
@@ -123,7 +124,6 @@ fn main() -> Result<(), ServerError> {
 
     // TODO: Make this configurable from config as a range
     // for example this instance of Iggy will use cores from 0..4
-    let core_ids = core_affinity::get_core_ids().unwrap();
     let available_cpus = available_parallelism().expect("Failed to get num of cores");
     let shards_count = available_cpus.into();
     let shards_set = 0..shards_count;
@@ -138,24 +138,11 @@ fn main() -> Result<(), ServerError> {
         let config = config.clone();
         let state_persister = resolve_persister(config.system.state.enforce_fsync);
 
-        let core_ids = core_ids.clone();
         let handle = std::thread::Builder::new()
             .name(format!("shard-{id}"))
             .spawn(move || {
-                let core_ids = core_ids.clone();
                 MemoryPool::init_pool(config.system.clone());
-                if core_ids.len() > shard_id {
-                    core_affinity::set_for_current(core_ids[shard_id]);
-                }
-
-                // TODO: Fix this once this PR gets resolved.
-                // https://github.com/compio-rs/compio/pull/445 
-                /*
-                compio::utils::bind_to_cpu_set(Some(shard_id))
-                    .unwrap_or_else(|e| panic!("Failed to set CPU affinity for shard-{id}: {e}"));
-                */
-
-                let rt = create_shard_executor();
+                let rt = create_shard_executor(HashSet::from([shard_id]));
                 rt.block_on(async move {
                     let version = SemanticVersion::current().expect("Invalid version");
                     info!(

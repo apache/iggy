@@ -23,7 +23,7 @@ use crate::{
         utils::file::overwrite,
     },
 };
-use std::{env, ops::Range, path::Path, sync::Arc};
+use std::{collections::HashSet, env, ops::Range, path::Path, sync::Arc};
 
 pub fn create_shard_connections(
     shards_set: Range<usize>,
@@ -121,7 +121,7 @@ pub fn create_root_user() -> User {
     user
 }
 
-pub fn create_shard_executor() -> Runtime {
+pub fn create_shard_executor(cpu_set: HashSet<usize>) -> Runtime {
     // TODO: The event intererval tick, could be configured based on the fact
     // How many clients we expect to have connected.
     // This roughly estimates the number of tasks we will create.
@@ -142,6 +142,7 @@ pub fn create_shard_executor() -> Runtime {
     compio::runtime::RuntimeBuilder::new()
         .with_proactor(proactor.to_owned())
         .event_interval(69)
+        .thread_affinity(cpu_set)
         .build()
         .unwrap()
 }
