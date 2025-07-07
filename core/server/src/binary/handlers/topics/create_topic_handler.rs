@@ -94,7 +94,7 @@ impl ServerCommandHandler for CreateTopic {
         let records = shard
             .create_shard_table_records(&partition_ids, numeric_stream_id, numeric_topic_id)
             .collect::<Vec<_>>();
-        // open the partitions and segments for that particular shard;
+        // Open partition and segments for that particular shard.
         for (ns, shard_info) in records.iter() {
             if shard_info.id() == shard.id {
                 let partition_id = ns.partition_id;

@@ -28,7 +28,7 @@ use ahash::{AHashMap, AHashSet, HashMap};
 use builder::IggyShardBuilder;
 use error_set::ErrContext;
 use futures::future::try_join_all;
-use iggy_common::{locking::IggySharedMutFn, EncryptorKind, Identifier, IggyError, UserId};
+use iggy_common::{EncryptorKind, Identifier, IggyError, UserId, locking::IggySharedMutFn};
 use namespace::IggyNamespace;
 use std::{
     cell::{Cell, RefCell},
@@ -557,6 +557,7 @@ impl IggyShard {
                     .collect::<Vec<_>>();
                 let stream = self.get_stream(&Identifier::numeric(*stream_id)?)?;
                 let topic = stream.get_topic(&Identifier::numeric(*topic_id)?)?;
+                // Open partition and segments for that particular shard.
                 for (ns, shard_info) in records.iter() {
                     if shard_info.id() == self.id {
                         let partition_id = ns.partition_id;
