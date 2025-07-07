@@ -1,16 +1,16 @@
 use std::sync::Mutex;
 
 #[derive(Default)]
-pub struct Gate<T> {
-    state: Mutex<GateState<T>>,
+pub struct Barrier<T> {
+    state: Mutex<BarrierState<T>>,
 }
 
 #[derive(Default)]
-pub struct GateState<T> {
+pub struct BarrierState<T> {
     result: Option<T>,
 }
 
-impl<T> GateState<T> {
+impl<T> BarrierState<T> {
     pub fn set_result(&mut self, result: T) {
         self.result = Some(result);
     }
@@ -20,22 +20,22 @@ impl<T> GateState<T> {
     }
 }
 
-impl<T> Gate<T>
+impl<T> Barrier<T>
 where
     T: Default,
 {
     pub fn new() -> Self {
-        Gate {
+        Barrier {
             state: Default::default(),
         }
     }
 
-    pub async fn with_async<R>(&self, f: impl AsyncFnOnce(&mut GateState<T>) -> R) {
+    pub async fn with_async<R>(&self, f: impl AsyncFnOnce(&mut BarrierState<T>) -> R) {
         let mut guard = self.state.lock().unwrap();
         f(&mut guard).await;
     }
 
-    pub async fn with<R>(&self, f: impl FnOnce(&mut GateState<T>) -> R) {
+    pub async fn with<R>(&self, f: impl FnOnce(&mut BarrierState<T>) -> R) {
         let mut guard = self.state.lock().unwrap();
         f(&mut guard);
     }

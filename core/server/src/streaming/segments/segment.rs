@@ -205,8 +205,8 @@ impl Segment {
         Ok(())
     }
 
-    /// Save the segment state to disk.
-    pub async fn persist(&mut self) -> Result<(), IggyError> {
+    /// Open segment.
+    pub async fn open(&mut self) -> Result<(), IggyError> {
         info!(
             "Saving segment with start offset: {} for partition with ID: {} for topic with ID: {} and stream with ID: {}",
             self.start_offset, self.partition_id, self.topic_id, self.stream_id

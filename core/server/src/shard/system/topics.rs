@@ -112,9 +112,8 @@ impl IggyShard {
         compression_algorithm: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,
         replication_factor: Option<u8>,
-        shards_assignment: Vec<(IggyNamespace, ShardInfo)>,
     ) -> Result<(), IggyError> {
-        let (topic_id, _) = self.create_topic_base(
+        self.create_topic_base(
             stream_id,
             topic_id,
             name,
@@ -124,25 +123,6 @@ impl IggyShard {
             max_topic_size,
             replication_factor,
         )?;
-        let stream = self.get_stream(stream_id).with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
-        })?;
-        let stream_id = stream.stream_id;
-        let topic = stream
-            .get_topic(&Identifier::numeric(topic_id)?)
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to get topic with ID: {topic_id} in stream with ID: {stream_id}")
-            })?;
-
-        for (_, shard_info) in &shards_assignment {
-            if shard_info.id() == self.id {
-                topic.persist().await.with_error_context(|error| {
-                    format!("{COMPONENT} (error: {error}) - failed to persist topic: {topic}")
-                })?;
-            }
-        }
-
-        self.insert_shard_table_records(shards_assignment);
 
         self.metrics.increment_topics(1);
         self.metrics.increment_partitions(partitions_count);
@@ -162,7 +142,7 @@ impl IggyShard {
         compression_algorithm: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,
         replication_factor: Option<u8>,
-    ) -> Result<(Vec<(IggyNamespace, ShardInfo)>, Identifier), IggyError> {
+    ) -> Result<(Identifier, Vec<u32>), IggyError> {
         self.ensure_authenticated(session)?;
         {
             let stream = self.get_stream(stream_id).with_error_context(|error| {
@@ -195,7 +175,7 @@ impl IggyShard {
         })?;
         let stream_id = stream.stream_id;
         let topic = stream
-                .get_topic(&Identifier::numeric(topic_id)?)
+                .get_topic(&topic_id)
                 .with_error_context(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to get topic with ID: {topic_id} in stream with ID: {stream_id}")
                 })?;
@@ -203,22 +183,11 @@ impl IggyShard {
             format!("{COMPONENT} (error: {error}) - failed to persist topic: {topic}")
         })?;
 
-        // TODO: Refactor
-        let records = partition_ids.into_iter().map(|partition_id| {
-            let namespace = IggyNamespace::new(stream_id, topic_id, partition_id);
-            let hash = namespace.generate_hash();
-            let shard_id = hash % self.get_available_shards_count();
-            let shard_info = ShardInfo::new(shard_id as u16);
-            (namespace, shard_info)
-        });
-        let records = records.collect::<Vec<_>>();
-        self.insert_shard_table_records(records.clone());
-
         self.metrics.increment_topics(1);
         self.metrics.increment_partitions(partitions_count);
         self.metrics.increment_segments(partitions_count);
 
-        Ok((records, Identifier::numeric(topic_id)?))
+        Ok((topic_id, partition_ids))
     }
 
     fn create_topic_base(
@@ -231,7 +200,7 @@ impl IggyShard {
         compression_algorithm: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,
         replication_factor: Option<u8>,
-    ) -> Result<(u32, Vec<u32>), IggyError> {
+    ) -> Result<(Identifier, Vec<u32>), IggyError> {
         let mut stream = self.get_stream_mut(stream_id).with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to get mutable reference to stream with ID: {stream_id}")
         })?;

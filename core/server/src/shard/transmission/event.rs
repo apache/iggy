@@ -9,6 +9,11 @@ use crate::{
 
 #[derive(Debug)]
 pub enum ShardEvent {
+    CreatedShardTableRecords {
+        stream_id: u32,
+        topic_id: u32,
+        partition_ids: Vec<u32>,
+    },
     CreatedStream {
         stream_id: Option<u32>,
         name: String,
@@ -20,14 +25,13 @@ pub enum ShardEvent {
     //DeletedPartitions(Identifier, Identifier, u32),
     CreatedTopic {
         stream_id: Identifier,
-        topic_id: Option<u32>,
+        topic_id: Identifier,
         name: String,
         partitions_count: u32,
         message_expiry: IggyExpiry,
         compression_algorithm: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,
         replication_factor: Option<u8>,
-        shards_assignment: Vec<(IggyNamespace, ShardInfo)>,
     },
     //CreatedConsumerGroup(Identifier, Identifier, Option<u32>, String),
     //DeletedConsumerGroup(Identifier, Identifier, Identifier),

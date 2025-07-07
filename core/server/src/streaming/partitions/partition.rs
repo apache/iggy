@@ -21,9 +21,11 @@ use crate::streaming::deduplication::message_deduplicator::MessageDeduplicator;
 use crate::streaming::segments::*;
 use crate::streaming::storage::SystemStorage;
 use dashmap::DashMap;
+use error_set::ErrContext;
 use iggy_common::ConsumerKind;
 use iggy_common::IggyByteSize;
 use iggy_common::IggyDuration;
+use iggy_common::IggyError;
 use iggy_common::IggyExpiry;
 use iggy_common::IggyTimestamp;
 use iggy_common::Sizeable;
@@ -31,6 +33,8 @@ use std::fmt;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+use super::COMPONENT;
 
 #[derive(Debug)]
 pub struct Partition {
@@ -177,6 +181,15 @@ impl Partition {
         }
 
         partition
+    }
+
+    pub async fn open(&mut self) -> Result<(), IggyError> {
+        for segment in self.get_segments_mut() {
+            segment.open().await.with_error_context(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to persist segment: {segment}",)
+            })?;
+        }
+        Ok(())
     }
 }
 
