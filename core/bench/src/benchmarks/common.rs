@@ -128,6 +128,7 @@ pub fn build_producer_futures(
     let shared_finish_condition =
         BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::Shared);
     let rate_limit = rate_limit_per_actor(args.rate_limit(), actors);
+    let use_high_level_api = args.high_level_api();
 
     (1..=producers)
         .map(|producer_id| {
@@ -155,6 +156,7 @@ pub fn build_producer_futures(
                     sampling_time,
                     moving_average_window,
                     rate_limit,
+                    use_high_level_api,
                 );
                 producer.run().await
             }
@@ -263,7 +265,15 @@ pub fn build_producing_consumers_futures(
                 &args,
                 BenchmarkFinishConditionMode::PerProducingConsumer,
             );
-
+            let origin_timestamp_latency_calculation = match args.kind() {
+                BenchmarkKind::PinnedConsumer
+                | BenchmarkKind::PinnedProducerAndConsumer
+                | BenchmarkKind::BalancedConsumerGroup  // TODO(hubcio): in future, PinnedProducerAndConsumer can also be true
+                | BenchmarkKind::EndToEndProducingConsumer => false,
+                BenchmarkKind::BalancedProducerAndConsumerGroup => true,
+                _ => unreachable!(),
+            };
+            let use_high_level_api = args.high_level_api();
             let rate_limit = rate_limit_per_actor(args.rate_limit(), producing_consumers);
 
             async move {
@@ -287,6 +297,8 @@ pub fn build_producing_consumers_futures(
                     args_clone.moving_average_window(),
                     rate_limit,
                     polling_kind,
+                    origin_timestamp_latency_calculation,
+                    use_high_level_api,
                 );
                 actor.run().await
             }
@@ -310,7 +322,7 @@ pub fn build_producing_consumer_groups_futures(
     let start_stream_id = args.start_stream_id();
     let start_consumer_group_id = CONSUMER_GROUP_BASE_ID;
     let polling_kind = PollingKind::Next;
-
+    let use_high_level_api = args.high_level_api();
     let shared_send_finish_condition =
         BenchmarkFinishCondition::new(&args, BenchmarkFinishConditionMode::SharedHalf);
 
@@ -349,6 +361,14 @@ pub fn build_producing_consumer_groups_futures(
             } else {
                 None
             };
+            let origin_timestamp_latency_calculation = match args.kind() {
+                BenchmarkKind::PinnedConsumer
+                | BenchmarkKind::PinnedProducerAndConsumer
+                | BenchmarkKind::BalancedConsumerGroup  // TODO(hubcio): in future, PinnedProducerAndConsumer can also be true
+                | BenchmarkKind::EndToEndProducingConsumer => false,
+                BenchmarkKind::BalancedProducerAndConsumerGroup => true,
+                _ => unreachable!(),
+            };
 
             async move {
                 let actor_type = match (should_produce, should_consume) {
@@ -385,6 +405,8 @@ pub fn build_producing_consumer_groups_futures(
                     args_clone.moving_average_window(),
                     rate_limit,
                     polling_kind,
+                    origin_timestamp_latency_calculation,
+                    use_high_level_api,
                 );
                 actor.run().await
             }

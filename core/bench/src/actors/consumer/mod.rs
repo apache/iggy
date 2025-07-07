@@ -16,9 +16,9 @@
  * under the License.
  */
 
-pub mod backend;
 pub mod benchmark_consumer;
-pub mod high_level_backend;
-pub mod low_level_backend;
+pub mod client;
+pub mod high_level_client;
+pub mod low_level_client;
 
 pub use benchmark_consumer::BenchmarkConsumer;
