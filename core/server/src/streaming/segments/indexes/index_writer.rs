@@ -92,7 +92,7 @@ impl IndexWriter {
 
         let bytes_written = self
             .direct_file
-            .write_all(&indexes)
+            .write_all(indexes)
             .await
             .with_error_context(|error| {
                 format!(

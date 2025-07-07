@@ -31,12 +31,19 @@ async fn write_batch_with_direct_file(
     mut batches: IggyMessagesBatchSet,
 ) -> Result<usize, IggyError> {
     let total_written: usize = batches.iter().map(|b| b.size() as usize).sum();
-    let mut messages_count = 0;
+    let messages_count: u32 = batches.iter().map(|b| b.count()).sum();
 
-    for batch in batches.iter_mut() {
-        messages_count += batch.count();
-        let messages = batch.take_messages();
-        direct_file.write_all(&messages).await?;
+    if batches.containers_count() == 1 {
+        // Single batch - use write_all with owned buffer
+        let messages = batches.iter_mut().next().unwrap().take_messages();
+        direct_file.write_all(messages).await?;
+    } else {
+        // Multiple batches - use vectored write for better performance
+        let mut buffers = Vec::with_capacity(batches.containers_count());
+        for batch in batches.iter_mut() {
+            buffers.push(batch.take_messages());
+        }
+        direct_file.write_vectored(buffers).await?;
     }
 
     tracing::trace!("Saved {} messages", messages_count);

@@ -214,16 +214,6 @@ impl PooledBuffer {
     pub fn put<T: AsRef<[u8]>>(&mut self, data: T) {
         self.extend_from_slice(data.as_ref());
     }
-
-    /// Align the buffer length to the next 512-byte boundary by padding with zeros
-    pub fn align(&mut self) {
-        let current_len = self.inner.len();
-        let aligned_len = (current_len + 511) & !511;
-        if aligned_len > current_len {
-            let padding = aligned_len - current_len;
-            self.resize(aligned_len, 0);
-        }
-    }
 }
 
 impl Deref for PooledBuffer {
