@@ -58,6 +58,15 @@ use tracing::{error, info, instrument};
 
 const COMPONENT: &str = "MAIN";
 
+fn thread_print_memory_pool_stats() {
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    let pool = server::streaming::utils::memory_pool();
+    loop {
+        pool.log_stats();
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+}
+
 #[instrument(skip_all, name = "trace_start_server")]
 fn main() -> Result<(), ServerError> {
     let startup_timestamp = Instant::now();
@@ -311,6 +320,8 @@ fn main() -> Result<(), ServerError> {
         })
         .expect("Error setting Ctrl-C handler");
     */
+
+    std::thread::spawn(thread_print_memory_pool_stats);
 
     info!("Iggy server is running. Press Ctrl+C or send SIGTERM to shutdown.");
     for (idx, handle) in handles.into_iter().enumerate() {

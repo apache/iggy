@@ -488,7 +488,7 @@ impl IggyMessagesBatchMut {
     /// subsequent messages in the new buffer.
     #[allow(clippy::too_many_arguments)]
     fn rebuild_indexes_for_chunk(
-        new_buffer: &BytesMut,
+        new_buffer: &PooledBuffer,
         new_indexes: &mut IggyIndexesMut,
         offset_in_new_buffer: &mut u32,
         chunk_start: usize,
@@ -571,7 +571,7 @@ impl IggyMessagesBatchMut {
 
         for &(start, end) in &boundaries_to_remove {
             if start > last_pos {
-                let keep_len = start - last_pos;
+                let keep_len: usize = start - last_pos;
                 let chunk = source.split_to(keep_len);
                 let chunk_start_in_new_buffer = new_buffer.len();
                 new_buffer.put(chunk);
@@ -684,7 +684,8 @@ impl IggyMessagesBatchMut {
 
             prev_offset = message.header().offset();
             prev_position = index.position();
-            messages_size += message.size();
+            let msg_size = message.size();
+            messages_size += msg_size;
             messages_count += 1;
         }
 
@@ -820,13 +821,5 @@ impl Index<usize> for IggyMessagesBatchMut {
             .expect("Invalid message boundaries");
 
         &self.messages[start..end]
-    }
-}
-
-impl Deref for IggyMessagesBatchMut {
-    type Target = BytesMut;
-
-    fn deref(&self) -> &Self::Target {
-        &self.messages
     }
 }

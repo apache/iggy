@@ -16,25 +16,20 @@
  * under the License.
  */
 
-use compio::fs::File;
-use compio::fs::OpenOptions;
-use compio::io::AsyncWriteAtExt;
+use crate::streaming::segments::DirectFile;
+use crate::streaming::utils::PooledBuffer;
 use error_set::ErrContext;
-use iggy_common::INDEX_SIZE;
-use iggy_common::IggyError;
+use iggy_common::{INDEX_SIZE, IggyError};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
 use tracing::trace;
 
-use crate::streaming::utils::PooledBuffer;
-
 /// A dedicated struct for writing to the index file.
 #[derive(Debug)]
 pub struct IndexWriter {
-    file_path: String,
-    file: File,
+    direct_file: DirectFile,
     index_size_bytes: Arc<AtomicU64>,
     fsync: bool,
 }
@@ -47,39 +42,34 @@ impl IndexWriter {
         fsync: bool,
         file_exists: bool,
     ) -> Result<Self, IggyError> {
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(file_path)
-            .await
-            .with_error_context(|error| format!("Failed to open index file: {file_path}. {error}"))
-            .map_err(|_| IggyError::CannotReadFile)?;
-
-        if file_exists {
-            let _ = file.sync_all().await.with_error_context(|error| {
-                format!("Failed to fsync index file after creation: {file_path}. {error}",)
-            });
-
-            let actual_index_size = file
-                .metadata()
-                .await
-                .with_error_context(|error| {
-                    format!("Failed to get metadata of index file: {file_path}. {error}")
-                })
-                .map_err(|_| IggyError::CannotReadFileMetadata)?
-                .len();
-
-            index_size_bytes.store(actual_index_size, Ordering::Release);
-        }
+        let file_position = if file_exists {
+            let current_size = index_size_bytes.load(Ordering::Acquire);
+            (current_size + 511) & !511
+        } else {
+            index_size_bytes.store(0, Ordering::Release);
+            0
+        };
 
         trace!(
-            "Opened index file for writing: {file_path}, size: {}",
-            index_size_bytes.load(Ordering::Acquire)
+            "Opening index file for writing: {file_path}, file_position: {}",
+            file_position
         );
 
+        let mut direct_file = DirectFile::open(file_path, file_position, file_exists).await?;
+
+        if file_exists {
+            let actual_index_size = direct_file.get_file_size().await?;
+            index_size_bytes.store(actual_index_size, Ordering::Release);
+
+            trace!(
+                "Opened existing index file: {file_path}, size: {}, file_position: {}",
+                actual_index_size,
+                direct_file.position()
+            );
+        }
+
         Ok(Self {
-            file_path: file_path.to_string(),
-            file,
+            direct_file,
             index_size_bytes,
             fsync,
         })
@@ -92,44 +82,33 @@ impl IndexWriter {
         }
 
         let count = indexes.len() / INDEX_SIZE;
-        let len = indexes.len();
+        let actual_len = indexes.len();
 
-        let position = self.index_size_bytes.load(Ordering::Relaxed);
-        self.file
-            .write_all_at(indexes, position)
+        trace!(
+            "Saving {count} indexes to file: {} (size: {} bytes)",
+            self.direct_file.file_path(),
+            actual_len
+        );
+
+        let bytes_written = self
+            .direct_file
+            .write_all(&indexes)
             .await
-            .0
             .with_error_context(|error| {
                 format!(
                     "Failed to write {} indexes to file: {}. {error}",
-                    count, self.file_path
+                    count,
+                    self.direct_file.file_path()
                 )
             })
             .map_err(|_| IggyError::CannotSaveIndexToSegment)?;
 
+        let new_logical_size = self.index_size_bytes.load(Ordering::Relaxed) + bytes_written as u64;
         self.index_size_bytes
-            .fetch_add(len as u64, Ordering::Release);
+            .store(new_logical_size, Ordering::Release);
 
-        if self.fsync {
-            let _ = self.fsync().await;
-        }
-        trace!(
-            "Saved {count} indexes of size {} to file: {}",
-            INDEX_SIZE * count,
-            self.file_path
-        );
+        trace!("Saved {count} indexes. Logical size: {}", new_logical_size);
 
-        Ok(())
-    }
-
-    pub async fn fsync(&self) -> Result<(), IggyError> {
-        self.file
-            .sync_all()
-            .await
-            .with_error_context(|error| {
-                format!("Failed to fsync index file: {}. {error}", self.file_path)
-            })
-            .map_err(|_| IggyError::CannotWriteToFile)?;
         Ok(())
     }
 }

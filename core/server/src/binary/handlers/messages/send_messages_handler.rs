@@ -57,18 +57,19 @@ impl ServerCommandHandler for SendMessages {
         let total_payload_size = length as usize - std::mem::size_of::<u32>();
         let metadata_len_field_size = std::mem::size_of::<u32>();
 
-        let metadata_length_buffer = PooledBuffer::with_capacity(4);
-        let (result, metadata_len_buf) = sender.read(metadata_length_buffer.slice(0..4)).await;
-        let metadata_len_buf = metadata_len_buf.into_inner();
-        result?;
-        let metadata_size = u32::from_le_bytes(metadata_len_buf[..].try_into().unwrap());
+        let mut metadata_length_buffer = PooledBuffer::with_capacity(4);
 
-        let metadata_buffer = PooledBuffer::with_capacity(metadata_size as usize);
-        let (result, metadata_buf) = sender
+        let metadata_length_buffer = sender
+            .read(metadata_length_buffer.slice(0..4))
+            .await?
+            .into_inner();
+        let metadata_size = u32::from_le_bytes(metadata_length_buffer[0..4].try_into().unwrap());
+
+        let mut metadata_buffer = PooledBuffer::with_capacity(metadata_size as usize);
+        let metadata_buf = sender
             .read(metadata_buffer.slice(0..metadata_size as usize))
-            .await;
-        result?;
-        let metadata_buf = metadata_buf.into_inner();
+            .await?
+            .into_inner();
 
         let mut element_size = 0;
 
@@ -91,17 +92,20 @@ impl ServerCommandHandler for SendMessages {
         );
         let indexes_size = messages_count as usize * INDEX_SIZE;
 
-        let indexes_buffer = PooledBuffer::with_capacity(indexes_size);
-        let (result, indexes_buffer) = sender.read(indexes_buffer.slice(0..indexes_size)).await;
-        result?;
-        let indexes_buffer = indexes_buffer.into_inner();
+        let mut indexes_buffer = PooledBuffer::with_capacity(indexes_size + 512); // extra space for possible padding to not cause reallocations
+        let indexes_buffer = sender
+            .read(indexes_buffer.slice(0..indexes_size))
+            .await?
+            .into_inner();
 
         let messages_size =
             total_payload_size - metadata_size as usize - indexes_size - metadata_len_field_size;
-        let messages_buffer = PooledBuffer::with_capacity(messages_size);
-        let (result, messages_buffer) = sender.read(messages_buffer.slice(0..messages_size)).await;
-        result?;
-        let messages_buffer = messages_buffer.into_inner();
+
+        let mut messages_buffer = PooledBuffer::with_capacity(messages_size + 512); // extra space for possible padding to not cause reallocations
+        let messages_buffer = sender
+            .read(messages_buffer.slice(0..messages_size))
+            .await?
+            .into_inner();
 
         let indexes = IggyIndexesMut::from_bytes(indexes_buffer, 0);
         let batch = IggyMessagesBatchMut::from_indexes_and_messages(

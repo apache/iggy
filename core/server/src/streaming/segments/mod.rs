@@ -16,6 +16,7 @@
  * under the License.
  */
 
+mod direct_file;
 mod indexes;
 mod messages;
 mod messages_accumulator;
@@ -24,6 +25,7 @@ mod segment;
 mod types;
 mod writing_messages;
 
+pub use direct_file::DirectFile;
 pub use indexes::IggyIndexesMut;
 pub use messages_accumulator::MessagesAccumulator;
 pub use segment::Segment;

@@ -65,7 +65,7 @@ impl SystemInfoStorage for FileSystemInfoStorage {
         let file = file::open(&self.path)
             .await
             .map_err(|_| IggyError::CannotReadFile)?;
-        let buffer = PooledBuffer::with_capacity(file_size);
+        let mut buffer = PooledBuffer::with_capacity(file_size);
         let (result, buffer) = file
             .read_exact_at(buffer.slice(0..file_size), 0)
             .await

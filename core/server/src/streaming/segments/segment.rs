@@ -92,6 +92,7 @@ impl Segment {
             IggyExpiry::ServerDefault => config.segment.message_expiry,
             _ => message_expiry,
         };
+
         Segment {
             stream_id,
             topic_id,
@@ -150,21 +151,15 @@ impl Segment {
             .with_error_context(|error| format!("Failed to load indexes for {self}. {error}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
-        info!(
-            "Loaded {} indexes for segment with start offset: {}, end offset: {}, and partition with ID: {}, topic with ID: {}, and stream with ID: {}.",
-            self.indexes.as_ref().map_or(0, |idx| idx.count()),
-            self.start_offset,
-            self.end_offset,
-            self.partition_id,
-            self.topic_id,
-            self.stream_id
-        );
-
         let last_index_offset = if loaded_indexes.is_empty() {
             0_u64
         } else {
             loaded_indexes.last().unwrap().offset() as u64
         };
+
+        if !loaded_indexes.is_empty() {
+            self.indexes = Some(loaded_indexes);
+        }
 
         self.end_offset = self.start_offset + last_index_offset;
 
@@ -306,29 +301,8 @@ impl Segment {
     }
 
     pub async fn shutdown_writing(&mut self) {
-        if let Some(log_writer) = self.messages_writer.take() {
-            //TODO: Fixme not sure whether we should spawn a task here.
-            compio::runtime::spawn(async move {
-                let _ = log_writer.fsync().await;
-            })
-            .detach();
-        } else {
-            warn!(
-                "Log writer already closed when calling close() for {}",
-                self
-            );
-        }
-
-        if let Some(index_writer) = self.index_writer.take() {
-            //TODO: Fixme not sure whether we should spawn a task here.
-            compio::runtime::spawn(async move {
-                let _ = index_writer.fsync().await;
-                drop(index_writer)
-            })
-            .detach();
-        } else {
-            warn!("Index writer already closed when calling close()");
-        }
+        let _ = self.messages_writer.take().map(|mut writer| {});
+        let _ = self.index_writer.take().map(|mut writer| {});
     }
 
     pub async fn delete(&mut self) -> Result<(), IggyError> {

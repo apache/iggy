@@ -113,14 +113,20 @@ impl Segment {
         self.indexes.as_mut().unwrap().mark_saved();
 
         if self.config.segment.cache_indexes == CacheIndexesConfig::None {
-            self.indexes.as_mut().unwrap().clear();
+            if let Some(indexes) = self.indexes.as_mut() {
+                indexes.clear();
+            }
         }
 
         self.check_and_handle_segment_full().await?;
 
         trace!(
-            "Saved {} messages on disk in segment with start offset: {} for partition with ID: {}, total bytes written: {}.",
-            unsaved_messages_count, self.start_offset, self.partition_id, saved_bytes
+            "Saved {} messages on disk in segment with start offset: {}, end offset: {}, for partition with ID: {}, total bytes written: {}.",
+            unsaved_messages_count,
+            self.start_offset,
+            self.end_offset,
+            self.partition_id,
+            saved_bytes
         );
 
         Ok(unsaved_messages_count)

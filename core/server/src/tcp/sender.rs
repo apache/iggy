@@ -23,31 +23,25 @@ use compio::{
     io::{AsyncRead, AsyncReadAtExt, AsyncReadExt, AsyncWriteExt},
 };
 use iggy_common::IggyError;
-use nix::libc;
-use std::io::IoSlice;
 use tracing::{debug, error};
 
 use crate::streaming::utils::PooledBuffer;
 
 const STATUS_OK: &[u8] = &[0; 4];
 
-pub(crate) async fn read<T, B>(stream: &mut T, buffer: B) -> (Result<usize, IggyError>, B)
+pub(crate) async fn read<T, B>(stream: &mut T, buffer: B) -> Result<B, IggyError>
 where
     T: AsyncReadExt + AsyncWriteExt + Unpin,
     B: IoBufMut,
 {
     let BufResult(result, buffer) = stream.read_exact(buffer).await;
-    match (result, buffer) {
-        (Ok(_), buffer) => (Ok(buffer.buf_len()), buffer),
-        // TODO: How to handle this ?(Ok(0), buffer) => (Err(IggyError::ConnectionClosed), buffer),
-        // `read_exact` from compio doesn't return how many bytes it read.
-        (Err(error), buffer) => {
+    match result {
+        Ok(_) => Ok(buffer),
+        Err(error) => {
             if error.kind() == std::io::ErrorKind::UnexpectedEof {
-                //error!("Got some error tho.. {}", error);
-                (Err(IggyError::ConnectionClosed), buffer)
+                Err(IggyError::ConnectionClosed)
             } else {
-                //error!("Got some other error tho.. {}", error);
-                (Err(IggyError::TcpError), buffer)
+                Err(IggyError::TcpError)
             }
         }
     }

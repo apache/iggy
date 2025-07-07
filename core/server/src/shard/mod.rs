@@ -283,16 +283,6 @@ impl IggyShard {
     }
 
     async fn load_version(&self) -> Result<(), IggyError> {
-        async fn update_system_info(
-            storage: &Rc<SystemStorage>,
-            system_info: &mut SystemInfo,
-            version: &SemanticVersion,
-        ) -> Result<(), IggyError> {
-            system_info.update_version(version);
-            storage.info.save(system_info).await?;
-            Ok(())
-        }
-
         let current_version = &self.version;
         let mut system_info;
         let load_system_info = self.storage.info.load().await;
@@ -301,7 +291,7 @@ impl IggyShard {
             if let IggyError::ResourceNotFound(_) = error {
                 info!("System info not found, creating...");
                 system_info = SystemInfo::default();
-                update_system_info(&self.storage, &mut system_info, current_version).await?;
+                Self::update_system_info(&self.storage, &mut system_info, current_version).await?;
             } else {
                 return Err(error);
             }
@@ -310,21 +300,31 @@ impl IggyShard {
         }
 
         info!("Loaded {system_info}.");
-        let loaded_version = SemanticVersion::from_str(&system_info.version.version)?;
+        let loaded_version = SemanticVersion::from_str(&system_info.version.version).unwrap();
         if current_version.is_equal_to(&loaded_version) {
             info!("System version {current_version} is up to date.");
         } else if current_version.is_greater_than(&loaded_version) {
             info!(
                 "System version {current_version} is greater than {loaded_version}, checking the available migrations..."
             );
-            update_system_info(&self.storage, &mut system_info, current_version).await?;
+            Self::update_system_info(&self.storage, &mut system_info, current_version).await?;
         } else {
             info!(
                 "System version {current_version} is lower than {loaded_version}, possible downgrade."
             );
-            update_system_info(&self.storage, &mut system_info, current_version).await?;
+            Self::update_system_info(&self.storage, &mut system_info, current_version).await?;
         }
 
+        Ok(())
+    }
+
+    async fn update_system_info(
+        storage: &Rc<SystemStorage>,
+        system_info: &mut SystemInfo,
+        version: &SemanticVersion,
+    ) -> Result<(), IggyError> {
+        system_info.update_version(version);
+        storage.info.save(system_info).await?;
         Ok(())
     }
 

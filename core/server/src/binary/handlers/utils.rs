@@ -32,8 +32,7 @@ pub async fn receive_and_validate(
     let buffer = if length == 0 {
         buffer
     } else {
-        let (result, buffer) = sender.read(buffer).await;
-        result?;
+        let buffer = sender.read(buffer).await?;
         buffer
     };
 

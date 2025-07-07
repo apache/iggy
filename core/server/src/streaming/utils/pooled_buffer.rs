@@ -16,8 +16,8 @@
  * under the License.
  */
 
-use super::memory_pool::{BytesMutExt, memory_pool};
-use bytes::{Buf, BufMut, BytesMut};
+use super::memory_pool::{AlignedBuffer, AlignedBufferExt, memory_pool};
+use crate::streaming::utils::memory_pool::ALIGNMENT;
 use compio::buf::{IoBuf, IoBufMut, SetBufInit};
 use std::ops::{Deref, DerefMut};
 
@@ -26,7 +26,7 @@ pub struct PooledBuffer {
     from_pool: bool,
     original_capacity: usize,
     original_bucket_idx: Option<usize>,
-    inner: BytesMut,
+    inner: AlignedBuffer,
 }
 
 impl Default for PooledBuffer {
@@ -42,32 +42,19 @@ impl PooledBuffer {
     ///
     /// * `capacity` - The capacity of the buffer
     pub fn with_capacity(capacity: usize) -> Self {
-        let (buffer, was_pool_allocated) = memory_pool().acquire_buffer(capacity);
+        let (mut buffer, was_pool_allocated) = memory_pool().acquire_buffer(capacity);
         let original_capacity = buffer.capacity();
         let original_bucket_idx = if was_pool_allocated {
             memory_pool().best_fit(original_capacity)
         } else {
             None
         };
+
         Self {
             from_pool: was_pool_allocated,
             original_capacity,
             original_bucket_idx,
             inner: buffer,
-        }
-    }
-
-    /// Creates a new pooled buffer from an existing `BytesMut`.
-    ///
-    /// # Arguments
-    ///
-    /// * `existing` - The existing `BytesMut` buffer
-    pub fn from_existing(existing: BytesMut) -> Self {
-        Self {
-            from_pool: false,
-            original_capacity: existing.capacity(),
-            original_bucket_idx: None,
-            inner: existing,
         }
     }
 
@@ -77,7 +64,7 @@ impl PooledBuffer {
             from_pool: false,
             original_capacity: 0,
             original_bucket_idx: None,
-            inner: BytesMut::new(),
+            inner: AlignedBuffer::new(ALIGNMENT),
         }
     }
 
@@ -90,6 +77,11 @@ impl PooledBuffer {
 
         let current_capacity = self.inner.capacity();
         if current_capacity != self.original_capacity {
+            tracing::error!(
+                "Pooled buffer resized from {} to {}",
+                self.original_capacity,
+                current_capacity
+            );
             memory_pool().inc_resize_events();
 
             if let Some(orig_idx) = self.original_bucket_idx {
@@ -131,20 +123,10 @@ impl PooledBuffer {
         }
     }
 
-    /// Wrapper for put_bytes which might cause resize
-    pub fn put_bytes(&mut self, byte: u8, len: usize) {
-        let before_cap = self.inner.capacity();
-        self.inner.put_bytes(byte, len);
-
-        if self.inner.capacity() != before_cap {
-            self.check_for_resize();
-        }
-    }
-
     /// Wrapper for put_slice which might cause resize
     pub fn put_slice(&mut self, src: &[u8]) {
         let before_cap = self.inner.capacity();
-        self.inner.put_slice(src);
+        self.extend_from_slice(src);
 
         if self.inner.capacity() != before_cap {
             self.check_for_resize();
@@ -154,7 +136,8 @@ impl PooledBuffer {
     /// Wrapper for put_u32_le which might cause resize
     pub fn put_u32_le(&mut self, value: u32) {
         let before_cap = self.inner.capacity();
-        self.inner.put_u32_le(value);
+        self.reserve(4);
+        self.inner.extend_from_slice(&value.to_le_bytes());
 
         if self.inner.capacity() != before_cap {
             self.check_for_resize();
@@ -164,16 +147,87 @@ impl PooledBuffer {
     /// Wrapper for put_u64_le which might cause resize
     pub fn put_u64_le(&mut self, value: u64) {
         let before_cap = self.inner.capacity();
-        self.inner.put_u64_le(value);
+        self.reserve(8);
+        self.inner.extend_from_slice(&value.to_le_bytes());
 
         if self.inner.capacity() != before_cap {
             self.check_for_resize();
         }
     }
+
+    /// Get a slice of the buffer's contents
+    pub fn as_slice(&self) -> &[u8] {
+        self.inner.as_slice()
+    }
+
+    /// Get the length of the buffer
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Check if the buffer is empty
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Get the capacity of the buffer
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+
+    /// Clear the buffer
+    pub fn clear(&mut self) {
+        self.inner.clear()
+    }
+
+    /// Resize the buffer
+    pub fn resize(&mut self, new_len: usize, value: u8) {
+        let before_cap = self.inner.capacity();
+        self.inner.resize(new_len, value);
+
+        if self.inner.capacity() != before_cap {
+            self.check_for_resize();
+        }
+    }
+
+    /// Split the buffer at the given index, returning the data before the split
+    /// and keeping the data after the split in self
+    pub fn split_to(&mut self, at: usize) -> Vec<u8> {
+        if at > self.inner.len() {
+            panic!("split_to out of bounds");
+        }
+
+        let mut result = Vec::with_capacity(at);
+        result.extend_from_slice(&self.inner[..at]);
+
+        let remaining = self.inner.len() - at;
+        let mut new_data = Vec::with_capacity(remaining);
+        new_data.extend_from_slice(&self.inner[at..]);
+
+        self.inner.clear();
+        self.inner.extend_from_slice(&new_data);
+
+        result
+    }
+
+    /// Put bytes from a slice
+    pub fn put<T: AsRef<[u8]>>(&mut self, data: T) {
+        self.extend_from_slice(data.as_ref());
+    }
+
+    /// Align the buffer length to the next 512-byte boundary by padding with zeros
+    pub fn align(&mut self) {
+        let current_len = self.inner.len();
+        let aligned_len = (current_len + 511) & !511;
+        if aligned_len > current_len {
+            let padding = aligned_len - current_len;
+            self.resize(aligned_len, 0);
+        }
+    }
 }
 
 impl Deref for PooledBuffer {
-    type Target = BytesMut;
+    type Target = AlignedBuffer;
 
     fn deref(&self) -> &Self::Target {
         &self.inner
@@ -189,9 +243,15 @@ impl DerefMut for PooledBuffer {
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
         if self.from_pool {
-            let buf = std::mem::take(&mut self.inner);
+            let buf = std::mem::replace(&mut self.inner, AlignedBuffer::new(ALIGNMENT));
             buf.return_to_pool(self.original_capacity, true);
         }
+    }
+}
+
+impl AsRef<[u8]> for PooledBuffer {
+    fn as_ref(&self) -> &[u8] {
+        self.inner.as_slice()
     }
 }
 
@@ -203,30 +263,10 @@ impl From<&[u8]> for PooledBuffer {
     }
 }
 
-impl Buf for PooledBuffer {
-    fn remaining(&self) -> usize {
-        self.inner.remaining()
-    }
-
-    fn chunk(&self) -> &[u8] {
-        self.inner.chunk()
-    }
-
-    fn advance(&mut self, cnt: usize) {
-        self.inner.advance(cnt)
-    }
-
-    fn chunks_vectored<'t>(&'t self, dst: &mut [std::io::IoSlice<'t>]) -> usize {
-        self.inner.chunks_vectored(dst)
-    }
-}
-
 impl SetBufInit for PooledBuffer {
     unsafe fn set_buf_init(&mut self, len: usize) {
-        if self.inner.len() <= len {
-            unsafe {
-                self.inner.set_len(len);
-            }
+        unsafe {
+            self.inner.set_len(len);
         }
     }
 }
@@ -239,7 +279,7 @@ unsafe impl IoBufMut for PooledBuffer {
 
 unsafe impl IoBuf for PooledBuffer {
     fn as_buf_ptr(&self) -> *const u8 {
-        self.inner.as_buf_ptr()
+        self.inner.as_ptr()
     }
 
     fn buf_len(&self) -> usize {

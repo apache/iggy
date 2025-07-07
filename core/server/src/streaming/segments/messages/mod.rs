@@ -19,25 +19,27 @@
 mod messages_reader;
 mod messages_writer;
 
-use super::IggyMessagesBatchSet;
-use compio::{fs::File, io::AsyncWriteAtExt};
+use super::{DirectFile, IggyMessagesBatchSet};
+use crate::streaming::utils::PooledBuffer;
 use iggy_common::IggyError;
 
 pub use messages_reader::MessagesReader;
 pub use messages_writer::MessagesWriter;
 
-/// Vectored write a batches of messages to file
-async fn write_batch(
-    file: &mut File,
-    position: u64,
+async fn write_batch_with_direct_file(
+    direct_file: &mut DirectFile,
     mut batches: IggyMessagesBatchSet,
 ) -> Result<usize, IggyError> {
-    let total_written = batches.iter().map(|b| b.size() as usize).sum();
-    let batches = batches
-        .iter_mut()
-        .map(|b| b.take_messages())
-        .collect::<Vec<_>>();
-    let (result, _) = file.write_vectored_all_at(batches, position).await.into();
-    result.map_err(|_| IggyError::CannotWriteToFile)?;
+    let total_written: usize = batches.iter().map(|b| b.size() as usize).sum();
+    let mut messages_count = 0;
+
+    for batch in batches.iter_mut() {
+        messages_count += batch.count();
+        let messages = batch.take_messages();
+        direct_file.write_all(&messages).await?;
+    }
+
+    tracing::trace!("Saved {} messages", messages_count);
+
     Ok(total_written)
 }
