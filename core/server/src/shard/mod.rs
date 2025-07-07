@@ -28,7 +28,7 @@ use ahash::{AHashMap, AHashSet, HashMap};
 use builder::IggyShardBuilder;
 use error_set::ErrContext;
 use futures::future::try_join_all;
-use iggy_common::{EncryptorKind, Identifier, IggyError, UserId};
+use iggy_common::{EncryptorKind, Identifier, IggyError, UserId, locking::IggySharedMutFn};
 use namespace::IggyNamespace;
 use std::{
     cell::{Cell, RefCell},
@@ -36,12 +36,12 @@ use std::{
     rc::Rc,
     str::FromStr,
     sync::{
-        Arc, RwLock,
+        Arc,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::{Duration, Instant},
 };
-use tracing::{error, info, instrument, trace, warn};
+use tracing::{error, info, instrument, warn};
 use transmission::connector::{Receiver, ShardConnector, StopReceiver, StopSender};
 
 use crate::{
@@ -59,7 +59,6 @@ use crate::{
     },
     state::{
         StateKind,
-        file::FileState,
         system::{StreamState, SystemState, UserState},
     },
     streaming::{
@@ -524,18 +523,17 @@ impl IggyShard {
                 compression_algorithm,
                 max_topic_size,
                 replication_factor,
-                shards_assignment,
             } => {
+                let topic_id = topic_id.get_u32_value().ok();
                 self.create_topic_bypass_auth(
                     stream_id,
-                    *topic_id,
+                    topic_id,
                     name,
                     *partitions_count,
                     *message_expiry,
                     *compression_algorithm,
                     *max_topic_size,
                     *replication_factor,
-                    shards_assignment.clone(),
                 )
                 .await
             }
@@ -547,6 +545,32 @@ impl IggyShard {
             ShardEvent::NewSession { address, transport } => {
                 let session = self.add_client(address, *transport);
                 self.add_active_session(session);
+                Ok(())
+            }
+            ShardEvent::CreatedShardTableRecords {
+                stream_id,
+                topic_id,
+                partition_ids,
+            } => {
+                let records = self
+                    .create_shard_table_records(&partition_ids, *stream_id, *topic_id)
+                    .collect::<Vec<_>>();
+                let stream = self.get_stream(&Identifier::numeric(*stream_id)?)?;
+                let topic = stream.get_topic(&Identifier::numeric(*topic_id)?)?;
+                // Open partition and segments for that particular shard.
+                for (ns, shard_info) in records.iter() {
+                    if shard_info.id() == self.id {
+                        let partition_id = ns.partition_id;
+                        let partition = topic.get_partition(partition_id)?;
+                        let mut partition = partition.write().await;
+                        partition.open().await.with_error_context(|error| {
+                    format!(
+                        "{COMPONENT} (error: {error}) - failed to open partition with ID: {partition_id} in topic with ID: {topic_id} for stream with ID: {stream_id}"
+                    )
+                })?;
+                    }
+                }
+                self.insert_shard_table_records(records);
                 Ok(())
             }
         }
@@ -609,6 +633,22 @@ impl IggyShard {
                 .find(|shard| shard.id == shard_info.id)
                 .expect("Shard not found in the shards table.")
         })
+    }
+
+    pub fn create_shard_table_records(
+        &self,
+        partition_ids: &[u32],
+        stream_id: u32,
+        topic_id: u32,
+    ) -> impl Iterator<Item = (IggyNamespace, ShardInfo)> {
+        let records = partition_ids.iter().map(move |partition_id| {
+            let namespace = IggyNamespace::new(stream_id, topic_id, *partition_id);
+            let hash = namespace.generate_hash();
+            let shard_id = hash % self.get_available_shards_count();
+            let shard_info = ShardInfo::new(shard_id as u16);
+            (namespace, shard_info)
+        });
+        records
     }
 
     pub fn insert_shard_table_records(

@@ -324,7 +324,7 @@ impl PartitionStorage for FilePartitionStorage {
         }
 
         for segment in partition.get_segments_mut() {
-            segment.persist().await.with_error_context(|error| {
+            segment.open().await.with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to persist segment: {segment}",)
             })?;
         }

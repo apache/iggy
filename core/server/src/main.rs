@@ -43,7 +43,7 @@ use server::log::logger::Logging;
 use server::log::tokio_console::Logging;
 use server::server_error::ServerError;
 use server::shard::IggyShard;
-use server::shard::gate::Gate;
+use server::shard::gate::Barrier;
 use server::state::StateKind;
 use server::state::command::EntryCommand;
 use server::state::file::FileState;
@@ -128,12 +128,12 @@ fn main() -> Result<(), ServerError> {
     let shards_count = available_cpus.into();
     let shards_set = 0..shards_count;
     let (connections, shutdown_handles) = create_shard_connections(shards_set.clone());
-    let gate = Arc::new(Gate::new());
+    let barrier = Arc::new(Barrier::new());
     let mut handles = Vec::with_capacity(shards_set.len());
 
     for shard_id in shards_set {
         let id = shard_id as u16;
-        let gate = gate.clone();
+        let barrier = barrier.clone();
         let connections = connections.clone();
         let config = config.clone();
         let state_persister = resolve_persister(config.system.state.enforce_fsync);
@@ -168,10 +168,10 @@ fn main() -> Result<(), ServerError> {
                     // Trait bound on the closure is FnOnce.
                     // Peak into the state to check if the root user exists.
                     // If it does not exist, create it.
-                    gate.with_async::<Result<(), IggyError>>(async |gate_state| {
+                    barrier.with_async::<Result<(), IggyError>>(async |barrier_state| {
                         // A thread already initialized state
                         // Thus, we can skip it.
-                        if let Some(_) = gate_state.inner() {
+                        if let Some(_) = barrier_state.inner() {
                             return Ok(());
                         }
 
@@ -225,7 +225,7 @@ fn main() -> Result<(), ServerError> {
                                 })?;
                         }
 
-                        gate_state.set_result(());
+                        barrier_state.set_result(());
                         Ok(())
                     })
                     .await;

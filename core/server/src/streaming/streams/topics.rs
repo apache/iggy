@@ -45,7 +45,7 @@ impl Stream {
         compression_algorithm: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,
         replication_factor: u8,
-    ) -> Result<(u32, Vec<u32>), IggyError> {
+    ) -> Result<(Identifier, Vec<u32>), IggyError> {
         let max_topic_size = Topic::get_max_topic_size(max_topic_size, &self.config)?;
         if self.topics_ids.contains_key(name) {
             return Err(IggyError::TopicNameAlreadyExists(
@@ -97,7 +97,7 @@ impl Stream {
         info!("Created topic {}", topic);
         self.topics_ids.insert(name.to_owned(), id);
         self.topics.insert(id, topic);
-        Ok((id, partition_ids))
+        Ok((Identifier::numeric(id).unwrap(), partition_ids))
     }
 
     pub fn update_topic(

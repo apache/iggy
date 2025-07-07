@@ -20,8 +20,9 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::{handlers::topics::COMPONENT, sender::SenderKind};
-use crate::shard::IggyShard;
+use crate::shard::namespace::IggyNamespace;
 use crate::shard::transmission::event::ShardEvent;
+use crate::shard::{IggyShard, ShardInfo};
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateTopicWithId;
 use crate::streaming::session::Session;
@@ -29,6 +30,7 @@ use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::create_topic::CreateTopic;
+use iggy_common::locking::IggySharedMutFn;
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -47,12 +49,12 @@ impl ServerCommandHandler for CreateTopic {
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
         let stream_id = self.stream_id.clone();
-        let topic_id = self.topic_id;
-        let (shards_assignment, created_topic_id) = shard
+        let maybe_topic_id = self.topic_id;
+        let (topic_id, partition_ids) = shard
                 .create_topic(
                     session,
-                    &self.stream_id,
-                    self.topic_id,
+                    &stream_id,
+                    maybe_topic_id,
                     &self.name,
                     self.partitions_count,
                     self.message_expiry,
@@ -61,35 +63,59 @@ impl ServerCommandHandler for CreateTopic {
                     self.replication_factor,
                 )
                 .await
-                .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to create topic for stream_id: {stream_id}, topic_id: {topic_id:?}"
+                .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to create topic for stream_id: {stream_id}, topic_id: {maybe_topic_id:?}"
                 ))?;
+        // `create_topic` always returns numeric identifier.
+        let numeric_topic_id = topic_id.get_u32_value().unwrap();
+        let numeric_stream_id = shard.get_stream(&stream_id).map(|s| s.stream_id).unwrap();
         let event = ShardEvent::CreatedTopic {
             stream_id: stream_id.clone(),
-            topic_id,
+            topic_id: topic_id.clone(),
             name: self.name.clone(),
             partitions_count: self.partitions_count,
             message_expiry: self.message_expiry,
             compression_algorithm: self.compression_algorithm,
             max_topic_size: self.max_topic_size,
             replication_factor: self.replication_factor,
-            shards_assignment,
         };
+        let _responses = shard.broadcast_event_to_all_shards(event.into());
+        let stream = shard.get_stream(&stream_id).with_error_context(|error| {
+            format!(
+                "{COMPONENT} (error: {error}) - failed to get stream for stream_id: {stream_id}"
+            )
+        })?;
+        let topic = stream.get_topic(&topic_id)
+            .with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - failed to get topic with ID: {topic_id} in stream with ID: {stream_id}"
+                )
+            })?;
+
+        let records = shard
+            .create_shard_table_records(&partition_ids, numeric_stream_id, numeric_topic_id)
+            .collect::<Vec<_>>();
+        // Open partition and segments for that particular shard.
+        for (ns, shard_info) in records.iter() {
+            if shard_info.id() == shard.id {
+                let partition_id = ns.partition_id;
+                let partition = topic.get_partition(partition_id)?;
+                let mut partition = partition.write().await;
+                partition.open().await.with_error_context(|error| {
+                    format!(
+                        "{COMPONENT} (error: {error}) - failed to open partition with ID: {partition_id} in topic with ID: {topic_id} for stream with ID: {stream_id}"
+                    )
+                })?;
+            }
+        }
+        shard.insert_shard_table_records(records);
         // Broadcast the event to all shards.
+        let event = ShardEvent::CreatedShardTableRecords {
+            stream_id: numeric_stream_id,
+            topic_id: numeric_topic_id,
+            partition_ids,
+        };
         let _responses = shard.broadcast_event_to_all_shards(event.into());
 
-        let stream = shard
-            .get_stream(&self.stream_id)
-            .with_error_context(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to get stream for stream_id: {stream_id}"
-                )
-            })?;
-        let topic = stream.get_topic(&created_topic_id)
-            .with_error_context(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to get topic with ID: {created_topic_id} in stream with ID: {stream_id}"
-                )
-            })?;
         self.message_expiry = topic.message_expiry;
         self.max_topic_size = topic.max_topic_size;
         let topic_id = topic.topic_id;

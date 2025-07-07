@@ -61,7 +61,7 @@ async fn should_persist_segment() {
         setup
             .create_partition_directory(stream_id, topic_id, partition_id)
             .await;
-        segment.persist().await.unwrap();
+        segment.open().await.unwrap();
         assert_persisted_segment(
             &setup
                 .config
@@ -98,7 +98,7 @@ async fn should_load_existing_segment_from_disk() {
         setup
             .create_partition_directory(stream_id, topic_id, partition_id)
             .await;
-        segment.persist().await.unwrap();
+        segment.open().await.unwrap();
         assert_persisted_segment(
             &setup
                 .config
@@ -168,7 +168,7 @@ async fn should_persist_and_load_segment_with_messages() {
     setup
         .create_partition_directory(stream_id, topic_id, partition_id)
         .await;
-    segment.persist().await.unwrap();
+    segment.open().await.unwrap();
     assert_persisted_segment(
         &setup
             .config
@@ -254,7 +254,7 @@ async fn given_at_least_one_not_expired_message_segment_should_not_be_expired() 
     setup
         .create_partition_directory(stream_id, topic_id, partition_id)
         .await;
-    segment.persist().await.unwrap();
+    segment.open().await.unwrap();
     assert_persisted_segment(
         &setup
             .config
