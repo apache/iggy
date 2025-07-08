@@ -18,8 +18,6 @@
 
 use super::COMPONENT;
 use crate::shard::IggyShard;
-use crate::shard::ShardInfo;
-use crate::shard::namespace::IggyNamespace;
 use crate::streaming::session::Session;
 use error_set::ErrContext;
 use iggy_common::Identifier;
@@ -34,10 +32,7 @@ impl IggyShard {
         stream_id: &Identifier,
         topic_id: &Identifier,
         partitions_count: u32,
-    ) -> Result<(), IggyError> {
-        // This whole method is yeah....
-        // I don't admit to writing it.
-        // Sorry, not sorry.
+    ) -> Result<Vec<u32>, IggyError> {
         self.ensure_authenticated(session)?;
         {
             let stream = self.get_stream(stream_id).with_error_context(|error| {
@@ -78,35 +73,6 @@ impl IggyShard {
             partition_ids
         };
 
-        {
-            let stream = self.get_stream(stream_id).with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
-            })?;
-            let stream_id = stream.stream_id;
-            let topic = stream.get_topic(topic_id).with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to get topic with ID: {topic_id} in stream with ID: {stream_id}")
-        })?;
-            let topic_id = topic.topic_id;
-            for partition_id in &partition_ids {
-                let partition = topic.partitions.get(partition_id).unwrap();
-                let mut partition = partition.write().await;
-                partition.persist().await.with_error_context(|error| {
-                    format!(
-                        "{COMPONENT} (error: {error}) - failed to persist partition with id: {}",
-                        partition.partition_id
-                    )
-                })?;
-            }
-            let records = partition_ids.into_iter().map(|partition_id| {
-                let namespace = IggyNamespace::new(stream_id, topic_id, partition_id);
-                let hash = namespace.generate_hash();
-                let shard_id = hash % self.get_available_shards_count();
-                let shard_info = ShardInfo::new(shard_id as u16);
-                (namespace, shard_info)
-            });
-            self.insert_shard_table_records(records);
-        }
-
         let mut stream = self.get_stream_mut(stream_id).with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
         })?;
@@ -117,7 +83,7 @@ impl IggyShard {
         topic.reassign_consumer_groups();
         self.metrics.increment_partitions(partitions_count);
         self.metrics.increment_segments(partitions_count);
-        Ok(())
+        Ok(partition_ids)
     }
 
     pub async fn delete_partitions(
@@ -126,7 +92,7 @@ impl IggyShard {
         stream_id: &Identifier,
         topic_id: &Identifier,
         partitions_count: u32,
-    ) -> Result<(), IggyError> {
+    ) -> Result<Vec<u32>, IggyError> {
         self.ensure_authenticated(session)?;
         {
             let stream = self.get_stream(stream_id).with_error_context(|error| {
@@ -147,7 +113,7 @@ impl IggyShard {
             ))?;
         }
 
-        let (numeric_topic_id, partitions) = {
+        let partitions = {
             let mut stream = self.get_stream_mut(stream_id).with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
             })?;
@@ -164,24 +130,19 @@ impl IggyShard {
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to delete persisted partitions for topic: {topic}")
             })?;
-            (topic.topic_id, partitions)
+            partitions
         };
 
         let mut segments_count = 0;
         let mut messages_count = 0;
+        let mut partition_ids = Vec::with_capacity(partitions.len());
         for partition in &partitions {
-            let mut partition = partition.write().await;
+            let partition = partition.read().await;
             let partition_id = partition.partition_id;
             let partition_messages_count = partition.get_messages_count();
             segments_count += partition.get_segments_count();
             messages_count += partition_messages_count;
-            partition.delete().await.with_error_context(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to delete partition with ID: {} in topic with ID: {}",
-                    partition_id,
-                    numeric_topic_id
-                )
-            })?;
+            partition_ids.push(partition_id);
         }
 
         let mut stream = self.get_stream_mut(stream_id).with_error_context(|error| {
@@ -196,6 +157,6 @@ impl IggyShard {
             self.metrics.decrement_segments(segments_count);
             self.metrics.decrement_messages(messages_count);
         }
-        Ok(())
+        Ok(partition_ids)
     }
 }

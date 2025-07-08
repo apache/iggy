@@ -20,12 +20,15 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::partitions::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
+use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::create_partitions::CreatePartitions;
+use iggy_common::locking::IggySharedMutFn;
+use std::num;
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -44,7 +47,7 @@ impl ServerCommandHandler for CreatePartitions {
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        shard
+        let partition_ids = shard
             .create_partitions(
                 session,
                 &self.stream_id,
@@ -58,9 +61,44 @@ impl ServerCommandHandler for CreatePartitions {
                     self.stream_id, self.topic_id, session
                 )
             })?;
-
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
+        let event = ShardEvent::CreatedPartitions {
+            stream_id: self.stream_id.clone(),
+            topic_id: self.topic_id.clone(),
+            partitions_count: partition_ids.len() as u32,
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event.into());
+
+        let stream = shard.get_stream(&stream_id).unwrap();
+        let topic = stream.get_topic(&topic_id).unwrap();
+        let numeric_stream_id = stream.stream_id;
+        let numeric_topic_id = topic.topic_id;
+
+        let records = shard
+            .create_shard_table_records(&partition_ids, numeric_stream_id, numeric_topic_id)
+            .collect::<Vec<_>>();
+        // Open partition and segments for that particular shard.
+        for (ns, shard_info) in records.iter() {
+            if shard_info.id() == shard.id {
+                let partition_id = ns.partition_id;
+                let partition = topic.get_partition(partition_id)?;
+                let mut partition = partition.write().await;
+                partition.open().await.with_error_context(|error| {
+                    format!(
+                        "{COMPONENT} (error: {error}) - failed to open partition with ID: {partition_id} in topic with ID: {topic_id} for stream with ID: {stream_id}"
+                    )
+                })?;
+            }
+        }
+        shard.insert_shard_table_records(records);
+        // Broadcast the event to all shards.
+        let event = ShardEvent::CreatedShardTableRecords {
+            stream_id: numeric_stream_id,
+            topic_id: numeric_topic_id,
+            partition_ids,
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event.into());
 
         shard
         .state
