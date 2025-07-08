@@ -607,6 +607,7 @@ impl IggyShard {
 
                 let mut segments_count = 0;
                 let mut messages_count = 0;
+                let partitions_count = partitions.len();
                 for partition in &partitions {
                     let partition = partition.read().await;
                     let partition_messages_count = partition.get_messages_count();
@@ -626,7 +627,7 @@ impl IggyShard {
                 })?;
                 topic.reassign_consumer_groups();
                 if partitions.len() > 0 {
-                    self.metrics.decrement_partitions(0);
+                    self.metrics.decrement_partitions(partitions_count as u32);
                     self.metrics.decrement_segments(segments_count);
                     self.metrics.decrement_messages(messages_count);
                 }
@@ -655,8 +656,15 @@ impl IggyShard {
                 }
                 Ok(())
             }
-
-            ShardEvent::DeletedStream { stream_id: _ } => todo!(),
+            ShardEvent::DeletedStream { stream_id } => {
+                let shard_id = self.id;
+                self.delete_stream_bypass_auth(stream_id).with_error_context(|err| {
+                    format!(
+                        "{COMPONENT} (error: {err}) - failed to delete, when handling event on shard: {shard_id} stream with ID: {stream_id}",
+                    )
+                })?;
+                Ok(())
+            }
             ShardEvent::UpdatedStream {
                 stream_id: _,
                 name: _,
@@ -687,9 +695,18 @@ impl IggyShard {
                 topic_id: _,
             } => todo!(),
             ShardEvent::DeletedTopic {
-                stream_id: _,
-                topic_id: _,
-            } => todo!(),
+                stream_id,
+                topic_id,
+            } => {
+                self.delete_topic_bypass_auth(stream_id, topic_id)
+                    .await
+                    .with_error_context(|err| {
+                        format!(
+                            "{COMPONENT} (error: {err}) - failed to delete topic with ID: {topic_id} in stream with ID: {stream_id}"
+                        )
+                    })?;
+                Ok(())
+            }
             ShardEvent::CreatedUser {
                 username: _,
                 password: _,

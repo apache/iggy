@@ -301,14 +301,22 @@ impl IggyShard {
         Ok(())
     }
 
+    pub async fn delete_topic_bypass_auth(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+    ) -> Result<Topic, IggyError> {
+        let topic = self.delete_topic_base(stream_id, topic_id).await?;
+        Ok(topic)
+    }
+
     pub async fn delete_topic(
         &self,
         session: &Session,
         stream_id: &Identifier,
         topic_id: &Identifier,
-    ) -> Result<(), IggyError> {
+    ) -> Result<Topic, IggyError> {
         self.ensure_authenticated(session)?;
-        let stream_id_value;
         {
             let stream = self.get_stream(stream_id).with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
@@ -328,24 +336,27 @@ impl IggyShard {
                     session.get_user_id(),
                 )
             })?;
-            stream_id_value = topic.stream_id;
         }
 
-        let topic = self
-            .get_stream_mut(stream_id)?
-            .delete_topic(topic_id)
-            .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to delete topic with ID: {topic_id} in stream with ID: {stream_id}"))?;
-        let stream = self.get_stream(stream_id).with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to get mutable reference to stream with ID: {stream_id}")
-        })?;
-        topic
-            .delete()
+        let topic = self.delete_topic_base(stream_id, topic_id)
             .await
             .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to delete topic: {topic}")
-            })
-            .map_err(|_| IggyError::CannotDeleteTopic(topic.topic_id, stream.stream_id))?;
+                format!("{COMPONENT} (error: {error}) - failed to delete topic with ID: {topic_id} in stream with ID: {stream_id}")
+            })?;
+        Ok(topic)
+    }
 
+    async fn delete_topic_base(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+    ) -> Result<Topic, IggyError> {
+        let mut stream = self.get_stream_mut(stream_id)?;
+        let stream_id_value = stream.stream_id;
+        let topic = stream
+            .delete_topic(topic_id)
+            .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to delete topic with ID: {topic_id} in stream with ID: {stream_id}"))?;
+        drop(stream);
         self.metrics.decrement_topics(1);
         self.metrics
             .decrement_partitions(topic.get_partitions_count());
@@ -355,7 +366,7 @@ impl IggyShard {
         self.client_manager
             .borrow_mut()
             .delete_consumer_groups_for_topic(stream_id_value, topic.topic_id);
-        Ok(())
+        Ok(topic)
     }
 
     pub async fn purge_topic(

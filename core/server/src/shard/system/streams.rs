@@ -319,16 +319,23 @@ impl IggyShard {
         Ok(())
     }
 
-    pub async fn delete_stream(
-        &self,
-        session: &Session,
-        id: &Identifier,
-    ) -> Result<u32, IggyError> {
+    pub fn delete_stream_bypass_auth(&self, id: &Identifier) -> Result<Stream, IggyError> {
+        let stream = self.get_stream(id).with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {id}")
+        })?;
+        let stream_id = stream.stream_id;
+        let stream_name = stream.name.clone();
+        let stream = self.delete_stream_base(stream_id, stream_name)?;
+        Ok(stream)
+    }
+
+    pub fn delete_stream(&self, session: &Session, id: &Identifier) -> Result<Stream, IggyError> {
         self.ensure_authenticated(session)?;
         let stream = self.get_stream(id).with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {id}")
         })?;
         let stream_id = stream.stream_id;
+        let stream_name = stream.name.clone();
         self.permissioner
             .borrow()
             .delete_stream(session.get_user_id(), stream_id)
@@ -339,10 +346,13 @@ impl IggyShard {
                     stream.stream_id,
                 )
             })?;
-        let stream_name = stream.name.clone();
-        if stream.delete().await.is_err() {
-            return Err(IggyError::CannotDeleteStream(stream_id));
-        }
+        let stream = self.delete_stream_base(stream_id, stream_name)?;
+        Ok(stream)
+    }
+
+    fn delete_stream_base(&self, stream_id: u32, stream_name: String) -> Result<Stream, IggyError> {
+        let stream = self.streams.borrow_mut().remove(&stream_id).unwrap();
+        self.streams_ids.borrow_mut().remove(&stream_name);
 
         self.metrics.decrement_streams(1);
         self.metrics.decrement_topics(stream.get_topics_count());
@@ -350,8 +360,6 @@ impl IggyShard {
             .decrement_partitions(stream.get_partitions_count());
         self.metrics.decrement_messages(stream.get_messages_count());
         self.metrics.decrement_segments(stream.get_segments_count());
-        self.streams.borrow_mut().remove(&stream_id);
-        self.streams_ids.borrow_mut().remove(&stream_name);
         let current_stream_id = CURRENT_STREAM_ID.load(Ordering::SeqCst);
         if current_stream_id > stream_id {
             CURRENT_STREAM_ID.store(stream_id, Ordering::SeqCst);
@@ -360,7 +368,7 @@ impl IggyShard {
         self.client_manager
             .borrow_mut()
             .delete_consumer_groups_for_stream(stream_id);
-        Ok(stream_id)
+        Ok(stream)
     }
 
     pub async fn purge_stream(

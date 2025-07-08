@@ -43,12 +43,6 @@ impl Stream {
     }
 
     pub async fn delete(&self) -> Result<(), IggyError> {
-        for topic in self.get_topics() {
-            topic.delete().await.with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to delete topic in stream: {self}")
-            })?;
-        }
-
         self.storage
             .stream
             .delete(self)
