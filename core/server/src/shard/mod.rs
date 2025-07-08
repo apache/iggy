@@ -632,7 +632,29 @@ impl IggyShard {
                 }
                 Ok(())
             }
-            ShardEvent::DeletedShardTableRecords { namespaces: _ } => todo!(),
+            ShardEvent::DeletedShardTableRecords { namespaces } => {
+                let (stream_id, topic_id) = namespaces
+                    .first()
+                    .map(|ns| (ns.stream_id, ns.topic_id))
+                    .unwrap();
+                let stream = self.get_stream(&Identifier::numeric(stream_id).unwrap())?;
+                let topic = stream.get_topic(&Identifier::numeric(topic_id).unwrap())?;
+                let records = self.remove_shard_table_records(&namespaces);
+                for (ns, shard_info) in records.iter() {
+                    if shard_info.id() == self.id {
+                        let partition = topic.get_partition(ns.partition_id)?;
+                        let mut partition = partition.write().await;
+                        partition.delete().await.with_error_context(|error| {
+                        format!(
+                            "{COMPONENT} (error: {error}) - failed to delete partition with ID: {} in topic with ID: {}",
+                            ns.partition_id,
+                            topic_id
+                    )
+                    })?;
+                    }
+                }
+                Ok(())
+            }
 
             ShardEvent::DeletedStream { stream_id: _ } => todo!(),
             ShardEvent::UpdatedStream {
