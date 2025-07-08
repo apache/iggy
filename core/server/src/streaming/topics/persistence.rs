@@ -35,16 +35,6 @@ impl Topic {
     }
 
     pub async fn delete(&self) -> Result<(), IggyError> {
-        for partition in self.get_partitions() {
-            let mut partition = partition.write().await;
-            partition.delete().await.with_error_context(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to delete partition with ID: {} in topic with ID: {}",
-                    partition.partition_id, self.topic_id
-                )
-            })?;
-        }
-
         self.storage.topic.delete(self).await
     }
 

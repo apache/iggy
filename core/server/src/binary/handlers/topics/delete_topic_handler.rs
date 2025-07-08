@@ -20,13 +20,17 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::topics::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
+use crate::shard::namespace::IggyNamespace;
+use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::delete_topic::DeleteTopic;
+use iggy_common::locking::IggySharedMutFn;
 use std::rc::Rc;
+use std::time::Duration;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for DeleteTopic {
@@ -43,22 +47,47 @@ impl ServerCommandHandler for DeleteTopic {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let stream_id = self.stream_id.clone();
-        let topic_id = self.topic_id.clone();
-
-        shard
+        let topic = shard
                 .delete_topic(session, &self.stream_id, &self.topic_id)
                 .await
                 .with_error_context(|error| format!(
-                    "{COMPONENT} (error: {error}) - failed to delete topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
+                    "{COMPONENT} (error: {error}) - failed to delete topic with ID: {} in stream with ID: {}, session: {session}",
+                    &self.topic_id, &self.stream_id
                 ))?;
+        let numeric_topic_id = topic.topic_id;
+        let numeric_stream_id = topic.stream_id;
+        let partitions = topic.get_partitions();
+        let mut namespaces = Vec::new();
+        for partition in partitions {
+            let partition_id = partition.read().await.partition_id;
+            let namespace = IggyNamespace::new(numeric_stream_id, topic.topic_id, partition_id);
+            namespaces.push(namespace);
+        }
+        let records = shard.remove_shard_table_records(&namespaces);
+        for (ns, shard_info) in records {
+            if shard_info.id() == shard.id {
+                let partition = topic.get_partition(ns.partition_id).unwrap();
+                let mut partition = partition.write().await;
+                let partition_id = partition.partition_id;
+                partition.delete().await.with_error_context(|error| {
+                        format!("{COMPONENT} (error: {error}) - failed to delete partition in stream: {self}, partition: {partition_id}")
+                    })?;
+            }
+        }
+        let event = ShardEvent::DeletedShardTableRecords { namespaces };
+        let _responses = shard.broadcast_event_to_all_shards(event.into());
+        //TODO: Once event response is implemented, we could get rid of this.
+        compio::time::sleep(Duration::from_millis(50)).await;
+        topic.delete().await.with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to delete topic in stream: {self}")
+        })?;
 
         shard
             .state
             .apply(session.get_user_id(), &EntryCommand::DeleteTopic(self))
             .await
             .with_error_context(|error| format!(
-                "{COMPONENT} (error: {error}) - failed to apply delete topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
+                "{COMPONENT} (error: {error}) - failed to apply delete topic with ID: {numeric_topic_id} in stream with ID: {numeric_stream_id}, session: {session}",
             ))?;
         sender.send_empty_ok_response().await?;
         Ok(())
