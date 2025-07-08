@@ -257,6 +257,20 @@ impl IggyShard {
         Ok(stream)
     }
 
+    pub fn update_stream_bypass_auth(&self, id: &Identifier, name: &str) -> Result<(), IggyError> {
+        let stream_id;
+        {
+            let stream = self.get_stream(id).with_error_context(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {id}")
+            })?;
+            stream_id = stream.stream_id;
+        }
+
+        let old_name = self.update_stream_base(stream_id, id, name)?;
+        info!("Stream with ID '{id}' updated. Old name: '{old_name}' changed to: '{name}'.");
+        Ok(())
+    }
+
     pub async fn update_stream(
         &self,
         session: &Session,
@@ -283,14 +297,27 @@ impl IggyShard {
                 )
             })?;
 
-        {
-            if let Some(stream_id_by_name) = self.streams_ids.borrow().get(name) {
-                if *stream_id_by_name != stream_id {
-                    return Err(IggyError::StreamNameAlreadyExists(name.to_owned()));
-                }
+        let old_name = self.update_stream_base(stream_id, id, name)?;
+        let stream = self.get_stream(id)?;
+        stream.persist().await.with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to persist stream with ID: {stream_id}, name: {name}")
+        })?;
+
+        info!("Stream with ID '{id}' updated. Old name: '{old_name}' changed to: '{name}'.");
+        Ok(())
+    }
+
+    fn update_stream_base(
+        &self,
+        stream_id: u32,
+        id: &Identifier,
+        name: &str,
+    ) -> Result<String, IggyError> {
+        if let Some(stream_id_by_name) = self.streams_ids.borrow().get(name) {
+            if *stream_id_by_name != stream_id {
+                return Err(IggyError::StreamNameAlreadyExists(name.to_owned()));
             }
         }
-
         let old_name;
         {
             let mut stream = self.get_stream_mut(id).with_error_context(|error| {
@@ -299,13 +326,6 @@ impl IggyShard {
             old_name = stream.name.clone();
             stream.name = name.to_owned();
             // Drop the exclusive borrow.
-            drop(stream);
-            // Get it again using inclusive borrow
-            let stream = self.get_stream(id).with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to get mutable reference to stream with id: {id}")
-            })?;
-            // Persist it.
-            stream.persist().await?;
         }
 
         {
@@ -314,9 +334,7 @@ impl IggyShard {
                 .borrow_mut()
                 .insert(name.to_owned(), stream_id);
         }
-
-        info!("Stream with ID '{id}' updated. Old name: '{old_name}' changed to: '{name}'.");
-        Ok(())
+        Ok(old_name)
     }
 
     pub fn delete_stream_bypass_auth(&self, id: &Identifier) -> Result<Stream, IggyError> {

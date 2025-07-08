@@ -20,6 +20,7 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::streams::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
+use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use anyhow::Result;
@@ -51,6 +52,11 @@ impl ServerCommandHandler for UpdateStream {
                 .with_error_context(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to update stream with id: {stream_id}, session: {session}")
                 })?;
+        let event = ShardEvent::UpdatedStream {
+            stream_id: self.stream_id.clone(),
+            name: self.name.clone(),
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event.into());
 
         shard
             .state

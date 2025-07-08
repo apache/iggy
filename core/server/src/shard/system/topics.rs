@@ -221,6 +221,27 @@ impl IggyShard {
         Ok((topic_id, partition_ids))
     }
 
+    pub async fn update_topic_bypass_auth(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        name: &str,
+        message_expiry: IggyExpiry,
+        compression_algorithm: CompressionAlgorithm,
+        max_topic_size: MaxTopicSize,
+        replication_factor: Option<u8>,
+    ) -> Result<(), IggyError> {
+        self.update_topic_base(
+            stream_id,
+            topic_id,
+            name,
+            message_expiry,
+            compression_algorithm,
+            max_topic_size,
+            replication_factor,
+        ).await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn update_topic(
         &self,
@@ -259,6 +280,43 @@ impl IggyShard {
             })?;
         }
 
+        self.update_topic_base(
+            stream_id,
+            topic_id,
+            name,
+            message_expiry,
+            compression_algorithm,
+            max_topic_size,
+            replication_factor,
+        )
+        .await
+        .with_error_context(|error| {
+            format!(
+                "{COMPONENT} (error: {error}) - failed to update topic with ID: {topic_id} in stream with ID: {stream_id}",
+            )
+        })?;
+        let stream = self.get_stream(stream_id)?;
+        let topic = stream.get_topic(topic_id)?;
+        topic.persist().await.with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to persist topic: {topic}")
+        })?;
+
+        // TODO: if message_expiry is changed, we need to check if we need to purge messages based on the new expiry
+        // TODO: if max_size_bytes is changed, we need to check if we need to purge messages based on the new size
+        // TODO: if replication_factor is changed, we need to do `something`
+        Ok(())
+    }
+
+    async fn update_topic_base(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        name: &str,
+        message_expiry: IggyExpiry,
+        compression_algorithm: CompressionAlgorithm,
+        max_topic_size: MaxTopicSize,
+        replication_factor: Option<u8>,
+    ) -> Result<(), IggyError> {
         self.get_stream_mut(stream_id)?
             .update_topic(
                 topic_id,
@@ -290,14 +348,8 @@ impl IggyShard {
                 segment.update_message_expiry(message_expiry);
             }
         }
-        topic.persist().await.with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to persist topic: {topic}")
-        })?;
-        info!("Updated topic: {topic}");
 
-        // TODO: if message_expiry is changed, we need to check if we need to purge messages based on the new expiry
-        // TODO: if max_size_bytes is changed, we need to check if we need to purge messages based on the new size
-        // TODO: if replication_factor is changed, we need to do `something`
+        info!("Updated topic: {topic}");
         Ok(())
     }
 
