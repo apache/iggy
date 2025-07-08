@@ -45,6 +45,19 @@ public readonly struct Message
         UserHeaders = userHeaders;
     }
     
+    [System.Diagnostics.CodeAnalysis.SetsRequiredMembersAttribute]
+    public Message(UInt128 id, byte[] payload, Dictionary<HeaderKey, HeaderValue>? userHeaders = null)
+    {
+        Header = new MessageHeader()
+        {
+            PayloadLength = payload.Length,
+            Id = id,
+            Checksum = CalculateChecksum(payload)
+        };
+        Payload = payload;
+        UserHeaders = userHeaders;
+    }
+    
     public int GetSize()
     {
         //return 56 + Payload.Length + (UserHeaders?.Count ?? 0);

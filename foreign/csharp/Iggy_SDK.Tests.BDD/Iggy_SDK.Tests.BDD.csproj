@@ -1,0 +1,44 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net8.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <IsPackable>false</IsPackable>
+        <AssemblyName>Apache.Iggy.Tests.BDD</AssemblyName>
+        <RootNamespace>Apache.Iggy.Tests.BDD</RootNamespace>
+    </PropertyGroup>
+
+    <PropertyGroup>
+        <Description>Behavior-Driven Development (BDD) tests in csharp SDK for Apache Iggy</Description>
+        <Authors>Apache Iggy</Authors>
+        <RepositoryUrl>https://github.com/apache/iggy</RepositoryUrl>
+        <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="coverlet.collector" />
+        <PackageReference Include="Microsoft.NET.Test.Sdk" />
+        <PackageReference Include="Reqnroll.xUnit" />
+        <PackageReference Include="Shouldly" />
+        <PackageReference Include="xunit" />
+        <PackageReference Include="xunit.runner.visualstudio" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <Using Include="Xunit" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <Content Include="..\..\..\bdd\scenarios\basic_messaging.feature">
+        <Link>Features\basic_messaging.feature</Link>
+        <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      </Content>
+    </ItemGroup>
+
+    <ItemGroup>
+      <ProjectReference Include="..\Iggy_SDK\Iggy_SDK.csproj" />
+    </ItemGroup>
+
+</Project>

@@ -58,4 +58,6 @@ jobs:
         run: dotnet build --no-restore
       - name: Test
         working-directory: foreign/csharp
-        run: dotnet test --no-build --verbosity normal
+        run: |
+          dotnet test Iggy_SDK_Tests --no-build --verbosity normal
+          dotnet test Iggy_SDK.Tests.Integration --no-build --verbosity normal

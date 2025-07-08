@@ -18,6 +18,8 @@ bdd/
 │   └── requirements.txt
 ├── node/                       # Node SDK BDD implementation
 │   └── Dockerfile              # Node BDD test container
+├── csharp/                     # csharp SDK BDD implementation
+│   └── Dockerfile              # csharp BDD test container
 ├── docker-compose.yml          # Orchestrates server + SDK containers
 ├── Dockerfile                  # Debug build of Iggy server
 └── README.md
@@ -36,6 +38,7 @@ bdd/
 ../scripts/run-bdd-tests.sh python
 ../scripts/run-bdd-tests.sh go
 ../scripts/run-bdd-tests.sh node
+../scripts/run-bdd-tests.sh csharp
 
 # Clean up Docker resources
 ../scripts/run-bdd-tests.sh clean
@@ -81,6 +84,10 @@ The Python implementation is in `bdd/python/tests/` and needs to be updated as t
 ### For Node SDK
 
 The node.js BDD test are run by cucumber-js, bdd test code is located at [foreign/node/src/bdd](../foreign/node/src/bdd/)
+
+### For csharp SDK
+
+The csharp implementation is located at [foreign/csharp/Iggy_SDK.Tests.BDD](../foreign/csharp/Iggy_SDK.Tests.BDD)
 
 ### Adding New Scenarios
 
