@@ -9,6 +9,14 @@
         <RootNamespace>Apache.Iggy.Tests.BDD</RootNamespace>
     </PropertyGroup>
 
+    <PropertyGroup>
+        <Description>Behavior-Driven Development (BDD) tests in csharp SDK for Apache Iggy</Description>
+        <Authors>Apache Iggy</Authors>
+        <RepositoryUrl>https://github.com/apache/iggy</RepositoryUrl>
+        <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
+    </PropertyGroup>
+
     <ItemGroup>
         <PackageReference Include="coverlet.collector" />
         <PackageReference Include="Microsoft.NET.Test.Sdk" />
