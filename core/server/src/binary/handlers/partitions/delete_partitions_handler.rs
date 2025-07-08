@@ -20,12 +20,15 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::partitions::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
+use crate::shard::namespace::IggyNamespace;
+use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::delete_partitions::DeletePartitions;
+use iggy_common::locking::IggySharedMutFn;
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -46,7 +49,7 @@ impl ServerCommandHandler for DeletePartitions {
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
 
-        shard
+        let partition_ids = shard
             .delete_partitions(
                 session,
                 &self.stream_id,
@@ -59,6 +62,44 @@ impl ServerCommandHandler for DeletePartitions {
                     "{COMPONENT} (error: {error}) - failed to delete partitions for topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
                 )
             })?;
+        let event = ShardEvent::DeletedPartitions {
+            stream_id: stream_id.clone(),
+            topic_id: topic_id.clone(),
+            partition_ids: partition_ids.clone(),
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event.into());
+        let stream = shard.get_stream(&stream_id).with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
+        })?;
+        let topic = stream
+            .get_topic(&topic_id)
+            .with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - failed to get topic with ID: {topic_id} in stream with ID: {stream_id}"
+                )
+            })?;
+        let numeric_stream_id = stream.stream_id;
+        let numeric_topic_id = topic.topic_id;
+        let namespaces = partition_ids
+            .into_iter()
+            .map(|id| IggyNamespace::new(numeric_stream_id, numeric_topic_id, id))
+            .collect::<Vec<_>>();
+        let records = shard.remove_shard_table_records(&namespaces);
+        for (ns, shard_info) in records.iter() {
+            if shard_info.id() == shard.id {
+                let partition = topic.get_partition(ns.partition_id)?;
+                let mut partition = partition.write().await;
+                partition.delete().await.with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - failed to delete partition with ID: {} in topic with ID: {}",
+                    ns.partition_id,
+                    numeric_topic_id
+                )
+            })?;
+            }
+        }
+        let event = ShardEvent::DeletedShardTableRecords { namespaces };
+        let _responses = shard.broadcast_event_to_all_shards(event.into());
 
         shard
         .state

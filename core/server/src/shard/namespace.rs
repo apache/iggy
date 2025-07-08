@@ -20,7 +20,7 @@ use hash32::{Hasher, Murmur3Hasher};
 use std::hash::Hasher as _;
 
 //TODO: Will probably want to move it to separate crate so we can share it with sdk.
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct IggyNamespace {
     pub(crate) stream_id: u32,
     pub(crate) topic_id: u32,

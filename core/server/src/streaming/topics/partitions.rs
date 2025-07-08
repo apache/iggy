@@ -22,6 +22,7 @@ use crate::streaming::topics::topic::Topic;
 use error_set::ErrContext;
 use iggy_common::locking::{IggyRwLock, IggySharedMutFn};
 use iggy_common::{IggyError, IggyTimestamp};
+use tracing::error;
 
 const MAX_PARTITIONS_COUNT: u32 = 100_000;
 
@@ -93,6 +94,24 @@ impl Topic {
         for partition_id in current_partitions_count - count + 1..=current_partitions_count {
             let partition = self.partitions.remove(&partition_id).unwrap();
             partitions.push(partition);
+        }
+        Ok(partitions)
+    }
+
+    pub fn delete_persisted_partitions_by_ids(
+        &mut self,
+        partition_ids: &[u32],
+    ) -> Result<Vec<IggyRwLock<Partition>>, IggyError> {
+        let mut partitions = Vec::with_capacity(partition_ids.len());
+        for partition_id in partition_ids {
+            if let Some(partition) = self.partitions.remove(partition_id) {
+                partitions.push(partition);
+            } else {
+                let topic_id = self.topic_id;
+                error!(
+                    "Failed to delete partition with ID: {partition_id} from topic with ID: {topic_id}"
+                );
+            }
         }
         Ok(partitions)
     }
