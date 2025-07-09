@@ -84,6 +84,16 @@ services:
       - IGGY_TCP_ADDRESS=iggy-server:8090
     command: ["npm", "run", "test:bdd"]
 
+  csharp-bdd:
+    build:
+      context: ..
+      dockerfile: bdd/csharp/Dockerfile
+    depends_on:
+      iggy-server:
+        condition: service_healthy
+    environment:
+      - IGGY_TCP_ADDRESS=iggy-server:8090
+    command: ["dotnet", "test"]
     
 volumes:
   iggy_data:
