@@ -67,7 +67,7 @@ impl ServerCommandHandler for DeletePartitions {
             topic_id: topic_id.clone(),
             partition_ids: partition_ids.clone(),
         };
-        let _responses = shard.broadcast_event_to_all_shards(event.into());
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
         let stream = shard.get_stream(&stream_id).with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
         })?;
@@ -99,7 +99,7 @@ impl ServerCommandHandler for DeletePartitions {
             }
         }
         let event = ShardEvent::DeletedShardTableRecords { namespaces };
-        let _responses = shard.broadcast_event_to_all_shards(event.into());
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
 
         shard
         .state

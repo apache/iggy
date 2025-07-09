@@ -58,7 +58,7 @@ impl ServerCommandHandler for CreateStream {
                 })?;
         let event = ShardEvent::CreatedStream { stream_id, name };
         // Broadcast the event to all shards.
-        let _responses = shard.broadcast_event_to_all_shards(event.into());
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
 
         let stream = shard.find_stream(session, &created_stream_id)
             .with_error_context(|error| {
