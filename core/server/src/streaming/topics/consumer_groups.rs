@@ -216,10 +216,7 @@ impl Topic {
         Ok(Identifier::numeric(id)?)
     }
 
-    pub async fn delete_consumer_group(
-        &mut self,
-        id: &Identifier,
-    ) -> Result<ConsumerGroup, IggyError> {
+    pub fn delete_consumer_group(&mut self, id: &Identifier) -> Result<ConsumerGroup, IggyError> {
         let group_id;
         {
             let consumer_group = self.get_consumer_group(id).with_error_context(|error| {
@@ -242,16 +239,6 @@ impl Topic {
             if current_group_id > group_id {
                 self.current_consumer_group_id
                     .store(group_id, Ordering::SeqCst);
-            }
-
-            for (_, partition) in self.partitions.iter() {
-                let partition = partition.read().await;
-                if let Some((_, offset)) = partition.consumer_group_offsets.remove(&group_id) {
-                    self.storage
-                        .partition
-                        .delete_consumer_offset(&offset.path)
-                        .await?;
-                }
             }
 
             info!(
@@ -380,9 +367,7 @@ mod tests {
         let result = topic.create_consumer_group(Some(group_id), name);
         assert!(result.is_ok());
         assert_eq!(topic.consumer_groups.borrow().len(), 1);
-        let result = topic
-            .delete_consumer_group(&Identifier::numeric(group_id).unwrap())
-            .await;
+        let result = topic.delete_consumer_group(&Identifier::numeric(group_id).unwrap());
         assert!(result.is_ok());
         assert!(topic.consumer_groups.borrow().is_empty());
     }
@@ -396,9 +381,7 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(topic.consumer_groups.borrow().len(), 1);
         let group_id = group_id + 1;
-        let result = topic
-            .delete_consumer_group(&Identifier::numeric(group_id).unwrap())
-            .await;
+        let result = topic.delete_consumer_group(&Identifier::numeric(group_id).unwrap());
         assert!(result.is_err());
         assert_eq!(topic.consumer_groups.borrow().len(), 1);
     }

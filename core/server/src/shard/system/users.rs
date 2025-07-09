@@ -143,7 +143,7 @@ impl IggyShard {
         Ok(self.users.borrow().values().cloned().collect())
     }
 
-    pub async fn create_user(
+    pub fn create_user(
         &self,
         session: &Session,
         username: &str,
@@ -162,6 +162,31 @@ impl IggyShard {
                 )
             })?;
 
+        let user_id = self.create_user_base(username, password, status, permissions)?;
+        self.get_user(&user_id.try_into()?)
+            .with_error_context(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to get user with id: {user_id}")
+            })
+    }
+
+    pub fn create_user_bypass_auth(
+        &self,
+        username: &str,
+        password: &str,
+        status: UserStatus,
+        permissions: Option<Permissions>,
+    ) -> Result<u32, IggyError> {
+        let user_id = self.create_user_base(username, password, status, permissions)?;
+        Ok(user_id)
+    }
+
+    fn create_user_base(
+        &self,
+        username: &str,
+        password: &str,
+        status: UserStatus,
+        permissions: Option<Permissions>,
+    ) -> Result<u32, IggyError> {
         if self
             .users
             .borrow()
@@ -186,26 +211,32 @@ impl IggyShard {
         self.users.borrow_mut().insert(user.id, user);
         info!("Created user: {username} with ID: {user_id}.");
         self.metrics.increment_users(1);
-        self.get_user(&user_id.try_into()?)
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to get user with id: {user_id}")
-            })
+        Ok(user_id)
     }
 
     pub fn delete_user(&self, session: &Session, user_id: &Identifier) -> Result<User, IggyError> {
         self.ensure_authenticated(session)?;
+        self.permissioner
+            .borrow()
+            .delete_user(session.get_user_id())
+            .with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - permission denied to delete user for user with id: {}",
+                    session.get_user_id()
+                )
+            })?;
+
+        self.delete_user_base(user_id)
+    }
+
+    pub fn delete_user_bypass_auth(&self, user_id: &Identifier) -> Result<User, IggyError> {
+        self.delete_user_base(user_id)
+    }
+
+    fn delete_user_base(&self, user_id: &Identifier) -> Result<User, IggyError> {
         let existing_user_id;
         let existing_username;
         {
-            self.permissioner
-                .borrow()
-                .delete_user(session.get_user_id())
-                .with_error_context(|error| {
-                    format!(
-                        "{COMPONENT} (error: {error}) - permission denied to delete user for user with id: {}",
-                        session.get_user_id()
-                    )
-                })?;
             let user = self.get_user(user_id).with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get user with id: {user_id}")
             })?;
@@ -257,6 +288,24 @@ impl IggyShard {
                 )
             })?;
 
+        self.update_user_base(user_id, username, status)
+    }
+
+    pub fn update_user_bypass_auth(
+        &self,
+        user_id: &Identifier,
+        username: Option<String>,
+        status: Option<UserStatus>,
+    ) -> Result<User, IggyError> {
+        self.update_user_base(user_id, username, status)
+    }
+
+    fn update_user_base(
+        &self,
+        user_id: &Identifier,
+        username: Option<String>,
+        status: Option<UserStatus>,
+    ) -> Result<User, IggyError> {
         if let Some(username) = username.to_owned() {
             let user = self.get_user(user_id)?;
             let existing_user = self.get_user(&username.to_owned().try_into()?);
@@ -310,7 +359,29 @@ impl IggyShard {
                 error!("Cannot change the root user permissions.");
                 return Err(IggyError::CannotChangePermissions(user.id));
             }
+        }
 
+        self.update_permissions_base(user_id, permissions)
+    }
+
+    pub fn update_permissions_bypass_auth(
+        &self,
+        user_id: &Identifier,
+        permissions: Option<Permissions>,
+    ) -> Result<(), IggyError> {
+        self.update_permissions_base(user_id, permissions)
+    }
+
+    fn update_permissions_base(
+        &self,
+        user_id: &Identifier,
+        permissions: Option<Permissions>,
+    ) -> Result<(), IggyError> {
+        {
+            let user: User = self.get_user(user_id).with_error_context(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to get user with id: {user_id}")
+            })?;
+            
             self.permissioner
                 .borrow_mut()
                 .update_permissions_for_user(user.id, permissions.clone());
@@ -353,6 +424,24 @@ impl IggyShard {
             }
         }
 
+        self.change_password_base(user_id, current_password, new_password)
+    }
+
+    pub fn change_password_bypass_auth(
+        &self,
+        user_id: &Identifier,
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<(), IggyError> {
+        self.change_password_base(user_id, current_password, new_password)
+    }
+
+    fn change_password_base(
+        &self,
+        user_id: &Identifier,
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<(), IggyError> {
         let mut user = self.get_user_mut(user_id).with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to get mutable reference to the user with id: {user_id}")
         })?;
@@ -456,25 +545,29 @@ impl IggyShard {
 
     pub fn logout_user(&self, session: &Session) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
+        let client_id = session.client_id;
+        let user_id = session.get_user_id();
+        self.logout_user_base(user_id, client_id)?;
+        Ok(())
+    }
+
+    fn logout_user_base(&self, user_id: u32, client_id: u32) -> Result<(), IggyError> {
         let user = self
-            .get_user(&Identifier::numeric(session.get_user_id())?)
+            .get_user(&Identifier::numeric(user_id)?)
             .with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to get user with id: {}",
-                    session.get_user_id()
+                    user_id,
                 )
             })?;
         info!(
             "Logging out user: {} with ID: {}...",
             user.username, user.id
         );
-        if session.client_id > 0 {
+        if client_id > 0 {
             let mut client_manager = self.client_manager.borrow_mut();
-            client_manager.clear_user_id(session.client_id)?;
-            info!(
-                "Cleared user ID: {} for client: {}.",
-                user.id, session.client_id
-            );
+            client_manager.clear_user_id(client_id)?;
+            info!("Cleared user ID: {} for client: {}.", user.id, client_id);
         }
         info!("Logged out user: {} with ID: {}.", user.username, user.id);
         Ok(())

@@ -22,6 +22,7 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
+use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use anyhow::Result;
@@ -39,7 +40,7 @@ impl ServerCommandHandler for DeleteUser {
     async fn handle(
         self,
         sender: &mut SenderKind,
-        length: u32,
+        _length: u32,
         session: &Rc<Session>,
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
@@ -53,6 +54,11 @@ impl ServerCommandHandler for DeleteUser {
                         self.user_id
                     )
                 })?;
+
+        let event = ShardEvent::DeletedUser {
+            user_id: self.user_id.clone(),
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
 
         let user_id = self.user_id.clone();
         shard

@@ -20,6 +20,7 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::{handlers::personal_access_tokens::COMPONENT, sender::SenderKind};
+use crate::shard::transmission::event::ShardEvent;
 use crate::shard::IggyShard;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreatePersonalAccessTokenWithHash;
@@ -47,7 +48,7 @@ impl ServerCommandHandler for CreatePersonalAccessToken {
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        let token = shard
+        let (personal_access_token, token) = shard
                 .create_personal_access_token(session, &self.name, self.expiry)
                 .with_error_context(|error| {
                     format!(
@@ -56,7 +57,11 @@ impl ServerCommandHandler for CreatePersonalAccessToken {
                     )
                 })?;
         let bytes = mapper::map_raw_pat(&token);
-        let token_hash = PersonalAccessToken::hash_token(&token);
+        let hash = personal_access_token.token.to_string();
+        let event = ShardEvent::CreatedPersonalAccessToken {
+            personal_access_token: personal_access_token.clone(),
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
 
         shard
             .state
@@ -67,7 +72,7 @@ impl ServerCommandHandler for CreatePersonalAccessToken {
                         name: self.name.to_owned(),
                         expiry: self.expiry,
                     },
-                    hash: token_hash,
+                    hash,
                 }),
             )
             .await

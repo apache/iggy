@@ -21,6 +21,7 @@ use std::rc::Rc;
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
+use crate::shard::transmission::event::ShardEvent;
 use crate::shard::IggyShard;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
@@ -50,7 +51,12 @@ impl ServerCommandHandler for UpdatePermissions {
                 .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to update permissions for user_id: {}, session: {session}",
                     self.user_id
                 ))?;
-
+        let event = ShardEvent::UpdatedPermissions {
+            user_id: self.user_id.clone(),
+            permissions: self.permissions.clone(),
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+        
         shard
             .state
             .apply(

@@ -51,6 +51,13 @@ impl ServerCommandHandler for DeletePersonalAccessToken {
                     "{COMPONENT} (error: {error}) - failed to delete personal access token with name: {token_name}, session: {session}"
                 )})?;
 
+        // Broadcast the event to other shards
+        let event = crate::shard::transmission::event::ShardEvent::DeletedPersonalAccessToken {
+            user_id: session.get_user_id(),
+            name: self.name.clone(),
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+
         shard
             .state
             .apply(

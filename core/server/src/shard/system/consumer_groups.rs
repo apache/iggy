@@ -26,6 +26,7 @@ use crate::streaming::topics::consumer_group::ConsumerGroup;
 use error_set::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
+use iggy_common::locking::IggySharedMutFn;
 
 impl IggyShard {
     pub fn get_consumer_group<'cg, 'stream>(
@@ -85,6 +86,17 @@ impl IggyShard {
         Ok(topic.get_consumer_groups())
     }
 
+    pub fn create_consumer_group_bypass_auth(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        group_id: Option<u32>,
+        name: &str,
+    ) -> Result<(), IggyError> {
+        self.create_consumer_group_base(stream_id, topic_id, group_id, name)?;
+        Ok(())
+    }
+
     pub fn create_consumer_group(
         &self,
         session: &Session,
@@ -109,7 +121,16 @@ impl IggyShard {
                 topic.topic_id,
             ).with_error_context(|error| format!("{COMPONENT} (error: {error}) - permission denied to create consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), topic.stream_id, topic.topic_id))?;
         }
+        self.create_consumer_group_base(stream_id, topic_id, group_id, name)
+    }
 
+    fn create_consumer_group_base(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        group_id: Option<u32>,
+        name: &str,
+    ) -> Result<Identifier, IggyError> {
         let mut stream = self.get_stream_mut(stream_id)
             .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to get mutable reference to stream with ID: {stream_id}"))?;
         let topic = stream.get_topic_mut(topic_id)
@@ -122,6 +143,15 @@ impl IggyShard {
             })
     }
 
+    pub fn delete_consumer_group_bypass_auth(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        consumer_group_id: &Identifier,
+    ) -> Result<ConsumerGroup, IggyError> {
+        self.delete_consumer_group_base(stream_id, topic_id, consumer_group_id)
+    }
+
     pub async fn delete_consumer_group(
         &self,
         session: &Session,
@@ -130,8 +160,6 @@ impl IggyShard {
         consumer_group_id: &Identifier,
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
-        let stream_id_value;
-        let topic_id_value;
         {
             let stream = self.get_stream(stream_id).with_error_context(|error| {
                 format!(
@@ -146,11 +174,32 @@ impl IggyShard {
                 topic.stream_id,
                 topic.topic_id,
             ).with_error_context(|error| format!("{COMPONENT} (error: {error}) - permission denied to delete consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), topic.stream_id, topic.topic_id))?;
+        }
+        let cg = self.delete_consumer_group_base(stream_id, topic_id, consumer_group_id)?;
+        let stream = self.get_stream(stream_id)?;
+        let topic = stream.get_topic(topic_id)?;
 
-            stream_id_value = topic.stream_id;
-            topic_id_value = topic.topic_id;
+        for (_, partition) in topic.partitions.iter() {
+            let partition = partition.read().await;
+            if let Some((_, offset)) = partition.consumer_group_offsets.remove(&cg.group_id) {
+                self.storage
+                    .partition
+                    .delete_consumer_offset(&offset.path)
+                    .await?;
+            }
         }
 
+        Ok(())
+    }
+
+    fn delete_consumer_group_base(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        consumer_group_id: &Identifier,
+    ) -> Result<ConsumerGroup, IggyError> {
+        let stream_id_value;
+        let topic_id_value;
         let consumer_group;
         {
             let mut stream = self.get_stream_mut(stream_id).with_error_context(|error| {
@@ -161,8 +210,9 @@ impl IggyShard {
             let topic = stream.get_topic_mut(topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
 
             consumer_group = topic.delete_consumer_group(consumer_group_id)
-                .await
-                .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to delete consumer group with ID: {consumer_group_id}"))?
+                .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to delete consumer group with ID: {consumer_group_id}"))?;
+            stream_id_value = topic.stream_id;
+            topic_id_value = topic.topic_id;
         }
 
         for member in consumer_group.get_members() {
@@ -174,8 +224,7 @@ impl IggyShard {
                 )
                 .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to make client leave consumer group for client ID: {}, group ID: {}", member.id, consumer_group.group_id))?;
         }
-
-        Ok(())
+        Ok(consumer_group)
     }
 
     pub fn join_consumer_group(

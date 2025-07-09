@@ -64,7 +64,6 @@ use crate::{
     streaming::{
         clients::client_manager::ClientManager,
         diagnostics::metrics::Metrics,
-        partitions::partition,
         personal_access_tokens::personal_access_token::PersonalAccessToken,
         session::Session,
         storage::SystemStorage,
@@ -512,240 +511,271 @@ impl IggyShard {
     async fn handle_event(&self, event: Arc<ShardEvent>) -> Result<(), IggyError> {
         match &*event {
             ShardEvent::CreatedStream { stream_id, name } => {
-                self.create_stream_bypass_auth(*stream_id, name)
-            }
+                        self.create_stream_bypass_auth(*stream_id, name)
+                    }
             ShardEvent::CreatedTopic {
-                stream_id,
-                topic_id,
-                name,
-                partitions_count,
-                message_expiry,
-                compression_algorithm,
-                max_topic_size,
-                replication_factor,
-            } => {
-                let topic_id = topic_id.get_u32_value().ok();
-                self.create_topic_bypass_auth(
-                    stream_id,
-                    topic_id,
-                    name,
-                    *partitions_count,
-                    *message_expiry,
-                    *compression_algorithm,
-                    *max_topic_size,
-                    *replication_factor,
-                )
-                .await
-            }
+                        stream_id,
+                        topic_id,
+                        name,
+                        partitions_count,
+                        message_expiry,
+                        compression_algorithm,
+                        max_topic_size,
+                        replication_factor,
+                    } => {
+                        let topic_id = topic_id.get_u32_value().ok();
+                        self.create_topic_bypass_auth(
+                            stream_id,
+                            topic_id,
+                            name,
+                            *partitions_count,
+                            *message_expiry,
+                            *compression_algorithm,
+                            *max_topic_size,
+                            *replication_factor,
+                        )
+                        .await
+                    }
             ShardEvent::LoginUser {
-                client_id,
-                username,
-                password,
-            } => self.login_user_event(*client_id, username, password),
+                        client_id,
+                        username,
+                        password,
+                    } => self.login_user_event(*client_id, username, password),
             ShardEvent::NewSession { address, transport } => {
-                let session = self.add_client(address, *transport);
-                self.add_active_session(session);
-                Ok(())
-            }
+                        let session = self.add_client(address, *transport);
+                        self.add_active_session(session);
+                        Ok(())
+                    }
             ShardEvent::CreatedShardTableRecords {
-                stream_id,
-                topic_id,
-                partition_ids,
-            } => {
-                let records = self
-                    .create_shard_table_records(&partition_ids, *stream_id, *topic_id)
-                    .collect::<Vec<_>>();
-                let stream = self.get_stream(&Identifier::numeric(*stream_id)?)?;
-                let topic = stream.get_topic(&Identifier::numeric(*topic_id)?)?;
-                // Open partition and segments for that particular shard.
-                for (ns, shard_info) in records.iter() {
-                    if shard_info.id() == self.id {
-                        let partition_id = ns.partition_id;
-                        let partition = topic.get_partition(partition_id)?;
-                        let mut partition = partition.write().await;
-                        partition.open().await.with_error_context(|error| {
+                        stream_id,
+                        topic_id,
+                        partition_ids,
+                    } => {
+                        let records = self
+                            .create_shard_table_records(&partition_ids, *stream_id, *topic_id)
+                            .collect::<Vec<_>>();
+                        let stream = self.get_stream(&Identifier::numeric(*stream_id)?)?;
+                        let topic = stream.get_topic(&Identifier::numeric(*topic_id)?)?;
+                        // Open partition and segments for that particular shard.
+                        for (ns, shard_info) in records.iter() {
+                            if shard_info.id() == self.id {
+                                let partition_id = ns.partition_id;
+                                let partition = topic.get_partition(partition_id)?;
+                                let mut partition = partition.write().await;
+                                partition.open().await.with_error_context(|error| {
+                                                    format!(
+                                                        "{COMPONENT} (error: {error}) - failed to open partition with ID: {partition_id} in topic with ID: {topic_id} for stream with ID: {stream_id}"
+                                                    )
+                                                })?;
+                            }
+                        }
+                        self.insert_shard_table_records(records);
+                        Ok(())
+                    }
+            ShardEvent::CreatedPartitions {
+                        stream_id,
+                        topic_id,
+                        partitions_count,
+                    } => {
+                        let mut stream = self.get_stream_mut(stream_id)?;
+                        let topic = stream.get_topic_mut(topic_id)?;
+                        topic.add_persisted_partitions(*partitions_count)
+                                            .with_error_context(|error| {
+                                                format!(
+                                                    "{COMPONENT} (error: {error}) - failed to create partitions for topic with ID: {topic_id} in stream with ID: {stream_id}"
+                                                )
+                                            })?;
+                        topic.reassign_consumer_groups();
+                        self.metrics.increment_partitions(*partitions_count);
+                        self.metrics.increment_segments(*partitions_count);
+                        Ok(())
+                    }
+            ShardEvent::DeletedPartitions {
+                        stream_id,
+                        topic_id,
+                        partition_ids,
+                    } => {
+                        let mut stream = self.get_stream_mut(stream_id)?;
+                        let topic = stream.get_topic_mut(topic_id)?;
+                        let partitions = topic
+                                    .       delete_persisted_partitions_by_ids(partition_ids)
+                                            .with_error_context(|error| {
+                                                format!("{COMPONENT} (error: {error}) - failed to delete persisted partitions for topic: {topic}")
+                                            })?;
+                        drop(stream);
+
+                        let mut segments_count = 0;
+                        let mut messages_count = 0;
+                        let partitions_count = partitions.len();
+                        for partition in &partitions {
+                            let partition = partition.read().await;
+                            let partition_messages_count = partition.get_messages_count();
+                            segments_count += partition.get_segments_count();
+                            messages_count += partition_messages_count;
+                        }
+
+                        let mut stream = self.get_stream_mut(stream_id).with_error_context(|error| {
                             format!(
-                                "{COMPONENT} (error: {error}) - failed to open partition with ID: {partition_id} in topic with ID: {topic_id} for stream with ID: {stream_id}"
+                                "{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}"
                             )
                         })?;
+                        let topic = stream.get_topic_mut(topic_id).with_error_context(|error| {
+                            format!(
+                                "{COMPONENT} (error: {error}) - failed to get topic with ID: {topic_id}"
+                            )
+                        })?;
+                        topic.reassign_consumer_groups();
+                        if partitions.len() > 0 {
+                            self.metrics.decrement_partitions(partitions_count as u32);
+                            self.metrics.decrement_segments(segments_count);
+                            self.metrics.decrement_messages(messages_count);
+                        }
+                        Ok(())
                     }
-                }
-                self.insert_shard_table_records(records);
-                Ok(())
-            }
-            ShardEvent::CreatedPartitions {
-                stream_id,
-                topic_id,
-                partitions_count,
-            } => {
-                let mut stream = self.get_stream_mut(stream_id)?;
-                let topic = stream.get_topic_mut(topic_id)?;
-                topic.add_persisted_partitions(*partitions_count)
-                    .with_error_context(|error| {
-                        format!(
-                            "{COMPONENT} (error: {error}) - failed to create partitions for topic with ID: {topic_id} in stream with ID: {stream_id}"
-                        )
-                    })?;
-                topic.reassign_consumer_groups();
-                self.metrics.increment_partitions(*partitions_count);
-                self.metrics.increment_segments(*partitions_count);
-                Ok(())
-            }
-            ShardEvent::DeletedPartitions {
-                stream_id,
-                topic_id,
-                partition_ids,
-            } => {
-                let mut stream = self.get_stream_mut(stream_id)?;
-                let topic = stream.get_topic_mut(topic_id)?;
-                let partitions = topic
-            .       delete_persisted_partitions_by_ids(partition_ids)
-                    .with_error_context(|error| {
-                        format!("{COMPONENT} (error: {error}) - failed to delete persisted partitions for topic: {topic}")
-                    })?;
-                drop(stream);
-
-                let mut segments_count = 0;
-                let mut messages_count = 0;
-                let partitions_count = partitions.len();
-                for partition in &partitions {
-                    let partition = partition.read().await;
-                    let partition_messages_count = partition.get_messages_count();
-                    segments_count += partition.get_segments_count();
-                    messages_count += partition_messages_count;
-                }
-
-                let mut stream = self.get_stream_mut(stream_id).with_error_context(|error| {
-                    format!(
-                        "{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}"
-                    )
-                })?;
-                let topic = stream.get_topic_mut(topic_id).with_error_context(|error| {
-                    format!(
-                        "{COMPONENT} (error: {error}) - failed to get topic with ID: {topic_id}"
-                    )
-                })?;
-                topic.reassign_consumer_groups();
-                if partitions.len() > 0 {
-                    self.metrics.decrement_partitions(partitions_count as u32);
-                    self.metrics.decrement_segments(segments_count);
-                    self.metrics.decrement_messages(messages_count);
-                }
-                Ok(())
-            }
             ShardEvent::DeletedShardTableRecords { namespaces } => {
-                let (stream_id, topic_id) = namespaces
-                    .first()
-                    .map(|ns| (ns.stream_id, ns.topic_id))
-                    .unwrap();
-                let stream = self.get_stream(&Identifier::numeric(stream_id).unwrap())?;
-                let topic = stream.get_topic(&Identifier::numeric(topic_id).unwrap())?;
-                let records = self.remove_shard_table_records(&namespaces);
-                for (ns, shard_info) in records.iter() {
-                    if shard_info.id() == self.id {
-                        let partition = topic.get_partition(ns.partition_id)?;
-                        let mut partition = partition.write().await;
-                        partition.delete().await.with_error_context(|error| {
-                        format!(
-                            "{COMPONENT} (error: {error}) - failed to delete partition with ID: {} in topic with ID: {}",
-                            ns.partition_id,
-                            topic_id
-                    )
-                    })?;
+                        let (stream_id, topic_id) = namespaces
+                            .first()
+                            .map(|ns| (ns.stream_id, ns.topic_id))
+                            .unwrap();
+                        let stream = self.get_stream(&Identifier::numeric(stream_id).unwrap())?;
+                        let topic = stream.get_topic(&Identifier::numeric(topic_id).unwrap())?;
+                        let records = self.remove_shard_table_records(&namespaces);
+                        for (ns, shard_info) in records.iter() {
+                            if shard_info.id() == self.id {
+                                let partition = topic.get_partition(ns.partition_id)?;
+                                let mut partition = partition.write().await;
+                                partition.delete().await.with_error_context(|error| {
+                                                format!(
+                                                    "{COMPONENT} (error: {error}) - failed to delete partition with ID: {} in topic with ID: {}",
+                                                    ns.partition_id,
+                                                    topic_id
+                                            )
+                                            })?;
+                            }
+                        }
+                        Ok(())
                     }
-                }
-                Ok(())
-            }
             ShardEvent::DeletedStream { stream_id } => {
-                let shard_id = self.id;
-                self.delete_stream_bypass_auth(stream_id).with_error_context(|err| {
-                    format!(
-                        "{COMPONENT} (error: {err}) - failed to delete, when handling event on shard: {shard_id} stream with ID: {stream_id}",
-                    )
-                })?;
-                Ok(())
-            }
+                        let shard_id = self.id;
+                        self.delete_stream_bypass_auth(stream_id).with_error_context(|err| {
+                                            format!(
+                                                "{COMPONENT} (error: {err}) - failed to delete, when handling event on shard: {shard_id} stream with ID: {stream_id}",
+                                            )
+                                        })?;
+                        Ok(())
+                    }
             ShardEvent::UpdatedStream { stream_id, name } => {
-                self.update_stream_bypass_auth(stream_id, name)?;
-                Ok(())
-            }
+                        self.update_stream_bypass_auth(stream_id, name)?;
+                        Ok(())
+                    }
             ShardEvent::UpdatedTopic {
-                stream_id,
-                topic_id,
-                name,
-                message_expiry,
-                compression_algorithm,
-                max_topic_size,
-                replication_factor,
-            } => {
-                self.update_topic_bypass_auth(
-                    stream_id,
-                    topic_id,
-                    name,
-                    *message_expiry,
-                    *compression_algorithm,
-                    *max_topic_size,
-                    *replication_factor,
-                )
-                .await?;
-                Ok(())
-            }
-            ShardEvent::PurgedStream { stream_id: _ } => todo!(),
-            ShardEvent::CreatedConsumerGroup {
-                stream_id: _,
-                topic_id: _,
-                consumer_group_id: _,
-                name: _,
-            } => todo!(),
-            ShardEvent::DeletedConsumerGroup {
-                stream_id: _,
-                topic_id: _,
-                consumer_group_id: _,
-            } => todo!(),
-            ShardEvent::PurgedTopic {
-                stream_id: _,
-                topic_id: _,
-            } => todo!(),
-            ShardEvent::DeletedTopic {
-                stream_id,
-                topic_id,
-            } => {
-                self.delete_topic_bypass_auth(stream_id, topic_id)
-                    .await
-                    .with_error_context(|err| {
-                        format!(
-                            "{COMPONENT} (error: {err}) - failed to delete topic with ID: {topic_id} in stream with ID: {stream_id}"
+                        stream_id,
+                        topic_id,
+                        name,
+                        message_expiry,
+                        compression_algorithm,
+                        max_topic_size,
+                        replication_factor,
+                    } => {
+                        self.update_topic_bypass_auth(
+                            stream_id,
+                            topic_id,
+                            name,
+                            *message_expiry,
+                            *compression_algorithm,
+                            *max_topic_size,
+                            *replication_factor,
                         )
-                    })?;
+                        .await?;
+                        Ok(())
+                    }
+            ShardEvent::PurgedStream { stream_id: _ } => todo!(),
+            ShardEvent::PurgedTopic {
+                        stream_id: _,
+                        topic_id: _,
+                    } => todo!(),
+            ShardEvent::DeletedTopic {
+                        stream_id,
+                        topic_id,
+                    } => {
+                        self.delete_topic_bypass_auth(stream_id, topic_id)
+                                            .await
+                                            .with_error_context(|err| {
+                                                format!(
+                                                    "{COMPONENT} (error: {err}) - failed to delete topic with ID: {topic_id} in stream with ID: {stream_id}"
+                                                )
+                                            })?;
+                        Ok(())
+                    }
+            ShardEvent::CreatedConsumerGroup {
+                        stream_id,
+                        topic_id,
+                        consumer_group_id,
+                        name,
+                    } => self.create_consumer_group_bypass_auth(
+                        stream_id,
+                        topic_id,
+                        *consumer_group_id,
+                        name,
+                    ),
+            ShardEvent::DeletedConsumerGroup {
+                        stream_id,
+                        topic_id,
+                        consumer_group_id,
+                    } => {
+                        self.delete_consumer_group_bypass_auth(stream_id, topic_id, consumer_group_id)?;
+                        Ok(())
+                    }
+            ShardEvent::CreatedUser {
+                        username,
+                        password,
+                        status,
+                        permissions,
+                    } => {
+                        self.create_user_bypass_auth(username, password, *status, permissions.clone())?;
+                        Ok(())
+                    }
+            ShardEvent::DeletedUser { user_id } => {
+                        self.delete_user_bypass_auth(user_id)?;
+                        Ok(())
+                    }
+            ShardEvent::LogoutUser { client_id } => {
+                        let sessions = self.active_sessions.borrow();
+                        let session = sessions.iter().find(|s| s.client_id == *client_id).unwrap();
+                        self.logout_user(session)?;
+                        self.remove_active_session(session.get_user_id());
+
+                        Ok(())
+                    }
+            ShardEvent::ChangedPassword {
+                        user_id,
+                        current_password,
+                        new_password,
+                    } => {
+                        self.change_password_bypass_auth(user_id, current_password, new_password)?;
+                        Ok(())
+                    }
+            ShardEvent::CreatedPersonalAccessToken {personal_access_token} => {
+                self.create_personal_access_token_bypass_auth(personal_access_token.to_owned())?;
+                Ok(())
+            },
+            ShardEvent::DeletedPersonalAccessToken { user_id, name } => {
+                self.delete_personal_access_token_bypass_auth(*user_id, name)?;
+                Ok(())
+            },
+            ShardEvent::LoginWithPersonalAccessToken { token: _ } => todo!(),
+            ShardEvent::UpdatedUser {
+                        user_id,
+                        username,
+                        status,
+                    } => {
+                        self.update_user_bypass_auth(user_id, username.to_owned(), *status)?;
+                        Ok(())
+                    },
+            ShardEvent::UpdatedPermissions { user_id, permissions } => {
+                self.update_permissions_bypass_auth(user_id, permissions.to_owned())?;
                 Ok(())
             }
-            ShardEvent::CreatedUser {
-                username: _,
-                password: _,
-                status: _,
-                permissions: _,
-            } => todo!(),
-            ShardEvent::DeletedUser { user_id: _ } => todo!(),
-            ShardEvent::LogoutUser { client_id: _ } => todo!(),
-            ShardEvent::UpdatedUser {
-                user_id: _,
-                username: _,
-                status: _,
-            } => todo!(),
-            ShardEvent::ChangedPassword {
-                user_id: _,
-                current_password: _,
-                new_password: _,
-            } => todo!(),
-            ShardEvent::CreatedPersonalAccessToken { name: _, expiry: _ } => todo!(),
-            ShardEvent::DeletedPersonalAccessToken { name: _ } => todo!(),
-            ShardEvent::LoginWithPersonalAccessToken { token: _ } => todo!(),
-            ShardEvent::StoredConsumerOffset {
-                stream_id: _,
-                topic_id: _,
-                consumer: _,
-                offset: _,
-            } => todo!(),
         }
     }
 
@@ -779,9 +809,13 @@ impl IggyShard {
         }
     }
 
-    pub async fn broadcast_event_to_all_shards(&self, event: Arc<ShardEvent>) -> Vec<ShardResponse> {
+    pub async fn broadcast_event_to_all_shards(
+        &self,
+        event: Arc<ShardEvent>,
+    ) -> Vec<ShardResponse> {
         let mut responses = Vec::with_capacity(self.get_available_shards_count() as usize);
-        for maybe_receiver in self.shards
+        for maybe_receiver in self
+            .shards
             .iter()
             .filter_map(|shard| {
                 if shard.id != self.id {
@@ -801,18 +835,19 @@ impl IggyShard {
                     conn.send(ShardFrame::new(event.clone().into(), None));
                     None
                 }
-            }) {
-                match maybe_receiver {
-                    Some(receiver) => {
-                        let response = receiver.recv().await.unwrap();
-                        responses.push(response);
-                    }
-                    None => {
-                        responses.push(ShardResponse::Event);
-                    }
+            })
+        {
+            match maybe_receiver {
+                Some(receiver) => {
+                    let response = receiver.recv().await.unwrap();
+                    responses.push(response);
+                }
+                None => {
+                    responses.push(ShardResponse::Event);
                 }
             }
-            responses
+        }
+        responses
     }
 
     fn find_shard(&self, namespace: &IggyNamespace) -> Option<&Shard> {
@@ -864,6 +899,20 @@ impl IggyShard {
 
     pub fn add_active_session(&self, session: Rc<Session>) {
         self.active_sessions.borrow_mut().push(session);
+    }
+
+    pub fn remove_active_session(&self, user_id: u32) {
+        let mut active_sessions = self.active_sessions.borrow_mut();
+        let pos = active_sessions
+            .iter()
+            .position(|s| s.get_user_id() == user_id);
+        if let Some(pos) = pos {
+            active_sessions.remove(pos);
+        } else {
+            error!(
+                "{COMPONENT} - failed to remove active session for user ID: {user_id}, session not found."
+            );
+        }
     }
 
     pub fn ensure_authenticated(&self, session: &Session) -> Result<u32, IggyError> {
