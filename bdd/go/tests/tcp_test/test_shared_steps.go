@@ -19,19 +19,19 @@ package tcp_test
 
 import (
 	ierror "github.com/apache/iggy/foreign/go/errors"
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
 )
 
 func itShouldReturnSpecificError(err error, errorMessage string) {
-	It("Should return error: "+errorMessage, func() {
-		Expect(err.Error()).To(ContainSubstring(errorMessage))
+	ginkgo.It("Should return error: "+errorMessage, func() {
+		gomega.Expect(err.Error()).To(gomega.ContainSubstring(errorMessage))
 	})
 }
 
 func itShouldReturnSpecificIggyError(err error, iggyError *ierror.IggyError) {
-	It("Should return error: "+iggyError.Error(), func() {
-		Expect(err).To(MatchError(iggyError))
+	ginkgo.It("Should return error: "+iggyError.Error(), func() {
+		gomega.Expect(err).To(gomega.MatchError(iggyError))
 	})
 }
 
@@ -40,13 +40,13 @@ func itShouldReturnUnauthenticatedError(err error) {
 }
 
 func itShouldNotReturnError(err error) {
-	It("Should not return error", func() {
-		Expect(err).To(BeNil())
+	ginkgo.It("Should not return error", func() {
+		gomega.Expect(err).To(gomega.BeNil())
 	})
 }
 
 func itShouldReturnError(err error) {
-	It("Should return error", func() {
-		Expect(err).ToNot(BeNil())
+	ginkgo.It("Should return error", func() {
+		gomega.Expect(err).ToNot(gomega.BeNil())
 	})
 }

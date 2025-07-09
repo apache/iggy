@@ -18,12 +18,12 @@
 package tcp_test
 
 import (
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("LOGOUT FEATURE:", func() {
-	When("User is logged in", func() {
-		Context("and tries to log out", func() {
+var _ = ginkgo.Describe("LOGOUT FEATURE:", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("and tries to log out", func() {
 			client := createAuthorizedConnection()
 			err := client.LogoutUser()
 
@@ -31,8 +31,8 @@ var _ = Describe("LOGOUT FEATURE:", func() {
 		})
 	})
 
-	When("User is not logged in", func() {
-		Context("and tries to log out", func() {
+	ginkgo.When("User is not logged in", func() {
+		ginkgo.Context("and tries to log out", func() {
 			client := createClient()
 			err := client.LogoutUser()
 

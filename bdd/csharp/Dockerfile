@@ -15,34 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: Cross-SDK BDD Tests
+FROM mcr.microsoft.com/dotnet/sdk:8.0
 
-on:
-  workflow_call:
+COPY ./foreign/csharp ./foreign/csharp
+COPY ./bdd/scenarios ./bdd/scenarios
 
-jobs:
-  bdd-tests:
-    name: BDD tests (${{ matrix.sdk }})
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        sdk: [rust, python, go, node, csharp]
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            . -> target
-            foreign/python -> target
-          cache-on-failure: true
-          key: bdd-${{ matrix.sdk }}
+WORKDIR /foreign/csharp/Iggy_SDK.Tests.BDD
+RUN dotnet build -c Release 
 
-      - name: Run BDD tests for ${{ matrix.sdk }}
-        run: ./scripts/run-bdd-tests.sh ${{ matrix.sdk }}
-
-      - name: Clean up Docker resources
-        if: always()
-        run: ./scripts/run-bdd-tests.sh clean
+CMD ["dotnet", "test"]

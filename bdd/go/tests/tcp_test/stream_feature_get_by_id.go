@@ -19,13 +19,13 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("GET STREAM BY ID:", func() {
+var _ = ginkgo.Describe("GET STREAM BY ID:", func() {
 	prefix := "GetStream"
-	When("User is logged in", func() {
-		Context("and tries to get existing stream", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("and tries to get existing stream", func() {
 			client := createAuthorizedConnection()
 			streamId, name := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
@@ -35,7 +35,7 @@ var _ = Describe("GET STREAM BY ID:", func() {
 			itShouldReturnSpecificStream(streamId, name, *stream)
 		})
 
-		Context("and tries to get non-existing stream", func() {
+		ginkgo.Context("and tries to get non-existing stream", func() {
 			client := createAuthorizedConnection()
 			streamId := int(createRandomUInt32())
 

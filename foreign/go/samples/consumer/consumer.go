@@ -23,7 +23,7 @@ import (
 	"fmt"
 	"time"
 
-	. "github.com/apache/iggy/foreign/go/contracts"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/apache/iggy/foreign/go/iggycli"
 	sharedDemoContracts "github.com/apache/iggy/foreign/go/samples/shared"
 	"github.com/apache/iggy/foreign/go/tcp"
@@ -62,7 +62,7 @@ func main() {
 }
 
 func EnsureInfrastructureIsInitialized(cli iggycli.Client) error {
-	if _, streamErr := cli.GetStream(NewIdentifier(DefaultStreamId)); streamErr != nil {
+	if _, streamErr := cli.GetStream(iggcon.NewIdentifier(DefaultStreamId)); streamErr != nil {
 		uint32DefaultStreamId := uint32(DefaultStreamId)
 		_, streamErr = cli.CreateStream("Test Producer Stream", &uint32DefaultStreamId)
 
@@ -75,10 +75,10 @@ func EnsureInfrastructureIsInitialized(cli iggycli.Client) error {
 
 	fmt.Printf("Stream with ID: %d exists.\n", DefaultStreamId)
 
-	if _, topicErr := cli.GetTopic(NewIdentifier(DefaultStreamId), NewIdentifier(TopicId)); topicErr != nil {
+	if _, topicErr := cli.GetTopic(iggcon.NewIdentifier(DefaultStreamId), iggcon.NewIdentifier(TopicId)); topicErr != nil {
 		uint32TopicId := TopicId
 		_, topicErr = cli.CreateTopic(
-			NewIdentifier(DefaultStreamId),
+			iggcon.NewIdentifier(DefaultStreamId),
 			"Test Topic From Producer Sample",
 			12,
 			0,
@@ -105,10 +105,10 @@ func ConsumeMessages(cli iggycli.Client) error {
 	for {
 		partionId := uint32(Partition)
 		messagesWrapper, err := cli.PollMessages(
-			NewIdentifier(DefaultStreamId),
-			NewIdentifier(TopicId),
-			Consumer{Kind: ConsumerKindSingle, Id: NewIdentifier(ConsumerId)},
-			NextPollingStrategy(),
+			iggcon.NewIdentifier(DefaultStreamId),
+			iggcon.NewIdentifier(TopicId),
+			iggcon.Consumer{Kind: iggcon.ConsumerKindSingle, Id: iggcon.NewIdentifier(ConsumerId)},
+			iggcon.NextPollingStrategy(),
 			1,
 			true,
 			&partionId)
@@ -133,7 +133,7 @@ func ConsumeMessages(cli iggycli.Client) error {
 	}
 }
 
-func HandleMessage(iggyMessage IggyMessage) error {
+func HandleMessage(iggyMessage iggcon.IggyMessage) error {
 	length := (len(iggyMessage.Payload) * 3) / 4
 	bytes := make([]byte, length)
 
