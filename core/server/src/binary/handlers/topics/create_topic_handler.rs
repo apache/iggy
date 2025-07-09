@@ -78,7 +78,7 @@ impl ServerCommandHandler for CreateTopic {
             max_topic_size: self.max_topic_size,
             replication_factor: self.replication_factor,
         };
-        let _responses = shard.broadcast_event_to_all_shards(event.into());
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
         let stream = shard.get_stream(&stream_id).with_error_context(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to get stream for stream_id: {stream_id}"
@@ -114,7 +114,7 @@ impl ServerCommandHandler for CreateTopic {
             topic_id: numeric_topic_id,
             partition_ids,
         };
-        let _responses = shard.broadcast_event_to_all_shards(event.into());
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
 
         self.message_expiry = topic.message_expiry;
         self.max_topic_size = topic.max_topic_size;

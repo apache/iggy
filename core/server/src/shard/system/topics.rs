@@ -239,7 +239,8 @@ impl IggyShard {
             compression_algorithm,
             max_topic_size,
             replication_factor,
-        ).await
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]

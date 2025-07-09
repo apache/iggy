@@ -781,8 +781,9 @@ impl IggyShard {
         }
     }
 
-    pub fn broadcast_event_to_all_shards(&self, event: Arc<ShardEvent>) -> Vec<ShardResponse> {
-        self.shards
+    pub async fn broadcast_event_to_all_shards(&self, event: Arc<ShardEvent>) -> Vec<ShardResponse> {
+        let mut responses = Vec::with_capacity(self.get_available_shards_count() as usize);
+        for maybe_receiver in self.shards
             .iter()
             .filter_map(|shard| {
                 if shard.id != self.id {
@@ -794,10 +795,26 @@ impl IggyShard {
             .map(|conn| {
                 // TODO: Fixme, maybe we should send response_sender
                 // and propagate errors back.
-                conn.send(ShardFrame::new(event.clone().into(), None));
-                ShardResponse::Event
-            })
-            .collect()
+                if let ShardEvent::CreatedShardTableRecords { .. } = &*event {
+                    let (sender, receiver) = async_channel::bounded(1);
+                    conn.send(ShardFrame::new(event.clone().into(), Some(sender.clone())));
+                    Some(receiver.clone())
+                } else {
+                    conn.send(ShardFrame::new(event.clone().into(), None));
+                    None
+                }
+            }) {
+                match maybe_receiver {
+                    Some(receiver) => {
+                        let response = receiver.recv().await.unwrap();
+                        responses.push(response);
+                    }
+                    None => {
+                        responses.push(ShardResponse::Event);
+                    }
+                }
+            }
+            responses
     }
 
     fn find_shard(&self, namespace: &IggyNamespace) -> Option<&Shard> {

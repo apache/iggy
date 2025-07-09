@@ -62,7 +62,7 @@ impl ServerCommandHandler for LoginUser {
             password,
         };
         // Broadcast the event to all shards.
-        let _responses = shard.broadcast_event_to_all_shards(event.into());
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
 
         let identity_info = mapper::map_identity_info(user.id);
         sender.send_ok_response(&identity_info).await?;

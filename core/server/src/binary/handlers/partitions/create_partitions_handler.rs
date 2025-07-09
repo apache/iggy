@@ -68,7 +68,7 @@ impl ServerCommandHandler for CreatePartitions {
             topic_id: self.topic_id.clone(),
             partitions_count: partition_ids.len() as u32,
         };
-        let _responses = shard.broadcast_event_to_all_shards(event.into());
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
 
         let stream = shard.get_stream(&stream_id).unwrap();
         let topic = stream.get_topic(&topic_id).unwrap();
@@ -98,7 +98,7 @@ impl ServerCommandHandler for CreatePartitions {
             topic_id: numeric_topic_id,
             partition_ids,
         };
-        let _responses = shard.broadcast_event_to_all_shards(event.into());
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
 
         shard
         .state

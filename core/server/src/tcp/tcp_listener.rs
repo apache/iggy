@@ -107,7 +107,7 @@ pub async fn start(
                         // Broadcast session to all shards.
                         let event = ShardEvent::NewSession { address, transport };
                         // TODO: Fixme look inside of broadcast_event_to_all_shards method.
-                        let _responses = shard_clone.broadcast_event_to_all_shards(event.into());
+                        let _responses = shard_clone.broadcast_event_to_all_shards(event.into()).await;
 
                         let client_id = session.client_id;
                         info!("Created new session: {session}");
