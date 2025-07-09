@@ -23,6 +23,7 @@ pub mod displays;
 pub mod http;
 pub mod quic;
 pub mod server;
+pub mod sharding;
 pub mod system;
 pub mod tcp;
 pub mod validators;

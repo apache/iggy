@@ -23,13 +23,16 @@ use crate::{
         utils::file::overwrite,
     },
 };
-use std::{collections::HashSet, env, ops::Range, path::Path, sync::Arc};
+use std::{collections::HashSet, env, path::Path, sync::Arc};
 
 pub fn create_shard_connections(
-    shards_set: Range<usize>,
+    shards_set: &HashSet<usize>,
 ) -> (Vec<ShardConnector<ShardFrame>>, Vec<(u16, StopSender)>) {
     let shards_count = shards_set.len();
-    let connectors: Vec<ShardConnector<ShardFrame>> = shards_set
+    let mut shards_vec: Vec<usize> = shards_set.iter().cloned().collect();
+    shards_vec.sort();
+
+    let connectors: Vec<ShardConnector<ShardFrame>> = shards_vec
         .into_iter()
         .map(|id| ShardConnector::new(id as u16, shards_count))
         .collect();
@@ -122,7 +125,7 @@ pub fn create_root_user() -> User {
 }
 
 pub fn create_shard_executor(cpu_set: HashSet<usize>) -> Runtime {
-    // TODO: The event intererval tick, could be configured based on the fact
+    // TODO: The event interval tick, could be configured based on the fact
     // How many clients we expect to have connected.
     // This roughly estimates the number of tasks we will create.
 

@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use super::sharding::ShardingConfig;
 use super::system::MemoryPoolConfig;
 use super::tcp::TcpSocketConfig;
 use crate::configs::http::{
@@ -324,6 +325,7 @@ impl Default for SystemConfig {
             message_deduplication: MessageDeduplicationConfig::default(),
             recovery: RecoveryConfig::default(),
             memory_pool: MemoryPoolConfig::default(),
+            sharding: ShardingConfig::default(),
         }
     }
 }

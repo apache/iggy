@@ -17,6 +17,7 @@
  */
 
 use super::cache_indexes::CacheIndexesConfig;
+use super::sharding::ShardingConfig;
 use iggy_common::IggyByteSize;
 use iggy_common::IggyExpiry;
 use iggy_common::MaxTopicSize;
@@ -41,6 +42,7 @@ pub struct SystemConfig {
     pub message_deduplication: MessageDeduplicationConfig,
     pub recovery: RecoveryConfig,
     pub memory_pool: MemoryPoolConfig,
+    pub sharding: ShardingConfig,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
