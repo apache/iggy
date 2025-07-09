@@ -666,9 +666,32 @@ impl IggyShard {
                 Ok(())
             }
             ShardEvent::UpdatedStream {
-                stream_id: _,
-                name: _,
-            } => todo!(),
+                stream_id,
+                name,
+            } => {
+                self.update_stream_bypass_auth(stream_id, name)?;
+                Ok(())
+            },
+            ShardEvent::UpdatedTopic {
+                stream_id,
+                topic_id,
+                name,
+                message_expiry,
+                compression_algorithm,
+                max_topic_size,
+                replication_factor,
+            } => {
+                self.update_topic_bypass_auth(
+                    stream_id,
+                    topic_id,
+                    name,
+                    *message_expiry,
+                    *compression_algorithm,
+                    *max_topic_size,
+                    *replication_factor,
+                ).await?;
+                Ok(())
+            },
             ShardEvent::PurgedStream { stream_id: _ } => todo!(),
             ShardEvent::CreatedConsumerGroup {
                 stream_id: _,
@@ -680,15 +703,6 @@ impl IggyShard {
                 stream_id: _,
                 topic_id: _,
                 consumer_group_id: _,
-            } => todo!(),
-            ShardEvent::UpdatedTopic {
-                stream_id: _,
-                topic_id: _,
-                name: _,
-                message_expiry: _,
-                compression_algorithm: _,
-                max_topic_size: _,
-                replication_factor: _,
             } => todo!(),
             ShardEvent::PurgedTopic {
                 stream_id: _,
