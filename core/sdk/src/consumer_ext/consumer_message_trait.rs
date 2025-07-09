@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use tokio::sync::oneshot;
 
 #[async_trait]
-pub trait IggyConsumerMessageExt {
+pub trait IggyConsumerMessageExt<'a> {
     /// This function starts an event loop that consumes messages from the stream and
     /// applies the provided consumer. The loop will exit when the shutdown receiver is triggered.
     ///
@@ -35,7 +35,7 @@ pub trait IggyConsumerMessageExt {
     ///
     async fn consume_messages<P>(
         &mut self,
-        message_consumer: &'static P,
+        message_consumer: &'a P,
         shutdown_rx: oneshot::Receiver<()>,
     ) -> Result<(), IggyError>
     where
