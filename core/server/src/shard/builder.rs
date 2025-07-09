@@ -17,7 +17,7 @@
  */
 
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     rc::Rc,
     sync::{Arc, atomic::AtomicBool},
 };

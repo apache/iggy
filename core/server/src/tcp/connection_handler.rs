@@ -95,17 +95,32 @@ pub(crate) async fn handle_connection(
                 );
             }
             Err(error) => {
-                error!("Command was not handled successfully, session: {session}, error: {error}.");
-                if let IggyError::ClientNotFound(_) = error {
-                    sender.send_error_response(error).await?;
-                    debug!("TCP error response was sent to: {session}.");
-                    error!("Session: {session} will be deleted.");
-                    return Err(ConnectionError::from(IggyError::ClientNotFound(
-                        session.client_id,
-                    )));
-                } else {
-                    sender.send_error_response(error).await?;
-                    debug!("TCP error response was sent to: {session}.");
+                match error {
+                    IggyError::SocketTransferred => {
+                        // Socket was transferred to another shard, exit cleanly without sending response
+                        info!(
+                            "Socket transferred for session: {session}, closing original handler."
+                        );
+                        return Err(ConnectionError::from(IggyError::SocketTransferred));
+                    }
+                    IggyError::ClientNotFound(_) => {
+                        error!(
+                            "Command was not handled successfully, session: {session}, error: {error}."
+                        );
+                        sender.send_error_response(error).await?;
+                        debug!("TCP error response was sent to: {session}.");
+                        error!("Session: {session} will be deleted.");
+                        return Err(ConnectionError::from(IggyError::ClientNotFound(
+                            session.client_id,
+                        )));
+                    }
+                    _ => {
+                        error!(
+                            "Command was not handled successfully, session: {session}, error: {error}."
+                        );
+                        sender.send_error_response(error).await?;
+                        debug!("TCP error response was sent to: {session}.");
+                    }
                 }
             }
         }
@@ -134,6 +149,9 @@ pub(crate) fn handle_error(error: ConnectionError) {
         ConnectionError::SdkError(sdk_error) => match sdk_error {
             IggyError::ConnectionClosed => {
                 debug!("Client closed connection.");
+            }
+            IggyError::SocketTransferred => {
+                info!("Socket successfully transferred to another shard.");
             }
             _ => {
                 error!("Failure in internal SDK call: {sdk_error}");

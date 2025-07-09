@@ -31,9 +31,10 @@ use compio::buf::{IntoInner as _, IoBuf};
 use iggy_common::Identifier;
 use iggy_common::Sizeable;
 use iggy_common::{INDEX_SIZE, IdKind};
-use iggy_common::{IggyError, Partitioning, SendMessages, Validatable};
+use iggy_common::{IggyError, Partitioning, PartitioningKind, SendMessages, Validatable};
+use nix::libc;
 use std::rc::Rc;
-use tracing::instrument;
+use tracing::{info, instrument};
 
 impl ServerCommandHandler for SendMessages {
     fn code(&self) -> u32 {
@@ -107,6 +108,72 @@ impl ServerCommandHandler for SendMessages {
             .await?
             .into_inner();
 
+        let user_id = session.get_user_id();
+
+        let stream = shard.get_stream(&self.stream_id)?;
+        let topic = stream.get_topic(&self.topic_id)?;
+        let partition_id = match self.partitioning.kind {
+            PartitioningKind::PartitionId => {
+                u32::from_le_bytes(self.partitioning.value[..4].try_into().unwrap())
+            }
+            _ => 0,
+        };
+
+        let namespace = IggyNamespace::new(stream.stream_id, topic.topic_id, partition_id);
+        if let Some(target_shard) = shard.find_shard(&namespace) {
+            if target_shard.id() != shard.id {
+                use crate::tcp::tcp_sender::TcpSender;
+                use std::os::fd::AsRawFd;
+
+                if let SenderKind::Tcp(TcpSender { stream: tcp_stream }) = sender {
+                    let raw_fd = tcp_stream.as_raw_fd();
+                    let new_fd = unsafe { libc::dup(raw_fd) };
+                    if new_fd == -1 {
+                        return Err(IggyError::CannotReadMessagePayload);
+                    }
+
+                    let mut initial_data = Vec::new();
+                    initial_data.extend_from_slice(&(length).to_le_bytes());
+                    initial_data.extend_from_slice(&(self.code()).to_le_bytes());
+                    initial_data.extend_from_slice(&(metadata_size).to_le_bytes());
+                    initial_data.extend_from_slice(&metadata_buf[..]);
+                    initial_data.extend_from_slice(&indexes_buffer[..]);
+                    initial_data.extend_from_slice(&messages_buffer[..]);
+
+                    let payload = ShardRequestPayload::SocketTransfer {
+                        fd: new_fd,
+                        from_shard: shard.id,
+                        client_id: session.client_id,
+                        user_id: session.get_user_id(),
+                        ip_address: session.ip_address,
+                        initial_data,
+                    };
+                    let request =
+                        ShardRequest::new(stream.stream_id, topic.topic_id, partition_id, payload);
+                    let message = ShardMessage::Request(request);
+
+                    match target_shard.send_request(message).await? {
+                        ShardResponse::SendMessages => {
+                            info!(
+                                "Socket transferred from shard {} to shard {}",
+                                shard.id,
+                                target_shard.id()
+                            );
+                            // Return SocketTransferred to signal clean exit without sending response
+                            // The socket has been transferred, so the original handler should stop
+                            return Err(IggyError::SocketTransferred);
+                        }
+                        _ => {
+                            unsafe {
+                                libc::close(new_fd);
+                            }
+                            return Err(IggyError::ShardCommunicationError(target_shard.id()));
+                        }
+                    }
+                }
+            }
+        }
+
         let indexes = IggyIndexesMut::from_bytes(indexes_buffer, 0);
         let batch = IggyMessagesBatchMut::from_indexes_and_messages(
             messages_count,
@@ -115,7 +182,6 @@ impl ServerCommandHandler for SendMessages {
         );
         batch.validate()?;
 
-        let user_id = session.get_user_id();
         shard
             .append_messages(
                 user_id,

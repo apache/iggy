@@ -31,6 +31,12 @@ pub struct TcpSender {
     pub(crate) stream: TcpStream,
 }
 
+impl TcpSender {
+    pub fn into_stream(self) -> TcpStream {
+        self.stream
+    }
+}
+
 impl Sender for TcpSender {
     async fn read<B: IoBufMut>(&mut self, buffer: B) -> Result<B, IggyError> {
         sender::read(&mut self.stream, buffer).await

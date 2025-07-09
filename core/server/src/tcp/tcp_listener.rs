@@ -117,19 +117,26 @@ pub async fn start(
 
                         let shard_for_conn = shard_clone.clone();
                         shard_clone.task_registry.spawn_tracked(async move {
-                            if let Err(error) = handle_connection(&session, &mut sender, &shard_for_conn, conn_stop_receiver).await {
+                            let should_shutdown = if let Err(error) = handle_connection(&session, &mut sender, &shard_for_conn, conn_stop_receiver).await {
+                                // Check if socket was transferred
+                                let is_transferred = matches!(&error, crate::server_error::ConnectionError::SdkError(e) if e.as_code() == iggy_common::IggyError::SocketTransferred.as_code());
                                 handle_error(error);
-                            }
+                                !is_transferred  // Don't shutdown if socket was transferred
+                            } else {
+                                true  // Normal completion, shutdown the socket
+                            };
                             shard_for_conn.task_registry.remove_connection(&client_id);
 
-                            if let Err(error) = sender.shutdown().await {
-                                error!(
-                                    "Failed to shutdown TCP stream for client: {client_id}, address: {address}. {error}"
-                                );
-                            } else {
-                                info!(
-                                    "Successfully closed TCP stream for client: {client_id}, address: {address}."
-                                );
+                            if should_shutdown {
+                                if let Err(error) = sender.shutdown().await {
+                                    error!(
+                                        "Failed to shutdown TCP stream for client: {client_id}, address: {address}. {error}"
+                                    );
+                                } else {
+                                    info!(
+                                        "Successfully closed TCP stream for client: {client_id}, address: {address}."
+                                    );
+                                }
                             }
                         });
                     }

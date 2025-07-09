@@ -1,4 +1,4 @@
-use std::{rc::Rc, sync::Arc};
+use std::{net::SocketAddr, os::fd::RawFd, rc::Rc, sync::Arc};
 
 use iggy_common::PollingStrategy;
 
@@ -24,7 +24,9 @@ use crate::{
         system::messages::PollingArgs,
         transmission::{event::ShardEvent, frame::ShardResponse},
     },
-    streaming::{polling_consumer::PollingConsumer, segments::IggyMessagesBatchMut},
+    streaming::{
+        polling_consumer::PollingConsumer, segments::IggyMessagesBatchMut, session::Session,
+    },
 };
 
 pub enum ShardSendRequestResult {
@@ -71,6 +73,14 @@ pub enum ShardRequestPayload {
     PollMessages {
         consumer: PollingConsumer,
         args: PollingArgs,
+    },
+    SocketTransfer {
+        fd: RawFd,
+        from_shard: u16,
+        client_id: u32,
+        user_id: u32,
+        ip_address: SocketAddr,
+        initial_data: Vec<u8>,
     },
 }
 

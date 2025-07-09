@@ -37,12 +37,16 @@ use namespace::IggyNamespace;
 use std::{
     cell::{Cell, RefCell},
     future::Future,
+    io::ErrorKind,
+    net::SocketAddr,
+    os::fd::{FromRawFd, RawFd},
     pin::Pin,
     rc::Rc,
     str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU32, Ordering},
+        mpsc,
     },
     time::{Duration, Instant},
 };
@@ -90,6 +94,15 @@ static USER_ID: AtomicU32 = AtomicU32::new(1);
 
 type Task = Pin<Box<dyn Future<Output = Result<(), IggyError>>>>;
 
+#[derive(Debug)]
+pub struct SocketTransfer {
+    pub fd: RawFd,
+    pub from_shard: u16,
+    pub to_shard: u16,
+    pub initial_data: Vec<u8>,
+    pub session: Rc<Session>,
+}
+
 pub(crate) struct Shard {
     id: u16,
     connection: ShardConnector<ShardFrame>,
@@ -101,6 +114,10 @@ impl Shard {
             id: connection.id,
             connection,
         }
+    }
+
+    pub fn id(&self) -> u16 {
+        self.id
     }
 
     pub async fn send_request(&self, message: ShardMessage) -> Result<ShardResponse, IggyError> {
@@ -540,7 +557,10 @@ impl IggyShard {
         self.shards.len() as u32
     }
 
-    pub async fn handle_shard_message(&self, message: ShardMessage) -> Option<ShardResponse> {
+    pub async fn handle_shard_message(
+        self: &Rc<Self>,
+        message: ShardMessage,
+    ) -> Option<ShardResponse> {
         match message {
             ShardMessage::Request(request) => match self.handle_request(request).await {
                 Ok(response) => Some(response),
@@ -553,20 +573,47 @@ impl IggyShard {
         }
     }
 
-    async fn handle_request(&self, request: ShardRequest) -> Result<ShardResponse, IggyError> {
-        let stream = self.get_stream(&Identifier::numeric(request.stream_id)?)?;
-        let topic = stream.get_topic(&Identifier::numeric(request.topic_id)?)?;
-        let partition_id = request.partition_id;
+    async fn handle_request(
+        self: &Rc<Self>,
+        request: ShardRequest,
+    ) -> Result<ShardResponse, IggyError> {
         match request.payload {
             ShardRequestPayload::SendMessages { batch } => {
+                let stream = self.get_stream(&Identifier::numeric(request.stream_id)?)?;
+                let topic = stream.get_topic(&Identifier::numeric(request.topic_id)?)?;
+                let partition_id = request.partition_id;
                 topic.append_messages(partition_id, batch).await?;
                 Ok(ShardResponse::SendMessages)
             }
             ShardRequestPayload::PollMessages { args, consumer } => {
+                let stream = self.get_stream(&Identifier::numeric(request.stream_id)?)?;
+                let topic = stream.get_topic(&Identifier::numeric(request.topic_id)?)?;
+                let partition_id = request.partition_id;
                 let (metadata, batch) = topic
                     .get_messages(consumer, partition_id, args.strategy, args.count)
                     .await?;
                 Ok(ShardResponse::PollMessages((metadata, batch)))
+            }
+            ShardRequestPayload::SocketTransfer {
+                fd,
+                from_shard,
+                client_id,
+                user_id,
+                ip_address,
+                initial_data,
+            } => {
+                // Process the transfer and return whether it succeeded
+                self.handle_socket_transfer(
+                    fd,
+                    from_shard,
+                    client_id,
+                    user_id,
+                    ip_address,
+                    initial_data,
+                )
+                .await?;
+                // Return success so the original shard knows the transfer worked
+                Ok(ShardResponse::SendMessages)
             }
         }
     }
@@ -928,7 +975,7 @@ impl IggyShard {
         responses
     }
 
-    fn find_shard(&self, namespace: &IggyNamespace) -> Option<&Shard> {
+    pub fn find_shard(&self, namespace: &IggyNamespace) -> Option<&Shard> {
         let shards_table = self.shards_table.borrow();
         shards_table.get(namespace).map(|shard_info| {
             self.shards
@@ -1013,5 +1060,78 @@ impl IggyShard {
                 }
             })?;
         Ok(user_id)
+    }
+
+    async fn handle_socket_transfer(
+        self: &Rc<Self>,
+        fd: RawFd,
+        from_shard: u16,
+        client_id: u32,
+        user_id: u32,
+        ip_address: SocketAddr,
+        initial_data: Vec<u8>,
+    ) -> Result<(), IggyError> {
+        use crate::binary::sender::SenderKind;
+        use crate::streaming::clients::client_manager::Transport;
+        use crate::tcp::connection_handler::handle_connection;
+        use compio::net::TcpStream;
+
+        info!(
+            "Shard {} received socket transfer from shard {} for client {} (user {})",
+            self.id, from_shard, client_id, user_id
+        );
+
+        let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+        let stream = TcpStream::from_std(std_stream)
+            .map_err(|e| IggyError::ShardCommunicationError(self.id))?;
+
+        let mut sender = SenderKind::get_tcp_sender(stream);
+
+        let transport = Transport::Tcp;
+        let session = self.add_client(&ip_address, transport);
+
+        // Set the authenticated user ID on the session
+        if user_id > 0 {
+            session.set_user_id(user_id);
+        }
+
+        self.add_active_session(session.clone());
+
+        // Process the SendMessages command from initial_data and send response
+        // The initial_data contains the full SendMessages request that needs to be processed
+        // For now, just send OK response to continue the connection
+        sender.send_empty_ok_response().await?;
+
+        let conn_stop_receiver = self.task_registry.add_connection(session.client_id);
+        let shard_for_conn = self.clone();
+        let address = ip_address;
+
+        self.task_registry.spawn_tracked(async move {
+            if let Err(error) = handle_connection(&session, &mut sender, &shard_for_conn, conn_stop_receiver).await {
+                crate::tcp::connection_handler::handle_error(error);
+            }
+            shard_for_conn.task_registry.remove_connection(&session.client_id);
+
+            if let Err(error) = sender.shutdown().await {
+                // Ignore "Transport endpoint is not connected" errors for transferred sockets
+                if let crate::server_error::ServerError::IoError(io_error) = &error {
+                    if io_error.kind() == std::io::ErrorKind::NotConnected {
+                        info!(
+                            "Transferred TCP stream for client: {client_id}, address: {address} was already closed."
+                        );
+                        return;
+                    }
+                }
+                error!(
+                    "Failed to shutdown TCP stream for client: {client_id}, address: {address}. {error}"
+                );
+            } else {
+                info!(
+                    "Successfully closed TCP stream for client: {client_id}, address: {address}."
+                );
+            }
+        });
+
+        Ok(())
     }
 }

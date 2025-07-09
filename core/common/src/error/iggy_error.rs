@@ -158,6 +158,8 @@ pub enum IggyError {
     InvalidClientId = 101,
     #[error("Connection closed")]
     ConnectionClosed = 206,
+    #[error("Socket transferred to another shard")]
+    SocketTransferred = 207,
     #[error("Cannot parse header kind from {0}")]
     CannotParseHeaderKind(String) = 209,
     #[error("HTTP response error, status: {0}, body: {1}")]
