@@ -19,7 +19,6 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::thread::available_parallelism;
 
 use anyhow::Result;
 use clap::Parser;
@@ -36,12 +35,13 @@ use server::bootstrap::{
 };
 use server::configs::config_provider::{self};
 use server::configs::server::ServerConfig;
+use server::configs::sharding::CpuAllocation;
 use server::io::fs_utils;
 #[cfg(not(feature = "tokio-console"))]
 use server::log::logger::Logging;
 #[cfg(feature = "tokio-console")]
 use server::log::tokio_console::Logging;
-use server::server_error::ServerError;
+use server::server_error::{ConfigError, ServerError};
 use server::shard::IggyShard;
 use server::shard::gate::Barrier;
 use server::state::StateKind;
@@ -122,12 +122,28 @@ fn main() -> Result<(), ServerError> {
     // From this point on, we can use tracing macros to log messages.
     logging.late_init(config.system.get_system_path(), &config.system.logging)?;
 
-    // TODO: Make this configurable from config as a range
-    // for example this instance of Iggy will use cores from 0..4
-    let available_cpus = available_parallelism().expect("Failed to get num of cores");
-    let shards_count = available_cpus.into();
-    let shards_set = 0..shards_count;
-    let (connections, shutdown_handles) = create_shard_connections(shards_set.clone());
+    let shards_set = config.system.sharding.cpu_allocation.to_shard_set();
+
+    match &config.system.sharding.cpu_allocation {
+        CpuAllocation::All => {
+            info!(
+                "Using all available CPU cores ({} shards with affinity)",
+                shards_set.len()
+            );
+        }
+        CpuAllocation::Count(count) => {
+            info!("Using {count} shards with affinity to cores 0..{count}");
+        }
+        CpuAllocation::Range(start, end) => {
+            info!(
+                "Using {} shards with affinity to cores {start}..{end}",
+                end - start
+            );
+        }
+    }
+
+    info!("Starting {} shard(s)", shards_set.len());
+    let (connections, shutdown_handles) = create_shard_connections(&shards_set);
     let barrier = Arc::new(Barrier::new());
     let mut handles = Vec::with_capacity(shards_set.len());
 
@@ -142,7 +158,8 @@ fn main() -> Result<(), ServerError> {
             .name(format!("shard-{id}"))
             .spawn(move || {
                 MemoryPool::init_pool(config.system.clone());
-                let rt = create_shard_executor(HashSet::from([shard_id]));
+                let affinity_set = HashSet::from([shard_id]);
+                let rt = create_shard_executor(affinity_set);
                 rt.block_on(async move {
                     let version = SemanticVersion::current().expect("Invalid version");
                     info!(

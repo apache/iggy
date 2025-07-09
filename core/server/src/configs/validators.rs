@@ -22,6 +22,7 @@ use super::server::{
     ArchiverConfig, DataMaintenanceConfig, MessageSaverConfig, MessagesMaintenanceConfig,
     StateMaintenanceConfig, TelemetryConfig,
 };
+use super::sharding::{CpuAllocation, ShardingConfig};
 use super::system::{CompressionConfig, MemoryPoolConfig, PartitionConfig};
 use crate::archiver::ArchiverKindType;
 use crate::configs::COMPONENT;
@@ -34,6 +35,7 @@ use iggy_common::CompressionAlgorithm;
 use iggy_common::IggyExpiry;
 use iggy_common::MaxTopicSize;
 use iggy_common::Validatable;
+use std::thread::available_parallelism;
 use tracing::error;
 
 impl Validatable<ConfigError> for ServerConfig {
@@ -68,6 +70,12 @@ impl Validatable<ConfigError> for ServerConfig {
         self.telemetry.validate().with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to validate telemetry config")
         })?;
+        self.system
+            .sharding
+            .validate()
+            .with_error_context(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to validate sharding config")
+            })?;
 
         let topic_size = match self.system.topic.max_size {
             MaxTopicSize::Custom(size) => Ok(size.as_bytes_u64()),
@@ -350,5 +358,45 @@ impl Validatable<ConfigError> for MemoryPoolConfig {
         }
 
         Ok(())
+    }
+}
+
+impl Validatable<ConfigError> for ShardingConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let available_cpus = available_parallelism()
+            .expect("Failed to get number of CPU cores")
+            .get();
+
+        match &self.cpu_allocation {
+            CpuAllocation::All => Ok(()),
+            CpuAllocation::Count(count) => {
+                if *count == 0 {
+                    eprintln!("Invalid sharding configuration: cpu_allocation count cannot be 0");
+                    return Err(ConfigError::InvalidConfiguration);
+                }
+                if *count > available_cpus {
+                    eprintln!(
+                        "Invalid sharding configuration: cpu_allocation count {count} exceeds available CPU cores {available_cpus}"
+                    );
+                    return Err(ConfigError::InvalidConfiguration);
+                }
+                Ok(())
+            }
+            CpuAllocation::Range(start, end) => {
+                if start >= end {
+                    eprintln!(
+                        "Invalid sharding configuration: cpu_allocation range {start}..{end} is invalid (start must be less than end)"
+                    );
+                    return Err(ConfigError::InvalidConfiguration);
+                }
+                if *end > available_cpus {
+                    eprintln!(
+                        "Invalid sharding configuration: cpu_allocation range {start}..{end} exceeds available CPU cores (max: {available_cpus})"
+                    );
+                    return Err(ConfigError::InvalidConfiguration);
+                }
+                Ok(())
+            }
+        }
     }
 }
