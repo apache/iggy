@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tracing::{error, info, trace, warn};
 
-pub const ALIGNMENT: usize = 512;
+pub const ALIGNMENT: usize = 4096;
 pub type Align512 = ConstAlign<ALIGNMENT>;
 pub type AlignedBuffer = AVec<u8, Align512>;
 

@@ -17,7 +17,7 @@
  */
 
 use crate::streaming::utils::{ALIGNMENT, PooledBuffer};
-use compio::buf::{IntoInner, IoBuf};
+use compio::buf::IoBuf;
 use compio::fs::{File, OpenOptions};
 use compio::io::AsyncWriteAtExt;
 use error_set::ErrContext;
@@ -25,7 +25,7 @@ use iggy_common::IggyError;
 
 const O_DIRECT: i32 = 0x4000;
 const O_DSYNC: i32 = 0x1000;
-
+const SCRATCH_SIZE: usize = ALIGNMENT * 8;
 /// Cache line padding to prevent false sharing
 /// Most modern CPUs have 64-byte cache lines
 #[repr(align(64))]
@@ -34,9 +34,9 @@ struct Padded<T>(T);
 
 /// Stack-allocated scratch buffer for small writes
 /// Aligned to 4KiB for optimal performance
-#[repr(align(512))]
+#[repr(align(4096))]
 #[derive(Debug)]
-struct ScratchBuffer([u8; 4096]);
+struct ScratchBuffer([u8; SCRATCH_SIZE]);
 
 /// A wrapper that allows us to pass a slice of ScratchBuffer as IoBuf
 /// This is safe because DirectFile owns the ScratchBuffer for its entire lifetime
@@ -124,7 +124,7 @@ impl DirectFile {
             tail: PooledBuffer::with_capacity(ALIGNMENT),
             tail_len: Padded(0),
             spare: PooledBuffer::with_capacity(ALIGNMENT),
-            scratch: ScratchBuffer([0u8; 4096]),
+            scratch: ScratchBuffer([0u8; SCRATCH_SIZE]),
         })
     }
 
@@ -140,18 +140,6 @@ impl DirectFile {
             })
             .map_err(|_| IggyError::CannotReadFileMetadata)
             .map(|metadata| metadata.len())
-    }
-
-    fn new(file: File, file_path: String, initial_position: u64) -> Self {
-        Self {
-            file_path,
-            file,
-            file_position: initial_position,
-            tail: PooledBuffer::with_capacity(ALIGNMENT),
-            tail_len: Padded(0),
-            spare: PooledBuffer::with_capacity(ALIGNMENT),
-            scratch: ScratchBuffer([0u8; 4096]),
-        }
     }
 
     /// Write data from an owned PooledBuffer with zero-copy optimization

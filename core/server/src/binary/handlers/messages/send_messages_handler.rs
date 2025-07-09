@@ -25,7 +25,7 @@ use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{ShardMessage, ShardRequest, ShardRequestPayload};
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use crate::streaming::session::Session;
-use crate::streaming::utils::PooledBuffer;
+use crate::streaming::utils::{ALIGNMENT, PooledBuffer};
 use anyhow::Result;
 use compio::buf::{IntoInner as _, IoBuf};
 use iggy_common::Identifier;
@@ -93,7 +93,7 @@ impl ServerCommandHandler for SendMessages {
         );
         let indexes_size = messages_count as usize * INDEX_SIZE;
 
-        let mut indexes_buffer = PooledBuffer::with_capacity(indexes_size + 512); // extra space for possible padding to not cause reallocations
+        let mut indexes_buffer = PooledBuffer::with_capacity(indexes_size + ALIGNMENT); // extra space for possible padding to not cause reallocations
         let indexes_buffer = sender
             .read(indexes_buffer.slice(0..indexes_size))
             .await?
@@ -102,7 +102,7 @@ impl ServerCommandHandler for SendMessages {
         let messages_size =
             total_payload_size - metadata_size as usize - indexes_size - metadata_len_field_size;
 
-        let mut messages_buffer = PooledBuffer::with_capacity(messages_size + 512); // extra space for possible padding to not cause reallocations
+        let mut messages_buffer = PooledBuffer::with_capacity(messages_size + ALIGNMENT); // extra space for possible padding to not cause reallocations
         let messages_buffer = sender
             .read(messages_buffer.slice(0..messages_size))
             .await?
