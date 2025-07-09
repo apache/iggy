@@ -19,15 +19,15 @@ package tcp
 
 import (
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
-	. "github.com/apache/iggy/foreign/go/contracts"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
 func (tms *IggyTcpClient) SendMessages(
-	streamId Identifier,
-	topicId Identifier,
-	partitioning Partitioning,
-	messages []IggyMessage,
+	streamId iggcon.Identifier,
+	topicId iggcon.Identifier,
+	partitioning iggcon.Partitioning,
+	messages []iggcon.IggyMessage,
 ) error {
 	if len(messages) == 0 {
 		return ierror.CustomError("messages_count_should_be_greater_than_zero")
@@ -38,19 +38,19 @@ func (tms *IggyTcpClient) SendMessages(
 		Partitioning: partitioning,
 		Messages:     messages,
 	}
-	_, err := tms.sendAndFetchResponse(serializedRequest.Serialize(tms.MessageCompression), SendMessagesCode)
+	_, err := tms.sendAndFetchResponse(serializedRequest.Serialize(tms.MessageCompression), iggcon.SendMessagesCode)
 	return err
 }
 
 func (tms *IggyTcpClient) PollMessages(
-	streamId Identifier,
-	topicId Identifier,
-	consumer Consumer,
-	strategy PollingStrategy,
+	streamId iggcon.Identifier,
+	topicId iggcon.Identifier,
+	consumer iggcon.Consumer,
+	strategy iggcon.PollingStrategy,
 	count uint32,
 	autoCommit bool,
 	partitionId *uint32,
-) (*PolledMessage, error) {
+) (*iggcon.PolledMessage, error) {
 	serializedRequest := binaryserialization.TcpFetchMessagesRequest{
 		StreamId:    streamId,
 		TopicId:     topicId,
@@ -60,7 +60,7 @@ func (tms *IggyTcpClient) PollMessages(
 		Count:       count,
 		PartitionId: partitionId,
 	}
-	buffer, err := tms.sendAndFetchResponse(serializedRequest.Serialize(), PollMessagesCode)
+	buffer, err := tms.sendAndFetchResponse(serializedRequest.Serialize(), iggcon.PollMessagesCode)
 	if err != nil {
 		return nil, err
 	}

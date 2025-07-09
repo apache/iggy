@@ -19,17 +19,17 @@ package tcp
 
 import (
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
-	. "github.com/apache/iggy/foreign/go/contracts"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
-func (tms *IggyTcpClient) GetConsumerOffset(consumer Consumer, streamId Identifier, topicId Identifier, partitionId *uint32) (*ConsumerOffsetInfo, error) {
-	message := binaryserialization.GetOffset(GetConsumerOffsetRequest{
+func (tms *IggyTcpClient) GetConsumerOffset(consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, partitionId *uint32) (*iggcon.ConsumerOffsetInfo, error) {
+	message := binaryserialization.GetOffset(iggcon.GetConsumerOffsetRequest{
 		StreamId:    streamId,
 		TopicId:     topicId,
 		Consumer:    consumer,
 		PartitionId: partitionId,
 	})
-	buffer, err := tms.sendAndFetchResponse(message, GetOffsetCode)
+	buffer, err := tms.sendAndFetchResponse(message, iggcon.GetOffsetCode)
 	if err != nil {
 		return nil, err
 	}
@@ -37,14 +37,14 @@ func (tms *IggyTcpClient) GetConsumerOffset(consumer Consumer, streamId Identifi
 	return binaryserialization.DeserializeOffset(buffer), nil
 }
 
-func (tms *IggyTcpClient) StoreConsumerOffset(consumer Consumer, streamId Identifier, topicId Identifier, offset uint64, partitionId *uint32) error {
-	message := binaryserialization.UpdateOffset(StoreConsumerOffsetRequest{
+func (tms *IggyTcpClient) StoreConsumerOffset(consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, offset uint64, partitionId *uint32) error {
+	message := binaryserialization.UpdateOffset(iggcon.StoreConsumerOffsetRequest{
 		StreamId:    streamId,
 		TopicId:     topicId,
 		Offset:      offset,
 		Consumer:    consumer,
 		PartitionId: partitionId,
 	})
-	_, err := tms.sendAndFetchResponse(message, StoreOffsetCode)
+	_, err := tms.sendAndFetchResponse(message, iggcon.StoreOffsetCode)
 	return err
 }

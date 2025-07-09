@@ -20,8 +20,8 @@ package tcp_test
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/apache/iggy/foreign/go/iggycli"
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
 )
 
 // OPERATIONS
@@ -54,8 +54,8 @@ func itShouldSuccessfullyDeleteAccessToken(name string, client iggycli.Client) {
 		}
 	}
 
-	It("should not fetch token with name "+name, func() {
-		Expect(found).To(BeFalse(), "Token with name %s exists", name)
+	ginkgo.It("should not fetch token with name "+name, func() {
+		gomega.Expect(found).To(gomega.BeFalse(), "Token with name %s exists", name)
 	})
 }
 
@@ -64,14 +64,14 @@ func itShouldBePossibleToLogInWithAccessToken(token string) {
 	userId, err := ms.LoginWithPersonalAccessToken(token)
 
 	itShouldNotReturnError(err)
-	It("should return userId", func() {
-		Expect(userId).NotTo(BeNil())
+	ginkgo.It("should return userId", func() {
+		gomega.Expect(userId).NotTo(gomega.BeNil())
 	})
 }
 
 func itShouldContainSpecificAccessToken(name string, tokens []iggcon.PersonalAccessTokenInfo) {
-	It("should fetch at least one user", func() {
-		Expect(len(tokens)).NotTo(Equal(0))
+	ginkgo.It("should fetch at least one user", func() {
+		gomega.Expect(len(tokens)).NotTo(gomega.Equal(0))
 	})
 
 	var token iggcon.PersonalAccessTokenInfo
@@ -85,8 +85,8 @@ func itShouldContainSpecificAccessToken(name string, tokens []iggcon.PersonalAcc
 		}
 	}
 
-	It("should fetch token with name "+name, func() {
-		Expect(found).To(BeTrue(), "Token with name %s not found", name)
-		Expect(token.Name).To(Equal(name))
+	ginkgo.It("should fetch token with name "+name, func() {
+		gomega.Expect(found).To(gomega.BeTrue(), "Token with name %s not found", name)
+		gomega.Expect(token.Name).To(gomega.Equal(name))
 	})
 }

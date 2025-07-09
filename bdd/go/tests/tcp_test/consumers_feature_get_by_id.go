@@ -20,13 +20,13 @@ package tcp_test
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("GET CONSUMER GROUP BY ID:", func() {
+var _ = ginkgo.Describe("GET CONSUMER GROUP BY ID:", func() {
 	prefix := "GetConsumerGroup"
-	When("User is logged in", func() {
-		Context("and tries to get existing consumer group", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("and tries to get existing consumer group", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
@@ -38,7 +38,7 @@ var _ = Describe("GET CONSUMER GROUP BY ID:", func() {
 			itShouldReturnSpecificConsumer(groupId, name, &group.ConsumerGroup)
 		})
 
-		Context("and tries to get consumer from non-existing stream", func() {
+		ginkgo.Context("and tries to get consumer from non-existing stream", func() {
 			client := createAuthorizedConnection()
 
 			_, err := client.GetConsumerGroup(
@@ -49,7 +49,7 @@ var _ = Describe("GET CONSUMER GROUP BY ID:", func() {
 			itShouldReturnSpecificIggyError(err, ierror.ConsumerGroupIdNotFound)
 		})
 
-		Context("and tries to get consumer from non-existing topic", func() {
+		ginkgo.Context("and tries to get consumer from non-existing topic", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
@@ -62,7 +62,7 @@ var _ = Describe("GET CONSUMER GROUP BY ID:", func() {
 			itShouldReturnSpecificIggyError(err, ierror.ConsumerGroupIdNotFound)
 		})
 
-		Context("and tries to get from non-existing consumer", func() {
+		ginkgo.Context("and tries to get from non-existing consumer", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)

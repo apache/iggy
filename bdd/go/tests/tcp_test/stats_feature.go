@@ -18,19 +18,19 @@
 package tcp_test
 
 import (
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
 )
 
-var _ = Describe("STAT FEATURE:", func() {
-	When("user is logged in", func() {
-		Context("and tries to log with correct data", func() {
+var _ = ginkgo.Describe("STAT FEATURE:", func() {
+	ginkgo.When("user is logged in", func() {
+		ginkgo.Context("and tries to log with correct data", func() {
 			client := createAuthorizedConnection()
 			stats, err := client.GetStats()
 
 			itShouldNotReturnError(err)
-			It("should return stats", func() {
-				Expect(stats).ToNot(BeNil())
+			ginkgo.It("should return stats", func() {
+				gomega.Expect(stats).ToNot(gomega.BeNil())
 			})
 		})
 	})

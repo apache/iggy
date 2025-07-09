@@ -21,13 +21,13 @@ import (
 	"math"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("CREATE TOPIC:", func() {
+var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 	prefix := "CreateTopic"
-	When("User is logged in", func() {
-		Context("and tries to create topic unique name and id", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("and tries to create topic unique name and id", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			topicId := 1
@@ -48,7 +48,7 @@ var _ = Describe("CREATE TOPIC:", func() {
 			itShouldSuccessfullyCreateTopic(streamId, topicId, name, client)
 		})
 
-		Context("and tries to create topic for a non existing stream", func() {
+		ginkgo.Context("and tries to create topic for a non existing stream", func() {
 			client := createAuthorizedConnection()
 			streamId := int(createRandomUInt32())
 			topicId := 1
@@ -67,7 +67,7 @@ var _ = Describe("CREATE TOPIC:", func() {
 			itShouldReturnSpecificError(err, "stream_id_not_found")
 		})
 
-		Context("and tries to create topic with duplicate topic name", func() {
+		ginkgo.Context("and tries to create topic with duplicate topic name", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
@@ -87,7 +87,7 @@ var _ = Describe("CREATE TOPIC:", func() {
 			itShouldReturnSpecificError(err, "topic_name_already_exists")
 		})
 
-		Context("and tries to create topic with duplicate topic id", func() {
+		ginkgo.Context("and tries to create topic with duplicate topic id", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
@@ -106,7 +106,7 @@ var _ = Describe("CREATE TOPIC:", func() {
 			itShouldReturnSpecificError(err, "topic_id_already_exists")
 		})
 
-		Context("and tries to create topic with name that's over 255 characters", func() {
+		ginkgo.Context("and tries to create topic with name that's over 255 characters", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, createAuthorizedConnection())
@@ -127,8 +127,8 @@ var _ = Describe("CREATE TOPIC:", func() {
 		})
 	})
 
-	When("User is not logged in", func() {
-		Context("and tries to create topic", func() {
+	ginkgo.When("User is not logged in", func() {
+		ginkgo.Context("and tries to create topic", func() {
 			client := createClient()
 			replicationFactor := uint8(1)
 			topicId := 1

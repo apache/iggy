@@ -20,11 +20,11 @@ package tcp
 import (
 	"context"
 	"encoding/binary"
+	"log"
 	"net"
 	"sync"
 	"time"
 
-	. "github.com/apache/iggy/foreign/go/contracts"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 )
@@ -99,7 +99,9 @@ func NewIggyTcpClient(options ...Option) (*IggyTcpClient, error) {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					client.Ping()
+					if err = client.Ping(); err != nil {
+						log.Printf("[WARN] heartbeat failed: %v", err)
+					}
 				}
 			}
 		}()
@@ -143,7 +145,7 @@ func (tms *IggyTcpClient) write(payload []byte) (int, error) {
 	return totalWritten, nil
 }
 
-func (tms *IggyTcpClient) sendAndFetchResponse(message []byte, command CommandCode) ([]byte, error) {
+func (tms *IggyTcpClient) sendAndFetchResponse(message []byte, command iggcon.CommandCode) ([]byte, error) {
 	tms.mtx.Lock()
 	defer tms.mtx.Unlock()
 
@@ -189,7 +191,7 @@ func (tms *IggyTcpClient) sendAndFetchResponse(message []byte, command CommandCo
 	return buffer, nil
 }
 
-func createPayload(message []byte, command CommandCode) []byte {
+func createPayload(message []byte, command iggcon.CommandCode) []byte {
 	messageLength := len(message) + 4
 	messageBytes := make([]byte, InitialBytesLength+messageLength)
 	binary.LittleEndian.PutUint32(messageBytes[:4], uint32(messageLength))
@@ -200,15 +202,4 @@ func createPayload(message []byte, command CommandCode) []byte {
 
 func getResponseCode(buffer []byte) int {
 	return int(binary.LittleEndian.Uint32(buffer[:4]))
-}
-
-func getResponseLength(buffer []byte) (int, error) {
-	length := int(binary.LittleEndian.Uint32(buffer[4:]))
-	if length <= 1 {
-		return 0, &ierror.IggyError{
-			Code:    0,
-			Message: "Received empty response.",
-		}
-	}
-	return length, nil
 }

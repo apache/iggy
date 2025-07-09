@@ -19,25 +19,25 @@ package tcp
 
 import (
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
-	. "github.com/apache/iggy/foreign/go/contracts"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
-func (tms *IggyTcpClient) CreatePartitions(streamId Identifier, topicId Identifier, partitionsCount uint32) error {
-	message := binaryserialization.CreatePartitions(CreatePartitionsRequest{
+func (tms *IggyTcpClient) CreatePartitions(streamId iggcon.Identifier, topicId iggcon.Identifier, partitionsCount uint32) error {
+	message := binaryserialization.CreatePartitions(iggcon.CreatePartitionsRequest{
 		StreamId:        streamId,
 		TopicId:         topicId,
 		PartitionsCount: partitionsCount,
 	})
-	_, err := tms.sendAndFetchResponse(message, CreatePartitionsCode)
+	_, err := tms.sendAndFetchResponse(message, iggcon.CreatePartitionsCode)
 	return err
 }
 
-func (tms *IggyTcpClient) DeletePartitions(streamId Identifier, topicId Identifier, partitionsCount uint32) error {
-	message := binaryserialization.DeletePartitions(DeletePartitionsRequest{
+func (tms *IggyTcpClient) DeletePartitions(streamId iggcon.Identifier, topicId iggcon.Identifier, partitionsCount uint32) error {
+	message := binaryserialization.DeletePartitions(iggcon.DeletePartitionsRequest{
 		StreamId:        streamId,
 		TopicId:         topicId,
 		PartitionsCount: partitionsCount,
 	})
-	_, err := tms.sendAndFetchResponse(message, DeletePartitionsCode)
+	_, err := tms.sendAndFetchResponse(message, iggcon.DeletePartitionsCode)
 	return err
 }

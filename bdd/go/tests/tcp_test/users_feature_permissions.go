@@ -19,12 +19,12 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("UPDATE USER PERMISSIONS:", func() {
-	When("User is logged in", func() {
-		Context("tries to update permissions of existing user", func() {
+var _ = ginkgo.Describe("UPDATE USER PERMISSIONS:", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("tries to update permissions of existing user", func() {
 			client := createAuthorizedConnection()
 			userId := successfullyCreateUser(createRandomString(16), client)
 			defer deleteUserAfterTests(userId, client)
@@ -51,8 +51,8 @@ var _ = Describe("UPDATE USER PERMISSIONS:", func() {
 		})
 	})
 
-	When("User is not logged in", func() {
-		Context("and tries to change user permissions", func() {
+	ginkgo.When("User is not logged in", func() {
+		ginkgo.Context("and tries to change user permissions", func() {
 			client := createClient()
 			username := createRandomString(16)
 			err := client.UpdateUser(

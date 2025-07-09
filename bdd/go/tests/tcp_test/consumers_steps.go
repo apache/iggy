@@ -22,8 +22,8 @@ import (
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/apache/iggy/foreign/go/iggycli"
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
 )
 
 // operations
@@ -56,20 +56,20 @@ func successfullyJoinConsumer(streamId int, topicId int, groupId int, client igg
 //assertions
 
 func itShouldReturnSpecificConsumer(id int, name string, consumer *iggcon.ConsumerGroup) {
-	It("should fetch consumer with id "+string(rune(id)), func() {
-		Expect(consumer).NotTo(BeNil())
-		Expect(consumer.Id).To(Equal(id))
+	ginkgo.It("should fetch consumer with id "+string(rune(id)), func() {
+		gomega.Expect(consumer).NotTo(gomega.BeNil())
+		gomega.Expect(consumer.Id).To(gomega.Equal(id))
 	})
 
-	It("should fetch consumer with name "+name, func() {
-		Expect(consumer).NotTo(BeNil())
-		Expect(consumer.Name).To(Equal(name))
+	ginkgo.It("should fetch consumer with name "+name, func() {
+		gomega.Expect(consumer).NotTo(gomega.BeNil())
+		gomega.Expect(consumer.Name).To(gomega.Equal(name))
 	})
 }
 
 func itShouldContainSpecificConsumer(id int, name string, consumers []iggcon.ConsumerGroup) {
-	It("should fetch at least one consumer", func() {
-		Expect(len(consumers)).NotTo(Equal(0))
+	ginkgo.It("should fetch at least one consumer", func() {
+		gomega.Expect(len(consumers)).NotTo(gomega.Equal(0))
 	})
 
 	var consumer iggcon.ConsumerGroup
@@ -83,28 +83,28 @@ func itShouldContainSpecificConsumer(id int, name string, consumers []iggcon.Con
 		}
 	}
 
-	It("should fetch consumer with id "+strconv.Itoa(id), func() {
-		Expect(found).To(BeTrue(), "Consumer with id %d and name %s not found", id, name)
-		Expect(consumer.Id).To(Equal(id))
+	ginkgo.It("should fetch consumer with id "+strconv.Itoa(id), func() {
+		gomega.Expect(found).To(gomega.BeTrue(), "Consumer with id %d and name %s not found", id, name)
+		gomega.Expect(consumer.Id).To(gomega.Equal(id))
 	})
 
-	It("should fetch consumer with name "+name, func() {
-		Expect(found).To(BeTrue(), "Consumer with id %d and name %s not found", id, name)
-		Expect(consumer.Name).To(Equal(name))
+	ginkgo.It("should fetch consumer with name "+name, func() {
+		gomega.Expect(found).To(gomega.BeTrue(), "Consumer with id %d and name %s not found", id, name)
+		gomega.Expect(consumer.Name).To(gomega.Equal(name))
 	})
 }
 
 func itShouldSuccessfullyCreateConsumer(streamId int, topicId int, groupId int, expectedName string, client iggycli.Client) {
 	consumer, err := client.GetConsumerGroup(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId), iggcon.NewIdentifier(groupId))
 
-	It("should create consumer with id "+string(rune(groupId)), func() {
-		Expect(consumer).NotTo(BeNil())
-		Expect(consumer.Id).To(Equal(groupId))
+	ginkgo.It("should create consumer with id "+string(rune(groupId)), func() {
+		gomega.Expect(consumer).NotTo(gomega.BeNil())
+		gomega.Expect(consumer.Id).To(gomega.Equal(groupId))
 	})
 
-	It("should create consumer with name "+expectedName, func() {
-		Expect(consumer).NotTo(BeNil())
-		Expect(consumer.Name).To(Equal(expectedName))
+	ginkgo.It("should create consumer with name "+expectedName, func() {
+		gomega.Expect(consumer).NotTo(gomega.BeNil())
+		gomega.Expect(consumer.Name).To(gomega.Equal(expectedName))
 	})
 	itShouldNotReturnError(err)
 }
@@ -113,17 +113,17 @@ func itShouldSuccessfullyDeletedConsumer(streamId int, topicId int, groupId int,
 	consumer, err := client.GetConsumerGroup(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId), iggcon.NewIdentifier(groupId))
 
 	itShouldReturnSpecificError(err, "consumer_group_not_found")
-	It("should not return consumer", func() {
-		Expect(consumer).To(BeNil())
+	ginkgo.It("should not return consumer", func() {
+		gomega.Expect(consumer).To(gomega.BeNil())
 	})
 }
 
 func itShouldSuccessfullyJoinConsumer(streamId int, topicId int, groupId int, client iggycli.Client) {
 	consumer, err := client.GetConsumerGroup(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId), iggcon.NewIdentifier(groupId))
 
-	It("should join consumer with id "+string(rune(groupId)), func() {
-		Expect(consumer).NotTo(BeNil())
-		Expect(consumer.MembersCount).ToNot(Equal(0))
+	ginkgo.It("should join consumer with id "+string(rune(groupId)), func() {
+		gomega.Expect(consumer).NotTo(gomega.BeNil())
+		gomega.Expect(consumer.MembersCount).ToNot(gomega.Equal(0))
 	})
 
 	itShouldNotReturnError(err)
@@ -132,9 +132,9 @@ func itShouldSuccessfullyJoinConsumer(streamId int, topicId int, groupId int, cl
 func itShouldSuccessfullyLeaveConsumer(streamId int, topicId int, groupId int, client iggycli.Client) {
 	consumer, err := client.GetConsumerGroup(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId), iggcon.NewIdentifier(groupId))
 
-	It("should leave consumer with id "+string(rune(groupId)), func() {
-		Expect(consumer).NotTo(BeNil())
-		Expect(consumer.MembersCount).To(Equal(0))
+	ginkgo.It("should leave consumer with id "+string(rune(groupId)), func() {
+		gomega.Expect(consumer).NotTo(gomega.BeNil())
+		gomega.Expect(consumer.MembersCount).To(gomega.Equal(0))
 	})
 
 	itShouldNotReturnError(err)

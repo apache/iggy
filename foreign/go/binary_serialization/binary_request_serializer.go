@@ -20,10 +20,10 @@ package binaryserialization
 import (
 	"encoding/binary"
 
-	. "github.com/apache/iggy/foreign/go/contracts"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
-func CreateGroup(request CreateConsumerGroupRequest) []byte {
+func CreateGroup(request iggcon.CreateConsumerGroupRequest) []byte {
 	if request.ConsumerGroupId == nil {
 		request.ConsumerGroupId = new(uint32)
 	}
@@ -36,7 +36,7 @@ func CreateGroup(request CreateConsumerGroupRequest) []byte {
 	return bytes
 }
 
-func UpdateOffset(request StoreConsumerOffsetRequest) []byte {
+func UpdateOffset(request iggcon.StoreConsumerOffsetRequest) []byte {
 	if request.PartitionId == nil {
 		request.PartitionId = new(uint32)
 	}
@@ -50,7 +50,7 @@ func UpdateOffset(request StoreConsumerOffsetRequest) []byte {
 	return bytes
 }
 
-func GetOffset(request GetConsumerOffsetRequest) []byte {
+func GetOffset(request iggcon.GetConsumerOffsetRequest) []byte {
 	if request.PartitionId == nil {
 		request.PartitionId = new(uint32)
 	}
@@ -62,7 +62,7 @@ func GetOffset(request GetConsumerOffsetRequest) []byte {
 	return bytes
 }
 
-func CreatePartitions(request CreatePartitionsRequest) []byte {
+func CreatePartitions(request iggcon.CreatePartitionsRequest) []byte {
 	bytes := make([]byte, 8+request.StreamId.Length+request.TopicId.Length)
 	position := 4 + request.StreamId.Length + request.TopicId.Length
 	copy(bytes[0:position], SerializeIdentifiers(request.StreamId, request.TopicId))
@@ -71,7 +71,7 @@ func CreatePartitions(request CreatePartitionsRequest) []byte {
 	return bytes
 }
 
-func DeletePartitions(request DeletePartitionsRequest) []byte {
+func DeletePartitions(request iggcon.DeletePartitionsRequest) []byte {
 	bytes := make([]byte, 8+request.StreamId.Length+request.TopicId.Length)
 	position := 4 + request.StreamId.Length + request.TopicId.Length
 	copy(bytes[0:position], SerializeIdentifiers(request.StreamId, request.TopicId))
@@ -82,7 +82,7 @@ func DeletePartitions(request DeletePartitionsRequest) []byte {
 
 //USERS
 
-func SerializeCreateUserRequest(request CreateUserRequest) []byte {
+func SerializeCreateUserRequest(request iggcon.CreateUserRequest) []byte {
 	capacity := 4 + len(request.Username) + len(request.Password)
 	if request.Permissions != nil {
 		capacity += 1 + 4 + CalculatePermissionsSize(request.Permissions)
@@ -102,9 +102,10 @@ func SerializeCreateUserRequest(request CreateUserRequest) []byte {
 	position += len(request.Password)
 
 	statusByte := byte(0)
-	if request.Status == Active {
+	switch request.Status {
+	case iggcon.Active:
 		statusByte = byte(1)
-	} else if request.Status == Inactive {
+	case iggcon.Inactive:
 		statusByte = byte(2)
 	}
 	bytes[position] = statusByte
@@ -117,16 +118,14 @@ func SerializeCreateUserRequest(request CreateUserRequest) []byte {
 		binary.LittleEndian.PutUint32(bytes[position:position+4], uint32(len(permissionsBytes)))
 		position += 4
 		copy(bytes[position:position+len(permissionsBytes)], permissionsBytes)
-		position += len(permissionsBytes)
 	} else {
 		bytes[position] = byte(0)
-		position += 1
 	}
 
 	return bytes
 }
 
-func GetBytesFromPermissions(data *Permissions) []byte {
+func GetBytesFromPermissions(data *iggcon.Permissions) []byte {
 	size := CalculatePermissionsSize(data)
 	bytes := make([]byte, size)
 
@@ -188,7 +187,7 @@ func GetBytesFromPermissions(data *Permissions) []byte {
 	return bytes
 }
 
-func CalculatePermissionsSize(data *Permissions) int {
+func CalculatePermissionsSize(data *iggcon.Permissions) int {
 	size := 10
 
 	if data.Streams != nil {
@@ -220,7 +219,7 @@ func boolToByte(b bool) byte {
 	return 0
 }
 
-func SerializeUpdateUser(request UpdateUserRequest) []byte {
+func SerializeUpdateUser(request iggcon.UpdateUserRequest) []byte {
 	length := request.UserID.Length + 2
 
 	if request.Username == nil {
@@ -259,9 +258,10 @@ func SerializeUpdateUser(request UpdateUserRequest) []byte {
 		bytes[position] = 1
 		position++
 		statusByte := byte(0)
-		if *request.Status == Active {
+		switch *request.Status {
+		case iggcon.Active:
 			statusByte = 1
-		} else if *request.Status == Inactive {
+		case iggcon.Inactive:
 			statusByte = 2
 		}
 		bytes[position] = statusByte
@@ -272,7 +272,7 @@ func SerializeUpdateUser(request UpdateUserRequest) []byte {
 	return bytes
 }
 
-func SerializeChangePasswordRequest(request ChangePasswordRequest) []byte {
+func SerializeChangePasswordRequest(request iggcon.ChangePasswordRequest) []byte {
 	length := request.UserID.Length + 2 + len(request.CurrentPassword) + len(request.NewPassword) + 2
 	bytes := make([]byte, length)
 	position := 0
@@ -288,12 +288,11 @@ func SerializeChangePasswordRequest(request ChangePasswordRequest) []byte {
 	bytes[position] = byte(len(request.NewPassword))
 	position++
 	copy(bytes[position:position+len(request.NewPassword)], []byte(request.NewPassword))
-	position += len(request.NewPassword)
 
 	return bytes
 }
 
-func SerializeUpdateUserPermissionsRequest(request UpdatePermissionsRequest) []byte {
+func SerializeUpdateUserPermissionsRequest(request iggcon.UpdatePermissionsRequest) []byte {
 	length := request.UserID.Length + 2
 
 	if request.Permissions != nil {
@@ -313,10 +312,8 @@ func SerializeUpdateUserPermissionsRequest(request UpdatePermissionsRequest) []b
 		binary.LittleEndian.PutUint32(bytes[position:position+4], uint32(len(permissionsBytes)))
 		position += 4
 		copy(bytes[position:position+len(permissionsBytes)], permissionsBytes)
-		position += len(permissionsBytes)
 	} else {
 		bytes[position] = 0
-		position++
 	}
 
 	return bytes
@@ -328,7 +325,7 @@ func SerializeInt(value int) []byte {
 	return bytes
 }
 
-func SerializeLoginWithPersonalAccessToken(request LoginWithPersonalAccessTokenRequest) []byte {
+func SerializeLoginWithPersonalAccessToken(request iggcon.LoginWithPersonalAccessTokenRequest) []byte {
 	length := 1 + len(request.Token)
 	bytes := make([]byte, length)
 	bytes[0] = byte(len(request.Token))
@@ -336,7 +333,7 @@ func SerializeLoginWithPersonalAccessToken(request LoginWithPersonalAccessTokenR
 	return bytes
 }
 
-func SerializeDeletePersonalAccessToken(request DeletePersonalAccessTokenRequest) []byte {
+func SerializeDeletePersonalAccessToken(request iggcon.DeletePersonalAccessTokenRequest) []byte {
 	length := 1 + len(request.Name)
 	bytes := make([]byte, length)
 	bytes[0] = byte(len(request.Name))
@@ -344,7 +341,7 @@ func SerializeDeletePersonalAccessToken(request DeletePersonalAccessTokenRequest
 	return bytes
 }
 
-func SerializeCreatePersonalAccessToken(request CreatePersonalAccessTokenRequest) []byte {
+func SerializeCreatePersonalAccessToken(request iggcon.CreatePersonalAccessTokenRequest) []byte {
 	length := 1 + len(request.Name) + 8
 	bytes := make([]byte, length)
 	bytes[0] = byte(len(request.Name))

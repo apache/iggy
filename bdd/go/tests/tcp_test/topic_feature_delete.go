@@ -20,13 +20,13 @@ package tcp_test
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("DELETE TOPIC:", func() {
+var _ = ginkgo.Describe("DELETE TOPIC:", func() {
 	prefix := "DeleteTopic"
-	When("User is logged in", func() {
-		Context("and tries to delete existing topic", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("and tries to delete existing topic", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
@@ -37,7 +37,7 @@ var _ = Describe("DELETE TOPIC:", func() {
 			itShouldSuccessfullyDeleteTopic(streamId, topicId, client)
 		})
 
-		Context("and tries to delete non-existing topic", func() {
+		ginkgo.Context("and tries to delete non-existing topic", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
@@ -48,7 +48,7 @@ var _ = Describe("DELETE TOPIC:", func() {
 			itShouldReturnSpecificIggyError(err, ierror.TopicIdNotFound)
 		})
 
-		Context("and tries to delete non-existing topic and stream", func() {
+		ginkgo.Context("and tries to delete non-existing topic and stream", func() {
 			client := createAuthorizedConnection()
 			streamId := int(createRandomUInt32())
 			topicId := int(createRandomUInt32())
@@ -59,8 +59,8 @@ var _ = Describe("DELETE TOPIC:", func() {
 		})
 	})
 
-	When("User is not logged in", func() {
-		Context("and tries to delete topic", func() {
+	ginkgo.When("User is not logged in", func() {
+		ginkgo.Context("and tries to delete topic", func() {
 			client := createClient()
 			err := client.DeleteTopic(iggcon.NewIdentifier(int(createRandomUInt32())), iggcon.NewIdentifier(int(createRandomUInt32())))
 

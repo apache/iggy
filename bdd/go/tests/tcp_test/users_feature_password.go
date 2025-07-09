@@ -19,12 +19,12 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("CHANGE PASSWORD:", func() {
-	When("User is logged in", func() {
-		Context("tries to change password of existing user", func() {
+var _ = ginkgo.Describe("CHANGE PASSWORD:", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("tries to change password of existing user", func() {
 			client := createAuthorizedConnection()
 
 			username := createRandomStringWithPrefix("ch_p_", 16)
@@ -47,6 +47,7 @@ var _ = Describe("CHANGE PASSWORD:", func() {
 						SendMessages:  true,
 					},
 				})
+			itShouldNotReturnError(err)
 			defer deleteUserAfterTests(username, client)
 
 			err = client.ChangePassword(iggcon.NewIdentifier(username), password, "newPassword")
@@ -56,8 +57,8 @@ var _ = Describe("CHANGE PASSWORD:", func() {
 		})
 	})
 
-	When("User is not logged in", func() {
-		Context("and tries to change password", func() {
+	ginkgo.When("User is not logged in", func() {
+		ginkgo.Context("and tries to change password", func() {
 			client := createClient()
 
 			err := client.UpdatePermissions(

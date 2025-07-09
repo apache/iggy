@@ -28,14 +28,17 @@ type MessageGenerator struct {
 	OrderCreatedId   int
 	OrderConfirmedId int
 	OrderRejectedId  int
+	rng              *rand.Rand
 }
 
 func NewMessageGenerator() *MessageGenerator {
-	return &MessageGenerator{}
+	return &MessageGenerator{
+		rng: rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
 }
 
 func (gen *MessageGenerator) GenerateMessage() sharedDemoContracts.ISerializableMessage {
-	switch rand.Intn(3) {
+	switch gen.rng.Intn(3) {
 	case 0:
 		return gen.GenerateOrderRejectedMessage()
 	case 1:
@@ -52,11 +55,11 @@ func (gen *MessageGenerator) GenerateOrderCreatedMessage() *sharedDemoContracts.
 
 	return &sharedDemoContracts.OrderCreated{
 		Id:           gen.OrderCreatedId,
-		CurrencyPair: currencyPairs[rand.Intn(len(currencyPairs))],
-		Price:        float64(rand.Intn(352) + 69),
-		Quantity:     float64(rand.Intn(352) + 69),
-		Side:         sides[rand.Intn(len(sides))],
-		Timestamp:    uint64(rand.Intn(69201) + 420),
+		CurrencyPair: currencyPairs[gen.rng.Intn(len(currencyPairs))],
+		Price:        float64(gen.rng.Intn(352) + 69),
+		Quantity:     float64(gen.rng.Intn(352) + 69),
+		Side:         sides[gen.rng.Intn(len(sides))],
+		Timestamp:    uint64(gen.rng.Intn(69201) + 420),
 	}
 }
 
@@ -65,8 +68,8 @@ func (gen *MessageGenerator) GenerateOrderConfirmedMessage() *sharedDemoContract
 
 	return &sharedDemoContracts.OrderConfirmed{
 		Id:        gen.OrderConfirmedId,
-		Price:     float64(rand.Intn(352) + 69),
-		Timestamp: uint64(rand.Intn(69201) + 420),
+		Price:     float64(gen.rng.Intn(352) + 69),
+		Timestamp: uint64(gen.rng.Intn(69201) + 420),
 	}
 }
 
@@ -76,11 +79,7 @@ func (gen *MessageGenerator) GenerateOrderRejectedMessage() *sharedDemoContracts
 
 	return &sharedDemoContracts.OrderRejected{
 		Id:        gen.OrderRejectedId,
-		Timestamp: uint64(rand.Intn(68999) + 421),
-		Reason:    reasons[rand.Intn(len(reasons))],
+		Timestamp: uint64(gen.rng.Intn(68999) + 421),
+		Reason:    reasons[gen.rng.Intn(len(reasons))],
 	}
-}
-
-func init() {
-	rand.Seed(time.Now().UnixNano())
 }

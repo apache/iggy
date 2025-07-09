@@ -23,8 +23,8 @@ import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/iggycli"
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
 )
 
 //operations
@@ -43,18 +43,18 @@ func successfullyCreateStream(prefix string, client iggycli.Client) (int, string
 //assertions
 
 func itShouldReturnSpecificStream(id int, name string, stream iggcon.StreamDetails) {
-	It("should fetch stream with id "+string(rune(id)), func() {
-		Expect(stream.Id).To(Equal(id))
+	ginkgo.It("should fetch stream with id "+string(rune(id)), func() {
+		gomega.Expect(stream.Id).To(gomega.Equal(id))
 	})
 
-	It("should fetch stream with name "+name, func() {
-		Expect(stream.Name).To(Equal(name))
+	ginkgo.It("should fetch stream with name "+name, func() {
+		gomega.Expect(stream.Name).To(gomega.Equal(name))
 	})
 }
 
 func itShouldContainSpecificStream(id int, name string, streams []iggcon.Stream) {
-	It("should fetch at least one stream", func() {
-		Expect(len(streams)).NotTo(Equal(0))
+	ginkgo.It("should fetch at least one stream", func() {
+		gomega.Expect(len(streams)).NotTo(gomega.Equal(0))
 	})
 
 	var stream iggcon.Stream
@@ -68,14 +68,14 @@ func itShouldContainSpecificStream(id int, name string, streams []iggcon.Stream)
 		}
 	}
 
-	It("should fetch stream with id "+strconv.Itoa(id), func() {
-		Expect(found).To(BeTrue(), "Stream with id %d and name %s not found", id, name)
-		Expect(stream.Id).To(Equal(id))
+	ginkgo.It("should fetch stream with id "+strconv.Itoa(id), func() {
+		gomega.Expect(found).To(gomega.BeTrue(), "Stream with id %d and name %s not found", id, name)
+		gomega.Expect(stream.Id).To(gomega.Equal(id))
 	})
 
-	It("should fetch stream with name "+name, func() {
-		Expect(found).To(BeTrue(), "Stream with id %d and name %s not found", id, name)
-		Expect(stream.Name).To(Equal(name))
+	ginkgo.It("should fetch stream with name "+name, func() {
+		gomega.Expect(found).To(gomega.BeTrue(), "Stream with id %d and name %s not found", id, name)
+		gomega.Expect(stream.Name).To(gomega.Equal(name))
 	})
 }
 
@@ -83,12 +83,12 @@ func itShouldSuccessfullyCreateStream(id int, expectedName string, client iggycl
 	stream, err := client.GetStream(iggcon.NewIdentifier(id))
 
 	itShouldNotReturnError(err)
-	It("should create stream with id "+string(rune(id)), func() {
-		Expect(stream.Id).To(Equal(id))
+	ginkgo.It("should create stream with id "+string(rune(id)), func() {
+		gomega.Expect(stream.Id).To(gomega.Equal(id))
 	})
 
-	It("should create stream with name "+expectedName, func() {
-		Expect(stream.Name).To(Equal(expectedName))
+	ginkgo.It("should create stream with name "+expectedName, func() {
+		gomega.Expect(stream.Name).To(gomega.Equal(expectedName))
 	})
 }
 
@@ -96,12 +96,12 @@ func itShouldSuccessfullyUpdateStream(id int, expectedName string, client iggycl
 	stream, err := client.GetStream(iggcon.NewIdentifier(id))
 
 	itShouldNotReturnError(err)
-	It("should update stream with id "+string(rune(id)), func() {
-		Expect(stream.Id).To(Equal(id))
+	ginkgo.It("should update stream with id "+string(rune(id)), func() {
+		gomega.Expect(stream.Id).To(gomega.Equal(id))
 	})
 
-	It("should update stream with name "+expectedName, func() {
-		Expect(stream.Name).To(Equal(expectedName))
+	ginkgo.It("should update stream with name "+expectedName, func() {
+		gomega.Expect(stream.Name).To(gomega.Equal(expectedName))
 	})
 }
 
@@ -109,8 +109,8 @@ func itShouldSuccessfullyDeleteStream(id int, client iggycli.Client) {
 	stream, err := client.GetStream(iggcon.NewIdentifier(id))
 
 	itShouldReturnSpecificIggyError(err, ierror.StreamIdNotFound)
-	It("should not return stream", func() {
-		Expect(stream).To(BeNil())
+	ginkgo.It("should not return stream", func() {
+		gomega.Expect(stream).To(gomega.BeNil())
 	})
 }
 

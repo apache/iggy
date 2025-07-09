@@ -18,35 +18,35 @@
 package tcp_test
 
 import (
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
 )
 
-var _ = Describe("GET ALL CLIENT FEATURE:", func() {
-	When("user is logged in", func() {
-		Context("and tries to log with correct data", func() {
+var _ = ginkgo.Describe("GET ALL CLIENT FEATURE:", func() {
+	ginkgo.When("user is logged in", func() {
+		ginkgo.Context("and tries to log with correct data", func() {
 			client := createAuthorizedConnection()
 			clients, err := client.GetClients()
 
 			itShouldNotReturnError(err)
-			It("should return stats", func() {
-				Expect(clients).ToNot(BeNil())
+			ginkgo.It("should return stats", func() {
+				gomega.Expect(clients).ToNot(gomega.BeNil())
 			})
 
-			It("should return at least one client", func() {
-				Expect(len(clients)).ToNot(BeZero())
+			ginkgo.It("should return at least one client", func() {
+				gomega.Expect(len(clients)).ToNot(gomega.BeZero())
 			})
 		})
 	})
 
-	When("user is not logged in", func() {
-		Context("and tries get all clients", func() {
+	ginkgo.When("user is not logged in", func() {
+		ginkgo.Context("and tries get all clients", func() {
 			client := createClient()
 			clients, err := client.GetClients()
 
 			itShouldReturnUnauthenticatedError(err)
-			It("should not return clients", func() {
-				Expect(clients).To(BeNil())
+			ginkgo.It("should not return clients", func() {
+				gomega.Expect(clients).To(gomega.BeNil())
 			})
 		})
 	})

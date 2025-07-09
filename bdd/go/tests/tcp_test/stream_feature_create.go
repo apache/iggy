@@ -18,12 +18,12 @@
 package tcp_test
 
 import (
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("CREATE STREAM:", func() {
-	When("User is logged in", func() {
-		Context("and tries to create stream with unique name and id", func() {
+var _ = ginkgo.Describe("CREATE STREAM:", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("and tries to create stream with unique name and id", func() {
 			client := createAuthorizedConnection()
 			streamId := createRandomUInt32()
 			name := createRandomString(32)
@@ -35,7 +35,7 @@ var _ = Describe("CREATE STREAM:", func() {
 			itShouldSuccessfullyCreateStream(int(streamId), name, client)
 		})
 
-		Context("and tries to create stream with duplicate stream name", func() {
+		ginkgo.Context("and tries to create stream with duplicate stream name", func() {
 			client := createAuthorizedConnection()
 			streamId := createRandomUInt32()
 			name := createRandomString(32)
@@ -52,7 +52,7 @@ var _ = Describe("CREATE STREAM:", func() {
 			itShouldReturnSpecificError(err, "stream_name_already_exists")
 		})
 
-		Context("and tries to create stream with duplicate stream id", func() {
+		ginkgo.Context("and tries to create stream with duplicate stream id", func() {
 			client := createAuthorizedConnection()
 			streamId := createRandomUInt32()
 			name := createRandomString(32)
@@ -68,7 +68,7 @@ var _ = Describe("CREATE STREAM:", func() {
 			itShouldReturnSpecificError(err, "stream_id_already_exists")
 		})
 
-		Context("and tries to create stream name that's over 255 characters", func() {
+		ginkgo.Context("and tries to create stream name that's over 255 characters", func() {
 			client := createAuthorizedConnection()
 			streamId := createRandomUInt32()
 			name := createRandomString(256)
@@ -79,8 +79,8 @@ var _ = Describe("CREATE STREAM:", func() {
 		})
 	})
 
-	When("User is not logged in", func() {
-		Context("and tries to create stream", func() {
+	ginkgo.When("User is not logged in", func() {
+		ginkgo.Context("and tries to create stream", func() {
 			client := createClient()
 			streamId := createRandomUInt32()
 			_, err := client.CreateStream(createRandomString(32), &streamId)

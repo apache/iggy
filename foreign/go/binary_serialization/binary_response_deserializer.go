@@ -23,41 +23,41 @@ import (
 	"fmt"
 	"time"
 
-	. "github.com/apache/iggy/foreign/go/contracts"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/klauspost/compress/s2"
 )
 
-func DeserializeLogInResponse(payload []byte) *IdentityInfo {
+func DeserializeLogInResponse(payload []byte) *iggcon.IdentityInfo {
 	userId := binary.LittleEndian.Uint32(payload[0:4])
-	return &IdentityInfo{
+	return &iggcon.IdentityInfo{
 		UserId: userId,
 	}
 }
 
-func DeserializeOffset(payload []byte) *ConsumerOffsetInfo {
+func DeserializeOffset(payload []byte) *iggcon.ConsumerOffsetInfo {
 	partitionId := int(binary.LittleEndian.Uint32(payload[0:4]))
 	currentOffset := binary.LittleEndian.Uint64(payload[4:12])
 	storedOffset := binary.LittleEndian.Uint64(payload[12:20])
 
-	return &ConsumerOffsetInfo{
+	return &iggcon.ConsumerOffsetInfo{
 		PartitionId:   partitionId,
 		CurrentOffset: currentOffset,
 		StoredOffset:  storedOffset,
 	}
 }
 
-func DeserializeStream(payload []byte) *StreamDetails {
+func DeserializeStream(payload []byte) *iggcon.StreamDetails {
 	stream, _ := DeserializeToStream(payload, 0)
 	// TODO implement deserialize topics
-	return &StreamDetails{
+	return &iggcon.StreamDetails{
 		Stream: stream,
 		Topics: nil,
 	}
 }
 
-func DeserializeStreams(payload []byte) []Stream {
-	streams := make([]Stream, 0)
+func DeserializeStreams(payload []byte) []iggcon.Stream {
+	streams := make([]iggcon.Stream, 0)
 	position := 0
 
 	//TODO there's a deserialization bug, investigate this
@@ -71,7 +71,7 @@ func DeserializeStreams(payload []byte) []Stream {
 	return streams
 }
 
-func DeserializeToStream(payload []byte, position int) (Stream, int) {
+func DeserializeToStream(payload []byte, position int) (iggcon.Stream, int) {
 	id := int(binary.LittleEndian.Uint32(payload[position : position+4]))
 	createdAt := binary.LittleEndian.Uint64(payload[position+4 : position+12])
 	topicsCount := int(binary.LittleEndian.Uint32(payload[position+12 : position+16]))
@@ -84,7 +84,7 @@ func DeserializeToStream(payload []byte, position int) (Stream, int) {
 
 	readBytes := 4 + 8 + 4 + 8 + 8 + 1 + nameLength
 
-	return Stream{
+	return iggcon.Stream{
 		Id:            id,
 		TopicsCount:   topicsCount,
 		Name:          name,
@@ -94,12 +94,12 @@ func DeserializeToStream(payload []byte, position int) (Stream, int) {
 	}, readBytes
 }
 
-func DeserializeFetchMessagesResponse(payload []byte, compression IggyMessageCompression) (*PolledMessage, error) {
+func DeserializeFetchMessagesResponse(payload []byte, compression iggcon.IggyMessageCompression) (*iggcon.PolledMessage, error) {
 	if len(payload) == 0 {
-		return &PolledMessage{
+		return &iggcon.PolledMessage{
 			PartitionId:   0,
 			CurrentOffset: 0,
-			Messages:      make([]IggyMessage, 0),
+			Messages:      make([]iggcon.IggyMessage, 0),
 		}, nil
 	}
 
@@ -108,17 +108,17 @@ func DeserializeFetchMessagesResponse(payload []byte, compression IggyMessageCom
 	currentOffset := binary.LittleEndian.Uint64(payload[4:12])
 	messagesCount := binary.LittleEndian.Uint32(payload[12:16])
 	position := 16
-	var messages = make([]IggyMessage, 0)
+	var messages = make([]iggcon.IggyMessage, 0)
 	for position < length {
-		if position+MessageHeaderSize >= length {
+		if position+iggcon.MessageHeaderSize >= length {
 			// body needs to be at least 1 byte
 			break
 		}
-		header, err := MessageHeaderFromBytes(payload[position : position+MessageHeaderSize])
+		header, err := iggcon.MessageHeaderFromBytes(payload[position : position+iggcon.MessageHeaderSize])
 		if err != nil {
 			return nil, err
 		}
-		position += MessageHeaderSize
+		position += iggcon.MessageHeaderSize
 		payload_end := position + int(header.PayloadLength)
 		if int(payload_end) > length {
 			break
@@ -133,7 +133,7 @@ func DeserializeFetchMessagesResponse(payload []byte, compression IggyMessageCom
 		position += int(header.UserHeaderLength)
 
 		switch compression {
-		case MESSAGE_COMPRESSION_S2, MESSAGE_COMPRESSION_S2_BETTER, MESSAGE_COMPRESSION_S2_BEST:
+		case iggcon.MESSAGE_COMPRESSION_S2, iggcon.MESSAGE_COMPRESSION_S2_BETTER, iggcon.MESSAGE_COMPRESSION_S2_BEST:
 			if length < 32 {
 				break
 			}
@@ -143,7 +143,7 @@ func DeserializeFetchMessagesResponse(payload []byte, compression IggyMessageCom
 			}
 		}
 
-		messages = append(messages, IggyMessage{
+		messages = append(messages, iggcon.IggyMessage{
 			Header:      *header,
 			Payload:     payloadSlice,
 			UserHeaders: user_headers,
@@ -151,7 +151,7 @@ func DeserializeFetchMessagesResponse(payload []byte, compression IggyMessageCom
 	}
 
 	// !TODO: Add message offset ordering
-	return &PolledMessage{
+	return &iggcon.PolledMessage{
 		PartitionId:   partitionId,
 		CurrentOffset: currentOffset,
 		Messages:      messages,
@@ -159,8 +159,8 @@ func DeserializeFetchMessagesResponse(payload []byte, compression IggyMessageCom
 	}, nil
 }
 
-func DeserializeTopics(payload []byte) ([]Topic, error) {
-	topics := make([]Topic, 0)
+func DeserializeTopics(payload []byte) ([]iggcon.Topic, error) {
+	topics := make([]iggcon.Topic, 0)
 	length := len(payload)
 	position := 0
 
@@ -176,13 +176,13 @@ func DeserializeTopics(payload []byte) ([]Topic, error) {
 	return topics, nil
 }
 
-func DeserializeTopic(payload []byte) (*TopicDetails, error) {
+func DeserializeTopic(payload []byte) (*iggcon.TopicDetails, error) {
 	topic, position, err := DeserializeToTopic(payload, 0)
 	if err != nil {
-		return &TopicDetails{}, err
+		return &iggcon.TopicDetails{}, err
 	}
 
-	partitions := make([]PartitionContract, 0)
+	partitions := make([]iggcon.PartitionContract, 0)
 	length := len(payload)
 
 	for position < length {
@@ -190,14 +190,14 @@ func DeserializeTopic(payload []byte) (*TopicDetails, error) {
 		partitions = append(partitions, partition)
 		position += readBytes
 	}
-	return &TopicDetails{
+	return &iggcon.TopicDetails{
 		Topic:      topic,
 		Partitions: partitions,
 	}, nil
 }
 
-func DeserializeToTopic(payload []byte, position int) (Topic, int, error) {
-	topic := Topic{}
+func DeserializeToTopic(payload []byte, position int) (iggcon.Topic, int, error) {
+	topic := iggcon.Topic{}
 	topic.Id = int(binary.LittleEndian.Uint32(payload[position : position+4]))
 	topic.CreatedAt = int(binary.LittleEndian.Uint64(payload[position+4 : position+12]))
 	topic.PartitionsCount = int(binary.LittleEndian.Uint32(payload[position+12 : position+16]))
@@ -215,7 +215,7 @@ func DeserializeToTopic(payload []byte, position int) (Topic, int, error) {
 	return topic, readBytes, nil
 }
 
-func DeserializePartition(payload []byte, position int) (PartitionContract, int) {
+func DeserializePartition(payload []byte, position int) (iggcon.PartitionContract, int) {
 	id := int(binary.LittleEndian.Uint32(payload[position : position+4]))
 	createdAt := binary.LittleEndian.Uint64(payload[position+4 : position+12])
 	segmentsCount := int(binary.LittleEndian.Uint32(payload[position+12 : position+16]))
@@ -224,7 +224,7 @@ func DeserializePartition(payload []byte, position int) (PartitionContract, int)
 	messagesCount := binary.LittleEndian.Uint64(payload[position+32 : position+40])
 	readBytes := 4 + 4 + 8 + 8 + 8 + 8
 
-	partition := PartitionContract{
+	partition := iggcon.PartitionContract{
 		Id:            id,
 		CreatedAt:     createdAt,
 		SegmentsCount: segmentsCount,
@@ -236,8 +236,8 @@ func DeserializePartition(payload []byte, position int) (PartitionContract, int)
 	return partition, readBytes
 }
 
-func DeserializeConsumerGroups(payload []byte) []ConsumerGroup {
-	var consumerGroups []ConsumerGroup
+func DeserializeConsumerGroups(payload []byte) []iggcon.ConsumerGroup {
+	var consumerGroups []iggcon.ConsumerGroup
 	length := len(payload)
 	position := 0
 
@@ -251,7 +251,7 @@ func DeserializeConsumerGroups(payload []byte) []ConsumerGroup {
 	return consumerGroups
 }
 
-func DeserializeToConsumerGroup(payload []byte, position int) (*ConsumerGroup, int) {
+func DeserializeToConsumerGroup(payload []byte, position int) (*iggcon.ConsumerGroup, int) {
 	id := int(binary.LittleEndian.Uint32(payload[position : position+4]))
 	partitionsCount := int(binary.LittleEndian.Uint32(payload[position+4 : position+8]))
 	membersCount := int(binary.LittleEndian.Uint32(payload[position+8 : position+12]))
@@ -260,7 +260,7 @@ func DeserializeToConsumerGroup(payload []byte, position int) (*ConsumerGroup, i
 
 	readBytes := 12 + 1 + nameLength
 
-	consumerGroup := ConsumerGroup{
+	consumerGroup := iggcon.ConsumerGroup{
 		Id:              id,
 		MembersCount:    membersCount,
 		PartitionsCount: partitionsCount,
@@ -270,21 +270,21 @@ func DeserializeToConsumerGroup(payload []byte, position int) (*ConsumerGroup, i
 	return &consumerGroup, readBytes
 }
 
-func DeserializeConsumerGroup(payload []byte) *ConsumerGroupDetails {
+func DeserializeConsumerGroup(payload []byte) *iggcon.ConsumerGroupDetails {
 	consumerGroup, _ := DeserializeToConsumerGroup(payload, 0)
 	// TODO: implement logic to deserialize the members.
-	return &ConsumerGroupDetails{
+	return &iggcon.ConsumerGroupDetails{
 		ConsumerGroup: *consumerGroup,
 		Members:       nil,
 	}
 }
 
-func DeserializeUsers(payload []byte) ([]UserInfo, error) {
+func DeserializeUsers(payload []byte) ([]iggcon.UserInfo, error) {
 	if len(payload) == 0 {
 		return nil, errors.New("empty payload")
 	}
 
-	var result []UserInfo
+	var result []iggcon.UserInfo
 	length := len(payload)
 	position := 0
 
@@ -300,13 +300,13 @@ func DeserializeUsers(payload []byte) ([]UserInfo, error) {
 	return result, nil
 }
 
-func DeserializeUser(payload []byte) (*UserInfoDetails, error) {
+func DeserializeUser(payload []byte) (*iggcon.UserInfoDetails, error) {
 	response, position, err := deserializeToUser(payload, 0)
 	if err != nil {
 		return nil, err
 	}
 	hasPermissions := payload[position]
-	userInfo := UserInfo{
+	userInfo := iggcon.UserInfo{
 		Id:        response.Id,
 		CreatedAt: response.CreatedAt,
 		Username:  response.Username,
@@ -316,22 +316,22 @@ func DeserializeUser(payload []byte) (*UserInfoDetails, error) {
 		permissionLength := binary.LittleEndian.Uint32(payload[position+1 : position+5])
 		permissionsPayload := payload[position+5 : position+5+int(permissionLength)]
 		permissions := deserializePermissions(permissionsPayload)
-		return &UserInfoDetails{
+		return &iggcon.UserInfoDetails{
 			UserInfo:    userInfo,
 			Permissions: permissions,
 		}, err
 	}
-	return &UserInfoDetails{
+	return &iggcon.UserInfoDetails{
 		UserInfo:    userInfo,
 		Permissions: nil,
 	}, err
 }
 
-func deserializePermissions(bytes []byte) *Permissions {
-	streamMap := make(map[int]*StreamPermissions)
+func deserializePermissions(bytes []byte) *iggcon.Permissions {
+	streamMap := make(map[int]*iggcon.StreamPermissions)
 	index := 0
 
-	globalPermissions := GlobalPermissions{
+	globalPermissions := iggcon.GlobalPermissions{
 		ManageServers: bytes[index] == 1,
 		ReadServers:   bytes[index+1] == 1,
 		ManageUsers:   bytes[index+2] == 1,
@@ -358,7 +358,7 @@ func deserializePermissions(bytes []byte) *Permissions {
 			readTopics := bytes[index+3] == 1
 			pollMessagesStream := bytes[index+4] == 1
 			sendMessagesStream := bytes[index+5] == 1
-			topicsMap := make(map[int]*TopicPermissions)
+			topicsMap := make(map[int]*iggcon.TopicPermissions)
 
 			index += 6
 
@@ -373,7 +373,7 @@ func deserializePermissions(bytes []byte) *Permissions {
 					pollMessagesTopic := bytes[index+2] == 1
 					sendMessagesTopic := bytes[index+3] == 1
 
-					topicsMap[topicId] = &TopicPermissions{
+					topicsMap[topicId] = &iggcon.TopicPermissions{
 						ManageTopic:  manageTopic,
 						ReadTopic:    readTopic,
 						PollMessages: pollMessagesTopic,
@@ -388,7 +388,7 @@ func deserializePermissions(bytes []byte) *Permissions {
 				}
 			}
 
-			streamMap[streamId] = &StreamPermissions{
+			streamMap[streamId] = &iggcon.StreamPermissions{
 				ManageStream: manageStream,
 				ReadStream:   readStream,
 				ManageTopics: manageTopics,
@@ -406,13 +406,13 @@ func deserializePermissions(bytes []byte) *Permissions {
 		}
 	}
 
-	return &Permissions{
+	return &iggcon.Permissions{
 		Global:  globalPermissions,
 		Streams: streamMap,
 	}
 }
 
-func deserializeToUser(payload []byte, position int) (*UserInfo, int, error) {
+func deserializeToUser(payload []byte, position int) (*iggcon.UserInfo, int, error) {
 	if len(payload) < position+14 {
 		return nil, 0, errors.New("not enough data to map UserInfo")
 	}
@@ -420,12 +420,12 @@ func deserializeToUser(payload []byte, position int) (*UserInfo, int, error) {
 	id := binary.LittleEndian.Uint32(payload[position : position+4])
 	createdAt := binary.LittleEndian.Uint64(payload[position+4 : position+12])
 	status := payload[position+12]
-	var userStatus UserStatus
+	var userStatus iggcon.UserStatus
 	switch status {
 	case 1:
-		userStatus = Active
+		userStatus = iggcon.Active
 	case 2:
-		userStatus = Inactive
+		userStatus = iggcon.Inactive
 	default:
 		return nil, 0, fmt.Errorf("invalid user status: %d", status)
 	}
@@ -438,7 +438,7 @@ func deserializeToUser(payload []byte, position int) (*UserInfo, int, error) {
 
 	readBytes := 4 + 8 + 1 + 1 + int(usernameLength)
 
-	return &UserInfo{
+	return &iggcon.UserInfo{
 		Id:        id,
 		CreatedAt: createdAt,
 		Status:    userStatus,
@@ -446,12 +446,12 @@ func deserializeToUser(payload []byte, position int) (*UserInfo, int, error) {
 	}, readBytes, nil
 }
 
-func DeserializeClients(payload []byte) ([]ClientInfo, error) {
+func DeserializeClients(payload []byte) ([]iggcon.ClientInfo, error) {
 	if len(payload) == 0 {
-		return []ClientInfo{}, nil
+		return []iggcon.ClientInfo{}, nil
 	}
 
-	var response []ClientInfo
+	var response []iggcon.ClientInfo
 	length := len(payload)
 	position := 0
 
@@ -464,17 +464,18 @@ func DeserializeClients(payload []byte) ([]ClientInfo, error) {
 	return response, nil
 }
 
-func MapClientInfo(payload []byte, position int) (ClientInfo, int) {
+func MapClientInfo(payload []byte, position int) (iggcon.ClientInfo, int) {
 	var readBytes int
 	id := binary.LittleEndian.Uint32(payload[position : position+4])
 	userId := binary.LittleEndian.Uint32(payload[position+4 : position+8])
-	transportByte := payload[position+8]
 	transport := "Unknown"
 
-	if transportByte == 1 {
-		transport = string(Tcp)
-	} else if transportByte == 2 {
-		transport = string(Quic)
+	transportByte := payload[position+8]
+	switch transportByte {
+	case 1:
+		transport = string(iggcon.Tcp)
+	case 2:
+		transport = string(iggcon.Quic)
 	}
 
 	addressLength := int(binary.LittleEndian.Uint32(payload[position+9 : position+13]))
@@ -484,7 +485,7 @@ func MapClientInfo(payload []byte, position int) (ClientInfo, int) {
 	consumerGroupsCount := binary.LittleEndian.Uint32(payload[position : position+4])
 	readBytes += 4
 
-	return ClientInfo{
+	return iggcon.ClientInfo{
 		ID:                  id,
 		UserID:              userId,
 		Transport:           transport,
@@ -493,9 +494,9 @@ func MapClientInfo(payload []byte, position int) (ClientInfo, int) {
 	}, readBytes
 }
 
-func DeserializeClient(payload []byte) *ClientInfoDetails {
+func DeserializeClient(payload []byte) *iggcon.ClientInfoDetails {
 	clientInfo, position := MapClientInfo(payload, 0)
-	consumerGroups := make([]ConsumerGroupInfo, clientInfo.ConsumerGroupsCount)
+	consumerGroups := make([]iggcon.ConsumerGroupInfo, clientInfo.ConsumerGroupsCount)
 	length := len(payload)
 
 	for position < length {
@@ -504,7 +505,7 @@ func DeserializeClient(payload []byte) *ClientInfoDetails {
 			topicId := int32(binary.LittleEndian.Uint32(payload[position+4 : position+8]))
 			consumerGroupId := int32(binary.LittleEndian.Uint32(payload[position+8 : position+12]))
 
-			consumerGroup := ConsumerGroupInfo{
+			consumerGroup := iggcon.ConsumerGroupInfo{
 				StreamId:        int(streamId),
 				TopicId:         int(topicId),
 				ConsumerGroupId: int(consumerGroupId),
@@ -513,26 +514,26 @@ func DeserializeClient(payload []byte) *ClientInfoDetails {
 			position += 12
 		}
 	}
-	return &ClientInfoDetails{
+	return &iggcon.ClientInfoDetails{
 		ClientInfo:     clientInfo,
 		ConsumerGroups: consumerGroups,
 	}
 }
 
-func DeserializeAccessToken(payload []byte) (*RawPersonalAccessToken, error) {
+func DeserializeAccessToken(payload []byte) (*iggcon.RawPersonalAccessToken, error) {
 	tokenLength := int(payload[0])
 	token := string(payload[1 : 1+tokenLength])
-	return &RawPersonalAccessToken{
+	return &iggcon.RawPersonalAccessToken{
 		Token: token,
 	}, nil
 }
 
-func DeserializeAccessTokens(payload []byte) ([]PersonalAccessTokenInfo, error) {
+func DeserializeAccessTokens(payload []byte) ([]iggcon.PersonalAccessTokenInfo, error) {
 	if len(payload) == 0 {
-		return []PersonalAccessTokenInfo{}, ierror.CustomError("Empty payload")
+		return []iggcon.PersonalAccessTokenInfo{}, ierror.CustomError("Empty payload")
 	}
 
-	var result []PersonalAccessTokenInfo
+	var result []iggcon.PersonalAccessTokenInfo
 	position := 0
 	length := len(payload)
 
@@ -545,7 +546,7 @@ func DeserializeAccessTokens(payload []byte) ([]PersonalAccessTokenInfo, error) 
 	return result, nil
 }
 
-func deserializeToPersonalAccessTokenResponse(payload []byte, position int) (PersonalAccessTokenInfo, int) {
+func deserializeToPersonalAccessTokenResponse(payload []byte, position int) (iggcon.PersonalAccessTokenInfo, int) {
 	nameLength := int(payload[position])
 	name := string(payload[position+1 : position+1+nameLength])
 	expiryBytes := payload[position+1+nameLength:]
@@ -559,7 +560,7 @@ func deserializeToPersonalAccessTokenResponse(payload []byte, position int) (Per
 
 	readBytes := 1 + nameLength + 8
 
-	return PersonalAccessTokenInfo{
+	return iggcon.PersonalAccessTokenInfo{
 		Name:   name,
 		Expiry: expiry,
 	}, readBytes

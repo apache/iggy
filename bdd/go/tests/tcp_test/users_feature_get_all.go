@@ -18,12 +18,12 @@
 package tcp_test
 
 import (
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("GET USER:", func() {
-	When("User is logged in", func() {
-		Context("tries to get all users", func() {
+var _ = ginkgo.Describe("GET USER:", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("tries to get all users", func() {
 			client := createAuthorizedConnection()
 			name := createRandomString(16)
 			userId := successfullyCreateUser(name, client)
@@ -36,8 +36,8 @@ var _ = Describe("GET USER:", func() {
 		})
 	})
 
-	When("User is not logged in", func() {
-		Context("and tries to all get users", func() {
+	ginkgo.When("User is not logged in", func() {
+		ginkgo.Context("and tries to all get users", func() {
 			client := createClient()
 			_, err := client.GetUsers()
 			itShouldReturnUnauthenticatedError(err)

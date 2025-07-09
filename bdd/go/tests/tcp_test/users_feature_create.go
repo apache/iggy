@@ -19,12 +19,12 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("CREATE USER:", func() {
-	When("User is logged in", func() {
-		Context("tries to create user with correct data", func() {
+var _ = ginkgo.Describe("CREATE USER:", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("tries to create user with correct data", func() {
 			client := createAuthorizedConnection()
 
 			username := createRandomString(16)
@@ -53,7 +53,7 @@ var _ = Describe("CREATE USER:", func() {
 			//itShouldBePossibleToLogInWithCredentials(request.Username, request.Password)
 		})
 
-		Context("tries to create user with correct data and custom permissions", func() {
+		ginkgo.Context("tries to create user with correct data and custom permissions", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream("ss", client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
@@ -109,8 +109,8 @@ var _ = Describe("CREATE USER:", func() {
 		})
 	})
 
-	When("User is not logged in", func() {
-		Context("and tries to create user", func() {
+	ginkgo.When("User is not logged in", func() {
+		ginkgo.Context("and tries to create user", func() {
 			client := createClient()
 
 			_, err := client.CreateUser(

@@ -35,10 +35,11 @@ func SerializeIdentifier(identifier iggcon.Identifier) []byte {
 	bytes[idKindOffset] = byte(identifier.Kind)
 	bytes[idLengthOffset] = byte(identifier.Length)
 
-	if identifier.Kind == iggcon.StringId {
+	switch identifier.Kind {
+	case iggcon.StringId:
 		valAsString := identifier.Value.(string)
 		copy(bytes[stringIdLength:], []byte(valAsString))
-	} else if identifier.Kind == iggcon.NumericId {
+	case iggcon.NumericId:
 		valAsInt := identifier.Value.(int)
 		binary.LittleEndian.PutUint32(bytes[stringIdLength:stringIdLength+numericIdLength], uint32(valAsInt))
 	}

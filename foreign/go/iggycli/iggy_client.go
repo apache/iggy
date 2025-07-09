@@ -20,18 +20,18 @@ package iggycli
 import (
 	"fmt"
 
-	. "github.com/apache/iggy/foreign/go/contracts"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/apache/iggy/foreign/go/tcp"
 )
 
 type Options struct {
-	protocol   Protocol
+	protocol   iggcon.Protocol
 	tcpOptions []tcp.Option
 }
 
 func GetDefaultOptions() Options {
 	return Options{
-		protocol:   Tcp,
+		protocol:   iggcon.Tcp,
 		tcpOptions: nil,
 	}
 }
@@ -41,7 +41,7 @@ type Option func(*Options)
 // WithTcp sets the client protocol to TCP and applies custom TCP options.
 func WithTcp(tcpOpts ...tcp.Option) Option {
 	return func(opts *Options) {
-		opts.protocol = Tcp
+		opts.protocol = iggcon.Tcp
 		opts.tcpOptions = tcpOpts
 	}
 }
@@ -58,7 +58,7 @@ func NewIggyClient(options ...Option) (Client, error) {
 	var err error
 	var cli Client
 	switch opts.protocol {
-	case Tcp:
+	case iggcon.Tcp:
 		cli, err = tcp.NewIggyTcpClient(opts.tcpOptions...)
 	default:
 		return nil, fmt.Errorf("unknown protocol type: %v", opts.protocol)
