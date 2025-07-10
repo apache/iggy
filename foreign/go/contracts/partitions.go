@@ -25,7 +25,7 @@ import (
 )
 
 type PartitionContract struct {
-	Id            int    `json:"id"`
+	Id            uint32 `json:"id"`
 	MessagesCount uint64 `json:"messagesCount"`
 	CreatedAt     uint64 `json:"createdAt"`
 	SegmentsCount int    `json:"segmentsCount"`

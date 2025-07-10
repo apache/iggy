@@ -23,7 +23,7 @@ type CreateStreamRequest struct {
 }
 
 type Stream struct {
-	Id            int    `json:"id"`
+	Id            uint32 `json:"id"`
 	Name          string `json:"name"`
 	SizeBytes     uint64 `json:"sizeBytes"`
 	CreatedAt     uint64 `json:"createdAt"`

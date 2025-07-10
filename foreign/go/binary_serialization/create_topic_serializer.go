@@ -32,12 +32,12 @@ type TcpCreateTopicRequest struct {
 	MaxTopicSize         uint64            `json:"maxTopicSize"`
 	Name                 string            `json:"name"`
 	ReplicationFactor    *uint8            `json:"replicationFactor"`
-	TopicId              *int              `json:"topicId"`
+	TopicId              *uint32           `json:"topicId"`
 }
 
 func (request *TcpCreateTopicRequest) Serialize() []byte {
 	if request.TopicId == nil {
-		request.TopicId = new(int)
+		request.TopicId = new(uint32)
 	}
 	if request.ReplicationFactor == nil {
 		request.ReplicationFactor = new(uint8)

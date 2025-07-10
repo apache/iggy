@@ -36,7 +36,7 @@ func DeserializeLogInResponse(payload []byte) *iggcon.IdentityInfo {
 }
 
 func DeserializeOffset(payload []byte) *iggcon.ConsumerOffsetInfo {
-	partitionId := int(binary.LittleEndian.Uint32(payload[0:4]))
+	partitionId := binary.LittleEndian.Uint32(payload[0:4])
 	currentOffset := binary.LittleEndian.Uint64(payload[4:12])
 	storedOffset := binary.LittleEndian.Uint64(payload[12:20])
 
@@ -72,7 +72,7 @@ func DeserializeStreams(payload []byte) []iggcon.Stream {
 }
 
 func DeserializeToStream(payload []byte, position int) (iggcon.Stream, int) {
-	id := int(binary.LittleEndian.Uint32(payload[position : position+4]))
+	id := binary.LittleEndian.Uint32(payload[position : position+4])
 	createdAt := binary.LittleEndian.Uint64(payload[position+4 : position+12])
 	topicsCount := int(binary.LittleEndian.Uint32(payload[position+12 : position+16]))
 	sizeBytes := binary.LittleEndian.Uint64(payload[position+16 : position+24])
@@ -198,7 +198,7 @@ func DeserializeTopic(payload []byte) (*iggcon.TopicDetails, error) {
 
 func DeserializeToTopic(payload []byte, position int) (iggcon.Topic, int, error) {
 	topic := iggcon.Topic{}
-	topic.Id = int(binary.LittleEndian.Uint32(payload[position : position+4]))
+	topic.Id = binary.LittleEndian.Uint32(payload[position : position+4])
 	topic.CreatedAt = int(binary.LittleEndian.Uint64(payload[position+4 : position+12]))
 	topic.PartitionsCount = int(binary.LittleEndian.Uint32(payload[position+12 : position+16]))
 	topic.MessageExpiry = time.Microsecond * time.Duration(int(binary.LittleEndian.Uint64(payload[position+16:position+24])))
@@ -216,7 +216,7 @@ func DeserializeToTopic(payload []byte, position int) (iggcon.Topic, int, error)
 }
 
 func DeserializePartition(payload []byte, position int) (iggcon.PartitionContract, int) {
-	id := int(binary.LittleEndian.Uint32(payload[position : position+4]))
+	id := binary.LittleEndian.Uint32(payload[position : position+4])
 	createdAt := binary.LittleEndian.Uint64(payload[position+4 : position+12])
 	segmentsCount := int(binary.LittleEndian.Uint32(payload[position+12 : position+16]))
 	currentOffset := binary.LittleEndian.Uint64(payload[position+16 : position+24])
@@ -252,7 +252,7 @@ func DeserializeConsumerGroups(payload []byte) []iggcon.ConsumerGroup {
 }
 
 func DeserializeToConsumerGroup(payload []byte, position int) (*iggcon.ConsumerGroup, int) {
-	id := int(binary.LittleEndian.Uint32(payload[position : position+4]))
+	id := binary.LittleEndian.Uint32(payload[position : position+4])
 	partitionsCount := int(binary.LittleEndian.Uint32(payload[position+4 : position+8]))
 	membersCount := int(binary.LittleEndian.Uint32(payload[position+8 : position+12]))
 	nameLength := int(payload[position+12])
@@ -501,14 +501,14 @@ func DeserializeClient(payload []byte) *iggcon.ClientInfoDetails {
 
 	for position < length {
 		for i := uint32(0); i < clientInfo.ConsumerGroupsCount; i++ {
-			streamId := int32(binary.LittleEndian.Uint32(payload[position : position+4]))
-			topicId := int32(binary.LittleEndian.Uint32(payload[position+4 : position+8]))
-			consumerGroupId := int32(binary.LittleEndian.Uint32(payload[position+8 : position+12]))
+			streamId := binary.LittleEndian.Uint32(payload[position : position+4])
+			topicId := binary.LittleEndian.Uint32(payload[position+4 : position+8])
+			consumerGroupId := binary.LittleEndian.Uint32(payload[position+8 : position+12])
 
 			consumerGroup := iggcon.ConsumerGroupInfo{
-				StreamId:        int(streamId),
-				TopicId:         int(topicId),
-				ConsumerGroupId: int(consumerGroupId),
+				StreamId:        streamId,
+				TopicId:         topicId,
+				ConsumerGroupId: consumerGroupId,
 			}
 			consumerGroups = append(consumerGroups, consumerGroup)
 			position += 12

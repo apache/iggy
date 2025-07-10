@@ -40,8 +40,8 @@ func SerializeIdentifier(identifier iggcon.Identifier) []byte {
 		valAsString := identifier.Value.(string)
 		copy(bytes[stringIdLength:], []byte(valAsString))
 	case iggcon.NumericId:
-		valAsInt := identifier.Value.(int)
-		binary.LittleEndian.PutUint32(bytes[stringIdLength:stringIdLength+numericIdLength], uint32(valAsInt))
+		valAsInt := identifier.Value.(uint32)
+		binary.LittleEndian.PutUint32(bytes[stringIdLength:stringIdLength+numericIdLength], valAsInt)
 	}
 	return bytes
 }

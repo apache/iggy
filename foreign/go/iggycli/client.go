@@ -62,7 +62,7 @@ type Client interface {
 		messageExpiry time.Duration,
 		maxTopicSize uint64,
 		replicationFactor *uint8,
-		topicId *int,
+		topicId *uint32,
 	) (*iggcon.TopicDetails, error)
 
 	// UpdateTopic update a topic by unique ID or name.
@@ -256,5 +256,5 @@ type Client interface {
 
 	// GetClient get the info about a specific client by unique ID (not to be confused with the user).
 	// Authentication is required, and the permission to read the server info.
-	GetClient(clientId int) (*iggcon.ClientInfoDetails, error)
+	GetClient(clientId uint32) (*iggcon.ClientInfoDetails, error)
 }

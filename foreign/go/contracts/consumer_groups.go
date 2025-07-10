@@ -18,7 +18,7 @@
 package iggcon
 
 type ConsumerGroup struct {
-	Id              int    `json:"id"`
+	Id              uint32 `json:"id"`
 	Name            string `json:"name"`
 	PartitionsCount int    `json:"partitionsCount"`
 	MembersCount    int    `json:"membersCount"`
@@ -30,7 +30,7 @@ type ConsumerGroupDetails struct {
 }
 
 type ConsumerGroupMember struct {
-	ID              int
+	ID              uint32
 	PartitionsCount int
 	Partitions      []int
 }
@@ -61,7 +61,7 @@ type LeaveConsumerGroupRequest struct {
 }
 
 type ConsumerGroupInfo struct {
-	StreamId        int `json:"streamId"`
-	TopicId         int `json:"topicId"`
-	ConsumerGroupId int `json:"consumerGroupId"`
+	StreamId        uint32 `json:"streamId"`
+	TopicId         uint32 `json:"topicId"`
+	ConsumerGroupId uint32 `json:"consumerGroupId"`
 }

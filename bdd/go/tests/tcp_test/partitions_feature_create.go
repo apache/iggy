@@ -30,10 +30,12 @@ var _ = ginkgo.Describe("CREATE PARTITION:", func() {
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
+			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
 			partitionsCount := 10
 			err := client.CreatePartitions(
-				iggcon.NewIdentifier(streamId),
-				iggcon.NewIdentifier(topicId),
+				streamIdentifier,
+				topicIdentifier,
 				uint32(partitionsCount))
 
 			itShouldNotReturnError(err)
@@ -43,8 +45,8 @@ var _ = ginkgo.Describe("CREATE PARTITION:", func() {
 		ginkgo.Context("and tries to create partitions for a non existing stream", func() {
 			client := createAuthorizedConnection()
 			err := client.CreatePartitions(
-				iggcon.NewIdentifier(int(createRandomUInt32())),
-				iggcon.NewIdentifier(int(createRandomUInt32())),
+				randomU32Identifier(),
+				randomU32Identifier(),
 				10,
 			)
 
@@ -55,9 +57,10 @@ var _ = ginkgo.Describe("CREATE PARTITION:", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
+			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
 			err := client.CreatePartitions(
-				iggcon.NewIdentifier(streamId),
-				iggcon.NewIdentifier(int(createRandomUInt32())),
+				streamIdentifier,
+				randomU32Identifier(),
 				10,
 			)
 
@@ -69,8 +72,8 @@ var _ = ginkgo.Describe("CREATE PARTITION:", func() {
 		ginkgo.Context("and tries to create partitions", func() {
 			client := createClient()
 			err := client.CreatePartitions(
-				iggcon.NewIdentifier(int(createRandomUInt32())),
-				iggcon.NewIdentifier(int(createRandomUInt32())),
+				randomU32Identifier(),
+				randomU32Identifier(),
 				10,
 			)
 
