@@ -43,6 +43,7 @@ chrono = { workspace = true }
 clap = { workspace = true }
 comfy-table = { workspace = true }
 crc32fast = { workspace = true }
+gxhash = { workspace = true }
 derive_more = { workspace = true }
 fast-async-mutex = { version = "0.6.7", optional = true }
 humantime = { workspace = true }

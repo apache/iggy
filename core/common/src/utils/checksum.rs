@@ -17,5 +17,5 @@
  */
 
 pub fn calculate_checksum(data: &[u8]) -> u32 {
-    crc32fast::hash(data)
+    gxhash::gxhash32(data, 0)
 }

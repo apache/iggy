@@ -137,6 +137,7 @@ uuid = { version = "1.17.0", features = [
     "serde",
     "zerocopy",
 ] }
+gxhash = "3.5.0"
 rust-s3 = { version = "0.36.0-beta.2", default-features = false, features = [
     "tokio-rustls-tls",
     "tags",
