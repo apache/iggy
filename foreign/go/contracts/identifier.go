@@ -17,6 +17,8 @@
 
 package iggcon
 
+import ierror "github.com/apache/iggy/foreign/go/errors"
+
 type Identifier struct {
 	Kind   IdKind
 	Length int
@@ -30,22 +32,45 @@ const (
 	StringId  IdKind = 2
 )
 
-func NewIdentifier(id any) Identifier {
-	var kind IdKind
-	var length int
-
-	switch v := id.(type) {
-	case int:
-		kind = NumericId
-		length = 4
-	case string:
-		kind = StringId
-		length = len(v)
+// NewNumericIdentifier creates a new identifier from the given numeric value.
+func NewNumericIdentifier(value uint32) (Identifier, error) {
+	if value == 0 {
+		return Identifier{}, ierror.InvalidIdentifier
 	}
-
 	return Identifier{
-		Kind:   kind,
-		Length: length,
-		Value:  id,
+		Kind:   NumericId,
+		Length: 4,
+		Value:  value,
+	}, nil
+}
+
+// NewStringIdentifier creates a new identifier from the given string value.
+func NewStringIdentifier(value string) (Identifier, error) {
+	length := len(value)
+	if length == 0 || length > 255 {
+		return Identifier{}, ierror.InvalidIdentifier
 	}
+	return Identifier{
+		Kind:   StringId,
+		Length: len(value),
+		Value:  value,
+	}, nil
+}
+
+// GetU32Value returns the numeric value of the identifier.
+func (id Identifier) GetU32Value() (uint32, error) {
+	if id.Kind != NumericId || id.Length != 4 {
+		return 0, ierror.ResourceNotFound
+	}
+
+	return id.Value.(uint32), nil
+}
+
+// GetStringValue returns the string value of the identifier.
+func (id Identifier) GetStringValue() (string, error) {
+	if id.Kind != StringId {
+		return "", ierror.InvalidIdentifier
+	}
+
+	return id.Value.(string), nil
 }
