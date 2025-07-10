@@ -24,7 +24,7 @@ import (
 	"github.com/onsi/gomega"
 )
 
-func itShouldHaveExpectedNumberOfPartitions(streamId uint32, topicId uint32, expectedPartitions int, client iggycli.Client) {
+func itShouldHaveExpectedNumberOfPartitions(streamId uint32, topicId uint32, expectedPartitions uint32, client iggycli.Client) {
 	streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
 	topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
 	topic, err := client.GetTopic(streamIdentifier, topicIdentifier)
@@ -32,7 +32,7 @@ func itShouldHaveExpectedNumberOfPartitions(streamId uint32, topicId uint32, exp
 	ginkgo.It("should have "+string(rune(expectedPartitions))+" partitions", func() {
 		gomega.Expect(topic).NotTo(gomega.BeNil())
 		gomega.Expect(topic.PartitionsCount).To(gomega.Equal(expectedPartitions))
-		gomega.Expect(len(topic.Partitions)).To(gomega.Equal(expectedPartitions))
+		gomega.Expect(len(topic.Partitions)).To(gomega.Equal(int(expectedPartitions)))
 	})
 
 	itShouldNotReturnError(err)

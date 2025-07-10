@@ -146,7 +146,7 @@ func itShouldSuccessfullyLeaveConsumer(streamId uint32, topicId uint32, groupId 
 	consumer, err := client.GetConsumerGroup(streamIdentifier, topicIdentifier, groupIdentifier)
 	ginkgo.It("should leave consumer with id "+string(rune(groupId)), func() {
 		gomega.Expect(consumer).NotTo(gomega.BeNil())
-		gomega.Expect(consumer.MembersCount).To(gomega.Equal(0))
+		gomega.Expect(consumer.MembersCount).To(gomega.Equal(uint32(0)))
 	})
 
 	itShouldNotReturnError(err)

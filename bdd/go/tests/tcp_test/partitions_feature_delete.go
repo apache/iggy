@@ -32,7 +32,7 @@ var _ = ginkgo.Describe("DELETE PARTITION:", func() {
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
 			topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
-			partitionsCount := 1
+			partitionsCount := uint32(1)
 			err := client.DeletePartitions(
 				streamIdentifier,
 				topicIdentifier,

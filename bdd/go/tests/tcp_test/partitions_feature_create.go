@@ -32,11 +32,12 @@ var _ = ginkgo.Describe("CREATE PARTITION:", func() {
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
 			topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
-			partitionsCount := 10
+			partitionsCount := uint32(10)
 			err := client.CreatePartitions(
 				streamIdentifier,
 				topicIdentifier,
-				uint32(partitionsCount))
+				partitionsCount,
+			)
 
 			itShouldNotReturnError(err)
 			itShouldHaveExpectedNumberOfPartitions(streamId, topicId, partitionsCount+2, client)
