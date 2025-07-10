@@ -41,7 +41,7 @@ A Helm chart for Kubernetes
 | serviceAccount.create | bool | `true` |  |
 | serviceAccount.name | string | `""` |  |
 | serviceMonitor.additionalLabels | object | `{}` | Add custom labels to the ServiceMonitor resource |
-| serviceMonitor.enabled | bool | `true` | Enable this if you're using https://github.com/coreos/prometheus-operator |
+| serviceMonitor.enabled | bool | `true` | Enable this if you're using `"https://github.com/coreos/prometheus-operator"` |
 | serviceMonitor.honorLabels | bool | `false` |  |
 | serviceMonitor.interval | string | `"30s"` | Fallback to the prometheus default unless specified |
 | serviceMonitor.namespace | string | `""` | Namespace to deploy the ServiceMonitor |
