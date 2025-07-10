@@ -28,7 +28,7 @@ type Stream struct {
 	SizeBytes     uint64 `json:"sizeBytes"`
 	CreatedAt     uint64 `json:"createdAt"`
 	MessagesCount uint64 `json:"messagesCount"`
-	TopicsCount   int    `json:"topicsCount"`
+	TopicsCount   uint32 `json:"topicsCount"`
 }
 
 type StreamDetails struct {

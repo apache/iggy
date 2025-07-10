@@ -74,7 +74,7 @@ func DeserializeStreams(payload []byte) []iggcon.Stream {
 func DeserializeToStream(payload []byte, position int) (iggcon.Stream, int) {
 	id := binary.LittleEndian.Uint32(payload[position : position+4])
 	createdAt := binary.LittleEndian.Uint64(payload[position+4 : position+12])
-	topicsCount := int(binary.LittleEndian.Uint32(payload[position+12 : position+16]))
+	topicsCount := binary.LittleEndian.Uint32(payload[position+12 : position+16])
 	sizeBytes := binary.LittleEndian.Uint64(payload[position+16 : position+24])
 	messagesCount := binary.LittleEndian.Uint64(payload[position+24 : position+32])
 	nameLength := int(payload[position+32])
