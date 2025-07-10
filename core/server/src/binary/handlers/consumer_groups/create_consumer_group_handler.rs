@@ -21,6 +21,7 @@ use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::{handlers::consumer_groups::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
+use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateConsumerGroupWithId;
 use crate::streaming::session::Session;
@@ -40,12 +41,11 @@ impl ServerCommandHandler for CreateConsumerGroup {
     async fn handle(
         self,
         sender: &mut SenderKind,
-        length: u32,
+        _length: u32,
         session: &Rc<Session>,
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-
         let consumer_group_id = shard
                 .create_consumer_group(
                     session,
@@ -60,6 +60,13 @@ impl ServerCommandHandler for CreateConsumerGroup {
                         self.stream_id, self.topic_id, self.group_id
                     )
                 })?;
+        let event = ShardEvent::CreatedConsumerGroup {
+            stream_id: self.stream_id.clone(),
+            topic_id: self.topic_id.clone(),
+            consumer_group_id: self.group_id,
+            name: self.name.clone(),
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
 
         let stream = shard.find_stream(session, &self.stream_id)
             .with_error_context(|error| {

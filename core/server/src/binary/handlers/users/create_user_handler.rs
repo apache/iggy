@@ -17,6 +17,7 @@
  */
 
 use crate::shard::IggyShard;
+use crate::shard::transmission::event::ShardEvent;
 use std::rc::Rc;
 
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
@@ -31,6 +32,7 @@ use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::create_user::CreateUser;
+use tower_http::map_response_body;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for CreateUser {
@@ -56,13 +58,19 @@ impl ServerCommandHandler for CreateUser {
                     self.status,
                     self.permissions.clone(),
                 )
-                .await
                 .with_error_context(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - failed to create user with name: {}, session: {session}",
                         self.username
                     )
                 })?;
+        let event = ShardEvent::CreatedUser {
+            username: self.username.to_owned(),
+            password: self.password.to_owned(),
+            status: self.status,
+            permissions: self.permissions.clone(),
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
         let user_id = user.id;
         let response = mapper::map_user(&user);
 

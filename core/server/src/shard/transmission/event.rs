@@ -6,7 +6,7 @@ use iggy_common::{
 
 use crate::{
     shard::namespace::IggyNamespace,
-    streaming::{clients::client_manager::Transport, polling_consumer::PollingConsumer},
+    streaming::{clients::client_manager::Transport, polling_consumer::PollingConsumer, personal_access_tokens::personal_access_token::PersonalAccessToken},
 };
 
 #[derive(Debug)]
@@ -87,6 +87,10 @@ pub enum ShardEvent {
         status: UserStatus,
         permissions: Option<Permissions>,
     },
+    UpdatedPermissions {
+        user_id: Identifier,
+        permissions: Option<Permissions>,
+    },
     DeletedUser {
         user_id: Identifier,
     },
@@ -109,20 +113,14 @@ pub enum ShardEvent {
         new_password: String,
     },
     CreatedPersonalAccessToken {
-        name: String,
-        expiry: IggyExpiry,
+        personal_access_token: PersonalAccessToken,
     },
     DeletedPersonalAccessToken {
+        user_id: u32,
         name: String,
     },
     LoginWithPersonalAccessToken {
         token: String,
-    },
-    StoredConsumerOffset {
-        stream_id: Identifier,
-        topic_id: Identifier,
-        consumer: PollingConsumer,
-        offset: u64,
     },
     NewSession {
         address: SocketAddr,

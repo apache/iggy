@@ -48,8 +48,7 @@ use server::state::StateKind;
 use server::state::command::EntryCommand;
 use server::state::file::FileState;
 use server::state::models::CreateUserWithId;
-use server::state::system::SystemState;
-use server::streaming::utils::{MemoryPool, crypto};
+use server::streaming::utils::MemoryPool;
 use server::versioning::SemanticVersion;
 use server::{IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV, map_toggle_str};
 use tokio::time::Instant;
@@ -183,7 +182,7 @@ fn main() -> Result<(), ServerError> {
 
                     // We can't use std::sync::Once because it doesn't support async.
                     // Trait bound on the closure is FnOnce.
-                    // Peak into the state to check if the root user exists.
+                    // Peek into the state to check if the root user exists.
                     // If it does not exist, create it.
                     barrier.with_async::<Result<(), IggyError>>(async |barrier_state| {
                         // A thread already initialized state

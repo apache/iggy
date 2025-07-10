@@ -58,7 +58,7 @@ impl IggyShard {
         session: &Session,
         name: &str,
         expiry: IggyExpiry,
-    ) -> Result<String, IggyError> {
+    ) -> Result<(PersonalAccessToken, String), IggyError> {
         self.ensure_authenticated(session)?;
         let user_id = session.get_user_id();
         let identifier = user_id.try_into()?;
@@ -78,6 +78,27 @@ impl IggyShard {
             }
         }
 
+        let (personal_access_token, token) =
+            PersonalAccessToken::new(user_id, name, IggyTimestamp::now(), expiry);
+        self.create_personal_access_token_base(personal_access_token.clone())?;
+        Ok((personal_access_token, token))
+    }
+
+    pub fn create_personal_access_token_bypass_auth(
+        &self,
+        personal_access_token: PersonalAccessToken,
+    ) -> Result<(), IggyError> {
+        self.create_personal_access_token_base(personal_access_token)
+    }
+
+    fn create_personal_access_token_base(
+        &self,
+        personal_access_token: PersonalAccessToken,
+    ) -> Result<(), IggyError> {
+        let user_id = personal_access_token.user_id;
+        let name = personal_access_token.name.clone();
+        let token_hash = personal_access_token.token.clone();
+        let identifier = user_id.try_into()?;
         let user = self.get_user_mut(&identifier).with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to get mutable reference to the user with id: {user_id}")
         })?;
@@ -85,22 +106,20 @@ impl IggyShard {
         if user
             .personal_access_tokens
             .iter()
-            .any(|pat| pat.name.as_str() == name)
+            .any(|pat| pat.name.as_str() == name.as_str())
         {
             error!("Personal access token: {name} for user with ID: {user_id} already exists.");
             return Err(IggyError::PersonalAccessTokenAlreadyExists(
-                name.to_owned(),
+                name.to_string(),
                 user_id,
             ));
         }
 
         info!("Creating personal access token: {name} for user with ID: {user_id}...");
-        let (personal_access_token, token) =
-            PersonalAccessToken::new(user_id, name, IggyTimestamp::now(), expiry);
         user.personal_access_tokens
-            .insert(personal_access_token.token.clone(), personal_access_token);
+            .insert(token_hash, personal_access_token);
         info!("Created personal access token: {name} for user with ID: {user_id}.");
-        Ok(token)
+        Ok(())
     }
 
     pub fn delete_personal_access_token(
@@ -110,6 +129,22 @@ impl IggyShard {
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
         let user_id = session.get_user_id();
+        self.delete_personal_access_token_base(user_id, name)
+    }
+
+    pub fn delete_personal_access_token_bypass_auth(
+        &self,
+        user_id: u32,
+        name: &str,
+    ) -> Result<(), IggyError> {
+        self.delete_personal_access_token_base(user_id, name)
+    }
+
+    fn delete_personal_access_token_base(
+        &self,
+        user_id: u32,
+        name: &str,
+    ) -> Result<(), IggyError> {
         let user = self
             .get_user_mut(&user_id.try_into()?)
             .with_error_context(|error| {
