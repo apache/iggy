@@ -18,19 +18,19 @@
 package tcp_test
 
 import (
-	"github.com/apache/iggy/foreign/go"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	"github.com/apache/iggy/foreign/go/iggycli"
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
 )
 
-func itShouldHaveExpectedNumberOfPartitions(streamId int, topicId int, expectedPartitions int, client iggy.MessageStream) {
-	topic, err := client.GetTopicById(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId))
+func itShouldHaveExpectedNumberOfPartitions(streamId int, topicId int, expectedPartitions int, client iggycli.Client) {
+	topic, err := client.GetTopic(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId))
 
-	It("should have "+string(rune(expectedPartitions))+" partitions", func() {
-		Expect(topic).NotTo(BeNil())
-		Expect(topic.PartitionsCount).To(Equal(expectedPartitions))
-		Expect(len(topic.Partitions)).To(Equal(expectedPartitions))
+	ginkgo.It("should have "+string(rune(expectedPartitions))+" partitions", func() {
+		gomega.Expect(topic).NotTo(gomega.BeNil())
+		gomega.Expect(topic.PartitionsCount).To(gomega.Equal(expectedPartitions))
+		gomega.Expect(len(topic.Partitions)).To(gomega.Equal(expectedPartitions))
 	})
 
 	itShouldNotReturnError(err)

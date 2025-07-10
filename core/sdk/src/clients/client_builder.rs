@@ -16,11 +16,12 @@
  * under the License.
  */
 
+use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::clients::client::IggyClient;
 use crate::http::http_client::HttpClient;
 use crate::prelude::{
-    AutoLogin, Client, EncryptorKind, HttpClientConfigBuilder, IggyDuration, IggyError,
-    Partitioner, QuicClientConfigBuilder, TcpClientConfigBuilder,
+    AutoLogin, EncryptorKind, HttpClientConfigBuilder, IggyDuration, IggyError, Partitioner,
+    QuicClientConfigBuilder, TcpClientConfigBuilder,
 };
 use crate::quic::quick_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
@@ -31,7 +32,7 @@ use tracing::error;
 /// The builder for the `IggyClient` instance, which allows to configure and provide custom implementations for the partitioner, encryptor or message handler.
 #[derive(Debug, Default)]
 pub struct IggyClientBuilder {
-    client: Option<Box<dyn Client>>,
+    client: Option<ClientWrapper>,
     partitioner: Option<Arc<dyn Partitioner>>,
     encryptor: Option<Arc<EncryptorKind>>,
 }
@@ -48,17 +49,17 @@ impl IggyClientBuilder {
 
         match ConnectionStringUtils::parse_protocol(connection_string)? {
             TransportProtocol::Tcp => {
-                builder.client = Some(Box::new(TcpClient::from_connection_string(
+                builder.client = Some(ClientWrapper::Tcp(TcpClient::from_connection_string(
                     connection_string,
                 )?));
             }
             TransportProtocol::Quic => {
-                builder.client = Some(Box::new(QuicClient::from_connection_string(
+                builder.client = Some(ClientWrapper::Quic(QuicClient::from_connection_string(
                     connection_string,
                 )?));
             }
             TransportProtocol::Http => {
-                builder.client = Some(Box::new(HttpClient::from_connection_string(
+                builder.client = Some(ClientWrapper::Http(HttpClient::from_connection_string(
                     connection_string,
                 )?));
             }
@@ -68,7 +69,7 @@ impl IggyClientBuilder {
     }
 
     /// Apply the provided client implementation for the specific transport. Setting client clears the client config.
-    pub fn with_client(mut self, client: Box<dyn Client>) -> Self {
+    pub fn with_client(mut self, client: ClientWrapper) -> Self {
         self.client = Some(client);
         self
     }
@@ -199,7 +200,10 @@ impl TcpClientBuilder {
     /// Builds the parent `IggyClient` with TCP configuration.
     pub fn build(self) -> Result<IggyClient, IggyError> {
         let client = TcpClient::create(Arc::new(self.config.build()?))?;
-        let client = self.parent_builder.with_client(Box::new(client)).build()?;
+        let client = self
+            .parent_builder
+            .with_client(ClientWrapper::Tcp(client))
+            .build()?;
         Ok(client)
     }
 }
@@ -248,7 +252,10 @@ impl QuicClientBuilder {
     /// Builds the parent `IggyClient` with QUIC configuration.
     pub fn build(self) -> Result<IggyClient, IggyError> {
         let client = QuicClient::create(Arc::new(self.config.build()))?;
-        let client = self.parent_builder.with_client(Box::new(client)).build()?;
+        let client = self
+            .parent_builder
+            .with_client(ClientWrapper::Quic(client))
+            .build()?;
         Ok(client)
     }
 }
@@ -275,7 +282,10 @@ impl HttpClientBuilder {
     /// Builds the parent `IggyClient` with HTTP configuration.
     pub fn build(self) -> Result<IggyClient, IggyError> {
         let client = HttpClient::create(Arc::new(self.config.build()))?;
-        let client = self.parent_builder.with_client(Box::new(client)).build()?;
+        let client = self
+            .parent_builder
+            .with_client(ClientWrapper::Http(client))
+            .build()?;
         Ok(client)
     }
 }

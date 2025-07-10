@@ -18,14 +18,16 @@
 package tcp
 
 import (
+	"time"
+
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
-	. "github.com/apache/iggy/foreign/go/contracts"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
-func (tms *IggyTcpClient) GetTopics(streamId Identifier) ([]TopicResponse, error) {
+func (tms *IggyTcpClient) GetTopics(streamId iggcon.Identifier) ([]iggcon.Topic, error) {
 	message := binaryserialization.SerializeIdentifier(streamId)
-	buffer, err := tms.sendAndFetchResponse(message, GetTopicsCode)
+	buffer, err := tms.sendAndFetchResponse(message, iggcon.GetTopicsCode)
 	if err != nil {
 		return nil, err
 	}
@@ -33,9 +35,9 @@ func (tms *IggyTcpClient) GetTopics(streamId Identifier) ([]TopicResponse, error
 	return binaryserialization.DeserializeTopics(buffer)
 }
 
-func (tms *IggyTcpClient) GetTopicById(streamId Identifier, topicId Identifier) (*TopicResponse, error) {
+func (tms *IggyTcpClient) GetTopic(streamId iggcon.Identifier, topicId iggcon.Identifier) (*iggcon.TopicDetails, error) {
 	message := binaryserialization.SerializeIdentifiers(streamId, topicId)
-	buffer, err := tms.sendAndFetchResponse(message, GetTopicCode)
+	buffer, err := tms.sendAndFetchResponse(message, iggcon.GetTopicCode)
 	if err != nil {
 		return nil, err
 	}
@@ -51,26 +53,63 @@ func (tms *IggyTcpClient) GetTopicById(streamId Identifier, topicId Identifier) 
 	return topic, nil
 }
 
-func (tms *IggyTcpClient) CreateTopic(request CreateTopicRequest) error {
-	if MaxStringLength < len(request.Name) {
+func (tms *IggyTcpClient) CreateTopic(
+	streamId iggcon.Identifier,
+	name string,
+	partitionsCount int,
+	compressionAlgorithm uint8,
+	messageExpiry time.Duration,
+	maxTopicSize uint64,
+	replicationFactor *uint8,
+	topicId *int,
+) (*iggcon.TopicDetails, error) {
+	if MaxStringLength < len(name) {
+		return nil, ierror.TextTooLong("topic_name")
+	}
+	serializedRequest := binaryserialization.TcpCreateTopicRequest{
+		StreamId:             streamId,
+		Name:                 name,
+		PartitionsCount:      partitionsCount,
+		CompressionAlgorithm: compressionAlgorithm,
+		MessageExpiry:        messageExpiry,
+		MaxTopicSize:         maxTopicSize,
+		ReplicationFactor:    replicationFactor,
+		TopicId:              topicId,
+	}
+	buffer, err := tms.sendAndFetchResponse(serializedRequest.Serialize(), iggcon.CreateTopicCode)
+	if err != nil {
+		return nil, err
+	}
+	topic, err := binaryserialization.DeserializeTopic(buffer)
+	return topic, err
+}
+
+func (tms *IggyTcpClient) UpdateTopic(
+	streamId iggcon.Identifier,
+	topicId iggcon.Identifier,
+	name string,
+	compressionAlgorithm uint8,
+	messageExpiry time.Duration,
+	maxTopicSize uint64,
+	replicationFactor *uint8,
+) error {
+	if MaxStringLength < len(name) {
 		return ierror.TextTooLong("topic_name")
 	}
-	serializedRequest := binaryserialization.TcpCreateTopicRequest{CreateTopicRequest: request}
-	_, err := tms.sendAndFetchResponse(serializedRequest.Serialize(), CreateTopicCode)
+	serializedRequest := binaryserialization.TcpUpdateTopicRequest{
+		StreamId:             streamId,
+		TopicId:              topicId,
+		CompressionAlgorithm: compressionAlgorithm,
+		MessageExpiry:        messageExpiry,
+		MaxTopicSize:         maxTopicSize,
+		ReplicationFactor:    replicationFactor,
+		Name:                 name}
+	_, err := tms.sendAndFetchResponse(serializedRequest.Serialize(), iggcon.UpdateTopicCode)
 	return err
 }
 
-func (tms *IggyTcpClient) UpdateTopic(request UpdateTopicRequest) error {
-	if MaxStringLength < len(request.Name) {
-		return ierror.TextTooLong("topic_name")
-	}
-	serializedRequest := binaryserialization.TcpUpdateTopicRequest{UpdateTopicRequest: request}
-	_, err := tms.sendAndFetchResponse(serializedRequest.Serialize(), UpdateTopicCode)
-	return err
-}
-
-func (tms *IggyTcpClient) DeleteTopic(streamId, topicId Identifier) error {
+func (tms *IggyTcpClient) DeleteTopic(streamId, topicId iggcon.Identifier) error {
 	message := binaryserialization.SerializeIdentifiers(streamId, topicId)
-	_, err := tms.sendAndFetchResponse(message, DeleteTopicCode)
+	_, err := tms.sendAndFetchResponse(message, iggcon.DeleteTopicCode)
 	return err
 }

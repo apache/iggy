@@ -40,7 +40,7 @@ async fn background_send_receive_ok() {
         server_address: test_server.get_raw_tcp_addr().unwrap(),
         ..TcpClientConfig::default()
     };
-    let client = Box::new(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
+    let client = ClientWrapper::Tcp(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
     let client = IggyClient::create(client, None, None);
 
     client.connect().await.unwrap();
@@ -106,7 +106,7 @@ async fn background_buffer_overflow_immediate() {
         server_address: test_server.get_raw_tcp_addr().unwrap(),
         ..TcpClientConfig::default()
     };
-    let client = Box::new(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
+    let client = ClientWrapper::Tcp(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
     let client = IggyClient::create(client, None, None);
 
     client.connect().await.unwrap();
@@ -157,7 +157,7 @@ async fn background_block_with_timeout() {
         server_address: test_server.get_raw_tcp_addr().unwrap(),
         ..TcpClientConfig::default()
     };
-    let client = Box::new(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
+    let client = ClientWrapper::Tcp(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
     let client = IggyClient::create(client, None, None);
 
     client.connect().await.unwrap();
@@ -215,7 +215,7 @@ async fn background_block_waits_then_succeeds() {
         server_address: test_server.get_raw_tcp_addr().unwrap(),
         ..TcpClientConfig::default()
     };
-    let client = Box::new(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
+    let client = ClientWrapper::Tcp(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
     let client = IggyClient::create(client, None, None);
 
     client.connect().await.unwrap();
@@ -271,7 +271,7 @@ async fn background_graceful_shutdown() {
         server_address: test_server.get_raw_tcp_addr().unwrap(),
         ..TcpClientConfig::default()
     };
-    let client = Box::new(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
+    let client = ClientWrapper::Tcp(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
     let client = IggyClient::create(client, None, None);
 
     client.connect().await.unwrap();
@@ -349,7 +349,7 @@ async fn background_many_parallel_producers() {
         server_address: test_server.get_raw_tcp_addr().unwrap(),
         ..TcpClientConfig::default()
     };
-    let client = Box::new(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
+    let client = ClientWrapper::Tcp(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
     let client = Arc::new(IggyClient::create(client, None, None));
 
     client.connect().await.unwrap();

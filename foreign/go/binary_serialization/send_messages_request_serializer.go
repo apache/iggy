@@ -25,7 +25,10 @@ import (
 )
 
 type TcpSendMessagesRequest struct {
-	iggcon.SendMessagesRequest
+	StreamId     iggcon.Identifier    `json:"streamId"`
+	TopicId      iggcon.Identifier    `json:"topicId"`
+	Partitioning iggcon.Partitioning  `json:"partitioning"`
+	Messages     []iggcon.IggyMessage `json:"messages"`
 }
 
 const indexSize = 16

@@ -19,36 +19,38 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("UPDATE USER:", func() {
-	When("User is logged in", func() {
-		Context("tries to update user existing user", func() {
+var _ = ginkgo.Describe("UPDATE USER:", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("tries to update user existing user", func() {
 			client := createAuthorizedConnection()
 			userId := successfullyCreateUser(createRandomString(16), client)
 			defer deleteUserAfterTests(userId, client)
-			request := iggcon.UpdateUserRequest{
-				UserID:   iggcon.NewIdentifier(int(userId)),
-				Username: createRandomString(16),
-			}
 
-			err := client.UpdateUser(request)
+			username := createRandomString(16)
+			err := client.UpdateUser(
+				iggcon.NewIdentifier(int(userId)),
+				&username,
+				nil,
+			)
 
 			itShouldNotReturnError(err)
-			itShouldSuccessfullyUpdateUser(userId, request.Username, client)
+			itShouldSuccessfullyUpdateUser(userId, username, client)
 		})
 	})
 
-	When("User is not logged in", func() {
-		Context("and tries to update user", func() {
-			client := createConnection()
-			request := iggcon.UpdateUserRequest{
-				UserID:   iggcon.NewIdentifier(int(createRandomUInt32())),
-				Username: createRandomString(16),
-			}
+	ginkgo.When("User is not logged in", func() {
+		ginkgo.Context("and tries to update user", func() {
+			client := createClient()
 
-			err := client.UpdateUser(request)
+			username := createRandomString(16)
+			err := client.UpdateUser(
+				iggcon.NewIdentifier(int(createRandomUInt32())),
+				&username,
+				nil,
+			)
 			itShouldReturnUnauthenticatedError(err)
 		})
 	})

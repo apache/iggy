@@ -73,6 +73,7 @@
     "bdd/docker-compose.yml",
     "scripts/run-bdd-tests.sh",
     ".github/workflows/ci-test-bdd.yml",
-    "core/.*\\.rs"
+    "core/.*\\.rs",
+    "foreign/csharp/Iggy_SDK.Tests.BDD/.*\\.cs"
   ]
 }

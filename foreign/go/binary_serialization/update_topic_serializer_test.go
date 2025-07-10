@@ -25,13 +25,11 @@ import (
 
 func TestSerialize_UpdateTopic(t *testing.T) {
 	request := TcpUpdateTopicRequest{
-		iggcon.UpdateTopicRequest{
-			StreamId:      iggcon.NewIdentifier("stream"),
-			TopicId:       iggcon.NewIdentifier(1),
-			Name:          "update_topic",
-			MessageExpiry: 100000,
-			MaxTopicSize:  100,
-		},
+		StreamId:      iggcon.NewIdentifier("stream"),
+		TopicId:       iggcon.NewIdentifier(1),
+		Name:          "update_topic",
+		MessageExpiry: 100000,
+		MaxTopicSize:  100,
 	}
 
 	serialized1 := request.Serialize()

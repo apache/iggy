@@ -18,27 +18,27 @@
 package tcp_test
 
 import (
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("GET PAT:", func() {
-	When("User is logged in", func() {
-		Context("tries to get all PATs", func() {
+var _ = ginkgo.Describe("GET PAT:", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("tries to get all PATs", func() {
 			client := createAuthorizedConnection()
 			name := createRandomString(16)
 			successfullyCreateAccessToken(name, client)
 
-			tokens, err := client.GetAccessTokens()
+			tokens, err := client.GetPersonalAccessTokens()
 
 			itShouldNotReturnError(err)
 			itShouldContainSpecificAccessToken(name, tokens)
 		})
 	})
 
-	When("User is not logged in", func() {
-		Context("and tries to all get PAT's", func() {
-			client := createConnection()
-			_, err := client.GetAccessTokens()
+	ginkgo.When("User is not logged in", func() {
+		ginkgo.Context("and tries to all get PAT's", func() {
+			client := createClient()
+			_, err := client.GetPersonalAccessTokens()
 			itShouldReturnUnauthenticatedError(err)
 		})
 	})

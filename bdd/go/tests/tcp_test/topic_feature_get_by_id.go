@@ -20,38 +20,38 @@ package tcp_test
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("GET TOPIC BY ID:", func() {
-	prefix := "GetTopicById"
-	When("User is logged in", func() {
-		Context("and tries to get existing topic", func() {
+var _ = ginkgo.Describe("GET TOPIC BY ID:", func() {
+	prefix := "GetTopic"
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("and tries to get existing topic", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, name := successfullyCreateTopic(streamId, client)
-			topic, err := client.GetTopicById(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId))
+			topic, err := client.GetTopic(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId))
 
 			itShouldNotReturnError(err)
 			itShouldReturnSpecificTopic(topicId, name, *topic)
 		})
 
-		Context("and tries to get topic from non-existing stream", func() {
+		ginkgo.Context("and tries to get topic from non-existing stream", func() {
 			client := createAuthorizedConnection()
 			streamId := int(createRandomUInt32())
 
-			_, err := client.GetTopicById(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(int(createRandomUInt32())))
+			_, err := client.GetTopic(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(int(createRandomUInt32())))
 
 			itShouldReturnSpecificIggyError(err, ierror.TopicIdNotFound)
 		})
 
-		Context("and tries to get non-existing topic", func() {
+		ginkgo.Context("and tries to get non-existing topic", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 
-			_, err := client.GetTopicById(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(int(createRandomUInt32())))
+			_, err := client.GetTopic(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(int(createRandomUInt32())))
 
 			itShouldReturnSpecificIggyError(err, ierror.TopicIdNotFound)
 		})

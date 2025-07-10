@@ -19,19 +19,20 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("CREATE USER:", func() {
-	When("User is logged in", func() {
-		Context("tries to create user with correct data", func() {
+var _ = ginkgo.Describe("CREATE USER:", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("tries to create user with correct data", func() {
 			client := createAuthorizedConnection()
 
-			request := iggcon.CreateUserRequest{
-				Username: createRandomString(16),
-				Password: createRandomString(16),
-				Status:   iggcon.Active,
-				Permissions: &iggcon.Permissions{
+			username := createRandomString(16)
+			_, err := client.CreateUser(
+				username,
+				createRandomString(16),
+				iggcon.Active,
+				&iggcon.Permissions{
 					Global: iggcon.GlobalPermissions{
 						ManageServers: true,
 						ReadServers:   true,
@@ -44,18 +45,15 @@ var _ = Describe("CREATE USER:", func() {
 						PollMessages:  true,
 						SendMessages:  true,
 					},
-				},
-			}
-
-			err := client.CreateUser(request)
-			defer deleteUserAfterTests(request.Username, client)
+				})
+			defer deleteUserAfterTests(username, client)
 
 			itShouldNotReturnError(err)
-			itShouldSuccessfullyCreateUser(request.Username, client)
+			itShouldSuccessfullyCreateUser(username, client)
 			//itShouldBePossibleToLogInWithCredentials(request.Username, request.Password)
 		})
 
-		Context("tries to create user with correct data and custom permissions", func() {
+		ginkgo.Context("tries to create user with correct data and custom permissions", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream("ss", client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
@@ -82,11 +80,12 @@ var _ = Describe("CREATE USER:", func() {
 				int(streamId): &streamPermissionRequest,
 			}
 
-			request := iggcon.CreateUserRequest{
-				Username: createRandomString(16),
-				Password: createRandomString(16),
-				Status:   iggcon.Active,
-				Permissions: &iggcon.Permissions{
+			username := createRandomString(16)
+			_, err := client.CreateUser(
+				username,
+				createRandomString(16),
+				iggcon.Active,
+				&iggcon.Permissions{
 					Global: iggcon.GlobalPermissions{
 						ManageServers: true,
 						ReadServers:   true,
@@ -100,27 +99,25 @@ var _ = Describe("CREATE USER:", func() {
 						SendMessages:  true,
 					},
 					Streams: userStreamPermissions,
-				},
-			}
-
-			err := client.CreateUser(request)
-			defer deleteUserAfterTests(request.Username, client)
+				})
+			defer deleteUserAfterTests(username, client)
 			defer deleteStreamAfterTests(streamId, client)
 
 			itShouldNotReturnError(err)
-			itShouldSuccessfullyCreateUserWithPermissions(request.Username, client, userStreamPermissions)
+			itShouldSuccessfullyCreateUserWithPermissions(username, client, userStreamPermissions)
 			//itShouldBePossibleToLogInWithCredentials(request.Username, request.Password)
 		})
 	})
 
-	When("User is not logged in", func() {
-		Context("and tries to create user", func() {
-			client := createConnection()
-			request := iggcon.CreateUserRequest{
-				Username: createRandomString(16),
-				Password: createRandomString(16),
-				Status:   iggcon.Active,
-				Permissions: &iggcon.Permissions{
+	ginkgo.When("User is not logged in", func() {
+		ginkgo.Context("and tries to create user", func() {
+			client := createClient()
+
+			_, err := client.CreateUser(
+				createRandomString(16),
+				createRandomString(16),
+				iggcon.Active,
+				&iggcon.Permissions{
 					Global: iggcon.GlobalPermissions{
 						ManageServers: true,
 						ReadServers:   true,
@@ -133,10 +130,8 @@ var _ = Describe("CREATE USER:", func() {
 						PollMessages:  true,
 						SendMessages:  true,
 					},
-				},
-			}
+				})
 
-			err := client.CreateUser(request)
 			itShouldReturnUnauthenticatedError(err)
 		})
 	})
