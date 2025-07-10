@@ -19,13 +19,13 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("SEND MESSAGES:", func() {
+var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 	prefix := "SendMessages"
-	When("User is logged in", func() {
-		Context("and tries to send messages to the topic with balanced partitioning", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("and tries to send messages to the topic with balanced partitioning", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream("1"+prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
@@ -41,7 +41,7 @@ var _ = Describe("SEND MESSAGES:", func() {
 			itShouldSuccessfullyPublishMessages(streamId, topicId, messages, client)
 		})
 
-		Context("and tries to send messages to the non existing topic", func() {
+		ginkgo.Context("and tries to send messages to the non existing topic", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream("2"+prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
@@ -55,7 +55,7 @@ var _ = Describe("SEND MESSAGES:", func() {
 			itShouldReturnSpecificError(err, "topic_id_not_found")
 		})
 
-		Context("and tries to send messages to the non existing stream", func() {
+		ginkgo.Context("and tries to send messages to the non existing stream", func() {
 			client := createAuthorizedConnection()
 			messages := createDefaultMessages()
 			err := client.SendMessages(
@@ -67,7 +67,7 @@ var _ = Describe("SEND MESSAGES:", func() {
 			itShouldReturnSpecificError(err, "stream_id_not_found")
 		})
 
-		Context("and tries to send messages to non existing partition", func() {
+		ginkgo.Context("and tries to send messages to non existing partition", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream("3"+prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
@@ -82,7 +82,7 @@ var _ = Describe("SEND MESSAGES:", func() {
 			itShouldReturnSpecificError(err, "partition_not_found")
 		})
 
-		Context("and tries to send messages to valid topic but with 0 messages in payload", func() {
+		ginkgo.Context("and tries to send messages to valid topic but with 0 messages in payload", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, createAuthorizedConnection())
@@ -97,8 +97,8 @@ var _ = Describe("SEND MESSAGES:", func() {
 		})
 	})
 
-	When("User is not logged in", func() {
-		Context("and tries to update stream", func() {
+	ginkgo.When("User is not logged in", func() {
+		ginkgo.Context("and tries to update stream", func() {
 			client := createClient()
 			messages := createDefaultMessages()
 			err := client.SendMessages(

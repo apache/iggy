@@ -24,8 +24,8 @@ import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/apache/iggy/foreign/go/iggycli"
 	"github.com/google/uuid"
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
 )
 
 func createDefaultMessageHeaders() map[iggcon.HeaderKey]iggcon.HeaderValue {
@@ -55,23 +55,23 @@ func itShouldSuccessfullyPublishMessages(streamId int, topicId int, messages []i
 		true,
 		nil)
 
-	It("It should not be nil", func() {
-		Expect(result).NotTo(BeNil())
+	ginkgo.It("It should not be nil", func() {
+		gomega.Expect(result).NotTo(gomega.BeNil())
 	})
 
-	It("It should contain 2 messages", func() {
-		Expect(len(result.Messages)).To(Equal(len(messages)))
+	ginkgo.It("It should contain 2 messages", func() {
+		gomega.Expect(len(result.Messages)).To(gomega.Equal(len(messages)))
 	})
 
 	for _, expectedMsg := range messages {
-		It("It should contain published messages", func() {
+		ginkgo.It("It should contain published messages", func() {
 			found := compareMessage(result.Messages, expectedMsg)
-			Expect(found).To(BeTrue(), "Message not found or does not match expected values")
+			gomega.Expect(found).To(gomega.BeTrue(), "Message not found or does not match expected values")
 		})
 	}
 
-	It("Should not return error", func() {
-		Expect(err).To(BeNil())
+	ginkgo.It("Should not return error", func() {
+		gomega.Expect(err).To(gomega.BeNil())
 	})
 }
 
