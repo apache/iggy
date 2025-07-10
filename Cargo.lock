@@ -3940,6 +3940,7 @@ dependencies = [
  "integration",
  "nonzero_lit",
  "rand 0.9.1",
+ "rayon",
  "serde",
  "sysinfo 0.35.2",
  "tokio",

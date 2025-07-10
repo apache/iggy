@@ -45,15 +45,19 @@ pub(crate) async fn start(
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let config = &shard.config.tcp.tls;
 
-    let (certs, key) =
-        if config.self_signed && !std::path::Path::new(&config.cert_file).exists() {
-            info!("Generating self-signed certificate for TCP TLS server");
-            generate_self_signed_cert()
-                .unwrap_or_else(|e| panic!("Failed to generate self-signed certificate: {e}"))
-        } else {
-            load_certificates(&config.cert_file, &config.key_file)
-                .unwrap_or_else(|e| panic!("Failed to load certificates: {e}"))
-        };
+        let (certs, key) =
+            if config.self_signed && !std::path::Path::new(&config.cert_file).exists() {
+                info!("Generating self-signed certificate for TCP TLS server");
+                generate_self_signed_cert()
+                    .unwrap_or_else(|e| panic!("Failed to generate self-signed certificate: {e}"))
+            } else {
+                info!(
+                    "Loading certificates from cert_file: {}, key_file: {}",
+                    config.cert_file, config.key_file
+                );
+                load_certificates(&config.cert_file, &config.key_file)
+                    .unwrap_or_else(|e| panic!("Failed to load certificates: {e}"))
+            };
 
     let server_config = ServerConfig::builder()
         .with_no_client_auth()

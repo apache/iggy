@@ -19,13 +19,13 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("CREATE CONSUMER GROUP:", func() {
+var _ = ginkgo.Describe("CREATE CONSUMER GROUP:", func() {
 	prefix := "CreateConsumerGroup"
-	When("User is logged in", func() {
-		Context("and tries to create consumer group unique name and id", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("and tries to create consumer group unique name and id", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
@@ -43,7 +43,7 @@ var _ = Describe("CREATE CONSUMER GROUP:", func() {
 			itShouldSuccessfullyCreateConsumer(streamId, topicId, int(groupId), name, client)
 		})
 
-		Context("and tries to create consumer group for a non existing stream", func() {
+		ginkgo.Context("and tries to create consumer group for a non existing stream", func() {
 			client := createAuthorizedConnection()
 			groupId := createRandomUInt32()
 			_, err := client.CreateConsumerGroup(
@@ -55,7 +55,7 @@ var _ = Describe("CREATE CONSUMER GROUP:", func() {
 			itShouldReturnSpecificError(err, "stream_id_not_found")
 		})
 
-		Context("and tries to create consumer group for a non existing topic", func() {
+		ginkgo.Context("and tries to create consumer group for a non existing topic", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
@@ -70,7 +70,7 @@ var _ = Describe("CREATE CONSUMER GROUP:", func() {
 			itShouldReturnSpecificError(err, "topic_id_not_found")
 		})
 
-		Context("and tries to create consumer group with duplicate group name", func() {
+		ginkgo.Context("and tries to create consumer group with duplicate group name", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
@@ -88,7 +88,7 @@ var _ = Describe("CREATE CONSUMER GROUP:", func() {
 			itShouldReturnSpecificError(err, "cannot_create_consumer_groups_directory")
 		})
 
-		Context("and tries to create consumer group with duplicate group id", func() {
+		ginkgo.Context("and tries to create consumer group with duplicate group id", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
@@ -105,7 +105,7 @@ var _ = Describe("CREATE CONSUMER GROUP:", func() {
 			itShouldReturnSpecificError(err, "consumer_group_already_exists")
 		})
 
-		Context("and tries to create group with name that's over 255 characters", func() {
+		ginkgo.Context("and tries to create group with name that's over 255 characters", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
@@ -121,8 +121,8 @@ var _ = Describe("CREATE CONSUMER GROUP:", func() {
 		})
 	})
 
-	When("User is not logged in", func() {
-		Context("and tries to create consumer group", func() {
+	ginkgo.When("User is not logged in", func() {
+		ginkgo.Context("and tries to create consumer group", func() {
 			client := createClient()
 			groupId := createRandomUInt32()
 			_, err := client.CreateConsumerGroup(

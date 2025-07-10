@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        sdk: [rust, python, go, node]
+        sdk: [rust, python, go, node, csharp]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
