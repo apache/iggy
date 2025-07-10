@@ -36,7 +36,7 @@ pub type IggyRwLock<T> = tokio_lock::IggyTokioRwLock<T>;
 pub type IggyRwLock<T> = fast_async_lock::IggyFastAsyncRwLock<T>;
 
 #[allow(async_fn_in_trait)]
-pub trait IggySharedMutFn<T> {
+pub trait IggyRwLockFn<T> {
     type ReadGuard<'a>: Deref<Target = T>
     where
         T: 'a,

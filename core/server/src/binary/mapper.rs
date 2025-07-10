@@ -26,7 +26,7 @@ use crate::streaming::topics::consumer_group::ConsumerGroup;
 use crate::streaming::topics::topic::Topic;
 use crate::streaming::users::user::User;
 use bytes::{BufMut, Bytes, BytesMut};
-use iggy_common::locking::IggySharedMutFn;
+use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{BytesSerializable, ConsumerOffsetInfo, Sizeable, Stats, UserId};
 
 pub fn map_stats(stats: &Stats) -> Bytes {

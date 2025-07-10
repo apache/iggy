@@ -62,7 +62,7 @@ pub struct Segment {
     pub(super) message_expiry: IggyExpiry,
     pub(super) accumulator: MessagesAccumulator,
     pub(super) config: Arc<SystemConfig>,
-    pub(super) indexes: IggyIndexesMut,
+    pub(super) indexes: Option<IggyIndexesMut>,
     pub(super) messages_size: Arc<AtomicU64>,
     pub(super) indexes_size: Arc<AtomicU64>,
 }
@@ -91,11 +91,6 @@ impl Segment {
             IggyExpiry::ServerDefault => config.segment.message_expiry,
             _ => message_expiry,
         };
-
-        // In order to preserve BytesMut buffer between restarts, initialize it with a capacity 0.
-        // We don't care whether server startup would be couple of seconds longer.
-        let indexes_capacity = if fresh { SIZE_16MB / INDEX_SIZE } else { 0 };
-
         Segment {
             stream_id,
             topic_id,
@@ -109,7 +104,7 @@ impl Segment {
             last_index_position: 0,
             max_size_bytes: config.segment.size,
             message_expiry,
-            indexes: IggyIndexesMut::with_capacity(indexes_capacity, 0),
+            indexes: None,
             accumulator: MessagesAccumulator::default(),
             is_closed: false,
             messages_writer: None,
@@ -145,7 +140,7 @@ impl Segment {
 
         self.last_index_position = log_size_bytes as _;
 
-        self.indexes = self
+        let loaded_indexes = self
             .index_reader
             .as_ref()
             .unwrap()
@@ -154,17 +149,27 @@ impl Segment {
             .with_error_context(|error| format!("Failed to load indexes for {self}. {error}"))
             .map_err(|_| IggyError::CannotReadFile)?;
 
-        let last_index_offset = if self.indexes.is_empty() {
+        info!(
+            "Loaded {} indexes for segment with start offset: {}, end offset: {}, and partition with ID: {}, topic with ID: {}, and stream with ID: {}.",
+            self.indexes.as_ref().map_or(0, |idx| idx.count()),
+            self.start_offset,
+            self.end_offset,
+            self.partition_id,
+            self.topic_id,
+            self.stream_id
+        );
+
+        let last_index_offset = if loaded_indexes.is_empty() {
             0_u64
         } else {
-            self.indexes.last().unwrap().offset() as u64
+            loaded_indexes.last().unwrap().offset() as u64
         };
 
         self.end_offset = self.start_offset + last_index_offset;
 
         info!(
             "Loaded {} indexes for segment with start offset: {}, end offset: {}, and partition with ID: {}, topic with ID: {}, and stream with ID: {}.",
-            self.indexes.count(),
+            self.indexes.as_ref().map_or(0, |idx| idx.count()),
             self.start_offset,
             self.end_offset,
             self.partition_id,
@@ -304,7 +309,8 @@ impl Segment {
             //TODO: Fixme not sure whether we should spawn a task here.
             compio::runtime::spawn(async move {
                 let _ = log_writer.fsync().await;
-            });
+            })
+            .detach();
         } else {
             warn!(
                 "Log writer already closed when calling close() for {}",
@@ -317,7 +323,8 @@ impl Segment {
             compio::runtime::spawn(async move {
                 let _ = index_writer.fsync().await;
                 drop(index_writer)
-            });
+            })
+            .detach();
         } else {
             warn!("Index writer already closed when calling close()");
         }
@@ -382,6 +389,14 @@ impl Segment {
         self.message_expiry = message_expiry;
     }
 
+    /// Ensure indexes are initialized with proper capacity
+    pub fn ensure_indexes(&mut self) {
+        if self.indexes.is_none() {
+            let capacity = SIZE_16MB / INDEX_SIZE;
+            self.indexes = Some(IggyIndexesMut::with_capacity(capacity, 0));
+        }
+    }
+
     pub fn is_closed(&self) -> bool {
         self.is_closed
     }
@@ -412,8 +427,7 @@ impl Segment {
 
     /// Explicitly drop the old indexes to ensure memory is freed
     pub fn drop_indexes(&mut self) {
-        let old_indexes = std::mem::replace(&mut self.indexes, IggyIndexesMut::empty());
-        drop(old_indexes);
+        self.indexes = None;
     }
 }
 
@@ -487,7 +501,7 @@ mod tests {
         assert_eq!(segment.messages_file_path(), messages_file_path);
         assert_eq!(segment.index_file_path(), index_path);
         assert_eq!(segment.message_expiry, message_expiry);
-        assert!(segment.indexes.is_empty());
+        assert!(segment.indexes.is_none());
         assert!(!segment.is_closed());
         assert!(!segment.is_full().await);
     }
@@ -530,6 +544,6 @@ mod tests {
             true,
         );
 
-        assert!(segment.indexes.is_empty());
+        assert!(segment.indexes.is_none());
     }
 }

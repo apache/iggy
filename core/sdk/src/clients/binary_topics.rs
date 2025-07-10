@@ -19,7 +19,7 @@
 use crate::prelude::IggyClient;
 use async_trait::async_trait;
 use iggy_binary_protocol::TopicClient;
-use iggy_common::locking::IggySharedMutFn;
+use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
     CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize, Topic, TopicDetails,
 };

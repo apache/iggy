@@ -20,7 +20,7 @@ use crate::streaming::partitions::partition::Partition;
 use crate::streaming::topics::COMPONENT;
 use crate::streaming::topics::topic::Topic;
 use error_set::ErrContext;
-use iggy_common::locking::{IggyRwLock, IggySharedMutFn};
+use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{IggyError, IggyTimestamp};
 use tracing::error;
 

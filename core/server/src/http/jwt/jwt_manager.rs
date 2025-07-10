@@ -29,7 +29,7 @@ use iggy_common::IggyExpiry;
 use iggy_common::IggyTimestamp;
 use iggy_common::UserId;
 use iggy_common::locking::IggyRwLock;
-use iggy_common::locking::IggySharedMutFn;
+use iggy_common::locking::IggyRwLockFn;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, TokenData, Validation, encode};
 use std::sync::Arc;
 use tracing::{debug, error, info};

@@ -28,7 +28,7 @@ use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::delete_topic::DeleteTopic;
-use iggy_common::locking::IggySharedMutFn;
+use iggy_common::locking::IggyRwLockFn;
 use std::rc::Rc;
 use std::time::Duration;
 use tracing::{debug, instrument};

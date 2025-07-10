@@ -35,7 +35,7 @@ use error_set::ErrContext;
 use iggy_common::Stats;
 use iggy_common::Validatable;
 use iggy_common::get_snapshot::GetSnapshot;
-use iggy_common::locking::IggySharedMutFn;
+use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{ClientInfo, ClientInfoDetails};
 use std::sync::Arc;
 

@@ -273,8 +273,16 @@ impl Segment {
         relative_start_offset: u32,
         count: u32,
     ) -> Result<Option<IggyIndexesMut>, IggyError> {
-        let indexes = if !self.indexes.is_empty() {
-            self.indexes.slice_by_offset(relative_start_offset, count)
+        let indexes = if let Some(ref indexes) = self.indexes {
+            if !indexes.is_empty() {
+                indexes.slice_by_offset(relative_start_offset, count)
+            } else {
+                self.index_reader
+                    .as_ref()
+                    .expect("Index reader not initialized")
+                    .load_from_disk_by_offset(relative_start_offset, count)
+                    .await?
+            }
         } else {
             self.index_reader
                 .as_ref()
@@ -290,8 +298,16 @@ impl Segment {
         timestamp: u64,
         count: u32,
     ) -> Result<Option<IggyIndexesMut>, IggyError> {
-        let indexes = if !self.indexes.is_empty() {
-            self.indexes.slice_by_timestamp(timestamp, count)
+        let indexes = if let Some(ref indexes) = self.indexes {
+            if !indexes.is_empty() {
+                indexes.slice_by_timestamp(timestamp, count)
+            } else {
+                self.index_reader
+                    .as_ref()
+                    .unwrap()
+                    .load_from_disk_by_timestamp(timestamp, count)
+                    .await?
+            }
         } else {
             self.index_reader
                 .as_ref()

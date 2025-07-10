@@ -26,7 +26,7 @@ use crate::streaming::topics::consumer_group::ConsumerGroup;
 use error_set::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
-use iggy_common::locking::IggySharedMutFn;
+use iggy_common::locking::IggyRwLockFn;
 
 impl IggyShard {
     pub fn get_consumer_group<'cg, 'stream>(

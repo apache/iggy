@@ -20,7 +20,7 @@ use crate::http::http_transport::HttpTransport;
 use crate::prelude::{Client, HttpClientConfig, IggyDuration, IggyError};
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
-use iggy_common::locking::{IggyRwLock, IggySharedMutFn};
+use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
     ConnectionString, ConnectionStringUtils, DiagnosticEvent, HttpConnectionStringOptions,
     IdentityInfo, TransportProtocol,

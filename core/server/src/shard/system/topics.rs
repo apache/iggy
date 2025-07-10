@@ -23,7 +23,7 @@ use crate::streaming::session::Session;
 use crate::streaming::streams::stream::Stream;
 use crate::streaming::topics::topic::Topic;
 use error_set::ErrContext;
-use iggy_common::locking::IggySharedMutFn;
+use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize};
 use tokio_util::io::StreamReader;
 use tracing::info;

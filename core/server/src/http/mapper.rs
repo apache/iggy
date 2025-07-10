@@ -28,7 +28,7 @@ use iggy_common::PersonalAccessTokenInfo;
 use iggy_common::Sizeable;
 use iggy_common::StreamDetails;
 use iggy_common::TopicDetails;
-use iggy_common::locking::IggySharedMutFn;
+use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{ConsumerGroupDetails, ConsumerGroupMember};
 use iggy_common::{IdentityInfo, TokenInfo};
 use iggy_common::{UserInfo, UserInfoDetails};

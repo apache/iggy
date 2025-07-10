@@ -22,7 +22,7 @@ use ahash::AHashMap;
 use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
 use iggy_common::UserId;
-use iggy_common::locking::IggySharedMutFn;
+use iggy_common::locking::IggyRwLockFn;
 use std::fmt::{Display, Formatter};
 use std::net::SocketAddr;
 use std::rc::Rc;

@@ -31,7 +31,7 @@ use error_set::ErrContext;
 use futures::future::join_all;
 use iggy_common::IggyError;
 use iggy_common::locking::IggyRwLock;
-use iggy_common::locking::IggySharedMutFn;
+use iggy_common::locking::IggyRwLockFn;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
