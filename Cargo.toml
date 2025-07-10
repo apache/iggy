@@ -37,6 +37,7 @@ members = [
     "core/connectors/sinks/stdout_sink",
     "core/connectors/sources/random_source",
     "core/integration",
+    "core/mcp",
     "core/sdk",
     "core/server",
     "core/tools",
