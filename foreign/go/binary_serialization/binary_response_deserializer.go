@@ -253,8 +253,8 @@ func DeserializeConsumerGroups(payload []byte) []iggcon.ConsumerGroup {
 
 func DeserializeToConsumerGroup(payload []byte, position int) (*iggcon.ConsumerGroup, int) {
 	id := binary.LittleEndian.Uint32(payload[position : position+4])
-	partitionsCount := int(binary.LittleEndian.Uint32(payload[position+4 : position+8]))
-	membersCount := int(binary.LittleEndian.Uint32(payload[position+8 : position+12]))
+	partitionsCount := binary.LittleEndian.Uint32(payload[position+4 : position+8])
+	membersCount := binary.LittleEndian.Uint32(payload[position+8 : position+12])
 	nameLength := int(payload[position+12])
 	name := string(payload[position+13 : position+13+nameLength])
 

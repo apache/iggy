@@ -20,8 +20,8 @@ package iggcon
 type ConsumerGroup struct {
 	Id              uint32 `json:"id"`
 	Name            string `json:"name"`
-	PartitionsCount int    `json:"partitionsCount"`
-	MembersCount    int    `json:"membersCount"`
+	PartitionsCount uint32 `json:"partitionsCount"`
+	MembersCount    uint32 `json:"membersCount"`
 }
 
 type ConsumerGroupDetails struct {
