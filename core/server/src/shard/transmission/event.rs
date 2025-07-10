@@ -6,7 +6,11 @@ use iggy_common::{
 
 use crate::{
     shard::namespace::IggyNamespace,
-    streaming::{clients::client_manager::Transport, polling_consumer::PollingConsumer, personal_access_tokens::personal_access_token::PersonalAccessToken},
+    streaming::{
+        clients::client_manager::Transport,
+        personal_access_tokens::personal_access_token::PersonalAccessToken,
+        polling_consumer::PollingConsumer,
+    },
 };
 
 #[derive(Debug)]

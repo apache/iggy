@@ -17,7 +17,7 @@
  */
 
 use crate::clients::client_builder::IggyClientBuilder;
-use iggy_common::locking::{IggyRwLock, IggySharedMutFn};
+use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::client_wrappers::client_wrapper::ClientWrapper;
@@ -48,7 +48,7 @@ use tracing::{debug, error, info};
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct IggyClient {
-    pub(crate) client: IggySharedMut<ClientWrapper>,
+    pub(crate) client: IggyRwLock<ClientWrapper>,
     partitioner: Option<Arc<dyn Partitioner>>,
     pub(crate) encryptor: Option<Arc<EncryptorKind>>,
 }
@@ -123,7 +123,7 @@ impl IggyClient {
     }
 
     /// Returns the underlying client implementation for the specific transport.
-    pub fn client(&self) -> IggySharedMut<ClientWrapper> {
+    pub fn client(&self) -> IggyRwLock<ClientWrapper> {
         self.client.clone()
     }
 

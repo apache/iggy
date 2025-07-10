@@ -140,11 +140,7 @@ impl IggyShard {
         self.delete_personal_access_token_base(user_id, name)
     }
 
-    fn delete_personal_access_token_base(
-        &self,
-        user_id: u32,
-        name: &str,
-    ) -> Result<(), IggyError> {
+    fn delete_personal_access_token_base(&self, user_id: u32, name: &str) -> Result<(), IggyError> {
         let user = self
             .get_user_mut(&user_id.try_into()?)
             .with_error_context(|error| {

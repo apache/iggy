@@ -22,7 +22,7 @@ use crate::streaming::topics::topic::Topic;
 use crate::streaming::topics::{COMPONENT, consumer_group};
 use error_set::ErrContext;
 use iggy_common::IggyError;
-use iggy_common::locking::IggySharedMutFn;
+use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{IdKind, Identifier};
 use std::cell::{Ref, RefMut};
 use std::sync::atomic::Ordering;

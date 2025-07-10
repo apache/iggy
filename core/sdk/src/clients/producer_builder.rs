@@ -19,7 +19,7 @@ use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::clients::producer_config::{BackgroundConfig, DirectConfig};
 use crate::prelude::IggyProducer;
-use iggy_common::locking::IggySharedMut;
+use iggy_common::locking::IggyRwLock;
 use iggy_common::{
     EncryptorKind, Identifier, IggyDuration, IggyExpiry, MaxTopicSize, Partitioner, Partitioning,
 };
@@ -37,7 +37,7 @@ impl Default for SendMode {
 }
 
 pub struct IggyProducerBuilder {
-    client: IggySharedMut<ClientWrapper>,
+    client: IggyRwLock<ClientWrapper>,
     stream: Identifier,
     stream_name: String,
     topic: Identifier,
@@ -59,7 +59,7 @@ pub struct IggyProducerBuilder {
 impl IggyProducerBuilder {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        client: IggySharedMut<ClientWrapper>,
+        client: IggyRwLock<ClientWrapper>,
         stream: Identifier,
         stream_name: String,
         topic: Identifier,

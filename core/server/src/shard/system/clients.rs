@@ -23,7 +23,7 @@ use crate::streaming::session::Session;
 use error_set::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
-use iggy_common::locking::IggySharedMutFn;
+use iggy_common::locking::IggyRwLockFn;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use tracing::{error, info};

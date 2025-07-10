@@ -17,7 +17,7 @@
  */
 
 use crate::streaming::topics::topic::Topic;
-use iggy_common::locking::IggySharedMutFn;
+use iggy_common::locking::IggyRwLockFn;
 
 impl Topic {
     pub async fn get_segments_count(&self) -> u32 {

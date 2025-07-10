@@ -32,7 +32,7 @@ use iggy_common::Permissions;
 use iggy_common::UserStatus;
 use iggy_common::create_user::CreateUser;
 use iggy_common::defaults::*;
-use iggy_common::locking::IggySharedMutFn;
+use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{IdKind, Identifier};
 use std::cell::RefMut;
 use std::env;
@@ -381,7 +381,7 @@ impl IggyShard {
             let user: User = self.get_user(user_id).with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get user with id: {user_id}")
             })?;
-            
+
             self.permissioner
                 .borrow_mut()
                 .update_permissions_for_user(user.id, permissions.clone());

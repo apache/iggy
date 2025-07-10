@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct IggyConsumerBuilder {
-    client: IggySharedMut<ClientWrapper>,
+    client: IggyRwLock<ClientWrapper>,
     consumer_name: String,
     consumer: Consumer,
     stream: Identifier,
@@ -48,7 +48,7 @@ pub struct IggyConsumerBuilder {
 impl IggyConsumerBuilder {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        client: IggySharedMut<ClientWrapper>,
+        client: IggyRwLock<ClientWrapper>,
         consumer_name: String,
         consumer: Consumer,
         stream_id: Identifier,

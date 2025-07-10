@@ -291,7 +291,7 @@ mod tests {
         persistence::persister::{FileWithSyncPersister, PersisterKind},
         utils::MemoryPool,
     };
-    use iggy_common::locking::IggySharedMutFn;
+    use iggy_common::locking::IggyRwLockFn;
     use std::str::FromStr;
 
     #[tokio::test]

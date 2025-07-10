@@ -30,7 +30,7 @@ use flume::Sender;
 use iggy_common::IggyDuration;
 use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
-use iggy_common::locking::IggySharedMutFn;
+use iggy_common::locking::IggyRwLockFn;
 use std::sync::Arc;
 use tokio::time;
 use tracing::{debug, error, info, instrument, trace};

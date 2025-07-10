@@ -19,7 +19,7 @@
 use crate::streaming::common::test_setup::TestSetup;
 use crate::streaming::create_message;
 use bytes::Bytes;
-use iggy::prelude::locking::IggySharedMutFn;
+use iggy::prelude::locking::IggyRwLockFn;
 use iggy::prelude::*;
 use server::configs::server::{DataMaintenanceConfig, PersonalAccessTokenConfig};
 use server::configs::system::{PartitionConfig, SegmentConfig, SystemConfig};

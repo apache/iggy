@@ -20,7 +20,7 @@ use crate::prelude::IggyClient;
 use async_dropper::AsyncDrop;
 use async_trait::async_trait;
 use iggy_binary_protocol::{ConsumerGroupClient, UserClient};
-use iggy_common::locking::IggySharedMutFn;
+use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{ConsumerGroup, ConsumerGroupDetails, Identifier, IggyError};
 
 #[async_trait]
