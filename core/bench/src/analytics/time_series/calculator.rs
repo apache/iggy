@@ -25,6 +25,7 @@ use super::calculators::{
 use crate::analytics::record::BenchmarkRecord;
 use bench_report::time_series::{TimePoint, TimeSeries, TimeSeriesKind};
 use iggy::prelude::IggyDuration;
+use rayon::prelude::*;
 use tracing::warn;
 
 /// Calculate time series data from benchmark records
@@ -64,7 +65,7 @@ impl TimeSeriesCalculator {
         all_times.dedup();
 
         let points = all_times
-            .into_iter()
+            .into_par_iter()
             .map(|time| {
                 let sum: f64 = series
                     .iter()
@@ -101,7 +102,7 @@ impl TimeSeriesCalculator {
         all_times.dedup();
 
         let points = all_times
-            .into_iter()
+            .into_par_iter()
             .map(|time| {
                 let matching_values: Vec<f64> = series
                     .iter()

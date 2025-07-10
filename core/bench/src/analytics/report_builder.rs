@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use std::collections::HashMap;
+use std::{collections::HashMap, thread};
 
 use super::metrics::group::{from_individual_metrics, from_producers_and_consumers_statistics};
 use crate::utils::get_server_stats;
@@ -83,25 +83,24 @@ impl BenchmarkReportBuilder {
             .cloned()
             .collect();
 
-        if !producer_metrics.is_empty() {
-            if let Some(metrics) = from_individual_metrics(&producer_metrics, moving_average_window)
-            {
-                group_metrics.push(metrics);
-            }
-        }
+        let mut join_handles = Vec::new();
 
-        if !consumer_metrics.is_empty() {
-            if let Some(metrics) = from_individual_metrics(&consumer_metrics, moving_average_window)
-            {
-                group_metrics.push(metrics);
-            }
-        }
+        for individual_metric in [
+            &producer_metrics,
+            &consumer_metrics,
+            &producing_consumers_metrics,
+        ] {
+            if !individual_metric.is_empty() {
+                let individual_metric_copy = individual_metric.clone();
 
-        if !producing_consumers_metrics.is_empty() {
-            if let Some(metrics) =
-                from_individual_metrics(&producing_consumers_metrics, moving_average_window)
-            {
-                group_metrics.push(metrics);
+                join_handles.push(thread::spawn(move || {
+                    if let Some(metric) =
+                        from_individual_metrics(&individual_metric_copy, moving_average_window)
+                    {
+                        return Some(metric);
+                    }
+                    None
+                }));
             }
         }
 
@@ -112,12 +111,21 @@ impl BenchmarkReportBuilder {
         ) && !producer_metrics.is_empty()
             && !consumer_metrics.is_empty()
         {
-            if let Some(metrics) = from_producers_and_consumers_statistics(
-                &producer_metrics,
-                &consumer_metrics,
-                moving_average_window,
-            ) {
-                group_metrics.push(metrics);
+            join_handles.push(thread::spawn(move || {
+                if let Some(metric) = from_producers_and_consumers_statistics(
+                    &producer_metrics,
+                    &consumer_metrics,
+                    moving_average_window,
+                ) {
+                    return Some(metric);
+                }
+                None
+            }));
+        }
+
+        for handle in join_handles {
+            if let Some(metric) = handle.join().expect("Should have computed group metric") {
+                group_metrics.push(metric);
             }
         }
 

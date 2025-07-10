@@ -44,6 +44,7 @@ iggy = { workspace = true }
 integration = { workspace = true }
 nonzero_lit = { workspace = true }
 rand = { workspace = true }
+rayon = "1.10.0"
 serde = { workspace = true }
 sysinfo = { workspace = true }
 tokio = { workspace = true }
