@@ -18,6 +18,26 @@
  */
 
 
-export type LoginResponse = {
-  userId: number
-}
+import { type Id } from '../identifier.utils.js';
+import { serializeFlushUnsavedBuffers } from './message.utils.js';
+import { deserializeVoidResponse } from '../../client/client.utils.js';
+import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
+
+export type FlushUnsavedBuffer = {
+  streamId: Id,
+  topicId: Id,
+  partitionId: number,
+};
+
+export const FLUSH_UNSAVED_BUFFERS = {
+  code: COMMAND_CODE.FlushUnsavedBuffers,
+
+  serialize: ({ streamId, topicId, partitionId }: FlushUnsavedBuffer) => {
+    return serializeFlushUnsavedBuffers(streamId, topicId, partitionId);
+  },
+
+  deserialize: deserializeVoidResponse
+};
+
+export const flushUnsavedBuffers = wrapCommand<FlushUnsavedBuffer, boolean>(FLUSH_UNSAVED_BUFFERS);

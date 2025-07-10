@@ -18,24 +18,25 @@
  */
 
 
-import type { CommandResponse } from '../../client/client.type.js';
-import { serializeLoginWithToken, type LoginResponse } from './login.utils.js';
-import { wrapCommand } from '../command.utils.js';
-import { COMMAND_CODE } from '../command.code.js';
+import { serializeIdentifier, type Id } from '../identifier.utils.js';
+import { uint32ToBuf } from '../number.utils.js';
 
-export type LoginWithTokenParam = {
-  token: string
+export const serializeSegmentsParams = (
+  streamId: Id, topicId: Id, partitionId: number, segmentsCount: number,
+) => {
+
+  if (segmentsCount < 1 || segmentsCount > 1000)
+    throw new Error('Topic partition_count must be between 1 and 1000');
+
+  const streamIdentifier = serializeIdentifier(streamId);
+  const topicIdentifier = serializeIdentifier(topicId);
+  const bPartitionId = uint32ToBuf(partitionId);
+  const bSegmentsCount = uint32ToBuf(segmentsCount);
+
+  return Buffer.concat([
+    streamIdentifier,
+    topicIdentifier,
+    bPartitionId,
+    bSegmentsCount
+  ])
 };
-
-export const LOGIN_WITH_TOKEN = {
-  code: COMMAND_CODE.LoginWithAccessToken,
-
-  serialize: ({token}: LoginWithTokenParam) => serializeLoginWithToken(token),
-
-  deserialize: (r: CommandResponse) => ({
-    userId: r.data.readUInt32LE(0)
-  })
-};
-
-
-export const loginWithToken = wrapCommand<LoginWithTokenParam, LoginResponse>(LOGIN_WITH_TOKEN);

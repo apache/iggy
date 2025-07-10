@@ -18,44 +18,25 @@
  */
 
 
+import { deserializeVoidResponse } from '../../client/client.utils.js';
 import type { CommandResponse } from '../../client/client.type.js';
-import { serializeIdentifier, type Id } from '../identifier.utils.js';
+import type { GetOffset } from './get-offset.command.js';
 import { wrapCommand } from '../command.utils.js';
+import { serializeGetOffset } from './offset.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
-import { deserializeConsumerGroup, type ConsumerGroup } from './group.utils.js';
 
-export type CreateGroup = {
-  streamId: Id,
-  topicId: Id,
-  groupId: number,
-  name: string,
-};
 
-export const CREATE_GROUP = {
-  code: COMMAND_CODE.CreateGroup,
+export type DeleteOffset = GetOffset;
 
-  serialize: ({ streamId, topicId, groupId, name }: CreateGroup) => {
-    const bName = Buffer.from(name);
+export const DELETE_OFFSET = {
+  code: COMMAND_CODE.DeleteConsumerOffset,
 
-    if (bName.length < 1 || bName.length > 255)
-      throw new Error('Consumer group name should be between 1 and 255 bytes');
-
-    const b = Buffer.allocUnsafe(5);
-    b.writeUInt32LE(groupId);
-    b.writeUInt8(bName.length, 4);
-
-    return Buffer.concat([
-      serializeIdentifier(streamId),
-      serializeIdentifier(topicId),
-      b,
-      bName
-    ]);
+  serialize: ({streamId, topicId, consumer, partitionId = 1}: DeleteOffset) => {
+    return serializeGetOffset(streamId, topicId, consumer, partitionId);
   },
 
-  deserialize: (r: CommandResponse) => {
-    return deserializeConsumerGroup(r.data).data;
-  }
+  deserialize: deserializeVoidResponse
 };
 
 
-export const createGroup = wrapCommand<CreateGroup, ConsumerGroup>(CREATE_GROUP);
+export const deleteOffset = wrapCommand<DeleteOffset, boolean>(DELETE_OFFSET);

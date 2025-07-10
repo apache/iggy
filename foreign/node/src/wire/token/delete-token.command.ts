@@ -20,20 +20,23 @@
 
 import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
+import { uint8ToBuf } from '../number.utils.js';
 
 export type DeleteToken = {
   name: string
 };
 
 export const DELETE_TOKEN = {
-  code: 43,
+  code: COMMAND_CODE.DeleteAccessToken,
 
   serialize: ({name}: DeleteToken): Buffer => {
     const bName = Buffer.from(name);
+
     if (bName.length < 1 || bName.length > 255)
       throw new Error('Token name should be between 1 and 255 bytes');
-    const b = Buffer.alloc(1);
-    b.writeUInt8(bName.length);
+
+    const b = uint8ToBuf(bName.length);
     return Buffer.concat([
       b,
       bName

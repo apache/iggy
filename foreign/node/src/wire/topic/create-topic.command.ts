@@ -21,12 +21,14 @@
 import type { CommandResponse } from '../../client/client.type.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 import {
   isValidCompressionAlgorithm, CompressionAlgorithmKind,
   deserializeTopic,
   type Topic,
   type CompressionAlgorithm
 } from './topic.utils.js';
+
 
 export type CreateTopic = {
   streamId: Id,
@@ -40,7 +42,8 @@ export type CreateTopic = {
 };
 
 export const CREATE_TOPIC = {
-  code: 302,
+  code: COMMAND_CODE.CreateTopic,
+
   serialize: ({
     streamId,
     topicId,
@@ -82,5 +85,6 @@ export const CREATE_TOPIC = {
     return deserializeTopic(r.data).data;
   }
 };
+
 
 export const createTopic = wrapCommand<CreateTopic, Topic>(CREATE_TOPIC);

@@ -21,6 +21,7 @@
 import type { CommandResponse } from '../../client/client.type.js';
 import type { Id } from '../identifier.utils.js';
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 import { serializeGetOffset, type Consumer, type OffsetResponse } from './offset.utils.js';
 
 export type GetOffset = {
@@ -32,7 +33,7 @@ export type GetOffset = {
 
 
 export const GET_OFFSET = {
-  code: 120,
+  code: COMMAND_CODE.GetOffset,
 
   serialize: ({streamId, topicId, consumer, partitionId = 1}: GetOffset) => {
     return serializeGetOffset(streamId, topicId, consumer, partitionId);
@@ -50,5 +51,6 @@ export const GET_OFFSET = {
     }
   }
 };
+
 
 export const getOffset = wrapCommand<GetOffset, OffsetResponse>(GET_OFFSET);

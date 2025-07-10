@@ -19,6 +19,7 @@
 
 
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
+import { uint32ToBuf } from '../number.utils.js';
 
 export const serializePartitionParams = (
   streamId: Id, topicId: Id, partitionCount = 1,
@@ -29,8 +30,7 @@ export const serializePartitionParams = (
 
   const streamIdentifier = serializeIdentifier(streamId);
   const topicIdentifier = serializeIdentifier(topicId);
-  const b = Buffer.alloc(4);
-  b.writeUInt32LE(partitionCount, 0);
+  const b = uint32ToBuf(partitionCount);
 
   return Buffer.concat([
     streamIdentifier,

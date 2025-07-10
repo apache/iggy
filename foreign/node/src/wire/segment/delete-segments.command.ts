@@ -18,24 +18,29 @@
  */
 
 
-import type { CommandResponse } from '../../client/client.type.js';
-import { serializeLoginWithToken, type LoginResponse } from './login.utils.js';
+import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
+import type { Id } from '../identifier.utils.js';
+import { serializeSegmentsParams } from './segment.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 
-export type LoginWithTokenParam = {
-  token: string
+
+export type DeleteSegments = {
+  streamId: Id,
+  topicId: Id,
+  partitionId: number,
+  segmentsCount: number
 };
 
-export const LOGIN_WITH_TOKEN = {
-  code: COMMAND_CODE.LoginWithAccessToken,
+export const DELETE_SEGMENTS = {
+  code: COMMAND_CODE.DeleteSegments,
 
-  serialize: ({token}: LoginWithTokenParam) => serializeLoginWithToken(token),
+  serialize: ({ streamId, topicId, partitionId, segmentsCount }: DeleteSegments) => {
+    return serializeSegmentsParams(streamId, topicId, partitionId, segmentsCount);
+  },
 
-  deserialize: (r: CommandResponse) => ({
-    userId: r.data.readUInt32LE(0)
-  })
+  deserialize: deserializeVoidResponse
 };
 
 
-export const loginWithToken = wrapCommand<LoginWithTokenParam, LoginResponse>(LOGIN_WITH_TOKEN);
+export const deleteSegments = wrapCommand<DeleteSegments, boolean>(DELETE_SEGMENTS);

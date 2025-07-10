@@ -20,16 +20,17 @@
 
 import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 
-// PING
 export const PING = {
-  code: 1,
+  code: COMMAND_CODE.Ping,
+  
   serialize: () => {
     return Buffer.alloc(0);
   },
 
   deserialize: deserializeVoidResponse
-
 };
+
 
 export const ping = wrapCommand<void, boolean>(PING);

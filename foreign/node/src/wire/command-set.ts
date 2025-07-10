@@ -44,9 +44,11 @@ import { deleteTopic } from './topic/delete-topic.command.js';
 
 import { getOffset } from './offset/get-offset.command.js';
 import { storeOffset } from './offset/store-offset.command.js';
+import { deleteOffset } from './offset/delete-offset.command.js';
 
 import { sendMessages } from './message/send-messages.command.js';
 import { pollMessages } from './message/poll-messages.command.js';
+import { flushUnsavedBuffers } from './message/flush-unsaved-buffers.command.js';
 
 import { createStream } from './stream/create-stream.command.js';
 import { updateStream } from './stream/update-stream.command.js';
@@ -57,6 +59,8 @@ import { purgeStream } from './stream/purge-stream.command.js';
 
 import { createPartition } from './partition/create-partition.command.js';
 import { deletePartition } from './partition/delete-partition.command.js';
+
+import { deleteSegments } from './segment/delete-segments.command.js';
 
 import { getStats } from './system/get-stats.command.js';
 import { ping } from './system/ping.command.js';
@@ -140,6 +144,12 @@ const partitionAPI = (c: ClientProvider) => ({
 
 type PartitionAPI = ReturnType<typeof partitionAPI>;
 
+const segmentAPI = (c: ClientProvider) => ({
+  delete: deleteSegments(c),
+});
+
+type SegmentAPI = ReturnType<typeof segmentAPI>;
+
 const groupAPI = (c: ClientProvider) => ({
   get: getGroup(c),
   list: getGroups(c),
@@ -153,14 +163,16 @@ type GroupAPI = ReturnType<typeof groupAPI>;
 
 const offsetAPI = (c: ClientProvider) => ({
   get: getOffset(c),
-  store: storeOffset(c)
+  store: storeOffset(c),
+  delete: deleteOffset(c)
 });
 
 type OffsetAPI = ReturnType<typeof offsetAPI>;
 
 const messageAPI = (c: ClientProvider) => ({
   poll: pollMessages(c),
-  send: sendMessages(c)
+  send: sendMessages(c),
+  flushUnsavedBuffers: flushUnsavedBuffers(c)
 });
 
 type MessageAPI = ReturnType<typeof messageAPI>;
@@ -188,6 +200,7 @@ export abstract class CommandAPI extends AbstractAPI{
   stream: StreamAPI = streamAPI(this.clientProvider);
   topic: TopicAPI = topicAPI(this.clientProvider);
   partition: PartitionAPI = partitionAPI(this.clientProvider);
+  segment: SegmentAPI = segmentAPI(this.clientProvider);
   group: GroupAPI = groupAPI(this.clientProvider);
   offset: OffsetAPI = offsetAPI(this.clientProvider);
   message: MessageAPI = messageAPI(this.clientProvider);
