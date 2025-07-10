@@ -19,7 +19,7 @@
 use error_set::error_set;
 use quinn::{ConnectionError as QuicConnectionError, ReadToEndError, WriteError};
 use std::array::TryFromSliceError;
-use tokio::io;
+use std::io;
 
 error_set!(
     ServerError = ConfigError || ArchiverError || ConnectionError || LogError || CompatError || QuicError;
