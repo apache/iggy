@@ -22,6 +22,7 @@ import { uint8ToBuf } from '../number.utils.js';
 import { serializeIdentifier } from '../identifier.utils.js';
 import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 
 
 export type ChangePassword = {
@@ -32,7 +33,7 @@ export type ChangePassword = {
 
 
 export const CHANGE_PASSWORD = {
-  code: 37,
+  code: COMMAND_CODE.ChangePassword,
 
   serialize: ({ userId, currentPassword, newPassword }: ChangePassword) => {
 
@@ -57,5 +58,6 @@ export const CHANGE_PASSWORD = {
 
   deserialize: deserializeVoidResponse
 };
+
 
 export const changePassword = wrapCommand<ChangePassword, boolean>(CHANGE_PASSWORD);

@@ -19,6 +19,7 @@
 
 import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { uint8ToBuf } from '../number.utils.js';
 
@@ -28,7 +29,7 @@ export type UpdateStream = {
 }
 
 export const UPDATE_STREAM = {
-  code: 204,
+  code: COMMAND_CODE.UpdateStream,
 
   serialize: ({streamId, name}: UpdateStream) => {
     const bId = serializeIdentifier(streamId);
@@ -46,5 +47,6 @@ export const UPDATE_STREAM = {
 
   deserialize: deserializeVoidResponse
 };
+
 
 export const updateStream = wrapCommand<UpdateStream, boolean>(UPDATE_STREAM);

@@ -18,24 +18,4 @@
  */
 
 
-import type { CommandResponse } from '../../client/client.type.js';
-import { serializeLoginWithToken, type LoginResponse } from './login.utils.js';
-import { wrapCommand } from '../command.utils.js';
-import { COMMAND_CODE } from '../command.code.js';
-
-export type LoginWithTokenParam = {
-  token: string
-};
-
-export const LOGIN_WITH_TOKEN = {
-  code: COMMAND_CODE.LoginWithAccessToken,
-
-  serialize: ({token}: LoginWithTokenParam) => serializeLoginWithToken(token),
-
-  deserialize: (r: CommandResponse) => ({
-    userId: r.data.readUInt32LE(0)
-  })
-};
-
-
-export const loginWithToken = wrapCommand<LoginWithTokenParam, LoginResponse>(LOGIN_WITH_TOKEN);
+export * from './delete-segments.command.js';
