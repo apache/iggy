@@ -42,7 +42,7 @@ type UpdateTopicRequest struct {
 
 type Topic struct {
 	Id                   uint32        `json:"id"`
-	CreatedAt            int           `json:"createdAt"`
+	CreatedAt            uint64        `json:"createdAt"`
 	Name                 string        `json:"name"`
 	SizeBytes            uint64        `json:"sizeBytes"`
 	MessageExpiry        time.Duration `json:"messageExpiry"`
@@ -50,7 +50,7 @@ type Topic struct {
 	MaxTopicSize         uint64        `json:"maxTopicSize"`
 	ReplicationFactor    uint8         `json:"replicationFactor"`
 	MessagesCount        uint64        `json:"messagesCount"`
-	PartitionsCount      int           `json:"partitionsCount"`
+	PartitionsCount      uint32        `json:"partitionsCount"`
 }
 
 type TopicDetails struct {

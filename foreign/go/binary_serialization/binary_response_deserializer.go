@@ -199,8 +199,8 @@ func DeserializeTopic(payload []byte) (*iggcon.TopicDetails, error) {
 func DeserializeToTopic(payload []byte, position int) (iggcon.Topic, int, error) {
 	topic := iggcon.Topic{}
 	topic.Id = binary.LittleEndian.Uint32(payload[position : position+4])
-	topic.CreatedAt = int(binary.LittleEndian.Uint64(payload[position+4 : position+12]))
-	topic.PartitionsCount = int(binary.LittleEndian.Uint32(payload[position+12 : position+16]))
+	topic.CreatedAt = binary.LittleEndian.Uint64(payload[position+4 : position+12])
+	topic.PartitionsCount = binary.LittleEndian.Uint32(payload[position+12 : position+16])
 	topic.MessageExpiry = time.Microsecond * time.Duration(int(binary.LittleEndian.Uint64(payload[position+16:position+24])))
 	topic.CompressionAlgorithm = payload[position+24]
 	topic.MaxTopicSize = binary.LittleEndian.Uint64(payload[position+25 : position+33])
@@ -218,7 +218,7 @@ func DeserializeToTopic(payload []byte, position int) (iggcon.Topic, int, error)
 func DeserializePartition(payload []byte, position int) (iggcon.PartitionContract, int) {
 	id := binary.LittleEndian.Uint32(payload[position : position+4])
 	createdAt := binary.LittleEndian.Uint64(payload[position+4 : position+12])
-	segmentsCount := int(binary.LittleEndian.Uint32(payload[position+12 : position+16]))
+	segmentsCount := binary.LittleEndian.Uint32(payload[position+12 : position+16])
 	currentOffset := binary.LittleEndian.Uint64(payload[position+16 : position+24])
 	sizeBytes := binary.LittleEndian.Uint64(payload[position+24 : position+32])
 	messagesCount := binary.LittleEndian.Uint64(payload[position+32 : position+40])

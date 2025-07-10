@@ -28,7 +28,7 @@ type PartitionContract struct {
 	Id            uint32 `json:"id"`
 	MessagesCount uint64 `json:"messagesCount"`
 	CreatedAt     uint64 `json:"createdAt"`
-	SegmentsCount int    `json:"segmentsCount"`
+	SegmentsCount uint32 `json:"segmentsCount"`
 	CurrentOffset uint64 `json:"currentOffset"`
 	SizeBytes     uint64 `json:"sizeBytes"`
 }

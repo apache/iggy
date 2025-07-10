@@ -31,8 +31,8 @@ type ConsumerGroupDetails struct {
 
 type ConsumerGroupMember struct {
 	ID              uint32
-	PartitionsCount int
-	Partitions      []int
+	PartitionsCount uint32
+	Partitions      []uint32
 }
 
 type CreateConsumerGroupRequest struct {
