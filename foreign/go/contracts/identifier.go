@@ -27,7 +27,7 @@ type Identifier struct {
 	value  any
 }
 
-type IdKind int
+type IdKind uint8
 
 const (
 	NumericId IdKind = 1
