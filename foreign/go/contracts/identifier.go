@@ -17,12 +17,15 @@
 
 package iggcon
 
-import ierror "github.com/apache/iggy/foreign/go/errors"
+import (
+	"encoding/binary"
+	ierror "github.com/apache/iggy/foreign/go/errors"
+)
 
 type Identifier struct {
 	Kind   IdKind
 	Length int
-	Value  any
+	Value  []byte
 }
 
 type IdKind uint8
@@ -48,10 +51,13 @@ func newNumericIdentifier(value uint32) (Identifier, error) {
 	if value == 0 {
 		return Identifier{}, ierror.InvalidIdentifier
 	}
+
+	val := make([]byte, 4)
+	binary.LittleEndian.PutUint32(val, value)
 	return Identifier{
 		Kind:   NumericId,
 		Length: 4,
-		Value:  value,
+		Value:  val,
 	}, nil
 }
 
@@ -64,7 +70,7 @@ func newStringIdentifier(value string) (Identifier, error) {
 	return Identifier{
 		Kind:   StringId,
 		Length: len(value),
-		Value:  value,
+		Value:  []byte(value),
 	}, nil
 }
 
@@ -74,7 +80,7 @@ func (id Identifier) Uint32() (uint32, error) {
 		return 0, ierror.ResourceNotFound
 	}
 
-	return id.Value.(uint32), nil
+	return binary.LittleEndian.Uint32(id.Value), nil
 }
 
 // String returns the string value of the identifier.
@@ -83,5 +89,5 @@ func (id Identifier) String() (string, error) {
 		return "", ierror.InvalidIdentifier
 	}
 
-	return id.Value.(string), nil
+	return string(id.Value), nil
 }
