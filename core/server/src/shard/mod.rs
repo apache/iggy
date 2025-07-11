@@ -32,6 +32,7 @@ use iggy_common::{EncryptorKind, Identifier, IggyError, UserId, locking::IggyRwL
 use namespace::IggyNamespace;
 use std::{
     cell::{Cell, RefCell},
+    future::Future,
     pin::Pin,
     rc::Rc,
     str::FromStr,
@@ -154,6 +155,50 @@ pub struct IggyShard {
 impl IggyShard {
     pub fn builder() -> IggyShardBuilder {
         Default::default()
+    }
+
+    pub fn default_from_config(server_config: ServerConfig) -> Self {
+        use crate::bootstrap::resolve_persister;
+        use crate::state::file::FileState;
+        use crate::streaming::diagnostics::metrics::Metrics;
+        use crate::streaming::storage::SystemStorage;
+        use crate::versioning::SemanticVersion;
+        
+        let version = SemanticVersion::current().expect("Invalid version");
+        let persister = resolve_persister(server_config.system.partition.enforce_fsync);
+        let storage = Rc::new(SystemStorage::new(
+            server_config.system.clone(),
+            persister.clone(),
+        ));
+        
+        let state_path = server_config.system.get_state_messages_file_path();
+        let file_state = FileState::new(&state_path, &version, persister, None);
+        let state = crate::state::StateKind::File(file_state);
+        
+        let (stop_sender, stop_receiver) = async_channel::unbounded();
+        
+        Self {
+            id: 0, // Default shard ID
+            shards: Vec::new(), // No other shards in default config
+            shards_table: Default::default(),
+            version,
+            streams: Default::default(),
+            streams_ids: Default::default(),
+            storage,
+            state,
+            encryptor: None,
+            config: server_config,
+            client_manager: Default::default(),
+            active_sessions: Default::default(),
+            permissioner: Default::default(),
+            users: Default::default(),
+            metrics: Metrics::init(),
+            messages_receiver: Cell::new(None),
+            stop_receiver,
+            stop_sender,
+            task_registry: TaskRegistry::new(),
+            is_shutting_down: AtomicBool::new(false),
+        }
     }
 
     pub async fn init(&self) -> Result<(), IggyError> {

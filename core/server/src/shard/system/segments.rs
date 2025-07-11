@@ -104,7 +104,6 @@ impl IggyShard {
             (segments_count, messages_count)
         };
         drop(partition);
-        drop(topic);
         drop(stream);
 
         let mut stream = self

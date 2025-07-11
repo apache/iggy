@@ -21,8 +21,9 @@ use crate::streaming::create_message;
 use bytes::Bytes;
 use iggy::prelude::locking::IggyRwLockFn;
 use iggy::prelude::*;
-use server::configs::server::{DataMaintenanceConfig, PersonalAccessTokenConfig};
+use server::configs::server::{DataMaintenanceConfig, PersonalAccessTokenConfig, ServerConfig};
 use server::configs::system::{PartitionConfig, SegmentConfig, SystemConfig};
+use server::shard::IggyShard;
 use server::streaming::segments::*;
 use server::streaming::session::Session;
 use std::fs::DirEntry;
@@ -307,9 +308,7 @@ async fn given_at_least_one_not_expired_message_segment_should_not_be_expired() 
     );
 }
 
-/*
-//TODO: Fixme use shard instead of system
-#[tokio::test]
+#[compio::test]
 async fn should_delete_persisted_segments() -> Result<(), Box<dyn std::error::Error>> {
     let config = SystemConfig {
         segment: SegmentConfig {
@@ -319,11 +318,11 @@ async fn should_delete_persisted_segments() -> Result<(), Box<dyn std::error::Er
         ..Default::default()
     };
     let setup = TestSetup::init_with_config(config).await;
-    let mut system = System::new(
-        setup.config.clone(),
-        DataMaintenanceConfig::default(),
-        PersonalAccessTokenConfig::default(),
-    );
+    let server_config = ServerConfig {
+        system: setup.config.clone(),
+        ..Default::default()
+    };
+    let shard = IggyShard::default_from_config(server_config);
 
     // Properties
     let stream_id = Identifier::numeric(1)?;
@@ -341,14 +340,14 @@ async fn should_delete_persisted_segments() -> Result<(), Box<dyn std::error::Er
         .await;
 
     let session = Session::new(1, 1, SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 1234));
-    system.init().await.unwrap();
+    shard.init().await.unwrap();
 
-    system
+    shard
         .create_stream(&session, Some(stream_id.get_u32_value()?), stream_name)
         .await
         .unwrap();
 
-    system
+    shard
         .create_topic(
             &session,
             &stream_id,
@@ -362,7 +361,8 @@ async fn should_delete_persisted_segments() -> Result<(), Box<dyn std::error::Er
         )
         .await?;
 
-    let topic = system.find_topic(&session, &stream_id, &topic_id)?;
+    let stream = shard.find_stream(&session, &stream_id)?;
+    let topic = shard.find_topic(&session, &stream, &topic_id)?;
     let partitions = topic.get_partitions();
     let partition = partitions
         .first()
@@ -384,7 +384,7 @@ async fn should_delete_persisted_segments() -> Result<(), Box<dyn std::error::Er
             .sum();
         let batch = IggyMessagesBatchMut::from_messages(&messages, messages_size);
 
-        partition_lock.append_messages(batch, None).await.unwrap();
+        partition_lock.append_messages(batch).await.unwrap();
 
         drop(partition_lock);
 
@@ -418,7 +418,7 @@ async fn should_delete_persisted_segments() -> Result<(), Box<dyn std::error::Er
     println!("Initial segment offsets (sorted): {initial_offsets:?}");
 
     let first_keep_count = 3usize;
-    system
+    shard
         .delete_segments(
             &session,
             &stream_id,
@@ -449,7 +449,7 @@ async fn should_delete_persisted_segments() -> Result<(), Box<dyn std::error::Er
 
     // Second attempt to delete segments - keeping only 1 closed segment + 1 open
     let second_keep_count = 1usize;
-    system
+    shard
         .delete_segments(
             &session,
             &stream_id,
@@ -497,7 +497,6 @@ async fn should_delete_persisted_segments() -> Result<(), Box<dyn std::error::Er
 
     Ok(())
 }
-*/
 
 // Helper function to extract segment offsets from DirEntry list
 fn get_segment_offsets(segments: &[DirEntry]) -> Vec<u64> {
