@@ -78,8 +78,6 @@ impl ServerCommandHandler for DeleteStream {
             }
             let event = ShardEvent::DeletedShardTableRecords { namespaces };
             let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
-            //TODO: Once event response is implemented, we could get rid of this.
-            compio::time::sleep(Duration::from_millis(50)).await;
             topic.delete().await.with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to delete topic in stream: {self}")
             })?;

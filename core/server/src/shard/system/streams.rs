@@ -18,10 +18,13 @@
 
 use super::COMPONENT;
 use crate::shard::IggyShard;
+use crate::shard::namespace::IggyNamespace;
+use crate::streaming::partitions::partition;
 use crate::streaming::session::Session;
 use crate::streaming::streams::stream::Stream;
 use error_set::ErrContext;
 use futures::future::try_join_all;
+use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{IdKind, Identifier, IggyError};
 use std::cell::{Ref, RefCell, RefMut};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -407,7 +410,36 @@ impl IggyShard {
                     stream.stream_id,
                 )
             })?;
-        stream.purge().await
+        self.purge_stream_base(stream.stream_id).await?;
+        Ok(())
+    }
+
+    pub async fn purge_stream_bypass_auth(
+        &self,
+        stream_id: &Identifier,
+    ) -> Result<(), IggyError> {
+        let stream = self.get_stream(stream_id).with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
+        })?;
+        self.purge_stream_base(stream.stream_id).await?;
+        Ok(())
+    }
+
+    async fn purge_stream_base(&self, stream_id: u32) -> Result<(), IggyError> {
+        let stream = self.get_stream_ref(stream_id);
+        for topic in stream.get_topics() {
+            let topic_id = topic.topic_id;
+            for partition in topic.get_partitions() {
+                let mut partition = partition.write().await;
+                let partition_id = partition.partition_id;
+                let namespace = IggyNamespace::new(stream_id, topic_id, partition_id);
+                let shard_info = self.find_shard_table_record(&namespace).unwrap();
+                if shard_info.id() == self.id {
+                    partition.purge().await?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 

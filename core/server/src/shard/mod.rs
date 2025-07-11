@@ -689,11 +689,17 @@ impl IggyShard {
                 .await?;
                 Ok(())
             }
-            ShardEvent::PurgedStream { stream_id: _ } => todo!(),
+            ShardEvent::PurgedStream { stream_id,}  => {
+                self.purge_stream_bypass_auth(stream_id).await?;
+                Ok(())
+            }
             ShardEvent::PurgedTopic {
-                stream_id: _,
-                topic_id: _,
-            } => todo!(),
+                stream_id,
+                topic_id,
+            } => {
+                self.purge_topic_bypass_auth(stream_id, topic_id).await?;
+                Ok(())
+            },
             ShardEvent::DeletedTopic {
                 stream_id,
                 topic_id,
@@ -832,7 +838,11 @@ impl IggyShard {
             .map(|conn| {
                 // TODO: Fixme, maybe we should send response_sender
                 // and propagate errors back.
-                if let ShardEvent::CreatedShardTableRecords { .. } = &*event {
+                if matches!(
+                    *event,
+                    ShardEvent::CreatedShardTableRecords { .. }
+                        | ShardEvent::DeletedShardTableRecords { .. }
+                ) {
                     let (sender, receiver) = async_channel::bounded(1);
                     conn.send(ShardFrame::new(event.clone().into(), Some(sender.clone())));
                     Some(receiver.clone())
@@ -863,6 +873,11 @@ impl IggyShard {
                 .find(|shard| shard.id == shard_info.id)
                 .expect("Shard not found in the shards table.")
         })
+    }
+
+    pub fn find_shard_table_record(&self, namespace: &IggyNamespace) -> Option<ShardInfo> {
+        let shards_table = self.shards_table.borrow();
+        shards_table.get(namespace).cloned()
     }
 
     pub fn remove_shard_table_records(
