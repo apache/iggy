@@ -27,7 +27,7 @@ import (
 
 func TestSerializeIdentifier_StringId(t *testing.T) {
 	// Test case for StringId
-	identifier, _ := iggcon.NewStringIdentifier("Hello")
+	identifier, _ := iggcon.NewIdentifier("Hello")
 
 	// Serialize the identifier
 	serialized := SerializeIdentifier(identifier)
@@ -47,7 +47,7 @@ func TestSerializeIdentifier_StringId(t *testing.T) {
 
 func TestSerializeIdentifier_NumericId(t *testing.T) {
 	// Test case for NumericId
-	identifier, _ := iggcon.NewNumericIdentifier(123)
+	identifier, _ := iggcon.NewIdentifier(uint32(123))
 
 	// Serialize the identifier
 	serialized := SerializeIdentifier(identifier)
@@ -67,7 +67,7 @@ func TestSerializeIdentifier_NumericId(t *testing.T) {
 
 func TestSerializeIdentifier_EmptyStringId(t *testing.T) {
 	// Test case for an empty StringId
-	_, err := iggcon.NewStringIdentifier("")
+	_, err := iggcon.NewIdentifier("")
 
 	// Check if the serialized bytes match the expected bytes
 	if !errors.Is(err, ierror.InvalidIdentifier) {

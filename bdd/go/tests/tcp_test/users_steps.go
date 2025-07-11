@@ -46,7 +46,7 @@ func successfullyCreateUser(name string, client iggycli.Client) uint32 {
 			},
 		})
 	itShouldNotReturnError(err)
-	nameIdentifier, _ := iggcon.NewStringIdentifier(name)
+	nameIdentifier, _ := iggcon.NewIdentifier(name)
 	user, err := client.GetUser(nameIdentifier)
 	itShouldNotReturnError(err)
 
@@ -56,7 +56,7 @@ func successfullyCreateUser(name string, client iggycli.Client) uint32 {
 // ASSERTIONS
 
 func itShouldSuccessfullyCreateUser(name string, client iggycli.Client) {
-	nameIdentifier, _ := iggcon.NewStringIdentifier(name)
+	nameIdentifier, _ := iggcon.NewIdentifier(name)
 	user, err := client.GetUser(nameIdentifier)
 
 	itShouldNotReturnError(err)
@@ -67,7 +67,7 @@ func itShouldSuccessfullyCreateUser(name string, client iggycli.Client) {
 }
 
 func itShouldSuccessfullyCreateUserWithPermissions(name string, client iggycli.Client, permissions map[int]*iggcon.StreamPermissions) {
-	nameIdentifier, _ := iggcon.NewStringIdentifier(name)
+	nameIdentifier, _ := iggcon.NewIdentifier(name)
 	user, err := client.GetUser(nameIdentifier)
 
 	itShouldNotReturnError(err)
@@ -98,7 +98,7 @@ func itShouldSuccessfullyCreateUserWithPermissions(name string, client iggycli.C
 }
 
 func itShouldSuccessfullyUpdateUser(id uint32, name string, client iggycli.Client) {
-	nameIdentifier, _ := iggcon.NewStringIdentifier(name)
+	nameIdentifier, _ := iggcon.NewIdentifier(name)
 	user, err := client.GetUser(nameIdentifier)
 
 	itShouldNotReturnError(err)
@@ -113,7 +113,7 @@ func itShouldSuccessfullyUpdateUser(id uint32, name string, client iggycli.Clien
 }
 
 func itShouldSuccessfullyDeleteUser(userId uint32, client iggycli.Client) {
-	identifier, _ := iggcon.NewNumericIdentifier(userId)
+	identifier, _ := iggcon.NewIdentifier(userId)
 	user, err := client.GetUser(identifier)
 
 	itShouldReturnSpecificError(err, "resource_not_found")
@@ -123,7 +123,7 @@ func itShouldSuccessfullyDeleteUser(userId uint32, client iggycli.Client) {
 }
 
 func itShouldSuccessfullyUpdateUserPermissions(userId uint32, client iggycli.Client) {
-	identifier, _ := iggcon.NewNumericIdentifier(userId)
+	identifier, _ := iggcon.NewIdentifier(userId)
 	user, err := client.GetUser(identifier)
 
 	itShouldNotReturnError(err)

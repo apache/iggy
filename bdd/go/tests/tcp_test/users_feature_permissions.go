@@ -27,7 +27,7 @@ var _ = ginkgo.Describe("UPDATE USER PERMISSIONS:", func() {
 		ginkgo.Context("tries to update permissions of existing user", func() {
 			client := createAuthorizedConnection()
 			userId := successfullyCreateUser(createRandomString(16), client)
-			identifier, _ := iggcon.NewNumericIdentifier(userId)
+			identifier, _ := iggcon.NewIdentifier(userId)
 			defer deleteUserAfterTests(identifier, client)
 
 			err := client.UpdatePermissions(

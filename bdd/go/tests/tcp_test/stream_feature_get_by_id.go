@@ -29,7 +29,7 @@ var _ = ginkgo.Describe("GET STREAM BY ID:", func() {
 			client := createAuthorizedConnection()
 			streamId, name := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			stream, err := client.GetStream(streamIdentifier)
 
 			itShouldNotReturnError(err)

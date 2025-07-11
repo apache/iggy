@@ -32,9 +32,9 @@ var _ = ginkgo.Describe("GET CONSUMER GROUP BY ID:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			groupId, name := successfullyCreateConsumer(streamId, topicId, client)
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
-			topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
-			groupIdentifier, _ := iggcon.NewNumericIdentifier(groupId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+			groupIdentifier, _ := iggcon.NewIdentifier(groupId)
 			group, err := client.GetConsumerGroup(streamIdentifier, topicIdentifier, groupIdentifier)
 
 			itShouldNotReturnError(err)
@@ -57,7 +57,7 @@ var _ = ginkgo.Describe("GET CONSUMER GROUP BY ID:", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			_, err := client.GetConsumerGroup(
 				streamIdentifier,
 				randomU32Identifier(),
@@ -72,8 +72,8 @@ var _ = ginkgo.Describe("GET CONSUMER GROUP BY ID:", func() {
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
-			topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			_, err := client.GetConsumerGroup(
 				streamIdentifier,
 				topicIdentifier,

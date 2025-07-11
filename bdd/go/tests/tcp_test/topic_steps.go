@@ -33,7 +33,7 @@ func successfullyCreateTopic(streamId uint32, client iggycli.Client) (uint32, st
 	topicId := createRandomUInt32()
 	replicationFactor := uint8(1)
 	name := createRandomString(128)
-	streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
+	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	_, err := client.CreateTopic(
 		streamIdentifier,
 		name,
@@ -89,8 +89,8 @@ func itShouldContainSpecificTopic(id uint32, name string, topics []iggcon.Topic)
 }
 
 func itShouldSuccessfullyCreateTopic(streamId uint32, topicId uint32, expectedName string, client iggycli.Client) {
-	streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
-	topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
+	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 	topic, err := client.GetTopic(streamIdentifier, topicIdentifier)
 	ginkgo.It("should create topic with id "+string(rune(topicId)), func() {
 		gomega.Expect(topic).NotTo(gomega.BeNil())
@@ -105,8 +105,8 @@ func itShouldSuccessfullyCreateTopic(streamId uint32, topicId uint32, expectedNa
 }
 
 func itShouldSuccessfullyUpdateTopic(streamId uint32, topicId uint32, expectedName string, client iggycli.Client) {
-	streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
-	topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
+	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 	topic, err := client.GetTopic(streamIdentifier, topicIdentifier)
 
 	ginkgo.It("should update topic with id "+string(rune(topicId)), func() {
@@ -122,8 +122,8 @@ func itShouldSuccessfullyUpdateTopic(streamId uint32, topicId uint32, expectedNa
 }
 
 func itShouldSuccessfullyDeleteTopic(streamId uint32, topicId uint32, client iggycli.Client) {
-	streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
-	topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
+	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 	topic, err := client.GetTopic(streamIdentifier, topicIdentifier)
 
 	itShouldReturnSpecificIggyError(err, ierror.TopicIdNotFound)

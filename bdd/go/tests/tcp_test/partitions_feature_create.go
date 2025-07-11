@@ -30,8 +30,8 @@ var _ = ginkgo.Describe("CREATE PARTITION:", func() {
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
-			topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			partitionsCount := uint32(10)
 			err := client.CreatePartitions(
 				streamIdentifier,
@@ -58,7 +58,7 @@ var _ = ginkgo.Describe("CREATE PARTITION:", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			err := client.CreatePartitions(
 				streamIdentifier,
 				randomU32Identifier(),

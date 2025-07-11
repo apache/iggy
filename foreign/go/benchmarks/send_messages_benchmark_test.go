@@ -104,7 +104,7 @@ func BenchmarkSendMessage(b *testing.B) {
 }
 
 func ensureInfrastructureIsInitialized(cli iggycli.Client, streamId uint32) error {
-	streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
+	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	if _, streamErr := cli.GetStream(streamIdentifier); streamErr != nil {
 		_, streamErr = cli.CreateStream("benchmark"+fmt.Sprint(streamId), &streamId)
 		if streamErr != nil {
@@ -112,7 +112,7 @@ func ensureInfrastructureIsInitialized(cli iggycli.Client, streamId uint32) erro
 		}
 	}
 
-	topicIdentifier, _ := iggcon.NewNumericIdentifier(1)
+	topicIdentifier, _ := iggcon.NewIdentifier(uint32(1))
 	if _, topicErr := cli.GetTopic(streamIdentifier, topicIdentifier); topicErr != nil {
 		_, topicErr = cli.CreateTopic(
 			streamIdentifier,
@@ -133,7 +133,7 @@ func ensureInfrastructureIsInitialized(cli iggycli.Client, streamId uint32) erro
 }
 
 func cleanupInfrastructure(cli iggycli.Client, streamId uint32) error {
-	streamIdent, _ := iggcon.NewNumericIdentifier(streamId)
+	streamIdent, _ := iggcon.NewIdentifier(streamId)
 	return cli.DeleteStream(streamIdent)
 }
 
@@ -162,13 +162,13 @@ func SendMessage(cli iggycli.Client, producerNumber, messagesCount, messagesBatc
 	totalMessagesBytes := int64(totalMessages * messageSize)
 	fmt.Printf("Executing Send Messages command for producer %d, messages count %d, with size %d bytes\n", producerNumber, totalMessages, totalMessagesBytes)
 
-	streamId, _ := iggcon.NewNumericIdentifier(uint32(startingStreamId + producerNumber))
+	streamId, _ := iggcon.NewIdentifier(uint32(startingStreamId + producerNumber))
 	messages := CreateMessages(messagesCount, messageSize)
 	latencies := make([]time.Duration, 0)
 
 	for i := 0; i < messagesBatch; i++ {
 		startTime := time.Now()
-		topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
+		topicIdentifier, _ := iggcon.NewIdentifier(uint32(topicId))
 		_ = cli.SendMessages(
 			streamId,
 			topicIdentifier,

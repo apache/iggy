@@ -79,7 +79,7 @@ func itShouldContainSpecificStream(id uint32, name string, streams []iggcon.Stre
 }
 
 func itShouldSuccessfullyCreateStream(id uint32, expectedName string, client iggycli.Client) {
-	streamIdentifier, _ := iggcon.NewNumericIdentifier(id)
+	streamIdentifier, _ := iggcon.NewIdentifier(id)
 	stream, err := client.GetStream(streamIdentifier)
 
 	itShouldNotReturnError(err)
@@ -93,7 +93,7 @@ func itShouldSuccessfullyCreateStream(id uint32, expectedName string, client igg
 }
 
 func itShouldSuccessfullyUpdateStream(id uint32, expectedName string, client iggycli.Client) {
-	streamIdentifier, _ := iggcon.NewNumericIdentifier(id)
+	streamIdentifier, _ := iggcon.NewIdentifier(id)
 	stream, err := client.GetStream(streamIdentifier)
 
 	itShouldNotReturnError(err)
@@ -107,7 +107,7 @@ func itShouldSuccessfullyUpdateStream(id uint32, expectedName string, client igg
 }
 
 func itShouldSuccessfullyDeleteStream(id uint32, client iggycli.Client) {
-	streamIdentifier, _ := iggcon.NewNumericIdentifier(id)
+	streamIdentifier, _ := iggcon.NewIdentifier(id)
 	stream, err := client.GetStream(streamIdentifier)
 
 	itShouldReturnSpecificIggyError(err, ierror.StreamIdNotFound)
@@ -117,6 +117,6 @@ func itShouldSuccessfullyDeleteStream(id uint32, client iggycli.Client) {
 }
 
 func deleteStreamAfterTests(streamId uint32, client iggycli.Client) {
-	streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
+	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	_ = client.DeleteStream(streamIdentifier)
 }

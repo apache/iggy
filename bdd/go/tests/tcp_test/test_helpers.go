@@ -63,7 +63,7 @@ func createRandomUInt32() uint32 {
 }
 
 func randomU32Identifier() iggcon.Identifier {
-	id, _ := iggcon.NewNumericIdentifier(createRandomUInt32())
+	id, _ := iggcon.NewIdentifier(createRandomUInt32())
 	return id
 }
 

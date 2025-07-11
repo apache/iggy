@@ -30,7 +30,7 @@ var _ = ginkgo.Describe("UPDATE STREAM:", func() {
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			newName := createRandomString(128)
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			err := client.UpdateStream(streamIdentifier, newName)
 			itShouldNotReturnError(err)
 			itShouldSuccessfullyUpdateStream(streamId, newName, client)
@@ -43,7 +43,7 @@ var _ = ginkgo.Describe("UPDATE STREAM:", func() {
 			defer deleteStreamAfterTests(stream1Id, client)
 			defer deleteStreamAfterTests(stream2Id, client)
 
-			stream2Identifier, _ := iggcon.NewNumericIdentifier(stream2Id)
+			stream2Identifier, _ := iggcon.NewIdentifier(stream2Id)
 			err := client.UpdateStream(stream2Identifier, stream1Name)
 
 			itShouldReturnSpecificError(err, "stream_name_already_exists")
@@ -60,7 +60,7 @@ var _ = ginkgo.Describe("UPDATE STREAM:", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, createAuthorizedConnection())
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			err := client.UpdateStream(streamIdentifier, createRandomString(256))
 
 			itShouldReturnSpecificError(err, "stream_name_too_long")

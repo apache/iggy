@@ -31,8 +31,8 @@ var _ = ginkgo.Describe("GET ALL CONSUMER GROUPS:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			groupId, name := successfullyCreateConsumer(streamId, topicId, client)
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
-			topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			groups, err := client.GetConsumerGroups(streamIdentifier, topicIdentifier)
 
 			itShouldNotReturnError(err)

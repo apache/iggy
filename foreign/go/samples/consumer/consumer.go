@@ -31,11 +31,11 @@ import (
 
 // config
 const (
-	DefaultStreamId = 1
+	DefaultStreamId = uint32(1)
 	TopicId         = uint32(1)
 	Partition       = 1
 	Interval        = 1000
-	ConsumerId      = 1
+	ConsumerId      = uint32(1)
 )
 
 func main() {
@@ -62,9 +62,9 @@ func main() {
 }
 
 func EnsureInfrastructureIsInitialized(cli iggycli.Client) error {
-	streamIdentifier, _ := iggcon.NewNumericIdentifier(DefaultStreamId)
+	streamIdentifier, _ := iggcon.NewIdentifier(DefaultStreamId)
 	if _, streamErr := cli.GetStream(streamIdentifier); streamErr != nil {
-		uint32DefaultStreamId := uint32(DefaultStreamId)
+		uint32DefaultStreamId := DefaultStreamId
 		_, streamErr = cli.CreateStream("Test Producer Stream", &uint32DefaultStreamId)
 
 		if streamErr != nil {
@@ -76,7 +76,7 @@ func EnsureInfrastructureIsInitialized(cli iggycli.Client) error {
 
 	fmt.Printf("Stream with ID: %d exists.\n", DefaultStreamId)
 
-	topicIdentifier, _ := iggcon.NewNumericIdentifier(TopicId)
+	topicIdentifier, _ := iggcon.NewIdentifier(TopicId)
 	if _, topicErr := cli.GetTopic(streamIdentifier, topicIdentifier); topicErr != nil {
 		uint32TopicId := TopicId
 		_, topicErr = cli.CreateTopic(
@@ -105,9 +105,9 @@ func ConsumeMessages(cli iggycli.Client) error {
 	fmt.Printf("Messages will be polled from stream '%d', topic '%d', partition '%d' with interval %d ms.\n", DefaultStreamId, TopicId, Partition, Interval)
 
 	for {
-		streamIdentifier, _ := iggcon.NewNumericIdentifier(DefaultStreamId)
-		topicIdentifier, _ := iggcon.NewNumericIdentifier(TopicId)
-		consumerIdentifier, _ := iggcon.NewNumericIdentifier(ConsumerId)
+		streamIdentifier, _ := iggcon.NewIdentifier(DefaultStreamId)
+		topicIdentifier, _ := iggcon.NewIdentifier(TopicId)
+		consumerIdentifier, _ := iggcon.NewIdentifier(ConsumerId)
 		partionId := uint32(Partition)
 		messagesWrapper, err := cli.PollMessages(
 			streamIdentifier,

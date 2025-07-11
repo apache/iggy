@@ -25,9 +25,9 @@ import (
 
 func TestSerialize_TcpFetchMessagesRequest(t *testing.T) {
 	partitionId := uint32(123)
-	consumerId, _ := iggcon.NewNumericIdentifier(42)
-	streamId, _ := iggcon.NewStringIdentifier("test_stream_id")
-	topicId, _ := iggcon.NewStringIdentifier("test_topic_id")
+	consumerId, _ := iggcon.NewIdentifier(uint32(42))
+	streamId, _ := iggcon.NewIdentifier("test_stream_id")
+	topicId, _ := iggcon.NewIdentifier("test_topic_id")
 	// Create a sample TcpFetchMessagesRequest
 	request := TcpFetchMessagesRequest{
 		Consumer: iggcon.Consumer{

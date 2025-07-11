@@ -34,8 +34,8 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			newName := createRandomString(128)
 			replicationFactor := uint8(1)
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
-			topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			err := client.UpdateTopic(
 				streamIdentifier,
 				topicIdentifier,
@@ -55,8 +55,8 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 			_, topic1Name := successfullyCreateTopic(streamId, client)
 			topic2Id, _ := successfullyCreateTopic(streamId, client)
 			replicationFactor := uint8(1)
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
-			topic2Identifier, _ := iggcon.NewNumericIdentifier(topic2Id)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topic2Identifier, _ := iggcon.NewIdentifier(topic2Id)
 			err := client.UpdateTopic(
 				streamIdentifier,
 				topic2Identifier,
@@ -89,7 +89,7 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, createAuthorizedConnection())
 			replicationFactor := uint8(1)
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			err := client.UpdateTopic(
 				streamIdentifier,
 				randomU32Identifier(),
@@ -108,8 +108,8 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 			defer deleteStreamAfterTests(streamId, createAuthorizedConnection())
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			replicationFactor := uint8(1)
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
-			topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			err := client.UpdateTopic(
 				streamIdentifier,
 				topicIdentifier,

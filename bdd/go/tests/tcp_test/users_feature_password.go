@@ -48,7 +48,7 @@ var _ = ginkgo.Describe("CHANGE PASSWORD:", func() {
 					},
 				})
 			itShouldNotReturnError(err)
-			identifier, _ := iggcon.NewStringIdentifier(username)
+			identifier, _ := iggcon.NewIdentifier(username)
 			defer deleteUserAfterTests(identifier, client)
 
 			err = client.ChangePassword(identifier, password, "newPassword")

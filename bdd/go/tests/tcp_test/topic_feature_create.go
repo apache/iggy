@@ -34,7 +34,7 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 			replicationFactor := uint8(1)
 			name := createRandomString(32)
 			defer deleteStreamAfterTests(streamId, client)
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			_, err := client.CreateTopic(
 				streamIdentifier,
 				name,
@@ -55,7 +55,7 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 			topicId := uint32(1)
 			replicationFactor := uint8(1)
 			name := createRandomString(32)
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			_, err := client.CreateTopic(
 				streamIdentifier,
 				name,
@@ -76,7 +76,7 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 			_, name := successfullyCreateTopic(streamId, client)
 
 			replicationFactor := uint8(1)
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topicId := createRandomUInt32()
 			_, err := client.CreateTopic(
 				streamIdentifier,
@@ -95,7 +95,7 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			replicationFactor := uint8(1)
 			_, err := client.CreateTopic(
 				streamIdentifier,
@@ -114,7 +114,7 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, createAuthorizedConnection())
 
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			replicationFactor := uint8(1)
 			topicId := createRandomUInt32()
 			_, err := client.CreateTopic(
@@ -136,7 +136,7 @@ var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 			client := createClient()
 			replicationFactor := uint8(1)
 			topicId := uint32(1)
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(10)
+			streamIdentifier, _ := iggcon.NewIdentifier[uint32](10)
 			_, err := client.CreateTopic(
 				streamIdentifier,
 				"name",

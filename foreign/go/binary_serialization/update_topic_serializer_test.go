@@ -24,8 +24,8 @@ import (
 )
 
 func TestSerialize_UpdateTopic(t *testing.T) {
-	streamId, _ := iggcon.NewStringIdentifier("stream")
-	topicId, _ := iggcon.NewNumericIdentifier(1)
+	streamId, _ := iggcon.NewIdentifier("stream")
+	topicId, _ := iggcon.NewIdentifier(uint32(1))
 	request := TcpUpdateTopicRequest{
 		StreamId:      streamId,
 		TopicId:       topicId,

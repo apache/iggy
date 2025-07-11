@@ -28,7 +28,7 @@ var _ = ginkgo.Describe("GET USER:", func() {
 			client := createAuthorizedConnection()
 			name := createRandomString(16)
 			userId := successfullyCreateUser(name, client)
-			userIdentifier, _ := iggcon.NewNumericIdentifier(userId)
+			userIdentifier, _ := iggcon.NewIdentifier(userId)
 			defer deleteUserAfterTests(userIdentifier, client)
 
 			users, err := client.GetUsers()

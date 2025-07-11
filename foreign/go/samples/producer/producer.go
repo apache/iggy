@@ -61,7 +61,7 @@ func main() {
 }
 
 func EnsureInfrastructureIsInitialized(cli iggycli.Client) error {
-	streamIdentifier, _ := iggcon.NewNumericIdentifier(StreamId)
+	streamIdentifier, _ := iggcon.NewIdentifier(StreamId)
 	if _, streamErr := cli.GetStream(streamIdentifier); streamErr != nil {
 		uint32StreamId := uint32(StreamId)
 		_, streamErr = cli.CreateStream("Test Producer Stream", &uint32StreamId)
@@ -77,7 +77,7 @@ func EnsureInfrastructureIsInitialized(cli iggycli.Client) error {
 
 	fmt.Printf("Stream with ID: %d exists.\n", StreamId)
 
-	topicIdentifier, _ := iggcon.NewNumericIdentifier(TopicId)
+	topicIdentifier, _ := iggcon.NewIdentifier(TopicId)
 	if _, topicErr := cli.GetTopic(streamIdentifier, topicIdentifier); topicErr != nil {
 		refStreamId := StreamId
 		_, topicErr = cli.CreateTopic(
@@ -126,8 +126,8 @@ func PublishMessages(messageStream iggycli.Client) error {
 			})
 		}
 
-		streamIdentifier, _ := iggcon.NewNumericIdentifier(StreamId)
-		topicIdentifier, _ := iggcon.NewNumericIdentifier(TopicId)
+		streamIdentifier, _ := iggcon.NewIdentifier(StreamId)
+		topicIdentifier, _ := iggcon.NewIdentifier(TopicId)
 		err := messageStream.SendMessages(
 			streamIdentifier,
 			topicIdentifier,

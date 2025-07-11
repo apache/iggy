@@ -27,7 +27,7 @@ var _ = ginkgo.Describe("DELETE USER:", func() {
 		ginkgo.Context("tries to delete user with correct data", func() {
 			client := createAuthorizedConnection()
 			userId := successfullyCreateUser(createRandomString(16), client)
-			userIdentifier, _ := iggcon.NewNumericIdentifier(userId)
+			userIdentifier, _ := iggcon.NewIdentifier(userId)
 			err := client.DeleteUser(userIdentifier)
 
 			itShouldNotReturnError(err)

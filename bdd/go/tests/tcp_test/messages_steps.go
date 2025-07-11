@@ -43,8 +43,8 @@ func createDefaultMessages() []iggcon.IggyMessage {
 }
 
 func itShouldSuccessfullyPublishMessages(streamId uint32, topicId uint32, messages []iggcon.IggyMessage, client iggycli.Client) {
-	streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
-	topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
+	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 	result, err := client.PollMessages(
 		streamIdentifier,
 		topicIdentifier,

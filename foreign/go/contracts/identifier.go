@@ -34,8 +34,19 @@ const (
 	StringId  IdKind = 2
 )
 
-// NewNumericIdentifier creates a new identifier from the given numeric value.
-func NewNumericIdentifier(value uint32) (Identifier, error) {
+// NewIdentifier create a new identifier
+func NewIdentifier[T uint32 | string](value T) (Identifier, error) {
+	switch v := any(value).(type) {
+	case uint32:
+		return newNumericIdentifier(v)
+	case string:
+		return newStringIdentifier(v)
+	}
+	return Identifier{}, ierror.InvalidIdentifier
+}
+
+// newNumericIdentifier creates a new identifier from the given numeric value.
+func newNumericIdentifier(value uint32) (Identifier, error) {
 	if value == 0 {
 		return Identifier{}, ierror.InvalidIdentifier
 	}
@@ -47,7 +58,7 @@ func NewNumericIdentifier(value uint32) (Identifier, error) {
 }
 
 // NewStringIdentifier creates a new identifier from the given string value.
-func NewStringIdentifier(value string) (Identifier, error) {
+func newStringIdentifier(value string) (Identifier, error) {
 	length := len(value)
 	if length == 0 || length > 255 {
 		return Identifier{}, ierror.InvalidIdentifier

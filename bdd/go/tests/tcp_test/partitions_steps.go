@@ -25,8 +25,8 @@ import (
 )
 
 func itShouldHaveExpectedNumberOfPartitions(streamId uint32, topicId uint32, expectedPartitions uint32, client iggycli.Client) {
-	streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
-	topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
+	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 	topic, err := client.GetTopic(streamIdentifier, topicIdentifier)
 
 	ginkgo.It("should have "+string(rune(expectedPartitions))+" partitions", func() {

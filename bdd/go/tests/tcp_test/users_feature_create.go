@@ -46,7 +46,7 @@ var _ = ginkgo.Describe("CREATE USER:", func() {
 						SendMessages:  true,
 					},
 				})
-			identifier, _ := iggcon.NewStringIdentifier(username)
+			identifier, _ := iggcon.NewIdentifier(username)
 			defer deleteUserAfterTests(identifier, client)
 
 			itShouldNotReturnError(err)
@@ -101,7 +101,7 @@ var _ = ginkgo.Describe("CREATE USER:", func() {
 					},
 					Streams: userStreamPermissions,
 				})
-			identifier, _ := iggcon.NewStringIdentifier(username)
+			identifier, _ := iggcon.NewIdentifier(username)
 			defer deleteUserAfterTests(identifier, client)
 			defer deleteStreamAfterTests(streamId, client)
 

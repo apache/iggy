@@ -31,8 +31,8 @@ var _ = ginkgo.Describe("GET TOPIC BY ID:", func() {
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, name := successfullyCreateTopic(streamId, client)
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
-			topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			topic, err := client.GetTopic(streamIdentifier, topicIdentifier)
 
 			itShouldNotReturnError(err)
@@ -51,7 +51,7 @@ var _ = ginkgo.Describe("GET TOPIC BY ID:", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 
 			_, err := client.GetTopic(streamIdentifier, randomU32Identifier())
 

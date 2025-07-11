@@ -26,8 +26,8 @@ import (
 
 func TestSerialize_SendMessagesRequest(t *testing.T) {
 	message1 := generateTestMessage("data1")
-	streamId, _ := iggcon.NewStringIdentifier("test_stream_id")
-	topicId, _ := iggcon.NewStringIdentifier("test_topic_id")
+	streamId, _ := iggcon.NewIdentifier("test_stream_id")
+	topicId, _ := iggcon.NewIdentifier("test_topic_id")
 	request := TcpSendMessagesRequest{
 		StreamId:     streamId,
 		TopicId:      topicId,

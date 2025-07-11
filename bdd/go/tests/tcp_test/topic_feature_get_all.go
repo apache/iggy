@@ -30,7 +30,7 @@ var _ = ginkgo.Describe("GET ALL TOPICS:", func() {
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, name := successfullyCreateTopic(streamId, client)
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			topics, err := client.GetTopics(streamIdentifier)
 
 			itShouldNotReturnError(err)

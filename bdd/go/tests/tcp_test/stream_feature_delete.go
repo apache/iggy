@@ -28,7 +28,7 @@ var _ = ginkgo.Describe("DELETE STREAM:", func() {
 		ginkgo.Context("and tries to delete existing stream", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			err := client.DeleteStream(streamIdentifier)
 
 			itShouldNotReturnError(err)

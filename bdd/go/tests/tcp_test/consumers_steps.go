@@ -29,8 +29,8 @@ import (
 func successfullyCreateConsumer(streamId uint32, topicId uint32, cli iggycli.Client) (uint32, string) {
 	groupId := createRandomUInt32()
 	name := createRandomString(16)
-	streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
-	topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
+	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 	_, err := cli.CreateConsumerGroup(
 		streamIdentifier,
 		topicIdentifier,
@@ -43,9 +43,9 @@ func successfullyCreateConsumer(streamId uint32, topicId uint32, cli iggycli.Cli
 }
 
 func successfullyJoinConsumer(streamId uint32, topicId uint32, groupId uint32, client iggycli.Client) {
-	streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
-	topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
-	groupIdentifier, _ := iggcon.NewNumericIdentifier(groupId)
+	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+	groupIdentifier, _ := iggcon.NewIdentifier(groupId)
 	err := client.JoinConsumerGroup(
 		streamIdentifier,
 		topicIdentifier,
@@ -98,9 +98,9 @@ func itShouldContainSpecificConsumer(id uint32, name string, consumers []iggcon.
 }
 
 func itShouldSuccessfullyCreateConsumer(streamId uint32, topicId uint32, groupId uint32, expectedName string, client iggycli.Client) {
-	streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
-	topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
-	groupIdentifier, _ := iggcon.NewNumericIdentifier(groupId)
+	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+	groupIdentifier, _ := iggcon.NewIdentifier(groupId)
 	consumer, err := client.GetConsumerGroup(streamIdentifier, topicIdentifier, groupIdentifier)
 	ginkgo.It("should create consumer with id "+string(rune(groupId)), func() {
 		gomega.Expect(consumer).NotTo(gomega.BeNil())
@@ -115,9 +115,9 @@ func itShouldSuccessfullyCreateConsumer(streamId uint32, topicId uint32, groupId
 }
 
 func itShouldSuccessfullyDeletedConsumer(streamId uint32, topicId uint32, groupId uint32, client iggycli.Client) {
-	streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
-	topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
-	groupIdentifier, _ := iggcon.NewNumericIdentifier(groupId)
+	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+	groupIdentifier, _ := iggcon.NewIdentifier(groupId)
 	consumer, err := client.GetConsumerGroup(streamIdentifier, topicIdentifier, groupIdentifier)
 	itShouldReturnSpecificError(err, "consumer_group_not_found")
 	ginkgo.It("should not return consumer", func() {
@@ -126,9 +126,9 @@ func itShouldSuccessfullyDeletedConsumer(streamId uint32, topicId uint32, groupI
 }
 
 func itShouldSuccessfullyJoinConsumer(streamId uint32, topicId uint32, groupId uint32, client iggycli.Client) {
-	streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
-	topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
-	groupIdentifier, _ := iggcon.NewNumericIdentifier(groupId)
+	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+	groupIdentifier, _ := iggcon.NewIdentifier(groupId)
 	consumer, err := client.GetConsumerGroup(streamIdentifier, topicIdentifier, groupIdentifier)
 
 	ginkgo.It("should join consumer with id "+string(rune(groupId)), func() {
@@ -140,9 +140,9 @@ func itShouldSuccessfullyJoinConsumer(streamId uint32, topicId uint32, groupId u
 }
 
 func itShouldSuccessfullyLeaveConsumer(streamId uint32, topicId uint32, groupId uint32, client iggycli.Client) {
-	streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
-	topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
-	groupIdentifier, _ := iggcon.NewNumericIdentifier(groupId)
+	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+	groupIdentifier, _ := iggcon.NewIdentifier(groupId)
 	consumer, err := client.GetConsumerGroup(streamIdentifier, topicIdentifier, groupIdentifier)
 	ginkgo.It("should leave consumer with id "+string(rune(groupId)), func() {
 		gomega.Expect(consumer).NotTo(gomega.BeNil())

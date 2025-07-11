@@ -31,8 +31,8 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			messages := createDefaultMessages()
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
-			topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			err := client.SendMessages(
 				streamIdentifier,
 				topicIdentifier,
@@ -48,7 +48,7 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 			streamId, _ := successfullyCreateStream("2"+prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			messages := createDefaultMessages()
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			err := client.SendMessages(
 				streamIdentifier,
 				randomU32Identifier(),
@@ -76,8 +76,8 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			messages := createDefaultMessages()
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
-			topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			err := client.SendMessages(
 				streamIdentifier,
 				topicIdentifier,
@@ -92,8 +92,8 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, createAuthorizedConnection())
 			topicId, _ := successfullyCreateTopic(streamId, client)
-			streamIdentifier, _ := iggcon.NewNumericIdentifier(streamId)
-			topicIdentifier, _ := iggcon.NewNumericIdentifier(topicId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			err := client.SendMessages(
 				streamIdentifier,
 				topicIdentifier,
