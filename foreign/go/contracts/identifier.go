@@ -17,14 +17,12 @@
 
 package iggcon
 
-import (
-	ierror "github.com/apache/iggy/foreign/go/errors"
-)
+import ierror "github.com/apache/iggy/foreign/go/errors"
 
 type Identifier struct {
 	Kind   IdKind
 	Length int
-	value  any
+	Value  any
 }
 
 type IdKind uint8
@@ -53,7 +51,7 @@ func newNumericIdentifier(value uint32) (Identifier, error) {
 	return Identifier{
 		Kind:   NumericId,
 		Length: 4,
-		value:  value,
+		Value:  value,
 	}, nil
 }
 
@@ -66,7 +64,7 @@ func newStringIdentifier(value string) (Identifier, error) {
 	return Identifier{
 		Kind:   StringId,
 		Length: len(value),
-		value:  value,
+		Value:  value,
 	}, nil
 }
 
@@ -76,7 +74,7 @@ func (id Identifier) Uint32() (uint32, error) {
 		return 0, ierror.ResourceNotFound
 	}
 
-	return id.value.(uint32), nil
+	return id.Value.(uint32), nil
 }
 
 // String returns the string value of the identifier.
@@ -85,5 +83,5 @@ func (id Identifier) String() (string, error) {
 		return "", ierror.InvalidIdentifier
 	}
 
-	return id.value.(string), nil
+	return id.Value.(string), nil
 }

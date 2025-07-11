@@ -37,11 +37,11 @@ func SerializeIdentifier(identifier iggcon.Identifier) []byte {
 
 	switch identifier.Kind {
 	case iggcon.StringId:
-		val, _ := identifier.String()
-		copy(bytes[stringIdLength:], val)
+		valAsString := identifier.Value.(string)
+		copy(bytes[stringIdLength:], []byte(valAsString))
 	case iggcon.NumericId:
-		val, _ := identifier.Uint32()
-		binary.LittleEndian.PutUint32(bytes[stringIdLength:stringIdLength+numericIdLength], val)
+		valAsInt := identifier.Value.(uint32)
+		binary.LittleEndian.PutUint32(bytes[stringIdLength:stringIdLength+numericIdLength], valAsInt)
 	}
 	return bytes
 }
