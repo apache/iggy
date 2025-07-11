@@ -57,8 +57,8 @@ func NewStringIdentifier(value string) (Identifier, error) {
 	}, nil
 }
 
-// GetU32Value returns the numeric value of the identifier.
-func (id Identifier) GetU32Value() (uint32, error) {
+// Uint32 returns the numeric value of the identifier.
+func (id Identifier) Uint32() (uint32, error) {
 	if id.Kind != NumericId || id.Length != 4 {
 		return 0, ierror.ResourceNotFound
 	}
@@ -66,8 +66,8 @@ func (id Identifier) GetU32Value() (uint32, error) {
 	return id.Value.(uint32), nil
 }
 
-// GetStringValue returns the string value of the identifier.
-func (id Identifier) GetStringValue() (string, error) {
+// String returns the string value of the identifier.
+func (id Identifier) String() (string, error) {
 	if id.Kind != StringId {
 		return "", ierror.InvalidIdentifier
 	}
