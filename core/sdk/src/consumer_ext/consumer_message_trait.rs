@@ -34,7 +34,7 @@ pub trait IggyConsumerMessageExt {
     /// * `shutdown_rx`: The receiver to listen to for shutdown.
     ///
     async fn consume_messages<P>(
-        mut self,
+        &mut self,
         message_consumer: &'static P,
         shutdown_rx: oneshot::Receiver<()>,
     ) -> Result<(), IggyError>

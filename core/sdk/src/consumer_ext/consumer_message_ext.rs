@@ -46,7 +46,7 @@ impl IggyConsumerMessageExt for IggyConsumer {
     /// * `IggyError::ClientShutdown`: The client has been shut down.
     ///
     async fn consume_messages<P>(
-        mut self,
+        &mut self,
         message_consumer: &'static P,
         mut shutdown_rx: oneshot::Receiver<()>,
     ) -> Result<(), IggyError>
