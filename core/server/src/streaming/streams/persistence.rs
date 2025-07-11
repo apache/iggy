@@ -64,13 +64,4 @@ impl Stream {
 
         Ok(saved_messages_number)
     }
-
-    pub async fn purge(&self) -> Result<(), IggyError> {
-        for topic in self.get_topics() {
-            topic.purge().await.with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to purge topic: {topic} in stream: {self}")
-            })?;
-        }
-        Ok(())
-    }
 }

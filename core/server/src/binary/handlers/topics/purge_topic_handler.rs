@@ -43,6 +43,9 @@ impl ServerCommandHandler for PurgeTopic {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
+        let topic_id = self.topic_id.clone();
+        let stream_id = self.stream_id.clone();
+        
         shard
             .purge_topic(session, &self.stream_id, &self.topic_id)
             .await
@@ -53,8 +56,12 @@ impl ServerCommandHandler for PurgeTopic {
                 )
             })?;
 
-        let topic_id = self.topic_id.clone();
-        let stream_id = self.stream_id.clone();
+        let event = crate::shard::transmission::event::ShardEvent::PurgedTopic { 
+            stream_id: self.stream_id.clone(),
+            topic_id: self.topic_id.clone(),
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+
         shard
             .state
             .apply(session.get_user_id(), &EntryCommand::PurgeTopic(self))

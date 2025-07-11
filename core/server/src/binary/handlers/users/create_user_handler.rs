@@ -32,7 +32,6 @@ use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::create_user::CreateUser;
-use tower_http::map_response_body;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for CreateUser {

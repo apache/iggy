@@ -23,7 +23,7 @@ use crate::{
         utils::file::overwrite,
     },
 };
-use std::{collections::HashSet, env, path::Path, sync::Arc};
+use std::{collections::HashSet, env, path::Path, sync::Arc, time::Duration};
 
 pub fn create_shard_connections(
     shards_set: &HashSet<usize>,
@@ -133,8 +133,9 @@ pub fn create_shard_executor(cpu_set: HashSet<usize>) -> Runtime {
 
     proactor
         .capacity(4096)
-        .coop_taskrun(true)
-        .taskrun_flag(false); // TODO: Try enabling this.
+        .sqpoll_idle(Duration::from_micros(100));
+        //.coop_taskrun(true)
+        //.taskrun_flag(false); // TODO: Try enabling this.
 
     // FIXME(hubcio): Only set thread_pool_limit(0) on non-macOS platforms
     // This causes a freeze on macOS with compio fs operations
