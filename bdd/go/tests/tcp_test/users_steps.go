@@ -46,7 +46,8 @@ func successfullyCreateUser(name string, client iggycli.Client) uint32 {
 			},
 		})
 	itShouldNotReturnError(err)
-	user, err := client.GetUser(iggcon.NewIdentifier(name))
+	nameIdentifier, _ := iggcon.NewIdentifier(name)
+	user, err := client.GetUser(nameIdentifier)
 	itShouldNotReturnError(err)
 
 	return user.Id
@@ -55,7 +56,8 @@ func successfullyCreateUser(name string, client iggycli.Client) uint32 {
 // ASSERTIONS
 
 func itShouldSuccessfullyCreateUser(name string, client iggycli.Client) {
-	user, err := client.GetUser(iggcon.NewIdentifier(name))
+	nameIdentifier, _ := iggcon.NewIdentifier(name)
+	user, err := client.GetUser(nameIdentifier)
 
 	itShouldNotReturnError(err)
 
@@ -65,7 +67,8 @@ func itShouldSuccessfullyCreateUser(name string, client iggycli.Client) {
 }
 
 func itShouldSuccessfullyCreateUserWithPermissions(name string, client iggycli.Client, permissions map[int]*iggcon.StreamPermissions) {
-	user, err := client.GetUser(iggcon.NewIdentifier(name))
+	nameIdentifier, _ := iggcon.NewIdentifier(name)
+	user, err := client.GetUser(nameIdentifier)
 
 	itShouldNotReturnError(err)
 
@@ -95,7 +98,8 @@ func itShouldSuccessfullyCreateUserWithPermissions(name string, client iggycli.C
 }
 
 func itShouldSuccessfullyUpdateUser(id uint32, name string, client iggycli.Client) {
-	user, err := client.GetUser(iggcon.NewIdentifier(name))
+	nameIdentifier, _ := iggcon.NewIdentifier(name)
+	user, err := client.GetUser(nameIdentifier)
 
 	itShouldNotReturnError(err)
 
@@ -108,8 +112,9 @@ func itShouldSuccessfullyUpdateUser(id uint32, name string, client iggycli.Clien
 	})
 }
 
-func itShouldSuccessfullyDeleteUser(userId int, client iggycli.Client) {
-	user, err := client.GetUser(iggcon.NewIdentifier(userId))
+func itShouldSuccessfullyDeleteUser(userId uint32, client iggycli.Client) {
+	identifier, _ := iggcon.NewIdentifier(userId)
+	user, err := client.GetUser(identifier)
 
 	itShouldReturnSpecificError(err, "resource_not_found")
 	ginkgo.It("should not return user", func() {
@@ -118,7 +123,8 @@ func itShouldSuccessfullyDeleteUser(userId int, client iggycli.Client) {
 }
 
 func itShouldSuccessfullyUpdateUserPermissions(userId uint32, client iggycli.Client) {
-	user, err := client.GetUser(iggcon.NewIdentifier(int(userId)))
+	identifier, _ := iggcon.NewIdentifier(userId)
+	user, err := client.GetUser(identifier)
 
 	itShouldNotReturnError(err)
 
@@ -166,6 +172,6 @@ func itShouldContainSpecificUser(name string, users []iggcon.UserInfo) {
 
 //CLEANUP
 
-func deleteUserAfterTests(name any, client iggycli.Client) {
-	_ = client.DeleteUser(iggcon.NewIdentifier(name))
+func deleteUserAfterTests(identifier iggcon.Identifier, client iggycli.Client) {
+	_ = client.DeleteUser(identifier)
 }

@@ -31,9 +31,11 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			messages := createDefaultMessages()
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			err := client.SendMessages(
-				iggcon.NewIdentifier(streamId),
-				iggcon.NewIdentifier(topicId),
+				streamIdentifier,
+				topicIdentifier,
 				iggcon.None(),
 				messages,
 			)
@@ -46,9 +48,10 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 			streamId, _ := successfullyCreateStream("2"+prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			messages := createDefaultMessages()
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			err := client.SendMessages(
-				iggcon.NewIdentifier(streamId),
-				iggcon.NewIdentifier(int(createRandomUInt32())),
+				streamIdentifier,
+				randomU32Identifier(),
 				iggcon.None(),
 				messages,
 			)
@@ -59,8 +62,8 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 			client := createAuthorizedConnection()
 			messages := createDefaultMessages()
 			err := client.SendMessages(
-				iggcon.NewIdentifier(int(createRandomUInt32())),
-				iggcon.NewIdentifier(int(createRandomUInt32())),
+				randomU32Identifier(),
+				randomU32Identifier(),
 				iggcon.None(),
 				messages,
 			)
@@ -73,9 +76,11 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			messages := createDefaultMessages()
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			err := client.SendMessages(
-				iggcon.NewIdentifier(streamId),
-				iggcon.NewIdentifier(topicId),
+				streamIdentifier,
+				topicIdentifier,
 				iggcon.PartitionId(int(createRandomUInt32())),
 				messages,
 			)
@@ -87,9 +92,11 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, createAuthorizedConnection())
 			topicId, _ := successfullyCreateTopic(streamId, client)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			err := client.SendMessages(
-				iggcon.NewIdentifier(streamId),
-				iggcon.NewIdentifier(topicId),
+				streamIdentifier,
+				topicIdentifier,
 				iggcon.PartitionId(int(createRandomUInt32())),
 				[]iggcon.IggyMessage{},
 			)
@@ -102,8 +109,8 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 			client := createClient()
 			messages := createDefaultMessages()
 			err := client.SendMessages(
-				iggcon.NewIdentifier(int(createRandomUInt32())),
-				iggcon.NewIdentifier(int(createRandomUInt32())),
+				randomU32Identifier(),
+				randomU32Identifier(),
 				iggcon.None(),
 				messages,
 			)

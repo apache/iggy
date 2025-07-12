@@ -61,7 +61,7 @@ func (tms *IggyTcpClient) CreateTopic(
 	messageExpiry time.Duration,
 	maxTopicSize uint64,
 	replicationFactor *uint8,
-	topicId *int,
+	topicId *uint32,
 ) (*iggcon.TopicDetails, error) {
 	if MaxStringLength < len(name) {
 		return nil, ierror.TextTooLong("topic_name")

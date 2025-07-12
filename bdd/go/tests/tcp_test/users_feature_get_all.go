@@ -18,6 +18,7 @@
 package tcp_test
 
 import (
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/onsi/ginkgo/v2"
 )
 
@@ -27,7 +28,8 @@ var _ = ginkgo.Describe("GET USER:", func() {
 			client := createAuthorizedConnection()
 			name := createRandomString(16)
 			userId := successfullyCreateUser(name, client)
-			defer deleteUserAfterTests(int(userId), client)
+			userIdentifier, _ := iggcon.NewIdentifier(userId)
+			defer deleteUserAfterTests(userIdentifier, client)
 
 			users, err := client.GetUsers()
 
