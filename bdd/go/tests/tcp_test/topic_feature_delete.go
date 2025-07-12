@@ -31,7 +31,9 @@ var _ = ginkgo.Describe("DELETE TOPIC:", func() {
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
-			err := client.DeleteTopic(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId))
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+			err := client.DeleteTopic(streamIdentifier, topicIdentifier)
 
 			itShouldNotReturnError(err)
 			itShouldSuccessfullyDeleteTopic(streamId, topicId, client)
@@ -41,19 +43,16 @@ var _ = ginkgo.Describe("DELETE TOPIC:", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
-			topicId := int(createRandomUInt32())
-
-			err := client.DeleteTopic(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId))
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			err := client.DeleteTopic(streamIdentifier, randomU32Identifier())
 
 			itShouldReturnSpecificIggyError(err, ierror.TopicIdNotFound)
 		})
 
 		ginkgo.Context("and tries to delete non-existing topic and stream", func() {
 			client := createAuthorizedConnection()
-			streamId := int(createRandomUInt32())
-			topicId := int(createRandomUInt32())
 
-			err := client.DeleteTopic(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId))
+			err := client.DeleteTopic(randomU32Identifier(), randomU32Identifier())
 
 			itShouldReturnSpecificIggyError(err, ierror.StreamIdNotFound)
 		})
@@ -62,7 +61,7 @@ var _ = ginkgo.Describe("DELETE TOPIC:", func() {
 	ginkgo.When("User is not logged in", func() {
 		ginkgo.Context("and tries to delete topic", func() {
 			client := createClient()
-			err := client.DeleteTopic(iggcon.NewIdentifier(int(createRandomUInt32())), iggcon.NewIdentifier(int(createRandomUInt32())))
+			err := client.DeleteTopic(randomU32Identifier(), randomU32Identifier())
 
 			itShouldReturnUnauthenticatedError(err)
 		})

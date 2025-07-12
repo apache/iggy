@@ -27,11 +27,12 @@ var _ = ginkgo.Describe("UPDATE USER:", func() {
 		ginkgo.Context("tries to update user existing user", func() {
 			client := createAuthorizedConnection()
 			userId := successfullyCreateUser(createRandomString(16), client)
-			defer deleteUserAfterTests(userId, client)
+			identifier, _ := iggcon.NewIdentifier(userId)
+			defer deleteUserAfterTests(identifier, client)
 
 			username := createRandomString(16)
 			err := client.UpdateUser(
-				iggcon.NewIdentifier(int(userId)),
+				identifier,
 				&username,
 				nil,
 			)
@@ -47,7 +48,7 @@ var _ = ginkgo.Describe("UPDATE USER:", func() {
 
 			username := createRandomString(16)
 			err := client.UpdateUser(
-				iggcon.NewIdentifier(int(createRandomUInt32())),
+				randomU32Identifier(),
 				&username,
 				nil,
 			)

@@ -33,10 +33,13 @@ var _ = ginkgo.Describe("LEAVE CONSUMER GROUP:", func() {
 			groupId, _ := successfullyCreateConsumer(streamId, topicId, client)
 			successfullyJoinConsumer(streamId, topicId, groupId, client)
 
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+			groupIdentifier, _ := iggcon.NewIdentifier(groupId)
 			err := client.LeaveConsumerGroup(
-				iggcon.NewIdentifier(streamId),
-				iggcon.NewIdentifier(topicId),
-				iggcon.NewIdentifier(groupId),
+				streamIdentifier,
+				topicIdentifier,
+				groupIdentifier,
 			)
 
 			itShouldNotReturnError(err)
@@ -48,11 +51,12 @@ var _ = ginkgo.Describe("LEAVE CONSUMER GROUP:", func() {
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
-			groupId := int(createRandomUInt32())
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			err := client.LeaveConsumerGroup(
-				iggcon.NewIdentifier(streamId),
-				iggcon.NewIdentifier(topicId),
-				iggcon.NewIdentifier(groupId),
+				streamIdentifier,
+				topicIdentifier,
+				randomU32Identifier(),
 			)
 
 			itShouldReturnSpecificError(err, "consumer_group_not_found")
@@ -62,12 +66,11 @@ var _ = ginkgo.Describe("LEAVE CONSUMER GROUP:", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
-			topicId := int(createRandomUInt32())
-
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			err := client.LeaveConsumerGroup(
-				iggcon.NewIdentifier(streamId),
-				iggcon.NewIdentifier(topicId),
-				iggcon.NewIdentifier(int(createRandomUInt32())),
+				streamIdentifier,
+				randomU32Identifier(),
+				randomU32Identifier(),
 			)
 
 			itShouldReturnSpecificError(err, "topic_id_not_found")
@@ -75,13 +78,11 @@ var _ = ginkgo.Describe("LEAVE CONSUMER GROUP:", func() {
 
 		ginkgo.Context("and tries to leave consumer for non-existing topic and stream", func() {
 			client := createAuthorizedConnection()
-			streamId := int(createRandomUInt32())
-			topicId := int(createRandomUInt32())
 
 			err := client.LeaveConsumerGroup(
-				iggcon.NewIdentifier(streamId),
-				iggcon.NewIdentifier(topicId),
-				iggcon.NewIdentifier(int(createRandomUInt32())),
+				randomU32Identifier(),
+				randomU32Identifier(),
+				randomU32Identifier(),
 			)
 
 			itShouldReturnSpecificError(err, "stream_id_not_found")
@@ -92,9 +93,9 @@ var _ = ginkgo.Describe("LEAVE CONSUMER GROUP:", func() {
 		ginkgo.Context("and tries to leave to the consumer group", func() {
 			client := createClient()
 			err := client.LeaveConsumerGroup(
-				iggcon.NewIdentifier(int(createRandomUInt32())),
-				iggcon.NewIdentifier(int(createRandomUInt32())),
-				iggcon.NewIdentifier(int(createRandomUInt32())),
+				randomU32Identifier(),
+				randomU32Identifier(),
+				randomU32Identifier(),
 			)
 
 			itShouldReturnUnauthenticatedError(err)

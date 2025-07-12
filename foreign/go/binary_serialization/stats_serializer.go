@@ -51,7 +51,7 @@ const (
 )
 
 func (stats *TcpStats) Deserialize(payload []byte) error {
-	stats.ProcessId = int(binary.LittleEndian.Uint32(payload[processIDPos : processIDPos+4]))
+	stats.ProcessId = binary.LittleEndian.Uint32(payload[processIDPos : processIDPos+4])
 	stats.CpuUsage = math.Float32frombits(binary.LittleEndian.Uint32(payload[cpuUsagePos : cpuUsagePos+4]))
 	stats.TotalCpuUsage = math.Float32frombits(binary.LittleEndian.Uint32(payload[totalCpuUsagePos : totalCpuUsagePos+4]))
 	stats.MemoryUsage = binary.LittleEndian.Uint64(payload[memoryUsagePos : memoryUsagePos+8])
@@ -62,13 +62,13 @@ func (stats *TcpStats) Deserialize(payload []byte) error {
 	stats.ReadBytes = binary.LittleEndian.Uint64(payload[readBytesPos : readBytesPos+8])
 	stats.WrittenBytes = binary.LittleEndian.Uint64(payload[writtenBytesPos : writtenBytesPos+8])
 	stats.MessagesSizeBytes = binary.LittleEndian.Uint64(payload[messagesSizeBytesPos : messagesSizeBytesPos+8])
-	stats.StreamsCount = int(binary.LittleEndian.Uint32(payload[streamsCountPos : streamsCountPos+4]))
-	stats.TopicsCount = int(binary.LittleEndian.Uint32(payload[topicsCountPos : topicsCountPos+4]))
-	stats.PartitionsCount = int(binary.LittleEndian.Uint32(payload[partitionsCountPos : partitionsCountPos+4]))
-	stats.SegmentsCount = int(binary.LittleEndian.Uint32(payload[segmentsCountPos : segmentsCountPos+4]))
+	stats.StreamsCount = binary.LittleEndian.Uint32(payload[streamsCountPos : streamsCountPos+4])
+	stats.TopicsCount = binary.LittleEndian.Uint32(payload[topicsCountPos : topicsCountPos+4])
+	stats.PartitionsCount = binary.LittleEndian.Uint32(payload[partitionsCountPos : partitionsCountPos+4])
+	stats.SegmentsCount = binary.LittleEndian.Uint32(payload[segmentsCountPos : segmentsCountPos+4])
 	stats.MessagesCount = binary.LittleEndian.Uint64(payload[messagesCountPos : messagesCountPos+8])
-	stats.ClientsCount = int(binary.LittleEndian.Uint32(payload[clientsCountPos : clientsCountPos+4]))
-	stats.ConsumerGroupsCount = int(binary.LittleEndian.Uint32(payload[consumerGroupsCountPos : consumerGroupsCountPos+4]))
+	stats.ClientsCount = binary.LittleEndian.Uint32(payload[clientsCountPos : clientsCountPos+4])
+	stats.ConsumerGroupsCount = binary.LittleEndian.Uint32(payload[consumerGroupsCountPos : consumerGroupsCountPos+4])
 
 	position := consumerGroupsCountPos + 4
 	hostnameLength := int(binary.LittleEndian.Uint32(payload[position : position+4]))

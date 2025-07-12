@@ -49,7 +49,7 @@ type PollMessageRequest struct {
 	StreamId        Identifier      `json:"streamId"`
 	TopicId         Identifier      `json:"topicId"`
 	Consumer        Consumer        `json:"consumer"`
-	PartitionId     int             `json:"partitionId"`
+	PartitionId     uint32          `json:"partitionId"`
 	PollingStrategy PollingStrategy `json:"pollingStrategy"`
 	Count           int             `json:"count"`
 	AutoCommit      bool            `json:"autoCommit"`

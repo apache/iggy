@@ -26,6 +26,10 @@ var (
 		Code:    2,
 		Message: "invalid_configuration",
 	}
+	InvalidIdentifier = &IggyError{
+		Code:    6,
+		Message: "invalid_identifier",
+	}
 	StreamIdNotFound = &IggyError{
 		Code:    1009,
 		Message: "stream_id_not_found",

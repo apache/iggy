@@ -29,10 +29,10 @@ var _ = ginkgo.Describe("CREATE STREAM:", func() {
 			name := createRandomString(32)
 
 			_, err := client.CreateStream(name, &streamId)
-			defer deleteStreamAfterTests(int(streamId), client)
+			defer deleteStreamAfterTests(streamId, client)
 
 			itShouldNotReturnError(err)
-			itShouldSuccessfullyCreateStream(int(streamId), name, client)
+			itShouldSuccessfullyCreateStream(streamId, name, client)
 		})
 
 		ginkgo.Context("and tries to create stream with duplicate stream name", func() {
@@ -41,10 +41,10 @@ var _ = ginkgo.Describe("CREATE STREAM:", func() {
 			name := createRandomString(32)
 
 			_, err := client.CreateStream(name, &streamId)
-			defer deleteStreamAfterTests(int(streamId), client)
+			defer deleteStreamAfterTests(streamId, client)
 
 			itShouldNotReturnError(err)
-			itShouldSuccessfullyCreateStream(int(streamId), name, client)
+			itShouldSuccessfullyCreateStream(streamId, name, client)
 
 			anotherStreamId := createRandomUInt32()
 			_, err = client.CreateStream(name, &anotherStreamId)
@@ -58,10 +58,10 @@ var _ = ginkgo.Describe("CREATE STREAM:", func() {
 			name := createRandomString(32)
 
 			_, err := client.CreateStream(name, &streamId)
-			defer deleteStreamAfterTests(int(streamId), client)
+			defer deleteStreamAfterTests(streamId, client)
 
 			itShouldNotReturnError(err)
-			itShouldSuccessfullyCreateStream(int(streamId), name, client)
+			itShouldSuccessfullyCreateStream(streamId, name, client)
 
 			_, err = client.CreateStream(createRandomString(32), &streamId)
 

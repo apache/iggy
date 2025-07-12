@@ -48,9 +48,10 @@ var _ = ginkgo.Describe("CHANGE PASSWORD:", func() {
 					},
 				})
 			itShouldNotReturnError(err)
-			defer deleteUserAfterTests(username, client)
+			identifier, _ := iggcon.NewIdentifier(username)
+			defer deleteUserAfterTests(identifier, client)
 
-			err = client.ChangePassword(iggcon.NewIdentifier(username), password, "newPassword")
+			err = client.ChangePassword(identifier, password, "newPassword")
 
 			itShouldNotReturnError(err)
 			//itShouldBePossibleToLogInWithCredentials(createRequest.Username, request.NewPassword)
@@ -62,7 +63,7 @@ var _ = ginkgo.Describe("CHANGE PASSWORD:", func() {
 			client := createClient()
 
 			err := client.UpdatePermissions(
-				iggcon.NewIdentifier(int(createRandomUInt32())),
+				randomU32Identifier(),
 				&iggcon.Permissions{
 					Global: iggcon.GlobalPermissions{
 						ManageServers: false,

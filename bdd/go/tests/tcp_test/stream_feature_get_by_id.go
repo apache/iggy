@@ -29,7 +29,8 @@ var _ = ginkgo.Describe("GET STREAM BY ID:", func() {
 			client := createAuthorizedConnection()
 			streamId, name := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
-			stream, err := client.GetStream(iggcon.NewIdentifier(streamId))
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			stream, err := client.GetStream(streamIdentifier)
 
 			itShouldNotReturnError(err)
 			itShouldReturnSpecificStream(streamId, name, *stream)
@@ -37,9 +38,8 @@ var _ = ginkgo.Describe("GET STREAM BY ID:", func() {
 
 		ginkgo.Context("and tries to get non-existing stream", func() {
 			client := createAuthorizedConnection()
-			streamId := int(createRandomUInt32())
 
-			_, err := client.GetStream(iggcon.NewIdentifier(streamId))
+			_, err := client.GetStream(randomU32Identifier())
 
 			itShouldReturnSpecificError(err, "stream_id_not_found")
 		})

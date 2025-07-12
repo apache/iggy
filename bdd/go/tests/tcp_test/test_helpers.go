@@ -18,6 +18,7 @@
 package tcp_test
 
 import (
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"math/rand"
 	"os"
 	"strings"
@@ -53,8 +54,17 @@ func createClient() iggycli.Client {
 }
 
 func createRandomUInt32() uint32 {
-	rand.New(rand.NewSource(time.Now().UnixNano()))
-	return rand.Uint32()
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	var v uint32
+	for v == 0 {
+		v = r.Uint32()
+	}
+	return v
+}
+
+func randomU32Identifier() iggcon.Identifier {
+	id, _ := iggcon.NewIdentifier(createRandomUInt32())
+	return id
 }
 
 func createRandomString(length int) string {

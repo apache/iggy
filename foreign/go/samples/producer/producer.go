@@ -30,8 +30,8 @@ import (
 )
 
 const (
-	StreamId          = 1
-	TopicId           = 1
+	StreamId          = uint32(1)
+	TopicId           = uint32(1)
 	MessageBatchCount = 1
 	Partition         = 1
 	Interval          = 1000
@@ -61,7 +61,8 @@ func main() {
 }
 
 func EnsureInfrastructureIsInitialized(cli iggycli.Client) error {
-	if _, streamErr := cli.GetStream(iggcon.NewIdentifier(StreamId)); streamErr != nil {
+	streamIdentifier, _ := iggcon.NewIdentifier(StreamId)
+	if _, streamErr := cli.GetStream(streamIdentifier); streamErr != nil {
 		uint32StreamId := uint32(StreamId)
 		_, streamErr = cli.CreateStream("Test Producer Stream", &uint32StreamId)
 
@@ -76,10 +77,11 @@ func EnsureInfrastructureIsInitialized(cli iggycli.Client) error {
 
 	fmt.Printf("Stream with ID: %d exists.\n", StreamId)
 
-	if _, topicErr := cli.GetTopic(iggcon.NewIdentifier(StreamId), iggcon.NewIdentifier(TopicId)); topicErr != nil {
+	topicIdentifier, _ := iggcon.NewIdentifier(TopicId)
+	if _, topicErr := cli.GetTopic(streamIdentifier, topicIdentifier); topicErr != nil {
 		refStreamId := StreamId
 		_, topicErr = cli.CreateTopic(
-			iggcon.NewIdentifier(StreamId),
+			streamIdentifier,
 			"Test Topic From Producer Sample",
 			12,
 			0,
@@ -124,9 +126,11 @@ func PublishMessages(messageStream iggycli.Client) error {
 			})
 		}
 
+		streamIdentifier, _ := iggcon.NewIdentifier(StreamId)
+		topicIdentifier, _ := iggcon.NewIdentifier(TopicId)
 		err := messageStream.SendMessages(
-			iggcon.NewIdentifier(StreamId),
-			iggcon.NewIdentifier(TopicId),
+			streamIdentifier,
+			topicIdentifier,
 			iggcon.PartitionId(Partition),
 			messages,
 		)

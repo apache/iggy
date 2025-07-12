@@ -23,12 +23,12 @@ type CreateStreamRequest struct {
 }
 
 type Stream struct {
-	Id            int    `json:"id"`
+	Id            uint32 `json:"id"`
 	Name          string `json:"name"`
 	SizeBytes     uint64 `json:"sizeBytes"`
 	CreatedAt     uint64 `json:"createdAt"`
 	MessagesCount uint64 `json:"messagesCount"`
-	TopicsCount   int    `json:"topicsCount"`
+	TopicsCount   uint32 `json:"topicsCount"`
 }
 
 type StreamDetails struct {

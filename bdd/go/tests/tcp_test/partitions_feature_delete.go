@@ -30,11 +30,12 @@ var _ = ginkgo.Describe("DELETE PARTITION:", func() {
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
-
-			partitionsCount := 1
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+			partitionsCount := uint32(1)
 			err := client.DeletePartitions(
-				iggcon.NewIdentifier(streamId),
-				iggcon.NewIdentifier(topicId),
+				streamIdentifier,
+				topicIdentifier,
 				1,
 			)
 
@@ -45,8 +46,8 @@ var _ = ginkgo.Describe("DELETE PARTITION:", func() {
 		ginkgo.Context("and tries to delete partitions for a non existing stream", func() {
 			client := createAuthorizedConnection()
 			err := client.DeletePartitions(
-				iggcon.NewIdentifier(int(createRandomUInt32())),
-				iggcon.NewIdentifier(int(createRandomUInt32())),
+				randomU32Identifier(),
+				randomU32Identifier(),
 				10,
 			)
 
@@ -57,9 +58,10 @@ var _ = ginkgo.Describe("DELETE PARTITION:", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			err := client.DeletePartitions(
-				iggcon.NewIdentifier(streamId),
-				iggcon.NewIdentifier(int(createRandomUInt32())),
+				streamIdentifier,
+				randomU32Identifier(),
 				10,
 			)
 
@@ -71,8 +73,8 @@ var _ = ginkgo.Describe("DELETE PARTITION:", func() {
 		ginkgo.Context("and tries to delete partitions", func() {
 			client := createClient()
 			err := client.DeletePartitions(
-				iggcon.NewIdentifier(int(createRandomUInt32())),
-				iggcon.NewIdentifier(int(createRandomUInt32())),
+				randomU32Identifier(),
+				randomU32Identifier(),
 				10,
 			)
 
