@@ -84,7 +84,8 @@ async fn main() -> Result<(), IggyError> {
         // .encryptor(Arc::new(EncryptorKind::Aes256Gcm(Aes256GcmEncryptor::new(&[1; 32])?)))
         .build();
 
-    let (client, consumer) = IggyStreamConsumer::with_client_from_url(IGGY_URL, &config).await?;
+    let (client, mut consumer) =
+        IggyStreamConsumer::with_client_from_url(IGGY_URL, &config).await?;
 
     println!("Start message stream");
     let (tx, rx) = oneshot::channel();
