@@ -60,7 +60,7 @@ jobs:
           working-directory: foreign/python
           before-script-linux: 'dnf install -y perl-IPC-Cmd && (python3 -m pip --version || python3 -m ensurepip)'
           manylinux: '2_28'
-          args: --release --out dist --find-interpreter
+          args: --release --out dist --interpreter /opt/python/cp38-cp38/bin/python /opt/python/cp39-cp39/bin/python /opt/python/cp310-cp310/bin/python /opt/python/cp311-cp311/bin/python /opt/python/cp312-cp312/bin/python /opt/python/cp313-cp313/bin/python /opt/python/cp314-cp314/bin/python
           sccache: 'true'
       - name: Set up Docker Buildx
         if: matrix.target == 'x86_64'
