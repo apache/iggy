@@ -15,29 +15,30 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
-use std::time::Duration;
-
-use iggy::prelude::IggyError;
-
-pub mod consumer;
-pub mod producer;
-pub mod producing_consumer;
+use crate::{
+    actors::{ApiLabel, BatchMetrics, BenchmarkInit},
+    utils::batch_generator::BenchmarkBatchGenerator,
+};
+use bench_report::numeric_parameter::BenchmarkNumericParameter;
+use iggy::prelude::*;
 
 #[derive(Debug, Clone)]
-pub struct BatchMetrics {
-    pub messages: u32,
-    pub user_data_bytes: u64,
-    pub total_bytes: u64,
-    pub latency: Duration,
+pub struct BenchmarkProducerConfig {
+    pub producer_id: u32,
+    pub stream_id: u32,
+    pub partitions: u32,
+    pub messages_per_batch: BenchmarkNumericParameter,
+    pub message_size: BenchmarkNumericParameter,
+    pub warmup_time: IggyDuration,
 }
 
 #[async_trait::async_trait]
-pub trait BenchmarkInit: Send + Sync {
-    async fn setup(&mut self) -> Result<(), IggyError>;
+pub trait ProducerClient: Send + Sync {
+    async fn produce_batch(
+        &mut self,
+        batch_generator: &mut BenchmarkBatchGenerator,
+    ) -> Result<Option<BatchMetrics>, IggyError>;
 }
 
 #[async_trait::async_trait]
-pub trait ApiLabel: Send + Sync {
-    fn api_label(&self) -> &'static str;
-}
+pub trait BenchmarkProducerClient: ProducerClient + BenchmarkInit + ApiLabel + Send + Sync {}
