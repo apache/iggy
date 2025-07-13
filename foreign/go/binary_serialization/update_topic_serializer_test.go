@@ -30,7 +30,7 @@ func TestSerialize_UpdateTopic(t *testing.T) {
 		StreamId:      streamId,
 		TopicId:       topicId,
 		Name:          "update_topic",
-		MessageExpiry: 100000,
+		MessageExpiry: 100 * iggcon.Microsecond,
 		MaxTopicSize:  100,
 	}
 
