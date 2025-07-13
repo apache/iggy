@@ -40,8 +40,8 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 				streamIdentifier,
 				topicIdentifier,
 				newName,
-				1,
-				1,
+				iggcon.CompressionAlgorithmNone,
+				iggcon.Microsecond,
 				math.MaxUint64,
 				&replicationFactor)
 			itShouldNotReturnError(err)
@@ -61,8 +61,8 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 				streamIdentifier,
 				topic2Identifier,
 				topic1Name,
-				1,
-				0,
+				iggcon.CompressionAlgorithmNone,
+				iggcon.IggyExpiryServerDefault,
 				math.MaxUint64,
 				&replicationFactor)
 

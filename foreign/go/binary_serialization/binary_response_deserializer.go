@@ -201,11 +201,11 @@ func DeserializeToTopic(payload []byte, position int) (iggcon.Topic, int, error)
 	topic.Id = binary.LittleEndian.Uint32(payload[position : position+4])
 	topic.CreatedAt = binary.LittleEndian.Uint64(payload[position+4 : position+12])
 	topic.PartitionsCount = binary.LittleEndian.Uint32(payload[position+12 : position+16])
-	topic.MessageExpiry = time.Microsecond * time.Duration(int(binary.LittleEndian.Uint64(payload[position+16:position+24])))
+	topic.MessageExpiry = iggcon.Duration(binary.LittleEndian.Uint64(payload[position+16 : position+24]))
 	topic.CompressionAlgorithm = payload[position+24]
 	topic.MaxTopicSize = binary.LittleEndian.Uint64(payload[position+25 : position+33])
 	topic.ReplicationFactor = payload[position+33]
-	topic.SizeBytes = binary.LittleEndian.Uint64(payload[position+34 : position+42])
+	topic.Size = binary.LittleEndian.Uint64(payload[position+34 : position+42])
 	topic.MessagesCount = binary.LittleEndian.Uint64(payload[position+42 : position+50])
 
 	nameLength := int(payload[position+50])

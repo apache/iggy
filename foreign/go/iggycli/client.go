@@ -18,8 +18,6 @@
 package iggycli
 
 import (
-	"time"
-
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
@@ -57,9 +55,9 @@ type Client interface {
 	CreateTopic(
 		streamId iggcon.Identifier,
 		name string,
-		partitionsCount int,
-		compressionAlgorithm uint8,
-		messageExpiry time.Duration,
+		partitionsCount uint32,
+		compressionAlgorithm iggcon.CompressionAlgorithm,
+		messageExpiry iggcon.Duration,
 		maxTopicSize uint64,
 		replicationFactor *uint8,
 		topicId *uint32,
@@ -71,8 +69,8 @@ type Client interface {
 		streamId iggcon.Identifier,
 		topicId iggcon.Identifier,
 		name string,
-		compressionAlgorithm uint8,
-		messageExpiry time.Duration,
+		compressionAlgorithm iggcon.CompressionAlgorithm,
+		messageExpiry iggcon.Duration,
 		maxTopicSize uint64,
 		replicationFactor *uint8,
 	) error
