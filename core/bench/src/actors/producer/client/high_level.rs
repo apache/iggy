@@ -18,7 +18,10 @@
 
 use crate::actors::{
     ApiLabel, BatchMetrics, BenchmarkInit,
-    producer::client::{BenchmarkProducerClient, BenchmarkProducerConfig, ProducerClient},
+    producer::client::{
+        BenchmarkProducerClient,
+        interface::{BenchmarkProducerConfig, ProducerClient},
+    },
 };
 use iggy::prelude::*;
 use integration::test_server::{ClientFactory, login_root};
@@ -41,16 +44,12 @@ impl HighLevelProducerClient {
     }
 }
 #[allow(clippy::significant_drop_tightening)]
-#[async_trait::async_trait]
 impl ProducerClient for HighLevelProducerClient {
     async fn produce_batch(
         &mut self,
         batch_generator: &mut crate::utils::batch_generator::BenchmarkBatchGenerator,
     ) -> Result<Option<BatchMetrics>, IggyError> {
-        let producer = self
-            .producer
-            .as_mut()
-            .expect("Producer must be initialized before sending");
+        let producer = self.producer.as_mut().expect("Producer not initialized");
 
         let batch = batch_generator.generate_owned_batch();
         if batch.messages.is_empty() {
@@ -70,7 +69,6 @@ impl ProducerClient for HighLevelProducerClient {
     }
 }
 
-#[async_trait::async_trait]
 impl BenchmarkInit for HighLevelProducerClient {
     async fn setup(&mut self) -> Result<(), IggyError> {
         let topic_id: u32 = 1;
@@ -100,8 +98,6 @@ impl BenchmarkInit for HighLevelProducerClient {
     }
 }
 impl ApiLabel for HighLevelProducerClient {
-    fn api_label(&self) -> &'static str {
-        "high-level API"
-    }
+    const API_LABEL: &'static str = "high-level";
 }
 impl BenchmarkProducerClient for HighLevelProducerClient {}

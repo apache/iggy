@@ -18,7 +18,10 @@
 
 use crate::actors::{
     ApiLabel, BatchMetrics, BenchmarkInit,
-    consumer::client::{BenchmarkConsumerClient, BenchmarkConsumerConfig, ConsumerClient},
+    consumer::client::{
+        BenchmarkConsumerClient,
+        interface::{BenchmarkConsumerConfig, ConsumerClient},
+    },
 };
 
 use futures_util::StreamExt;
@@ -44,7 +47,6 @@ impl HighLevelConsumerClient {
     }
 }
 
-#[async_trait::async_trait]
 impl ConsumerClient for HighLevelConsumerClient {
     async fn consume_batch(&mut self) -> Result<Option<BatchMetrics>, IggyError> {
         let consumer = self.consumer.as_mut().expect("Consumer not initialized");
@@ -97,7 +99,6 @@ impl ConsumerClient for HighLevelConsumerClient {
     }
 }
 
-#[async_trait::async_trait]
 impl BenchmarkInit for HighLevelConsumerClient {
     async fn setup(&mut self) -> Result<(), IggyError> {
         let topic_id = 1;
@@ -141,9 +142,7 @@ impl BenchmarkInit for HighLevelConsumerClient {
 }
 
 impl ApiLabel for HighLevelConsumerClient {
-    fn api_label(&self) -> &'static str {
-        "high-level API"
-    }
+    const API_LABEL: &'static str = "high-level";
 }
 
 impl BenchmarkConsumerClient for HighLevelConsumerClient {}

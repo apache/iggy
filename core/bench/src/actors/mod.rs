@@ -32,12 +32,10 @@ pub struct BatchMetrics {
     pub latency: Duration,
 }
 
-#[async_trait::async_trait]
 pub trait BenchmarkInit: Send + Sync {
     async fn setup(&mut self) -> Result<(), IggyError>;
 }
 
-#[async_trait::async_trait]
-pub trait ApiLabel: Send + Sync {
-    fn api_label(&self) -> &'static str;
+pub trait ApiLabel {
+    const API_LABEL: &'static str;
 }

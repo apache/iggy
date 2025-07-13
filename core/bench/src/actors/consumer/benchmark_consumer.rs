@@ -16,10 +16,8 @@
  * under the License.
  */
 
-use super::client::BenchmarkConsumerConfig;
 use crate::actors::consumer::client::BenchmarkConsumerClient;
-use crate::actors::consumer::high_level_client::HighLevelConsumerClient;
-use crate::actors::consumer::low_level_client::LowLevelConsumerClient;
+use crate::actors::consumer::client::interface::BenchmarkConsumerConfig;
 use crate::analytics::metrics::individual::from_records;
 use crate::analytics::record::BenchmarkRecord;
 use crate::utils::finish_condition::BenchmarkFinishCondition;
@@ -30,14 +28,13 @@ use bench_report::individual_metrics::BenchmarkIndividualMetrics;
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use human_repr::HumanCount;
 use iggy::prelude::*;
-use integration::test_server::ClientFactory;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 use tracing::info;
 
-pub struct BenchmarkConsumer {
-    pub client: Box<dyn BenchmarkConsumerClient>,
+pub struct BenchmarkConsumer<C: BenchmarkConsumerClient> {
+    pub client: C,
     pub benchmark_kind: BenchmarkKind,
     pub finish_condition: Arc<BenchmarkFinishCondition>,
     pub sampling_time: IggyDuration,
@@ -46,40 +43,16 @@ pub struct BenchmarkConsumer {
     pub config: BenchmarkConsumerConfig,
 }
 
-impl BenchmarkConsumer {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        client_factory: Arc<dyn ClientFactory>,
+impl<C: BenchmarkConsumerClient> BenchmarkConsumer<C> {
+    pub const fn new(
+        client: C,
         benchmark_kind: BenchmarkKind,
-        consumer_id: u32,
-        consumer_group_id: Option<u32>,
-        stream_id: u32,
-        messages_per_batch: BenchmarkNumericParameter,
         finish_condition: Arc<BenchmarkFinishCondition>,
-        warmup_time: IggyDuration,
         sampling_time: IggyDuration,
         moving_average_window: u32,
-        polling_kind: PollingKind,
         limit_bytes_per_second: Option<IggyByteSize>,
-        origin_timestamp_latency_calculation: bool,
-        use_high_level_api: bool,
+        config: BenchmarkConsumerConfig,
     ) -> Self {
-        let config = BenchmarkConsumerConfig {
-            consumer_id,
-            consumer_group_id,
-            stream_id,
-            messages_per_batch,
-            warmup_time,
-            polling_kind,
-            origin_timestamp_latency_calculation,
-        };
-
-        let client: Box<dyn BenchmarkConsumerClient> = if use_high_level_api {
-            Box::new(HighLevelConsumerClient::new(client_factory, config.clone()))
-        } else {
-            Box::new(LowLevelConsumerClient::new(client_factory, config.clone()))
-        };
-
         Self {
             client,
             benchmark_kind,
@@ -90,6 +63,7 @@ impl BenchmarkConsumer {
             config,
         }
     }
+
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::cognitive_complexity)]
     pub async fn run(mut self) -> Result<BenchmarkIndividualMetrics, IggyError> {
@@ -178,7 +152,7 @@ impl BenchmarkConsumer {
                 cg_id,
                 self.config.messages_per_batch,
                 self.config.stream_id,
-                self.client.api_label(),
+                C::API_LABEL,
             );
         } else {
             info!(
@@ -186,7 +160,7 @@ impl BenchmarkConsumer {
                 self.config.consumer_id,
                 self.config.messages_per_batch,
                 self.config.stream_id,
-                self.client.api_label(),
+                C::API_LABEL,
             );
         }
     }

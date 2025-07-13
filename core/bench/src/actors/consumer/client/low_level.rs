@@ -16,9 +16,8 @@
  * under the License.
  */
 
-use crate::actors::consumer::client::{
-    BenchmarkConsumerClient, BenchmarkConsumerConfig, ConsumerClient,
-};
+use crate::actors::consumer::client::BenchmarkConsumerClient;
+use crate::actors::consumer::client::interface::{BenchmarkConsumerConfig, ConsumerClient};
 use crate::actors::{ApiLabel, BatchMetrics, BenchmarkInit};
 use crate::benchmarks::common::create_consumer;
 use crate::utils::{batch_total_size_bytes, batch_user_size_bytes};
@@ -33,9 +32,11 @@ pub struct LowLevelConsumerClient {
     config: BenchmarkConsumerConfig,
     client: Option<IggyClient>,
     consumer: Option<Consumer>,
-    stream_id: Option<Identifier>,
-    topic_id: Option<Identifier>,
+    stream_id: Identifier,
+    topic_id: Identifier,
     partition_id: Option<u32>,
+    polling_strategy: PollingStrategy,
+    auto_commit: bool,
     offset: u64,
 }
 
@@ -46,39 +47,32 @@ impl LowLevelConsumerClient {
             config,
             client: None,
             consumer: None,
-            stream_id: None,
-            topic_id: None,
+            stream_id: Identifier::default(),
+            topic_id: Identifier::default(),
             partition_id: None,
+            polling_strategy: PollingStrategy::next(),
+            auto_commit: true,
             offset: 0,
         }
     }
 }
 
-#[async_trait::async_trait]
 impl ConsumerClient for LowLevelConsumerClient {
     async fn consume_batch(&mut self) -> Result<Option<BatchMetrics>, IggyError> {
-        let client = self.client.as_ref().unwrap();
-        let stream_id = self.stream_id.as_ref().unwrap();
-        let topic_id = self.topic_id.as_ref().unwrap();
-        let partition_id = self.partition_id;
-        let consumer = self.consumer.as_ref().unwrap();
+        let client = self.client.as_ref().expect("client not initialized");
+        let consumer = self.consumer.as_ref().expect("consumer not initialized");
         let messages_to_receive = self.config.messages_per_batch.get();
-        let (strategy, auto_commit) = match self.config.polling_kind {
-            PollingKind::Offset => (PollingStrategy::offset(self.offset), false),
-            PollingKind::Next => (PollingStrategy::next(), true),
-            _ => panic!("Unsupported polling kind: {:?}", self.config.polling_kind),
-        };
 
         let before_poll = Instant::now();
         let polled = client
             .poll_messages(
-                stream_id,
-                topic_id,
-                partition_id,
+                &self.stream_id,
+                &self.topic_id,
+                self.partition_id,
                 consumer,
-                &strategy,
+                &self.polling_strategy,
                 messages_to_receive,
-                auto_commit,
+                self.auto_commit,
             )
             .await;
 
@@ -116,7 +110,7 @@ impl ConsumerClient for LowLevelConsumerClient {
         }))
     }
 }
-#[async_trait::async_trait]
+
 impl BenchmarkInit for LowLevelConsumerClient {
     async fn setup(&mut self) -> Result<(), IggyError> {
         let topic_id = 1u32;
@@ -142,21 +136,27 @@ impl BenchmarkInit for LowLevelConsumerClient {
             self.config.consumer_id,
         )
         .await;
+        let (polling_strategy, auto_commit) = match self.config.polling_kind {
+            PollingKind::Offset => (PollingStrategy::offset(self.offset), false),
+            PollingKind::Next => (PollingStrategy::next(), true),
+            _ => panic!("Unsupported polling kind: {:?}", self.config.polling_kind),
+        };
 
         self.client = Some(client);
-        self.stream_id = Some(stream_id);
-        self.topic_id = Some(topic_id);
-        self.partition_id = partition_id;
         self.consumer = Some(consumer);
+
+        self.stream_id = stream_id;
+        self.topic_id = topic_id;
+        self.partition_id = partition_id;
+        self.polling_strategy = polling_strategy;
+        self.auto_commit = auto_commit;
 
         Ok(())
     }
 }
 
 impl ApiLabel for LowLevelConsumerClient {
-    fn api_label(&self) -> &'static str {
-        "low-level API"
-    }
+    const API_LABEL: &'static str = "low-level";
 }
 
 impl BenchmarkConsumerClient for LowLevelConsumerClient {}

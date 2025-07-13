@@ -21,7 +21,10 @@ use std::sync::Arc;
 use crate::{
     actors::{
         ApiLabel, BatchMetrics, BenchmarkInit,
-        producer::client::{BenchmarkProducerClient, BenchmarkProducerConfig, ProducerClient},
+        producer::client::{
+            BenchmarkProducerClient,
+            interface::{BenchmarkProducerConfig, ProducerClient},
+        },
     },
     utils::batch_generator::BenchmarkBatchGenerator,
 };
@@ -33,7 +36,9 @@ pub struct LowLevelProducerClient {
     client_factory: Arc<dyn ClientFactory>,
     config: BenchmarkProducerConfig,
     client: Option<IggyClient>,
-    partitioning: Option<Partitioning>,
+    stream_id: Identifier,
+    topic_id: Identifier,
+    partitioning: Partitioning,
 }
 
 impl LowLevelProducerClient {
@@ -42,22 +47,19 @@ impl LowLevelProducerClient {
             client_factory,
             config,
             client: None,
-            partitioning: None,
+            stream_id: Identifier::default(),
+            topic_id: Identifier::default(),
+            partitioning: Partitioning::partition_id(1),
         }
     }
 }
 
-#[async_trait::async_trait]
 impl ProducerClient for LowLevelProducerClient {
     async fn produce_batch(
         &mut self,
         batch_generator: &mut BenchmarkBatchGenerator,
     ) -> Result<Option<BatchMetrics>, IggyError> {
         let client = self.client.as_mut().unwrap();
-        let stream_id: Identifier = self.config.stream_id.try_into().unwrap();
-        let topic_id: Identifier = 1.try_into().unwrap();
-        let partitioning = self.partitioning.as_ref().unwrap();
-
         let batch = batch_generator.generate_batch();
         if batch.messages.is_empty() {
             return Ok(None);
@@ -65,7 +67,12 @@ impl ProducerClient for LowLevelProducerClient {
 
         let before_send = Instant::now();
         client
-            .send_messages(&stream_id, &topic_id, partitioning, &mut batch.messages)
+            .send_messages(
+                &self.stream_id,
+                &self.topic_id,
+                &self.partitioning,
+                &mut batch.messages,
+            )
             .await?;
         let latency = before_send.elapsed();
 
@@ -78,7 +85,6 @@ impl ProducerClient for LowLevelProducerClient {
     }
 }
 
-#[async_trait::async_trait]
 impl BenchmarkInit for LowLevelProducerClient {
     async fn setup(&mut self) -> Result<(), IggyError> {
         let default_partition_id = 1;
@@ -95,13 +101,13 @@ impl BenchmarkInit for LowLevelProducerClient {
         };
 
         self.client = Some(client);
-        self.partitioning = Some(partitioning);
+        self.partitioning = partitioning;
+        self.stream_id = self.config.stream_id.try_into()?;
+        self.topic_id = Identifier::numeric(1)?;
         Ok(())
     }
 }
 impl ApiLabel for LowLevelProducerClient {
-    fn api_label(&self) -> &'static str {
-        "low-level API"
-    }
+    const API_LABEL: &'static str = "low-level";
 }
 impl BenchmarkProducerClient for LowLevelProducerClient {}

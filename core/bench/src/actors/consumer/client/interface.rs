@@ -15,30 +15,24 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-use crate::{
-    actors::{ApiLabel, BatchMetrics, BenchmarkInit},
-    utils::batch_generator::BenchmarkBatchGenerator,
-};
+
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use iggy::prelude::*;
 
+use crate::actors::{ApiLabel, BatchMetrics, BenchmarkInit};
+
 #[derive(Debug, Clone)]
-pub struct BenchmarkProducerConfig {
-    pub producer_id: u32,
+pub struct BenchmarkConsumerConfig {
+    pub consumer_id: u32,
+    pub consumer_group_id: Option<u32>,
     pub stream_id: u32,
-    pub partitions: u32,
     pub messages_per_batch: BenchmarkNumericParameter,
-    pub message_size: BenchmarkNumericParameter,
     pub warmup_time: IggyDuration,
+    pub polling_kind: PollingKind,
+    pub origin_timestamp_latency_calculation: bool,
 }
 
-#[async_trait::async_trait]
-pub trait ProducerClient: Send + Sync {
-    async fn produce_batch(
-        &mut self,
-        batch_generator: &mut BenchmarkBatchGenerator,
-    ) -> Result<Option<BatchMetrics>, IggyError>;
+pub trait ConsumerClient: Send + Sync {
+    async fn consume_batch(&mut self) -> Result<Option<BatchMetrics>, IggyError>;
 }
-
-#[async_trait::async_trait]
-pub trait BenchmarkProducerClient: ProducerClient + BenchmarkInit + ApiLabel + Send + Sync {}
+pub trait BenchmarkConsumerClient: ConsumerClient + BenchmarkInit + ApiLabel + Send + Sync {}

@@ -20,16 +20,8 @@ use std::{sync::Arc, time::Duration};
 
 use crate::{
     actors::{
-        consumer::{
-            client::{BenchmarkConsumerClient, BenchmarkConsumerConfig},
-            high_level_client::HighLevelConsumerClient,
-            low_level_client::LowLevelConsumerClient,
-        },
-        producer::{
-            client::{BenchmarkProducerClient, BenchmarkProducerConfig},
-            high_level_client::HighLevelProducerClient,
-            low_level_client::LowLevelProducerClient,
-        },
+        consumer::client::{BenchmarkConsumerClient, interface::BenchmarkConsumerConfig},
+        producer::client::{BenchmarkProducerClient, interface::BenchmarkProducerConfig},
     },
     analytics::{metrics::individual::from_records, record::BenchmarkRecord},
     utils::{
@@ -43,89 +35,44 @@ use bench_report::{
 };
 use human_repr::HumanCount;
 use iggy::prelude::*;
-use integration::test_server::ClientFactory;
 use tokio::time::Instant;
 use tracing::info;
 
-pub struct BenchmarkProducingConsumer {
-    producer: Box<dyn BenchmarkProducerClient>,
-    consumer: Box<dyn BenchmarkConsumerClient>,
-    benchmark_kind: BenchmarkKind,
-    send_finish_condition: Arc<BenchmarkFinishCondition>,
-    poll_finish_condition: Arc<BenchmarkFinishCondition>,
-    sampling_time: IggyDuration,
-    moving_average_window: u32,
-    limit_bytes_per_second: Option<IggyByteSize>,
-    producer_config: BenchmarkProducerConfig,
-    consumer_config: BenchmarkConsumerConfig,
+pub struct BenchmarkProducingConsumer<P, C>
+where
+    P: BenchmarkProducerClient,
+    C: BenchmarkConsumerClient,
+{
+    pub producer: P,
+    pub consumer: C,
+    pub benchmark_kind: BenchmarkKind,
+    pub send_finish_condition: Arc<BenchmarkFinishCondition>,
+    pub poll_finish_condition: Arc<BenchmarkFinishCondition>,
+    pub sampling_time: IggyDuration,
+    pub moving_average_window: u32,
+    pub limit_bytes_per_second: Option<IggyByteSize>,
+    pub producer_config: BenchmarkProducerConfig,
+    pub consumer_config: BenchmarkConsumerConfig,
 }
 
-impl BenchmarkProducingConsumer {
+impl<P, C> BenchmarkProducingConsumer<P, C>
+where
+    P: BenchmarkProducerClient,
+    C: BenchmarkConsumerClient,
+{
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        client_factory: Arc<dyn ClientFactory>,
+    pub const fn new(
+        producer: P,
+        consumer: C,
         benchmark_kind: BenchmarkKind,
-        actor_id: u32,
-        consumer_group_id: Option<u32>,
-        stream_id: u32,
-        partitions_count: u32,
-        messages_per_batch: BenchmarkNumericParameter,
-        message_size: BenchmarkNumericParameter,
         send_finish_condition: Arc<BenchmarkFinishCondition>,
         poll_finish_condition: Arc<BenchmarkFinishCondition>,
-        warmup_time: IggyDuration,
         sampling_time: IggyDuration,
         moving_average_window: u32,
         limit_bytes_per_second: Option<IggyByteSize>,
-        polling_kind: PollingKind,
-        origin_timestamp_latency_calculation: bool,
-        use_high_level_api: bool,
+        producer_config: BenchmarkProducerConfig,
+        consumer_config: BenchmarkConsumerConfig,
     ) -> Self {
-        let producer_config = BenchmarkProducerConfig {
-            producer_id: actor_id,
-            stream_id,
-            partitions: partitions_count,
-            messages_per_batch,
-            message_size,
-            warmup_time,
-        };
-
-        let consumer_config = BenchmarkConsumerConfig {
-            consumer_id: actor_id,
-            consumer_group_id,
-            stream_id,
-            messages_per_batch,
-            warmup_time,
-            polling_kind,
-            origin_timestamp_latency_calculation,
-        };
-        let (producer, consumer): (
-            Box<dyn BenchmarkProducerClient>,
-            Box<dyn BenchmarkConsumerClient>,
-        ) = if use_high_level_api {
-            (
-                Box::new(HighLevelProducerClient::new(
-                    client_factory.clone(),
-                    producer_config.clone(),
-                )),
-                Box::new(HighLevelConsumerClient::new(
-                    client_factory,
-                    consumer_config.clone(),
-                )),
-            )
-        } else {
-            (
-                Box::new(LowLevelProducerClient::new(
-                    client_factory.clone(),
-                    producer_config.clone(),
-                )),
-                Box::new(LowLevelConsumerClient::new(
-                    client_factory,
-                    consumer_config.clone(),
-                )),
-            )
-        };
-
         Self {
             producer,
             consumer,
@@ -289,7 +236,7 @@ impl BenchmarkProducingConsumer {
                 self.producer_config.stream_id,
                 self.producer_config.partitions,
                 cg_id,
-                self.consumer.api_label()
+                C::API_LABEL
             );
         } else {
             info!(
@@ -299,7 +246,7 @@ impl BenchmarkProducingConsumer {
                 self.producer_config.message_size,
                 self.producer_config.stream_id,
                 self.producer_config.partitions,
-                self.consumer.api_label()
+                C::API_LABEL
             );
         }
     }

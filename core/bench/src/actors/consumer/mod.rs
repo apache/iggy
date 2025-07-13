@@ -18,7 +18,5 @@
 
 pub mod benchmark_consumer;
 pub mod client;
-pub mod high_level_client;
-pub mod low_level_client;
-
+pub mod typed_benchmark_consumer;
 pub use benchmark_consumer::BenchmarkConsumer;

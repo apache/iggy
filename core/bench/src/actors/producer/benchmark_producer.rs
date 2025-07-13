@@ -15,12 +15,9 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+
 use crate::{
-    actors::producer::{
-        client::{BenchmarkProducerClient, BenchmarkProducerConfig},
-        high_level_client::HighLevelProducerClient,
-        low_level_client::LowLevelProducerClient,
-    },
+    actors::producer::client::{BenchmarkProducerClient, interface::BenchmarkProducerConfig},
     analytics::{metrics::individual::from_records, record::BenchmarkRecord},
     utils::{
         batch_generator::BenchmarkBatchGenerator, finish_condition::BenchmarkFinishCondition,
@@ -33,13 +30,12 @@ use bench_report::individual_metrics::BenchmarkIndividualMetrics;
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use human_repr::HumanCount;
 use iggy::prelude::*;
-use integration::test_server::ClientFactory;
 use std::{sync::Arc, time::Duration};
 use tokio::time::Instant;
 use tracing::info;
 
-pub struct BenchmarkProducer {
-    pub client: Box<dyn BenchmarkProducerClient>,
+pub struct BenchmarkProducer<P: BenchmarkProducerClient> {
+    pub client: P,
     pub benchmark_kind: BenchmarkKind,
     pub finish_condition: Arc<BenchmarkFinishCondition>,
     pub sampling_time: IggyDuration,
@@ -48,38 +44,17 @@ pub struct BenchmarkProducer {
     pub config: BenchmarkProducerConfig,
 }
 
-impl BenchmarkProducer {
+impl<P: BenchmarkProducerClient> BenchmarkProducer<P> {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        client_factory: Arc<dyn ClientFactory>,
+    pub const fn new(
+        client: P,
         benchmark_kind: BenchmarkKind,
-        producer_id: u32,
-        stream_id: u32,
-        partitions: u32,
-        messages_per_batch: BenchmarkNumericParameter,
-        message_size: BenchmarkNumericParameter,
         finish_condition: Arc<BenchmarkFinishCondition>,
-        warmup_time: IggyDuration,
         sampling_time: IggyDuration,
         moving_average_window: u32,
         limit_bytes_per_second: Option<IggyByteSize>,
-        use_high_level_api: bool,
+        config: BenchmarkProducerConfig,
     ) -> Self {
-        let config = BenchmarkProducerConfig {
-            producer_id,
-            stream_id,
-            partitions,
-            messages_per_batch,
-            message_size,
-            warmup_time,
-        };
-
-        let client: Box<dyn BenchmarkProducerClient> = if use_high_level_api {
-            Box::new(HighLevelProducerClient::new(client_factory, config.clone()))
-        } else {
-            Box::new(LowLevelProducerClient::new(client_factory, config.clone()))
-        };
-
         Self {
             client,
             benchmark_kind,
@@ -90,6 +65,7 @@ impl BenchmarkProducer {
             config,
         }
     }
+
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::cognitive_complexity)]
     pub async fn run(mut self) -> Result<BenchmarkIndividualMetrics, IggyError> {
@@ -201,7 +177,7 @@ impl BenchmarkProducer {
             self.config.message_size,
             self.config.stream_id,
             self.config.partitions,
-            self.client.api_label(),
+            P::API_LABEL,
         );
     }
 

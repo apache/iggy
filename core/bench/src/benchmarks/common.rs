@@ -19,8 +19,9 @@
 use super::{CONSUMER_GROUP_BASE_ID, CONSUMER_GROUP_NAME_PREFIX};
 use crate::{
     actors::{
-        consumer::BenchmarkConsumer, producer::BenchmarkProducer,
-        producing_consumer::BenchmarkProducingConsumer,
+        consumer::typed_benchmark_consumer::TypedBenchmarkConsumer,
+        producer::typed_benchmark_producer::TypedBenchmarkProducer,
+        producing_consumer::typed_banchmark_producing_consumer::TypedBenchmarkProducingConsumer,
     },
     args::common::IggyBenchArgs,
     utils::finish_condition::{BenchmarkFinishCondition, BenchmarkFinishConditionMode},
@@ -143,7 +144,8 @@ pub fn build_producer_futures(
             let stream_id = start_stream_id + 1 + (producer_id % streams);
 
             async move {
-                let producer = BenchmarkProducer::new(
+                let producer = TypedBenchmarkProducer::new(
+                    use_high_level_api,
                     client_factory,
                     kind,
                     producer_id,
@@ -156,7 +158,6 @@ pub fn build_producer_futures(
                     sampling_time,
                     moving_average_window,
                     rate_limit,
-                    use_high_level_api,
                 );
                 producer.run().await
             }
@@ -215,7 +216,8 @@ pub fn build_consumer_futures(
             };
 
             async move {
-                let consumer = BenchmarkConsumer::new(
+                let consumer = TypedBenchmarkConsumer::new(
+                    use_high_level_api,
                     client_factory,
                     kind,
                     consumer_id,
@@ -229,7 +231,6 @@ pub fn build_consumer_futures(
                     polling_kind,
                     rate_limit,
                     origin_timestamp_latency_calculation,
-                    use_high_level_api,
                 );
                 consumer.run().await
             }
@@ -281,11 +282,12 @@ pub fn build_producing_consumers_futures(
                     "Executing producing consumer #{}, stream_id={}",
                     actor_id, stream_id
                 );
-                let actor = BenchmarkProducingConsumer::new(
+                let actor = TypedBenchmarkProducingConsumer::new(
+                    use_high_level_api,
                     client_factory_clone,
                     args_clone.kind(),
                     actor_id,
-                    None,
+                    None, // consumer_group_id
                     stream_id,
                     partitions,
                     messages_per_batch,
@@ -298,7 +300,6 @@ pub fn build_producing_consumers_futures(
                     rate_limit,
                     polling_kind,
                     origin_timestamp_latency_calculation,
-                    use_high_level_api,
                 );
                 actor.run().await
             }
@@ -389,7 +390,8 @@ pub fn build_producing_consumer_groups_futures(
                     stream_id,
                     actor_type
                 );
-                let actor = BenchmarkProducingConsumer::new(
+                let actor = TypedBenchmarkProducingConsumer::new(
+                    use_high_level_api,
                     client_factory_clone,
                     args_clone.kind(),
                     actor_id,
@@ -406,8 +408,8 @@ pub fn build_producing_consumer_groups_futures(
                     rate_limit,
                     polling_kind,
                     origin_timestamp_latency_calculation,
-                    use_high_level_api,
                 );
+
                 actor.run().await
             }
         })
