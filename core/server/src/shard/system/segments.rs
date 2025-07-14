@@ -87,6 +87,7 @@ impl IggyShard {
             .map(|segment| (segment.start_offset(), segment.get_messages_count()))
             .collect::<Vec<_>>();
 
+
         // Delete the segments in sequence.
         let (deleted_segments_count, deleted_messages_count) = {
             let mut segments_count = 0;
@@ -103,9 +104,8 @@ impl IggyShard {
 
             (segments_count, messages_count)
         };
-        drop(partition);
-        drop(topic);
         drop(stream);
+        drop(partition);
 
         let mut stream = self
             .get_stream_mut(stream_id)

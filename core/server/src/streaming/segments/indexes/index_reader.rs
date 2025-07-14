@@ -20,12 +20,11 @@ use super::IggyIndexesMut;
 use crate::streaming::utils::PooledBuffer;
 use bytes::BytesMut;
 use compio::{
-    BufResult,
-    fs::{File, OpenOptions},
-    io::AsyncReadAtExt,
+    buf::{IntoInner, IoBuf}, fs::{File, OpenOptions}, io::AsyncReadAtExt, BufResult
 };
 use error_set::ErrContext;
 use iggy_common::{INDEX_SIZE, IggyError, IggyIndex, IggyIndexView};
+use ring::error;
 use std::{
     io::ErrorKind,
     os::unix::fs::FileExt,
@@ -150,6 +149,7 @@ impl IndexReader {
         {
             Ok(buf) => buf,
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+                error!("Unexpected EOF while reading indexes");
                 return Ok(None);
             }
             Err(error) => {
@@ -337,9 +337,10 @@ impl IndexReader {
         use_pool: bool,
     ) -> Result<PooledBuffer, std::io::Error> {
         if use_pool {
-            let mut buf = PooledBuffer::with_capacity(len as usize);
-            unsafe { buf.set_len(len as usize) };
-            let (result, buf) = self.file.read_exact_at(buf, offset as u64).await.into();
+            let len = len as usize;
+            let buf = PooledBuffer::with_capacity(len as usize);
+            let (result, buf) = self.file.read_exact_at(buf.slice(..len), offset as u64).await.into();
+            let buf = buf.into_inner();
             result?;
             Ok(buf)
         } else {

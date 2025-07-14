@@ -4275,6 +4275,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "chrono",
+ "compio",
  "ctor",
  "derive_more 2.0.1",
  "env_logger",

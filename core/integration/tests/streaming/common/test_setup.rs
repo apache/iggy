@@ -16,13 +16,15 @@
  * under the License.
  */
 
+use compio::fs;
+use log::error;
+use server::bootstrap::create_directories;
 use server::configs::system::SystemConfig;
 use server::streaming::persistence::persister::{FileWithSyncPersister, PersisterKind};
 use server::streaming::storage::SystemStorage;
 use server::streaming::utils::MemoryPool;
 use std::rc::Rc;
 use std::sync::Arc;
-use tokio::fs;
 use uuid::Uuid;
 
 pub struct TestSetup {
@@ -42,6 +44,7 @@ impl TestSetup {
 
         let config = Arc::new(config);
         fs::create_dir(config.get_system_path()).await.unwrap();
+        create_directories(&config).await.unwrap();
         let persister = PersisterKind::FileWithSync(FileWithSyncPersister {});
         let storage = Rc::new(SystemStorage::new(config.clone(), Arc::new(persister)));
         MemoryPool::init_pool(config.clone());

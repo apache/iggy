@@ -19,6 +19,7 @@
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut};
 use crate::streaming::utils::PooledBuffer;
 use bytes::BytesMut;
+use compio::buf::{IntoInner, IoBuf};
 use compio::fs::{File, OpenOptions};
 use compio::io::AsyncReadAtExt;
 use error_set::ErrContext;
@@ -178,8 +179,9 @@ impl MessagesReader {
     ) -> Result<PooledBuffer, std::io::Error> {
         if use_pool {
             let mut buf = PooledBuffer::with_capacity(len as usize);
-            unsafe { buf.set_len(len as usize) };
-            let (result, buf) = self.file.read_exact_at(buf, offset as u64).await.into();
+            let len = len as usize;
+            let (result, buf) = self.file.read_exact_at(buf.slice(..len), offset as u64).await.into();
+            let buf = buf.into_inner();
             result?;
             Ok(buf)
         } else {
