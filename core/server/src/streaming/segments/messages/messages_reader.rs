@@ -180,7 +180,11 @@ impl MessagesReader {
         if use_pool {
             let mut buf = PooledBuffer::with_capacity(len as usize);
             let len = len as usize;
-            let (result, buf) = self.file.read_exact_at(buf.slice(..len), offset as u64).await.into();
+            let (result, buf) = self
+                .file
+                .read_exact_at(buf.slice(..len), offset as u64)
+                .await
+                .into();
             let buf = buf.into_inner();
             result?;
             Ok(buf)

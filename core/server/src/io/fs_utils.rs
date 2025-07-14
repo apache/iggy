@@ -24,18 +24,24 @@ use std::path::{Path, PathBuf};
 pub struct DirEntry {
     pub path: PathBuf,
     pub is_dir: bool,
+    pub name: Option<String>,
 }
 
 impl DirEntry {
-    fn file(path: PathBuf) -> Self {
+    fn file(path: PathBuf, name: Option<String>) -> Self {
         Self {
             path,
             is_dir: false,
+            name,
         }
     }
 
-    fn dir(path: PathBuf) -> Self {
-        Self { path, is_dir: true }
+    fn dir(path: PathBuf, name: Option<String>) -> Self {
+        Self {
+            path,
+            is_dir: true,
+            name,
+        }
     }
 }
 
@@ -59,7 +65,10 @@ pub async fn walk_dir(root: impl AsRef<Path>) -> io::Result<Vec<DirEntry>> {
     let mut stack = vec![root.to_path_buf()];
 
     while let Some(current_dir) = stack.pop() {
-        directories.push(DirEntry::dir(current_dir.clone()));
+        directories.push(DirEntry::dir(
+            current_dir.clone(),
+            current_dir.to_str().map(|s| s.to_string()),
+        ));
 
         for entry in std::fs::read_dir(&current_dir)? {
             let entry = entry?;
@@ -69,7 +78,10 @@ pub async fn walk_dir(root: impl AsRef<Path>) -> io::Result<Vec<DirEntry>> {
             if metadata.is_dir() {
                 stack.push(entry_path);
             } else {
-                files.push(DirEntry::file(entry_path));
+                files.push(DirEntry::file(
+                    entry_path,
+                    entry.file_name().into_string().ok(),
+                ));
             }
         }
     }

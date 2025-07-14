@@ -20,7 +20,10 @@ use super::IggyIndexesMut;
 use crate::streaming::utils::PooledBuffer;
 use bytes::BytesMut;
 use compio::{
-    buf::{IntoInner, IoBuf}, fs::{File, OpenOptions}, io::AsyncReadAtExt, BufResult
+    BufResult,
+    buf::{IntoInner, IoBuf},
+    fs::{File, OpenOptions},
+    io::AsyncReadAtExt,
 };
 use error_set::ErrContext;
 use iggy_common::{INDEX_SIZE, IggyError, IggyIndex, IggyIndexView};
@@ -339,7 +342,11 @@ impl IndexReader {
         if use_pool {
             let len = len as usize;
             let buf = PooledBuffer::with_capacity(len as usize);
-            let (result, buf) = self.file.read_exact_at(buf.slice(..len), offset as u64).await.into();
+            let (result, buf) = self
+                .file
+                .read_exact_at(buf.slice(..len), offset as u64)
+                .await
+                .into();
             let buf = buf.into_inner();
             result?;
             Ok(buf)

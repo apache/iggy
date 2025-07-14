@@ -570,7 +570,8 @@ impl IggyShard {
     async fn handle_event(&self, event: Arc<ShardEvent>) -> Result<(), IggyError> {
         match &*event {
             ShardEvent::CreatedStream { stream_id, name } => {
-                self.create_stream_bypass_auth(*stream_id, name)
+                self.create_stream_bypass_auth(*stream_id, name)?;
+                Ok(())
             }
             ShardEvent::CreatedTopic {
                 stream_id,

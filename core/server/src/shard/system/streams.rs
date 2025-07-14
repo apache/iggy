@@ -193,13 +193,13 @@ impl IggyShard {
         &self,
         stream_id: Option<u32>,
         name: &str,
-    ) -> Result<(), IggyError> {
+    ) -> Result<u32, IggyError> {
         let stream = self.create_stream_base(stream_id, name)?;
         let id = stream.stream_id;
         self.streams_ids.borrow_mut().insert(name.to_owned(), id);
         self.streams.borrow_mut().insert(id, stream);
         self.metrics.increment_streams(1);
-        Ok(())
+        Ok(id)
     }
 
     pub async fn create_stream(
@@ -341,22 +341,30 @@ impl IggyShard {
     }
 
     pub fn delete_stream_bypass_auth(&self, id: &Identifier) -> Result<Stream, IggyError> {
-        let stream = self.get_stream(id).with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {id}")
-        })?;
-        let stream_id = stream.stream_id;
-        let stream_name = stream.name.clone();
+        let stream_id;
+        let stream_name;
+        {
+            let stream = self.get_stream(id).with_error_context(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {id}")
+            })?;
+            stream_id = stream.stream_id;
+            stream_name = stream.name.clone();
+        }
         let stream = self.delete_stream_base(stream_id, stream_name)?;
         Ok(stream)
     }
 
     pub fn delete_stream(&self, session: &Session, id: &Identifier) -> Result<Stream, IggyError> {
         self.ensure_authenticated(session)?;
-        let stream = self.get_stream(id).with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {id}")
-        })?;
-        let stream_id = stream.stream_id;
-        let stream_name = stream.name.clone();
+        let stream_id;
+        let stream_name;
+        {
+            let stream = self.get_stream(id).with_error_context(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {id}")
+            })?;
+            stream_id = stream.stream_id;
+            stream_name = stream.name.clone();
+        }
         self.permissioner
             .borrow()
             .delete_stream(session.get_user_id(), stream_id)
@@ -364,7 +372,7 @@ impl IggyShard {
                 format!(
                     "{COMPONENT} (error: {error}) - permission denied to delete stream for user {}, stream ID: {}",
                     session.get_user_id(),
-                    stream.stream_id,
+                    stream_id,
                 )
             })?;
         let stream = self.delete_stream_base(stream_id, stream_name)?;
