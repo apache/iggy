@@ -33,7 +33,7 @@ use server::state::models::{
 };
 use server::state::system::SystemState;
 
-#[tokio::test]
+#[compio::test]
 async fn should_be_initialized_based_on_state_entries() {
     let setup = StateSetup::init().await;
     let state = setup.state();

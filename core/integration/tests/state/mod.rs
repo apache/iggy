@@ -17,12 +17,14 @@
  */
 
 use iggy::prelude::{Aes256GcmEncryptor, EncryptorKind};
+use server::bootstrap::create_directories;
 use server::state::file::FileState;
 use server::streaming::persistence::persister::{FileWithSyncPersister, PersisterKind};
+use server::streaming::utils::file::overwrite;
 use server::versioning::SemanticVersion;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::fs::create_dir;
+use compio::fs::create_dir;
 use uuid::Uuid;
 
 mod file;
@@ -47,6 +49,7 @@ impl StateSetup {
         let directory_path = format!("state_{}", Uuid::now_v7().to_u128_le());
         let messages_file_path = format!("{directory_path}/log");
         create_dir(&directory_path).await.unwrap();
+        overwrite(&messages_file_path).await.unwrap();
 
         let version = SemanticVersion::from_str("1.2.3").unwrap();
         let persister = PersisterKind::FileWithSync(FileWithSyncPersister {});

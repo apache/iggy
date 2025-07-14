@@ -26,7 +26,7 @@ use server::state::command::EntryCommand;
 use server::state::entry::StateEntry;
 use server::state::models::{CreateStreamWithId, CreateUserWithId};
 
-#[tokio::test]
+#[compio::test]
 async fn should_be_empty_given_initialized_state() {
     let setup = StateSetup::init().await;
     let state = setup.state();
@@ -35,7 +35,7 @@ async fn should_be_empty_given_initialized_state() {
     assert!(entries.is_empty());
 }
 
-#[tokio::test]
+#[compio::test]
 async fn should_apply_single_entry() {
     let setup = StateSetup::init().await;
     let state = setup.state();
@@ -61,7 +61,7 @@ async fn should_apply_single_entry() {
     assert_entry(entry, 0, setup.version(), user_id, command_bytes);
 }
 
-#[tokio::test]
+#[compio::test]
 async fn should_apply_encrypted_entry() {
     let setup = StateSetup::init_with_encryptor().await;
     let state = setup.state();
@@ -87,7 +87,7 @@ async fn should_apply_encrypted_entry() {
     assert_entry(entry, 0, setup.version(), user_id, command_bytes);
 }
 
-#[tokio::test]
+#[compio::test]
 async fn should_apply_multiple_entries() {
     let setup = StateSetup::init().await;
     let state = setup.state();
