@@ -20,6 +20,7 @@
 
 import type { CommandResponse } from '../../client/client.type.js';
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { deserializeTopics, type Topic } from './topic.utils.js';
 
@@ -28,7 +29,7 @@ export type GetTopics = {
 };
 
 export const GET_TOPICS = {
-  code: 301,
+  code: COMMAND_CODE.GetTopics,
 
   serialize: ({streamId}: GetTopics) => {
     return serializeIdentifier(streamId);

@@ -18,8 +18,6 @@
 package tcp
 
 import (
-	"time"
-
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
@@ -56,12 +54,12 @@ func (tms *IggyTcpClient) GetTopic(streamId iggcon.Identifier, topicId iggcon.Id
 func (tms *IggyTcpClient) CreateTopic(
 	streamId iggcon.Identifier,
 	name string,
-	partitionsCount int,
-	compressionAlgorithm uint8,
-	messageExpiry time.Duration,
+	partitionsCount uint32,
+	compressionAlgorithm iggcon.CompressionAlgorithm,
+	messageExpiry iggcon.Duration,
 	maxTopicSize uint64,
 	replicationFactor *uint8,
-	topicId *int,
+	topicId *uint32,
 ) (*iggcon.TopicDetails, error) {
 	if MaxStringLength < len(name) {
 		return nil, ierror.TextTooLong("topic_name")
@@ -88,8 +86,8 @@ func (tms *IggyTcpClient) UpdateTopic(
 	streamId iggcon.Identifier,
 	topicId iggcon.Identifier,
 	name string,
-	compressionAlgorithm uint8,
-	messageExpiry time.Duration,
+	compressionAlgorithm iggcon.CompressionAlgorithm,
+	messageExpiry iggcon.Duration,
 	maxTopicSize uint64,
 	replicationFactor *uint8,
 ) error {

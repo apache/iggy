@@ -17,35 +17,77 @@
 
 package iggcon
 
+import (
+	"encoding/binary"
+	ierror "github.com/apache/iggy/foreign/go/errors"
+)
+
 type Identifier struct {
 	Kind   IdKind
 	Length int
-	Value  any
+	Value  []byte
 }
 
-type IdKind int
+type IdKind uint8
 
 const (
 	NumericId IdKind = 1
 	StringId  IdKind = 2
 )
 
-func NewIdentifier(id any) Identifier {
-	var kind IdKind
-	var length int
-
-	switch v := id.(type) {
-	case int:
-		kind = NumericId
-		length = 4
+// NewIdentifier create a new identifier
+func NewIdentifier[T uint32 | string](value T) (Identifier, error) {
+	switch v := any(value).(type) {
+	case uint32:
+		return newNumericIdentifier(v)
 	case string:
-		kind = StringId
-		length = len(v)
+		return newStringIdentifier(v)
+	}
+	return Identifier{}, ierror.InvalidIdentifier
+}
+
+// newNumericIdentifier creates a new identifier from the given numeric value.
+func newNumericIdentifier(value uint32) (Identifier, error) {
+	if value == 0 {
+		return Identifier{}, ierror.InvalidIdentifier
 	}
 
+	val := make([]byte, 4)
+	binary.LittleEndian.PutUint32(val, value)
 	return Identifier{
-		Kind:   kind,
-		Length: length,
-		Value:  id,
+		Kind:   NumericId,
+		Length: 4,
+		Value:  val,
+	}, nil
+}
+
+// NewStringIdentifier creates a new identifier from the given string value.
+func newStringIdentifier(value string) (Identifier, error) {
+	length := len(value)
+	if length == 0 || length > 255 {
+		return Identifier{}, ierror.InvalidIdentifier
 	}
+	return Identifier{
+		Kind:   StringId,
+		Length: len(value),
+		Value:  []byte(value),
+	}, nil
+}
+
+// Uint32 returns the numeric value of the identifier.
+func (id Identifier) Uint32() (uint32, error) {
+	if id.Kind != NumericId || id.Length != 4 {
+		return 0, ierror.ResourceNotFound
+	}
+
+	return binary.LittleEndian.Uint32(id.Value), nil
+}
+
+// String returns the string value of the identifier.
+func (id Identifier) String() (string, error) {
+	if id.Kind != StringId {
+		return "", ierror.InvalidIdentifier
+	}
+
+	return string(id.Value), nil
 }

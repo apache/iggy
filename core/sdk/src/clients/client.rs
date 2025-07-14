@@ -70,6 +70,7 @@ impl IggyClient {
         IggyClientBuilder::from_connection_string(connection_string)
     }
 
+
     /// Creates a new `IggyClient` with the provided client implementation for the specific transport.
     pub fn new(client: ClientWrapper) -> Self {
         let client = IggyRwLock::new(client);

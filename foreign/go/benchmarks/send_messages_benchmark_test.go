@@ -60,7 +60,7 @@ func BenchmarkSendMessage(b *testing.B) {
 	}
 
 	for index, value := range clients {
-		err := ensureInfrastructureIsInitialized(value, startingStreamId+index)
+		err := ensureInfrastructureIsInitialized(value, uint32(startingStreamId+index))
 		if err != nil {
 			panic("COULD NOT INITIALIZE INFRASTRUCTURE")
 		}
@@ -96,28 +96,30 @@ func BenchmarkSendMessage(b *testing.B) {
 	fmt.Printf("Summarized Average Throughput: %.2f MB/s\n", aggregateThroughput)
 
 	for index, value := range clients {
-		err := cleanupInfrastructure(value, startingStreamId+index)
+		err := cleanupInfrastructure(value, uint32(startingStreamId+index))
 		if err != nil {
 			panic("COULD NOT CLEANUP INFRASTRUCTURE")
 		}
 	}
 }
 
-func ensureInfrastructureIsInitialized(cli iggycli.Client, streamId int) error {
-	if _, streamErr := cli.GetStream(iggcon.NewIdentifier(streamId)); streamErr != nil {
-		uint32StreamId := uint32(streamId)
-		_, streamErr = cli.CreateStream("benchmark"+fmt.Sprint(streamId), &uint32StreamId)
+func ensureInfrastructureIsInitialized(cli iggycli.Client, streamId uint32) error {
+	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+	if _, streamErr := cli.GetStream(streamIdentifier); streamErr != nil {
+		_, streamErr = cli.CreateStream("benchmark"+fmt.Sprint(streamId), &streamId)
 		if streamErr != nil {
 			panic(streamErr)
 		}
 	}
-	if _, topicErr := cli.GetTopic(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(1)); topicErr != nil {
+
+	topicIdentifier, _ := iggcon.NewIdentifier(uint32(1))
+	if _, topicErr := cli.GetTopic(streamIdentifier, topicIdentifier); topicErr != nil {
 		_, topicErr = cli.CreateTopic(
-			iggcon.NewIdentifier(streamId),
+			streamIdentifier,
 			"benchmark",
 			1,
-			1,
-			0,
+			iggcon.CompressionAlgorithmNone,
+			iggcon.IggyExpiryServerDefault,
 			1,
 			nil,
 			nil,
@@ -130,8 +132,9 @@ func ensureInfrastructureIsInitialized(cli iggycli.Client, streamId int) error {
 	return nil
 }
 
-func cleanupInfrastructure(cli iggycli.Client, streamId int) error {
-	return cli.DeleteStream(iggcon.NewIdentifier(streamId))
+func cleanupInfrastructure(cli iggycli.Client, streamId uint32) error {
+	streamIdent, _ := iggcon.NewIdentifier(streamId)
+	return cli.DeleteStream(streamIdent)
 }
 
 // CreateMessages creates messages with random payloads.
@@ -159,15 +162,16 @@ func SendMessage(cli iggycli.Client, producerNumber, messagesCount, messagesBatc
 	totalMessagesBytes := int64(totalMessages * messageSize)
 	fmt.Printf("Executing Send Messages command for producer %d, messages count %d, with size %d bytes\n", producerNumber, totalMessages, totalMessagesBytes)
 
-	streamId := iggcon.NewIdentifier(startingStreamId + producerNumber)
+	streamId, _ := iggcon.NewIdentifier(uint32(startingStreamId + producerNumber))
 	messages := CreateMessages(messagesCount, messageSize)
 	latencies := make([]time.Duration, 0)
 
 	for i := 0; i < messagesBatch; i++ {
 		startTime := time.Now()
+		topicIdentifier, _ := iggcon.NewIdentifier(uint32(topicId))
 		_ = cli.SendMessages(
 			streamId,
-			iggcon.NewIdentifier(topicId),
+			topicIdentifier,
 			iggcon.PartitionId(1),
 			messages,
 		)

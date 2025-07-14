@@ -33,7 +33,7 @@ type GetConsumerOffsetRequest struct {
 }
 
 type ConsumerOffsetInfo struct {
-	PartitionId   int    `json:"partitionId"`
+	PartitionId   uint32 `json:"partitionId"`
 	CurrentOffset uint64 `json:"currentOffset"`
 	StoredOffset  uint64 `json:"storedOffset"`
 }

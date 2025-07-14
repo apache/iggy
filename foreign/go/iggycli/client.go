@@ -18,8 +18,6 @@
 package iggycli
 
 import (
-	"time"
-
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
@@ -57,12 +55,12 @@ type Client interface {
 	CreateTopic(
 		streamId iggcon.Identifier,
 		name string,
-		partitionsCount int,
-		compressionAlgorithm uint8,
-		messageExpiry time.Duration,
+		partitionsCount uint32,
+		compressionAlgorithm iggcon.CompressionAlgorithm,
+		messageExpiry iggcon.Duration,
 		maxTopicSize uint64,
 		replicationFactor *uint8,
-		topicId *int,
+		topicId *uint32,
 	) (*iggcon.TopicDetails, error)
 
 	// UpdateTopic update a topic by unique ID or name.
@@ -71,8 +69,8 @@ type Client interface {
 		streamId iggcon.Identifier,
 		topicId iggcon.Identifier,
 		name string,
-		compressionAlgorithm uint8,
-		messageExpiry time.Duration,
+		compressionAlgorithm iggcon.CompressionAlgorithm,
+		messageExpiry iggcon.Duration,
 		maxTopicSize uint64,
 		replicationFactor *uint8,
 	) error
@@ -256,5 +254,5 @@ type Client interface {
 
 	// GetClient get the info about a specific client by unique ID (not to be confused with the user).
 	// Authentication is required, and the permission to read the server info.
-	GetClient(clientId int) (*iggcon.ClientInfoDetails, error)
+	GetClient(clientId uint32) (*iggcon.ClientInfoDetails, error)
 }

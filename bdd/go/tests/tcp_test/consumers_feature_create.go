@@ -30,25 +30,27 @@ var _ = ginkgo.Describe("CREATE CONSUMER GROUP:", func() {
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			groupId := createRandomUInt32()
 			name := createRandomString(16)
 			_, err := client.CreateConsumerGroup(
-				iggcon.NewIdentifier(streamId),
-				iggcon.NewIdentifier(topicId),
+				streamIdentifier,
+				topicIdentifier,
 				name,
 				&groupId,
 			)
 
 			itShouldNotReturnError(err)
-			itShouldSuccessfullyCreateConsumer(streamId, topicId, int(groupId), name, client)
+			itShouldSuccessfullyCreateConsumer(streamId, topicId, groupId, name, client)
 		})
 
 		ginkgo.Context("and tries to create consumer group for a non existing stream", func() {
 			client := createAuthorizedConnection()
 			groupId := createRandomUInt32()
 			_, err := client.CreateConsumerGroup(
-				iggcon.NewIdentifier(int(createRandomUInt32())),
-				iggcon.NewIdentifier(int(createRandomUInt32())),
+				randomU32Identifier(),
+				randomU32Identifier(),
 				createRandomString(16),
 				&groupId)
 
@@ -60,9 +62,10 @@ var _ = ginkgo.Describe("CREATE CONSUMER GROUP:", func() {
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			groupId := createRandomUInt32()
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			_, err := client.CreateConsumerGroup(
-				iggcon.NewIdentifier(streamId),
-				iggcon.NewIdentifier(int(createRandomUInt32())),
+				streamIdentifier,
+				randomU32Identifier(),
 				createRandomString(16),
 				&groupId,
 			)
@@ -77,10 +80,12 @@ var _ = ginkgo.Describe("CREATE CONSUMER GROUP:", func() {
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			_, name := successfullyCreateConsumer(streamId, topicId, client)
 
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			groupId := createRandomUInt32()
 			_, err := client.CreateConsumerGroup(
-				iggcon.NewIdentifier(streamId),
-				iggcon.NewIdentifier(topicId),
+				streamIdentifier,
+				topicIdentifier,
 				name,
 				&groupId,
 			)
@@ -95,12 +100,13 @@ var _ = ginkgo.Describe("CREATE CONSUMER GROUP:", func() {
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			groupId, _ := successfullyCreateConsumer(streamId, topicId, client)
 
-			uint32GroupId := uint32(groupId)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			_, err := client.CreateConsumerGroup(
-				iggcon.NewIdentifier(streamId),
-				iggcon.NewIdentifier(topicId),
+				streamIdentifier,
+				topicIdentifier,
 				createRandomString(16),
-				&uint32GroupId)
+				&groupId)
 
 			itShouldReturnSpecificError(err, "consumer_group_already_exists")
 		})
@@ -112,8 +118,11 @@ var _ = ginkgo.Describe("CREATE CONSUMER GROUP:", func() {
 			topicId, _ := successfullyCreateTopic(streamId, client)
 
 			groupId := createRandomUInt32()
-			_, err := client.CreateConsumerGroup(iggcon.NewIdentifier(streamId),
-				iggcon.NewIdentifier(topicId),
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+			_, err := client.CreateConsumerGroup(
+				streamIdentifier,
+				topicIdentifier,
 				createRandomString(256),
 				&groupId)
 
@@ -126,8 +135,8 @@ var _ = ginkgo.Describe("CREATE CONSUMER GROUP:", func() {
 			client := createClient()
 			groupId := createRandomUInt32()
 			_, err := client.CreateConsumerGroup(
-				iggcon.NewIdentifier(int(createRandomUInt32())),
-				iggcon.NewIdentifier(int(createRandomUInt32())),
+				randomU32Identifier(),
+				randomU32Identifier(),
 				createRandomString(16),
 				&groupId,
 			)

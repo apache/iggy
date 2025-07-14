@@ -28,7 +28,8 @@ var _ = ginkgo.Describe("DELETE STREAM:", func() {
 		ginkgo.Context("and tries to delete existing stream", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
-			err := client.DeleteStream(iggcon.NewIdentifier(streamId))
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			err := client.DeleteStream(streamIdentifier)
 
 			itShouldNotReturnError(err)
 			itShouldSuccessfullyDeleteStream(streamId, client)
@@ -36,9 +37,8 @@ var _ = ginkgo.Describe("DELETE STREAM:", func() {
 
 		ginkgo.Context("and tries to delete non-existing stream", func() {
 			client := createAuthorizedConnection()
-			streamId := int(createRandomUInt32())
 
-			err := client.DeleteStream(iggcon.NewIdentifier(streamId))
+			err := client.DeleteStream(randomU32Identifier())
 
 			itShouldReturnSpecificError(err, "stream_id_not_found")
 		})
@@ -47,7 +47,7 @@ var _ = ginkgo.Describe("DELETE STREAM:", func() {
 	ginkgo.When("User is not logged in", func() {
 		ginkgo.Context("and tries to delete stream", func() {
 			client := createClient()
-			err := client.DeleteStream(iggcon.NewIdentifier(int(createRandomUInt32())))
+			err := client.DeleteStream(randomU32Identifier())
 
 			itShouldReturnUnauthenticatedError(err)
 		})

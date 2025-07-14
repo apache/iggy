@@ -18,31 +18,14 @@
 package binaryserialization
 
 import (
-	"encoding/binary"
-
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
-const (
-	idKindOffset    = 0
-	idLengthOffset  = 1
-	stringIdLength  = 2
-	numericIdLength = 4
-)
-
 func SerializeIdentifier(identifier iggcon.Identifier) []byte {
-	bytes := make([]byte, int(identifier.Length)+2)
-	bytes[idKindOffset] = byte(identifier.Kind)
-	bytes[idLengthOffset] = byte(identifier.Length)
-
-	switch identifier.Kind {
-	case iggcon.StringId:
-		valAsString := identifier.Value.(string)
-		copy(bytes[stringIdLength:], []byte(valAsString))
-	case iggcon.NumericId:
-		valAsInt := identifier.Value.(int)
-		binary.LittleEndian.PutUint32(bytes[stringIdLength:stringIdLength+numericIdLength], uint32(valAsInt))
-	}
+	bytes := make([]byte, identifier.Length+2)
+	bytes[0] = byte(identifier.Kind)
+	bytes[1] = byte(identifier.Length)
+	copy(bytes[2:], identifier.Value)
 	return bytes
 }
 

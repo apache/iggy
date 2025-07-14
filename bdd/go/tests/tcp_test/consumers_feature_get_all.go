@@ -31,7 +31,9 @@ var _ = ginkgo.Describe("GET ALL CONSUMER GROUPS:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			groupId, name := successfullyCreateConsumer(streamId, topicId, client)
-			groups, err := client.GetConsumerGroups(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId))
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+			groups, err := client.GetConsumerGroups(streamIdentifier, topicIdentifier)
 
 			itShouldNotReturnError(err)
 			itShouldContainSpecificConsumer(groupId, name, groups)
@@ -41,7 +43,7 @@ var _ = ginkgo.Describe("GET ALL CONSUMER GROUPS:", func() {
 	ginkgo.When("User is not logged in", func() {
 		ginkgo.Context("and tries to get all consumer groups", func() {
 			client := createClient()
-			_, err := client.GetConsumerGroups(iggcon.NewIdentifier(int(createRandomUInt32())), iggcon.NewIdentifier(int(createRandomUInt32())))
+			_, err := client.GetConsumerGroups(randomU32Identifier(), randomU32Identifier())
 
 			itShouldReturnUnauthenticatedError(err)
 		})

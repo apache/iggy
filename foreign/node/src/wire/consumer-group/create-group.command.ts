@@ -21,6 +21,7 @@
 import type { CommandResponse } from '../../client/client.type.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 import { deserializeConsumerGroup, type ConsumerGroup } from './group.utils.js';
 
 export type CreateGroup = {
@@ -31,7 +32,7 @@ export type CreateGroup = {
 };
 
 export const CREATE_GROUP = {
-  code: 602,
+  code: COMMAND_CODE.CreateGroup,
 
   serialize: ({ streamId, topicId, groupId, name }: CreateGroup) => {
     const bName = Buffer.from(name);
@@ -55,5 +56,6 @@ export const CREATE_GROUP = {
     return deserializeConsumerGroup(r.data).data;
   }
 };
+
 
 export const createGroup = wrapCommand<CreateGroup, ConsumerGroup>(CREATE_GROUP);

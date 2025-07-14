@@ -19,6 +19,7 @@
 
 
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 
@@ -27,7 +28,7 @@ export type PurgeStream = {
 };
 
 export const PURGE_STREAM = {
-  code: 205,
+  code: COMMAND_CODE.PurgeStream,
 
   serialize: ({streamId}: PurgeStream) => {
     return serializeIdentifier(streamId);
@@ -35,5 +36,6 @@ export const PURGE_STREAM = {
 
   deserialize: deserializeVoidResponse
 };
+
 
 export const purgeStream = wrapCommand<PurgeStream, boolean>(PURGE_STREAM);
