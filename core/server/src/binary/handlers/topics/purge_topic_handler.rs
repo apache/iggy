@@ -45,7 +45,7 @@ impl ServerCommandHandler for PurgeTopic {
         debug!("session: {session}, command: {self}");
         let topic_id = self.topic_id.clone();
         let stream_id = self.stream_id.clone();
-        
+
         shard
             .purge_topic(session, &self.stream_id, &self.topic_id)
             .await
@@ -56,7 +56,7 @@ impl ServerCommandHandler for PurgeTopic {
                 )
             })?;
 
-        let event = crate::shard::transmission::event::ShardEvent::PurgedTopic { 
+        let event = crate::shard::transmission::event::ShardEvent::PurgedTopic {
             stream_id: self.stream_id.clone(),
             topic_id: self.topic_id.clone(),
         };

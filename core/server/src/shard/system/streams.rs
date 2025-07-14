@@ -414,10 +414,7 @@ impl IggyShard {
         Ok(())
     }
 
-    pub async fn purge_stream_bypass_auth(
-        &self,
-        stream_id: &Identifier,
-    ) -> Result<(), IggyError> {
+    pub async fn purge_stream_bypass_auth(&self, stream_id: &Identifier) -> Result<(), IggyError> {
         let stream = self.get_stream(stream_id).with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
         })?;

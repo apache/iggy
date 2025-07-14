@@ -28,10 +28,15 @@ use ahash::{AHashMap, AHashSet, HashMap};
 use builder::IggyShardBuilder;
 use error_set::ErrContext;
 use futures::future::try_join_all;
-use iggy_common::{EncryptorKind, Identifier, IggyError, UserId, locking::IggyRwLockFn};
+use iggy_common::{
+    EncryptorKind, Identifier, IggyError, Permissions, UserId, UserStatus,
+    defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME},
+    locking::IggyRwLockFn,
+};
 use namespace::IggyNamespace;
 use std::{
     cell::{Cell, RefCell},
+    future::Future,
     pin::Pin,
     rc::Rc,
     str::FromStr,
@@ -156,13 +161,67 @@ impl IggyShard {
         Default::default()
     }
 
+    pub fn default_from_config(server_config: ServerConfig) -> Self {
+        use crate::bootstrap::resolve_persister;
+        use crate::state::file::FileState;
+        use crate::streaming::diagnostics::metrics::Metrics;
+        use crate::streaming::storage::SystemStorage;
+        use crate::versioning::SemanticVersion;
+
+        let version = SemanticVersion::current().expect("Invalid version");
+        let persister = resolve_persister(server_config.system.partition.enforce_fsync);
+        let storage = Rc::new(SystemStorage::new(
+            server_config.system.clone(),
+            persister.clone(),
+        ));
+
+        let state_path = server_config.system.get_state_messages_file_path();
+        let file_state = FileState::new(&state_path, &version, persister, None);
+        let state = crate::state::StateKind::File(file_state);
+
+        let (stop_sender, stop_receiver) = async_channel::unbounded();
+
+        let shard = Self {
+            id: 0,              // Default shard ID
+            shards: Vec::new(), // No other shards in default config
+            shards_table: Default::default(),
+            version,
+            streams: Default::default(),
+            streams_ids: Default::default(),
+            storage,
+            state,
+            encryptor: None,
+            config: server_config,
+            client_manager: Default::default(),
+            active_sessions: Default::default(),
+            permissioner: Default::default(),
+            users: Default::default(),
+            metrics: Metrics::init(),
+            messages_receiver: Cell::new(None),
+            stop_receiver,
+            stop_sender,
+            task_registry: TaskRegistry::new(),
+            is_shutting_down: AtomicBool::new(false),
+        };
+        let user = User::root(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD);
+        shard
+            .create_user_bypass_auth(
+                &user.username,
+                &user.password,
+                UserStatus::Active,
+                Some(Permissions::root()),
+            )
+            .unwrap();
+        shard
+    }
+
     pub async fn init(&self) -> Result<(), IggyError> {
         let now = Instant::now();
 
         self.load_version().await?;
         let SystemState { users, streams } = self.load_state().await?;
-        self.load_users(users.into_values().collect()).await;
-        self.load_streams(streams.into_values().collect()).await;
+        let _ = self.load_users(users.into_values().collect()).await;
+        let _ = self.load_streams(streams.into_values().collect()).await;
 
         //TODO: Fix the archiver.
         /*
@@ -534,7 +593,6 @@ impl IggyShard {
                     *max_topic_size,
                     *replication_factor,
                 )
-                .await
             }
             ShardEvent::LoginUser {
                 client_id,
@@ -689,7 +747,7 @@ impl IggyShard {
                 .await?;
                 Ok(())
             }
-            ShardEvent::PurgedStream { stream_id,}  => {
+            ShardEvent::PurgedStream { stream_id } => {
                 self.purge_stream_bypass_auth(stream_id).await?;
                 Ok(())
             }
@@ -699,7 +757,7 @@ impl IggyShard {
             } => {
                 self.purge_topic_bypass_auth(stream_id, topic_id).await?;
                 Ok(())
-            },
+            }
             ShardEvent::DeletedTopic {
                 stream_id,
                 topic_id,

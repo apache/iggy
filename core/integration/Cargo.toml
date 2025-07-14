@@ -51,6 +51,7 @@ server = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }
 tokio = { workspace = true }
+compio = { workspace = true }
 twox-hash = { workspace = true }
 uuid = { workspace = true }
 zip = { workspace = true }

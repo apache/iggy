@@ -102,7 +102,7 @@ impl IggyShard {
         Ok(Some(topic))
     }
 
-    pub async fn create_topic_bypass_auth(
+    pub fn create_topic_bypass_auth(
         &self,
         stream_id: &Identifier,
         topic_id: Option<u32>,
@@ -445,7 +445,7 @@ impl IggyShard {
                     session.get_user_id(),
                 )
             })?;
-        
+
         self.purge_topic_base(topic.stream_id, topic.topic_id).await
     }
 
@@ -462,14 +462,15 @@ impl IggyShard {
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get topic with ID: {topic_id} in stream with ID: {stream_id}")
             })?;
-        
-        self.purge_topic_base(stream.stream_id, topic.topic_id).await
+
+        self.purge_topic_base(stream.stream_id, topic.topic_id)
+            .await
     }
 
     async fn purge_topic_base(&self, stream_id: u32, topic_id: u32) -> Result<(), IggyError> {
         let stream = self.get_stream(&Identifier::numeric(stream_id)?)?;
         let topic = stream.get_topic(&Identifier::numeric(topic_id)?)?;
-        
+
         for partition in topic.get_partitions() {
             let mut partition = partition.write().await;
             let partition_id = partition.partition_id;
