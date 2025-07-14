@@ -489,6 +489,7 @@ impl TcpClient {
         }
 
         let stream = self.stream.clone();
+        // SAFETY: we run code holding the `stream` lock in a task so we can't be cancelled while holding the lock.
         tokio::spawn(async move {
             let mut stream = stream.lock().await;
             if let Some(stream) = stream.as_mut() {

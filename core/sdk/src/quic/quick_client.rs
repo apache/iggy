@@ -455,6 +455,7 @@ impl QuicClient {
 
         let connection = self.connection.clone();
         let response_buffer_size = self.config.response_buffer_size;
+        // SAFETY: we run code holding the `connection` lock in a task so we can't be cancelled while holding the lock.
         tokio::spawn(async move {
             let connection = connection.lock().await;
             if let Some(connection) = connection.as_ref() {
