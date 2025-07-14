@@ -19,7 +19,6 @@ package binaryserialization
 
 import (
 	"encoding/binary"
-	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )

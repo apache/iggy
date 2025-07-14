@@ -17,7 +17,6 @@
  */
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
-use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::prelude::{AutoCommit, AutoCommitWhen, IggyConsumer};
 use iggy_binary_protocol::Client;
 use iggy_common::locking::IggyRwLock;
