@@ -27,9 +27,9 @@ use server::streaming::topics::topic::Topic;
 use std::default::Default;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64};
-use tokio::fs;
+use compio::fs;
 
-#[tokio::test]
+#[compio::test]
 async fn should_persist_topics_with_partitions_directories_and_info_file() {
     let setup = TestSetup::init().await;
     let stream_id = 1;
@@ -67,7 +67,7 @@ async fn should_persist_topics_with_partitions_directories_and_info_file() {
     }
 }
 
-#[tokio::test]
+#[compio::test]
 async fn should_load_existing_topic_from_disk() {
     let setup = TestSetup::init().await;
     let stream_id = 1;
@@ -145,7 +145,7 @@ async fn should_load_existing_topic_from_disk() {
     }
 }
 
-#[tokio::test]
+#[compio::test]
 async fn should_delete_existing_topic_from_disk() {
     let setup = TestSetup::init().await;
     let stream_id = 1;
@@ -185,7 +185,7 @@ async fn should_delete_existing_topic_from_disk() {
     }
 }
 
-#[tokio::test]
+#[compio::test]
 async fn should_purge_existing_topic_on_disk() {
     let setup = TestSetup::init().await;
     let stream_id = 1;

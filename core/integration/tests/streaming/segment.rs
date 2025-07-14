@@ -344,13 +344,14 @@ async fn should_delete_persisted_segments() -> Result<(), Box<dyn std::error::Er
 
     let session = Session::new(1, 1, SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 1234));
     let session = Rc::new(session);
-    shard.init().await.unwrap();
     shard.add_active_session(session.clone());
 
-    shard
-        .create_stream(&session, Some(stream_id.get_u32_value()?), stream_name)
-        .await
+    let id = shard
+        .create_stream_bypass_auth( Some(stream_id.get_u32_value()?), stream_name)
         .unwrap();
+    let stream = shard.get_stream(&Identifier::numeric(id).unwrap()).unwrap();
+    stream.persist();
+    drop(stream);
 
     let result = shard
         .create_topic(

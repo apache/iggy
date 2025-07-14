@@ -24,9 +24,9 @@ use server::streaming::partitions::partition::Partition;
 use server::streaming::segments::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64};
-use tokio::fs;
+use compio::fs;
 
-#[tokio::test]
+#[compio::test]
 async fn should_persist_partition_with_segment() {
     let setup = TestSetup::init().await;
     let with_segment = true;
@@ -57,7 +57,7 @@ async fn should_persist_partition_with_segment() {
     }
 }
 
-#[tokio::test]
+#[compio::test]
 async fn should_load_existing_partition_from_disk() {
     let setup = TestSetup::init().await;
     let with_segment = true;
@@ -125,7 +125,7 @@ async fn should_load_existing_partition_from_disk() {
     }
 }
 
-#[tokio::test]
+#[compio::test]
 async fn should_delete_existing_partition_from_disk() {
     let setup = TestSetup::init().await;
     let with_segment = true;
@@ -158,7 +158,7 @@ async fn should_delete_existing_partition_from_disk() {
     }
 }
 
-#[tokio::test]
+#[compio::test]
 async fn should_purge_existing_partition_on_disk() {
     let setup = TestSetup::init().await;
     let with_segment = true;

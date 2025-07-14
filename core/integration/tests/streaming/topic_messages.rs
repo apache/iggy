@@ -29,7 +29,7 @@ use std::str::from_utf8;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
-#[tokio::test]
+#[compio::test]
 async fn assert_polling_messages() {
     let messages_count = 1000;
     let payload_size_bytes = 1000;
@@ -89,7 +89,7 @@ async fn assert_polling_messages() {
     }
 }
 
-#[tokio::test]
+#[compio::test]
 async fn given_key_none_messages_should_be_appended_to_the_next_partition_using_round_robin() {
     let setup = TestSetup::init().await;
     let partitions_count = 3;
@@ -115,7 +115,7 @@ async fn given_key_none_messages_should_be_appended_to_the_next_partition_using_
     }
 }
 
-#[tokio::test]
+#[compio::test]
 async fn given_key_partition_id_messages_should_be_appended_to_the_chosen_partition() {
     let setup = TestSetup::init().await;
     let partition_id = 1;
@@ -147,7 +147,7 @@ async fn given_key_partition_id_messages_should_be_appended_to_the_chosen_partit
     }
 }
 
-#[tokio::test]
+#[compio::test]
 async fn given_key_messages_key_messages_should_be_appended_to_the_calculated_partition() {
     let setup = TestSetup::init().await;
     let partitions_count = 3;

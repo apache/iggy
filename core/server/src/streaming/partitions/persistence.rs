@@ -23,7 +23,7 @@ use error_set::ErrContext;
 use iggy_common::IggyError;
 use std::path::Path;
 use std::sync::atomic::Ordering;
-use tokio::fs::create_dir_all;
+use compio::fs::create_dir_all;
 use tracing::error;
 
 impl Partition {

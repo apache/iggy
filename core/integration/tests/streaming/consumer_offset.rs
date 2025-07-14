@@ -22,9 +22,9 @@ use server::configs::system::SystemConfig;
 use server::streaming::partitions::partition::ConsumerOffset;
 use server::streaming::storage::PartitionStorageKind;
 use std::sync::Arc;
-use tokio::fs;
+use compio::fs;
 
-#[tokio::test]
+#[compio::test]
 async fn should_persist_consumer_offsets_and_then_load_them_from_disk() {
     let setup = TestSetup::init().await;
     let storage = setup.storage.partition.as_ref();

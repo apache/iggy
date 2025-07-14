@@ -79,7 +79,7 @@ fn very_large_batches() -> Vec<u32> {
     [msgs_req_to_save(1), msgs_req_to_save(24), msgs_req_to_save(1000), msgs_req_to_save(10000)],
     [segment_size(10), segment_size(200), segment_size(10000000)],
     [index_cache_none(), index_cache_all(), index_cache_open_segment()])]
-#[tokio::test]
+#[compio::test]
 async fn test_get_messages_by_offset(
     message_size: IggyByteSize,
     batch_lengths: Vec<u32>,

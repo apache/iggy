@@ -28,7 +28,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
-#[tokio::test]
+#[compio::test]
 async fn should_persist_messages_and_then_load_them_from_disk() {
     let setup = TestSetup::init().await;
     let stream_id = 1;
