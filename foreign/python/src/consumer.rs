@@ -80,7 +80,7 @@ impl IggyConsumer {
     }
 
     /// Gets the name of the topic this consumer group is configured for.
-    fn topic<'a>(&self, _py: Python<'a>) -> PyIdentifier {
+    fn topic<'a>(&self) -> PyIdentifier {
         self.inner.blocking_lock().topic().into()
     }
 
