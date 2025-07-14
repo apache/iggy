@@ -15,3 +15,11 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+
+use rmcp::schemars;
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GetStream {
+    #[schemars(description = "stream identifier (numeric or string)")]
+    pub stream_id: String,
+}

@@ -18,7 +18,8 @@
 
 use std::sync::Arc;
 
-use iggy::prelude::{Identifier, IggyClient, IggyError};
+use iggy::prelude::{Identifier, IggyClient, IggyError, StreamClient};
+use requests::*;
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, tool::Parameters},
@@ -26,24 +27,14 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use serde::Serialize;
-use streams::GetStream;
 use tracing::error;
-
-mod consumer_groups;
-mod consumer_offsets;
-mod messages;
-mod partitions;
-mod personal_access_tokens;
-mod segments;
-mod streams;
-mod system;
-mod topics;
-mod users;
+mod requests;
 
 #[derive(Debug, Clone)]
 pub struct IggyService {
     tool_router: ToolRouter<Self>,
-    service: InternalService,
+    consumer: Arc<IggyClient>,
+    _producer: Arc<IggyClient>,
 }
 
 #[tool_router]
@@ -51,16 +42,14 @@ impl IggyService {
     pub fn new(consumer: Arc<IggyClient>, producer: Arc<IggyClient>) -> Self {
         Self {
             tool_router: Self::tool_router(),
-            service: InternalService {
-                consumer,
-                _producer: producer,
-            },
+            consumer,
+            _producer: producer,
         }
     }
 
     #[tool(description = "Get streams")]
     pub async fn get_streams(&self) -> Result<CallToolResult, ErrorData> {
-        self.service.get_streams().await
+        request(self.consumer.get_streams().await)
     }
 
     #[tool(description = "Get stream")]
@@ -68,7 +57,7 @@ impl IggyService {
         &self,
         Parameters(GetStream { stream_id }): Parameters<GetStream>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.service.get_stream(id(&stream_id)?).await
+        request(self.consumer.get_stream(&id(&stream_id)?).await)
     }
 }
 
@@ -91,29 +80,18 @@ fn id(id: &str) -> Result<Identifier, ErrorData> {
     })
 }
 
-#[derive(Debug, Clone)]
-struct InternalService {
-    consumer: Arc<IggyClient>,
-    _producer: Arc<IggyClient>,
-}
+fn request(result: Result<impl Sized + Serialize, IggyError>) -> Result<CallToolResult, ErrorData> {
+    let result = result.map_err(|e| {
+        let message = format!("There was an error when invoking the method. {e}");
+        error!(message);
+        ErrorData::invalid_request(message, None)
+    })?;
 
-impl InternalService {
-    fn request(
-        &self,
-        result: Result<impl Sized + Serialize, IggyError>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let result = result.map_err(|e| {
-            let message = format!("There was an error when invoking the method. {e}");
-            error!(message);
-            ErrorData::invalid_request(message, None)
-        })?;
+    let content = Content::json(result).map_err(|error| {
+        let message = format!("Failed to serialize result. {error}");
+        error!(message);
+        ErrorData::internal_error(message, None)
+    })?;
 
-        let content = Content::json(result).map_err(|error| {
-            let message = format!("Failed to serialize result. {error}");
-            error!(message);
-            ErrorData::internal_error(message, None)
-        })?;
-
-        Ok(CallToolResult::success(vec![content]))
-    }
+    Ok(CallToolResult::success(vec![content]))
 }
