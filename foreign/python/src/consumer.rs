@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,12 +26,13 @@ use iggy::prelude::{
     AutoCommitWhen as RustAutoCommitWhen, *,
 };
 use iggy::prelude::{IggyConsumer as RustIggyConsumer, IggyError, ReceivedMessage};
-use pyo3::types::{PyDelta, PyDeltaAccess};
+use pyo3::types::{PyDelta, PyDeltaAccess, PyFunction};
 
-use pyo3::prelude::*;
+use pyo3::{prelude::*, type_object};
 use pyo3_async_runtimes::tokio::{future_into_py, get_runtime, into_future, scope};
 use pyo3_async_runtimes::TaskLocals;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_enum, gen_stub_pymethods};
+use pyo3_stub_gen::PyStubType;
 use tokio::sync::oneshot::Sender;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -133,12 +135,13 @@ impl IggyConsumer {
     fn consume_messages<'a>(
         &self,
         py: Python<'a>,
-        callback: Bound<'a, PyAny>,
-        shutdown_event: Option<Bound<'a, PyAny>>,
+        callback: Bound<'a, PyMessageCallback>,
+        shutdown_event: Option<Bound<'a, PyAsyncioEvent>>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
-        let callback: Py<PyAny> = callback.unbind();
-        let shutdown_event: Option<Py<PyAny>> = shutdown_event.and_then(|e| Some(e.unbind()));
+        let callback: Py<PyMessageCallback> = callback.unbind();
+        let shutdown_event: Option<Py<PyAsyncioEvent>> =
+            shutdown_event.and_then(|e| Some(e.unbind()));
 
         future_into_py(py, async {
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -167,11 +170,17 @@ impl IggyConsumer {
             if let Some(shutdown_event) = shutdown_event {
                 let task_locals = Python::with_gil(pyo3_async_runtimes::tokio::get_current_locals)?;
                 async fn shutdown_impl(
-                    shutdown_event: Py<PyAny>,
+                    shutdown_event: Py<PyAsyncioEvent>,
                     shutdown_tx: Sender<()>,
                 ) -> PyResult<()> {
                     Python::with_gil(|py| {
-                        into_future(shutdown_event.bind(py).call_method0("wait").unwrap())
+                        into_future(
+                            shutdown_event
+                                .bind(py)
+                                .as_any()
+                                .call_method0("wait")
+                                .unwrap(),
+                        )
                     })?
                     .await?;
                     shutdown_tx.send(()).map_err(|e| {
@@ -199,7 +208,7 @@ impl IggyConsumer {
 }
 
 struct PyCallbackConsumer {
-    callback: Arc<Py<PyAny>>,
+    callback: Arc<Py<PyMessageCallback>>,
     task_locals: Arc<Mutex<TaskLocals>>,
 }
 
@@ -213,7 +222,7 @@ impl MessageConsumer for PyCallbackConsumer {
             .spawn(scope(task_locals, async move {
                 Python::with_gil(|py| {
                     let callback = callback.bind(py);
-                    let result = callback.call1((message,))?;
+                    let result = callback.as_any().call1((message,))?;
                     into_future(result)
                 })
             }))
@@ -223,6 +232,82 @@ impl MessageConsumer for PyCallbackConsumer {
             .await
             .map_err(|_| IggyError::CannotReadMessage)?;
         Ok(())
+    }
+}
+
+#[repr(transparent)]
+pub struct PyMessageCallback(PyFunction);
+
+unsafe impl type_object::PyTypeInfo for PyMessageCallback {
+    const NAME: &'static str = stringify!(PyMessageCallback);
+    const MODULE: ::std::option::Option<&'static str> = None;
+
+    #[inline]
+    #[allow(clippy::redundant_closure_call)]
+    fn type_object_raw(py: Python<'_>) -> *mut pyo3::ffi::PyTypeObject {
+        (|_py| {
+            #[allow(unused_unsafe)] // https://github.com/rust-lang/rust/pull/125834
+            unsafe {
+                ::std::ptr::addr_of_mut!(pyo3::ffi::PyFunction_Type)
+            }
+        })(py)
+    }
+
+    #[inline]
+    fn is_type_of(obj: &Bound<'_, PyAny>) -> bool {
+        #[allow(unused_unsafe)]
+        unsafe {
+            pyo3::ffi::PyFunction_Check(obj.as_ptr()) > 0
+        }
+    }
+}
+
+impl PyStubType for PyMessageCallback {
+    fn type_output() -> pyo3_stub_gen::TypeInfo {
+        pyo3_stub_gen::TypeInfo {
+            name: String::from("collections.abc.Callable[[str]]"),
+            import: HashSet::from(["collections.abc".into()]),
+        }
+    }
+}
+
+#[repr(transparent)]
+pub struct PyAsyncioEvent(PyAny);
+
+unsafe impl type_object::PyTypeInfo for PyAsyncioEvent {
+    const NAME: &'static str = stringify!(PyAsyncioEvent);
+    const MODULE: ::std::option::Option<&'static str> = None;
+
+    #[inline]
+    #[allow(clippy::redundant_closure_call)]
+    fn type_object_raw(py: Python<'_>) -> *mut pyo3::ffi::PyTypeObject {
+        (|_py| {
+            #[allow(unused_unsafe)] // https://github.com/rust-lang/rust/pull/125834
+            unsafe {
+                ::std::ptr::addr_of_mut!(pyo3::ffi::PyBaseObject_Type)
+            }
+        })(py)
+    }
+
+    #[inline]
+    fn is_type_of(obj: &Bound<'_, PyAny>) -> bool {
+        (|| {
+            let ty = obj.get_type();
+            Ok::<bool, PyErr>(
+                ty.name()?.extract::<&str>()? == "Event"
+                    && ty.module()?.extract::<&str>()? == "asyncio.locks",
+            )
+        })()
+        .unwrap_or(false)
+    }
+}
+
+impl PyStubType for PyAsyncioEvent {
+    fn type_output() -> pyo3_stub_gen::TypeInfo {
+        pyo3_stub_gen::TypeInfo {
+            name: String::from("asyncio.Event"),
+            import: HashSet::from(["asyncio".into()]),
+        }
     }
 }
 
