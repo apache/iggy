@@ -21,7 +21,7 @@
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { SingleClient } from '../client/client.js';
-import { ConsumerKind, PollingStrategy, Partitioning } from '../wire/index.js';
+import { Consumer, PollingStrategy, Partitioning } from '../wire/index.js';
 import { generateMessages } from '../tcp.sm.utils.js';
 import { getIggyAddress } from '../tcp.sm.utils.js';
 
@@ -86,7 +86,8 @@ describe('e2e -> consumer-group', async () => {
     const mn = 200;
     for (let i = 0; i <= ct; i += mn) {
       assert.ok(await c.message.send({
-        streamId, topicId,
+        streamId,
+        topicId,
         messages: generateMessages(mn),
         partition: Partitioning.MessageKey(`key-${ i % 300 }`)
       }));
@@ -102,7 +103,7 @@ describe('e2e -> consumer-group', async () => {
     const pollReq = {
       streamId,
       topicId,
-      consumer: { kind: ConsumerKind.Group, id: groupId },
+      consumer: Consumer.Group(groupId),
       partitionId: 0,
       pollingStrategy: PollingStrategy.Next,
       count: 100,
@@ -130,8 +131,6 @@ describe('e2e -> consumer-group', async () => {
   });
 
   after(async () => {
-    // await c.group.leave({ streamId, topicId, groupId });
-    // await c.group.delete({ streamId, topicId, groupId });
     assert.ok(await c.stream.delete(stream));
     assert.ok(await c.session.logout());
     c.destroy();
