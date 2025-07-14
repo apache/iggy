@@ -25,13 +25,13 @@ import (
 	"github.com/apache/iggy/foreign/go/tcp"
 	"github.com/google/uuid"
 
-	. "github.com/apache/iggy/foreign/go/contracts"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	sharedDemoContracts "github.com/apache/iggy/foreign/go/samples/shared"
 )
 
 const (
-	StreamId          = 1
-	TopicId           = 1
+	StreamId          = uint32(1)
+	TopicId           = uint32(1)
 	MessageBatchCount = 1
 	Partition         = 1
 	Interval          = 1000
@@ -61,7 +61,8 @@ func main() {
 }
 
 func EnsureInfrastructureIsInitialized(cli iggycli.Client) error {
-	if _, streamErr := cli.GetStream(NewIdentifier(StreamId)); streamErr != nil {
+	streamIdentifier, _ := iggcon.NewIdentifier(StreamId)
+	if _, streamErr := cli.GetStream(streamIdentifier); streamErr != nil {
 		uint32StreamId := uint32(StreamId)
 		_, streamErr = cli.CreateStream("Test Producer Stream", &uint32StreamId)
 
@@ -76,10 +77,11 @@ func EnsureInfrastructureIsInitialized(cli iggycli.Client) error {
 
 	fmt.Printf("Stream with ID: %d exists.\n", StreamId)
 
-	if _, topicErr := cli.GetTopic(NewIdentifier(StreamId), NewIdentifier(TopicId)); topicErr != nil {
+	topicIdentifier, _ := iggcon.NewIdentifier(TopicId)
+	if _, topicErr := cli.GetTopic(streamIdentifier, topicIdentifier); topicErr != nil {
 		refStreamId := StreamId
 		_, topicErr = cli.CreateTopic(
-			NewIdentifier(StreamId),
+			streamIdentifier,
 			"Test Topic From Producer Sample",
 			12,
 			0,
@@ -106,16 +108,16 @@ func PublishMessages(messageStream iggycli.Client) error {
 
 	for {
 		var debugMessages []sharedDemoContracts.ISerializableMessage
-		var messages []IggyMessage
+		var messages []iggcon.IggyMessage
 
 		for i := 0; i < MessageBatchCount; i++ {
 			message := messageGenerator.GenerateMessage()
 			json := message.ToBytes()
 
 			debugMessages = append(debugMessages, message)
-			messages = append(messages, IggyMessage{
-				Header: MessageHeader{
-					Id:               MessageID(uuid.New()),
+			messages = append(messages, iggcon.IggyMessage{
+				Header: iggcon.MessageHeader{
+					Id:               iggcon.MessageID(uuid.New()),
 					OriginTimestamp:  uint64(time.Now().UnixMicro()),
 					UserHeaderLength: 0,
 					PayloadLength:    uint32(len(json)),
@@ -124,10 +126,12 @@ func PublishMessages(messageStream iggycli.Client) error {
 			})
 		}
 
+		streamIdentifier, _ := iggcon.NewIdentifier(StreamId)
+		topicIdentifier, _ := iggcon.NewIdentifier(TopicId)
 		err := messageStream.SendMessages(
-			NewIdentifier(StreamId),
-			NewIdentifier(TopicId),
-			PartitionId(Partition),
+			streamIdentifier,
+			topicIdentifier,
+			iggcon.PartitionId(Partition),
 			messages,
 		)
 		if err != nil {

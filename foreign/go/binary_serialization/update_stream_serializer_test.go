@@ -24,8 +24,9 @@ import (
 )
 
 func TestSerialize_UpdateStream(t *testing.T) {
+	streamId, _ := iggcon.NewIdentifier("stream")
 	request := TcpUpdateStreamRequest{
-		StreamId: iggcon.NewIdentifier("stream"),
+		StreamId: streamId,
 		Name:     "update_stream",
 	}
 

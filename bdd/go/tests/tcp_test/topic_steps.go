@@ -18,24 +18,24 @@
 package tcp_test
 
 import (
-	"math"
-	"strconv"
-
+	"fmt"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/iggycli"
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
+	"math"
 )
 
 //operations
 
-func successfullyCreateTopic(streamId int, client iggycli.Client) (int, string) {
-	topicId := int(createRandomUInt32())
+func successfullyCreateTopic(streamId uint32, client iggycli.Client) (uint32, string) {
+	topicId := createRandomUInt32()
 	replicationFactor := uint8(1)
 	name := createRandomString(128)
+	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 	_, err := client.CreateTopic(
-		iggcon.NewIdentifier(streamId),
+		streamIdentifier,
 		name,
 		2,
 		1,
@@ -51,19 +51,19 @@ func successfullyCreateTopic(streamId int, client iggycli.Client) (int, string) 
 
 //assertions
 
-func itShouldReturnSpecificTopic(id int, name string, topic iggcon.TopicDetails) {
-	It("should fetch topic with id "+string(rune(id)), func() {
-		Expect(topic.Id).To(Equal(id))
+func itShouldReturnSpecificTopic(id uint32, name string, topic iggcon.TopicDetails) {
+	ginkgo.It("should fetch topic with id "+string(rune(id)), func() {
+		gomega.Expect(topic.Id).To(gomega.Equal(id))
 	})
 
-	It("should fetch topic with name "+name, func() {
-		Expect(topic.Name).To(Equal(name))
+	ginkgo.It("should fetch topic with name "+name, func() {
+		gomega.Expect(topic.Name).To(gomega.Equal(name))
 	})
 }
 
-func itShouldContainSpecificTopic(id int, name string, topics []iggcon.Topic) {
-	It("should fetch at least one topic", func() {
-		Expect(len(topics)).NotTo(Equal(0))
+func itShouldContainSpecificTopic(id uint32, name string, topics []iggcon.Topic) {
+	ginkgo.It("should fetch at least one topic", func() {
+		gomega.Expect(len(topics)).NotTo(gomega.Equal(0))
 	})
 
 	var topic iggcon.Topic
@@ -77,51 +77,57 @@ func itShouldContainSpecificTopic(id int, name string, topics []iggcon.Topic) {
 		}
 	}
 
-	It("should fetch topic with id "+strconv.Itoa(id), func() {
-		Expect(found).To(BeTrue(), "Topic with id %d and name %s not found", id, name)
-		Expect(topic.Id).To(Equal(id))
+	ginkgo.It(fmt.Sprintf("should fetch topic with id %d", id), func() {
+		gomega.Expect(found).To(gomega.BeTrue(), "Topic with id %d and name %s not found", id, name)
+		gomega.Expect(topic.Id).To(gomega.Equal(id))
 	})
 
-	It("should fetch topic with name "+name, func() {
-		Expect(found).To(BeTrue(), "Topic with id %d and name %s not found", id, name)
-		Expect(topic.Name).To(Equal(name))
+	ginkgo.It("should fetch topic with name "+name, func() {
+		gomega.Expect(found).To(gomega.BeTrue(), "Topic with id %d and name %s not found", id, name)
+		gomega.Expect(topic.Name).To(gomega.Equal(name))
 	})
 }
 
-func itShouldSuccessfullyCreateTopic(streamId int, topicId int, expectedName string, client iggycli.Client) {
-	topic, err := client.GetTopic(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId))
-	It("should create topic with id "+string(rune(topicId)), func() {
-		Expect(topic).NotTo(BeNil())
-		Expect(topic.Id).To(Equal(topicId))
+func itShouldSuccessfullyCreateTopic(streamId uint32, topicId uint32, expectedName string, client iggycli.Client) {
+	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+	topic, err := client.GetTopic(streamIdentifier, topicIdentifier)
+	ginkgo.It("should create topic with id "+string(rune(topicId)), func() {
+		gomega.Expect(topic).NotTo(gomega.BeNil())
+		gomega.Expect(topic.Id).To(gomega.Equal(topicId))
 	})
 
-	It("should create topic with name "+expectedName, func() {
-		Expect(topic).NotTo(BeNil())
-		Expect(topic.Name).To(Equal(expectedName))
+	ginkgo.It("should create topic with name "+expectedName, func() {
+		gomega.Expect(topic).NotTo(gomega.BeNil())
+		gomega.Expect(topic.Name).To(gomega.Equal(expectedName))
 	})
 	itShouldNotReturnError(err)
 }
 
-func itShouldSuccessfullyUpdateTopic(streamId int, topicId int, expectedName string, client iggycli.Client) {
-	topic, err := client.GetTopic(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId))
+func itShouldSuccessfullyUpdateTopic(streamId uint32, topicId uint32, expectedName string, client iggycli.Client) {
+	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+	topic, err := client.GetTopic(streamIdentifier, topicIdentifier)
 
-	It("should update topic with id "+string(rune(topicId)), func() {
-		Expect(topic).NotTo(BeNil())
-		Expect(topic.Id).To(Equal(topicId))
+	ginkgo.It("should update topic with id "+string(rune(topicId)), func() {
+		gomega.Expect(topic).NotTo(gomega.BeNil())
+		gomega.Expect(topic.Id).To(gomega.Equal(topicId))
 	})
 
-	It("should update topic with name "+expectedName, func() {
-		Expect(topic).NotTo(BeNil())
-		Expect(topic.Name).To(Equal(expectedName))
+	ginkgo.It("should update topic with name "+expectedName, func() {
+		gomega.Expect(topic).NotTo(gomega.BeNil())
+		gomega.Expect(topic.Name).To(gomega.Equal(expectedName))
 	})
 	itShouldNotReturnError(err)
 }
 
-func itShouldSuccessfullyDeleteTopic(streamId int, topicId int, client iggycli.Client) {
-	topic, err := client.GetTopic(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId))
+func itShouldSuccessfullyDeleteTopic(streamId uint32, topicId uint32, client iggycli.Client) {
+	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+	topic, err := client.GetTopic(streamIdentifier, topicIdentifier)
 
 	itShouldReturnSpecificIggyError(err, ierror.TopicIdNotFound)
-	It("should not return topic", func() {
-		Expect(topic).To(BeNil())
+	ginkgo.It("should not return topic", func() {
+		gomega.Expect(topic).To(gomega.BeNil())
 	})
 }

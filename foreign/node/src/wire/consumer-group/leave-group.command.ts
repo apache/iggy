@@ -22,6 +22,7 @@ import { type Id } from '../identifier.utils.js';
 import { serializeTargetGroup } from './group.utils.js';
 import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 
 export type LeaveGroup = {
   streamId: Id,
@@ -30,7 +31,7 @@ export type LeaveGroup = {
 };
 
 export const LEAVE_GROUP = {
-  code: 605,
+  code: COMMAND_CODE.LeaveGroup,
 
   serialize: ({streamId, topicId, groupId}: LeaveGroup) => {
     return serializeTargetGroup(streamId, topicId, groupId);

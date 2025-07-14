@@ -21,25 +21,26 @@ import (
 	"math"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("CREATE TOPIC:", func() {
+var _ = ginkgo.Describe("CREATE TOPIC:", func() {
 	prefix := "CreateTopic"
-	When("User is logged in", func() {
-		Context("and tries to create topic unique name and id", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("and tries to create topic unique name and id", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
-			topicId := 1
+			topicId := uint32(1)
 			replicationFactor := uint8(1)
 			name := createRandomString(32)
 			defer deleteStreamAfterTests(streamId, client)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			_, err := client.CreateTopic(
-				iggcon.NewIdentifier(streamId),
+				streamIdentifier,
 				name,
 				2,
-				1,
-				1000,
+				iggcon.CompressionAlgorithmNone,
+				iggcon.Millisecond,
 				math.MaxUint64,
 				&replicationFactor,
 				&topicId)
@@ -48,18 +49,19 @@ var _ = Describe("CREATE TOPIC:", func() {
 			itShouldSuccessfullyCreateTopic(streamId, topicId, name, client)
 		})
 
-		Context("and tries to create topic for a non existing stream", func() {
+		ginkgo.Context("and tries to create topic for a non existing stream", func() {
 			client := createAuthorizedConnection()
-			streamId := int(createRandomUInt32())
-			topicId := 1
+			streamId := createRandomUInt32()
+			topicId := uint32(1)
 			replicationFactor := uint8(1)
 			name := createRandomString(32)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			_, err := client.CreateTopic(
-				iggcon.NewIdentifier(streamId),
+				streamIdentifier,
 				name,
 				2,
-				1,
-				1000,
+				iggcon.CompressionAlgorithmNone,
+				iggcon.Millisecond,
 				math.MaxUint64,
 				&replicationFactor,
 				&topicId)
@@ -67,58 +69,60 @@ var _ = Describe("CREATE TOPIC:", func() {
 			itShouldReturnSpecificError(err, "stream_id_not_found")
 		})
 
-		Context("and tries to create topic with duplicate topic name", func() {
+		ginkgo.Context("and tries to create topic with duplicate topic name", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			_, name := successfullyCreateTopic(streamId, client)
 
 			replicationFactor := uint8(1)
-			topicId := int(createRandomUInt32())
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicId := createRandomUInt32()
 			_, err := client.CreateTopic(
-				iggcon.NewIdentifier(streamId),
+				streamIdentifier,
 				name,
 				2,
-				1,
-				0,
+				iggcon.CompressionAlgorithmNone,
+				iggcon.IggyExpiryServerDefault,
 				math.MaxUint64,
 				&replicationFactor,
 				&topicId)
 			itShouldReturnSpecificError(err, "topic_name_already_exists")
 		})
 
-		Context("and tries to create topic with duplicate topic id", func() {
+		ginkgo.Context("and tries to create topic with duplicate topic id", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
-
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			replicationFactor := uint8(1)
 			_, err := client.CreateTopic(
-				iggcon.NewIdentifier(streamId),
+				streamIdentifier,
 				createRandomString(32),
 				2,
-				1,
-				0,
+				iggcon.CompressionAlgorithmNone,
+				iggcon.IggyExpiryServerDefault,
 				math.MaxUint64,
 				&replicationFactor,
 				&topicId)
 			itShouldReturnSpecificError(err, "topic_id_already_exists")
 		})
 
-		Context("and tries to create topic with name that's over 255 characters", func() {
+		ginkgo.Context("and tries to create topic with name that's over 255 characters", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, createAuthorizedConnection())
 
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			replicationFactor := uint8(1)
-			topicId := int(createRandomUInt32())
+			topicId := createRandomUInt32()
 			_, err := client.CreateTopic(
-				iggcon.NewIdentifier(streamId),
+				streamIdentifier,
 				createRandomString(256),
 				2,
-				1,
-				0,
+				iggcon.CompressionAlgorithmNone,
+				iggcon.IggyExpiryServerDefault,
 				math.MaxUint64,
 				&replicationFactor,
 				&topicId)
@@ -127,17 +131,18 @@ var _ = Describe("CREATE TOPIC:", func() {
 		})
 	})
 
-	When("User is not logged in", func() {
-		Context("and tries to create topic", func() {
+	ginkgo.When("User is not logged in", func() {
+		ginkgo.Context("and tries to create topic", func() {
 			client := createClient()
 			replicationFactor := uint8(1)
-			topicId := 1
+			topicId := uint32(1)
+			streamIdentifier, _ := iggcon.NewIdentifier[uint32](10)
 			_, err := client.CreateTopic(
-				iggcon.NewIdentifier(10),
+				streamIdentifier,
 				"name",
 				2,
-				1,
-				0,
+				iggcon.CompressionAlgorithmNone,
+				iggcon.IggyExpiryServerDefault,
 				math.MaxUint64,
 				&replicationFactor,
 				&topicId)

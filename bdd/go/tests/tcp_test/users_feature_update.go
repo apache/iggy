@@ -19,19 +19,20 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("UPDATE USER:", func() {
-	When("User is logged in", func() {
-		Context("tries to update user existing user", func() {
+var _ = ginkgo.Describe("UPDATE USER:", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("tries to update user existing user", func() {
 			client := createAuthorizedConnection()
 			userId := successfullyCreateUser(createRandomString(16), client)
-			defer deleteUserAfterTests(userId, client)
+			identifier, _ := iggcon.NewIdentifier(userId)
+			defer deleteUserAfterTests(identifier, client)
 
 			username := createRandomString(16)
 			err := client.UpdateUser(
-				iggcon.NewIdentifier(int(userId)),
+				identifier,
 				&username,
 				nil,
 			)
@@ -41,13 +42,13 @@ var _ = Describe("UPDATE USER:", func() {
 		})
 	})
 
-	When("User is not logged in", func() {
-		Context("and tries to update user", func() {
+	ginkgo.When("User is not logged in", func() {
+		ginkgo.Context("and tries to update user", func() {
 			client := createClient()
 
 			username := createRandomString(16)
 			err := client.UpdateUser(
-				iggcon.NewIdentifier(int(createRandomUInt32())),
+				randomU32Identifier(),
 				&username,
 				nil,
 			)

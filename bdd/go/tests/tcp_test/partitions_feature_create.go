@@ -19,45 +19,49 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("CREATE PARTITION:", func() {
+var _ = ginkgo.Describe("CREATE PARTITION:", func() {
 	prefix := "CreatePartitions"
-	When("User is logged in", func() {
-		Context("and tries to create partitions for existing stream", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("and tries to create partitions for existing stream", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
-			partitionsCount := 10
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+			partitionsCount := uint32(10)
 			err := client.CreatePartitions(
-				iggcon.NewIdentifier(streamId),
-				iggcon.NewIdentifier(topicId),
-				uint32(partitionsCount))
+				streamIdentifier,
+				topicIdentifier,
+				partitionsCount,
+			)
 
 			itShouldNotReturnError(err)
 			itShouldHaveExpectedNumberOfPartitions(streamId, topicId, partitionsCount+2, client)
 		})
 
-		Context("and tries to create partitions for a non existing stream", func() {
+		ginkgo.Context("and tries to create partitions for a non existing stream", func() {
 			client := createAuthorizedConnection()
 			err := client.CreatePartitions(
-				iggcon.NewIdentifier(int(createRandomUInt32())),
-				iggcon.NewIdentifier(int(createRandomUInt32())),
+				randomU32Identifier(),
+				randomU32Identifier(),
 				10,
 			)
 
 			itShouldReturnSpecificError(err, "stream_id_not_found")
 		})
 
-		Context("and tries to create partitions for a non existing topic", func() {
+		ginkgo.Context("and tries to create partitions for a non existing topic", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			err := client.CreatePartitions(
-				iggcon.NewIdentifier(streamId),
-				iggcon.NewIdentifier(int(createRandomUInt32())),
+				streamIdentifier,
+				randomU32Identifier(),
 				10,
 			)
 
@@ -65,12 +69,12 @@ var _ = Describe("CREATE PARTITION:", func() {
 		})
 	})
 
-	When("User is not logged in", func() {
-		Context("and tries to create partitions", func() {
+	ginkgo.When("User is not logged in", func() {
+		ginkgo.Context("and tries to create partitions", func() {
 			client := createClient()
 			err := client.CreatePartitions(
-				iggcon.NewIdentifier(int(createRandomUInt32())),
-				iggcon.NewIdentifier(int(createRandomUInt32())),
+				randomU32Identifier(),
+				randomU32Identifier(),
 				10,
 			)
 

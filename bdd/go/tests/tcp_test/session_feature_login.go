@@ -18,14 +18,14 @@
 package tcp_test
 
 import (
-	. "github.com/apache/iggy/foreign/go/contracts"
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
 )
 
-var _ = Describe("LOGIN FEATURE:", func() {
-	When("user is already logged in", func() {
-		Context("and tries to log with correct data", func() {
+var _ = ginkgo.Describe("LOGIN FEATURE:", func() {
+	ginkgo.When("user is already logged in", func() {
+		ginkgo.Context("and tries to log with correct data", func() {
 			client := createAuthorizedConnection()
 			user, err := client.LoginUser("iggy", "iggy")
 
@@ -33,7 +33,7 @@ var _ = Describe("LOGIN FEATURE:", func() {
 			itShouldReturnUserId(user, 1)
 		})
 
-		Context("and tries to log with invalid credentials", func() {
+		ginkgo.Context("and tries to log with invalid credentials", func() {
 			client := createAuthorizedConnection()
 			user, err := client.LoginUser("incorrect", "random")
 
@@ -42,8 +42,8 @@ var _ = Describe("LOGIN FEATURE:", func() {
 		})
 	})
 
-	When("user is not logged in", func() {
-		Context("and tries to log with correct data", func() {
+	ginkgo.When("user is not logged in", func() {
+		ginkgo.Context("and tries to log with correct data", func() {
 			client := createClient()
 			user, err := client.LoginUser("iggy", "iggy")
 
@@ -51,7 +51,7 @@ var _ = Describe("LOGIN FEATURE:", func() {
 			itShouldReturnUserId(user, 1)
 		})
 
-		Context("and tries to log with invalid credentials", func() {
+		ginkgo.Context("and tries to log with invalid credentials", func() {
 			client := createClient()
 			user, err := client.LoginUser("incorrect", "random")
 
@@ -61,14 +61,14 @@ var _ = Describe("LOGIN FEATURE:", func() {
 	})
 })
 
-func itShouldReturnUserId(user *IdentityInfo, id uint32) {
-	It("should return user id", func() {
-		Expect(user.UserId).To(Equal(id))
+func itShouldReturnUserId(user *iggcon.IdentityInfo, id uint32) {
+	ginkgo.It("should return user id", func() {
+		gomega.Expect(user.UserId).To(gomega.Equal(id))
 	})
 }
 
-func itShouldNotReturnUser(user *IdentityInfo) {
-	It("should return user id", func() {
-		Expect(user).To(BeNil())
+func itShouldNotReturnUser(user *iggcon.IdentityInfo) {
+	ginkgo.It("should return user id", func() {
+		gomega.Expect(user).To(gomega.BeNil())
 	})
 }

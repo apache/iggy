@@ -20,38 +20,40 @@ package tcp_test
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("GET TOPIC BY ID:", func() {
+var _ = ginkgo.Describe("GET TOPIC BY ID:", func() {
 	prefix := "GetTopic"
-	When("User is logged in", func() {
-		Context("and tries to get existing topic", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("and tries to get existing topic", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, name := successfullyCreateTopic(streamId, client)
-			topic, err := client.GetTopic(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId))
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+			topic, err := client.GetTopic(streamIdentifier, topicIdentifier)
 
 			itShouldNotReturnError(err)
 			itShouldReturnSpecificTopic(topicId, name, *topic)
 		})
 
-		Context("and tries to get topic from non-existing stream", func() {
+		ginkgo.Context("and tries to get topic from non-existing stream", func() {
 			client := createAuthorizedConnection()
-			streamId := int(createRandomUInt32())
 
-			_, err := client.GetTopic(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(int(createRandomUInt32())))
+			_, err := client.GetTopic(randomU32Identifier(), randomU32Identifier())
 
 			itShouldReturnSpecificIggyError(err, ierror.TopicIdNotFound)
 		})
 
-		Context("and tries to get non-existing topic", func() {
+		ginkgo.Context("and tries to get non-existing topic", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 
-			_, err := client.GetTopic(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(int(createRandomUInt32())))
+			_, err := client.GetTopic(streamIdentifier, randomU32Identifier())
 
 			itShouldReturnSpecificIggyError(err, ierror.TopicIdNotFound)
 		})

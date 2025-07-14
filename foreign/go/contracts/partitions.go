@@ -25,10 +25,10 @@ import (
 )
 
 type PartitionContract struct {
-	Id            int    `json:"id"`
+	Id            uint32 `json:"id"`
 	MessagesCount uint64 `json:"messagesCount"`
 	CreatedAt     uint64 `json:"createdAt"`
-	SegmentsCount int    `json:"segmentsCount"`
+	SegmentsCount uint32 `json:"segmentsCount"`
 	CurrentOffset uint64 `json:"currentOffset"`
 	SizeBytes     uint64 `json:"sizeBytes"`
 }
@@ -49,8 +49,8 @@ type PartitioningKind int
 
 const (
 	Balanced        PartitioningKind = 1
-	PartitionIdKind                  = 2
-	MessageKey                       = 3
+	PartitionIdKind PartitioningKind = 2
+	MessageKey      PartitioningKind = 3
 )
 
 type Partitioning struct {
@@ -80,7 +80,7 @@ func PartitionId(value int) Partitioning {
 
 func EntityIdString(value string) (Partitioning, error) {
 	if len(value) == 0 || len(value) > 255 {
-		return Partitioning{}, errors.New("Value has incorrect size, must be between 1 and 255")
+		return Partitioning{}, errors.New("value has incorrect size, must be between 1 and 255")
 	}
 
 	return Partitioning{
@@ -92,7 +92,7 @@ func EntityIdString(value string) (Partitioning, error) {
 
 func EntityIdBytes(value []byte) (Partitioning, error) {
 	if len(value) == 0 || len(value) > 255 {
-		return Partitioning{}, errors.New("Value has incorrect size, must be between 1 and 255")
+		return Partitioning{}, errors.New("value has incorrect size, must be between 1 and 255")
 	}
 
 	return Partitioning{

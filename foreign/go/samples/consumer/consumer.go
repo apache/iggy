@@ -23,7 +23,7 @@ import (
 	"fmt"
 	"time"
 
-	. "github.com/apache/iggy/foreign/go/contracts"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/apache/iggy/foreign/go/iggycli"
 	sharedDemoContracts "github.com/apache/iggy/foreign/go/samples/shared"
 	"github.com/apache/iggy/foreign/go/tcp"
@@ -31,11 +31,11 @@ import (
 
 // config
 const (
-	DefaultStreamId = 1
-	TopicId         = 1
+	DefaultStreamId = uint32(1)
+	TopicId         = uint32(1)
 	Partition       = 1
 	Interval        = 1000
-	ConsumerId      = 1
+	ConsumerId      = uint32(1)
 )
 
 func main() {
@@ -62,8 +62,9 @@ func main() {
 }
 
 func EnsureInfrastructureIsInitialized(cli iggycli.Client) error {
-	if _, streamErr := cli.GetStream(NewIdentifier(DefaultStreamId)); streamErr != nil {
-		uint32DefaultStreamId := uint32(DefaultStreamId)
+	streamIdentifier, _ := iggcon.NewIdentifier(DefaultStreamId)
+	if _, streamErr := cli.GetStream(streamIdentifier); streamErr != nil {
+		uint32DefaultStreamId := DefaultStreamId
 		_, streamErr = cli.CreateStream("Test Producer Stream", &uint32DefaultStreamId)
 
 		if streamErr != nil {
@@ -75,10 +76,11 @@ func EnsureInfrastructureIsInitialized(cli iggycli.Client) error {
 
 	fmt.Printf("Stream with ID: %d exists.\n", DefaultStreamId)
 
-	if _, topicErr := cli.GetTopic(NewIdentifier(DefaultStreamId), NewIdentifier(TopicId)); topicErr != nil {
+	topicIdentifier, _ := iggcon.NewIdentifier(TopicId)
+	if _, topicErr := cli.GetTopic(streamIdentifier, topicIdentifier); topicErr != nil {
 		uint32TopicId := TopicId
 		_, topicErr = cli.CreateTopic(
-			NewIdentifier(DefaultStreamId),
+			streamIdentifier,
 			"Test Topic From Producer Sample",
 			12,
 			0,
@@ -103,12 +105,18 @@ func ConsumeMessages(cli iggycli.Client) error {
 	fmt.Printf("Messages will be polled from stream '%d', topic '%d', partition '%d' with interval %d ms.\n", DefaultStreamId, TopicId, Partition, Interval)
 
 	for {
+		streamIdentifier, _ := iggcon.NewIdentifier(DefaultStreamId)
+		topicIdentifier, _ := iggcon.NewIdentifier(TopicId)
+		consumerIdentifier, _ := iggcon.NewIdentifier(ConsumerId)
 		partionId := uint32(Partition)
 		messagesWrapper, err := cli.PollMessages(
-			NewIdentifier(DefaultStreamId),
-			NewIdentifier(TopicId),
-			Consumer{Kind: ConsumerKindSingle, Id: NewIdentifier(ConsumerId)},
-			NextPollingStrategy(),
+			streamIdentifier,
+			topicIdentifier,
+			iggcon.Consumer{
+				Kind: iggcon.ConsumerKindSingle,
+				Id:   consumerIdentifier,
+			},
+			iggcon.NextPollingStrategy(),
 			1,
 			true,
 			&partionId)
@@ -133,7 +141,7 @@ func ConsumeMessages(cli iggycli.Client) error {
 	}
 }
 
-func HandleMessage(iggyMessage IggyMessage) error {
+func HandleMessage(iggyMessage iggcon.IggyMessage) error {
 	length := (len(iggyMessage.Payload) * 3) / 4
 	bytes := make([]byte, length)
 

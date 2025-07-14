@@ -24,11 +24,13 @@ import (
 )
 
 func TestSerialize_UpdateTopic(t *testing.T) {
+	streamId, _ := iggcon.NewIdentifier("stream")
+	topicId, _ := iggcon.NewIdentifier(uint32(1))
 	request := TcpUpdateTopicRequest{
-		StreamId:      iggcon.NewIdentifier("stream"),
-		TopicId:       iggcon.NewIdentifier(1),
+		StreamId:      streamId,
+		TopicId:       topicId,
 		Name:          "update_topic",
-		MessageExpiry: 100000,
+		MessageExpiry: 100 * iggcon.Microsecond,
 		MaxTopicSize:  100,
 	}
 
