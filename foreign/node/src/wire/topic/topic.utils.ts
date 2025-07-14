@@ -53,7 +53,6 @@ type BaseTopicSerialized = { data: BaseTopic } & Serialized;
 
 type TopicSerialized = { data: Topic } & Serialized;
 
-
 export const CompressionAlgorithmKind = {
   None: 1,
   Gzip: 2
@@ -69,7 +68,6 @@ export type CompressionAlgorithm = CompressionAlgorithmNone | CompressionAlgorit
 
 export const isValidCompressionAlgorithm = (ca: number): ca is CompressionAlgorithm =>
   Object.values(CompressionAlgorithmKind).includes(ca);
-
 
 export const deserializeBaseTopic = (p: Buffer, pos = 0): BaseTopicSerialized => {
   const id = p.readUInt32LE(pos);
@@ -119,6 +117,9 @@ export const deserializePartition = (p: Buffer, pos = 0): PartitionSerialized =>
 
 
 export const deserializeTopic = (p: Buffer, pos = 0): TopicSerialized => {
+  if (p.length === 0)
+    throw new Error('Topic does not exist');
+
   const start = pos;
   const { bytesRead, data } = deserializeBaseTopic(p, pos);
   pos += bytesRead;
