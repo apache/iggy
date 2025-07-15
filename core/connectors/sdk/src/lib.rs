@@ -17,10 +17,18 @@
  */
 
 use async_trait::async_trait;
-use decoders::{json::JsonStreamDecoder, raw::RawStreamDecoder, text::TextStreamDecoder};
-use encoders::{json::JsonStreamEncoder, raw::RawStreamEncoder, text::TextStreamEncoder};
+use base64::{self, Engine};
+use decoders::{
+    flatbuffer::FlatBufferStreamDecoder, json::JsonStreamDecoder, proto::ProtoStreamDecoder,
+    raw::RawStreamDecoder, text::TextStreamDecoder,
+};
+use encoders::{
+    flatbuffer::FlatBufferStreamEncoder, json::JsonStreamEncoder, proto::ProtoStreamEncoder,
+    raw::RawStreamEncoder, text::TextStreamEncoder,
+};
 use iggy::prelude::{HeaderKey, HeaderValue};
 use once_cell::sync::OnceCell;
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 use strum_macros::{Display, IntoStaticStr};
@@ -33,11 +41,16 @@ pub mod sink;
 pub mod source;
 pub mod transforms;
 
+pub use transforms::Transform;
+
 static RUNTIME: OnceCell<Runtime> = OnceCell::new();
 
 pub fn get_runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| Runtime::new().expect("Failed to create Tokio runtime"))
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConnectorState(pub Vec<u8>);
 
 /// The Source trait defines the interface for a source connector, responsible for producing the messages to the configured stream and topic.
 /// Once the messages are produced (e.g. fetched from an external API), they will be sent further to the specified destination.
@@ -247,11 +260,172 @@ impl StateStorage for FileStateStorage {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Optional trait for sinks that need state persistence
+#[async_trait]
+pub trait StatefulSink: Sink {
+    /// Get the current state of the sink
+    async fn get_state(&self) -> Result<SinkState, Error>;
+    
+    /// Set the state of the sink
+    async fn set_state(&mut self, state: SinkState) -> Result<(), Error>;
+    
+    /// Save the current state to persistent storage
+    async fn save_state(&self) -> Result<(), Error>;
+    
+    /// Load the state from persistent storage
+    async fn load_state(&mut self) -> Result<(), Error>;
+}
+
+/// State management for source connectors
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceState {
+    /// Unique identifier for this state
+    pub id: String,
+    /// Timestamp when this state was last updated
+    pub last_updated: chrono::DateTime<chrono::Utc>,
+    /// Version of the state format
+    pub version: u32,
+    /// Generic state data as JSON
+    pub data: serde_json::Value,
+    /// Optional metadata
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// State management for sink connectors
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SinkState {
+    /// Unique identifier for this state
+    pub id: String,
+    /// Timestamp when this state was last updated
+    pub last_updated: chrono::DateTime<chrono::Utc>,
+    /// Version of the state format
+    pub version: u32,
+    /// Generic state data as JSON
+    pub data: serde_json::Value,
+    /// Optional metadata
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// State storage backend trait
+#[async_trait]
+pub trait StateStorage: Send + Sync {
+    /// Save state to storage
+    async fn save_state(&self, state: &SourceState) -> Result<(), Error>;
+    
+    /// Load state from storage
+    async fn load_state(&self, id: &str) -> Result<Option<SourceState>, Error>;
+    
+    /// Delete state from storage
+    async fn delete_state(&self, id: &str) -> Result<(), Error>;
+    
+    /// List all state IDs
+    async fn list_states(&self) -> Result<Vec<String>, Error>;
+}
+
+/// File-based state storage implementation
+pub struct FileStateStorage {
+    base_path: std::path::PathBuf,
+}
+
+impl FileStateStorage {
+    pub fn new<P: AsRef<std::path::Path>>(base_path: P) -> Self {
+        Self {
+            base_path: base_path.as_ref().to_path_buf(),
+        }
+    }
+    
+    fn get_state_path(&self, id: &str) -> std::path::PathBuf {
+        self.base_path.join(format!("{}.json", id))
+    }
+}
+
+#[async_trait]
+impl StateStorage for FileStateStorage {
+    async fn save_state(&self, state: &SourceState) -> Result<(), Error> {
+        use tokio::fs;
+        
+        // Ensure directory exists
+        if let Some(parent) = self.base_path.parent() {
+            fs::create_dir_all(parent).await
+                .map_err(|e| Error::Storage(format!("Failed to create state directory: {}", e)))?;
+        }
+        
+        let path = self.get_state_path(&state.id);
+        let json = serde_json::to_string_pretty(state)
+            .map_err(|e| Error::Serialization(format!("Failed to serialize state: {}", e)))?;
+        
+        fs::write(path, json).await
+            .map_err(|e| Error::Storage(format!("Failed to write state file: {}", e)))?;
+        
+        Ok(())
+    }
+    
+    async fn load_state(&self, id: &str) -> Result<Option<SourceState>, Error> {
+        use tokio::fs;
+        
+        let path = self.get_state_path(id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        
+        let content = fs::read_to_string(path).await
+            .map_err(|e| Error::Storage(format!("Failed to read state file: {}", e)))?;
+        
+        let state: SourceState = serde_json::from_str(&content)
+            .map_err(|e| Error::Serialization(format!("Failed to deserialize state: {}", e)))?;
+        
+        Ok(Some(state))
+    }
+    
+    async fn delete_state(&self, id: &str) -> Result<(), Error> {
+        use tokio::fs;
+        
+        let path = self.get_state_path(id);
+        if path.exists() {
+            fs::remove_file(path).await
+                .map_err(|e| Error::Storage(format!("Failed to delete state file: {}", e)))?;
+        }
+        
+        Ok(())
+    }
+    
+    async fn list_states(&self) -> Result<Vec<String>, Error> {
+        use tokio::fs;
+        
+        let mut states = Vec::new();
+        
+        if !self.base_path.exists() {
+            return Ok(states);
+        }
+        
+        let mut entries = fs::read_dir(&self.base_path).await
+            .map_err(|e| Error::Storage(format!("Failed to read state directory: {}", e)))?;
+        
+        while let Some(entry) = entries.next_entry().await
+            .map_err(|e| Error::Storage(format!("Failed to read directory entry: {}", e)))? {
+            
+            if let Some(extension) = entry.path().extension() {
+                if extension == "json" {
+                    if let Some(stem) = entry.path().file_stem() {
+                        if let Some(id) = stem.to_str() {
+                            states.push(id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(states)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Payload {
     Json(simd_json::OwnedValue),
     Raw(Vec<u8>),
     Text(String),
+    Proto(String),
+    FlatBuffer(Vec<u8>),
 }
 
 impl Payload {
@@ -262,6 +436,8 @@ impl Payload {
             }
             Payload::Raw(value) => Ok(value),
             Payload::Text(text) => Ok(text.into_bytes()),
+            Payload::Proto(text) => Ok(text.into_bytes()),
+            Payload::FlatBuffer(value) => Ok(value),
         }
     }
 }
@@ -274,8 +450,10 @@ impl std::fmt::Display for Payload {
                 "Json({})",
                 simd_json::to_string_pretty(value).unwrap_or_default()
             ),
-            Payload::Raw(value) => write!(f, "Raw({:#?})", value),
-            Payload::Text(text) => write!(f, "Text({})", text),
+            Payload::Raw(value) => write!(f, "Raw({value:#?})"),
+            Payload::Text(text) => write!(f, "Text({text})"),
+            Payload::Proto(text) => write!(f, "Proto({text})"),
+            Payload::FlatBuffer(value) => write!(f, "FlatBuffer({} bytes)", value.len()),
         }
     }
 }
@@ -292,6 +470,10 @@ pub enum Schema {
     Raw,
     #[strum(to_string = "text")]
     Text,
+    #[strum(to_string = "proto")]
+    Proto,
+    #[strum(to_string = "flatbuffer")]
+    FlatBuffer,
 }
 
 impl Schema {
@@ -304,6 +486,17 @@ impl Schema {
             Schema::Text => Ok(Payload::Text(
                 String::from_utf8(value).map_err(|_| Error::InvalidTextPayload)?,
             )),
+            Schema::Proto => match prost_types::Any::decode(value.as_slice()) {
+                Ok(any) => {
+                    let json_value = simd_json::json!({
+                        "type_url": any.type_url,
+                        "value": base64::engine::general_purpose::STANDARD.encode(&any.value),
+                    });
+                    Ok(Payload::Json(json_value))
+                }
+                Err(_) => Ok(Payload::Raw(value)),
+            },
+            Schema::FlatBuffer => Ok(Payload::FlatBuffer(value)),
         }
     }
 
@@ -312,6 +505,8 @@ impl Schema {
             Schema::Json => Arc::new(JsonStreamDecoder),
             Schema::Raw => Arc::new(RawStreamDecoder),
             Schema::Text => Arc::new(TextStreamDecoder),
+            Schema::Proto => Arc::new(ProtoStreamDecoder::default()),
+            Schema::FlatBuffer => Arc::new(FlatBufferStreamDecoder::default()),
         }
     }
 
@@ -320,6 +515,8 @@ impl Schema {
             Schema::Json => Arc::new(JsonStreamEncoder),
             Schema::Raw => Arc::new(RawStreamEncoder),
             Schema::Text => Arc::new(TextStreamEncoder),
+            Schema::Proto => Arc::new(ProtoStreamEncoder::default()),
+            Schema::FlatBuffer => Arc::new(FlatBufferStreamEncoder::default()),
         }
     }
 }
@@ -356,6 +553,7 @@ pub struct ReceivedMessage {
 pub struct ProducedMessages {
     pub schema: Schema,
     pub messages: Vec<ProducedMessage>,
+    pub state: Option<ConnectorState>,
 }
 
 #[repr(C)]
@@ -391,7 +589,11 @@ pub struct RawMessages {
 #[repr(C)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RawMessage {
+    pub id: u128,
     pub offset: u64,
+    pub checksum: u64,
+    pub timestamp: u64,
+    pub origin_timestamp: u64,
     pub headers: Vec<u8>,
     pub payload: Vec<u8>,
 }
@@ -399,7 +601,11 @@ pub struct RawMessage {
 #[repr(C)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ConsumedMessage {
+    pub id: u128,
     pub offset: u64,
+    pub checksum: u64,
+    pub timestamp: u64,
+    pub origin_timestamp: u64,
     pub headers: Option<HashMap<HeaderKey, HeaderValue>>,
     pub payload: Payload,
 }
@@ -438,4 +644,14 @@ pub enum Error {
     Storage(String),
     #[error("Serialization error: {0}")]
     Serialization(String),
+    #[error("Invalid protobuf payload.")]
+    InvalidProtobufPayload,
+    #[error("Cannot open state file")]
+    CannotOpenStateFile,
+    #[error("Cannot read state file")]
+    CannotReadStateFile,
+    #[error("Cannot write state file")]
+    CannotWriteStateFile,
+    #[error("Invalid state")]
+    InvalidState,
 }

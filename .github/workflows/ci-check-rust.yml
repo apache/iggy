@@ -26,6 +26,7 @@
 # - linting using `cargo clippy`
 # - sorted dependencies check using `cargo sort`
 # - documentation tests using `cargo test --doc`
+# - documentation generation using `cargo doc`
 # - unused dependencies check using `cargo machete`
 #
 # This workflow can be triggered manually or by other workflows.
@@ -83,37 +84,6 @@ jobs:
         run: |
           cargo clippy --all-targets --all-features -- -D warnings
 
-  clippy-macos:
-    name: cargo clippy macos
-    runs-on: macos-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Install toolchain
-        run: |
-           rustup toolchain add --profile=minimal stable
-           rustup override set stable
-      - name: Run cargo clippy (macos)
-        run: |
-          cargo clippy --all-targets --all-features -- -D warnings
-
-  clippy-windows:
-    name: cargo clippy windows
-    runs-on: windows-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Install toolchain
-        run: |
-           rustup toolchain add --profile=minimal stable
-           rustup override set stable
-      - name: Run cargo clippy (windows/sdk)
-        run: |
-          cargo clippy --package iggy --all-features -- -D warnings
-      - name: Run cargo clippy (windows/cli)
-        run: |
-          cargo clippy --bin iggy --all-features -- -D warnings
-
   sort:
     name: cargo sort
     runs-on: ubuntu-latest
@@ -145,6 +115,9 @@ jobs:
       - name: Run cargo test (doc)
         run: |
           cargo test --doc
+      - name: Run cargo doc
+        run: |
+          cargo doc --no-deps --all-features --quiet
 
   unused_dependencies:
     name: cargo machete

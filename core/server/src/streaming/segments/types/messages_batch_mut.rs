@@ -551,9 +551,7 @@ impl IggyMessagesBatchMut {
         assert_eq!(
             boundaries_to_remove.len(),
             indexes_to_remove.len(),
-            "Could not retrieve valid boundaries for some message indexes: {:?}, boundaries: {:?}",
-            indexes_to_remove,
-            boundaries_to_remove
+            "Could not retrieve valid boundaries for some message indexes: {indexes_to_remove:?}, boundaries: {boundaries_to_remove:?}"
         );
 
         let new_size = current_size - size_to_remove;

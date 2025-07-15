@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod certificates;
 mod commands;
 mod error;
 mod traits;
@@ -81,6 +82,7 @@ pub use types::user::user_identity_info::*;
 pub use types::user::user_info::*;
 pub use types::user::user_status::*;
 // Utils
+pub use certificates::generate_self_signed_certificate;
 pub use utils::byte_size::IggyByteSize;
 pub use utils::checksum::*;
 pub use utils::crypto::*;

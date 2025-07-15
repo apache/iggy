@@ -157,9 +157,7 @@ impl Segment {
             let current_segment_size = self.get_messages_size();
             assert!(
                 current_segment_size >= max_segment_size_from_config,
-                "Current segment size: {} is greater than max segment size: {}",
-                current_segment_size,
-                max_segment_size_from_config
+                "Current segment size: {current_segment_size} is greater than max segment size: {max_segment_size_from_config}"
             );
 
             // Since segment is closing, indexes should be dropped if index cache is disabled

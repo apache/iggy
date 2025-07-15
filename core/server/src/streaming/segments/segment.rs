@@ -162,9 +162,10 @@ impl Segment {
         self.end_offset = self.start_offset + last_index_offset;
 
         info!(
-            "Loaded {} indexes for segment with start offset: {} and partition with ID: {} for topic with ID: {} and stream with ID: {}.",
+            "Loaded {} indexes for segment with start offset: {}, end offset: {}, and partition with ID: {}, topic with ID: {}, and stream with ID: {}.",
             self.indexes.count(),
             self.start_offset,
+            self.end_offset,
             self.partition_id,
             self.topic_id,
             self.stream_id
@@ -371,11 +372,11 @@ impl Segment {
     }
 
     fn get_messages_file_path(path: &str) -> String {
-        format!("{}.{}", path, LOG_EXTENSION)
+        format!("{path}.{LOG_EXTENSION}")
     }
 
     fn get_index_path(path: &str) -> String {
-        format!("{}.{}", path, INDEX_EXTENSION)
+        format!("{path}.{INDEX_EXTENSION}")
     }
 
     pub fn update_message_expiry(&mut self, message_expiry: IggyExpiry) {
@@ -408,10 +409,6 @@ impl Segment {
 
     pub fn messages_file_path(&self) -> &str {
         &self.messages_path
-    }
-
-    pub fn set_end_offset(&mut self, end_offset: u64) {
-        self.end_offset = end_offset;
     }
 
     /// Explicitly drop the old indexes to ensure memory is freed

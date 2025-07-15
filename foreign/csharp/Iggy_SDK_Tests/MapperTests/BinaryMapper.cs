@@ -49,6 +49,7 @@ public sealed class BinaryMapper
         Assert.Equal(name, response[0].Name);
         Assert.Equal(assertExpiry, response[0].ExpiryAt);
     }
+    
     [Fact]
     public void MapOffsets_ReturnsValidOffsetResponse()
     {
@@ -340,7 +341,8 @@ public sealed class BinaryMapper
         Assert.Equal(membersCount, response.MembersCount);
         Assert.Equal(partitionsCount, response.PartitionsCount);
         Assert.Equal(memberPartitions.Count, partitionsCount);
-        Assert.Equal(response.Members.Count, 1);
+        Assert.NotNull(response.Members);
+        Assert.Single(response.Members);
     }
 
     [Fact]

@@ -141,7 +141,7 @@ async fn cleanup_system(client: &IggyClient) {
 }
 
 fn create_message_payload(offset: u64) -> Bytes {
-    Bytes::from(format!("message {}", offset))
+    Bytes::from(format!("message {offset}"))
 }
 
 fn create_message_headers() -> HashMap<HeaderKey, HeaderValue> {

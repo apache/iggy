@@ -22,11 +22,11 @@ pub fn footer() -> Html {
     html! {
         <footer class="footer">
             <div class="footer-content">
-                <a href="https://iggy.rs" target="_blank" rel="noopener noreferrer">
-                    {"iggy.rs"}
+                <a href="https://iggy.apache.org" target="_blank" rel="noopener noreferrer">
+                    {"iggy.apache.org"}
                 </a>
                 <span class="separator">{"|"}</span>
-                <a href="https://github.com/iggy-rs" target="_blank" rel="noopener noreferrer">
+                <a href="https://github.com/apache/iggy" target="_blank" rel="noopener noreferrer">
                     {"GitHub"}
                 </a>
                 <span class="separator">{"|"}</span>

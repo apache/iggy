@@ -41,13 +41,13 @@ internal static class TopicFactory
     internal static TopicRequest CreateTopicRequest()
     {
         return new TopicRequest(
-            TopicId: Random.Shared.Next(1, 9999),
-            Name: "test_topic" + Random.Shared.Next(1, 69) + Utility.RandomString(12).ToLower(),
-            CompressionAlgorithm: CompressionAlgorithm.Gzip,
-            MessageExpiry: (ulong)Random.Shared.Next(1, 69),
-            MaxTopicSize: (ulong)Random.Shared.NextInt64(2_000_000_000, 10_000_000_000),
-            ReplicationFactor: (byte)Random.Shared.Next(1, 8),
-            PartitionsCount: Random.Shared.Next(5, 25));
+            topicId: Random.Shared.Next(1, 9999),
+            name: "test_topic" + Random.Shared.Next(1, 69) + Utility.RandomString(12).ToLower(),
+            compressionAlgorithm: CompressionAlgorithm.Gzip,
+            messageExpiry: (ulong)Random.Shared.Next(1, 69),
+            maxTopicSize: (ulong)Random.Shared.NextInt64(2_000_000_000, 10_000_000_000),
+            replicationFactor: (byte)Random.Shared.Next(1, 8),
+            partitionsCount: Random.Shared.Next(5, 25));
     }
 
     internal static UpdateTopicRequest CreateUpdateTopicRequest()
@@ -63,13 +63,13 @@ internal static class TopicFactory
     internal static TopicRequest CreateTopicRequest(int topicId)
     {
         return new TopicRequest(
-            TopicId: topicId,
-            Name: "test_topic" + Random.Shared.Next(1, 69) + Utility.RandomString(12).ToLower(),
-            CompressionAlgorithm: CompressionAlgorithm.None,
-            MessageExpiry: (ulong)Random.Shared.Next(1, 69),
-            MaxTopicSize: (ulong)Random.Shared.NextInt64(2_000_000_000, 10_000_000_000),
-            ReplicationFactor: (byte)Random.Shared.Next(1, 8),
-            PartitionsCount: Random.Shared.Next(5, 25));
+            topicId: topicId,
+            name: "test_topic" + Random.Shared.Next(1, 69) + Utility.RandomString(12).ToLower(),
+            compressionAlgorithm: CompressionAlgorithm.None,
+            messageExpiry: (ulong)Random.Shared.Next(1, 69),
+            maxTopicSize: (ulong)Random.Shared.NextInt64(2_000_000_000, 10_000_000_000),
+            replicationFactor: (byte)Random.Shared.Next(1, 8),
+            partitionsCount: Random.Shared.Next(5, 25));
     }
     
     internal static TopicResponse CreateTopicsResponse()

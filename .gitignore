@@ -1,11 +1,13 @@
 target*
 .idea/
 .vscode/
+.vs/
 .zed/
 .DS_Store
 .gradle
 local_data*
-bench_*
+local_state*
+/bench_*
 /sdk/errors_table/
 /rust-clippy-results.sarif
 /performance_results*
@@ -34,6 +36,5 @@ foreign/csharp/**/*.DotSettings.user
 *.a
 *.lib
 *.out
-*.test
 go.work
 core/bench/dashboard/frontend/dist

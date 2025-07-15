@@ -20,8 +20,8 @@ package iggcon
 type ConsumerKind int
 
 const (
-	ConsumerSingle ConsumerKind = 1
-	ConsumerGroup  ConsumerKind = 2
+	ConsumerKindSingle ConsumerKind = 1
+	ConsumerKindGroup  ConsumerKind = 2
 )
 
 type Consumer struct {

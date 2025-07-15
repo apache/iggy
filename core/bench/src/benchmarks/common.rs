@@ -66,6 +66,7 @@ pub fn rate_limit_per_actor(total_rate: Option<IggyByteSize>, actors: u32) -> Op
     })
 }
 
+#[allow(clippy::cognitive_complexity)]
 pub async fn init_consumer_groups(
     client_factory: &Arc<dyn ClientFactory>,
     args: &IggyBenchArgs,

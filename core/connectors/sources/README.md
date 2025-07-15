@@ -31,6 +31,7 @@ pub struct SourceConfig {
     pub path: String,
     pub transforms: Option<TransformsConfig>,
     pub streams: Vec<StreamProducerConfig>,
+    pub config_format: ConfigFormat,
     pub config: Option<serde_json::Value>,
 }
 ```
@@ -43,14 +44,15 @@ Below is the example configuration for a source connector, using `random` as it'
 enabled = true # Toggle source on/off
 name = "Random source" # Name of the source
 path = "libiggy_connector_random_source" # Path to the source connector
+config_format = "toml"
 
 # Collection of the streams to which the produced messages are sent
 [[sources.random.streams]]
 stream = "example_stream"
 topic = "example_topic"
 schema = "json"
-batch_size = 100
-send_interval = "5ms"
+batch_length = 100
+linger_time = "5ms"
 
 # Custom configuration for the source connector, deserialized to type T from `config` field
 [sources.random.config]
@@ -76,7 +78,7 @@ Keep in mind, that the produced messages will be sent further to the specified s
 
 Also, when implementing the source connector, make sure to use the `source_connector!` macro to expose the FFI interface and allow the connector runtime to register the source with the runtime.
 
-And finally, each source should have its own, custom configuration, which is passed along with the unique plugin ID via expected `new()` method.
+And finally, each source should have its own, custom configuration, which is passed along with the unique plugin ID and optional state via expected `new()` method.
 
 Let's start by defining the internal state and the public source connector along with its own configuration.
 
@@ -103,15 +105,28 @@ pub struct RandomSourceConfig {
 }
 ```
 
-At this point, we can expose the expected `new()` method, which will be used by the runtime to create a new instance of the source connector. The `id` is assigned by the runtime, and represents the unique identifier of the source connector.
+At this point, we can expose the required `new()` method, which will be used by the runtime to create a new instance of the source connector. The `id` is assigned by the runtime, and represents the unique identifier of the source connector. The `state` is an optional connector state (e.g. persisted in the local file), which will be provided by the runtime, given that the connector has persisted its own state before the runtime was restarted.
 
 ```rust
 impl RandomSource {
-    pub fn new(id: u32, config: RandomSourceConfig) -> Self {
+    pub fn new(id: u32, config: RandomSourceConfig, state: Option<ConnectorState>) -> Self {
+        let current_id = if let Some(state) = state {
+            u64::from_le_bytes(
+                state.0[0..8]
+                    .try_into()
+                    .inspect_err(|error| {
+                        error!("Failed to convert state to current ID. {error}");
+                    })
+                    .unwrap_or_default(),
+            )
+        } else {
+            0
+        } as usize;
+
         RandomSource {
             id,
             payload_size: config.payload_size.unwrap_or(100),
-            state: Mutex::new(State { current_id: 0 }),
+            state: Mutex::new(State { current_id }),
         }
     }
 }
@@ -139,7 +154,7 @@ struct Record {
 }
 ```
 
-Now, let's implement the `Source` trait for our `RandomSource` struct. We'll assume that the amount of messages (provided in the config), will be generated every 100ms to mimic the behavior of a real-world external source.
+Now, let's implement the `Source` trait for our `RandomSource` struct. We'll assume that the amount of messages (provided in the config), will be generated every 100ms to mimic the behavior of a real-world external source. On top of this, we'll also keep track of the current ID of the last message produced and return the state along with the `ProducedMessages` - the state in this case, will be just a binary encoded number, but it can be anything else, including the complex structs.
 
 ```rust
 #[async_trait]
@@ -192,6 +207,7 @@ impl Source for RandomSource {
         Ok(ProducedMessages {
             schema: Schema::Json,
             messages,
+            state: Some(ConnectorState(state.current_id.to_le_bytes().to_vec())),
         })
     }
 
@@ -212,7 +228,7 @@ Eventually, compile the source code and update the runtime configuration file us
 
 And before starting the runtime, do not forget to create the specified stream and topic e.g. via Iggy CLI.
 
-```
+```bash
 iggy --username iggy --password iggy stream create example_stream
 
 iggy --username iggy --password iggy topic create example_stream example_topic 1 none 1d

@@ -73,6 +73,8 @@ impl PartitionStorage for FilePartitionStorage {
             }
 
         let mut dir_entries = dir_entries.unwrap();
+
+        let mut log_files = Vec::new();
         while let Some(dir_entry) = dir_entries.next_entry().await.unwrap_or(None) {
             let path = dir_entry.path();
             let extension = path.extension();
@@ -83,12 +85,17 @@ impl PartitionStorage for FilePartitionStorage {
             if metadata.is_dir() {
                 continue;
             }
+            log_files.push(dir_entry);
+        }
 
+        log_files.sort_by_key(|a| a.file_name());
+
+        for dir_entry in log_files {
             let log_file_name = dir_entry
                 .file_name()
                 .into_string()
                 .unwrap()
-                .replace(&format!(".{}", LOG_EXTENSION), "");
+                .replace(&format!(".{LOG_EXTENSION}"), "");
 
             let start_offset = log_file_name.parse::<u64>().unwrap();
             let mut segment = Segment::create(
@@ -211,23 +218,6 @@ impl PartitionStorage for FilePartitionStorage {
                 .segments_count_of_parent_stream
                 .fetch_add(1, Ordering::SeqCst);
             partition.segments.push(segment);
-        }
-
-        partition.segments.sort_by_key(|a| a.start_offset());
-
-        let end_offsets = partition
-            .segments
-            .iter()
-            .skip(1)
-            .map(|segment| segment.start_offset() - 1)
-            .collect::<Vec<u64>>();
-
-        let segments_count = partition.segments.len();
-        for (end_offset_index, segment) in partition.get_segments_mut().iter_mut().enumerate() {
-            if end_offset_index == segments_count - 1 {
-                break;
-            }
-            segment.set_end_offset(end_offsets[end_offset_index]);
         }
 
         if !partition.segments.is_empty() {
@@ -404,8 +394,7 @@ impl PartitionStorage for FilePartitionStorage {
             .overwrite(path, &offset.to_le_bytes())
             .await
             .with_error_context(|error| format!(
-                "{COMPONENT} (error: {error}) - failed to overwrite consumer offset with value: {}, path: {}",
-                offset, path,
+                "{COMPONENT} (error: {error}) - failed to overwrite consumer offset with value: {offset}, path: {path}",
             ))?;
         trace!("Stored consumer offset value: {}, path: {}", offset, path);
         Ok(())

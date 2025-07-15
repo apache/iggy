@@ -19,15 +19,74 @@
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    author = "Apache Iggy (Incubating)",
+    version,
+    about = "Apache Iggy: Hyper-Efficient Message Streaming at Laser Speed",
+    long_about = r#"Apache Iggy (Incubating) - A persistent message streaming platform written in Rust
+
+Apache Iggy is a high-performance message streaming platform that supports QUIC, TCP, and HTTP 
+transport protocols, capable of processing millions of messages per second with low latency.
+
+WEBSITE:
+    https://iggy.apache.org
+
+REPOSITORY:
+    https://github.com/apache/iggy
+
+DOCUMENTATION:
+    https://iggy.apache.org/docs
+
+CONFIGURATION:
+    The server uses a TOML configuration file. By default, it looks for 'configs/server.toml' 
+    in the current working directory. You can override this with the IGGY_CONFIG_PATH environment
+    variable or use the --config-provider flag.
+
+    Examples:
+        iggy-server                                    # Uses default file provider (configs/server.toml)
+        iggy-server --config-provider file             # Explicitly use file provider
+        IGGY_CONFIG_PATH=custom.toml iggy-server       # Use custom config file path
+
+ENVIRONMENT VARIABLES:
+    Any configuration value can be overridden using environment variables with the IGGY_ prefix.
+    Use underscores to separate nested configuration keys (e.g., IGGY_TCP_ADDRESS=127.0.0.1:8090).
+
+    Common examples:
+        IGGY_TCP_ADDRESS=0.0.0.0:8090                  # Override TCP server address
+        IGGY_HTTP_ENABLED=true                         # Enable HTTP transport
+        IGGY_SYSTEM_PATH=/data/iggy                    # Set data storage path
+        IGGY_SYSTEM_LOGGING_LEVEL=debug                # Set log level to debug
+
+TRANSPORT PROTOCOLS:
+    - TCP (binary protocol): High-performance, low-latency (default: 127.0.0.1:8090)
+    - QUIC: Modern UDP-based protocol with built-in encryption (default: 127.0.0.1:8080)
+    - HTTP: RESTful API for web integration (default: 127.0.0.1:3000, disabled by default)
+
+GETTING STARTED:
+    1. Start the server: iggy-server
+    2. Install CLI: cargo install iggy-cli
+    3. Create a stream: iggy stream create my-stream
+    4. Create a topic: iggy topic create my-stream my-topic 1 none
+    5. Send messages: echo "Hello, Iggy!" | iggy message send my-stream my-topic
+
+For more information, visit: https://iggy.apache.org/docs/introduction/getting-started/"#
+)]
 pub struct Args {
-    #[arg(short, long, default_value = "file")]
+    /// Configuration provider type
+    ///
+    /// Currently only 'file' provider is supported, which loads configuration from a TOML file.
+    /// The file path can be specified via IGGY_CONFIG_PATH environment variable.
+    #[arg(short, long, default_value = "file", verbatim_doc_comment)]
     pub config_provider: String,
 
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "Remove system path (local_data by default) before starting. THIS WILL REMOVE ALL SAVED DATA!"
-    )]
+    /// Remove system path before starting (WARNING: THIS WILL DELETE ALL DATA!)
+    ///
+    /// This flag will completely remove the system data directory (local_data by default)
+    /// before starting the server. Use this for clean development setups or testing.
+    ///
+    /// Examples:
+    ///   iggy-server --fresh                          # Start with fresh data directory
+    ///   iggy-server -f                               # Short form
+    #[arg(short, long, default_value_t = false, verbatim_doc_comment)]
     pub fresh: bool,
 }

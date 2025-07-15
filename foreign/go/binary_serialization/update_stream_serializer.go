@@ -18,11 +18,12 @@
 package binaryserialization
 
 import (
-	iggcon "github.com/iggy-rs/iggy-go-client/contracts"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
 type TcpUpdateStreamRequest struct {
-	iggcon.UpdateStreamRequest
+	StreamId iggcon.Identifier `json:"streamId"`
+	Name     string            `json:"name"`
 }
 
 func (request *TcpUpdateStreamRequest) Serialize() []byte {

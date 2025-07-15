@@ -15,6 +15,9 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+
+use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
+use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::partitions::COMPONENT, sender::SenderKind};
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
@@ -25,26 +28,32 @@ use iggy_common::IggyError;
 use iggy_common::delete_segments::DeleteSegments;
 use tracing::{debug, instrument};
 
-#[instrument(skip_all, name = "trace_delete_segments", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id, iggy_stream_id = command.stream_id.as_string(), iggy_topic_id = command.topic_id.as_string()))]
-pub async fn handle(
-    command: DeleteSegments,
-    sender: &mut SenderKind,
-    session: &Session,
-    system: &SharedSystem,
-) -> Result<(), IggyError> {
-    debug!("session: {session}, command: {command}");
-    let stream_id = command.stream_id.clone();
-    let topic_id = command.topic_id.clone();
-    let partition_id = command.partition_id;
+impl ServerCommandHandler for DeleteSegments {
+    fn code(&self) -> u32 {
+        iggy_common::DELETE_SEGMENTS_CODE
+    }
 
-    let mut system = system.write().await;
-    system
+    #[instrument(skip_all, name = "trace_delete_segments", fields(iggy_user_id = session.get_user_id(), iggy_client_id = session.client_id, iggy_stream_id = self.stream_id.as_string(), iggy_topic_id = self.topic_id.as_string()))]
+    async fn handle(
+        self,
+        sender: &mut SenderKind,
+        _length: u32,
+        session: &Session,
+        system: &SharedSystem,
+    ) -> Result<(), IggyError> {
+        debug!("session: {session}, command: {self}");
+        let stream_id = self.stream_id.clone();
+        let topic_id = self.topic_id.clone();
+        let partition_id = self.partition_id;
+
+        let mut system = system.write().await;
+        system
             .delete_segments(
                 session,
-                &command.stream_id,
-                &command.topic_id,
-                command.partition_id,
-                command.segments_count,
+                &self.stream_id,
+                &self.topic_id,
+                self.partition_id,
+                self.segments_count,
             )
             .await
             .with_error_context(|error| {
@@ -53,19 +62,33 @@ pub async fn handle(
                 )
             })?;
 
-    let system = system.downgrade();
-    system
-        .state
-        .apply(
-            session.get_user_id(),
-            &EntryCommand::DeleteSegments(command),
-        )
-        .await
-        .with_error_context(|error| {
-            format!(
-                "{COMPONENT} (error: {error}) - failed to apply 'delete segments' command for partition with ID: {partition_id} in topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
+        let system = system.downgrade();
+        system
+            .state
+            .apply(
+                session.get_user_id(),
+                &EntryCommand::DeleteSegments(self),
             )
-        })?;
-    sender.send_empty_ok_response().await?;
-    Ok(())
+            .await
+            .with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - failed to apply 'delete segments' command for partition with ID: {partition_id} in topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
+                )
+            })?;
+        sender.send_empty_ok_response().await?;
+        Ok(())
+    }
+}
+
+impl BinaryServerCommand for DeleteSegments {
+    async fn from_sender(
+        sender: &mut SenderKind,
+        code: u32,
+        length: u32,
+    ) -> Result<Self, IggyError> {
+        match receive_and_validate(sender, code, length).await? {
+            ServerCommand::DeleteSegments(delete_segments) => Ok(delete_segments),
+            _ => Err(IggyError::InvalidCommand),
+        }
+    }
 }

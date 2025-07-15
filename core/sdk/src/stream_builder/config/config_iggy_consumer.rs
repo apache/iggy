@@ -196,7 +196,7 @@ impl IggyConsumerConfig {
             batch_length,
             create_stream_if_not_exists: false,
             create_topic_if_not_exists: false,
-            consumer_name: format!("consumer-{}-{}", stream, topic),
+            consumer_name: format!("consumer-{stream}-{topic}"),
             consumer_kind: ConsumerKind::ConsumerGroup,
             polling_interval,
             polling_strategy: PollingStrategy::last(),

@@ -19,11 +19,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# This script is used to generate Cross.toml file for user which executes
-# this script. This is needed since Cross.toml build.dockerfile.build-args
-# section requires statically defined Docker build arguments and parameters
-# like current UID or GID must be entered (cannot be generated or fetched
-# during cross execution time).
+# This script is used to prepare the release artifacts for the Apache Iggy project.
 
 set -euo pipefail
 
@@ -53,7 +49,7 @@ rm -rf "$RELEASE_DIR"
 mkdir -p "$TEMP_DIR"
 mkdir -p "$RELEASE_DIR"
 
-FILES=(
+RELEASE_FILES=(
   "Cargo.lock"
   "Cargo.toml"
   "DEPENDENCIES.md"
@@ -65,29 +61,109 @@ FILES=(
   "justfile"
 )
 
-DIRS=(
-  "bench"
-  "certs"
-  "cli"
-  "configs"
+RELEASE_DIRS=(
+  "bdd"
+  "core"
   "examples"
-  "integration"
+  "foreign"
   "licenses"
   "scripts"
-  "sdk"
-  "server"
-  "tools"
+  "web"
 )
 
-for file in "${FILES[@]}"; do
+IGNORED_FILES=(
+  ".DS_Store"
+  ".gitignore"
+)
+
+IGNORED_DIRS=(
+  "target"
+  "node_modules"
+  "pkg"
+  "build"
+  "out"
+  "dist"
+  "bin"
+  "obj"
+  "__pycache__"
+  ".elixir_ls"
+  ".tox"
+  ".eggs"
+  ".venv"
+  ".svelte-kit"
+)
+
+for file in "${RELEASE_FILES[@]}"; do
   cp "$SRC_DIR/$file" "$TEMP_DIR/"
 done
 
-for dir in "${DIRS[@]}"; do
-  cp -r "$SRC_DIR/$dir" "$TEMP_DIR/"
+shopt -s dotglob nullglob
+
+for dir in "${RELEASE_DIRS[@]}"; do
+  src="$SRC_DIR/$dir"
+  dest="$TEMP_DIR/$dir"
+
+  [ -d "$src" ] || continue
+  mkdir -p "$dest"
+
+  for item in "$src"/*; do
+    name=$(basename "$item")
+
+    if [[ "$dir" == "web" ]]; then
+      if [ -d "$item" ]; then
+        for ignored in "${IGNORED_DIRS[@]}"; do
+          if [[ "$name" == "$ignored" ]]; then
+            continue 2
+          fi
+        done
+      fi
+
+      if [ -f "$item" ]; then
+        for ignored_file in "${IGNORED_FILES[@]}"; do
+          if [[ "$name" == "$ignored_file" ]]; then
+            continue 2
+          fi
+        done
+      fi
+    fi
+
+    if [[ "$dir" == "foreign" && -d "$item" ]]; then
+      sdk=$(basename "$item")
+      mkdir -p "$dest/$sdk"
+
+      for sdk_item in "$item"/*; do
+        sdk_name=$(basename "$sdk_item")
+
+        if [ -d "$sdk_item" ]; then
+          for ignored in "${IGNORED_DIRS[@]}"; do
+            if [[ "$sdk_name" == "$ignored" ]]; then
+              continue 2
+            fi
+          done
+        fi
+
+        if [ -f "$sdk_item" ]; then
+          for ignored_file in "${IGNORED_FILES[@]}"; do
+            if [[ "$sdk_name" == "$ignored_file" ]]; then
+              continue 2
+            fi
+          done
+        fi
+
+        cp -r "$sdk_item" "$dest/$sdk/"
+      done
+
+      continue
+    fi
+
+    cp -r "$item" "$dest/"
+  done
 done
 
-VERSION=$(grep '^version' "$TEMP_DIR/server/Cargo.toml" | head -n 1 | cut -d '"' -f2)
+shopt -u dotglob nullglob
+
+
+VERSION=$(grep '^version' "$TEMP_DIR/core/server/Cargo.toml" | head -n 1 | cut -d '"' -f2)
 
 echo "Preparing release for version: $VERSION"
 
@@ -111,5 +187,3 @@ echo "✔ Checksum saved to: $CHECKSUM_FILE"
 
 mv "$ARCHIVE_NAME" "$RELEASE_DIR/"
 mv "$CHECKSUM_FILE" "$RELEASE_DIR/"
-
-

@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use std::collections::HashMap;
+use std::{collections::HashMap, thread};
 
 use super::metrics::group::{from_individual_metrics, from_producers_and_consumers_statistics};
 use crate::utils::get_server_stats;
@@ -31,6 +31,8 @@ use bench_report::{
 };
 use chrono::{DateTime, Utc};
 use iggy::prelude::{CacheMetrics, CacheMetricsKey, IggyTimestamp, Stats};
+use integration::test_server::ClientFactory;
+use std::sync::Arc;
 
 pub struct BenchmarkReportBuilder;
 
@@ -41,6 +43,7 @@ impl BenchmarkReportBuilder {
         mut params: BenchmarkParams,
         mut individual_metrics: Vec<BenchmarkIndividualMetrics>,
         moving_average_window: u32,
+        client_factory: &Arc<dyn ClientFactory>,
     ) -> BenchmarkReport {
         let uuid = uuid::Uuid::new_v4();
 
@@ -48,10 +51,7 @@ impl BenchmarkReportBuilder {
             DateTime::<Utc>::from_timestamp_micros(IggyTimestamp::now().as_micros() as i64)
                 .map_or_else(|| String::from("unknown"), |dt| dt.to_rfc3339());
 
-        let transport = params.transport;
-        let server_addr = params.server_address.clone();
-
-        let server_stats = get_server_stats(&transport, &server_addr)
+        let server_stats = get_server_stats(client_factory)
             .await
             .expect("Failed to get server stats");
 
@@ -83,25 +83,24 @@ impl BenchmarkReportBuilder {
             .cloned()
             .collect();
 
-        if !producer_metrics.is_empty() {
-            if let Some(metrics) = from_individual_metrics(&producer_metrics, moving_average_window)
-            {
-                group_metrics.push(metrics);
-            }
-        }
+        let mut join_handles = Vec::new();
 
-        if !consumer_metrics.is_empty() {
-            if let Some(metrics) = from_individual_metrics(&consumer_metrics, moving_average_window)
-            {
-                group_metrics.push(metrics);
-            }
-        }
+        for individual_metric in [
+            &producer_metrics,
+            &consumer_metrics,
+            &producing_consumers_metrics,
+        ] {
+            if !individual_metric.is_empty() {
+                let individual_metric_copy = individual_metric.clone();
 
-        if !producing_consumers_metrics.is_empty() {
-            if let Some(metrics) =
-                from_individual_metrics(&producing_consumers_metrics, moving_average_window)
-            {
-                group_metrics.push(metrics);
+                join_handles.push(thread::spawn(move || {
+                    if let Some(metric) =
+                        from_individual_metrics(&individual_metric_copy, moving_average_window)
+                    {
+                        return Some(metric);
+                    }
+                    None
+                }));
             }
         }
 
@@ -112,12 +111,21 @@ impl BenchmarkReportBuilder {
         ) && !producer_metrics.is_empty()
             && !consumer_metrics.is_empty()
         {
-            if let Some(metrics) = from_producers_and_consumers_statistics(
-                &producer_metrics,
-                &consumer_metrics,
-                moving_average_window,
-            ) {
-                group_metrics.push(metrics);
+            join_handles.push(thread::spawn(move || {
+                if let Some(metric) = from_producers_and_consumers_statistics(
+                    &producer_metrics,
+                    &consumer_metrics,
+                    moving_average_window,
+                ) {
+                    return Some(metric);
+                }
+                None
+            }));
+        }
+
+        for handle in join_handles {
+            if let Some(metric) = handle.join().expect("Should have computed group metric") {
+                group_metrics.push(metric);
             }
         }
 

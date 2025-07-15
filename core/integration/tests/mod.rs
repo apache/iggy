@@ -26,11 +26,9 @@ use std::sync::{Arc, Once};
 use std::{panic, thread};
 
 mod archiver;
-mod bench;
 mod cli;
 mod config_provider;
 mod data_integrity;
-mod examples;
 mod sdk;
 mod server;
 mod state;
@@ -107,7 +105,7 @@ fn teardown() {
             if let Ok(failed) = FAILED_TEST_CASES.read() {
                 for test in failed.iter() {
                     if let Some(logs) = buffer.get(test) {
-                        eprintln!("Logs for failed test '{}':", test);
+                        eprintln!("Logs for failed test '{test}':");
                         eprintln!("{}", String::from_utf8_lossy(logs));
                     }
                 }

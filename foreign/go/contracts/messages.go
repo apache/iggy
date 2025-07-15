@@ -18,62 +18,109 @@
 package iggcon
 
 import (
-	"github.com/google/uuid"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
-type FetchMessagesRequest struct {
+const (
+	// MaxPayloadSize is maximum allowed size in bytes for a message payload.
+	//
+	// This constant defines the upper limit for the size of an IggyMessage payload. Attempting to create a message
+	// with a payload larger than this value will result
+	// in an ierror.TooBigUserMessagePayload error.
+	//
+	//  Constraints
+	//  - Minimum payload size: 1 byte (empty payloads are not allowed)
+	//  - Maximum payload size: 10 MB
+	MaxPayloadSize = 10 * 1000 * 1000
+
+	// MaxUserHeadersSize is maximum allowed size in bytes for user-defined headers.
+	//
+	// This constant defines the upper limit for the combined size of all user headers in an IggyMessage. Attempting to
+	// create a message with user headers larger than this value will result in an ierror.TooBigUserHeaders error.
+	//
+	//  Constraints
+	//  - Maximum headers size: 100 KB
+	//  - Each individual header key is limited to 255 bytes
+	//  - Each individual header value is limited to 255 bytes
+	MaxUserHeadersSize = 100 * 1000
+)
+
+type PollMessageRequest struct {
 	StreamId        Identifier      `json:"streamId"`
 	TopicId         Identifier      `json:"topicId"`
 	Consumer        Consumer        `json:"consumer"`
-	PartitionId     int             `json:"partitionId"`
+	PartitionId     uint32          `json:"partitionId"`
 	PollingStrategy PollingStrategy `json:"pollingStrategy"`
 	Count           int             `json:"count"`
 	AutoCommit      bool            `json:"autoCommit"`
 }
 
-type FetchMessagesResponse struct {
-	PartitionId   int
+type PolledMessage struct {
+	PartitionId   uint32
 	CurrentOffset uint64
-	Messages      []MessageResponse
-	MessageCount  int
+	MessageCount  uint32
+	Messages      []IggyMessage
 }
-
-type MessageResponse struct {
-	Offset    uint64                    `json:"offset"`
-	Timestamp uint64                    `json:"timestamp"`
-	Checksum  uint32                    `json:"checksum"`
-	Id        uuid.UUID                 `json:"id"`
-	Payload   []byte                    `json:"payload"`
-	Headers   map[HeaderKey]HeaderValue `json:"headers,omitempty"`
-	State     MessageState              `json:"state"`
-}
-
-type MessageState int
-
-const (
-	MessageStateAvailable MessageState = iota
-	MessageStateUnavailable
-	MessageStatePoisoned
-	MessageStateMarkedForDeletion
-)
 
 type SendMessagesRequest struct {
-	StreamId     Identifier   `json:"streamId"`
-	TopicId      Identifier   `json:"topicId"`
-	Partitioning Partitioning `json:"partitioning"`
-	Messages     []Message    `json:"messages"`
+	StreamId     Identifier    `json:"streamId"`
+	TopicId      Identifier    `json:"topicId"`
+	Partitioning Partitioning  `json:"partitioning"`
+	Messages     []IggyMessage `json:"messages"`
 }
 
-type Message struct {
-	Id      uuid.UUID
-	Payload []byte
-	Headers map[HeaderKey]HeaderValue
+type ReceivedMessage struct {
+	Message       IggyMessage
+	CurrentOffset uint64
+	PartitionId   uint32
 }
 
-func NewMessage(payload []byte, headers map[HeaderKey]HeaderValue) Message {
-	return Message{
-		Id:      uuid.New(),
-		Payload: payload,
-		Headers: headers,
+type IggyMessage struct {
+	Header      MessageHeader
+	Payload     []byte
+	UserHeaders []byte
+}
+
+type IggyMessageOpt func(message *IggyMessage)
+
+// NewIggyMessage Creates a new message with customizable parameters.
+func NewIggyMessage(payload []byte, opts ...IggyMessageOpt) (IggyMessage, error) {
+	if len(payload) == 0 {
+		return IggyMessage{}, ierror.InvalidMessagePayloadLength
+	}
+
+	if len(payload) > MaxPayloadSize {
+		return IggyMessage{}, ierror.TooBigUserMessagePayload
+	}
+
+	header := NewMessageHeader(MessageID{}, uint32(len(payload)), 0)
+	message := IggyMessage{
+		Header:      header,
+		Payload:     payload,
+		UserHeaders: make([]byte, 0),
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&message)
+		}
+	}
+	userHeaderLength := len(message.UserHeaders)
+	if userHeaderLength > MaxUserHeadersSize {
+		return IggyMessage{}, ierror.TooBigUserHeaders
+	}
+	message.Header.UserHeaderLength = uint32(userHeaderLength)
+	return message, nil
+}
+
+func WithID(id [16]byte) IggyMessageOpt {
+	return func(m *IggyMessage) {
+		m.Header.Id = id
+	}
+}
+
+func WithUserHeaders(userHeaders map[HeaderKey]HeaderValue) IggyMessageOpt {
+	return func(m *IggyMessage) {
+		userHeaderBytes := GetHeadersBytes(userHeaders)
+		m.UserHeaders = userHeaderBytes
 	}
 }

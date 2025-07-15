@@ -5,6 +5,7 @@ The highly performant and modular runtime for statically typed, yet dynamically 
 **This is still WiP, and the runtime can be started only after compilation from the source code (no installable package yet).**
 
 ## Features
+
 - **High Performance**: Utilizes Rust's performance characteristics to ensure fast data ingestion and egress.
 - **Low memory footprint**: Designed with memory efficiency in mind, minimizing the memory footprint of the connectors.
 - **Modular Design**: Designed with modularity in mind, allowing for easy extension and customization.
@@ -18,21 +19,22 @@ The highly performant and modular runtime for statically typed, yet dynamically 
 
 1. Build the project in release mode, and make sure that the plugins specified in `core/connectors/config.toml` under `path` are available. You can use either of `toml`, `json` or `yaml` formats for the configuration file.
 
-2. Run `docker compose up -d` from `/core/examples/sink-data-producer` which will start the Quickwit server to be used by an example sink connector. At this point, you can access the Quickwit UI at [http://localhost:7280](http://localhost:7280) - check this dashboard again later on, after the `events` index will be created.
+2. Run `docker compose up -d` from `/examples/rust/src/sink-data-producer` which will start the Quickwit server to be used by an example sink connector. At this point, you can access the Quickwit UI at [http://localhost:7280](http://localhost:7280) - check this dashboard again later on, after the `events` index will be created.
 
-3. Set environment variable `IGGY_CONNECTORS_RUNTIME_CONFIG_PATH=core/connectors/runtime/config` (adjust the path as needed) pointing to the runtime configuration file.
+3. Set environment variable `IGGY_CONNECTORS_CONFIG_PATH=core/connectors/runtime/config` (adjust the path as needed) pointing to the runtime configuration file.
 
 4. Start the Iggy server and invoke the following commands via Iggy CLI to create the example streams and topics used by the sample connectors.
 
-```
-iggy --username iggy --password iggy stream create example
-iggy --username iggy --password iggy stream create qw
-iggy --username iggy --password iggy topic create qw records 1 none 1d
-```
+    ```bash
+    iggy --username iggy --password iggy stream create example_stream
+    iggy --username iggy --password iggy topic create example_stream example_topic 1 none 1d
+    iggy --username iggy --password iggy stream create qw
+    iggy --username iggy --password iggy topic create qw records 1 none 1d
+    ```
 
-5. Execute `cargo r --example sink-data-producer -r` which will start the example data producer application, sending the messages to previously created `qw` stream and `records` topic (this will be used by the Quickwit sink connector).
+5. Execute `cargo run --example sink-data-producer -r` which will start the example data producer application, sending the messages to previously created `qw` stream and `records` topic (this will be used by the Quickwit sink connector).
 
-6. Start the connector runtime `cargo r --bin iggy_connector_runtime -r` - you should be able to browse Quickwit UI with records being constantly added to the `events` index. At the same time, you should see the new messages being added to the `example` stream and `topic1` topic by the test source connector - you can use Iggy Web UI to browse the data. The messages will have applied the basic fields transformations.
+6. Start the connector runtime `cargo run --bin iggy-connectors -r` - you should be able to browse Quickwit UI with records being constantly added to the `events` index. At the same time, you should see the new messages being added to the `example` stream and `topic1` topic by the test source connector - you can use Iggy Web UI to browse the data. The messages will have applied the basic fields transformations.
 
 ## Runtime
 

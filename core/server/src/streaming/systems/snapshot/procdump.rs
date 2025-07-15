@@ -22,7 +22,7 @@ use tokio::fs::{self};
 fn parse_stat(contents: &str) -> String {
     let fields: Vec<&str> = contents.split_whitespace().collect();
     if fields.len() < 52 {
-        return format!("Invalid stat format: {}", contents);
+        return format!("Invalid stat format: {contents}");
     }
 
     let cmd_start = contents.find('(').unwrap_or(0);
@@ -31,7 +31,7 @@ fn parse_stat(contents: &str) -> String {
 
     let mut result = String::new();
     result.push_str(&format!("PID: {}\n", fields[0]));
-    result.push_str(&format!("Command: {}\n", comm));
+    result.push_str(&format!("Command: {comm}\n"));
     result.push_str(&format!(
         "State: {} ({})\n",
         fields[2],
@@ -139,7 +139,7 @@ pub async fn get_proc_info() -> Result<String, std::io::Error> {
     async fn dump_file(result: &mut String, path: &str) -> Result<(), std::io::Error> {
         match fs::read_to_string(path).await {
             Ok(contents) => {
-                result.push_str(&format!("=== {} ===\n", path));
+                result.push_str(&format!("=== {path} ===\n"));
 
                 if path.ends_with("/stat") && path.contains("/task/") {
                     result.push_str(&parse_stat(&contents));
@@ -152,7 +152,7 @@ pub async fn get_proc_info() -> Result<String, std::io::Error> {
             Err(e) => {
                 if let Ok(metadata) = fs::metadata(path).await {
                     if metadata.is_dir() && path.ends_with("/fd") {
-                        result.push_str(&format!("=== {} (directory) ===\n", path));
+                        result.push_str(&format!("=== {path} (directory) ===\n"));
                         if let Ok(mut rd) = fs::read_dir(path).await {
                             while let Ok(Some(entry)) = rd.next_entry().await {
                                 let fd_path = entry.path();
@@ -175,10 +175,10 @@ pub async fn get_proc_info() -> Result<String, std::io::Error> {
                         }
                         result.push('\n');
                     } else {
-                        result.push_str(&format!("=== {} ERROR: {} ===\n\n", path, e));
+                        result.push_str(&format!("=== {path} ERROR: {e} ===\n\n"));
                     }
                 } else {
-                    result.push_str(&format!("=== {} ERROR: {} ===\n\n", path, e));
+                    result.push_str(&format!("=== {path} ERROR: {e} ===\n\n"));
                 }
             }
         }

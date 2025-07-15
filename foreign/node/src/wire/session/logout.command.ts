@@ -20,15 +20,17 @@
 
 import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 
-// LOGOUT
 export const LOGOUT = {
-  code: 39,
+  code: COMMAND_CODE.LogoutUser,
+
   serialize: () => {
     return Buffer.alloc(0);
   },
 
   deserialize: deserializeVoidResponse
 };
+
 
 export const logout = wrapCommand<void, boolean>(LOGOUT);

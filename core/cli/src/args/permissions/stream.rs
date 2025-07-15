@@ -124,7 +124,7 @@ impl FromStr for StreamPermissionsArg {
             .ok_or("Missing stream ID".to_string())
             .and_then(|id| {
                 id.parse()
-                    .map_err(|error| format!("Invalid stream ID - {}", error))
+                    .map_err(|error| format!("Invalid stream ID - {error}"))
             })?;
 
         let (stream_permissions, stream_errors): (Vec<StreamPermission>, Option<String>) =
@@ -183,7 +183,7 @@ impl FromStr for StreamPermissionsArg {
         };
 
         match (stream_errors, topic_errors) {
-            (Some(e), Some(f)) => return Err(format!("{}; {}", e, f)),
+            (Some(e), Some(f)) => return Err(format!("{e}; {f}")),
             (Some(e), None) => return Err(e),
             (None, Some(f)) => return Err(f),
             (None, None) => (),

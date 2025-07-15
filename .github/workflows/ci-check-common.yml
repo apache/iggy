@@ -20,8 +20,12 @@
 #
 # CI Check Common Workflow
 #
-# This workflow validates commit messages and checks for conventional commits.
-# This workflow is mandatory and runs on pull request events.
+# This workflow runs common code quality checks that are not specific
+# to any programming language. Checks include:
+# - PR title validation using conventional commits
+# - license header verification
+# - license list validation
+# - markdown linting using markdownlint
 #
 name: ci-check-common
 
@@ -98,3 +102,20 @@ jobs:
            rustup toolchain add --profile=minimal stable
            rustup override set stable
       - run: scripts/licenses-list.sh --check
+
+  markdownlint:
+    name: markdownlint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+      - name: Install markdownlint-cli
+        run: |
+          npm install -g markdownlint-cli
+      - name: Run markdownlint
+        run: |
+          markdownlint '**/*.md' --ignore-path .gitignore

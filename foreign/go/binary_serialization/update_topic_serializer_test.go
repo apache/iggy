@@ -20,18 +20,18 @@ package binaryserialization
 import (
 	"testing"
 
-	iggcon "github.com/iggy-rs/iggy-go-client/contracts"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
 func TestSerialize_UpdateTopic(t *testing.T) {
+	streamId, _ := iggcon.NewIdentifier("stream")
+	topicId, _ := iggcon.NewIdentifier(uint32(1))
 	request := TcpUpdateTopicRequest{
-		iggcon.UpdateTopicRequest{
-			StreamId:      iggcon.NewIdentifier("stream"),
-			TopicId:       iggcon.NewIdentifier(1),
-			Name:          "update_topic",
-			MessageExpiry: 100000,
-			MaxTopicSize:  100,
-		},
+		StreamId:      streamId,
+		TopicId:       topicId,
+		Name:          "update_topic",
+		MessageExpiry: 100 * iggcon.Microsecond,
+		MaxTopicSize:  100,
 	}
 
 	serialized1 := request.Serialize()

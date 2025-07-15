@@ -1,17 +1,15 @@
 # Apache Iggy (Incubating)
 
-<div style="display: flex; flex-wrap: wrap; justify-content: center; align-items: center; text-align: center;">
+<div align="center">
 
-  [Website](https://iggy.apache.org) | [Getting started](https://iggy.apache.org/docs/introduction/getting-started/) | [Documentation](https://iggy.apache.org/docs/) | [Blog](https://iggy.apache.org/blogs/) | [Discord](https://discord.gg/C5Sux5NcRa) | [Crates](https://crates.io/crates/iggy)
+[Website](https://iggy.apache.org) | [Getting started](https://iggy.apache.org/docs/introduction/getting-started/) | [Documentation](https://iggy.apache.org/docs/) | [Blog](https://iggy.apache.org/blogs/) | [Discord](https://discord.gg/C5Sux5NcRa) | [Crates](https://crates.io/crates/iggy)
 
 </div>
 <div style="display: flex; flex-wrap: wrap; justify-content: center; align-items: center; text-align: center;">
 
   [![crates.io](https://img.shields.io/crates/v/iggy.svg)](https://crates.io/crates/iggy)
   [![crates.io](https://img.shields.io/crates/d/iggy.svg)](https://crates.io/crates/iggy)
-  [![docs](https://docs.rs/iggy/badge.svg)](https://docs.rs/iggy)
-  [![workflow](https://github.com/apache/iggy/actions/workflows/test.yml/badge.svg)](https://github.com/apache/iggy/actions/workflows/test.yml)
-  [![coverage](https://coveralls.io/repos/github/iggy-rs/iggy/badge.svg?branch=master)](https://coveralls.io/github/iggy-rs/iggy?branch=master)
+  [![coverage](https://coveralls.io/repos/github/apache/iggy/badge.svg?branch=master)](https://coveralls.io/github/apache/iggy?branch=master)
   [![dependency](https://deps.rs/repo/github/apache/iggy/status.svg)](https://deps.rs/repo/github/apache/iggy)
   [![x](https://img.shields.io/twitter/follow/ApacheIggy?style=social)](https://twitter.com/ApacheIggy)
   [![discord-badge](https://img.shields.io/discord/1144142576266530928)](https://discord.gg/C5Sux5NcRa)
@@ -28,13 +26,13 @@
 
 ---
 
-**Iggy** is the persistent message streaming platform written in Rust, supporting QUIC, TCP (custom binary specification) and HTTP (regular REST API) transport protocols, **capable of processing millions of messages per second at the low latency**.
+**Iggy** is a persistent message streaming platform written in Rust, supporting QUIC, TCP (custom binary specification) and HTTP (regular REST API) transport protocols, **capable of processing millions of messages per second at ultra-low latency**.
 
 Iggy provides **exceptionally high throughput and performance** while utilizing minimal computing resources.
 
-This is **not yet another extension** running on top of the existing infrastructure, such as Kafka or SQL database.
+This is **not yet another extension** running on top of existing infrastructure, such as Kafka or SQL database.
 
-Iggy is the persistent message streaming log **built from the ground up** using the low lvl I/O for speed and efficiency.
+Iggy is a persistent message streaming log **built from the ground up** using low-level I/O for speed and efficiency.
 
 The name is an abbreviation for the Italian Greyhound - small yet extremely fast dogs, the best in their class. See the lovely [Fabio & Cookie](https://www.instagram.com/fabio.and.cookie/) ❤️
 
@@ -42,18 +40,18 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 
 ## Features
 
-- **Highly performant**, persistent append-only log for the message streaming
+- **Highly performant**, persistent append-only log for message streaming
 - **Very high throughput** for both writes and reads
 - **Low latency and predictable resource usage** thanks to the Rust compiled language (no GC)
-- **Users authentication and authorization** with granular permissions and PAT (Personal Access Tokens)
+- **User authentication and authorization** with granular permissions and Personal Access Tokens (PAT)
 - Support for multiple streams, topics and partitions
 - Support for **multiple transport protocols** (QUIC, TCP, HTTP)
 - Fully operational RESTful API which can be optionally enabled
 - Available client SDK in multiple languages
-- **Works directly with the binary data** (lack of enforced schema and serialization/deserialization)
+- **Works directly with binary data**, avoiding enforced schema and serialization/deserialization overhead
 - Custom **zero-copy (de)serialization**, which greatly improves the performance and reduces memory usage.
 - Configurable server features (e.g. caching, segment size, data flush interval, transport protocols etc.)
-- Possibility of storing the **consumer offsets** on the server
+- Server-side storage of **consumer offsets**
 - Multiple ways of polling the messages:
   - By offset (using the indexes)
   - By timestamp (using the time indexes)
@@ -63,12 +61,12 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 - **Consumer groups** providing the message ordering and horizontal scaling across the connected clients
 - **Message expiry** with auto deletion based on the configurable **retention policy**
 - Additional features such as **server side message deduplication**
-- **Multi-tenant** support via abstraction of **streams** whch group **topics**
+- **Multi-tenant** support via abstraction of **streams** which group **topics**
 - **TLS** support for all transport protocols (TCP, QUIC, HTTPS)
 - **[Connectors](https://github.com/apache/iggy/tree/master/core/connectors)** - sinks, sources and data transformations based on the **custom Rust plugins**
 - Optional server-side as well as client-side **data encryption** using AES-256-GCM
 - Optional metadata support in the form of **message headers**
-- Optional **data backups & archivization** on disk and/or the **S3** compatible cloud storage (e.g. AWS S3)
+- Optional **data backups and archiving** to disk or **S3** compatible cloud storage (e.g. AWS S3)
 - Support for **OpenTelemetry** logs & traces + Prometheus metrics
 - Built-in **CLI** to manage the streaming server installable via `cargo install iggy-cli`
 - Built-in **benchmarking app** to test the performance
@@ -79,12 +77,11 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 
 ![files structure](assets/files_structure.png)
 
-
 ---
 
 ## Architecture
 
-This is the high-level architecture of the Iggy message streaming server, where extremely high performance and ultra low and stable tail latencies are the primary goals. The server is designed to handle high throughput and very low latency (submillisecond tail latencies), making it suitable for real-time applications. For more details, please refer to the [documentation](https://iggy.apache.org/docs/introduction/architecture).
+This is the high-level architecture of the Iggy message streaming server, where extremely high performance and ultra low and stable tail latencies are the primary goals. The server is designed to handle high throughput and very low latency (sub-millisecond tail latencies), making it suitable for real-time applications. For more details, please refer to the [documentation](https://iggy.apache.org/docs/introduction/architecture).
 
 ![server](assets/iggy_architecture.png)
 
@@ -116,9 +113,6 @@ The recent improvements based on the zero-copy (de)serialization, along with upd
 - C++
 - Elixir
 
-
-Almost all the tooling has been migrated from [iggy-rs](https://github.com/iggy-rs/) organization to this monorepo. There's no an ongoing work to support the zero-copy (de)serialization for all the SDKs.
-
 ---
 
 ## CLI
@@ -131,7 +125,7 @@ Iggy CLI can be installed with `cargo install iggy-cli` and then simply accessed
 
 ## Web UI
 
-There's a dedicated Web UI for the server, which allows managing the streams, topics, partitions, browsing the messages and so on. This is an ongoing effort to build the compressive dashboard for the administrative purposes of the Iggy server. Check the Web UI in the `/web` directory. The docker image for Web UI is available [here](https://hub.docker.com/r/iggyrs/iggy-web-ui), and can be fetched via `docker pull iggyrs/iggy-web-ui`.
+There's a dedicated Web UI for the server, which allows managing the streams, topics, partitions, browsing the messages and so on. This is an ongoing effort to build a comprehensive dashboard for administrative purposes of the Iggy server. Check the Web UI in the `/web` directory. The [docker image for Web UI](https://hub.docker.com/r/iggyrs/iggy-web-ui) is available, and can be fetched via `docker pull iggyrs/iggy-web-ui`.
 
 ![Web UI](assets/web_ui.png)
 
@@ -139,7 +133,7 @@ There's a dedicated Web UI for the server, which allows managing the streams, to
 
 ## Docker
 
-The official images can be found [here](https://hub.docker.com/r/apache/iggy), simply type `docker pull apache/iggy` to pull the image.
+The official images can be found [in Docker Hub](https://hub.docker.com/r/apache/iggy), simply type `docker pull apache/iggy` to pull the image.
 
 Please note that the images tagged as `latest` are based on the official, stable releases, while the `edge` ones are updated directly from latest version of the `master` branch.
 
@@ -175,49 +169,64 @@ Run the tests:
 
 Start the server:
 
-`cargo r --bin iggy-server`
+`cargo run --bin iggy-server`
+
+For configuration options and detailed help:
+
+`cargo run --bin iggy-server -- --help`
+
+You can also use environment variables to override any configuration setting:
+
+- Override TCP address
+   `IGGY_TCP_ADDRESS=0.0.0.0:8090 cargo run --bin iggy-server`
+
+- Set custom data path
+   `IGGY_SYSTEM_PATH=/data/iggy cargo run --bin iggy-server`
+
+- Enable HTTP transport
+   `IGGY_HTTP_ENABLED=true cargo run --bin iggy-server`
 
 To quickly generate the sample data:
 
-`cargo r --bin data-seeder-tool`
+`cargo run --bin data-seeder-tool`
 
 *Please note that all commands below are using `iggy` binary, which is part of release (`cli` sub-crate).*
 
 Create a stream with name `dev` (numerical ID will be assigned by server automatically) using default credentials and `tcp` transport (available transports: `quic`, `tcp`, `http`, default `tcp`):
 
-`cargo r --bin iggy -- --transport tcp --username iggy --password iggy stream create dev`
+`cargo run --bin iggy -- --transport tcp --username iggy --password iggy stream create dev`
 
 List available streams:
 
-`cargo r --bin iggy -- --username iggy --password iggy stream list`
+`cargo run --bin iggy -- --username iggy --password iggy stream list`
 
 Get `dev` stream details:
 
-`cargo r --bin iggy -- -u iggy -p iggy stream get dev`
+`cargo run --bin iggy -- -u iggy -p iggy stream get dev`
 
 Create a topic named `sample` (numerical ID will be assigned by server automatically) for stream `dev`, with 2 partitions (IDs 1 and 2), disabled compression (`none`) and disabled message expiry (skipped optional parameter):
 
-`cargo r --bin iggy -- -u iggy -p iggy topic create dev sample 2 none`
+`cargo run --bin iggy -- -u iggy -p iggy topic create dev sample 2 none`
 
 List available topics for stream `dev`:
 
-`cargo r --bin iggy -- -u iggy -p iggy topic list dev`
+`cargo run --bin iggy -- -u iggy -p iggy topic list dev`
 
 Get topic details for topic `sample` in stream `dev`:
 
-`cargo r --bin iggy -- -u iggy -p iggy topic get dev sample`
+`cargo run --bin iggy -- -u iggy -p iggy topic get dev sample`
 
 Send a message 'hello world' (message ID 1) to the stream `dev` to topic `sample` and partition 1:
 
-`cargo r --bin iggy -- -u iggy -p iggy message send --partition-id 1 dev sample "hello world"`
+`cargo run --bin iggy -- -u iggy -p iggy message send --partition-id 1 dev sample "hello world"`
 
 Send another message 'lorem ipsum' (message ID 2) to the same stream, topic and partition:
 
-`cargo r --bin iggy -- -u iggy -p iggy message send --partition-id 1 dev sample "lorem ipsum"`
+`cargo run --bin iggy -- -u iggy -p iggy message send --partition-id 1 dev sample "lorem ipsum"`
 
 Poll messages by a regular consumer with ID 1 from the stream `dev` for topic `sample` and partition with ID 1, starting with offset 0, messages count 2, without auto commit (storing consumer offset on server):
 
-`cargo r --bin iggy -- -u iggy -p iggy message poll --consumer 1 --offset 0 --message-count 2 --auto-commit dev sample 1`
+`cargo run --bin iggy -- -u iggy -p iggy message poll --consumer 1 --offset 0 --message-count 2 --auto-commit dev sample 1`
 
 Finally, restart the server to see it is able to load the persisted data.
 
@@ -229,15 +238,9 @@ To see the detailed logs from the CLI/server, run it with `RUST_LOG=trace` envir
 
 ## Examples
 
-You can find the sample consumer & producer applications under `examples` directory. The purpose of these apps is to showcase the usage of the client SDK. To find out more about building the applications, please refer to the [getting started](https://iggy.apache.org/docs/introduction/getting-started) guide.
+You can find comprehensive sample applications under the `examples/rust` directory. These examples showcase various usage patterns of the Iggy client SDK, from basic operations to advanced multi-tenant scenarios.
 
-To run the example, first start the server with `cargo r --bin iggy-server` and then run the producer and consumer apps with `cargo r --example message-envelope-producer` and `cargo r --example message-envelope-consumer` respectively.
-
-You might start multiple producers and consumers at the same time to see how the messages are being handled across multiple clients. Check the [Args](https://github.com/apache/iggy/blob/master/core/examples/src/shared/args.rs) struct to see the available options, such as the transport protocol, stream, topic, partition, consumer ID, message size etc.
-
-By default, the consumer will poll the messages using the `next` available offset with auto commit enabled, to store its offset on the server. With this approach, you can easily achieve *at-most-once* delivery.
-
-![sample](assets/sample.png)
+For detailed information about available examples and how to run them, please see the [Examples README](examples/rust/README.md).
 
 ---
 
@@ -296,7 +299,7 @@ while let Some(message) = consumer.next().await {
 **Benchmarks should be the first-class citizens**. We believe that performance is crucial for any system, and we strive to provide the best possible performance for our users. Please check, why we believe that the **[transparent
 benchmarking](https://iggy.apache.org/blogs/2025/02/17/transparent-benchmarks)** is so important.
 
-We've also built the **[benchmarking platform](https://benchmarks.iggy.rs)** where anyone can upload the benchmarks and compare the results with others. This is the another open-source project available [here](https://github.com/iggy-rs/iggy-bench-dashboard).
+We've also built the **[benchmarking platform](https://benchmarks.iggy.rs)** where anyone can upload the benchmarks and compare the results with others. Source code for the platform is available in the `core/bench/dashboard` directory.
 
 ![server](assets/benchmarking_platform.png)
 
@@ -315,43 +318,43 @@ Then, run the benchmarking app with the desired options:
 1. Sending (writing) benchmark
 
    ```bash
-   cargo r --bin iggy-bench -r -- -v pinned-producer tcp
+   cargo run --bin iggy-bench -r -- -v pinned-producer tcp
    ```
 
 2. Polling (reading) benchmark
 
    ```bash
-   cargo r --bin iggy-bench -r -- -v pinned-consumer tcp
+   cargo run --bin iggy-bench -r -- -v pinned-consumer tcp
    ```
 
 3. Parallel sending and polling benchmark
 
    ```bash
-   cargo r --bin iggy-bench -r -- -v pinned-producer-and-consumer tcp
+   cargo run --bin iggy-bench -r -- -v pinned-producer-and-consumer tcp
    ```
 
 4. Balanced sending to multiple partitions benchmark
 
    ```bash
-   cargo r --bin iggy-bench -r -- -v balanced-producer tcp
+   cargo run --bin iggy-bench -r -- -v balanced-producer tcp
    ```
 
 5. Consumer group polling benchmark:
 
    ```bash
-   cargo r --bin iggy-bench -r -- -v balanced-consumer-group tcp
+   cargo run --bin iggy-bench -r -- -v balanced-consumer-group tcp
    ```
 
 6. Parallel balanced sending and polling from consumer group benchmark:
 
    ```bash
-   cargo r --bin iggy-bench -r -- -v balanced-producer-and-consumer-group tcp
+   cargo run --bin iggy-bench -r -- -v balanced-producer-and-consumer-group tcp
    ```
 
 7. End to end producing and consuming benchmark (single task produces and consumes messages in sequence):
 
    ```bash
-   cargo r --bin iggy-bench -r -- -v end-to-end-producing-consumer tcp
+   cargo run --bin iggy-bench -r -- -v end-to-end-producing-consumer tcp
    ```
 
 These benchmarks would start the server with the default configuration, create a stream, topic and partition, and then send or poll the messages. The default configuration is optimized for the best performance, so you might want to tweak it for your needs. If you need more options, please refer to `iggy-bench` subcommands `help` and `examples`.

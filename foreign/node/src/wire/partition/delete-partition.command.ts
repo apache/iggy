@@ -22,6 +22,7 @@ import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
 import type { Id } from '../identifier.utils.js';
 import { serializePartitionParams } from './partition.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 
 export type DeletePartition = {
   streamId: Id,
@@ -29,8 +30,8 @@ export type DeletePartition = {
   partitionCount: number
 };
     
-export const DELETE_PARTITION = {
-  code: 403,
+export const DELETE_PARTITIONS = {
+  code: COMMAND_CODE.DeletePartitions,
 
   serialize: ({ streamId, topicId, partitionCount }: DeletePartition) => {
     return serializePartitionParams(streamId, topicId, partitionCount);
@@ -39,4 +40,5 @@ export const DELETE_PARTITION = {
   deserialize: deserializeVoidResponse
 };
 
-export const deletePartition = wrapCommand<DeletePartition, boolean>(DELETE_PARTITION);
+
+export const deletePartition = wrapCommand<DeletePartition, boolean>(DELETE_PARTITIONS);

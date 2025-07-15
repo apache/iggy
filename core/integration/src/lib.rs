@@ -16,6 +16,7 @@
  * under the License.
  */
 
+pub mod bench_utils;
 pub mod file;
 #[allow(deprecated)]
 pub mod http_client;
@@ -25,3 +26,4 @@ pub mod quic_client;
 pub mod tcp_client;
 #[allow(deprecated)]
 pub mod test_server;
+pub mod test_tls_utils;

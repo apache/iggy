@@ -42,16 +42,15 @@ iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 keyring = { workspace = true }
 lazy_static = { workspace = true }
-libc = "0.2.172"
+libc = "0.2.174"
 log = { workspace = true }
 predicates = { workspace = true }
-regex = { workspace = true }
+rcgen = "0.13.2"
 serial_test = { workspace = true }
 server = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }
 tokio = { workspace = true }
-tracing-subscriber = { workspace = true }
 twox-hash = { workspace = true }
 uuid = { workspace = true }
 zip = { workspace = true }

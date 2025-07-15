@@ -23,57 +23,49 @@ import (
 	"fmt"
 	"time"
 
-	. "github.com/iggy-rs/iggy-go-client"
-	. "github.com/iggy-rs/iggy-go-client/contracts"
-	sharedDemoContracts "github.com/iggy-rs/iggy-go-client/samples/shared"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	"github.com/apache/iggy/foreign/go/iggycli"
+	sharedDemoContracts "github.com/apache/iggy/foreign/go/samples/shared"
+	"github.com/apache/iggy/foreign/go/tcp"
 )
 
 // config
 const (
-	DefaultStreamId = 1
-	TopicId         = 1
+	DefaultStreamId = uint32(1)
+	TopicId         = uint32(1)
 	Partition       = 1
 	Interval        = 1000
-	ConsumerId      = 1
+	ConsumerId      = uint32(1)
 )
 
 func main() {
-	factory := &IggyClientFactory{}
-	config := IggyConfiguration{
-		BaseAddress: "127.0.0.1:8090",
-		Protocol:    Tcp,
-	}
-
-	messageStream, err := factory.CreateMessageStream(config)
+	cli, err := iggycli.NewIggyClient(
+		iggycli.WithTcp(
+			tcp.WithServerAddress("127.0.0.1:8090"),
+		),
+	)
 	if err != nil {
 		panic(err)
 	}
-
-	_, err = messageStream.LogIn(LogInRequest{
-		Username: "iggy",
-		Password: "iggy",
-	})
+	_, err = cli.LoginUser("iggy", "iggy")
 	if err != nil {
 		panic("COULD NOT LOG IN")
 	}
 
-	if err = EnsureInsfrastructureIsInitialized(messageStream); err != nil {
+	if err = EnsureInfrastructureIsInitialized(cli); err != nil {
 		panic(err)
 	}
 
-	if err := ConsumeMessages(messageStream); err != nil {
+	if err = ConsumeMessages(cli); err != nil {
 		panic(err)
 	}
 }
 
-func EnsureInsfrastructureIsInitialized(messageStream MessageStream) error {
-	if _, streamErr := messageStream.GetStreamById(GetStreamRequest{
-		StreamID: NewIdentifier(DefaultStreamId),
-	}); streamErr != nil {
-		streamErr = messageStream.CreateStream(CreateStreamRequest{
-			StreamId: DefaultStreamId,
-			Name:     "Test Producer Stream",
-		})
+func EnsureInfrastructureIsInitialized(cli iggycli.Client) error {
+	streamIdentifier, _ := iggcon.NewIdentifier(DefaultStreamId)
+	if _, streamErr := cli.GetStream(streamIdentifier); streamErr != nil {
+		uint32DefaultStreamId := DefaultStreamId
+		_, streamErr = cli.CreateStream("Test Producer Stream", &uint32DefaultStreamId)
 
 		if streamErr != nil {
 			panic(streamErr)
@@ -84,13 +76,18 @@ func EnsureInsfrastructureIsInitialized(messageStream MessageStream) error {
 
 	fmt.Printf("Stream with ID: %d exists.\n", DefaultStreamId)
 
-	if _, topicErr := messageStream.GetTopicById(NewIdentifier(DefaultStreamId), NewIdentifier(TopicId)); topicErr != nil {
-		topicErr = messageStream.CreateTopic(CreateTopicRequest{
-			TopicId:         TopicId,
-			Name:            "Test Topic From Producer Sample",
-			PartitionsCount: 12,
-			StreamId:        NewIdentifier(DefaultStreamId),
-		})
+	topicIdentifier, _ := iggcon.NewIdentifier(TopicId)
+	if _, topicErr := cli.GetTopic(streamIdentifier, topicIdentifier); topicErr != nil {
+		uint32TopicId := TopicId
+		_, topicErr = cli.CreateTopic(
+			streamIdentifier,
+			"Test Topic From Producer Sample",
+			12,
+			0,
+			0,
+			0,
+			nil,
+			&uint32TopicId)
 
 		if topicErr != nil {
 			panic(topicErr)
@@ -104,19 +101,25 @@ func EnsureInsfrastructureIsInitialized(messageStream MessageStream) error {
 	return nil
 }
 
-func ConsumeMessages(messageStream MessageStream) error {
+func ConsumeMessages(cli iggycli.Client) error {
 	fmt.Printf("Messages will be polled from stream '%d', topic '%d', partition '%d' with interval %d ms.\n", DefaultStreamId, TopicId, Partition, Interval)
 
 	for {
-		messagesWrapper, err := messageStream.PollMessages(FetchMessagesRequest{
-			Count:           1,
-			StreamId:        NewIdentifier(DefaultStreamId),
-			TopicId:         NewIdentifier(TopicId),
-			Consumer:        Consumer{Kind: ConsumerSingle, Id: NewIdentifier(ConsumerId)},
-			PartitionId:     Partition,
-			PollingStrategy: NextPollingStrategy(),
-			AutoCommit:      true,
-		})
+		streamIdentifier, _ := iggcon.NewIdentifier(DefaultStreamId)
+		topicIdentifier, _ := iggcon.NewIdentifier(TopicId)
+		consumerIdentifier, _ := iggcon.NewIdentifier(ConsumerId)
+		partionId := uint32(Partition)
+		messagesWrapper, err := cli.PollMessages(
+			streamIdentifier,
+			topicIdentifier,
+			iggcon.Consumer{
+				Kind: iggcon.ConsumerKindSingle,
+				Id:   consumerIdentifier,
+			},
+			iggcon.NextPollingStrategy(),
+			1,
+			true,
+			&partionId)
 		if err != nil {
 			return err
 		}
@@ -138,11 +141,11 @@ func ConsumeMessages(messageStream MessageStream) error {
 	}
 }
 
-func HandleMessage(messageResponse MessageResponse) error {
-	length := (len(messageResponse.Payload) * 3) / 4
+func HandleMessage(iggyMessage iggcon.IggyMessage) error {
+	length := (len(iggyMessage.Payload) * 3) / 4
 	bytes := make([]byte, length)
 
-	str := string(messageResponse.Payload)
+	str := string(iggyMessage.Payload)
 	isBase64 := false
 
 	if _, err := base64.StdEncoding.Decode(bytes, []byte(str)); err == nil {
@@ -162,12 +165,12 @@ func HandleMessage(messageResponse MessageResponse) error {
 			return err
 		}
 	} else {
-		if err := json.Unmarshal([]byte(messageResponse.Payload), &envelope); err != nil {
+		if err := json.Unmarshal(iggyMessage.Payload, &envelope); err != nil {
 			return err
 		}
 	}
 
-	fmt.Printf("Handling message type: %s at offset: %d with message Id: %s ", envelope.MessageType, messageResponse.Offset, messageResponse.Id)
+	fmt.Printf("Handling message type: %s at offset: %d with message Id: %s ", envelope.MessageType, iggyMessage.Header.Offset, iggyMessage.Header.Id)
 
 	switch envelope.MessageType {
 	case "order_created":

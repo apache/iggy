@@ -38,4 +38,24 @@ pub enum RuntimeError {
     IggyError(#[from] iggy::prelude::IggyError),
     #[error("Missing Iggy credentials")]
     MissingIggyCredentials,
+    #[error("JSON error")]
+    JsonError(#[from] serde_json::Error),
+    #[error("Sink not found with key: {0}")]
+    SinkNotFound(String),
+    #[error("Source not found with key: {0}")]
+    SourceNotFound(String),
+    #[error("Cannot convert configuration")]
+    CannotConvertConfiguration,
+}
+
+impl RuntimeError {
+    pub fn as_code(&self) -> &'static str {
+        match self {
+            RuntimeError::SinkNotFound(_) => "sink_not_found",
+            RuntimeError::SourceNotFound(_) => "source_not_found",
+            RuntimeError::MissingIggyCredentials => "invalid_configuration",
+            RuntimeError::InvalidConfiguration(_) => "invalid_configuration",
+            _ => "error",
+        }
+    }
 }

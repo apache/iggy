@@ -39,7 +39,7 @@ async fn check_server_health() -> Result<()> {
     let resp = Request::get(&url)
         .send()
         .await
-        .map_err(|e| IggyBenchDashboardError::HealthCheck(format!("Network error: {}", e)))?;
+        .map_err(|e| IggyBenchDashboardError::HealthCheck(format!("Network error: {e}")))?;
 
     if !resp.ok() {
         return Err(IggyBenchDashboardError::HealthCheck(format!(
@@ -131,7 +131,7 @@ pub async fn fetch_benchmark_by_uuid(uuid: &str) -> Result<BenchmarkReportLight>
 
     log!(format!("Fetching benchmark for UUID: {}", uuid));
     let base_url = get_api_base_url();
-    let url = format!("{}/api/benchmark/light/{}", base_url, uuid);
+    let url = format!("{base_url}/api/benchmark/light/{uuid}");
     let response = Request::get(&url).send().await.map_err(|e| {
         log!(format!("Network error fetching benchmark: {}", e));
         IggyBenchDashboardError::Network(e.to_string())

@@ -36,11 +36,11 @@ use test_case::test_matrix;
  */
 
 fn msg_size(size: u64) -> IggyByteSize {
-    IggyByteSize::from_str(&format!("{}B", size)).unwrap()
+    IggyByteSize::from_str(&format!("{size}B")).unwrap()
 }
 
 fn segment_size(size: u64) -> IggyByteSize {
-    IggyByteSize::from_str(&format!("{}B", size)).unwrap()
+    IggyByteSize::from_str(&format!("{size}B")).unwrap()
 }
 
 fn msgs_req_to_save(count: u32) -> u32 {
@@ -84,14 +84,13 @@ fn very_large_batches() -> Vec<u32> {
 #[tokio::test]
 async fn test_get_messages_by_timestamp(
     message_size: IggyByteSize,
-    batch_lentghs: Vec<u32>,
+    batch_lengths: Vec<u32>,
     messages_required_to_save: u32,
     segment_size: IggyByteSize,
     cache_indexes: CacheIndexesConfig,
 ) {
     println!(
-        "Running test with message_size: {}, batches: {:?}, messages_required_to_save: {}, segment_size: {}, cache_indexes: {}",
-        message_size, batch_lentghs, messages_required_to_save, segment_size, cache_indexes
+        "Running test with message_size: {message_size}, batches: {batch_lengths:?}, messages_required_to_save: {messages_required_to_save}, segment_size: {segment_size}, cache_indexes: {cache_indexes}"
     );
 
     let setup = TestSetup::init().await;
@@ -99,7 +98,7 @@ async fn test_get_messages_by_timestamp(
     let topic_id = 1;
     let partition_id = 1;
 
-    let total_messages_count = batch_lentghs.iter().sum();
+    let total_messages_count = batch_lengths.iter().sum();
 
     let config = Arc::new(SystemConfig {
         path: setup.config.path.to_string(),
@@ -141,7 +140,7 @@ async fn test_get_messages_by_timestamp(
     // Generate all messages as defined in the test matrix
     for i in 1..=total_messages_count {
         let id = i as u128;
-        let beginning_of_payload = format!("message {}", i);
+        let beginning_of_payload = format!("message {i}");
         let mut payload = BytesMut::new();
         payload.extend_from_slice(beginning_of_payload.as_bytes());
         payload.resize(message_size.as_bytes_usize(), 0xD);
@@ -173,11 +172,11 @@ async fn test_get_messages_by_timestamp(
 
     // Timestamp tracking for messages
     let initial_timestamp = IggyTimestamp::now();
-    let mut batch_timestamps = Vec::with_capacity(batch_lentghs.len());
+    let mut batch_timestamps = Vec::with_capacity(batch_lengths.len());
     let mut current_pos = 0;
 
     // Append all batches as defined in the test matrix with separate timestamps
-    for (batch_idx, &batch_len) in batch_lentghs.iter().enumerate() {
+    for (batch_idx, &batch_len) in batch_lengths.iter().enumerate() {
         // Add a small delay between batches to ensure distinct timestamps
         sleep(std::time::Duration::from_millis(2));
 
@@ -189,7 +188,7 @@ async fn test_get_messages_by_timestamp(
         println!(
             "Appending batch {}/{} with {} messages",
             batch_idx + 1,
-            batch_lentghs.len(),
+            batch_lengths.len(),
             batch_len
         );
 
@@ -241,7 +240,7 @@ async fn test_get_messages_by_timestamp(
         let middle_timestamp = IggyTimestamp::from(batch_timestamps[2].as_micros() + 1000);
 
         // Calculate how many messages should be in batches after the 3rd
-        let prior_batches_sum: u32 = batch_lentghs[..3].iter().sum();
+        let prior_batches_sum: u32 = batch_lengths[..3].iter().sum();
         let remaining_messages = total_sent_messages - prior_batches_sum;
 
         let middle_messages = partition
@@ -312,9 +311,7 @@ async fn test_get_messages_by_timestamp(
                 let msg_timestamp = msg.header().timestamp();
                 assert!(
                     msg_timestamp >= span_timestamp_micros,
-                    "Message timestamp {} should be >= span timestamp {}",
-                    msg_timestamp,
-                    span_timestamp_micros
+                    "Message timestamp {msg_timestamp} should be >= span timestamp {span_timestamp_micros}"
                 );
 
                 // Verify message content

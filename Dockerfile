@@ -15,13 +15,17 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM rust:latest as builder
+FROM rust:latest AS builder
 WORKDIR /build
 COPY . /build
 RUN cargo build --bin iggy --release
 RUN cargo build --bin iggy-server --release
 
-FROM gcr.io/distroless/cc
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    liblzma5 \
+    && rm -rf /var/lib/apt/lists/*
 COPY ./core/configs ./configs
 COPY --from=builder /build/target/release/iggy .
 COPY --from=builder /build/target/release/iggy-server .

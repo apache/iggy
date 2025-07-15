@@ -20,7 +20,7 @@ use std::{str::FromStr, time::Duration};
 
 use async_trait::async_trait;
 use iggy_connector_sdk::{
-    Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
+    ConnectorState, Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
 };
 use rand::{
     Rng,
@@ -57,17 +57,31 @@ struct State {
 }
 
 impl RandomSource {
-    pub fn new(id: u32, config: RandomSourceConfig) -> Self {
+    pub fn new(id: u32, config: RandomSourceConfig, state: Option<ConnectorState>) -> Self {
         let interval = config.interval.unwrap_or("1s".to_string());
         let interval = humantime::Duration::from_str(&interval)
-            .unwrap_or(humantime::Duration::from_str("1s").unwrap());
+            .unwrap_or(humantime::Duration::from_str("1s").expect("Failed to parse interval"));
+
+        let current_number = if let Some(state) = state {
+            u64::from_le_bytes(
+                state.0[0..8]
+                    .try_into()
+                    .inspect_err(|error| {
+                        error!("Failed to convert state to current number. {error}");
+                    })
+                    .unwrap_or_default(),
+            )
+        } else {
+            0
+        } as usize;
+
         RandomSource {
             id,
             max_count: config.max_count,
             interval: *interval,
             messages_range: config.messages_range.unwrap_or((10, 50)),
             payload_size: config.payload_size.unwrap_or(100),
-            state: Mutex::new(State { current_number: 0 }),
+            state: Mutex::new(State { current_number }),
         }
     }
 
@@ -117,7 +131,7 @@ impl RandomSource {
 impl Source for RandomSource {
     async fn open(&mut self) -> Result<(), iggy_connector_sdk::Error> {
         info!(
-            "Initialized random source connector with ID: {}. Interval: {:#?}, max offset: {:#?}, messages range: {} - {}, payload size: {}",
+            "Opened random source connector with ID: {}. Interval: {:#?}, max offset: {:#?}, messages range: {} - {}, payload size: {}",
             self.id,
             self.interval,
             self.max_count,
@@ -140,6 +154,7 @@ impl Source for RandomSource {
                 return Ok(ProducedMessages {
                     schema: Schema::Json,
                     messages: vec![],
+                    state: Some(ConnectorState(state.current_number.to_le_bytes().to_vec())),
                 });
             }
         }
@@ -154,14 +169,12 @@ impl Source for RandomSource {
         Ok(ProducedMessages {
             schema: Schema::Json,
             messages,
+            state: Some(ConnectorState(state.current_number.to_le_bytes().to_vec())),
         })
     }
 
     async fn close(&mut self) -> Result<(), Error> {
-        info!(
-            "Random source connector with ID: {} is shutting down",
-            self.id
-        );
+        info!("Random source connector with ID: {} is closed.", self.id);
         Ok(())
     }
 }

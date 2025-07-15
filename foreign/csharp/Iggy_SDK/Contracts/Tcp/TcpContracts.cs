@@ -767,18 +767,6 @@ internal static class TcpContracts
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static byte GetPartitioningKindByte(Partitioning kind)
-    {
-        return kind switch
-        {
-            Partitioning.Balanced => 1,
-            Partitioning.PartitionId => 2,
-            Partitioning.MessageKey => 3,
-            _ => throw new ArgumentOutOfRangeException()
-        };
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static byte GetPollingStrategyByte(MessagePolling pollingStrategy)
     {
         return pollingStrategy switch
