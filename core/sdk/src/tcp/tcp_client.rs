@@ -532,7 +532,10 @@ impl TcpClient {
             Err(IggyError::NotConnected)
         })
         .await
-        .unwrap()
+        .map_err(|e| {
+            error!("Task execution failed during TCP request: {}", e);
+            IggyError::TcpError
+        })?
     }
 
     async fn get_client_address_value(&self) -> String {

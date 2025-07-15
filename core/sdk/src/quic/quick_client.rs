@@ -491,7 +491,10 @@ impl QuicClient {
             Err(IggyError::NotConnected)
         })
         .await
-        .unwrap()
+        .map_err(|e| {
+            error!("Task execution failed during QUIC request: {}", e);
+            IggyError::QuicError
+        })?
     }
 }
 
