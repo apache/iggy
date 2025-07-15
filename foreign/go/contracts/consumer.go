@@ -28,3 +28,27 @@ type Consumer struct {
 	Kind ConsumerKind
 	Id   Identifier
 }
+
+func DefaultConsumer() Consumer {
+	defaultID, _ := NewIdentifier(uint32(1))
+	return Consumer{
+		Kind: ConsumerKindSingle,
+		Id:   defaultID,
+	}
+}
+
+// NewSingleConsumer create a new Consumer whose kind is ConsumerKindSingle from the Identifier
+func NewSingleConsumer(id Identifier) Consumer {
+	return Consumer{
+		Kind: ConsumerKindSingle,
+		Id:   id,
+	}
+}
+
+// NewGroupConsumer create a new Consumer whose kind is ConsumerKindGroup from the Identifier
+func NewGroupConsumer(id Identifier) Consumer {
+	return Consumer{
+		Kind: ConsumerKindGroup,
+		Id:   id,
+	}
+}

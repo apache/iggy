@@ -30,10 +30,7 @@ func TestSerialize_TcpFetchMessagesRequest(t *testing.T) {
 	topicId, _ := iggcon.NewIdentifier("test_topic_id")
 	// Create a sample TcpFetchMessagesRequest
 	request := TcpFetchMessagesRequest{
-		Consumer: iggcon.Consumer{
-			Kind: iggcon.ConsumerKindSingle,
-			Id:   consumerId,
-		},
+		Consumer:    iggcon.NewSingleConsumer(consumerId),
 		StreamId:    streamId,
 		TopicId:     topicId,
 		PartitionId: &partitionId,
