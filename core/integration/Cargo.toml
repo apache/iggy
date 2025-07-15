@@ -50,7 +50,7 @@ serial_test = { workspace = true }
 server = { workspace = true }
 tempfile = { workspace = true }
 test-case = { workspace = true }
-tokio = { workspace = true }
+tokio = { version = "1.45.1", features = ["full"] }
 compio = { workspace = true }
 twox-hash = { workspace = true }
 uuid = { workspace = true }

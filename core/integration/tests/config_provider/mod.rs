@@ -36,7 +36,7 @@ async fn scenario_parsing_from_file(extension: &str) {
     );
 }
 
-#[tokio::test]
+#[compio::test]
 async fn validate_server_config_toml_from_repository() {
     scenario_parsing_from_file("toml").await;
 }
@@ -44,7 +44,7 @@ async fn validate_server_config_toml_from_repository() {
 // This test needs to be run in serial because it modifies the environment variables
 // which are shared, since all tests run in parallel by default.
 #[serial]
-#[tokio::test]
+#[compio::test]
 async fn validate_custom_env_provider() {
     let expected_datagram_send_buffer_size = "1.00 KB";
     let expected_quic_certificate_self_signed = false;
