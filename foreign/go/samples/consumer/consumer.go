@@ -112,10 +112,7 @@ func ConsumeMessages(cli iggycli.Client) error {
 		messagesWrapper, err := cli.PollMessages(
 			streamIdentifier,
 			topicIdentifier,
-			iggcon.Consumer{
-				Kind: iggcon.ConsumerKindSingle,
-				Id:   consumerIdentifier,
-			},
+			iggcon.NewSingleConsumer(consumerIdentifier),
 			iggcon.NextPollingStrategy(),
 			1,
 			true,
