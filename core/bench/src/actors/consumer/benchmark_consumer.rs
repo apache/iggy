@@ -16,10 +16,8 @@
  * under the License.
  */
 
-use super::backend::{
-    BenchmarkConsumerBackend, BenchmarkConsumerConfig, ConsumerBackend, HighLevelBackend,
-    LowLevelBackend,
-};
+use crate::actors::consumer::client::BenchmarkConsumerClient;
+use crate::actors::consumer::client::interface::BenchmarkConsumerConfig;
 use crate::analytics::metrics::individual::from_records;
 use crate::analytics::record::BenchmarkRecord;
 use crate::utils::finish_condition::BenchmarkFinishCondition;
@@ -30,58 +28,33 @@ use bench_report::individual_metrics::BenchmarkIndividualMetrics;
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use human_repr::HumanCount;
 use iggy::prelude::*;
-use integration::test_server::ClientFactory;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 use tracing::info;
 
-pub struct BenchmarkConsumer {
-    backend: ConsumerBackend,
-    benchmark_kind: BenchmarkKind,
-    finish_condition: Arc<BenchmarkFinishCondition>,
-    sampling_time: IggyDuration,
-    moving_average_window: u32,
-    limit_bytes_per_second: Option<IggyByteSize>,
-    config: BenchmarkConsumerConfig,
+pub struct BenchmarkConsumer<C: BenchmarkConsumerClient> {
+    pub client: C,
+    pub benchmark_kind: BenchmarkKind,
+    pub finish_condition: Arc<BenchmarkFinishCondition>,
+    pub sampling_time: IggyDuration,
+    pub moving_average_window: u32,
+    pub limit_bytes_per_second: Option<IggyByteSize>,
+    pub config: BenchmarkConsumerConfig,
 }
 
-impl BenchmarkConsumer {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        client_factory: Arc<dyn ClientFactory>,
+impl<C: BenchmarkConsumerClient> BenchmarkConsumer<C> {
+    pub const fn new(
+        client: C,
         benchmark_kind: BenchmarkKind,
-        consumer_id: u32,
-        consumer_group_id: Option<u32>,
-        stream_id: u32,
-        messages_per_batch: BenchmarkNumericParameter,
         finish_condition: Arc<BenchmarkFinishCondition>,
-        warmup_time: IggyDuration,
         sampling_time: IggyDuration,
         moving_average_window: u32,
-        polling_kind: PollingKind,
         limit_bytes_per_second: Option<IggyByteSize>,
-        origin_timestamp_latency_calculation: bool,
-        use_high_level_api: bool,
+        config: BenchmarkConsumerConfig,
     ) -> Self {
-        let config = BenchmarkConsumerConfig {
-            consumer_id,
-            consumer_group_id,
-            stream_id,
-            messages_per_batch,
-            warmup_time,
-            polling_kind,
-            origin_timestamp_latency_calculation,
-        };
-
-        let backend = if use_high_level_api {
-            ConsumerBackend::HighLevel(HighLevelBackend::new(client_factory, config.clone()))
-        } else {
-            ConsumerBackend::LowLevel(LowLevelBackend::new(client_factory, config.clone()))
-        };
-
         Self {
-            backend,
+            client,
             benchmark_kind,
             finish_condition,
             sampling_time,
@@ -91,64 +64,32 @@ impl BenchmarkConsumer {
         }
     }
 
-    pub async fn run(self) -> Result<BenchmarkIndividualMetrics, IggyError> {
-        match self.backend {
-            ConsumerBackend::LowLevel(backend) => {
-                Self::run_with_backend(
-                    self.benchmark_kind,
-                    self.finish_condition,
-                    self.sampling_time,
-                    self.moving_average_window,
-                    self.limit_bytes_per_second,
-                    self.config,
-                    backend,
-                )
-                .await
-            }
-            ConsumerBackend::HighLevel(backend) => {
-                Self::run_with_backend(
-                    self.benchmark_kind,
-                    self.finish_condition,
-                    self.sampling_time,
-                    self.moving_average_window,
-                    self.limit_bytes_per_second,
-                    self.config,
-                    backend,
-                )
-                .await
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::cognitive_complexity)]
+    pub async fn run(mut self) -> Result<BenchmarkIndividualMetrics, IggyError> {
+        self.client.setup().await?;
+
+        if self.config.warmup_time.get_duration() != Duration::from_millis(0) {
+            self.log_warmup_info();
+            let warmup_end = Instant::now() + self.config.warmup_time.get_duration();
+            while Instant::now() < warmup_end {
+                let _ = self.client.consume_batch().await?;
             }
         }
-    }
 
-    async fn run_with_backend<B: BenchmarkConsumerBackend>(
-        benchmark_kind: BenchmarkKind,
-        finish_condition: Arc<BenchmarkFinishCondition>,
-        sampling_time: IggyDuration,
-        moving_average_window: u32,
-        limit_bytes_per_second: Option<IggyByteSize>,
-        config: BenchmarkConsumerConfig,
-        backend: B,
-    ) -> Result<BenchmarkIndividualMetrics, IggyError> {
-        let mut consumer = backend.setup().await?;
+        self.log_setup_info();
 
-        if config.warmup_time.get_duration() != Duration::from_millis(0) {
-            backend.log_warmup_info();
-            backend.warmup(&mut consumer).await?;
-        }
-
-        backend.log_setup_info();
-
-        let max_capacity = finish_condition.max_capacity();
+        let max_capacity = self.finish_condition.max_capacity();
         let mut records = Vec::with_capacity(max_capacity);
         let mut messages_processed = 0;
         let mut batches_processed = 0;
         let mut bytes_processed = 0;
         let mut user_data_bytes_processed = 0;
         let start_timestamp = Instant::now();
-        let rate_limiter = limit_bytes_per_second.map(BenchmarkRateLimiter::new);
+        let rate_limiter = self.limit_bytes_per_second.map(BenchmarkRateLimiter::new);
 
-        while !finish_condition.is_done() {
-            let batch_opt = backend.consume_batch(&mut consumer).await?;
+        while !self.finish_condition.is_done() {
+            let batch_opt = self.client.consume_batch().await?;
 
             let Some(batch) = batch_opt else {
                 continue;
@@ -175,29 +116,67 @@ impl BenchmarkConsumer {
                     .await;
             }
 
-            if finish_condition.account_and_check(batch.user_data_bytes) {
+            if self
+                .finish_condition
+                .account_and_check(batch.user_data_bytes)
+            {
                 break;
             }
         }
 
         let metrics = from_records(
             &records,
-            benchmark_kind,
+            self.benchmark_kind,
             ActorKind::Consumer,
-            config.consumer_id,
-            sampling_time,
-            moving_average_window,
+            self.config.consumer_id,
+            self.sampling_time,
+            self.moving_average_window,
         );
 
         Self::log_statistics(
-            config.consumer_id,
+            self.config.consumer_id,
             messages_processed,
             u32::try_from(batches_processed).unwrap_or(u32::MAX),
-            &config.messages_per_batch,
+            &self.config.messages_per_batch,
             &metrics,
         );
 
         Ok(metrics)
+    }
+
+    pub fn log_setup_info(&self) {
+        if let Some(cg_id) = self.config.consumer_group_id {
+            info!(
+                "Consumer #{}, part of consumer group #{} → polling in {} messages per batch from stream {}, using {}...",
+                self.config.consumer_id,
+                cg_id,
+                self.config.messages_per_batch,
+                self.config.stream_id,
+                C::API_LABEL,
+            );
+        } else {
+            info!(
+                "Consumer #{} → polling in {} messages per batch from stream {}, using {}...",
+                self.config.consumer_id,
+                self.config.messages_per_batch,
+                self.config.stream_id,
+                C::API_LABEL,
+            );
+        }
+    }
+
+    pub fn log_warmup_info(&self) {
+        if let Some(cg_id) = self.config.consumer_group_id {
+            info!(
+                "Consumer #{}, group #{} → warming up for {}",
+                self.config.consumer_id, cg_id, self.config.warmup_time,
+            );
+        } else {
+            info!(
+                "Consumer #{} → warming up for {}",
+                self.config.consumer_id, self.config.warmup_time,
+            );
+        }
     }
 
     pub fn log_statistics(
