@@ -173,6 +173,16 @@ timestamp_field = "@timestamp"
 query = {
 "match_all": {}
 }
+state = {
+  enabled = true
+  storage_type = "file"
+  storage_config = {
+    base_path = "./connector_states"
+  }
+  state_id = "elasticsearch_logs_connector"
+  auto_save_interval = "5m"
+  tracked_fields = ["last_poll_timestamp", "last_document_id", "total_documents_fetched"]
+}
 
 # Elasticsearch Sink配置
 [sinks.elasticsearch]

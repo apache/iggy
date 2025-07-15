@@ -53,6 +53,22 @@ pub trait Source: Send + Sync {
     async fn close(&mut self) -> Result<(), Error>;
 }
 
+/// Optional trait for sources that need state persistence
+#[async_trait]
+pub trait StatefulSource: Source {
+    /// Get the current state of the source
+    async fn get_state(&self) -> Result<SourceState, Error>;
+    
+    /// Set the state of the source
+    async fn set_state(&mut self, state: SourceState) -> Result<(), Error>;
+    
+    /// Save the current state to persistent storage
+    async fn save_state(&self) -> Result<(), Error>;
+    
+    /// Load the state from persistent storage
+    async fn load_state(&mut self) -> Result<(), Error>;
+}
+
 /// The Sink trait defines the interface for a sink connector, responsible for consuming the messages from the configured topics.
 /// Once the messages are consumed (and optionally transformed before), they should be sent further to the specified destination.
 #[async_trait]
@@ -70,6 +86,165 @@ pub trait Sink: Send + Sync {
 
     /// Invoked when the sink is closed, allowing it to perform any necessary cleanup.
     async fn close(&mut self) -> Result<(), Error>;
+}
+
+/// Optional trait for sinks that need state persistence
+#[async_trait]
+pub trait StatefulSink: Sink {
+    /// Get the current state of the sink
+    async fn get_state(&self) -> Result<SinkState, Error>;
+    
+    /// Set the state of the sink
+    async fn set_state(&mut self, state: SinkState) -> Result<(), Error>;
+    
+    /// Save the current state to persistent storage
+    async fn save_state(&self) -> Result<(), Error>;
+    
+    /// Load the state from persistent storage
+    async fn load_state(&mut self) -> Result<(), Error>;
+}
+
+/// State management for source connectors
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceState {
+    /// Unique identifier for this state
+    pub id: String,
+    /// Timestamp when this state was last updated
+    pub last_updated: chrono::DateTime<chrono::Utc>,
+    /// Version of the state format
+    pub version: u32,
+    /// Generic state data as JSON
+    pub data: serde_json::Value,
+    /// Optional metadata
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// State management for sink connectors
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SinkState {
+    /// Unique identifier for this state
+    pub id: String,
+    /// Timestamp when this state was last updated
+    pub last_updated: chrono::DateTime<chrono::Utc>,
+    /// Version of the state format
+    pub version: u32,
+    /// Generic state data as JSON
+    pub data: serde_json::Value,
+    /// Optional metadata
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// State storage backend trait
+#[async_trait]
+pub trait StateStorage: Send + Sync {
+    /// Save state to storage
+    async fn save_state(&self, state: &SourceState) -> Result<(), Error>;
+    
+    /// Load state from storage
+    async fn load_state(&self, id: &str) -> Result<Option<SourceState>, Error>;
+    
+    /// Delete state from storage
+    async fn delete_state(&self, id: &str) -> Result<(), Error>;
+    
+    /// List all state IDs
+    async fn list_states(&self) -> Result<Vec<String>, Error>;
+}
+
+/// File-based state storage implementation
+pub struct FileStateStorage {
+    base_path: std::path::PathBuf,
+}
+
+impl FileStateStorage {
+    pub fn new<P: AsRef<std::path::Path>>(base_path: P) -> Self {
+        Self {
+            base_path: base_path.as_ref().to_path_buf(),
+        }
+    }
+    
+    fn get_state_path(&self, id: &str) -> std::path::PathBuf {
+        self.base_path.join(format!("{}.json", id))
+    }
+}
+
+#[async_trait]
+impl StateStorage for FileStateStorage {
+    async fn save_state(&self, state: &SourceState) -> Result<(), Error> {
+        use tokio::fs;
+        
+        // Ensure directory exists
+        if let Some(parent) = self.base_path.parent() {
+            fs::create_dir_all(parent).await
+                .map_err(|e| Error::Storage(format!("Failed to create state directory: {}", e)))?;
+        }
+        
+        let path = self.get_state_path(&state.id);
+        let json = serde_json::to_string_pretty(state)
+            .map_err(|e| Error::Serialization(format!("Failed to serialize state: {}", e)))?;
+        
+        fs::write(path, json).await
+            .map_err(|e| Error::Storage(format!("Failed to write state file: {}", e)))?;
+        
+        Ok(())
+    }
+    
+    async fn load_state(&self, id: &str) -> Result<Option<SourceState>, Error> {
+        use tokio::fs;
+        
+        let path = self.get_state_path(id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        
+        let content = fs::read_to_string(path).await
+            .map_err(|e| Error::Storage(format!("Failed to read state file: {}", e)))?;
+        
+        let state: SourceState = serde_json::from_str(&content)
+            .map_err(|e| Error::Serialization(format!("Failed to deserialize state: {}", e)))?;
+        
+        Ok(Some(state))
+    }
+    
+    async fn delete_state(&self, id: &str) -> Result<(), Error> {
+        use tokio::fs;
+        
+        let path = self.get_state_path(id);
+        if path.exists() {
+            fs::remove_file(path).await
+                .map_err(|e| Error::Storage(format!("Failed to delete state file: {}", e)))?;
+        }
+        
+        Ok(())
+    }
+    
+    async fn list_states(&self) -> Result<Vec<String>, Error> {
+        use tokio::fs;
+        
+        let mut states = Vec::new();
+        
+        if !self.base_path.exists() {
+            return Ok(states);
+        }
+        
+        let mut entries = fs::read_dir(&self.base_path).await
+            .map_err(|e| Error::Storage(format!("Failed to read state directory: {}", e)))?;
+        
+        while let Some(entry) = entries.next_entry().await
+            .map_err(|e| Error::Storage(format!("Failed to read directory entry: {}", e)))? {
+            
+            if let Some(extension) = entry.path().extension() {
+                if extension == "json" {
+                    if let Some(stem) = entry.path().file_stem() {
+                        if let Some(id) = stem.to_str() {
+                            states.push(id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(states)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -259,4 +434,8 @@ pub enum Error {
     InvalidTextPayload,
     #[error("Cannot decode schema {0}")]
     CannotDecode(Schema),
+    #[error("Storage error: {0}")]
+    Storage(String),
+    #[error("Serialization error: {0}")]
+    Serialization(String),
 }
