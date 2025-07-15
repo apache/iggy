@@ -81,7 +81,7 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 			err := client.SendMessages(
 				streamIdentifier,
 				topicIdentifier,
-				iggcon.PartitionId(int(createRandomUInt32())),
+				iggcon.PartitionId(createRandomUInt32()),
 				messages,
 			)
 			itShouldReturnSpecificError(err, "partition_not_found")
@@ -97,7 +97,7 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 			err := client.SendMessages(
 				streamIdentifier,
 				topicIdentifier,
-				iggcon.PartitionId(int(createRandomUInt32())),
+				iggcon.PartitionId(createRandomUInt32()),
 				[]iggcon.IggyMessage{},
 			)
 			itShouldReturnSpecificError(err, "messages_count_should_be_greater_than_zero")
