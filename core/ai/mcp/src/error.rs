@@ -32,4 +32,6 @@ pub enum McpRuntimeError {
     IggyError(#[from] iggy::prelude::IggyError),
     #[error("Missing Iggy credentials")]
     MissingIggyCredentials,
+    #[error("Failed to create Iggy consumer ID")]
+    FailedToCreateConsumerId,
 }

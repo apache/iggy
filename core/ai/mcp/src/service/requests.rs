@@ -52,3 +52,153 @@ pub struct PurgeStream {
     #[schemars(description = "stream identifier (name or number)")]
     pub stream_id: String,
 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetTopics {
+    #[schemars(description = "stream identifier (name or number)")]
+    pub stream_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetTopic {
+    #[schemars(description = "stream identifier (name or number)")]
+    pub stream_id: String,
+
+    #[schemars(description = "topic identifier (name or number)")]
+    pub topic_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreateTopic {
+    #[schemars(description = "stream identifier (name or number)")]
+    pub stream_id: String,
+
+    #[schemars(description = "name (required, must be unique)")]
+    pub name: String,
+
+    #[schemars(description = "partitions count (required, must be greater than 0)")]
+    pub partitions_count: u32,
+
+    #[schemars(description = "compression algorithm (optional, can be one of 'none', 'gzip')")]
+    pub compression_algorithm: Option<String>,
+
+    #[schemars(description = "replication factor (optional, must be greater than 0)")]
+    pub replication_factor: Option<u8>,
+
+    #[schemars(description = "topic identifier (numeric, optional)")]
+    pub topic_id: Option<u32>,
+
+    #[schemars(description = "message expiry (optional)")]
+    pub message_expiry: Option<String>,
+
+    #[schemars(description = "maximum size (optional)")]
+    pub max_size: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UpdateTopic {
+    #[schemars(description = "stream identifier (name or number)")]
+    pub stream_id: String,
+
+    #[schemars(description = "topic identifier (name or number)")]
+    pub topic_id: String,
+
+    #[schemars(description = "name (required, must be unique)")]
+    pub name: String,
+
+    #[schemars(description = "compression algorithm (optional, can be one of 'none', 'gzip')")]
+    pub compression_algorithm: Option<String>,
+
+    #[schemars(description = "replication factor (optional, must be greater than 0)")]
+    pub replication_factor: Option<u8>,
+
+    #[schemars(description = "message expiry (optional)")]
+    pub message_expiry: Option<String>,
+
+    #[schemars(description = "maximum size (optional)")]
+    pub max_size: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeleteTopic {
+    #[schemars(description = "stream identifier (name or number)")]
+    pub stream_id: String,
+
+    #[schemars(description = "topic identifier (name or number)")]
+    pub topic_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PurgeTopic {
+    #[schemars(description = "stream identifier (name or number)")]
+    pub stream_id: String,
+
+    #[schemars(description = "topic identifier (name or number)")]
+    pub topic_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreatePartitions {
+    #[schemars(description = "stream identifier (name or number)")]
+    pub stream_id: String,
+
+    #[schemars(description = "topic identifier (name or number)")]
+    pub topic_id: String,
+
+    #[schemars(description = "partitions count (required, must be greater than 0)")]
+    pub partitions_count: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeletePartitions {
+    #[schemars(description = "stream identifier (name or number)")]
+    pub stream_id: String,
+
+    #[schemars(description = "topic identifier (name or number)")]
+    pub topic_id: String,
+
+    #[schemars(description = "partitions count (required, must be greater than 0)")]
+    pub partitions_count: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeleteSegments {
+    #[schemars(description = "stream identifier (name or number)")]
+    pub stream_id: String,
+
+    #[schemars(description = "topic identifier (name or number)")]
+    pub topic_id: String,
+
+    #[schemars(description = "partition identifier (number)")]
+    pub partition_id: u32,
+
+    #[schemars(description = "segments count (required, must be greater than 0)")]
+    pub segments_count: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PollMessages {
+    #[schemars(description = "stream identifier (name or number)")]
+    pub stream_id: String,
+
+    #[schemars(description = "topic identifier (name or number)")]
+    pub topic_id: String,
+
+    #[schemars(description = "partition identifier (optional, number)")]
+    pub partition_id: Option<u32>,
+
+    #[schemars(description = "strategy (optional, string)")]
+    pub strategy: Option<String>,
+
+    #[schemars(description = "offset to start from (optional)")]
+    pub offset: Option<u64>,
+
+    #[schemars(description = "timestamp to start from (optional, microseconds from Unix Epoch)")]
+    pub timestamp: Option<u64>,
+
+    #[schemars(description = "count (optional, must be greater than 0)")]
+    pub count: Option<u32>,
+
+    #[schemars(description = "auto commit (optional, boolean)")]
+    pub auto_commit: Option<bool>,
+}

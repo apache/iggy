@@ -15,28 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::{configs::IggyConfig, error::McpRuntimeError};
 use iggy::prelude::{Client, IggyClient, IggyClientBuilder};
 use tracing::{error, info};
 
-use crate::{configs::IggyConfig, error::McpRuntimeError};
-
-pub struct IggyClients {
-    pub producer: IggyClient,
-    pub consumer: IggyClient,
-}
-
-pub async fn init(config: IggyConfig) -> Result<IggyClients, McpRuntimeError> {
-    let consumer = create_client(&config).await?;
-    let producer = create_client(&config).await?;
-    let iggy_clients = IggyClients { producer, consumer };
-    Ok(iggy_clients)
-}
-
-async fn create_client(config: &IggyConfig) -> Result<IggyClient, McpRuntimeError> {
-    let address = config.address.to_owned();
-    let username = config.username.to_owned();
-    let password = config.password.to_owned();
-    let token = config.token.to_owned();
+pub async fn init(config: IggyConfig) -> Result<IggyClient, McpRuntimeError> {
+    let address = config.address;
+    let username = config.username;
+    let password = config.password;
+    let token = config.token;
 
     let connection_string = if let Some(token) = token {
         if token.is_empty() {

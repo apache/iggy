@@ -16,9 +16,10 @@
  * under the License.
  */
 
-use std::sync::Arc;
-
-use iggy::prelude::{Identifier, IggyClient, IggyError, StreamClient};
+use iggy::prelude::{
+    Consumer, Identifier, IggyClient, IggyError, IggyTimestamp, MessageClient, PartitionClient,
+    PollingKind, PollingStrategy, SegmentClient, StreamClient, TopicClient,
+};
 use requests::*;
 use rmcp::{
     ServerHandler,
@@ -27,6 +28,7 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use serde::Serialize;
+use std::sync::Arc;
 use tracing::error;
 
 use crate::Permissions;
@@ -35,22 +37,18 @@ mod requests;
 #[derive(Debug, Clone)]
 pub struct IggyService {
     tool_router: ToolRouter<Self>,
-    consumer: Arc<IggyClient>,
-    _producer: Arc<IggyClient>,
+    client: Arc<IggyClient>,
+    consumer: Arc<Consumer>,
     permissions: Permissions,
 }
 
 #[tool_router]
 impl IggyService {
-    pub fn new(
-        consumer: Arc<IggyClient>,
-        producer: Arc<IggyClient>,
-        permissions: Permissions,
-    ) -> Self {
+    pub fn new(client: Arc<IggyClient>, consumer: Arc<Consumer>, permissions: Permissions) -> Self {
         Self {
             tool_router: Self::tool_router(),
+            client,
             consumer,
-            _producer: producer,
             permissions,
         }
     }
@@ -61,13 +59,13 @@ impl IggyService {
         Parameters(GetStream { stream_id }): Parameters<GetStream>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_read()?;
-        request(self.consumer.get_stream(&id(&stream_id)?).await)
+        request(self.client.get_stream(&id(&stream_id)?).await)
     }
 
     #[tool(description = "Get streams")]
     pub async fn get_streams(&self) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_read()?;
-        request(self.consumer.get_streams().await)
+        request(self.client.get_streams().await)
     }
 
     #[tool(description = "Create stream")]
@@ -76,7 +74,7 @@ impl IggyService {
         Parameters(CreateStream { name, stream_id }): Parameters<CreateStream>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_create()?;
-        request(self.consumer.create_stream(&name, stream_id).await)
+        request(self.client.create_stream(&name, stream_id).await)
     }
 
     #[tool(description = "Update stream")]
@@ -85,7 +83,7 @@ impl IggyService {
         Parameters(UpdateStream { stream_id, name }): Parameters<UpdateStream>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_update()?;
-        request(self.consumer.update_stream(&id(&stream_id)?, &name).await)
+        request(self.client.update_stream(&id(&stream_id)?, &name).await)
     }
 
     #[tool(description = "Delete stream")]
@@ -94,7 +92,7 @@ impl IggyService {
         Parameters(DeleteStream { stream_id }): Parameters<DeleteStream>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_delete()?;
-        request(self.consumer.delete_stream(&id(&stream_id)?).await)
+        request(self.client.delete_stream(&id(&stream_id)?).await)
     }
 
     #[tool(description = "Purge stream")]
@@ -103,7 +101,246 @@ impl IggyService {
         Parameters(PurgeStream { stream_id }): Parameters<PurgeStream>,
     ) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_delete()?;
-        request(self.consumer.purge_stream(&id(&stream_id)?).await)
+        request(self.client.purge_stream(&id(&stream_id)?).await)
+    }
+
+    #[tool(description = "Get topics")]
+    pub async fn get_topics(
+        &self,
+        Parameters(GetTopics { stream_id }): Parameters<GetTopics>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
+        request(self.client.get_topics(&id(&stream_id)?).await)
+    }
+
+    #[tool(description = "Get topic")]
+    pub async fn get_topic(
+        &self,
+        Parameters(GetTopic {
+            stream_id,
+            topic_id,
+        }): Parameters<GetTopic>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
+        request(
+            self.client
+                .get_topic(&id(&stream_id)?, &id(&topic_id)?)
+                .await,
+        )
+    }
+
+    #[tool(description = "Create topic")]
+    pub async fn create_topic(
+        &self,
+        Parameters(CreateTopic {
+            stream_id,
+            name,
+            partitions_count,
+            compression_algorithm,
+            replication_factor,
+            topic_id,
+            message_expiry,
+            max_size,
+        }): Parameters<CreateTopic>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_create()?;
+        let compression_algorithm = compression_algorithm
+            .and_then(|ca| ca.parse().ok())
+            .unwrap_or_default();
+        let message_expiry = message_expiry
+            .and_then(|me| me.parse().ok())
+            .unwrap_or_default();
+        let max_size = max_size.and_then(|ms| ms.parse().ok()).unwrap_or_default();
+        request(
+            self.client
+                .create_topic(
+                    &id(&stream_id)?,
+                    &name,
+                    partitions_count,
+                    compression_algorithm,
+                    replication_factor,
+                    topic_id,
+                    message_expiry,
+                    max_size,
+                )
+                .await,
+        )
+    }
+
+    #[tool(description = "Update topic")]
+    pub async fn update_topic(
+        &self,
+        Parameters(UpdateTopic {
+            stream_id,
+            topic_id,
+            name,
+            compression_algorithm,
+            replication_factor,
+            message_expiry,
+            max_size,
+        }): Parameters<UpdateTopic>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_update()?;
+        let compression_algorithm = compression_algorithm
+            .and_then(|ca| ca.parse().ok())
+            .unwrap_or_default();
+        let message_expiry = message_expiry
+            .and_then(|me| me.parse().ok())
+            .unwrap_or_default();
+        let max_size = max_size.and_then(|ms| ms.parse().ok()).unwrap_or_default();
+        request(
+            self.client
+                .update_topic(
+                    &id(&stream_id)?,
+                    &id(&topic_id)?,
+                    &name,
+                    compression_algorithm,
+                    replication_factor,
+                    message_expiry,
+                    max_size,
+                )
+                .await,
+        )
+    }
+
+    #[tool(description = "Delete topic")]
+    pub async fn delete_topic(
+        &self,
+        Parameters(DeleteTopic {
+            stream_id,
+            topic_id,
+        }): Parameters<DeleteTopic>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_delete()?;
+        request(
+            self.client
+                .delete_topic(&id(&stream_id)?, &id(&topic_id)?)
+                .await,
+        )
+    }
+
+    #[tool(description = "Purge topic")]
+    pub async fn purge_topic(
+        &self,
+        Parameters(PurgeTopic {
+            stream_id,
+            topic_id,
+        }): Parameters<PurgeTopic>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_delete()?;
+        request(
+            self.client
+                .purge_topic(&id(&stream_id)?, &id(&topic_id)?)
+                .await,
+        )
+    }
+
+    #[tool(description = "Create partitions")]
+    pub async fn create_partitions(
+        &self,
+        Parameters(CreatePartitions {
+            stream_id,
+            topic_id,
+            partitions_count,
+        }): Parameters<CreatePartitions>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_create()?;
+        request(
+            self.client
+                .create_partitions(&id(&stream_id)?, &id(&topic_id)?, partitions_count)
+                .await,
+        )
+    }
+
+    #[tool(description = "Delete partitions")]
+    pub async fn delete_partitions(
+        &self,
+        Parameters(DeletePartitions {
+            stream_id,
+            topic_id,
+            partitions_count,
+        }): Parameters<DeletePartitions>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_delete()?;
+        request(
+            self.client
+                .delete_partitions(&id(&stream_id)?, &id(&topic_id)?, partitions_count)
+                .await,
+        )
+    }
+
+    #[tool(description = "Delete segments")]
+    pub async fn delete_segments(
+        &self,
+        Parameters(DeleteSegments {
+            stream_id,
+            topic_id,
+            partition_id,
+            segments_count,
+        }): Parameters<DeleteSegments>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_delete()?;
+        request(
+            self.client
+                .delete_segments(
+                    &id(&stream_id)?,
+                    &id(&topic_id)?,
+                    partition_id,
+                    segments_count,
+                )
+                .await,
+        )
+    }
+
+    #[tool(description = "Poll messages")]
+    pub async fn poll_messages(
+        &self,
+        Parameters(PollMessages {
+            stream_id,
+            topic_id,
+            partition_id,
+            strategy,
+            offset,
+            timestamp,
+            count,
+            auto_commit,
+        }): Parameters<PollMessages>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
+        let offset = offset.unwrap_or(0);
+        let count = count.unwrap_or(10);
+        let mut auto_commit = auto_commit.unwrap_or(false);
+        let strategy = if let Some(strategy) = strategy {
+            match strategy.as_str() {
+                "offset" => PollingStrategy::offset(offset),
+                "first" => PollingStrategy::first(),
+                "last" => PollingStrategy::last(),
+                "next" => PollingStrategy::next(),
+                "timestamp" => PollingStrategy::timestamp(IggyTimestamp::from(
+                    timestamp.unwrap_or(IggyTimestamp::now().as_micros()),
+                )),
+                _ => PollingStrategy::offset(offset),
+            }
+        } else {
+            PollingStrategy::offset(offset)
+        };
+        if strategy.kind == PollingKind::Next {
+            auto_commit = true;
+        }
+
+        request(
+            self.client
+                .poll_messages(
+                    &id(&stream_id)?,
+                    &id(&topic_id)?,
+                    partition_id,
+                    &self.consumer,
+                    &strategy,
+                    count,
+                    auto_commit,
+                )
+                .await,
+        )
     }
 }
 

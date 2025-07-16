@@ -33,6 +33,7 @@ pub struct IggyConfig {
     pub username: Option<String>,
     pub password: Option<String>,
     pub token: Option<String>,
+    pub consumer_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

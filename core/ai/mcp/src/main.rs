@@ -21,6 +21,7 @@ use configs::{McpServerConfig, McpTransport};
 use dotenvy::dotenv;
 use error::McpRuntimeError;
 use figlet_rs::FIGfont;
+use iggy::prelude::Identifier;
 use rmcp::{
     ServiceExt,
     model::ErrorData,
@@ -85,9 +86,14 @@ async fn main() -> Result<(), McpRuntimeError> {
 
     info!("Starting Iggy MCP Server, transport: {transport}...");
 
-    let iggy_clients = stream::init(config.iggy).await?;
-    let consumer = Arc::new(iggy_clients.consumer);
-    let producer = Arc::new(iggy_clients.producer);
+    let consumer_id =
+        Identifier::from_str_value(config.iggy.consumer_name.as_deref().unwrap_or("iggy-mcp"))
+            .map_err(|error| {
+                error!("Failed to create Iggy consumer ID: {:?}", error);
+                McpRuntimeError::FailedToCreateConsumerId
+            })?;
+    let iggy_consumer = Arc::new(iggy::prelude::Consumer::new(consumer_id));
+    let iggy_client = Arc::new(stream::init(config.iggy).await?);
     let permissions = Permissions {
         create: config.permissions.create,
         read: config.permissions.read,
@@ -96,7 +102,7 @@ async fn main() -> Result<(), McpRuntimeError> {
     };
 
     if transport == McpTransport::Stdio {
-        let Ok(service) = IggyService::new(consumer, producer, permissions)
+        let Ok(service) = IggyService::new(iggy_client, iggy_consumer, permissions)
             .serve(stdio())
             .await
             .inspect_err(|e| {
@@ -119,8 +125,8 @@ async fn main() -> Result<(), McpRuntimeError> {
         let service = StreamableHttpService::new(
             move || {
                 Ok(IggyService::new(
-                    consumer.clone(),
-                    producer.clone(),
+                    iggy_client.clone(),
+                    iggy_consumer.clone(),
                     permissions,
                 ))
             },
