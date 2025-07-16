@@ -45,12 +45,10 @@ async function* genEagerUntilPoll(
   const state: Map<string, number> = new Map();
 
   while (true) {
-    console.log('pollin:', poll);
     const r = await c.message.poll(poll);
-    console.log('Yelding polled:', r);
     yield r;
     state.set(`${r.partitionId}`, r.count);
-    
+
     if (Array.from(state).every(([, last]) => last === 0)) {
       if( endOnLastOffset )
         return;
@@ -60,6 +58,7 @@ async function* genEagerUntilPoll(
   }
 };
 
+
 export type ConsumerStreamRequest = {
   streamId: Id,
   topicId: Id,
@@ -67,11 +66,11 @@ export type ConsumerStreamRequest = {
   count: number,
   interval?: number,
   autocommit?: boolean
+  endOnLastOffset?: boolean
 }
 
 export type SingleConsumerStreamRequest = ConsumerStreamRequest & {
   partitionId: number,
-  endOnLastOffset?: boolean
 };
 
 export type GroupConsumerStreamRequest = ConsumerStreamRequest & { groupId: number };
@@ -116,7 +115,8 @@ export const groupConsumerStream = (config: ClientConfig) =>
     pollingStrategy,
     count,
     interval = 1000,
-    autocommit = true
+    autocommit = true,
+    endOnLastOffset = false
   }: GroupConsumerStreamRequest): Promise<Readable> {
     const s = await getClient(config);
     
@@ -140,7 +140,10 @@ export const groupConsumerStream = (config: ClientConfig) =>
       count,
       autocommit
     }
-    const ps = Readable.from(genEagerUntilPoll(s, poll, interval), { objectMode: true });
+    const ps = Readable.from(
+      genEagerUntilPoll(s, poll, interval, endOnLastOffset),
+      { objectMode: true }
+    );
 
     return ps;
   };
