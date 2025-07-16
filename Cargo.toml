@@ -38,6 +38,7 @@ members = [
     "core/connectors/sinks/stdout_sink",
     "core/connectors/sources/postgres_source",
     "core/connectors/sources/random_source",
+    "core/connectors/sources/elasticsearch_source",
     "core/integration",
     "core/sdk",
     "core/server",
