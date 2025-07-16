@@ -23,6 +23,7 @@ use error::McpRuntimeError;
 use figlet_rs::FIGfont;
 use rmcp::{
     ServiceExt,
+    model::ErrorData,
     transport::{
         StreamableHttpService, stdio, streamable_http_server::session::local::LocalSessionManager,
     },
@@ -87,9 +88,15 @@ async fn main() -> Result<(), McpRuntimeError> {
     let iggy_clients = stream::init(config.iggy).await?;
     let consumer = Arc::new(iggy_clients.consumer);
     let producer = Arc::new(iggy_clients.producer);
+    let permissions = Permissions {
+        create: config.permissions.create,
+        read: config.permissions.read,
+        update: config.permissions.update,
+        delete: config.permissions.delete,
+    };
 
     if transport == McpTransport::Stdio {
-        let Ok(service) = IggyService::new(consumer, producer)
+        let Ok(service) = IggyService::new(consumer, producer, permissions)
             .serve(stdio())
             .await
             .inspect_err(|e| {
@@ -110,7 +117,13 @@ async fn main() -> Result<(), McpRuntimeError> {
         };
 
         let service = StreamableHttpService::new(
-            move || Ok(IggyService::new(consumer.clone(), producer.clone())),
+            move || {
+                Ok(IggyService::new(
+                    consumer.clone(),
+                    producer.clone(),
+                    permissions,
+                ))
+            },
             LocalSessionManager::default().into(),
             Default::default(),
         );
@@ -149,4 +162,58 @@ async fn main() -> Result<(), McpRuntimeError> {
 
     info!("Iggy MCP Server stopped successfully");
     Ok(())
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct Permissions {
+    create: bool,
+    read: bool,
+    update: bool,
+    delete: bool,
+}
+
+impl Permissions {
+    pub fn ensure_read(&self) -> Result<(), ErrorData> {
+        if self.read {
+            Ok(())
+        } else {
+            Err(ErrorData::invalid_request(
+                "Insufficient 'read' permissions",
+                None,
+            ))
+        }
+    }
+
+    pub fn ensure_create(&self) -> Result<(), ErrorData> {
+        if self.create {
+            Ok(())
+        } else {
+            Err(ErrorData::invalid_request(
+                "Insufficient 'create' permissions",
+                None,
+            ))
+        }
+    }
+
+    pub fn ensure_update(&self) -> Result<(), ErrorData> {
+        if self.update {
+            Ok(())
+        } else {
+            Err(ErrorData::invalid_request(
+                "Insufficient 'update' permissions",
+                None,
+            ))
+        }
+    }
+
+    pub fn ensure_delete(&self) -> Result<(), ErrorData> {
+        if self.delete {
+            Ok(())
+        } else {
+            Err(ErrorData::invalid_request(
+                "Insufficient 'delete' permissions",
+                None,
+            ))
+        }
+    }
 }

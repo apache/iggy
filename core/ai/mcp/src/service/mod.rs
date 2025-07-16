@@ -28,6 +28,8 @@ use rmcp::{
 };
 use serde::Serialize;
 use tracing::error;
+
+use crate::Permissions;
 mod requests;
 
 #[derive(Debug, Clone)]
@@ -35,15 +37,21 @@ pub struct IggyService {
     tool_router: ToolRouter<Self>,
     consumer: Arc<IggyClient>,
     _producer: Arc<IggyClient>,
+    permissions: Permissions,
 }
 
 #[tool_router]
 impl IggyService {
-    pub fn new(consumer: Arc<IggyClient>, producer: Arc<IggyClient>) -> Self {
+    pub fn new(
+        consumer: Arc<IggyClient>,
+        producer: Arc<IggyClient>,
+        permissions: Permissions,
+    ) -> Self {
         Self {
             tool_router: Self::tool_router(),
             consumer,
             _producer: producer,
+            permissions,
         }
     }
 
@@ -52,11 +60,13 @@ impl IggyService {
         &self,
         Parameters(GetStream { stream_id }): Parameters<GetStream>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
         request(self.consumer.get_stream(&id(&stream_id)?).await)
     }
 
     #[tool(description = "Get streams")]
     pub async fn get_streams(&self) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
         request(self.consumer.get_streams().await)
     }
 
@@ -65,6 +75,7 @@ impl IggyService {
         &self,
         Parameters(CreateStream { name, stream_id }): Parameters<CreateStream>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_create()?;
         request(self.consumer.create_stream(&name, stream_id).await)
     }
 
@@ -73,6 +84,7 @@ impl IggyService {
         &self,
         Parameters(UpdateStream { stream_id, name }): Parameters<UpdateStream>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_update()?;
         request(self.consumer.update_stream(&id(&stream_id)?, &name).await)
     }
 
@@ -81,6 +93,7 @@ impl IggyService {
         &self,
         Parameters(DeleteStream { stream_id }): Parameters<DeleteStream>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_delete()?;
         request(self.consumer.delete_stream(&id(&stream_id)?).await)
     }
 
@@ -89,6 +102,7 @@ impl IggyService {
         &self,
         Parameters(PurgeStream { stream_id }): Parameters<PurgeStream>,
     ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_delete()?;
         request(self.consumer.purge_stream(&id(&stream_id)?).await)
     }
 }

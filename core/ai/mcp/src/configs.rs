@@ -23,6 +23,7 @@ use strum::Display;
 pub struct McpServerConfig {
     pub http_api: Option<HttpApiConfig>,
     pub iggy: IggyConfig,
+    pub permissions: PermissionsConfig,
     pub transport: McpTransport,
 }
 
@@ -39,6 +40,14 @@ pub struct HttpApiConfig {
     pub address: String,
     pub api_key: Option<String>,
     pub tls: Option<HttpTlsConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PermissionsConfig {
+    pub create: bool,
+    pub read: bool,
+    pub update: bool,
+    pub delete: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
