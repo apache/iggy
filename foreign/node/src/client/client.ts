@@ -20,7 +20,7 @@
 
 import { createPool, type Pool } from 'generic-pool';
 import type { RawClient, ClientConfig } from "./client.type.js"
-import { getRawClient } from './client.socket.js';
+import { getRawClient } from '../client/client.socket.js';
 import { CommandAPI } from '../wire/command-set.js';
 import { debug } from './client.debug.js';
 
@@ -41,8 +41,6 @@ const poolClientProvider = (config: ClientConfig) => {
   const pool = createPool(createPoolFactory(config), { min, max });
   const poolClientProvider = async () => {
     const c = await pool.acquire();
-    if (!c.isAuthenticated)
-      await c.authenticate(config.credentials);
     debug('client acquired from pool. pool size is', pool.size);
     c.once('finishQueue', () => {
       pool.release(c)
@@ -58,7 +56,7 @@ const poolClientProvider = (config: ClientConfig) => {
 export class Client extends CommandAPI {
   _config: ClientConfig
   _pool: Pool<RawClient>
-  
+
   constructor(config: ClientConfig) {
     const pcp = poolClientProvider(config);
     super(pcp);
@@ -76,9 +74,7 @@ export class Client extends CommandAPI {
 
 const singleClientProvider = (config: ClientConfig) => {
   const c = getRawClient(config);
-  return async function singleClientProvider () {
-    if (!c.isAuthenticated)
-      await c.authenticate(config.credentials);
+  return async function singleClientProvider() {
     return c;
   }
 }
@@ -102,7 +98,7 @@ export class SimpleClient extends CommandAPI {
   constructor(client: RawClient) {
     super(() => Promise.resolve(client));
   }
-  
+
   async destroy() {
     const s = await this.clientProvider();
     s.destroy();
@@ -112,8 +108,5 @@ export class SimpleClient extends CommandAPI {
 
 export const getClient = async (config: ClientConfig) => {
   const cli = getRawClient(config);
-  if (!cli.isAuthenticated)
-    await cli.authenticate(config.credentials);
-  const api = new SimpleClient(cli);
-  return api;
+  return new SimpleClient(cli);
 };

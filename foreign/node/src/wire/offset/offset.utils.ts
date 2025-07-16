@@ -37,6 +37,21 @@ export type Consumer = {
   id: Id
 }
 
+export const ConsumerSingle = {
+  kind: ConsumerKind.Single,
+  id: 0
+};
+
+export type ConsumerSingle = typeof ConsumerSingle;
+
+export const Consumer = {
+  Single: ConsumerSingle,
+  Group: (groupId: Id) => ({
+    kind: ConsumerKind.Group,
+    id: groupId
+  })
+}
+
 export type OffsetResponse = {
   partitionId: number,
   currentOffset: bigint,

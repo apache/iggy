@@ -20,7 +20,7 @@
 
 import assert from 'node:assert/strict';
 import { When, Then } from "@cucumber/cucumber";
-import { ConsumerKind, PollingStrategy, Partitioning } from '../wire/index.js';
+import { Consumer,  PollingStrategy, Partitioning } from '../wire/index.js';
 import { someMessageContent } from '../tcp.sm.utils.js';
 import type { TestWorld } from './world.js';
 
@@ -67,7 +67,7 @@ When(
     const pollReq = {
       streamId,
       topicId,
-      consumer: { kind: ConsumerKind.Single, id: 1 },
+      consumer: Consumer.Single,
       partitionId,
       pollingStrategy: PollingStrategy.Offset(BigInt(offset)),
       count: 100,

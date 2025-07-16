@@ -73,7 +73,7 @@ const msg = {
 };
 
 try {
-
+  
   await c.stream.create(stream);
   console.log('server stream CREATED::', { streamId });
   await c.topic.create(topic);

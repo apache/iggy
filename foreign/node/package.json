@@ -15,14 +15,17 @@
   },
   "publishConfig": {
     "access": "public",
-    "main": "dist/index.js",
-    "types": "dist/index.d.ts"
+    "main": "dist/src/index.js",
+    "types": "dist/src/index.d.ts"
   },
   "homepage": "https://iggy.apache.org",
   "files": [
-    "dist/**/*.js",
-    "dist/**/*.d.ts",
-    "dist/index.d.ts"
+    "dist/src/**/*.js",
+    "dist/src/**/*.d.ts",
+    "dist/src/index.d.ts",
+    "!dist/src/bdd/",
+    "!dist/src/e2e/",
+    "!dist/**/*.test.*"
   ],
   "types": "dist/index.d.ts",
   "main": "dist/index.js",
@@ -32,7 +35,7 @@
     "test:bdd": "cucumber-js --exit",
     "test": "npm run test:unit && npm run test:bdd && npm run test:e2e",
     "clean": "rm -Rf dist/",
-    "lint": "eslint src/**/*.ts",
+    "lint": "eslint src/**/*.ts examples/**/*.ts",
     "commitlint": "commitlint --edit",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",

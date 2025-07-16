@@ -52,27 +52,19 @@ const COMMAND_LENGTH = 4;
 
 export const serializeCommand = (command: number, payload: Buffer) => {
   const payloadSize = payload.length + COMMAND_LENGTH;
-  const head = Buffer.allocUnsafe(8);
+  const data = Buffer.allocUnsafe(8 + payload.length);
 
-  head.writeUint32LE(payloadSize, 0);
-  head.writeUint32LE(command, 4);
+  data.writeUint32LE(payloadSize, 0);
+  data.writeUint32LE(command, 4);
+  data.fill(payload, 8);
 
   debug(
     '==> CMD', command,
     translateCommandCode(command),
-    head.subarray(4, 8).toString('hex'),
-    'LENGTH', payloadSize,
-    head.subarray(0, 4).toString('hex')
+    'LENGTH', payloadSize
   );
 
-  debug('message#HEAD', head.toString('hex'));
-  debug('message#PAYLOAD', payload.toString('hex'));
+  debug('FullMessage#Base64', data.toString('base64'));
 
-  const pl = Buffer.concat([head, payload])
-  
-  debug('FullMessage#Base64', pl.toString('base64'));
-
-  return pl;
+  return data;
 }
-
-
