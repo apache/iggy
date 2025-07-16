@@ -25,7 +25,7 @@ use crate::prelude::EncryptorKind;
 use crate::prelude::IggyConsumerBuilder;
 use crate::prelude::IggyError;
 use crate::prelude::IggyProducerBuilder;
-use crate::quic::quick_client::QuicClient;
+use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
 use async_broadcast::Receiver;
 use async_trait::async_trait;
