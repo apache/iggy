@@ -21,7 +21,7 @@ use chrono::{DateTime, Utc};
 use elasticsearch::{Elasticsearch, http::transport::Transport, SearchParts};
 use iggy_connector_sdk::{
     Error, ProducedMessage, ProducedMessages, Schema, Source, source_connector,
-    StatefulSource, SourceState, StateStorage, FileStateStorage,
+    SourceState, StateStorage, FileStateStorage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -539,24 +539,33 @@ impl Source for ElasticsearchSource {
         info!("Elasticsearch source connector with ID: {} is closed.", self.id);
         Ok(())
     }
-}
 
-#[async_trait]
-impl StatefulSource for ElasticsearchSource {
-    async fn get_state(&self) -> Result<SourceState, Error> {
-        self.internal_state_to_source_state().await
+    async fn get_state(&self) -> Result<Option<SourceState>, Error> {
+        if self.config.state.as_ref().map(|s| s.enabled).unwrap_or(false) {
+            Ok(Some(self.internal_state_to_source_state().await?))
+        } else {
+            Ok(None)
+        }
     }
     
     async fn set_state(&mut self, state: SourceState) -> Result<(), Error> {
-        self.source_state_to_internal_state(state).await
+        if self.config.state.as_ref().map(|s| s.enabled).unwrap_or(false) {
+            self.source_state_to_internal_state(state).await
+        } else {
+            Ok(())
+        }
     }
     
     async fn save_state(&self) -> Result<(), Error> {
+        if !self.config.state.as_ref().map(|s| s.enabled).unwrap_or(false) {
+            return Ok(());
+        }
+
         let storage = self.create_state_storage()
             .ok_or_else(|| Error::Storage("State storage not configured".to_string()))?;
         
         let source_state = self.internal_state_to_source_state().await?;
-        storage.save_state(&source_state).await?;
+        storage.save_source_state(&source_state).await?;
         
         info!(
             "Saved state for Elasticsearch source connector with ID: {}",
@@ -566,11 +575,15 @@ impl StatefulSource for ElasticsearchSource {
     }
     
     async fn load_state(&mut self) -> Result<(), Error> {
+        if !self.config.state.as_ref().map(|s| s.enabled).unwrap_or(false) {
+            return Ok(());
+        }
+
         let storage = self.create_state_storage()
             .ok_or_else(|| Error::Storage("State storage not configured".to_string()))?;
         
         let state_id = self.get_state_id();
-        if let Some(source_state) = storage.load_state(&state_id).await? {
+        if let Some(source_state) = storage.load_source_state(&state_id).await? {
             self.source_state_to_internal_state(source_state).await?;
             
             let state = self.state.lock().await;

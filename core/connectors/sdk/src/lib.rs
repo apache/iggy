@@ -64,22 +64,26 @@ pub trait Source: Send + Sync {
 
     /// Invoked when the source is closed, allowing it to perform any necessary cleanup.
     async fn close(&mut self) -> Result<(), Error>;
-}
 
-/// Optional trait for sources that need state persistence
-#[async_trait]
-pub trait StatefulSource: Source {
-    /// Get the current state of the source
-    async fn get_state(&self) -> Result<SourceState, Error>;
+    /// Optional: Get the current state of the source (default implementation returns None)
+    async fn get_state(&self) -> Result<Option<SourceState>, Error> {
+        Ok(None)
+    }
     
-    /// Set the state of the source
-    async fn set_state(&mut self, state: SourceState) -> Result<(), Error>;
+    /// Optional: Set the state of the source (default implementation does nothing)
+    async fn set_state(&mut self, _state: SourceState) -> Result<(), Error> {
+        Ok(())
+    }
     
-    /// Save the current state to persistent storage
-    async fn save_state(&self) -> Result<(), Error>;
+    /// Optional: Save the current state to persistent storage (default implementation does nothing)
+    async fn save_state(&self) -> Result<(), Error> {
+        Ok(())
+    }
     
-    /// Load the state from persistent storage
-    async fn load_state(&mut self) -> Result<(), Error>;
+    /// Optional: Load the state from persistent storage (default implementation does nothing)
+    async fn load_state(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 /// The Sink trait defines the interface for a sink connector, responsible for consuming the messages from the configured topics.
@@ -99,22 +103,26 @@ pub trait Sink: Send + Sync {
 
     /// Invoked when the sink is closed, allowing it to perform any necessary cleanup.
     async fn close(&mut self) -> Result<(), Error>;
-}
 
-/// Optional trait for sinks that need state persistence
-#[async_trait]
-pub trait StatefulSink: Sink {
-    /// Get the current state of the sink
-    async fn get_state(&self) -> Result<SinkState, Error>;
+    /// Optional: Get the current state of the sink (default implementation returns None)
+    async fn get_state(&self) -> Result<Option<SinkState>, Error> {
+        Ok(None)
+    }
     
-    /// Set the state of the sink
-    async fn set_state(&mut self, state: SinkState) -> Result<(), Error>;
+    /// Optional: Set the state of the sink (default implementation does nothing)
+    async fn set_state(&mut self, _state: SinkState) -> Result<(), Error> {
+        Ok(())
+    }
     
-    /// Save the current state to persistent storage
-    async fn save_state(&self) -> Result<(), Error>;
+    /// Optional: Save the current state to persistent storage (default implementation does nothing)
+    async fn save_state(&self) -> Result<(), Error> {
+        Ok(())
+    }
     
-    /// Load the state from persistent storage
-    async fn load_state(&mut self) -> Result<(), Error>;
+    /// Optional: Load the state from persistent storage (default implementation does nothing)
+    async fn load_state(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 /// State management for source connectors
@@ -132,6 +140,8 @@ pub struct SourceState {
     pub metadata: Option<serde_json::Value>,
 }
 
+
+
 /// State management for sink connectors
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SinkState {
@@ -147,14 +157,22 @@ pub struct SinkState {
     pub metadata: Option<serde_json::Value>,
 }
 
+
+
 /// State storage backend trait
 #[async_trait]
 pub trait StateStorage: Send + Sync {
-    /// Save state to storage
-    async fn save_state(&self, state: &SourceState) -> Result<(), Error>;
+    /// Save source state to storage
+    async fn save_source_state(&self, state: &SourceState) -> Result<(), Error>;
     
-    /// Load state from storage
-    async fn load_state(&self, id: &str) -> Result<Option<SourceState>, Error>;
+    /// Load source state from storage
+    async fn load_source_state(&self, id: &str) -> Result<Option<SourceState>, Error>;
+    
+    /// Save sink state to storage
+    async fn save_sink_state(&self, state: &SinkState) -> Result<(), Error>;
+    
+    /// Load sink state from storage
+    async fn load_sink_state(&self, id: &str) -> Result<Option<SinkState>, Error>;
     
     /// Delete state from storage
     async fn delete_state(&self, id: &str) -> Result<(), Error>;
@@ -182,7 +200,7 @@ impl FileStateStorage {
 
 #[async_trait]
 impl StateStorage for FileStateStorage {
-    async fn save_state(&self, state: &SourceState) -> Result<(), Error> {
+    async fn save_source_state(&self, state: &SourceState) -> Result<(), Error> {
         use tokio::fs;
         
         // Ensure directory exists
@@ -193,7 +211,7 @@ impl StateStorage for FileStateStorage {
         
         let path = self.get_state_path(&state.id);
         let json = serde_json::to_string_pretty(state)
-            .map_err(|e| Error::Serialization(format!("Failed to serialize state: {}", e)))?;
+            .map_err(|e| Error::Serialization(format!("Failed to serialize source state: {}", e)))?;
         
         fs::write(path, json).await
             .map_err(|e| Error::Storage(format!("Failed to write state file: {}", e)))?;
@@ -201,7 +219,7 @@ impl StateStorage for FileStateStorage {
         Ok(())
     }
     
-    async fn load_state(&self, id: &str) -> Result<Option<SourceState>, Error> {
+    async fn load_source_state(&self, id: &str) -> Result<Option<SourceState>, Error> {
         use tokio::fs;
         
         let path = self.get_state_path(id);
@@ -213,7 +231,43 @@ impl StateStorage for FileStateStorage {
             .map_err(|e| Error::Storage(format!("Failed to read state file: {}", e)))?;
         
         let state: SourceState = serde_json::from_str(&content)
-            .map_err(|e| Error::Serialization(format!("Failed to deserialize state: {}", e)))?;
+            .map_err(|e| Error::Serialization(format!("Failed to deserialize source state: {}", e)))?;
+        
+        Ok(Some(state))
+    }
+    
+    async fn save_sink_state(&self, state: &SinkState) -> Result<(), Error> {
+        use tokio::fs;
+        
+        // Ensure directory exists
+        if let Some(parent) = self.base_path.parent() {
+            fs::create_dir_all(parent).await
+                .map_err(|e| Error::Storage(format!("Failed to create state directory: {}", e)))?;
+        }
+        
+        let path = self.get_state_path(&state.id);
+        let json = serde_json::to_string_pretty(state)
+            .map_err(|e| Error::Serialization(format!("Failed to serialize sink state: {}", e)))?;
+        
+        fs::write(path, json).await
+            .map_err(|e| Error::Storage(format!("Failed to write state file: {}", e)))?;
+        
+        Ok(())
+    }
+    
+    async fn load_sink_state(&self, id: &str) -> Result<Option<SinkState>, Error> {
+        use tokio::fs;
+        
+        let path = self.get_state_path(id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        
+        let content = fs::read_to_string(path).await
+            .map_err(|e| Error::Storage(format!("Failed to read state file: {}", e)))?;
+        
+        let state: SinkState = serde_json::from_str(&content)
+            .map_err(|e| Error::Serialization(format!("Failed to deserialize sink state: {}", e)))?;
         
         Ok(Some(state))
     }
