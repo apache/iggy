@@ -111,7 +111,7 @@ pub struct ElasticsearchSource {
 }
 
 impl ElasticsearchSource {
-    pub fn new(id: u32, config: ElasticsearchSourceConfig) -> Self {
+    pub fn new(id: u32, config: ElasticsearchSourceConfig, _state: Option<serde_json::Value>) -> Self {
         let polling_interval = config
             .polling_interval
             .as_deref()
