@@ -29,6 +29,7 @@ use std::time::Duration;
 use tokio::{sync::Mutex, time::sleep};
 use tracing::{error, info, warn};
 use std::sync::Arc;
+use std::str::FromStr;
 
 mod state_manager;
 pub use state_manager::{StateManager, StateManagerExt, StateStats, StateInfo};
@@ -38,8 +39,8 @@ mod state_manager_test;
 
 source_connector!(ElasticsearchSource);
 
-#[derive(Debug)]
-struct State {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct State {
     last_poll_timestamp: Option<DateTime<Utc>>,
     total_documents_fetched: usize,
     poll_count: usize,
@@ -56,7 +57,7 @@ struct State {
     processing_stats: ProcessingStats,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProcessingStats {
     /// Total bytes processed
     total_bytes_processed: u64,
@@ -70,22 +71,7 @@ struct ProcessingStats {
     successful_polls_count: usize,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ElasticsearchSourceConfig {
-    pub url: String,
-    pub index: String,
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub query: Option<Value>,
-    pub polling_interval: Option<String>,
-    pub batch_size: Option<usize>,
-    pub timestamp_field: Option<String>,
-    pub scroll_timeout: Option<String>,
-    /// State management configuration
-    pub state: Option<StateConfig>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateConfig {
     /// Enable state persistence
     pub enabled: bool,
@@ -99,6 +85,20 @@ pub struct StateConfig {
     pub auto_save_interval: Option<String>,
     /// Fields to track in state (e.g., ["last_timestamp", "last_document_id"])
     pub tracked_fields: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ElasticsearchSourceConfig {
+    pub url: String,
+    pub index: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub query: Option<serde_json::Value>,
+    pub polling_interval: Option<String>,
+    pub batch_size: Option<usize>,
+    pub timestamp_field: Option<String>,
+    pub scroll_timeout: Option<String>,
+    pub state: Option<StateConfig>,
 }
 
 #[derive(Debug)]
@@ -273,18 +273,16 @@ impl ElasticsearchSource {
 
     async fn create_client(&self) -> Result<Elasticsearch, Error> {
         let mut transport_builder = Transport::single_node(&self.config.url)
-            .map_err(|e| Error::Connection(format!("Failed to create transport: {}", e)))?;
+            .map_err(|e| Error::Storage(format!("Failed to create transport: {}", e)))?;
 
         if let (Some(username), Some(password)) = (&self.config.username, &self.config.password) {
-            transport_builder = transport_builder.auth(elasticsearch::auth::Credentials::Basic(
+            transport_builder.set_auth(elasticsearch::auth::Credentials::Basic(
                 username.clone(),
                 password.clone(),
             ));
         }
 
-        let transport = transport_builder
-            .build()
-            .map_err(|e| Error::Connection(format!("Failed to build transport: {}", e)))?;
+        let transport = transport_builder;
 
         Ok(Elasticsearch::new(transport))
     }
@@ -337,14 +335,14 @@ impl ElasticsearchSource {
             .body(search_body)
             .send()
             .await
-            .map_err(|e| Error::Connection(format!("Failed to execute search: {}", e)))?;
+            .map_err(|e| Error::Storage(format!("Failed to execute search: {}", e)))?;
 
         if !response.status_code().is_success() {
             let error_text = response
                 .text()
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(Error::Connection(format!(
+            return Err(Error::Storage(format!(
                 "Search request failed: {}",
                 error_text
             )));
@@ -353,7 +351,7 @@ impl ElasticsearchSource {
         let response_body: Value = response
             .json()
             .await
-            .map_err(|e| Error::Connection(format!("Failed to parse search response: {}", e)))?;
+            .map_err(|e| Error::Storage(format!("Failed to parse search response: {}", e)))?;
 
         let mut messages = Vec::new();
         let mut latest_timestamp = None;
@@ -422,10 +420,10 @@ impl Source for ElasticsearchSource {
             .exists(elasticsearch::indices::IndicesExistsParts::Index(&[&self.config.index]))
             .send()
             .await
-            .map_err(|e| Error::Connection(format!("Failed to check index existence: {}", e)))?;
+            .map_err(|e| Error::Storage(format!("Failed to check index existence: {}", e)))?;
 
         if !response.status_code().is_success() {
-            return Err(Error::Connection(format!(
+            return Err(Error::Storage(format!(
                 "Index '{}' does not exist or is not accessible",
                 self.config.index
             )));
@@ -456,7 +454,7 @@ impl Source for ElasticsearchSource {
         sleep(self.polling_interval).await;
 
         let client = self.client.as_ref().ok_or_else(|| {
-            Error::Connection("Elasticsearch client not initialized".to_string())
+            Error::Storage("Elasticsearch client not initialized".to_string())
         })?;
 
         let messages = match self.search_documents(client).await {
@@ -488,32 +486,12 @@ impl Source for ElasticsearchSource {
             }
         };
 
-        let state = self.state.lock().await;
-        info!(
-            "Elasticsearch source connector with ID: {} polled {} documents (total: {}, polls: {}, errors: {})",
-            self.id,
-            messages.len(),
-            state.total_documents_fetched,
-            state.poll_count,
-            state.error_count
-        );
-        drop(state);
-
-        // Auto-save state if configured
-        if let Some(state_config) = &self.config.state {
-            if state_config.enabled {
-                if let Err(e) = self.save_state().await {
-                    warn!(
-                        "Failed to auto-save state for Elasticsearch source connector with ID: {}: {}",
-                        self.id, e
-                    );
-                }
-            }
-        }
-
+        let state_guard = self.state.lock().await;
+        let state_value = serde_json::to_value(&*state_guard).ok();
         Ok(ProducedMessages {
             schema: Schema::Json,
             messages,
+            state: state_value,
         })
     }
 

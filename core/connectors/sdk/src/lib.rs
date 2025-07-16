@@ -448,7 +448,7 @@ pub struct ReceivedMessage {
 pub struct ProducedMessages {
     pub schema: Schema,
     pub messages: Vec<ProducedMessage>,
-    pub state: Option<ConnectorState>,
+    pub state: Option<serde_json::Value>,
 }
 
 #[repr(C)]
