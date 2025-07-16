@@ -164,6 +164,7 @@ pub struct StateInfo {
 }
 
 /// Extension trait for ElasticsearchSource to add state management utilities
+#[allow(async_fn_in_trait)]
 pub trait StateManagerExt {
     /// Get state manager for this connector
     fn get_state_manager(&self) -> Option<StateManager>;
@@ -191,7 +192,7 @@ impl StateManagerExt for ElasticsearchSource {
 
     async fn export_state(&self) -> Result<Value, Error> {
         let state = Source::get_state(self).await?;
-        Ok(serde_json::to_value(state).map_err(|e| Error::Storage(e.to_string()))?)
+        serde_json::to_value(state).map_err(|e| Error::Storage(e.to_string()))
     }
 
     async fn import_state(&mut self, state_json: Value) -> Result<(), Error> {

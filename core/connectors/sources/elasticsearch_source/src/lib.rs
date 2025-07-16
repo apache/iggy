@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::{sync::Mutex, time::sleep};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use std::sync::Arc;
 use std::str::FromStr;
 
@@ -272,7 +272,7 @@ impl ElasticsearchSource {
     }
 
     async fn create_client(&self) -> Result<Elasticsearch, Error> {
-        let mut transport_builder = Transport::single_node(&self.config.url)
+        let transport_builder = Transport::single_node(&self.config.url)
             .map_err(|e| Error::Storage(format!("Failed to create transport: {}", e)))?;
 
         if let (Some(username), Some(password)) = (&self.config.username, &self.config.password) {
@@ -288,7 +288,7 @@ impl ElasticsearchSource {
     }
 
     async fn search_documents(&self, client: &Elasticsearch) -> Result<Vec<ProducedMessage>, Error> {
-        let mut state = self.state.lock().await;
+        let state = self.state.lock().await;
         let batch_size = self.config.batch_size.unwrap_or(100);
 
         // Build query based on timestamp field if configured

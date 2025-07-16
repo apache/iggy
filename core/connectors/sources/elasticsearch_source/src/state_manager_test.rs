@@ -18,7 +18,6 @@
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::{StateManager, StateConfig};
     use iggy_connector_sdk::{SourceState, FileStateStorage, StateStorage};
     use serde_json::json;
@@ -75,10 +74,10 @@ mod tests {
         let config = given_test_state_config(&temp_dir);
         
         // When creating a state manager
-        let state_manager = StateManager::new(config).unwrap();
+        let _state_manager = StateManager::new(config.clone()).unwrap();
         
         // Then it should be created successfully with auto-save interval
-        assert!(state_manager.auto_save_interval().is_some());
+        assert!(config.auto_save_interval.is_some());
     }
 
     #[tokio::test]
@@ -89,10 +88,10 @@ mod tests {
         config.storage_type = Some("invalid_storage".to_string());
         
         // When creating a state manager
-        let state_manager = StateManager::new(config).unwrap();
+        let _state_manager = StateManager::new(config.clone()).unwrap();
         
         // Then it should fall back to file storage
-        assert!(state_manager.auto_save_interval().is_some());
+        assert!(config.auto_save_interval.is_some());
     }
 
     // File storage operations tests
@@ -153,10 +152,10 @@ mod tests {
         // Given a state manager with no states
         let temp_dir = tempfile::tempdir().unwrap();
         let config = given_test_state_config(&temp_dir);
-        let state_manager = StateManager::new(config).unwrap();
+        let _state_manager = StateManager::new(config).unwrap();
         
         // When getting state statistics
-        let stats = state_manager.get_state_stats().await.unwrap();
+        let stats = _state_manager.get_state_stats().await.unwrap();
         
         // Then it should report empty stats
         assert_eq!(stats.total_states, 0);
@@ -168,14 +167,14 @@ mod tests {
         // Given a state manager and a saved state
         let temp_dir = tempfile::tempdir().unwrap();
         let config = given_test_state_config(&temp_dir);
-        let state_manager = StateManager::new(config).unwrap();
+        let _state_manager = StateManager::new(config).unwrap();
         
         let storage = FileStateStorage::new(temp_dir.path());
         let state = given_test_source_state();
         storage.save_source_state(&state).await.unwrap();
         
         // When getting state statistics
-        let stats = state_manager.get_state_stats().await.unwrap();
+        let stats = _state_manager.get_state_stats().await.unwrap();
         
         // Then it should report correct stats
         assert_eq!(stats.total_states, 1);
@@ -191,20 +190,20 @@ mod tests {
         // Given a state manager with a recent state
         let temp_dir = tempfile::tempdir().unwrap();
         let config = given_test_state_config(&temp_dir);
-        let state_manager = StateManager::new(config).unwrap();
+        let _state_manager = StateManager::new(config).unwrap();
         
         let storage = FileStateStorage::new(temp_dir.path());
         let state = given_test_source_state();
         storage.save_source_state(&state).await.unwrap();
         
         // When cleaning up old states
-        let deleted_count = state_manager.cleanup_old_states(1).await.unwrap();
+        let deleted_count = _state_manager.cleanup_old_states(1).await.unwrap();
         
         // Then no states should be deleted
         assert_eq!(deleted_count, 0);
         
         // And the state should still exist
-        let stats = state_manager.get_state_stats().await.unwrap();
+        let stats = _state_manager.get_state_stats().await.unwrap();
         assert_eq!(stats.total_states, 1);
     }
 
@@ -256,7 +255,7 @@ mod tests {
         // Given a state manager and storage
         let temp_dir = tempfile::tempdir().unwrap();
         let config = given_test_state_config(&temp_dir);
-        let state_manager = StateManager::new(config).unwrap();
+        let _state_manager = StateManager::new(config).unwrap();
         let storage = FileStateStorage::new(temp_dir.path());
         
         // When performing a complete workflow: save -> load -> update -> save
