@@ -44,6 +44,7 @@ impl IggyClientBuilder {
         IggyClientBuilder::default()
     }
 
+    /// Creates a new `IggyClientBuilder` from the provided connection string.
     pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
         let mut builder = Self::new();
 
