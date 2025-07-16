@@ -16,10 +16,39 @@
  * under the License.
  */
 
-use rmcp::schemars;
+use rmcp::schemars::{self, JsonSchema};
+use serde::Deserialize;
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetStream {
-    #[schemars(description = "stream identifier (numeric or string)")]
+    #[schemars(description = "stream identifier (name or number)")]
+    pub stream_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreateStream {
+    #[schemars(description = "stream name (required, must be unique)")]
+    pub name: String,
+    #[schemars(description = "stream identifier (numeric, optional)")]
+    pub stream_id: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UpdateStream {
+    #[schemars(description = "stream identifier (name or number)")]
+    pub stream_id: String,
+    #[schemars(description = "stream name (required, must be unique)")]
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeleteStream {
+    #[schemars(description = "stream identifier (name or number)")]
+    pub stream_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PurgeStream {
+    #[schemars(description = "stream identifier (name or number)")]
     pub stream_id: String,
 }

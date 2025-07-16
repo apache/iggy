@@ -47,17 +47,49 @@ impl IggyService {
         }
     }
 
-    #[tool(description = "Get streams")]
-    pub async fn get_streams(&self) -> Result<CallToolResult, ErrorData> {
-        request(self.consumer.get_streams().await)
-    }
-
     #[tool(description = "Get stream")]
     pub async fn get_stream(
         &self,
         Parameters(GetStream { stream_id }): Parameters<GetStream>,
     ) -> Result<CallToolResult, ErrorData> {
         request(self.consumer.get_stream(&id(&stream_id)?).await)
+    }
+
+    #[tool(description = "Get streams")]
+    pub async fn get_streams(&self) -> Result<CallToolResult, ErrorData> {
+        request(self.consumer.get_streams().await)
+    }
+
+    #[tool(description = "Create stream")]
+    pub async fn create_stream(
+        &self,
+        Parameters(CreateStream { name, stream_id }): Parameters<CreateStream>,
+    ) -> Result<CallToolResult, ErrorData> {
+        request(self.consumer.create_stream(&name, stream_id).await)
+    }
+
+    #[tool(description = "Update stream")]
+    pub async fn update_stream(
+        &self,
+        Parameters(UpdateStream { stream_id, name }): Parameters<UpdateStream>,
+    ) -> Result<CallToolResult, ErrorData> {
+        request(self.consumer.update_stream(&id(&stream_id)?, &name).await)
+    }
+
+    #[tool(description = "Delete stream")]
+    pub async fn delete_stream(
+        &self,
+        Parameters(DeleteStream { stream_id }): Parameters<DeleteStream>,
+    ) -> Result<CallToolResult, ErrorData> {
+        request(self.consumer.delete_stream(&id(&stream_id)?).await)
+    }
+
+    #[tool(description = "Purge stream")]
+    pub async fn purge_stream(
+        &self,
+        Parameters(PurgeStream { stream_id }): Parameters<PurgeStream>,
+    ) -> Result<CallToolResult, ErrorData> {
+        request(self.consumer.purge_stream(&id(&stream_id)?).await)
     }
 }
 
