@@ -232,3 +232,18 @@ pub struct Message {
     #[schemars(description = "message payload, base64 encoded string")]
     pub payload: String,
 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetClient {
+    #[schemars(description = "client identifier (number)")]
+    pub client_id: u32,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct Snapshot {
+    #[schemars(description = "compression (optional, string)")]
+    pub compression: Option<String>,
+
+    #[schemars(description = "types")]
+    pub types: Vec<String>,
+}

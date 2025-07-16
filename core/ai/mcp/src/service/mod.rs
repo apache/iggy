@@ -19,7 +19,7 @@
 use iggy::prelude::{
     Consumer, Identifier, IggyClient, IggyError, IggyMessage, IggyTimestamp, MessageClient,
     PartitionClient, Partitioning, PollingKind, PollingStrategy, SegmentClient, StreamClient,
-    TopicClient,
+    SystemClient, SystemSnapshotType, TopicClient,
 };
 use requests::*;
 use rmcp::{
@@ -406,6 +406,57 @@ impl IggyService {
                 )
                 .await,
         )
+    }
+
+    #[tool(description = "Get stats")]
+    pub async fn get_stats(&self) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
+        request(self.client.get_stats().await)
+    }
+
+    #[tool(description = "Get me")]
+    pub async fn get_me(&self) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
+        request(self.client.get_stats().await)
+    }
+
+    #[tool(description = "Get client")]
+    pub async fn get_client(
+        &self,
+        Parameters(GetClient { client_id }): Parameters<GetClient>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
+        request(self.client.get_client(client_id).await)
+    }
+
+    #[tool(description = "Get clients")]
+    pub async fn get_clients(&self) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
+        request(self.client.get_clients().await)
+    }
+
+    #[tool(description = "ping")]
+    pub async fn ping(&self) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
+        request(self.client.ping().await)
+    }
+
+    #[tool(description = "Snapshot")]
+    pub async fn snapshot(
+        &self,
+        Parameters(Snapshot { compression, types }): Parameters<Snapshot>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
+        let compression = compression.and_then(|c| c.parse().ok()).unwrap_or_default();
+        let mut types = types
+            .into_iter()
+            .flat_map(|t| t.parse().ok())
+            .collect::<Vec<_>>();
+        if types.is_empty() {
+            types = SystemSnapshotType::all_snapshot_types();
+        }
+
+        request(self.client.snapshot(compression, types).await)
     }
 }
 
