@@ -46,10 +46,14 @@ jobs:
       - name: Unit Test
         working-directory: foreign/go
         run: go test -v ./...
+
+      - name: Run and Verify CLI Commands from Go SDK Examples README
+        run: ./scripts/run-go-examples-from-readme.sh
+
   lint:
     strategy:
       matrix:
-        module: [ foreign/go, bdd/go ]
+        module: [ foreign/go, bdd/go, examples/go ]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
