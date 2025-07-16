@@ -80,10 +80,11 @@ impl ServerCommandHandler for CreatePartitions {
             .collect::<Vec<_>>();
         // Open partition and segments for that particular shard.
         for (ns, shard_info) in records.iter() {
+            let partition = topic.get_partition(ns.partition_id).unwrap();
+            let mut partition = partition.write().await;
+            partition.persist().await.unwrap();
             if shard_info.id() == shard.id {
                 let partition_id = ns.partition_id;
-                let partition = topic.get_partition(partition_id)?;
-                let mut partition = partition.write().await;
                 partition.open().await.with_error_context(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - failed to open partition with ID: {partition_id} in topic with ID: {topic_id} for stream with ID: {stream_id}"

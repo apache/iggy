@@ -19,6 +19,7 @@
 use crate::streaming::common::test_setup::TestSetup;
 use bytes::Bytes;
 use iggy::prelude::*;
+use iggy_common::locking::IggyRwLockFn;
 use server::configs::system::SystemConfig;
 use server::streaming::polling_consumer::PollingConsumer;
 use server::streaming::segments::IggyMessagesBatchMut;
@@ -225,6 +226,11 @@ async fn init_topic(setup: &TestSetup, partitions_count: u32) -> Topic {
     .unwrap();
     let topic = created_topic_info.topic;
     topic.persist().await.unwrap();
+    for partition in topic.get_partitions() {
+        let mut partition = partition.write().await;
+        partition.persist().await.unwrap();
+        partition.open().await.unwrap();
+    }
     topic
 }
 

@@ -323,12 +323,6 @@ impl PartitionStorage for FilePartitionStorage {
             ));
         }
 
-        for segment in partition.get_segments_mut() {
-            segment.open().await.with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to persist segment: {segment}",)
-            })?;
-        }
-
         info!(
             "Saved partition with start ID: {} for stream with ID: {} and topic with ID: {}, path: {}.",
             partition.partition_id,

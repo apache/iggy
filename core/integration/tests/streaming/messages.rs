@@ -59,6 +59,8 @@ async fn should_persist_messages_and_then_load_them_from_disk() {
         Arc::new(AtomicU32::new(0)),
         IggyTimestamp::now(),
     );
+    partition.persist().await.unwrap();
+    partition.open().await.unwrap();
 
     let mut messages = Vec::with_capacity(messages_count as usize);
     let mut appended_messages = Vec::with_capacity(messages_count as usize);

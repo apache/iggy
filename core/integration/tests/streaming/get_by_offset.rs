@@ -131,6 +131,7 @@ async fn test_get_messages_by_offset(
 
     setup.create_partitions_directory(stream_id, topic_id).await;
     partition.persist().await.unwrap();
+    partition.open().await.unwrap();
 
     let mut all_messages = Vec::with_capacity(total_messages_count as usize);
 

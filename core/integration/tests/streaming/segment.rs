@@ -373,6 +373,12 @@ async fn should_delete_persisted_segments() -> Result<(), Box<dyn std::error::Er
     let stream = shard.find_stream(&session, &stream_id)?;
     let topic = shard.find_topic(&session, &stream, &topic_id)?;
     let partitions = topic.get_partitions();
+    for partition in &partitions {
+        let mut partition_lock = partition.write().await;
+        partition_lock.persist().await.unwrap();
+        partition_lock.open().await.unwrap();
+        drop(partition_lock);
+    }
     let partition = partitions
         .first()
         .ok_or(IggyError::Error)

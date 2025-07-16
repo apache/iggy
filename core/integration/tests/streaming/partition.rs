@@ -52,6 +52,7 @@ async fn should_persist_partition_with_segment() {
         );
 
         partition.persist().await.unwrap();
+        partition.open().await.unwrap();
 
         assert_persisted_partition(&partition.partition_path, with_segment).await;
     }
@@ -82,6 +83,7 @@ async fn should_load_existing_partition_from_disk() {
             IggyTimestamp::now(),
         );
         partition.persist().await.unwrap();
+        partition.open().await.unwrap();
         assert_persisted_partition(&partition.partition_path, with_segment).await;
 
         let now = IggyTimestamp::now();
@@ -150,6 +152,7 @@ async fn should_delete_existing_partition_from_disk() {
             IggyTimestamp::now(),
         );
         partition.persist().await.unwrap();
+        partition.open().await.unwrap();
         assert_persisted_partition(&partition.partition_path, with_segment).await;
 
         partition.delete().await.unwrap();
@@ -183,6 +186,7 @@ async fn should_purge_existing_partition_on_disk() {
             IggyTimestamp::now(),
         );
         partition.persist().await.unwrap();
+        partition.open().await.unwrap();
         assert_persisted_partition(&partition.partition_path, with_segment).await;
         let messages = create_messages();
         let messages_count = messages.len() as u32;
