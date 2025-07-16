@@ -202,3 +202,33 @@ pub struct PollMessages {
     #[schemars(description = "auto commit (optional, boolean)")]
     pub auto_commit: Option<bool>,
 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SendMessages {
+    #[schemars(description = "stream identifier (name or number)")]
+    pub stream_id: String,
+
+    #[schemars(description = "topic identifier (name or number)")]
+    pub topic_id: String,
+
+    #[schemars(description = "partition identifier (optional, number)")]
+    pub partition_id: Option<u32>,
+
+    #[schemars(description = "partitioning (optional, string)")]
+    pub partitioning: Option<String>,
+
+    #[schemars(description = "messages key (optional, string)")]
+    pub messages_key: Option<String>,
+
+    #[schemars(description = "messages collection")]
+    pub messages: Vec<Message>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct Message {
+    #[schemars(description = "message identifier (optional, number)")]
+    pub id: Option<u128>,
+
+    #[schemars(description = "message payload, base64 encoded string")]
+    pub payload: String,
+}

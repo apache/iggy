@@ -17,8 +17,9 @@
  */
 
 use iggy::prelude::{
-    Consumer, Identifier, IggyClient, IggyError, IggyTimestamp, MessageClient, PartitionClient,
-    PollingKind, PollingStrategy, SegmentClient, StreamClient, TopicClient,
+    Consumer, Identifier, IggyClient, IggyError, IggyMessage, IggyTimestamp, MessageClient,
+    PartitionClient, Partitioning, PollingKind, PollingStrategy, SegmentClient, StreamClient,
+    TopicClient,
 };
 use requests::*;
 use rmcp::{
@@ -338,6 +339,70 @@ impl IggyService {
                     &strategy,
                     count,
                     auto_commit,
+                )
+                .await,
+        )
+    }
+
+    #[tool(description = "Send messages")]
+    pub async fn send_messages(
+        &self,
+        Parameters(SendMessages {
+            stream_id,
+            topic_id,
+            partition_id,
+            partitioning,
+            messages_key,
+            messages,
+        }): Parameters<SendMessages>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_create()?;
+        let partitioning = if let Some(partitioning) = partitioning {
+            match partitioning.as_str() {
+                "balanced" => Partitioning::balanced(),
+                "key" => {
+                    let key = messages_key.unwrap_or_default().as_bytes().to_vec();
+                    if key.is_empty() {
+                        return Err(ErrorData::invalid_request(
+                            "Messages key cannot be empty",
+                            None,
+                        ));
+                    }
+
+                    Partitioning::messages_key(&key).map_err(|error| {
+                        ErrorData::invalid_request(format!("Invalid messages key: {error}"), None)
+                    })?
+                }
+                "partition" => Partitioning::partition_id(partition_id.unwrap_or(1)),
+                _ => Partitioning::balanced(),
+            }
+        } else {
+            Partitioning::balanced()
+        };
+
+        let mut messages = messages
+            .into_iter()
+            .flat_map(|message| {
+                if let Some(id) = message.id {
+                    return IggyMessage::builder()
+                        .id(id)
+                        .payload(message.payload.into())
+                        .build();
+                }
+
+                IggyMessage::builder()
+                    .payload(message.payload.into())
+                    .build()
+            })
+            .collect::<Vec<_>>();
+
+        request(
+            self.client
+                .send_messages(
+                    &id(&stream_id)?,
+                    &id(&topic_id)?,
+                    &partitioning,
+                    &mut messages,
                 )
                 .await,
         )
