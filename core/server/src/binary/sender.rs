@@ -27,6 +27,7 @@ use bytes::BytesMut;
 use compio::buf::{IoBuf, IoBufMut};
 use compio::io::{AsyncReadExt, AsyncWriteExt};
 use compio::net::TcpStream;
+use compio::tls::TlsStream;
 use iggy_common::IggyError;
 use nix::libc;
 use quinn::{RecvStream, SendStream};
@@ -85,9 +86,8 @@ impl SenderKind {
         Self::Tcp(TcpSender { stream })
     }
 
-    pub fn get_tcp_tls_sender(stream: ()) -> Self {
-        todo!();
-        //Self::TcpTls(TcpTlsSender { stream })
+    pub fn get_tcp_tls_sender(stream: TlsStream<TcpStream>) -> Self {
+        Self::TcpTls(TcpTlsSender { stream })
     }
 
     pub fn get_quic_sender(send_stream: SendStream, recv_stream: RecvStream) -> Self {

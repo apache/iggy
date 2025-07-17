@@ -16,8 +16,11 @@
  * under the License.
  */
 
+use compio::net::{TcpListener, TcpOpts};
+use compio::tls::TlsAcceptor;
+
+use crate::configs::tcp::TcpSocketConfig;
 use crate::binary::sender::SenderKind;
-use crate::configs::tcp::TcpTlsConfig;
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
 use crate::streaming::clients::client_manager::Transport;
@@ -27,7 +30,7 @@ use iggy_common::IggyError;
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls_pemfile::{certs, private_key};
-use socket2::Socket;
+use socket2::{SockAddr, Socket};
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -35,29 +38,61 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info};
 
+async fn create_listener(
+    addr: SocketAddr,
+    config: &TcpSocketConfig,
+) -> Result<TcpListener, std::io::Error> {
+    // Required by the thread-per-core model...
+    // We create bunch of sockets on different threads, that bind to exactly the same address and port.
+    let opts = TcpOpts::new().reuse_port(true).reuse_port(true);
+    let opts = if config.override_defaults {
+        let recv_buffer_size = config
+            .recv_buffer_size
+            .as_bytes_u64()
+            .try_into()
+            .expect("Failed to parse recv_buffer_size for TCP socket");
+
+        let send_buffer_size = config
+            .send_buffer_size
+            .as_bytes_u64()
+            .try_into()
+            .expect("Failed to parse send_buffer_size for TCP socket");
+
+        opts.recv_buffer_size(recv_buffer_size)
+            .send_buffer_size(send_buffer_size)
+            .keepalive(config.keepalive)
+            .linger(config.linger.get_duration())
+            .nodelay(config.nodelay)
+    } else {
+        opts
+    };
+    TcpListener::bind_with_options(addr, opts).await
+}
+
 pub(crate) async fn start(
     server_name: &'static str,
     addr: SocketAddr,
+    // Hmmmm... Does this argument need to be removed?
     socket: Socket,
     shard: Rc<IggyShard>,
 ) -> Result<(), IggyError> {
-    /*
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let config = &shard.config.tcp.tls;
+    let sock_config = &shard.config.tcp.socket;
 
-        let (certs, key) =
-            if config.self_signed && !std::path::Path::new(&config.cert_file).exists() {
-                info!("Generating self-signed certificate for TCP TLS server");
-                generate_self_signed_cert()
-                    .unwrap_or_else(|e| panic!("Failed to generate self-signed certificate: {e}"))
-            } else {
-                info!(
-                    "Loading certificates from cert_file: {}, key_file: {}",
-                    config.cert_file, config.key_file
-                );
-                load_certificates(&config.cert_file, &config.key_file)
-                    .unwrap_or_else(|e| panic!("Failed to load certificates: {e}"))
-            };
+    let (certs, key) =
+        if config.self_signed && !std::path::Path::new(&config.cert_file).exists() {
+            info!("Generating self-signed certificate for TCP TLS server");
+            generate_self_signed_cert()
+                .unwrap_or_else(|e| panic!("Failed to generate self-signed certificate: {e}"))
+        } else {
+            info!(
+                "Loading certificates from cert_file: {}, key_file: {}",
+                config.cert_file, config.key_file
+            );
+            load_certificates(&config.cert_file, &config.key_file)
+                .unwrap_or_else(|e| panic!("Failed to load certificates: {e}"))
+        };
 
     let server_config = ServerConfig::builder()
         .with_no_client_auth()
@@ -65,13 +100,11 @@ pub(crate) async fn start(
         .unwrap_or_else(|e| panic!("Unable to create TLS server config: {e}"));
 
     let acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let acceptor = Arc::new(acceptor);
 
-    socket
-        .bind(&addr.into())
-        .unwrap_or_else(|e| panic!("Unable to bind socket to address '{addr}': {e}",));
+    let listener = create_listener(addr, sock_config).await
+        .unwrap_or_else(|e| panic!("Unable to bind socket to address '{addr:?}': {e}"));
 
-    let listener: std::net::TcpListener = socket.into();
-    let listener = monoio::net::TcpListener::from_std(listener).unwrap();
     info!("{server_name} server has started on: {:?}", addr);
 
     loop {
@@ -80,7 +113,7 @@ pub(crate) async fn start(
                 if shard.is_shutting_down() {
                     return;
                 }
-                monoio::time::sleep(Duration::from_millis(100)).await;
+                compio::time::sleep(Duration::from_millis(100)).await;
             }
         };
 
@@ -115,13 +148,16 @@ pub(crate) async fn start(
                         let conn_stop_receiver = shard_clone.task_registry.add_connection(client_id);
 
                         let shard_for_conn = shard_clone.clone();
+
                         shard_clone.task_registry.spawn_tracked(async move {
                             match acceptor.accept(stream).await {
                                 Ok(tls_stream) => {
                                     let mut sender = SenderKind::get_tcp_tls_sender(tls_stream.into());
+
                                     if let Err(error) = handle_connection(&session, &mut sender, &shard_for_conn, conn_stop_receiver).await {
                                         handle_error(error);
                                     }
+
                                     shard_for_conn.task_registry.remove_connection(&client_id);
 
                                     if let Err(error) = sender.shutdown().await {
@@ -146,7 +182,6 @@ pub(crate) async fn start(
             }
         }
     }
-    */
     Ok(())
 }
 
