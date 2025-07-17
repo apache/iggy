@@ -16,6 +16,9 @@
  * under the License.
  */
 
+use std::collections::HashMap;
+
+use iggy::prelude;
 use rmcp::schemars::{self, JsonSchema};
 use serde::Deserialize;
 
@@ -246,4 +249,311 @@ pub struct Snapshot {
 
     #[schemars(description = "types")]
     pub types: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetConsumerGroup {
+    #[schemars(description = "stream identifier (name or number)")]
+    pub stream_id: String,
+
+    #[schemars(description = "topic identifier (name or number)")]
+    pub topic_id: String,
+
+    #[schemars(description = "consumer group identifier (name or number)")]
+    pub group_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetConsumerGroups {
+    #[schemars(description = "stream identifier (name or number)")]
+    pub stream_id: String,
+
+    #[schemars(description = "topic identifier (name or number)")]
+    pub topic_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreateConsumerGroup {
+    #[schemars(description = "stream identifier (name or number)")]
+    pub stream_id: String,
+
+    #[schemars(description = "topic identifier (name or number)")]
+    pub topic_id: String,
+
+    #[schemars(description = "consumer group name (required, must be unique)")]
+    pub name: String,
+
+    #[schemars(description = "consumer group identifier (optional, number)")]
+    pub group_id: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeleteConsumerGroup {
+    #[schemars(description = "stream identifier (name or number)")]
+    pub stream_id: String,
+
+    #[schemars(description = "topic identifier (name or number)")]
+    pub topic_id: String,
+
+    #[schemars(description = "consumer group identifier (name or number)")]
+    pub group_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetConsumerOffset {
+    #[schemars(description = "stream identifier (name or number)")]
+    pub stream_id: String,
+
+    #[schemars(description = "topic identifier (name or number)")]
+    pub topic_id: String,
+
+    #[schemars(description = "partition identifier (optional, number)")]
+    pub partition_id: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct StoreConsumerOffset {
+    #[schemars(description = "stream identifier (name or number)")]
+    pub stream_id: String,
+
+    #[schemars(description = "topic identifier (name or number)")]
+    pub topic_id: String,
+
+    #[schemars(description = "partition identifier (optional, number)")]
+    pub partition_id: Option<u32>,
+
+    #[schemars(description = "offset (required, number)")]
+    pub offset: u64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeleteConsumerOffset {
+    #[schemars(description = "stream identifier (name or number)")]
+    pub stream_id: String,
+
+    #[schemars(description = "topic identifier (name or number)")]
+    pub topic_id: String,
+
+    #[schemars(description = "partition identifier (optional, number)")]
+    pub partition_id: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreatePersonalAccessToken {
+    #[schemars(description = "personal access token name")]
+    pub name: String,
+
+    #[schemars(description = "personal access token expiry(optional)")]
+    pub expiry: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeletePersonalAccessToken {
+    #[schemars(description = "personal access token name")]
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetUser {
+    #[schemars(description = "user identifier (name or number)")]
+    pub user_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CreateUser {
+    #[schemars(description = "username")]
+    pub username: String,
+
+    #[schemars(description = "password")]
+    pub password: String,
+
+    #[schemars(description = "active (optional)")]
+    pub active: Option<bool>,
+
+    #[schemars(description = "permissions (optional)")]
+    pub permissions: Option<Permissions>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UpdateUser {
+    #[schemars(description = "user identifier (name or number)")]
+    pub user_id: String,
+
+    #[schemars(description = "username (optional)")]
+    pub username: Option<String>,
+
+    #[schemars(description = "active (optional)")]
+    pub active: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UpdatePermissions {
+    #[schemars(description = "user identifier (name or number)")]
+    pub user_id: String,
+
+    #[schemars(description = "permissions (optional)")]
+    pub permissions: Option<Permissions>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeleteUser {
+    #[schemars(description = "user identifier (name or number)")]
+    pub user_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ChangePassword {
+    #[schemars(description = "user identifier (name or number)")]
+    pub user_id: String,
+
+    #[schemars(description = "current password")]
+    pub current_password: String,
+
+    #[schemars(description = "new password")]
+    pub new_password: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct Permissions {
+    #[schemars(description = "global permissions (optional)")]
+    pub global: Option<GlobalPermissions>,
+
+    #[schemars(description = "stream permissions (optional)")]
+    pub streams: Option<HashMap<u32, StreamPermissions>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GlobalPermissions {
+    #[schemars(description = "manage servers (optional)")]
+    pub manage_servers: Option<bool>,
+
+    #[schemars(description = "read servers (optional)")]
+    pub read_servers: Option<bool>,
+
+    #[schemars(description = "manage users (optional)")]
+    pub manage_users: Option<bool>,
+
+    #[schemars(description = "read users (optional)")]
+    pub read_users: Option<bool>,
+
+    #[schemars(description = "manage streams (optional)")]
+    pub manage_streams: Option<bool>,
+
+    #[schemars(description = "read streams (optional)")]
+    pub read_streams: Option<bool>,
+
+    #[schemars(description = "manage topics (optional)")]
+    pub manage_topics: Option<bool>,
+
+    #[schemars(description = "read topics (optional)")]
+    pub read_topics: Option<bool>,
+
+    #[schemars(description = "poll messages (optional)")]
+    pub poll_messages: Option<bool>,
+
+    #[schemars(description = "send messages (optional)")]
+    pub send_messages: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct StreamPermissions {
+    #[schemars(description = "manage stream (optional)")]
+    pub manage_stream: Option<bool>,
+
+    #[schemars(description = "read stream (optional)")]
+    pub read_stream: Option<bool>,
+
+    #[schemars(description = "manage topics (optional)")]
+    pub manage_topics: Option<bool>,
+
+    #[schemars(description = "read topics (optional)")]
+    pub read_topics: Option<bool>,
+
+    #[schemars(description = "poll messages (optional)")]
+    pub poll_messages: Option<bool>,
+
+    #[schemars(description = "send messages (optional)")]
+    pub send_messages: Option<bool>,
+
+    #[schemars(description = "topics permissions (optional)")]
+    pub topics: Option<HashMap<u32, TopicPermissions>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TopicPermissions {
+    #[schemars(description = "manage topic (optional)")]
+    pub manage_topic: Option<bool>,
+
+    #[schemars(description = "read topic (optional)")]
+    pub read_topic: Option<bool>,
+
+    #[schemars(description = "poll messages (optional)")]
+    pub poll_messages: Option<bool>,
+
+    #[schemars(description = "send messages (optional)")]
+    pub send_messages: Option<bool>,
+}
+
+impl From<Permissions> for prelude::Permissions {
+    fn from(permissions: Permissions) -> Self {
+        prelude::Permissions {
+            global: permissions
+                .global
+                .map(|global| global.into())
+                .unwrap_or_default(),
+            streams: permissions.streams.map(|streams| {
+                streams
+                    .into_iter()
+                    .map(|(id, stream)| (id, stream.into()))
+                    .collect()
+            }),
+        }
+    }
+}
+
+impl From<GlobalPermissions> for prelude::GlobalPermissions {
+    fn from(permissions: GlobalPermissions) -> Self {
+        prelude::GlobalPermissions {
+            manage_servers: permissions.manage_servers.unwrap_or_default(),
+            read_servers: permissions.read_servers.unwrap_or_default(),
+            manage_users: permissions.manage_users.unwrap_or_default(),
+            read_users: permissions.read_users.unwrap_or_default(),
+            manage_streams: permissions.manage_streams.unwrap_or_default(),
+            read_streams: permissions.read_streams.unwrap_or_default(),
+            manage_topics: permissions.manage_topics.unwrap_or_default(),
+            read_topics: permissions.read_topics.unwrap_or_default(),
+            poll_messages: permissions.poll_messages.unwrap_or_default(),
+            send_messages: permissions.send_messages.unwrap_or_default(),
+        }
+    }
+}
+
+impl From<StreamPermissions> for prelude::StreamPermissions {
+    fn from(permissions: StreamPermissions) -> Self {
+        prelude::StreamPermissions {
+            manage_stream: permissions.manage_stream.unwrap_or_default(),
+            read_stream: permissions.read_stream.unwrap_or_default(),
+            manage_topics: permissions.manage_topics.unwrap_or_default(),
+            read_topics: permissions.read_topics.unwrap_or_default(),
+            poll_messages: permissions.poll_messages.unwrap_or_default(),
+            send_messages: permissions.send_messages.unwrap_or_default(),
+            topics: permissions.topics.map(|topics| {
+                topics
+                    .into_iter()
+                    .map(|(id, topic)| (id, topic.into()))
+                    .collect()
+            }),
+        }
+    }
+}
+
+impl From<TopicPermissions> for prelude::TopicPermissions {
+    fn from(permissions: TopicPermissions) -> Self {
+        prelude::TopicPermissions {
+            manage_topic: permissions.manage_topic.unwrap_or_default(),
+            read_topic: permissions.read_topic.unwrap_or_default(),
+            poll_messages: permissions.poll_messages.unwrap_or_default(),
+            send_messages: permissions.send_messages.unwrap_or_default(),
+        }
+    }
 }

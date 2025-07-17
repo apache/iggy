@@ -134,14 +134,17 @@ async fn main() -> Result<(), McpRuntimeError> {
             Default::default(),
         );
 
-        let router = axum::Router::new().nest_service("/mcp", service);
+        let router = axum::Router::new().nest_service(&http_config.path, service);
         let tcp_listener = tokio::net::TcpListener::bind(&http_config.address)
             .await
             .map_err(|error| {
                 error!("Failed to bind TCP listener: {:?}", error);
                 McpRuntimeError::FailedToStartHttpServer
             })?;
-        info!("HTTP API listening on: {}", http_config.address);
+        info!(
+            "HTTP API listening on: {}, MCP path: {}",
+            http_config.address, http_config.path
+        );
         let _ = axum::serve(tcp_listener, router)
             .with_graceful_shutdown(async { tokio::signal::ctrl_c().await.unwrap() })
             .await;

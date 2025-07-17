@@ -17,9 +17,10 @@
  */
 
 use iggy::prelude::{
-    Consumer, Identifier, IggyClient, IggyError, IggyMessage, IggyTimestamp, MessageClient,
-    PartitionClient, Partitioning, PollingKind, PollingStrategy, SegmentClient, StreamClient,
-    SystemClient, SystemSnapshotType, TopicClient,
+    Consumer, ConsumerGroupClient, ConsumerOffsetClient, Identifier, IggyClient, IggyError,
+    IggyMessage, IggyTimestamp, MessageClient, PartitionClient, Partitioning,
+    PersonalAccessTokenClient, PollingKind, PollingStrategy, SegmentClient, StreamClient,
+    SystemClient, SystemSnapshotType, TopicClient, UserClient, UserStatus,
 };
 use requests::*;
 use rmcp::{
@@ -435,7 +436,7 @@ impl IggyService {
         request(self.client.get_clients().await)
     }
 
-    #[tool(description = "ping")]
+    #[tool(description = "Ping")]
     pub async fn ping(&self) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_read()?;
         request(self.client.ping().await)
@@ -457,6 +458,281 @@ impl IggyService {
         }
 
         request(self.client.snapshot(compression, types).await)
+    }
+
+    #[tool(description = "Get consumer groups")]
+    pub async fn get_consumer_groups(
+        &self,
+        Parameters(GetConsumerGroups {
+            stream_id,
+            topic_id,
+        }): Parameters<GetConsumerGroups>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
+        request(
+            self.client
+                .get_consumer_groups(&id(&stream_id)?, &id(&topic_id)?)
+                .await,
+        )
+    }
+
+    #[tool(description = "Get consumer group")]
+    pub async fn get_consumer_group(
+        &self,
+        Parameters(GetConsumerGroup {
+            stream_id,
+            topic_id,
+            group_id,
+        }): Parameters<GetConsumerGroup>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
+        request(
+            self.client
+                .get_consumer_group(&id(&stream_id)?, &id(&topic_id)?, &id(&group_id)?)
+                .await,
+        )
+    }
+
+    #[tool(description = "Create consumer group")]
+    pub async fn create_consumer_group(
+        &self,
+        Parameters(CreateConsumerGroup {
+            stream_id,
+            topic_id,
+            name,
+            group_id,
+        }): Parameters<CreateConsumerGroup>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_create()?;
+        request(
+            self.client
+                .create_consumer_group(&id(&stream_id)?, &id(&topic_id)?, &name, group_id)
+                .await,
+        )
+    }
+
+    #[tool(description = "Delete consumer group")]
+    pub async fn delete_consumer_group(
+        &self,
+        Parameters(DeleteConsumerGroup {
+            stream_id,
+            topic_id,
+            group_id,
+        }): Parameters<DeleteConsumerGroup>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_delete()?;
+        request(
+            self.client
+                .delete_consumer_group(&id(&stream_id)?, &id(&topic_id)?, &id(&group_id)?)
+                .await,
+        )
+    }
+
+    #[tool(description = "Get consumer offset")]
+    pub async fn get_consumer_offset(
+        &self,
+        Parameters(GetConsumerOffset {
+            stream_id,
+            topic_id,
+            partition_id,
+        }): Parameters<GetConsumerOffset>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
+        request(
+            self.client
+                .get_consumer_offset(
+                    &self.consumer,
+                    &id(&stream_id)?,
+                    &id(&topic_id)?,
+                    partition_id,
+                )
+                .await,
+        )
+    }
+
+    #[tool(description = "Store consumer offset")]
+    pub async fn store_consumer_offset(
+        &self,
+        Parameters(StoreConsumerOffset {
+            stream_id,
+            topic_id,
+            partition_id,
+            offset,
+        }): Parameters<StoreConsumerOffset>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
+        request(
+            self.client
+                .store_consumer_offset(
+                    &self.consumer,
+                    &id(&stream_id)?,
+                    &id(&topic_id)?,
+                    partition_id,
+                    offset,
+                )
+                .await,
+        )
+    }
+
+    #[tool(description = "Delete consumer offset")]
+    pub async fn delete_consumer_offset(
+        &self,
+        Parameters(DeleteConsumerOffset {
+            stream_id,
+            topic_id,
+            partition_id,
+        }): Parameters<DeleteConsumerOffset>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
+        request(
+            self.client
+                .delete_consumer_offset(
+                    &self.consumer,
+                    &id(&stream_id)?,
+                    &id(&topic_id)?,
+                    partition_id,
+                )
+                .await,
+        )
+    }
+
+    #[tool(description = "Get personal access tokens")]
+    pub async fn get_personal_access_tokens(&self) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
+        request(self.client.get_personal_access_tokens().await)
+    }
+
+    #[tool(description = "Create personal access token")]
+    pub async fn create_personal_access_token(
+        &self,
+        Parameters(CreatePersonalAccessToken { name, expiry }): Parameters<
+            CreatePersonalAccessToken,
+        >,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
+        let expiry = expiry
+            .and_then(|expiry| expiry.parse().ok())
+            .unwrap_or_default();
+        request(
+            self.client
+                .create_personal_access_token(&name, expiry)
+                .await,
+        )
+    }
+
+    #[tool(description = "Delete personal access token")]
+    pub async fn delete_personal_access_token(
+        &self,
+        Parameters(DeletePersonalAccessToken { name }): Parameters<DeletePersonalAccessToken>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
+        request(self.client.delete_personal_access_token(&name).await)
+    }
+
+    #[tool(description = "Get users")]
+    pub async fn get_users(&self) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
+        request(self.client.get_users().await)
+    }
+
+    #[tool(description = "Get user")]
+    pub async fn get_user(
+        &self,
+        Parameters(GetUser { user_id }): Parameters<GetUser>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
+        request(self.client.get_user(&id(&user_id)?).await)
+    }
+
+    #[tool(description = "Create user")]
+    pub async fn create_user(
+        &self,
+        Parameters(CreateUser {
+            username,
+            password,
+            active,
+            permissions,
+        }): Parameters<CreateUser>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_create()?;
+        let status = if active.unwrap_or_default() {
+            UserStatus::Active
+        } else {
+            UserStatus::Inactive
+        };
+        let permissions = permissions.map(|p| p.into());
+        request(
+            self.client
+                .create_user(&username, &password, status, permissions)
+                .await,
+        )
+    }
+
+    #[tool(description = "Update user")]
+    pub async fn update_user(
+        &self,
+        Parameters(UpdateUser {
+            user_id,
+            username,
+            active,
+        }): Parameters<UpdateUser>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_update()?;
+        let status = active.map(|active| {
+            if active {
+                UserStatus::Active
+            } else {
+                UserStatus::Inactive
+            }
+        });
+        request(
+            self.client
+                .update_user(&id(&user_id)?, username.as_deref(), status)
+                .await,
+        )
+    }
+
+    #[tool(description = "Update permissions")]
+    pub async fn update_permissions(
+        &self,
+        Parameters(UpdatePermissions {
+            user_id,
+            permissions,
+        }): Parameters<UpdatePermissions>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_update()?;
+        let permissions = permissions.map(|p| p.into());
+        request(
+            self.client
+                .update_permissions(&id(&user_id)?, permissions)
+                .await,
+        )
+    }
+
+    #[tool(description = "Delete user")]
+    pub async fn delete_user(
+        &self,
+        Parameters(DeleteUser { user_id }): Parameters<DeleteUser>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_delete()?;
+        request(self.client.delete_user(&id(&user_id)?).await)
+    }
+
+    #[tool(description = "Change password")]
+    pub async fn change_password(
+        &self,
+        Parameters(ChangePassword {
+            user_id,
+            current_password,
+            new_password,
+        }): Parameters<ChangePassword>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_update()?;
+        request(
+            self.client
+                .change_password(&id(&user_id)?, &current_password, &new_password)
+                .await,
+        )
     }
 }
 

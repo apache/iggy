@@ -19,6 +19,7 @@ transport = "stdio"
 
 [http_api] # Optional HTTP API configuration
 address = "127.0.0.1:8082"
+path = "/mcp"
 # api_key = "secret" # Optional API key for authentication to be passed as `api-key` header
 
 [http_api.tls] # Optional TLS configuration for HTTP API

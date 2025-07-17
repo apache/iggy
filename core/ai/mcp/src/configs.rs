@@ -39,6 +39,7 @@ pub struct IggyConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HttpApiConfig {
     pub address: String,
+    pub path: String,
     pub api_key: Option<String>,
     pub tls: Option<HttpTlsConfig>,
 }
