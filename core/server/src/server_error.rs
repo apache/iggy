@@ -18,6 +18,7 @@
 
 use error_set::error_set;
 use quinn::{ConnectionError as QuicConnectionError, ReadToEndError, WriteError};
+use rusty_s3::BucketError;
 use std::array::TryFromSliceError;
 use tokio::io;
 
@@ -58,6 +59,9 @@ error_set!(
 
         #[display("Invalid S3 credentials")]
         InvalidS3Credentials,
+
+        #[display("Invalid S3 Bucket configuration")]
+        BucketError(BucketError),
 
         #[display("Cannot archive file: {}", file_path)]
         CannotArchiveFile { file_path: String },

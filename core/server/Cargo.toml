@@ -26,7 +26,7 @@ license = "Apache-2.0"
 normal = ["tracing-appender"]
 
 [package.metadata.cargo-machete]
-ignored = ["rust-s3"]
+ignored = [""]
 
 [features]
 default = ["mimalloc"]
@@ -94,7 +94,6 @@ prometheus-client = "0.23.1"
 quinn = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls-no-provider"] }
 ring = "0.17.14"
-rust-s3 = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = "2.2.0"
 serde = { workspace = true }
@@ -118,6 +117,7 @@ tracing-subscriber = { workspace = true }
 twox-hash = { workspace = true }
 ulid = "1.2.1"
 uuid = { workspace = true }
+rusty-s3 = "0.7.0"
 
 [build-dependencies]
 figment = { version = "0.10.19", features = ["json", "toml", "env"] }
