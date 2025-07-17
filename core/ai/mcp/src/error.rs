@@ -34,4 +34,6 @@ pub enum McpRuntimeError {
     MissingIggyCredentials,
     #[error("Failed to create Iggy consumer ID")]
     FailedToCreateConsumerId,
+    #[error("Invalid API path")]
+    InvalidApiPath,
 }

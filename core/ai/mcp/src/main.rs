@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use axum::routing::get;
 use config::{Config, Environment, File};
 use configs::{McpServerConfig, McpTransport};
 use dotenvy::dotenv;
@@ -134,7 +135,21 @@ async fn main() -> Result<(), McpRuntimeError> {
             Default::default(),
         );
 
-        let router = axum::Router::new().nest_service(&http_config.path, service);
+        if !http_config.path.starts_with("/") {
+            error!("HTTP API path must start with '/'");
+            return Err(McpRuntimeError::InvalidApiPath);
+        }
+
+        if http_config.path == "/" {
+            error!("HTTP API path cannot be '/'");
+            return Err(McpRuntimeError::InvalidApiPath);
+        }
+
+        let router = axum::Router::new()
+            .route("/", get(|| async { "Iggy MCP Server" }))
+            .route("/ping", get(|| async { "pong" }))
+            .route("/health", get(|| async { "healthy" }))
+            .nest_service(&http_config.path, service);
         let tcp_listener = tokio::net::TcpListener::bind(&http_config.address)
             .await
             .map_err(|error| {
