@@ -16,12 +16,13 @@
  * under the License.
  */
 
+use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use serde::{Deserialize, Serialize};
 use strum::Display;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct McpServerConfig {
-    pub http_api: Option<HttpApiConfig>,
+    pub http: Option<HttpApiConfig>,
     pub iggy: IggyConfig,
     pub permissions: PermissionsConfig,
     pub transport: McpTransport,
@@ -33,14 +34,13 @@ pub struct IggyConfig {
     pub username: Option<String>,
     pub password: Option<String>,
     pub token: Option<String>,
-    pub consumer_name: Option<String>,
+    pub consumer: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HttpApiConfig {
     pub address: String,
     pub path: String,
-    pub api_key: Option<String>,
     pub tls: Option<HttpTlsConfig>,
 }
 
@@ -52,11 +52,11 @@ pub struct PermissionsConfig {
     pub delete: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct HttpTlsConfig {
     pub enabled: bool,
-    pub cert_file: String,
-    pub key_file: String,
+    pub cert: String,
+    pub key: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, Display, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,4 +68,48 @@ pub enum McpTransport {
     Http,
     #[strum(to_string = "stdio")]
     Stdio,
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        Self {
+            http: Some(HttpApiConfig::default()),
+            iggy: IggyConfig::default(),
+            permissions: PermissionsConfig::default(),
+            transport: McpTransport::Http,
+        }
+    }
+}
+
+impl Default for IggyConfig {
+    fn default() -> Self {
+        Self {
+            address: "localhost:8090".to_owned(),
+            username: Some(DEFAULT_ROOT_USERNAME.to_owned()),
+            password: Some(DEFAULT_ROOT_PASSWORD.to_owned()),
+            token: None,
+            consumer: None,
+        }
+    }
+}
+
+impl Default for HttpApiConfig {
+    fn default() -> Self {
+        Self {
+            address: "localhost:8082".to_owned(),
+            path: "/mcp".to_owned(),
+            tls: None,
+        }
+    }
+}
+
+impl Default for PermissionsConfig {
+    fn default() -> Self {
+        Self {
+            create: true,
+            read: true,
+            update: true,
+            delete: true,
+        }
+    }
 }

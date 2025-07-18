@@ -58,14 +58,11 @@ async fn main() -> Result<(), McpRuntimeError> {
     }
 
     let config_path = env::var("IGGY_MCP_CONFIG_PATH").unwrap_or_else(|_| "config".to_string());
-
-    eprintln!("Loading configuration from: {config_path}");
-
-    let builder = Config::builder()
-        .add_source(File::with_name(&config_path))
-        .add_source(Environment::with_prefix("IGGY_MCP").separator("_"));
-
-    let config: McpServerConfig = builder
+    eprintln!("Configuration file path: {config_path}");
+    let config: McpServerConfig = Config::builder()
+        .add_source(Config::try_from(&McpServerConfig::default()).expect("Failed to init config"))
+        .add_source(File::with_name(&config_path).required(false))
+        .add_source(Environment::with_prefix("IGGY_MCP").separator("_"))
         .build()
         .expect("Failed to build runtime config")
         .try_deserialize()
@@ -87,12 +84,13 @@ async fn main() -> Result<(), McpRuntimeError> {
 
     info!("Starting Iggy MCP Server, transport: {transport}...");
 
-    let consumer_id =
-        Identifier::from_str_value(config.iggy.consumer_name.as_deref().unwrap_or("iggy-mcp"))
-            .map_err(|error| {
-                error!("Failed to create Iggy consumer ID: {:?}", error);
-                McpRuntimeError::FailedToCreateConsumerId
-            })?;
+    let consumer_id = Identifier::from_str_value(
+        config.iggy.consumer.as_deref().unwrap_or("iggy-mcp"),
+    )
+    .map_err(|error| {
+        error!("Failed to create Iggy consumer ID: {:?}", error);
+        McpRuntimeError::FailedToCreateConsumerId
+    })?;
     let iggy_consumer = Arc::new(iggy::prelude::Consumer::new(consumer_id));
     let iggy_client = Arc::new(stream::init(config.iggy).await?);
     let permissions = Permissions {
@@ -118,7 +116,7 @@ async fn main() -> Result<(), McpRuntimeError> {
             error!("waiting error: {:?}", error);
         }
     } else {
-        let Some(http_config) = config.http_api else {
+        let Some(http_config) = config.http else {
             error!("HTTP API configuration not found");
             return Err(McpRuntimeError::MissingConfig);
         };
