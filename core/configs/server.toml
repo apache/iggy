@@ -17,7 +17,7 @@
 
 [data_maintenance.archiver]
 # Enables or disables the archiver process.
-enabled = true
+enabled = false
 
 # Kind of archiver to use. Available options: "disk".
 kind = "disk"
@@ -47,7 +47,7 @@ tmp_upload_dir = "local_data/s3_tmp"
 
 [data_maintenance.messages]
 # Enables or disables the archiver process for closed segments containing messages.
-archiver_enabled = true
+archiver_enabled = false
 
 # Enables or disables the expired message cleaner process.
 cleaner_enabled = false
