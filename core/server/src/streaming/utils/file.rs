@@ -19,10 +19,6 @@
 use compio::fs::{File, OpenOptions, remove_file};
 use std::path::Path;
 
-pub fn open_std(path: &str) -> Result<std::fs::File, std::io::Error> {
-    std::fs::OpenOptions::new().read(true).open(path)
-}
-
 pub async fn open(path: &str) -> Result<File, std::io::Error> {
     OpenOptions::new().read(true).open(path).await
 }

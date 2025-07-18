@@ -16,29 +16,24 @@
  * under the License.
  */
 
-//TODO: Fixme
-/*
-use crate::configs::server::ServerConfig;
-use crate::streaming::systems::system::SharedSystem;
+use crate::{configs::server::ServerConfig, shard::IggyShard};
 use flume::{Receiver, Sender};
-use std::future::Future;
+use std::{future::Future, rc::Rc};
 
 pub trait BackgroundServerCommand<C> {
-    fn execute(&mut self, system: &SharedSystem, command: C) -> impl Future<Output = ()>;
+    fn execute(&mut self, system: &IggyShard, command: C) -> impl Future<Output = ()>;
 
     fn start_command_sender(
         &mut self,
-        system: SharedSystem,
+        shard: Rc<IggyShard>,
         config: &ServerConfig,
         sender: Sender<C>,
     );
 
     fn start_command_consumer(
         self,
-        system: SharedSystem,
+        shard: Rc<IggyShard>,
         config: &ServerConfig,
         receiver: Receiver<C>,
     );
 }
-
-*/

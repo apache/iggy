@@ -120,6 +120,7 @@ tempfile = "3.20.0"
 thiserror = "2.0.12"
 tokio = { version = "1.45.1", features = ["full"] }
 compio =  { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be", features = ["runtime", "macros", "io-uring", "time", "rustls"] }
+cyper = { version = "0.4.0", features = ["rustls"], default-features = false}
 tokio-rustls = "0.26.2"
 toml = "0.8.23"
 tracing = "0.1.41"

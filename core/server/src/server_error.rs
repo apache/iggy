@@ -46,6 +46,7 @@ error_set!(
         #[display("Invalid configuration")]
         InvalidConfiguration,
 
+
         #[display("Cache config validation failure")]
         CacheConfigValidationFailure,
     };
@@ -59,6 +60,9 @@ error_set!(
 
         #[display("Invalid S3 credentials")]
         InvalidS3Credentials,
+
+        #[display("HTTP request error: {0}")]
+        CyperError(cyper::Error),
 
         #[display("Invalid S3 Bucket configuration")]
         BucketError(BucketError),

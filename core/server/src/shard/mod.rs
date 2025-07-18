@@ -50,12 +50,16 @@ use tracing::{error, info, instrument, warn};
 use transmission::connector::{Receiver, ShardConnector, StopReceiver, StopSender};
 
 use crate::{
+    archiver::ArchiverKind,
     configs::server::ServerConfig,
     io::fs_utils,
     shard::{
         system::info::SystemInfo,
         task_registry::TaskRegistry,
-        tasks::messages::spawn_shard_message_task,
+        tasks::{
+            auxilary::maintain_messages::spawn_message_maintainance_task,
+            messages::spawn_shard_message_task,
+        },
         transmission::{
             event::ShardEvent,
             frame::{ShardFrame, ShardResponse},
@@ -141,6 +145,7 @@ pub struct IggyShard {
 
     pub(crate) state: StateKind,
     pub(crate) encryptor: Option<EncryptorKind>,
+    pub(crate) archiver: Option<Rc<ArchiverKind>>,
     pub(crate) config: ServerConfig,
     //TODO: This could be shared.
     pub(crate) client_manager: RefCell<ClientManager>,
@@ -182,8 +187,8 @@ impl IggyShard {
         let (stop_sender, stop_receiver) = async_channel::unbounded();
 
         let shard = Self {
-            id: 0,              // Default shard ID
-            shards: Vec::new(), // No other shards in default config
+            id: 0,
+            shards: Vec::new(),
             shards_table: Default::default(),
             version,
             streams: Default::default(),
@@ -191,6 +196,7 @@ impl IggyShard {
             storage,
             state,
             encryptor: None,
+            archiver: None,
             config: server_config,
             client_manager: Default::default(),
             active_sessions: Default::default(),
@@ -223,15 +229,12 @@ impl IggyShard {
         let _ = self.load_users(users.into_values().collect()).await;
         let _ = self.load_streams(streams.into_values().collect()).await;
 
-        //TODO: Fix the archiver.
-        /*
         if let Some(archiver) = self.archiver.as_ref() {
             archiver
                 .init()
                 .await
                 .expect("Failed to initialize archiver");
         }
-        */
         info!("Initialized system in {} ms.", now.elapsed().as_millis());
         Ok(())
     }
@@ -248,6 +251,7 @@ impl IggyShard {
 
         // Create all tasks (tcp listener, http listener, command processor, in the future also the background jobs).
         let mut tasks: Vec<Task> = vec![Box::pin(spawn_shard_message_task(self.clone()))];
+        tasks.push(Box::pin(spawn_message_maintainance_task(self.clone())));
         if self.config.tcp.enabled {
             tasks.push(Box::pin(spawn_tcp_server(self.clone())));
         }

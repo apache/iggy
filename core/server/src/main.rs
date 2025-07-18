@@ -19,6 +19,7 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
 use clap::Parser;
@@ -28,6 +29,7 @@ use figlet_rs::FIGfont;
 use iggy_common::create_user::CreateUser;
 use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyError};
+use server::archiver::{ArchiverKind, ArchiverKindType};
 use server::args::Args;
 use server::bootstrap::{
     create_directories, create_root_user, create_shard_connections, create_shard_executor,
@@ -172,6 +174,30 @@ fn main() -> Result<(), ServerError> {
                         )),
                         false => None,
                     };
+                    let archiver_config = &config.data_maintenance.archiver;
+                    let archiver: Option<ArchiverKind> = if archiver_config.enabled {
+                        info!("Archiving is enabled, kind: {}", archiver_config.kind);
+                        match archiver_config.kind {
+                            ArchiverKindType::Disk => Some(ArchiverKind::get_disk_archiver(
+                                archiver_config
+                                    .disk
+                                    .clone()
+                                    .expect("Disk archiver config is missing"),
+                            )),
+                            ArchiverKindType::S3 => Some(
+                                ArchiverKind::get_s3_archiver(
+                                    archiver_config
+                                        .s3
+                                        .clone()
+                                        .expect("S3 archiver config is missing"),
+                                )
+                                .expect("Failed to create S3 archiver"),
+                            ),
+                        }
+                    } else {
+                        info!("Archiving is disabled.");
+                        None
+                    };
 
                     let state = StateKind::File(FileState::new(
                         &config.system.get_state_messages_file_path(),
@@ -251,6 +277,7 @@ fn main() -> Result<(), ServerError> {
                         .id(id)
                         .connections(connections)
                         .config(config)
+                        .archiver(archiver)
                         .encryptor(encryptor)
                         .version(version)
                         .state(state)

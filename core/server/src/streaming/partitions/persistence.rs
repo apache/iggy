@@ -19,11 +19,11 @@
 use crate::state::system::PartitionState;
 use crate::streaming::partitions::COMPONENT;
 use crate::streaming::partitions::partition::Partition;
+use compio::fs::create_dir_all;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use std::path::Path;
 use std::sync::atomic::Ordering;
-use compio::fs::create_dir_all;
 use tracing::error;
 
 impl Partition {

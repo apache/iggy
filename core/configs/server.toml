@@ -17,7 +17,7 @@
 
 [data_maintenance.archiver]
 # Enables or disables the archiver process.
-enabled = false
+enabled = true
 
 # Kind of archiver to use. Available options: "disk".
 kind = "disk"
@@ -47,13 +47,13 @@ tmp_upload_dir = "local_data/s3_tmp"
 
 [data_maintenance.messages]
 # Enables or disables the archiver process for closed segments containing messages.
-archiver_enabled = false
+archiver_enabled = true
 
 # Enables or disables the expired message cleaner process.
 cleaner_enabled = false
 
 # Interval for running the message archiver and cleaner.
-interval = "1 m"
+interval = "35s"
 
 [data_maintenance.state]
 # Enables or disables the archiver process for state log.
@@ -549,4 +549,4 @@ bucket_capacity = 8192
 # - "all": Use all available CPU cores (default)
 # - numeric value (e.g. 4): Use 4 shards (4 threads pinned to cores 0, 1, 2, 3)
 # - range (e.g. "5..8"): Use 3 shards with affinity to cores 5, 6, 7
-cpu_allocation = "all"
+cpu_allocation = "4"

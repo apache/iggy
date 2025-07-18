@@ -18,13 +18,13 @@
 
 use crate::streaming::common::test_setup::TestSetup;
 use crate::streaming::create_messages;
+use compio::fs;
 use iggy::prelude::{IggyExpiry, IggyTimestamp, Sizeable};
 use server::state::system::PartitionState;
 use server::streaming::partitions::partition::Partition;
 use server::streaming::segments::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64};
-use compio::fs;
 
 #[compio::test]
 async fn should_persist_partition_with_segment() {

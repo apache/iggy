@@ -16,13 +16,12 @@
  * under the License.
  */
 
+use compio::fs::create_dir;
 use server::archiver::disk::DiskArchiver;
 use server::configs::server::DiskArchiverConfig;
-use tokio::fs::create_dir;
 use uuid::Uuid;
 
 mod disk;
-mod s3;
 
 pub struct DiskArchiverSetup {
     base_path: String,

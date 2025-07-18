@@ -347,7 +347,7 @@ async fn should_delete_persisted_segments() -> Result<(), Box<dyn std::error::Er
     shard.add_active_session(session.clone());
 
     let id = shard
-        .create_stream_bypass_auth( Some(stream_id.get_u32_value()?), stream_name)
+        .create_stream_bypass_auth(Some(stream_id.get_u32_value()?), stream_name)
         .unwrap();
     let stream = shard.get_stream(&Identifier::numeric(id).unwrap()).unwrap();
     stream.persist();

@@ -19,6 +19,7 @@
 use crate::streaming::common::test_setup::TestSetup;
 use crate::streaming::create_messages;
 use ahash::AHashMap;
+use compio::fs;
 use iggy::prelude::*;
 use server::state::system::{PartitionState, TopicState};
 use server::streaming::polling_consumer::PollingConsumer;
@@ -27,7 +28,6 @@ use server::streaming::topics::topic::Topic;
 use std::default::Default;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64};
-use compio::fs;
 
 #[compio::test]
 async fn should_persist_topics_with_partitions_directories_and_info_file() {

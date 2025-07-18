@@ -159,7 +159,9 @@ impl Segment {
             }
             self.shutdown_writing().await;
             info!(
-                "Closed segment with start offset: {}, end offset: {}, size: {} for partition with ID: {}.",
+                "Closed segment for stream: {}, topic: {} with start offset: {}, end offset: {}, size: {} for partition with ID: {}.",
+                self.stream_id,
+                self.topic_id,
                 self.start_offset,
                 self.end_offset,
                 self.get_messages_size(),

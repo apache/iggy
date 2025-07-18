@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use compio::fs::create_dir;
 use iggy::prelude::{Aes256GcmEncryptor, EncryptorKind};
 use server::bootstrap::create_directories;
 use server::state::file::FileState;
@@ -24,7 +25,6 @@ use server::streaming::utils::file::overwrite;
 use server::versioning::SemanticVersion;
 use std::str::FromStr;
 use std::sync::Arc;
-use compio::fs::create_dir;
 use uuid::Uuid;
 
 mod file;

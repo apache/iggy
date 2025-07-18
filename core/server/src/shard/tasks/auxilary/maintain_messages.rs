@@ -1,222 +1,124 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
-
-//TODO: Fixme
-/*
-
-use crate::archiver::ArchiverKind;
-use crate::channels::server_command::BackgroundServerCommand;
-use crate::configs::server::MessagesMaintenanceConfig;
-use crate::map_toggle_str;
-use crate::streaming::systems::system::SharedSystem;
-use crate::streaming::topics::topic::Topic;
+use crate::{
+    archiver::ArchiverKind, configs::server::MessagesMaintenanceConfig, map_toggle_str,
+    shard::IggyShard, streaming::topics::topic::Topic,
+};
+use compio::time;
 use error_set::ErrContext;
-use flume::Sender;
-use iggy_common::IggyDuration;
-use iggy_common::IggyError;
-use iggy_common::IggyTimestamp;
-use iggy_common::locking::IggyRwLockFn;
-use std::sync::Arc;
-use tokio::time;
-use tracing::{debug, error, info, instrument, trace};
+use futures::FutureExt;
+use iggy_common::{IggyDuration, IggyError, IggyTimestamp, locking::IggyRwLockFn};
+use std::{rc::Rc, time::Duration};
+use tracing::{debug, error, info, trace};
 
-pub struct MessagesMaintainer {
-    cleaner_enabled: bool,
-    archiver_enabled: bool,
-    interval: IggyDuration,
-    sender: Sender<MaintainMessagesCommand>,
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct MaintainMessagesCommand {
-    clean_messages: bool,
-    archive_messages: bool,
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct MaintainMessagesExecutor;
-
-impl MessagesMaintainer {
-    pub fn new(
-        config: &MessagesMaintenanceConfig,
-        sender: Sender<MaintainMessagesCommand>,
-    ) -> Self {
-        Self {
-            cleaner_enabled: config.cleaner_enabled,
-            archiver_enabled: config.archiver_enabled,
-            interval: config.interval,
-            sender,
-        }
+pub async fn spawn_message_maintainance_task(shard: Rc<IggyShard>) -> Result<(), IggyError> {
+    let config = &shard.config.data_maintenance.messages;
+    if !config.cleaner_enabled && !config.archiver_enabled {
+        info!("Messages maintainer is disabled.");
+        return Ok(());
     }
 
-    pub fn start(&self) {
-        if !self.cleaner_enabled && !self.archiver_enabled {
-            info!("Messages maintainer is disabled.");
-            return;
-        }
-
-        let interval = self.interval;
-        let sender = self.sender.clone();
-        info!(
-            "Message maintainer, cleaner is {}, archiver is {}, interval: {interval}",
-            map_toggle_str(self.cleaner_enabled),
-            map_toggle_str(self.archiver_enabled)
-        );
-        let clean_messages = self.cleaner_enabled;
-        let archive_messages = self.archiver_enabled;
-        tokio::spawn(async move {
-            let mut interval_timer = time::interval(interval.get_duration());
+    let interval = config.interval;
+    info!(
+        "Message maintainer, cleaner is {}, archiver is {}, interval: {interval}",
+        map_toggle_str(config.cleaner_enabled),
+        map_toggle_str(config.archiver_enabled)
+    );
+    let clean_messages = config.cleaner_enabled;
+    let mut interval_timer = time::interval(interval.get_duration());
+    loop {
+        let shutdown_check = async {
             loop {
-                interval_timer.tick().await;
-                sender
-                    .send(MaintainMessagesCommand {
-                        clean_messages,
-                        archive_messages,
-                    })
-                    .unwrap_or_else(|err| {
-                        error!("Failed to send MaintainMessagesCommand. Error: {}", err);
-                    });
+                if shard.is_shutting_down() {
+                    return;
+                }
+                compio::time::sleep(Duration::from_millis(100)).await;
             }
-        });
-    }
-}
+        };
+        let archiver = shard.archiver.clone();
+        let fut = interval_timer.tick();
 
-impl BackgroundServerCommand<MaintainMessagesCommand> for MaintainMessagesExecutor {
-    #[instrument(skip_all, name = "trace_maintain_messages")]
-    async fn execute(&mut self, system: &SharedSystem, command: MaintainMessagesCommand) {
-        let system = system.read().await;
-        let streams = system.get_streams();
-        for stream in streams {
-            let topics = stream.get_topics();
-            for topic in topics {
-                let archiver = if command.archive_messages {
-                    system.archiver.clone()
-                } else {
-                    None
-                };
-                let expired_segments = handle_expired_segments(
-                    topic,
-                    archiver.clone(),
-                    system.config.segment.archive_expired,
-                    command.clean_messages,
-                )
-                .await;
-                if expired_segments.is_err() {
-                    error!(
-                        "Failed to get expired segments for stream ID: {}, topic ID: {}",
-                        topic.stream_id, topic.topic_id
-                    );
-                    continue;
-                }
+        futures::select! {
+            _ = shutdown_check.fuse() => {
+                info!("Shard {} message maintainer shutting down", shard.id);
+                break;
+            }
+            _ = fut.fuse() => {
+                let streams = shard.get_streams();
+                for stream in streams {
+                    let topics = stream.get_topics();
+                    for topic in topics {
+                        let expired_segments = handle_expired_segments(
+                            topic,
+                            archiver.clone(),
+                            shard.config.system.segment.archive_expired,
+                            clean_messages,
+                        )
+                        .await;
+                        if expired_segments.is_err() {
+                            error!(
+                                "Failed to get expired segments for stream ID: {}, topic ID: {}",
+                                topic.stream_id, topic.topic_id
+                            );
+                            continue;
+                        }
 
-                let oldest_segments = handle_oldest_segments(
-                    topic,
-                    archiver.clone(),
-                    system.config.topic.delete_oldest_segments,
-                )
-                .await;
-                if oldest_segments.is_err() {
-                    error!(
-                        "Failed to get oldest segments for stream ID: {}, topic ID: {}",
-                        topic.stream_id, topic.topic_id
-                    );
-                    continue;
-                }
+                        let stream_id = stream.stream_id;
+                        let oldest_segments = handle_oldest_segments(
+                            stream_id,
+                            topic,
+                            archiver.clone(),
+                            shard.config.system.topic.delete_oldest_segments,
+                        )
+                        .await;
+                        if oldest_segments.is_err() {
+                            error!(
+                                "Failed to get oldest segments for stream ID: {}, topic ID: {}",
+                                topic.stream_id, topic.topic_id
+                            );
+                            continue;
+                        }
 
-                let deleted_expired_segments = expired_segments.unwrap();
-                let deleted_oldest_segments = oldest_segments.unwrap();
-                let deleted_segments = HandledSegments {
-                    segments_count: deleted_expired_segments.segments_count
-                        + deleted_oldest_segments.segments_count,
-                    messages_count: deleted_expired_segments.messages_count
-                        + deleted_oldest_segments.messages_count,
-                };
+                        let deleted_expired_segments = expired_segments.unwrap();
+                        let deleted_oldest_segments = oldest_segments.unwrap();
+                        let deleted_segments = HandledSegments {
+                            segments_count: deleted_expired_segments.segments_count
+                                + deleted_oldest_segments.segments_count,
+                            messages_count: deleted_expired_segments.messages_count
+                                + deleted_oldest_segments.messages_count,
+                        };
 
-                if deleted_segments.segments_count == 0 {
-                    trace!(
-                        "No segments were deleted for stream ID: {}, topic ID: {}",
-                        topic.stream_id, topic.topic_id
-                    );
-                    continue;
-                }
+                        if deleted_segments.segments_count == 0 {
+                            trace!(
+                                "No segments were deleted for stream ID: {}, topic ID: {}",
+                                topic.stream_id, topic.topic_id
+                            );
+                            continue;
+                        }
 
-                info!(
-                    "Deleted {} segments and {} messages for stream ID: {}, topic ID: {}",
-                    deleted_segments.segments_count,
-                    deleted_segments.messages_count,
-                    topic.stream_id,
-                    topic.topic_id
-                );
+                        info!(
+                            "Deleted {} segments and {} messages for stream ID: {}, topic ID: {}",
+                            deleted_segments.segments_count,
+                            deleted_segments.messages_count,
+                            topic.stream_id,
+                            topic.topic_id
+                        );
 
-                system
-                    .metrics
-                    .decrement_segments(deleted_segments.segments_count);
-                system
-                    .metrics
-                    .decrement_messages(deleted_segments.messages_count);
+                        shard
+                            .metrics
+                            .decrement_segments(deleted_segments.segments_count);
+                        shard
+                            .metrics
+                            .decrement_messages(deleted_segments.messages_count);
+                    }
             }
         }
-    }
-
-    fn start_command_sender(
-        &mut self,
-        _system: SharedSystem,
-        config: &crate::configs::server::ServerConfig,
-        sender: Sender<MaintainMessagesCommand>,
-    ) {
-        if (!config.data_maintenance.archiver.enabled
-            || !config.data_maintenance.messages.archiver_enabled)
-            && !config.data_maintenance.messages.cleaner_enabled
-        {
-            return;
         }
-
-        let messages_maintainer =
-            MessagesMaintainer::new(&config.data_maintenance.messages, sender);
-        messages_maintainer.start();
     }
-
-    fn start_command_consumer(
-        mut self,
-        system: SharedSystem,
-        config: &crate::configs::server::ServerConfig,
-        receiver: flume::Receiver<MaintainMessagesCommand>,
-    ) {
-        if (!config.data_maintenance.archiver.enabled
-            || !config.data_maintenance.messages.archiver_enabled)
-            && !config.data_maintenance.messages.cleaner_enabled
-        {
-            return;
-        }
-
-        tokio::spawn(async move {
-            let system = system.clone();
-            while let Ok(command) = receiver.recv_async().await {
-                self.execute(&system, command).await;
-            }
-            info!("Messages maintainer receiver stopped.");
-        });
-    }
+    Ok(())
 }
 
 async fn handle_expired_segments(
     topic: &Topic,
-    archiver: Option<Arc<ArchiverKind>>,
+    archiver: Option<Rc<ArchiverKind>>,
     archive: bool,
     clean: bool,
 ) -> Result<HandledSegments, IggyError> {
@@ -287,8 +189,9 @@ async fn get_expired_segments(topic: &Topic, now: IggyTimestamp) -> Vec<Segments
 }
 
 async fn handle_oldest_segments(
+    stream_id: u32,
     topic: &Topic,
-    archiver: Option<Arc<ArchiverKind>>,
+    archiver: Option<Rc<ArchiverKind>>,
     delete_oldest_segments: bool,
 ) -> Result<HandledSegments, IggyError> {
     if let Some(archiver) = archiver {
@@ -296,11 +199,7 @@ async fn handle_oldest_segments(
         for partition in topic.partitions.values() {
             let mut start_offsets = Vec::new();
             let partition = partition.read().await;
-            for segment in partition.get_segments() {
-                if !segment.is_closed() {
-                    continue;
-                }
-
+            for segment in partition.get_segments().iter().filter(|s| s.is_closed()) {
                 let is_archived = archiver.is_archived(segment.index_file_path(), None).await;
                 if is_archived.is_err() {
                     error!(
@@ -325,6 +224,7 @@ async fn handle_oldest_segments(
                     start_offsets.push(segment.start_offset());
                 }
             }
+
             if !start_offsets.is_empty() {
                 info!(
                     "Found {} segments to archive for stream ID: {}, topic ID: {}, partition ID: {}",
@@ -340,11 +240,13 @@ async fn handle_oldest_segments(
             }
         }
 
+        let segments_count = segments_to_archive
+            .iter()
+            .map(|s| s.start_offsets.len())
+            .sum::<usize>();
         info!(
             "Archiving {} oldest segments for stream ID: {}, topic ID: {}...",
-            segments_to_archive.len(),
-            topic.stream_id,
-            topic.topic_id,
+            segments_count, topic.stream_id, topic.topic_id,
         );
         archive_segments(topic, &segments_to_archive, archiver.clone())
             .await
@@ -446,17 +348,19 @@ impl HandledSegments {
 async fn archive_segments(
     topic: &Topic,
     segments_to_archive: &[SegmentsToHandle],
-    archiver: Arc<ArchiverKind>,
+    archiver: Rc<ArchiverKind>,
 ) -> Result<u64, IggyError> {
     if segments_to_archive.is_empty() {
         return Ok(0);
     }
 
+    let segments_count = segments_to_archive
+        .iter()
+        .map(|s| s.start_offsets.len())
+        .sum::<usize>();
     info!(
         "Found {} segments to archive for stream ID: {}, topic ID: {}, archiving...",
-        segments_to_archive.len(),
-        topic.stream_id,
-        topic.topic_id
+        segments_count, topic.stream_id, topic.topic_id
     );
 
     let mut archived_segments = 0;
@@ -556,5 +460,3 @@ async fn delete_segments(
         messages_count,
     })
 }
-
-*/

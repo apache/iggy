@@ -17,12 +17,12 @@
  */
 
 use crate::archiver::DiskArchiverSetup;
+use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use server::streaming::utils::file;
 use server::{archiver::Archiver, server_error::ArchiverError};
 use std::path::Path;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-#[tokio::test]
+#[compio::test]
 async fn should_init_base_archiver_directory() {
     let setup = DiskArchiverSetup::init().await;
     let archiver = setup.archiver();
@@ -32,7 +32,7 @@ async fn should_init_base_archiver_directory() {
     assert!(path.exists());
 }
 
-#[tokio::test]
+#[compio::test]
 async fn should_archive_file_on_disk_by_making_a_copy_of_original_file() {
     let setup = DiskArchiverSetup::init().await;
     let archiver = setup.archiver();
@@ -47,7 +47,7 @@ async fn should_archive_file_on_disk_by_making_a_copy_of_original_file() {
     assert_archived_file(&file_to_archive_path, &archived_file_path, content).await;
 }
 
-#[tokio::test]
+#[compio::test]
 async fn should_archive_file_on_disk_within_additional_base_directory() {
     let setup = DiskArchiverSetup::init().await;
     let archiver = setup.archiver();
@@ -68,7 +68,7 @@ async fn should_archive_file_on_disk_within_additional_base_directory() {
     assert_archived_file(&file_to_archive_path, &archived_file_path, content).await;
 }
 
-#[tokio::test]
+#[compio::test]
 async fn should_return_true_when_file_is_archived() {
     let setup = DiskArchiverSetup::init().await;
     let archiver = setup.archiver();
@@ -83,7 +83,7 @@ async fn should_return_true_when_file_is_archived() {
     assert!(is_archived.unwrap());
 }
 
-#[tokio::test]
+#[compio::test]
 async fn should_return_false_when_file_is_not_archived() {
     let setup = DiskArchiverSetup::init().await;
     let archiver = setup.archiver();
@@ -96,7 +96,7 @@ async fn should_return_false_when_file_is_not_archived() {
     assert!(!is_archived.unwrap());
 }
 
-#[tokio::test]
+#[compio::test]
 async fn should_fail_when_file_to_archive_does_not_exist() {
     let setup = DiskArchiverSetup::init().await;
     let archiver = setup.archiver();
@@ -110,26 +110,23 @@ async fn should_fail_when_file_to_archive_does_not_exist() {
 }
 
 async fn create_file(path: &str, content: &str) {
-    // TODO: Fixme
-    /*
     let mut file = file::overwrite(path).await.unwrap();
-    file.write_all(content.as_bytes()).await.unwrap();
-    */
+    let content = content.as_bytes().to_vec();
+    file.write_all_at(content, 0).await.unwrap();
 }
 
 async fn assert_archived_file(file_to_archive_path: &str, archived_file_path: &str, content: &str) {
-    // TODO: Fixme
-    /*
     assert!(Path::new(&file_to_archive_path).exists());
     assert!(Path::new(&archived_file_path).exists());
     let archived_file = file::open(archived_file_path).await;
     assert!(archived_file.is_ok());
-    let mut archived_file = archived_file.unwrap();
-    let mut archived_file_content = String::new();
-    archived_file
-        .read_to_string(&mut archived_file_content)
+    let archived_file = archived_file.unwrap();
+    let len = archived_file.metadata().await.unwrap().len();
+    let archived_file_content = Vec::with_capacity(len as usize);
+    let (_, archived_file_content) = archived_file
+        .read_exact_at(archived_file_content, 0)
         .await
         .unwrap();
+    let archived_file_content = String::from_utf8(archived_file_content).unwrap();
     assert_eq!(content, archived_file_content);
-    */
 }

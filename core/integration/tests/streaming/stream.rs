@@ -19,12 +19,12 @@
 use crate::streaming::common::test_setup::TestSetup;
 use crate::streaming::create_messages;
 use ahash::AHashMap;
+use compio::fs;
 use iggy::prelude::*;
 use server::state::system::StreamState;
 use server::streaming::polling_consumer::PollingConsumer;
 use server::streaming::segments::IggyMessagesBatchMut;
 use server::streaming::streams::stream::Stream;
-use compio::fs;
 
 #[compio::test]
 async fn should_persist_stream_with_topics_directory_and_info_file() {

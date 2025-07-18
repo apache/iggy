@@ -30,6 +30,10 @@ use std::str::FromStr;
 use crate::archiver::disk::DiskArchiver;
 use crate::archiver::s3::S3Archiver;
 
+pub(crate) struct PutObjectStreamResponse {
+    status: u16,
+    total_size: usize,
+}
 pub(crate) type Region = String;
 pub const COMPONENT: &str = "ARCHIVER";
 

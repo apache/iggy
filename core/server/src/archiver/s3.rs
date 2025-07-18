@@ -16,24 +16,31 @@
  * under the License.
  */
 
-use crate::archiver::{Archiver, Region, COMPONENT};
+use crate::archiver::{Archiver, COMPONENT, PutObjectStreamResponse, Region};
 use crate::configs::server::S3ArchiverConfig;
 use crate::io;
 use crate::server_error::ArchiverError;
-use crate::streaming::utils::{file, PooledBuffer};
+use crate::streaming::utils::{PooledBuffer, file};
+use bytes::BytesMut;
 use compio::buf::{IntoInner, IoBuf};
-use compio::io::{copy, AsyncRead, AsyncReadExt};
-use error_set::ErrContext;
-use rusty_s3::actions::{CompleteMultipartUpload, CreateMultipartUpload, UploadPart};
-use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
-use std::io::Cursor;
-use std::path::Path;
-use std::time::Duration;
 use compio::fs;
+use compio::io::{AsyncRead, AsyncReadExt, copy};
+use cyper::{Client, ClientBuilder};
+use error_set::ErrContext;
+use futures::future::try_join_all;
+use rusty_s3::actions::{CompleteMultipartUpload, CreateMultipartUpload, GetObject, UploadPart};
+use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
+use std::collections::HashMap;
+use std::io::Cursor;
+use std::ops::Deref;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, error, info};
 
 #[derive(Debug)]
 pub struct S3Archiver {
+    client: Client,
     bucket: Bucket,
     credentials: Credentials,
     tmp_upload_dir: String,
@@ -49,22 +56,23 @@ impl S3Archiver {
     ///
     /// Returns an error if the S3 client cannot be initialized or credentials are invalid.
     pub fn new(config: S3ArchiverConfig) -> Result<Self, ArchiverError> {
-        let credentials = Credentials::new(
-            &config.key_id,
-            &config.key_secret,
-        );
-        let region: Region =
-            config.region.map_or_else(String::new, |r| r);
-        let endpoint = config.endpoint.map_or_else(String::new, |e| e).parse().expect("Endpoint should be valid URL");
+        let credentials = Credentials::new(&config.key_id, &config.key_secret);
+        let region: Region = config.region.map_or_else(String::new, |r| r);
+        let endpoint = config
+            .endpoint
+            .map_or_else(String::new, |e| e)
+            .parse()
+            .expect("Endpoint should be valid URL");
         let path_style = UrlStyle::VirtualHost;
         let name = config.bucket;
 
-
         let bucket = Bucket::new(endpoint, path_style, name, region)?;
         //TODO: Make this configurable ?
-        let expiration = Duration::from_secs(1);
+        let expiration = Duration::from_secs(60);
+        let client = ClientBuilder::new().use_rustls_default().build();
         Ok(Self {
             bucket,
+            client,
             credentials,
             expiration,
             tmp_upload_dir: config.tmp_upload_dir,
@@ -98,63 +106,105 @@ impl S3Archiver {
         Ok(destination_path)
     }
 
-    async fn put_object_stream(&self, reader: &mut impl AsyncReadExt, destination_path: &str) -> Result<(), ArchiverError> {
-        let buf = PooledBuffer::with_capacity(CHUNK_SIZE);
+    async fn put_object_stream(
+        &self,
+        reader: &mut impl AsyncReadExt,
+        destination_path: &str,
+    ) -> Result<PutObjectStreamResponse, ArchiverError> {
+        let buf = BytesMut::with_capacity(CHUNK_SIZE);
         let (result, chunk) = reader.read_exact(buf.slice(..CHUNK_SIZE)).await.into();
         result?;
-        let buf = chunk.into_inner();
+        let buf = chunk.into_inner().freeze();
         if buf.len() < CHUNK_SIZE {
             // Normal upload
-            let action = self.bucket.put_object(Some(&self.credentials), destination_path);
-            // TODO: use `cypher` client to send the request.
-            return Ok(());
+            let action = self
+                .bucket
+                .put_object(Some(&self.credentials), destination_path);
+            let url = action.sign(self.expiration);
+            let buf_len = buf.len();
+            let response = self.client.put(url)?.body(buf).send().await?;
+            return Ok(PutObjectStreamResponse {
+                status: response.status().as_u16(),
+                total_size: buf_len,
+            });
         }
 
-        let action = self.bucket.create_multipart_upload(Some(&self.credentials), destination_path);
+        let action = self
+            .bucket
+            .create_multipart_upload(Some(&self.credentials), destination_path);
         let url = action.sign(self.expiration);
-        let response = CreateMultipartUpload::parse_response(String::new()).expect("Failed to parse response");
+        let response = self.client.post(url)?.send().await?;
+        let body = response.text().await?;
+        let response =
+            CreateMultipartUpload::parse_response(&body).expect("Failed to parse response");
         let upload_id = response.upload_id();
-        let part_number = 0;
 
-        let mut handles = Vec::new();
         let mut total_size = 0;
-
-        let action = self.bucket.upload_part(Some(&self.credentials), destination_path, part_number, upload_id);
+        let mut part_number = 0;
+        let mut handles = Vec::new();
+        let action = self.bucket.upload_part(
+            Some(&self.credentials),
+            destination_path,
+            part_number,
+            upload_id,
+        );
         let url = action.sign(self.expiration);
-        // TODO: use `cypher` client to send the request.
-        // put bytes in the body.
-        total_size += buf.len();
-        handles.push(());
-        let mut buf = buf;
+        let buf_size = buf.len();
+        let response = self.client.put(url)?.body(buf).send();
+        total_size += buf_size;
+        part_number += 1;
+        handles.push(response);
         loop {
+            let buf = BytesMut::with_capacity(CHUNK_SIZE);
             let (result, chunk) = reader.read_exact(buf.slice(..CHUNK_SIZE)).await.into();
             result?;
-            buf = chunk.into_inner();
-            total_size += buf.len();
-            let done = buf.len() < CHUNK_SIZE;
-            let action = self.bucket.upload_part(Some(&self.credentials), destination_path, part_number, upload_id);
+            let buf = chunk.into_inner().freeze();
+            let buf_len = buf.len();
+            let done = buf_len < CHUNK_SIZE;
+            let action = self.bucket.upload_part(
+                Some(&self.credentials),
+                destination_path,
+                part_number,
+                upload_id,
+            );
             let url = action.sign(self.expiration);
-            // TODO: use `cypher` client to send the request.
-            // put bytes in the body.
+            let response = self.client.put(url)?.body(buf).send();
+            part_number += 1;
+            total_size += buf_len;
 
-            handles.push(());
+            handles.push(response);
             if done {
                 break;
             }
         }
-        // join all handles.
-        for handle in handles {
-            // get response status
-            // if any of those is != 200, we should abort the upload.
+        let responses = try_join_all(handles).await?;
+        let mut etags = Vec::new();
+        for response in responses {
+            let status_code = response.status().as_u16();
+            if status_code == 200 {
+                let etag = response
+                    .headers()
+                    .get("etag")
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
+                etags.push(etag);
+            }
         }
-
-        // TODO: Send using `cypher` client.
-        let etags: Vec<&'static str> = Vec::new();
-        let action = self.bucket.complete_multipart_upload(Some(&self.credentials), destination_path, upload_id, etags.into_iter());
+        let action = self.bucket.complete_multipart_upload(
+            Some(&self.credentials),
+            destination_path,
+            upload_id,
+            etags.iter().map(|s| s.as_str()),
+        );
         let url = action.sign(self.expiration);
         let body = CompleteMultipartUpload::body(action);
-
-        Ok(())
+        let response = self.client.post(url)?.body(body).send().await?;
+        Ok(PutObjectStreamResponse {
+            status: response.status().as_u16(),
+            total_size,
+        })
     }
 }
 
@@ -162,9 +212,7 @@ impl Archiver for S3Archiver {
     async fn init(&self) -> Result<(), ArchiverError> {
         let action = self.bucket.list_objects_v2(Some(&self.credentials));
         let url = action.sign(self.expiration);
-        // TODO: Send request to S3 using the `cypher` client.
-        /*
-        //let response = self.bucket.list("/".to_string(), None).await;
+        let response = self.client.get(url)?.send().await;
         if let Err(error) = response {
             error!("Cannot initialize S3 archiver: {error}");
             return Err(ArchiverError::CannotInitializeS3Archiver);
@@ -182,7 +230,6 @@ impl Archiver for S3Archiver {
             self.tmp_upload_dir
         );
         fs::create_dir_all(&self.tmp_upload_dir).await?;
-        */
         Ok(())
     }
 
@@ -195,25 +242,24 @@ impl Archiver for S3Archiver {
         let base_directory = base_directory.as_deref().unwrap_or_default();
         let destination = Path::new(&base_directory).join(file);
         let destination_path = destination.to_str().unwrap_or_default().to_owned();
-        let mut object_tagging = self.bucket.get_object(Some(&self.credentials), &destination_path);
+        let mut object_tagging = self
+            .bucket
+            .get_object(Some(&self.credentials), &destination_path);
         object_tagging.query_mut().insert("tagging", "");
-        // Filter all the tags.
-        // TODO: Send request to S3 using the `cypher` client.
-        /*
-        let response = self.bucket.get_object_tagging(destination_path).await;
+        let url = object_tagging.sign(self.expiration);
+        let response = self.client.get(url)?.send().await;
         if response.is_err() {
             debug!("File: {file} is not archived on S3.");
             return Ok(false);
         }
 
-        let (_, status) = response.expect("Response should be valid if not an error");
-        if status == 200 {
+        let response = response.expect("Response should be valid if not an error");
+        if response.status() == 200 {
             debug!("File: {file} is archived on S3.");
             return Ok(true);
         }
 
         debug!("File: {file} is not archived on S3.");
-        */
         Ok(false)
     }
 
@@ -239,9 +285,7 @@ impl Archiver for S3Archiver {
             let destination = Path::new(&base_directory).join(path);
             let destination_path = destination.to_str().unwrap_or_default().to_owned();
             // Egh.. multi part upload.
-            let response = self
-                .put_object_stream(&mut reader, &destination_path)
-                .await;
+            let response = self.put_object_stream(&mut reader, &destination_path).await;
             if let Err(error) = response {
                 error!("Cannot archive file: {path} on S3: {}", error);
                 fs::remove_file(&source).await.with_error_context(|error| {
@@ -251,8 +295,8 @@ impl Archiver for S3Archiver {
                     file_path: (*path).to_string(),
                 });
             }
-
-            if response.is_ok() {
+            let PutObjectStreamResponse { status, total_size } = response.unwrap();
+            if status == 200 {
                 debug!("Archived file: {path} on S3.");
                 fs::remove_file(&source).await.with_error_context(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to remove temporary file: {source} after successful archive")
@@ -260,9 +304,7 @@ impl Archiver for S3Archiver {
                 continue;
             }
 
-            error!("Cannot archive file: {path} on S3");
-            // TODO: Return response status from the S3 client.
-            //error!("Cannot archive file: {path} on S3, received an invalid status code: {status}.");
+            error!("Cannot archive file: {path} on S3, received an invalid status code: {status}.");
             fs::remove_file(&source).await.with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to remove temporary file: {source} after invalid status code")
             })?;

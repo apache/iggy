@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 /* Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -15,21 +17,17 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-
-//TODO: Fixme
-/*
 use super::server_command::BackgroundServerCommand;
-use crate::configs::server::ServerConfig;
-use crate::streaming::systems::system::SharedSystem;
+use crate::{configs::server::ServerConfig, shard::IggyShard};
 
 pub struct BackgroundServerCommandHandler<'a> {
-    system: SharedSystem,
+    shard: Rc<IggyShard>,
     config: &'a ServerConfig,
 }
 
 impl<'a> BackgroundServerCommandHandler<'a> {
-    pub fn new(system: SharedSystem, config: &'a ServerConfig) -> Self {
-        Self { system, config }
+    pub fn new(shard: Rc<IggyShard>, config: &'a ServerConfig) -> Self {
+        Self { shard, config }
     }
 
     pub fn install_handler<C, E>(&mut self, mut executor: E) -> Self
@@ -37,14 +35,12 @@ impl<'a> BackgroundServerCommandHandler<'a> {
         E: BackgroundServerCommand<C> + Send + Sync + 'static,
     {
         let (sender, receiver) = flume::unbounded();
-        let system = self.system.clone();
-        executor.start_command_sender(system.clone(), self.config, sender);
-        executor.start_command_consumer(system.clone(), self.config, receiver);
+        let shard = self.shard.clone();
+        executor.start_command_sender(shard.clone(), self.config, sender);
+        executor.start_command_consumer(shard.clone(), self.config, receiver);
         Self {
-            system,
+            shard,
             config: self.config,
         }
     }
 }
-
-*/

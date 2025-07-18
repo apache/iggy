@@ -26,6 +26,7 @@ use iggy_common::{Aes256GcmEncryptor, EncryptorKind};
 use tracing::info;
 
 use crate::{
+    archiver::{Archiver, ArchiverKind},
     bootstrap::resolve_persister,
     configs::server::ServerConfig,
     map_toggle_str,
@@ -44,6 +45,7 @@ pub struct IggyShardBuilder {
     config: Option<ServerConfig>,
     encryptor: Option<EncryptorKind>,
     version: Option<SemanticVersion>,
+    archiver: Option<ArchiverKind>,
     state: Option<StateKind>,
 }
 
@@ -78,6 +80,11 @@ impl IggyShardBuilder {
         self
     }
 
+    pub fn archiver(mut self, archiver: Option<ArchiverKind>) -> Self {
+        self.archiver = archiver;
+        self
+    }
+
     // TODO: Too much happens in there, some of those bootstrapping logic should be moved outside.
     pub fn build(self) -> IggyShard {
         let id = self.id.unwrap();
@@ -105,6 +112,7 @@ impl IggyShardBuilder {
             config.system.clone(),
             partition_persister,
         ));
+        let archiver = self.archiver.map(Rc::new);
 
         IggyShard {
             id: id,
@@ -112,6 +120,7 @@ impl IggyShardBuilder {
             shards_table: Default::default(),
             storage: storage,
             encryptor: encryptor,
+            archiver: archiver,
             state: state,
             config: config,
             version: version,

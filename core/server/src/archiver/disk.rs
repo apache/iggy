@@ -19,10 +19,12 @@
 use crate::archiver::{Archiver, COMPONENT};
 use crate::configs::server::DiskArchiverConfig;
 use crate::server_error::ArchiverError;
+use crate::streaming::utils::file;
+use compio::fs;
+use compio::io::copy;
 use error_set::ErrContext;
 use std::path::Path;
-use tokio::fs;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 #[derive(Debug)]
 pub struct DiskArchiver {
@@ -70,8 +72,7 @@ impl Archiver for DiskArchiver {
         files: &[&str],
         base_directory: Option<String>,
     ) -> Result<(), ArchiverError> {
-        //TODO: Fixme figure this out, we can't use tokio methods there.
-        /* debug!("Archiving files on disk: {:?}", files);
+        debug!("Archiving files on disk: {:?}", files);
         for file in files {
             debug!("Archiving file: {file}");
             let source = Path::new(file);
@@ -89,12 +90,15 @@ impl Archiver for DiskArchiver {
                 .with_error_context(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to create file: {file} at path: {destination_path}",)
                 })?;
-            fs::copy(source, destination).await.with_error_context(|error| {
+            let source = file::open(file).await.unwrap();
+            let mut source = std::io::Cursor::new(source);
+            let (destination, _) = file::append(&destination_path).await.unwrap();
+            let mut destination = std::io::Cursor::new(destination);
+            copy(&mut source, &mut destination).await.with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to copy file: {file} to destination: {destination_path}")
             })?;
             debug!("Archived file: {file} at: {destination_path}");
         }
-        */
         Ok(())
     }
 }
