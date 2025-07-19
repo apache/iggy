@@ -130,4 +130,7 @@ pub enum ShardEvent {
         address: SocketAddr,
         transport: Transport,
     },
+    TcpBound {
+        address: SocketAddr,
+    },
 }

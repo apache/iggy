@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::thread::available_parallelism;
@@ -35,7 +35,7 @@ impl Default for ShardingConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum CpuAllocation {
     All,
     Count(usize),
@@ -87,6 +87,21 @@ impl FromStr for CpuAllocation {
                     .parse::<usize>()
                     .map_err(|_| format!("Invalid shard count: {s}"))?;
                 Ok(CpuAllocation::Count(count))
+            }
+        }
+    }
+}
+
+impl Serialize for CpuAllocation {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            CpuAllocation::All => serializer.serialize_str("all"),
+            CpuAllocation::Count(n) => serializer.serialize_u64(*n as u64),
+            CpuAllocation::Range(start, end) => {
+                serializer.serialize_str(&format!("{start}..{end}"))
             }
         }
     }

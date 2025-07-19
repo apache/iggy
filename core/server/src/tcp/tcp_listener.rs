@@ -28,6 +28,7 @@ use futures::FutureExt;
 use iggy_common::IggyError;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info};
 
@@ -64,17 +65,68 @@ async fn create_listener(
 
 pub async fn start(
     server_name: &'static str,
-    addr: SocketAddr,
+    mut addr: SocketAddr,
     config: &TcpSocketConfig,
     shard: Rc<IggyShard>,
 ) -> Result<(), IggyError> {
+    if shard.id != 0 && addr.port() == 0 {
+        info!("Shard {} waiting for TCP address from shard 0...", shard.id);
+        loop {
+            if let Some(bound_addr) = shard.tcp_bound_address.get() {
+                addr = bound_addr;
+                info!("Shard {} received TCP address: {}", shard.id, addr);
+                break;
+            }
+            compio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     let listener = create_listener(addr, config)
         .await
         .map_err(|_| IggyError::CannotBindToSocket(addr.to_string()))
         .with_error_context(|err| {
             format!("Failed to bind {server_name} server to address: {addr}, {err}")
         })?;
-    info!("{server_name} server has started on: {:?}", addr);
+    let actual_addr = listener.local_addr().map_err(|e| {
+        error!("Failed to get local address: {e}");
+        IggyError::CannotBindToSocket(addr.to_string())
+    })?;
+    info!("{server_name} server has started on: {:?}", actual_addr);
+
+    if shard.id == 0 {
+        if addr.port() == 0 {
+            let event = ShardEvent::TcpBound {
+                address: actual_addr,
+            };
+            shard.broadcast_event_to_all_shards(Arc::new(event)).await;
+        }
+
+        let mut current_config = shard.config.clone();
+        current_config.tcp.address = actual_addr.to_string();
+
+        let runtime_path = current_config.system.get_runtime_path();
+        let current_config_path = format!("{runtime_path}/current_config.toml");
+        let current_config_content =
+            toml::to_string(&current_config).expect("Cannot serialize current_config");
+
+        let buf_result = compio::fs::write(&current_config_path, current_config_content).await;
+        match buf_result.0 {
+            Ok(_) => info!("Current config written to: {}", current_config_path),
+            Err(e) => error!(
+                "Failed to write current config to {}: {}",
+                current_config_path, e
+            ),
+        }
+    }
+
+    accept_loop(server_name, listener, shard).await
+}
+
+async fn accept_loop(
+    server_name: &'static str,
+    listener: TcpListener,
+    shard: Rc<IggyShard>,
+) -> Result<(), IggyError> {
     loop {
         let shutdown_check = async {
             loop {

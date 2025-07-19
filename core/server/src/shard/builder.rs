@@ -16,11 +16,7 @@
  * under the License.
  */
 
-use std::{
-    cell::Cell,
-    rc::Rc,
-    sync::{Arc, atomic::AtomicBool},
-};
+use std::{cell::Cell, rc::Rc, sync::atomic::AtomicBool};
 
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind};
 use tracing::info;
@@ -130,6 +126,7 @@ impl IggyShardBuilder {
             metrics: Metrics::init(),
             task_registry: TaskRegistry::new(),
             is_shutting_down: AtomicBool::new(false),
+            tcp_bound_address: Cell::new(None),
 
             users: Default::default(),
             permissioner: Default::default(),

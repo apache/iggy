@@ -37,6 +37,7 @@ use namespace::IggyNamespace;
 use std::{
     cell::{Cell, RefCell},
     future::Future,
+    net::SocketAddr,
     pin::Pin,
     rc::Rc,
     str::FromStr,
@@ -159,6 +160,7 @@ pub struct IggyShard {
     pub(crate) stop_sender: StopSender,
     pub(crate) task_registry: TaskRegistry,
     pub(crate) is_shutting_down: AtomicBool,
+    pub(crate) tcp_bound_address: Cell<Option<SocketAddr>>,
 }
 
 impl IggyShard {
@@ -208,6 +210,7 @@ impl IggyShard {
             stop_sender,
             task_registry: TaskRegistry::new(),
             is_shutting_down: AtomicBool::new(false),
+            tcp_bound_address: Cell::new(None),
         };
         let user = User::root(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD);
         shard
@@ -848,6 +851,11 @@ impl IggyShard {
                 permissions,
             } => {
                 self.update_permissions_bypass_auth(user_id, permissions.to_owned())?;
+                Ok(())
+            }
+            ShardEvent::TcpBound { address } => {
+                info!("Received TcpBound event with address: {}", address);
+                self.tcp_bound_address.set(Some(*address));
                 Ok(())
             }
         }

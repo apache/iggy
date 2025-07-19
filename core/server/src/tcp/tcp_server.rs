@@ -24,7 +24,6 @@ use std::rc::Rc;
 use tracing::info;
 
 /// Starts the TCP server.
-/// Returns the address the server is listening on.
 pub async fn spawn_tcp_server(shard: Rc<IggyShard>) -> Result<(), IggyError> {
     let server_name = if shard.config.tcp.tls.enabled {
         "Iggy TCP TLS"
@@ -41,7 +40,7 @@ pub async fn spawn_tcp_server(shard: Rc<IggyShard>) -> Result<(), IggyError> {
         .expect("Failed to parse TCP address");
     let socket = tcp_socket::build(ip_v6, socket_config);
     info!("Initializing {server_name} server...");
-    // TODO: Fixme -- storing addr of the server inside of the config for integration tests...
+
     match shard.config.tcp.tls.enabled {
         true => tcp_tls_listener::start(server_name, addr, socket, shard.clone()).await?,
         false => tcp_listener::start(server_name, addr, socket_config, shard.clone()).await?,
