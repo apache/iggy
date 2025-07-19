@@ -16,11 +16,32 @@
  * under the License.
  */
 
-use integration::test_server::TestServer;
+use integration::{test_mcp_server::TestMcpServer, test_server::TestServer};
 
 #[tokio::test]
-async fn test_mcp() {
+async fn mcp_server_should_list_tools() {
     let mut test_server = TestServer::default();
     test_server.start();
-    let _server_addr = test_server.get_raw_tcp_addr().unwrap();
+    let iggy_server_address = test_server
+        .get_raw_tcp_addr()
+        .expect("Failed to get Iggy TCP address");
+    println!("Iggy server address: {iggy_server_address}");
+    let mut test_mcp_server = TestMcpServer::with_iggy_address(&iggy_server_address);
+    test_mcp_server.start();
+    test_mcp_server.ensure_started().await;
+    let client = test_mcp_server.get_client().await;
+    println!("Invoking MCP client");
+
+    let server_info = client.peer_info();
+    println!("Connected to MCP server: {server_info:#?}");
+
+    let tools = client
+        .list_tools(Default::default())
+        .await
+        .expect("Failed to list tools");
+    println!("Available tools: {tools:#?}");
+
+    assert!(!tools.tools.is_empty());
+    let tools_count = tools.tools.len();
+    assert_eq!(tools_count, 40);
 }

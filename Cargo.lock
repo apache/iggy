@@ -4267,7 +4267,9 @@ dependencies = [
  "libc",
  "log",
  "predicates",
+ "rand 0.9.1",
  "rcgen",
+ "reqwest",
  "rmcp",
  "serial_test",
  "server",
@@ -5251,26 +5253,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oauth2"
-version = "5.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
-dependencies = [
- "base64 0.21.7",
- "chrono",
- "getrandom 0.2.16",
- "http 1.3.1",
- "rand 0.8.5",
- "reqwest",
- "serde",
- "serde_json",
- "serde_path_to_error",
- "sha2",
- "thiserror 1.0.69",
- "url",
-]
-
-[[package]]
 name = "objc2-core-foundation"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5978,20 +5960,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "process-wrap"
-version = "8.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3ef4f2f0422f23a82ec9f628ea2acd12871c81a9362b02c43c1aa86acfc3ba1"
-dependencies = [
- "futures",
- "indexmap 2.9.0",
- "nix",
- "tokio",
- "tracing",
- "windows 0.61.3",
-]
-
-[[package]]
 name = "prokio"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6595,10 +6563,8 @@ dependencies = [
  "http 1.3.1",
  "http-body",
  "http-body-util",
- "oauth2",
  "paste",
  "pin-project-lite",
- "process-wrap",
  "rand 0.9.1",
  "reqwest",
  "rmcp-macros",
@@ -6612,7 +6578,6 @@ dependencies = [
  "tokio-util",
  "tower-service",
  "tracing",
- "url",
  "uuid",
 ]
 
