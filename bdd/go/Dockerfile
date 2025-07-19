@@ -27,4 +27,4 @@ RUN go install github.com/onsi/ginkgo/v2/ginkgo@latest
 WORKDIR /app/bdd/go
 
 # Default command
-CMD ["ginkgo", "-v", "-r"]
+CMD ["go", "test", "-v", "./..."]
