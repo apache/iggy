@@ -16,10 +16,68 @@
  * under the License.
  */
 
-use integration::{test_mcp_server::TestMcpServer, test_server::TestServer};
+use iggy_common::Stream;
+use integration::{
+    test_mcp_server::{McpClient, TestMcpServer},
+    test_server::TestServer,
+};
+use rmcp::{
+    ServiceError,
+    model::{CallToolRequestParam, CallToolResult, ListToolsResult},
+    serde::de::DeserializeOwned,
+    serde_json,
+};
 
 #[tokio::test]
 async fn mcp_server_should_list_tools() {
+    let infra = setup().await;
+    let client = infra.client;
+    let tools = client.list_tools().await.expect("Failed to list tools");
+
+    assert!(!tools.tools.is_empty());
+    let tools_count = tools.tools.len();
+    assert_eq!(tools_count, 40);
+}
+
+#[tokio::test]
+async fn mcp_server_should_handle_ping() {
+    assert_empty_response("ping", None).await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_return_list_of_streams() {
+    assert_response::<Vec<Stream>>("get_streams", None, |streams| assert!(streams.is_empty()))
+        .await;
+}
+
+async fn assert_empty_response(method: &str, data: Option<serde_json::Value>) {
+    assert_response::<()>(method, data, |()| {}).await
+}
+
+async fn assert_response<T: DeserializeOwned>(
+    method: &str,
+    data: Option<serde_json::Value>,
+    assert_response: impl FnOnce(T),
+) {
+    let infra = setup().await;
+    let client = infra.client;
+    let error_message = format!("Failed to invoke method: {method}",);
+    let mut result = client.invoke(method, data).await.expect(&error_message);
+
+    if result.content.is_empty() {
+        panic!("No content returned");
+    }
+
+    let result = result.content.remove(0);
+    let Some(text) = result.as_text() else {
+        panic!("Expected text response");
+    };
+
+    let json = serde_json::from_str::<T>(&text.text).expect("Failed to parse JSON");
+    assert_response(json)
+}
+
+async fn setup() -> McpInfra {
     let mut test_server = TestServer::default();
     test_server.start();
     let iggy_server_address = test_server
@@ -30,18 +88,42 @@ async fn mcp_server_should_list_tools() {
     test_mcp_server.start();
     test_mcp_server.ensure_started().await;
     let client = test_mcp_server.get_client().await;
-    println!("Invoking MCP client");
-
     let server_info = client.peer_info();
     println!("Connected to MCP server: {server_info:#?}");
+    McpInfra {
+        _iggy_server: test_server,
+        _mcp_server: test_mcp_server,
+        client: TestMcpClient { client },
+    }
+}
 
-    let tools = client
-        .list_tools(Default::default())
-        .await
-        .expect("Failed to list tools");
-    println!("Available tools: {tools:#?}");
+#[derive(Debug)]
+struct McpInfra {
+    _iggy_server: TestServer,
+    _mcp_server: TestMcpServer,
+    client: TestMcpClient,
+}
 
-    assert!(!tools.tools.is_empty());
-    let tools_count = tools.tools.len();
-    assert_eq!(tools_count, 40);
+#[derive(Debug)]
+struct TestMcpClient {
+    client: McpClient,
+}
+
+impl TestMcpClient {
+    pub async fn list_tools(&self) -> Result<ListToolsResult, ServiceError> {
+        self.client.list_tools(Default::default()).await
+    }
+
+    pub async fn invoke(
+        &self,
+        method: &str,
+        data: Option<serde_json::Value>,
+    ) -> Result<CallToolResult, ServiceError> {
+        self.client
+            .call_tool(CallToolRequestParam {
+                name: method.to_owned().into(),
+                arguments: data.and_then(|value| value.as_object().cloned()),
+            })
+            .await
+    }
 }
