@@ -3930,6 +3930,7 @@ name = "iggy-mcp"
 version = "0.1.0"
 dependencies = [
  "axum 0.8.4",
+ "axum-server",
  "config",
  "dotenvy",
  "figlet-rs",
@@ -3939,6 +3940,7 @@ dependencies = [
  "strum",
  "thiserror 2.0.12",
  "tokio",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
 ]

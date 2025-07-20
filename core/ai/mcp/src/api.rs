@@ -16,43 +16,60 @@
  * under the License.
  */
 
-use crate::context::RuntimeContext;
-use auth::resolve_api_key;
-use axum::{Json, Router, middleware, routing::get};
+use crate::{
+    Permissions,
+    configs::{HttpApiConfig, configure_cors},
+    error::McpRuntimeError,
+    service::IggyService,
+};
+use axum::{Json, Router, routing::get};
 use axum_server::tls_rustls::RustlsConfig;
-use config::{HttpApiConfig, configure_cors};
+use iggy::prelude::{Consumer, IggyClient};
+use rmcp::{
+    serde_json,
+    transport::{
+        StreamableHttpService, streamable_http_server::session::local::LocalSessionManager,
+    },
+};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::spawn;
 use tracing::{error, info};
 
-mod auth;
-pub mod config;
-mod error;
-mod models;
-mod sink;
-mod source;
+pub async fn init(
+    config: HttpApiConfig,
+    iggy_client: Arc<IggyClient>,
+    iggy_consumer: Arc<Consumer>,
+    permissions: Permissions,
+) -> Result<(), McpRuntimeError> {
+    let service = StreamableHttpService::new(
+        move || {
+            Ok(IggyService::new(
+                iggy_client.clone(),
+                iggy_consumer.clone(),
+                permissions,
+            ))
+        },
+        LocalSessionManager::default().into(),
+        Default::default(),
+    );
 
-const NAME: &str = env!("CARGO_PKG_NAME");
+    if !config.path.starts_with("/") {
+        error!("HTTP API path must start with '/'");
+        return Err(McpRuntimeError::InvalidApiPath);
+    }
 
-pub async fn init(config: &HttpApiConfig, context: Arc<RuntimeContext>) {
-    if !config.enabled {
-        info!("{NAME} HTTP API is disabled");
-        return;
+    if config.path == "/" {
+        error!("HTTP API path cannot be '/'");
+        return Err(McpRuntimeError::InvalidApiPath);
     }
 
     let mut app = Router::new()
-        .route("/", get(|| async { "Connector Runtime API" }))
+        .route("/", get(|| async { "Iggy MCP Server" }))
         .route(
             "/health",
             get(|| async { Json(serde_json::json!({ "status": "healthy" })) }),
         )
-        .merge(sink::router(context.clone()))
-        .merge(source::router(context.clone()));
-
-    app = app.layer(middleware::from_fn_with_state(
-        context.clone(),
-        resolve_api_key,
-    ));
+        .nest_service(&config.path, service);
 
     if let Some(cors) = &config.cors {
         if cors.enabled {
@@ -65,14 +82,21 @@ pub async fn init(config: &HttpApiConfig, context: Arc<RuntimeContext>) {
         .as_ref()
         .map(|tls| tls.enabled)
         .unwrap_or_default();
+
     if !tls_enabled {
         let listener = tokio::net::TcpListener::bind(&config.address)
             .await
-            .unwrap_or_else(|_| panic!("Failed to bind to HTTP address {}", config.address));
+            .map_err(|error| {
+                error!("Failed to bind TCP listener: {:?}", error);
+                McpRuntimeError::FailedToStartHttpServer
+            })?;
         let address = listener
             .local_addr()
             .expect("Failed to get local address for HTTP server");
-        info!("Started {NAME} on: {address}");
+        info!(
+            "HTTP API listening on: {address}, MCP path: {}",
+            config.path
+        );
         spawn(async move {
             if let Err(error) = axum::serve(
                 listener,
@@ -80,31 +104,35 @@ pub async fn init(config: &HttpApiConfig, context: Arc<RuntimeContext>) {
             )
             .await
             {
-                error!("Failed to start {NAME} server, error: {error}");
+                error!("Failed to start MCP server, error: {error}");
             }
         });
-        return;
+        return Ok(());
     }
 
     let tls = config.tls.as_ref().expect("TLS configuration is required");
-    let tls_config =
-        RustlsConfig::from_pem_file(PathBuf::from(&tls.cert_file), PathBuf::from(&tls.key_file))
-            .await
-            .unwrap();
+    let tls_config = RustlsConfig::from_pem_file(PathBuf::from(&tls.cert), PathBuf::from(&tls.key))
+        .await
+        .unwrap();
 
     let listener = std::net::TcpListener::bind(&config.address).unwrap();
     let address = listener
         .local_addr()
         .expect("Failed to get local address for HTTPS / TLS server");
 
-    info!("Started {NAME} on: {address}");
+    info!(
+        "HTTP API (TLS) listening on: {address}, MCP path: {}",
+        config.path
+    );
 
     spawn(async move {
         if let Err(error) = axum_server::from_tcp_rustls(listener, tls_config)
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
         {
-            error!("Failed to start {NAME} server, error: {error}");
+            error!("Failed to start MCP server, error: {error}");
         }
     });
+
+    Ok(())
 }

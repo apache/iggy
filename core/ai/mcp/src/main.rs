@@ -16,25 +16,19 @@
  * under the License.
  */
 
-use axum::routing::get;
 use config::{Config, Environment, File};
 use configs::{McpServerConfig, McpTransport};
 use dotenvy::dotenv;
 use error::McpRuntimeError;
 use figlet_rs::FIGfont;
-use iggy::prelude::Identifier;
-use rmcp::{
-    ServiceExt,
-    model::ErrorData,
-    transport::{
-        StreamableHttpService, stdio, streamable_http_server::session::local::LocalSessionManager,
-    },
-};
+use iggy::prelude::{Client, Identifier};
+use rmcp::{ServiceExt, model::ErrorData, transport::stdio};
 use service::IggyService;
 use std::{env, sync::Arc};
 use tracing::{error, info};
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
+mod api;
 mod configs;
 mod error;
 mod service;
@@ -93,6 +87,7 @@ async fn main() -> Result<(), McpRuntimeError> {
     })?;
     let iggy_consumer = Arc::new(iggy::prelude::Consumer::new(consumer_id));
     let iggy_client = Arc::new(stream::init(config.iggy).await?);
+    let client_to_shutdown = iggy_client.clone();
     let permissions = Permissions {
         create: config.permissions.create,
         read: config.permissions.read,
@@ -121,46 +116,7 @@ async fn main() -> Result<(), McpRuntimeError> {
             return Err(McpRuntimeError::MissingConfig);
         };
 
-        let service = StreamableHttpService::new(
-            move || {
-                Ok(IggyService::new(
-                    iggy_client.clone(),
-                    iggy_consumer.clone(),
-                    permissions,
-                ))
-            },
-            LocalSessionManager::default().into(),
-            Default::default(),
-        );
-
-        if !http_config.path.starts_with("/") {
-            error!("HTTP API path must start with '/'");
-            return Err(McpRuntimeError::InvalidApiPath);
-        }
-
-        if http_config.path == "/" {
-            error!("HTTP API path cannot be '/'");
-            return Err(McpRuntimeError::InvalidApiPath);
-        }
-
-        let router = axum::Router::new()
-            .route("/", get(|| async { "Iggy MCP Server" }))
-            .route("/ping", get(|| async { "pong" }))
-            .route("/health", get(|| async { "healthy" }))
-            .nest_service(&http_config.path, service);
-        let tcp_listener = tokio::net::TcpListener::bind(&http_config.address)
-            .await
-            .map_err(|error| {
-                error!("Failed to bind TCP listener: {:?}", error);
-                McpRuntimeError::FailedToStartHttpServer
-            })?;
-        info!(
-            "HTTP API listening on: {}, MCP path: {}",
-            http_config.address, http_config.path
-        );
-        let _ = axum::serve(tcp_listener, router)
-            .with_graceful_shutdown(async { tokio::signal::ctrl_c().await.unwrap() })
-            .await;
+        api::init(http_config, iggy_client, iggy_consumer, permissions).await?;
     }
 
     #[cfg(unix)]
@@ -182,6 +138,7 @@ async fn main() -> Result<(), McpRuntimeError> {
         }
     }
 
+    client_to_shutdown.shutdown().await?;
     info!("Iggy MCP Server stopped successfully");
     Ok(())
 }

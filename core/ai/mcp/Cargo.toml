@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 axum = { workspace = true }
+axum-server = { workspace = true }
 config = { workspace = true }
 dotenvy = { workspace = true }
 figlet-rs = { workspace = true }
@@ -19,5 +20,6 @@ serde = { workspace = true }
 strum = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
