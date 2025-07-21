@@ -17,10 +17,11 @@
  */
 
 use iggy::prelude::{Client, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, IggyClient};
-use iggy_binary_protocol::{MessageClient, StreamClient, TopicClient};
+use iggy_binary_protocol::{ConsumerGroupClient, MessageClient, StreamClient, TopicClient};
 use iggy_common::{
-    Identifier, IggyExpiry, IggyMessage, MaxTopicSize, Partitioning, Stream, StreamDetails, Topic,
-    TopicDetails,
+    ClientInfo, ClientInfoDetails, ConsumerGroup, ConsumerGroupDetails, Identifier, IggyExpiry,
+    IggyMessage, MaxTopicSize, Partitioning, PolledMessages, Snapshot, Stats, Stream,
+    StreamDetails, Topic, TopicDetails,
 };
 use integration::{
     test_mcp_server::{McpClient, TestMcpServer},
@@ -37,12 +38,15 @@ use rmcp::{
 const STREAM_NAME: &str = "test_stream";
 const TOPIC_NAME: &str = "test_topic";
 const MESSAGE_PAYLOAD: &str = "test_message";
+const CONSUMER_GROUP_NAME: &str = "test_consumer_group";
 
 lazy_static! {
     static ref STREAM_ID: Identifier =
         Identifier::from_str_value(STREAM_NAME).expect("Failed to create stream ID");
     static ref TOPIC_ID: Identifier =
         Identifier::from_str_value(TOPIC_NAME).expect("Failed to create topic ID");
+    static ref CONSUMER_GROUP_ID: Identifier =
+        Identifier::from_str_value(CONSUMER_GROUP_NAME).expect("Failed to create group ID");
 }
 
 #[tokio::test]
@@ -191,6 +195,144 @@ async fn mcp_server_should_purge_topic() {
     .await;
 }
 
+#[tokio::test]
+async fn mcp_server_should_create_partitions() {
+    assert_empty_response(
+        "create_partitions",
+        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partitions_count": 3 })),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_delete_partitions() {
+    assert_empty_response(
+        "delete_partitions",
+        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partitions_count": 1 })),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_delete_segments() {
+    assert_empty_response(
+        "delete_segments",
+        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partition_id": 1, "segments_count": 1 })),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_poll_messages() {
+    assert_response::<PolledMessages>(
+        "poll_messages",
+        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partition_id": 1, "offset": 0 })),
+        |messages| {
+            assert_eq!(messages.messages.len(), 1);
+            let message = &messages.messages[0];
+            assert_eq!(message.header.offset, 0);
+            let payload = message.payload_as_string().expect("Failed to parse message payload");
+            assert_eq!(payload, MESSAGE_PAYLOAD);
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_send_messages() {
+    assert_empty_response(
+        "send_messages",
+        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partition_id": 1, "messages": [
+            {
+                "payload": "test"
+            }
+        ] })),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_return_stats() {
+    assert_response::<Stats>("get_stats", None, |stats| {
+        assert!(!stats.hostname.is_empty());
+        assert_eq!(stats.messages_count, 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_return_me() {
+    assert_response::<ClientInfoDetails>("get_me", None, |client| {
+        assert!(client.client_id > 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_return_clients() {
+    assert_response::<Vec<ClientInfo>>("get_clients", None, |clients| {
+        assert!(!clients.is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_handle_snapshot() {
+    assert_response::<Snapshot>("snapshot", None, |snapshot| {
+        assert!(!snapshot.0.is_empty());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_return_consumer_groups() {
+    assert_response::<Vec<ConsumerGroup>>(
+        "get_consumer_groups",
+        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME})),
+        |groups| {
+            assert!(!groups.is_empty());
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_return_consumer_group_details() {
+    assert_response::<ConsumerGroupDetails>("get_consumer_group", Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "group_id": CONSUMER_GROUP_NAME })), |group| {
+        assert_eq!(group.name, CONSUMER_GROUP_NAME);
+        assert_eq!(group.partitions_count, 1);
+        assert_eq!(group.members_count, 0);
+        assert!(group.members.is_empty());
+
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_create_consumer_group() {
+    let name = "test";
+    assert_response::<ConsumerGroupDetails>(
+        "create_consumer_group",
+        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "name": name })),
+        |group| {
+            assert_eq!(group.name, name);
+            assert_eq!(group.partitions_count, 1);
+            assert_eq!(group.members_count, 0);
+            assert!(group.members.is_empty());
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_delete_consumer_group() {
+    assert_empty_response(
+        "delete_consumer_group",
+        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "group_id": CONSUMER_GROUP_NAME })),
+    )
+    .await;
+}
+
 async fn assert_empty_response(method: &str, data: Option<serde_json::Value>) {
     assert_response::<()>(method, data, |()| {}).await
 }
@@ -202,6 +344,15 @@ async fn assert_response<T: DeserializeOwned>(
 ) {
     let infra = setup().await;
     let client = infra.mcp_client;
+    let result = invoke_request(&client, method, data).await;
+    assert_response(result)
+}
+
+async fn invoke_request<T: DeserializeOwned>(
+    client: &TestMcpClient,
+    method: &str,
+    data: Option<serde_json::Value>,
+) -> T {
     let error_message = format!("Failed to invoke MCP method: {method}",);
     let mut result = client.invoke(method, data).await.expect(&error_message);
 
@@ -214,8 +365,7 @@ async fn assert_response<T: DeserializeOwned>(
         panic!("Expected text response for MCP method: {method}");
     };
 
-    let json = serde_json::from_str::<T>(&text.text).expect("Failed to parse JSON");
-    assert_response(json)
+    serde_json::from_str::<T>(&text.text).expect("Failed to parse JSON")
 }
 
 async fn setup() -> McpInfra {
@@ -291,6 +441,11 @@ async fn seed_data(iggy_server_address: &str) {
         )
         .await
         .expect("Failed to send messages");
+
+    iggy_client
+        .create_consumer_group(&STREAM_ID, &TOPIC_ID, CONSUMER_GROUP_NAME, None)
+        .await
+        .expect("Failed to create consumer group");
 }
 
 #[derive(Debug)]

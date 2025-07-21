@@ -55,6 +55,12 @@ impl IggyService {
         }
     }
 
+    #[tool(description = "Ping")]
+    pub async fn ping(&self) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_read()?;
+        request(self.client.ping().await)
+    }
+
     #[tool(description = "Get stream")]
     pub async fn get_stream(
         &self,
@@ -418,7 +424,7 @@ impl IggyService {
     #[tool(description = "Get me")]
     pub async fn get_me(&self) -> Result<CallToolResult, ErrorData> {
         self.permissions.ensure_read()?;
-        request(self.client.get_stats().await)
+        request(self.client.get_me().await)
     }
 
     #[tool(description = "Get client")]
@@ -436,12 +442,6 @@ impl IggyService {
         request(self.client.get_clients().await)
     }
 
-    #[tool(description = "Ping")]
-    pub async fn ping(&self) -> Result<CallToolResult, ErrorData> {
-        self.permissions.ensure_read()?;
-        request(self.client.ping().await)
-    }
-
     #[tool(description = "Snapshot")]
     pub async fn snapshot(
         &self,
@@ -451,6 +451,7 @@ impl IggyService {
         let compression = compression.and_then(|c| c.parse().ok()).unwrap_or_default();
         let mut types = types
             .into_iter()
+            .flatten()
             .flat_map(|t| t.parse().ok())
             .collect::<Vec<_>>();
         if types.is_empty() {

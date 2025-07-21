@@ -248,7 +248,7 @@ pub struct Snapshot {
     pub compression: Option<String>,
 
     #[schemars(description = "types")]
-    pub types: Vec<String>,
+    pub types: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
