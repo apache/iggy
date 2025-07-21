@@ -18,29 +18,24 @@
  */
 
 
-import { Duplex } from 'node:stream';
-
+import { EventEmitter } from 'node:events';
 import type {
   ClientConfig,
   ClientCredentials, CommandResponse,
   PasswordCredentials, RawClient, TokenCredentials
-} from './client.type.js';
-
-import { handleResponse, serializeCommand } from './client.utils.js';
+} from '../client/client.type.js';
+import { handleResponse } from './client.utils.js';
 import { responseError } from '../wire/error.utils.js';
-import { LOGIN } from '../wire/session/login.command.js';
-import { LOGIN_WITH_TOKEN } from '../wire/session/login-with-token.command.js';
 import { debug } from './client.debug.js';
-import { IggyTransport } from './client.transport.js';
-import { PING } from '../wire/index.js';
+import { IggyConnection } from './client.connection.js';
+import { LOGIN, LOGIN_WITH_TOKEN, PING } from '../wire/index.js';
+
 
 const UNLOGGED_COMMAND_CODE = [
   PING.code,
   LOGIN.code,
   LOGIN_WITH_TOKEN.code
 ];
-
-type WriteCb = ((error: Error | null | undefined) => void) | undefined
 
 type Job = {
   command: number,
@@ -50,51 +45,47 @@ type Job = {
 };
 
 
-export class CommandResponseStream extends Duplex  {
+export class CommandResponseStream extends EventEmitter {
   private options: ClientConfig;
-  private transport: IggyTransport;
-  private _readPaused: boolean;
+  private connection: IggyConnection;
   private _execQueue: Job[];
   public busy: boolean;
   isAuthenticated: boolean;
   userId?: number;
+  heartbeatIntervalHandler?: NodeJS.Timeout;
 
   constructor(options: ClientConfig) {
     super();
     this.options = options;
-    this.transport = new IggyTransport(options);    
-    this._readPaused = false;
+    this.connection = new IggyConnection(options);
     this.busy = false;
     this.isAuthenticated = false;
     this._execQueue = [];
-    this.wrapTransport();
-    this.heartbeat(options.heartbeatInterval);
-  };
-  
-  _destroy() {
-    this.transport.socket.destroy();
-  }
-
-  _read(size: number): void {
-    this._readPaused = false;
-    debug('stream#_read', size);
-    setImmediate(this._onReadable.bind(this));
-  }
-
-  _write(chunk: Buffer, encoding: BufferEncoding | undefined, cb?: WriteCb) {
-    return this.transport.socket.write(chunk, encoding, cb);
+    this._init();
   };
 
-  writeCommand(command: number, payload: Buffer): boolean {
-    const cmd = serializeCommand(command, payload);
-    return this.transport.socket.write(cmd);
+  _init() {
+    this.heartbeat(this.options.heartbeatInterval);
+    this.connection.on('disconnected', async () => {
+      this.isAuthenticated = false;
+    });
   }
 
-  sendCommand(
-    command: number, payload: Buffer, handleResponse = true, last = true
+  async sendCommand(
+    command: number,
+    payload: Buffer,
+    handleResponse = true,
+    last = true
   ): Promise<CommandResponse> {
-    return new Promise((resolve, reject) => {
-      if(last)
+
+    if (!this.connection.connected)
+      await this.connection.connect()
+
+    if (!this.isAuthenticated && !UNLOGGED_COMMAND_CODE.includes(command))
+      await this.authenticate(this.options.credentials);
+
+    return new Promise(async (resolve, reject) => {
+      if (last)
         this._execQueue.push({ command, payload, resolve, reject });
       else
         this._execQueue.unshift({ command, payload, resolve, reject });
@@ -106,7 +97,7 @@ export class CommandResponseStream extends Duplex  {
     if (this.busy)
       return;
     this.busy = true;
-    while (this._execQueue.length > 0 && this.transport.socket.writable) {
+    while (this._execQueue.length > 0 && this.connection.socket.writable) {
       const next = this._execQueue.shift();
       if (!next) break;
       const { command, payload, resolve, reject } = next;
@@ -125,15 +116,15 @@ export class CommandResponseStream extends Duplex  {
     payload: Buffer,
     handleResp = true
   ): Promise<CommandResponse> {
-    const lastWrite = this.writeCommand(command, payload);
+    const lastWrite = this.connection.writeCommand(command, payload);
     debug('==> writeCommand', lastWrite);
     return new Promise((resolve, reject) => {
-      if(!lastWrite)
+      if (!lastWrite)
         return reject(new Error('failed to write to socket'));
       const errCb = (err: unknown) => reject(err);
-      this.once('error', errCb);
-      this.once('data', (resp) => {
-        this.removeListener('error', errCb);
+      this.connection.once('error', errCb);
+      this.connection.once('response', (resp) => {
+        this.connection.removeListener('error', errCb);
         if (!handleResp) return resolve(resp);
         const r = handleResponse(resp);
         if (r.status !== 0) {
@@ -147,98 +138,6 @@ export class CommandResponseStream extends Duplex  {
   _failQueue(err: Error) {
     this._execQueue.forEach(({ reject }) => reject(err));
     this._execQueue = [];
-  }  
-
-  getReadStream() {
-    return this;
-  }
-  
-  wrapTransport() {
-    this.transport.on('connect', () => {
-      debug('socket#connect event');
-      this.emit('connect');
-      if(this._execQueue.length > 0) {
-        if(!this.isAuthenticated) {
-          const needAuth = this._execQueue.some(
-            q => !UNLOGGED_COMMAND_CODE.includes(q.command)
-          );
-          if(needAuth)
-            this.authenticate(this.options.credentials);
-        }
-        this._processQueue();
-      }
-    });
-
-    this.transport.on('close', async (hadError?: boolean) => {
-      console.log(
-        'socket#close',
-        { hadError, connected: this.transport.connected },
-      );
-      this.emit('close');
-    });
-
-    this.transport.on('end', async () => {
-      console.error('socket#end');
-      this.emit('end');
-    });
-    
-    this.transport.on('error', (err) => {
-      console.error('socket#err', err);
-      this._failQueue(err);
-      this.emit('error', err);
-    });
-
-    this.transport.on('disconnected', async () => {
-      this.isAuthenticated = false;
-    });
-
-    this.transport.on('drain', () => this.emit('drain'));
-
-    this.transport.on(
-      'lookup',
-      (err, address, family, host) => this.emit('lookup', err, address, family, host)
-    );
-    this.transport.on('ready', () => this.emit('ready'));
-    this.transport.on('timeout', () => this.emit('timeout'));
-
-    // customize data events
-    this.transport.on('readable', () => this._onReadable());
-    return this.transport;
-  }
-
-  _onReadable() {
-    while (!this._readPaused) {
-      const head = this.transport.socket.read(8);
-      if (!head || head.length === 0) return;
-      if (head.length < 8) {
-        this.transport.socket.unshift(head);
-        return;
-      }
-      /** first chunk[4:8] hold response length */
-      const responseSize = head.readUInt32LE(4);
-      /** response has no payload (create/update/delete ops...) */
-      if (responseSize === 0) {
-        this.push(head);
-        return;
-      }
-
-      const payload = this.transport.socket.read(responseSize);
-      debug('payload', payload, responseSize, head.readUInt32LE(0));
-      if (!payload) {
-        this.transport.socket.unshift(head);
-        return;
-      }
-      /** payload is incomplete, unshift until next read */
-      if (payload.length < responseSize) {
-        this.transport.socket.unshift(Buffer.concat([head, payload]));
-        return;
-      }
-
-      const pushOk = this.push(Buffer.concat([head, payload]));
-      /** consumer is slower than producer */
-      if (!pushOk)
-        this._readPaused = true;
-    }
   }
 
   async authenticate(creds: ClientCredentials) {
@@ -269,19 +168,28 @@ export class CommandResponseStream extends Duplex  {
   }
 
   heartbeat(interval?: number) {
-    if(!interval)
+    if (!interval)
       return
-    
-    setInterval(async () => {
-      if(this.transport.connected) {
+
+    this.heartbeatIntervalHandler = setInterval(async () => {
+      if (this.connection.connected) {
         debug(`sending hearbeat ping (interval: ${interval} ms)`);
         await this.ping()
       }
     }, interval);
   }
 
-  
+  getReadStream() {
+    return this.connection.socket;
+  }
+
+  destroy() {
+    if (this.heartbeatIntervalHandler)
+      clearInterval(this.heartbeatIntervalHandler);
+    return this.connection._destroy();
+  }
 };
+
 
 export function getRawClient(options: ClientConfig): RawClient {
   return new CommandResponseStream(options);
