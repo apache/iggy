@@ -1,7 +1,7 @@
 {
   "name": "@apache-iggy/node-sdk",
   "type": "module",
-  "version": "0.5.1",
+  "version": "0.5.0",
   "description": "Official apache iggy nodejs binary client",
   "keywords": [
     "iggy",
