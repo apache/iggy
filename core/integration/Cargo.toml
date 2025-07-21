@@ -46,7 +46,7 @@ libc = "0.2.174"
 log = { workspace = true }
 predicates = { workspace = true }
 rand = { workspace = true }
-rcgen = "0.13.2"
+rcgen = "0.14.3"
 reqwest = { workspace = true }
 rmcp = { version = "0.3.0", features = [
     "client",
