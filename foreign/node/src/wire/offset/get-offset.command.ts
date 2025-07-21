@@ -40,6 +40,9 @@ export const GET_OFFSET = {
   },
 
   deserialize: (r: CommandResponse): OffsetResponse => {
+    if(r.data.length < 20)
+      throw new Error('Offset not found');
+    
     const partitionId = r.data.readUInt32LE(0);
     const currentOffset = r.data.readBigUInt64LE(4);
     const storedOffset = r.data.readBigUInt64LE(12);

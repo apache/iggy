@@ -35,9 +35,9 @@ export type RawClient = {
   sendCommand: (
     code: number, payload: Buffer, handleResponse?: boolean
   ) => Promise<CommandResponse>,
-  destroy: () => void,
   isAuthenticated: boolean
   authenticate: (c: ClientCredentials) => Promise<boolean>
+  destroy: () => void,
   on: (ev: string, cb: (e?: unknown) => void) => void
   once: (ev: string, cb: (e?: unknown) => void) => void
   getReadStream: () => Readable
