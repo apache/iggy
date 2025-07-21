@@ -87,7 +87,38 @@ async fn mcp_server_should_return_stream_details() {
 }
 
 #[tokio::test]
-async fn mcp_server_should_return_list_of_topcics() {
+async fn mcp_server_should_create_stream() {
+    let name = "new_stream";
+    assert_response::<StreamDetails>("create_stream", Some(json!({ "name": name})), |stream| {
+        assert_eq!(stream.name, name);
+        assert_eq!(stream.topics_count, 0);
+        assert_eq!(stream.messages_count, 0);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_update_stream() {
+    let name = "updated_stream";
+    assert_empty_response(
+        "update_stream",
+        Some(json!({"stream_id": STREAM_NAME, "name": name})),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_delete_stream() {
+    assert_empty_response("delete_stream", Some(json!({"stream_id": STREAM_NAME}))).await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_purge_stream() {
+    assert_empty_response("purge_stream", Some(json!({"stream_id": STREAM_NAME}))).await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_return_list_of_topics() {
     assert_response::<Vec<Topic>>(
         "get_topics",
         Some(json!({"stream_id": STREAM_NAME})),
@@ -116,6 +147,50 @@ async fn mcp_server_should_return_topic_details() {
     .await;
 }
 
+#[tokio::test]
+async fn mcp_server_should_create_topic() {
+    let name = "new_topic";
+    assert_response::<TopicDetails>(
+        "create_topic",
+        Some(json!({ "stream_id": STREAM_NAME, "name": name, "partitions_count": 1})),
+        |topic| {
+            assert_eq!(topic.id, 2);
+            assert_eq!(topic.name, name);
+            assert_eq!(topic.partitions_count, 1);
+            assert_eq!(topic.messages_count, 0);
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_update_topic() {
+    let name = "updated_topic";
+    assert_empty_response(
+        "update_topic",
+        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "name": name})),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_delete_topic() {
+    assert_empty_response(
+        "delete_topic",
+        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME })),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_purge_topic() {
+    assert_empty_response(
+        "purge_topic",
+        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME })),
+    )
+    .await;
+}
+
 async fn assert_empty_response(method: &str, data: Option<serde_json::Value>) {
     assert_response::<()>(method, data, |()| {}).await
 }
@@ -127,16 +202,16 @@ async fn assert_response<T: DeserializeOwned>(
 ) {
     let infra = setup().await;
     let client = infra.mcp_client;
-    let error_message = format!("Failed to invoke method: {method}",);
+    let error_message = format!("Failed to invoke MCP method: {method}",);
     let mut result = client.invoke(method, data).await.expect(&error_message);
 
     if result.content.is_empty() {
-        panic!("No content returned");
+        panic!("No content returned from MCP for method: {method}");
     }
 
     let result = result.content.remove(0);
     let Some(text) = result.as_text() else {
-        panic!("Expected text response");
+        panic!("Expected text response for MCP method: {method}");
     };
 
     let json = serde_json::from_str::<T>(&text.text).expect("Failed to parse JSON");
