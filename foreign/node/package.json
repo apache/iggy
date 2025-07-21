@@ -20,12 +20,11 @@
   },
   "homepage": "https://iggy.apache.org",
   "files": [
-    "dist/src/**/*.js",
-    "dist/src/**/*.d.ts",
-    "dist/src/index.d.ts",
-    "!dist/src/bdd/",
-    "!dist/src/e2e/",
-    "!dist/**/*.test.*"
+    "dist/**/*.js",
+    "dist/**/*.d.ts",
+    "dist/index.d.ts",
+    "!dist/bdd/",
+    "!dist/examples/"
   ],
   "types": "dist/index.d.ts",
   "main": "dist/index.js",
@@ -35,7 +34,7 @@
     "test:bdd": "cucumber-js --exit",
     "test": "npm run test:unit && npm run test:bdd && npm run test:e2e",
     "clean": "rm -Rf dist/",
-    "lint": "eslint src/**/*.ts examples/**/*.ts",
+    "lint": "eslint src/**/*.ts",
     "commitlint": "commitlint --edit",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",

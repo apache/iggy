@@ -23,7 +23,9 @@ import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 import {
-  type CompressionAlgorithm, CompressionAlgorithmKind, isValidCompressionAlgorithm
+  type CompressionAlgorithm as CompressionAlgorithmT,
+  CompressionAlgorithm,
+  isValidCompressionAlgorithm
 } from './topic.utils.js';
 
 
@@ -31,7 +33,7 @@ export type UpdateTopic = {
   streamId: Id,
   topicId: Id,
   name: string,
-  compressionAlgorithm?: CompressionAlgorithm,
+  compressionAlgorithm?: CompressionAlgorithmT,
   messageExpiry?: bigint,
   maxTopicSize?: bigint,
   replicationFactor?: number,
@@ -44,7 +46,7 @@ export const UPDATE_TOPIC = {
     streamId,
     topicId,
     name,
-    compressionAlgorithm = CompressionAlgorithmKind.None,
+    compressionAlgorithm = CompressionAlgorithm.None,
     messageExpiry = 0n,
     maxTopicSize = 0n,
     replicationFactor = 1,
