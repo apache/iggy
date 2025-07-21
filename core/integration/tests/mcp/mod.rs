@@ -16,13 +16,17 @@
  * under the License.
  */
 
-use iggy::prelude::{Client, IggyClient};
-use iggy_binary_protocol::{StreamClient, TopicClient};
-use iggy_common::{Identifier, IggyExpiry, MaxTopicSize, Stream, StreamDetails};
+use iggy::prelude::{Client, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, IggyClient};
+use iggy_binary_protocol::{MessageClient, StreamClient, TopicClient};
+use iggy_common::{
+    Identifier, IggyExpiry, IggyMessage, MaxTopicSize, Partitioning, Stream, StreamDetails, Topic,
+    TopicDetails,
+};
 use integration::{
     test_mcp_server::{McpClient, TestMcpServer},
     test_server::TestServer,
 };
+use lazy_static::lazy_static;
 use rmcp::{
     ServiceError,
     model::{CallToolRequestParam, CallToolResult, ListToolsResult},
@@ -32,6 +36,14 @@ use rmcp::{
 
 const STREAM_NAME: &str = "test_stream";
 const TOPIC_NAME: &str = "test_topic";
+const MESSAGE_PAYLOAD: &str = "test_message";
+
+lazy_static! {
+    static ref STREAM_ID: Identifier =
+        Identifier::from_str_value(STREAM_NAME).expect("Failed to create stream ID");
+    static ref TOPIC_ID: Identifier =
+        Identifier::from_str_value(TOPIC_NAME).expect("Failed to create topic ID");
+}
 
 #[tokio::test]
 async fn mcp_server_should_list_tools() {
@@ -53,20 +65,52 @@ async fn mcp_server_should_handle_ping() {
 async fn mcp_server_should_return_list_of_streams() {
     assert_response::<Vec<Stream>>("get_streams", None, |streams| {
         assert_eq!(streams.len(), 1);
-        assert_eq!(&streams[0].name, STREAM_NAME);
-        assert_eq!(&streams[0].topics_count, &1);
+        let stream = &streams[0];
+        assert_eq!(&stream.name, STREAM_NAME);
+        assert_eq!(&stream.topics_count, &1);
     })
     .await;
 }
 
 #[tokio::test]
-async fn mcp_server_should_return_stream() {
+async fn mcp_server_should_return_stream_details() {
     assert_response::<StreamDetails>(
         "get_stream",
         Some(json!({"stream_id": STREAM_NAME})),
         |stream| {
             assert_eq!(stream.name, STREAM_NAME);
             assert_eq!(stream.topics_count, 1);
+            assert_eq!(stream.messages_count, 1);
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_return_list_of_topcics() {
+    assert_response::<Vec<Topic>>(
+        "get_topics",
+        Some(json!({"stream_id": STREAM_NAME})),
+        |topics| {
+            assert_eq!(topics.len(), 1);
+            let topic = &topics[0];
+            assert_eq!(topic.name, TOPIC_NAME);
+            assert_eq!(topic.partitions_count, 1);
+            assert_eq!(topic.messages_count, 1);
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_return_topic_details() {
+    assert_response::<TopicDetails>(
+        "get_topic",
+        Some(json!({"stream_id": STREAM_NAME, "topic_id": TOPIC_NAME})),
+        |topic| {
+            assert_eq!(topic.id, 1);
+            assert_eq!(topic.name, TOPIC_NAME);
+            assert_eq!(topic.messages_count, 1);
         },
     )
     .await;
@@ -95,7 +139,6 @@ async fn assert_response<T: DeserializeOwned>(
         panic!("Expected text response");
     };
 
-    println!("Received response: {}", text.text);
     let json = serde_json::from_str::<T>(&text.text).expect("Failed to parse JSON");
     assert_response(json)
 }
@@ -106,19 +149,32 @@ async fn setup() -> McpInfra {
     let iggy_server_address = test_server
         .get_raw_tcp_addr()
         .expect("Failed to get Iggy TCP address");
-    println!("Iggy server address: {iggy_server_address}");
+    seed_data(&iggy_server_address).await;
+
+    let mut test_mcp_server = TestMcpServer::with_iggy_address(&iggy_server_address);
+    test_mcp_server.start();
+    test_mcp_server.ensure_started().await;
+    let mcp_client = test_mcp_server.get_client().await;
+
+    McpInfra {
+        _iggy_server: test_server,
+        _mcp_server: test_mcp_server,
+        mcp_client: TestMcpClient { mcp_client },
+    }
+}
+
+async fn seed_data(iggy_server_address: &str) {
     let iggy_port = iggy_server_address
         .split(':')
         .next_back()
         .unwrap()
         .parse::<u16>()
         .unwrap();
-    let mut test_mcp_server = TestMcpServer::with_iggy_address(&iggy_server_address);
-    test_mcp_server.start();
-    test_mcp_server.ensure_started().await;
-    let iggy_client =
-        IggyClient::from_connection_string(&format!("iggy://iggy:iggy@localhost:{iggy_port}"))
-            .expect("Failed to create Iggy client");
+
+    let iggy_client = IggyClient::from_connection_string(&format!(
+        "iggy://{DEFAULT_ROOT_USERNAME}:{DEFAULT_ROOT_PASSWORD}@localhost:{iggy_port}"
+    ))
+    .expect("Failed to create Iggy client");
 
     iggy_client
         .connect()
@@ -130,11 +186,9 @@ async fn setup() -> McpInfra {
         .await
         .expect("Failed to create stream");
 
-    let stream_id = Identifier::from_str_value(STREAM_NAME).expect("Failed to create stream ID");
-
     iggy_client
         .create_topic(
-            &stream_id,
+            &STREAM_ID,
             TOPIC_NAME,
             1,
             iggy_common::CompressionAlgorithm::None,
@@ -146,14 +200,22 @@ async fn setup() -> McpInfra {
         .await
         .expect("Failed to create topic");
 
-    let mcp_client = test_mcp_server.get_client().await;
-    let server_info = mcp_client.peer_info();
-    println!("Connected to MCP server: {server_info:#?}");
-    McpInfra {
-        _iggy_server: test_server,
-        _mcp_server: test_mcp_server,
-        mcp_client: TestMcpClient { mcp_client },
-    }
+    let mut messages = vec![
+        IggyMessage::builder()
+            .payload(MESSAGE_PAYLOAD.into())
+            .build()
+            .expect("Failed to build message"),
+    ];
+
+    iggy_client
+        .send_messages(
+            &STREAM_ID,
+            &TOPIC_ID,
+            &Partitioning::partition_id(1),
+            &mut messages,
+        )
+        .await
+        .expect("Failed to send messages");
 }
 
 #[derive(Debug)]
