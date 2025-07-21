@@ -24,3 +24,4 @@ export * from './get-topic.command.js';
 export * from './get-topics.command.js';
 export * from './purge-topic.command.js';
 export * from './update-topic.command.js';
+export { CompressionAlgorithm } from './topic.utils.js';

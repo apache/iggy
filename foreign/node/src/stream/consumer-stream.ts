@@ -18,13 +18,16 @@
  */
 
 
-import { Readable, pipeline, PassThrough } from "node:stream";
-import type { ClientConfig, RawClient } from "../client/client.type.js";
-import { getRawClient } from '../client/client.socket.js';
+import { Readable } from "node:stream";
+import type { ClientConfig } from "../client/client.type.js";
 import type { Id } from '../wire/identifier.utils.js';
 import { getClient } from "../client/client.js";
-import { type PollMessages, POLL_MESSAGES } from "../wire/message/poll-messages.command.js";
-import { type PollingStrategy, ConsumerKind, type CommandAPI } from "../wire/index.js";
+import { type PollMessages } from "../wire/message/poll-messages.command.js";
+import {
+  type PollingStrategy,
+  type CommandAPI,
+  Consumer
+} from "../wire/index.js";
 import { debug } from "../client/client.debug.js";
 
 
@@ -33,10 +36,11 @@ const wait = (interval: number, cb?: () => void): Promise<void> =>
     setTimeout(() => resolve(cb ? cb() : undefined), interval)
   });
 
-async function* genAutoCommitedPoll(
+async function* genEagerUntilPoll(
   c: CommandAPI,
   poll: PollMessages,
-  interval = 1000
+  interval = 1000,
+  endOnLastOffset = false
 ) {
   const state: Map<string, number> = new Map();
 
@@ -44,48 +48,64 @@ async function* genAutoCommitedPoll(
     const r = await c.message.poll(poll);
     yield r;
     state.set(`${r.partitionId}`, r.count);
-    
+
     if (Array.from(state).every(([, last]) => last === 0)) {
-      await wait(interval);
+      if( endOnLastOffset )
+        return;
+      else
+        await wait(interval);
     }
   }
 };
 
-async function* genPoll(
-  c: RawClient,
-  poll: PollMessages,
-) {
-  const pl = POLL_MESSAGES.serialize(poll);
-  yield await c.sendCommand(POLL_MESSAGES.code, pl, false);
-};
 
-
-export const singleConsumerStream = (config: ClientConfig) => async (
-  poll: PollMessages,
-  // interval: 1000
-): Promise<Readable> => {
-  const c = getRawClient(config);
-  if (!c.isAuthenticated)
-    await c.authenticate(config.credentials);
-  const ps = Readable.from(genPoll(c, poll), { objectMode: true });
-  // const ps = Readable.from(genAutoCommitedPoll(c, poll, interval), { objectMode: true });
-  
-  return pipeline(
-    ps,
-    new PassThrough({ objectMode: true }),
-    (err) => console.error('pipeline error', err)
-  );
-};
-
-export type ConsumerGroupStreamRequest = {
-  groupId: number,
+export type ConsumerStreamRequest = {
   streamId: Id,
   topicId: Id,
   pollingStrategy: PollingStrategy,
   count: number,
   interval?: number,
   autocommit?: boolean
+  endOnLastOffset?: boolean
 }
+
+export type SingleConsumerStreamRequest = ConsumerStreamRequest & {
+  partitionId: number,
+};
+
+export type GroupConsumerStreamRequest = ConsumerStreamRequest & { groupId: number };
+
+export const singleConsumerStream = (config: ClientConfig) => async (
+  {
+    streamId,
+    topicId,
+    partitionId,
+    pollingStrategy,
+    count,
+    interval = 1000,
+    autocommit = true,
+    endOnLastOffset = false
+  }: SingleConsumerStreamRequest
+): Promise<Readable> => {
+  const c = await getClient(config);
+
+  const poll = {
+    streamId,
+    topicId,
+    partitionId,
+    consumer: Consumer.Single,
+    pollingStrategy,
+    count,
+    autocommit
+  };
+  
+  const ps = Readable.from(
+    genEagerUntilPoll(c, poll, interval, endOnLastOffset),
+    { objectMode: true }
+  );
+  return ps;
+};
+
 
 export const groupConsumerStream = (config: ClientConfig) =>
   async function groupConsumerStream({
@@ -95,8 +115,9 @@ export const groupConsumerStream = (config: ClientConfig) =>
     pollingStrategy,
     count,
     interval = 1000,
-    autocommit = true
-  }: ConsumerGroupStreamRequest): Promise<Readable> {
+    autocommit = true,
+    endOnLastOffset = false
+  }: GroupConsumerStreamRequest): Promise<Readable> {
     const s = await getClient(config);
     
     try {
@@ -113,24 +134,16 @@ export const groupConsumerStream = (config: ClientConfig) =>
     const poll = {
       streamId,
       topicId,
-      consumer: { kind: ConsumerKind.Group, id: groupId },
+      consumer: Consumer.Group(groupId),
       partitionId: 0,
       pollingStrategy,
       count,
       autocommit
     }
-    const ps = Readable.from(genAutoCommitedPoll(s, poll, interval), { objectMode: true });
-    // return (await s.clientProvider()).getReadStream();
-    // c.on('error', (err: unknown) => {
-    //   debug('groupConsumerStream::client error', err);
-    //   // ps.emit('error', err);
-    // });
-
-    // c.on('end', () => {
-    //   debug('groupConsumerStream::END');
-    //   // ps.emit('end');
-    // });
+    const ps = Readable.from(
+      genEagerUntilPoll(s, poll, interval, endOnLastOffset),
+      { objectMode: true }
+    );
 
     return ps;
   };
-
