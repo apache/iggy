@@ -18,11 +18,11 @@
  */
 
 
-import { PollingStrategy, singleConsumerStream, Consumer } from '../src/index.js';
+import { PollingStrategy, singleConsumerStream, Consumer } from '../index.js';
 import { open } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { getClient } from './utils.js';
-import type { PollMessagesResponse } from '../src/wire/index.js';
+import type { PollMessagesResponse } from '../wire/index.js';
 
 
 export const topicToFile = async (

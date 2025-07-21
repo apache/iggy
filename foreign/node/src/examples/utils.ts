@@ -18,8 +18,8 @@
  */
 
 
-import { Client } from '../src/index.js';
-import { getIggyAddress } from '../src/tcp.sm.utils.js';
+import { Client } from '../index.js';
+import { getIggyAddress } from '../tcp.sm.utils.js';
 
 
 export const getClient = () => {
