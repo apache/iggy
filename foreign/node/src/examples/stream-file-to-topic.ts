@@ -18,11 +18,11 @@
  */
 
 
-import { HeaderValue } from '../src/index.js';
 import { open } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Writable, type TransformCallback } from 'node:stream';
+import { HeaderValue } from '../index.js';
 import { getClient, ensureStream, ensureTopic } from './utils.js';
 
 export const fileToTopic = async (

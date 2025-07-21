@@ -17,14 +17,16 @@
  */
 
 use iggy::prelude::{Client, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, IggyClient};
-use iggy_binary_protocol::{ConsumerGroupClient, MessageClient, StreamClient, TopicClient};
+use iggy_binary_protocol::{
+    ConsumerGroupClient, ConsumerOffsetClient, MessageClient, StreamClient, TopicClient,
+};
 use iggy_common::{
-    ClientInfo, ClientInfoDetails, ConsumerGroup, ConsumerGroupDetails, Identifier, IggyExpiry,
-    IggyMessage, MaxTopicSize, Partitioning, PolledMessages, Snapshot, Stats, Stream,
-    StreamDetails, Topic, TopicDetails,
+    ClientInfo, ClientInfoDetails, Consumer, ConsumerGroup, ConsumerGroupDetails,
+    ConsumerOffsetInfo, Identifier, IggyExpiry, IggyMessage, MaxTopicSize, Partitioning,
+    PolledMessages, Snapshot, Stats, Stream, StreamDetails, Topic, TopicDetails,
 };
 use integration::{
-    test_mcp_server::{McpClient, TestMcpServer},
+    test_mcp_server::{CONSUMER_NAME, McpClient, TestMcpServer},
     test_server::TestServer,
 };
 use lazy_static::lazy_static;
@@ -333,6 +335,40 @@ async fn mcp_server_should_delete_consumer_group() {
     .await;
 }
 
+#[tokio::test]
+async fn mcp_server_should_return_consumer_offset() {
+    assert_response::<Option<ConsumerOffsetInfo>>(
+        "get_consumer_offset",
+        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partition_id": 1 })),
+        |offset| {
+            assert!(offset.is_some());
+            let offset = offset.unwrap();
+            assert_eq!(offset.partition_id, 1);
+            assert_eq!(offset.stored_offset, 0);
+            assert_eq!(offset.current_offset, 0);
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_store_consumer_offset() {
+    assert_empty_response(
+        "store_consumer_offset",
+        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partition_id": 1, "offset": 0 })),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_delete_consumer_offset() {
+    assert_empty_response(
+        "delete_consumer_offset",
+        Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "partition_id": 1, "offset": 0 })),
+    )
+    .await;
+}
+
 async fn assert_empty_response(method: &str, data: Option<serde_json::Value>) {
     assert_response::<()>(method, data, |()| {}).await
 }
@@ -441,6 +477,14 @@ async fn seed_data(iggy_server_address: &str) {
         )
         .await
         .expect("Failed to send messages");
+
+    let consumer =
+        Consumer::new(Identifier::named(CONSUMER_NAME).expect("Failed to create consumer"));
+
+    iggy_client
+        .store_consumer_offset(&consumer, &STREAM_ID, &TOPIC_ID, Some(1), 0)
+        .await
+        .expect("Failed to store consumer offset");
 
     iggy_client
         .create_consumer_group(&STREAM_ID, &TOPIC_ID, CONSUMER_GROUP_NAME, None)

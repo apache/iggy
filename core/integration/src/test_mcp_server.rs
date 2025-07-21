@@ -33,6 +33,7 @@ use std::time::Duration;
 use std::{collections::HashMap, net::TcpListener};
 use tokio::time::sleep;
 
+pub const CONSUMER_NAME: &str = "mcp";
 const MCP_PATH: &str = "/mcp";
 
 pub type McpClient = RunningService<RoleClient, InitializeRequestParam>;
@@ -68,6 +69,10 @@ impl TestMcpServer {
         envs.insert(
             "IGGY_MCP_IGGY_ADDRESS".to_string(),
             iggy_tcp_server_address.to_string(),
+        );
+        envs.insert(
+            "IGGY_MCP_IGGY_CONSUMER".to_string(),
+            CONSUMER_NAME.to_string(),
         );
         envs.insert("IGGY_MCP_TRANSPORT".to_string(), "http".to_string());
         Self::create(envs, server_executable_path)
