@@ -18,12 +18,15 @@
 
 use iggy::prelude::{Client, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, IggyClient};
 use iggy_binary_protocol::{
-    ConsumerGroupClient, ConsumerOffsetClient, MessageClient, StreamClient, TopicClient,
+    ConsumerGroupClient, ConsumerOffsetClient, MessageClient, PersonalAccessTokenClient,
+    StreamClient, TopicClient, UserClient,
 };
 use iggy_common::{
     ClientInfo, ClientInfoDetails, Consumer, ConsumerGroup, ConsumerGroupDetails,
     ConsumerOffsetInfo, Identifier, IggyExpiry, IggyMessage, MaxTopicSize, Partitioning,
-    PolledMessages, Snapshot, Stats, Stream, StreamDetails, Topic, TopicDetails,
+    PersonalAccessTokenExpiry, PersonalAccessTokenInfo, PolledMessages, RawPersonalAccessToken,
+    Snapshot, Stats, Stream, StreamDetails, Topic, TopicDetails, UserInfo, UserInfoDetails,
+    UserStatus,
 };
 use integration::{
     test_mcp_server::{CONSUMER_NAME, McpClient, TestMcpServer},
@@ -41,6 +44,9 @@ const STREAM_NAME: &str = "test_stream";
 const TOPIC_NAME: &str = "test_topic";
 const MESSAGE_PAYLOAD: &str = "test_message";
 const CONSUMER_GROUP_NAME: &str = "test_consumer_group";
+const PERSONAL_ACCESS_TOKEN_NAME: &str = "test_personal_access_token";
+const USER_NAME: &str = "test_user";
+const USER_PASSWORD: &str = "secret";
 
 lazy_static! {
     static ref STREAM_ID: Identifier =
@@ -369,6 +375,120 @@ async fn mcp_server_should_delete_consumer_offset() {
     .await;
 }
 
+#[tokio::test]
+async fn mcp_server_should_return_personal_access_tokens() {
+    assert_response::<Vec<PersonalAccessTokenInfo>>("get_personal_access_tokens", None, |tokens| {
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].name, PERSONAL_ACCESS_TOKEN_NAME);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_create_personal_access_token() {
+    let name = "test_token";
+    let expiry = PersonalAccessTokenExpiry::NeverExpire.to_string();
+    assert_response::<RawPersonalAccessToken>(
+        "create_personal_access_token",
+        Some(json!({ "name": name, "expiry": expiry  })),
+        |token| {
+            assert!(!token.token.is_empty());
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_delete_personal_access_token() {
+    assert_empty_response(
+        "delete_personal_access_token",
+        Some(json!({ "name": PERSONAL_ACCESS_TOKEN_NAME})),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_return_users() {
+    assert_response::<Vec<UserInfo>>("get_users", None, |users| {
+        assert_eq!(users.len(), 2);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_return_user_details() {
+    assert_response::<UserInfoDetails>("get_user", Some(json!({ "user_id": USER_NAME})), |user| {
+        assert_eq!(user.username, USER_NAME);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_create_user() {
+    let username = "test-mcp-user";
+    assert_response::<UserInfoDetails>(
+        "create_user",
+        Some(json!({ "username": username, "password": "secret"})),
+        |user| {
+            assert_eq!(user.username, username);
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_update_user() {
+    assert_empty_response(
+        "update_user",
+        Some(json!({ "user_id": USER_NAME, "username": "test-mcp-user", "active": false})),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_delete_user() {
+    assert_empty_response("delete_user", Some(json!({ "user_id": USER_NAME}))).await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_update_permissions() {
+    let permissions = json!({
+        "global": {
+            "manage_servers": true,
+            "read_users": true,
+        },
+        "streams": {
+            "1": {
+                "manage_stream": true,
+                "manage_topics": true,
+                "topics": {
+                    "1": {
+                        "manage_topic": true,
+                        "read_topic": true,
+                        "poll_messages": true,
+                        "send_messages": true,
+                    }
+                }
+            }
+        }
+    });
+
+    assert_empty_response(
+        "update_permissions",
+        Some(json!({ "user_id": USER_NAME, "permissions": permissions })),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn mcp_server_should_change_password() {
+    assert_empty_response(
+        "change_password",
+        Some(json!({ "user_id": USER_NAME, "current_password": USER_PASSWORD, "new_password": "secret2"})),
+    )
+    .await;
+}
+
 async fn assert_empty_response(method: &str, data: Option<serde_json::Value>) {
     assert_response::<()>(method, data, |()| {}).await
 }
@@ -490,6 +610,19 @@ async fn seed_data(iggy_server_address: &str) {
         .create_consumer_group(&STREAM_ID, &TOPIC_ID, CONSUMER_GROUP_NAME, None)
         .await
         .expect("Failed to create consumer group");
+
+    iggy_client
+        .create_user(USER_NAME, USER_PASSWORD, UserStatus::Active, None)
+        .await
+        .expect("Failed to create user");
+
+    iggy_client
+        .create_personal_access_token(
+            PERSONAL_ACCESS_TOKEN_NAME,
+            PersonalAccessTokenExpiry::NeverExpire,
+        )
+        .await
+        .expect("Failed to create personal access token");
 }
 
 #[derive(Debug)]

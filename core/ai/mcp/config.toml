@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-transport = "stdio" # http or stdio are supported
+transport = "http" # http or stdio are supported
 
 [http] # Optional HTTP API configuration
 address = "127.0.0.1:8082"

@@ -693,6 +693,15 @@ impl IggyService {
         )
     }
 
+    #[tool(description = "Delete user")]
+    pub async fn delete_user(
+        &self,
+        Parameters(DeleteUser { user_id }): Parameters<DeleteUser>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.permissions.ensure_delete()?;
+        request(self.client.delete_user(&id(&user_id)?).await)
+    }
+
     #[tool(description = "Update permissions")]
     pub async fn update_permissions(
         &self,
@@ -708,15 +717,6 @@ impl IggyService {
                 .update_permissions(&id(&user_id)?, permissions)
                 .await,
         )
-    }
-
-    #[tool(description = "Delete user")]
-    pub async fn delete_user(
-        &self,
-        Parameters(DeleteUser { user_id }): Parameters<DeleteUser>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.permissions.ensure_delete()?;
-        request(self.client.delete_user(&id(&user_id)?).await)
     }
 
     #[tool(description = "Change password")]
