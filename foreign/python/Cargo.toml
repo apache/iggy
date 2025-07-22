@@ -16,6 +16,7 @@ pyo3-async-runtimes = { version = "0.25.0", features = [
     "tokio-runtime",
 ] }
 pyo3-stub-gen = "0.9.1"
+tokio = "1.40.0"
 
 [lib]
 name = "iggy_py"

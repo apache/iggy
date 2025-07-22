@@ -27,7 +27,8 @@ async fn main() -> Result<(), IggyError> {
     println!("Build iggy client & consumer");
     //For customization, use the `new` or `from_stream_topic` constructor
     let config = IggyConsumerConfig::default();
-    let (client, consumer) = IggyStreamConsumer::with_client_from_url(IGGY_URL, &config).await?;
+    let (client, mut consumer) =
+        IggyStreamConsumer::with_client_from_url(IGGY_URL, &config).await?;
 
     println!("Start message stream");
     let (tx, rx) = oneshot::channel();

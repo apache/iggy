@@ -24,7 +24,7 @@ use crate::prelude::{
     ClientError, HttpClientConfig, IggyDuration, QuicClientConfig, QuicClientReconnectionConfig,
     TcpClientConfig, TcpClientReconnectionConfig,
 };
-use crate::quic::quick_client::QuicClient;
+use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
 use iggy_binary_protocol::Client;
 use iggy_common::{AutoLogin, Credentials};
