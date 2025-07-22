@@ -206,7 +206,15 @@ impl TestMcpServer {
         let max_retries = 10;
 
         for _ in 0..max_retries {
-            let port = rng.gen_range(49152..=65535);
+            #[cfg(target_os = "linux")]
+            let port = rng.gen_range(20000..=29999);
+
+            #[cfg(target_os = "macos")]
+            let port = rng.gen_range(20000..=49151);
+
+            #[cfg(target_os = "windows")]
+            let port = rng.gen_range(20000..=49151);
+
             let addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
             if TcpListener::bind(addr).is_ok() {
                 return addr;
