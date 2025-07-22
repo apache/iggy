@@ -167,7 +167,7 @@ impl TestMcpServer {
     pub async fn ensure_started(&self) {
         let http_api_address = self.get_http_api_address();
         let client = reqwest::Client::new();
-        let max_retries = 100;
+        let max_retries = 500;
         let mut retries = 0;
         while let Err(error) = client.get(&http_api_address).send().await {
             sleep(Duration::from_millis(10)).await;
@@ -203,7 +203,7 @@ impl TestMcpServer {
 
     fn get_random_server_address() -> SocketAddr {
         let mut rng = rand::thread_rng();
-        let max_retries = 10;
+        let max_retries = 100;
 
         for _ in 0..max_retries {
             #[cfg(target_os = "linux")]
