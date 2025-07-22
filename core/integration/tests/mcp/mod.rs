@@ -30,7 +30,7 @@ use iggy_common::{
 };
 use integration::{
     test_mcp_server::{CONSUMER_NAME, McpClient, TestMcpServer},
-    test_server::TestServer,
+    test_server::{IpAddrKind, TestServer},
 };
 use lazy_static::lazy_static;
 use rmcp::{
@@ -39,6 +39,8 @@ use rmcp::{
     serde::de::DeserializeOwned,
     serde_json::{self, json},
 };
+use serial_test::parallel;
+use std::collections::HashMap;
 
 const STREAM_NAME: &str = "test_stream";
 const TOPIC_NAME: &str = "test_topic";
@@ -58,6 +60,7 @@ lazy_static! {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_list_tools() {
     let infra = setup().await;
     let client = infra.mcp_client;
@@ -69,11 +72,13 @@ async fn mcp_server_should_list_tools() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_handle_ping() {
     assert_empty_response("ping", None).await;
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_return_list_of_streams() {
     assert_response::<Vec<Stream>>("get_streams", None, |streams| {
         assert_eq!(streams.len(), 1);
@@ -85,6 +90,7 @@ async fn mcp_server_should_return_list_of_streams() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_return_stream_details() {
     assert_response::<StreamDetails>(
         "get_stream",
@@ -99,6 +105,7 @@ async fn mcp_server_should_return_stream_details() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_create_stream() {
     let name = "new_stream";
     assert_response::<StreamDetails>("create_stream", Some(json!({ "name": name})), |stream| {
@@ -110,6 +117,7 @@ async fn mcp_server_should_create_stream() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_update_stream() {
     let name = "updated_stream";
     assert_empty_response(
@@ -120,16 +128,19 @@ async fn mcp_server_should_update_stream() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_delete_stream() {
     assert_empty_response("delete_stream", Some(json!({"stream_id": STREAM_NAME}))).await;
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_purge_stream() {
     assert_empty_response("purge_stream", Some(json!({"stream_id": STREAM_NAME}))).await;
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_return_list_of_topics() {
     assert_response::<Vec<Topic>>(
         "get_topics",
@@ -146,6 +157,7 @@ async fn mcp_server_should_return_list_of_topics() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_return_topic_details() {
     assert_response::<TopicDetails>(
         "get_topic",
@@ -160,6 +172,7 @@ async fn mcp_server_should_return_topic_details() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_create_topic() {
     let name = "new_topic";
     assert_response::<TopicDetails>(
@@ -176,6 +189,7 @@ async fn mcp_server_should_create_topic() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_update_topic() {
     let name = "updated_topic";
     assert_empty_response(
@@ -186,6 +200,7 @@ async fn mcp_server_should_update_topic() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_delete_topic() {
     assert_empty_response(
         "delete_topic",
@@ -195,6 +210,7 @@ async fn mcp_server_should_delete_topic() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_purge_topic() {
     assert_empty_response(
         "purge_topic",
@@ -204,6 +220,7 @@ async fn mcp_server_should_purge_topic() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_create_partitions() {
     assert_empty_response(
         "create_partitions",
@@ -213,6 +230,7 @@ async fn mcp_server_should_create_partitions() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_delete_partitions() {
     assert_empty_response(
         "delete_partitions",
@@ -222,6 +240,7 @@ async fn mcp_server_should_delete_partitions() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_delete_segments() {
     assert_empty_response(
         "delete_segments",
@@ -231,6 +250,7 @@ async fn mcp_server_should_delete_segments() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_poll_messages() {
     assert_response::<PolledMessages>(
         "poll_messages",
@@ -247,6 +267,7 @@ async fn mcp_server_should_poll_messages() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_send_messages() {
     assert_empty_response(
         "send_messages",
@@ -260,6 +281,7 @@ async fn mcp_server_should_send_messages() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_return_stats() {
     assert_response::<Stats>("get_stats", None, |stats| {
         assert!(!stats.hostname.is_empty());
@@ -269,6 +291,7 @@ async fn mcp_server_should_return_stats() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_return_me() {
     assert_response::<ClientInfoDetails>("get_me", None, |client| {
         assert!(client.client_id > 0);
@@ -277,6 +300,7 @@ async fn mcp_server_should_return_me() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_return_clients() {
     assert_response::<Vec<ClientInfo>>("get_clients", None, |clients| {
         assert!(!clients.is_empty());
@@ -285,6 +309,7 @@ async fn mcp_server_should_return_clients() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_handle_snapshot() {
     assert_response::<Snapshot>("snapshot", None, |snapshot| {
         assert!(!snapshot.0.is_empty());
@@ -293,6 +318,7 @@ async fn mcp_server_should_handle_snapshot() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_return_consumer_groups() {
     assert_response::<Vec<ConsumerGroup>>(
         "get_consumer_groups",
@@ -305,6 +331,7 @@ async fn mcp_server_should_return_consumer_groups() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_return_consumer_group_details() {
     assert_response::<ConsumerGroupDetails>("get_consumer_group", Some(json!({ "stream_id": STREAM_NAME, "topic_id": TOPIC_NAME, "group_id": CONSUMER_GROUP_NAME })), |group| {
         assert_eq!(group.name, CONSUMER_GROUP_NAME);
@@ -317,6 +344,7 @@ async fn mcp_server_should_return_consumer_group_details() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_create_consumer_group() {
     let name = "test";
     assert_response::<ConsumerGroupDetails>(
@@ -333,6 +361,7 @@ async fn mcp_server_should_create_consumer_group() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_delete_consumer_group() {
     assert_empty_response(
         "delete_consumer_group",
@@ -342,6 +371,7 @@ async fn mcp_server_should_delete_consumer_group() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_return_consumer_offset() {
     assert_response::<Option<ConsumerOffsetInfo>>(
         "get_consumer_offset",
@@ -358,6 +388,7 @@ async fn mcp_server_should_return_consumer_offset() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_store_consumer_offset() {
     assert_empty_response(
         "store_consumer_offset",
@@ -367,6 +398,7 @@ async fn mcp_server_should_store_consumer_offset() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_delete_consumer_offset() {
     assert_empty_response(
         "delete_consumer_offset",
@@ -376,6 +408,7 @@ async fn mcp_server_should_delete_consumer_offset() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_return_personal_access_tokens() {
     assert_response::<Vec<PersonalAccessTokenInfo>>("get_personal_access_tokens", None, |tokens| {
         assert_eq!(tokens.len(), 1);
@@ -385,6 +418,7 @@ async fn mcp_server_should_return_personal_access_tokens() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_create_personal_access_token() {
     let name = "test_token";
     let expiry = PersonalAccessTokenExpiry::NeverExpire.to_string();
@@ -399,6 +433,7 @@ async fn mcp_server_should_create_personal_access_token() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_delete_personal_access_token() {
     assert_empty_response(
         "delete_personal_access_token",
@@ -408,6 +443,7 @@ async fn mcp_server_should_delete_personal_access_token() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_return_users() {
     assert_response::<Vec<UserInfo>>("get_users", None, |users| {
         assert_eq!(users.len(), 2);
@@ -416,6 +452,7 @@ async fn mcp_server_should_return_users() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_return_user_details() {
     assert_response::<UserInfoDetails>("get_user", Some(json!({ "user_id": USER_NAME})), |user| {
         assert_eq!(user.username, USER_NAME);
@@ -424,6 +461,7 @@ async fn mcp_server_should_return_user_details() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_create_user() {
     let username = "test-mcp-user";
     assert_response::<UserInfoDetails>(
@@ -437,6 +475,7 @@ async fn mcp_server_should_create_user() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_update_user() {
     assert_empty_response(
         "update_user",
@@ -446,11 +485,13 @@ async fn mcp_server_should_update_user() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_delete_user() {
     assert_empty_response("delete_user", Some(json!({ "user_id": USER_NAME}))).await;
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_update_permissions() {
     let permissions = json!({
         "global": {
@@ -481,6 +522,7 @@ async fn mcp_server_should_update_permissions() {
 }
 
 #[tokio::test]
+#[parallel]
 async fn mcp_server_should_change_password() {
     assert_empty_response(
         "change_password",
@@ -525,7 +567,9 @@ async fn invoke_request<T: DeserializeOwned>(
 }
 
 async fn setup() -> McpInfra {
-    let mut test_server = TestServer::default();
+    let mut iggy_envs = HashMap::new();
+    iggy_envs.insert("IGGY_QUIC_ENABLED".to_owned(), "false".to_owned());
+    let mut test_server = TestServer::new(Some(iggy_envs), true, None, IpAddrKind::V4);
     test_server.start();
     let iggy_server_address = test_server
         .get_raw_tcp_addr()

@@ -4,13 +4,13 @@ The [Model Context Protocol](https://modelcontextprotocol.io) (MCP) is an open p
 
 To start the MCP server, simply run `cargo run --bin iggy-mcp`.
 
-The minimal viable configuration requires at least the Iggy credentials, to create the connection with the running Iggy server with which the MCP server will communicate. You can choose between HTTP and STDIO transports (e.g. for the local usage with tools such as [Claude Desktop](https://claude.ai/download) choose `stdio`).
+The minimal viable configuration requires at least the Iggy credentials, to create the connection with the running Iggy server using TCP with which the MCP server will communicate. You can choose between HTTP and STDIO transports (e.g. for the local usage with tools such as [Claude Desktop](https://claude.ai/download) choose `stdio`).
 
 ```toml
 transport = "stdio" # http or stdio are supported
 
 [iggy]
-address = "localhost:8090"
+address = "localhost:8090" # TCP address of the Iggy server
 username = "iggy"
 password = "iggy"
 # token = "secret" # Personal Access Token (PAT) can be used instead of username and password

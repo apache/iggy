@@ -167,10 +167,10 @@ impl TestMcpServer {
     pub async fn ensure_started(&self) {
         let http_api_address = self.get_http_api_address();
         let client = reqwest::Client::new();
-        let max_retries = 500;
+        let max_retries = 3000;
         let mut retries = 0;
         while let Err(error) = client.get(&http_api_address).send().await {
-            sleep(Duration::from_millis(10)).await;
+            sleep(Duration::from_millis(20)).await;
             retries += 1;
             if retries >= max_retries {
                 panic!(
