@@ -24,6 +24,7 @@ use crate::binary::mapper;
 use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
+use crate::shard_info;
 use crate::streaming::session::Session;
 use anyhow::Result;
 use error_set::ErrContext;
@@ -48,6 +49,7 @@ impl ServerCommandHandler for LoginUser {
         let LoginUser {
             username, password, ..
         } = self;
+        shard_info!(shard.id, "Logging in user: {} ...", &username);
         let user = shard
             .login_user(&username, &password, Some(session))
             .with_error_context(|error| {
@@ -56,6 +58,12 @@ impl ServerCommandHandler for LoginUser {
                     username
                 )
             })?;
+        shard_info!(
+            shard.id,
+            "Logged in user: {} with ID: {}.",
+            username,
+            user.id
+        );
         let event = ShardEvent::LoginUser {
             client_id: session.client_id,
             username,

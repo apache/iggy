@@ -26,7 +26,7 @@ use error_set::ErrContext;
 use std::path::Path;
 use tracing::{debug, error, info};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DiskArchiver {
     config: DiskArchiverConfig,
 }

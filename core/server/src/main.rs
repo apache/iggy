@@ -18,6 +18,7 @@
 
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -33,7 +34,7 @@ use server::archiver::{ArchiverKind, ArchiverKindType};
 use server::args::Args;
 use server::bootstrap::{
     create_directories, create_root_user, create_shard_connections, create_shard_executor,
-    load_config, resolve_persister,
+    load_config, resolve_persister, update_system_info,
 };
 use server::configs::config_provider::{self};
 use server::configs::server::ServerConfig;
@@ -45,21 +46,24 @@ use server::log::logger::Logging;
 use server::log::tokio_console::Logging;
 use server::server_error::{ConfigError, ServerError};
 use server::shard::IggyShard;
-use server::shard::gate::Barrier;
+use server::shard::system::info::SystemInfo;
 use server::state::StateKind;
 use server::state::command::EntryCommand;
 use server::state::file::FileState;
 use server::state::models::CreateUserWithId;
+use server::state::system::SystemState;
+use server::streaming::storage::SystemStorage;
 use server::streaming::utils::MemoryPool;
 use server::versioning::SemanticVersion;
-use server::{IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV, map_toggle_str};
+use server::{IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV, map_toggle_str, shard_info};
 use tokio::time::Instant;
 use tracing::{error, info, instrument};
 
 const COMPONENT: &str = "MAIN";
 
 #[instrument(skip_all, name = "trace_start_server")]
-fn main() -> Result<(), ServerError> {
+#[compio::main]
+async fn main() -> Result<(), ServerError> {
     let startup_timestamp = Instant::now();
     let standard_font = FIGfont::standard().unwrap();
     let figure = standard_font.convert("Iggy Server");
@@ -79,52 +83,133 @@ fn main() -> Result<(), ServerError> {
             path.display()
         );
     }
-
     let args = Args::parse();
+    // FIRST DISCRETE LOADING STEP.
     // TODO: I think we could get rid of config provider, since we support only TOML
     // as config provider.
     let config_provider = config_provider::resolve(&args.config_provider)?;
     // Load config and create directories.
     // Remove `local_data` directory if run with `--fresh` flag.
-    // TODO: Replace this once we use `monoio::main` macro.
-    let rt = create_shard_executor(Default::default());
-    let config = rt
-        .block_on(async {
-            let config = load_config(&config_provider)
-                .await
-                .with_error_context(|error| {
-                    format!("{COMPONENT} (error: {error}) - failed to load config during bootstrap")
-                })?;
-            if args.fresh {
-                let system_path = config.system.get_system_path();
-                if compio::fs::metadata(&system_path).await.is_ok() {
-                    println!(
-                        "Removing system path at: {} because `--fresh` flag was set",
-                        system_path
-                    );
-                    if let Err(e) = fs_utils::remove_dir_all(&system_path).await {
-                        eprintln!("Failed to remove system path at {}: {}", system_path, e);
-                    }
-                }
-            }
-
-            // Create directories.
-            create_directories(&config.system).await?;
-            Ok::<ServerConfig, ServerError>(config)
-        })
+    let config = load_config(&config_provider)
+        .await
         .with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to load config")
+            format!("{COMPONENT} (error: {error}) - failed to load config during bootstrap")
         })?;
+    if args.fresh {
+        let system_path = config.system.get_system_path();
+        if compio::fs::metadata(&system_path).await.is_ok() {
+            println!(
+                "Removing system path at: {} because `--fresh` flag was set",
+                system_path
+            );
+            if let Err(e) = fs_utils::remove_dir_all(&system_path).await {
+                eprintln!("Failed to remove system path at {}: {}", system_path, e);
+            }
+        }
+    }
+
+    // SECOND DISCRETE LOADING STEP.
+    // Create directories.
+    create_directories(&config.system).await?;
 
     // Initialize logging
+    // THIRD DISCRETE LOADING STEP.
     let mut logging = Logging::new(config.telemetry.clone());
     logging.early_init();
 
     // From this point on, we can use tracing macros to log messages.
     logging.late_init(config.system.get_system_path(), &config.system.logging)?;
 
-    let shards_set = config.system.sharding.cpu_allocation.to_shard_set();
+    // FOURTH DISCRETE LOADING STEP.
+    MemoryPool::init_pool(config.system.clone());
 
+    // SIXTH DISCRETE LOADING STEP.
+    let partition_persister = resolve_persister(config.system.partition.enforce_fsync);
+    let storage = SystemStorage::new(config.system.clone(), partition_persister);
+
+    // SEVENTH DISCRETE LOADING STEP.
+    let current_version = SemanticVersion::current().expect("Invalid version");
+    let mut system_info;
+    let load_system_info = storage.info.load().await;
+    match load_system_info {
+        Ok(info) => {
+            system_info = info;
+        }
+        Err(e) => {
+            if let IggyError::ResourceNotFound(_) = e {
+                info!("System info not found, creating...");
+                system_info = SystemInfo::default();
+                update_system_info(&storage, &mut system_info, &current_version).await?;
+            } else {
+                panic!("Failed to load system info from disk. {e}");
+            }
+        }
+    }
+    info!("Loaded {system_info}.");
+    let loaded_version = SemanticVersion::from_str(&system_info.version.version)?;
+    if current_version.is_equal_to(&loaded_version) {
+        info!("System version {current_version} is up to date.");
+    } else if current_version.is_greater_than(&loaded_version) {
+        info!(
+            "System version {current_version} is greater than {loaded_version}, checking the available migrations..."
+        );
+        update_system_info(&storage, &mut system_info, &current_version).await?;
+    } else {
+        info!(
+            "System version {current_version} is lower than {loaded_version}, possible downgrade."
+        );
+        update_system_info(&storage, &mut system_info, &current_version).await?;
+    }
+
+    // EIGHTH DISCRETE LOADING STEP.
+    info!(
+        "Server-side encryption is {}.",
+        map_toggle_str(config.system.encryption.enabled)
+    );
+    let encryptor: Option<EncryptorKind> = match config.system.encryption.enabled {
+        true => Some(EncryptorKind::Aes256Gcm(
+            Aes256GcmEncryptor::from_base64_key(&config.system.encryption.key).unwrap(),
+        )),
+        false => None,
+    };
+    // NINTH DISCRETE LOADING STEP.
+    let archiver_config = &config.data_maintenance.archiver;
+    let archiver: Option<ArchiverKind> = if archiver_config.enabled {
+        info!("Archiving is enabled, kind: {}", archiver_config.kind);
+        match archiver_config.kind {
+            ArchiverKindType::Disk => Some(ArchiverKind::get_disk_archiver(
+                archiver_config
+                    .disk
+                    .clone()
+                    .expect("Disk archiver config is missing"),
+            )),
+            ArchiverKindType::S3 => Some(
+                ArchiverKind::get_s3_archiver(
+                    archiver_config
+                        .s3
+                        .clone()
+                        .expect("S3 archiver config is missing"),
+                )
+                .expect("Failed to create S3 archiver"),
+            ),
+        }
+    } else {
+        info!("Archiving is disabled.");
+        None
+    };
+
+    // TENTH DISCRETE LOADING STEP.
+    let state_persister = resolve_persister(config.system.state.enforce_fsync);
+    let state = StateKind::File(FileState::new(
+        &config.system.get_state_messages_file_path(),
+        &current_version,
+        state_persister,
+        encryptor.clone(),
+    ));
+    let init_state = SystemState::load(state).await?;
+
+    // ELEVENTH DISCRETE LOADING STEP.
+    let shards_set = config.system.sharding.cpu_allocation.to_shard_set();
     match &config.system.sharding.cpu_allocation {
         CpuAllocation::All => {
             info!(
@@ -143,151 +228,51 @@ fn main() -> Result<(), ServerError> {
         }
     }
 
+    // TWELFTH DISCRETE LOADING STEP.
     info!("Starting {} shard(s)", shards_set.len());
     let (connections, shutdown_handles) = create_shard_connections(&shards_set);
-    let barrier = Arc::new(Barrier::new());
     let mut handles = Vec::with_capacity(shards_set.len());
 
     for shard_id in shards_set {
         let id = shard_id as u16;
-        let barrier = barrier.clone();
+        let storage = storage.clone();
         let connections = connections.clone();
         let config = config.clone();
+        let encryptor = encryptor.clone();
+        let archiver = archiver.clone();
+        let init_state = init_state.clone();
         let state_persister = resolve_persister(config.system.state.enforce_fsync);
+        let state = StateKind::File(FileState::new(
+            &config.system.get_state_messages_file_path(),
+            &current_version,
+            state_persister,
+            encryptor.clone(),
+        ));
 
         let handle = std::thread::Builder::new()
             .name(format!("shard-{id}"))
             .spawn(move || {
-                MemoryPool::init_pool(config.system.clone());
                 let affinity_set = HashSet::from([shard_id]);
                 let rt = create_shard_executor(affinity_set);
                 rt.block_on(async move {
-                    let version = SemanticVersion::current().expect("Invalid version");
-                    info!(
-                        "Server-side encryption is {}.",
-                        map_toggle_str(config.system.encryption.enabled)
-                    );
-                    let encryptor: Option<EncryptorKind> = match config.system.encryption.enabled {
-                        true => Some(EncryptorKind::Aes256Gcm(
-                            Aes256GcmEncryptor::from_base64_key(&config.system.encryption.key)
-                                .unwrap(),
-                        )),
-                        false => None,
-                    };
-                    let archiver_config = &config.data_maintenance.archiver;
-                    let archiver: Option<ArchiverKind> = if archiver_config.enabled {
-                        info!("Archiving is enabled, kind: {}", archiver_config.kind);
-                        match archiver_config.kind {
-                            ArchiverKindType::Disk => Some(ArchiverKind::get_disk_archiver(
-                                archiver_config
-                                    .disk
-                                    .clone()
-                                    .expect("Disk archiver config is missing"),
-                            )),
-                            ArchiverKindType::S3 => Some(
-                                ArchiverKind::get_s3_archiver(
-                                    archiver_config
-                                        .s3
-                                        .clone()
-                                        .expect("S3 archiver config is missing"),
-                                )
-                                .expect("Failed to create S3 archiver"),
-                            ),
-                        }
-                    } else {
-                        info!("Archiving is disabled.");
-                        None
-                    };
-
-                    let state = StateKind::File(FileState::new(
-                        &config.system.get_state_messages_file_path(),
-                        &version,
-                        state_persister,
-                        encryptor.clone(),
-                    ));
-
-                    // We can't use std::sync::Once because it doesn't support async.
-                    // Trait bound on the closure is FnOnce.
-                    // Peek into the state to check if the root user exists.
-                    // If it does not exist, create it.
-                    barrier.with_async::<Result<(), IggyError>>(async |barrier_state| {
-                        // A thread already initialized state
-                        // Thus, we can skip it.
-                        if let Some(_) = barrier_state.inner() {
-                            return Ok(());
-                        }
-
-                        let state_entries = state.load_entries().await.with_error_context(|error| {
-                            format!(
-                                "{COMPONENT} (error: {error}) - failed to load state entries"
-                            )
-                        })?;
-                        let root_exists = state_entries
-                            .into_iter()
-                            .find(|entry| {
-                                entry
-                                    .command()
-                                    .and_then(|command| match command {
-                                        EntryCommand::CreateUser(payload) if payload.user_id == DEFAULT_ROOT_USER_ID =>
-                                        {
-                                            Ok(true)
-                                        }
-                                        _ => Ok(false),
-                                    })
-                                    .map_or_else(
-                                        |err| {
-                                            error!("Failed to check if root user exists: {err}");
-                                            false
-                                        },
-                                        |v| v,
-                                    )
-                            })
-                            .is_some();
-
-                        if !root_exists {
-                            info!("No users found, creating the root user...");
-                            let root = create_root_user();
-                            let command = CreateUser {
-                                username: root.username.clone(),
-                                password: root.password.clone(),
-                                status: root.status,
-                                permissions: root.permissions.clone(),
-                            };
-                            state
-                                .apply(0, &EntryCommand::CreateUser(CreateUserWithId {
-                                    user_id: root.id,
-                                    command
-                                }))
-                                .await
-                                .with_error_context(|error| {
-                                    format!(
-                                        "{COMPONENT} (error: {error}) - failed to apply create user command, username: {}",
-                                        root.username
-                                    )
-                                })?;
-                        }
-
-                        barrier_state.set_result(());
-                        Ok(())
-                    })
-                    .await;
-
                     let builder = IggyShard::builder();
                     let shard: Rc<IggyShard> = builder
                         .id(id)
                         .connections(connections)
                         .config(config)
+                        .storage(storage)
                         .archiver(archiver)
                         .encryptor(encryptor)
-                        .version(version)
+                        .version(current_version)
                         .state(state)
+                        .init_state(init_state)
                         .build()
                         .into();
 
                     if let Err(e) = shard.run().await {
                         error!("Failed to run shard-{id}: {e}");
                     }
-                    info!("Shard {} run completed", id);
+                    shard_info!(shard.id, "Run completed");
                 })
             })
             .unwrap_or_else(|e| panic!("Failed to spawn thread for shard-{id}: {e}"));
@@ -314,9 +299,7 @@ fn main() -> Result<(), ServerError> {
 
     info!("Iggy server is running. Press Ctrl+C or send SIGTERM to shutdown.");
     for (idx, handle) in handles.into_iter().enumerate() {
-        info!("Waiting for shard thread {} to complete...", idx);
         handle.join().expect("Failed to join shard thread");
-        info!("Shard thread {} completed", idx);
     }
 
     info!("All shards have shut down. Iggy server is exiting.");

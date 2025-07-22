@@ -13,17 +13,22 @@ use crate::{
     configs::{config_provider::ConfigProviderKind, server::ServerConfig, system::SystemConfig},
     io::fs_utils,
     server_error::ServerError,
-    shard::transmission::{
-        connector::{ShardConnector, StopSender},
-        frame::ShardFrame,
+    shard::{
+        system::info::SystemInfo,
+        transmission::{
+            connector::{ShardConnector, StopSender},
+            frame::ShardFrame,
+        },
     },
     streaming::{
         persistence::persister::{FilePersister, FileWithSyncPersister, PersisterKind},
+        storage::SystemStorage,
         users::user::User,
         utils::file::overwrite,
     },
+    versioning::SemanticVersion,
 };
-use std::{collections::HashSet, env, path::Path, sync::Arc, time::Duration};
+use std::{collections::HashSet, env, path::Path, rc::Rc, sync::Arc, time::Duration};
 
 pub fn create_shard_connections(
     shards_set: &HashSet<usize>,
@@ -155,4 +160,14 @@ pub fn resolve_persister(enforce_fsync: bool) -> Arc<PersisterKind> {
         true => Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister)),
         false => Arc::new(PersisterKind::File(FilePersister)),
     }
+}
+
+pub async fn update_system_info(
+    storage: &SystemStorage,
+    system_info: &mut SystemInfo,
+    version: &SemanticVersion,
+) -> Result<(), IggyError> {
+    system_info.update_version(version);
+    storage.info.save(system_info).await?;
+    Ok(())
 }

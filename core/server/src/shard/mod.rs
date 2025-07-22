@@ -17,7 +17,7 @@
  */
 
 pub mod builder;
-pub mod gate;
+pub mod logging;
 pub mod namespace;
 pub mod system;
 pub mod task_registry;
@@ -67,6 +67,7 @@ use crate::{
             message::{ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult},
         },
     },
+    shard_error, shard_info, shard_warn,
     state::{
         StateKind,
         system::{StreamState, SystemState, UserState},
@@ -145,6 +146,8 @@ pub struct IggyShard {
     pub(crate) storage: Rc<SystemStorage>,
 
     pub(crate) state: StateKind,
+    // Temporal...
+    pub(crate) init_state: Option<SystemState>,
     pub(crate) encryptor: Option<EncryptorKind>,
     pub(crate) archiver: Option<Rc<ArchiverKind>>,
     pub(crate) config: ServerConfig,
@@ -197,6 +200,8 @@ impl IggyShard {
             streams_ids: Default::default(),
             storage,
             state,
+            //TODO: Fix
+            init_state: None,
             encryptor: None,
             archiver: None,
             config: server_config,
@@ -225,12 +230,10 @@ impl IggyShard {
     }
 
     pub async fn init(&self) -> Result<(), IggyError> {
-        let now = Instant::now();
-
-        self.load_version().await?;
-        let SystemState { users, streams } = self.load_state().await?;
-        let _ = self.load_users(users.into_values().collect()).await;
-        let _ = self.load_streams(streams.into_values().collect()).await;
+        let system_state = self.init_state.as_ref().unwrap();
+        let SystemState { users, streams } = system_state;
+        let _ = self.load_users(users.values().cloned().collect()).await;
+        let _ = self.load_streams(streams.values().cloned().collect()).await;
 
         if let Some(archiver) = self.archiver.as_ref() {
             archiver
@@ -238,7 +241,6 @@ impl IggyShard {
                 .await
                 .expect("Failed to initialize archiver");
         }
-        info!("Initialized system in {} ms.", now.elapsed().as_millis());
         Ok(())
     }
 
@@ -246,11 +248,12 @@ impl IggyShard {
         // Workaround to ensure that the statistics are initialized before the server
         // loads streams and starts accepting connections. This is necessary to
         // have the correct statistics when the server starts.
+        let now = Instant::now();
         //self.get_stats().await?;
+        shard_info!(self.id, "Starting...");
         self.init().await?;
         // TODO: Fixme
         //self.assert_init();
-        info!("Initiated shard with ID: {}", self.id);
 
         // Create all tasks (tcp listener, http listener, command processor, in the future also the background jobs).
         let mut tasks: Vec<Task> = vec![Box::pin(spawn_shard_message_task(self.clone()))];
@@ -269,82 +272,22 @@ impl IggyShard {
 
             let shutdown_success = shard_for_shutdown.trigger_shutdown().await;
             if !shutdown_success {
-                error!("Shard {} shutdown timed out", shard_for_shutdown.id);
+                shard_error!(shard_for_shutdown.id, "shutdown timed out");
             } else {
-                info!(
-                    "Shard {} shutdown completed successfully",
-                    shard_for_shutdown.id
-                );
+                shard_info!(shard_for_shutdown.id, "shutdown completed successfully");
             }
         });
         */
 
+        let elapsed = now.elapsed();
+        shard_info!(self.id, "Initialized in {} ms.", elapsed.as_millis());
         let result = try_join_all(tasks).await;
         result?;
-
         Ok(())
-    }
-
-    async fn load_version(&self) -> Result<(), IggyError> {
-        async fn update_system_info(
-            storage: &Rc<SystemStorage>,
-            system_info: &mut SystemInfo,
-            version: &SemanticVersion,
-        ) -> Result<(), IggyError> {
-            system_info.update_version(version);
-            storage.info.save(system_info).await?;
-            Ok(())
-        }
-
-        let current_version = &self.version;
-        let mut system_info;
-        let load_system_info = self.storage.info.load().await;
-        if load_system_info.is_err() {
-            let error = load_system_info.err().unwrap();
-            if let IggyError::ResourceNotFound(_) = error {
-                info!("System info not found, creating...");
-                system_info = SystemInfo::default();
-                update_system_info(&self.storage, &mut system_info, current_version).await?;
-            } else {
-                return Err(error);
-            }
-        } else {
-            system_info = load_system_info.unwrap();
-        }
-
-        info!("Loaded {system_info}.");
-        let loaded_version = SemanticVersion::from_str(&system_info.version.version)?;
-        if current_version.is_equal_to(&loaded_version) {
-            info!("System version {current_version} is up to date.");
-        } else if current_version.is_greater_than(&loaded_version) {
-            info!(
-                "System version {current_version} is greater than {loaded_version}, checking the available migrations..."
-            );
-            update_system_info(&self.storage, &mut system_info, current_version).await?;
-        } else {
-            info!(
-                "System version {current_version} is lower than {loaded_version}, possible downgrade."
-            );
-            update_system_info(&self.storage, &mut system_info, current_version).await?;
-        }
-
-        Ok(())
-    }
-
-    async fn load_state(&self) -> Result<SystemState, IggyError> {
-        let state_entries = self.state.init().await.with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to initialize state entries")
-        })?;
-        let system_state = SystemState::init(state_entries)
-            .await
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to initialize system state")
-            })?;
-        Ok(system_state)
     }
 
     async fn load_users(&self, users: Vec<UserState>) -> Result<(), IggyError> {
-        info!("Loading users...");
+        shard_info!(self.id, "Loading users...");
         for user_state in users.into_iter() {
             let mut user = User::with_password(
                 user_state.id,
@@ -381,17 +324,17 @@ impl IggyShard {
             .borrow_mut()
             .init(&users.values().collect::<Vec<_>>());
         self.metrics.increment_users(users_count as u32);
-        info!("Initialized {users_count} user(s).");
+        shard_info!(self.id, "Initialized {} user(s).", users_count);
         Ok(())
     }
 
     async fn load_streams(&self, streams: Vec<StreamState>) -> Result<(), IggyError> {
-        info!("Loading streams from disk...");
+        shard_info!(self.id, "Loading streams from disk...");
         let mut unloaded_streams = Vec::new();
-        // Does mononio has api for that ?
+        // Does compio have api for that ?
         let mut dir_entries =
             std::fs::read_dir(&self.config.system.get_streams_path()).map_err(|error| {
-                error!("Cannot read streams directory: {error}");
+                shard_error!(self.id, "Cannot read streams directory: {error}");
                 IggyError::CannotReadStreams
             })?;
 
@@ -400,18 +343,19 @@ impl IggyShard {
             let dir_entry = dir_entry.unwrap();
             let name = dir_entry.file_name().into_string().unwrap();
             let stream_id = name.parse::<u32>().map_err(|_| {
-                error!("Invalid stream ID file with name: '{name}'.");
+                shard_error!(self.id, "Invalid stream ID file with name: '{name}'.");
                 IggyError::InvalidNumberValue
             })?;
             let stream_state = streams.iter().find(|s| s.id == stream_id);
             if stream_state.is_none() {
-                error!(
+                shard_error!(
+                    self.id,
                     "Stream with ID: '{stream_id}' was not found in state, but exists on disk and will be removed."
                 );
                 if let Err(error) = fs_utils::remove_dir_all(&dir_entry.path()).await {
-                    error!("Cannot remove stream directory: {error}");
+                    shard_error!(self.id, "Cannot remove stream directory: {error}");
                 } else {
-                    warn!("Stream with ID: '{stream_id}' was removed.");
+                    shard_warn!(self.id, "Stream with ID: '{stream_id}' was removed.");
                 }
                 continue;
             }
@@ -440,11 +384,12 @@ impl IggyShard {
             .copied()
             .collect::<AHashSet<u32>>();
         if missing_ids.is_empty() {
-            info!("All streams found on disk were found in state.");
+            shard_info!(self.id, "All streams found on disk were found in state.");
         } else {
             warn!("Streams with IDs: '{missing_ids:?}' were not found on disk.");
             if self.config.system.recovery.recreate_missing_state {
-                info!(
+                shard_info!(
+                    self.id,
                     "Recreating missing state in recovery config is enabled, missing streams will be created."
                 );
                 for stream_id in missing_ids.iter() {
@@ -465,7 +410,8 @@ impl IggyShard {
                 }
                 missing_ids.clear();
             } else {
-                warn!(
+                shard_warn!(
+                    self.id,
                     "Recreating missing state in recovery config is disabled, missing streams will not be created."
                 );
             }
@@ -491,12 +437,20 @@ impl IggyShard {
 
         for stream in loaded_streams.take() {
             if self.streams.borrow().contains_key(&stream.stream_id) {
-                error!("Stream with ID: '{}' already exists.", &stream.stream_id);
+                shard_error!(
+                    self.id,
+                    "Stream with ID: '{}' already exists.",
+                    &stream.stream_id
+                );
                 continue;
             }
 
             if self.streams_ids.borrow().contains_key(&stream.name) {
-                error!("Stream with name: '{}' already exists.", &stream.name);
+                shard_error!(
+                    self.id,
+                    "Stream with name: '{}' already exists.",
+                    &stream.name
+                );
                 continue;
             }
 
@@ -513,7 +467,8 @@ impl IggyShard {
             self.streams.borrow_mut().insert(stream.stream_id, stream);
         }
 
-        info!(
+        shard_info!(
+            self.id,
             "Loaded {} stream(s) from disk.",
             self.streams.borrow().len()
         );

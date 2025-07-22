@@ -17,6 +17,7 @@
  */
 
 use crate::shard::IggyShard;
+use crate::shard_info;
 use crate::tcp::{tcp_listener, tcp_socket, tcp_tls_listener};
 use iggy_common::IggyError;
 use std::net::SocketAddr;
@@ -39,7 +40,7 @@ pub async fn spawn_tcp_server(shard: Rc<IggyShard>) -> Result<(), IggyError> {
         .parse()
         .expect("Failed to parse TCP address");
     let socket = tcp_socket::build(ip_v6, socket_config);
-    info!("Initializing {server_name} server...");
+    shard_info!(shard.id, "Initializing {} server...", server_name);
 
     match shard.config.tcp.tls.enabled {
         true => tcp_tls_listener::start(server_name, addr, socket, shard.clone()).await?,

@@ -22,6 +22,7 @@ use crate::binary::{handlers::streams::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
 use crate::shard::namespace::IggyNamespace;
 use crate::shard::transmission::event::ShardEvent;
+use crate::shard_info;
 use crate::state::command::EntryCommand;
 use crate::streaming::partitions::partition;
 use crate::streaming::session::Session;
@@ -55,6 +56,12 @@ impl ServerCommandHandler for DeleteStream {
                 .with_error_context(|error| {
                     format!("{COMPONENT} (error: {error}) - failed to delete stream with ID: {stream_id}, session: {session}")
                 })?;
+        shard_info!(
+            shard.id,
+            "Deleted stream with name: {}, ID: {}",
+            stream.name,
+            stream.stream_id
+        );
         // First we have to go over all of the partitions inside of topics
         // and make sure that they are deleted.
         for topic in stream.get_topics() {

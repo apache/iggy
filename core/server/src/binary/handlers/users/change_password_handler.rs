@@ -24,6 +24,7 @@ use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use crate::streaming::utils::crypto;
+use crate::{shard_debug, shard_info};
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
@@ -46,6 +47,11 @@ impl ServerCommandHandler for ChangePassword {
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
+        shard_info!(
+            shard.id,
+            "Changing password for user with ID: {}...",
+            self.user_id
+        );
         shard
                 .change_password(
                     session,
@@ -59,6 +65,12 @@ impl ServerCommandHandler for ChangePassword {
                         self.user_id
                     )
                 })?;
+
+        shard_info!(
+            shard.id,
+            "Changed password for user with ID: {}.",
+            self.user_id
+        );
 
         let event = ShardEvent::ChangedPassword {
             user_id: self.user_id.clone(),

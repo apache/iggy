@@ -18,6 +18,7 @@
 
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
+use crate::{shard_debug, shard_info};
 use std::rc::Rc;
 
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
@@ -47,8 +48,9 @@ impl ServerCommandHandler for CreateUser {
         session: &Rc<Session>,
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
-        debug!("session: {session}, command: {self}");
+        shard_debug!(shard.id, "session: {session}, command: {self}");
 
+        shard_info!(shard.id, "Creating user: {}", self.username);
         let user = shard
                 .create_user(
                     session,
@@ -59,10 +61,16 @@ impl ServerCommandHandler for CreateUser {
                 )
                 .with_error_context(|error| {
                     format!(
-                        "{COMPONENT} (error: {error}) - failed to create user with name: {}, session: {session}",
-                        self.username
+                        "{COMPONENT} (error: {error}) - failed to create user with name: {}, session: {}",
+                        self.username, session
                     )
                 })?;
+        shard_info!(
+            shard.id,
+            "Created user: {} with ID: {}.",
+            user.username,
+            user.id
+        );
         let event = ShardEvent::CreatedUser {
             username: self.username.to_owned(),
             password: self.password.to_owned(),

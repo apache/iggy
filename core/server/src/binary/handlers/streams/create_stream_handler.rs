@@ -22,6 +22,7 @@ use crate::binary::mapper;
 use crate::binary::{handlers::streams::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
+use crate::shard_info;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateStreamWithId;
 use crate::streaming::session::Session;
@@ -56,6 +57,12 @@ impl ServerCommandHandler for CreateStream {
                         "{COMPONENT} (error: {error}) - failed to create stream with id: {stream_id:?}, session: {session}"
                     )
                 })?;
+        shard_info!(
+            shard.id,
+            "Created stream with ID: {}, name: '{}'.",
+            created_stream_id,
+            name
+        );
         let event = ShardEvent::CreatedStream { stream_id, name };
         // Broadcast the event to all shards.
         let _responses = shard.broadcast_event_to_all_shards(event.into()).await;

@@ -23,9 +23,11 @@ use crate::binary::{handlers::topics::COMPONENT, sender::SenderKind};
 use crate::shard::namespace::IggyNamespace;
 use crate::shard::transmission::event::ShardEvent;
 use crate::shard::{IggyShard, ShardInfo};
+use crate::shard_info;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateTopicWithId;
 use crate::streaming::session::Session;
+use crate::streaming::topics::topic::Topic;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
@@ -65,6 +67,16 @@ impl ServerCommandHandler for CreateTopic {
                 .await
                 .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to create topic for stream_id: {stream_id}, topic_id: {maybe_topic_id:?}"
                 ))?;
+
+        let message_expiry = Topic::get_message_expiry(self.message_expiry, &shard.config.system);
+        shard_info!(
+            shard.id,
+            "Received message expiry: {}, set expiry: {}",
+            self.message_expiry,
+            message_expiry
+        );
+        shard_info!(shard.id, "Created topic with ID: {}", topic_id);
+
         // `create_topic` always returns numeric identifier.
         let numeric_topic_id = topic_id.get_u32_value().unwrap();
         let numeric_stream_id = shard.get_stream(&stream_id).map(|s| s.stream_id).unwrap();

@@ -21,7 +21,7 @@ use iggy_common::IggyError;
 use std::fmt::Display;
 use std::str::FromStr;
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub struct SemanticVersion {
     pub major: u32,
     pub minor: u32,

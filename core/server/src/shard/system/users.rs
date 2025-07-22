@@ -203,13 +203,11 @@ impl IggyShard {
         }
 
         let user_id = USER_ID.fetch_add(1, Ordering::SeqCst);
-        info!("Creating user: {username} with ID: {user_id}...");
         let user = User::new(user_id, username, password, status, permissions.clone());
         self.permissioner
             .borrow_mut()
             .init_permissions_for_user(user_id, permissions);
         self.users.borrow_mut().insert(user.id, user);
-        info!("Created user: {username} with ID: {user_id}.");
         self.metrics.increment_users(1);
         Ok(user_id)
     }
@@ -249,7 +247,6 @@ impl IggyShard {
             existing_username = user.username.clone();
         }
 
-        info!("Deleting user: {existing_username} with ID: {user_id}...");
         let user = self
             .users
             .borrow_mut()
@@ -265,7 +262,6 @@ impl IggyShard {
                     "{COMPONENT} (error: {error}) - failed to delete clients for user with ID: {existing_user_id}"
                 )
             })?;
-        info!("Deleted user: {existing_username} with ID: {user_id}.");
         self.metrics.decrement_users(1);
         Ok(user)
     }
@@ -328,10 +324,6 @@ impl IggyShard {
         let cloned_user = user.clone();
         drop(user);
 
-        info!(
-            "Updated user: {} with ID: {}.",
-            cloned_user.username, cloned_user.id
-        );
         Ok(cloned_user)
     }
 
@@ -394,10 +386,6 @@ impl IggyShard {
                 )
             })?;
             user.permissions = permissions;
-            info!(
-                "Updated permissions for user: {} with ID: {user_id}.",
-                user.username
-            );
         }
 
         Ok(())
@@ -454,10 +442,6 @@ impl IggyShard {
         }
 
         user.password = crypto::hash_password(new_password);
-        info!(
-            "Changed password for user: {} with ID: {user_id}.",
-            user.username
-        );
         Ok(())
     }
 
@@ -499,7 +483,6 @@ impl IggyShard {
             }
         };
 
-        info!("Logging in user: {username} with ID: {}...", user.id);
         if !user.is_active() {
             warn!("User: {username} with ID: {} is inactive.", user.id);
             return Err(IggyError::UserInactive);
@@ -515,7 +498,6 @@ impl IggyShard {
             }
         }
 
-        info!("Logged in user: {username} with ID: {}.", user.id);
         if session.is_none() {
             return Ok(user);
         }
@@ -560,16 +542,10 @@ impl IggyShard {
                     user_id,
                 )
             })?;
-        info!(
-            "Logging out user: {} with ID: {}...",
-            user.username, user.id
-        );
         if client_id > 0 {
             let mut client_manager = self.client_manager.borrow_mut();
             client_manager.clear_user_id(client_id)?;
-            info!("Cleared user ID: {} for client: {}.", user.id, client_id);
         }
-        info!("Logged out user: {} with ID: {}.", user.username, user.id);
         Ok(())
     }
 }

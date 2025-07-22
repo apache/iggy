@@ -22,19 +22,20 @@ use crate::streaming::topics::topic::Topic;
 use ahash::AHashMap;
 use iggy_common::IggyByteSize;
 use iggy_common::IggyTimestamp;
+use std::cell::Cell;
 use std::fmt::Display;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Stream {
     pub stream_id: u32,
     pub name: String,
     pub path: String,
     pub topics_path: String,
     pub created_at: IggyTimestamp,
-    pub current_topic_id: AtomicU32,
+    pub current_topic_id: Arc<AtomicU32>,
     pub size_bytes: Arc<AtomicU64>,
     pub messages_count: Arc<AtomicU64>,
     pub segments_count: Arc<AtomicU32>,
@@ -69,7 +70,7 @@ impl Stream {
             path,
             topics_path,
             config,
-            current_topic_id: AtomicU32::new(1),
+            current_topic_id: Arc::new(AtomicU32::new(1)),
             size_bytes: Arc::new(AtomicU64::new(0)),
             messages_count: Arc::new(AtomicU64::new(0)),
             segments_count: Arc::new(AtomicU32::new(0)),

@@ -27,7 +27,7 @@ use crate::{
     configs::server::ServerConfig,
     map_toggle_str,
     shard::{Shard, task_registry::TaskRegistry},
-    state::{StateKind, file::FileState},
+    state::{StateKind, system::SystemState},
     streaming::{diagnostics::metrics::Metrics, storage::SystemStorage},
     versioning::SemanticVersion,
 };
@@ -41,8 +41,10 @@ pub struct IggyShardBuilder {
     config: Option<ServerConfig>,
     encryptor: Option<EncryptorKind>,
     version: Option<SemanticVersion>,
+    storage: Option<SystemStorage>,
     archiver: Option<ArchiverKind>,
     state: Option<StateKind>,
+    init_state: Option<SystemState>,
 }
 
 impl IggyShardBuilder {
@@ -76,8 +78,17 @@ impl IggyShardBuilder {
         self
     }
 
+    pub fn init_state(mut self, init_state: SystemState) -> Self {
+        self.init_state = Some(init_state);
+        self
+    }
+
     pub fn archiver(mut self, archiver: Option<ArchiverKind>) -> Self {
         self.archiver = archiver;
+        self
+    }
+    pub fn storage(mut self, storage: SystemStorage) -> Self {
+        self.storage = Some(storage);
         self
     }
 
@@ -86,7 +97,9 @@ impl IggyShardBuilder {
         let id = self.id.unwrap();
         let config = self.config.unwrap();
         let connections = self.connections.unwrap();
+        let storage = self.storage.unwrap();
         let state = self.state.unwrap();
+        let init_state = self.init_state;
         let encryptor = self.encryptor;
         let version = self.version.unwrap();
         let (stop_sender, stop_receiver, frame_receiver) = connections
@@ -102,14 +115,8 @@ impl IggyShardBuilder {
             .next()
             .expect("Failed to find connection with the specified ID");
         let shards = connections.into_iter().map(Shard::new).collect();
-        //TODO: Eghhhh.......
-        let partition_persister = resolve_persister(config.system.partition.enforce_fsync);
-        let storage = Rc::new(SystemStorage::new(
-            config.system.clone(),
-            partition_persister,
-        ));
         let archiver = self.archiver.map(Rc::new);
-
+        let storage = Rc::new(storage);
         IggyShard {
             id: id,
             shards: shards,
@@ -118,6 +125,7 @@ impl IggyShardBuilder {
             encryptor: encryptor,
             archiver: archiver,
             state: state,
+            init_state: init_state,
             config: config,
             version: version,
             stop_receiver: stop_receiver,

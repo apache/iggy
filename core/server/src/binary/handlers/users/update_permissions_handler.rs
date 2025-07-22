@@ -23,6 +23,7 @@ use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
+use crate::shard_info;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use anyhow::Result;
@@ -51,6 +52,11 @@ impl ServerCommandHandler for UpdatePermissions {
                 .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to update permissions for user_id: {}, session: {session}",
                     self.user_id
                 ))?;
+        shard_info!(
+            shard.id,
+            "Updated permissions for user with ID: {}.",
+            self.user_id
+        );
         let event = ShardEvent::UpdatedPermissions {
             user_id: self.user_id.clone(),
             permissions: self.permissions.clone(),

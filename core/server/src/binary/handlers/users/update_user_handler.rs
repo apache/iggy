@@ -23,6 +23,7 @@ use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
+use crate::shard_info;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use anyhow::Result;
@@ -46,7 +47,7 @@ impl ServerCommandHandler for UpdateUser {
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
-        shard
+        let user =shard
                 .update_user(
                     session,
                     &self.user_id,
@@ -59,6 +60,13 @@ impl ServerCommandHandler for UpdateUser {
                         self.user_id
                     )
                 })?;
+
+        shard_info!(
+            shard.id,
+            "Updated user: {} with ID: {}.",
+            user.username,
+            user.id
+        );
 
         let event = ShardEvent::UpdatedUser {
             user_id: self.user_id.clone(),

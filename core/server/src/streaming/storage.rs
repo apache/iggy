@@ -134,7 +134,7 @@ pub trait PartitionStorage {
     fn delete_consumer_offset(&self, path: &str) -> impl Future<Output = Result<(), IggyError>>;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SystemStorage {
     pub info: Arc<SystemInfoStorageKind>,
     pub stream: Arc<StreamStorageKind>,

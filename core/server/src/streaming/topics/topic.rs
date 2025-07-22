@@ -28,7 +28,7 @@ use iggy_common::{
     CompressionAlgorithm, Consumer, ConsumerKind, IggyByteSize, IggyError, IggyExpiry,
     IggyTimestamp, MaxTopicSize, Sizeable,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use std::sync::Arc;
@@ -37,7 +37,7 @@ use tracing::info;
 
 const ALMOST_FULL_THRESHOLD: f64 = 0.9;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Topic {
     pub stream_id: u32,
     pub topic_id: u32,
@@ -54,8 +54,8 @@ pub struct Topic {
     pub(crate) storage: Rc<SystemStorage>,
     pub(crate) consumer_groups: RefCell<AHashMap<u32, ConsumerGroup>>,
     pub(crate) consumer_groups_ids: AHashMap<String, u32>,
-    pub(crate) current_consumer_group_id: AtomicU32,
-    pub(crate) current_partition_id: AtomicU32,
+    pub(crate) current_consumer_group_id: Arc<AtomicU32>,
+    pub(crate) current_partition_id: Arc<AtomicU32>,
     pub message_expiry: IggyExpiry,
     pub compression_algorithm: CompressionAlgorithm,
     pub max_topic_size: MaxTopicSize,
@@ -131,8 +131,8 @@ impl Topic {
             segments_count_of_parent_stream,
             consumer_groups: RefCell::new(AHashMap::new()),
             consumer_groups_ids: AHashMap::new(),
-            current_consumer_group_id: AtomicU32::new(1),
-            current_partition_id: AtomicU32::new(1),
+            current_consumer_group_id: Arc::new(AtomicU32::new(1)),
+            current_partition_id: Arc::new(AtomicU32::new(1)),
             message_expiry: Topic::get_message_expiry(message_expiry, &config),
             max_topic_size: Topic::get_max_topic_size(max_topic_size, &config)?,
             compression_algorithm,
@@ -140,11 +140,6 @@ impl Topic {
             config,
             created_at: IggyTimestamp::now(),
         };
-
-        info!(
-            "Received message expiry: {}, set expiry: {}",
-            message_expiry, topic.message_expiry
-        );
 
         let partition_ids = topic.add_partitions(partitions_count)?;
         Ok(CreatedTopicInfo {

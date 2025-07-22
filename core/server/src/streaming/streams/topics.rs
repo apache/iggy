@@ -94,7 +94,6 @@ impl Stream {
             replication_factor,
         )?;
 
-        info!("Created topic {}", topic);
         self.topics_ids.insert(name.to_owned(), id);
         self.topics.insert(id, topic);
         Ok((Identifier::numeric(id).unwrap(), partition_ids))

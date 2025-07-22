@@ -16,7 +16,9 @@
  * under the License.
  */
 
-use crate::state::{COMPONENT, EntryCommand, StateEntry};
+use crate::bootstrap::create_root_user;
+use crate::state::models::CreateUserWithId;
+use crate::state::{COMPONENT, EntryCommand, StateEntry, StateKind};
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use ahash::AHashMap;
 use error_set::ErrContext;
@@ -25,17 +27,19 @@ use iggy_common::IggyError;
 use iggy_common::IggyExpiry;
 use iggy_common::IggyTimestamp;
 use iggy_common::MaxTopicSize;
+use iggy_common::create_user::CreateUser;
+use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::{IdKind, Identifier, Permissions, UserStatus};
 use std::fmt::Display;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SystemState {
     pub streams: AHashMap<u32, StreamState>,
     pub users: AHashMap<u32, UserState>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StreamState {
     pub id: u32,
     pub name: String,
@@ -43,7 +47,7 @@ pub struct StreamState {
     pub topics: AHashMap<u32, TopicState>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TopicState {
     pub id: u32,
     pub name: String,
@@ -56,20 +60,20 @@ pub struct TopicState {
     pub created_at: IggyTimestamp,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PartitionState {
     pub id: u32,
     pub created_at: IggyTimestamp,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PersonalAccessTokenState {
     pub name: String,
     pub token_hash: String,
     pub expiry_at: Option<IggyTimestamp>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UserState {
     pub id: u32,
     pub username: String,
@@ -80,13 +84,76 @@ pub struct UserState {
     pub personal_access_tokens: AHashMap<String, PersonalAccessTokenState>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ConsumerGroupState {
     pub id: u32,
     pub name: String,
 }
 
 impl SystemState {
+    pub async fn load(state: StateKind) -> Result<Self, IggyError> {
+        let mut state_entries = state.init().await.with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to initialize state entries")
+        })?;
+
+        // Create root user if does not exist.
+        let root_exists = state_entries
+            .iter()
+            .find(|entry| {
+                entry
+                    .command()
+                    .and_then(|command| match command {
+                        EntryCommand::CreateUser(payload)
+                            if payload.user_id == DEFAULT_ROOT_USER_ID =>
+                        {
+                            Ok(true)
+                        }
+                        _ => Ok(false),
+                    })
+                    .map_or_else(
+                        |err| {
+                            error!("Failed to check if root user exists: {err}");
+                            false
+                        },
+                        |v| v,
+                    )
+            })
+            .is_some();
+
+        if !root_exists {
+            info!("No users found, creating the root user...");
+            let root = create_root_user();
+            let command = CreateUser {
+                username: root.username.clone(),
+                password: root.password.clone(),
+                status: root.status,
+                permissions: root.permissions.clone(),
+            };
+            state
+                .apply(0, &EntryCommand::CreateUser(CreateUserWithId {
+                    user_id: root.id,
+                    command
+                }))
+                .await
+                .with_error_context(|error| {
+                    format!(
+                        "{COMPONENT} (error: {error}) - failed to apply create user command, username: {}",
+                        root.username
+                    )
+                })?;
+            state_entries = state.init().await.with_error_context(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to initialize state entries")
+            })?;
+        }
+
+        let system_state = Self::init(state_entries)
+            .await
+            .with_error_context(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to initialize system state")
+            })?;
+        Ok(system_state)
+    }
+
     pub async fn init(entries: Vec<StateEntry>) -> Result<Self, IggyError> {
         let mut streams = AHashMap::new();
         let mut users = AHashMap::new();

@@ -72,7 +72,7 @@ pub trait Archiver {
     ) -> impl Future<Output = Result<(), ArchiverError>>;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)] // TODO(hubcio): consider `Box`ing
 pub enum ArchiverKind {
     Disk(DiskArchiver),

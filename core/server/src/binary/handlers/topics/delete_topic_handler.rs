@@ -22,6 +22,7 @@ use crate::binary::{handlers::topics::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
 use crate::shard::namespace::IggyNamespace;
 use crate::shard::transmission::event::ShardEvent;
+use crate::shard_info;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use anyhow::Result;
@@ -54,6 +55,13 @@ impl ServerCommandHandler for DeleteTopic {
                     "{COMPONENT} (error: {error}) - failed to delete topic with ID: {} in stream with ID: {}, session: {session}",
                     &self.topic_id, &self.stream_id
                 ))?;
+        shard_info!(
+            shard.id,
+            "Deleted topic with name: {}, ID: {} in stream with ID: {}",
+            topic.name,
+            topic.topic_id,
+            topic.stream_id
+        );
         let numeric_topic_id = topic.topic_id;
         let numeric_stream_id = topic.stream_id;
         let partitions = topic.get_partitions();

@@ -32,7 +32,6 @@ impl IggyShard {
     pub fn add_client(&self, address: &SocketAddr, transport: Transport) -> Rc<Session> {
         let mut client_manager = self.client_manager.borrow_mut();
         let session = client_manager.add_client(address, transport);
-        info!("Added {transport} client with session: {session} for IP address: {address}");
         self.metrics.increment_clients(1);
         session
     }

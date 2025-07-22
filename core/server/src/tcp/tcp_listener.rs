@@ -22,6 +22,7 @@ use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
 use crate::streaming::clients::client_manager::Transport;
 use crate::tcp::connection_handler::{handle_connection, handle_error};
+use crate::{shard_error, shard_info};
 use compio::net::{TcpListener, TcpOpts};
 use error_set::ErrContext;
 use futures::FutureExt;
@@ -70,11 +71,11 @@ pub async fn start(
     shard: Rc<IggyShard>,
 ) -> Result<(), IggyError> {
     if shard.id != 0 && addr.port() == 0 {
-        info!("Shard {} waiting for TCP address from shard 0...", shard.id);
+        shard_info!(shard.id, "Waiting for TCP address from shard 0...");
         loop {
             if let Some(bound_addr) = shard.tcp_bound_address.get() {
                 addr = bound_addr;
-                info!("Shard {} received TCP address: {}", shard.id, addr);
+                shard_info!(shard.id, "Received TCP address: {}", addr);
                 break;
             }
             compio::time::sleep(Duration::from_millis(10)).await;
@@ -88,10 +89,15 @@ pub async fn start(
             format!("Failed to bind {server_name} server to address: {addr}, {err}")
         })?;
     let actual_addr = listener.local_addr().map_err(|e| {
-        error!("Failed to get local address: {e}");
+        shard_error!(shard.id, "Failed to get local address: {e}");
         IggyError::CannotBindToSocket(addr.to_string())
     })?;
-    info!("{server_name} server has started on: {:?}", actual_addr);
+    shard_info!(
+        shard.id,
+        "{} server has started on: {:?}",
+        server_name,
+        actual_addr
+    );
 
     if shard.id == 0 {
         if addr.port() == 0 {
@@ -111,10 +117,16 @@ pub async fn start(
 
         let buf_result = compio::fs::write(&current_config_path, current_config_content).await;
         match buf_result.0 {
-            Ok(_) => info!("Current config written to: {}", current_config_path),
-            Err(e) => error!(
+            Ok(_) => shard_info!(
+                shard.id,
+                "Current config written to: {}",
+                current_config_path
+            ),
+            Err(e) => shard_error!(
+                shard.id,
                 "Failed to write current config to {}: {}",
-                current_config_path, e
+                current_config_path,
+                e
             ),
         }
     }
@@ -128,6 +140,7 @@ async fn accept_loop(
     shard: Rc<IggyShard>,
 ) -> Result<(), IggyError> {
     loop {
+        let shard = shard.clone();
         let shutdown_check = async {
             loop {
                 if shard.is_shutting_down() {
@@ -140,20 +153,21 @@ async fn accept_loop(
         let accept_future = listener.accept();
         futures::select! {
             _ = shutdown_check.fuse() => {
-                info!("{server_name} detected shutdown flag, no longer accepting connections");
+                shard_info!(shard.id, "{} detected shutdown flag, no longer accepting connections", server_name);
                 break;
             }
             result = accept_future.fuse() => {
                 match result {
                     Ok((stream, address)) => {
                         if shard.is_shutting_down() {
-                            info!("Rejecting new connection from {} during shutdown", address);
+                            shard_info!(shard.id, "Rejecting new connection from {} during shutdown", address);
                             continue;
                         }
                         let shard_clone = shard.clone();
-                        info!("Accepted new TCP connection: {address}");
+                        shard_info!(shard.id, "Accepted new TCP connection: {}", address);
                         let transport = Transport::Tcp;
                         let session = shard_clone.add_client(&address, transport);
+                        shard_info!(shard.id, "Added {} client with session: {} for IP address: {}", transport, session, address);
                         //TODO: Those can be shared with other shards.
                         shard_clone.add_active_session(session.clone());
                         // Broadcast session to all shards.
@@ -162,7 +176,7 @@ async fn accept_loop(
                         let _responses = shard_clone.broadcast_event_to_all_shards(event.into()).await;
 
                         let client_id = session.client_id;
-                        info!("Created new session: {session}");
+                        shard_info!(shard.id, "Created new session: {}", session);
                         let mut sender = SenderKind::get_tcp_sender(stream);
 
                         let conn_stop_receiver = shard_clone.task_registry.add_connection(client_id);
@@ -175,17 +189,13 @@ async fn accept_loop(
                             shard_for_conn.task_registry.remove_connection(&client_id);
 
                             if let Err(error) = sender.shutdown().await {
-                                error!(
-                                    "Failed to shutdown TCP stream for client: {client_id}, address: {address}. {error}"
-                                );
+                                shard_error!(shard.id, "Failed to shutdown TCP stream for client: {}, address: {}. {}", client_id, address, error);
                             } else {
-                                info!(
-                                    "Successfully closed TCP stream for client: {client_id}, address: {address}."
-                                );
+                                shard_info!(shard.id, "Successfully closed TCP stream for client: {}, address: {}.", client_id, address);
                             }
                         });
                     }
-                    Err(error) => error!("Unable to accept TCP socket. {error}"),
+                    Err(error) => shard_error!(shard.id, "Unable to accept TCP socket. {}", error),
                 }
             }
         }

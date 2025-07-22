@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct S3Archiver {
     client: Client,
     bucket: Bucket,
