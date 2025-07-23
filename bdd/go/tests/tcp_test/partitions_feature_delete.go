@@ -19,65 +19,64 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("DELETE PARTITION:", func() {
-	prefix := "DeletePartition"
-	When("User is logged in", func() {
-		Context("and tries to delete partitions for existing stream", func() {
+var _ = ginkgo.Describe("DELETE PARTITION:", func() {
+	prefix := "DeletePartitions"
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("and tries to delete partitions for existing stream", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
-
-			request := iggcon.DeletePartitionRequest{
-				StreamId:        iggcon.NewIdentifier(streamId),
-				TopicId:         iggcon.NewIdentifier(topicId),
-				PartitionsCount: 1,
-			}
-			err := client.DeletePartition(request)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+			partitionsCount := uint32(1)
+			err := client.DeletePartitions(
+				streamIdentifier,
+				topicIdentifier,
+				1,
+			)
 
 			itShouldNotReturnError(err)
-			itShouldHaveExpectedNumberOfPartitions(streamId, topicId, 2-request.PartitionsCount, client)
+			itShouldHaveExpectedNumberOfPartitions(streamId, topicId, 2-partitionsCount, client)
 		})
 
-		Context("and tries to delete partitions for a non existing stream", func() {
+		ginkgo.Context("and tries to delete partitions for a non existing stream", func() {
 			client := createAuthorizedConnection()
-			request := iggcon.DeletePartitionRequest{
-				StreamId:        iggcon.NewIdentifier(int(createRandomUInt32())),
-				TopicId:         iggcon.NewIdentifier(int(createRandomUInt32())),
-				PartitionsCount: 10,
-			}
-			err := client.DeletePartition(request)
+			err := client.DeletePartitions(
+				randomU32Identifier(),
+				randomU32Identifier(),
+				10,
+			)
 
 			itShouldReturnSpecificError(err, "stream_id_not_found")
 		})
 
-		Context("and tries to delete partitions for a non existing topic", func() {
+		ginkgo.Context("and tries to delete partitions for a non existing topic", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
-			request := iggcon.DeletePartitionRequest{
-				StreamId:        iggcon.NewIdentifier(streamId),
-				TopicId:         iggcon.NewIdentifier(int(createRandomUInt32())),
-				PartitionsCount: 10,
-			}
-			err := client.DeletePartition(request)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			err := client.DeletePartitions(
+				streamIdentifier,
+				randomU32Identifier(),
+				10,
+			)
 
 			itShouldReturnSpecificError(err, "topic_id_not_found")
 		})
 	})
 
-	When("User is not logged in", func() {
-		Context("and tries to delete partitions", func() {
-			client := createConnection()
-			request := iggcon.DeletePartitionRequest{
-				StreamId:        iggcon.NewIdentifier(int(createRandomUInt32())),
-				TopicId:         iggcon.NewIdentifier(int(createRandomUInt32())),
-				PartitionsCount: 10,
-			}
-			err := client.DeletePartition(request)
+	ginkgo.When("User is not logged in", func() {
+		ginkgo.Context("and tries to delete partitions", func() {
+			client := createClient()
+			err := client.DeletePartitions(
+				randomU32Identifier(),
+				randomU32Identifier(),
+				10,
+			)
 
 			itShouldReturnUnauthenticatedError(err)
 		})

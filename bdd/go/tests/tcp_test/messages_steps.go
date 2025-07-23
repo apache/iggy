@@ -21,11 +21,11 @@ import (
 	"bytes"
 	"reflect"
 
-	"github.com/apache/iggy/foreign/go"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	"github.com/apache/iggy/foreign/go/iggycli"
 	"github.com/google/uuid"
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
 )
 
 func createDefaultMessageHeaders() map[iggcon.HeaderKey]iggcon.HeaderValue {
@@ -42,36 +42,35 @@ func createDefaultMessages() []iggcon.IggyMessage {
 	return []iggcon.IggyMessage{msg1, msg2}
 }
 
-func itShouldSuccessfullyPublishMessages(streamId int, topicId int, messages []iggcon.IggyMessage, client iggy.MessageStream) {
-	result, err := client.PollMessages(iggcon.FetchMessagesRequest{
-		StreamId: iggcon.NewIdentifier(streamId),
-		TopicId:  iggcon.NewIdentifier(topicId),
-		Consumer: iggcon.Consumer{
-			Kind: iggcon.ConsumerSingle,
-			Id:   iggcon.NewIdentifier(int(createRandomUInt32())),
-		},
-		PollingStrategy: iggcon.FirstPollingStrategy(),
-		Count:           len(messages),
-		AutoCommit:      true,
+func itShouldSuccessfullyPublishMessages(streamId uint32, topicId uint32, messages []iggcon.IggyMessage, client iggycli.Client) {
+	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+	result, err := client.PollMessages(
+		streamIdentifier,
+		topicIdentifier,
+		iggcon.NewSingleConsumer(randomU32Identifier()),
+		iggcon.FirstPollingStrategy(),
+		uint32(len(messages)),
+		true,
+		nil)
+
+	ginkgo.It("It should not be nil", func() {
+		gomega.Expect(result).NotTo(gomega.BeNil())
 	})
 
-	It("It should not be nil", func() {
-		Expect(result).NotTo(BeNil())
-	})
-
-	It("It should contain 2 messages", func() {
-		Expect(len(result.Messages)).To(Equal(len(messages)))
+	ginkgo.It("It should contain 2 messages", func() {
+		gomega.Expect(len(result.Messages)).To(gomega.Equal(len(messages)))
 	})
 
 	for _, expectedMsg := range messages {
-		It("It should contain published messages", func() {
+		ginkgo.It("It should contain published messages", func() {
 			found := compareMessage(result.Messages, expectedMsg)
-			Expect(found).To(BeTrue(), "Message not found or does not match expected values")
+			gomega.Expect(found).To(gomega.BeTrue(), "Message not found or does not match expected values")
 		})
 	}
 
-	It("Should not return error", func() {
-		Expect(err).To(BeNil())
+	ginkgo.It("Should not return error", func() {
+		gomega.Expect(err).To(gomega.BeNil())
 	})
 }
 

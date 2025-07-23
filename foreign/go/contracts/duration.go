@@ -15,41 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package iggy
+package iggcon
 
 import (
-	"context"
-	"errors"
-
-	"github.com/apache/iggy/foreign/go/tcp"
-
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	"math"
 )
 
-type IMessageStreamFactory interface {
-	CreateStream(config iggcon.IggyConfiguration) (MessageStream, error)
-}
+const (
+	// IggyExpiryServerDefault use the default expiry time from the server
+	IggyExpiryServerDefault Duration = 0
+	// IggyExpiryNeverExpire never expire
+	IggyExpiryNeverExpire Duration = math.MaxUint64
+)
 
-type IggyClientFactory struct{}
+// Duration represents the expiration duration in microsecond (µs).
+type Duration uint64
 
-func (msf *IggyClientFactory) CreateMessageStream(config iggcon.IggyConfiguration) (MessageStream, error) {
-	// Support previous behaviour
-	if config.Context == nil {
-		config.Context = context.Background()
-	}
-
-	if config.Protocol == iggcon.Tcp {
-		tcpMessageStream, err := tcp.NewTcpMessageStream(
-			config.Context,
-			config.BaseAddress,
-			config.MessageCompression,
-			config.HeartbeatInterval,
-		)
-		if err != nil {
-			return nil, err
-		}
-		return tcpMessageStream, nil
-	}
-
-	return nil, errors.New("unsupported protocol")
-}
+const (
+	Microsecond Duration = 1
+	Millisecond          = 1000 * Microsecond
+	Second               = 1000 * Millisecond
+	Minute               = 60 * Second
+	Hour                 = 60 * Minute
+)

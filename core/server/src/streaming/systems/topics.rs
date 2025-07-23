@@ -177,6 +177,7 @@ impl System {
         replication_factor: Option<u8>,
     ) -> Result<&Topic, IggyError> {
         self.ensure_authenticated(session)?;
+        let topic_numeric_id;
         {
             let topic = self
                 .find_topic(session, stream_id, topic_id)
@@ -185,6 +186,7 @@ impl System {
                         "{COMPONENT} (error: {error}) - failed to find topic with ID: {topic_id}"
                     )
                 })?;
+            topic_numeric_id = topic.topic_id;
             self.permissioner.update_topic(
                 session.get_user_id(),
                 topic.stream_id,
@@ -222,7 +224,7 @@ impl System {
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
             })?
-            .get_topic(topic_id)
+            .get_topic(&Identifier::numeric(topic_numeric_id)?)
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get topic with ID: {topic_id} in stream with ID: {stream_id}")
             })

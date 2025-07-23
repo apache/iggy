@@ -19,18 +19,21 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("CHANGE PASSWORD:", func() {
-	When("User is logged in", func() {
-		Context("tries to change password of existing user", func() {
+var _ = ginkgo.Describe("CHANGE PASSWORD:", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("tries to change password of existing user", func() {
 			client := createAuthorizedConnection()
-			createRequest := iggcon.CreateUserRequest{
-				Username: createRandomStringWithPrefix("ch_p_", 16),
-				Password: "oldPassword",
-				Status:   iggcon.Active,
-				Permissions: &iggcon.Permissions{
+
+			username := createRandomStringWithPrefix("ch_p_", 16)
+			password := "oldPassword"
+			_, err := client.CreateUser(
+				username,
+				password,
+				iggcon.Active,
+				&iggcon.Permissions{
 					Global: iggcon.GlobalPermissions{
 						ManageServers: true,
 						ReadServers:   true,
@@ -43,30 +46,25 @@ var _ = Describe("CHANGE PASSWORD:", func() {
 						PollMessages:  true,
 						SendMessages:  true,
 					},
-				},
-			}
+				})
+			itShouldNotReturnError(err)
+			identifier, _ := iggcon.NewIdentifier(username)
+			defer deleteUserAfterTests(identifier, client)
 
-			err := client.CreateUser(createRequest)
-			defer deleteUserAfterTests(createRequest.Username, client)
-			request := iggcon.ChangePasswordRequest{
-				UserID:          iggcon.NewIdentifier(createRequest.Username),
-				CurrentPassword: createRequest.Password,
-				NewPassword:     "newPassword",
-			}
-
-			err = client.ChangePassword(request)
+			err = client.ChangePassword(identifier, password, "newPassword")
 
 			itShouldNotReturnError(err)
 			//itShouldBePossibleToLogInWithCredentials(createRequest.Username, request.NewPassword)
 		})
 	})
 
-	When("User is not logged in", func() {
-		Context("and tries to change password", func() {
-			client := createConnection()
-			request := iggcon.UpdateUserPermissionsRequest{
-				UserID: iggcon.NewIdentifier(int(createRandomUInt32())),
-				Permissions: &iggcon.Permissions{
+	ginkgo.When("User is not logged in", func() {
+		ginkgo.Context("and tries to change password", func() {
+			client := createClient()
+
+			err := client.UpdatePermissions(
+				randomU32Identifier(),
+				&iggcon.Permissions{
 					Global: iggcon.GlobalPermissions{
 						ManageServers: false,
 						ReadServers:   false,
@@ -79,10 +77,7 @@ var _ = Describe("CHANGE PASSWORD:", func() {
 						PollMessages:  false,
 						SendMessages:  false,
 					},
-				},
-			}
-
-			err := client.UpdateUserPermissions(request)
+				})
 			itShouldReturnUnauthenticatedError(err)
 		})
 	})

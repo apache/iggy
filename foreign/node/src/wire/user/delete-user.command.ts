@@ -20,6 +20,7 @@
 
 import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 
 export type DeleteUser = {
@@ -27,7 +28,7 @@ export type DeleteUser = {
 }
 
 export const DELETE_USER = {
-  code: 34,
+  code: COMMAND_CODE.DeleteUser,
 
   serialize: ({userId}: DeleteUser) => {
     return serializeIdentifier(userId);
@@ -35,5 +36,6 @@ export const DELETE_USER = {
 
   deserialize: deserializeVoidResponse
 };
+
 
 export const deleteUser = wrapCommand<DeleteUser, boolean>(DELETE_USER);

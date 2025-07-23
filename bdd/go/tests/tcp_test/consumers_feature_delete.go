@@ -20,81 +20,84 @@ package tcp_test
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("DELETE CONSUMER GROUP:", func() {
+var _ = ginkgo.Describe("DELETE CONSUMER GROUP:", func() {
 	prefix := "DeleteConsumerGroup"
-	When("User is logged in", func() {
-		Context("and tries to delete existing consumer group", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("and tries to delete existing consumer group", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			groupId, _ := successfullyCreateConsumer(streamId, topicId, client)
-			err := client.DeleteConsumerGroup(iggcon.DeleteConsumerGroupRequest{
-				StreamId:        iggcon.NewIdentifier(streamId),
-				TopicId:         iggcon.NewIdentifier(topicId),
-				ConsumerGroupId: iggcon.NewIdentifier(groupId),
-			})
+
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+			groupIdentifier, _ := iggcon.NewIdentifier(groupId)
+			err := client.DeleteConsumerGroup(
+				streamIdentifier,
+				topicIdentifier,
+				groupIdentifier,
+			)
 
 			itShouldNotReturnError(err)
 			itShouldSuccessfullyDeletedConsumer(streamId, topicId, groupId, client)
 		})
 
-		Context("and tries to delete non-existing consumer group", func() {
+		ginkgo.Context("and tries to delete non-existing consumer group", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
-			groupId := int(createRandomUInt32())
-			err := client.DeleteConsumerGroup(iggcon.DeleteConsumerGroupRequest{
-				StreamId:        iggcon.NewIdentifier(streamId),
-				TopicId:         iggcon.NewIdentifier(topicId),
-				ConsumerGroupId: iggcon.NewIdentifier(groupId),
-			})
+
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+			err := client.DeleteConsumerGroup(
+				streamIdentifier,
+				topicIdentifier,
+				randomU32Identifier(),
+			)
 
 			itShouldReturnSpecificIggyError(err, ierror.ConsumerGroupIdNotFound)
 		})
 
-		Context("and tries to delete consumer non-existing topic", func() {
+		ginkgo.Context("and tries to delete consumer non-existing topic", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
-			topicId := int(createRandomUInt32())
 
-			err := client.DeleteConsumerGroup(iggcon.DeleteConsumerGroupRequest{
-				StreamId:        iggcon.NewIdentifier(streamId),
-				TopicId:         iggcon.NewIdentifier(topicId),
-				ConsumerGroupId: iggcon.NewIdentifier(int(createRandomUInt32())),
-			})
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			err := client.DeleteConsumerGroup(
+				streamIdentifier,
+				randomU32Identifier(),
+				randomU32Identifier(),
+			)
 
 			itShouldReturnSpecificError(err, "topic_id_not_found")
 		})
 
-		Context("and tries to delete consumer for non-existing topic and stream", func() {
+		ginkgo.Context("and tries to delete consumer for non-existing topic and stream", func() {
 			client := createAuthorizedConnection()
-			streamId := int(createRandomUInt32())
-			topicId := int(createRandomUInt32())
-
-			err := client.DeleteConsumerGroup(iggcon.DeleteConsumerGroupRequest{
-				StreamId:        iggcon.NewIdentifier(streamId),
-				TopicId:         iggcon.NewIdentifier(topicId),
-				ConsumerGroupId: iggcon.NewIdentifier(int(createRandomUInt32())),
-			})
+			err := client.DeleteConsumerGroup(
+				randomU32Identifier(),
+				randomU32Identifier(),
+				randomU32Identifier(),
+			)
 
 			itShouldReturnSpecificError(err, "stream_id_not_found")
 		})
 	})
 
-	When("User is not logged in", func() {
-		Context("and tries to delete consumer group", func() {
-			client := createConnection()
-			err := client.DeleteConsumerGroup(iggcon.DeleteConsumerGroupRequest{
-				StreamId:        iggcon.NewIdentifier(int(createRandomUInt32())),
-				TopicId:         iggcon.NewIdentifier(int(createRandomUInt32())),
-				ConsumerGroupId: iggcon.NewIdentifier(int(createRandomUInt32())),
-			})
+	ginkgo.When("User is not logged in", func() {
+		ginkgo.Context("and tries to delete consumer group", func() {
+			client := createClient()
+			err := client.DeleteConsumerGroup(
+				randomU32Identifier(),
+				randomU32Identifier(),
+				randomU32Identifier(),
+			)
 
 			itShouldReturnUnauthenticatedError(err)
 		})

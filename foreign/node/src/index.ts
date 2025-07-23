@@ -19,13 +19,12 @@
 
 
 export {
+  type Id,
   PollingStrategy,
-  ConsumerKind,
+  Consumer,
   Partitioning,
-  HeaderValue
+  HeaderValue,
 } from './wire/index.js';
-
-export { Id } from './wire/identifier.utils.js';
 
 export * from './client/index.js';
 export * from './stream/index.js';

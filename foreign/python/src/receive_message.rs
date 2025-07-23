@@ -96,11 +96,13 @@ pub enum PollingStrategy {
     Next {},
 }
 
-impl From<PollingStrategy> for RustPollingStrategy {
-    fn from(value: PollingStrategy) -> Self {
+impl From<&PollingStrategy> for RustPollingStrategy {
+    fn from(value: &PollingStrategy) -> Self {
         match value {
-            PollingStrategy::Offset { value } => RustPollingStrategy::offset(value),
-            PollingStrategy::Timestamp { value } => RustPollingStrategy::timestamp(value.into()),
+            PollingStrategy::Offset { value } => RustPollingStrategy::offset(value.to_owned()),
+            PollingStrategy::Timestamp { value } => {
+                RustPollingStrategy::timestamp(value.to_owned().into())
+            }
             PollingStrategy::First {} => RustPollingStrategy::first(),
             PollingStrategy::Last {} => RustPollingStrategy::last(),
             PollingStrategy::Next {} => RustPollingStrategy::next(),

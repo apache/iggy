@@ -53,23 +53,22 @@ type BaseTopicSerialized = { data: BaseTopic } & Serialized;
 
 type TopicSerialized = { data: Topic } & Serialized;
 
-
-export const CompressionAlgorithmKind = {
+export const CompressionAlgorithm = {
   None: 1,
   Gzip: 2
 };
 
-export type CompressionAlgorithmKind = typeof CompressionAlgorithmKind;
-export type CompressionAlgorithmKindId = keyof CompressionAlgorithmKind;
-export type CompressionAlgorithmKindValue = ValueOf<CompressionAlgorithmKind>;
+export type CompressionAlgorithmKind = typeof CompressionAlgorithm;
+export type CompressionAlgorithmKindId = keyof CompressionAlgorithm;
+export type CompressionAlgorithmKindValue = ValueOf<CompressionAlgorithm>;
 
 export type CompressionAlgorithmNone = CompressionAlgorithmKind['None'];
 export type CompressionAlgorithmGzip = CompressionAlgorithmKind['Gzip'];
 export type CompressionAlgorithm = CompressionAlgorithmNone | CompressionAlgorithmGzip;
 
-export const isValidCompressionAlgorithm = (ca: number): ca is CompressionAlgorithm =>
-  Object.values(CompressionAlgorithmKind).includes(ca);
 
+export const isValidCompressionAlgorithm = (ca: number): ca is CompressionAlgorithm =>
+  Object.values(CompressionAlgorithm).includes(ca);
 
 export const deserializeBaseTopic = (p: Buffer, pos = 0): BaseTopicSerialized => {
   const id = p.readUInt32LE(pos);
@@ -119,6 +118,9 @@ export const deserializePartition = (p: Buffer, pos = 0): PartitionSerialized =>
 
 
 export const deserializeTopic = (p: Buffer, pos = 0): TopicSerialized => {
+  if (p.length === 0)
+    throw new Error('Topic does not exist');
+
   const start = pos;
   const { bytesRead, data } = deserializeBaseTopic(p, pos);
   pos += bytesRead;

@@ -20,20 +20,20 @@ package binaryserialization
 import (
 	"testing"
 
-	"github.com/google/uuid"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	"github.com/google/uuid"
 )
 
 func TestSerialize_SendMessagesRequest(t *testing.T) {
 	message1 := generateTestMessage("data1")
+	streamId, _ := iggcon.NewIdentifier("test_stream_id")
+	topicId, _ := iggcon.NewIdentifier("test_topic_id")
 	request := TcpSendMessagesRequest{
-		SendMessagesRequest: iggcon.SendMessagesRequest{
-			StreamId:     iggcon.NewIdentifier("test_stream_id"),
-			TopicId:      iggcon.NewIdentifier("test_topic_id"),
-			Partitioning: iggcon.PartitionId(1),
-			Messages: []iggcon.IggyMessage{
-				message1,
-			},
+		StreamId:     streamId,
+		TopicId:      topicId,
+		Partitioning: iggcon.PartitionId(1),
+		Messages: []iggcon.IggyMessage{
+			message1,
 		},
 	}
 

@@ -18,48 +18,53 @@
 package tcp_test
 
 import (
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"math/rand"
 	"os"
 	"strings"
 	"time"
 
-	. "github.com/apache/iggy/foreign/go"
-	. "github.com/apache/iggy/foreign/go/contracts"
+	"github.com/apache/iggy/foreign/go/iggycli"
+	"github.com/apache/iggy/foreign/go/tcp"
 )
 
-func createAuthorizedConnection() MessageStream {
-	ms := createConnection()
-	_, err := ms.LogIn(LogInRequest{
-		Username: "iggy",
-		Password: "iggy",
-	})
+func createAuthorizedConnection() iggycli.Client {
+	cli := createClient()
+	_, err := cli.LoginUser("iggy", "iggy")
 	if err != nil {
 		panic(err)
 	}
-	return ms
+	return cli
 }
 
-func createConnection() MessageStream {
+func createClient() iggycli.Client {
 	addr := os.Getenv("IGGY_TCP_ADDRESS")
 	if addr == "" {
 		addr = "127.0.0.1:8090"
 	}
-	factory := &IggyClientFactory{}
-	config := IggyConfiguration{
-		BaseAddress: addr,
-		Protocol:    Tcp,
-	}
-
-	ms, err := factory.CreateMessageStream(config)
+	cli, err := iggycli.NewIggyClient(
+		iggycli.WithTcp(
+			tcp.WithServerAddress(addr),
+		),
+	)
 	if err != nil {
 		panic(err)
 	}
-	return ms
+	return cli
 }
 
 func createRandomUInt32() uint32 {
-	rand.New(rand.NewSource(time.Now().UnixNano()))
-	return rand.Uint32()
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	var v uint32
+	for v == 0 {
+		v = r.Uint32()
+	}
+	return v
+}
+
+func randomU32Identifier() iggcon.Identifier {
+	id, _ := iggcon.NewIdentifier(createRandomUInt32())
+	return id
 }
 
 func createRandomString(length int) string {

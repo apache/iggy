@@ -19,28 +19,29 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("GET ALL TOPICS:", func() {
+var _ = ginkgo.Describe("GET ALL TOPICS:", func() {
 	prefix := "GetAllTopics"
-	When("User is logged in", func() {
-		Context("and tries to get all topics", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("and tries to get all topics", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, name := successfullyCreateTopic(streamId, client)
-			topics, err := client.GetTopics(iggcon.NewIdentifier(streamId))
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topics, err := client.GetTopics(streamIdentifier)
 
 			itShouldNotReturnError(err)
 			itShouldContainSpecificTopic(topicId, name, topics)
 		})
 	})
 
-	When("User is not logged in", func() {
-		Context("and tries to get all topics", func() {
-			client := createConnection()
-			_, err := client.GetTopics(iggcon.NewIdentifier(int(createRandomUInt32())))
+	ginkgo.When("User is not logged in", func() {
+		ginkgo.Context("and tries to get all topics", func() {
+			client := createClient()
+			_, err := client.GetTopics(randomU32Identifier())
 
 			itShouldReturnUnauthenticatedError(err)
 		})

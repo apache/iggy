@@ -16,6 +16,7 @@
  * under the License.
  */
 
+pub mod flatbuffer;
 pub mod json;
 pub mod proto;
 pub mod raw;

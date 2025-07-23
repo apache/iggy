@@ -19,6 +19,7 @@
 mod add_fields;
 mod delete_fields;
 mod filter_fields;
+pub mod flatbuffer_convert;
 pub mod json;
 pub mod proto_convert;
 mod update_fields;
@@ -29,6 +30,7 @@ pub use filter_fields::{
     FilterFields, FilterFieldsConfig, FilterPattern, KeyPattern as FilterKeyPattern,
     ValuePattern as FilterValuePattern,
 };
+pub use flatbuffer_convert::{FlatBufferConvert, FlatBufferConvertConfig};
 pub use proto_convert::{ProtoConvert, ProtoConvertConfig};
 use serde::{Deserialize, Serialize};
 use simd_json::OwnedValue;
@@ -83,6 +85,7 @@ pub enum TransformType {
     FilterFields,
     UpdateFields,
     ProtoConvert,
+    FlatBufferConvert,
 }
 
 pub fn from_config(
@@ -114,6 +117,11 @@ pub fn from_config(
             let cfg: proto_convert::ProtoConvertConfig =
                 serde_json::from_value(raw.clone()).map_err(|_| Error::InvalidConfig)?;
             Ok(Arc::new(proto_convert::ProtoConvert::new(cfg)))
+        }
+        TransformType::FlatBufferConvert => {
+            let cfg: FlatBufferConvertConfig =
+                serde_json::from_value(raw.clone()).map_err(|_| Error::InvalidConfig)?;
+            Ok(Arc::new(FlatBufferConvert::new(cfg)))
         }
     }
 }

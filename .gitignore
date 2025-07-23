@@ -6,6 +6,7 @@ target*
 .DS_Store
 .gradle
 local_data*
+local_state*
 /bench_*
 /sdk/errors_table/
 /rust-clippy-results.sarif

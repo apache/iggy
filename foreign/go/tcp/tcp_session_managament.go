@@ -20,12 +20,15 @@ package tcp
 import (
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
 
-	. "github.com/apache/iggy/foreign/go/contracts"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
-func (tms *IggyTcpClient) LogIn(request LogInRequest) (*LogInResponse, error) {
-	serializedRequest := binaryserialization.TcpLogInRequest{LogInRequest: request}
-	buffer, err := tms.sendAndFetchResponse(serializedRequest.Serialize(), LoginUserCode)
+func (tms *IggyTcpClient) LoginUser(username string, password string) (*iggcon.IdentityInfo, error) {
+	serializedRequest := binaryserialization.TcpLogInRequest{
+		Username: username,
+		Password: password,
+	}
+	buffer, err := tms.sendAndFetchResponse(serializedRequest.Serialize(), iggcon.LoginUserCode)
 	if err != nil {
 		return nil, err
 	}
@@ -33,9 +36,11 @@ func (tms *IggyTcpClient) LogIn(request LogInRequest) (*LogInResponse, error) {
 	return binaryserialization.DeserializeLogInResponse(buffer), nil
 }
 
-func (tms *IggyTcpClient) LogInWithAccessToken(request LogInAccessTokenRequest) (*LogInResponse, error) {
-	message := binaryserialization.SerializeLoginWithPersonalAccessToken(request)
-	buffer, err := tms.sendAndFetchResponse(message, LoginWithAccessTokenCode)
+func (tms *IggyTcpClient) LoginWithPersonalAccessToken(token string) (*iggcon.IdentityInfo, error) {
+	message := binaryserialization.SerializeLoginWithPersonalAccessToken(iggcon.LoginWithPersonalAccessTokenRequest{
+		Token: token,
+	})
+	buffer, err := tms.sendAndFetchResponse(message, iggcon.LoginWithAccessTokenCode)
 	if err != nil {
 		return nil, err
 	}
@@ -43,7 +48,7 @@ func (tms *IggyTcpClient) LogInWithAccessToken(request LogInAccessTokenRequest) 
 	return binaryserialization.DeserializeLogInResponse(buffer), nil
 }
 
-func (tms *IggyTcpClient) LogOut() error {
-	_, err := tms.sendAndFetchResponse([]byte{}, LogoutUserCode)
+func (tms *IggyTcpClient) LogoutUser() error {
+	_, err := tms.sendAndFetchResponse([]byte{}, iggcon.LogoutUserCode)
 	return err
 }

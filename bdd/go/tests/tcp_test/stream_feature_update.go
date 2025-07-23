@@ -19,72 +19,58 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("UPDATE STREAM:", func() {
+var _ = ginkgo.Describe("UPDATE STREAM:", func() {
 	prefix := "UpdateStream"
-	When("User is logged in", func() {
-		Context("and tries to update existing stream with a valid name", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("and tries to update existing stream with a valid name", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			newName := createRandomString(128)
-
-			err := client.UpdateStream(iggcon.UpdateStreamRequest{
-				StreamId: iggcon.NewIdentifier(streamId),
-				Name:     newName,
-			})
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			err := client.UpdateStream(streamIdentifier, newName)
 			itShouldNotReturnError(err)
 			itShouldSuccessfullyUpdateStream(streamId, newName, client)
 		})
 
-		Context("and tries to update stream with duplicate stream name", func() {
+		ginkgo.Context("and tries to update stream with duplicate stream name", func() {
 			client := createAuthorizedConnection()
 			stream1Id, stream1Name := successfullyCreateStream(prefix, client)
 			stream2Id, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(stream1Id, client)
 			defer deleteStreamAfterTests(stream2Id, client)
 
-			err := client.UpdateStream(iggcon.UpdateStreamRequest{
-				StreamId: iggcon.NewIdentifier(stream2Id),
-				Name:     stream1Name,
-			})
+			stream2Identifier, _ := iggcon.NewIdentifier(stream2Id)
+			err := client.UpdateStream(stream2Identifier, stream1Name)
 
 			itShouldReturnSpecificError(err, "stream_name_already_exists")
 		})
 
-		Context("and tries to update non-existing stream", func() {
+		ginkgo.Context("and tries to update non-existing stream", func() {
 			client := createAuthorizedConnection()
-			err := client.UpdateStream(iggcon.UpdateStreamRequest{
-				StreamId: iggcon.NewIdentifier(int(createRandomUInt32())),
-				Name:     createRandomString(128),
-			})
+			err := client.UpdateStream(randomU32Identifier(), createRandomString(128))
 
 			itShouldReturnSpecificError(err, "stream_id_not_found")
 		})
 
-		Context("and tries to update existing stream with a name that's over 255 characters", func() {
+		ginkgo.Context("and tries to update existing stream with a name that's over 255 characters", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, createAuthorizedConnection())
-
-			err := client.UpdateStream(iggcon.UpdateStreamRequest{
-				StreamId: iggcon.NewIdentifier(streamId),
-				Name:     createRandomString(256),
-			})
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			err := client.UpdateStream(streamIdentifier, createRandomString(256))
 
 			itShouldReturnSpecificError(err, "stream_name_too_long")
 		})
 	})
 
-	When("User is not logged in", func() {
-		Context("and tries to update stream", func() {
-			client := createConnection()
-			err := client.UpdateStream(iggcon.UpdateStreamRequest{
-				StreamId: iggcon.NewIdentifier(int(createRandomUInt32())),
-				Name:     createRandomString(128),
-			})
+	ginkgo.When("User is not logged in", func() {
+		ginkgo.Context("and tries to update stream", func() {
+			client := createClient()
+			err := client.UpdateStream(randomU32Identifier(), createRandomString(128))
 
 			itShouldReturnUnauthenticatedError(err)
 		})

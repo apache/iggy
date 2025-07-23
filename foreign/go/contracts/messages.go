@@ -45,17 +45,17 @@ const (
 	MaxUserHeadersSize = 100 * 1000
 )
 
-type FetchMessagesRequest struct {
+type PollMessageRequest struct {
 	StreamId        Identifier      `json:"streamId"`
 	TopicId         Identifier      `json:"topicId"`
 	Consumer        Consumer        `json:"consumer"`
-	PartitionId     int             `json:"partitionId"`
+	PartitionId     uint32          `json:"partitionId"`
 	PollingStrategy PollingStrategy `json:"pollingStrategy"`
 	Count           int             `json:"count"`
 	AutoCommit      bool            `json:"autoCommit"`
 }
 
-type FetchMessagesResponse struct {
+type PolledMessage struct {
 	PartitionId   uint32
 	CurrentOffset uint64
 	MessageCount  uint32

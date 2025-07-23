@@ -19,19 +19,18 @@ package binaryserialization
 
 import (
 	"encoding/binary"
-
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
 type TcpLogInRequest struct {
-	iggcon.LogInRequest
+	Username string `json:"username"`
+	Password string `json:"password"`
 }
 
 func (request *TcpLogInRequest) Serialize() []byte {
 	usernameBytes := []byte(request.Username)
 	passwordBytes := []byte(request.Password)
-	versionBytes := []byte(request.Version)
-	contextBytes := []byte(request.Context)
+	versionBytes := []byte("")
+	contextBytes := []byte("")
 
 	// Calculate total length
 	totalLength := 2 + len(usernameBytes) + len(passwordBytes) +

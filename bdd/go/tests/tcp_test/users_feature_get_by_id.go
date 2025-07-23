@@ -19,21 +19,22 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("GET USER:", func() {
-	When("User is logged in", func() {
-		Context("tries to get existing user", func() {
+var _ = ginkgo.Describe("GET USER:", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("tries to get existing user", func() {
 			client := createAuthorizedConnection()
 			name := createRandomString(16)
 			userId := successfullyCreateUser(name, client)
-			defer deleteUserAfterTests(int(userId), client)
+			userIdentifier, _ := iggcon.NewIdentifier(userId)
+			defer deleteUserAfterTests(userIdentifier, client)
 
-			user, err := client.GetUser(iggcon.NewIdentifier(int(userId)))
+			user, err := client.GetUser(userIdentifier)
 
 			itShouldNotReturnError(err)
-			itShouldReturnSpecificUser(name, *user)
+			itShouldReturnSpecificUser(name, user.UserInfo)
 		})
 	})
 

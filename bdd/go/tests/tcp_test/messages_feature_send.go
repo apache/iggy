@@ -19,100 +19,101 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("SEND MESSAGES:", func() {
+var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 	prefix := "SendMessages"
-	When("User is logged in", func() {
-		Context("and tries to send messages to the topic with balanced partitioning", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("and tries to send messages to the topic with balanced partitioning", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream("1"+prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			messages := createDefaultMessages()
-			request := iggcon.SendMessagesRequest{
-				StreamId:     iggcon.NewIdentifier(streamId),
-				TopicId:      iggcon.NewIdentifier(topicId),
-				Partitioning: iggcon.None(),
-				Messages:     messages,
-			}
-			err := client.SendMessages(request)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+			err := client.SendMessages(
+				streamIdentifier,
+				topicIdentifier,
+				iggcon.None(),
+				messages,
+			)
 			itShouldNotReturnError(err)
 			itShouldSuccessfullyPublishMessages(streamId, topicId, messages, client)
 		})
 
-		Context("and tries to send messages to the non existing topic", func() {
+		ginkgo.Context("and tries to send messages to the non existing topic", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream("2"+prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			messages := createDefaultMessages()
-			request := iggcon.SendMessagesRequest{
-				StreamId:     iggcon.NewIdentifier(streamId),
-				TopicId:      iggcon.NewIdentifier(int(createRandomUInt32())),
-				Partitioning: iggcon.None(),
-				Messages:     messages,
-			}
-			err := client.SendMessages(request)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			err := client.SendMessages(
+				streamIdentifier,
+				randomU32Identifier(),
+				iggcon.None(),
+				messages,
+			)
 			itShouldReturnSpecificError(err, "topic_id_not_found")
 		})
 
-		Context("and tries to send messages to the non existing stream", func() {
+		ginkgo.Context("and tries to send messages to the non existing stream", func() {
 			client := createAuthorizedConnection()
 			messages := createDefaultMessages()
-			request := iggcon.SendMessagesRequest{
-				StreamId:     iggcon.NewIdentifier(int(createRandomUInt32())),
-				TopicId:      iggcon.NewIdentifier(int(createRandomUInt32())),
-				Partitioning: iggcon.None(),
-				Messages:     messages,
-			}
-			err := client.SendMessages(request)
+			err := client.SendMessages(
+				randomU32Identifier(),
+				randomU32Identifier(),
+				iggcon.None(),
+				messages,
+			)
 			itShouldReturnSpecificError(err, "stream_id_not_found")
 		})
 
-		Context("and tries to send messages to non existing partition", func() {
+		ginkgo.Context("and tries to send messages to non existing partition", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream("3"+prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			messages := createDefaultMessages()
-			request := iggcon.SendMessagesRequest{
-				StreamId:     iggcon.NewIdentifier(streamId),
-				TopicId:      iggcon.NewIdentifier(topicId),
-				Partitioning: iggcon.PartitionId(int(createRandomUInt32())),
-				Messages:     messages,
-			}
-			err := client.SendMessages(request)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+			err := client.SendMessages(
+				streamIdentifier,
+				topicIdentifier,
+				iggcon.PartitionId(createRandomUInt32()),
+				messages,
+			)
 			itShouldReturnSpecificError(err, "partition_not_found")
 		})
 
-		Context("and tries to send messages to valid topic but with 0 messages in payload", func() {
+		ginkgo.Context("and tries to send messages to valid topic but with 0 messages in payload", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, createAuthorizedConnection())
 			topicId, _ := successfullyCreateTopic(streamId, client)
-			request := iggcon.SendMessagesRequest{
-				StreamId:     iggcon.NewIdentifier(streamId),
-				TopicId:      iggcon.NewIdentifier(topicId),
-				Partitioning: iggcon.PartitionId(int(createRandomUInt32())),
-				Messages:     []iggcon.IggyMessage{},
-			}
-			err := client.SendMessages(request)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+			err := client.SendMessages(
+				streamIdentifier,
+				topicIdentifier,
+				iggcon.PartitionId(createRandomUInt32()),
+				[]iggcon.IggyMessage{},
+			)
 			itShouldReturnSpecificError(err, "messages_count_should_be_greater_than_zero")
 		})
 	})
 
-	When("User is not logged in", func() {
-		Context("and tries to update stream", func() {
-			client := createConnection()
+	ginkgo.When("User is not logged in", func() {
+		ginkgo.Context("and tries to update stream", func() {
+			client := createClient()
 			messages := createDefaultMessages()
-			request := iggcon.SendMessagesRequest{
-				StreamId:     iggcon.NewIdentifier(int(createRandomUInt32())),
-				TopicId:      iggcon.NewIdentifier(int(createRandomUInt32())),
-				Partitioning: iggcon.None(),
-				Messages:     messages,
-			}
-			err := client.SendMessages(request)
+			err := client.SendMessages(
+				randomU32Identifier(),
+				randomU32Identifier(),
+				iggcon.None(),
+				messages,
+			)
 
 			itShouldReturnUnauthenticatedError(err)
 		})

@@ -19,35 +19,35 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
-	. "github.com/onsi/ginkgo/v2"
+	"github.com/onsi/ginkgo/v2"
 )
 
-var _ = Describe("DELETE STREAM:", func() {
+var _ = ginkgo.Describe("DELETE STREAM:", func() {
 	prefix := "DeleteStream"
-	When("User is logged in", func() {
-		Context("and tries to delete existing stream", func() {
+	ginkgo.When("User is logged in", func() {
+		ginkgo.Context("and tries to delete existing stream", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
-			err := client.DeleteStream(iggcon.NewIdentifier(streamId))
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			err := client.DeleteStream(streamIdentifier)
 
 			itShouldNotReturnError(err)
 			itShouldSuccessfullyDeleteStream(streamId, client)
 		})
 
-		Context("and tries to delete non-existing stream", func() {
+		ginkgo.Context("and tries to delete non-existing stream", func() {
 			client := createAuthorizedConnection()
-			streamId := int(createRandomUInt32())
 
-			err := client.DeleteStream(iggcon.NewIdentifier(streamId))
+			err := client.DeleteStream(randomU32Identifier())
 
 			itShouldReturnSpecificError(err, "stream_id_not_found")
 		})
 	})
 
-	When("User is not logged in", func() {
-		Context("and tries to delete stream", func() {
-			client := createConnection()
-			err := client.DeleteStream(iggcon.NewIdentifier(int(createRandomUInt32())))
+	ginkgo.When("User is not logged in", func() {
+		ginkgo.Context("and tries to delete stream", func() {
+			client := createClient()
+			err := client.DeleteStream(randomU32Identifier())
 
 			itShouldReturnUnauthenticatedError(err)
 		})

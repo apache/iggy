@@ -11,7 +11,7 @@ note: previous works on node.js http client has been moved to [iggy-node-http-cl
 ## install
 
 ```bash
-npm i @apache-iggy/node-sdk
+npm i --save @apache-iggy/node-sdk
 ```
 
 ## basic usage
@@ -46,10 +46,12 @@ npm run build
 
 ### test
 
+note: use env var `IGGY_TCP_ADDRESS="host:port"` to set server address for bdd and e2e tests.
+
 #### unit tests
 
 ```bash
-npm run test
+npm run test:unit
 ```
 
 #### e2e tests
@@ -59,6 +61,18 @@ e2e test expect an iggy-server at tcp://127.0.0.1:8090
 ```bash
 npm run test:e2e
 ```
+
+#### bdd tests
+
+bdd test expect an iggy-server at tcp://127.0.0.1:8090
+
+```bash
+npm run test:bdd
+```
+
+#### run all test
+
+`npm run test` runs unit, bdd and e2e tests suite (expect an iggy-server at tcp://127.0.0.1:8090)
 
 ### lint
 

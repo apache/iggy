@@ -1,5 +1,4 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
+/* Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -17,7 +16,15 @@
  * under the License.
  */
 
-
-export type LoginResponse = {
-  userId: number
-}
+mod binary_client;
+mod binary_consumer_group_client;
+mod binary_consumer_offset_client;
+mod binary_message_client;
+mod binary_partition_client;
+mod binary_personal_access_token_client;
+mod binary_segment_client;
+mod binary_stream_client;
+mod binary_system_client;
+mod binary_topic_client;
+mod binary_user_client;
+pub mod client_wrapper;
