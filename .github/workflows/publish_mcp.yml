@@ -15,16 +15,16 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: publish_server
+name: publish_mcp
 
 on:
   push:
     tags:
-      - "server-*"
+      - "mcp-*"
 
 env:
-  DOCKERHUB_REGISTRY_NAME: apache/iggy
-  CRATE_NAME: iggy
+  DOCKERHUB_REGISTRY_NAME: apache/iggy-mcp
+  CRATE_NAME: iggy-mcp
   GITHUB_TOKEN: ${{ github.token }}
   RUST_BACKTRACE: 1
   CARGO_TERM_COLOR: always
@@ -32,7 +32,7 @@ env:
 
 jobs:
   validate:
-    if: startsWith(github.ref, 'refs/tags/server-')
+    if: startsWith(github.ref, 'refs/tags/mcp-')
     runs-on: ubuntu-latest
     steps:
       - name: Extract tag name
@@ -42,8 +42,8 @@ jobs:
       - name: Validate tag format
         run: |
           TAG=${TAG}
-          if [[ ! "$TAG" =~ ^server-([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
-            echo "Tag $TAG does not match strict semver format (server-X.Y.Z where 0 <= X,Y,Z <= 999)"
+          if [[ ! "$TAG" =~ ^mcp-([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+            echo "Tag $TAG does not match strict semver format (mcp-X.Y.Z where 0 <= X,Y,Z <= 999)"
             exit 1
           fi
           echo "Valid tag: $TAG"
@@ -64,17 +64,17 @@ jobs:
           echo "tag_name=$tag" >> "$GITHUB_OUTPUT"
           echo "::notice ::Tag that triggered the workflow: $tag"
 
-      - name: Extract iggy-server version from Cargo.toml
+      - name: Extract iggy-mcp version from Cargo.toml
         id: extract_version
         run: |
-          version=$(cargo pkgid -p server | cut -d# -f2 | cut -d: -f2)
-          echo "server_version=$version" >> "$GITHUB_OUTPUT"
+          version=$(cargo pkgid -p iggy-mcp | cut -d# -f2 | cut -d: -f2)
+          echo "mcp_version=$version" >> "$GITHUB_OUTPUT"
           echo "::notice ::Version from Cargo.toml $version"
 
       - name: Check if version from Cargo.toml is the same as the tag
         id: check_git_tag
         run: |
-          if [[ "server-${{ steps.extract_version.outputs.server_version }}" == "${{ steps.extract_tag.outputs.tag_name }}" ]];
+          if [[ "mcp-${{ steps.extract_version.outputs.mcp_version }}" == "${{ steps.extract_tag.outputs.tag_name }}" ]];
           then
             echo "::notice ::Tag ${{ steps.extract_tag.outputs.tag_name }} matches the version in Cargo.toml"
             echo "tag_matches=true" >> "$GITHUB_OUTPUT"
@@ -84,7 +84,7 @@ jobs:
           fi
 
     outputs:
-      server_version: ${{ steps.extract_version.outputs.server_version }}
+      mcp_version: ${{ steps.extract_version.outputs.mcp_version }}
       tag_created: ${{ steps.check_git_tag.outputs.tag_matches }}
 
   release_and_publish:
@@ -98,9 +98,8 @@ jobs:
             os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             bin:
-              - iggy-server
-              - iggy
-            name: iggy-Linux-x86_64-musl.tar.gz
+              - iggy-mcp
+            name: iggy-mcp-Linux-x86_64-musl.tar.gz
             cargo_command: cargo
             docker_arch: linux/amd64
             cross: false
@@ -109,9 +108,8 @@ jobs:
             os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             bin:
-              - iggy-server
-              - iggy
-            name: iggy-Linux-aarch64-musl.tar.gz
+              - iggy-mcp
+            name: iggy-mcp-Linux-aarch64-musl.tar.gz
             docker_arch: linux/arm64/v8
             cross: true
 
@@ -125,7 +123,7 @@ jobs:
       - name: Cache cargo & target directories
         uses: Swatinem/rust-cache@v2
         with:
-          key: "publish-server-${{ matrix.platform.target }}"
+          key: "publish-mcp-${{ matrix.platform.target }}"
 
       - name: Install musl-tools on Linux
         run: sudo apt-get update --yes && sudo apt-get install --yes musl-tools
@@ -142,8 +140,8 @@ jobs:
         with:
           tool: cross
 
-      - name: Build iggy-server ${{ matrix.platform.target }} release binary
-        run: cross +stable build --verbose --release --target ${{ matrix.platform.target }} --bin iggy-server
+      - name: Build iggy-mcp ${{ matrix.platform.target }} release binary
+        run: cross +stable build --verbose --release --target ${{ matrix.platform.target }} --bin iggy-mcp
 
       - name: Build iggy-cli ${{ matrix.platform.target }} release binary
         run: cross +stable build --verbose --release --no-default-features --target ${{ matrix.platform.target }} --bin iggy
@@ -151,11 +149,11 @@ jobs:
       - name: Prepare artifacts
         run: |
           mkdir -p release_artifacts/
-          cp target/${{ matrix.platform.target }}/release/iggy-server release_artifacts/
+          cp target/${{ matrix.platform.target }}/release/iggy-mcp release_artifacts/
           cp target/${{ matrix.platform.target }}/release/iggy release_artifacts/
 
       - name: Print message
-        run: echo "::notice ::Published ${{ needs.tag.outputs.server_version }} release artifacts on GitHub"
+        run: echo "::notice ::Published ${{ needs.tag.outputs.mcp }} release artifacts on GitHub"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -186,13 +184,12 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: ./
-          file: ./Dockerfile.ci
+          file: ./Dockerfile.mcp.ci
           platforms: ${{ matrix.platform.docker_arch }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.DOCKERHUB_REGISTRY_NAME }},push-by-digest=true,name-canonical=true,push=true
           build-args: |
-            IGGY_CMD_PATH=target/${{ matrix.platform.target }}/release/iggy
-            IGGY_SERVER_PATH=target/${{ matrix.platform.target }}/release/iggy-server
+            IGGY_MCP_PATH=target/${{ matrix.platform.target }}/release/iggy-mcp
 
       - name: Export digest
         run: |
@@ -236,7 +233,7 @@ jobs:
         with:
           images: ${{ env.DOCKERHUB_REGISTRY_NAME }}
           tags: |
-            ${{ needs.tag.outputs.server_version }}
+            ${{ needs.tag.outputs.mcp_version }}
             latest
 
       - name: Docker meta (tag was not created)
@@ -258,13 +255,13 @@ jobs:
           docker buildx imagetools inspect ${{ env.DOCKERHUB_REGISTRY_NAME }}:latest
 
   github_release:
-    uses: ./.github/workflows/release_server.yml
+    uses: ./.github/workflows/release_mcp.yml
     needs: tag
     if: ${{ needs.tag.outputs.tag_created == 'true' }}
     with:
-      tag_name: "server-${{ needs.tag.outputs.server_version }}"
+      tag_name: "mcp-${{ needs.tag.outputs.mcp_version }}"
 
-  finalize_publish_server:
+  finalize_publish_mcp:
     runs-on: ubuntu-latest
     needs:
       - release_and_publish

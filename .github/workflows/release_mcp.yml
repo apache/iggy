@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: release_bench
+name: release_mcp
 
 on:
   workflow_call:
@@ -32,39 +32,39 @@ env:
   IGGY_CI_BUILD: true
 
 jobs:
-  build_bench:
+  build_mcp:
     runs-on: ${{ matrix.platform.os }}
     strategy:
       matrix:
         platform:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            executable: iggy-bench
-            file: iggy-bench-x86_64-unknown-linux-musl.tgz
+            executable: iggy-mcp
+            file: iggy-mcp-x86_64-unknown-linux-musl.tgz
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
-            executable: iggy-bench
-            file: iggy-bench-aarch64-unknown-linux-musl.tgz
+            executable: iggy-mcp
+            file: iggy-mcp-aarch64-unknown-linux-musl.tgz
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            executable: iggy-bench
-            file: iggy-bench-x86_64-unknown-linux-gnu.tgz
+            executable: iggy-mcp
+            file: iggy-mcp-x86_64-unknown-linux-gnu.tgz
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            executable: iggy-bench.exe
-            file: iggy-bench-x86_64-pc-windows-msvc.zip
+            executable: iggy-mcp.exe
+            file: iggy-mcp-x86_64-pc-windows-msvc.zip
           - target: aarch64-pc-windows-msvc
             os: windows-latest
-            executable: iggy-bench.exe
-            file: iggy-bench-aarch64-pc-windows-msvc.zip
+            executable: iggy-mcp.exe
+            file: iggy-mcp-aarch64-pc-windows-msvc.zip
           - target: x86_64-apple-darwin
             os: macos-latest
-            executable: iggy-bench
-            file: iggy-bench-x86_64-apple-darwin.zip
+            executable: iggy-mcp
+            file: iggy-mcp-x86_64-apple-darwin.zip
           - target: aarch64-apple-darwin
             os: macos-latest
-            executable: iggy-bench
-            file: iggy-bench-aarch64-apple-darwin.zip
+            executable: iggy-mcp
+            file: iggy-mcp-aarch64-apple-darwin.zip
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -72,7 +72,7 @@ jobs:
       - name: Cache cargo & target directories
         uses: Swatinem/rust-cache@v2
         with:
-          key: "release-bench-${{ matrix.platform.target }}"
+          key: "release-mcp-${{ matrix.platform.target }}"
 
       - name: Install musl-tools on Linux
         run: sudo apt-get update --yes && sudo apt-get install --yes musl-tools
@@ -90,7 +90,7 @@ jobs:
           tool: cross
 
       - name: Build ${{ matrix.platform.target }} release binary
-        run: cross +stable build --verbose --release --target ${{ matrix.platform.target }} -p iggy-bench
+        run: cross +stable build --verbose --release --target ${{ matrix.platform.target }} -p iggy-mcp
 
       - name: Collect ${{ matrix.platform.target }} executable
         run: |

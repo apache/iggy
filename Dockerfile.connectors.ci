@@ -15,16 +15,18 @@
 # specific language governing permissions and limitations
 # under the License.
 
-.config
-.github
-/assets
-/local_data
-/licenses
-/certs
-/helm
-/web
-Dockerfile
-docker-compose.yml
-.dockerignore
-.git
-.gitignore
+FROM alpine:latest
+
+ARG IGGY_CONNECTORS_PATH
+RUN test -n "$IGGY_CONNECTORS_PATH" || (echo "IGGY_CONNECTORS_PATH not set" && false)
+
+WORKDIR /iggy
+
+COPY ./core/connectors/runtime/config.toml ./config.toml
+COPY ${IGGY_CONNECTORS_PATH} ./
+
+RUN chmod +x ./iggy-connectors
+
+RUN ln -sf /iggy/iggy-connectors /usr/bin/iggy-connectors
+
+CMD ["/iggy/iggy-connectors"]

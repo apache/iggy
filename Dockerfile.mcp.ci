@@ -15,16 +15,18 @@
 # specific language governing permissions and limitations
 # under the License.
 
-.config
-.github
-/assets
-/local_data
-/licenses
-/certs
-/helm
-/web
-Dockerfile
-docker-compose.yml
-.dockerignore
-.git
-.gitignore
+FROM alpine:latest
+
+ARG IGGY_MCP_PATH
+RUN test -n "$IGGY_MCP_PATH" || (echo "IGGY_MCP_PATH not set" && false)
+
+WORKDIR /iggy
+
+COPY ./core/ai/mcp/config.toml ./config.toml
+COPY ${IGGY_MCP_PATH} ./
+
+RUN chmod +x ./iggy-mcp
+
+RUN ln -sf /iggy/iggy-mcp /usr/bin/iggy-mcp
+
+CMD ["/iggy/iggy-mcp"]
