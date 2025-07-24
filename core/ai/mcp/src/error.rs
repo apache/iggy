@@ -16,16 +16,24 @@
  * under the License.
  */
 
-pub mod bench_utils;
-pub mod file;
-#[allow(deprecated)]
-pub mod http_client;
-#[allow(deprecated)]
-pub mod quic_client;
-#[allow(deprecated)]
-pub mod tcp_client;
-#[allow(deprecated)]
-pub mod test_mcp_server;
-#[allow(deprecated)]
-pub mod test_server;
-pub mod test_tls_utils;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum McpRuntimeError {
+    #[error("Failed to create service")]
+    FailedToCreateService,
+    #[error("Missing configuration")]
+    MissingConfig,
+    #[error("Failed to start HTTP server")]
+    FailedToStartHttpServer,
+    #[error("Iggy client error")]
+    IggyClient(#[from] iggy::prelude::ClientError),
+    #[error("Iggy error")]
+    IggyError(#[from] iggy::prelude::IggyError),
+    #[error("Missing Iggy credentials")]
+    MissingIggyCredentials,
+    #[error("Failed to create Iggy consumer ID")]
+    FailedToCreateConsumerId,
+    #[error("Invalid API path")]
+    InvalidApiPath,
+}

@@ -38,7 +38,7 @@ pub fn generate_test_certificates(cert_dir: &str) -> Result<(), Box<dyn std::err
 
     let key_path = Path::new(cert_dir).join("test_key.pem");
     let mut key_file = File::create(&key_path)?;
-    key_file.write_all(cert.key_pair.serialize_pem().as_bytes())?;
+    key_file.write_all(cert.signing_key.serialize_pem().as_bytes())?;
 
     Ok(())
 }

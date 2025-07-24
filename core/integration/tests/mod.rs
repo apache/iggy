@@ -29,6 +29,7 @@ mod archiver;
 mod cli;
 mod config_provider;
 mod data_integrity;
+mod mcp;
 mod sdk;
 mod server;
 mod state;

@@ -1,6 +1,6 @@
 {
   "rust": [
-    "core/(bench|cli|examples|integration|sdk|server|tools|connectors).*\\.rs",
+    "core/(bench|cli|examples|integration|sdk|server|tools|connectors|ai).*\\.rs",
     "bdd/rust/.*\\.rs",
     "core/Cargo.toml",
     "Cargo.toml",
@@ -15,7 +15,7 @@
     ".github/workflows/ci-check-pr.yml"
   ],
   "rust-prod": [
-    "core/(bench|cli|examples|integration|sdk|server|tools|connectors).*\\.rs",
+    "core/(bench|cli|examples|integration|sdk|server|tools|connectors|ai).*\\.rs",
     "bdd/rust/.*\\.rs",
     "core/Cargo.toml",
     "Cargo.toml",

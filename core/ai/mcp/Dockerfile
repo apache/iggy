@@ -15,24 +15,17 @@
 # specific language governing permissions and limitations
 # under the License.
 
-services:
-  iggy-server:
-    build: .
-    container_name: iggy-server
-    restart: unless-stopped
-    networks:
-      - iggy
-    ports:
-      - 3000:3000
-      - 8080:8080
-      - 8090:8090
-    volumes:
-      - iggy-server:/local_data
+FROM rust:latest AS builder
+WORKDIR /build
+COPY . /build
+RUN cargo build --bin iggy-mcp --release
 
-volumes:
-  iggy-server:
-    driver: local
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    liblzma5 \
+    && rm -rf /var/lib/apt/lists/*
+COPY ./core/ai/mcp/config.toml ./config.toml
+COPY --from=builder /build/target/release/iggy-mcp .
 
-networks:
-  iggy:
-    name: iggy-network
+CMD ["/iggy-mcp"]

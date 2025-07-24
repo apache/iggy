@@ -75,9 +75,9 @@ jobs:
           echo -n "test" | gnome-keyring-daemon --unlock
       - name: Prepare ${{ matrix.platform.target }} toolchain
         run: |
-           rustup toolchain add --profile=minimal stable
-           rustup target add --toolchain=stable ${{ matrix.platform.target }}
-           rustup override set stable
+          rustup toolchain add --profile=minimal stable
+          rustup target add --toolchain=stable ${{ matrix.platform.target }}
+          rustup override set stable
       - name: Install cross tool
         uses: taiki-e/install-action@v2
         with:

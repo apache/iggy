@@ -3,8 +3,15 @@
 .git
 .github
 .gitignore
+.idea
+.vscode
+.zed
 /assets
-/certs
+/core/certs
+/helm
+/licenses
 /local_data
+/performance_results
 /scripts
 /target
+/web

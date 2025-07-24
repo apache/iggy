@@ -15,24 +15,18 @@
 # specific language governing permissions and limitations
 # under the License.
 
-services:
-  iggy-server:
-    build: .
-    container_name: iggy-server
-    restart: unless-stopped
-    networks:
-      - iggy
-    ports:
-      - 3000:3000
-      - 8080:8080
-      - 8090:8090
-    volumes:
-      - iggy-server:/local_data
+FROM alpine:latest
 
-volumes:
-  iggy-server:
-    driver: local
+ARG IGGY_CONNECTORS_PATH
+RUN test -n "$IGGY_CONNECTORS_PATH" || (echo "IGGY_CONNECTORS_PATH not set" && false)
 
-networks:
-  iggy:
-    name: iggy-network
+WORKDIR /iggy
+
+COPY ./core/connectors/runtime/config.toml ./config.toml
+COPY ${IGGY_CONNECTORS_PATH} ./
+
+RUN chmod +x ./iggy-connectors
+
+RUN ln -sf /iggy/iggy-connectors /usr/bin/iggy-connectors
+
+CMD ["/iggy/iggy-connectors"]
