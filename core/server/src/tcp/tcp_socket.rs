@@ -58,7 +58,7 @@ pub fn build(ipv6: bool, config: &TcpSocketConfig) -> Socket {
             .set_keepalive(config.keepalive)
             .expect("Unable to set SO_KEEPALIVE on socket");
         socket
-            .set_nodelay(config.nodelay)
+            .set_tcp_nodelay(config.nodelay)
             .expect("Unable to set TCP_NODELAY on socket");
         socket
             .set_linger(Some(config.linger.get_duration()))
@@ -92,7 +92,7 @@ mod tests {
         assert!(socket.recv_buffer_size().unwrap() >= buffer_size as usize);
         assert!(socket.send_buffer_size().unwrap() >= buffer_size as usize);
         assert!(socket.keepalive().unwrap());
-        assert!(socket.nodelay().unwrap());
+        assert!(socket.tcp_nodelay().unwrap());
         assert_eq!(socket.linger().unwrap(), Some(linger_dur));
     }
 }

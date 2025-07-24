@@ -46,6 +46,9 @@ blake3 = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
+cyper = { workspace = true }
+cyper-axum = { workspace = true }
+compio-net = { workspace = true }
 console-subscriber = { workspace = true, optional = true }
 crossbeam = { workspace = true }
 ctrlc = { version = "3.4", features = ["termination"] }
@@ -62,7 +65,7 @@ futures = { workspace = true }
 human-repr = { workspace = true }
 iggy_common = { workspace = true }
 jsonwebtoken = "9.3.1"
-socket2 = "0.5.10"
+socket2 = "0.6.0"
 lending-iterator = "0.1.7"
 hash32 = "1.0.0"
 mimalloc = { workspace = true, optional = true }
@@ -106,7 +109,6 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 compio = { workspace = true }
-cyper = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-util = { workspace = true }
 toml = { workspace = true }
@@ -118,6 +120,7 @@ tracing-subscriber = { workspace = true }
 twox-hash = { workspace = true }
 ulid = "1.2.1"
 uuid = { workspace = true }
+send_wrapper = "0.6.0"
 rusty-s3 = "0.7.0"
 
 [build-dependencies]

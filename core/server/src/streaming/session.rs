@@ -16,20 +16,17 @@
  * under the License.
  */
 
-use iggy_common::{AtomicUserId, UserId};
+use iggy_common::UserId;
+use std::cell::Cell;
 use std::fmt::Display;
 use std::net::SocketAddr;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 // This might be extended with more fields in the future e.g. custom name, permissions etc.
 #[derive(Debug, Clone)]
 pub struct Session {
-    // TODO: Fixme, those don't have to be atomics anymore, simple integers will suffice
-    // Once the atomics are removed, we can impl Copy trait aswell.
-    user_id: Rc<AtomicUserId>,
-    active: Rc<AtomicBool>,
     pub client_id: u32,
+    user_id: Cell<UserId>,
+    active: Cell<bool>,
     pub ip_address: SocketAddr,
 }
 
@@ -37,8 +34,8 @@ impl Session {
     pub fn new(client_id: u32, user_id: UserId, ip_address: SocketAddr) -> Self {
         Self {
             client_id,
-            active: Rc::new(AtomicBool::new(true)),
-            user_id: Rc::new(AtomicUserId::new(user_id)),
+            user_id: Cell::new(user_id),
+            active: Cell::new(true),
             ip_address,
         }
     }
@@ -52,23 +49,23 @@ impl Session {
     }
 
     pub fn get_user_id(&self) -> UserId {
-        self.user_id.load(Ordering::Relaxed)
+        self.user_id.get()
     }
 
     pub fn set_user_id(&self, user_id: UserId) {
-        self.user_id.store(user_id, Ordering::Relaxed)
+        self.user_id.set(user_id);
     }
 
     pub fn set_stale(&self) {
-        self.active.store(false, Ordering::Relaxed)
+        self.active.set(false);
     }
 
     pub fn clear_user_id(&self) {
-        self.set_user_id(0)
+        self.set_user_id(0);
     }
 
     pub fn is_active(&self) -> bool {
-        self.active.load(Ordering::Relaxed)
+        self.active.get()
     }
 
     pub fn is_authenticated(&self) -> bool {
@@ -80,17 +77,17 @@ impl Display for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let user_id = self.get_user_id();
         if user_id > 0 {
-            return write!(
+            write!(
                 f,
                 "client ID: {}, user ID: {}, IP address: {}",
                 self.client_id, user_id, self.ip_address
-            );
+            )
+        } else {
+            write!(
+                f,
+                "client ID: {}, IP address: {}",
+                self.client_id, self.ip_address
+            )
         }
-
-        write!(
-            f,
-            "client ID: {}, IP address: {}",
-            self.client_id, self.ip_address
-        )
     }
 }

@@ -16,13 +16,14 @@
  * under the License.
  */
 
-use crate::{http::jwt::jwt_manager::JwtManager, shard::IggyShard};
+use super::http_shard_wrapper::HttpSafeShard;
+use crate::http::jwt::jwt_manager::JwtManager;
 use std::net::SocketAddr;
 use ulid::Ulid;
 
 pub struct AppState {
     pub jwt_manager: JwtManager,
-    pub shard: IggyShard,
+    pub shard: HttpSafeShard,
 }
 
 #[derive(Debug, Copy, Clone)]
