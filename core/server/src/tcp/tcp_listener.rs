@@ -70,6 +70,7 @@ pub async fn start(
     config: &TcpSocketConfig,
     shard: Rc<IggyShard>,
 ) -> Result<(), IggyError> {
+    //TODO: Fix me, this needs to take into account that first shard id potentially can be greater than 0.
     if shard.id != 0 && addr.port() == 0 {
         shard_info!(shard.id, "Waiting for TCP address from shard 0...");
         loop {
@@ -99,6 +100,7 @@ pub async fn start(
         actual_addr
     );
 
+    //TODO: Fix me, this needs to take into account that first shard id potentially can be greater than 0.
     if shard.id == 0 {
         if addr.port() == 0 {
             let event = ShardEvent::TcpBound {

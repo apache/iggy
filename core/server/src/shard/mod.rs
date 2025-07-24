@@ -961,20 +961,17 @@ impl IggyShard {
         }
     }
 
-    pub fn ensure_authenticated(&self, session: &Session) -> Result<u32, IggyError> {
-        let active_sessions = self.active_sessions.borrow();
-        let user_id = active_sessions
-            .iter()
-            .find(|s| s.get_user_id() == session.get_user_id())
-            .ok_or_else(|| IggyError::Unauthenticated)
-            .and_then(|session| {
-                if session.is_authenticated() {
-                    Ok(session.get_user_id())
-                } else {
-                    error!("{COMPONENT} - unauthenticated access attempt, session: {session}");
-                    Err(IggyError::Unauthenticated)
-                }
-            })?;
-        Ok(user_id)
+    pub fn ensure_authenticated(&self, session: &Session) -> Result<(), IggyError> {
+        if !session.is_active() {
+            error!("{COMPONENT} - session is inactive, session: {session}");
+            return Err(IggyError::StaleClient);
+        }
+
+        if session.is_authenticated() {
+            Ok(())
+        } else {
+            error!("{COMPONENT} - unauthenticated access attempt, session: {session}");
+            Err(IggyError::Unauthenticated)
+        }
     }
 }
