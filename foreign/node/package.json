@@ -2,10 +2,14 @@
   "name": "@apache-iggy/node-sdk",
   "type": "module",
   "version": "0.5.0",
-  "description": "Official apache iggy nodejs binary client",
+  "description": "Official Apache Iggy NodeJS SDK",
   "keywords": [
     "iggy",
     "driver",
+    "sdk",
+    "apache",
+    "messaging",
+    "streaming",
     "client",
     "protocol"
   ],
