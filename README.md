@@ -133,7 +133,7 @@ There's a dedicated Web UI for the server, which allows managing the streams, to
 
 ## Docker
 
-The official images can be found [in Docker Hub](https://hub.docker.com/r/apache/iggy), simply type `docker pull apache/iggy` to pull the image.
+The official images can be found in [Docker Hub](https://hub.docker.com/r/apache/iggy), simply type `docker pull apache/iggy` to pull the image.
 
 Please note that the images tagged as `latest` are based on the official, stable releases, while the `edge` ones are updated directly from latest version of the `master` branch.
 
@@ -299,7 +299,7 @@ while let Some(message) = consumer.next().await {
 **Benchmarks should be the first-class citizens**. We believe that performance is crucial for any system, and we strive to provide the best possible performance for our users. Please check, why we believe that the **[transparent
 benchmarking](https://iggy.apache.org/blogs/2025/02/17/transparent-benchmarks)** is so important.
 
-We've also built the **[benchmarking platform](https://benchmarks.iggy.rs)** where anyone can upload the benchmarks and compare the results with others. Source code for the platform is available in the `core/bench/dashboard` directory.
+We've also built the **[benchmarking platform](https://benchmarks.iggy.apache.org)** where anyone can upload the benchmarks and compare the results with others. Source code for the platform is available in the `core/bench/dashboard` directory.
 
 ![server](assets/benchmarking_platform.png)
 
@@ -365,7 +365,7 @@ Depending on the hardware, transport protocol (`quic`, `tcp` or `http`) and payl
 
 **Iggy is already capable of processing millions of messages per second at the microseconds range for p99+ latency**, and with the upcoming optimizations related to the io_uring support along with the shared-nothing design, it will only get better.
 
-Please refer to the mentioned [benchmarking platform](https://benchmarks.iggy.rs) where you can browse the results achieved on the different hardware configurations, using the different Iggy server versions.
+Please refer to the mentioned [benchmarking platform](https://benchmarks.iggy.apache.org) where you can browse the results achieved on the different hardware configurations, using the different Iggy server versions.
 
 ---
 
