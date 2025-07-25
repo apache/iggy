@@ -1,0 +1,40 @@
+[iggy]
+address = "localhost:8090"
+username = "iggy"
+password = "iggy"
+
+[sources.elasticsearch_test]
+enabled = true
+name = "Elasticsearch test source"
+path = "target/release/libiggy_connector_elasticsearch_source"
+
+[[sources.elasticsearch_test.streams]]
+stream = "test_stream"
+topic = "test_topic"
+schema = "json"
+batch_length = 10
+linger_time = "1s"
+
+[sources.elasticsearch_test.config]
+url = "http://localhost:9200"
+index = "test_logs"
+polling_interval = "1s"
+batch_size = 10
+timestamp_field = "@timestamp"
+query = {
+  "match_all": {}
+}
+state = {
+  enabled = true
+  storage_type = "file"
+  storage_config = {
+    base_path = "./test_states"
+  }
+  state_id = "test_elasticsearch_connector"
+  auto_save_interval = "1s"
+  tracked_fields = [
+    "last_poll_timestamp",
+    "last_document_id",
+    "total_documents_fetched"
+  ]
+} 
