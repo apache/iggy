@@ -18,7 +18,7 @@
 
 use crate::clients::client::IggyClient;
 use crate::http::http_client::HttpClient;
-use crate::quic::quick_client::QuicClient;
+use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
 
 #[allow(clippy::large_enum_variant)]

@@ -28,9 +28,10 @@ var _ = ginkgo.Describe("GET USER:", func() {
 			client := createAuthorizedConnection()
 			name := createRandomString(16)
 			userId := successfullyCreateUser(name, client)
-			defer deleteUserAfterTests(int(userId), client)
+			userIdentifier, _ := iggcon.NewIdentifier(userId)
+			defer deleteUserAfterTests(userIdentifier, client)
 
-			user, err := client.GetUser(iggcon.NewIdentifier(int(userId)))
+			user, err := client.GetUser(userIdentifier)
 
 			itShouldNotReturnError(err)
 			itShouldReturnSpecificUser(name, user.UserInfo)

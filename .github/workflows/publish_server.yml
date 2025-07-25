@@ -20,7 +20,7 @@ name: publish_server
 on:
   push:
     tags:
-      - 'server-*'
+      - "server-*"
 
 env:
   DOCKERHUB_REGISTRY_NAME: apache/iggy
@@ -133,9 +133,9 @@ jobs:
 
       - name: Prepare ${{ matrix.platform.target }} toolchain
         run: |
-           rustup toolchain add --profile=minimal stable
-           rustup target add --toolchain=stable ${{ matrix.platform.target }}
-           rustup override set stable
+          rustup toolchain add --profile=minimal stable
+          rustup target add --toolchain=stable ${{ matrix.platform.target }}
+          rustup override set stable
 
       - name: Install cross
         uses: taiki-e/install-action@v2
@@ -217,7 +217,7 @@ jobs:
       - name: Download digests
         uses: actions/download-artifact@v4
         with:
-          pattern: 'digests-*'
+          pattern: "digests-*"
           merge-multiple: true
           path: /tmp/digests
 

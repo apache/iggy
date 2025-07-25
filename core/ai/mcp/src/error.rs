@@ -1,5 +1,4 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
+/* Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -17,7 +16,24 @@
  * under the License.
  */
 
+use thiserror::Error;
 
-export type LoginResponse = {
-  userId: number
+#[derive(Debug, Error)]
+pub enum McpRuntimeError {
+    #[error("Failed to create service")]
+    FailedToCreateService,
+    #[error("Missing configuration")]
+    MissingConfig,
+    #[error("Failed to start HTTP server")]
+    FailedToStartHttpServer,
+    #[error("Iggy client error")]
+    IggyClient(#[from] iggy::prelude::ClientError),
+    #[error("Iggy error")]
+    IggyError(#[from] iggy::prelude::IggyError),
+    #[error("Missing Iggy credentials")]
+    MissingIggyCredentials,
+    #[error("Failed to create Iggy consumer ID")]
+    FailedToCreateConsumerId,
+    #[error("Invalid API path")]
+    InvalidApiPath,
 }

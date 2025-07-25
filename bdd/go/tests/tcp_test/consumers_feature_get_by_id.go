@@ -32,7 +32,10 @@ var _ = ginkgo.Describe("GET CONSUMER GROUP BY ID:", func() {
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
 			groupId, name := successfullyCreateConsumer(streamId, topicId, client)
-			group, err := client.GetConsumerGroup(iggcon.NewIdentifier(streamId), iggcon.NewIdentifier(topicId), iggcon.NewIdentifier(groupId))
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
+			groupIdentifier, _ := iggcon.NewIdentifier(groupId)
+			group, err := client.GetConsumerGroup(streamIdentifier, topicIdentifier, groupIdentifier)
 
 			itShouldNotReturnError(err)
 			itShouldReturnSpecificConsumer(groupId, name, &group.ConsumerGroup)
@@ -42,9 +45,10 @@ var _ = ginkgo.Describe("GET CONSUMER GROUP BY ID:", func() {
 			client := createAuthorizedConnection()
 
 			_, err := client.GetConsumerGroup(
-				iggcon.NewIdentifier(int(createRandomUInt32())),
-				iggcon.NewIdentifier(int(createRandomUInt32())),
-				iggcon.NewIdentifier(int(createRandomUInt32())))
+				randomU32Identifier(),
+				randomU32Identifier(),
+				randomU32Identifier(),
+			)
 
 			itShouldReturnSpecificIggyError(err, ierror.ConsumerGroupIdNotFound)
 		})
@@ -53,11 +57,12 @@ var _ = ginkgo.Describe("GET CONSUMER GROUP BY ID:", func() {
 			client := createAuthorizedConnection()
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
-
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			_, err := client.GetConsumerGroup(
-				iggcon.NewIdentifier(streamId),
-				iggcon.NewIdentifier(int(createRandomUInt32())),
-				iggcon.NewIdentifier(int(createRandomUInt32())))
+				streamIdentifier,
+				randomU32Identifier(),
+				randomU32Identifier(),
+			)
 
 			itShouldReturnSpecificIggyError(err, ierror.ConsumerGroupIdNotFound)
 		})
@@ -67,11 +72,13 @@ var _ = ginkgo.Describe("GET CONSUMER GROUP BY ID:", func() {
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, _ := successfullyCreateTopic(streamId, client)
-
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 			_, err := client.GetConsumerGroup(
-				iggcon.NewIdentifier(streamId),
-				iggcon.NewIdentifier(topicId),
-				iggcon.NewIdentifier(int(createRandomUInt32())))
+				streamIdentifier,
+				topicIdentifier,
+				randomU32Identifier(),
+			)
 
 			itShouldReturnSpecificIggyError(err, ierror.ConsumerGroupIdNotFound)
 		})

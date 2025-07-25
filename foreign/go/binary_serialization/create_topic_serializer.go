@@ -19,25 +19,23 @@ package binaryserialization
 
 import (
 	"encoding/binary"
-	"time"
-
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
 type TcpCreateTopicRequest struct {
-	StreamId             iggcon.Identifier `json:"streamId"`
-	PartitionsCount      int               `json:"partitionsCount"`
-	CompressionAlgorithm uint8             `json:"compressionAlgorithm"`
-	MessageExpiry        time.Duration     `json:"messageExpiry"`
-	MaxTopicSize         uint64            `json:"maxTopicSize"`
-	Name                 string            `json:"name"`
-	ReplicationFactor    *uint8            `json:"replicationFactor"`
-	TopicId              *int              `json:"topicId"`
+	StreamId             iggcon.Identifier           `json:"streamId"`
+	PartitionsCount      uint32                      `json:"partitionsCount"`
+	CompressionAlgorithm iggcon.CompressionAlgorithm `json:"compressionAlgorithm"`
+	MessageExpiry        iggcon.Duration             `json:"messageExpiry"`
+	MaxTopicSize         uint64                      `json:"maxTopicSize"`
+	Name                 string                      `json:"name"`
+	ReplicationFactor    *uint8                      `json:"replicationFactor"`
+	TopicId              *uint32                     `json:"topicId"`
 }
 
 func (request *TcpCreateTopicRequest) Serialize() []byte {
 	if request.TopicId == nil {
-		request.TopicId = new(int)
+		request.TopicId = new(uint32)
 	}
 	if request.ReplicationFactor == nil {
 		request.ReplicationFactor = new(uint8)
@@ -64,19 +62,19 @@ func (request *TcpCreateTopicRequest) Serialize() []byte {
 	position += len(streamIdBytes)
 
 	// TopicId
-	binary.LittleEndian.PutUint32(bytes[position:], uint32(*request.TopicId))
+	binary.LittleEndian.PutUint32(bytes[position:], *request.TopicId)
 	position += 4
 
 	// PartitionsCount
-	binary.LittleEndian.PutUint32(bytes[position:], uint32(request.PartitionsCount))
+	binary.LittleEndian.PutUint32(bytes[position:], request.PartitionsCount)
 	position += 4
 
 	// CompressionAlgorithm
-	bytes[position] = request.CompressionAlgorithm
+	bytes[position] = byte(request.CompressionAlgorithm)
 	position++
 
 	// MessageExpiry
-	binary.LittleEndian.PutUint64(bytes[position:], uint64(request.MessageExpiry.Microseconds()))
+	binary.LittleEndian.PutUint64(bytes[position:], uint64(request.MessageExpiry))
 	position += 8
 
 	// MaxTopicSize

@@ -30,7 +30,8 @@ var _ = ginkgo.Describe("GET ALL TOPICS:", func() {
 			streamId, _ := successfullyCreateStream(prefix, client)
 			defer deleteStreamAfterTests(streamId, client)
 			topicId, name := successfullyCreateTopic(streamId, client)
-			topics, err := client.GetTopics(iggcon.NewIdentifier(streamId))
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+			topics, err := client.GetTopics(streamIdentifier)
 
 			itShouldNotReturnError(err)
 			itShouldContainSpecificTopic(topicId, name, topics)
@@ -40,7 +41,7 @@ var _ = ginkgo.Describe("GET ALL TOPICS:", func() {
 	ginkgo.When("User is not logged in", func() {
 		ginkgo.Context("and tries to get all topics", func() {
 			client := createClient()
-			_, err := client.GetTopics(iggcon.NewIdentifier(int(createRandomUInt32())))
+			_, err := client.GetTopics(randomU32Identifier())
 
 			itShouldReturnUnauthenticatedError(err)
 		})

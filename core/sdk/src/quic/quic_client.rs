@@ -49,7 +49,7 @@ const NAME: &str = "Iggy";
 #[derive(Debug)]
 pub struct QuicClient {
     pub(crate) endpoint: Endpoint,
-    pub(crate) connection: Mutex<Option<Connection>>,
+    pub(crate) connection: Arc<Mutex<Option<Connection>>>,
     pub(crate) config: Arc<QuicClientConfig>,
     pub(crate) server_address: SocketAddr,
     pub(crate) state: Mutex<ClientState>,
@@ -196,7 +196,7 @@ impl QuicClient {
             config,
             endpoint,
             server_address,
-            connection: Mutex::new(None),
+            connection: Arc::new(Mutex::new(None)),
             state: Mutex::new(ClientState::Disconnected),
             events: broadcast(1000),
             connected_at: Mutex::new(None),
@@ -214,9 +214,12 @@ impl QuicClient {
         ))
     }
 
-    async fn handle_response(&self, recv: &mut RecvStream) -> Result<Bytes, IggyError> {
+    async fn handle_response(
+        recv: &mut RecvStream,
+        response_buffer_size: usize,
+    ) -> Result<Bytes, IggyError> {
         let buffer = recv
-            .read_to_end(self.config.response_buffer_size as usize)
+            .read_to_end(response_buffer_size)
             .await
             .map_err(|error| {
                 error!("Failed to read response data: {error}");
@@ -450,38 +453,48 @@ impl QuicClient {
             _ => {}
         }
 
-        let connection = self.connection.lock().await;
-        if let Some(connection) = connection.as_ref() {
-            let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
-            let (mut send, mut recv) = connection.open_bi().await.map_err(|error| {
-                error!("Failed to open a bidirectional stream: {error}");
-                IggyError::QuicError
-            })?;
-            trace!("Sending a QUIC request with code: {code}");
-            send.write_all(&(payload_length as u32).to_le_bytes())
-                .await
-                .map_err(|error| {
-                    error!("Failed to write payload length: {error}");
+        let connection = self.connection.clone();
+        let response_buffer_size = self.config.response_buffer_size;
+        // SAFETY: we run code holding the `connection` lock in a task so we can't be cancelled while holding the lock.
+        tokio::spawn(async move {
+            let connection = connection.lock().await;
+            if let Some(connection) = connection.as_ref() {
+                let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
+                let (mut send, mut recv) = connection.open_bi().await.map_err(|error| {
+                    error!("Failed to open a bidirectional stream: {error}");
                     IggyError::QuicError
                 })?;
-            send.write_all(&code.to_le_bytes()).await.map_err(|error| {
-                error!("Failed to write payload code: {error}");
-                IggyError::QuicError
-            })?;
-            send.write_all(&payload).await.map_err(|error| {
-                error!("Failed to write payload: {error}");
-                IggyError::QuicError
-            })?;
-            send.finish().map_err(|error| {
-                error!("Failed to finish sending data: {error}");
-                IggyError::QuicError
-            })?;
-            trace!("Sent a QUIC request with code: {code}, waiting for a response...");
-            return self.handle_response(&mut recv).await;
-        }
+                trace!("Sending a QUIC request with code: {code}");
+                send.write_all(&(payload_length as u32).to_le_bytes())
+                    .await
+                    .map_err(|error| {
+                        error!("Failed to write payload length: {error}");
+                        IggyError::QuicError
+                    })?;
+                send.write_all(&code.to_le_bytes()).await.map_err(|error| {
+                    error!("Failed to write payload code: {error}");
+                    IggyError::QuicError
+                })?;
+                send.write_all(&payload).await.map_err(|error| {
+                    error!("Failed to write payload: {error}");
+                    IggyError::QuicError
+                })?;
+                send.finish().map_err(|error| {
+                    error!("Failed to finish sending data: {error}");
+                    IggyError::QuicError
+                })?;
+                trace!("Sent a QUIC request with code: {code}, waiting for a response...");
+                return QuicClient::handle_response(&mut recv, response_buffer_size as usize).await;
+            }
 
-        error!("Cannot send data. Client is not connected.");
-        Err(IggyError::NotConnected)
+            error!("Cannot send data. Client is not connected.");
+            Err(IggyError::NotConnected)
+        })
+        .await
+        .map_err(|e| {
+            error!("Task execution failed during QUIC request: {}", e);
+            IggyError::QuicError
+        })?
     }
 }
 

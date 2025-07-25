@@ -29,8 +29,10 @@ use bench_report::{
     group_metrics_kind::GroupMetricsKind,
     group_metrics_summary::BenchmarkGroupMetricsSummary,
     individual_metrics::BenchmarkIndividualMetrics,
+    time_series::{TimeSeries, TimeSeriesKind},
     utils::{max, min, std_dev},
 };
+use std::thread;
 
 pub fn from_producers_and_consumers_statistics(
     producers_stats: &[BenchmarkIndividualMetrics],
@@ -155,37 +157,69 @@ fn determine_group_kind(stats: &[BenchmarkIndividualMetrics]) -> GroupMetricsKin
     }
 }
 
-use bench_report::time_series::TimeSeries;
-
 fn calculate_group_time_series(
     stats: &[BenchmarkIndividualMetrics],
     moving_average_window: u32,
 ) -> (TimeSeries, TimeSeries, TimeSeries) {
-    let mut avg_throughput_mb_ts = TimeSeriesCalculator::aggregate_sum(
-        &stats
-            .iter()
-            .map(|r| r.throughput_mb_ts.clone())
-            .collect::<Vec<_>>(),
-    );
-    let mut avg_throughput_msg_ts = TimeSeriesCalculator::aggregate_sum(
-        &stats
-            .iter()
-            .map(|r| r.throughput_msg_ts.clone())
-            .collect::<Vec<_>>(),
-    );
-    let mut avg_latency_ts = TimeSeriesCalculator::aggregate_avg(
-        &stats
-            .iter()
-            .map(|r| r.latency_ts.clone())
-            .collect::<Vec<_>>(),
-    );
-
     let sma = MovingAverageProcessor::new(moving_average_window as usize);
-    avg_throughput_mb_ts = sma.process(&avg_throughput_mb_ts);
-    avg_throughput_msg_ts = sma.process(&avg_throughput_msg_ts);
-    avg_latency_ts = sma.process(&avg_latency_ts);
 
-    (avg_throughput_mb_ts, avg_throughput_msg_ts, avg_latency_ts)
+    thread::scope(|scope| {
+        let mut join_handles = Vec::new();
+
+        join_handles.push(scope.spawn(|| {
+            let avg_throughput_mb_ts = TimeSeriesCalculator::aggregate_sum(
+                &stats
+                    .iter()
+                    .map(|r| r.throughput_mb_ts.clone())
+                    .collect::<Vec<_>>(),
+            );
+            sma.process(&avg_throughput_mb_ts)
+        }));
+        join_handles.push(scope.spawn(|| {
+            let avg_throughput_msg_ts = TimeSeriesCalculator::aggregate_sum(
+                &stats
+                    .iter()
+                    .map(|r| r.throughput_msg_ts.clone())
+                    .collect::<Vec<_>>(),
+            );
+            sma.process(&avg_throughput_msg_ts)
+        }));
+        join_handles.push(scope.spawn(|| {
+            let avg_latency_ts = TimeSeriesCalculator::aggregate_avg(
+                &stats
+                    .iter()
+                    .map(|r| r.latency_ts.clone())
+                    .collect::<Vec<_>>(),
+            );
+            sma.process(&avg_latency_ts)
+        }));
+
+        let mut time_series: Vec<_> = join_handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .expect("Should not fail to compute aggregated time series")
+            })
+            .collect();
+
+        (
+            extract_time_series_of_kind(&mut time_series, TimeSeriesKind::ThroughputMB),
+            extract_time_series_of_kind(&mut time_series, TimeSeriesKind::ThroughputMsg),
+            extract_time_series_of_kind(&mut time_series, TimeSeriesKind::Latency),
+        )
+    })
+}
+
+fn extract_time_series_of_kind(
+    ts_vec: &mut Vec<TimeSeries>,
+    target_kind: TimeSeriesKind,
+) -> TimeSeries {
+    let position = ts_vec
+        .iter()
+        .position(|ts| ts.kind == target_kind)
+        .expect("Should be able to find TimeSeries of target kind");
+    ts_vec.swap_remove(position)
 }
 
 fn calculate_min_max_latencies(

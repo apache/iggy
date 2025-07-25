@@ -18,8 +18,7 @@
 package tcp_test
 
 import (
-	"strconv"
-
+	"fmt"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/iggycli"
@@ -29,20 +28,20 @@ import (
 
 //operations
 
-func successfullyCreateStream(prefix string, client iggycli.Client) (int, string) {
+func successfullyCreateStream(prefix string, client iggycli.Client) (uint32, string) {
 	streamId := createRandomUInt32()
 	name := createRandomStringWithPrefix(prefix, 128)
 
 	_, err := client.CreateStream(name, &streamId)
 
 	itShouldNotReturnError(err)
-	itShouldSuccessfullyCreateStream(int(streamId), name, client)
-	return int(streamId), name
+	itShouldSuccessfullyCreateStream(streamId, name, client)
+	return streamId, name
 }
 
 //assertions
 
-func itShouldReturnSpecificStream(id int, name string, stream iggcon.StreamDetails) {
+func itShouldReturnSpecificStream(id uint32, name string, stream iggcon.StreamDetails) {
 	ginkgo.It("should fetch stream with id "+string(rune(id)), func() {
 		gomega.Expect(stream.Id).To(gomega.Equal(id))
 	})
@@ -52,7 +51,7 @@ func itShouldReturnSpecificStream(id int, name string, stream iggcon.StreamDetai
 	})
 }
 
-func itShouldContainSpecificStream(id int, name string, streams []iggcon.Stream) {
+func itShouldContainSpecificStream(id uint32, name string, streams []iggcon.Stream) {
 	ginkgo.It("should fetch at least one stream", func() {
 		gomega.Expect(len(streams)).NotTo(gomega.Equal(0))
 	})
@@ -68,7 +67,7 @@ func itShouldContainSpecificStream(id int, name string, streams []iggcon.Stream)
 		}
 	}
 
-	ginkgo.It("should fetch stream with id "+strconv.Itoa(id), func() {
+	ginkgo.It(fmt.Sprintf("should fetch stream with id %d", id), func() {
 		gomega.Expect(found).To(gomega.BeTrue(), "Stream with id %d and name %s not found", id, name)
 		gomega.Expect(stream.Id).To(gomega.Equal(id))
 	})
@@ -79,8 +78,9 @@ func itShouldContainSpecificStream(id int, name string, streams []iggcon.Stream)
 	})
 }
 
-func itShouldSuccessfullyCreateStream(id int, expectedName string, client iggycli.Client) {
-	stream, err := client.GetStream(iggcon.NewIdentifier(id))
+func itShouldSuccessfullyCreateStream(id uint32, expectedName string, client iggycli.Client) {
+	streamIdentifier, _ := iggcon.NewIdentifier(id)
+	stream, err := client.GetStream(streamIdentifier)
 
 	itShouldNotReturnError(err)
 	ginkgo.It("should create stream with id "+string(rune(id)), func() {
@@ -92,8 +92,9 @@ func itShouldSuccessfullyCreateStream(id int, expectedName string, client iggycl
 	})
 }
 
-func itShouldSuccessfullyUpdateStream(id int, expectedName string, client iggycli.Client) {
-	stream, err := client.GetStream(iggcon.NewIdentifier(id))
+func itShouldSuccessfullyUpdateStream(id uint32, expectedName string, client iggycli.Client) {
+	streamIdentifier, _ := iggcon.NewIdentifier(id)
+	stream, err := client.GetStream(streamIdentifier)
 
 	itShouldNotReturnError(err)
 	ginkgo.It("should update stream with id "+string(rune(id)), func() {
@@ -105,8 +106,9 @@ func itShouldSuccessfullyUpdateStream(id int, expectedName string, client iggycl
 	})
 }
 
-func itShouldSuccessfullyDeleteStream(id int, client iggycli.Client) {
-	stream, err := client.GetStream(iggcon.NewIdentifier(id))
+func itShouldSuccessfullyDeleteStream(id uint32, client iggycli.Client) {
+	streamIdentifier, _ := iggcon.NewIdentifier(id)
+	stream, err := client.GetStream(streamIdentifier)
 
 	itShouldReturnSpecificIggyError(err, ierror.StreamIdNotFound)
 	ginkgo.It("should not return stream", func() {
@@ -114,6 +116,7 @@ func itShouldSuccessfullyDeleteStream(id int, client iggycli.Client) {
 	})
 }
 
-func deleteStreamAfterTests(streamId int, client iggycli.Client) {
-	_ = client.DeleteStream(iggcon.NewIdentifier(streamId))
+func deleteStreamAfterTests(streamId uint32, client iggycli.Client) {
+	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+	_ = client.DeleteStream(streamIdentifier)
 }

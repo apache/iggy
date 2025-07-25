@@ -42,14 +42,13 @@ func createDefaultMessages() []iggcon.IggyMessage {
 	return []iggcon.IggyMessage{msg1, msg2}
 }
 
-func itShouldSuccessfullyPublishMessages(streamId int, topicId int, messages []iggcon.IggyMessage, client iggycli.Client) {
+func itShouldSuccessfullyPublishMessages(streamId uint32, topicId uint32, messages []iggcon.IggyMessage, client iggycli.Client) {
+	streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 	result, err := client.PollMessages(
-		iggcon.NewIdentifier(streamId),
-		iggcon.NewIdentifier(topicId),
-		iggcon.Consumer{
-			Kind: iggcon.ConsumerKindSingle,
-			Id:   iggcon.NewIdentifier(int(createRandomUInt32())),
-		},
+		streamIdentifier,
+		topicIdentifier,
+		iggcon.NewSingleConsumer(randomU32Identifier()),
 		iggcon.FirstPollingStrategy(),
 		uint32(len(messages)),
 		true,

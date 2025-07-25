@@ -25,10 +25,10 @@ import (
 )
 
 type PartitionContract struct {
-	Id            int    `json:"id"`
+	Id            uint32 `json:"id"`
 	MessagesCount uint64 `json:"messagesCount"`
 	CreatedAt     uint64 `json:"createdAt"`
-	SegmentsCount int    `json:"segmentsCount"`
+	SegmentsCount uint32 `json:"segmentsCount"`
 	CurrentOffset uint64 `json:"currentOffset"`
 	SizeBytes     uint64 `json:"sizeBytes"`
 }
@@ -67,9 +67,9 @@ func None() Partitioning {
 	}
 }
 
-func PartitionId(value int) Partitioning {
+func PartitionId(value uint32) Partitioning {
 	bytes := make([]byte, 4)
-	binary.LittleEndian.PutUint32(bytes, uint32(value))
+	binary.LittleEndian.PutUint32(bytes, value)
 
 	return Partitioning{
 		Kind:   PartitionIdKind,
