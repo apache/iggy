@@ -2,7 +2,6 @@
   "rust": [
     "core/(bench|cli|examples|integration|sdk|server|tools|connectors|ai).*\\.rs",
     "bdd/rust/.*\\.rs",
-    "core/Cargo.toml",
     "Cargo.toml",
     "Cargo.lock",
     ".github/workflows/ci-.*-rust.yml",
@@ -17,11 +16,26 @@
   "rust-prod": [
     "core/(bench|cli|examples|integration|sdk|server|tools|connectors|ai).*\\.rs",
     "bdd/rust/.*\\.rs",
-    "core/Cargo.toml",
     "Cargo.toml",
     "Cargo.lock",
     "Dockerfile.*",
     ".github/workflows/ci-prod-rust.yml"
+  ],
+  "connectors": [
+    "core/(sdk|connectors).*\\.rs",
+    "core/connectors/runtime/Cargo.toml",
+    "Cargo.toml",
+    "Cargo.lock",
+    "Dockerfile.connectors.*",
+    ".github/workflows/ci-publish-connectors.yml"
+  ],
+  "mcp": [
+    "core/(sdk|ai).*\\.rs",
+    "core/ai/mcp/Cargo.toml",
+    "Cargo.toml",
+    "Cargo.lock",
+    "Dockerfile.mcp.*",
+    ".github/workflows/ci-publish-mcp.yml"
   ],
   "go-sdk": [
     "foreign/go/.*\\.go",
