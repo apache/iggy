@@ -33,7 +33,7 @@ pub fn get_api_base_url() -> String {
     // In release mode, try to get from window.API_BASE_URL if it exists
     let window = match web_sys::window() {
         Some(win) => win,
-        None => return "https://benchmarks.iggy.rs".to_string(),
+        None => return "https://benchmarks.iggy.apache.org".to_string(),
     };
 
     if let Some(api_url) = Reflect::get(&window, &JsValue::from_str("API_BASE_URL"))
@@ -52,5 +52,5 @@ pub fn get_api_base_url() -> String {
     }
 
     // Fallback to production URL
-    "https://benchmarks.iggy.rs".to_string()
+    "https://benchmarks.iggy.apache.org".to_string()
 }
