@@ -28,6 +28,10 @@ normal = ["tracing-appender"]
 [package.metadata.cargo-machete]
 ignored = ["rusty-s3"]
 
+[[bin]]
+name = "iggy-server"
+path = "src/main.rs"
+
 [features]
 default = ["mimalloc"]
 tokio-console = ["dep:console-subscriber", "tokio/tracing"]
@@ -37,6 +41,7 @@ mimalloc = ["dep:mimalloc"]
 [dependencies]
 ahash = { workspace = true }
 anyhow = { workspace = true }
+async-channel = { workspace = true }
 async_zip = { workspace = true }
 axum = { workspace = true }
 axum-server = { workspace = true }
@@ -47,6 +52,7 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 console-subscriber = { workspace = true, optional = true }
+core_affinity = "0.8.0"
 crossbeam = { workspace = true }
 ctrlc = { version = "3.4", features = ["termination"] }
 dashmap = { workspace = true }
@@ -57,14 +63,12 @@ error_set = { version = "0.8.5", features = ["tracing"] }
 figlet-rs = { workspace = true }
 figment = { version = "0.10.19", features = ["toml", "env"] }
 flume = { workspace = true }
-async-channel = { workspace = true }
 futures = { workspace = true }
+hash32 = "1.0.0"
 human-repr = { workspace = true }
 iggy_common = { workspace = true }
 jsonwebtoken = "9.3.1"
-socket2 = "0.5.10"
 lending-iterator = "0.1.7"
-hash32 = "1.0.0"
 mimalloc = { workspace = true, optional = true }
 moka = { version = "0.12.10", features = ["future"] }
 nix = { version = "0.30", features = ["fs"] }
@@ -98,8 +102,9 @@ rustls = { workspace = true }
 rustls-pemfile = "2.2.0"
 serde = { workspace = true }
 serde_with = { workspace = true }
-static-toml = "1.3.0"
 sharded_queue = "2.0.1"
+socket2 = "0.5.10"
+static-toml = "1.3.0"
 strum = { workspace = true }
 sysinfo = { workspace = true }
 tempfile = { workspace = true }
@@ -132,7 +137,3 @@ vergen-git2 = { version = "1.0.7", features = [
 [dev-dependencies]
 mockall = { workspace = true }
 serial_test = { workspace = true }
-
-[[bin]]
-name = "iggy-server"
-path = "src/main.rs"

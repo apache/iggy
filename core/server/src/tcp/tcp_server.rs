@@ -43,7 +43,7 @@ pub async fn spawn_tcp_server(shard: Rc<IggyShard>) -> Result<(), IggyError> {
     shard_info!(shard.id, "Initializing {} server...", server_name);
 
     match shard.config.tcp.tls.enabled {
-        true => tcp_tls_listener::start(server_name, addr, socket, shard.clone()).await?,
+        true => tcp_tls_listener::start(server_name, addr.into(), socket, shard.clone()).await?,
         false => tcp_listener::start(server_name, addr, socket_config, shard.clone()).await?,
     };
 
