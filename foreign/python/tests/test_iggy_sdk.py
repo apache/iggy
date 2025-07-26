@@ -25,7 +25,6 @@ Tests are marked as either 'unit' or 'integration' based on their requirements.
 import asyncio
 from datetime import timedelta
 import uuid
-from typing import List
 
 import pytest
 
