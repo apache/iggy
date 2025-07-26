@@ -37,7 +37,7 @@ pub struct QuicSender {
 }
 
 impl Sender for QuicSender {
-    async fn read<B: IoBufMut>(&mut self, buffer: B) -> (Result<usize, IggyError>, B) {
+    async fn read<B: IoBufMut>(&mut self, buffer: B) -> (Result<(), IggyError>, B) {
         //TODO: Fixme
         // Not-so-nice code because quinn recv stream has different API for read_exact
         /*

@@ -178,7 +178,7 @@ impl MessagesReader {
         use_pool: bool,
     ) -> Result<PooledBuffer, std::io::Error> {
         if use_pool {
-            let mut buf = PooledBuffer::with_capacity(len as usize);
+            let buf = PooledBuffer::with_capacity(len as usize);
             let len = len as usize;
             let (result, buf) = self
                 .file

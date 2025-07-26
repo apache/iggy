@@ -56,10 +56,7 @@ macro_rules! forward_async_methods {
 }
 
 pub trait Sender {
-    fn read<B: IoBufMut>(
-        &mut self,
-        buffer: B,
-    ) -> impl Future<Output = (Result<usize, IggyError>, B)>;
+    fn read<B: IoBufMut>(&mut self, buffer: B) -> impl Future<Output = (Result<(), IggyError>, B)>;
     fn send_empty_ok_response(&mut self) -> impl Future<Output = Result<(), IggyError>>;
     fn send_ok_response(&mut self, payload: &[u8]) -> impl Future<Output = Result<(), IggyError>>;
     fn send_ok_response_vectored(
@@ -98,7 +95,7 @@ impl SenderKind {
     }
 
     forward_async_methods! {
-        async fn read<B: IoBufMut>(&mut self, buffer: B) -> (Result<usize, IggyError>, B);
+        async fn read<B: IoBufMut>(&mut self, buffer: B) -> (Result<(), IggyError>, B);
         async fn send_empty_ok_response(&mut self) -> Result<(), IggyError>;
         async fn send_ok_response(&mut self, payload: &[u8]) -> Result<(), IggyError>;
         async fn send_ok_response_vectored(&mut self, length: &[u8], slices: Vec<PooledBuffer>) -> Result<(), IggyError>;
