@@ -11,6 +11,7 @@ readme = "README.md"
 license = { file = "LICENSE" }
 authors = [
     { name = "Dario Lencina Talarico", email = "darioalessandrolencina@gmail.com" },
+    { name = "Albin Skott", email = "albin@mattsson.io" },
 ]
 keywords = ["streaming", "messaging", "pubsub", "iggy", "rust", "performance"]
 classifiers = [
