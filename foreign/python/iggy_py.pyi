@@ -23,7 +23,159 @@ import builtins
 import collections.abc
 import datetime
 import typing
-from enum import Enum
+
+class AutoCommit:
+    r"""
+    The auto-commit configuration for storing the offset on the server.
+    """
+    class Disabled(AutoCommit):
+        r"""
+        The auto-commit is disabled and the offset must be stored manually by the consumer.
+        """
+        __match_args__ = ((),)
+        def __new__(cls) -> AutoCommit.Disabled: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key:builtins.int) -> typing.Any: ...
+    
+    class Interval(AutoCommit):
+        r"""
+        The auto-commit is enabled and the offset is stored on the server after a certain interval.
+        """
+        __match_args__ = ("_0",)
+        @property
+        def _0(self) -> datetime.timedelta: ...
+        def __new__(cls, _0:datetime.timedelta) -> AutoCommit.Interval: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key:builtins.int) -> typing.Any: ...
+    
+    class IntervalOrWhen(AutoCommit):
+        r"""
+        The auto-commit is enabled and the offset is stored on the server after a certain interval or depending on the mode when consuming the messages.
+        """
+        __match_args__ = ("_0", "_1",)
+        @property
+        def _0(self) -> datetime.timedelta: ...
+        @property
+        def _1(self) -> AutoCommitWhen: ...
+        def __new__(cls, _0:datetime.timedelta, _1:AutoCommitWhen) -> AutoCommit.IntervalOrWhen: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key:builtins.int) -> typing.Any: ...
+    
+    class IntervalOrAfter(AutoCommit):
+        r"""
+        The auto-commit is enabled and the offset is stored on the server after a certain interval or depending on the mode after consuming the messages.
+        """
+        __match_args__ = ("_0", "_1",)
+        @property
+        def _0(self) -> datetime.timedelta: ...
+        @property
+        def _1(self) -> AutoCommitAfter: ...
+        def __new__(cls, _0:datetime.timedelta, _1:AutoCommitAfter) -> AutoCommit.IntervalOrAfter: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key:builtins.int) -> typing.Any: ...
+    
+    class When(AutoCommit):
+        r"""
+        The auto-commit is enabled and the offset is stored on the server depending on the mode when consuming the messages.
+        """
+        __match_args__ = ("_0",)
+        @property
+        def _0(self) -> AutoCommitWhen: ...
+        def __new__(cls, _0:AutoCommitWhen) -> AutoCommit.When: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key:builtins.int) -> typing.Any: ...
+    
+    class After(AutoCommit):
+        r"""
+        The auto-commit is enabled and the offset is stored on the server depending on the mode after consuming the messages.
+        """
+        __match_args__ = ("_0",)
+        @property
+        def _0(self) -> AutoCommitAfter: ...
+        def __new__(cls, _0:AutoCommitAfter) -> AutoCommit.After: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key:builtins.int) -> typing.Any: ...
+    
+    ...
+
+class AutoCommitAfter:
+    r"""
+    The auto-commit mode for storing the offset on the server **after** receiving the messages.
+    """
+    class ConsumingAllMessages(AutoCommitAfter):
+        r"""
+        The offset is stored on the server after all the messages are consumed.
+        """
+        __match_args__ = ((),)
+        def __new__(cls) -> AutoCommitAfter.ConsumingAllMessages: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key:builtins.int) -> typing.Any: ...
+    
+    class ConsumingEachMessage(AutoCommitAfter):
+        r"""
+        The offset is stored on the server after consuming each message.
+        """
+        __match_args__ = ((),)
+        def __new__(cls) -> AutoCommitAfter.ConsumingEachMessage: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key:builtins.int) -> typing.Any: ...
+    
+    class ConsumingEveryNthMessage(AutoCommitAfter):
+        r"""
+        The offset is stored on the server after consuming every Nth message.
+        """
+        __match_args__ = ("_0",)
+        @property
+        def _0(self) -> builtins.int: ...
+        def __new__(cls, _0:builtins.int) -> AutoCommitAfter.ConsumingEveryNthMessage: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key:builtins.int) -> typing.Any: ...
+    
+    ...
+
+class AutoCommitWhen:
+    r"""
+    The auto-commit mode for storing the offset on the server.
+    """
+    class PollingMessages(AutoCommitWhen):
+        r"""
+        The offset is stored on the server when the messages are received.
+        """
+        __match_args__ = ((),)
+        def __new__(cls) -> AutoCommitWhen.PollingMessages: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key:builtins.int) -> typing.Any: ...
+    
+    class ConsumingAllMessages(AutoCommitWhen):
+        r"""
+        The offset is stored on the server when all the messages are consumed.
+        """
+        __match_args__ = ((),)
+        def __new__(cls) -> AutoCommitWhen.ConsumingAllMessages: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key:builtins.int) -> typing.Any: ...
+    
+    class ConsumingEachMessage(AutoCommitWhen):
+        r"""
+        The offset is stored on the server when consuming each message.
+        """
+        __match_args__ = ((),)
+        def __new__(cls) -> AutoCommitWhen.ConsumingEachMessage: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key:builtins.int) -> typing.Any: ...
+    
+    class ConsumingEveryNthMessage(AutoCommitWhen):
+        r"""
+        The offset is stored on the server when consuming every Nth message.
+        """
+        __match_args__ = ("_0",)
+        @property
+        def _0(self) -> builtins.int: ...
+        def __new__(cls, _0:builtins.int) -> AutoCommitWhen.ConsumingEveryNthMessage: ...
+        def __len__(self) -> builtins.int: ...
+        def __getitem__(self, key:builtins.int) -> typing.Any: ...
+    
+    ...
 
 class IggyClient:
     r"""
@@ -153,6 +305,33 @@ class IggyConsumer:
         Returns an awaitable that completes when shutdown is signaled or a PyRuntimeError on failure.
         """
 
+class PollingStrategy:
+    class Offset(PollingStrategy):
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value:builtins.int) -> PollingStrategy.Offset: ...
+    
+    class Timestamp(PollingStrategy):
+        __match_args__ = ("value",)
+        @property
+        def value(self) -> builtins.int: ...
+        def __new__(cls, value:builtins.int) -> PollingStrategy.Timestamp: ...
+    
+    class First(PollingStrategy):
+        __match_args__ = ((),)
+        def __new__(cls) -> PollingStrategy.First: ...
+    
+    class Last(PollingStrategy):
+        __match_args__ = ((),)
+        def __new__(cls) -> PollingStrategy.Last: ...
+    
+    class Next(PollingStrategy):
+        __match_args__ = ((),)
+        def __new__(cls) -> PollingStrategy.Next: ...
+    
+    ...
+
 class ReceiveMessage:
     r"""
     A Python class representing a received message.
@@ -212,88 +391,22 @@ class SendMessage:
         """
 
 class StreamDetails:
-    id: builtins.int
-    name: builtins.str
-    messages_count: builtins.int
-    topics_count: builtins.int
+    @property
+    def id(self) -> builtins.int: ...
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def messages_count(self) -> builtins.int: ...
+    @property
+    def topics_count(self) -> builtins.int: ...
 
 class TopicDetails:
-    id: builtins.int
-    name: builtins.str
-    messages_count: builtins.int
-    partitions_count: builtins.int
-
-class AutoCommit(Enum):
-    r"""
-    The auto-commit configuration for storing the offset on the server.
-    """
-    Disabled = ...
-    r"""
-    The auto-commit is disabled and the offset must be stored manually by the consumer.
-    """
-    Interval = ...
-    r"""
-    The auto-commit is enabled and the offset is stored on the server after a certain interval.
-    """
-    IntervalOrWhen = ...
-    r"""
-    The auto-commit is enabled and the offset is stored on the server after a certain interval or depending on the mode when consuming the messages.
-    """
-    IntervalOrAfter = ...
-    r"""
-    The auto-commit is enabled and the offset is stored on the server after a certain interval or depending on the mode after consuming the messages.
-    """
-    When = ...
-    r"""
-    The auto-commit is enabled and the offset is stored on the server depending on the mode when consuming the messages.
-    """
-    After = ...
-    r"""
-    The auto-commit is enabled and the offset is stored on the server depending on the mode after consuming the messages.
-    """
-
-class AutoCommitAfter(Enum):
-    r"""
-    The auto-commit mode for storing the offset on the server **after** receiving the messages.
-    """
-    ConsumingAllMessages = ...
-    r"""
-    The offset is stored on the server after all the messages are consumed.
-    """
-    ConsumingEachMessage = ...
-    r"""
-    The offset is stored on the server after consuming each message.
-    """
-    ConsumingEveryNthMessage = ...
-    r"""
-    The offset is stored on the server after consuming every Nth message.
-    """
-
-class AutoCommitWhen(Enum):
-    r"""
-    The auto-commit mode for storing the offset on the server.
-    """
-    PollingMessages = ...
-    r"""
-    The offset is stored on the server when the messages are received.
-    """
-    ConsumingAllMessages = ...
-    r"""
-    The offset is stored on the server when all the messages are consumed.
-    """
-    ConsumingEachMessage = ...
-    r"""
-    The offset is stored on the server when consuming each message.
-    """
-    ConsumingEveryNthMessage = ...
-    r"""
-    The offset is stored on the server when consuming every Nth message.
-    """
-
-class PollingStrategy(Enum):
-    Offset = ...
-    Timestamp = ...
-    First = ...
-    Last = ...
-    Next = ...
+    @property
+    def id(self) -> builtins.int: ...
+    @property
+    def name(self) -> builtins.str: ...
+    @property
+    def messages_count(self) -> builtins.int: ...
+    @property
+    def partitions_count(self) -> builtins.int: ...
 

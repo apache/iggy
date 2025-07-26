@@ -15,7 +15,7 @@ pyo3-async-runtimes = { version = "0.25.0", features = [
     "attributes",
     "tokio-runtime",
 ] }
-pyo3-stub-gen = "0.9.1"
+pyo3-stub-gen = "0.11.1"
 tokio = "1.40.0"
 
 [lib]

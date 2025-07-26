@@ -31,7 +31,7 @@ use pyo3::types::{PyDelta, PyDeltaAccess, PyFunction};
 use pyo3::{prelude::*, type_object};
 use pyo3_async_runtimes::tokio::{future_into_py, get_runtime, into_future, scope};
 use pyo3_async_runtimes::TaskLocals;
-use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_enum, gen_stub_pymethods};
+use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
 use pyo3_stub_gen::PyStubType;
 use tokio::sync::oneshot::Sender;
 use tokio::sync::Mutex;
@@ -313,7 +313,7 @@ impl PyStubType for PyAsyncioEvent {
 
 /// The auto-commit configuration for storing the offset on the server.
 // #[derive(Debug, PartialEq, Copy, Clone)]
-#[gen_stub_pyclass_enum]
+#[gen_stub_pyclass_complex_enum]
 #[pyclass]
 pub enum AutoCommit {
     /// The auto-commit is disabled and the offset must be stored manually by the consumer.
@@ -354,7 +354,7 @@ impl Into<RustAutoCommit> for &AutoCommit {
 
 /// The auto-commit mode for storing the offset on the server.
 #[derive(Debug, PartialEq, Copy, Clone)]
-#[gen_stub_pyclass_enum]
+#[gen_stub_pyclass_complex_enum]
 #[pyclass]
 pub enum AutoCommitWhen {
     /// The offset is stored on the server when the messages are received.
@@ -382,7 +382,7 @@ impl Into<RustAutoCommitWhen> for &AutoCommitWhen {
 
 /// The auto-commit mode for storing the offset on the server **after** receiving the messages.
 #[derive(Debug, PartialEq, Copy, Clone)]
-#[gen_stub_pyclass_enum]
+#[gen_stub_pyclass_complex_enum]
 #[pyclass]
 pub enum AutoCommitAfter {
     /// The offset is stored on the server after all the messages are consumed.
