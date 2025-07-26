@@ -39,17 +39,10 @@ pub(crate) async fn handle_connection(
     stop_receiver: Receiver<()>,
 ) -> Result<(), ConnectionError> {
     let mut length_buffer = BytesMut::with_capacity(INITIAL_BYTES_LENGTH);
-    unsafe {
-        length_buffer.set_len(INITIAL_BYTES_LENGTH);
-    }
     let mut code_buffer = BytesMut::with_capacity(INITIAL_BYTES_LENGTH);
-    unsafe {
-        code_buffer.set_len(INITIAL_BYTES_LENGTH);
-    }
     loop {
-        let read_future = sender.read(length_buffer.clone());
-
-        let (read_length, initial_buffer) = futures::select! {
+        let read_future = sender.read(length_buffer);
+        let (_, mut initial_buffer) = futures::select! {
             _ = stop_receiver.recv().fuse() => {
                 info!("Connection stop signal received for session: {}", session);
                 let _ = sender.send_error_response(IggyError::Disconnected).await;
@@ -58,7 +51,8 @@ pub(crate) async fn handle_connection(
             result = read_future.fuse() => {
                 match result {
                     (Ok(read_length), initial_buffer) => (read_length, initial_buffer),
-                    (Err(error), _) => {
+                    (Err(error), initial_buffer) => {
+                        length_buffer = initial_buffer;
                         if error.as_code() == IggyError::ConnectionClosed.as_code() {
                             return Err(ConnectionError::from(error));
                         } else {
@@ -71,21 +65,16 @@ pub(crate) async fn handle_connection(
             }
         };
 
-        if read_length != INITIAL_BYTES_LENGTH {
-            sender.send_error_response(IggyError::CommandLengthError(format!(
-                "Unable to read the TCP request length, expected: {INITIAL_BYTES_LENGTH} bytes, received: {read_length} bytes."
-            ))).await?;
-            continue;
-        }
-
-        let initial_buffer = initial_buffer.freeze();
         let length =
             u32::from_le_bytes(initial_buffer[0..INITIAL_BYTES_LENGTH].try_into().unwrap());
-        let (res, code_buffer) = sender.read(code_buffer.clone()).await;
+        let (res, mut code_buffer_out) = sender.read(code_buffer).await;
         let _ = res?;
-        let code_buffer = code_buffer.freeze();
         let code: u32 =
-            u32::from_le_bytes(code_buffer[0..INITIAL_BYTES_LENGTH].try_into().unwrap());
+            u32::from_le_bytes(code_buffer_out[0..INITIAL_BYTES_LENGTH].try_into().unwrap());
+        initial_buffer.clear();
+        code_buffer_out.clear();
+        length_buffer = BytesMut::from(initial_buffer);
+        code_buffer = BytesMut::from(code_buffer_out);
         debug!("Received a TCP request, length: {length}, code: {code}");
         let command = ServerCommand::from_code_and_reader(code, sender, length - 4).await?;
         debug!("Received a TCP command: {command}, payload size: {length}");
