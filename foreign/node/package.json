@@ -1,5 +1,5 @@
 {
-  "name": "@apache-iggy/node-sdk",
+  "name": "apache-iggy",
   "type": "module",
   "version": "0.5.0",
   "description": "Official Apache Iggy NodeJS SDK",
