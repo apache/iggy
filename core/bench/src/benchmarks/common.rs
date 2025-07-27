@@ -287,7 +287,7 @@ pub fn build_producing_consumers_futures(
                     client_factory_clone,
                     args_clone.kind(),
                     actor_id,
-                    None, // consumer_group_id
+                    None,
                     stream_id,
                     partitions,
                     messages_per_batch,
