@@ -19,8 +19,8 @@
   },
   "publishConfig": {
     "access": "public",
-    "main": "dist/src/index.js",
-    "types": "dist/src/index.d.ts"
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts"
   },
   "homepage": "https://iggy.apache.org",
   "files": [
