@@ -770,6 +770,14 @@ impl IggyConsumer {
         }
 
         let now: u64 = IggyTimestamp::now().into();
+        if now < last_sent_at {
+            warn!(
+                "Returned monotonic time went backwards, now < last_sent_at: ({now} < {last_sent_at})"
+            );
+            sleep(Duration::from_micros(interval)).await;
+            return;
+        }
+
         let elapsed = now - last_sent_at;
         if elapsed >= interval {
             trace!("No need to wait before polling messages. {now} - {last_sent_at} = {elapsed}");
