@@ -205,9 +205,9 @@ impl System {
         let mut position = 0;
 
         for message in batch.iter() {
-            let header = message.header();
-            let payload_length = header.payload_length();
-            let user_headers_length = header.user_headers_length();
+            let header = message.header().to_header();
+            let payload_length = header.payload_length;
+            let user_headers_length = header.user_headers_length;
             let payload_bytes = message.payload();
             let user_headers_bytes = message.user_headers();
 
@@ -221,7 +221,9 @@ impl System {
                         encrypted_messages.extend_from_slice(user_headers_bytes);
                     }
                     indexes.insert(0, position as u32, 0);
-                    position += IGGY_MESSAGE_HEADER_SIZE + payload_length + user_headers_length;
+                    position += IGGY_MESSAGE_HEADER_SIZE
+                        + payload_length as usize
+                        + user_headers_length as usize;
                 }
                 Err(error) => {
                     error!("Cannot encrypt the message. Error: {}", error);
