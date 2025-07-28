@@ -17,6 +17,7 @@
  */
 use super::ORDERING;
 use crate::client_wrappers::client_wrapper::ClientWrapper;
+use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::clients::MAX_BATCH_LENGTH;
 use crate::clients::producer_builder::SendMode;
 use crate::clients::producer_config::DirectConfig;

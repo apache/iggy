@@ -80,7 +80,7 @@ pub async fn init(config: &HttpApiConfig, context: Arc<RuntimeContext>) {
             )
             .await
             {
-                error!("Failed to start {NAME} server, error {}", error);
+                error!("Failed to start {NAME} server, error: {error}");
             }
         });
         return;
@@ -104,7 +104,7 @@ pub async fn init(config: &HttpApiConfig, context: Arc<RuntimeContext>) {
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
         {
-            error!("Failed to start {NAME} server, error: {}", error);
+            error!("Failed to start {NAME} server, error: {error}");
         }
     });
 }

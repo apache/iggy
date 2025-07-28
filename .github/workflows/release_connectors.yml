@@ -39,31 +39,31 @@ jobs:
         platform:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            executable: iggy
+            executable: iggy-connectors
             file: iggy-connectors-x86_64-unknown-linux-musl.tgz
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
-            executable: iggy
+            executable: iggy-connectors
             file: iggy-connectors-aarch64-unknown-linux-musl.tgz
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            executable: iggy
+            executable: iggy-connectors
             file: iggy-connectors-x86_64-unknown-linux-gnu.tgz
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            executable: iggy.exe
+            executable: iggy-connectors.exe
             file: iggy-connectors-x86_64-pc-windows-msvc.zip
           - target: aarch64-pc-windows-msvc
             os: windows-latest
-            executable: iggy.exe
+            executable: iggy-connectors.exe
             file: iggy-connectors-aarch64-pc-windows-msvc.zip
           - target: x86_64-apple-darwin
             os: macos-latest
-            executable: iggy
+            executable: iggy-connectors
             file: iggy-connectors-x86_64-apple-darwin.zip
           - target: aarch64-apple-darwin
             os: macos-latest
-            executable: iggy
+            executable: iggy-connectors
             file: iggy-connectors-aarch64-apple-darwin.zip
     steps:
       - name: Checkout code
@@ -90,7 +90,7 @@ jobs:
           tool: cross
 
       - name: Build ${{ matrix.platform.target }} release binary
-        run: cross +stable build --verbose --release --target ${{ matrix.platform.target }} -p iggy
+        run: cross +stable build --verbose --release --target ${{ matrix.platform.target }} -p iggy-connectors
 
       - name: Collect ${{ matrix.platform.target }} executable
         run: |

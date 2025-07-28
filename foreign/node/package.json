@@ -1,11 +1,15 @@
 {
-  "name": "@apache-iggy/node-sdk",
+  "name": "apache-iggy",
   "type": "module",
   "version": "0.5.0",
-  "description": "Official apache iggy nodejs binary client",
+  "description": "Official Apache Iggy NodeJS SDK",
   "keywords": [
     "iggy",
     "driver",
+    "sdk",
+    "apache",
+    "messaging",
+    "streaming",
     "client",
     "protocol"
   ],
@@ -22,7 +26,9 @@
   "files": [
     "dist/**/*.js",
     "dist/**/*.d.ts",
-    "dist/index.d.ts"
+    "dist/index.d.ts",
+    "!dist/bdd/",
+    "!dist/examples/"
   ],
   "types": "dist/index.d.ts",
   "main": "dist/index.js",

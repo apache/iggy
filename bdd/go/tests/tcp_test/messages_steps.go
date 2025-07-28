@@ -48,10 +48,7 @@ func itShouldSuccessfullyPublishMessages(streamId uint32, topicId uint32, messag
 	result, err := client.PollMessages(
 		streamIdentifier,
 		topicIdentifier,
-		iggcon.Consumer{
-			Kind: iggcon.ConsumerKindSingle,
-			Id:   randomU32Identifier(),
-		},
+		iggcon.NewSingleConsumer(randomU32Identifier()),
 		iggcon.FirstPollingStrategy(),
 		uint32(len(messages)),
 		true,

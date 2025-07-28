@@ -23,7 +23,7 @@ use crate::prelude::{
     AutoLogin, EncryptorKind, HttpClientConfigBuilder, IggyDuration, IggyError, Partitioner,
     QuicClientConfigBuilder, TcpClientConfigBuilder,
 };
-use crate::quic::quick_client::QuicClient;
+use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
 use iggy_common::{ConnectionStringUtils, TransportProtocol};
 use std::sync::Arc;

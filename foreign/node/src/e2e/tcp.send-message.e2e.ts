@@ -20,7 +20,7 @@
 
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { ConsumerKind, PollingStrategy, Partitioning } from '../wire/index.js';
+import { Consumer, PollingStrategy, Partitioning } from '../wire/index.js';
 import { generateMessages } from '../tcp.sm.utils.js';
 import { getTestClient } from './test-client.utils.js';
 
@@ -64,7 +64,7 @@ describe('e2e -> message', async () => {
     const pollReq = {
       streamId,
       topicId,
-      consumer: { kind: ConsumerKind.Single, id: 12 },
+      consumer: Consumer.Single,
       partitionId,
       pollingStrategy: PollingStrategy.Last,
       count: 10,
@@ -79,7 +79,7 @@ describe('e2e -> message', async () => {
     const pollReq = {
       streamId,
       topicId,
-      consumer: { kind: ConsumerKind.Single, id: 12 },
+      consumer: Consumer.Single,
       partitionId,
       pollingStrategy: PollingStrategy.First,
       count: 10,
@@ -94,7 +94,7 @@ describe('e2e -> message', async () => {
     const pollReq = {
       streamId,
       topicId,
-      consumer: { kind: ConsumerKind.Single, id: 12 },
+      consumer: Consumer.Single,
       partitionId,
       pollingStrategy: PollingStrategy.Next,
       count: 10,
@@ -109,7 +109,7 @@ describe('e2e -> message', async () => {
     const pollReq = {
       streamId,
       topicId,
-      consumer: { kind: ConsumerKind.Single, id: 12 },
+      consumer: Consumer.Single,
       partitionId,
       pollingStrategy: PollingStrategy.Next,
       count: 10,

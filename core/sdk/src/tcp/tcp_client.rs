@@ -49,7 +49,7 @@ const NAME: &str = "Iggy";
 /// It requires a valid server address.
 #[derive(Debug)]
 pub struct TcpClient {
-    pub(crate) stream: Mutex<Option<ConnectionStreamKind>>,
+    pub(crate) stream: Arc<Mutex<Option<ConnectionStreamKind>>>,
     pub(crate) config: Arc<TcpClientConfig>,
     pub(crate) state: Mutex<ClientState>,
     client_address: Mutex<Option<SocketAddr>>,
@@ -194,7 +194,7 @@ impl TcpClient {
         Ok(Self {
             config,
             client_address: Mutex::new(None),
-            stream: Mutex::new(None),
+            stream: Arc::new(Mutex::new(None)),
             state: Mutex::new(ClientState::Disconnected),
             events: broadcast(1000),
             connected_at: Mutex::new(None),
@@ -202,7 +202,6 @@ impl TcpClient {
     }
 
     async fn handle_response(
-        &self,
         status: u32,
         length: u32,
         stream: &mut ConnectionStreamKind,
@@ -490,45 +489,54 @@ impl TcpClient {
             _ => {}
         }
 
-        let mut stream = self.stream.lock().await;
-        if let Some(stream) = stream.as_mut() {
-            let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
-            trace!("Sending a TCP request of size {payload_length} with code: {code}");
-            stream.write(&(payload_length as u32).to_le_bytes()).await?;
-            stream.write(&code.to_le_bytes()).await?;
-            stream.write(&payload).await?;
-            stream.flush().await?;
-            trace!("Sent a TCP request with code: {code}, waiting for a response...");
-            let mut response_buffer = [0u8; RESPONSE_INITIAL_BYTES_LENGTH];
-            let read_bytes = stream.read(&mut response_buffer).await.map_err(|error| {
-                error!(
-                    "Failed to read response for TCP request with code: {code}: {error}",
-                    code = code,
-                    error = error
-                );
-                IggyError::Disconnected
-            })?;
+        let stream = self.stream.clone();
+        // SAFETY: we run code holding the `stream` lock in a task so we can't be cancelled while holding the lock.
+        tokio::spawn(async move {
+            let mut stream = stream.lock().await;
+            if let Some(stream) = stream.as_mut() {
+                let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
+                trace!("Sending a TCP request of size {payload_length} with code: {code}");
+                stream.write(&(payload_length as u32).to_le_bytes()).await?;
+                stream.write(&code.to_le_bytes()).await?;
+                stream.write(&payload).await?;
+                stream.flush().await?;
+                trace!("Sent a TCP request with code: {code}, waiting for a response...");
+                let mut response_buffer = [0u8; RESPONSE_INITIAL_BYTES_LENGTH];
+                let read_bytes = stream.read(&mut response_buffer).await.map_err(|error| {
+                    error!(
+                        "Failed to read response for TCP request with code: {code}: {error}",
+                        code = code,
+                        error = error
+                    );
+                    IggyError::Disconnected
+                })?;
 
-            if read_bytes != RESPONSE_INITIAL_BYTES_LENGTH {
-                error!("Received an invalid or empty response.");
-                return Err(IggyError::EmptyResponse);
+                if read_bytes != RESPONSE_INITIAL_BYTES_LENGTH {
+                    error!("Received an invalid or empty response.");
+                    return Err(IggyError::EmptyResponse);
+                }
+
+                let status = u32::from_le_bytes(
+                    response_buffer[..4]
+                        .try_into()
+                        .map_err(|_| IggyError::InvalidNumberEncoding)?,
+                );
+                let length = u32::from_le_bytes(
+                    response_buffer[4..]
+                        .try_into()
+                        .map_err(|_| IggyError::InvalidNumberEncoding)?,
+                );
+                return TcpClient::handle_response(status, length, stream).await;
             }
 
-            let status = u32::from_le_bytes(
-                response_buffer[..4]
-                    .try_into()
-                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
-            );
-            let length = u32::from_le_bytes(
-                response_buffer[4..]
-                    .try_into()
-                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
-            );
-            return self.handle_response(status, length, stream).await;
-        }
-
-        error!("Cannot send data. Client is not connected.");
-        Err(IggyError::NotConnected)
+            error!("Cannot send data. Client is not connected.");
+            Err(IggyError::NotConnected)
+        })
+        .await
+        .map_err(|e| {
+            error!("Task execution failed during TCP request: {}", e);
+            IggyError::TcpError
+        })?
     }
 
     async fn get_client_address_value(&self) -> String {

@@ -137,8 +137,6 @@ impl Stream {
         };
 
         {
-            self.topics_ids.remove(&old_topic_name.clone());
-            self.topics_ids.insert(name.to_owned(), topic_id);
             let topic = self.get_topic_mut(id).with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get mutable reference to topic with id {id}")
             })?;
@@ -149,6 +147,12 @@ impl Stream {
             topic.max_topic_size = max_topic_size;
             topic.replication_factor = replication_factor;
         }
+
+        {
+            self.topics_ids.borrow_mut().remove(&old_topic_name.clone());
+            self.topics_ids.borrow_mut().insert(name.to_owned(), topic_id);
+        }
+
         Ok(())
     }
 

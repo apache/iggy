@@ -1,8 +1,8 @@
 [package]
 name = "iggy-py"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
-authors = ["Dario Lencina Talarico <darioalessandrolencina@gmail.com>"]
+authors = ["Dario Lencina Talarico <darioalessandrolencina@gmail.com>", "Albin Skott <albin@mattsson.io>"]
 license = "Apache-2.0"
 description = "Apache Iggy is the persistent message streaming platform written in Rust, supporting QUIC, TCP and HTTP transport protocols, capable of processing millions of messages per second."
 documentation = "https://iggy.apache.org/docs/"
@@ -15,7 +15,8 @@ pyo3-async-runtimes = { version = "0.25.0", features = [
     "attributes",
     "tokio-runtime",
 ] }
-pyo3-stub-gen = "0.9.1"
+pyo3-stub-gen = "0.11.1"
+tokio = "1.40.0"
 
 [lib]
 name = "iggy_py"

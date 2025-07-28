@@ -1,0 +1,286 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: publish_mcp
+
+on:
+  push:
+    tags:
+      - "mcp-*"
+
+env:
+  DOCKERHUB_REGISTRY_NAME: apache/iggy-mcp
+  CRATE_NAME: iggy-mcp
+  GITHUB_TOKEN: ${{ github.token }}
+  RUST_BACKTRACE: 1
+  CARGO_TERM_COLOR: always
+  IGGY_CI_BUILD: true
+
+jobs:
+  validate:
+    if: startsWith(github.ref, 'refs/tags/mcp-')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract tag name
+        id: extract
+        run: echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+
+      - name: Validate tag format
+        run: |
+          TAG=${TAG}
+          if [[ ! "$TAG" =~ ^mcp-([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+            echo "Tag $TAG does not match strict semver format (mcp-X.Y.Z where 0 <= X,Y,Z <= 999)"
+            exit 1
+          fi
+          echo "Valid tag: $TAG"
+
+  tag:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract tag name
+        id: extract_tag
+        run: |
+          tag=${GITHUB_REF#refs/tags/}
+          echo "tag_name=$tag" >> "$GITHUB_OUTPUT"
+          echo "::notice ::Tag that triggered the workflow: $tag"
+
+      - name: Extract iggy-mcp version from Cargo.toml
+        id: extract_version
+        run: |
+          version=$(cargo pkgid -p iggy-mcp | cut -d# -f2 | cut -d: -f2)
+          echo "mcp_version=$version" >> "$GITHUB_OUTPUT"
+          echo "::notice ::Version from Cargo.toml $version"
+
+      - name: Check if version from Cargo.toml is the same as the tag
+        id: check_git_tag
+        run: |
+          if [[ "mcp-${{ steps.extract_version.outputs.mcp_version }}" == "${{ steps.extract_tag.outputs.tag_name }}" ]];
+          then
+            echo "::notice ::Tag ${{ steps.extract_tag.outputs.tag_name }} matches the version in Cargo.toml"
+            echo "tag_matches=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning ::Tag ${{ steps.extract_tag.outputs.tag_name }} does not match the version from Cargo.toml"
+            echo "tag_matches=false" >> "$GITHUB_OUTPUT"
+          fi
+
+    outputs:
+      mcp_version: ${{ steps.extract_version.outputs.mcp_version }}
+      tag_created: ${{ steps.check_git_tag.outputs.tag_matches }}
+
+  release_and_publish:
+    name: build release ${{ matrix.platform.os_name }}
+    needs: tag
+    runs-on: ${{ matrix.platform.os }}
+    strategy:
+      matrix:
+        platform:
+          - os_name: Linux-x86_64-musl
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            bin:
+              - iggy-mcp
+            name: iggy-mcp-Linux-x86_64-musl.tar.gz
+            cargo_command: cargo
+            docker_arch: linux/amd64
+            cross: false
+
+          - os_name: Linux-aarch64-musl
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            bin:
+              - iggy-mcp
+            name: iggy-mcp-Linux-aarch64-musl.tar.gz
+            docker_arch: linux/arm64/v8
+            cross: true
+
+        toolchain:
+          - stable
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache cargo & target directories
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: "publish-mcp-${{ matrix.platform.target }}"
+
+      - name: Install musl-tools on Linux
+        run: sudo apt-get update --yes && sudo apt-get install --yes musl-tools
+        if: contains(matrix.platform.name, 'musl')
+
+      - name: Prepare ${{ matrix.platform.target }} toolchain
+        run: |
+          rustup toolchain add --profile=minimal stable
+          rustup target add --toolchain=stable ${{ matrix.platform.target }}
+          rustup override set stable
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build iggy-mcp ${{ matrix.platform.target }} release binary
+        run: cross +stable build --verbose --release --target ${{ matrix.platform.target }} --bin iggy-mcp
+
+      - name: Build iggy-cli ${{ matrix.platform.target }} release binary
+        run: cross +stable build --verbose --release --no-default-features --target ${{ matrix.platform.target }} --bin iggy
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p release_artifacts/
+          cp target/${{ matrix.platform.target }}/release/iggy-mcp release_artifacts/
+          cp target/${{ matrix.platform.target }}/release/iggy release_artifacts/
+
+      - name: Print message
+        run: echo "::notice ::Published ${{ needs.tag.outputs.mcp }} release artifacts on GitHub"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: "arm64,arm"
+        if: ${{ matrix.platform.cross }}
+
+      - name: Set up Docker
+        uses: crazy-max/ghaction-setup-docker@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKERHUB_REGISTRY_NAME }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./
+          file: ./Dockerfile.mcp.ci
+          platforms: ${{ matrix.platform.docker_arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.DOCKERHUB_REGISTRY_NAME }},push-by-digest=true,name-canonical=true,push=true
+          build-args: |
+            IGGY_MCP_PATH=target/${{ matrix.platform.target }}/release/iggy-mcp
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.platform.os_name }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge_docker_manifest:
+    runs-on: ubuntu-latest
+    needs:
+      - release_and_publish
+      - tag
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "digests-*"
+          merge-multiple: true
+          path: /tmp/digests
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USER }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker meta (tag was created)
+        if: ${{ needs.tag.outputs.tag_created == 'true' }}
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKERHUB_REGISTRY_NAME }}
+          tags: |
+            ${{ needs.tag.outputs.mcp_version }}
+            latest
+
+      - name: Docker meta (tag was not created)
+        if: ${{ needs.tag.outputs.tag_created == '' }}
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKERHUB_REGISTRY_NAME }}
+          tags: |
+            edge
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.DOCKERHUB_REGISTRY_NAME }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.DOCKERHUB_REGISTRY_NAME }}:latest
+
+  github_release:
+    uses: ./.github/workflows/release_mcp.yml
+    needs: tag
+    if: ${{ needs.tag.outputs.tag_created == 'true' }}
+    with:
+      tag_name: "mcp-${{ needs.tag.outputs.mcp_version }}"
+
+  finalize_publish_mcp:
+    runs-on: ubuntu-latest
+    needs:
+      - release_and_publish
+      - merge_docker_manifest
+      - github_release
+    if: always()
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Everything is fine
+        if: ${{ !(contains(needs.*.result, 'failure')) }}
+        run: exit 0
+
+      - name: Something went wrong
+        if: ${{ contains(needs.*.result, 'failure') && github.event_name != 'workflow_dispatch' }}
+        uses: JasonEtco/create-an-issue@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_BOT_CONTEXT_STRING: "build and release to dockerhub"
+        with:
+          filename: .github/BOT_ISSUE_TEMPLATE.md

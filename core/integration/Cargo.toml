@@ -45,7 +45,14 @@ lazy_static = { workspace = true }
 libc = "0.2.174"
 log = { workspace = true }
 predicates = { workspace = true }
-rcgen = "0.13.2"
+rand = { workspace = true }
+rcgen = "0.14.3"
+reqwest = { workspace = true }
+rmcp = { version = "0.3.0", features = [
+    "client",
+    "reqwest",
+    "transport-streamable-http-client",
+] }
 serial_test = { workspace = true }
 server = { workspace = true }
 tempfile = { workspace = true }

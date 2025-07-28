@@ -256,6 +256,7 @@ impl IggyShard {
         replication_factor: Option<u8>,
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
+        let topic_numeric_id;
         {
             let stream = self.get_stream(stream_id).with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
