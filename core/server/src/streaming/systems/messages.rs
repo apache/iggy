@@ -172,7 +172,11 @@ impl System {
                 let payload = encryptor.decrypt(message.payload());
                 match payload {
                     Ok(payload) => {
-                        message.header().write_to_buffer(&mut decrypted_messages);
+                        // Update the header with the decrypted payload length
+                        let mut header = message.header().to_header();
+                        header.payload_length = payload.len() as u32;
+
+                        decrypted_messages.extend_from_slice(&header.to_bytes());
                         decrypted_messages.extend_from_slice(&payload);
                         if let Some(user_headers) = message.user_headers() {
                             decrypted_messages.extend_from_slice(user_headers);
