@@ -45,7 +45,7 @@ echo "📍 Resolved ${IGGY_SERVER_HOST} to ${SERVER_IP}"
 python3 -c "
 import asyncio
 import sys
-from iggy_py import IggyClient
+from apache_iggy import IggyClient
 
 async def test_connection():
     try:
@@ -89,12 +89,12 @@ fi
 # Run examples if tests pass
 if [ $TEST_EXIT_CODE -eq 0 ] && [ "${RUN_EXAMPLES:-false}" = "true" ]; then
     echo "🚀 Running example scripts..."
-    
+
     # Note: Examples might run indefinitely, so we'll just test they start correctly
     timeout 10 python3 examples/producer.py &
     PRODUCER_PID=$!
     sleep 5
-    
+
     if kill -0 $PRODUCER_PID 2>/dev/null; then
         echo "✅ Producer example started successfully"
         kill $PRODUCER_PID

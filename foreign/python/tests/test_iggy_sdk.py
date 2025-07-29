@@ -28,8 +28,8 @@ import uuid
 
 import pytest
 
-from iggy_py import IggyClient, PollingStrategy, AutoCommit
-from iggy_py import SendMessage as Message
+from apache_iggy import IggyClient, PollingStrategy, AutoCommit
+from apache_iggy import SendMessage as Message
 
 
 class TestConnectivity:

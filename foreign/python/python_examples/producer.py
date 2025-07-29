@@ -19,7 +19,7 @@ import asyncio
 from loguru import logger
 
 # Assuming we have a Python module for iggy with similar functionality as the Rust one.
-from iggy_py import IggyClient, SendMessage as Message, StreamDetails, TopicDetails
+from apache_iggy import IggyClient, SendMessage as Message, StreamDetails, TopicDetails
 
 STREAM_NAME = "sample-stream"
 TOPIC_NAME = "sample-topic"

@@ -40,11 +40,11 @@ impl From<PyIdentifier> for Identifier {
     }
 }
 
-impl Into<PyIdentifier> for &Identifier {
-    fn into(self) -> PyIdentifier {
-        match self.kind {
-            IdKind::String => PyIdentifier::String(self.get_string_value().unwrap()),
-            IdKind::Numeric => PyIdentifier::Int(self.get_u32_value().unwrap()),
+impl From<&Identifier> for PyIdentifier {
+    fn from(val: &Identifier) -> PyIdentifier {
+        match val.kind {
+            IdKind::String => PyIdentifier::String(val.get_string_value().unwrap()),
+            IdKind::Numeric => PyIdentifier::Int(val.get_u32_value().unwrap()),
         }
     }
 }
