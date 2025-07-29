@@ -90,7 +90,6 @@ derive-new = "0.7.0"
 dirs = "6.0.0"
 dlopen2 = "0.8.0"
 dotenvy = "0.15.7"
-dotenvy = "0.15.7"
 enum_dispatch = "0.3.13"
 figlet-rs = "0.1.5"
 flume = "0.11.1"
@@ -122,7 +121,6 @@ simd-json = { version = "0.15.1", features = ["serde_impl"] }
 sysinfo = "0.36.1"
 tempfile = "3.20.0"
 thiserror = "2.0.12"
-tokio = { version = "1.45.1", features = ["full"] }
 compio =  { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be", features = ["runtime", "macros", "io-uring", "time", "rustls"] }
 cyper = { version = "0.4.0", features = ["rustls"], default-features = false}
 tokio = { version = "1.46.1", features = ["full"] }

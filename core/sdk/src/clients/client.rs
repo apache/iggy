@@ -20,7 +20,6 @@ use crate::clients::client_builder::IggyClientBuilder;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
-use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::http::http_client::HttpClient;
 use crate::prelude::EncryptorKind;
 use crate::prelude::IggyConsumerBuilder;
@@ -30,7 +29,6 @@ use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
 use async_broadcast::Receiver;
 use async_trait::async_trait;
-use iggy_binary_protocol::{Client, SystemClient};
 use iggy_binary_protocol::{Client, SystemClient};
 use iggy_common::{
     ConnectionStringUtils, Consumer, DiagnosticEvent, Partitioner, TransportProtocol,
@@ -85,14 +83,11 @@ impl IggyClient {
     pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
         match ConnectionStringUtils::parse_protocol(connection_string)? {
             TransportProtocol::Tcp => Ok(IggyClient::new(ClientWrapper::Tcp(
-            TransportProtocol::Tcp => Ok(IggyClient::new(ClientWrapper::Tcp(
                 TcpClient::from_connection_string(connection_string)?,
             ))),
             TransportProtocol::Quic => Ok(IggyClient::new(ClientWrapper::Quic(
-            TransportProtocol::Quic => Ok(IggyClient::new(ClientWrapper::Quic(
                 QuicClient::from_connection_string(connection_string)?,
             ))),
-            TransportProtocol::Http => Ok(IggyClient::new(ClientWrapper::Http(
             TransportProtocol::Http => Ok(IggyClient::new(ClientWrapper::Http(
                 HttpClient::from_connection_string(connection_string)?,
             ))),
@@ -101,7 +96,6 @@ impl IggyClient {
 
     /// Creates a new `IggyClient` with the provided client implementation for the specific transport and the optional implementations for the `partitioner` and `encryptor`.
     pub fn create(
-        client: ClientWrapper,
         client: ClientWrapper,
         partitioner: Option<Arc<dyn Partitioner>>,
         encryptor: Option<Arc<EncryptorKind>>,
