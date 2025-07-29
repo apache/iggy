@@ -30,6 +30,9 @@
     "bdd/go/.*\\.go",
     "bdd/go/go.mod",
     "bdd/go/go.sum",
+    "examples/go/.*\\.go",
+    "examples/go/go.mod",
+    "examples/go/go.sum",
     ".github/workflows/ci-check-go-sdk.yml"
   ],
   "java-sdk": [
