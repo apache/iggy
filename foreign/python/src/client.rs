@@ -316,7 +316,7 @@ impl IggyClient {
         init_retry_interval=None,
         allow_replay=false,
     ))]
-    fn consumer_group<'a>(
+    fn consumer_group(
         &self,
         name: &str,
         stream: &str,
