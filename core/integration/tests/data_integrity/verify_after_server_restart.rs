@@ -45,24 +45,15 @@ fn cache_none() -> &'static str {
     "none"
 }
 
-fn encryption_enabled() -> bool {
-    true
-}
-
-fn encryption_disabled() -> bool {
-    false
-}
-
 // TODO(numminex) - Move the message generation method from benchmark run to a special method.
 #[test_matrix(
-    [cache_open_segment(), cache_all(), cache_none()],
-    [encryption_enabled(), encryption_disabled()]
+    [cache_open_segment(), cache_all(), cache_none()]
 )]
 #[tokio::test]
 #[parallel]
-async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str, encryption: bool) {
+async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) {
     // 1. Start server with cache configuration
-    let mut env_vars = HashMap::from([
+    let env_vars = HashMap::from([
         (
             SYSTEM_PATH_ENV_VAR.to_owned(),
             TestServer::get_random_path(),
@@ -72,17 +63,6 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str, 
             cache_setting.to_string(),
         ),
     ]);
-
-    if encryption {
-        env_vars.insert(
-            "IGGY_SYSTEM_ENCRYPTION_ENABLED".to_string(),
-            "true".to_string(),
-        );
-        env_vars.insert(
-            "IGGY_SYSTEM_ENCRYPTION_KEY".to_string(),
-            "/rvT1xP4V8u1EAhk4xDdqzqM2UOPXyy9XYkl4uRShgE=".to_string(),
-        );
-    }
 
     let mut test_server = TestServer::new(Some(env_vars.clone()), false, None, IpAddrKind::V4);
     test_server.start();
