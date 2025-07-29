@@ -13,5 +13,5 @@
 /local_data
 /performance_results
 /scripts
-/target
+**/target
 /web
