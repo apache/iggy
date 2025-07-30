@@ -53,9 +53,9 @@ func MessageHeaderFromBytes(data []byte) (*MessageHeader, error) {
 	}
 	checksum := binary.LittleEndian.Uint64(data[0:8])
 	id := data[8:24]
-	timestamp := binary.LittleEndian.Uint64(data[24:32])
-	originTimestamp := binary.LittleEndian.Uint64(data[32:40])
-	offset := binary.LittleEndian.Uint64(data[40:48])
+	offset := binary.LittleEndian.Uint64(data[24:32])
+	timestamp := binary.LittleEndian.Uint64(data[32:40])
+	originTimestamp := binary.LittleEndian.Uint64(data[40:48])
 	userHeaderLength := binary.LittleEndian.Uint32(data[48:52])
 	payloadLength := binary.LittleEndian.Uint32(data[52:56])
 
