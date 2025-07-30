@@ -25,7 +25,7 @@ use crate::streaming::session::Session;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get};
-use axum::{Extension, Json, Router};
+use axum::{Extension, Json, Router, debug_handler};
 use error_set::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::Validatable;
@@ -34,6 +34,7 @@ use iggy_common::delete_stream::DeleteStream;
 use iggy_common::purge_stream::PurgeStream;
 use iggy_common::update_stream::UpdateStream;
 use iggy_common::{Stream, StreamDetails};
+use send_wrapper::SendWrapper;
 
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateStreamWithId;
@@ -51,14 +52,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+#[debug_handler]
 async fn get_stream(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<Identity>,
     Path(stream_id): Path<String>,
 ) -> Result<Json<StreamDetails>, CustomError> {
-    let system = state.system.read().await;
     let stream_id = Identifier::from_str_value(&stream_id)?;
-    let Ok(stream) = system.try_find_stream(
+    let Ok(stream) = state.shard.shard().try_find_stream(
         &Session::stateless(identity.user_id, identity.ip_address),
         &stream_id,
     ) else {
@@ -68,16 +69,18 @@ async fn get_stream(
         return Err(CustomError::ResourceNotFound);
     };
 
-    let stream = mapper::map_stream(stream);
+    let stream = mapper::map_stream(&SendWrapper::new(stream));
     Ok(Json(stream))
 }
 
+#[debug_handler]
 async fn get_streams(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<Identity>,
 ) -> Result<Json<Vec<Stream>>, CustomError> {
-    let system = state.system.read().await;
-    let streams = system
+    let streams: Vec<std::cell::Ref<'_, crate::streaming::streams::stream::Stream>> = state
+        .shard
+        .shard()
         .find_streams(&Session::stateless(identity.user_id, identity.ip_address))
         .with_error_context(|error| {
             format!(
@@ -85,10 +88,16 @@ async fn get_streams(
                 identity.user_id
             )
         })?;
-    let streams = mapper::map_streams(&streams);
+    let stream_refs = {
+        let refs: Vec<&crate::streaming::streams::stream::Stream> =
+            streams.iter().map(|ref_guard| &**ref_guard).collect();
+        refs
+    };
+    let streams = mapper::map_streams(&stream_refs);
     Ok(Json(streams))
 }
 
+#[debug_handler]
 #[instrument(skip_all, name = "trace_create_stream", fields(iggy_user_id = identity.user_id))]
 async fn create_stream(
     State(state): State<Arc<AppState>>,
@@ -97,39 +106,76 @@ async fn create_stream(
 ) -> Result<Json<StreamDetails>, CustomError> {
     command.validate()?;
 
-    let mut system = state.system.write().await;
-    let stream = system
-        .create_stream(
-            &Session::stateless(identity.user_id, identity.ip_address),
-            command.stream_id,
-            &command.name,
+    let session = Session::stateless(identity.user_id, identity.ip_address);
+    let create_stream_future = SendWrapper::new(state.shard.shard().create_stream(
+        &session,
+        command.stream_id,
+        &command.name,
+    ));
+
+    let stream_identifier = create_stream_future.await.with_error_context(|error| {
+        format!(
+            "{COMPONENT} (error: {error}) - failed to create stream, stream ID: {:?}",
+            command.stream_id
         )
-        .await
+    })?;
+
+    let broadcast_future = SendWrapper::new(async {
+        use crate::shard::transmission::event::ShardEvent;
+
+        let shard = state.shard.shard();
+
+        let event = ShardEvent::CreatedStream {
+            stream_id: command.stream_id,
+            name: command.name.clone(),
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+
+        Ok::<(), CustomError>(())
+    });
+
+    broadcast_future.await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to create stream, stream ID: {:?}",
-                command.stream_id
+                "{COMPONENT} (error: {error}) - failed to broadcast stream creation event, stream ID: {stream_identifier}"
             )
         })?;
-    let stream_id = stream.stream_id;
-    let response = Json(mapper::map_stream(stream));
 
-    let system = system.downgrade();
-    system
-        .state
-        .apply(identity.user_id, &EntryCommand::CreateStream(CreateStreamWithId {
-            stream_id,
-            command
-        }))
+    let stream = state
+        .shard
+        .shard()
+        .find_stream(&Session::stateless(identity.user_id, identity.ip_address), &stream_identifier)
+        .with_error_context(|error| {
+            format!(
+                "{COMPONENT} (error: {error}) - failed to find created stream, stream ID: {stream_identifier}"
+            )
+        })?;
+
+    let response = Json(mapper::map_stream(&SendWrapper::new(stream)));
+
+    let entry_command = EntryCommand::CreateStream(CreateStreamWithId {
+        stream_id: command.stream_id.unwrap(), // TODO: handle unwrap
+        command,
+    });
+    let state_future = SendWrapper::new(
+        state
+            .shard
+            .shard()
+            .state
+            .apply(identity.user_id, &entry_command),
+    );
+
+    state_future
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply create stream, stream ID: {stream_id}",
+                "{COMPONENT} (error: {error}) - failed to apply create stream, stream ID: {stream_identifier}",
             )
         })?;
     Ok(response)
 }
 
+#[debug_handler]
 #[instrument(skip_all, name = "trace_update_stream", fields(iggy_user_id = identity.user_id, iggy_stream_id = stream_id))]
 async fn update_stream(
     State(state): State<Arc<AppState>>,
@@ -140,33 +186,35 @@ async fn update_stream(
     command.stream_id = Identifier::from_str_value(&stream_id)?;
     command.validate()?;
 
-    let mut system = state.system.write().await;
-    system
-        .update_stream(
-            &Session::stateless(identity.user_id, identity.ip_address),
-            &command.stream_id,
-            &command.name,
-        )
-        .await
-        .with_error_context(|error| {
-            format!(
-                "{COMPONENT} (error: {error}) - failed to update stream, stream ID: {stream_id}"
-            )
-        })?;
+    let session = Session::stateless(identity.user_id, identity.ip_address);
+    let update_stream_future = SendWrapper::new(state.shard.shard().update_stream(
+        &session,
+        &command.stream_id,
+        &command.name,
+    ));
 
-    let system = system.downgrade();
-    system
-        .state
-        .apply(identity.user_id, &EntryCommand::UpdateStream(command))
-        .await
-        .with_error_context(|error| {
-            format!(
-                "{COMPONENT} (error: {error}) - failed to apply update stream, stream ID: {stream_id}"
-            )
-        })?;
+    update_stream_future.await.with_error_context(|error| {
+        format!("{COMPONENT} (error: {error}) - failed to update stream, stream ID: {stream_id}")
+    })?;
+
+    let entry_command = EntryCommand::UpdateStream(command);
+    let state_future = SendWrapper::new(
+        state
+            .shard
+            .shard()
+            .state
+            .apply(identity.user_id, &entry_command),
+    );
+
+    state_future.await.with_error_context(|error| {
+        format!(
+            "{COMPONENT} (error: {error}) - failed to apply update stream, stream ID: {stream_id}"
+        )
+    })?;
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[debug_handler]
 #[instrument(skip_all, name = "trace_delete_stream", fields(iggy_user_id = identity.user_id, iggy_stream_id = stream_id))]
 async fn delete_stream(
     State(state): State<Arc<AppState>>,
@@ -175,32 +223,33 @@ async fn delete_stream(
 ) -> Result<StatusCode, CustomError> {
     let identifier_stream_id = Identifier::from_str_value(&stream_id)?;
 
-    let mut system = state.system.write().await;
-    system
+    state
+        .shard
+        .shard()
         .delete_stream(
             &Session::stateless(identity.user_id, identity.ip_address),
             &identifier_stream_id,
         )
-        .await
         .with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to delete stream with ID: {stream_id}",)
         })?;
 
-    let system = system.downgrade();
-    system
-        .state
-        .apply(
-            identity.user_id,
-            &EntryCommand::DeleteStream(DeleteStream {
-                stream_id: identifier_stream_id,
-            }),
+    let entry_command = EntryCommand::DeleteStream(DeleteStream {
+        stream_id: identifier_stream_id,
+    });
+    let state_future = SendWrapper::new(
+        state
+            .shard
+            .shard()
+            .state
+            .apply(identity.user_id, &entry_command),
+    );
+
+    state_future.await.with_error_context(|error| {
+        format!(
+            "{COMPONENT} (error: {error}) - failed to apply delete stream with ID: {stream_id}",
         )
-        .await
-        .with_error_context(|error| {
-            format!(
-                "{COMPONENT} (error: {error}) - failed to apply delete stream with ID: {stream_id}",
-            )
-        })?;
+    })?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -211,29 +260,33 @@ async fn purge_stream(
     Path(stream_id): Path<String>,
 ) -> Result<StatusCode, CustomError> {
     let identifier_stream_id = Identifier::from_str_value(&stream_id)?;
-    let system = state.system.read().await;
-    system
-        .purge_stream(
-            &Session::stateless(identity.user_id, identity.ip_address),
-            &identifier_stream_id,
+    let session = Session::stateless(identity.user_id, identity.ip_address);
+    let purge_stream_future = SendWrapper::new(
+        state
+            .shard
+            .shard()
+            .purge_stream(&session, &identifier_stream_id),
+    );
+
+    purge_stream_future.await.with_error_context(|error| {
+        format!("{COMPONENT} (error: {error}) - failed to purge stream, stream ID: {stream_id}")
+    })?;
+
+    let entry_command = EntryCommand::PurgeStream(PurgeStream {
+        stream_id: identifier_stream_id,
+    });
+    let state_future = SendWrapper::new(
+        state
+            .shard
+            .shard()
+            .state
+            .apply(identity.user_id, &entry_command),
+    );
+
+    state_future.await.with_error_context(|error| {
+        format!(
+            "{COMPONENT} (error: {error}) - failed to apply purge stream, stream ID: {stream_id}"
         )
-        .await
-        .with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to purge stream, stream ID: {stream_id}")
-        })?;
-    system
-        .state
-        .apply(
-            identity.user_id,
-            &EntryCommand::PurgeStream(PurgeStream {
-                stream_id: identifier_stream_id,
-            }),
-        )
-        .await
-        .with_error_context(|error| {
-            format!(
-                "{COMPONENT} (error: {error}) - failed to apply purge stream, stream ID: {stream_id}"
-            )
-        })?;
+    })?;
     Ok(StatusCode::NO_CONTENT)
 }

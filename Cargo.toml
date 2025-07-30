@@ -64,7 +64,7 @@ async_zip = { version = "0.0.17", features = [
     "deflate",
     "zstd",
 ] }
-axum = "0.8.4"
+axum = { version = "0.8.4", features = ["macros"] }
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
 bcrypt = "0.17.0"
 bincode = { version = "2.0.1", features = ["serde"] }
@@ -84,6 +84,7 @@ comfy-table = "7.1.4"
 crc32fast = "1.5.0"
 crossbeam = "0.8.4"
 dashmap = "6.1.0"
+socket2 = "=0.5.10"
 derive_builder = "0.20.2"
 derive_more = { version = "2.0.1", features = ["full"] }
 derive-new = "0.7.0"
@@ -121,9 +122,19 @@ simd-json = { version = "0.15.1", features = ["serde_impl"] }
 sysinfo = "0.36.1"
 tempfile = "3.20.0"
 thiserror = "2.0.12"
-compio =  { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be", features = ["runtime", "macros", "io-uring", "time", "rustls"] }
-cyper = { version = "0.4.0", features = ["rustls"], default-features = false}
 tokio = { version = "1.46.1", features = ["full"] }
+compio = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be", features = [
+    "runtime",
+    "macros",
+    "io-uring",
+    "time",
+    "rustls",
+] }
+cyper = { git = "https://github.com/krishvishal/cyper.git", rev = "cd75e266df6ab0a9b9474eb7dda1735650d17db6", features = [
+    "rustls",
+], default-features = false }
+cyper-axum = { git = "https://github.com/krishvishal/cyper", rev = "cd75e266df6ab0a9b9474eb7dda1735650d17db6" }
+compio-net = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be" }
 tokio-rustls = "0.26.2"
 toml = "0.9.2"
 tracing = "0.1.41"

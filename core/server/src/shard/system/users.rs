@@ -203,7 +203,14 @@ impl IggyShard {
         }
 
         let user_id = USER_ID.fetch_add(1, Ordering::SeqCst);
-        let user = User::new(user_id, username, password, status, permissions.clone());
+        let current_user_id = USER_ID.load(Ordering::SeqCst);
+        let user = User::new(
+            current_user_id,
+            username,
+            password,
+            status,
+            permissions.clone(),
+        );
         self.permissioner
             .borrow_mut()
             .init_permissions_for_user(user_id, permissions);

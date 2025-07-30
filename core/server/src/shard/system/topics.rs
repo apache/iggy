@@ -18,6 +18,7 @@
 
 use super::COMPONENT;
 use crate::shard::namespace::IggyNamespace;
+use crate::shard::transmission::event::ShardEvent;
 use crate::shard::{IggyShard, ShardInfo};
 use crate::streaming::session::Session;
 use crate::streaming::streams::stream::Stream;
@@ -173,11 +174,11 @@ impl IggyShard {
         let stream = self.get_stream(stream_id).with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
         })?;
-        let stream_id = stream.stream_id;
+        let numeric_stream_id = stream.stream_id;
         let topic = stream
                 .get_topic(&topic_id)
                 .with_error_context(|error| {
-                    format!("{COMPONENT} (error: {error}) - failed to get topic with ID: {topic_id} in stream with ID: {stream_id}")
+                    format!("{COMPONENT} (error: {error}) - failed to get topic with ID: {topic_id} in stream with ID: {numeric_stream_id}")
                 })?;
         topic.persist().await.with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to persist topic: {topic}")

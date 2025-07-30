@@ -16,37 +16,71 @@
  * under the License.
  */
 
-//TODO: Fixme
-/*
 use crate::configs::http::{HttpConfig, HttpCorsConfig};
 use crate::http::diagnostics::request_diagnostics;
+use crate::http::http_shard_wrapper::HttpSafeShard;
 use crate::http::jwt::cleaner::start_expired_tokens_cleaner;
 use crate::http::jwt::jwt_manager::JwtManager;
 use crate::http::jwt::middleware::jwt_auth;
 use crate::http::metrics::metrics;
 use crate::http::shared::AppState;
 use crate::http::*;
-use crate::streaming::systems::system::SharedSystem;
+use crate::shard::IggyShard;
+// use crate::streaming::systems::system::SharedSystem;
 use axum::extract::DefaultBodyLimit;
+use axum::extract::connect_info::Connected;
 use axum::http::Method;
 use axum::{Router, middleware};
 use axum_server::tls_rustls::RustlsConfig;
+use compio_net::TcpListener;
+use iggy_common::IggyError;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info};
 
+#[derive(Debug, Clone, Copy)]
+pub struct CompioSocketAddr(pub SocketAddr);
+
+impl From<SocketAddr> for CompioSocketAddr {
+    fn from(addr: SocketAddr) -> Self {
+        CompioSocketAddr(addr)
+    }
+}
+
+impl From<CompioSocketAddr> for SocketAddr {
+    fn from(addr: CompioSocketAddr) -> Self {
+        addr.0
+    }
+}
+
+impl<'a> Connected<cyper_axum::IncomingStream<'a, TcpListener>> for CompioSocketAddr {
+    fn connect_info(target: cyper_axum::IncomingStream<'a, TcpListener>) -> Self {
+        let addr = *target.remote_addr();
+        CompioSocketAddr(addr)
+    }
+}
+
 /// Starts the HTTP API server.
 /// Returns the address the server is listening on.
-pub async fn start(config: HttpConfig, system: SharedSystem) -> SocketAddr {
+pub async fn start(config: HttpConfig, shard: Rc<IggyShard>) -> Result<(), IggyError> {
+    if shard.id != 0 {
+        info!(
+            "HTTP server disabled for shard {} (only runs on shard 0)",
+            shard.id
+        );
+        panic!("HTTP server only runs on shard 0");
+    }
+
     let api_name = if config.tls.enabled {
         "HTTP API (TLS)"
     } else {
         "HTTP API"
     };
 
-    let app_state = build_app_state(&config, system).await;
+    let app_state = build_app_state(&config, shard).await;
     let mut app = Router::new()
         .merge(system::router(app_state.clone(), &config.metrics))
         .merge(personal_access_tokens::router(app_state.clone()))
@@ -74,25 +108,26 @@ pub async fn start(config: HttpConfig, system: SharedSystem) -> SocketAddr {
     app = app.layer(middleware::from_fn(request_diagnostics));
 
     if !config.tls.enabled {
-        let listener = tokio::net::TcpListener::bind(config.address.clone())
+        let listener = TcpListener::bind(config.address.clone())
             .await
             .unwrap_or_else(|_| panic!("Failed to bind to HTTP address {}", config.address));
         let address = listener
             .local_addr()
             .expect("Failed to get local address for HTTP server");
         info!("Started {api_name} on: {address}");
-        tokio::task::spawn(async move {
-            if let Err(error) = axum::serve(
+        compio::runtime::spawn(async move {
+            if let Err(error) = cyper_axum::serve(
                 listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
+                app.into_make_service_with_connect_info::<CompioSocketAddr>(),
             )
             .await
             {
                 error!("Failed to start {api_name} server, error {}", error);
             }
-        });
-
-        address
+        })
+        .detach();
+        // address
+        Ok(())
     } else {
         let tls_config = RustlsConfig::from_pem_file(
             PathBuf::from(config.tls.cert_file),
@@ -117,17 +152,17 @@ pub async fn start(config: HttpConfig, system: SharedSystem) -> SocketAddr {
             }
         });
 
-        address
+        // address
+        Ok(())
     }
 }
 
-async fn build_app_state(config: &HttpConfig, system: SharedSystem) -> Arc<AppState> {
+async fn build_app_state(config: &HttpConfig, shard: Rc<IggyShard>) -> Arc<AppState> {
     let tokens_path;
     let persister;
     {
-        let system = system.read().await;
-        tokens_path = system.config.get_state_tokens_path();
-        persister = system.storage.persister.clone();
+        tokens_path = shard.config.system.get_state_tokens_path();
+        persister = shard.storage.persister.clone();
     }
 
     let jwt_manager = JwtManager::from_config(persister, &tokens_path, &config.jwt);
@@ -142,7 +177,7 @@ async fn build_app_state(config: &HttpConfig, system: SharedSystem) -> Arc<AppSt
 
     Arc::new(AppState {
         jwt_manager,
-        system,
+        shard: HttpSafeShard::new(shard),
     })
 }
 
@@ -193,4 +228,3 @@ fn configure_cors(config: HttpCorsConfig) -> CorsLayer {
         .allow_credentials(config.allow_credentials)
         .allow_private_network(config.allow_private_network)
 }
-*/

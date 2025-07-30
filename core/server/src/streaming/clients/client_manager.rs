@@ -22,7 +22,6 @@ use ahash::AHashMap;
 use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
 use iggy_common::UserId;
-use iggy_common::locking::IggyRwLockFn;
 use std::fmt::{Display, Formatter};
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -130,11 +129,12 @@ impl ClientManager {
     }
 
     pub fn delete_client(&mut self, client_id: u32) -> Option<Client> {
-        let client = self.clients.remove(&client_id);
-        if let Some(client) = client.as_ref() {
+        if let Some(mut client) = self.clients.remove(&client_id) {
             client.session.clear_user_id();
+            Some(client)
+        } else {
+            None
         }
-        client
     }
 
     pub fn join_consumer_group(

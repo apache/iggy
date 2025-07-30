@@ -257,6 +257,7 @@ impl IggyShard {
         let id = stream.stream_id;
 
         stream.persist().await?;
+
         self.streams_ids.borrow_mut().insert(name.to_owned(), id);
         self.streams.borrow_mut().insert(id, stream);
         self.metrics.increment_streams(1);
