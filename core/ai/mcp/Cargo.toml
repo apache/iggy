@@ -18,7 +18,13 @@
 [package]
 name = "iggy-mcp"
 version = "0.1.0"
+description = "MCP Server for Iggy message streaming platform"
 edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/apache/iggy"
+homepage = "https://iggy.apache.org"
+keywords = ["iggy", "messaging", "streaming", "mcp"]
+readme = "README.md"
 
 [dependencies]
 axum = { workspace = true }
