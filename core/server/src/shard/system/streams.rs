@@ -22,6 +22,7 @@ use crate::shard::namespace::IggyNamespace;
 use crate::streaming::partitions::partition;
 use crate::streaming::session::Session;
 use crate::streaming::streams::stream::Stream;
+use crate::streaming::streams::stream2;
 use error_set::ErrContext;
 use futures::future::try_join_all;
 use iggy_common::locking::IggyRwLockFn;
@@ -200,6 +201,39 @@ impl IggyShard {
         self.streams.borrow_mut().insert(id, stream);
         self.metrics.increment_streams(1);
         Ok(id)
+    }
+
+    pub async fn create_stream2(
+        &self,
+        session: &Session,
+        stream_id: Option<u32>,
+        name: String,
+    ) -> Result<usize, IggyError> {
+        self.ensure_authenticated(session)?;
+        self.permissioner
+            .borrow()
+            .create_stream(session.get_user_id())?;
+        let stream_id = self.create_stream2_base(name).await?;
+        self.streams2
+            .create_stream_file_hierarchy(stream_id, &self.config.system)
+            .await?;
+        Ok(stream_id)
+    }
+
+    pub async fn create_stream2_bypass_auth(&self, name: String) -> Result<usize, IggyError> {
+        self.create_stream2_base(name).await
+    }
+
+    async fn create_stream2_base(&self, name: String) -> Result<usize, IggyError> {
+        let exists = self.streams2.with(|streams| streams.exists(&name));
+        if exists {
+            return Err(IggyError::StreamNameAlreadyExists(name));
+        }
+        let stream = stream2::Stream::new(name);
+        let stream_id = self
+            .streams2
+            .with_mut(|streams| stream.insert_into(streams));
+        Ok(stream_id)
     }
 
     pub async fn create_stream(

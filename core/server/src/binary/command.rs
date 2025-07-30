@@ -20,6 +20,7 @@ use std::rc::Rc;
 
 use crate::binary::sender::SenderKind;
 use crate::define_server_command_enum;
+use crate::io::storage::Storage;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use bytes::{BufMut, Bytes, BytesMut};

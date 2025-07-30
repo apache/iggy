@@ -148,8 +148,8 @@ impl Stream {
             topic.replication_factor = replication_factor;
         }
 
-            self.topics_ids.remove(&old_topic_name.clone());
-            self.topics_ids.insert(name.to_owned(), topic_id);
+        self.topics_ids.remove(&old_topic_name.clone());
+        self.topics_ids.insert(name.to_owned(), topic_id);
 
         Ok(())
     }

@@ -18,6 +18,7 @@
 
 use crate::binary::sender::SenderKind;
 use crate::configs::tcp::TcpTlsConfig;
+use crate::io::storage::Storage;
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
 use crate::streaming::clients::client_manager::Transport;

@@ -1,7 +1,6 @@
 use futures::{FutureExt, StreamExt};
 use iggy_common::IggyError;
 use std::{rc::Rc, time::Duration};
-use tracing::{error, info};
 
 use crate::{
     shard::{IggyShard, transmission::frame::ShardFrame},

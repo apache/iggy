@@ -22,6 +22,7 @@ use crate::streaming::clients::client_manager::{Client, Transport};
 use crate::streaming::partitions::partition::Partition;
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::streams::stream::Stream;
+use crate::streaming::streams::stream2;
 use crate::streaming::topics::consumer_group::ConsumerGroup;
 use crate::streaming::topics::topic::Topic;
 use crate::streaming::users::user::User;
@@ -148,6 +149,16 @@ pub fn map_personal_access_tokens(personal_access_tokens: Vec<PersonalAccessToke
     bytes.freeze()
 }
 
+pub fn map_stream2(stream: &stream2::Stream) -> Bytes {
+    let mut bytes = BytesMut::new();
+    extend_stream2(stream, &mut bytes);
+    /*
+    for topic in stream.get_topics() {
+        extend_topic(topic, &mut bytes);
+    }
+    */
+    bytes.freeze()
+}
 pub fn map_stream(stream: &Stream) -> Bytes {
     let mut bytes = BytesMut::new();
     extend_stream(stream, &mut bytes);
@@ -204,6 +215,11 @@ pub fn map_consumer_groups(consumer_groups: Vec<ConsumerGroup>) -> Bytes {
         extend_consumer_group(&consumer_group, &mut bytes);
     }
     bytes.freeze()
+}
+
+fn extend_stream2(stream: &stream2::Stream, bytes: &mut BytesMut) {
+    //stream.serialize_into(bytes);
+    // TODO:
 }
 
 fn extend_stream(stream: &Stream, bytes: &mut BytesMut) {

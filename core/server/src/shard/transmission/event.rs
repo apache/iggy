@@ -23,6 +23,10 @@ pub enum ShardEvent {
     DeletedShardTableRecords {
         namespaces: Vec<IggyNamespace>,
     },
+    CreatedStream2 {
+        id: usize,
+        name: String,
+    },
     CreatedStream {
         stream_id: Option<u32>,
         name: String,

@@ -256,7 +256,7 @@ async fn main() -> Result<(), ServerError> {
                 let rt = create_shard_executor(affinity_set);
                 rt.block_on(async move {
                     let builder = IggyShard::builder();
-                    let shard: Rc<IggyShard> = builder
+                    let shard = builder
                         .id(id)
                         .connections(connections)
                         .config(config)
@@ -266,8 +266,8 @@ async fn main() -> Result<(), ServerError> {
                         .version(current_version)
                         .state(state)
                         .init_state(init_state)
-                        .build()
-                        .into();
+                        .build();
+                    let shard = Rc::new(shard);
 
                     if let Err(e) = shard.run().await {
                         error!("Failed to run shard-{id}: {e}");

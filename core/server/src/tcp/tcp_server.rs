@@ -22,7 +22,6 @@ use crate::tcp::{tcp_listener, tcp_socket, tcp_tls_listener};
 use iggy_common::IggyError;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use tracing::info;
 
 /// Starts the TCP server.
 pub async fn spawn_tcp_server(shard: Rc<IggyShard>) -> Result<(), IggyError> {

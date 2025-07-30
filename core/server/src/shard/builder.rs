@@ -23,10 +23,10 @@ use tracing::info;
 
 use crate::{
     archiver::{Archiver, ArchiverKind},
-    bootstrap::resolve_persister,
     configs::server::ServerConfig,
-    map_toggle_str,
+    io::storage::Storage,
     shard::{Shard, task_registry::TaskRegistry},
+    slab::streams::Streams,
     state::{StateKind, system::SystemState},
     streaming::{diagnostics::metrics::Metrics, storage::SystemStorage},
     versioning::SemanticVersion,
@@ -136,6 +136,7 @@ impl IggyShardBuilder {
             is_shutting_down: AtomicBool::new(false),
             tcp_bound_address: Cell::new(None),
 
+            streams2: Streams::init(),
             users: Default::default(),
             permissioner: Default::default(),
             streams: Default::default(),

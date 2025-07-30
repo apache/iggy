@@ -28,8 +28,8 @@ use crate::state::models::CreateStreamWithId;
 use crate::streaming::session::Session;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy_common::IggyError;
 use iggy_common::create_stream::CreateStream;
+use iggy_common::{Identifier, IggyError};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -49,6 +49,27 @@ impl ServerCommandHandler for CreateStream {
         debug!("session: {session}, command: {self}");
         let stream_id = self.stream_id;
         let name = self.name.clone();
+        let new_stream_id = shard
+            .create_stream2(session, stream_id, self.name.clone())
+            .await?;
+        shard_info!(
+            shard.id,
+            "Created stream with new API, Stream ID: {}, name: '{}'.",
+            new_stream_id,
+            name
+        );
+        let event = ShardEvent::CreatedStream2 {
+            id: new_stream_id,
+            name: self.name.clone(),
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+
+        //TODO: Replace the mapping from line 89 with this once the Stream layer is finished.
+        let _ = shard.streams2.with_stream_by_id(
+            &Identifier::numeric(new_stream_id as u32).unwrap(),
+            |stream| mapper::map_stream2(stream),
+        );
+
         let created_stream_id = shard
                 .create_stream(session, stream_id, &name)
                 .await

@@ -1,14 +1,12 @@
 use crate::{
-    archiver::ArchiverKind, configs::server::MessagesMaintenanceConfig, map_toggle_str,
-    shard::IggyShard, shard_debug, shard_error, shard_info, shard_trace,
-    streaming::topics::topic::Topic,
+    archiver::ArchiverKind, map_toggle_str, shard::IggyShard, shard_debug, shard_error, shard_info,
+    shard_trace, streaming::topics::topic::Topic,
 };
 use compio::time;
 use error_set::ErrContext;
 use futures::FutureExt;
-use iggy_common::{IggyDuration, IggyError, IggyTimestamp, locking::IggyRwLockFn};
+use iggy_common::{IggyError, IggyTimestamp, locking::IggyRwLockFn};
 use std::{rc::Rc, time::Duration};
-use tracing::{debug, error, info, trace};
 
 pub async fn spawn_message_maintainance_task(shard: Rc<IggyShard>) -> Result<(), IggyError> {
     let config = &shard.config.data_maintenance.messages;

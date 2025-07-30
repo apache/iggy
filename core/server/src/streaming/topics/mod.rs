@@ -17,6 +17,7 @@
  */
 
 pub mod consumer_group;
+pub mod consumer_group2;
 pub mod consumer_groups;
 pub mod consumer_offsets;
 pub mod messages;
@@ -25,5 +26,6 @@ pub mod persistence;
 pub mod segments;
 pub mod storage;
 pub mod topic;
+pub mod topic2;
 
 pub const COMPONENT: &str = "STREAMING_TOPICS";

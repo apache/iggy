@@ -66,9 +66,6 @@ impl<T> ShardConnector<T> {
     }
 }
 
-// TODO: I think those Arcs can be replaced with 'static lifetimes...
-// Those connectors will live for the duration of the shard itself
-// and the shard lives for the duration of the entire application.
 pub struct Receiver<T> {
     channel: Arc<ShardedChannel<T>>,
 }
