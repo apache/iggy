@@ -32,7 +32,7 @@ assert_cmd = "2.0.17"
 async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
-ctor = "0.4.2"
+ctor = "0.4.3"
 derive_more = { workspace = true }
 env_logger = { workspace = true }
 futures = { workspace = true }
@@ -48,7 +48,7 @@ predicates = { workspace = true }
 rand = { workspace = true }
 rcgen = "0.14.3"
 reqwest = { workspace = true }
-rmcp = { version = "0.3.0", features = [
+rmcp = { version = "0.3.2", features = [
     "client",
     "reqwest",
     "transport-streamable-http-client",
