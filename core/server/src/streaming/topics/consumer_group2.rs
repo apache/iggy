@@ -1,6 +1,6 @@
 use crate::slab::Keyed;
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct ConsumerGroup {
     name: String,
 }

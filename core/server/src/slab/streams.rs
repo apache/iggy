@@ -1,10 +1,11 @@
 use compio::fs::create_dir_all;
-use iggy_common::{Identifier, IggyError};
+use iggy_common::{CompressionAlgorithm, Identifier, IggyError, MaxTopicSize};
 use slab::Slab;
 use std::{
     cell::{RefCell, UnsafeCell},
     ops::Index,
     path::Path,
+    sync::Arc,
 };
 use tracing::info;
 
@@ -13,46 +14,46 @@ use crate::{
     io::storage::Storage,
     shard_info,
     slab::{IndexedSlab, partitions::Partitions, topics::Topics},
-    streaming::{partitions::partition2, streams::stream2, topics::topic2},
+    streaming::{
+        partitions::partition2, stats::stats::StreamStats, streams::stream2, topics::topic2,
+    },
 };
 
 const CAPACITY: usize = 1024;
 
 pub struct Streams {
     container: RefCell<IndexedSlab<stream2::Stream>>,
-    stats: (),
+    stats: RefCell<Slab<Arc<StreamStats>>>,
 }
 
 impl Streams {
     pub fn init() -> Self {
         Self {
             container: RefCell::new(IndexedSlab::with_capacity(CAPACITY)),
-            stats: (),
+            stats: RefCell::new(Slab::with_capacity(CAPACITY)),
         }
     }
 
-    pub async fn create_stream_file_hierarchy(
+    pub fn with_stats<T>(&self, f: impl FnOnce(&Slab<Arc<StreamStats>>) -> T) -> T {
+        let stats = self.stats.borrow();
+        f(&stats)
+    }
+
+    pub fn with_stats_by_id<T>(
         &self,
-        id: usize,
-        config: &SystemConfig,
-    ) -> Result<(), IggyError> {
-        let id = id as u32;
-        let path = config.get_stream_path(id);
-        let topics_path = config.get_topics_path(id);
+        id: &Identifier,
+        f: impl FnOnce(&Arc<StreamStats>) -> T,
+    ) -> T {
+        let stream_id = self.with_stream_by_id(id, |stream| stream.id());
+        self.with_stats(|stats| {
+            let stats = &stats[stream_id];
+            f(stats)
+        })
+    }
 
-        if !Path::new(&path).exists() && create_dir_all(&path).await.is_err() {
-            return Err(IggyError::CannotCreateStreamDirectory(id, path.clone()));
-        }
-
-        if !Path::new(&topics_path).exists() && create_dir_all(&topics_path).await.is_err() {
-            return Err(IggyError::CannotCreateTopicsDirectory(
-                id,
-                topics_path.clone(),
-            ));
-        }
-
-        info!("Saved stream with ID: {id}.");
-        Ok(())
+    pub fn with_stats_mut<T>(&self, f: impl FnOnce(&mut Slab<Arc<StreamStats>>) -> T) -> T {
+        let mut stats = self.stats.borrow_mut();
+        f(&mut stats)
     }
 
     pub async fn with_async(&self, f: impl AsyncFnOnce(&IndexedSlab<stream2::Stream>)) {
@@ -90,7 +91,7 @@ impl Streams {
         })
     }
 
-    pub fn with_stream_by_id_mut(&self, id: &Identifier, mut f: impl FnMut(&mut stream2::Stream)) {
+    pub fn with_stream_by_id_mut(&self, id: &Identifier, mut f: impl FnOnce(&mut stream2::Stream)) {
         self.with_mut(|streams| {
             let stream = match id.kind {
                 iggy_common::IdKind::Numeric => {
@@ -106,7 +107,7 @@ impl Streams {
         });
     }
 
-    pub fn with_topics(&self, stream_id: &Identifier, f: impl FnOnce(&Topics)) {
+    pub fn with_topics<T>(&self, stream_id: &Identifier, f: impl FnOnce(&Topics) -> T) -> T {
         self.with(|streams| {
             let stream = match stream_id.kind {
                 iggy_common::IdKind::Numeric => {
@@ -119,7 +120,7 @@ impl Streams {
                 }
             };
             f(stream.topics())
-        });
+        })
     }
 
     pub fn with_topic_by_id(
@@ -131,6 +132,15 @@ impl Streams {
         self.with_topics(id, |topics| {
             topics.with_topic_by_id(topic_id, f);
         });
+    }
+
+    pub fn with_topic_by_id_mut<T>(
+        &self,
+        id: &Identifier,
+        topic_id: &Identifier,
+        f: impl FnOnce(&mut topic2::Topic) -> T,
+    ) -> T {
+        self.with_topics(id, |topics| topics.with_topic_by_id_mut(topic_id, f))
     }
 
     pub fn with_partitions(

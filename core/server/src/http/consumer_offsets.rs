@@ -63,7 +63,8 @@ async fn get_consumer_offset(
     query.validate()?;
     let consumer = Consumer::new(query.0.consumer.id);
     let session = SendWrapper::new(Session::stateless(identity.user_id, identity.ip_address));
-    let Ok(offset) = state.shard
+    let Ok(offset) = state
+        .shard
         .get_consumer_offset(
             &session,
             &consumer,
@@ -118,7 +119,8 @@ async fn delete_consumer_offset(
 ) -> Result<StatusCode, CustomError> {
     let consumer = Consumer::new(consumer_id.try_into()?);
     let session = SendWrapper::new(Session::stateless(identity.user_id, identity.ip_address));
-    state.shard        
+    state
+        .shard
         .delete_consumer_offset(
             &session,
             consumer,

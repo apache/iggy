@@ -33,7 +33,6 @@ use iggy_common::{ConsumerGroupDetails, ConsumerGroupMember};
 use iggy_common::{IdentityInfo, TokenInfo};
 use iggy_common::{UserInfo, UserInfoDetails};
 
-
 pub fn map_stream(stream: &Stream) -> StreamDetails {
     let topics = map_topics(&stream.get_topics());
     let mut stream_details = StreamDetails {
@@ -193,9 +192,7 @@ pub fn map_clients(clients: &[Client]) -> Vec<iggy_common::ClientInfo> {
     all_clients
 }
 
-pub fn map_consumer_groups(
-    consumer_groups: &[ConsumerGroup],
-) -> Vec<iggy_common::ConsumerGroup> {
+pub fn map_consumer_groups(consumer_groups: &[ConsumerGroup]) -> Vec<iggy_common::ConsumerGroup> {
     let mut groups = Vec::new();
     for consumer_group in consumer_groups {
         let consumer_group = iggy_common::ConsumerGroup {

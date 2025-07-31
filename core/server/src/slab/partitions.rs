@@ -1,17 +1,18 @@
-use std::cell::RefCell;
+use std::{cell::RefCell, sync::Arc};
 
 use iggy_common::Partition;
 use slab::Slab;
 
-use crate::streaming::{partitions::partition2, segments};
+use crate::streaming::{partitions::partition2, segments, stats::stats::PartitionStats};
 
 // TODO: This could be upper limit of partitions per topic, use that value to validate instead of whathever this thing is in `common` crate.
 const CAPACITY: usize = 16384;
 
+
+#[derive(Debug)]
 pub struct Partitions {
     container: Slab<partition2::Partition>,
-    storage: (),
-    stats: (),
+    stats: Slab<Arc<PartitionStats>>,
     segments: Slab<Vec<segments::Segment2>>,
 }
 
@@ -19,8 +20,7 @@ impl Default for Partitions {
     fn default() -> Self {
         Self {
             container: Slab::with_capacity(CAPACITY),
-            storage: (),
-            stats: (),
+            stats: Slab::with_capacity(CAPACITY),
             segments: Slab::with_capacity(CAPACITY),
         }
     }
@@ -37,9 +37,9 @@ impl Partitions {
         f(&container);
     }
 
-    pub fn with_mut(&mut self, f: impl FnOnce(&mut Slab<partition2::Partition>)) {
+    pub fn with_mut<T>(&mut self, f: impl FnOnce(&mut Slab<partition2::Partition>) -> T) -> T {
         let mut container = &mut self.container;
-        f(&mut container);
+        f(&mut container)
     }
 
     pub fn with_partition_id(&self, partition_id: usize, f: impl FnOnce(&partition2::Partition)) {

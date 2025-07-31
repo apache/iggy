@@ -26,6 +26,7 @@ pub mod personal_access_tokens;
 pub mod polling_consumer;
 pub mod segments;
 pub mod session;
+pub mod stats;
 pub mod storage;
 pub mod streams;
 pub mod topics;

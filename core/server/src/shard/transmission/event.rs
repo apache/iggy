@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 
 use iggy_common::{
     CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, Permissions, UserStatus,
@@ -10,6 +10,7 @@ use crate::{
         clients::client_manager::Transport,
         personal_access_tokens::personal_access_token::PersonalAccessToken,
         polling_consumer::PollingConsumer,
+        stats::stats::{StreamStats, TopicStats},
     },
 };
 
@@ -26,6 +27,7 @@ pub enum ShardEvent {
     CreatedStream2 {
         id: usize,
         name: String,
+        stats: Arc<StreamStats>,
     },
     CreatedStream {
         stream_id: Option<u32>,
@@ -60,6 +62,17 @@ pub enum ShardEvent {
         compression_algorithm: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,
         replication_factor: Option<u8>,
+    },
+    CreatedTopic2 {
+        id: usize,
+        stream_id: Identifier,
+        name: String,
+        partitions_count: u32,
+        message_expiry: IggyExpiry,
+        compression_algorithm: CompressionAlgorithm,
+        max_topic_size: MaxTopicSize,
+        replication_factor: Option<u8>,
+        stats: Arc<TopicStats>,
     },
     CreatedConsumerGroup {
         stream_id: Identifier,

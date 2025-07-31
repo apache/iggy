@@ -157,9 +157,11 @@ impl Identifier {
 
     /// Creates a new identifier from the given numeric value.
     pub fn numeric(value: u32) -> Result<Self, IggyError> {
+        /*
         if value == 0 {
             return Err(IggyError::InvalidIdentifier);
         }
+        */
 
         Ok(Self {
             kind: IdKind::Numeric,

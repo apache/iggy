@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use crate::Identifier;
 use crate::utils::topic_size::MaxTopicSize;
 use crate::{IggyMessage, utils::byte_size::IggyByteSize};
 use std::sync::Arc;

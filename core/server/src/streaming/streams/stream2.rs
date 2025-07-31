@@ -3,12 +3,22 @@ use iggy_common::IggyTimestamp;
 
 use crate::slab::{IndexedSlab, Keyed, topics::Topics};
 
-#[derive(Default)]
 pub struct Stream {
     id: usize,
     name: String,
     created_at: IggyTimestamp,
     topics: Topics,
+}
+
+impl Default for Stream {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            name: String::new(),
+            created_at: IggyTimestamp::now(),
+            topics: Topics::init(),
+        }
+    }
 }
 
 impl Keyed for Stream {
@@ -26,8 +36,16 @@ impl Stream {
             id: 0,
             name,
             created_at: now,
-            topics: Topics::default(),
+            topics: Topics::init(),
         }
+    }
+
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
+    pub fn topics_count(&self) -> usize {
+        self.topics.len()
     }
 
     pub fn insert_into(self, container: &mut IndexedSlab<Self>) -> usize {

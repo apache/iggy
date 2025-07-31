@@ -21,6 +21,8 @@ use crate::shard::IggyShard;
 use crate::shard::namespace::IggyNamespace;
 use crate::streaming::partitions::partition;
 use crate::streaming::session::Session;
+use crate::streaming::stats::stats::StreamStats;
+use crate::streaming::streams::storage2::create_stream_file_hierarchy;
 use crate::streaming::streams::stream::Stream;
 use crate::streaming::streams::stream2;
 use error_set::ErrContext;
@@ -28,6 +30,7 @@ use futures::future::try_join_all;
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{IdKind, Identifier, IggyError};
 use std::cell::{Ref, RefCell, RefMut};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::fs;
 use tracing::{error, info, warn};
@@ -208,23 +211,30 @@ impl IggyShard {
         session: &Session,
         stream_id: Option<u32>,
         name: String,
+        stats: Arc<StreamStats>,
     ) -> Result<usize, IggyError> {
         self.ensure_authenticated(session)?;
         self.permissioner
             .borrow()
             .create_stream(session.get_user_id())?;
-        let stream_id = self.create_stream2_base(name).await?;
-        self.streams2
-            .create_stream_file_hierarchy(stream_id, &self.config.system)
-            .await?;
+        let stream_id = self.create_stream2_base(name, stats).await?;
+        create_stream_file_hierarchy(stream_id, &self.config.system).await?;
         Ok(stream_id)
     }
 
-    pub async fn create_stream2_bypass_auth(&self, name: String) -> Result<usize, IggyError> {
-        self.create_stream2_base(name).await
+    pub async fn create_stream2_bypass_auth(
+        &self,
+        name: String,
+        stats: Arc<StreamStats>,
+    ) -> Result<usize, IggyError> {
+        self.create_stream2_base(name, stats).await
     }
 
-    async fn create_stream2_base(&self, name: String) -> Result<usize, IggyError> {
+    async fn create_stream2_base(
+        &self,
+        name: String,
+        stats: Arc<StreamStats>,
+    ) -> Result<usize, IggyError> {
         let exists = self.streams2.with(|streams| streams.exists(&name));
         if exists {
             return Err(IggyError::StreamNameAlreadyExists(name));
@@ -233,6 +243,8 @@ impl IggyShard {
         let stream_id = self
             .streams2
             .with_mut(|streams| stream.insert_into(streams));
+        self.streams2
+            .with_stats_mut(|container| container.insert(stats));
         Ok(stream_id)
     }
 

@@ -12,32 +12,22 @@ pub trait Keyed {
     fn key(&self) -> &Self::Key;
 }
 
+#[derive(Debug)]
 pub struct IndexedSlab<T: Keyed> {
     slab: Slab<T>,
     index: AHashMap<T::Key, usize>,
 }
 
-impl<T> Default for IndexedSlab<T>
-where
-    T: Keyed + Default,
-{
-    fn default() -> Self {
-        Self {
-            slab: Slab::new(),
-            index: AHashMap::new(),
-        }
-    }
-}
-
 impl<T: Keyed + Default> IndexedSlab<T> {
     pub fn with_capacity(capacity: usize) -> Self {
-        let mut slab = Slab::with_capacity(capacity);
-        // Advance the slab once, by inserting a default value.
-        slab.insert(T::default());
         Self {
-            slab,
+            slab: Slab::with_capacity(capacity),
             index: AHashMap::with_capacity(capacity),
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.slab.len()
     }
 
     pub fn exists(&self, key: &T::Key) -> bool {

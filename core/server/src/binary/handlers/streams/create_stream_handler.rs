@@ -26,11 +26,13 @@ use crate::shard_info;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateStreamWithId;
 use crate::streaming::session::Session;
+use crate::streaming::stats::stats::StreamStats;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::create_stream::CreateStream;
 use iggy_common::{Identifier, IggyError};
 use std::rc::Rc;
+use std::sync::Arc;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for CreateStream {
@@ -49,8 +51,10 @@ impl ServerCommandHandler for CreateStream {
         debug!("session: {session}, command: {self}");
         let stream_id = self.stream_id;
         let name = self.name.clone();
+        let stats = Arc::new(StreamStats::new());
+
         let new_stream_id = shard
-            .create_stream2(session, stream_id, self.name.clone())
+            .create_stream2(session, stream_id, self.name.clone(), stats.clone())
             .await?;
         shard_info!(
             shard.id,
@@ -61,6 +65,7 @@ impl ServerCommandHandler for CreateStream {
         let event = ShardEvent::CreatedStream2 {
             id: new_stream_id,
             name: self.name.clone(),
+            stats,
         };
         let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
 

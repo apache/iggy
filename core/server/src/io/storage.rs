@@ -3,7 +3,7 @@ use std::future::Future;
 use compio::{
     buf::{IoBuf, IoBufMut},
     driver::op,
-    io::{util::Splittable, AsyncReadAtExt, AsyncWriteAt, AsyncWriteAtExt, BufWriter},
+    io::{AsyncReadAtExt, AsyncWriteAt, AsyncWriteAtExt, BufWriter, util::Splittable},
 };
 use enum_dispatch::enum_dispatch;
 
@@ -78,7 +78,6 @@ impl BlockStorage {
         let buf = Vec::new();
         (&*file).write_all_at(buf, 0).await.unwrap();
     }
-
 }
 
 impl BlockStorage {

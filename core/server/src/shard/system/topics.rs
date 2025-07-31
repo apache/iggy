@@ -16,13 +16,19 @@
  * under the License.
  */
 
+use std::sync::Arc;
+
 use super::COMPONENT;
 use crate::shard::namespace::IggyNamespace;
 use crate::shard::transmission::event::ShardEvent;
 use crate::shard::{IggyShard, ShardInfo};
+use crate::streaming::partitions::partition2;
 use crate::streaming::session::Session;
+use crate::streaming::stats::stats::TopicStats;
 use crate::streaming::streams::stream::Stream;
 use crate::streaming::topics::topic::Topic;
+use crate::streaming::topics::topic2;
+use clap::Id;
 use error_set::ErrContext;
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize};
@@ -129,6 +135,143 @@ impl IggyShard {
         self.metrics.increment_partitions(partitions_count);
         self.metrics.increment_segments(partitions_count);
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_topic2(
+        &self,
+        session: &Session,
+        stream_id: &Identifier,
+        topic_id: Option<u32>,
+        name: String,
+        partitions_count: u32,
+        message_expiry: IggyExpiry,
+        compression: CompressionAlgorithm,
+        max_topic_size: MaxTopicSize,
+        replication_factor: Option<u8>,
+        stats: Arc<TopicStats>,
+    ) -> Result<usize, IggyError> {
+        self.ensure_authenticated(session)?;
+        {
+            let stream_id = self
+                .streams2
+                .with_stream_by_id(stream_id, |stream| stream.id());
+            self.permissioner
+            .borrow()
+                .create_topic(session.get_user_id(), stream_id as u32)
+                .with_error_context(|error| {
+                    format!(
+                        "{COMPONENT} (error: {error}) - permission denied to create topic with name: {name} in stream with ID: {stream_id} for user with ID: {}",
+                        session.get_user_id(),
+                    )
+                })?;
+        }
+        let topic_id = self.create_topic2_base(
+            stream_id,
+            name,
+            replication_factor.unwrap_or(1),
+            message_expiry,
+            compression,
+            max_topic_size,
+            stats,
+        )?;
+        // TODO: Create dir hierarchy for the topic.
+        let partition_ids = self.create_partitions2(
+            stream_id,
+            &Identifier::numeric(topic_id as u32).unwrap(),
+            partitions_count,
+        )?;
+        // TODO: Create partition files and open descriptors for partitions that belong to _this_ shard.
+        Ok(topic_id)
+    }
+
+    fn create_partitions2(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partitions_count: u32,
+    ) -> Result<Vec<usize>, IggyError> {
+        let partition_ids = self
+            .streams2
+            .with_topic_by_id_mut(stream_id, topic_id, |topic| {
+                // Create partitions...
+                let partition_ids = std::iter::repeat_with(partition2::Partition::new)
+                    .map(|partition| {
+                        topic
+                            .partitions_mut()
+                            .with_mut(|partitions| partition.insert_into(partitions))
+                    })
+                    .take(partitions_count as usize)
+                    .collect::<Vec<_>>();
+                partition_ids
+            });
+        Ok(partition_ids)
+    }
+
+    pub fn create_topic2_bypass_auth(
+        &self,
+        stream_id: &Identifier,
+        name: String,
+        partitions_count: u32,
+        replication_factor: Option<u8>,
+        message_expiry: IggyExpiry,
+        compression: CompressionAlgorithm,
+        max_topic_size: MaxTopicSize,
+        stats: Arc<TopicStats>,
+    ) -> Result<usize, IggyError> {
+        let topic_id = self.create_topic2_base(
+            stream_id,
+            name,
+            replication_factor.unwrap_or(1),
+            message_expiry,
+            compression,
+            max_topic_size,
+            stats,
+        )?;
+        let partition_ids = self.create_partitions2(
+            stream_id,
+            &Identifier::numeric(topic_id as u32).unwrap(),
+            partitions_count,
+        )?;
+        // TODO: Create partition files and open descriptors for partitions that belong to _this_ shard.
+        Ok(topic_id)
+    }
+
+    fn create_topic2_base(
+        &self,
+        stream_id: &Identifier,
+        name: String,
+        replication_factor: u8,
+        message_expiry: IggyExpiry,
+        compression: CompressionAlgorithm,
+        max_topic_size: MaxTopicSize,
+        stats: Arc<TopicStats>,
+    ) -> Result<usize, IggyError> {
+        let topic_id = self.streams2.with_stream_by_id(stream_id, |stream| {
+            let exists = stream.topics().exists(&name);
+            if exists {
+                // TODO: Fixme, replace the second argument with identifier, rather than numeric ID.
+                return Err(IggyError::TopicNameAlreadyExists(name.to_owned(), 0));
+            }
+            let topic = topic2::Topic::new(
+                name,
+                replication_factor,
+                message_expiry,
+                compression,
+                max_topic_size,
+            );
+            let topic_id = stream.topics().with_mut(|topics| {
+                let topic_id = topic.insert_into(topics);
+                topic_id
+            });
+
+            stream.topics().with_stats_mut(|container| {
+                container.insert(stats);
+            });
+            Ok(topic_id)
+        })?;
+
+        Ok(topic_id)
     }
 
     #[allow(clippy::too_many_arguments)]
