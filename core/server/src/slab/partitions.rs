@@ -8,7 +8,6 @@ use crate::streaming::{partitions::partition2, segments, stats::stats::Partition
 // TODO: This could be upper limit of partitions per topic, use that value to validate instead of whathever this thing is in `common` crate.
 const CAPACITY: usize = 16384;
 
-
 #[derive(Debug)]
 pub struct Partitions {
     container: Slab<partition2::Partition>,
@@ -27,6 +26,16 @@ impl Default for Partitions {
 }
 
 impl Partitions {
+    pub fn with_stats<T>(&self, f: impl FnOnce(&Slab<Arc<PartitionStats>>) -> T) -> T {
+        let stats = &self.stats;
+        f(stats)
+    }
+
+    pub fn with_stats_mut<T>(&mut self, f: impl FnOnce(&mut Slab<Arc<PartitionStats>>) -> T) -> T {
+        let mut stats = &mut self.stats;
+        f(&mut stats)
+    }
+
     pub async fn with_async(&self, f: impl AsyncFnOnce(&Slab<partition2::Partition>)) {
         let container = &self.container;
         f(&container).await;

@@ -46,6 +46,20 @@ impl ServerCommandHandler for CreatePartitions {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
+        shard
+            .create_partitions2(
+                session,
+                &self.stream_id,
+                &self.topic_id,
+                self.partitions_count,
+            )
+            .await?;
+        let event = ShardEvent::CreatedPartitions2 {
+            stream_id: self.stream_id.clone(),
+            topic_id: self.topic_id.clone(),
+            partitions_count: self.partitions_count,
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
 
         let partition_ids = shard
             .create_partitions(

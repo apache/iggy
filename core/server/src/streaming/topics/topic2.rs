@@ -37,12 +37,8 @@ impl Topic {
         }
     }
 
-    pub fn with(&self, f: impl FnOnce(&Self)) {
-        f(self);
-    }
-
-    pub fn with_mut(&mut self, f: impl FnOnce(&mut Self)) {
-        f(self);
+    pub fn id(&self) -> usize {
+        self.id
     }
 
     pub fn partitions(&self) -> &Partitions {

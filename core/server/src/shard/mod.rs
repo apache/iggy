@@ -597,10 +597,10 @@ impl IggyShard {
                         let partition = topic.get_partition(partition_id)?;
                         let mut partition = partition.write().await;
                         partition.open().await.with_error_context(|error| {
-                                                                    format!(
-                                                                        "{COMPONENT} (error: {error}) - failed to open partition with ID: {partition_id} in topic with ID: {topic_id} for stream with ID: {stream_id}"
-                                                                    )
-                                                                })?;
+                                                                            format!(
+                                                                                "{COMPONENT} (error: {error}) - failed to open partition with ID: {partition_id} in topic with ID: {topic_id} for stream with ID: {stream_id}"
+                                                                            )
+                                                                        })?;
                     }
                 }
                 self.insert_shard_table_records(records);
@@ -614,11 +614,11 @@ impl IggyShard {
                 let mut stream = self.get_stream_mut(stream_id)?;
                 let topic = stream.get_topic_mut(topic_id)?;
                 topic.add_persisted_partitions(*partitions_count)
-                                                            .with_error_context(|error| {
-                                                                format!(
-                                                                    "{COMPONENT} (error: {error}) - failed to create partitions for topic with ID: {topic_id} in stream with ID: {stream_id}"
-                                                                )
-                                                            })?;
+                                                                    .with_error_context(|error| {
+                                                                        format!(
+                                                                            "{COMPONENT} (error: {error}) - failed to create partitions for topic with ID: {topic_id} in stream with ID: {stream_id}"
+                                                                        )
+                                                                    })?;
                 topic.reassign_consumer_groups();
                 self.metrics.increment_partitions(*partitions_count);
                 self.metrics.increment_segments(*partitions_count);
@@ -632,10 +632,10 @@ impl IggyShard {
                 let mut stream = self.get_stream_mut(stream_id)?;
                 let topic = stream.get_topic_mut(topic_id)?;
                 let partitions = topic
-                                                    .       delete_persisted_partitions_by_ids(partition_ids)
-                                                            .with_error_context(|error| {
-                                                                format!("{COMPONENT} (error: {error}) - failed to delete persisted partitions for topic: {topic}")
-                                                            })?;
+                                                            .       delete_persisted_partitions_by_ids(partition_ids)
+                                                                    .with_error_context(|error| {
+                                                                        format!("{COMPONENT} (error: {error}) - failed to delete persisted partitions for topic: {topic}")
+                                                                    })?;
                 drop(stream);
 
                 let mut segments_count = 0;
@@ -679,12 +679,12 @@ impl IggyShard {
                         let partition = topic.get_partition(ns.partition_id)?;
                         let mut partition = partition.write().await;
                         partition.delete().await.with_error_context(|error| {
-                                                                format!(
-                                                                    "{COMPONENT} (error: {error}) - failed to delete partition with ID: {} in topic with ID: {}",
-                                                                    ns.partition_id,
-                                                                    topic_id
-                                                            )
-                                                            })?;
+                                                                        format!(
+                                                                            "{COMPONENT} (error: {error}) - failed to delete partition with ID: {} in topic with ID: {}",
+                                                                            ns.partition_id,
+                                                                            topic_id
+                                                                    )
+                                                                    })?;
                     }
                 }
                 Ok(())
@@ -692,10 +692,10 @@ impl IggyShard {
             ShardEvent::DeletedStream { stream_id } => {
                 let shard_id = self.id;
                 self.delete_stream_bypass_auth(stream_id).with_error_context(|err| {
-                                                            format!(
-                                                                "{COMPONENT} (error: {err}) - failed to delete, when handling event on shard: {shard_id} stream with ID: {stream_id}",
-                                                            )
-                                                        })?;
+                                                                    format!(
+                                                                        "{COMPONENT} (error: {err}) - failed to delete, when handling event on shard: {shard_id} stream with ID: {stream_id}",
+                                                                    )
+                                                                })?;
                 Ok(())
             }
             ShardEvent::UpdatedStream { stream_id, name } => {
@@ -739,12 +739,12 @@ impl IggyShard {
                 topic_id,
             } => {
                 self.delete_topic_bypass_auth(stream_id, topic_id)
-                                                            .await
-                                                            .with_error_context(|err| {
-                                                                format!(
-                                                                    "{COMPONENT} (error: {err}) - failed to delete topic with ID: {topic_id} in stream with ID: {stream_id}"
-                                                                )
-                                                            })?;
+                                                                    .await
+                                                                    .with_error_context(|err| {
+                                                                        format!(
+                                                                            "{COMPONENT} (error: {err}) - failed to delete topic with ID: {topic_id} in stream with ID: {stream_id}"
+                                                                        )
+                                                                    })?;
                 Ok(())
             }
             ShardEvent::CreatedConsumerGroup {
@@ -857,6 +857,15 @@ impl IggyShard {
                 assert_eq!(topic_id, *id);
                 Ok(())
             }
+            ShardEvent::CreatedPartitions2 {
+                stream_id,
+                topic_id,
+                partitions_count,
+            } => {
+                self.create_partitions2_bypass_auth(stream_id, topic_id, *partitions_count)
+                    .await?;
+                Ok(())
+            }
         }
     }
 
@@ -914,6 +923,7 @@ impl IggyShard {
                         | ShardEvent::DeletedShardTableRecords { .. }
                         | ShardEvent::CreatedStream2 { .. }
                         | ShardEvent::CreatedTopic2 { .. }
+                        | ShardEvent::CreatedPartitions2 { .. }
                 ) {
                     let (sender, receiver) = async_channel::bounded(1);
                     conn.send(ShardFrame::new(event.clone().into(), Some(sender.clone())));

@@ -176,36 +176,13 @@ impl IggyShard {
             stats,
         )?;
         // TODO: Create dir hierarchy for the topic.
-        let partition_ids = self.create_partitions2(
+        let partition_ids = self.create_partitions2_base(
             stream_id,
             &Identifier::numeric(topic_id as u32).unwrap(),
             partitions_count,
-        )?;
+        );
         // TODO: Create partition files and open descriptors for partitions that belong to _this_ shard.
         Ok(topic_id)
-    }
-
-    fn create_partitions2(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partitions_count: u32,
-    ) -> Result<Vec<usize>, IggyError> {
-        let partition_ids = self
-            .streams2
-            .with_topic_by_id_mut(stream_id, topic_id, |topic| {
-                // Create partitions...
-                let partition_ids = std::iter::repeat_with(partition2::Partition::new)
-                    .map(|partition| {
-                        topic
-                            .partitions_mut()
-                            .with_mut(|partitions| partition.insert_into(partitions))
-                    })
-                    .take(partitions_count as usize)
-                    .collect::<Vec<_>>();
-                partition_ids
-            });
-        Ok(partition_ids)
     }
 
     pub fn create_topic2_bypass_auth(
@@ -228,12 +205,12 @@ impl IggyShard {
             max_topic_size,
             stats,
         )?;
-        let partition_ids = self.create_partitions2(
+        let partition_ids = self.create_partitions2_base(
             stream_id,
             &Identifier::numeric(topic_id as u32).unwrap(),
             partitions_count,
-        )?;
-        // TODO: Create partition files and open descriptors for partitions that belong to _this_ shard.
+        );
+        // TODO: Open descriptors for partitions that belong to _this_ shard.
         Ok(topic_id)
     }
 

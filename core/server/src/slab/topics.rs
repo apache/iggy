@@ -45,9 +45,9 @@ impl Topics {
         f(&mut stats)
     }
 
-    pub fn with(&self, f: impl FnOnce(&IndexedSlab<topic2::Topic>)) {
+    pub fn with<T>(&self, f: impl FnOnce(&IndexedSlab<topic2::Topic>) -> T) -> T {
         let container = self.container.borrow();
-        f(&container);
+        f(&container)
     }
 
     pub fn with_mut<T>(&self, f: impl FnOnce(&mut IndexedSlab<topic2::Topic>) -> T) -> T {
@@ -55,7 +55,7 @@ impl Topics {
         f(&mut container)
     }
 
-    pub fn with_topic_by_id(&self, id: &Identifier, f: impl FnOnce(&topic2::Topic)) {
+    pub fn with_topic_by_id<T>(&self, id: &Identifier, f: impl FnOnce(&topic2::Topic) -> T) -> T {
         self.with(|topics| {
             let topic = match id.kind {
                 iggy_common::IdKind::Numeric => {
@@ -68,7 +68,7 @@ impl Topics {
                 }
             };
             f(topic)
-        });
+        })
     }
 
     pub fn with_topic_by_id_mut<T>(

@@ -123,15 +123,13 @@ impl Streams {
         })
     }
 
-    pub fn with_topic_by_id(
+    pub fn with_topic_by_id<T>(
         &self,
+        stream_id: &Identifier,
         id: &Identifier,
-        topic_id: &Identifier,
-        f: impl FnOnce(&topic2::Topic),
-    ) {
-        self.with_topics(id, |topics| {
-            topics.with_topic_by_id(topic_id, f);
-        });
+        f: impl FnOnce(&topic2::Topic) -> T,
+    ) -> T {
+        self.with_topics(stream_id, |topics| topics.with_topic_by_id(id, f))
     }
 
     pub fn with_topic_by_id_mut<T>(

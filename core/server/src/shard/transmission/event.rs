@@ -43,6 +43,11 @@ pub enum ShardEvent {
     PurgedStream {
         stream_id: Identifier,
     },
+    CreatedPartitions2 {
+        stream_id: Identifier,
+        topic_id: Identifier,
+        partitions_count: u32,
+    },
     CreatedPartitions {
         stream_id: Identifier,
         topic_id: Identifier,

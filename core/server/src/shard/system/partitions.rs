@@ -18,6 +18,7 @@
 
 use super::COMPONENT;
 use crate::shard::IggyShard;
+use crate::streaming::partitions::partition2;
 use crate::streaming::session::Session;
 use error_set::ErrContext;
 use iggy_common::Identifier;
@@ -26,6 +27,70 @@ use iggy_common::locking::IggyRwLockFn;
 
 // TODO: MAJOR REFACTOR!!!!!!!!!!!!!!!!!
 impl IggyShard {
+    pub fn create_partitions2_base(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partitions_count: u32,
+    ) -> Vec<usize> {
+        let partition_ids = self
+            .streams2
+            .with_topic_by_id_mut(stream_id, topic_id, |topic| {
+                // Create partitions...
+                let partition_ids = std::iter::repeat_with(partition2::Partition::new)
+                    .map(|partition| {
+                        topic
+                            .partitions_mut()
+                            .with_mut(|partitions| partition.insert_into(partitions))
+                    })
+                    .take(partitions_count as usize)
+                    .collect::<Vec<_>>();
+                partition_ids
+            });
+        partition_ids
+    }
+
+    pub async fn create_partitions2(
+        &self,
+        session: &Session,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partitions_count: u32,
+    ) -> Result<(), IggyError> {
+        self.ensure_authenticated(session)?;
+        {
+            let numeric_stream_id = self
+                .streams2
+                .with_stream_by_id(stream_id, |stream| stream.id());
+            let numeric_topic_id = self
+                .streams2
+                .with_topic_by_id(stream_id, topic_id, |topic| topic.id());
+            self.permissioner.borrow().create_partitions(
+                session.get_user_id(),
+                numeric_stream_id as u32,
+                numeric_topic_id as u32,
+            ).with_error_context(|error| format!(
+                "{COMPONENT} (error: {error}) - permission denied to create partitions for user {} on stream ID: {}, topic ID: {}",
+                session.get_user_id(),
+                numeric_stream_id,
+                numeric_topic_id
+            ))?;
+        }
+        self.create_partitions2_base(stream_id, topic_id, partitions_count);
+        Ok(())
+    }
+
+    pub async fn create_partitions2_bypass_auth(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partitions_count: u32,
+    ) -> Result<(), IggyError> {
+        let partition_ids = self.create_partitions2_base(stream_id, topic_id, partitions_count);
+        // Open partitions for this shard.
+        Ok(())
+    }
+
     pub async fn create_partitions(
         &self,
         session: &Session,
