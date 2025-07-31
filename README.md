@@ -64,6 +64,7 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 - **Multi-tenant** support via abstraction of **streams** which group **topics**
 - **TLS** support for all transport protocols (TCP, QUIC, HTTPS)
 - **[Connectors](https://github.com/apache/iggy/tree/master/core/connectors)** - sinks, sources and data transformations based on the **custom Rust plugins**
+- **[Model Context Protocol](https://github.com/apache/iggy/tree/master/core/ai/mcp)** - provide context to LLM with **MCP server**
 - Optional server-side as well as client-side **data encryption** using AES-256-GCM
 - Optional metadata support in the form of **message headers**
 - Optional **data backups and archiving** to disk or **S3** compatible cloud storage (e.g. AWS S3)
@@ -92,6 +93,8 @@ This is the high-level architecture of the Iggy message streaming server, where 
 The latest released version is `0.4.300` for Iggy server, which is compatible with `0.6` Rust client SDK and the others.
 
 The recent improvements based on the zero-copy (de)serialization, along with updated SDKs etc. will be available in the upcoming release with Iggy server `0.5.0`, Rust SDK `0.7` and all the other SDKs.
+
+You can also find the `edge` versions of SDKs that are compatible with the `edge` version of Iggy Server Docker Image, but should be used with caution as these are not based on the official release.
 
 ---
 
@@ -128,6 +131,45 @@ Iggy CLI can be installed with `cargo install iggy-cli` and then simply accessed
 There's a dedicated Web UI for the server, which allows managing the streams, topics, partitions, browsing the messages and so on. This is an ongoing effort to build a comprehensive dashboard for administrative purposes of the Iggy server. Check the Web UI in the `/web` directory. The [docker image for Web UI](https://hub.docker.com/r/iggyrs/iggy-web-ui) is available, and can be fetched via `docker pull iggyrs/iggy-web-ui`.
 
 ![Web UI](assets/web_ui.png)
+
+---
+
+## Connectors
+
+The highly performant and modular **[runtime](https://github.com/apache/iggy/tree/master/core/connectors)** for statically typed, yet dynamically loaded connectors. Ingest the data from the external sources and push it further to the Iggy streams, or fetch the data from the Iggy streams and push it further to the external sources. **Create your own Rust plugins** by simply implementing either the `Source` or `Sink` trait and **build custom pipelines for the data processing**.
+
+```toml
+## Configure a sink or source connector, depending on your needs
+[sinks.quickwit]
+enabled = true
+name = "Quickwit sink"
+path = "target/release/libiggy_connector_quickwit_sink"
+config_format = "yaml"
+
+[[sinks.quickwit.streams]]
+stream = "qw"
+topics = ["records"]
+schema = "json"
+batch_length = 1000
+poll_interval = "5ms"
+consumer_group = "qw_sink_connector"
+
+[[sinks.quickwit.transforms.add_fields.fields]]
+key = "random_id"
+value.computed = "uuid_v7"
+
+[sinks.quickwit.transforms.delete_fields]
+enabled = true
+fields = ["email", "created_at"]
+```
+
+---
+
+## Model Context Protocol
+
+The [Model Context Protocol](https://modelcontextprotocol.io) (MCP) is an open protocol that standardizes how applications provide context to LLMs. The **[Iggy MCP Server](https://github.com/apache/iggy/tree/master/core/ai/mcp)** is an implementation of the MCP protocol for the message streaming infrastructure. It can be used to provide context to LLMs in real-time, allowing for more accurate and relevant responses.
+
+![server](assets/iggy_mcp_server.png)
 
 ---
 
@@ -259,8 +301,12 @@ let client = IggyClient::from_connection_string("iggy://user:secret@localhost:80
 // Create a producer for the given stream and one of its topics
 let mut producer = client
     .producer("dev01", "events")?
-    .batch_length(1000)
-    .linger_time(IggyDuration::from_str("1ms")?)
+    .direct( // Use either direct (instant) or background message sending
+        DirectConfig::builder()
+            .batch_length(1000)
+            .linger_time(IggyDuration::from_str("1ms")?)
+            .build(),
+    )
     .partitioning(Partitioning::balanced())
     .build();
 
