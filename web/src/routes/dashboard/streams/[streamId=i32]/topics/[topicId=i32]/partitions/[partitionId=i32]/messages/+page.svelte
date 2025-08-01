@@ -18,11 +18,13 @@
 
   let direction = $state(page.url.searchParams.get('direction') || 'desc');
   let currentPage = $state(1);
-  let totalPages = $derived(Math.ceil(partitionMessages.currentOffset / data.pagination.count));
+  let totalPages = $derived(
+    Math.ceil((partitionMessages.currentOffset + 1) / data.pagination.count)
+  );
 
   async function loadPage(page: number) {
     const messagesPerPage = data.pagination.count;
-    const totalMessages = partitionMessages.currentOffset;
+    const totalMessages = partitionMessages.currentOffset + 1;
 
     let offset: number;
     if (direction === 'desc') {

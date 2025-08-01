@@ -29,7 +29,7 @@ on:
   workflow_call:
   push:
     tags:
-      - 'python-v*'
+      - "python-v*"
 
 permissions:
   contents: read
@@ -44,7 +44,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -58,10 +58,10 @@ jobs:
         with:
           target: ${{ matrix.target }}
           working-directory: foreign/python
-          before-script-linux: 'dnf install -y perl-IPC-Cmd && (python3 -m pip --version || python3 -m ensurepip)'
-          manylinux: '2_28'
+          before-script-linux: "dnf install -y perl-IPC-Cmd && (python3 -m pip --version || python3 -m ensurepip)"
+          manylinux: "2_28"
           args: --release --out dist --interpreter python3.8 python3.9 python3.10 python3.11 python3.12 python3.13 python3.14
-          sccache: 'true'
+          sccache: "true"
       - name: Set up Docker Buildx
         if: matrix.target == 'x86_64'
         uses: docker/setup-buildx-action@v3
@@ -80,31 +80,31 @@ jobs:
           name: wheels-linux-${{ matrix.target }}
           path: foreign/python/dist
 
-  windows:
-    runs-on: windows-latest
-    strategy:
-      matrix:
-        target: [x64]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-          architecture: ${{ matrix.target }}
-      - name: Set up NASM
-        uses: ilammy/setup-nasm@v1
-      - name: Build wheels
-        uses: PyO3/maturin-action@v1
-        with:
-          target: ${{ matrix.target }}
-          working-directory: foreign/python
-          args: --release --out dist --find-interpreter
-          sccache: 'true'
-      - name: Upload wheels
-        uses: actions/upload-artifact@v4
-        with:
-          name: wheels-windows-${{ matrix.target }}
-          path: foreign/python/dist
+  # windows:
+  #   runs-on: windows-latest
+  #   strategy:
+  #     matrix:
+  #       target: [x64]
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-python@v5
+  #       with:
+  #         python-version: "3.10"
+  #         architecture: ${{ matrix.target }}
+  #     - name: Set up NASM # Action disallowed
+  #       uses: ilammy/setup-nasm@v1
+  #     - name: Build wheels
+  #       uses: PyO3/maturin-action@v1
+  #       with:
+  #         target: ${{ matrix.target }}
+  #         working-directory: foreign/python
+  #         args: --release --out dist --find-interpreter
+  #         sccache: "true"
+  #     - name: Upload wheels
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: wheels-windows-${{ matrix.target }}
+  #         path: foreign/python/dist
 
   macos:
     runs-on: macos-latest
@@ -115,14 +115,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
           working-directory: foreign/python
           args: --release --out dist --find-interpreter
-          sccache: 'true'
+          sccache: "true"
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -149,7 +149,7 @@ jobs:
     name: Release
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/python-v')
-    needs: [linux, windows, macos, sdist]
+    needs: [linux, macos, sdist]
     steps:
       - uses: actions/download-artifact@v4
         with:
