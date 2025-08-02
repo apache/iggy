@@ -27,9 +27,9 @@ use bytes::BytesMut;
 use compio::buf::{IoBuf, IoBufMut};
 use compio::io::{AsyncReadExt, AsyncWriteExt};
 use compio::net::TcpStream;
+use compio_quic::{RecvStream, SendStream};
 use iggy_common::IggyError;
 use nix::libc;
-use quinn::{RecvStream, SendStream};
 
 macro_rules! forward_async_methods {
     (

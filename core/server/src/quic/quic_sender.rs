@@ -19,13 +19,10 @@
 use crate::quic::COMPONENT;
 use crate::streaming::utils::PooledBuffer;
 use crate::{binary::sender::Sender, server_error::ServerError};
-use bytes::BytesMut;
-use compio::buf::{IoBuf, IoBufMut};
+use compio::buf::IoBufMut;
+use compio_quic::{RecvStream, SendStream};
 use error_set::ErrContext;
 use iggy_common::IggyError;
-use nix::libc;
-use quinn::{RecvStream, SendStream};
-use std::io::IoSlice;
 use tracing::{debug, error};
 
 const STATUS_OK: &[u8] = &[0; 4];
@@ -37,19 +34,16 @@ pub struct QuicSender {
 }
 
 impl Sender for QuicSender {
+    /// Reads data from the QUIC stream directly into the buffer.
     async fn read<B: IoBufMut>(&mut self, buffer: B) -> (Result<(), IggyError>, B) {
-        //TODO: Fixme
-        // Not-so-nice code because quinn recv stream has different API for read_exact
-        /*
-        let read_bytes = buffer.len();
-        self.recv.read_exact(buffer).await.map_err(|error| {
-            error!("Failed to read from the stream: {:?}", error);
-            IggyError::QuicError
-        })?;
-        */
-
-        //Ok(read_bytes)
-        todo!();
+        let mut buffer = buffer;
+        match self.recv.read_exact(buffer.as_mut_slice()).await {
+            Ok(_) => (Ok(()), buffer),
+            Err(error) => {
+                error!("Failed to read from QUIC stream: {:?}", error);
+                (Err(IggyError::QuicError), buffer)
+            }
+        }
     }
 
     async fn send_empty_ok_response(&mut self) -> Result<(), IggyError> {
@@ -87,8 +81,6 @@ impl Sender for QuicSender {
 
         let mut total_bytes_written = 0;
 
-        //TODO: Fixme
-        /*
         for slice in slices {
             let slice_data = &*slice;
             if !slice_data.is_empty() {
@@ -103,7 +95,6 @@ impl Sender for QuicSender {
                 total_bytes_written += slice_data.len();
             }
         }
-        */
 
         debug!(
             "Sent vectored response: {} bytes of payload",

@@ -26,6 +26,10 @@ use tracing::error;
 pub(crate) struct Metrics {
     registry: Registry,
     http_requests: Counter,
+    quic_connections: Gauge,
+    quic_requests: Counter,
+    quic_errors: Counter,
+    tcp_connections: Gauge,
     streams: Gauge,
     topics: Gauge,
     partitions: Gauge,
@@ -40,6 +44,10 @@ impl Metrics {
         let mut metrics = Metrics {
             registry: <Registry>::default(),
             http_requests: Counter::default(),
+            quic_connections: Gauge::default(),
+            quic_requests: Counter::default(),
+            quic_errors: Counter::default(),
+            tcp_connections: Gauge::default(),
             streams: Gauge::default(),
             topics: Gauge::default(),
             partitions: Gauge::default(),
@@ -50,6 +58,10 @@ impl Metrics {
         };
 
         metrics.register_counter("http_requests", metrics.http_requests.clone());
+        metrics.register_gauge("quic_connections", metrics.quic_connections.clone());
+        metrics.register_counter("quic_requests", metrics.quic_requests.clone());
+        metrics.register_counter("quic_errors", metrics.quic_errors.clone());
+        metrics.register_gauge("tcp_connections", metrics.tcp_connections.clone());
         metrics.register_gauge("streams", metrics.streams.clone());
         metrics.register_gauge("topics", metrics.topics.clone());
         metrics.register_gauge("partitions", metrics.partitions.clone());
@@ -81,6 +93,30 @@ impl Metrics {
 
     pub fn increment_http_requests(&self) {
         self.http_requests.inc();
+    }
+
+    pub fn increment_quic_connections(&self) {
+        self.quic_connections.inc();
+    }
+
+    pub fn decrement_quic_connections(&self) {
+        self.quic_connections.dec();
+    }
+
+    pub fn increment_quic_requests(&self) {
+        self.quic_requests.inc();
+    }
+
+    pub fn increment_quic_errors(&self) {
+        self.quic_errors.inc();
+    }
+
+    pub fn increment_tcp_connections(&self) {
+        self.tcp_connections.inc();
+    }
+
+    pub fn decrement_tcp_connections(&self) {
+        self.tcp_connections.dec();
     }
 
     pub fn increment_streams(&self, count: u32) {
