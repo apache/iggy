@@ -110,6 +110,7 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 compio = { workspace = true }
+compio-quic = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-util = { workspace = true }
 toml = { workspace = true }

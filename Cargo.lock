@@ -7455,6 +7455,7 @@ dependencies = [
  "clap",
  "compio",
  "compio-net",
+ "compio-quic",
  "console-subscriber",
  "crossbeam",
  "ctrlc",

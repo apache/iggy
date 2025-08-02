@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use compio_quic::ConnectionError as CompioQuicConnectionError;
 use error_set::error_set;
 use quinn::{ConnectionError as QuicConnectionError, ReadToEndError, WriteError};
 use rusty_s3::BucketError;
@@ -74,6 +75,9 @@ error_set!(
     ConnectionError = {
         #[display("Connection error")]
         QuicConnectionError(QuicConnectionError),
+
+        #[display("Compio QUIC connection error")]
+        CompioQuicConnectionError(CompioQuicConnectionError),
     } || IoError || CommonError;
 
     LogError = {
