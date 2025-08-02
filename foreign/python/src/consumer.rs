@@ -27,7 +27,7 @@ use iggy::prelude::{
 use iggy::prelude::{IggyConsumer as RustIggyConsumer, IggyError, ReceivedMessage};
 use pyo3::types::{PyDelta, PyDeltaAccess};
 
-use pyo3::{prelude::*};
+use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::{future_into_py, get_runtime, into_future, scope};
 use pyo3_async_runtimes::TaskLocals;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
@@ -89,6 +89,7 @@ impl IggyConsumer {
     ///
     /// Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
     /// if the operation fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn store_offset<'a>(
         &self,
         py: Python<'a>,
@@ -111,6 +112,7 @@ impl IggyConsumer {
     ///
     /// Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
     /// if the operation fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn delete_offset<'a>(
         &self,
         py: Python<'a>,
@@ -130,6 +132,7 @@ impl IggyConsumer {
     /// Consumes messages continuously using a callback function and an optional `asyncio.Event` for signaling shutdown.
     ///
     /// Returns an awaitable that completes when shutdown is signaled or a PyRuntimeError on failure.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn consume_messages<'a>(
         &self,
         py: Python<'a>,
@@ -140,8 +143,7 @@ impl IggyConsumer {
     ) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
         let callback: Py<PyAny> = callback.unbind();
-        let shutdown_event: Option<Py<PyAny>> =
-            shutdown_event.map(|e| e.unbind());
+        let shutdown_event: Option<Py<PyAny>> = shutdown_event.map(|e| e.unbind());
 
         future_into_py(py, async {
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
