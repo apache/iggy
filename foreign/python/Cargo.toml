@@ -32,8 +32,11 @@ pyo3-async-runtimes = { version = "0.25.0", features = [
     "attributes",
     "tokio-runtime",
 ] }
-pyo3-stub-gen = "0.11.1"
+pyo3-stub-gen = "0.12.0"
 tokio = "1.40.0"
+
+[patch.crates-io]
+pyo3-stub-gen = { git = "https://github.com/Jij-Inc/pyo3-stub-gen.git", rev = "1870f637f700605395a666e3bdc0276aece73b5f" }
 
 [lib]
 name = "apache_iggy"
