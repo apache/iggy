@@ -7486,7 +7486,6 @@ dependencies = [
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
  "prometheus-client",
- "quinn",
  "reqwest",
  "ring",
  "rustls",
