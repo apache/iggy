@@ -25,7 +25,7 @@ plugins {
 }
 
 group = "org.apache.iggy"
-version = "0.2.0-SNAPSHOT"
+version = "0.5.0"
 
 repositories {
     mavenCentral()
@@ -69,7 +69,7 @@ publishing {
         create<MavenPublication>("maven") {
             groupId = "org.apache.iggy"
             artifactId = "iggy-java-sdk"
-            version = "0.2.0-SNAPSHOT"
+            version = "0.5.0"
 
             from(components["java"])
 
