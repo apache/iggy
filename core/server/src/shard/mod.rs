@@ -277,8 +277,7 @@ impl IggyShard {
             )));
         }
 
-        if self.config.quic.enabled && self.id == 0 {
-            shard_info!(self.id, "Starting QUIC server on shard");
+        if self.config.quic.enabled {
             tasks.push(Box::pin(crate::quic::quic_server::start(self.clone())));
         }
 
