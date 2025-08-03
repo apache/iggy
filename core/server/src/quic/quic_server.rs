@@ -36,12 +36,7 @@ use crate::shard::IggyShard;
 
 /// Starts the QUIC server.
 /// Returns the address the server is listening on.
-pub async fn start(
-    server_name: &'static str,
-    addr: SocketAddr,
-    config: &QuicConfig,
-    shard: Rc<IggyShard>,
-) -> Result<(), iggy_common::IggyError> {
+pub async fn start(shard: Rc<IggyShard>) -> Result<(), iggy_common::IggyError> {
     if shard.id != 0 {
         info!(
             "QUIC server restricted to shard 0, skipping on shard {}",
@@ -50,10 +45,17 @@ pub async fn start(
         return Ok(());
     }
 
+    let server_name = "Iggy QUIC";
+    let config = shard.config.quic.clone();
+    let addr: SocketAddr = config
+        .address
+        .parse()
+        .expect("Failed to parse QUIC address");
+
     info!("Initializing Iggy QUIC server on shard 0...");
 
     // Configure QUIC server
-    let server_config = configure_quic(config).map_err(|e| {
+    let server_config = configure_quic(&config).map_err(|e| {
         error!("Failed to configure QUIC: {:?}", e);
         iggy_common::IggyError::QuicError
     })?;

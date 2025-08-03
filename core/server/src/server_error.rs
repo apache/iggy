@@ -16,9 +16,8 @@
  * under the License.
  */
 
-use compio_quic::ConnectionError as CompioQuicConnectionError;
+use compio_quic::{ConnectionError as QuicConnectionError, ReadError, WriteError};
 use error_set::error_set;
-use quinn::{ConnectionError as QuicConnectionError, ReadToEndError, WriteError};
 use rusty_s3::BucketError;
 use std::array::TryFromSliceError;
 use tokio::io;
@@ -33,8 +32,8 @@ error_set!(
         #[display("Write error")]
         WriteError(WriteError),
 
-        #[display("Read to end error")]
-        ReadToEndError(ReadToEndError)
+        #[display("Read error")]
+        ReadToEndError(ReadError)
     };
 
     ConfigError = {
@@ -75,9 +74,6 @@ error_set!(
     ConnectionError = {
         #[display("Connection error")]
         QuicConnectionError(QuicConnectionError),
-
-        #[display("Compio QUIC connection error")]
-        CompioQuicConnectionError(CompioQuicConnectionError),
     } || IoError || CommonError;
 
     LogError = {

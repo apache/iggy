@@ -277,6 +277,11 @@ impl IggyShard {
             )));
         }
 
+        if self.config.quic.enabled && self.id == 0 {
+            shard_info!(self.id, "Starting QUIC server on shard");
+            tasks.push(Box::pin(crate::quic::quic_server::start(self.clone())));
+        }
+
         let stop_receiver = self.get_stop_receiver();
         let shard_for_shutdown = self.clone();
 

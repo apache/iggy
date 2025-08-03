@@ -89,19 +89,15 @@ impl IggyShard {
                     .await?
                 {
                     ShardSendRequestResult::Recoil(message) => {
-                        if let ShardMessage::Request( ShardRequest { partition_id, payload, .. } ) = message {
-                            if let ShardRequestPayload::SendMessages { batch } = payload {
-                                topic.append_messages(partition_id, batch).await.with_error_context(|error| {
-                                    format!("{COMPONENT}: Failed to append messages to stream_id: {stream_id}, topic_id: {topic_id}, partition_id: {partition_id}, error: {error})")
-                                })
-                            } else {
-                                unreachable!(
-                                    "Expected a SendMessages request inside of SendMessages handler, impossible state"
-                                );
-                            }
+                        if let ShardMessage::Request( ShardRequest { partition_id, payload, .. } ) = message
+                            && let ShardRequestPayload::SendMessages { batch } = payload
+                        {
+                            topic.append_messages(partition_id, batch).await.with_error_context(|error| {
+                                format!("{COMPONENT}: Failed to append messages to stream_id: {stream_id}, topic_id: {topic_id}, partition_id: {partition_id}, error: {error})")
+                            })
                         } else {
                             unreachable!(
-                                "Expected a ShardMessage request inside of ShardMessage handler, impossible state"
+                                "Expected a SendMessages request inside of SendMessages handler, impossible state"
                             );
                         }
                     }
@@ -176,19 +172,15 @@ impl IggyShard {
                     .await?
                 {
                     ShardSendRequestResult::Recoil(message) => {
-                        if let ShardMessage::Request( ShardRequest { partition_id, payload, .. } ) = message {
-                            if let ShardRequestPayload::PollMessages { consumer, args } = payload {
-                                topic.get_messages(consumer, partition_id, args.strategy, args.count).await.with_error_context(|error| {
-                                    format!("{COMPONENT}: Failed to get messages for stream_id: {stream_id}, topic_id: {topic_id}, partition_id: {partition_id}, error: {error})")
-                                })
-                            } else {
-                                unreachable!(
-                                    "Expected a PollMessages request inside of PollMessages handler, impossible state"
-                                );
-                            }
+                        if let ShardMessage::Request( ShardRequest { partition_id, payload, .. } ) = message
+                            && let ShardRequestPayload::PollMessages { consumer, args } = payload
+                        {
+                            topic.get_messages(consumer, partition_id, args.strategy, args.count).await.with_error_context(|error| {
+                                format!("{COMPONENT}: Failed to get messages for stream_id: {stream_id}, topic_id: {topic_id}, partition_id: {partition_id}, error: {error})")
+                            })
                         } else {
                             unreachable!(
-                                "Expected a ShardMessage request inside of ShardMessage handler, impossible state"
+                                "Expected a PollMessages request inside of PollMessages handler, impossible state"
                             );
                         }
                     }

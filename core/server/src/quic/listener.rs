@@ -52,17 +52,12 @@ pub async fn start(endpoint: Endpoint, shard: Rc<IggyShard>) -> Result<(), IggyE
                         );
 
                         let connection = match incoming_conn.await {
-                            Ok(conn) => {
-                                // Track successful connection establishment
-                                shard.metrics.increment_quic_connections();
-                                conn
-                            }
+                            Ok(conn) => conn,
                             Err(error) => {
                                 error!(
                                     "QUIC connection acceptance failed on listener {}: {:?}",
                                     i, error
                                 );
-                                shard.metrics.increment_quic_errors();
                                 continue;
                             }
                         };
@@ -95,12 +90,8 @@ pub async fn start(endpoint: Endpoint, shard: Rc<IggyShard>) -> Result<(), IggyE
                                         connection_id,
                                         duration.as_millis()
                                     );
-                                    shard.metrics.increment_quic_errors();
                                 }
                             }
-
-                            // Decrement connection count when connection ends
-                            shard.metrics.decrement_quic_connections();
                             debug!("QUIC connection {} closed", connection_id);
                         });
                     }
@@ -174,8 +165,6 @@ async fn handle_stream(
     let request_id = random_id::get_ulid();
     let start_time = std::time::Instant::now();
 
-    shard.metrics.increment_quic_requests();
-
     let mut length_buffer = [0u8; INITIAL_BYTES_LENGTH];
     let mut code_buffer = [0u8; INITIAL_BYTES_LENGTH];
 
@@ -221,8 +210,6 @@ async fn handle_stream(
                 duration.as_millis(),
                 session.client_id
             );
-
-            shard.metrics.increment_quic_errors();
 
             if let IggyError::ClientNotFound(_) = e {
                 sender.send_error_response(e.clone()).await?;
