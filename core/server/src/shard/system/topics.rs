@@ -154,6 +154,7 @@ impl IggyShard {
         stats: Arc<TopicStats>,
     ) -> Result<usize, IggyError> {
         self.ensure_authenticated(session)?;
+        self.ensure_stream_exists(stream_id)?;
         {
             let stream_id = self
                 .streams2
@@ -391,6 +392,7 @@ impl IggyShard {
         replication_factor: Option<u8>,
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
+        self.ensure_topic_exists(stream_id, topic_id)?;
         {
             let topic_id = self
                 .streams2
@@ -595,6 +597,7 @@ impl IggyShard {
         topic_id: &Identifier,
     ) -> Result<topic2::Topic, IggyError> {
         self.ensure_authenticated(session)?;
+        self.ensure_topic_exists(stream_id, topic_id)?;
         {
             let topic_id = self
                 .streams2
@@ -633,11 +636,6 @@ impl IggyShard {
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<topic2::Topic, IggyError> {
-        let stream_exists = self.streams2.exists(stream_id);
-        if !stream_exists {
-            return Err(IggyError::StreamIdNotFound(0));
-        }
-
         let topic = self.streams2.with_stream_by_id(stream_id, |stream| {
             let id = stream
                 .topics()
@@ -720,7 +718,12 @@ impl IggyShard {
             .delete_consumer_groups_for_topic(stream_id_value, topic.topic_id);
         Ok(topic)
     }
-    pub async fn purge_topic2(&self, session: &Session, stream_id: &Identifier, topic_id: &Identifier) -> Result<(), IggyError> {
+    pub async fn purge_topic2(
+        &self,
+        session: &Session,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+    ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
         {
             let topic_id = self
@@ -744,10 +747,15 @@ impl IggyShard {
         Ok(())
     }
 
-    async fn purge_topic_base2(&self, stream_id: &Identifier, topic_id: &Identifier) -> Result<(), IggyError> {
-        self.streams2.with_partitions(stream_id, topic_id, |partitions| {
-            //partitions
-        });
+    async fn purge_topic_base2(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+    ) -> Result<(), IggyError> {
+        self.streams2
+            .with_partitions(stream_id, topic_id, |partitions| {
+                //partitions
+            });
 
         Ok(())
     }

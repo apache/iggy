@@ -23,10 +23,16 @@ use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use crate::streaming::streams::stream::Stream;
 use crate::streaming::topics::consumer_group::ConsumerGroup;
+use crate::streaming::topics::consumer_group2;
+use crate::streaming::topics::consumer_group2::MEMBERS_CAPACITY;
+use crate::streaming::topics::consumer_group2::Member;
+use ahash::AHashMap;
+use arcshift::ArcShift;
 use error_set::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
 use iggy_common::locking::IggyRwLockFn;
+use slab::Slab;
 
 impl IggyShard {
     pub fn get_consumer_group<'cg, 'stream>(
@@ -97,6 +103,61 @@ impl IggyShard {
         Ok(())
     }
 
+    pub fn create_consumer_group2(
+        &self,
+        session: &Session,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        members: ArcShift<Slab<Member>>,
+        group_id: Option<u32>,
+        name: String,
+    ) -> Result<usize, IggyError> {
+        self.ensure_authenticated(session)?;
+        self.ensure_topic_exists(stream_id, topic_id)?;
+        {
+            let topic_id = self
+                .streams2
+                .with_topic_by_id(stream_id, topic_id, |topic| topic.id());
+            let stream_id = self
+                .streams2
+                .with_stream_by_id(stream_id, |stream| stream.id());
+            self.permissioner.borrow().create_consumer_group(
+                session.get_user_id(),
+                stream_id as u32,
+                topic_id as u32,
+            ).with_error_context(|error| format!("{COMPONENT} (error: {error}) - permission denied to create consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), stream_id, topic_id))?;
+        }
+        self.create_consumer_group_base2(stream_id, topic_id, members, name)
+    }
+
+    pub fn create_consumer_group_bypass_auth2(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        members: ArcShift<Slab<Member>>,
+        name: String,
+    ) -> Result<usize, IggyError> {
+        self.create_consumer_group_base2(stream_id, topic_id, members, name)
+    }
+
+    fn create_consumer_group_base2(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        members: ArcShift<Slab<Member>>,
+        name: String,
+    ) -> Result<usize, IggyError> {
+        let id = self
+            .streams2
+            .with_topic_by_id_mut(stream_id, topic_id, |topic| {
+                topic.consumer_groups_mut().with_mut(|container| {
+                    let cg = consumer_group2::ConsumerGroup::new(name, members.clone());
+                    cg.insert_into(container)
+                })
+            });
+        Ok(id)
+    }
+
     pub fn create_consumer_group(
         &self,
         session: &Session,
@@ -150,6 +211,68 @@ impl IggyShard {
         consumer_group_id: &Identifier,
     ) -> Result<ConsumerGroup, IggyError> {
         self.delete_consumer_group_base(stream_id, topic_id, consumer_group_id)
+    }
+
+    pub fn delete_consumer_group2(
+        &self,
+        session: &Session,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        group_id: &Identifier,
+    ) -> Result<consumer_group2::ConsumerGroup, IggyError> {
+        self.ensure_authenticated(session)?;
+        self.ensure_consumer_group_exists(stream_id, topic_id, group_id)?;
+        {
+            let topic_id = self
+                .streams2
+                .with_topic_by_id(stream_id, topic_id, |topic| topic.id());
+            let stream_id = self
+                .streams2
+                .with_stream_by_id(stream_id, |stream| stream.id());
+            self.permissioner.borrow().delete_consumer_group(
+                session.get_user_id(),
+                stream_id as u32,
+                topic_id as u32,
+            ).with_error_context(|error| format!("{COMPONENT} (error: {error}) - permission denied to delete consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), stream_id, topic_id))?;
+        }
+        self.delete_consumer_group_base2(stream_id, topic_id, group_id)
+    }
+
+    pub fn delete_consumer_group_bypass_auth2(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        group_id: &Identifier,
+    ) -> Result<consumer_group2::ConsumerGroup, IggyError> {
+        self.delete_consumer_group_base2(stream_id, topic_id, group_id)
+    }
+
+    fn delete_consumer_group_base2(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        group_id: &Identifier,
+    ) -> Result<consumer_group2::ConsumerGroup, IggyError> {
+        let cg = self
+            .streams2
+            .with_topic_by_id_mut(stream_id, topic_id, |topic| {
+                topic.consumer_groups_mut().with_mut(|container| {
+                    match group_id.kind {
+                        iggy_common::IdKind::Numeric => {
+                            container.try_remove(group_id.get_u32_value().unwrap() as usize)
+                        }
+                        iggy_common::IdKind::String => {
+                            let key = group_id.get_cow_str_value().unwrap().to_string();
+                            container.try_remove_by_key(&key)
+                        }
+                    }
+                    .ok_or_else(|| {
+                        //TODO: Fix the not found erros to accept Identifier instead of u32
+                        IggyError::ConsumerGroupIdNotFound(0, 0)
+                    })
+                })
+            })?;
+        Ok(cg)
     }
 
     pub async fn delete_consumer_group(

@@ -1,8 +1,10 @@
 use std::{net::SocketAddr, sync::Arc};
 
+use arcshift::ArcShift;
 use iggy_common::{
     CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, Permissions, UserStatus,
 };
+use slab::Slab;
 
 use crate::{
     shard::namespace::IggyNamespace,
@@ -11,6 +13,7 @@ use crate::{
         personal_access_tokens::personal_access_token::PersonalAccessToken,
         polling_consumer::PollingConsumer,
         stats::stats::{StreamStats, TopicStats},
+        topics::consumer_group2::Member,
     },
 };
 
@@ -85,10 +88,23 @@ pub enum ShardEvent {
         consumer_group_id: Option<u32>,
         name: String,
     },
+    CreatedConsumerGroup2 {
+        cg_id: usize,
+        stream_id: Identifier,
+        topic_id: Identifier,
+        name: String,
+        members: ArcShift<Slab<Member>>,
+    },
     DeletedConsumerGroup {
         stream_id: Identifier,
         topic_id: Identifier,
         consumer_group_id: Identifier,
+    },
+    DeletedConsumerGroup2 {
+        id: usize,
+        stream_id: Identifier,
+        topic_id: Identifier,
+        group_id: Identifier,
     },
     UpdatedTopic2 {
         stream_id: Identifier,

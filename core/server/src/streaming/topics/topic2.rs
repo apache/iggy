@@ -89,6 +89,14 @@ impl Topic {
         &mut self.partitions
     }
 
+    pub fn consumer_groups(&self) -> &ConsumerGroups {
+        &self.consumer_groups
+    }
+
+    pub fn consumer_groups_mut(&mut self) -> &mut ConsumerGroups {
+        &mut self.consumer_groups
+    }
+
     pub fn insert_into(self, container: &mut IndexedSlab<Self>) -> usize {
         let idx = container.insert(self);
         let topic = &mut container[idx];

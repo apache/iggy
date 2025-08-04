@@ -72,7 +72,6 @@ impl Topics {
         self.container.borrow().len()
     }
 
-
     pub async fn with_async<T>(&self, f: impl AsyncFnOnce(&IndexedSlab<topic2::Topic>) -> T) -> T {
         let container = self.container.borrow();
         f(&container).await

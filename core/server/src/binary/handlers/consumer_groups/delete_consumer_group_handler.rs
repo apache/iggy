@@ -20,6 +20,7 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::consumer_groups::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
+use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use anyhow::Result;
@@ -43,6 +44,19 @@ impl ServerCommandHandler for DeleteConsumerGroup {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
+        let cg = shard.delete_consumer_group2(session, &self.stream_id, &self.topic_id, &self.group_id).with_error_context(|error| {
+            format!(
+                "{COMPONENT} (error: {error}) - failed to delete consumer group with ID: {} for topic with ID: {} in stream with ID: {} for session: {}",
+                self.group_id, self.topic_id, self.stream_id, session
+            )
+        })?;
+        let event = ShardEvent::DeletedConsumerGroup2 {
+            id: cg.id(),
+            stream_id: self.stream_id.clone(),
+            topic_id: self.topic_id.clone(),
+            group_id: self.group_id.clone(),
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
 
         shard
                 .delete_consumer_group(

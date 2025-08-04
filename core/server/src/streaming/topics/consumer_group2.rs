@@ -1,37 +1,55 @@
-use std::sync::{atomic::AtomicUsize, Arc};
+use crate::slab::{IndexedSlab, Keyed};
 use ahash::AHashMap;
 use arcshift::ArcShift;
 use slab::Slab;
-use crate::slab::Keyed;
+use std::{
+    sync::{Arc, atomic::AtomicUsize},
+    task::Context,
+};
 
-const CAPACITY: usize = 128;
+pub const MEMBERS_CAPACITY: usize = 128;
 
 #[derive(Default, Debug)]
 pub struct ConsumerGroup {
     id: usize,
     name: String,
-    membership: AHashMap<u32, usize>,
-    members: ArcShift<Slab<Member>>
+    members: ArcShift<Slab<Member>>,
 }
 
 impl ConsumerGroup {
-    pub fn new(id: usize, name: String) -> Self {
+    pub fn new(name: String, members: ArcShift<Slab<Member>>) -> Self {
         ConsumerGroup {
-            id,
+            id: 0,
             name,
-            members: ArcShift::new(Slab::with_capacity(CAPACITY)),
-            membership: AHashMap::with_capacity(CAPACITY),
+            members,
         }
+    }
+
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
+    pub fn insert_into(self, container: &mut IndexedSlab<Self>) -> usize {
+        let idx = container.insert(self);
+        let group = &mut container[idx];
+        group.id = idx;
+        idx
     }
 }
 
 #[derive(Debug)]
-struct Member {
+pub struct Member {
     id: usize,
+    client_id: u32,
     partitions: Vec<u32>,
-    current_partition_idx: Arc<AtomicUsize>,
+    current_partition_idx: AtomicUsize,
 }
 
+impl Member {
+    pub fn id(&self) -> usize {
+        self.id
+    }
+}
 
 impl Keyed for ConsumerGroup {
     type Key = String;
