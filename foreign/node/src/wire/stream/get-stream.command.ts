@@ -36,9 +36,11 @@ export const GET_STREAM = {
   },
 
   deserialize: (r: CommandResponse) => {
+    if(r.status === 0 && r.length === 0)
+      return null;
     return deserializeToStream(r.data, 0).data
   }
 }
 
 
-export const getStream = wrapCommand<GetStream, Stream>(GET_STREAM);
+export const getStream = wrapCommand<GetStream, Stream | null>(GET_STREAM);

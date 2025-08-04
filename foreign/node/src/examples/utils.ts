@@ -36,12 +36,10 @@ export const getClient = () => {
 }
 
 export const ensureStream = async (cli: Client, streamId: number) => {
-  try {
-    return !!await cli.stream.get({ streamId });
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  } catch (err) {
-    return cli.stream.create({ streamId, name: `ensure-stream-${streamId}` })
-  }
+  const s = await cli.stream.get({ streamId });
+  return s === null ?
+    cli.stream.create({ streamId, name: `ensure-stream-${streamId}` }) :
+    true;
 }
 
 export const ensureTopic = async (
@@ -51,17 +49,15 @@ export const ensureTopic = async (
   partitionCount = 1,
   compressionAlgorithm = 1
 ) => {
-  try {
-    return !!await cli.topic.get({ streamId, topicId });
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  } catch (err) {
-    return cli.topic.create({
+  const t = await cli.topic.get({ streamId, topicId });
+  return t === null ?
+    cli.topic.create({
       streamId,
       topicId,
       name: `ensure-topic-${streamId}-${topicId}`,
       partitionCount,
       compressionAlgorithm
-    });
-  }
+    }) :
+    true;
 }
 

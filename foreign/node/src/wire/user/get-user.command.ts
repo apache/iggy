@@ -36,8 +36,12 @@ export const GET_USER = {
     return serializeIdentifier(userId);
   },
 
-  deserialize: (r: CommandResponse) => deserializeUser(r.data)
+  deserialize: (r: CommandResponse) => {
+    if(r.status === 0 && r.length === 0)
+      return null;
+    return deserializeUser(r.data);
+  }
 };
 
 
-export const getUser = wrapCommand<GetUser, User>(GET_USER);
+export const getUser = wrapCommand<GetUser, User | null>(GET_USER);
