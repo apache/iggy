@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::streaming::{partitions::partition2, segments, stats::stats::PartitionStats};
 
 // TODO: This could be upper limit of partitions per topic, use that value to validate instead of whathever this thing is in `common` crate.
-const CAPACITY: usize = 16384;
+pub const PARTITIONS_CAPACITY: usize = 16384;
 
 #[derive(Debug)]
 pub struct Partitions {
@@ -16,9 +16,9 @@ pub struct Partitions {
 impl Default for Partitions {
     fn default() -> Self {
         Self {
-            container: Slab::with_capacity(CAPACITY),
-            stats: Slab::with_capacity(CAPACITY),
-            segments: Slab::with_capacity(CAPACITY),
+            container: Slab::with_capacity(PARTITIONS_CAPACITY),
+            stats: Slab::with_capacity(PARTITIONS_CAPACITY),
+            segments: Slab::with_capacity(PARTITIONS_CAPACITY),
         }
     }
 }

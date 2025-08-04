@@ -150,8 +150,14 @@ impl IggyShard {
         let id = self
             .streams2
             .with_topic_by_id_mut(stream_id, topic_id, |topic| {
+                let partitions = topic.partitions().with(|partitions| {
+                    partitions
+                        .iter()
+                        .map(|(_, partition)| partition.id())
+                        .collect::<Vec<_>>()
+                });
                 topic.consumer_groups_mut().with_mut(|container| {
-                    let cg = consumer_group2::ConsumerGroup::new(name, members.clone());
+                    let cg = consumer_group2::ConsumerGroup::new(name, members.clone(), partitions);
                     cg.insert_into(container)
                 })
             });

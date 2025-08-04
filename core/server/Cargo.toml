@@ -115,6 +115,7 @@ tokio-rustls = { workspace = true }
 tokio-util = { workspace = true }
 toml = { workspace = true }
 tower-http = { workspace = true }
+test-case = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-opentelemetry = "0.31.0"

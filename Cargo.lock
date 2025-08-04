@@ -7509,6 +7509,7 @@ dependencies = [
  "strum",
  "sysinfo 0.36.1",
  "tempfile",
+ "test-case",
  "thiserror 2.0.12",
  "tokio",
  "tokio-rustls",

@@ -12,6 +12,10 @@ impl Partition {
         Self { id: 0 }
     }
 
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
     pub fn insert_into(self, container: &mut Slab<Self>) -> usize {
         let idx = container.insert(self);
         let partition = &mut container[idx];
