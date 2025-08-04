@@ -41,7 +41,6 @@ pub async fn start(endpoint: Endpoint, shard: Rc<IggyShard>) -> Result<(), IggyE
         let shard = shard.clone();
         let _ = compio::runtime::spawn(async move {
             info!("Starting QUIC listener worker {}", i);
-
             loop {
                 match endpoint.wait_incoming().await {
                     Some(incoming_conn) => {
@@ -50,7 +49,6 @@ pub async fn start(endpoint: Endpoint, shard: Rc<IggyShard>) -> Result<(), IggyE
                             "Incoming connection from client: {}",
                             incoming_conn.remote_address()
                         );
-
                         let connection = match incoming_conn.await {
                             Ok(conn) => conn,
                             Err(error) => {
@@ -61,15 +59,12 @@ pub async fn start(endpoint: Endpoint, shard: Rc<IggyShard>) -> Result<(), IggyE
                                 continue;
                             }
                         };
-
                         let remote_addr = connection.remote_address();
                         let connection_id = random_id::get_ulid();
-
                         info!(
                             "QUIC connection {} established from {} on listener {}",
                             connection_id, remote_addr, i
                         );
-
                         // Spawn a task to handle this connection
                         let _ = compio::runtime::spawn(async move {
                             let start_time = std::time::Instant::now();
@@ -103,7 +98,6 @@ pub async fn start(endpoint: Endpoint, shard: Rc<IggyShard>) -> Result<(), IggyE
             }
         });
     }
-
     // Keep the main task alive
     loop {
         compio::time::sleep(std::time::Duration::from_secs(1)).await;
