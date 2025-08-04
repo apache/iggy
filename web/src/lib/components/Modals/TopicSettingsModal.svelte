@@ -57,7 +57,8 @@
           path: `/streams/${+page.params.streamId}/topics/${topic.id}`,
           body: {
             name: form.data.name,
-            message_expiry: form.data.message_expiry
+            message_expiry: form.data.message_expiry,
+            compression_algorithm: topic.compressionAlgorithm
           }
         });
 
@@ -150,7 +151,7 @@
       </span>
 
       <div class="flex justify-end gap-3 w-full mt-auto">
-        <Button type="button" variant="text" class="w-2/5" on:click={() => closeModal()}
+        <Button type="button" variant="text" class="w-2/5" onclick={() => closeModal()}
           >Cancel</Button
         >
 
@@ -171,7 +172,7 @@
           <Button
             variant="containedRed"
             class="max-h-[36px]"
-            on:click={() => (confirmationOpen = true)}
+            onclick={() => (confirmationOpen = true)}
           >
             <Icon name="trash" class="w-[20px] -ml-1" />
             Delete</Button

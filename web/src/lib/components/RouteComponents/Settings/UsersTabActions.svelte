@@ -34,7 +34,7 @@
         </Input>
       </div>
       <!-- 
-      <Button variant="contained" on:click={() => openModal('AddUserModal', {streams: })}>
+      <Button variant="contained" onclick={() => openModal('AddUserModal', {streams: })}>
         <Icon name="plus" />
         Add user
       </Button> -->

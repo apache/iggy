@@ -54,7 +54,7 @@
   )}
 >
   <div class="h-[15%]">
-    <Button variant="rounded" on:click={() => closeModal()} class="absolute p-2 top-5 right-5">
+    <Button variant="rounded" onclick={() => closeModal()} class="absolute p-2 top-5 right-5">
       <Icon name="close" strokeWidth={2.3} />
     </Button>
 

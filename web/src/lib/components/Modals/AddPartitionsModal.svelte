@@ -73,7 +73,7 @@
     />
 
     <div class="flex justify-end gap-3 mt-auto">
-      <Button variant="text" type="button" class="w-2/5" on:click={() => closeModal()}
+      <Button variant="text" type="button" class="w-2/5" onclick={() => closeModal()}
         >Cancel</Button
       >
       <Button type="submit" variant="contained" class="w-2/5">Create</Button>

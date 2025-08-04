@@ -129,7 +129,7 @@
       />
 
       <div class="flex justify-end gap-3 w-full mt-auto">
-        <Button type="button" variant="text" class="w-2/5" on:click={() => closeModal()}
+        <Button type="button" variant="text" class="w-2/5" onclick={() => closeModal()}
           >Cancel</Button
         >
 
@@ -150,7 +150,7 @@
           <Button
             variant="containedRed"
             class="max-h-[36px]"
-            on:click={() => (confirmationOpen = true)}
+            onclick={() => (confirmationOpen = true)}
           >
             <Icon name="trash" class="w-[20px] -ml-1" />
             Delete</Button

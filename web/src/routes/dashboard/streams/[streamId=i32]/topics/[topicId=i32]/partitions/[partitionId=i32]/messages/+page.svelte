@@ -61,7 +61,7 @@
 </script>
 
 <div class="h-[80px] flex text-xs items-center pl-2 pr-5">
-  <Button variant="rounded" class="mr-5" on:click={() => goto(prevPage)}>
+  <Button variant="rounded" class="mr-5" onclick={() => goto(prevPage)}>
     <Icon name="arrowLeft" class="h-[40px] w-[30px]" />
   </Button>
 
@@ -76,7 +76,7 @@
   </div>
 
   <div class="flex gap-2 ml-auto">
-    <Button variant="contained" on:click={toggleDirection}>
+    <Button variant="contained" onclick={toggleDirection}>
       <Icon name={direction === 'desc' ? 'arrowDown' : 'arrowUp'} class="h-5 w-5 mr-2" />
       {direction === 'desc' ? 'Newest first' : 'Oldest first'}
     </Button>
@@ -116,3 +116,4 @@
 <div class="mt-2 mb-2">
   <Paginator {currentPage} {totalPages} maxVisiblePages={5} on:pageChange={onPageChange} />
 </div>
+

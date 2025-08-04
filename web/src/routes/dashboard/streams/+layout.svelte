@@ -88,7 +88,7 @@
       <Button
         variant="outlined"
         class="w-full"
-        on:click={() =>
+        onclick={() =>
           openModal('AddStreamModal', {
             nextStreamId: arrayMax(data.streams.map((s) => s.id)) + 1
           })}

@@ -97,7 +97,7 @@
 
           <Button
             variant="contained"
-            on:click={() =>
+            onclick={() =>
               openModal('AddUserModal', {
                 streams: data.streams
               })}

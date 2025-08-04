@@ -51,7 +51,7 @@
     <div class="p-5 pt-10 flex flex-col items-center border-b relative text-color">
       <Button
         variant="rounded"
-        on:click={() => dispatch('result', false)}
+        onclick={() => dispatch('result', false)}
         class="absolute top-3 right-3 p-2"
       >
         <Icon name="close" strokeWidth={2.3} />
@@ -73,7 +73,7 @@
       <div class="w-full">
         <Button
           variant="containedRed"
-          on:click={() => dispatch('result', true)}
+          onclick={() => dispatch('result', true)}
           disabled={retypedText !== retypeText}
           class="w-full">{deleteButtonTitle}</Button
         >
@@ -83,8 +83,8 @@
 {/if}
 
 <!-- <div class="flex gap-2 p-5 py-10 w-full">
-  <Button variant="containedRed" class="flex-1" on:click={() => dispatch('result', true)}
+  <Button variant="containedRed" class="flex-1" onclick={() => dispatch('result', true)}
     >Yes</Button
   >
-  <Button variant="text" class="flex-1" on:click={() => dispatch('result', false)}>No</Button>
+  <Button variant="text" class="flex-1" onclick={() => dispatch('result', false)}>No</Button>
 </div> -->

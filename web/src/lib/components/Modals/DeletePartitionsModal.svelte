@@ -112,14 +112,14 @@
       />
 
       <div class="flex justify-end gap-3 mt-auto">
-        <Button type="button" variant="text" class="w-2/5" on:click={() => closeModal()}
+        <Button type="button" variant="text" class="w-2/5" onclick={() => closeModal()}
           >Cancel</Button
         >
         <Button
           type="button"
           variant="containedRed"
           class="w-2/5"
-          on:click={async () => {
+          onclick={async () => {
             const result = await validateForm();
             if (result.valid) confirmationOpen = true;
           }}>Delete</Button
