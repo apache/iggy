@@ -32,7 +32,7 @@
 
   type DistributiveOmit<T, K extends string> = T extends T ? Omit<T, K> : never;
   type AllModals = keyof typeof modals;
-  type ModalProps<T extends AllModals> = ComponentProps<InstanceType<(typeof modals)[T]>>;
+  type ModalProps<T extends AllModals> = ComponentProps<(typeof modals)[T]>;
   type ExtraProps<T extends AllModals> = DistributiveOmit<ModalProps<T>, 'closeModal'>;
 
   const openedModal = writable<
@@ -70,7 +70,7 @@
 <svelte:window
   onkeydown={(e) => {
     if (e.key === Keys.ESCAPE && $openedModal) {
-      $openedModal.props.closeModal();
+      $openedModal?.props.closeModal();
     }
   }}
 />
@@ -79,11 +79,11 @@
   <div 
     transition:fade={{ duration: 100 }} 
     class="fixed inset-0 bg-black/40 z-[500]" 
-    onclick={$openedModal.props.closeModal}
+    onclick={() => $openedModal.props.closeModal()}
     onkeydown={(e) => {
        if (e.key === Keys.ENTER || e.key === Keys.SPACE) {
          e.preventDefault();
-         $openedModal.props.closeModal();
+         $openedModal?.props.closeModal();
        }
      }}
     role="button" 

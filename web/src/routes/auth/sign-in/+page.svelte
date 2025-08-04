@@ -44,7 +44,7 @@
   <Input
     label="Username"
     name="username"
-    errorMessage={$errors?.username?.join(',')}
+    errorMessage={Array.isArray($errors?.username) ? $errors.username.join(',') : String($errors?.username || '')}
     bind:value={$form.username}
     {...$constraints.username}
   />
@@ -52,7 +52,7 @@
   <PasswordInput
     label="Password"
     name="password"
-    errorMessage={$errors.password?.join(',')}
+    errorMessage={Array.isArray($errors?.password) ? $errors.password.join(',') : String($errors?.password || '')}
     bind:value={$form.password}
     {...$constraints.password}
   />

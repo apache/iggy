@@ -92,7 +92,7 @@
           { name: 'Inactive', value: 'inactive' }
         ]}
         selectedValue={$form.status}
-        on:selectedValue={(e) => $form.status = e.detail}
+        on:selectedValue={(e) => $form.status = e.detail as 'active' | 'inactive'}
       />
     </div>
 

@@ -6,9 +6,18 @@
   import { openModal } from '$lib/components/Modals/AppModals.svelte';
   import SortableList from '$lib/components/SortableList.svelte';
   import Paginator from '$lib/components/Paginator.svelte';
+  import type { Message, MessagePartition } from '$lib/domain/Message';
+  import type { TopicDetails } from '$lib/domain/TopicDetails';
 
   interface Props {
-    data: any;
+    data: {
+      partitionMessages: MessagePartition;
+      topic: TopicDetails;
+      pagination: {
+        offset: number;
+        count: number;
+      };
+    };
   }
 
   let { data }: Props = $props();

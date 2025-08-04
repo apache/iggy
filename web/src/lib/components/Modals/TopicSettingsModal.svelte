@@ -50,6 +50,7 @@
       taintedMessage: false,
       async onUpdate({ form }) {
         if (!form.valid) return;
+        if (!page.params.streamId) return;
 
         const { data, ok } = await fetchRouteApi({
           method: 'PUT',
@@ -85,7 +86,7 @@
     if (result) {
       const { data, ok } = await fetchRouteApi({
         method: 'DELETE',
-        path: `/streams/${+page.params.streamId}/topics/${topic.id}`
+        path: `/streams/${+(page.params.streamId || '')}/topics/${topic.id}`
       });
 
       if (ok) {

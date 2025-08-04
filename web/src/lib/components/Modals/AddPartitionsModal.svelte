@@ -31,6 +31,7 @@
     taintedMessage: false,
     async onUpdate({ form }) {
       if (!form.valid) return;
+      if (!page.params.streamId || !page.params.topicId) return;
 
       const { data, ok } = await fetchRouteApi({
         method: 'POST',

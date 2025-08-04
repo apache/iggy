@@ -32,21 +32,21 @@
       label: 'Edit',
       icon: 'editPen',
       action: () => {
-        openModal('EditUserModal', {});
+        openModal('EditUserModal');
       }
     },
     {
       label: 'Permissions',
       icon: 'shieldLock',
       action: () => {
-        openModal('EditUserPermissionsModal', {});
+        openModal('EditUserPermissionsModal');
       }
     },
     {
       label: 'Delete',
       icon: 'trash',
       action: () => {
-        openModal('DeleteUserModal', {});
+        openModal('DeleteUserModal');
       }
     }
   ] satisfies { label: string; icon: iconType; action: VoidFunction }[];
@@ -99,7 +99,7 @@
 >
   {#snippet header()}
     <div class="flex items-center justify-center" >
-      <Checkbox value="all" checked={allChecked} on:change={toggleAllChecked} />
+      <Checkbox value="all" checked={allChecked} onclick={toggleAllChecked} />
     </div>
   {/snippet}
 

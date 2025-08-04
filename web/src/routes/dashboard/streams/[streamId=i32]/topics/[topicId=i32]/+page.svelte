@@ -61,7 +61,7 @@
         >Delete partitions</Button
       >
     {/if}
-    <Button variant="contained" on:click={() => openModal('AddPartitionsModal', {})}
+    <Button variant="contained" on:click={() => openModal('AddPartitionsModal')}
       >Add partitions</Button
     >
   </div>
@@ -72,9 +72,9 @@
   rowClass="grid grid-cols-[150px_1fr_1fr_1fr_1fr_1fr]"
   data={topic.partitions}
   hrefBuilder={(partition) =>
-    typedRoute(
+    page.params.streamId ? typedRoute(
       `/dashboard/streams/${+page.params.streamId}/topics/${topic.id}/partitions/${partition.id}/messages`
-    )}
+    ) : '#'}
   colNames={{
     id: 'ID',
     currentOffset: 'Offset',
