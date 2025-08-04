@@ -110,7 +110,7 @@ reqwest-middleware = { version = "0.4.2", features = ["json"] }
 reqwest-retry = "0.7.0"
 rustls = { version = "0.23.31", features = ["ring"] }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
-serde_json = "1.0.141"
+serde_json = "1.0.142"
 serde_with = { version = "3.14.0", features = ["base64", "macros"] }
 serde_yml = "0.0.12"
 serial_test = "3.2.0"
@@ -118,7 +118,7 @@ simd-json = { version = "0.15.1", features = ["serde_impl"] }
 sysinfo = "0.36.1"
 tempfile = "3.20.0"
 thiserror = "2.0.12"
-tokio = { version = "1.47.0", features = ["full"] }
+tokio = { version = "1.47.1", features = ["full"] }
 tokio-rustls = "0.26.2"
 toml = "0.9.4"
 tracing = "0.1.41"
@@ -154,7 +154,7 @@ mockall = "0.13.1"
 predicates = "3.1.3"
 regex = "1.11.1"
 test-case = "3.3.1"
-tokio-util = { version = "0.7.15", features = ["compat"] }
+tokio-util = { version = "0.7.16", features = ["compat"] }
 tower-http = { version = "0.6.6", features = [
     "add-extension",
     "cors",
