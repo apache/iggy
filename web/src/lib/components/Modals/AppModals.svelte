@@ -14,6 +14,7 @@
   import { fade } from 'svelte/transition';
   import { noTypeCheck } from '$lib/utils/noTypeCheck';
   import { writable } from 'svelte/store';
+  import { Keys } from '$lib/utils/constants/keys';
 
   const modals = {
     AddPartitionsModal,
@@ -68,14 +69,27 @@
 
 <svelte:window
   onkeydown={(e) => {
-    if (e.key === 'Escape' && $openedModal) {
+    if (e.key === Keys.ESCAPE && $openedModal) {
       $openedModal.props.closeModal();
     }
   }}
 />
 
 {#if $openedModal}
-  <div transition:fade={{ duration: 100 }} class="fixed inset-0 bg-black/40 z-[500]" onclick={$openedModal.props.closeModal} role="button" tabindex={1}></div>
+  <div 
+    transition:fade={{ duration: 100 }} 
+    class="fixed inset-0 bg-black/40 z-[500]" 
+    onclick={$openedModal.props.closeModal}
+    onkeydown={(e) => {
+       if (e.key === Keys.ENTER || e.key === Keys.SPACE) {
+         e.preventDefault();
+         $openedModal.props.closeModal();
+       }
+     }}
+    role="button" 
+    tabindex="0"
+    aria-label="Close modal"
+  ></div>
   {@const SvelteComponent_1 = noTypeCheck(modals[$openedModal.modal])}
   <SvelteComponent_1
     {...$openedModal.props}

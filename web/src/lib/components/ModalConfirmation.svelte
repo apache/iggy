@@ -4,6 +4,7 @@
   import { createEventDispatcher } from 'svelte';
   import Input from './Input.svelte';
   import Icon from './Icon.svelte';
+  import { Keys } from '$lib/utils/constants/keys';
 
   interface Props {
     open: boolean;
@@ -32,6 +33,15 @@
   <div
     transition:fade={{ duration: 100 }}
     onclick={() => dispatch('result', false)}
+    onkeydown={(e) => {
+      if (e.key === Keys.ENTER || e.key === Keys.SPACE) {
+        e.preventDefault();
+        dispatch('result', false);
+      }
+    }}
+    role="button"
+    tabindex="0"
+    aria-label="Close confirmation dialog"
     class="absolute z-40 backdrop-blur-xs rounded-2xl inset-3"
 ></div>
   <div
