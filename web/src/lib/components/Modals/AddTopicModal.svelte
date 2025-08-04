@@ -9,11 +9,9 @@
   import type { CloseModalFn } from '$lib/types/utilTypes';
   import type { StreamDetails } from '$lib/domain/StreamDetails';
   import { fetchRouteApi } from '$lib/api/fetchRouteApi';
-  import { intervalToDuration } from 'date-fns';
   import { durationFormatter } from '$lib/utils/formatters/durationFormatter';
   import { numberSizes } from '$lib/utils/constants/numberSizes';
   import { dataHas } from '$lib/utils/dataHas';
-  import { invalidateAll } from '$app/navigation';
   import { showToast } from '../AppToasts.svelte';
   import { customInvalidateAll } from '../PeriodicInvalidator.svelte';
 

@@ -1,10 +1,7 @@
 <script lang="ts">
-  import type { HTMLInputAttributes } from 'svelte/elements';
   import Input from '$lib/components/Input.svelte';
   import Icon from './Icon.svelte';
   import Button from './Button.svelte';
-
-  
 
   interface Props {
     label: string;

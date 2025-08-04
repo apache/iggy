@@ -53,5 +53,3 @@ export const Keys = {
   F11: 'F11',
   F12: 'F12',
 } as const;
-
-export type KeyValue = typeof Keys[keyof typeof Keys];

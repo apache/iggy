@@ -3,10 +3,9 @@
 
   interface Props {
     checked?: boolean;
-    value?: string;
   }
 
-  let { checked = $bindable(false), value = '1' }: Props = $props();
+  let { checked = $bindable(false) }: Props = $props();
 </script>
 
 <label

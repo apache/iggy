@@ -11,7 +11,7 @@
   import { zod } from 'sveltekit-superforms/adapters';
   import { fetchRouteApi } from '$lib/api/fetchRouteApi';
   import { dataHas } from '$lib/utils/dataHas';
-  import { goto, invalidateAll } from '$app/navigation';
+  import { goto } from '$app/navigation';
   import { showToast } from '../AppToasts.svelte';
   import ModalConfirmation from '../ModalConfirmation.svelte';
   import { typedRoute } from '$lib/types/appRoutes';
@@ -36,7 +36,7 @@
       .default(stream.name)
   });
 
-  const { form, errors, enhance, constraints, submitting, reset, tainted } = superForm(
+  const { form, errors, enhance, submitting, tainted } = superForm(
     defaults(zod(schema)),
     {
       SPA: true,
@@ -77,7 +77,7 @@
     confirmationOpen = false;
 
     if (result) {
-      const { data, ok } = await fetchRouteApi({
+      const { ok } = await fetchRouteApi({
         method: 'DELETE',
         path: `/streams/${stream.id}`
       });

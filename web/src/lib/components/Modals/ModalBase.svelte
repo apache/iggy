@@ -1,5 +1,4 @@
 <script lang="ts">
-  import type { HTMLAttributes } from 'svelte/elements';
   import { twMerge } from 'tailwind-merge';
   import Icon from '../Icon.svelte';
   import type { TransitionConfig } from 'svelte/transition';

@@ -9,7 +9,6 @@
   import { fetchRouteApi } from '$lib/api/fetchRouteApi';
   import { page } from '$app/state';
   import { dataHas } from '$lib/utils/dataHas';
-  import { invalidateAll } from '$app/navigation';
   import { showToast } from '../AppToasts.svelte';
   import Button from '../Button.svelte';
   import { customInvalidateAll } from '../PeriodicInvalidator.svelte';

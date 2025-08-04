@@ -1,6 +1,6 @@
 <script lang="ts">
-  import type { StreamDetails } from '$lib/domain/StreamDetails';
   import type { CloseModalFn } from '$lib/types/utilTypes';
+  import type { TopicDetails } from '$lib/domain/TopicDetails';
   import { z } from 'zod';
 
   import Button from '../Button.svelte';
@@ -11,15 +11,13 @@
   import { zod } from 'sveltekit-superforms/adapters';
   import { fetchRouteApi } from '$lib/api/fetchRouteApi';
   import { dataHas } from '$lib/utils/dataHas';
-  import { goto, invalidateAll } from '$app/navigation';
+  import { goto } from '$app/navigation';
   import { showToast } from '../AppToasts.svelte';
   import ModalConfirmation from '../ModalConfirmation.svelte';
-  import { typedRoute } from '$lib/types/appRoutes';
   import { browser } from '$app/environment';
-  import type { TopicDetails } from '$lib/domain/TopicDetails';
+  import { customInvalidateAll } from '../PeriodicInvalidator.svelte';
   import { numberSizes } from '$lib/utils/constants/numberSizes';
   import { page } from '$app/state';
-  import { customInvalidateAll } from '../PeriodicInvalidator.svelte';
   import { durationFormatter } from '$lib/utils/formatters/durationFormatter';
 
   interface Props {
@@ -41,7 +39,7 @@
     message_expiry: z.number().min(0).max(numberSizes.max.u32).default(topic.messageExpiry)
   });
 
-  const { form, errors, enhance, constraints, submitting, reset, tainted } = superForm(
+  const { form, errors, enhance, constraints, submitting, tainted } = superForm(
     defaults(zod(schema)),
     {
       SPA: true,
@@ -85,7 +83,7 @@
     confirmationOpen = false;
 
     if (result) {
-      const { data, ok } = await fetchRouteApi({
+      const { ok } = await fetchRouteApi({
         method: 'DELETE',
         path: `/streams/${+(page.params.streamId || '')}/topics/${topic.id}`
       });

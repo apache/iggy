@@ -21,13 +21,13 @@
   export const setDarkMode = () => {
     document.body.classList.add('transitions-disabled');
     document.documentElement.classList.add('dark');
-    const _ = window.getComputedStyle(document.body).opacity;
+    void window.getComputedStyle(document.body).opacity;
     document.body.classList.remove('transitions-disabled');
   };
   export const setLightMode = () => {
     document.body.classList.add('transitions-disabled');
     document.documentElement.classList.remove('dark');
-    const _ = window.getComputedStyle(document.body).opacity;
+    void window.getComputedStyle(document.body).opacity;
     document.body.classList.remove('transitions-disabled');
   };
 

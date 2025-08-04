@@ -1,5 +1,5 @@
 <script lang="ts" module>
-  import type { ComponentProps, ComponentType, SvelteComponent } from 'svelte';
+  import type { ComponentProps } from 'svelte';
   import AddPartitionsModal from './AddPartitionsModal.svelte';
   import AddStreamModal from './AddStreamModal.svelte';
   import AddTopicModal from './AddTopicModal.svelte';

@@ -11,7 +11,6 @@
   import ModalConfirmation from '../ModalConfirmation.svelte';
   import { fetchRouteApi } from '$lib/api/fetchRouteApi';
   import { page } from '$app/state';
-  import { invalidateAll } from '$app/navigation';
   import { showToast } from '../AppToasts.svelte';
   import { dataHas } from '$lib/utils/dataHas';
   import { customInvalidateAll } from '../PeriodicInvalidator.svelte';
@@ -41,7 +40,7 @@
     partitions_count: z.coerce.number().min(1).max(topic.partitionsCount).default(1)
   });
 
-  const { form, errors, enhance, constraints, submitting, validateForm } = superForm(
+  const { form, errors, enhance, constraints, validateForm } = superForm(
     defaults(zod(schema)),
     {
       SPA: true,

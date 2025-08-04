@@ -9,7 +9,6 @@
   import { showToast } from '../AppToasts.svelte';
   import { fetchRouteApi } from '$lib/api/fetchRouteApi';
   import { dataHas } from '$lib/utils/dataHas';
-  import { invalidateAll } from '$app/navigation';
   import { numberSizes } from '$lib/utils/constants/numberSizes';
   import { customInvalidateAll } from '../PeriodicInvalidator.svelte';
 
@@ -28,7 +27,7 @@
       .max(255, 'Name must not exceed 255 characters')
   });
 
-  const { form, errors, enhance, constraints, submitting, reset } = superForm(
+  const { form, errors, enhance, constraints, submitting } = superForm(
     defaults(zod(schema)),
     {
       SPA: true,
