@@ -44,5 +44,5 @@ web-sys = { version = "0.3", features = [
     "Navigator",
 ] }
 yew = { version = "0.21", features = ["csr"] }
-yew-hooks = "0.3.3"
+yew-hooks = "0.3.4"
 yew-router = "0.18"
