@@ -37,8 +37,48 @@ impl Topic {
         }
     }
 
+    pub fn invoke<T>(&self, f: impl FnOnce(&Self) -> T) -> T {
+        f(self)
+    }
+
+    pub fn invoke_mut<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        f(self)
+    }
+
+    pub async fn invoke_async<T>(&self, f: impl AsyncFnOnce(&Self) -> T) -> T {
+        f(self).await
+    }
+
+    pub fn message_expiry(&self) -> IggyExpiry {
+        self.message_expiry
+    }
+
     pub fn id(&self) -> usize {
         self.id
+    }
+
+    pub fn name(&self) -> &String {
+        &self.name
+    }
+
+    pub fn set_name(&mut self, name: String) {
+        self.name = name;
+    }
+
+    pub fn set_compression(&mut self, compression: CompressionAlgorithm) {
+        self.compression_algorithm = compression;
+    }
+
+    pub fn set_message_expiry(&mut self, message_expiry: IggyExpiry) {
+        self.message_expiry = message_expiry;
+    }
+
+    pub fn set_max_topic_size(&mut self, max_topic_size: MaxTopicSize) {
+        self.max_topic_size = max_topic_size;
+    }
+
+    pub fn set_replication_factor(&mut self, replication_factor: u8) {
+        self.replication_factor = replication_factor;
     }
 
     pub fn partitions(&self) -> &Partitions {

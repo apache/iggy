@@ -1,18 +1,8 @@
-use compio::fs::create_dir_all;
-use iggy_common::{CompressionAlgorithm, Identifier, IggyError, MaxTopicSize};
+use iggy_common::Identifier;
 use slab::Slab;
-use std::{
-    cell::{RefCell, UnsafeCell},
-    ops::Index,
-    path::Path,
-    sync::Arc,
-};
-use tracing::info;
+use std::{cell::RefCell, sync::Arc};
 
 use crate::{
-    configs::system::SystemConfig,
-    io::storage::Storage,
-    shard_info,
     slab::{IndexedSlab, partitions::Partitions, topics::Topics},
     streaming::{
         partitions::partition2, stats::stats::StreamStats, streams::stream2, topics::topic2,
@@ -31,6 +21,19 @@ impl Streams {
         Self {
             container: RefCell::new(IndexedSlab::with_capacity(CAPACITY)),
             stats: RefCell::new(Slab::with_capacity(CAPACITY)),
+        }
+    }
+
+    pub fn exists(&self, id: &Identifier) -> bool {
+        match id.kind {
+            iggy_common::IdKind::Numeric => {
+                let id = id.get_u32_value().unwrap() as usize;
+                self.container.borrow().slab.contains(id)
+            }
+            iggy_common::IdKind::String => {
+                let key = id.get_string_value().unwrap();
+                self.container.borrow().index.contains_key(&key)
+            }
         }
     }
 
@@ -56,9 +59,12 @@ impl Streams {
         f(&mut stats)
     }
 
-    pub async fn with_async(&self, f: impl AsyncFnOnce(&IndexedSlab<stream2::Stream>)) {
+    pub async fn with_async<T>(
+        &self,
+        f: impl AsyncFnOnce(&IndexedSlab<stream2::Stream>) -> T,
+    ) -> T {
         let container = self.container.borrow();
-        f(&container).await;
+        f(&container).await
     }
 
     pub fn with<T>(&self, f: impl FnOnce(&IndexedSlab<stream2::Stream>) -> T) -> T {
@@ -91,7 +97,7 @@ impl Streams {
         })
     }
 
-    pub fn with_stream_by_id_mut(&self, id: &Identifier, mut f: impl FnOnce(&mut stream2::Stream)) {
+    pub fn with_stream_by_id_mut(&self, id: &Identifier, f: impl FnOnce(&mut stream2::Stream)) {
         self.with_mut(|streams| {
             let stream = match id.kind {
                 iggy_common::IdKind::Numeric => {
@@ -108,7 +114,15 @@ impl Streams {
     }
 
     pub fn with_topics<T>(&self, stream_id: &Identifier, f: impl FnOnce(&Topics) -> T) -> T {
-        self.with(|streams| {
+        self.with_stream_by_id(stream_id, |stream| f(stream.topics()))
+    }
+
+    pub async fn with_topics_async<T>(
+        &self,
+        stream_id: &Identifier,
+        f: impl AsyncFnOnce(&Topics) -> T,
+    ) -> T {
+        self.with_async(async |streams: &IndexedSlab<stream2::Stream>| {
             let stream = match stream_id.kind {
                 iggy_common::IdKind::Numeric => {
                     let id = stream_id.get_u32_value().unwrap() as usize;
@@ -119,7 +133,28 @@ impl Streams {
                     unsafe { streams.get_by_key_unchecked(&key) }
                 }
             };
-            f(stream.topics())
+            f(stream.topics()).await
+        })
+        .await
+    }
+
+    pub fn with_topics_mut<T>(
+        &self,
+        stream_id: &Identifier,
+        f: impl FnOnce(&mut Topics) -> T,
+    ) -> T {
+        self.with_mut(|streams| {
+            let stream = match stream_id.kind {
+                iggy_common::IdKind::Numeric => {
+                    let id = stream_id.get_u32_value().unwrap() as usize;
+                    &mut streams[id]
+                }
+                iggy_common::IdKind::String => {
+                    let key = stream_id.get_string_value().unwrap();
+                    unsafe { streams.get_by_key_mut_unchecked(&key) }
+                }
+            };
+            f(stream.topics_mut())
         })
     }
 
@@ -150,6 +185,18 @@ impl Streams {
         self.with_topics(stream_id, |topics| {
             topics.with_partitions(topic_id, f);
         });
+    }
+
+    pub async fn with_partitions_async<T>(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        f: impl AsyncFnOnce(&Partitions) -> T,
+    ) -> T {
+        self.with_topics_async(stream_id, async |topics| {
+            topics.with_partitions_async(topic_id, f).await
+        })
+        .await
     }
 
     pub fn with_partition_by_id(

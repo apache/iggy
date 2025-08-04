@@ -90,6 +90,15 @@ pub enum ShardEvent {
         topic_id: Identifier,
         consumer_group_id: Identifier,
     },
+    UpdatedTopic2 {
+        stream_id: Identifier,
+        topic_id: Identifier,
+        name: String,
+        message_expiry: IggyExpiry,
+        compression_algorithm: CompressionAlgorithm,
+        max_topic_size: MaxTopicSize,
+        replication_factor: Option<u8>,
+    },
     UpdatedTopic {
         stream_id: Identifier,
         topic_id: Identifier,
@@ -104,6 +113,11 @@ pub enum ShardEvent {
         topic_id: Identifier,
     },
     DeletedTopic {
+        stream_id: Identifier,
+        topic_id: Identifier,
+    },
+    DeletedTopic2 {
+        id: usize,
         stream_id: Identifier,
         topic_id: Identifier,
     },

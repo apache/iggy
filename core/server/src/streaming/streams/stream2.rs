@@ -3,6 +3,7 @@ use iggy_common::IggyTimestamp;
 
 use crate::slab::{IndexedSlab, Keyed, topics::Topics};
 
+#[derive(Debug)]
 pub struct Stream {
     id: usize,
     name: String,
@@ -44,6 +45,10 @@ impl Stream {
         self.id
     }
 
+    pub fn name(&self) -> &String {
+        &self.name
+    }
+
     pub fn topics_count(&self) -> usize {
         self.topics.len()
     }
@@ -57,5 +62,9 @@ impl Stream {
 
     pub fn topics(&self) -> &Topics {
         &self.topics
+    }
+
+    pub fn topics_mut(&mut self) -> &mut Topics {
+        &mut self.topics
     }
 }

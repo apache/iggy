@@ -36,6 +36,7 @@ mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 ahash = { workspace = true }
+arcshift = "0.4.0"
 anyhow = { workspace = true }
 async_zip = { workspace = true }
 axum = { workspace = true }

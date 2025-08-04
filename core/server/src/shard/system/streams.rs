@@ -235,7 +235,7 @@ impl IggyShard {
         name: String,
         stats: Arc<StreamStats>,
     ) -> Result<usize, IggyError> {
-        let exists = self.streams2.with(|streams| streams.exists(&name));
+        let exists = self.streams2.exists(&Identifier::named(&name).unwrap());
         if exists {
             return Err(IggyError::StreamNameAlreadyExists(name));
         }

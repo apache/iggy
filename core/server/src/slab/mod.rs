@@ -5,10 +5,13 @@ pub mod topics;
 
 use ahash::AHashMap;
 use slab::Slab;
-use std::ops::{Index, IndexMut};
+use std::{
+    fmt::{Debug, Display},
+    ops::{Index, IndexMut},
+};
 
 pub trait Keyed {
-    type Key: Eq + std::hash::Hash + Clone;
+    type Key: Eq + std::hash::Hash + Clone + Debug + Display;
     fn key(&self) -> &Self::Key;
 }
 
@@ -18,7 +21,7 @@ pub struct IndexedSlab<T: Keyed> {
     index: AHashMap<T::Key, usize>,
 }
 
-impl<T: Keyed + Default> IndexedSlab<T> {
+impl<T: Keyed + Default + Debug> IndexedSlab<T> {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             slab: Slab::with_capacity(capacity),
@@ -30,15 +33,29 @@ impl<T: Keyed + Default> IndexedSlab<T> {
         self.slab.len()
     }
 
-    pub fn exists(&self, key: &T::Key) -> bool {
-        self.index.contains_key(key)
-    }
-
     pub fn insert(&mut self, value: T) -> usize {
         let key = value.key().clone();
         let index = self.slab.insert(value);
         self.index.insert(key, index);
         index
+    }
+
+    pub fn try_remove(&mut self, id: usize) -> Option<T> {
+        self.slab.try_remove(id).and_then(|value| {
+            self.index.remove(value.key());
+            Some(value)
+        })
+    }
+
+    pub fn try_remove_by_key(&mut self, key: &T::Key) -> Option<T> {
+        self.index
+            .remove(key)
+            .and_then(|index| Some(self.slab.remove(index)))
+    }
+
+    pub fn rename_unchecked(&mut self, old: &T::Key, new_key: T::Key) {
+        let idx = self.index.remove(old).expect("Rename key: key not found");
+        self.index.insert(new_key, idx);
     }
 
     pub fn get(&self, index: usize) -> Option<&T> {
@@ -49,9 +66,14 @@ impl<T: Keyed + Default> IndexedSlab<T> {
         self.slab.get_mut(index)
     }
 
-    fn get_by_key(&self, key: &T::Key) -> Option<&T> {
+    pub fn get_by_key(&self, key: &T::Key) -> Option<&T> {
         let index = self.index.get(key)?;
         self.slab.get(*index)
+    }
+
+    pub fn get_by_key_mut(&mut self, key: &T::Key) -> Option<&mut T> {
+        let index = self.index.get(key)?;
+        self.slab.get_mut(*index)
     }
 
     unsafe fn get_by_key_unchecked(&self, key: &T::Key) -> &T {

@@ -1,4 +1,8 @@
 use crate::{slab::IndexedSlab, streaming::topics::consumer_group2};
+use ahash::AHashMap;
+use arcshift::ArcShift;
+use slab::Slab;
+use std::sync::{Arc, atomic::AtomicUsize};
 
 const CAPACITY: usize = 1024;
 
@@ -10,7 +14,9 @@ pub struct ConsumerGroups {
 impl Default for ConsumerGroups {
     fn default() -> Self {
         Self {
-            container: IndexedSlab::with_capacity(1024),
+            container: IndexedSlab::with_capacity(CAPACITY),
         }
     }
 }
+
+

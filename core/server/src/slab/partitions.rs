@@ -1,7 +1,5 @@
-use std::{cell::RefCell, sync::Arc};
-
-use iggy_common::Partition;
 use slab::Slab;
+use std::sync::Arc;
 
 use crate::streaming::{partitions::partition2, segments, stats::stats::PartitionStats};
 
@@ -36,14 +34,14 @@ impl Partitions {
         f(&mut stats)
     }
 
-    pub async fn with_async(&self, f: impl AsyncFnOnce(&Slab<partition2::Partition>)) {
+    pub async fn with_async<T>(&self, f: impl AsyncFnOnce(&Slab<partition2::Partition>) -> T) -> T {
         let container = &self.container;
-        f(&container).await;
+        f(&container).await
     }
 
-    pub fn with(&self, f: impl FnOnce(&Slab<partition2::Partition>)) {
+    pub fn with<T>(&self, f: impl FnOnce(&Slab<partition2::Partition>) -> T) -> T {
         let container = &self.container;
-        f(&container);
+        f(&container)
     }
 
     pub fn with_mut<T>(&mut self, f: impl FnOnce(&mut Slab<partition2::Partition>) -> T) -> T {
@@ -51,12 +49,26 @@ impl Partitions {
         f(&mut container)
     }
 
-    pub fn with_partition_id(&self, partition_id: usize, f: impl FnOnce(&partition2::Partition)) {
+    pub fn with_partition_id<T>(
+        &self,
+        partition_id: usize,
+        f: impl FnOnce(&partition2::Partition) -> T,
+    ) -> T {
         self.with(|partitions| {
-            if let Some(partition) = partitions.get(partition_id) {
-                f(partition);
-            }
-        });
+            let partition = &partitions[partition_id];
+            f(partition)
+        })
+    }
+
+    pub fn with_partition_by_id_mut<T>(
+        &mut self,
+        partition_id: usize,
+        f: impl FnOnce(&mut partition2::Partition) -> T,
+    ) -> T {
+        self.with_mut(|partitions| {
+            let partition = &mut partitions[partition_id];
+            f(partition)
+        })
     }
 
     pub fn with_segments(&self, partition_id: usize, f: impl FnOnce(&Vec<segments::Segment2>)) {
@@ -71,6 +83,7 @@ impl Partitions {
         f: impl FnOnce(&segments::Segment2),
     ) {
         self.with_segments(partition_id, |segments| {
+            // we could binary search for that segment technically, but this is fine for now.
             if let Some(segment) = segments.iter().find(|s| s.id == segment_id) {
                 f(segment);
             }

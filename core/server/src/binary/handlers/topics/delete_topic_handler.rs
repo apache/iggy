@@ -48,6 +48,16 @@ impl ServerCommandHandler for DeleteTopic {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
+        let topic2 = shard
+            .delete_topic2(session, &self.stream_id, &self.topic_id)
+            .await?;
+        let event = ShardEvent::DeletedTopic2 {
+            id: topic2.id(),
+            stream_id: self.stream_id.clone(),
+            topic_id: self.topic_id.clone(),
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+
         let topic = shard
                 .delete_topic(session, &self.stream_id, &self.topic_id)
                 .await
