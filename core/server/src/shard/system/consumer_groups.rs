@@ -227,7 +227,7 @@ impl IggyShard {
         group_id: &Identifier,
     ) -> Result<consumer_group2::ConsumerGroup, IggyError> {
         self.ensure_authenticated(session)?;
-        self.ensure_consumer_group_exists(stream_id, topic_id, group_id)?;
+        //self.ensure_consumer_group_exists(stream_id, topic_id, group_id)?;
         {
             let topic_id = self
                 .streams2

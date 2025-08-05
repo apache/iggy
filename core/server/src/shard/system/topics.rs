@@ -154,7 +154,7 @@ impl IggyShard {
         stats: Arc<TopicStats>,
     ) -> Result<usize, IggyError> {
         self.ensure_authenticated(session)?;
-        self.ensure_stream_exists(stream_id)?;
+        //self.ensure_stream_exists(stream_id)?;
         {
             let stream_id = self
                 .streams2
@@ -392,7 +392,7 @@ impl IggyShard {
         replication_factor: Option<u8>,
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
-        self.ensure_topic_exists(stream_id, topic_id)?;
+        //self.ensure_topic_exists(stream_id, topic_id)?;
         {
             let topic_id = self
                 .streams2
