@@ -102,13 +102,7 @@ impl ConsumerGroup {
             .members
             .shared_get()
             .iter()
-            .find_map(|(_, member)| {
-                if member.client_id == client_id {
-                    return Some(member.id);
-                } else {
-                    None
-                }
-            })
+            .find_map(|(_, member)| (member.client_id == client_id).then_some(member.id))
             .expect("delete_member: find member in consumer group slab");
         let mut members = self.mimic_members();
         members.remove(member_id);
