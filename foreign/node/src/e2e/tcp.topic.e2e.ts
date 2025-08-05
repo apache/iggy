@@ -72,6 +72,7 @@ describe('e2e -> topic', async () => {
 
   it('e2e -> topic::update', async () => {
     const topic = await c.topic.get({ streamId, topicId });
+    assert.ok(topic);
     const u2 = await c.topic.update({
       streamId, topicId,
       name: topic.name,

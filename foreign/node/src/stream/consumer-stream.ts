@@ -120,10 +120,8 @@ export const groupConsumerStream = (config: ClientConfig) =>
   }: GroupConsumerStreamRequest): Promise<Readable> {
     const s = await getClient(config);
     
-    try {
-      await s.group.get({ streamId, topicId, groupId })
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    } catch (err) {
+    const grp = await s.group.get({ streamId, topicId, groupId })
+    if(!grp) {
       const ng = { streamId, topicId, groupId, name: `auto-${groupId}` };
       debug('group does not exist, creating it', ng);
       await s.group.create(ng)

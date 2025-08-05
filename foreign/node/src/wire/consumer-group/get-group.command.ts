@@ -41,9 +41,11 @@ export const GET_GROUP = {
   },
 
   deserialize: (r: CommandResponse) => {
+    if(r.status === 0 && r.length === 0)
+      return null;
     return deserializeConsumerGroup(r.data).data;
   }
 };
 
 
-export const getGroup = wrapCommand<GetGroup, ConsumerGroup>(GET_GROUP);
+export const getGroup = wrapCommand<GetGroup, ConsumerGroup | null>(GET_GROUP);

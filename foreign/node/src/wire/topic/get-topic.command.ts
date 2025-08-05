@@ -40,9 +40,11 @@ export const GET_TOPIC = {
   },
 
   deserialize: (r: CommandResponse) => {
+    if(r.status === 0 && r.length === 0)
+      return null;
     return deserializeTopic(r.data).data;
   }
 };
 
 
-export const getTopic = wrapCommand<GetTopic, Topic>(GET_TOPIC);
+export const getTopic = wrapCommand<GetTopic, Topic | null>(GET_TOPIC);

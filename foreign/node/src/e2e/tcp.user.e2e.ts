@@ -65,12 +65,14 @@ describe('e2e -> user', async () => {
 
   it('e2e -> user::get#id', async () => {
     const u1 = await c.user.get({ userId: username });
+    assert.ok(u1);
     const u2 = await c.user.get({ userId: u1.id });
     assert.deepEqual(u1, u2);
   });
 
   it('e2e -> user::update', async () => {
     const user = await c.user.get({ userId: username });
+    assert.ok(user);
     const u2 = await c.user.update({
       userId: user.id,
       status: 2
@@ -80,6 +82,7 @@ describe('e2e -> user', async () => {
 
   it('e2e -> user::changePassword', async () => {
     const user = await c.user.get({ userId: username });
+    assert.ok(user);
     assert.ok(await c.user.changePassword({
       userId: user.id, currentPassword: password, newPassword: 'h4x0r42'
     }));
@@ -87,6 +90,7 @@ describe('e2e -> user', async () => {
 
   it('e2e -> user::updatePermissions', async () => {
     const user = await c.user.get({ userId: username });
+    assert.ok(user);
     const perms2 = { ...permissions };
     perms2.global.ReadServers = true;
     const u2 = await c.user.updatePermissions({
@@ -97,6 +101,7 @@ describe('e2e -> user', async () => {
   
   it('e2e -> user::delete', async () => {
     const user = await c.user.get({ userId: username });
+    assert.ok(user);
     assert.ok(await c.user.delete({ userId: user.id }));
   });
 
