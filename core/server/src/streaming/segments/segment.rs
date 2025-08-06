@@ -85,7 +85,7 @@ impl Segment {
         messages_count_of_parent_partition: Arc<AtomicU64>,
         fresh: bool, // `fresh` means created and persisted in this runtime, in other words it's set to false when loading from disk
     ) -> Segment {
-        let path = config.get_segment_path(stream_id, topic_id, partition_id, start_offset);
+        let path = config.get_segment_path(stream_id as usize, topic_id as usize, partition_id as usize, start_offset);
         let messages_path = Self::get_messages_file_path(&path);
         let index_path = Self::get_index_path(&path);
         let message_expiry = match message_expiry {
@@ -460,9 +460,9 @@ mod tests {
 
     #[tokio::test]
     async fn should_be_created_given_valid_parameters() {
-        let stream_id = 1;
-        let topic_id = 2;
-        let partition_id = 3;
+        let stream_id = 1usize;
+        let topic_id = 2usize;
+        let partition_id = 3usize;
         let start_offset = 0;
         let config = Arc::new(SystemConfig::default());
         let path = config.get_segment_path(stream_id, topic_id, partition_id, start_offset);
@@ -478,9 +478,9 @@ mod tests {
         MemoryPool::init_pool(config.clone());
 
         let segment = Segment::create(
-            stream_id,
-            topic_id,
-            partition_id,
+            stream_id as u32,
+            topic_id as u32,
+            partition_id as u32,
             start_offset,
             config,
             message_expiry,
@@ -493,9 +493,9 @@ mod tests {
             true,
         );
 
-        assert_eq!(segment.stream_id, stream_id);
-        assert_eq!(segment.topic_id, topic_id);
-        assert_eq!(segment.partition_id, partition_id);
+        assert_eq!(segment.stream_id, stream_id as u32);
+        assert_eq!(segment.topic_id, topic_id as u32);
+        assert_eq!(segment.partition_id, partition_id as u32);
         assert_eq!(segment.start_offset(), start_offset);
         assert_eq!(segment.end_offset(), 0);
         assert_eq!(segment.get_messages_size(), 0);

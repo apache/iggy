@@ -68,7 +68,7 @@ async fn should_persist_segment() {
         assert_persisted_segment(
             &setup
                 .config
-                .get_partition_path(stream_id, topic_id, partition_id),
+                .get_partition_path(stream_id as usize, topic_id as usize, partition_id as usize),
             start_offset,
         )
         .await;
@@ -105,7 +105,7 @@ async fn should_load_existing_segment_from_disk() {
         assert_persisted_segment(
             &setup
                 .config
-                .get_partition_path(stream_id, topic_id, partition_id),
+                .get_partition_path(stream_id as usize, topic_id as usize, partition_id as usize),
             start_offset,
         )
         .await;
@@ -175,7 +175,7 @@ async fn should_persist_and_load_segment_with_messages() {
     assert_persisted_segment(
         &setup
             .config
-            .get_partition_path(stream_id, topic_id, partition_id),
+            .get_partition_path(stream_id as usize, topic_id as usize, partition_id as usize),
         start_offset,
     )
     .await;
@@ -261,7 +261,7 @@ async fn given_at_least_one_not_expired_message_segment_should_not_be_expired() 
     assert_persisted_segment(
         &setup
             .config
-            .get_partition_path(stream_id, topic_id, partition_id),
+            .get_partition_path(stream_id as usize, topic_id as usize, partition_id as usize),
         start_offset,
     )
     .await;
@@ -408,9 +408,9 @@ async fn should_delete_persisted_segments() -> Result<(), Box<dyn std::error::Er
     drop(stream);
 
     let partition_path = setup.config.get_partition_path(
-        stream_id.get_u32_value()?,
-        topic_id.get_u32_value()?,
-        partition_id,
+        stream_id.get_u32_value()? as usize,
+        topic_id.get_u32_value()? as usize,
+        partition_id as usize,
     );
 
     let initial_segments = get_segment_paths_for_partition(&partition_path);

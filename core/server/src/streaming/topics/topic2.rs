@@ -3,9 +3,6 @@ use iggy_common::{CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize}
 
 #[derive(Default, Debug)]
 pub struct Topic {
-    partitions: Partitions,
-    consumer_groups: ConsumerGroups,
-
     id: usize,
     // TODO: This property should be removed, we won't use it in our clustering impl.
     replication_factor: u8,
@@ -14,6 +11,11 @@ pub struct Topic {
     message_expiry: IggyExpiry,
     compression_algorithm: CompressionAlgorithm,
     max_topic_size: MaxTopicSize,
+
+    partitions: Partitions,
+    consumer_groups: ConsumerGroups,
+    //consumer_offsets: (),
+    //consumer_group_offsets: (),
 }
 
 impl Topic {

@@ -103,12 +103,12 @@ impl Partition {
         segments_count_of_parent_stream: Arc<AtomicU32>,
         created_at: IggyTimestamp,
     ) -> Partition {
-        let partition_path = config.get_partition_path(stream_id, topic_id, partition_id);
-        let offsets_path = config.get_offsets_path(stream_id, topic_id, partition_id);
+        let partition_path = config.get_partition_path(stream_id as usize, topic_id as usize, partition_id as usize);
+        let offsets_path = config.get_offsets_path(stream_id as usize, topic_id as usize, partition_id as usize);
         let consumer_offsets_path =
-            config.get_consumer_offsets_path(stream_id, topic_id, partition_id);
+            config.get_consumer_offsets_path(stream_id as usize, topic_id as usize, partition_id as usize);
         let consumer_group_offsets_path =
-            config.get_consumer_group_offsets_path(stream_id, topic_id, partition_id);
+            config.get_consumer_group_offsets_path(stream_id as usize, topic_id as usize, partition_id as usize);
 
         let message_deduplicator = match config.message_deduplication.enabled {
             true => Some(MessageDeduplicator::new(
@@ -240,16 +240,16 @@ mod tests {
         ));
         MemoryPool::init_pool(config.clone());
 
-        let stream_id = 1;
-        let topic_id = 2;
-        let partition_id = 3;
+        let stream_id = 1usize;
+        let topic_id = 2usize;
+        let partition_id = 3usize;
         let with_segment = true;
-        let path = config.get_partition_path(stream_id, topic_id, partition_id);
+        let path = config.get_partition_path(stream_id as usize, topic_id as usize, partition_id as usize);
         let message_expiry = IggyExpiry::ExpireDuration(IggyDuration::from(10));
         let partition = Partition::create(
-            stream_id,
-            topic_id,
-            partition_id,
+            stream_id as u32,
+            topic_id as u32,
+            partition_id as u32,
             with_segment,
             config,
             storage,
@@ -262,9 +262,9 @@ mod tests {
             IggyTimestamp::now(),
         );
 
-        assert_eq!(partition.stream_id, stream_id);
-        assert_eq!(partition.topic_id, topic_id);
-        assert_eq!(partition.partition_id, partition_id);
+        assert_eq!(partition.stream_id, stream_id as u32);
+        assert_eq!(partition.topic_id, topic_id as u32);
+        assert_eq!(partition.partition_id, partition_id as u32);
         assert_eq!(partition.partition_path, path);
         assert_eq!(partition.current_offset, 0);
         assert_eq!(partition.unsaved_messages_count, 0);

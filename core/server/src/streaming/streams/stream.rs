@@ -61,8 +61,8 @@ impl Stream {
         config: Arc<SystemConfig>,
         storage: Rc<SystemStorage>,
     ) -> Self {
-        let path = config.get_stream_path(id);
-        let topics_path = config.get_topics_path(id);
+        let path = config.get_stream_path(id as usize);
+        let topics_path = config.get_topics_path(id as usize);
 
         Stream {
             stream_id: id,
@@ -116,11 +116,11 @@ mod tests {
             Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister {})),
         ));
         MemoryPool::init_pool(config.clone());
-        let id = 1;
+        let id = 1u32;
         let name = "test";
         let config = Arc::new(SystemConfig::default());
-        let path = config.get_stream_path(id);
-        let topics_path = config.get_topics_path(id);
+        let path = config.get_stream_path(id as usize);
+        let topics_path = config.get_topics_path(id as usize);
 
         let stream = Stream::create(id, name, config, storage);
 

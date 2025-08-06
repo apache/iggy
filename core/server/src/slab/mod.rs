@@ -21,7 +21,7 @@ pub struct IndexedSlab<T: Keyed> {
     index: AHashMap<T::Key, usize>,
 }
 
-impl<T: Keyed + Default + Debug> IndexedSlab<T> {
+impl<T: Keyed + Debug> IndexedSlab<T> {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             slab: Slab::with_capacity(capacity),

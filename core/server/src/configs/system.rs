@@ -193,19 +193,19 @@ impl SystemConfig {
         format!("{}/{}", self.get_system_path(), self.stream.path)
     }
 
-    pub fn get_stream_path(&self, stream_id: u32) -> String {
+    pub fn get_stream_path(&self, stream_id: usize) -> String {
         format!("{}/{}", self.get_streams_path(), stream_id)
     }
 
-    pub fn get_topics_path(&self, stream_id: u32) -> String {
+    pub fn get_topics_path(&self, stream_id: usize) -> String {
         format!("{}/{}", self.get_stream_path(stream_id), self.topic.path)
     }
 
-    pub fn get_topic_path(&self, stream_id: u32, topic_id: u32) -> String {
+    pub fn get_topic_path(&self, stream_id: usize, topic_id: usize) -> String {
         format!("{}/{}", self.get_topics_path(stream_id), topic_id)
     }
 
-    pub fn get_partitions_path(&self, stream_id: u32, topic_id: u32) -> String {
+    pub fn get_partitions_path(&self, stream_id: usize, topic_id: usize) -> String {
         format!(
             "{}/{}",
             self.get_topic_path(stream_id, topic_id),
@@ -213,7 +213,12 @@ impl SystemConfig {
         )
     }
 
-    pub fn get_partition_path(&self, stream_id: u32, topic_id: u32, partition_id: u32) -> String {
+    pub fn get_partition_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
         format!(
             "{}/{}",
             self.get_partitions_path(stream_id, topic_id),
@@ -221,7 +226,12 @@ impl SystemConfig {
         )
     }
 
-    pub fn get_offsets_path(&self, stream_id: u32, topic_id: u32, partition_id: u32) -> String {
+    pub fn get_offsets_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+    ) -> String {
         format!(
             "{}/offsets",
             self.get_partition_path(stream_id, topic_id, partition_id)
@@ -230,9 +240,9 @@ impl SystemConfig {
 
     pub fn get_consumer_offsets_path(
         &self,
-        stream_id: u32,
-        topic_id: u32,
-        partition_id: u32,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
     ) -> String {
         format!(
             "{}/consumers",
@@ -242,9 +252,9 @@ impl SystemConfig {
 
     pub fn get_consumer_group_offsets_path(
         &self,
-        stream_id: u32,
-        topic_id: u32,
-        partition_id: u32,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
     ) -> String {
         format!(
             "{}/groups",
@@ -254,9 +264,9 @@ impl SystemConfig {
 
     pub fn get_segment_path(
         &self,
-        stream_id: u32,
-        topic_id: u32,
-        partition_id: u32,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
         start_offset: u64,
     ) -> String {
         format!(

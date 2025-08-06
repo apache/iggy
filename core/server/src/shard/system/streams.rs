@@ -218,7 +218,7 @@ impl IggyShard {
             .borrow()
             .create_stream(session.get_user_id())?;
         let stream_id = self.create_stream2_base(name, stats).await?;
-        create_stream_file_hierarchy(stream_id, &self.config.system).await?;
+        create_stream_file_hierarchy(self.id, stream_id, &self.config.system).await?;
         Ok(stream_id)
     }
 

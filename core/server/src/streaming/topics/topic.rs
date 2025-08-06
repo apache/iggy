@@ -114,8 +114,8 @@ impl Topic {
         max_topic_size: MaxTopicSize,
         replication_factor: u8,
     ) -> Result<CreatedTopicInfo, IggyError> {
-        let path = config.get_topic_path(stream_id, topic_id);
-        let partitions_path = config.get_partitions_path(stream_id, topic_id);
+        let path = config.get_topic_path(stream_id as usize, topic_id as usize);
+        let partitions_path = config.get_partitions_path(stream_id as usize, topic_id as usize);
         let mut topic = Topic {
             stream_id,
             topic_id,
@@ -316,8 +316,8 @@ mod tests {
         let segments_count_of_parent_stream = Arc::new(AtomicU32::new(0));
 
         let topic_info = Topic::create(
-            stream_id,
-            topic_id,
+            stream_id as u32,
+            topic_id as u32,
             name,
             partitions_count,
             config,
@@ -332,8 +332,8 @@ mod tests {
         )
         .unwrap();
         let topic = topic_info.topic;
-        assert_eq!(topic.stream_id, stream_id);
-        assert_eq!(topic.topic_id, topic_id);
+        assert_eq!(topic.stream_id, stream_id as u32);
+        assert_eq!(topic.topic_id, topic_id as u32);
         assert_eq!(topic.path, path);
         assert_eq!(topic.name, name);
         assert_eq!(topic.partitions.len(), partitions_count as usize);
@@ -341,7 +341,7 @@ mod tests {
 
         for (id, partition) in topic.partitions {
             let partition = partition.read().await;
-            assert_eq!(partition.stream_id, stream_id);
+            assert_eq!(partition.stream_id, stream_id as u32);
             assert_eq!(partition.topic_id, topic.topic_id);
             assert_eq!(partition.partition_id, id);
             assert_eq!(partition.segments.len(), 1);

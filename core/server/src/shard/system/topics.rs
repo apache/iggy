@@ -192,6 +192,7 @@ impl IggyShard {
         );
 
         // TODO: Create dir hierarchy for the topic.
+        
         let partition_ids = self.create_partitions2_base(
             stream_id,
             &Identifier::numeric(topic_id as u32).unwrap(),

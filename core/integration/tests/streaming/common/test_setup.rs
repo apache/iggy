@@ -61,11 +61,11 @@ impl TestSetup {
 
     pub async fn create_stream_directory(&self, stream_id: u32) {
         self.create_streams_directory().await;
-        if fs::metadata(&self.config.get_stream_path(stream_id))
+        if fs::metadata(&self.config.get_stream_path(stream_id as usize))
             .await
             .is_err()
         {
-            fs::create_dir(&self.config.get_stream_path(stream_id))
+            fs::create_dir(&self.config.get_stream_path(stream_id as usize))
                 .await
                 .unwrap();
         }
@@ -73,11 +73,11 @@ impl TestSetup {
 
     pub async fn create_topics_directory(&self, stream_id: u32) {
         self.create_stream_directory(stream_id).await;
-        if fs::metadata(&self.config.get_topics_path(stream_id))
+        if fs::metadata(&self.config.get_topics_path(stream_id as usize))
             .await
             .is_err()
         {
-            fs::create_dir(&self.config.get_topics_path(stream_id))
+            fs::create_dir(&self.config.get_topics_path(stream_id as usize))
                 .await
                 .unwrap();
         }
@@ -85,11 +85,11 @@ impl TestSetup {
 
     pub async fn create_topic_directory(&self, stream_id: u32, topic_id: u32) {
         self.create_topics_directory(stream_id).await;
-        if fs::metadata(&self.config.get_topic_path(stream_id, topic_id))
+        if fs::metadata(&self.config.get_topic_path(stream_id as usize, topic_id as usize))
             .await
             .is_err()
         {
-            fs::create_dir(&self.config.get_topic_path(stream_id, topic_id))
+            fs::create_dir(&self.config.get_topic_path(stream_id as usize, topic_id as usize))
                 .await
                 .unwrap();
         }
@@ -97,11 +97,11 @@ impl TestSetup {
 
     pub async fn create_partitions_directory(&self, stream_id: u32, topic_id: u32) {
         self.create_topic_directory(stream_id, topic_id).await;
-        if fs::metadata(&self.config.get_partitions_path(stream_id, topic_id))
+        if fs::metadata(&self.config.get_partitions_path(stream_id as usize, topic_id as usize))
             .await
             .is_err()
         {
-            fs::create_dir(&self.config.get_partitions_path(stream_id, topic_id))
+            fs::create_dir(&self.config.get_partitions_path(stream_id as usize, topic_id as usize))
                 .await
                 .unwrap();
         }
@@ -117,7 +117,7 @@ impl TestSetup {
         if fs::metadata(
             &self
                 .config
-                .get_partition_path(stream_id, topic_id, partition_id),
+                .get_partition_path(stream_id as usize, topic_id as usize, partition_id as usize),
         )
         .await
         .is_err()
@@ -125,7 +125,7 @@ impl TestSetup {
             fs::create_dir(
                 &self
                     .config
-                    .get_partition_path(stream_id, topic_id, partition_id),
+                    .get_partition_path(stream_id as usize, topic_id as usize, partition_id as usize),
             )
             .await
             .unwrap();
