@@ -17,25 +17,25 @@
  * under the License.
  */
 
-package org.apache.iggy.client.blocking;
+package org.apache.iggy.client.async;
 
-import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
-import org.apache.iggy.client.blocking.http.IggyHttpClient;
+import org.apache.iggy.client.async.tcp.IggyTcpAsyncClient;
+import java.util.concurrent.CompletableFuture;
 
 /**
- * Builder for creating instances of {@link IggyClient}.
+ * Builder for creating instances of {@link IggyAsyncClient}.
  */
-public class IggyClientBuilder {
+public class IggyAsyncClientBuilder {
 
-    private IggyBaseClient client;
+    private IggyBaseAsyncClient client;
 
     /**
-     * Sets the base client to use.
+     * Sets the base async client to use.
      *
-     * @param client the base client
+     * @param client the base async client
      * @return this builder
      */
-    public IggyClientBuilder withBaseClient(IggyBaseClient client) {
+    public IggyAsyncClientBuilder withBaseClient(IggyBaseAsyncClient client) {
         this.client = client;
         return this;
     }
@@ -47,35 +47,37 @@ public class IggyClientBuilder {
      * @param port the server port
      * @return this builder
      */
-    public IggyClientBuilder withTcpClient(String host, Integer port) {
-        IggyTcpClient tcpClient = new IggyTcpClient(host, port);
+    public IggyAsyncClientBuilder withTcpClient(String host, Integer port) {
+        IggyTcpAsyncClient tcpClient = new IggyTcpAsyncClient(host, port);
         this.client = tcpClient;
         return this;
     }
 
     /**
-     * Configures the builder to use an HTTP client.
+     * Builds a new {@link IggyAsyncClient} instance and connects to the server.
      *
-     * @param baseUrl the base URL of the server
-     * @return this builder
+     * @return a CompletableFuture that emits the connected IggyAsyncClient
+     * @throws IllegalArgumentException if the base client is not provided
      */
-    public IggyClientBuilder withHttpClient(String baseUrl) {
-        IggyHttpClient httpClient = new IggyHttpClient(baseUrl);
-        this.client = httpClient;
-        return this;
+    public CompletableFuture<IggyAsyncClient> buildAndConnect() {
+        IggyAsyncClient asyncClient = build();
+        if (client instanceof IggyTcpAsyncClient) {
+            return ((IggyTcpAsyncClient) client).connect()
+                    .thenApply(v -> asyncClient);
+        }
+        return CompletableFuture.completedFuture(asyncClient);
     }
 
     /**
-     * Builds a new {@link IggyClient} instance.
+     * Builds a new {@link IggyAsyncClient} instance.
      *
-     * @return a new IggyClient
+     * @return a new IggyAsyncClient
      * @throws IllegalArgumentException if the base client is not provided
      */
-    public IggyClient build() {
+    public IggyAsyncClient build() {
         if (client == null) {
             throw new IllegalArgumentException("Base client not provided");
         }
-        return new IggyClient(client);
+        return new IggyAsyncClient(client);
     }
-
 }
