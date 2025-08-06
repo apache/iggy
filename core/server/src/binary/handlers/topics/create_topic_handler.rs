@@ -32,9 +32,9 @@ use crate::streaming::stats::stats::TopicStats;
 use crate::streaming::topics::topic::Topic;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy_common::IggyError;
 use iggy_common::create_topic::CreateTopic;
 use iggy_common::locking::IggyRwLockFn;
+use iggy_common::{Identifier, IggyError};
 use std::rc::Rc;
 use std::sync::Arc;
 use tracing::{debug, instrument};
@@ -65,7 +65,6 @@ impl ServerCommandHandler for CreateTopic {
                 &stream_id,
                 maybe_topic_id,
                 self.name.clone(),
-                self.partitions_count,
                 self.message_expiry,
                 self.compression_algorithm,
                 self.max_topic_size,
@@ -73,11 +72,20 @@ impl ServerCommandHandler for CreateTopic {
                 stats.clone(),
             )
             .await?;
+
+        shard
+            .create_partitions2(
+                session,
+                &stream_id,
+                &Identifier::numeric(new_topic_id as u32).unwrap(),
+                self.partitions_count,
+            )
+            .await?;
+
         let event = ShardEvent::CreatedTopic2 {
             stream_id: self.stream_id.clone(),
             id: new_topic_id,
             name: self.name.clone(),
-            partitions_count: self.partitions_count,
             message_expiry: self.message_expiry,
             compression_algorithm: self.compression_algorithm,
             max_topic_size: self.max_topic_size,

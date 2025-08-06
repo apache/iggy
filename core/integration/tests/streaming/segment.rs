@@ -66,9 +66,11 @@ async fn should_persist_segment() {
             .await;
         segment.open().await.unwrap();
         assert_persisted_segment(
-            &setup
-                .config
-                .get_partition_path(stream_id as usize, topic_id as usize, partition_id as usize),
+            &setup.config.get_partition_path(
+                stream_id as usize,
+                topic_id as usize,
+                partition_id as usize,
+            ),
             start_offset,
         )
         .await;
@@ -103,9 +105,11 @@ async fn should_load_existing_segment_from_disk() {
             .await;
         segment.open().await.unwrap();
         assert_persisted_segment(
-            &setup
-                .config
-                .get_partition_path(stream_id as usize, topic_id as usize, partition_id as usize),
+            &setup.config.get_partition_path(
+                stream_id as usize,
+                topic_id as usize,
+                partition_id as usize,
+            ),
             start_offset,
         )
         .await;
@@ -173,9 +177,11 @@ async fn should_persist_and_load_segment_with_messages() {
         .await;
     segment.open().await.unwrap();
     assert_persisted_segment(
-        &setup
-            .config
-            .get_partition_path(stream_id as usize, topic_id as usize, partition_id as usize),
+        &setup.config.get_partition_path(
+            stream_id as usize,
+            topic_id as usize,
+            partition_id as usize,
+        ),
         start_offset,
     )
     .await;
@@ -259,9 +265,11 @@ async fn given_at_least_one_not_expired_message_segment_should_not_be_expired() 
         .await;
     segment.open().await.unwrap();
     assert_persisted_segment(
-        &setup
-            .config
-            .get_partition_path(stream_id as usize, topic_id as usize, partition_id as usize),
+        &setup.config.get_partition_path(
+            stream_id as usize,
+            topic_id as usize,
+            partition_id as usize,
+        ),
         start_offset,
     )
     .await;

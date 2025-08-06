@@ -41,6 +41,18 @@ impl Stream {
         }
     }
 
+    pub fn invoke<T>(&self, f: impl FnOnce(&Self) -> T) -> T {
+        f(self)
+    }
+
+    pub fn invoke_mut<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        f(self)
+    }
+
+    pub async fn invoke_async<T>(&self, f: impl AsyncFnOnce(&Self) -> T) -> T {
+        f(self).await
+    }
+
     pub fn id(&self) -> usize {
         self.id
     }

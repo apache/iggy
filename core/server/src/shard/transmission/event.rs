@@ -75,7 +75,6 @@ pub enum ShardEvent {
         id: usize,
         stream_id: Identifier,
         name: String,
-        partitions_count: u32,
         message_expiry: IggyExpiry,
         compression_algorithm: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,

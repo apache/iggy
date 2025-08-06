@@ -103,12 +103,20 @@ impl Partition {
         segments_count_of_parent_stream: Arc<AtomicU32>,
         created_at: IggyTimestamp,
     ) -> Partition {
-        let partition_path = config.get_partition_path(stream_id as usize, topic_id as usize, partition_id as usize);
-        let offsets_path = config.get_offsets_path(stream_id as usize, topic_id as usize, partition_id as usize);
-        let consumer_offsets_path =
-            config.get_consumer_offsets_path(stream_id as usize, topic_id as usize, partition_id as usize);
-        let consumer_group_offsets_path =
-            config.get_consumer_group_offsets_path(stream_id as usize, topic_id as usize, partition_id as usize);
+        let partition_path =
+            config.get_partition_path(stream_id as usize, topic_id as usize, partition_id as usize);
+        let offsets_path =
+            config.get_offsets_path(stream_id as usize, topic_id as usize, partition_id as usize);
+        let consumer_offsets_path = config.get_consumer_offsets_path(
+            stream_id as usize,
+            topic_id as usize,
+            partition_id as usize,
+        );
+        let consumer_group_offsets_path = config.get_consumer_group_offsets_path(
+            stream_id as usize,
+            topic_id as usize,
+            partition_id as usize,
+        );
 
         let message_deduplicator = match config.message_deduplication.enabled {
             true => Some(MessageDeduplicator::new(
@@ -244,7 +252,8 @@ mod tests {
         let topic_id = 2usize;
         let partition_id = 3usize;
         let with_segment = true;
-        let path = config.get_partition_path(stream_id as usize, topic_id as usize, partition_id as usize);
+        let path =
+            config.get_partition_path(stream_id as usize, topic_id as usize, partition_id as usize);
         let message_expiry = IggyExpiry::ExpireDuration(IggyDuration::from(10));
         let partition = Partition::create(
             stream_id as u32,

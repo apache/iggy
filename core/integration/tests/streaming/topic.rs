@@ -60,7 +60,9 @@ async fn should_persist_topics_with_partitions_directories_and_info_file() {
 
         assert_persisted_topic(
             &topic.path,
-            &setup.config.get_partitions_path(stream_id as usize, topic_id as usize),
+            &setup
+                .config
+                .get_partitions_path(stream_id as usize, topic_id as usize),
             3,
         )
         .await;
@@ -97,7 +99,9 @@ async fn should_load_existing_topic_from_disk() {
         topic.persist().await.unwrap();
         assert_persisted_topic(
             &topic.path,
-            &setup.config.get_partitions_path(stream_id as usize, topic_id as usize),
+            &setup
+                .config
+                .get_partitions_path(stream_id as usize, topic_id as usize),
             partitions_count,
         )
         .await;
@@ -174,7 +178,9 @@ async fn should_delete_existing_topic_from_disk() {
         topic.persist().await.unwrap();
         assert_persisted_topic(
             &topic.path,
-            &setup.config.get_partitions_path(stream_id as usize, topic_id as usize),
+            &setup
+                .config
+                .get_partitions_path(stream_id as usize, topic_id as usize),
             partitions_count,
         )
         .await;
@@ -214,7 +220,9 @@ async fn should_purge_existing_topic_on_disk() {
         topic.persist().await.unwrap();
         assert_persisted_topic(
             &topic.path,
-            &setup.config.get_partitions_path(stream_id as usize, topic_id as usize),
+            &setup
+                .config
+                .get_partitions_path(stream_id as usize, topic_id as usize),
             partitions_count,
         )
         .await;

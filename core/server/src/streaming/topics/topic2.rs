@@ -1,5 +1,15 @@
-use crate::slab::{IndexedSlab, Keyed, consumer_groups::ConsumerGroups, partitions::Partitions};
+use crate::{
+    slab::{
+        IndexedSlab, Keyed,
+        consumer_groups::ConsumerGroups,
+        partitions::{PARTITIONS_CAPACITY, Partitions},
+    },
+    streaming::partitions::partition::ConsumerOffset,
+};
+use ahash::AHashMap;
+use dashmap::DashMap;
 use iggy_common::{CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize};
+use slab::Slab;
 
 #[derive(Default, Debug)]
 pub struct Topic {
@@ -14,8 +24,9 @@ pub struct Topic {
 
     partitions: Partitions,
     consumer_groups: ConsumerGroups,
-    //consumer_offsets: (),
-    //consumer_group_offsets: (),
+
+    consumer_offsets: Slab<AHashMap<usize, ConsumerOffset>>,
+    consumer_group_offsets: Slab<AHashMap<usize, ConsumerOffset>>,
 }
 
 impl Topic {
@@ -30,12 +41,14 @@ impl Topic {
             id: 0,
             name,
             created_at: IggyTimestamp::now(),
-            partitions: Partitions::default(),
-            consumer_groups: ConsumerGroups::default(),
             replication_factor,
             message_expiry,
             compression_algorithm: compression,
             max_topic_size,
+            partitions: Partitions::default(),
+            consumer_groups: ConsumerGroups::default(),
+            consumer_offsets: Slab::with_capacity(PARTITIONS_CAPACITY),
+            consumer_group_offsets: Slab::with_capacity(PARTITIONS_CAPACITY),
         }
     }
 
@@ -97,6 +110,22 @@ impl Topic {
 
     pub fn consumer_groups_mut(&mut self) -> &mut ConsumerGroups {
         &mut self.consumer_groups
+    }
+
+    pub fn consumer_offsets(&self) -> &Slab<AHashMap<usize, ConsumerOffset>> {
+        &self.consumer_offsets
+    }
+
+    pub fn consumer_offsets_mut(&mut self) -> &mut Slab<AHashMap<usize, ConsumerOffset>> {
+        &mut self.consumer_offsets
+    }
+
+    pub fn consumer_group_offsets(&self) -> &Slab<AHashMap<usize, ConsumerOffset>> {
+        &self.consumer_group_offsets
+    }
+
+    pub fn consumer_group_offsets_mut(&mut self) -> &mut Slab<AHashMap<usize, ConsumerOffset>> {
+        &mut self.consumer_group_offsets
     }
 
     pub fn insert_into(self, container: &mut IndexedSlab<Self>) -> usize {

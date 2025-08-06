@@ -19,7 +19,9 @@
 use super::COMPONENT;
 use crate::shard::IggyShard;
 use crate::streaming::partitions::partition2;
+use crate::streaming::partitions::storage2::create_partition_file_hierarchy;
 use crate::streaming::session::Session;
+use ahash::AHashMap;
 use error_set::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
@@ -39,6 +41,8 @@ impl IggyShard {
                 // Create partitions...
                 let partition_ids = std::iter::repeat_with(partition2::Partition::new)
                     .map(|partition| {
+                        topic.consumer_group_offsets_mut().insert(AHashMap::new());
+                        topic.consumer_offsets_mut().insert(AHashMap::new());
                         topic
                             .partitions_mut()
                             .with_mut(|partitions| partition.insert_into(partitions))
@@ -58,13 +62,13 @@ impl IggyShard {
         partitions_count: u32,
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
+        let numeric_stream_id = self
+            .streams2
+            .with_stream_by_id(stream_id, |stream| stream.id());
+        let numeric_topic_id = self
+            .streams2
+            .with_topic_by_id(stream_id, topic_id, |topic| topic.id());
         {
-            let numeric_stream_id = self
-                .streams2
-                .with_stream_by_id(stream_id, |stream| stream.id());
-            let numeric_topic_id = self
-                .streams2
-                .with_topic_by_id(stream_id, topic_id, |topic| topic.id());
             self.permissioner.borrow().create_partitions(
                 session.get_user_id(),
                 numeric_stream_id as u32,
@@ -76,7 +80,23 @@ impl IggyShard {
                 numeric_topic_id
             ))?;
         }
-        self.create_partitions2_base(stream_id, topic_id, partitions_count);
+
+        let partition_ids = self.create_partitions2_base(stream_id, topic_id, partitions_count);
+        //  Create file hierarchy for partition
+        for partition_id in partition_ids {
+            create_partition_file_hierarchy(
+                self.id,
+                numeric_stream_id,
+                numeric_topic_id,
+                partition_id,
+                &self.config.system,
+            )
+            .await?;
+
+            // And open descriptors for partitions that belong to _this_ shard.
+            // Or maybe not, maybe those should be opened lazily ?
+            // I think the lazy option is better - Claude Sonnet 4
+        }
         Ok(())
     }
 

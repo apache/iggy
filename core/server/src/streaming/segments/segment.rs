@@ -85,7 +85,12 @@ impl Segment {
         messages_count_of_parent_partition: Arc<AtomicU64>,
         fresh: bool, // `fresh` means created and persisted in this runtime, in other words it's set to false when loading from disk
     ) -> Segment {
-        let path = config.get_segment_path(stream_id as usize, topic_id as usize, partition_id as usize, start_offset);
+        let path = config.get_segment_path(
+            stream_id as usize,
+            topic_id as usize,
+            partition_id as usize,
+            start_offset,
+        );
         let messages_path = Self::get_messages_file_path(&path);
         let index_path = Self::get_index_path(&path);
         let message_expiry = match message_expiry {

@@ -25,9 +25,11 @@ use crate::shard::transmission::event::ShardEvent;
 use crate::shard::{IggyShard, ShardInfo};
 use crate::shard_info;
 use crate::streaming::partitions::partition2;
+use crate::streaming::partitions::storage2::create_partition_file_hierarchy;
 use crate::streaming::session::Session;
 use crate::streaming::stats::stats::TopicStats;
 use crate::streaming::streams::stream::Stream;
+use crate::streaming::topics::storage2::create_topic_file_hierarchy;
 use crate::streaming::topics::topic::Topic;
 use crate::streaming::topics::topic2;
 use clap::Id;
@@ -146,7 +148,6 @@ impl IggyShard {
         stream_id: &Identifier,
         topic_id: Option<u32>,
         name: String,
-        partitions_count: u32,
         message_expiry: IggyExpiry,
         compression: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,
@@ -155,13 +156,13 @@ impl IggyShard {
     ) -> Result<usize, IggyError> {
         self.ensure_authenticated(session)?;
         //self.ensure_stream_exists(stream_id)?;
+        let numeric_stream_id = self
+            .streams2
+            .with_stream_by_id(stream_id, |stream| stream.id());
         {
-            let stream_id = self
-                .streams2
-                .with_stream_by_id(stream_id, |stream| stream.id());
             self.permissioner
             .borrow()
-                .create_topic(session.get_user_id(), stream_id as u32)
+                .create_topic(session.get_user_id(), numeric_stream_id as u32)
                 .with_error_context(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - permission denied to create topic with name: {name} in stream with ID: {stream_id} for user with ID: {}",
@@ -191,14 +192,9 @@ impl IggyShard {
             },
         );
 
-        // TODO: Create dir hierarchy for the topic.
-        
-        let partition_ids = self.create_partitions2_base(
-            stream_id,
-            &Identifier::numeric(topic_id as u32).unwrap(),
-            partitions_count,
-        );
-        // TODO: Create partition files and open descriptors for partitions that belong to _this_ shard.
+        // Create file hierarchy for the topic.
+        create_topic_file_hierarchy(self.id, numeric_stream_id, topic_id, &self.config.system)
+            .await?;
         Ok(topic_id)
     }
 
@@ -206,7 +202,6 @@ impl IggyShard {
         &self,
         stream_id: &Identifier,
         name: String,
-        partitions_count: u32,
         replication_factor: Option<u8>,
         message_expiry: IggyExpiry,
         compression: CompressionAlgorithm,
@@ -222,12 +217,6 @@ impl IggyShard {
             max_topic_size,
             stats,
         )?;
-        let partition_ids = self.create_partitions2_base(
-            stream_id,
-            &Identifier::numeric(topic_id as u32).unwrap(),
-            partitions_count,
-        );
-        // TODO: Open descriptors for partitions that belong to _this_ shard.
         Ok(topic_id)
     }
 

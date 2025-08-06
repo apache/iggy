@@ -837,7 +837,6 @@ impl IggyShard {
                 id,
                 stream_id,
                 name,
-                partitions_count,
                 message_expiry,
                 compression_algorithm,
                 max_topic_size,
@@ -847,7 +846,6 @@ impl IggyShard {
                 let topic_id = self.create_topic2_bypass_auth(
                     stream_id,
                     name.to_owned(),
-                    *partitions_count,
                     *replication_factor,
                     *message_expiry,
                     *compression_algorithm,
