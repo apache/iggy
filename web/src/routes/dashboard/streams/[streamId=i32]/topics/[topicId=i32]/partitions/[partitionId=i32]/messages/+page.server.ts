@@ -45,7 +45,7 @@ export const load = async ({ params, cookies, url }) => {
     const { data: initialData } = await handleFetchErrors(initialResult, cookies);
     const initialMessages = partitionMessagesDetailsMapper(initialData as any);
 
-    const totalMessages = initialMessages.currentOffset;
+    const totalMessages = initialMessages.currentOffset + 1;
     const offset =
       url.searchParams.get('offset') ??
       (direction === 'desc' ? Math.max(0, totalMessages - MESSAGES_PER_PAGE).toString() : '0');

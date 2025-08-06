@@ -6,7 +6,7 @@
   import { openModal } from '$lib/components/Modals/AppModals.svelte';
   import SortableList from '$lib/components/SortableList.svelte';
   import Paginator from '$lib/components/Paginator.svelte';
-  import type { Message, MessagePartition } from '$lib/domain/Message';
+  import type { MessagePartition } from '$lib/domain/Message';
   import type { TopicDetails } from '$lib/domain/TopicDetails';
 
   interface Props {
@@ -71,7 +71,7 @@
 
   <div class="flex gap-3 ml-7">
     <div class="chip">
-      <span>Messages: {partitionMessages.currentOffset}</span>
+      <span>Messages: {partitionMessages.messages.length > 0 ? partitionMessages.currentOffset + 1 : 0}</span>
     </div>
   </div>
 
