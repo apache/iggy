@@ -18,10 +18,27 @@
  */
 
 
-export * from './create-stream.command.js';
-export * from './delete-stream.command.js';
-export * from './get-stream.command.js';
-export * from './get-streams.command.js';
-export * from './purge-stream.command.js';
-export * from './update-stream.command.js';
-export * from './ensure-stream.virtual.command.js';
+import { Id } from '../identifier.utils.js';
+import { ClientProvider } from '../../client/index.js';
+import { createTopic } from './create-topic.command.js';
+import { getTopic } from './get-topic.command.js';
+
+export const ensureTopic = (c: ClientProvider) =>
+  async function ensureTopic(
+    streamId: Id,
+    topicId: number,
+    topicName = `ensure-topic-${streamId}-${topicId}`,
+    partitionCount = 1,
+    compressionAlgorithm = 1
+  ) {
+    const topic = await getTopic(c)({ streamId, topicId });
+    return topic === null ?
+      createTopic(c)({
+        streamId,
+        topicId,
+        name: topicName,
+        partitionCount,
+        compressionAlgorithm
+      }) :
+      true;
+  };
