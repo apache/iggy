@@ -33,31 +33,4 @@ export const getClient = () => {
   };
 
   return new Client(opt);
-}
-
-export const ensureStream = async (cli: Client, streamId: number) => {
-  const s = await cli.stream.get({ streamId });
-  return s === null ?
-    cli.stream.create({ streamId, name: `ensure-stream-${streamId}` }) :
-    true;
-}
-
-export const ensureTopic = async (
-  cli: Client,
-  streamId: number,
-  topicId: number,
-  partitionCount = 1,
-  compressionAlgorithm = 1
-) => {
-  const t = await cli.topic.get({ streamId, topicId });
-  return t === null ?
-    cli.topic.create({
-      streamId,
-      topicId,
-      name: `ensure-topic-${streamId}-${topicId}`,
-      partitionCount,
-      compressionAlgorithm
-    }) :
-    true;
-}
-
+};

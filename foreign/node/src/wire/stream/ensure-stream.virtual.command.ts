@@ -18,10 +18,21 @@
  */
 
 
-export * from './create-stream.command.js';
-export * from './delete-stream.command.js';
-export * from './get-stream.command.js';
-export * from './get-streams.command.js';
-export * from './purge-stream.command.js';
-export * from './update-stream.command.js';
-export * from './ensure-stream.virtual.command.js';
+import { ClientProvider } from '../../client/index.js';
+import { createStream } from './create-stream.command.js';
+import { getStream } from './get-stream.command.js';
+
+
+export const ensureStream = (c: ClientProvider) =>
+  async function ensureStream(
+    streamId: number,
+    streamName = `ensure-stream-${streamId}`
+  ) {
+    const stream = await getStream(c)({ streamId });
+    return stream === null ?
+      createStream(c)({
+        streamId,
+        name: streamName,
+      }) :
+      true;
+  };

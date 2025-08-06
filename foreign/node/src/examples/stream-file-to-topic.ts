@@ -23,7 +23,7 @@ import { resolve } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { Writable, type TransformCallback } from 'node:stream';
 import { HeaderValue } from '../index.js';
-import { getClient, ensureStream, ensureTopic } from './utils.js';
+import { getClient } from './utils.js';
 
 export const fileToTopic = async (
   filepath: string,
@@ -32,8 +32,8 @@ export const fileToTopic = async (
   highWaterMark = 512 * 1024
 ) => {
   const cli = getClient();
-  await ensureStream(cli, streamId);
-  await ensureTopic(cli, streamId, topicId);
+  await cli.stream.ensure(streamId);
+  await cli.topic.ensure(streamId, topicId);
   const fd = await open(filepath);
   const fname = filepath.split('/').pop() || filepath;
   const st = await fd.stat();
