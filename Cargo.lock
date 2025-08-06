@@ -1531,7 +1531,7 @@ dependencies = [
  "rust-ini",
  "serde",
  "serde_json",
- "toml 0.9.4",
+ "toml 0.9.5",
  "winnow 0.7.12",
  "yaml-rust2",
 ]
@@ -3840,7 +3840,7 @@ dependencies = [
  "serde",
  "sysinfo 0.36.1",
  "tokio",
- "toml 0.9.4",
+ "toml 0.9.5",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -3891,7 +3891,7 @@ dependencies = [
  "strum",
  "thiserror 2.0.12",
  "tokio",
- "toml 0.9.4",
+ "toml 0.9.5",
  "tower-http",
  "tracing",
  "tracing-subscriber",
@@ -3934,7 +3934,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "toml 0.9.4",
+ "toml 0.9.5",
  "tracing",
 ]
 
@@ -7270,7 +7270,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-util",
- "toml 0.9.4",
+ "toml 0.9.5",
  "tower-http",
  "tracing",
  "tracing-appender",
@@ -8149,9 +8149,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "0.9.4"
+version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41ae868b5a0f67631c14589f7e250c1ea2c574ee5ba21c6c8dd4b1485705a5a1"
+checksum = "75129e1dc5000bfbaa9fee9d1b21f974f9fbad9daec557a521ee6e080825f6e8"
 dependencies = [
  "indexmap 2.10.0",
  "serde",
@@ -8207,9 +8207,9 @@ dependencies = [
 
 [[package]]
 name = "toml_parser"
-version = "1.0.1"
+version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97200572db069e74c512a14117b296ba0a80a30123fbbb5aa1f4a348f639ca30"
+checksum = "b551886f449aa90d4fe2bdaa9f4a2577ad2dde302c61ecf262d80b116db95c10"
 dependencies = [
  "winnow 0.7.12",
 ]
