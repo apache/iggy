@@ -7,8 +7,9 @@
         <TargetFramework>net8.0</TargetFramework>
         <AssemblyName>Apache.Iggy</AssemblyName>
         <RootNamespace>Apache.Iggy</RootNamespace>
+        <PackageVersion>0.5.0</PackageVersion>
     </PropertyGroup>
-    
+
     <PropertyGroup>
         <Description>C# SDK for Apache Iggy</Description>
         <Authors>Apache Iggy</Authors>
@@ -18,11 +19,11 @@
         <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
         <PackageReadmeFile>README.md</PackageReadmeFile>
     </PropertyGroup>
-    
+
     <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
       <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     </PropertyGroup>
-    
+
     <PropertyGroup Condition=" '$(Configuration)' == 'Release' ">
       <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     </PropertyGroup>
@@ -46,5 +47,5 @@
         <Link>Properties\DEPENDENCIES.md</Link>
       </Content>
     </ItemGroup>
-    
+
 </Project>

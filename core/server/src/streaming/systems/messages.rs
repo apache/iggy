@@ -172,13 +172,19 @@ impl System {
                 let payload = encryptor.decrypt(message.payload());
                 match payload {
                     Ok(payload) => {
-                        message.header().write_to_buffer(&mut decrypted_messages);
+                        // Update the header with the decrypted payload length
+                        let mut header = message.header().to_header();
+                        header.payload_length = payload.len() as u32;
+
+                        decrypted_messages.extend_from_slice(&header.to_bytes());
                         decrypted_messages.extend_from_slice(&payload);
                         if let Some(user_headers) = message.user_headers() {
                             decrypted_messages.extend_from_slice(user_headers);
                         }
+                        position += IGGY_MESSAGE_HEADER_SIZE
+                            + payload.len()
+                            + message.header().user_headers_length();
                         indexes.insert(0, position as u32, 0);
-                        position += message.size();
                     }
                     Err(error) => {
                         error!("Cannot decrypt the message. Error: {}", error);
@@ -205,9 +211,8 @@ impl System {
         let mut position = 0;
 
         for message in batch.iter() {
-            let header = message.header();
-            let payload_length = header.payload_length();
-            let user_headers_length = header.user_headers_length();
+            let header = message.header().to_header();
+            let user_headers_length = header.user_headers_length;
             let payload_bytes = message.payload();
             let user_headers_bytes = message.user_headers();
 
@@ -215,13 +220,18 @@ impl System {
 
             match encrypted_payload {
                 Ok(encrypted_payload) => {
-                    encrypted_messages.extend_from_slice(&header.to_bytes());
+                    let mut updated_header = header;
+                    updated_header.payload_length = encrypted_payload.len() as u32;
+
+                    encrypted_messages.extend_from_slice(&updated_header.to_bytes());
                     encrypted_messages.extend_from_slice(&encrypted_payload);
                     if let Some(user_headers_bytes) = user_headers_bytes {
                         encrypted_messages.extend_from_slice(user_headers_bytes);
                     }
+                    position += IGGY_MESSAGE_HEADER_SIZE
+                        + encrypted_payload.len()
+                        + user_headers_length as usize;
                     indexes.insert(0, position as u32, 0);
-                    position += IGGY_MESSAGE_HEADER_SIZE + payload_length + user_headers_length;
                 }
                 Err(error) => {
                     error!("Cannot encrypt the message. Error: {}", error);

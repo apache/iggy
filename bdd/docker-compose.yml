@@ -71,7 +71,7 @@ services:
       - IGGY_TCP_ADDRESS=iggy-server:8090
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
-    command: [ "ginkgo", "-v", "-r" ]
+    command: [ "go", "test", "-v", "./..." ]
 
   node-bdd:
     build:

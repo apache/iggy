@@ -111,7 +111,7 @@ export const deserializePartition = (p: Buffer, pos = 0): PartitionSerialized =>
       segmentsCount: p.readUInt32LE(pos + 12),
       currentOffset: p.readBigUint64LE(pos + 16),
       sizeBytes: p.readBigUint64LE(pos + 24),
-      messagesCount: p.readBigUint64LE(pos + 24),
+      messagesCount: p.readBigUint64LE(pos + 32),
     }
   }
 };

@@ -39,9 +39,9 @@ export const GET_OFFSET = {
     return serializeGetOffset(streamId, topicId, consumer, partitionId);
   },
 
-  deserialize: (r: CommandResponse): OffsetResponse => {
-    if(r.data.length < 20)
-      throw new Error('Offset not found');
+  deserialize: (r: CommandResponse) => {
+    if(r.status === 0 && r.length === 0)
+      return null;
     
     const partitionId = r.data.readUInt32LE(0);
     const currentOffset = r.data.readBigUInt64LE(4);
@@ -56,4 +56,4 @@ export const GET_OFFSET = {
 };
 
 
-export const getOffset = wrapCommand<GetOffset, OffsetResponse>(GET_OFFSET);
+export const getOffset = wrapCommand<GetOffset, OffsetResponse | null>(GET_OFFSET);

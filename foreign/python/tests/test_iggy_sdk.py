@@ -25,12 +25,11 @@ Tests are marked as either 'unit' or 'integration' based on their requirements.
 import asyncio
 from datetime import timedelta
 import uuid
-from typing import List
 
 import pytest
 
-from iggy_py import IggyClient, PollingStrategy, AutoCommit
-from iggy_py import SendMessage as Message
+from apache_iggy import IggyClient, PollingStrategy, AutoCommit
+from apache_iggy import SendMessage as Message
 
 
 class TestConnectivity:
