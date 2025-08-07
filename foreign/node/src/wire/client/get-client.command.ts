@@ -37,7 +37,11 @@ export const GET_CLIENT = {
     return b;
   },
 
-  deserialize: (r: CommandResponse) => deserializeClient(r.data).data
+  deserialize: (r: CommandResponse) => {
+    if(r.status === 0 && r.length === 0)
+      return null;
+    return deserializeClient(r.data).data
+  }
 };
 
-export const getClient = wrapCommand<GetClient, Client>(GET_CLIENT);
+export const getClient = wrapCommand<GetClient, Client | null>(GET_CLIENT);

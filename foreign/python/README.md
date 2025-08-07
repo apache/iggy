@@ -1,4 +1,4 @@
-# iggy_py
+# apache-iggy
 
 [![discord-badge](https://img.shields.io/discord/1144142576266530928)](https://discord.gg/C5Sux5NcRa)
 
@@ -9,7 +9,7 @@ Apache Iggy is the persistent message streaming platform written in Rust, suppor
 ### Basic Installation
 
 ```bash
-pip install iggy-py
+pip install apache-iggy
 ```
 
 ### Development Installation

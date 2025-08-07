@@ -28,7 +28,6 @@ import {
   type CommandAPI,
   Consumer
 } from "../wire/index.js";
-import { debug } from "../client/client.debug.js";
 
 
 const wait = (interval: number, cb?: () => void): Promise<void> =>
@@ -119,18 +118,8 @@ export const groupConsumerStream = (config: ClientConfig) =>
     endOnLastOffset = false
   }: GroupConsumerStreamRequest): Promise<Readable> {
     const s = await getClient(config);
+    await s.group.ensureAndJoin(streamId, topicId, groupId);
     
-    try {
-      await s.group.get({ streamId, topicId, groupId })
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    } catch (err) {
-      const ng = { streamId, topicId, groupId, name: `auto-${groupId}` };
-      debug('group does not exist, creating it', ng);
-      await s.group.create(ng)
-    }
-
-    await s.group.join({ streamId, topicId, groupId });
-
     const poll = {
       streamId,
       topicId,
@@ -139,7 +128,7 @@ export const groupConsumerStream = (config: ClientConfig) =>
       pollingStrategy,
       count,
       autocommit
-    }
+    };
     const ps = Readable.from(
       genEagerUntilPoll(s, poll, interval, endOnLastOffset),
       { objectMode: true }
