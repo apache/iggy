@@ -16,6 +16,28 @@
  * under the License.
  */
 
-pub mod benchmark_producing_consumer;
-pub mod typed_banchmark_producing_consumer;
-pub use benchmark_producing_consumer::BenchmarkProducingConsumer;
+use crate::{
+    actors::{ApiLabel, BatchMetrics, BenchmarkInit},
+    utils::batch_generator::BenchmarkBatchGenerator,
+};
+use bench_report::numeric_parameter::BenchmarkNumericParameter;
+use iggy::prelude::*;
+
+#[derive(Debug, Clone)]
+pub struct BenchmarkProducerConfig {
+    pub producer_id: u32,
+    pub stream_id: u32,
+    pub partitions: u32,
+    pub messages_per_batch: BenchmarkNumericParameter,
+    pub message_size: BenchmarkNumericParameter,
+    pub warmup_time: IggyDuration,
+}
+
+pub trait ProducerClient: Send + Sync {
+    async fn produce_batch(
+        &mut self,
+        batch_generator: &mut BenchmarkBatchGenerator,
+    ) -> Result<Option<BatchMetrics>, IggyError>;
+}
+
+pub trait BenchmarkProducerClient: ProducerClient + BenchmarkInit + ApiLabel + Send + Sync {}

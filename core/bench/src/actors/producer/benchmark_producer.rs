@@ -16,144 +16,102 @@
  * under the License.
  */
 
-use crate::analytics::metrics::individual::from_records;
-use crate::analytics::record::BenchmarkRecord;
-use crate::utils::batch_generator::BenchmarkBatchGenerator;
-use crate::utils::finish_condition::BenchmarkFinishCondition;
-use crate::utils::rate_limiter::BenchmarkRateLimiter;
+use crate::{
+    actors::producer::client::{BenchmarkProducerClient, interface::BenchmarkProducerConfig},
+    analytics::{metrics::individual::from_records, record::BenchmarkRecord},
+    utils::{
+        batch_generator::BenchmarkBatchGenerator, finish_condition::BenchmarkFinishCondition,
+        rate_limiter::BenchmarkRateLimiter,
+    },
+};
 use bench_report::actor_kind::ActorKind;
 use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::individual_metrics::BenchmarkIndividualMetrics;
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use human_repr::HumanCount;
 use iggy::prelude::*;
-use integration::test_server::{ClientFactory, login_root};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tokio::time::Instant;
 use tracing::info;
 
-pub struct BenchmarkProducer {
-    client_factory: Arc<dyn ClientFactory>,
-    benchmark_kind: BenchmarkKind,
-    producer_id: u32,
-    stream_id: u32,
-    partitions: u32,
-    messages_per_batch: BenchmarkNumericParameter,
-    message_size: BenchmarkNumericParameter,
-    finish_condition: Arc<BenchmarkFinishCondition>,
-    warmup_time: IggyDuration,
-    sampling_time: IggyDuration,
-    moving_average_window: u32,
-    limit_bytes_per_second: Option<IggyByteSize>,
+pub struct BenchmarkProducer<P: BenchmarkProducerClient> {
+    pub client: P,
+    pub benchmark_kind: BenchmarkKind,
+    pub finish_condition: Arc<BenchmarkFinishCondition>,
+    pub sampling_time: IggyDuration,
+    pub moving_average_window: u32,
+    pub limit_bytes_per_second: Option<IggyByteSize>,
+    pub config: BenchmarkProducerConfig,
 }
 
-impl BenchmarkProducer {
+impl<P: BenchmarkProducerClient> BenchmarkProducer<P> {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        client_factory: Arc<dyn ClientFactory>,
+    pub const fn new(
+        client: P,
         benchmark_kind: BenchmarkKind,
-        producer_id: u32,
-        stream_id: u32,
-        partitions: u32,
-        messages_per_batch: BenchmarkNumericParameter,
-        message_size: BenchmarkNumericParameter,
         finish_condition: Arc<BenchmarkFinishCondition>,
-        warmup_time: IggyDuration,
         sampling_time: IggyDuration,
         moving_average_window: u32,
         limit_bytes_per_second: Option<IggyByteSize>,
+        config: BenchmarkProducerConfig,
     ) -> Self {
         Self {
-            client_factory,
+            client,
             benchmark_kind,
-            producer_id,
-            stream_id,
-            partitions,
-            messages_per_batch,
-            message_size,
             finish_condition,
-            warmup_time,
             sampling_time,
             moving_average_window,
             limit_bytes_per_second,
+            config,
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     #[allow(clippy::cognitive_complexity)]
-    pub async fn run(self) -> Result<BenchmarkIndividualMetrics, IggyError> {
-        let mut batch_generator =
-            BenchmarkBatchGenerator::new(self.message_size, self.messages_per_batch);
-        let rate_limiter = self.limit_bytes_per_second.map(BenchmarkRateLimiter::new);
-
-        let topic_id: u32 = 1;
-        let default_partition_id: u32 = 1;
-        let partitions = self.partitions;
-        let client = self.client_factory.create_client().await;
-        let client = IggyClient::create(client, None, None);
-        login_root(&client).await;
-
-        let stream_id = self.stream_id.try_into()?;
-        let topic_id = topic_id.try_into()?;
-        let partitioning = match partitions {
-            0 => panic!("Partition count must be greater than 0"),
-            1 => Partitioning::partition_id(default_partition_id),
-            2.. => Partitioning::balanced(),
-        };
-
-        // -----------------------
-        // WARM-UP
-        // -----------------------
-
-        if self.warmup_time.get_duration() != Duration::from_millis(0) {
-            info!(
-                "Producer #{} → warming up for {}...",
-                self.producer_id, self.warmup_time
-            );
-            let warmup_end = Instant::now() + self.warmup_time.get_duration();
-
-            while Instant::now() < warmup_end {
-                let batch = batch_generator.generate_batch();
-                client
-                    .send_messages(&stream_id, &topic_id, &partitioning, &mut batch.messages)
-                    .await?;
-            }
-        }
-        // -----------------------
-        // MAIN BENCHMARK
-        // -----------------------
-
+    pub async fn run(mut self) -> Result<BenchmarkIndividualMetrics, IggyError> {
         info!(
-            "Producer #{} → sending {} in batches of {} messages to stream {} with {} partitions, partitioning: {}, rate limit: {:?}...",
-            self.producer_id,
+            "Producer #{} → sending {} ({} msgs/batch) on stream {}, rate limit: {:?}",
+            self.config.producer_id,
             self.finish_condition.total_str(),
-            self.messages_per_batch,
-            stream_id,
-            partitions,
-            partitioning,
-            self.limit_bytes_per_second
+            self.config.messages_per_batch,
+            self.config.stream_id,
+            self.limit_bytes_per_second,
         );
 
+        self.client.setup().await?;
+
+        let mut batch_generator =
+            BenchmarkBatchGenerator::new(self.config.message_size, self.config.messages_per_batch);
+
+        if self.config.warmup_time.get_duration() != Duration::from_millis(0) {
+            self.log_warmup_info();
+            let warmup_end = Instant::now() + self.config.warmup_time.get_duration();
+
+            while Instant::now() < warmup_end {
+                let _ = self.client.produce_batch(&mut batch_generator).await?;
+            }
+        }
+
+        self.log_setup_info();
+
         let max_capacity = self.finish_condition.max_capacity();
-        let mut records: Vec<BenchmarkRecord> = Vec::with_capacity(max_capacity);
+        let mut records = Vec::with_capacity(max_capacity);
         let mut messages_processed = 0;
         let mut batches_processed = 0;
-        let mut total_bytes_processed = 0;
         let mut user_data_bytes_processed = 0;
+        let mut total_bytes_processed = 0;
+
+        let rate_limiter = self.limit_bytes_per_second.map(BenchmarkRateLimiter::new);
         let start_timestamp = Instant::now();
 
-        loop {
-            if self.finish_condition.is_done() {
-                break;
-            }
-            let batch = batch_generator.generate_batch();
-            let before_send = Instant::now();
-            client
-                .send_messages(&stream_id, &topic_id, &partitioning, &mut batch.messages)
-                .await?;
-            let latency = before_send.elapsed();
+        while !self.finish_condition.is_done() {
+            let batch_opt = self.client.produce_batch(&mut batch_generator).await?;
 
-            messages_processed += batch.messages.len() as u64;
+            let Some(batch) = batch_opt else {
+                continue;
+            };
+
+            messages_processed += u64::from(batch.messages);
             batches_processed += 1;
             user_data_bytes_processed += batch.user_data_bytes;
             total_bytes_processed += batch.total_bytes;
@@ -161,7 +119,7 @@ impl BenchmarkProducer {
             records.push(BenchmarkRecord {
                 elapsed_time_us: u64::try_from(start_timestamp.elapsed().as_micros())
                     .unwrap_or(u64::MAX),
-                latency_us: u64::try_from(latency.as_micros()).unwrap_or(u64::MAX),
+                latency_us: u64::try_from(batch.latency.as_micros()).unwrap_or(u64::MAX),
                 messages: messages_processed,
                 message_batches: batches_processed,
                 user_data_bytes: user_data_bytes_processed,
@@ -178,6 +136,15 @@ impl BenchmarkProducer {
                 .finish_condition
                 .account_and_check(batch.user_data_bytes)
             {
+                info!(
+                    "Producer #{} → finished sending {} messages in {} batches ({} user bytes, {} total bytes), send finish condition: {}",
+                    self.config.producer_id,
+                    messages_processed.human_count_bare(),
+                    batches_processed.human_count_bare(),
+                    user_data_bytes_processed.human_count_bytes(),
+                    total_bytes_processed.human_count_bytes(),
+                    self.finish_condition.status(),
+                );
                 break;
             }
         }
@@ -186,20 +153,39 @@ impl BenchmarkProducer {
             &records,
             self.benchmark_kind,
             ActorKind::Producer,
-            self.producer_id,
+            self.config.producer_id,
             self.sampling_time,
             self.moving_average_window,
         );
 
         Self::log_statistics(
-            self.producer_id,
+            self.config.producer_id,
             messages_processed,
             batches_processed,
-            &self.messages_per_batch,
+            &self.config.messages_per_batch,
             &metrics,
         );
 
         Ok(metrics)
+    }
+
+    fn log_setup_info(&self) {
+        info!(
+            "Producer #{} → sending {} messages per batch (each {} bytes) to stream {} across {} partition(s), using {}...",
+            self.config.producer_id,
+            self.config.messages_per_batch,
+            self.config.message_size,
+            self.config.stream_id,
+            self.config.partitions,
+            P::API_LABEL,
+        );
+    }
+
+    fn log_warmup_info(&self) {
+        info!(
+            "Producer #{} → warming up for {}...",
+            self.config.producer_id, self.config.warmup_time,
+        );
     }
 
     fn log_statistics(
