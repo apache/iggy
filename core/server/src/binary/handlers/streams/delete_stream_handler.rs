@@ -51,6 +51,23 @@ impl ServerCommandHandler for DeleteStream {
         debug!("session: {session}, command: {self}");
         let stream_id = self.stream_id.clone();
 
+        let stream2 = shard
+                                .delete_stream2(session, &self.stream_id)
+                                .with_error_context(|error| {
+                                    format!("{COMPONENT} (error: {error}) - failed to delete stream2 with ID: {stream_id}, session: {session}")
+                                })?;
+        shard_info!(
+            shard.id,
+            "Deleted stream2 with name: {}, ID: {}",
+            stream2.name(),
+            stream2.id()
+        );
+        let event = ShardEvent::DeletedStream2 {
+            id: stream2.id(),
+            stream_id: self.stream_id.clone(),
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+
         let stream = shard
                 .delete_stream(session, &self.stream_id)
                 .with_error_context(|error| {

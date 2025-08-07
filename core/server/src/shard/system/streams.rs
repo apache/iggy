@@ -386,6 +386,59 @@ impl IggyShard {
         Ok(old_name)
     }
 
+    pub fn update_stream2_bypass_auth(&self, id: &Identifier, name: &str) -> Result<(), IggyError> {
+        self.update_stream2_base(id, name.to_string())?;
+        Ok(())
+    }
+
+    pub fn update_stream2(
+        &self,
+        session: &Session,
+        id: &Identifier,
+        name: &str,
+    ) -> Result<(), IggyError> {
+        self.ensure_authenticated(session)?;
+        let stream_id = self
+            .streams2
+            .with_stream_by_id(id, |stream| stream.id() as u32);
+
+        self.permissioner
+            .borrow()
+            .update_stream(session.get_user_id(), stream_id)
+            .with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - failed to update stream, user ID: {}, stream ID: {}",
+                    session.get_user_id(),
+                    stream_id
+                )
+            })?;
+        self.update_stream2_base(id, name.to_string())?;
+        Ok(())
+    }
+
+    fn update_stream2_base(&self, id: &Identifier, name: String) -> Result<String, IggyError> {
+        let old_name = self
+            .streams2
+            .with_stream_by_id(id, |stream| stream.name().clone());
+
+        if old_name == name {
+            return Ok(old_name);
+        }
+
+        // if stream with name already exists, return error
+        if self.streams2.with(|streams| streams.contains_key(&name)) {
+            return Err(IggyError::StreamNameAlreadyExists(name.to_string()));
+        }
+
+        self.streams2.with_stream_by_id_mut(id, |stream| {
+            stream.set_name(name.clone());
+        });
+
+        self.streams2
+            .with_mut(|streams| streams.update_key_unchecked(&old_name, name));
+        Ok(old_name)
+    }
+
     pub fn delete_stream_bypass_auth(&self, id: &Identifier) -> Result<Stream, IggyError> {
         let stream_id;
         let stream_name;
@@ -446,6 +499,75 @@ impl IggyShard {
         Ok(stream)
     }
 
+    pub fn delete_stream2_bypass_auth(
+        &self,
+        id: &Identifier,
+    ) -> Result<stream2::Stream, IggyError> {
+        let stream = self.delete_stream2_base(id)?;
+        Ok(stream)
+    }
+
+    fn delete_stream2_base(&self, id: &Identifier) -> Result<stream2::Stream, IggyError> {
+        let (stream_id, stream_name) = self
+            .streams2
+            .with_stream_by_id(id, |stream| (stream.id() as u32, stream.name().clone()));
+
+        let stream = self.streams2.with_mut(|streams| {
+            streams
+                .try_remove(stream_id as usize)
+                .ok_or_else(|| match id.kind {
+                    iggy_common::IdKind::Numeric => IggyError::StreamIdNotFound(stream_id as u32),
+                    iggy_common::IdKind::String => {
+                        IggyError::StreamNameNotFound(stream_name.clone())
+                    }
+                })
+        })?;
+
+        self.streams2.with_stats_mut(|stats| {
+            if let Some(stream_stats) = stats.try_remove(stream_id as usize) {
+                self.metrics.decrement_streams(1);
+                self.metrics.decrement_topics(0); // TODO: stats doesn't have topic count
+                self.metrics.decrement_partitions(0); // TODO: stats doesn't have partition count
+                self.metrics
+                    .decrement_messages(stream_stats.messages_count());
+                self.metrics
+                    .decrement_segments(stream_stats.segments_count());
+            } else {
+                self.metrics.decrement_streams(1);
+            }
+        });
+
+        self.client_manager
+            .borrow_mut()
+            .delete_consumer_groups_for_stream(stream_id as u32);
+
+        Ok(stream)
+    }
+
+    pub fn delete_stream2(
+        &self,
+        session: &Session,
+        id: &Identifier,
+    ) -> Result<stream2::Stream, IggyError> {
+        self.ensure_authenticated(session)?;
+        // self.ensure_stream_exists(id)?;
+        let stream_id = self
+            .streams2
+            .with_stream_by_id(id, |stream| stream.id() as u32);
+        self.permissioner
+            .borrow()
+            .delete_stream(session.get_user_id(), stream_id as u32)
+            .with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - permission denied to delete stream for user {}, stream ID: {}",
+                    session.get_user_id(),
+                    stream_id,
+                )
+            })?;
+        let stream = self.delete_stream2_base(id)?;
+        Ok(stream)
+    }
+
     pub async fn purge_stream(
         &self,
         session: &Session,
@@ -490,6 +612,36 @@ impl IggyShard {
                 }
             }
         }
+        Ok(())
+    }
+
+    pub fn purge_stream2(&self, session: &Session, id: &Identifier) -> Result<(), IggyError> {
+        self.ensure_authenticated(session)?;
+        // self.ensure_stream_exists(id)?;
+        let stream_id = self
+            .streams2
+            .with_stream_by_id(id, |stream| stream.id() as u32);
+        self.permissioner
+            .borrow()
+            .purge_stream(session.get_user_id(), stream_id)
+            .with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - permission denied to purge stream for user {}, stream ID: {}",
+                    session.get_user_id(),
+                    stream_id,
+                )
+            })?;
+        self.purge_stream2_base(id)?;
+        Ok(())
+    }
+
+    pub fn purge_stream2_bypass_auth(&self, stream_id: &Identifier) -> Result<(), IggyError> {
+        self.purge_stream2_base(stream_id)?;
+        Ok(())
+    }
+
+    fn purge_stream2_base(&self, stream_id: &Identifier) -> Result<(), IggyError> {
+        // TODO
         Ok(())
     }
 }

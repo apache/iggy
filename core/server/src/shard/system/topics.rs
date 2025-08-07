@@ -411,7 +411,7 @@ impl IggyShard {
             compression_algorithm,
             max_topic_size,
             replication_factor.unwrap_or(1),
-        );
+        )?;
         Ok(())
     }
 
@@ -424,7 +424,7 @@ impl IggyShard {
         compression_algorithm: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,
         replication_factor: Option<u8>,
-    ) {
+    ) -> Result<(), IggyError> {
         self.update_topic_base2(
             stream_id,
             topic_id,
@@ -433,7 +433,8 @@ impl IggyShard {
             compression_algorithm,
             max_topic_size,
             replication_factor.unwrap_or(1),
-        );
+        )?;
+        Ok(())
     }
 
     pub fn update_topic_base2(
@@ -445,24 +446,40 @@ impl IggyShard {
         compression_algorithm: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,
         replication_factor: u8,
-    ) {
-        let (old_name, new_name) =
-            self.streams2
-                .with_topic_by_id_mut(stream_id, topic_id, |topic| {
-                    let old_name = topic.name().clone();
-                    topic.set_name(name.clone());
-                    topic.set_message_expiry(message_expiry);
-                    topic.set_compression(compression_algorithm);
-                    topic.set_max_topic_size(max_topic_size);
-                    topic.set_replication_factor(replication_factor);
-                    (old_name, name)
-                    // TODO: Set message expiry for all partitions and segments.
-                });
-        self.streams2.with_topics(stream_id, |topics| {
-            topics.with_mut(|container| {
-                container.rename_unchecked(&old_name, new_name);
-            })
-        });
+    ) -> Result<(), IggyError> {
+        let old_name = self
+            .streams2
+            .with_topic_by_id(stream_id, topic_id, |topic| topic.name().clone());
+
+        if old_name != name {
+            let exists = self.streams2.with_topics(stream_id, |topics| {
+                topics.with(|container| container.contains_key(&name))
+            });
+            if exists {
+                return Err(IggyError::TopicNameAlreadyExists(name, 0));
+            }
+        }
+
+        self.streams2
+            .with_topic_by_id_mut(stream_id, topic_id, |topic| {
+                topic.set_name(name.clone());
+                topic.set_message_expiry(message_expiry);
+                topic.set_compression(compression_algorithm);
+                topic.set_max_topic_size(max_topic_size);
+                topic.set_replication_factor(replication_factor);
+                // TODO: Set message expiry for all partitions and segments.
+            });
+
+        // Only update index if name actually changed
+        if old_name != name {
+            self.streams2.with_topics(stream_id, |topics| {
+                topics.with_mut(|container| {
+                    container.update_key_unchecked(&old_name, name);
+                })
+            });
+        }
+
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]

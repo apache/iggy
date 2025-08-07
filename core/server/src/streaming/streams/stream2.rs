@@ -61,6 +61,10 @@ impl Stream {
         &self.name
     }
 
+    pub fn set_name(&mut self, name: String) {
+        self.name = name;
+    }
+
     pub fn topics_count(&self) -> usize {
         self.topics.len()
     }

@@ -39,11 +39,22 @@ pub enum ShardEvent {
     DeletedStream {
         stream_id: Identifier,
     },
+    DeletedStream2 {
+        id: usize,
+        stream_id: Identifier,
+    },
     UpdatedStream {
         stream_id: Identifier,
         name: String,
     },
+    UpdatedStream2 {
+        stream_id: Identifier,
+        name: String,
+    },
     PurgedStream {
+        stream_id: Identifier,
+    },
+    PurgedStream2 {
         stream_id: Identifier,
     },
     CreatedPartitions2 {

@@ -702,6 +702,10 @@ impl IggyShard {
                 self.update_stream_bypass_auth(stream_id, name)?;
                 Ok(())
             }
+            ShardEvent::UpdatedStream2 { stream_id, name } => {
+                self.update_stream2_bypass_auth(stream_id, name)?;
+                Ok(())
+            }
             ShardEvent::UpdatedTopic {
                 stream_id,
                 topic_id,
@@ -725,6 +729,10 @@ impl IggyShard {
             }
             ShardEvent::PurgedStream { stream_id } => {
                 self.purge_stream_bypass_auth(stream_id).await?;
+                Ok(())
+            }
+            ShardEvent::PurgedStream2 { stream_id } => {
+                self.purge_stream2_bypass_auth(stream_id)?;
                 Ok(())
             }
             ShardEvent::PurgedTopic {
@@ -831,6 +839,11 @@ impl IggyShard {
                     .create_stream2_bypass_auth(name.to_owned(), stats.clone())
                     .await?;
                 assert_eq!(stream_id, *id);
+                Ok(())
+            }
+            ShardEvent::DeletedStream2 { id, stream_id } => {
+                let stream = self.delete_stream2_bypass_auth(stream_id)?;
+                assert_eq!(stream.id(), *id);
                 Ok(())
             }
             ShardEvent::CreatedTopic2 {
@@ -975,6 +988,7 @@ impl IggyShard {
                     ShardEvent::CreatedShardTableRecords { .. }
                         | ShardEvent::DeletedShardTableRecords { .. }
                         | ShardEvent::CreatedStream2 { .. }
+                        | ShardEvent::DeletedStream2 { .. }
                         | ShardEvent::CreatedTopic2 { .. }
                         | ShardEvent::DeletedTopic2 { .. }
                         | ShardEvent::UpdatedTopic2 { .. }

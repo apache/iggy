@@ -53,7 +53,7 @@ impl<T: Keyed + Debug> IndexedSlab<T> {
             .and_then(|index| Some(self.slab.remove(index)))
     }
 
-    pub fn rename_unchecked(&mut self, old: &T::Key, new_key: T::Key) {
+    pub fn update_key_unchecked(&mut self, old: &T::Key, new_key: T::Key) {
         let idx = self.index.remove(old).expect("Rename key: key not found");
         self.index.insert(new_key, idx);
     }
@@ -84,6 +84,10 @@ impl<T: Keyed + Debug> IndexedSlab<T> {
     unsafe fn get_by_key_mut_unchecked(&mut self, key: &T::Key) -> &mut T {
         let index = self.index.get(key).unwrap();
         unsafe { self.slab.get_unchecked_mut(*index) }
+    }
+
+    pub fn contains_key(&self, key: &T::Key) -> bool {
+        self.index.contains_key(key)
     }
 }
 

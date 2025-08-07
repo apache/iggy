@@ -1,6 +1,6 @@
 use std::sync::{
     Arc,
-    atomic::{AtomicU32, AtomicU64},
+    atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
 #[derive(Default, Debug)]
@@ -17,6 +17,18 @@ impl StreamStats {
             messages_count: AtomicU64::new(0),
             segments_count: AtomicU32::new(0),
         }
+    }
+
+    pub fn size_bytes(&self) -> u64 {
+        self.size_bytes.load(Ordering::SeqCst)
+    }
+
+    pub fn messages_count(&self) -> u64 {
+        self.messages_count.load(Ordering::SeqCst)
+    }
+
+    pub fn segments_count(&self) -> u32 {
+        self.segments_count.load(Ordering::SeqCst)
     }
 }
 
