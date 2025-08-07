@@ -19,50 +19,60 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use anyhow::Result;
+use compio_quic::{Endpoint, IdleTimeout, ServerConfig, TransportConfig, VarInt};
 use error_set::ErrContext;
-use quinn::{Endpoint, IdleTimeout, VarInt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tracing::info;
+use tracing::{error, info};
 
 use crate::configs::quic::QuicConfig;
 use crate::quic::COMPONENT;
 use crate::quic::listener;
 use crate::server_error::QuicError;
+use crate::shard::IggyShard;
 
-//TODO: Fixme
-/*
 /// Starts the QUIC server.
 /// Returns the address the server is listening on.
-pub fn start(config: QuicConfig, system: SharedSystem) -> SocketAddr {
-    info!("Initializing Iggy QUIC server...");
-    let address = config.address.parse().unwrap();
-    let quic_config = configure_quic(config);
-    if let Err(error) = quic_config {
-        panic!("Error when configuring QUIC: {error:?}");
-    }
+pub async fn start(shard: Rc<IggyShard>) -> Result<(), iggy_common::IggyError> {
+    let config = shard.config.quic.clone();
+    let addr: SocketAddr = config
+        .address
+        .parse()
+        .expect("Failed to parse QUIC address");
 
-    let endpoint = Endpoint::server(quic_config.unwrap(), address).unwrap();
-    let addr = endpoint.local_addr().unwrap();
-    listener::start(endpoint, system);
-    info!("Iggy QUIC server has started on: {:?}", addr);
-    addr
+    info!("Initializing Iggy QUIC server on shard {}...", shard.id);
+    let server_config = configure_quic(&config).map_err(|e| {
+        error!("Failed to configure QUIC: {:?}", e);
+        iggy_common::IggyError::QuicError
+    })?;
+    let endpoint = Endpoint::server(addr, server_config).await.map_err(|e| {
+        error!("Failed to create QUIC endpoint: {:?}", e);
+        iggy_common::IggyError::CannotBindToSocket(addr.to_string())
+    })?;
+    let actual_addr = endpoint.local_addr().map_err(|e| {
+        error!("Failed to get local address: {e}");
+        iggy_common::IggyError::CannotBindToSocket(addr.to_string())
+    })?;
+    info!("Iggy QUIC server has started on: {:?}", actual_addr);
+    shard.quic_bound_address.set(Some(actual_addr));
+    listener::start(endpoint, shard).await
 }
 
-fn configure_quic(config: QuicConfig) -> Result<quinn::ServerConfig, QuicError> {
-    let (certificate, key) = match config.certificate.self_signed {
+fn configure_quic(config: &QuicConfig) -> Result<ServerConfig, QuicError> {
+    let (certificates, private_key) = match config.certificate.self_signed {
         true => generate_self_signed_cert()?,
         false => load_certificates(&config.certificate.cert_file, &config.certificate.key_file)?,
     };
 
-    let mut server_config = quinn::ServerConfig::with_single_cert(certificate, key)
+    let mut server_config = ServerConfig::with_single_cert(certificates, private_key)
         .with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to create server config")
         })
         .map_err(|_| QuicError::ConfigCreationError)?;
-    let mut transport = quinn::TransportConfig::default();
+    let mut transport = TransportConfig::default();
     transport.initial_mtu(config.initial_mtu.as_bytes_u64() as u16);
     transport.send_window(config.send_window.as_bytes_u64());
     transport.receive_window(
@@ -137,4 +147,3 @@ fn load_certificates(
     let key = keys.remove(0);
     Ok((certs, key))
 }
-    */
