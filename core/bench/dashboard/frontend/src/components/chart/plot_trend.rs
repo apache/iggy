@@ -15,6 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// TODO(hubcio): Currently, trend charts are not used in the dashboard,
+// but they are kept for future use.
+#![allow(dead_code)]
+
 use super::{PlotConfig, PlotType};
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_report::{

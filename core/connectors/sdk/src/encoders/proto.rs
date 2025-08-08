@@ -91,10 +91,10 @@ impl ProtoStreamEncoder {
             file_descriptor_set: None,
         };
 
-        if encoder.config.schema_path.is_some() || encoder.config.descriptor_set.is_some() {
-            if let Err(e) = encoder.load_schema() {
-                tracing::error!("Failed to load schema during encoder creation: {}", e);
-            }
+        if (encoder.config.schema_path.is_some() || encoder.config.descriptor_set.is_some())
+            && let Err(e) = encoder.load_schema()
+        {
+            tracing::error!("Failed to load schema during encoder creation: {}", e);
         }
 
         encoder

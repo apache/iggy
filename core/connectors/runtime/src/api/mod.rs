@@ -54,10 +54,10 @@ pub async fn init(config: &HttpApiConfig, context: Arc<RuntimeContext>) {
         resolve_api_key,
     ));
 
-    if let Some(cors) = &config.cors {
-        if cors.enabled {
-            app = app.layer(configure_cors(cors));
-        }
+    if let Some(cors) = &config.cors
+        && cors.enabled
+    {
+        app = app.layer(configure_cors(cors));
     }
 
     let tls_enabled = config

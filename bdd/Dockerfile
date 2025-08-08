@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM rust:1.87 AS builder
+FROM rust:1.89 AS builder
 
 WORKDIR /app
 COPY . .

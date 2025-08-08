@@ -44,17 +44,15 @@ impl BenchmarkReport {
             self.params.benchmark_kind,
             BenchmarkKind::PinnedProducerAndConsumer
                 | BenchmarkKind::BalancedProducerAndConsumerGroup
-        ) {
-            if let Some(total) = self.group_metrics.iter().find(|s| {
-                s.summary.kind == GroupMetricsKind::ProducersAndConsumers
-                    || s.summary.kind == GroupMetricsKind::ProducingConsumers
-            }) {
-                stats.push(format!(
-                    "Total System Throughput: {:.2} MB/s, {:.0} msg/s",
-                    total.summary.total_throughput_megabytes_per_second,
-                    total.summary.total_throughput_messages_per_second
-                ));
-            }
+        ) && let Some(total) = self.group_metrics.iter().find(|s| {
+            s.summary.kind == GroupMetricsKind::ProducersAndConsumers
+                || s.summary.kind == GroupMetricsKind::ProducingConsumers
+        }) {
+            stats.push(format!(
+                "Total System Throughput: {:.2} MB/s, {:.0} msg/s",
+                total.summary.total_throughput_megabytes_per_second,
+                total.summary.total_throughput_messages_per_second
+            ));
         }
         let stats_text = stats.join("\n");
 

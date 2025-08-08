@@ -307,7 +307,9 @@ impl System {
         }
 
         let mut id;
-        if stream_id.is_none() {
+        if let Some(stream_id) = stream_id {
+            id = stream_id;
+        } else {
             id = CURRENT_STREAM_ID.fetch_add(1, Ordering::SeqCst);
             loop {
                 if self.streams.contains_key(&id) {
@@ -319,8 +321,6 @@ impl System {
                     break;
                 }
             }
-        } else {
-            id = stream_id.unwrap();
         }
 
         if self.streams.contains_key(&id) {
@@ -362,10 +362,10 @@ impl System {
             })?;
 
         {
-            if let Some(stream_id_by_name) = self.streams_ids.get(name) {
-                if *stream_id_by_name != stream_id {
-                    return Err(IggyError::StreamNameAlreadyExists(name.to_owned()));
-                }
+            if let Some(stream_id_by_name) = self.streams_ids.get(name)
+                && *stream_id_by_name != stream_id
+            {
+                return Err(IggyError::StreamNameAlreadyExists(name.to_owned()));
             }
         }
 

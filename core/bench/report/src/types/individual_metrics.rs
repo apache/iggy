@@ -86,22 +86,22 @@ impl<'de> Deserialize<'de> for BenchmarkIndividualMetrics {
 
                 let mut updated_summary = summary.clone();
 
-                if updated_summary.min_latency_ms == 0.0 {
-                    if let Some(min_val) = min(&latency_ts) {
-                        updated_summary.min_latency_ms = min_val;
-                    }
+                if updated_summary.min_latency_ms == 0.0
+                    && let Some(min_val) = min(&latency_ts)
+                {
+                    updated_summary.min_latency_ms = min_val;
                 }
 
-                if updated_summary.max_latency_ms == 0.0 {
-                    if let Some(max_val) = max(&latency_ts) {
-                        updated_summary.max_latency_ms = max_val;
-                    }
+                if updated_summary.max_latency_ms == 0.0
+                    && let Some(max_val) = max(&latency_ts)
+                {
+                    updated_summary.max_latency_ms = max_val;
                 }
 
-                if updated_summary.std_dev_latency_ms == 0.0 {
-                    if let Some(std_dev_val) = std_dev(&latency_ts) {
-                        updated_summary.std_dev_latency_ms = std_dev_val;
-                    }
+                if updated_summary.std_dev_latency_ms == 0.0
+                    && let Some(std_dev_val) = std_dev(&latency_ts)
+                {
+                    updated_summary.std_dev_latency_ms = std_dev_val;
                 }
 
                 Ok(BenchmarkIndividualMetrics {

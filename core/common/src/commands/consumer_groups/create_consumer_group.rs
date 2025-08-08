@@ -67,10 +67,10 @@ impl Default for CreateConsumerGroup {
 
 impl Validatable<IggyError> for CreateConsumerGroup {
     fn validate(&self) -> Result<(), IggyError> {
-        if let Some(group_id) = self.group_id {
-            if group_id == 0 {
-                return Err(IggyError::InvalidConsumerGroupId);
-            }
+        if let Some(group_id) = self.group_id
+            && group_id == 0
+        {
+            return Err(IggyError::InvalidConsumerGroupId);
         }
 
         if self.name.is_empty() || self.name.len() > MAX_NAME_LENGTH {

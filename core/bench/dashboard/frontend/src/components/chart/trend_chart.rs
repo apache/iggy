@@ -26,8 +26,6 @@ use yew::platform::spawn_local;
 use yew::prelude::*;
 use yew_hooks::use_size;
 
-type CleanupFn = Box<dyn FnOnce()>;
-
 #[derive(Properties, PartialEq)]
 pub struct TrendChartProps {
     pub params_identifier: String,
@@ -65,7 +63,7 @@ pub fn trend_chart(props: &TrendChartProps) -> Html {
                         }
                     }
                 });
-                Box::new(|| ()) as CleanupFn
+                Box::new(|| ())
             },
         );
     }
@@ -74,41 +72,40 @@ pub fn trend_chart(props: &TrendChartProps) -> Html {
         let data = (*chart_data).clone();
         let measurement_type = props.measurement_type.clone();
         let is_dark = props.is_dark;
-        let echarts = echarts.clone();
+        let echarts: UseStateHandle<Option<Echarts>> = echarts.clone();
 
         use_effect_with(
             (data, measurement_type, is_dark, chart_size),
             move |(data, measurement_type, is_dark, size)| {
-                if data.is_empty() {
+                if !data.is_empty() {
+                    let plot_type = match measurement_type {
+                        MeasurementType::Latency => PlotType::Latency,
+                        MeasurementType::Throughput => PlotType::Throughput,
+                    };
+
+                    let (width, height) = *size;
+                    let config = PlotConfig {
+                        width,
+                        height,
+                        is_dark: *is_dark,
+                        element_id: "trend-chart".to_string(),
+                    };
+
+                    // Dispose existing chart if any
+                    if echarts.is_some() {
+                        dispose_chart("trend-chart");
+                    }
+
+                    // Render new chart
+                    match create_chart(&config, data, &plot_type) {
+                        Ok(new_e) => echarts.set(Some(new_e)),
+                        Err(e) => log!(format!("Error rendering chart: {}", e)),
+                    }
+                } else {
                     log!(format!("No data to render chart"));
-                    return Box::new(|| ()) as CleanupFn;
                 }
 
-                let plot_type = match measurement_type {
-                    MeasurementType::Latency => PlotType::Latency,
-                    MeasurementType::Throughput => PlotType::Throughput,
-                };
-
-                let (width, height) = *size;
-                let config = PlotConfig {
-                    width,
-                    height,
-                    is_dark: *is_dark,
-                    element_id: "trend-chart".to_string(),
-                };
-
-                // Dispose existing chart if any
-                if echarts.is_some() {
-                    dispose_chart("trend-chart");
-                }
-
-                // Render new chart
-                match create_chart(&config, data, &plot_type) {
-                    Ok(new_e) => echarts.set(Some(new_e)),
-                    Err(e) => log!(format!("Error rendering chart: {}", e)),
-                }
-
-                Box::new(|| ()) as CleanupFn
+                || ()
             },
         );
     }

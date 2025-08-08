@@ -350,14 +350,14 @@ async fn should_perform_json_to_proto_to_json_roundtrip() {
                 simd_json::to_string_pretty(&final_json).unwrap()
             );
 
-            if let simd_json::OwnedValue::Object(final_map) = &final_json {
-                if let simd_json::OwnedValue::Object(original_map) = &original_data {
-                    for key in ["name", "email"] {
-                        if let (Some(original_val), Some(final_val)) =
-                            (original_map.get(key), final_map.get(key))
-                        {
-                            assert_eq!(original_val, final_val, "Field {key} should be preserved");
-                        }
+            if let simd_json::OwnedValue::Object(final_map) = &final_json
+                && let simd_json::OwnedValue::Object(original_map) = &original_data
+            {
+                for key in ["name", "email"] {
+                    if let (Some(original_val), Some(final_val)) =
+                        (original_map.get(key), final_map.get(key))
+                    {
+                        assert_eq!(original_val, final_val, "Field {key} should be preserved");
                     }
                 }
             }

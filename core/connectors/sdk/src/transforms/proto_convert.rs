@@ -92,10 +92,10 @@ impl ProtoConvert {
             file_descriptor_set: None,
         };
 
-        if converter.config.schema_path.is_some() || converter.config.descriptor_set.is_some() {
-            if let Err(e) = converter.load_schema() {
-                tracing::error!("Failed to load schema during converter creation: {}", e);
-            }
+        if (converter.config.schema_path.is_some() || converter.config.descriptor_set.is_some())
+            && let Err(e) = converter.load_schema()
+        {
+            tracing::error!("Failed to load schema during converter creation: {}", e);
         }
 
         converter

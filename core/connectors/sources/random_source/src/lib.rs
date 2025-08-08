@@ -145,18 +145,18 @@ impl Source for RandomSource {
     async fn poll(&self) -> Result<ProducedMessages, iggy_connector_sdk::Error> {
         sleep(self.interval).await;
         let mut state = self.state.lock().await;
-        if let Some(max_count) = self.max_count {
-            if state.current_number >= max_count {
-                info!(
-                    "Reached max number of {max_count} messages for random source connector with ID: {}",
-                    self.id
-                );
-                return Ok(ProducedMessages {
-                    schema: Schema::Json,
-                    messages: vec![],
-                    state: Some(ConnectorState(state.current_number.to_le_bytes().to_vec())),
-                });
-            }
+        if let Some(max_count) = self.max_count
+            && state.current_number >= max_count
+        {
+            info!(
+                "Reached max number of {max_count} messages for random source connector with ID: {}",
+                self.id
+            );
+            return Ok(ProducedMessages {
+                schema: Schema::Json,
+                messages: vec![],
+                state: Some(ConnectorState(state.current_number.to_le_bytes().to_vec())),
+            });
         }
 
         let messages = self.generate_messages();

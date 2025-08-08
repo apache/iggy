@@ -49,10 +49,10 @@ impl TimeSeriesProcessor for MovingAverageProcessor {
             window.push_back(point.value);
             sum += point.value;
 
-            if window.len() > self.window_size {
-                if let Some(old_value) = window.pop_front() {
-                    sum -= old_value;
-                }
+            if window.len() > self.window_size
+                && let Some(old_value) = window.pop_front()
+            {
+                sum -= old_value;
             }
 
             let avg = sum / window.len() as f64;

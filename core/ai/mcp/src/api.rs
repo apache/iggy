@@ -71,10 +71,10 @@ pub async fn init(
         )
         .nest_service(&config.path, service);
 
-    if let Some(cors) = &config.cors {
-        if cors.enabled {
-            app = app.layer(configure_cors(cors));
-        }
+    if let Some(cors) = &config.cors
+        && cors.enabled
+    {
+        app = app.layer(configure_cors(cors));
     }
 
     let tls_enabled = config

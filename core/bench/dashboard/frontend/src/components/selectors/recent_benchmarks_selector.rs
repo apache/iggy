@@ -121,22 +121,22 @@ pub fn recent_benchmarks_selector(props: &RecentBenchmarksSelectorProps) -> Html
                 return true;
             }
 
-            if let Some(identifier) = &benchmark.hardware.identifier {
-                if identifier.to_lowercase().contains(&query) {
-                    return true;
-                }
+            if let Some(identifier) = &benchmark.hardware.identifier
+                && identifier.to_lowercase().contains(&query)
+            {
+                return true;
             }
 
-            if let Some(gitref) = &benchmark.params.gitref {
-                if gitref.to_lowercase().contains(&query) {
-                    return true;
-                }
+            if let Some(gitref) = &benchmark.params.gitref
+                && gitref.to_lowercase().contains(&query)
+            {
+                return true;
             }
 
-            if let Some(remark) = &benchmark.params.remark {
-                if remark.to_lowercase().contains(&query) {
-                    return true;
-                }
+            if let Some(remark) = &benchmark.params.remark
+                && remark.to_lowercase().contains(&query)
+            {
+                return true;
             }
 
             if benchmark.timestamp.to_lowercase().contains(&query) {
@@ -232,8 +232,9 @@ pub fn recent_benchmarks_selector(props: &RecentBenchmarksSelectorProps) -> Html
                                                     }}
                                                 </div>
 
-                                                {if let Some(remark) = benchmark.params.remark.as_deref() {
-                                                    if !remark.is_empty() {
+                                                {if let Some(remark) = benchmark.params.remark.as_deref()
+                                                    && !remark.is_empty()
+                                                {
                                                         let truncated_remark = if remark.len() > 30 {
                                                             format!("{}..", &remark[0..28])
                                                         } else {
@@ -244,9 +245,6 @@ pub fn recent_benchmarks_selector(props: &RecentBenchmarksSelectorProps) -> Html
                                                                 {truncated_remark}
                                                             </div>
                                                         }
-                                                    } else {
-                                                        html! {}
-                                                    }
                                                 } else {
                                                     html! {}
                                                 }}

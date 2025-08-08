@@ -51,7 +51,7 @@ impl IggyMessagesBatch {
     }
 
     /// Create iterator over messages
-    pub fn iter(&self) -> IggyMessageViewIterator {
+    pub fn iter(&self) -> IggyMessageViewIterator<'_> {
         IggyMessageViewIterator::new(&self.messages)
     }
 
@@ -155,7 +155,7 @@ impl IggyMessagesBatch {
 
     /// Get the message at the specified index.
     /// Returns None if the index is out of bounds.
-    pub fn get(&self, index: usize) -> Option<IggyMessageView> {
+    pub fn get(&self, index: usize) -> Option<IggyMessageView<'_>> {
         if let Some((start, end)) = self.get_message_boundaries(index) {
             Some(IggyMessageView::new(&self.messages[start..end]))
         } else {

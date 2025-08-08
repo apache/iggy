@@ -209,14 +209,14 @@ impl HttpTransport for HttpClient {
     }
 
     /// Refresh the access token using the current access token.
-    // method `refresh_access_token` is never used
+    // TODO(hubcio): method `refresh_access_token` is never used
     async fn _refresh_access_token(&self) -> Result<(), IggyError> {
         let token = self.access_token.read().await;
         if token.is_empty() {
             return Err(IggyError::AccessTokenMissing);
         }
 
-        let command = RefreshToken {
+        let command = _RefreshToken {
             token: token.to_owned(),
         };
         let response = self.post("/users/refresh-token", &command).await?;
@@ -332,7 +332,7 @@ impl HttpClient {
 }
 
 #[derive(Debug, Serialize)]
-struct RefreshToken {
+struct _RefreshToken {
     token: String,
 }
 

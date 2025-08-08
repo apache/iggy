@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM rust:1.87-slim-bookworm
+FROM rust:1.89-slim-bookworm
 
 RUN apt-get update && \
     apt-get install -y \
