@@ -1,3 +1,4 @@
+use crate::streaming::stats::stats::PartitionStats;
 use crate::{
     slab::{
         IndexedSlab, Keyed,
@@ -10,6 +11,7 @@ use ahash::AHashMap;
 use dashmap::DashMap;
 use iggy_common::{CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize};
 use slab::Slab;
+use std::sync::Arc;
 
 #[derive(Default, Debug)]
 pub struct Topic {
@@ -62,6 +64,13 @@ impl Topic {
 
     pub async fn invoke_async<T>(&self, f: impl AsyncFnOnce(&Self) -> T) -> T {
         f(self).await
+    }
+
+    pub fn with_partition_stats_mut<T>(
+        &mut self,
+        f: impl FnOnce(&mut Slab<Arc<PartitionStats>>) -> T,
+    ) -> T {
+        self.partitions.with_stats_mut(f)
     }
 
     pub fn message_expiry(&self) -> IggyExpiry {

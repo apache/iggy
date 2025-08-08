@@ -35,7 +35,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::fs;
 use tracing::{error, info, warn};
 
-static CURRENT_STREAM_ID: AtomicU32 = AtomicU32::new(1);
+thread_local! {
+    static CURRENT_STREAM_ID: AtomicU32 = AtomicU32::new(1);
+}
 
 impl IggyShard {
     pub fn get_streams(&self) -> Vec<Ref<'_, Stream>> {
@@ -283,13 +285,14 @@ impl IggyShard {
 
         let mut id;
         if stream_id.is_none() {
-            id = CURRENT_STREAM_ID.fetch_add(1, Ordering::SeqCst);
+            id = CURRENT_STREAM_ID.with(|current_id| current_id.fetch_add(1, Ordering::SeqCst));
             loop {
                 if self.streams.borrow().contains_key(&id) {
                     if id == u32::MAX {
                         return Err(IggyError::StreamIdAlreadyExists(id));
                     }
-                    id = CURRENT_STREAM_ID.fetch_add(1, Ordering::SeqCst);
+                    id = CURRENT_STREAM_ID
+                        .with(|current_id| current_id.fetch_add(1, Ordering::SeqCst));
                 } else {
                     break;
                 }
@@ -297,6 +300,7 @@ impl IggyShard {
         } else {
             id = stream_id.unwrap();
         }
+        tracing::warn!("CREATED STREAM WITH ID STREAM_IDS: {id}, NAME: {name}");
 
         if self.streams.borrow().contains_key(&id) {
             return Err(IggyError::StreamIdAlreadyExists(id));
@@ -435,9 +439,10 @@ impl IggyShard {
             .decrement_partitions(stream.get_partitions_count());
         self.metrics.decrement_messages(stream.get_messages_count());
         self.metrics.decrement_segments(stream.get_segments_count());
-        let current_stream_id = CURRENT_STREAM_ID.load(Ordering::SeqCst);
+        let current_stream_id =
+            CURRENT_STREAM_ID.with(|current_id| current_id.load(Ordering::SeqCst));
         if current_stream_id > stream_id {
-            CURRENT_STREAM_ID.store(stream_id, Ordering::SeqCst);
+            CURRENT_STREAM_ID.with(|current_id| current_id.store(stream_id, Ordering::SeqCst));
         }
 
         self.client_manager

@@ -1,8 +1,12 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, atomic::AtomicU64},
+};
 
 use arcshift::ArcShift;
 use iggy_common::{
-    CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, Permissions, UserStatus,
+    CompressionAlgorithm, Identifier, IggyExpiry, IggyTimestamp, MaxTopicSize, Permissions,
+    UserStatus,
 };
 use slab::Slab;
 
@@ -10,9 +14,10 @@ use crate::{
     shard::namespace::IggyNamespace,
     streaming::{
         clients::client_manager::Transport,
+        partitions::{partition::ConsumerOffset, partition2::SharedPartition},
         personal_access_tokens::personal_access_token::PersonalAccessToken,
         polling_consumer::PollingConsumer,
-        stats::stats::{StreamStats, TopicStats},
+        stats::stats::{PartitionStats, StreamStats, TopicStats},
         topics::consumer_group2::Member,
     },
 };
@@ -49,7 +54,8 @@ pub enum ShardEvent {
     CreatedPartitions2 {
         stream_id: Identifier,
         topic_id: Identifier,
-        partitions_count: u32,
+        created_at: IggyTimestamp,
+        shared_partitions: Vec<SharedPartition>,
     },
     CreatedPartitions {
         stream_id: Identifier,
@@ -57,6 +63,11 @@ pub enum ShardEvent {
         partitions_count: u32,
     },
     DeletedPartitions {
+        stream_id: Identifier,
+        topic_id: Identifier,
+        partition_ids: Vec<u32>,
+    },
+    DeletedPartitions2 {
         stream_id: Identifier,
         topic_id: Identifier,
         partition_ids: Vec<u32>,

@@ -2,6 +2,7 @@ pub mod consumer_groups;
 pub mod partitions;
 pub mod streams;
 pub mod topics;
+pub mod traits;
 
 use ahash::AHashMap;
 use slab::Slab;

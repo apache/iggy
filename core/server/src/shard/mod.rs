@@ -624,6 +624,15 @@ impl IggyShard {
                 self.metrics.increment_segments(*partitions_count);
                 Ok(())
             }
+            ShardEvent::DeletedPartitions2 {
+                stream_id,
+                topic_id,
+                partition_ids,
+            } => {
+                self.delete_partitions2_bypass_auth(stream_id, topic_id, &partition_ids)
+                    .await?;
+                Ok(())
+            }
             ShardEvent::DeletedPartitions {
                 stream_id,
                 topic_id,
@@ -858,10 +867,16 @@ impl IggyShard {
             ShardEvent::CreatedPartitions2 {
                 stream_id,
                 topic_id,
-                partitions_count,
+                created_at,
+                shared_partitions,
             } => {
-                self.create_partitions2_bypass_auth(stream_id, topic_id, *partitions_count)
-                    .await?;
+                self.create_partitions2_bypass_auth(
+                    stream_id,
+                    topic_id,
+                    *created_at,
+                    shared_partitions,
+                )
+                .await?;
                 Ok(())
             }
             ShardEvent::DeletedTopic2 {
@@ -979,6 +994,7 @@ impl IggyShard {
                         | ShardEvent::DeletedTopic2 { .. }
                         | ShardEvent::UpdatedTopic2 { .. }
                         | ShardEvent::CreatedPartitions2 { .. }
+                        | ShardEvent::DeletedPartitions2 { .. }
                         | ShardEvent::CreatedConsumerGroup2 { .. }
                         | ShardEvent::DeletedConsumerGroup2 { .. }
                 ) {

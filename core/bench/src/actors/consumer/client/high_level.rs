@@ -101,13 +101,12 @@ impl ConsumerClient for HighLevelConsumerClient {
 
 impl BenchmarkInit for HighLevelConsumerClient {
     async fn setup(&mut self) -> Result<(), IggyError> {
-        let topic_id = 1;
+        let topic_id_str = "topic-1";
         let client = self.client_factory.create_client().await;
         let client = IggyClient::create(client, None, None);
         login_root(&client).await;
 
         let stream_id_str = self.config.stream_id.to_string();
-        let topic_id_str = topic_id.to_string();
 
         let mut consumer = if let Some(cg_id) = self.config.consumer_group_id {
             let consumer_group_name = format!("cg_{cg_id}");

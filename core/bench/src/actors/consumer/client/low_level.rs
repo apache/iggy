@@ -113,15 +113,15 @@ impl ConsumerClient for LowLevelConsumerClient {
 
 impl BenchmarkInit for LowLevelConsumerClient {
     async fn setup(&mut self) -> Result<(), IggyError> {
-        let topic_id = 1u32;
+        let topic_id_str = "topic-1";
         let default_partition_id = 1u32;
 
         let client = self.client_factory.create_client().await;
         let client = IggyClient::create(client, None, None);
         login_root(&client).await;
 
-        let stream_id = self.config.stream_id.try_into().unwrap();
-        let topic_id = topic_id.try_into().unwrap();
+        let stream_id: Identifier = self.config.stream_id.as_str().try_into().unwrap();
+        let topic_id = topic_id_str.try_into().unwrap();
         let partition_id = if self.config.consumer_group_id.is_some() {
             None
         } else {

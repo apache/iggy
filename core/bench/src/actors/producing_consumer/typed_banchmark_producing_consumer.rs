@@ -52,7 +52,7 @@ impl TypedBenchmarkProducingConsumer {
         benchmark_kind: BenchmarkKind,
         actor_id: u32,
         consumer_group_id: Option<u32>,
-        stream_id: u32,
+        stream_id: String,
         partitions_count: u32,
         messages_per_batch: BenchmarkNumericParameter,
         message_size: BenchmarkNumericParameter,
@@ -67,7 +67,7 @@ impl TypedBenchmarkProducingConsumer {
     ) -> Self {
         let producer_config = BenchmarkProducerConfig {
             producer_id: actor_id,
-            stream_id,
+            stream_id: stream_id.clone(),
             partitions: partitions_count,
             messages_per_batch,
             message_size,

@@ -1,7 +1,13 @@
+use crate::slab::traits::{Access, AccessMut};
+use crate::{
+    slab::traits::{Decompose, Project, ProjectMut},
+    streaming::{
+        deduplication::message_deduplicator::MessageDeduplicator, partitions::partition2, segments,
+        stats::stats::PartitionStats,
+    },
+};
 use slab::Slab;
-use std::sync::Arc;
-
-use crate::streaming::{partitions::partition2, segments, stats::stats::PartitionStats};
+use std::sync::{Arc, atomic::AtomicU64};
 
 // TODO: This could be upper limit of partitions per topic, use that value to validate instead of whathever this thing is in `common` crate.
 pub const PARTITIONS_CAPACITY: usize = 16384;
@@ -11,6 +17,8 @@ pub struct Partitions {
     container: Slab<partition2::Partition>,
     stats: Slab<Arc<PartitionStats>>,
     segments: Slab<Vec<segments::Segment2>>,
+    message_deduplicators: Slab<Option<MessageDeduplicator>>,
+    partition_offsets: Slab<Arc<AtomicU64>>,
 }
 
 impl Default for Partitions {
@@ -19,6 +27,58 @@ impl Default for Partitions {
             container: Slab::with_capacity(PARTITIONS_CAPACITY),
             stats: Slab::with_capacity(PARTITIONS_CAPACITY),
             segments: Slab::with_capacity(PARTITIONS_CAPACITY),
+            message_deduplicators: Slab::with_capacity(PARTITIONS_CAPACITY),
+            partition_offsets: Slab::with_capacity(PARTITIONS_CAPACITY),
+        }
+    }
+}
+
+pub struct PartitionRef<'partitions> {
+    partition: &'partitions Slab<partition2::Partition>,
+}
+
+impl<'partitions> Decompose for PartitionRef<'partitions> {
+    type Target = &'partitions Slab<partition2::Partition>;
+
+    fn decompose(self) -> Self::Target {
+        self.partition
+    }
+}
+
+impl Project for Partitions {
+    type View<'me>
+        = PartitionRef<'me>
+    where
+        Self: 'me;
+
+    fn project(&self) -> Self::View<'_> {
+        PartitionRef {
+            partition: &self.container,
+        }
+    }
+}
+
+pub struct PartitionRefMut<'partitions> {
+    partition: &'partitions mut Slab<partition2::Partition>,
+}
+
+impl<'partitions> Decompose for PartitionRefMut<'partitions> {
+    type Target = &'partitions mut Slab<partition2::Partition>;
+
+    fn decompose(self) -> Self::Target {
+        self.partition
+    }
+}
+
+impl ProjectMut for Partitions {
+    type ViewMut<'me>
+        = PartitionRefMut<'me>
+    where
+        Self: 'me;
+
+    fn project_mut(&mut self) -> Self::ViewMut<'_> {
+        PartitionRefMut {
+            partition: &mut self.container,
         }
     }
 }
@@ -34,19 +94,33 @@ impl Partitions {
         f(&mut stats)
     }
 
-    pub async fn with_async<T>(&self, f: impl AsyncFnOnce(&Slab<partition2::Partition>) -> T) -> T {
-        let container = &self.container;
-        f(&container).await
+    pub fn with_message_deduplicators<T>(
+        &self,
+        f: impl FnOnce(&Slab<Option<MessageDeduplicator>>) -> T,
+    ) -> T {
+        let message_deduplicators = &self.message_deduplicators;
+        f(message_deduplicators)
     }
 
-    pub fn with<T>(&self, f: impl FnOnce(&Slab<partition2::Partition>) -> T) -> T {
-        let container = &self.container;
-        f(&container)
+    pub fn with_message_deduplicators_mut<T>(
+        &mut self,
+        f: impl FnOnce(&mut Slab<Option<MessageDeduplicator>>) -> T,
+    ) -> T {
+        let mut message_deduplicators = &mut self.message_deduplicators;
+        f(&mut message_deduplicators)
     }
 
-    pub fn with_mut<T>(&mut self, f: impl FnOnce(&mut Slab<partition2::Partition>) -> T) -> T {
-        let mut container = &mut self.container;
-        f(&mut container)
+    pub fn with_partition_offsets<T>(&self, f: impl FnOnce(&Slab<Arc<AtomicU64>>) -> T) -> T {
+        let partition_offsets = &self.partition_offsets;
+        f(partition_offsets)
+    }
+
+    pub fn with_partition_offsets_mut<T>(
+        &mut self,
+        f: impl FnOnce(&mut Slab<Arc<AtomicU64>>) -> T,
+    ) -> T {
+        let mut partition_offsets = &mut self.partition_offsets;
+        f(&mut partition_offsets)
     }
 
     pub fn with_partition_id<T>(

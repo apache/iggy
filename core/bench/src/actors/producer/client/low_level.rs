@@ -102,8 +102,8 @@ impl BenchmarkInit for LowLevelProducerClient {
 
         self.client = Some(client);
         self.partitioning = partitioning;
-        self.stream_id = self.config.stream_id.try_into()?;
-        self.topic_id = Identifier::numeric(1)?;
+        self.stream_id = self.config.stream_id.as_str().try_into()?;
+        self.topic_id = Identifier::from_str_value("topic-1")?;
         Ok(())
     }
 }

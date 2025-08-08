@@ -17,7 +17,7 @@
  */
 
 pub mod clients;
-mod deduplication;
+pub mod deduplication;
 pub mod diagnostics;
 pub mod local_sizeable;
 pub mod partitions;

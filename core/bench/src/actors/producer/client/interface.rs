@@ -26,7 +26,7 @@ use iggy::prelude::*;
 #[derive(Debug, Clone)]
 pub struct BenchmarkProducerConfig {
     pub producer_id: u32,
-    pub stream_id: u32,
+    pub stream_id: String,
     pub partitions: u32,
     pub messages_per_batch: BenchmarkNumericParameter,
     pub message_size: BenchmarkNumericParameter,
