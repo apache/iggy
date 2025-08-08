@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use super::COMPONENT;
 use crate::configs::system::SystemConfig;
 use crate::streaming::deduplication::message_deduplicator::MessageDeduplicator;
 use crate::streaming::segments::*;
@@ -34,8 +35,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use super::COMPONENT;
-
 #[derive(Debug)]
 pub struct Partition {
     pub stream_id: u32,
@@ -47,8 +46,6 @@ pub struct Partition {
     pub consumer_group_offsets_path: String,
     pub current_offset: u64,
     pub message_deduplicator: Option<MessageDeduplicator>,
-    pub unsaved_messages_count: u32,
-    pub unsaved_messages_size: IggyByteSize,
     pub should_increment_offset: bool,
     pub created_at: IggyTimestamp,
     pub avg_timestamp_delta: IggyDuration,
@@ -148,8 +145,6 @@ impl Partition {
             message_deduplicator,
             segments: vec![],
             current_offset: 0,
-            unsaved_messages_count: 0,
-            unsaved_messages_size: IggyByteSize::from(0),
             should_increment_offset: false,
             consumer_offsets: DashMap::new(),
             consumer_group_offsets: DashMap::new(),
@@ -276,7 +271,6 @@ mod tests {
         assert_eq!(partition.partition_id, partition_id as u32);
         assert_eq!(partition.partition_path, path);
         assert_eq!(partition.current_offset, 0);
-        assert_eq!(partition.unsaved_messages_count, 0);
         assert_eq!(partition.segments.len(), 1);
         assert!(!partition.should_increment_offset);
         let consumer_offsets = partition.consumer_offsets;

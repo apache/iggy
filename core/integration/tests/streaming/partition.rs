@@ -112,9 +112,11 @@ async fn should_load_existing_partition_from_disk() {
         assert_eq!(loaded_partition.partition_id, partition.partition_id);
         assert_eq!(loaded_partition.partition_path, partition.partition_path);
         assert_eq!(loaded_partition.current_offset, partition.current_offset);
+        let loaded_last_segment = loaded_partition.get_segments().last().unwrap();
+        let last_segment = partition.get_segments().last().unwrap();
         assert_eq!(
-            loaded_partition.unsaved_messages_count,
-            partition.unsaved_messages_count
+            loaded_last_segment.unsaved_messages_count(),
+            last_segment.unsaved_messages_count()
         );
         assert_eq!(
             loaded_partition.get_segments().len(),
@@ -200,7 +202,8 @@ async fn should_purge_existing_partition_on_disk() {
         assert_eq!(loaded_messages.count(), messages_count);
         partition.purge().await.unwrap();
         assert_eq!(partition.current_offset, 0);
-        assert_eq!(partition.unsaved_messages_count, 0);
+        let last_segment = partition.get_segments().last().unwrap();
+        assert_eq!(last_segment.unsaved_messages_count(), 0);
         assert!(!partition.should_increment_offset);
         let loaded_messages = partition.get_messages_by_offset(0, 100).await.unwrap();
         assert!(loaded_messages.is_empty());

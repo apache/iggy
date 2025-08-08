@@ -435,6 +435,16 @@ impl Segment {
     pub fn drop_indexes(&mut self) {
         self.indexes = None;
     }
+
+    /// Returns the count of unsaved messages in the accumulator
+    pub fn unsaved_messages_count(&self) -> u32 {
+        self.accumulator.unsaved_messages_count() as u32
+    }
+
+    /// Returns the size of unsaved messages in the accumulator
+    pub fn unsaved_messages_size(&self) -> u32 {
+        self.accumulator.unsaved_messages_size()
+    }
 }
 
 impl std::fmt::Display for Segment {
