@@ -1,3 +1,4 @@
+#!/bin/bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -15,17 +16,19 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM rust:1.88.0
 
-WORKDIR /app
+# Extract Rust version from rust-toolchain.toml
+RUST_VERSION=$(grep 'channel' rust-toolchain.toml | sed 's/.*"\(.*\)".*/\1/')
 
-# Copy entire repository (needed for workspace)
-COPY . .
+if [ -z "$RUST_VERSION" ]; then
+    echo "Error: Could not extract Rust version from rust-toolchain.toml"
+    exit 1
+fi
 
-# Create features directory for BDD feature files
-RUN mkdir -p /app/features
+echo "Syncing Rust version $RUST_VERSION to Dockerfiles..."
 
-RUN cargo fetch
+# Update Dockerfiles
+sed -i "s/FROM rust:[0-9.]\+/FROM rust:$RUST_VERSION/" bdd/rust/Dockerfile
+sed -i "s/FROM rust:[0-9.]\+-slim-bookworm/FROM rust:$RUST_VERSION-slim-bookworm/" core/bench/dashboard/server/Dockerfile
 
-# Default command will be overridden by docker-compose
-CMD ["cargo", "test", "-p", "bdd", "--features", "iggy-server-in-docker", "--features", "bdd"]
+echo "Updated Dockerfiles to use Rust $RUST_VERSION"

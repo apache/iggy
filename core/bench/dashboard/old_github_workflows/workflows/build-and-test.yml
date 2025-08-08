@@ -38,7 +38,9 @@ jobs:
           version: 'latest'
 
       - name: Install wasm-target
-        run: rustup target add wasm32-unknown-unknown
+        run: |
+          rustup target add wasm32-unknown-unknown
+          echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
 
       - name: Build Frontend
         run: |

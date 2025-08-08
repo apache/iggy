@@ -93,9 +93,8 @@ jobs:
 
       - name: Prepare ${{ matrix.platform.target }} toolchain
         run: |
-           rustup toolchain add --profile=minimal stable
-           rustup target add --toolchain=stable ${{ matrix.platform.target }}
-           rustup override set stable
+           rustup target add ${{ matrix.platform.target }}
+           echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
 
       - name: Install cross
         uses: taiki-e/install-action@v2

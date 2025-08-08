@@ -42,8 +42,7 @@ jobs:
 
       - name: Install Rust toolchain
         run: |
-          rustup toolchain add --profile=minimal --component=clippy stable
-          rustup override set stable
+          echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
 
       - name: Install clippy-sarif sarif-fmt
         run: cargo install clippy-sarif sarif-fmt

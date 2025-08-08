@@ -16,7 +16,7 @@
 # under the License.
 
 # Build stage
-FROM rust:1.87-slim-bookworm AS builder
+FROM rust:1.88.0-slim-bookworm AS builder
 
 WORKDIR /usr/src/iggy-bench-dashboard
 
@@ -37,6 +37,8 @@ RUN cargo binstall -y trunk
 
 # Add wasm target
 RUN rustup target add wasm32-unknown-unknown
+
+RUN echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
 
 # Copy the entire workspace
 COPY . .

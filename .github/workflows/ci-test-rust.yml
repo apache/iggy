@@ -60,9 +60,8 @@ jobs:
           echo -n "test" | gnome-keyring-daemon --unlock
       - name: Prepare ${{ matrix.target }} toolchain
         run: |
-           rustup toolchain add --profile=minimal stable
-           rustup target add --toolchain=stable ${{ matrix.target }}
-           rustup override set stable
+           rustup target add ${{ matrix.target }}
+           echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
       - name: Set verbose flag
         shell: bash
         run: echo "VERBOSE_FLAG=$([[ "${RUNNER_DEBUG}" = "1" ]] && echo "--verbose" || echo "")" >> $GITHUB_ENV
@@ -88,9 +87,8 @@ jobs:
           key: "x86_64-pc-windows-msvc"
       - name: Prepare x86_64-pc-windows-msvc toolchain
         run: |
-           rustup toolchain add --profile=minimal stable
-           rustup target add --toolchain=stable x86_64-pc-windows-msvc
-           rustup override set stable
+           rustup target add x86_64-pc-windows-msvc
+           echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
       - name: Set verbose flag
         shell: pwsh
         run: |
