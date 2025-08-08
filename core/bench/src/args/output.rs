@@ -53,4 +53,28 @@ pub struct BenchmarkOutputArgs {
     /// Open generated charts in browser after benchmark is finished
     #[arg(long, short = 'c', default_value_t = false)]
     pub open_charts: bool,
+
+    /// Enable OpenTelemetry metrics export
+    #[arg(long, default_value_t = false)]
+    pub otel_enabled: bool,
+
+    /// OpenTelemetry collector endpoint (gRPC)
+    #[arg(long, default_value = "http://localhost:4317")]
+    pub otel_endpoint: String,
+
+    /// OpenTelemetry metrics export interval in seconds
+    #[arg(long, default_value_t = 1)]
+    pub otel_export_interval_secs: u64,
+
+    /// OpenTelemetry metrics export timeout in seconds
+    #[arg(long, default_value_t = 10)]
+    pub otel_export_timeout_secs: u64,
+
+    /// Metrics buffer size (number of events)
+    #[arg(long, default_value_t = 10000)]
+    pub otel_buffer_size: usize,
+
+    /// Metrics buffer flush interval in milliseconds
+    #[arg(long, default_value_t = 100)]
+    pub otel_buffer_flush_ms: u64,
 }

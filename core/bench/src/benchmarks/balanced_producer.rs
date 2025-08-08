@@ -19,6 +19,7 @@
 use super::benchmark::Benchmarkable;
 use crate::args::common::IggyBenchArgs;
 use crate::benchmarks::common::build_producer_futures;
+use crate::telemetry::{MetricsHandle, TelemetryContext};
 use async_trait::async_trait;
 use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::individual_metrics::BenchmarkIndividualMetrics;
@@ -31,13 +32,31 @@ use tracing::info;
 pub struct BalancedProducerBenchmark {
     args: Arc<IggyBenchArgs>,
     client_factory: Arc<dyn ClientFactory>,
+    telemetry_handles: Vec<MetricsHandle>,
 }
 
 impl BalancedProducerBenchmark {
-    pub fn new(args: Arc<IggyBenchArgs>, client_factory: Arc<dyn ClientFactory>) -> Self {
+    pub fn new(
+        args: Arc<IggyBenchArgs>,
+        client_factory: Arc<dyn ClientFactory>,
+        telemetry: Option<&TelemetryContext>,
+    ) -> Self {
+        let telemetry_handles = telemetry.map_or_else(Vec::new, |ctx| {
+            let producers = args.producers();
+            let streams = args.streams();
+            let start_stream_id = args.start_stream_id();
+            (1..=producers)
+                .map(|producer_id| {
+                    let stream_id = start_stream_id + 1 + (producer_id % streams);
+                    ctx.create_handle("producer", producer_id, stream_id)
+                })
+                .collect()
+        });
+
         Self {
             args,
             client_factory,
+            telemetry_handles,
         }
     }
 }
@@ -50,7 +69,7 @@ impl Benchmarkable for BalancedProducerBenchmark {
         self.init_streams().await?;
         let cf = &self.client_factory;
         let args = self.args.clone();
-        let producer_futures = build_producer_futures(cf, &args);
+        let producer_futures = build_producer_futures(cf, &args, &self.telemetry_handles);
         let mut tasks = JoinSet::new();
 
         for fut in producer_futures {

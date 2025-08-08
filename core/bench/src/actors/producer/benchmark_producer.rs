@@ -19,6 +19,7 @@
 use crate::{
     actors::producer::client::{BenchmarkProducerClient, interface::BenchmarkProducerConfig},
     analytics::{metrics::individual::from_records, record::BenchmarkRecord},
+    telemetry::MetricsHandle,
     utils::{
         batch_generator::BenchmarkBatchGenerator, finish_condition::BenchmarkFinishCondition,
         rate_limiter::BenchmarkRateLimiter,
@@ -42,6 +43,7 @@ pub struct BenchmarkProducer<P: BenchmarkProducerClient> {
     pub moving_average_window: u32,
     pub limit_bytes_per_second: Option<IggyByteSize>,
     pub config: BenchmarkProducerConfig,
+    pub telemetry: Option<MetricsHandle>,
 }
 
 impl<P: BenchmarkProducerClient> BenchmarkProducer<P> {
@@ -54,6 +56,7 @@ impl<P: BenchmarkProducerClient> BenchmarkProducer<P> {
         moving_average_window: u32,
         limit_bytes_per_second: Option<IggyByteSize>,
         config: BenchmarkProducerConfig,
+        telemetry: Option<MetricsHandle>,
     ) -> Self {
         Self {
             client,
@@ -63,6 +66,7 @@ impl<P: BenchmarkProducerClient> BenchmarkProducer<P> {
             moving_average_window,
             limit_bytes_per_second,
             config,
+            telemetry,
         }
     }
 
@@ -125,6 +129,17 @@ impl<P: BenchmarkProducerClient> BenchmarkProducer<P> {
                 user_data_bytes: user_data_bytes_processed,
                 total_bytes: total_bytes_processed,
             });
+
+            // Record metrics to OpenTelemetry if enabled
+            if let Some(ref telemetry) = self.telemetry {
+                #[allow(clippy::cast_precision_loss)]
+                let latency_us = batch.latency.as_micros() as f64;
+                telemetry.record_batch_sent(
+                    u64::from(batch.messages),
+                    batch.total_bytes,
+                    latency_us,
+                );
+            }
 
             if let Some(rate_limiter) = &rate_limiter {
                 rate_limiter

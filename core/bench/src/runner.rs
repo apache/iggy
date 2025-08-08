@@ -20,6 +20,7 @@ use crate::analytics::report_builder::BenchmarkReportBuilder;
 use crate::args::common::IggyBenchArgs;
 use crate::benchmarks::benchmark::Benchmarkable;
 use crate::plot::{ChartType, plot_chart};
+use crate::telemetry::setup::TelemetryContext;
 use crate::utils::cpu_name::append_cpu_name_lowercase;
 use crate::utils::server_starter::start_server_if_needed;
 use crate::utils::{collect_server_logs_and_save_to_file, params_from_args_and_metrics};
@@ -34,6 +35,7 @@ use tracing::{error, info};
 pub struct BenchmarkRunner {
     pub args: Option<IggyBenchArgs>,
     pub test_server: Option<TestServer>,
+    pub telemetry: Option<TelemetryContext>,
 }
 
 impl BenchmarkRunner {
@@ -41,6 +43,7 @@ impl BenchmarkRunner {
         Self {
             args: Some(args),
             test_server: None,
+            telemetry: None,
         }
     }
 
@@ -48,13 +51,32 @@ impl BenchmarkRunner {
     pub async fn run(mut self) -> Result<(), IggyError> {
         let args = self.args.take().unwrap();
         let should_open_charts = args.open_charts();
+
+        // Initialize OpenTelemetry if configured
+        if let Some(otel_config) = args.otel_config() {
+            match TelemetryContext::init(otel_config).await {
+                Ok(ctx) => {
+                    self.telemetry = ctx;
+                    if self.telemetry.is_some() {
+                        info!("OpenTelemetry metrics streaming enabled and connected");
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to initialize OpenTelemetry: {}", e);
+                    error!("Benchmark cannot proceed without OpenTelemetry connection");
+                    error!("Please ensure the OpenTelemetry collector is running and accessible");
+                    return Err(IggyError::CannotEstablishConnection);
+                }
+            }
+        }
+
         self.test_server = start_server_if_needed(&args).await;
 
         let transport = args.transport();
         let server_addr = args.server_address();
         info!("Starting to benchmark: {transport} with server: {server_addr}",);
 
-        let mut benchmark: Box<dyn Benchmarkable> = args.into();
+        let mut benchmark: Box<dyn Benchmarkable> = (args, self.telemetry.as_ref()).into();
         benchmark.print_info();
         let mut join_handles = benchmark.run().await?;
 
@@ -129,6 +151,10 @@ impl BenchmarkRunner {
                 error!("Failed to generate plots: {e}");
                 IggyError::CannotWriteToFile
             })?;
+        }
+
+        if let Some(telemetry) = self.telemetry.take() {
+            telemetry.shutdown().await;
         }
 
         Ok(())

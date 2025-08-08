@@ -22,6 +22,7 @@ mod args;
 mod benchmarks;
 mod plot;
 mod runner;
+mod telemetry;
 mod utils;
 
 use crate::{args::common::IggyBenchArgs, runner::BenchmarkRunner};

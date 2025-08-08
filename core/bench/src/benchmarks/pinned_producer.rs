@@ -16,9 +16,10 @@
  * under the License.
  */
 
-use crate::args::common::IggyBenchArgs;
 use crate::benchmarks::benchmark::Benchmarkable;
 use crate::benchmarks::common::build_producer_futures;
+use crate::telemetry::TelemetryContext;
+use crate::{args::common::IggyBenchArgs, telemetry::MetricsHandle};
 use async_trait::async_trait;
 use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::individual_metrics::BenchmarkIndividualMetrics;
@@ -31,13 +32,31 @@ use tracing::info;
 pub struct PinnedProducerBenchmark {
     args: Arc<IggyBenchArgs>,
     client_factory: Arc<dyn ClientFactory>,
+    telemetry_handles: Vec<MetricsHandle>,
 }
 
 impl PinnedProducerBenchmark {
-    pub fn new(args: Arc<IggyBenchArgs>, client_factory: Arc<dyn ClientFactory>) -> Self {
+    pub fn new(
+        args: Arc<IggyBenchArgs>,
+        client_factory: Arc<dyn ClientFactory>,
+        telemetry: Option<&TelemetryContext>,
+    ) -> Self {
+        let telemetry_handles = telemetry.map_or_else(Vec::new, |ctx| {
+            let producers = args.producers();
+            let streams = args.streams();
+            let start_stream_id = args.start_stream_id();
+            (1..=producers)
+                .map(|producer_id| {
+                    let stream_id = start_stream_id + 1 + (producer_id % streams);
+                    ctx.create_handle("producer", producer_id, stream_id)
+                })
+                .collect()
+        });
+
         Self {
             args,
             client_factory,
+            telemetry_handles,
         }
     }
 }
@@ -52,7 +71,8 @@ impl Benchmarkable for PinnedProducerBenchmark {
         let args = self.args.clone();
         let mut tasks = JoinSet::new();
 
-        let producer_futures = build_producer_futures(client_factory, &args);
+        let producer_futures =
+            build_producer_futures(client_factory, &args, &self.telemetry_handles);
 
         for fut in producer_futures {
             tasks.spawn(fut);

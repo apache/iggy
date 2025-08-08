@@ -24,6 +24,7 @@ use crate::{
         producer::client::{BenchmarkProducerClient, interface::BenchmarkProducerConfig},
     },
     analytics::{metrics::individual::from_records, record::BenchmarkRecord},
+    telemetry::MetricsHandle,
     utils::{
         batch_generator::BenchmarkBatchGenerator, finish_condition::BenchmarkFinishCondition,
         rate_limiter::BenchmarkRateLimiter,
@@ -53,6 +54,7 @@ where
     pub limit_bytes_per_second: Option<IggyByteSize>,
     pub producer_config: BenchmarkProducerConfig,
     pub consumer_config: BenchmarkConsumerConfig,
+    pub telemetry: Option<MetricsHandle>,
 }
 
 impl<P, C> BenchmarkProducingConsumer<P, C>
@@ -72,6 +74,7 @@ where
         limit_bytes_per_second: Option<IggyByteSize>,
         producer_config: BenchmarkProducerConfig,
         consumer_config: BenchmarkConsumerConfig,
+        telemetry: Option<MetricsHandle>,
     ) -> Self {
         Self {
             producer,
@@ -84,6 +87,7 @@ where
             limit_bytes_per_second,
             producer_config,
             consumer_config,
+            telemetry,
         }
     }
     #[allow(clippy::too_many_lines)]
@@ -155,6 +159,17 @@ where
                     sent_batches += 1;
                     awaiting_reply = is_consumer;
 
+                    // Record producer metrics to OpenTelemetry if enabled
+                    if let Some(ref telemetry) = self.telemetry {
+                        #[allow(clippy::cast_precision_loss)]
+                        let latency_us = batch.latency.as_micros() as f64;
+                        telemetry.record_batch_sent(
+                            u64::from(batch.messages),
+                            batch.total_bytes,
+                            latency_us,
+                        );
+                    }
+
                     if self
                         .send_finish_condition
                         .account_and_check(batch.user_data_bytes)
@@ -192,6 +207,17 @@ where
                         user_data_bytes: sent_user_bytes + recv_user_bytes,
                         total_bytes: sent_total_bytes + recv_total_bytes,
                     });
+
+                    // Record consumer metrics to OpenTelemetry if enabled
+                    if let Some(ref telemetry) = self.telemetry {
+                        #[allow(clippy::cast_precision_loss)]
+                        let latency_us = batch.latency.as_micros() as f64;
+                        telemetry.record_batch_received(
+                            u64::from(batch.messages),
+                            batch.total_bytes,
+                            latency_us,
+                        );
+                    }
 
                     if let Some(limiter) = &rate_limiter {
                         limiter.wait_until_necessary(rl_value).await;

@@ -20,6 +20,7 @@ use super::benchmark::Benchmarkable;
 use crate::{
     args::common::IggyBenchArgs,
     benchmarks::common::{build_consumer_futures, build_producer_futures, init_consumer_groups},
+    telemetry::{MetricsHandle, TelemetryContext},
 };
 use async_trait::async_trait;
 use bench_report::{benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics};
@@ -32,13 +33,54 @@ use tracing::info;
 pub struct BalancedProducerAndConsumerGroupBenchmark {
     args: Arc<IggyBenchArgs>,
     client_factory: Arc<dyn ClientFactory>,
+    producer_telemetry_handles: Vec<MetricsHandle>,
+    // TODO: Use this field when consumer telemetry is implemented
+    #[allow(dead_code)]
+    consumer_telemetry_handles: Vec<MetricsHandle>,
 }
 
 impl BalancedProducerAndConsumerGroupBenchmark {
-    pub fn new(args: Arc<IggyBenchArgs>, client_factory: Arc<dyn ClientFactory>) -> Self {
+    pub fn new(
+        args: Arc<IggyBenchArgs>,
+        client_factory: Arc<dyn ClientFactory>,
+        telemetry: Option<&TelemetryContext>,
+    ) -> Self {
+        let (producer_telemetry_handles, consumer_telemetry_handles) = telemetry.map_or_else(
+            || (Vec::new(), Vec::new()),
+            |ctx| {
+                let producers = args.producers();
+                let consumers = args.consumers();
+                let streams = args.streams();
+                let cg_count = args.number_of_consumer_groups();
+                let start_stream_id = args.start_stream_id();
+
+                let producer_handles = (1..=producers)
+                    .map(|producer_id| {
+                        let stream_id = start_stream_id + 1 + (producer_id % streams);
+                        ctx.create_handle("producer", producer_id, stream_id)
+                    })
+                    .collect();
+
+                let consumer_handles = (1..=consumers)
+                    .map(|consumer_id| {
+                        let stream_id = if cg_count > 0 {
+                            start_stream_id + 1 + (consumer_id % cg_count)
+                        } else {
+                            start_stream_id + consumer_id
+                        };
+                        ctx.create_handle("consumer", consumer_id, stream_id)
+                    })
+                    .collect();
+
+                (producer_handles, consumer_handles)
+            },
+        );
+
         Self {
             args,
             client_factory,
+            producer_telemetry_handles,
+            consumer_telemetry_handles,
         }
     }
 }
@@ -55,8 +97,8 @@ impl Benchmarkable for BalancedProducerAndConsumerGroupBenchmark {
 
         init_consumer_groups(cf, &args).await?;
 
-        let producer_futures = build_producer_futures(cf, &args);
-        let consumer_futures = build_consumer_futures(cf, &args);
+        let producer_futures = build_producer_futures(cf, &args, &self.producer_telemetry_handles);
+        let consumer_futures = build_consumer_futures(cf, &args, &self.consumer_telemetry_handles);
 
         for fut in producer_futures {
             tasks.spawn(fut);

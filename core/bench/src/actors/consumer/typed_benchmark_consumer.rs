@@ -26,6 +26,7 @@ use crate::{
             low_level::LowLevelConsumerClient,
         },
     },
+    telemetry::MetricsHandle,
     utils::finish_condition::BenchmarkFinishCondition,
 };
 use bench_report::{
@@ -57,6 +58,7 @@ impl TypedBenchmarkConsumer {
         polling_kind: PollingKind,
         limit_bytes_per_second: Option<IggyByteSize>,
         origin_timestamp_latency_calculation: bool,
+        telemetry: Option<MetricsHandle>,
     ) -> Self {
         let config = BenchmarkConsumerConfig {
             consumer_id,
@@ -77,6 +79,7 @@ impl TypedBenchmarkConsumer {
                 moving_average_window,
                 limit_bytes_per_second,
                 config,
+                telemetry,
             ))
         } else {
             Self::Low(BenchmarkConsumer::new(
@@ -87,6 +90,7 @@ impl TypedBenchmarkConsumer {
                 moving_average_window,
                 limit_bytes_per_second,
                 config,
+                telemetry,
             ))
         }
     }

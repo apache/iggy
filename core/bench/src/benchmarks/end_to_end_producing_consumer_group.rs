@@ -18,6 +18,7 @@
 
 use crate::args::common::IggyBenchArgs;
 use crate::benchmarks::common::{build_producing_consumer_groups_futures, init_consumer_groups};
+use crate::telemetry::{MetricsHandle, TelemetryContext};
 use async_trait::async_trait;
 use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::individual_metrics::BenchmarkIndividualMetrics;
@@ -32,13 +33,34 @@ use super::benchmark::Benchmarkable;
 pub struct EndToEndProducingConsumerGroupBenchmark {
     args: Arc<IggyBenchArgs>,
     client_factory: Arc<dyn ClientFactory>,
+    telemetry_handles: Vec<MetricsHandle>,
 }
 
 impl EndToEndProducingConsumerGroupBenchmark {
-    pub fn new(args: Arc<IggyBenchArgs>, client_factory: Arc<dyn ClientFactory>) -> Self {
+    pub fn new(
+        args: Arc<IggyBenchArgs>,
+        client_factory: Arc<dyn ClientFactory>,
+        telemetry: Option<&TelemetryContext>,
+    ) -> Self {
+        let telemetry_handles = telemetry.map_or_else(Vec::new, |ctx| {
+            let producers = args.producers();
+            let consumers = args.consumers();
+            let total_actors = producers.max(consumers);
+            let cg_count = args.number_of_consumer_groups();
+            let start_stream_id = args.start_stream_id();
+
+            (1..=total_actors)
+                .map(|actor_id| {
+                    let stream_id = start_stream_id + 1 + (actor_id % cg_count);
+                    ctx.create_handle("producing_consumer_group", actor_id, stream_id)
+                })
+                .collect()
+        });
+
         Self {
             args,
             client_factory,
+            telemetry_handles,
         }
     }
 }
@@ -55,7 +77,7 @@ impl Benchmarkable for EndToEndProducingConsumerGroupBenchmark {
 
         init_consumer_groups(&cf, &args).await?;
 
-        let futures = build_producing_consumer_groups_futures(cf, args);
+        let futures = build_producing_consumer_groups_futures(cf, args, &self.telemetry_handles);
         for fut in futures {
             tasks.spawn(fut);
         }

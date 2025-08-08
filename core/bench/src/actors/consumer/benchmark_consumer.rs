@@ -20,6 +20,7 @@ use crate::actors::consumer::client::BenchmarkConsumerClient;
 use crate::actors::consumer::client::interface::BenchmarkConsumerConfig;
 use crate::analytics::metrics::individual::from_records;
 use crate::analytics::record::BenchmarkRecord;
+use crate::telemetry::MetricsHandle;
 use crate::utils::finish_condition::BenchmarkFinishCondition;
 use crate::utils::rate_limiter::BenchmarkRateLimiter;
 use bench_report::actor_kind::ActorKind;
@@ -41,9 +42,11 @@ pub struct BenchmarkConsumer<C: BenchmarkConsumerClient> {
     pub moving_average_window: u32,
     pub limit_bytes_per_second: Option<IggyByteSize>,
     pub config: BenchmarkConsumerConfig,
+    pub telemetry: Option<MetricsHandle>,
 }
 
 impl<C: BenchmarkConsumerClient> BenchmarkConsumer<C> {
+    #[allow(clippy::too_many_arguments)]
     pub const fn new(
         client: C,
         benchmark_kind: BenchmarkKind,
@@ -52,6 +55,7 @@ impl<C: BenchmarkConsumerClient> BenchmarkConsumer<C> {
         moving_average_window: u32,
         limit_bytes_per_second: Option<IggyByteSize>,
         config: BenchmarkConsumerConfig,
+        telemetry: Option<MetricsHandle>,
     ) -> Self {
         Self {
             client,
@@ -61,6 +65,7 @@ impl<C: BenchmarkConsumerClient> BenchmarkConsumer<C> {
             moving_average_window,
             limit_bytes_per_second,
             config,
+            telemetry,
         }
     }
 
@@ -109,6 +114,17 @@ impl<C: BenchmarkConsumerClient> BenchmarkConsumer<C> {
                 user_data_bytes: user_data_bytes_processed,
                 total_bytes: bytes_processed,
             });
+
+            // Record metrics to OpenTelemetry if enabled
+            if let Some(ref telemetry) = self.telemetry {
+                #[allow(clippy::cast_precision_loss)]
+                let latency_us = batch.latency.as_micros() as f64;
+                telemetry.record_batch_received(
+                    u64::from(batch.messages),
+                    batch.total_bytes,
+                    latency_us,
+                );
+            }
 
             if let Some(rate_limiter) = &rate_limiter {
                 rate_limiter

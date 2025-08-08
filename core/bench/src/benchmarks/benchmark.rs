@@ -17,6 +17,7 @@
  */
 
 use crate::args::kind::BenchmarkKindCommand;
+use crate::telemetry::TelemetryContext;
 use crate::{args::common::IggyBenchArgs, utils::client_factory::create_client_factory};
 use async_trait::async_trait;
 use bench_report::benchmark_kind::BenchmarkKind;
@@ -37,43 +38,58 @@ use super::pinned_consumer::PinnedConsumerBenchmark;
 use super::pinned_producer::PinnedProducerBenchmark;
 use super::pinned_producer_and_consumer::PinnedProducerAndConsumerBenchmark;
 
-impl From<IggyBenchArgs> for Box<dyn Benchmarkable> {
-    fn from(args: IggyBenchArgs) -> Self {
+impl From<(IggyBenchArgs, Option<&TelemetryContext>)> for Box<dyn Benchmarkable> {
+    fn from(
+        (args, telemetry): (IggyBenchArgs, Option<&crate::telemetry::TelemetryContext>),
+    ) -> Self {
         let client_factory = create_client_factory(&args);
 
         match args.benchmark_kind {
-            BenchmarkKindCommand::PinnedProducer(_) => {
-                Box::new(PinnedProducerBenchmark::new(Arc::new(args), client_factory))
-            }
+            BenchmarkKindCommand::PinnedProducer(_) => Box::new(PinnedProducerBenchmark::new(
+                Arc::new(args),
+                client_factory,
+                telemetry,
+            )),
 
-            BenchmarkKindCommand::PinnedConsumer(_) => {
-                Box::new(PinnedConsumerBenchmark::new(Arc::new(args), client_factory))
-            }
+            BenchmarkKindCommand::PinnedConsumer(_) => Box::new(PinnedConsumerBenchmark::new(
+                Arc::new(args),
+                client_factory,
+                telemetry,
+            )),
 
             BenchmarkKindCommand::PinnedProducerAndConsumer(_) => Box::new(
-                PinnedProducerAndConsumerBenchmark::new(Arc::new(args), client_factory),
+                PinnedProducerAndConsumerBenchmark::new(Arc::new(args), client_factory, telemetry),
             ),
 
             BenchmarkKindCommand::BalancedProducer(_) => Box::new(BalancedProducerBenchmark::new(
                 Arc::new(args),
                 client_factory,
+                telemetry,
             )),
 
             BenchmarkKindCommand::BalancedConsumerGroup(_) => Box::new(
-                BalancedConsumerGroupBenchmark::new(Arc::new(args), client_factory),
+                BalancedConsumerGroupBenchmark::new(Arc::new(args), client_factory, telemetry),
             ),
 
-            BenchmarkKindCommand::BalancedProducerAndConsumerGroup(_) => Box::new(
-                BalancedProducerAndConsumerGroupBenchmark::new(Arc::new(args), client_factory),
-            ),
+            BenchmarkKindCommand::BalancedProducerAndConsumerGroup(_) => {
+                Box::new(BalancedProducerAndConsumerGroupBenchmark::new(
+                    Arc::new(args),
+                    client_factory,
+                    telemetry,
+                ))
+            }
 
             BenchmarkKindCommand::EndToEndProducingConsumer(_) => Box::new(
-                EndToEndProducingConsumerBenchmark::new(Arc::new(args), client_factory),
+                EndToEndProducingConsumerBenchmark::new(Arc::new(args), client_factory, telemetry),
             ),
 
-            BenchmarkKindCommand::EndToEndProducingConsumerGroup(_) => Box::new(
-                EndToEndProducingConsumerGroupBenchmark::new(Arc::new(args), client_factory),
-            ),
+            BenchmarkKindCommand::EndToEndProducingConsumerGroup(_) => {
+                Box::new(EndToEndProducingConsumerGroupBenchmark::new(
+                    Arc::new(args),
+                    client_factory,
+                    telemetry,
+                ))
+            }
             BenchmarkKindCommand::Examples => {
                 unreachable!("Examples should be handled before this point")
             }

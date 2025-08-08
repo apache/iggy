@@ -24,6 +24,7 @@ use crate::{
             low_level::LowLevelProducerClient,
         },
     },
+    telemetry::MetricsHandle,
     utils::finish_condition::BenchmarkFinishCondition,
 };
 use bench_report::{
@@ -55,6 +56,7 @@ impl TypedBenchmarkProducer {
         sampling_time: IggyDuration,
         moving_average_window: u32,
         limit_bytes_per_second: Option<IggyByteSize>,
+        telemetry: Option<MetricsHandle>,
     ) -> Self {
         let config = BenchmarkProducerConfig {
             producer_id,
@@ -75,6 +77,7 @@ impl TypedBenchmarkProducer {
                 moving_average_window,
                 limit_bytes_per_second,
                 config,
+                telemetry,
             ))
         } else {
             let client = LowLevelProducerClient::new(client_factory, config.clone());
@@ -86,6 +89,7 @@ impl TypedBenchmarkProducer {
                 moving_average_window,
                 limit_bytes_per_second,
                 config,
+                telemetry,
             ))
         }
     }

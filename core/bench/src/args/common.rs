@@ -16,6 +16,8 @@
  * under the License.
  */
 
+use crate::telemetry::TelemetryConfig;
+
 use super::kind::BenchmarkKindCommand;
 use super::output::BenchmarkOutputCommand;
 use super::props::{BenchmarkKindProps, BenchmarkTransportProps};
@@ -337,6 +339,39 @@ impl IggyBenchArgs {
             .as_ref()
             .is_some_and(|cmd| match cmd {
                 BenchmarkOutputCommand::Output(args) => args.open_charts,
+            })
+    }
+
+    pub fn otel_config(&self) -> Option<TelemetryConfig> {
+        self.benchmark_kind
+            .inner()
+            .transport_command()
+            .output_command()
+            .as_ref()
+            .and_then(|cmd| match cmd {
+                BenchmarkOutputCommand::Output(args) => {
+                    if args.otel_enabled {
+                        Some(TelemetryConfig {
+                            enabled: true,
+                            endpoint: args.otel_endpoint.clone(),
+                            export_interval: std::time::Duration::from_secs(
+                                args.otel_export_interval_secs,
+                            ),
+                            export_timeout: std::time::Duration::from_secs(
+                                args.otel_export_timeout_secs,
+                            ),
+                            buffer_size: args.otel_buffer_size,
+                            buffer_flush_interval: std::time::Duration::from_millis(
+                                args.otel_buffer_flush_ms,
+                            ),
+                            service_name: "iggy-bench".to_string(),
+                            service_version: env!("CARGO_PKG_VERSION").to_string(),
+                            benchmark_id: uuid::Uuid::new_v4().to_string(),
+                        })
+                    } else {
+                        None
+                    }
+                }
             })
     }
 

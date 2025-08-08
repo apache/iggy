@@ -18,6 +18,7 @@
 use crate::args::common::IggyBenchArgs;
 use crate::benchmarks::benchmark::Benchmarkable;
 use crate::benchmarks::common::{build_consumer_futures, build_producer_futures};
+use crate::telemetry::{MetricsHandle, TelemetryContext};
 use async_trait::async_trait;
 use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::individual_metrics::BenchmarkIndividualMetrics;
@@ -30,13 +31,49 @@ use tracing::info;
 pub struct PinnedProducerAndConsumerBenchmark {
     args: Arc<IggyBenchArgs>,
     client_factory: Arc<dyn ClientFactory>,
+    producer_telemetry_handles: Vec<MetricsHandle>,
+    // TODO: Use this field when consumer telemetry is implemented
+    #[allow(dead_code)]
+    consumer_telemetry_handles: Vec<MetricsHandle>,
 }
 
 impl PinnedProducerAndConsumerBenchmark {
-    pub fn new(args: Arc<IggyBenchArgs>, client_factory: Arc<dyn ClientFactory>) -> Self {
+    pub fn new(
+        args: Arc<IggyBenchArgs>,
+        client_factory: Arc<dyn ClientFactory>,
+        telemetry: Option<&TelemetryContext>,
+    ) -> Self {
+        let (producer_telemetry_handles, consumer_telemetry_handles) = telemetry.map_or_else(
+            || (Vec::new(), Vec::new()),
+            |ctx| {
+                let producers = args.producers();
+                let consumers = args.consumers();
+                let streams = args.streams();
+                let start_stream_id = args.start_stream_id();
+
+                let producer_handles = (1..=producers)
+                    .map(|producer_id| {
+                        let stream_id = start_stream_id + 1 + (producer_id % streams);
+                        ctx.create_handle("producer", producer_id, stream_id)
+                    })
+                    .collect();
+
+                let consumer_handles = (1..=consumers)
+                    .map(|consumer_id| {
+                        let stream_id = start_stream_id + consumer_id;
+                        ctx.create_handle("consumer", consumer_id, stream_id)
+                    })
+                    .collect();
+
+                (producer_handles, consumer_handles)
+            },
+        );
+
         Self {
             args,
             client_factory,
+            producer_telemetry_handles,
+            consumer_telemetry_handles,
         }
     }
 }
@@ -51,8 +88,8 @@ impl Benchmarkable for PinnedProducerAndConsumerBenchmark {
         let args = self.args.clone();
         let mut tasks = JoinSet::new();
 
-        let producer_futures = build_producer_futures(cf, &args);
-        let consumer_futures = build_consumer_futures(cf, &args);
+        let producer_futures = build_producer_futures(cf, &args, &self.producer_telemetry_handles);
+        let consumer_futures = build_consumer_futures(cf, &args, &self.consumer_telemetry_handles);
 
         for fut in producer_futures {
             tasks.spawn(fut);

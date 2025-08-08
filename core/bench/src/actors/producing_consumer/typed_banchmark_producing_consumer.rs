@@ -30,6 +30,7 @@ use crate::{
         },
         producing_consumer::BenchmarkProducingConsumer,
     },
+    telemetry::MetricsHandle,
     utils::finish_condition::BenchmarkFinishCondition,
 };
 use bench_report::{
@@ -64,6 +65,7 @@ impl TypedBenchmarkProducingConsumer {
         limit_bytes_per_second: Option<IggyByteSize>,
         polling_kind: PollingKind,
         origin_timestamp_latency_calculation: bool,
+        telemetry: Option<MetricsHandle>,
     ) -> Self {
         let producer_config = BenchmarkProducerConfig {
             producer_id: actor_id,
@@ -99,6 +101,7 @@ impl TypedBenchmarkProducingConsumer {
                 limit_bytes_per_second,
                 producer_config,
                 consumer_config,
+                telemetry,
             ))
         } else {
             let producer =
@@ -115,6 +118,7 @@ impl TypedBenchmarkProducingConsumer {
                 limit_bytes_per_second,
                 producer_config,
                 consumer_config,
+                telemetry,
             ))
         }
     }

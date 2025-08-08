@@ -114,6 +114,7 @@ pub async fn init_consumer_groups(
 pub fn build_producer_futures(
     client_factory: &Arc<dyn ClientFactory>,
     args: &IggyBenchArgs,
+    telemetry_handles: &[crate::telemetry::MetricsHandle],
 ) -> Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send + use<>> {
     let streams = args.streams();
     let partitions = args.number_of_partitions();
@@ -143,6 +144,10 @@ pub fn build_producer_futures(
 
             let stream_id = start_stream_id + 1 + (producer_id % streams);
 
+            let metrics_handle = telemetry_handles
+                .get((producer_id as usize).saturating_sub(1))
+                .cloned();
+
             async move {
                 let producer = TypedBenchmarkProducer::new(
                     use_high_level_api,
@@ -158,6 +163,7 @@ pub fn build_producer_futures(
                     sampling_time,
                     moving_average_window,
                     rate_limit,
+                    metrics_handle,
                 );
                 producer.run().await
             }
@@ -168,6 +174,7 @@ pub fn build_producer_futures(
 pub fn build_consumer_futures(
     client_factory: &Arc<dyn ClientFactory>,
     args: &IggyBenchArgs,
+    telemetry_handles: &[crate::telemetry::MetricsHandle],
 ) -> Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send + use<>> {
     let start_stream_id = args.start_stream_id();
     let cg_count = args.number_of_consumer_groups();
@@ -215,6 +222,10 @@ pub fn build_consumer_futures(
                 None
             };
 
+            let metrics_handle = telemetry_handles
+                .get((consumer_id as usize).saturating_sub(1))
+                .cloned();
+
             async move {
                 let consumer = TypedBenchmarkConsumer::new(
                     use_high_level_api,
@@ -231,6 +242,7 @@ pub fn build_consumer_futures(
                     polling_kind,
                     rate_limit,
                     origin_timestamp_latency_calculation,
+                    metrics_handle,
                 );
                 consumer.run().await
             }
@@ -242,7 +254,8 @@ pub fn build_consumer_futures(
 pub fn build_producing_consumers_futures(
     client_factory: Arc<dyn ClientFactory>,
     args: Arc<IggyBenchArgs>,
-) -> Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send> {
+    telemetry_handles: &[crate::telemetry::MetricsHandle],
+) -> Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send + use<>> {
     let producing_consumers = args.producers();
     let streams = args.streams();
     let partitions = args.number_of_partitions();
@@ -277,6 +290,10 @@ pub fn build_producing_consumers_futures(
             let use_high_level_api = args.high_level_api();
             let rate_limit = rate_limit_per_actor(args.rate_limit(), producing_consumers);
 
+            let metrics_handle = telemetry_handles
+                .get((actor_id as usize).saturating_sub(1))
+                .cloned();
+
             async move {
                 info!(
                     "Executing producing consumer #{}, stream_id={}",
@@ -300,6 +317,7 @@ pub fn build_producing_consumers_futures(
                     rate_limit,
                     polling_kind,
                     origin_timestamp_latency_calculation,
+                    metrics_handle,
                 );
                 actor.run().await
             }
@@ -311,7 +329,8 @@ pub fn build_producing_consumers_futures(
 pub fn build_producing_consumer_groups_futures(
     client_factory: Arc<dyn ClientFactory>,
     args: Arc<IggyBenchArgs>,
-) -> Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send> {
+    telemetry_handles: &[crate::telemetry::MetricsHandle],
+) -> Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send + use<>> {
     let producers = args.producers();
     let consumers = args.consumers();
     let total_actors = producers.max(consumers);
@@ -371,6 +390,10 @@ pub fn build_producing_consumer_groups_futures(
                 _ => unreachable!(),
             };
 
+            let metrics_handle = telemetry_handles
+                .get((actor_id as usize).saturating_sub(1))
+                .cloned();
+
             async move {
                 let actor_type = match (should_produce, should_consume) {
                     (true, true) => "(producer+consumer)",
@@ -408,6 +431,7 @@ pub fn build_producing_consumer_groups_futures(
                     rate_limit,
                     polling_kind,
                     origin_timestamp_latency_calculation,
+                    metrics_handle,
                 );
 
                 actor.run().await

@@ -20,6 +20,7 @@ use super::benchmark::Benchmarkable;
 use crate::{
     args::common::IggyBenchArgs,
     benchmarks::common::{build_consumer_futures, init_consumer_groups},
+    telemetry::{MetricsHandle, TelemetryContext},
 };
 use async_trait::async_trait;
 use bench_report::{benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics};
@@ -32,13 +33,36 @@ use tracing::info;
 pub struct BalancedConsumerGroupBenchmark {
     args: Arc<IggyBenchArgs>,
     client_factory: Arc<dyn ClientFactory>,
+    telemetry_handles: Vec<MetricsHandle>,
 }
 
 impl BalancedConsumerGroupBenchmark {
-    pub fn new(args: Arc<IggyBenchArgs>, client_factory: Arc<dyn ClientFactory>) -> Self {
+    pub fn new(
+        args: Arc<IggyBenchArgs>,
+        client_factory: Arc<dyn ClientFactory>,
+        telemetry: Option<&TelemetryContext>,
+    ) -> Self {
+        let telemetry_handles = telemetry.map_or_else(Vec::new, |ctx| {
+            let consumers = args.consumers();
+            let cg_count = args.number_of_consumer_groups();
+            let start_stream_id = args.start_stream_id();
+
+            (1..=consumers)
+                .map(|consumer_id| {
+                    let stream_id = if cg_count > 0 {
+                        start_stream_id + 1 + (consumer_id % cg_count)
+                    } else {
+                        start_stream_id + consumer_id
+                    };
+                    ctx.create_handle("consumer", consumer_id, stream_id)
+                })
+                .collect()
+        });
+
         Self {
             args,
             client_factory,
+            telemetry_handles,
         }
     }
 }
@@ -55,7 +79,7 @@ impl Benchmarkable for BalancedConsumerGroupBenchmark {
 
         init_consumer_groups(cf, &args).await?;
 
-        let consumer_futures = build_consumer_futures(cf, &args);
+        let consumer_futures = build_consumer_futures(cf, &args, &self.telemetry_handles);
         for fut in consumer_futures {
             tasks.spawn(fut);
         }
