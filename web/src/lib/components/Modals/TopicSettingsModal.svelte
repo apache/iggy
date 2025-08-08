@@ -56,7 +56,8 @@
           body: {
             name: form.data.name,
             message_expiry: form.data.message_expiry,
-            compression_algorithm: topic.compressionAlgorithm
+            compression_algorithm: topic.compressionAlgorithm,
+            max_topic_size: 0
           }
         });
 
