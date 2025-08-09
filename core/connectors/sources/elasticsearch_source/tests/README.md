@@ -28,6 +28,7 @@ chmod +x tests/run_tests.sh
 ```
 
 This script will:
+
 1. Start Elasticsearch using Docker Compose
 2. Wait for Elasticsearch to be ready
 3. Run all integration tests
@@ -36,18 +37,21 @@ This script will:
 ### Manual Setup
 
 1. Start Elasticsearch:
+
 ```bash
 cd tests
 docker-compose up -d elasticsearch
 ```
 
 2. Wait for Elasticsearch to be ready:
+
 ```bash
 # Check health
 curl http://localhost:9200/_cluster/health
 ```
 
 3. Run tests:
+
 ```bash
 # Run integration tests
 cargo test --test integration_test -- --nocapture
@@ -60,6 +64,7 @@ cargo test
 ```
 
 4. Clean up:
+
 ```bash
 cd tests
 docker-compose down
@@ -113,6 +118,7 @@ Tests that don't require external dependencies:
 ### Test Data
 
 Tests create and use the following indices:
+
 - `test_logs` - Basic test data
 - `perf_test_logs` - Performance test data
 
@@ -153,6 +159,7 @@ Tests create and use the following indices:
 ### Common Issues
 
 1. **Elasticsearch not starting**:
+
    ```bash
    # Check Docker logs
    docker-compose logs elasticsearch
@@ -162,6 +169,7 @@ Tests create and use the following indices:
    ```
 
 2. **Port conflicts**:
+
    ```bash
    # Check if port 9200 is in use
    lsof -i :9200
@@ -170,12 +178,14 @@ Tests create and use the following indices:
    ```
 
 3. **Test timeouts**:
+
    ```bash
    # Increase timeout in test files
    # Default is 30 seconds for ES startup
    ```
 
 4. **Permission issues**:
+
    ```bash
    # Make script executable
    chmod +x tests/run_tests.sh
@@ -260,4 +270,4 @@ When adding new tests:
 - Clean up resources after tests
 - Use realistic test data
 - Include performance benchmarks
-- Test both success and failure scenarios 
+- Test both success and failure scenarios

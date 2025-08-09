@@ -69,6 +69,7 @@ state = {
 The connector tracks the following state information:
 
 ### Processing State
+
 - `last_poll_timestamp`: Last successful poll timestamp
 - `total_documents_fetched`: Total number of documents processed
 - `poll_count`: Number of polling cycles executed
@@ -77,10 +78,12 @@ The connector tracks the following state information:
 - `last_offset`: Last processed offset
 
 ### Error Tracking
+
 - `error_count`: Total number of errors encountered
 - `last_error`: Last error message
 
 ### Performance Statistics
+
 - `total_bytes_processed`: Total bytes processed
 - `avg_batch_processing_time_ms`: Average processing time per batch
 - `last_successful_poll`: Timestamp of last successful poll
@@ -90,6 +93,7 @@ The connector tracks the following state information:
 ## Storage Backends
 
 ### File Storage (Default)
+
 ```toml
 state = {
   enabled = true
@@ -101,6 +105,7 @@ state = {
 ```
 
 ### Elasticsearch Storage
+
 ```toml
 state = {
   enabled = true
@@ -113,6 +118,7 @@ state = {
 ```
 
 ### Redis Storage
+
 ```toml
 state = {
   enabled = true
@@ -244,6 +250,7 @@ State files are stored as JSON with the following structure:
 ### Monitoring
 
 Monitor the following metrics:
+
 - State save/load success rates
 - Processing statistics
 - Error counts and types
