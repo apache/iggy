@@ -17,7 +17,7 @@
  * under the License.
  */
 
-import { bytesFormatter } from '$lib/utils/formatters/bytesFormatter';
+
 
 export type Stream = {
   id: number;

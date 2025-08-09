@@ -9,7 +9,6 @@
   import { fetchRouteApi } from '$lib/api/fetchRouteApi';
   import { page } from '$app/state';
   import { dataHas } from '$lib/utils/dataHas';
-  import { invalidateAll } from '$app/navigation';
   import { showToast } from '../AppToasts.svelte';
   import Button from '../Button.svelte';
   import { customInvalidateAll } from '../PeriodicInvalidator.svelte';
@@ -31,6 +30,7 @@
     taintedMessage: false,
     async onUpdate({ form }) {
       if (!form.valid) return;
+      if (!page.params.streamId || !page.params.topicId) return;
 
       const { data, ok } = await fetchRouteApi({
         method: 'POST',
@@ -72,7 +72,7 @@
     />
 
     <div class="flex justify-end gap-3 mt-auto">
-      <Button variant="text" type="button" class="w-2/5" on:click={() => closeModal()}
+      <Button variant="text" type="button" class="w-2/5" onclick={() => closeModal()}
         >Cancel</Button
       >
       <Button type="submit" variant="contained" class="w-2/5">Create</Button>

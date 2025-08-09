@@ -349,7 +349,7 @@
         value={globalPerms[key].name}
         id={`global-permissions-${key}`}
         name={globalPerms[key].name}
-        on:change={(e) => onGlobalPermChanged(key, noTypeCheck(e).target.checked)}
+        onclick={(e) => onGlobalPermChanged(key, noTypeCheck(e).target.checked)}
       />
       <span class="text-sm">{globalPerms[key].name}</span>
     </label>

@@ -1,6 +1,6 @@
 <script lang="ts">
   import Icon from '$lib/components/Icon.svelte';
-  import { goto, invalidateAll, onNavigate } from '$app/navigation';
+  import { goto } from '$app/navigation';
   import { twMerge } from 'tailwind-merge';
   import { page } from '$app/state';
   import { openModal } from '$lib/components/Modals/AppModals.svelte';
@@ -9,9 +9,6 @@
   import { typedRoute } from '$lib/types/appRoutes';
   import { arrayMax } from '$lib/utils/arrayMax';
   import { onMount } from 'svelte';
-  import { noTypeCheck } from '$lib/utils/noTypeCheck.js';
-  import { slide } from 'svelte/transition';
-  import { bytesFormatter } from '$lib/utils/formatters/bytesFormatter';
 
   interface Props {
     data: any;
@@ -88,7 +85,7 @@
       <Button
         variant="outlined"
         class="w-full"
-        on:click={() =>
+        onclick={() =>
           openModal('AddStreamModal', {
             nextStreamId: arrayMax(data.streams.map((s) => s.id)) + 1
           })}

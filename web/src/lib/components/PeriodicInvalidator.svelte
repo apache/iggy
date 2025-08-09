@@ -50,12 +50,17 @@
   });
 </script>
 
-<Button variant="rounded" on:click={customInvalidateAll}>
-  <div class={twMerge($isInvalidatingClampMin && 'spin')}>
-    <Icon name="refresh" class=" dark:stroke-white" />
-  </div>
+<Button
+  variant="rounded"
+  onclick={customInvalidateAll}
+>
+  {#snippet children()}
+    <div class={twMerge($isInvalidatingClampMin && 'spin')}>
+      <Icon name="refresh" class="dark:text-white" />
+    </div>
+  {/snippet}
   {#snippet tooltip()}
-    <div >Refresh</div>
+    <div>Refresh</div>
   {/snippet}
 </Button>
 

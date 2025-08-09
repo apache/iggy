@@ -18,7 +18,6 @@
  */
 
 import { formatDuration, intervalToDuration, isValid } from 'date-fns';
-import { number } from 'zod';
 
 export const durationFormatter = (seconds: number) => {
   if (seconds <= 0 || seconds.toString().length > 11 || !isValid(seconds)) return '';

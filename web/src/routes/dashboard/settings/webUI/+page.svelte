@@ -36,7 +36,7 @@
         </span>
         <Button
           disabled={saveDisabled}
-          on:click={() => {
+          onclick={() => {
             $invalidateIntervalDuration = intervalValue;
           }}
           variant="contained">Save</Button

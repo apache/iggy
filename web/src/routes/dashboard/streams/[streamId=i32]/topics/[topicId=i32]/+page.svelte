@@ -23,7 +23,7 @@
 </script>
 
 <div class="h-[80px] flex text-xs items-center pl-2 pr-5">
-  <Button variant="rounded" class="mr-5" on:click={() => goto(prevPage)}>
+  <Button variant="rounded" class="mr-5" onclick={() => goto(prevPage)}>
     <Icon name="arrowLeft" class="h-[40px] w-[30px]" />
   </Button>
 
@@ -32,12 +32,14 @@
   <Button
     variant="rounded"
     class="ml-3"
-    on:click={() => openModal('TopicSettingsModal', { topic, onDeleteRedirectPath: prevPage })}
+    onclick={() => openModal('TopicSettingsModal', { topic, onDeleteRedirectPath: prevPage })}
   >
-    <Icon name="settings" />
+    {#snippet children()}
+      <Icon name="settings" class="dark:text-white" />
+    {/snippet}
     {#snippet tooltip()}
-        <div >Settings</div>
-      {/snippet}
+      <div>Settings</div>
+    {/snippet}
   </Button>
 
   <div class="flex gap-3 ml-7">
@@ -57,11 +59,11 @@
 
   <div class="flex gap-2 ml-auto">
     {#if topic.partitions.length > 0}
-      <Button variant="outlinedRed" on:click={() => openModal('DeletePartitionsModal', { topic })}
+      <Button variant="outlinedRed" onclick={() => openModal('DeletePartitionsModal', { topic })}
         >Delete partitions</Button
       >
     {/if}
-    <Button variant="contained" on:click={() => openModal('AddPartitionsModal', {})}
+    <Button variant="contained" onclick={() => openModal('AddPartitionsModal')}
       >Add partitions</Button
     >
   </div>
@@ -73,7 +75,7 @@
   data={topic.partitions}
   hrefBuilder={(partition) =>
     typedRoute(
-      `/dashboard/streams/${+page.params.streamId}/topics/${topic.id}/partitions/${partition.id}/messages`
+      `/dashboard/streams/${+(page.params.streamId || '')}/topics/${topic.id}/partitions/${partition.id}/messages`
     )}
   colNames={{
     id: 'ID',

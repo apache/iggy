@@ -17,8 +17,6 @@
  * under the License.
  */
 
-import prettyBytes from 'pretty-bytes';
-
 export function bytesFormatter(bytes: any) {
   // The bytes size string is already formatted by the API
   return bytes;

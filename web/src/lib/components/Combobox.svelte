@@ -67,7 +67,7 @@
 
 <div class="flex flex-col gap-2">
   {#if label}
-    <label class="text-sm ml-1 text-color">
+    <label for="combobox-input" class="text-sm ml-1 text-color">
       {label}
     </label>
   {/if}
@@ -77,6 +77,7 @@
       class="rounded-md dark:bg-shadeD400 ring-1 text-color ring-gray-300 dark:ring-gray-500 flex items-center h-[40px] text-color relative focus-within:ring-2 focus-within:ring-gray-400 transition group"
     >
       <input
+        id="combobox-input"
         use:combobox.input
         onselect={(e) => {
           selectedValue = noTypeCheck(e).detail.selected;

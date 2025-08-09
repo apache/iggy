@@ -12,6 +12,7 @@
     name?: string | undefined;
     bindGroup?: string[] | undefined;
     disabled?: boolean;
+    onclick?: (e: Event) => void;
   }
 
   let {
@@ -20,7 +21,8 @@
     id = '',
     name = undefined,
     bindGroup = $bindable(undefined),
-    disabled = false
+    disabled = false,
+    onclick
   }: Props = $props();
 
   function onChange(e: Event) {
@@ -47,6 +49,7 @@
     {id}
     {disabled}
     onchange={handlers(onChange, bubble('change'))}
+    onclick={onclick}
     onmousedown={() => (isMouseDown = true)}
     onmouseup={() => (isMouseDown = false)}
     onmouseleave={() => (isMouseDown = false)}

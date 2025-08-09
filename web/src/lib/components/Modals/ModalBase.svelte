@@ -1,5 +1,4 @@
 <script lang="ts">
-  import type { HTMLAttributes } from 'svelte/elements';
   import { twMerge } from 'tailwind-merge';
   import Icon from '../Icon.svelte';
   import type { TransitionConfig } from 'svelte/transition';
@@ -54,7 +53,7 @@
   )}
 >
   <div class="h-[15%]">
-    <Button variant="rounded" on:click={() => closeModal()} class="absolute p-2 top-5 right-5">
+    <Button variant="rounded" onclick={() => closeModal()} class="absolute p-2 top-5 right-5">
       <Icon name="close" strokeWidth={2.3} />
     </Button>
 

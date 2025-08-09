@@ -51,7 +51,7 @@
 </div>
 
 <div class="flex gap-12 border-b px-10">
-  {#each tabs as { icon, name, tab, href }, idx (idx)}
+  {#each tabs as { icon, name, href }, idx (idx)}
     {@const isActive = activeTab === href.split('/').slice(-1)[0]}
     <a
       {href}

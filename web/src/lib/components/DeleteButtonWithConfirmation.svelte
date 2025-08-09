@@ -31,13 +31,13 @@
 </script>
 
 <div bind:this={wrapperRef} use:tooltip={{ placement: 'top' }}>
-  <Button variant="containedRed" on:click={() => (isTooltipOpen = true)}>Delete</Button>
+  <Button variant="containedRed" onclick={() => (isTooltipOpen = true)}>Delete</Button>
 
   <div class="tooltip">
     <div class="flex flex-col gap-4 items-center justify-center p-2">
       <span>Are you sure? </span>
       <div class="flex flex-row gap-2">
-        <Button variant="text" type="button" on:click={() => (isTooltipOpen = false)} size="sm"
+        <Button variant="text" type="button" onclick={() => (isTooltipOpen = false)} size="sm"
           >No</Button
         >
         <Button
