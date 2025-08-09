@@ -43,14 +43,14 @@ cd tests
 docker-compose up -d elasticsearch
 ```
 
-2. Wait for Elasticsearch to be ready:
+1. Wait for Elasticsearch to be ready:
 
 ```bash
 # Check health
 curl http://localhost:9200/_cluster/health
 ```
 
-3. Run tests:
+1. Run tests:
 
 ```bash
 # Run integration tests
@@ -63,7 +63,7 @@ cargo test --test performance_test -- --nocapture
 cargo test
 ```
 
-4. Clean up:
+1. Clean up:
 
 ```bash
 cd tests
