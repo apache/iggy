@@ -1,4 +1,5 @@
-/* Licensed to the Apache Software Foundation (ASF) under one
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
@@ -16,6 +17,22 @@
  * under the License.
  */
 
-pub mod benchmark_producing_consumer;
-pub mod typed_banchmark_producing_consumer;
-pub use benchmark_producing_consumer::BenchmarkProducingConsumer;
+
+import { ClientProvider } from '../../client/index.js';
+import { createStream } from './create-stream.command.js';
+import { getStream } from './get-stream.command.js';
+
+
+export const ensureStream = (c: ClientProvider) =>
+  async function ensureStream(
+    streamId: number,
+    streamName = `ensure-stream-${streamId}`
+  ) {
+    const stream = await getStream(c)({ streamId });
+    return stream === null ?
+      createStream(c)({
+        streamId,
+        name: streamName,
+      }) :
+      true;
+  };

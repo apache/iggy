@@ -16,6 +16,8 @@
  * under the License.
  */
 
-pub mod benchmark_producing_consumer;
-pub mod typed_banchmark_producing_consumer;
-pub use benchmark_producing_consumer::BenchmarkProducingConsumer;
+pub mod high_level;
+pub mod interface;
+pub mod low_level;
+
+pub use interface::BenchmarkProducerClient;

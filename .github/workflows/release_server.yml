@@ -46,9 +46,8 @@ jobs:
 
       - name: Prepare x86_64-unknown-linux-musl toolchain
         run: |
-           rustup toolchain add --profile=minimal stable
-           rustup target add --toolchain=stable x86_64-unknown-linux-musl
-           rustup override set stable
+           rustup target add x86_64-unknown-linux-musl
+           echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
 
       - name: Install cross
         uses: taiki-e/install-action@v2
@@ -65,9 +64,8 @@ jobs:
 
       - name: Prepare aarch64-unknown-linux-musl toolchain
         run: |
-           rustup toolchain add --profile=minimal stable
-           rustup target add --toolchain=stable aarch64-unknown-linux-musl
-           rustup override set stable
+           rustup target add aarch64-unknown-linux-musl
+           echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
 
       - name: Build iggy-server release binary for aarch64-unknown-linux-musl
         run: cross +stable build --verbose --target aarch64-unknown-linux-musl --release --bin iggy-server --target-dir target_aarch64
