@@ -21,7 +21,7 @@ on:
   workflow_call:
     inputs:
       tag_name:
-        description: 'The name of the tag to be released'
+        description: "The name of the tag to be released"
         required: true
         type: string
 
@@ -80,8 +80,8 @@ jobs:
 
       - name: Prepare ${{ matrix.platform.target }} toolchain
         run: |
-           rustup target add ${{ matrix.platform.target }}
-           echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
+          rustup target add ${{ matrix.platform.target }}
+          echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
 
       - name: Install cross
         uses: taiki-e/install-action@v2
@@ -135,15 +135,16 @@ jobs:
       - name: List files
         run: find
 
-      - name: Create Changelog
-        uses: orhun/git-cliff-action@v4
-        id: changelog
-        with:
-          config: cliff.toml
-          args: -vv --latest
-        env:
-          OUTPUT: CHANGELOG.md
-          GITHUB_REPO: ${{ github.repository }}
+      # Action disallowed
+      # - name: Create Changelog
+      #   uses: orhun/git-cliff-action@v4
+      #   id: changelog
+      #   with:
+      #     config: cliff.toml
+      #     args: -vv --latest
+      #   env:
+      #     OUTPUT: CHANGELOG.md
+      #     GITHUB_REPO: ${{ github.repository }}
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
