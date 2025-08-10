@@ -90,11 +90,9 @@ This is the high-level architecture of the Iggy message streaming server, where 
 
 ## Version
 
-The latest released version is `0.4.300` for Iggy server, which is compatible with `0.6` Rust client SDK and the others.
+The official releases follow the regular semver (`0.5.0`) or have `latest` tag applied (`apache/iggy:latest`).
 
-The recent improvements based on the zero-copy (de)serialization, along with updated SDKs etc. will be available in the upcoming release with Iggy server `0.5.0`, Rust SDK `0.7` and all the other SDKs.
-
-You can also find the `edge` versions of SDKs that are compatible with the `edge` version of Iggy Server Docker Image, but should be used with caution as these are not based on the official release.
+We do also publish edge/dev/nightly releases (e.g. `0.5.0-edge.1` or `apache/iggy:edge`), for both, SDKs and the Docker images, which are typically compatible with the latest changes, but are not guaranteed to be stable, and as the name states, are not recommended for production use.
 
 ---
 
@@ -105,22 +103,22 @@ You can also find the `edge` versions of SDKs that are compatible with the `edge
 
 ---
 
-## Supported languages SDK (work in progress)
+## Supported languages SDK
 
-- Rust
-- C#
-- Java
-- Go
-- Python
-- Node
-- C++
-- Elixir
+- [Rust](https://crates.io/crates/iggy)
+- [C#](https://www.nuget.org/packages/Apache.Iggy/)
+- [Java](https://repository.apache.org/#nexus-search;quick~iggy)
+- [Python](https://pypi.org/project/apache-iggy/)
+- [Node.js (TypeScript)](https://www.npmjs.com/package/apache-iggy)
+- [Go](https://pkg.go.dev/github.com/apache/iggy/foreign/go)
+
+C++ and Elixir are work in progress.
 
 ---
 
 ## CLI
 
-The brand new, rich, interactive CLI is implemented under the `cli` project, to provide the best developer experience. This is a great addition to the Web UI, especially for all the developers who prefer using the console tools.
+The interactive CLI is implemented under the `cli` project, to provide the best developer experience. This is a great addition to the Web UI, especially for all the developers who prefer using the console tools.
 
 Iggy CLI can be installed with `cargo install iggy-cli` and then simply accessed by typing `iggy` in your terminal.
 
@@ -175,7 +173,9 @@ The [Model Context Protocol](https://modelcontextprotocol.io) (MCP) is an open p
 
 ## Docker
 
-The official images can be found in [Docker Hub](https://hub.docker.com/r/apache/iggy), simply type `docker pull apache/iggy` to pull the image.
+The official Apache Iggy images can be found in [Docker Hub](https://hub.docker.com/r/apache/iggy), simply type `docker pull apache/iggy` to pull the image.
+
+You can also find the images for all the different tooling such as Connectors, MCP Server etc. [here](https://hub.docker.com/u/apache?page=1&search=iggy).
 
 Please note that the images tagged as `latest` are based on the official, stable releases, while the `edge` ones are updated directly from latest version of the `master` branch.
 
@@ -313,7 +313,7 @@ let mut producer = client
 producer.init().await?;
 
 // Send some messages to the topic
-let messages = vec![Message::from_str("Hello Apache Iggy")?];
+let messages = vec![IggyMessage::from_str("Hello Apache Iggy")?];
 producer.send(messages).await?;
 
 // Create a consumer for the given stream and one of its topics

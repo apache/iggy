@@ -27,7 +27,7 @@ pub trait Sink: Send + Sync {
 
 ## Configuration
 
-Sink is configured in the default `config` file used by runtime. Each sink configuration, is part of the map of <String, SinkConfig>, which can be represented using toml, json, or yaml.
+Sink is configured in the default `config` file used by runtime. Each sink configuration, is part of the map of `<String, SinkConfig>`, which can be represented using toml, json, or yaml.
 
 ```rust
 pub struct SinkConfig {

@@ -60,3 +60,5 @@ Here's the example configuration to be used with Claude Desktop:
 ```
 
 **Remember to use the appropriate Iggy account credentials for your environment** (e.g. create the user with read-only permissions to avoid modifying the data). On top of this, you can also configure the `permissions` for the MCP server to control which operations are allowed (this will be checked first, before forwarding the actual request to the Iggy server).
+
+![MCP](../../../assets/iggy_mcp_server.png)
