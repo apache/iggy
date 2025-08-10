@@ -33,32 +33,39 @@ const LISTENERS_COUNT: u32 = 10;
 const INITIAL_BYTES_LENGTH: usize = 4;
 
 pub async fn start(endpoint: Endpoint, shard: Rc<IggyShard>) -> Result<(), IggyError> {
-    for _ in 0..LISTENERS_COUNT {
+    info!("Starting QUIC listener with {} workers", LISTENERS_COUNT);
+    for i in 0..LISTENERS_COUNT {
         let endpoint = endpoint.clone();
         let shard = shard.clone();
-        let _ = compio::runtime::spawn(async move {
+
+        compio::runtime::spawn(async move {
+            trace!("QUIC listener worker {} waiting for incoming connections...",i);
             while let Some(incoming_conn) = endpoint.wait_incoming().await {
                 let remote_addr = incoming_conn.remote_address();
-                info!("Incoming connection from client: {}", remote_addr);
+                trace!("Incoming connection from client: {}", remote_addr);
                 let shard = shard.clone();
-                let connection = match incoming_conn.await {
-                    Ok(conn) => conn,
-                    Err(error) => {
-                        error!(
-                            "Error when accepting incoming connection from {}: {:?}",
-                            remote_addr, error
-                        );
-                        continue;
+                compio::runtime::spawn(async move {
+                    trace!("Accepting connection from {}", remote_addr);
+                    match incoming_conn.await {
+                        Ok(connection) => {
+                            trace!("Connection established from {}", remote_addr);
+                            if let Err(error) = handle_connection(connection, shard).await {
+                                error!("QUIC connection from {} has failed: {error}", remote_addr);
+                            }
+                        }
+                        Err(error) => {
+                            error!(
+                                "Error when accepting incoming connection from {}: {:?}",
+                                remote_addr, error
+                            );
+                        }
                     }
-                };
-                let _ = compio::runtime::spawn(async move {
-                    let remote_addr = connection.remote_address();
-                    if let Err(error) = handle_connection(connection, shard).await {
-                        error!("QUIC connection from {} has failed: {error}", remote_addr);
-                    }
-                });
+                })
+                .detach();
             }
-        });
+            info!("QUIC listener worker {} stopped", i);
+        })
+        .detach();
     }
     Ok(())
 }
@@ -82,7 +89,7 @@ async fn handle_connection(
                 error!("Error when handling QUIC stream: {:?}", err)
             }
         };
-        let _handle = compio::runtime::spawn(handle_stream_task);
+        let _handle = compio::runtime::spawn(handle_stream_task).detach();
     }
     Ok(())
 }

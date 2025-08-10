@@ -23,10 +23,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use anyhow::Result;
-use compio_quic::{Endpoint, IdleTimeout, ServerConfig, TransportConfig, VarInt};
+use compio_quic::{
+    Endpoint, EndpointConfig, IdleTimeout, ServerBuilder, ServerConfig, TransportConfig, VarInt,
+};
 use error_set::ErrContext;
+use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tracing::{error, info};
+use tracing::{error, info, trace};
 
 use crate::configs::quic::QuicConfig;
 use crate::quic::COMPONENT;
@@ -36,26 +39,51 @@ use crate::shard::IggyShard;
 
 /// Starts the QUIC server.
 /// Returns the address the server is listening on.
-pub async fn start(shard: Rc<IggyShard>) -> Result<(), iggy_common::IggyError> {
-    let config = shard.config.quic.clone();
-    let addr: SocketAddr = config
-        .address
-        .parse()
-        .expect("Failed to parse QUIC address");
+pub async fn span_quic_server(shard: Rc<IggyShard>) -> Result<(), iggy_common::IggyError> {
+    if let Err(e) = default_provider().install_default() {
+        error!("Failed to install crypto provider: {:?}", e);
+        return Err(iggy_common::IggyError::QuicError);
+    }
 
+    let config = shard.config.quic.clone();
+    let addr: SocketAddr = config.address.parse().map_err(|e| {
+        error!("Failed to parse QUIC address '{}': {}", config.address, e);
+        iggy_common::IggyError::QuicError
+    })?;
     info!("Initializing Iggy QUIC server on shard {}...", shard.id);
+
     let server_config = configure_quic(&config).map_err(|e| {
         error!("Failed to configure QUIC: {:?}", e);
         iggy_common::IggyError::QuicError
     })?;
-    let endpoint = Endpoint::server(addr, server_config).await.map_err(|e| {
-        error!("Failed to create QUIC endpoint: {:?}", e);
+    trace!("Binding UDP socket on {}", addr);
+
+    let std_socket = std::net::UdpSocket::bind(addr).map_err(|e| {
+        error!("Failed to bind UDP socket: {}", e);
         iggy_common::IggyError::CannotBindToSocket(addr.to_string())
     })?;
+    std_socket.set_nonblocking(true).map_err(|e| {
+        error!("Failed to set socket to nonblocking mode: {}", e);
+        iggy_common::IggyError::QuicError
+    })?;
+
+    let socket = compio_net::UdpSocket::from_std(std_socket).map_err(|e| {
+        error!("Failed to convert std socket to compio socket: {:?}", e);
+        iggy_common::IggyError::QuicError
+    })?;
+    trace!("Creating QUIC endpoint with server config");
+
+    let endpoint = Endpoint::new(socket, EndpointConfig::default(), Some(server_config), None)
+        .map_err(|e| {
+            error!("Failed to create QUIC endpoint: {:?}", e);
+            iggy_common::IggyError::QuicError
+        })?;
+
     let actual_addr = endpoint.local_addr().map_err(|e| {
         error!("Failed to get local address: {e}");
         iggy_common::IggyError::CannotBindToSocket(addr.to_string())
     })?;
+
     info!("Iggy QUIC server has started on: {:?}", actual_addr);
     shard.quic_bound_address.set(Some(actual_addr));
     listener::start(endpoint, shard).await
@@ -67,9 +95,9 @@ fn configure_quic(config: &QuicConfig) -> Result<ServerConfig, QuicError> {
         false => load_certificates(&config.certificate.cert_file, &config.certificate.key_file)?,
     };
 
-    let mut server_config = ServerConfig::with_single_cert(certificates, private_key)
+    let mut builder = ServerBuilder::new_with_single_cert(certificates, private_key)
         .with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to create server config")
+            format!("{COMPONENT} (error: {error}) - failed to create QUIC server builder")
         })
         .map_err(|_| QuicError::ConfigCreationError)?;
     let mut transport = TransportConfig::default();
@@ -90,6 +118,7 @@ fn configure_quic(config: &QuicConfig) -> Result<ServerConfig, QuicError> {
             })
             .map_err(|_| QuicError::TransportConfigError)?,
     );
+
     if !config.keep_alive_interval.is_zero() {
         transport.keep_alive_interval(Some(config.keep_alive_interval.get_duration()));
     }
@@ -102,6 +131,7 @@ fn configure_quic(config: &QuicConfig) -> Result<ServerConfig, QuicError> {
         transport.max_idle_timeout(Some(max_idle_timeout));
     }
 
+    let mut server_config = builder.build();
     server_config.transport_config(Arc::new(transport));
     Ok(server_config)
 }

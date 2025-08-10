@@ -278,7 +278,7 @@ impl IggyShard {
         }
 
         if self.config.quic.enabled {
-            tasks.push(Box::pin(crate::quic::quic_server::start(self.clone())));
+            tasks.push(Box::pin(crate::quic::quic_server::span_quic_server(self.clone())));
         }
 
         let stop_receiver = self.get_stop_receiver();
