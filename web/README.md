@@ -1,12 +1,8 @@
-# Apache Iggy (Incubating) Web UI
+# Apache Iggy Web UI
 
-This proejcts hosts the web user interface for Apache Iggy. The web UI is built using SvelteKit.
+This project hosts the web user interface for Apache Iggy. The web UI is built using SvelteKit.
 
-![iggy](static/signIn.png)
-![iggy](static/stats.png)
-![iggy](static/permissions.png)
-![iggy](static/streams.png)
-![iggy](static/streamsLight.png)
+![Web](../assets/web_ui.png)
 
 ## Overview
 
@@ -24,20 +20,20 @@ The Iggy Web UI provides a user-friendly panel for managing various aspects of t
    docker run -p 3000:3000 -p 8090:8090 apache/iggy:latest
    ```
 
-1. **Clone the repository:**
+2. **Clone the repository:**
 
    ```sh
    git clone https://github.com/apache/iggy.git
    ```
 
-1. **Build the project:**
+3. **Build the project:**
 
    ```sh
-   cd iggy-web-ui
+   cd web
    npm install
    ```
 
-1. **Run the project:**
+4. **Run the project:**
 
    ```sh
    npm run dev

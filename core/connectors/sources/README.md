@@ -22,7 +22,7 @@ pub trait Source: Send + Sync {
 
 ## Configuration
 
-Source is configured in the default `config` file used by runtime. Each source configuration, is part of the map of <String, SourceConfig>, which can be represented using toml, json, or yaml.
+Source is configured in the default `config` file used by runtime. Each source configuration, is part of the map of `<String, SourceConfig>`, which can be represented using toml, json, or yaml.
 
 ```rust
 pub struct SourceConfig {
