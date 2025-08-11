@@ -1,0 +1,172 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: rust-post-merge
+description: Rust post-merge crates.io publishing github iggy actions
+
+inputs:
+  package:
+    description: "Package name for publishing (e.g., iggy, iggy_common, iggy_binary_protocol)"
+    required: true
+  version:
+    description: "Version for publishing"
+    required: true
+  dry_run:
+    description: "Dry run mode"
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Rust with cache
+      uses: ./.github/actions/utils/setup-rust-with-cache
+      with:
+        cache-targets: false  # Only cache registry and git deps, not target dir (sccache handles that)
+        show-stats: false  # Don't need stats for publishing
+
+    - name: Validate package
+      run: |
+        PACKAGE="${{ inputs.package }}"
+        VERSION="${{ inputs.version }}"
+
+        echo "📦 Validating Rust crate: $PACKAGE"
+        echo "Version: $VERSION"
+        echo ""
+
+        # Check if package exists in workspace
+        if ! cargo metadata --format-version 1 | jq -e ".packages[] | select(.name == \"$PACKAGE\")" > /dev/null; then
+          echo "❌ Package '$PACKAGE' not found in workspace"
+          echo ""
+          echo "Available packages:"
+          cargo metadata --format-version 1 | jq -r '.packages[].name' | sort
+          exit 1
+        fi
+
+        # Get package information
+        CARGO_VERSION=$(cargo metadata --format-version 1 | jq -r ".packages[] | select(.name == \"$PACKAGE\") | .version")
+        CARGO_PATH=$(cargo metadata --format-version 1 | jq -r ".packages[] | select(.name == \"$PACKAGE\") | .manifest_path")
+
+        echo "Current Cargo.toml version: $CARGO_VERSION"
+        echo "Target version: $VERSION"
+        echo "Manifest path: $CARGO_PATH"
+
+        # Check version consistency
+        if [ "$CARGO_VERSION" != "$VERSION" ]; then
+          echo "⚠️ Warning: Cargo.toml version ($CARGO_VERSION) doesn't match target version ($VERSION)"
+          echo "Make sure to update Cargo.toml before publishing"
+        fi
+
+        # Show package dependencies
+        echo ""
+        echo "Package dependencies:"
+        cargo tree -p "$PACKAGE" --depth 1 | head -20
+      shell: bash
+
+    - name: Build package
+      run: |
+        PACKAGE="${{ inputs.package }}"
+
+        echo "🔨 Building package: $PACKAGE"
+        cargo build -p "$PACKAGE" --release
+
+        # Verify the build
+        if [ $? -eq 0 ]; then
+          echo "✅ Package built successfully"
+        else
+          echo "❌ Build failed"
+          exit 1
+        fi
+      shell: bash
+
+    - name: Verify package contents
+      run: |
+        PACKAGE="${{ inputs.package }}"
+
+        echo "📋 Package contents verification:"
+        echo ""
+
+        # List what would be included in the package
+        cargo package -p "$PACKAGE" --list | head -50
+
+        echo ""
+        echo "Package size estimate:"
+        cargo package -p "$PACKAGE" --list | wc -l
+        echo "files would be included"
+      shell: bash
+
+    - name: Publish to crates.io
+      env:
+        CARGO_REGISTRY_TOKEN: ${{ env.CARGO_REGISTRY_TOKEN }}
+      run: |
+        PACKAGE="${{ inputs.package }}"
+        VERSION="${{ inputs.version }}"
+
+        if [ "${{ inputs.dry_run }}" = "true" ]; then
+          echo "🔍 Dry run - would publish crate: $PACKAGE"
+          echo ""
+
+          # Run cargo publish in dry-run mode
+          cargo publish --dry-run -p "$PACKAGE"
+
+          echo ""
+          echo "Would publish:"
+          echo "  Package: $PACKAGE"
+          echo "  Version: $VERSION"
+          echo "  Registry: crates.io"
+          echo ""
+          echo "After publishing, users could use:"
+          echo '  [dependencies]'
+          echo "  $PACKAGE = \"$VERSION\""
+          echo ""
+          echo "Or with cargo add:"
+          echo "  cargo add $PACKAGE@$VERSION"
+        else
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "❌ CARGO_REGISTRY_TOKEN is not set"
+            exit 1
+          fi
+
+          echo "📦 Publishing crate to crates.io..."
+          echo "Package: $PACKAGE"
+          echo "Version: $VERSION"
+          echo ""
+
+          # Publish the package
+          cargo publish -p "$PACKAGE"
+
+          if [ $? -eq 0 ]; then
+            echo ""
+            echo "✅ Successfully published to crates.io"
+            echo ""
+            echo "Package: $PACKAGE v$VERSION"
+            echo "Registry: https://crates.io/crates/$PACKAGE"
+            echo ""
+            echo "Users can now use:"
+            echo '  [dependencies]'
+            echo "  $PACKAGE = \"$VERSION\""
+            echo ""
+            echo "Or with cargo add:"
+            echo "  cargo add $PACKAGE@$VERSION"
+            echo ""
+            echo "View on crates.io: https://crates.io/crates/$PACKAGE/$VERSION"
+          else
+            echo "❌ Publishing failed"
+            exit 1
+          fi
+        fi
+      shell: bash

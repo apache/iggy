@@ -1,0 +1,141 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# NOTE: this action sets up the Rust toolchain + swatinem/rust-cache for dependencies + sccache for compilation,
+#       it is a convenience wrapper, so that we can use it in all workflows.
+
+name: setup-rust-with-cache
+description: Setup Rust toolchain and comprehensive caching (rust-cache for dependencies + sccache for compilation)
+inputs:
+  enabled:
+    description: "Whether to enable caching"
+    required: false
+    default: "true"
+  show-stats:
+    description: "Whether to show sccache statistics at the end"
+    required: false
+    default: "false"
+  cache-targets:
+    description: "Whether to cache target directory (passed to rust-cache)"
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Rust toolchain
+      run: |
+        echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
+      shell: bash
+
+    - name: Setup Rust dependencies cache
+      if: inputs.enabled == 'true'
+      uses: Swatinem/rust-cache@v2
+      with:
+        cache-targets: ${{ inputs.cache-targets }}
+
+    - name: Setup sccache cache
+      if: inputs.enabled == 'true'
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cache/sccache
+          ~/Library/Caches/sccache
+          ~/.local/share/sccache
+        key: sccache-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+        restore-keys: |
+          sccache-${{ runner.os }}-${{ github.job }}-
+          sccache-${{ runner.os }}-
+
+    - name: Install sccache
+      if: inputs.enabled == 'true'
+      run: |
+        # Check if sccache is already installed
+        if ! command -v sccache &> /dev/null; then
+          echo "Installing sccache..."
+          SCCACHE_VERSION="v0.8.2"
+          SCCACHE_URL="https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+
+          curl -L "$SCCACHE_URL" | tar xz
+          sudo mv sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache /usr/local/bin/
+          rm -rf sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl
+        fi
+      shell: bash
+      continue-on-error: true
+
+    - name: Install cargo-nextest
+      run: |
+        # Check if cargo-nextest is already installed
+        if ! command -v cargo-nextest &> /dev/null; then
+          echo "Installing cargo-nextest..."
+          # Use the install script for the fastest installation
+          curl -LsSf https://get.nexte.st/latest/linux | tar xzf - -C ${CARGO_HOME:-~/.cargo}/bin
+          echo "✅ cargo-nextest installed successfully"
+        else
+          echo "✅ cargo-nextest already installed"
+        fi
+
+        # Verify installation
+        cargo nextest --version || true
+      shell: bash
+      continue-on-error: true
+
+    - name: Configure Rust for sccache
+      if: inputs.enabled == 'true'
+      run: |
+        # Only use sccache if it was successfully installed
+        if command -v sccache &> /dev/null; then
+          # Configure sccache to use local disk cache
+          export SCCACHE_DIR="${HOME}/.cache/sccache"
+          mkdir -p "$SCCACHE_DIR"
+
+          echo "SCCACHE_DIR=$SCCACHE_DIR" >> $GITHUB_ENV
+          echo "SCCACHE_CACHE_SIZE=2G" >> $GITHUB_ENV
+          echo "SCCACHE_ERROR_BEHAVIOR=warn" >> $GITHUB_ENV
+          echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1" >> $GITHUB_ENV
+
+          # Don't use GHA cache backend - use local disk cache with actions/cache
+          # This provides better control and persistence
+          echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+
+          # Start sccache server
+          sccache --stop-server 2>/dev/null || true
+          sccache --start-server || true
+
+          # Test if sccache is working
+          if sccache --show-stats >/dev/null 2>&1; then
+            echo "✅ sccache configured with local cache at $SCCACHE_DIR"
+
+            # Show initial stats
+            echo "Initial cache stats:"
+            sccache --show-stats || true
+          else
+            echo "⚠️ sccache installed but not functioning, continuing without cache"
+          fi
+        else
+          echo "⚠️ sccache not available, continuing without cache"
+        fi
+      shell: bash
+
+    - name: Show sccache stats on completion
+      if: always() && inputs.enabled == 'true' && inputs.show-stats == 'true'
+      run: |
+        if command -v sccache &> /dev/null; then
+          echo "### Final sccache Statistics ###"
+          sccache --show-stats || true
+        fi
+      shell: bash

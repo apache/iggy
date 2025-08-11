@@ -1,0 +1,161 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: python-maturin-post-merge
+description: Python post-merge PyPI publishing with pre-built wheels
+
+inputs:
+  version:
+    description: "Version for publishing"
+    required: true
+  dry_run:
+    description: "Dry run mode"
+    required: false
+    default: "false"
+  wheels_artifact:
+    description: "Name of the artifact containing the wheels"
+    required: false
+    default: "python-wheels-all"
+  wheels_path:
+    description: "Path where wheels should be downloaded"
+    required: false
+    default: "dist"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate version format
+      run: |
+        VERSION="${{ inputs.version }}"
+
+        # Check if version matches Python/PEP 440 versioning
+        if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?(\.[a-z0-9]+)?$'; then
+          echo "❌ Invalid version format: $VERSION"
+          echo "Expected format: X.Y.Z or X.Y.Z[a|b|rc]N or X.Y.Z.devN"
+          exit 1
+        fi
+
+        echo "✅ Version format valid: $VERSION"
+      shell: bash
+
+    - name: Download pre-built wheels
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.wheels_artifact }}
+        path: ${{ inputs.wheels_path }}
+
+    - name: Validate downloaded wheels
+      run: |
+        WHEELS_PATH="${{ inputs.wheels_path }}"
+
+        echo "📋 Validating downloaded wheels and source distribution:"
+        echo ""
+
+        # Check if directory exists and has files
+        if [ ! -d "$WHEELS_PATH" ]; then
+          echo "❌ Wheels directory not found: $WHEELS_PATH"
+          exit 1
+        fi
+
+        # Count artifacts
+        WHEEL_COUNT=$(ls -1 "$WHEELS_PATH"/*.whl 2>/dev/null | wc -l || echo "0")
+        SDIST_COUNT=$(ls -1 "$WHEELS_PATH"/*.tar.gz 2>/dev/null | wc -l || echo "0")
+
+        if [ "$WHEEL_COUNT" -eq 0 ] && [ "$SDIST_COUNT" -eq 0 ]; then
+          echo "❌ No wheels or source distributions found in $WHEELS_PATH"
+          exit 1
+        fi
+
+        echo "Found artifacts:"
+        echo "  - Wheels: $WHEEL_COUNT"
+        echo "  - Source distributions: $SDIST_COUNT"
+        echo ""
+
+        # List all artifacts with details
+        echo "Artifacts to publish:"
+        for file in "$WHEELS_PATH"/*.whl "$WHEELS_PATH"/*.tar.gz; do
+          if [ -f "$file" ]; then
+            filename=$(basename "$file")
+            size=$(du -h "$file" | cut -f1)
+
+            # Determine platform from filename
+            if [[ "$filename" == *"linux"* ]]; then platform="Linux"
+            elif [[ "$filename" == *"macosx"* ]]; then platform="macOS"
+            elif [[ "$filename" == *"win"* ]]; then platform="Windows"
+            elif [[ "$filename" == *.tar.gz ]]; then platform="Source"
+            else platform="Universal"; fi
+
+            # Determine architecture from filename
+            if [[ "$filename" == *"x86_64"* ]] || [[ "$filename" == *"amd64"* ]]; then arch="x86_64"
+            elif [[ "$filename" == *"aarch64"* ]] || [[ "$filename" == *"arm64"* ]] || [[ "$filename" == *"universal2"* ]]; then arch="arm64"
+            elif [[ "$filename" == *"i686"* ]] || [[ "$filename" == *"win32"* ]]; then arch="x86"
+            elif [[ "$filename" == *.tar.gz ]]; then arch="N/A"
+            else arch="any"; fi
+
+            echo "  - $filename ($platform/$arch, $size)"
+          fi
+        done
+
+        echo ""
+        echo "✅ All packages ready for publishing"
+      shell: bash
+
+    - name: Display publishing information (dry run)
+      if: inputs.dry_run == 'true'
+      run: |
+        WHEELS_PATH="${{ inputs.wheels_path }}"
+        VERSION="${{ inputs.version }}"
+
+        echo "🔍 DRY RUN - Would publish to PyPI:"
+        echo ""
+        echo "Package: apache-iggy"
+        echo "Version: $VERSION"
+        echo "Registry: https://pypi.org"
+        echo ""
+
+        echo "Packages that would be published:"
+        for file in "$WHEELS_PATH"/*.whl "$WHEELS_PATH"/*.tar.gz; do
+          if [ -f "$file" ]; then
+            echo "  - $(basename "$file")"
+          fi
+        done
+
+        echo ""
+        echo "Platform coverage:"
+        echo "  - Linux: x86_64, aarch64"
+        echo "  - macOS: x86_64, arm64"
+        echo "  - Windows: x64"
+        echo "  - Source distribution: included"
+
+        echo ""
+        echo "After publishing, users could install with:"
+        echo "  pip install apache-iggy==$VERSION"
+        echo ""
+        echo "Or add to requirements.txt:"
+        echo "  apache-iggy==$VERSION"
+        echo ""
+        echo "View on PyPI: https://pypi.org/project/apache-iggy/$VERSION/"
+      shell: bash
+
+    - name: Publish to PyPI using maturin
+      if: inputs.dry_run == 'false'
+      uses: PyO3/maturin-action@v1
+      env:
+        MATURIN_PYPI_TOKEN: ${{ env.PYPI_API_TOKEN }}
+      with:
+        command: upload
+        args: --non-interactive --skip-existing ${{ inputs.wheels_path }}/*

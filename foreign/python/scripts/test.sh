@@ -35,14 +35,14 @@ echo "✅ Server is ready!"
 echo "🔗 Testing basic connectivity..."
 
 # Resolve hostname to IP address for Rust client compatibility
-SERVER_IP=$(getent hosts ${IGGY_SERVER_HOST} | awk '{ print $1 }' | head -n1)
+SERVER_IP=$(getent hosts "${IGGY_SERVER_HOST}" | awk '{ print $1 }' | head -n1)
 if [ -z "$SERVER_IP" ]; then
     echo "❌ Could not resolve hostname: ${IGGY_SERVER_HOST}"
     exit 1
 fi
 echo "📍 Resolved ${IGGY_SERVER_HOST} to ${SERVER_IP}"
 
-python3 -c "
+if ! python3 -c "
 import asyncio
 import sys
 from apache_iggy import IggyClient
@@ -61,9 +61,7 @@ async def test_connection():
 
 result = asyncio.run(test_connection())
 sys.exit(0 if result else 1)
-"
-
-if [ $? -ne 0 ]; then
+"; then
     echo "❌ Connection test failed, aborting tests"
     exit 1
 fi
@@ -74,7 +72,7 @@ mkdir -p test-results
 # Run tests with detailed output
 echo "🧪 Running Python SDK tests..."
 python3 -m pytest \
-    ${PYTEST_ARGS:-"-v --tb=short"} \
+    "${PYTEST_ARGS:--v --tb=short}" \
     --junit-xml=test-results/pytest.xml \
     tests/
 

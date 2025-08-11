@@ -86,20 +86,30 @@ test -d local_data && rm -fr local_data
 test -e ${LOG_FILE} && rm ${LOG_FILE}
 test -e ${PID_FILE} && rm ${PID_FILE}
 
-# Build binaries
-echo "Building binaries..."
+# Check if server binary exists
+SERVER_BIN=""
 if [ -n "${TARGET}" ]; then
-    cargo build --target "${TARGET}"
+    SERVER_BIN="target/${TARGET}/debug/iggy-server"
 else
-    cargo build
+    SERVER_BIN="target/debug/iggy-server"
 fi
 
-# Run iggy server and let it run in the background
-if [ -n "${TARGET}" ]; then
-    cargo run --target "${TARGET}" --bin iggy-server &>${LOG_FILE} &
-else
-    cargo run --bin iggy-server &>${LOG_FILE} &
+if [ ! -f "${SERVER_BIN}" ]; then
+    echo "Error: Server binary not found at ${SERVER_BIN}"
+    echo "Please build the server binary before running this script:"
+    if [ -n "${TARGET}" ]; then
+        echo "  cargo build --target ${TARGET} --bin iggy-server"
+    else
+        echo "  cargo build --bin iggy-server"
+    fi
+    exit 1
 fi
+
+echo "Using server binary at ${SERVER_BIN}"
+
+# Run iggy server using the prebuilt binary
+echo "Starting server from ${SERVER_BIN}..."
+${SERVER_BIN} &>${LOG_FILE} &
 echo $! >${PID_FILE}
 
 # Wait until "Iggy server has started" string is present inside iggy-server.log

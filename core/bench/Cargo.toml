@@ -25,6 +25,10 @@ homepage = "https://iggy.apache.org"
 description = "Benchmarking CLI for Iggy message streaming platform"
 keywords = ["iggy", "cli", "messaging", "streaming"]
 readme = "../../README.md"
+
+[[bin]]
+name = "iggy-bench"
+path = "src/main.rs"
 # Due to dependency to integration, which has a dependency to server, setting
 # mimalloc on server is also setting it on bench.
 
@@ -53,10 +57,6 @@ tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
-
-[[bin]]
-name = "iggy-bench"
-path = "src/main.rs"
 
 [lints.clippy]
 enum_glob_use = "deny"
