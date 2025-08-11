@@ -1,0 +1,109 @@
+components:
+  rust-server:
+    paths: 
+      - "core/server/**"
+      - "core/common/**"
+      - "core/binary_protocol/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+    tasks: ["lint", "test", "coverage", "compat", "docker"]
+    publish: ["docker", "crates"]
+
+  rust-cli:
+    paths: 
+      - "core/cli/**"
+      - "core/common/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+    tasks: ["lint", "test"]
+    publish: ["crates"]
+
+  rust-sdk:
+    paths:
+      - "core/sdk/**"
+      - "core/common/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+    tasks: ["lint", "test", "coverage"]
+    publish: ["crates"]
+
+  rust-bench:
+    paths:
+      - "core/bench/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+    tasks: ["lint", "test"]
+    publish: []
+
+  rust-integration:
+    paths:
+      - "core/integration/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+    tasks: ["test"]
+    publish: []
+
+  sdk-python:
+    paths: 
+      - "foreign/python/**"
+    tasks: ["test", "build"]
+    publish: ["pypi"]
+
+  sdk-node:
+    paths: 
+      - "foreign/node/**"
+    tasks: ["lint", "test", "build"]
+    publish: ["npm"]
+
+  sdk-go:
+    paths: 
+      - "foreign/go/**"
+    tasks: ["test"]
+    publish: ["gomod"]
+
+  sdk-java:
+    paths: 
+      - "foreign/java/**"
+    tasks: ["test", "build"]
+    publish: ["maven"]
+
+  sdk-csharp:
+    paths: 
+      - "foreign/csharp/**"
+    tasks: ["test", "build"]
+    publish: ["nuget"]
+
+  connectors-runtime:
+    paths: 
+      - "core/connectors/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+    tasks: ["lint", "test", "docker"]
+    publish: ["docker"]
+
+  mcp:
+    paths: 
+      - "core/ai/mcp/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+    tasks: ["build", "docker"]
+    publish: ["docker"]
+
+  bdd-suite:
+    paths: 
+      - "bdd/**"
+      - "core/server/**"
+    tasks: ["bdd"]
+    publish: []
+
+  examples:
+    paths:
+      - "examples/**"
+    tasks: ["test"]
+    publish: []
+
+  web-ui:
+    paths:
+      - "web/**"
+    tasks: ["lint", "build"]
+    publish: ["docker"]

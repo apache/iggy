@@ -1,0 +1,117 @@
+name: Publish
+on:
+  push:
+    tags:
+      - server-[0-9]+.[0-9]+.[0-9]+
+      - cli-[0-9]+.[0-9]+.[0-9]+
+      - sdk-[0-9]+.[0-9]+.[0-9]+
+      - python-v[0-9]+.[0-9]+.[0-9]+
+      - node-sdk-[0-9]+.[0-9]+.[0-9]+
+      - java-sdk-[0-9]+.[0-9]+.[0-9]+
+      - csharp-sdk-[0-9]+.[0-9]+.[0-9]+
+      - foreign/go/v[0-9]+.[0-9]+.[0-9]+
+      - connectors-[0-9]+.[0-9]+.[0-9]+
+      - mcp-[0-9]+.[0-9]+.[0-9]+
+      - web-ui-[0-9]+.[0-9]+.[0-9]+
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (don't actually publish)"
+        required: false
+        default: true
+        type: boolean
+      tag:
+        description: "Tag to publish (leave empty to use current ref)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish Release
+    uses: ./.github/workflows/_publish.yml
+    with:
+      dry_run: ${{ inputs.dry_run || false }}
+    secrets: inherit
+
+  create-release:
+    name: Create GitHub Release
+    needs: publish
+    if: success() && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Extract changelog
+        id: changelog
+        run: |
+          # Extract relevant section from CHANGELOG.md if it exists
+          if [ -f "CHANGELOG.md" ]; then
+            # This would need proper changelog parsing
+            echo "Changelog entry found"
+          else
+            echo "No changelog found"
+          fi
+          
+      - name: Create Release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = context.ref.replace('refs/tags/', '');
+            const component = '${{ needs.publish.outputs.component }}';
+            const version = '${{ needs.publish.outputs.version }}';
+            
+            // Determine release name based on component
+            let releaseName = tag;
+            if (component.includes('server')) {
+              releaseName = `Iggy Server v${version}`;
+            } else if (component.includes('cli')) {
+              releaseName = `Iggy CLI v${version}`;
+            } else if (component.includes('sdk')) {
+              const lang = component.split('-')[1];
+              releaseName = `${lang.charAt(0).toUpperCase() + lang.slice(1)} SDK v${version}`;
+            }
+            
+            // Create release
+            const release = await github.rest.repos.createRelease({
+              ...context.repo,
+              tag_name: tag,
+              name: releaseName,
+              body: `## Release ${version}\n\nSee [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${tag}/CHANGELOG.md) for details.`,
+              draft: false,
+              prerelease: version.includes('-')
+            });
+            
+            console.log(`Created release: ${release.data.html_url}`);
+
+  notify-failure:
+    name: Notify on Failure
+    needs: [publish, create-release]
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Create issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = context.ref.replace('refs/tags/', '');
+            await github.rest.issues.create({
+              ...context.repo,
+              title: `Publish failed for ${tag}`,
+              body: `The publish workflow failed for tag \`${tag}\`.\n\n[View run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`,
+              labels: ['ci', 'publish-failure', 'automated']
+            });

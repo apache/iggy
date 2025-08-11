@@ -1,0 +1,187 @@
+name: _security
+on:
+  workflow_call:
+    inputs:
+      create_issues:
+        type: boolean
+        required: false
+        default: false
+        description: "Create issues for security findings"
+        
+permissions:
+  contents: read
+  security-events: write
+  issues: write
+
+jobs:
+  rust-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+        
+      - name: Run cargo audit
+        id: audit
+        run: |
+          cargo audit --json > audit.json || true
+          cargo audit || echo "::warning::Cargo audit found vulnerabilities"
+          
+      - name: Upload SARIF
+        if: always()
+        continue-on-error: true
+        run: |
+          # Convert audit output to SARIF if possible
+          # This would need a converter tool
+          echo "Audit results available in workflow logs"
+
+  dependency-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy.sarif
+          severity: 'CRITICAL,HIGH,MEDIUM'
+          
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy.sarif
+          
+  license-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Check licenses
+        run: |
+          # Check license headers
+          docker run --rm -v ${{ github.workspace }}:/src -w /src \
+            ghcr.io/google/addlicense:latest \
+            -check -f ASF_LICENSE.txt . || \
+            echo "::warning::Some files missing license headers"
+            
+      - name: Check dependency licenses
+        run: |
+          ./scripts/licenses-list.sh --check || \
+            echo "::warning::License list may be out of date"
+
+  sdk-audits:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        sdk: [node, python, java, csharp, go]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Audit ${{ matrix.sdk }} dependencies
+        run: |
+          case "${{ matrix.sdk }}" in
+            node)
+              if [ -f "foreign/node/package-lock.json" ]; then
+                cd foreign/node && npm audit --audit-level=high || true
+              fi
+              ;;
+            python)
+              if [ -f "foreign/python/requirements.txt" ]; then
+                pip install safety
+                cd foreign/python && safety check || true
+              fi
+              ;;
+            java)
+              if [ -f "foreign/java/build.gradle" ]; then
+                cd foreign/java && ./gradlew dependencyCheckAnalyze || true
+              fi
+              ;;
+            csharp)
+              if [ -f "foreign/csharp/Iggy_SDK.sln" ]; then
+                cd foreign/csharp && dotnet list package --vulnerable || true
+              fi
+              ;;
+            go)
+              if [ -f "foreign/go/go.mod" ]; then
+                cd foreign/go && go list -m all | nancy sleuth || true
+              fi
+              ;;
+          esac
+
+  clippy-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          
+      - name: Install tools
+        run: |
+          cargo install clippy-sarif sarif-fmt --locked
+          
+      - name: Run clippy
+        run: |
+          cargo clippy --all-features --all-targets --message-format=json | \
+            clippy-sarif | tee clippy.sarif | sarif-fmt
+        continue-on-error: true
+        
+      - name: Upload clippy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: clippy.sarif
+
+  summary:
+    needs: [rust-audit, dependency-check, license-check, sdk-audits, clippy-analysis]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create summary
+        run: |
+          echo "## Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Rust Audit | ${{ needs.rust-audit.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dependency Check | ${{ needs.dependency-check.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| License Check | ${{ needs.license-check.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| SDK Audits | ${{ needs.sdk-audits.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Clippy Analysis | ${{ needs.clippy-analysis.result }} |" >> $GITHUB_STEP_SUMMARY
+          
+      - name: Create issue if requested
+        if: inputs.create_issues && contains(needs.*.result, 'failure')
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const date = new Date().toISOString().split('T')[0];
+            const title = `Security scan failures - ${date}`;
+            const body = `## Security Scan Results
+            
+            The following security checks have issues:
+            - Rust Audit: ${{ needs.rust-audit.result }}
+            - Dependency Check: ${{ needs.dependency-check.result }}
+            - License Check: ${{ needs.license-check.result }}
+            - SDK Audits: ${{ needs.sdk-audits.result }}
+            - Clippy Analysis: ${{ needs.clippy-analysis.result }}
+            
+            [View run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`;
+            
+            await github.rest.issues.create({
+              ...context.repo,
+              title,
+              body,
+              labels: ['security', 'automated']
+            });

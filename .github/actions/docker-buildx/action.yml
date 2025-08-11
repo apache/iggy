@@ -1,0 +1,141 @@
+name: docker-buildx
+description: Multi-arch Docker build and push with caching
+inputs:
+  component:
+    description: "Component to build"
+    required: false
+    default: ""
+  image:
+    description: "Docker image name (deprecated, use component)"
+    required: false
+    default: ""
+  version:
+    description: "Version tag"
+    required: true
+  context:
+    description: "Build context"
+    required: false
+    default: "."
+  dockerfile:
+    description: "Dockerfile path"
+    required: false
+    default: ""
+  push:
+    description: "Push to registry"
+    required: false
+    default: "true"
+    
+runs:
+  using: "composite"
+  steps:
+    - name: Determine image configuration
+      id: config
+      shell: bash
+      run: |
+        # Determine image name and dockerfile based on component
+        component="${{ inputs.component }}"
+        image="${{ inputs.image }}"
+        dockerfile="${{ inputs.dockerfile }}"
+        
+        if [ -n "$component" ]; then
+          case "$component" in
+            rust-server)
+              image="apache/iggy"
+              dockerfile="Dockerfile.ci"
+              ;;
+            connectors-runtime)
+              image="apache/iggy-connectors"
+              dockerfile="core/connectors/runtime/Dockerfile"
+              ;;
+            mcp)
+              image="apache/iggy-mcp"
+              dockerfile="core/ai/mcp/Dockerfile"
+              ;;
+            web-ui)
+              image="apache/iggy-web-ui"
+              dockerfile="web/Dockerfile"
+              ;;
+            *)
+              echo "Unknown component: $component"
+              exit 1
+              ;;
+          esac
+        fi
+        
+        # Use provided dockerfile if not set
+        if [ -z "$dockerfile" ] && [ -n "${{ inputs.dockerfile }}" ]; then
+          dockerfile="${{ inputs.dockerfile }}"
+        elif [ -z "$dockerfile" ]; then
+          dockerfile="Dockerfile"
+        fi
+        
+        echo "image=$image" >> "$GITHUB_OUTPUT"
+        echo "dockerfile=$dockerfile" >> "$GITHUB_OUTPUT"
+        
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+      with:
+        platforms: all
+        
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      with:
+        driver-opts: |
+          network=host
+          image=moby/buildkit:latest
+          
+    - name: Login to Docker Hub
+      if: inputs.push == 'true'
+      uses: docker/login-action@v3
+      with:
+        username: ${{ env.DOCKERHUB_USERNAME || env.DOCKERHUB_USER }}
+        password: ${{ env.DOCKERHUB_TOKEN || env.DOCKERHUB_PASSWORD }}
+        
+    - name: Docker meta
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ steps.config.outputs.image }}
+        tags: |
+          type=raw,value=latest,enable=${{ inputs.push == 'true' }}
+          type=raw,value=${{ inputs.version }}
+          type=raw,value=edge,enable=${{ github.ref == 'refs/heads/master' }}
+          
+    - name: Determine platforms
+      id: platforms
+      shell: bash
+      run: |
+        # Start with default platforms
+        platforms="linux/amd64,linux/arm64"
+        
+        # Add more platforms for production builds
+        if [ "${{ inputs.push }}" = "true" ]; then
+          # Could add more platforms here if needed
+          # platforms="linux/amd64,linux/arm64,linux/arm/v7"
+          true
+        fi
+        
+        echo "platforms=$platforms" >> "$GITHUB_OUTPUT"
+        
+    - name: Build and push
+      uses: docker/build-push-action@v6
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ steps.config.outputs.dockerfile }}
+        platforms: ${{ steps.platforms.outputs.platforms }}
+        push: ${{ inputs.push }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        build-args: |
+          VERSION=${{ inputs.version }}
+          BUILD_DATE=${{ github.event.repository.updated_at }}
+          VCS_REF=${{ github.sha }}
+          
+    - name: Image digest
+      if: inputs.push == 'true'
+      shell: bash
+      run: |
+        echo "Image digest: ${{ steps.build.outputs.digest }}"
+        echo "Image: ${{ steps.config.outputs.image }}:${{ inputs.version }}"

@@ -1,0 +1,187 @@
+name: _publish
+on:
+  workflow_call:
+    inputs:
+      dry_run:
+        type: boolean
+        required: false
+        default: false
+        description: "Run in dry-run mode"
+        
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  
+environment: release
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+    outputs:
+      component: ${{ steps.p.outputs.component }}
+      version: ${{ steps.p.outputs.version }}
+      valid: ${{ steps.p.outputs.valid }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Parse tag
+        id: p
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const yaml = require('js-yaml');
+            
+            const ref = context.ref; // refs/tags/<tag>
+            const tag = ref.split('/').pop();
+            console.log(`Processing tag: ${tag}`);
+            
+            // Load policies
+            let policies = {};
+            try {
+              const content = fs.readFileSync('.github/ci/config/policies.yml', 'utf8');
+              policies = yaml.load(content).tag_patterns || {};
+            } catch (e) {
+              core.setFailed('Could not load policies.yml');
+              return;
+            }
+            
+            // Match tag to component
+            let component = '';
+            let version = '';
+            
+            for (const [comp, pattern] of Object.entries(policies)) {
+              const re = new RegExp('^' + pattern + '$');
+              const match = tag.match(re);
+              if (match) {
+                component = comp;
+                // Extract version from tag
+                version = tag.match(/([0-9]+\.[0-9]+\.[0-9]+)/)?.[1] || '';
+                break;
+              }
+            }
+            
+            if (!component) {
+              core.setFailed(`Tag ${tag} didn't match any component pattern`);
+              core.setOutput('valid', 'false');
+              return;
+            }
+            
+            console.log(`Component: ${component}, Version: ${version}`);
+            core.setOutput('component', component);
+            core.setOutput('version', version);
+            core.setOutput('valid', 'true');
+
+  publish:
+    needs: parse
+    if: needs.parse.outputs.valid == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup environment
+        run: |
+          echo "Component: ${{ needs.parse.outputs.component }}"
+          echo "Version: ${{ needs.parse.outputs.version }}"
+          echo "Dry run: ${{ inputs.dry_run }}"
+
+      # Docker images (multi-arch)
+      - name: Publish Docker image
+        if: contains(fromJSON('["rust-server", "connectors-runtime", "mcp", "web-ui"]'), needs.parse.outputs.component)
+        uses: ./.github/actions/docker-buildx
+        with:
+          component: ${{ needs.parse.outputs.component }}
+          version: ${{ needs.parse.outputs.version }}
+          push: ${{ !inputs.dry_run }}
+
+      # Rust crates
+      - name: Publish Rust crates
+        if: startsWith(needs.parse.outputs.component, 'rust-')
+        uses: ./.github/actions/rust
+        with:
+          task: publish
+          version: ${{ needs.parse.outputs.version }}
+          dry_run: ${{ inputs.dry_run }}
+
+      # Python package
+      - name: Publish Python package
+        if: needs.parse.outputs.component == 'sdk-python'
+        uses: ./.github/actions/python-maturin
+        with:
+          task: publish
+          version: ${{ needs.parse.outputs.version }}
+          dry_run: ${{ inputs.dry_run }}
+
+      # Node package
+      - name: Publish Node package
+        if: needs.parse.outputs.component == 'sdk-node'
+        uses: ./.github/actions/node-npm
+        with:
+          task: publish
+          version: ${{ needs.parse.outputs.version }}
+          dry_run: ${{ inputs.dry_run }}
+
+      # Java package
+      - name: Publish Java package
+        if: needs.parse.outputs.component == 'sdk-java'
+        uses: ./.github/actions/java-gradle
+        with:
+          task: publish
+          version: ${{ needs.parse.outputs.version }}
+          dry_run: ${{ inputs.dry_run }}
+
+      # C# package
+      - name: Publish C# package
+        if: needs.parse.outputs.component == 'sdk-csharp'
+        uses: ./.github/actions/csharp-dotnet
+        with:
+          task: publish
+          version: ${{ needs.parse.outputs.version }}
+          dry_run: ${{ inputs.dry_run }}
+
+      # Go module (tag-based only)
+      - name: Tag Go module
+        if: needs.parse.outputs.component == 'sdk-go'
+        run: |
+          echo "Go modules are published via git tags"
+          echo "Tag ${{ github.ref }} will be available as a Go module version"
+
+  notify:
+    needs: [parse, publish]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create issue on failure
+        if: failure() && !inputs.dry_run
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `Publish failed for ${context.ref}`;
+            const body = `## Publish Failure
+            
+            **Tag:** ${context.ref}
+            **Component:** ${{ needs.parse.outputs.component }}
+            **Version:** ${{ needs.parse.outputs.version }}
+            **Run:** [${context.runId}](https://github.com/${{ github.repository }}/actions/runs/${context.runId})
+            
+            Please investigate and retry if necessary.`;
+            
+            await github.rest.issues.create({
+              ...context.repo,
+              title,
+              body,
+              labels: ['ci', 'publish-failure', 'automated']
+            });
+            
+      - name: Summary
+        if: success()
+        run: |
+          echo "## Publish Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Successfully published:" >> $GITHUB_STEP_SUMMARY
+          echo "- Component: ${{ needs.parse.outputs.component }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Version: ${{ needs.parse.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Dry run: ${{ inputs.dry_run }}" >> $GITHUB_STEP_SUMMARY

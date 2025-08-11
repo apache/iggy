@@ -1,0 +1,46 @@
+registries:
+  docker-hub:
+    type: docker
+    images:
+      server: "apache/iggy"
+      connectors: "apache/iggy-connectors"
+      mcp: "apache/iggy-mcp"
+      web-ui: "apache/iggy-web-ui"
+    multi_arch: true
+    edge_tag: edge
+    latest_tag: latest
+
+  crates:
+    type: cargo
+    packages:
+      - iggy
+      - server
+      - iggy-cli
+    auth: token
+
+  npm:
+    type: npm
+    package: "@apache/iggy"
+    provenance: true
+    auth: token
+    access: public
+
+  pypi:
+    type: python
+    package: apache-iggy
+    tool: maturin
+    auth: oidc_or_token
+
+  maven:
+    type: gradle
+    group_id: org.apache.iggy
+    artifact_id: iggy-java-sdk
+    repo_url: https://repository.apache.org/releases
+    snapshots_url: https://repository.apache.org/snapshots
+    auth: token
+
+  nuget:
+    type: dotnet
+    package: Apache.Iggy
+    source: https://api.nuget.org/v3/index.json
+    auth: token

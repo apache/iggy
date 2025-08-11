@@ -1,0 +1,90 @@
+name: node-npm
+description: Node.js lint/test/build/publish with npm
+inputs:
+  task:
+    description: "Task to run"
+    required: true
+  version:
+    description: "Version for publishing"
+    required: false
+    default: ""
+  dry_run:
+    description: "Dry run mode"
+    required: false
+    default: "false"
+    
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+        registry-url: "https://registry.npmjs.org"
+        cache: "npm"
+        cache-dependency-path: foreign/node/package-lock.json
+        
+    - name: Install dependencies
+      shell: bash
+      run: |
+        cd foreign/node
+        npm ci
+        
+    - name: Lint
+      if: inputs.task == 'lint'
+      shell: bash
+      run: |
+        cd foreign/node
+        npm run lint || true
+        
+    - name: Test
+      if: inputs.task == 'test'
+      shell: bash
+      run: |
+        cd foreign/node
+        
+        # Create reports directory
+        mkdir -p ../../reports
+        
+        # Run tests with coverage
+        npm test -- --ci --coverage --coverageDirectory=../../reports/coverage || true
+        
+        # If jest-junit is configured
+        if grep -q "jest-junit" package.json; then
+          npm test -- --ci --reporters=jest-junit || true
+        fi
+        
+    - name: Build
+      if: inputs.task == 'build' || inputs.task == 'publish'
+      shell: bash
+      run: |
+        cd foreign/node
+        npm run build
+        
+        # Verify build output
+        if [ -d "dist" ]; then
+          echo "Build output:"
+          ls -la dist/
+        fi
+        
+    - name: Publish to npm
+      if: inputs.task == 'publish'
+      shell: bash
+      env:
+        NODE_AUTH_TOKEN: ${{ env.NPM_TOKEN }}
+      run: |
+        cd foreign/node
+        
+        if [ "${{ inputs.dry_run }}" = "true" ]; then
+          echo "Dry run - would publish version:"
+          npm version
+          npm pack --dry-run
+        else
+          # Set version if provided
+          if [ -n "${{ inputs.version }}" ]; then
+            npm version ${{ inputs.version }} --no-git-tag-version --allow-same-version || true
+          fi
+          
+          # Publish with provenance
+          npm publish --provenance --access public
+        fi

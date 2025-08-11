@@ -1,0 +1,33 @@
+docker:
+  linux: 
+    - linux/amd64
+    - linux/arm64
+    # - linux/arm/v7
+    # - linux/ppc64le
+    # - linux/s390x
+    # - linux/386
+    # - linux/riscv64
+
+binaries:
+  rust-musl: 
+    - x86_64-unknown-linux-musl
+    - aarch64-unknown-linux-musl
+  
+  rust-gnu:
+    - x86_64-unknown-linux-gnu
+    - aarch64-unknown-linux-gnu
+  
+  rust-windows:
+    - x86_64-pc-windows-msvc
+  
+  rust-macos:
+    - x86_64-apple-darwin
+    - aarch64-apple-darwin
+
+test-platforms:
+  primary:
+    - ubuntu-latest
+  extended:
+    - ubuntu-latest
+    - windows-latest
+    - macos-latest

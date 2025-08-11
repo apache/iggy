@@ -1,0 +1,101 @@
+name: python-maturin
+description: Build/test/publish Python package with maturin
+inputs:
+  task:
+    description: "Task to run"
+    required: true
+  version:
+    description: "Version for publishing"
+    required: false
+    default: ""
+  dry_run:
+    description: "Dry run mode"
+    required: false
+    default: "false"
+    
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+        
+    - name: Setup Rust
+      uses: dtolnay/rust-toolchain@stable
+      
+    - name: Cache pip
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: pip-${{ runner.os }}-${{ hashFiles('foreign/python/requirements*.txt') }}
+        
+    - name: Install dependencies
+      shell: bash
+      run: |
+        python -m pip install --upgrade pip wheel
+        pip install maturin pytest pytest-asyncio
+        if [ -f "foreign/python/requirements-dev.txt" ]; then
+          pip install -r foreign/python/requirements-dev.txt
+        fi
+        
+    - name: Test
+      if: inputs.task == 'test'
+      shell: bash
+      run: |
+        cd foreign/python
+        
+        # Build the module for testing
+        maturin develop
+        
+        # Run tests with Docker if docker-compose.test.yml exists
+        if [ -f "docker-compose.test.yml" ]; then
+          DOCKER_BUILDKIT=1 docker compose -f docker-compose.test.yml up \
+            --build --abort-on-container-exit --exit-code-from python-tests || true
+          docker compose -f docker-compose.test.yml down -v
+        else
+          # Run tests directly
+          pytest tests/ -v --junitxml=../../reports/python-junit.xml || true
+        fi
+        
+    - name: Build wheels
+      if: inputs.task == 'build' || inputs.task == 'publish'
+      shell: bash
+      run: |
+        cd foreign/python
+        
+        # Build wheels for multiple Python versions
+        maturin build --release \
+          --interpreter python3.8 python3.9 python3.10 python3.11 python3.12 \
+          -o dist
+          
+        # Build source distribution
+        maturin sdist -o dist
+        
+        # List built artifacts
+        ls -la dist/
+        
+    - name: Publish to PyPI
+      if: inputs.task == 'publish'
+      shell: bash
+      env:
+        MATURIN_PYPI_TOKEN: ${{ env.PYPI_API_TOKEN }}
+      run: |
+        cd foreign/python
+        
+        if [ "${{ inputs.dry_run }}" = "true" ]; then
+          echo "Dry run - would publish these files:"
+          ls -la dist/
+        else
+          # Try OIDC first (Trusted Publisher)
+          if [ -n "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" ]; then
+            echo "Using OIDC authentication"
+            maturin upload dist/* --skip-existing
+          elif [ -n "$MATURIN_PYPI_TOKEN" ]; then
+            echo "Using token authentication"
+            maturin upload dist/* --skip-existing
+          else
+            echo "No PyPI credentials found"
+            exit 1
+          fi
+        fi

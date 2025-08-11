@@ -1,0 +1,49 @@
+gates:
+  required_on_pr: 
+    - test
+    - lint
+    - bdd
+  advisory_on_pr: 
+    - coverage
+    - security
+    - compat
+  required_for_merge:
+    - test
+    - lint
+
+tag_patterns:
+  rust-server: "server-[0-9]+\\.[0-9]+\\.[0-9]+"
+  rust-cli: "cli-[0-9]+\\.[0-9]+\\.[0-9]+"
+  rust-sdk: "sdk-[0-9]+\\.[0-9]+\\.[0-9]+"
+  sdk-python: "python-v[0-9]+\\.[0-9]+\\.[0-9]+"
+  sdk-node: "node-sdk-[0-9]+\\.[0-9]+\\.[0-9]+"
+  sdk-java: "java-sdk-[0-9]+\\.[0-9]+\\.[0-9]+"
+  sdk-csharp: "csharp-sdk-[0-9]+\\.[0-9]+\\.[0-9]+"
+  sdk-go: "foreign/go/v[0-9]+\\.[0-9]+\\.[0-9]+"
+  connectors-runtime: "connectors-[0-9]+\\.[0-9]+\\.[0-9]+"
+  mcp: "mcp-[0-9]+\\.[0-9]+\\.[0-9]+"
+  web-ui: "web-ui-[0-9]+\\.[0-9]+\\.[0-9]+"
+
+concurrency:
+  cancel_in_progress_pr: true
+  cancel_in_progress_push: false
+  group_by: "${{ github.workflow }}-${{ github.ref }}"
+
+timeouts:
+  default: 30
+  extended_test: 60
+  docker_build: 45
+  publish: 30
+
+cache:
+  rust_cache: true
+  docker_layer_cache: true
+  npm_cache: true
+  gradle_cache: true
+  dotnet_cache: true
+  go_cache: true
+
+notifications:
+  auto_issue_on_failure: true
+  issue_labels: ["ci", "automated"]
+  slack_webhook: false  # Set to webhook URL if needed

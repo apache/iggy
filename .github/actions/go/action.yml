@@ -1,0 +1,76 @@
+name: go
+description: Go setup and test
+inputs:
+  task:
+    description: "Task to run"
+    required: true
+    
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: "1.22"
+        cache-dependency-path: |
+          foreign/go/go.sum
+          bdd/go/go.sum
+          examples/go/go.sum
+          
+    - name: Download dependencies
+      shell: bash
+      run: |
+        if [ -f "foreign/go/go.mod" ]; then
+          cd foreign/go && go mod download
+        fi
+        if [ -f "bdd/go/go.mod" ]; then
+          cd bdd/go && go mod download
+        fi
+        if [ -f "examples/go/go.mod" ]; then
+          cd examples/go && go mod download
+        fi
+        
+    - name: Test
+      if: inputs.task == 'test'
+      shell: bash
+      run: |
+        cd foreign/go
+        
+        # Create reports directory
+        mkdir -p ../../reports
+        
+        # Run tests with coverage
+        go test -v -race -coverprofile=../../reports/go-coverage.out ./...
+        
+        # Generate coverage report
+        go tool cover -html=../../reports/go-coverage.out -o ../../reports/go-coverage.html || true
+        
+        # Run tests with JSON output for better reporting
+        go test -v -json ./... > ../../reports/go-tests.json || true
+        
+    - name: Lint
+      if: inputs.task == 'lint'
+      shell: bash
+      run: |
+        cd foreign/go
+        
+        # Install golangci-lint
+        go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+        
+        # Run linter
+        golangci-lint run ./... || true
+        
+    - name: Build
+      if: inputs.task == 'build'
+      shell: bash
+      run: |
+        cd foreign/go
+        
+        # Build the module
+        go build -v ./...
+        
+        # Verify examples compile
+        if [ -d "../../examples/go" ]; then
+          cd ../../examples/go
+          go build -v ./...
+        fi

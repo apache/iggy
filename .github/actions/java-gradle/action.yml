@@ -1,0 +1,106 @@
+name: java-gradle
+description: Java Gradle test/build/publish
+inputs:
+  task:
+    description: "Task to run"
+    required: true
+  version:
+    description: "Version for publishing"
+    required: false
+    default: ""
+  dry_run:
+    description: "Dry run mode"
+    required: false
+    default: "false"
+    
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: "temurin"
+        java-version: "21"
+        cache: "gradle"
+        
+    - name: Grant execute permission for gradlew
+      shell: bash
+      run: |
+        if [ -f "foreign/java/gradlew" ]; then
+          chmod +x foreign/java/gradlew
+        fi
+        
+    - name: Test
+      if: inputs.task == 'test'
+      shell: bash
+      run: |
+        cd foreign/java
+        
+        # Run tests
+        ./gradlew test --no-daemon --info
+        
+        # Copy test reports
+        if [ -d "build/test-results" ]; then
+          mkdir -p ../../reports
+          cp -r build/test-results ../../reports/java-tests
+        fi
+        
+        # Generate test report
+        ./gradlew jacocoTestReport --no-daemon || true
+        
+    - name: Build
+      if: inputs.task == 'build' || inputs.task == 'publish'
+      shell: bash
+      run: |
+        cd foreign/java
+        
+        # Clean and build
+        ./gradlew clean build -x test --no-daemon
+        
+        # List artifacts
+        echo "Build artifacts:"
+        find build/libs -type f -name "*.jar" | head -20
+        
+    - name: Publish to Maven
+      if: inputs.task == 'publish'
+      shell: bash
+      env:
+        MAVEN_USERNAME: ${{ env.MAVEN_USERNAME }}
+        MAVEN_PASSWORD: ${{ env.MAVEN_PASSWORD }}
+        MAVEN_CENTRAL_USERNAME: ${{ env.MAVEN_CENTRAL_USERNAME }}
+        MAVEN_CENTRAL_PASSWORD: ${{ env.MAVEN_CENTRAL_PASSWORD }}
+        OSSRH_USERNAME: ${{ env.OSSRH_USERNAME }}
+        OSSRH_PASSWORD: ${{ env.OSSRH_PASSWORD }}
+      run: |
+        cd foreign/java
+        
+        if [ "${{ inputs.dry_run }}" = "true" ]; then
+          echo "Dry run - would publish:"
+          ./gradlew properties | grep -E "(group|version)" || true
+        else
+          # Set version if provided
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "version=${{ inputs.version }}" >> gradle.properties
+          fi
+          
+          # Publish to Maven repository
+          ./gradlew publish --no-daemon
+        fi
+        
+    - name: Publish snapshot
+      if: inputs.task == 'publish-snapshot'
+      shell: bash
+      env:
+        MAVEN_USERNAME: ${{ env.MAVEN_USERNAME }}
+        MAVEN_PASSWORD: ${{ env.MAVEN_PASSWORD }}
+      run: |
+        cd foreign/java
+        
+        # Ensure version ends with -SNAPSHOT
+        current_version=$(./gradlew properties -q | grep "^version:" | awk '{print $2}')
+        if [[ ! "$current_version" == *"-SNAPSHOT" ]]; then
+          echo "version=${current_version}-SNAPSHOT" >> gradle.properties
+        fi
+        
+        # Publish snapshot
+        ./gradlew publish -Psnapshot --no-daemon

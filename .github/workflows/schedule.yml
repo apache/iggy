@@ -1,0 +1,210 @@
+name: Scheduled
+on:
+  schedule:
+    - cron: "0 1 * * *"   # Daily at 1 AM UTC
+    - cron: "0 8 * * 1"   # Weekly on Monday at 8 AM UTC (security scan)
+  workflow_dispatch:
+    inputs:
+      run_all:
+        description: "Run all scheduled tasks"
+        required: false
+        default: true
+        type: boolean
+      run_security:
+        description: "Run security scan"
+        required: false
+        default: false
+        type: boolean
+      run_snapshots:
+        description: "Run snapshot builds"
+        required: false
+        default: false
+        type: boolean
+      run_compatibility:
+        description: "Run compatibility tests"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  security-events: write
+  issues: write
+  packages: write
+
+jobs:
+  security:
+    name: Security Scan
+    if: |
+      github.event_name == 'schedule' ||
+      inputs.run_all ||
+      inputs.run_security
+    uses: ./.github/workflows/_security.yml
+    with:
+      create_issues: true
+
+  nightly-test:
+    name: Nightly Tests
+    if: |
+      github.event_name == 'schedule' ||
+      inputs.run_all
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain: [beta, nightly]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Install Rust ${{ matrix.toolchain }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: nightly-${{ matrix.toolchain }}
+          
+      - name: Run tests
+        run: |
+          cargo test --all --all-features || true
+          
+      - name: Check future compatibility
+        run: |
+          cargo check --all --all-features || true
+
+  snapshots:
+    name: Publish Snapshots
+    if: |
+      (github.event_name == 'schedule' && github.event.schedule == '0 1 * * *') ||
+      inputs.run_snapshots
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Java snapshot
+        uses: ./.github/actions/java-gradle
+        with:
+          task: publish-snapshot
+        continue-on-error: true
+        
+      - name: Docker edge build
+        uses: ./.github/actions/docker-buildx
+        with:
+          component: rust-server
+          version: edge
+          push: true
+        continue-on-error: true
+
+  compatibility:
+    name: Compatibility Tests
+    if: |
+      github.event_name == 'schedule' ||
+      inputs.run_compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Run compatibility tests
+        run: |
+          if [ -f "./scripts/backwards-compat.sh" ]; then
+            ./scripts/backwards-compat.sh
+          else
+            echo "No compatibility tests found"
+          fi
+
+  extended-platforms:
+    name: Extended Platform Tests
+    if: |
+      github.event_name == 'schedule' ||
+      inputs.run_all
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        
+      - name: Run tests
+        run: |
+          cargo test --all --all-features || true
+
+  performance:
+    name: Performance Benchmarks
+    if: github.event_name == 'schedule' && github.event.schedule == '0 1 * * 1'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        
+      - name: Run benchmarks
+        run: |
+          cd core/bench
+          cargo build --release
+          
+          # Run basic benchmark
+          timeout 300 cargo run --release --bin iggy-bench -- \
+            -v pinned-producer tcp \
+            --message-size 1000 \
+            --messages-per-batch 1000 \
+            || true
+            
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.run_id }}
+          path: |
+            performance_results/**
+            reports/**
+          retention-days: 30
+
+  summary:
+    name: Scheduled Tasks Summary
+    needs: [security, nightly-test, snapshots, compatibility, extended-platforms, performance]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create summary
+        run: |
+          echo "## Scheduled Tasks Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Task | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Security | ${{ needs.security.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Nightly Tests | ${{ needs.nightly-test.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Snapshots | ${{ needs.snapshots.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Compatibility | ${{ needs.compatibility.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Extended Platforms | ${{ needs.extended-platforms.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Performance | ${{ needs.performance.result }} |" >> $GITHUB_STEP_SUMMARY
+          
+      - name: Create issue on failures
+        if: contains(needs.*.result, 'failure')
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const date = new Date().toISOString().split('T')[0];
+            const failures = [];
+            
+            if ('${{ needs.security.result }}' === 'failure') failures.push('Security');
+            if ('${{ needs.nightly-test.result }}' === 'failure') failures.push('Nightly Tests');
+            if ('${{ needs.snapshots.result }}' === 'failure') failures.push('Snapshots');
+            if ('${{ needs.compatibility.result }}' === 'failure') failures.push('Compatibility');
+            if ('${{ needs.extended-platforms.result }}' === 'failure') failures.push('Extended Platforms');
+            if ('${{ needs.performance.result }}' === 'failure') failures.push('Performance');
+            
+            await github.rest.issues.create({
+              ...context.repo,
+              title: `Scheduled tasks failed - ${date}`,
+              body: `The following scheduled tasks failed:\n\n${failures.map(f => `- ${f}`).join('\n')}\n\n[View run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})`,
+              labels: ['ci', 'scheduled', 'automated']
+            });

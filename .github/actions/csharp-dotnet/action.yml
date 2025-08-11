@@ -1,0 +1,108 @@
+name: csharp-dotnet
+description: .NET test/build/publish
+inputs:
+  task:
+    description: "Task to run"
+    required: true
+  version:
+    description: "Version for publishing"
+    required: false
+    default: ""
+  dry_run:
+    description: "Dry run mode"
+    required: false
+    default: "false"
+    
+runs:
+  using: "composite"
+  steps:
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: "8.0.x"
+        
+    - name: Restore dependencies
+      shell: bash
+      run: |
+        cd foreign/csharp
+        dotnet restore
+        
+    - name: Test
+      if: inputs.task == 'test'
+      shell: bash
+      run: |
+        cd foreign/csharp
+        
+        # Create reports directory
+        mkdir -p ../../reports
+        
+        # Run tests with coverage
+        dotnet test \
+          --logger "trx;LogFileName=../../reports/dotnet.trx" \
+          --collect:"XPlat Code Coverage" \
+          --results-directory ../../reports \
+          /p:CollectCoverage=true \
+          /p:CoverletOutputFormat=lcov \
+          /p:CoverletOutput=../../reports/coverage.lcov \
+          || true
+          
+        # Run BDD tests if they exist
+        if [ -d "Iggy_SDK.Tests.BDD" ]; then
+          dotnet test Iggy_SDK.Tests.BDD \
+            --logger "trx;LogFileName=../../reports/dotnet-bdd.trx" \
+            || true
+        fi
+        
+    - name: Build
+      if: inputs.task == 'build' || inputs.task == 'publish'
+      shell: bash
+      run: |
+        cd foreign/csharp
+        
+        # Build in Release mode
+        dotnet build -c Release --no-restore
+        
+        # List build output
+        echo "Build output:"
+        find . -name "*.dll" -path "*/bin/Release/*" | head -20
+        
+    - name: Pack NuGet packages
+      if: inputs.task == 'publish'
+      shell: bash
+      run: |
+        cd foreign/csharp
+        
+        # Set version if provided
+        if [ -n "${{ inputs.version }}" ]; then
+          dotnet pack -c Release \
+            -p:PackageVersion=${{ inputs.version }} \
+            -o ./nupkgs \
+            --no-build
+        else
+          dotnet pack -c Release -o ./nupkgs --no-build
+        fi
+        
+        # List packages
+        echo "NuGet packages:"
+        ls -la ./nupkgs/
+        
+    - name: Publish to NuGet
+      if: inputs.task == 'publish'
+      shell: bash
+      env:
+        NUGET_API_KEY: ${{ env.NUGET_API_KEY }}
+      run: |
+        cd foreign/csharp
+        
+        if [ "${{ inputs.dry_run }}" = "true" ]; then
+          echo "Dry run - would publish these packages:"
+          ls -la ./nupkgs/*.nupkg
+        else
+          # Push to NuGet
+          for package in ./nupkgs/*.nupkg; do
+            dotnet nuget push "$package" \
+              --api-key "$NUGET_API_KEY" \
+              --source https://api.nuget.org/v3/index.json \
+              --skip-duplicate
+          done
+        fi

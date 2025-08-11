@@ -1,0 +1,121 @@
+name: _test
+on:
+  workflow_call:
+    inputs:
+      component:
+        type: string
+        required: true
+        description: "Component to test"
+      task:
+        type: string
+        required: true
+        description: "Task to run"
+        
+permissions:
+  contents: read
+  security-events: write
+  
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.component }}-${{ inputs.task }}
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Skip noop
+        if: inputs.component == 'noop'
+        run: echo "No changes detected, skipping tests"
+
+      # Rust components
+      - name: Run Rust task
+        if: startsWith(inputs.component, 'rust-') || inputs.component == 'connectors-runtime' || inputs.component == 'mcp'
+        uses: ./.github/actions/rust
+        with:
+          task: ${{ inputs.task }}
+          component: ${{ inputs.component }}
+
+      # Python SDK
+      - name: Run Python SDK task
+        if: inputs.component == 'sdk-python'
+        uses: ./.github/actions/python-maturin
+        with:
+          task: ${{ inputs.task }}
+
+      # Node SDK
+      - name: Run Node SDK task
+        if: inputs.component == 'sdk-node'
+        uses: ./.github/actions/node-npm
+        with:
+          task: ${{ inputs.task }}
+
+      # Go SDK
+      - name: Run Go SDK task
+        if: inputs.component == 'sdk-go'
+        uses: ./.github/actions/go
+        with:
+          task: ${{ inputs.task }}
+
+      # Java SDK
+      - name: Run Java SDK task
+        if: inputs.component == 'sdk-java'
+        uses: ./.github/actions/java-gradle
+        with:
+          task: ${{ inputs.task }}
+
+      # C# SDK
+      - name: Run C# SDK task
+        if: inputs.component == 'sdk-csharp'
+        uses: ./.github/actions/csharp-dotnet
+        with:
+          task: ${{ inputs.task }}
+
+      # BDD Tests
+      - name: Run BDD tests
+        if: inputs.component == 'bdd-suite' && inputs.task == 'bdd'
+        run: |
+          echo "BDD tests will run in separate workflow"
+          
+      # Examples
+      - name: Run examples tests
+        if: inputs.component == 'examples' && inputs.task == 'test'
+        run: |
+          ./scripts/run-rust-examples-from-readme.sh x86_64-unknown-linux-gnu
+          
+      # Web UI
+      - name: Run Web UI task
+        if: inputs.component == 'web-ui'
+        run: |
+          cd web
+          npm ci
+          if [ "${{ inputs.task }}" = "lint" ]; then
+            npm run lint || true
+          elif [ "${{ inputs.task }}" = "build" ]; then
+            npm run build
+          fi
+
+      # Docker build task (for components that support it)
+      - name: Docker build test
+        if: inputs.task == 'docker' && (inputs.component == 'rust-server' || inputs.component == 'connectors-runtime' || inputs.component == 'mcp' || inputs.component == 'web-ui')
+        uses: ./.github/actions/docker-buildx
+        with:
+          image: test-${{ inputs.component }}
+          version: test
+          push: false
+          
+      # Upload reports
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.component }}-${{ inputs.task }}-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            reports/**
+            target/llvm-cov/**
+            coverage.lcov
+          if-no-files-found: ignore
+          retention-days: 7

@@ -1,0 +1,161 @@
+name: _detect
+on: 
+  workflow_call:
+    outputs:
+      matrix:
+        description: "Matrix of components and tasks to run"
+        value: ${{ jobs.detect.outputs.matrix }}
+      
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: Detect changed files
+        id: changed
+        uses: tj-actions/changed-files@v45
+        with:
+          json: true
+          files_yaml: |
+            rust_server:
+              - 'core/server/**'
+              - 'core/common/**'
+              - 'core/binary_protocol/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+            rust_cli:
+              - 'core/cli/**'
+              - 'core/common/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+            rust_sdk:
+              - 'core/sdk/**'
+              - 'core/common/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+            rust_bench:
+              - 'core/bench/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+            rust_integration:
+              - 'core/integration/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+            sdk_python:
+              - 'foreign/python/**'
+            sdk_node:
+              - 'foreign/node/**'
+            sdk_go:
+              - 'foreign/go/**'
+            sdk_java:
+              - 'foreign/java/**'
+            sdk_csharp:
+              - 'foreign/csharp/**'
+            connectors:
+              - 'core/connectors/**'
+            mcp:
+              - 'core/ai/mcp/**'
+            bdd:
+              - 'bdd/**'
+              - 'core/server/**'
+            examples:
+              - 'examples/**'
+            web:
+              - 'web/**'
+              
+      - name: Build matrix
+        id: mk
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const yaml = require('js-yaml');
+            
+            // Load components config
+            const componentsPath = '.github/ci/config/components.yml';
+            let components = {};
+            try {
+              const content = fs.readFileSync(componentsPath, 'utf8');
+              components = yaml.load(content).components;
+            } catch (e) {
+              console.log('Warning: Could not load components.yml, using defaults');
+              // Provide minimal defaults for CI to work
+              components = {
+                'rust-server': { tasks: ['test'] },
+                'rust-cli': { tasks: ['test'] },
+                'sdk-python': { tasks: ['test'] },
+                'sdk-node': { tasks: ['test'] },
+                'sdk-go': { tasks: ['test'] },
+                'sdk-java': { tasks: ['test'] },
+                'sdk-csharp': { tasks: ['test'] }
+              };
+            }
+            
+            // Map changed file groups to components
+            const changeMap = {
+              'rust_server_any_changed': 'rust-server',
+              'rust_cli_any_changed': 'rust-cli',
+              'rust_sdk_any_changed': 'rust-sdk',
+              'rust_bench_any_changed': 'rust-bench',
+              'rust_integration_any_changed': 'rust-integration',
+              'sdk_python_any_changed': 'sdk-python',
+              'sdk_node_any_changed': 'sdk-node',
+              'sdk_go_any_changed': 'sdk-go',
+              'sdk_java_any_changed': 'sdk-java',
+              'sdk_csharp_any_changed': 'sdk-csharp',
+              'connectors_any_changed': 'connectors-runtime',
+              'mcp_any_changed': 'mcp',
+              'bdd_any_changed': 'bdd-suite',
+              'examples_any_changed': 'examples',
+              'web_any_changed': 'web-ui'
+            };
+            
+            // Collect changed components
+            const changedComponents = new Set();
+            for (const [key, component] of Object.entries(changeMap)) {
+              if (context.payload[key] === 'true' || 
+                  (typeof context.payload.inputs !== 'undefined' && context.payload.inputs[key] === 'true')) {
+                changedComponents.add(component);
+              }
+            }
+            
+            // Check outputs from changed-files action
+            const outputs = ${{ toJSON(steps.changed.outputs) }};
+            for (const [key, value] of Object.entries(outputs)) {
+              if (key.endsWith('_any_changed') && value === 'true') {
+                const component = changeMap[key];
+                if (component) {
+                  changedComponents.add(component);
+                }
+              }
+            }
+            
+            // If this is a push to master or manual trigger, run everything
+            if (context.eventName === 'push' && context.ref === 'refs/heads/master') {
+              console.log('Master push detected, adding all components');
+              Object.keys(components).forEach(c => changedComponents.add(c));
+            }
+            
+            // Build matrix
+            const pairs = [];
+            for (const component of changedComponents) {
+              const config = components[component];
+              if (config && config.tasks) {
+                for (const task of config.tasks) {
+                  pairs.push({ component, task });
+                }
+              }
+            }
+            
+            // Ensure we have at least one job
+            const matrix = pairs.length > 0 
+              ? { include: pairs } 
+              : { include: [{ component: 'noop', task: 'noop' }] };
+            
+            console.log('Matrix:', JSON.stringify(matrix, null, 2));
+            core.setOutput('matrix', JSON.stringify(matrix));

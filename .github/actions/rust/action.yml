@@ -1,0 +1,151 @@
+name: rust
+description: Setup Rust and run tasks (lint/test/coverage/compat/publish/docker)
+inputs:
+  task:
+    description: "Task to run"
+    required: true
+  component:
+    description: "Component name"
+    required: false
+    default: ""
+  version:
+    description: "Version for publishing"
+    required: false
+    default: ""
+  dry_run:
+    description: "Dry run mode"
+    required: false
+    default: "false"
+    
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+        
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.component }}-${{ inputs.task }}
+        
+    - name: Install required tools
+      shell: bash
+      run: |
+        # Install tools based on task
+        case "${{ inputs.task }}" in
+          coverage)
+            cargo install cargo-llvm-cov --locked || true
+            ;;
+          lint)
+            cargo install cargo-sort cargo-machete --locked || true
+            ;;
+        esac
+        
+    - name: Lint
+      if: inputs.task == 'lint'
+      shell: bash
+      run: |
+        echo "::group::cargo fmt"
+        cargo fmt --all -- --check
+        echo "::endgroup::"
+        
+        echo "::group::cargo clippy"
+        cargo clippy --all-targets --all-features -- -D warnings
+        echo "::endgroup::"
+        
+        echo "::group::cargo sort"
+        cargo sort --check --workspace || true
+        echo "::endgroup::"
+        
+        echo "::group::cargo machete"
+        cargo machete --with-metadata || true
+        echo "::endgroup::"
+        
+    - name: Test
+      if: inputs.task == 'test'
+      shell: bash
+      run: |
+        # Component-specific test commands
+        case "${{ inputs.component }}" in
+          rust-integration)
+            cargo test --package integration --all-features
+            ;;
+          rust-bench)
+            cargo test --package iggy-bench --all-features
+            ;;
+          *)
+            cargo test --all --all-features --no-fail-fast
+            ;;
+        esac
+        
+    - name: Doc test
+      if: inputs.task == 'test'
+      shell: bash
+      run: |
+        cargo test --doc
+        cargo doc --no-deps --all-features --quiet
+        
+    - name: Coverage
+      if: inputs.task == 'coverage'
+      shell: bash
+      run: |
+        # Generate coverage report
+        source <(cargo llvm-cov show-env --export-prefix)
+        cargo build
+        cargo test
+        cargo llvm-cov report --lcov --output-path coverage.lcov \
+          --ignore-filename-regex '(bench/|integration/|tools/)'
+          
+        # Display summary
+        cargo llvm-cov report --summary-only
+        
+    - name: Compatibility check
+      if: inputs.task == 'compat'
+      shell: bash
+      run: |
+        # Check backwards compatibility
+        if [ -f "./scripts/backwards-compat.sh" ]; then
+          ./scripts/backwards-compat.sh
+        else
+          echo "No compatibility check script found"
+        fi
+        
+    - name: Build for Docker
+      if: inputs.task == 'docker'
+      shell: bash
+      run: |
+        # Build release binaries for Docker
+        case "${{ inputs.component }}" in
+          rust-server)
+            cargo build --release --bin iggy-server
+            cargo build --release --bin iggy --no-default-features
+            ;;
+          connectors-runtime)
+            cargo build --release --package connectors-runtime
+            ;;
+          mcp)
+            cargo build --release --package mcp
+            ;;
+        esac
+        
+    - name: Publish to crates.io
+      if: inputs.task == 'publish'
+      shell: bash
+      env:
+        CARGO_REGISTRY_TOKEN: ${{ env.CARGO_REGISTRY_TOKEN }}
+      run: |
+        if [ "${{ inputs.dry_run }}" = "true" ]; then
+          echo "Dry run - would publish:"
+          cargo publish --dry-run --allow-dirty -p iggy || true
+          cargo publish --dry-run --allow-dirty -p server || true
+          cargo publish --dry-run --allow-dirty -p iggy-cli || true
+        else
+          # Publish in dependency order
+          cargo publish -p iggy --allow-dirty || true
+          sleep 30  # Wait for crates.io to index
+          cargo publish -p server --allow-dirty || true
+          sleep 30
+          cargo publish -p iggy-cli --allow-dirty || true
+        fi
