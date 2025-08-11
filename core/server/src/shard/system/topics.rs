@@ -415,7 +415,7 @@ impl IggyShard {
             compression_algorithm,
             max_topic_size,
             replication_factor.unwrap_or(1),
-        )?;
+        );
         Ok(())
     }
 
