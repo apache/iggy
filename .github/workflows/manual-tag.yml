@@ -1,0 +1,162 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Manual Tag Components
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: 'Commit SHA to tag (all selected registries will be tagged at this commit)'
+        required: true
+        type: string
+      dry_run:
+        description: 'Dry run - show what would be tagged without creating/pushing tags'
+        required: false
+        type: boolean
+        default: true
+
+      # Granular: select which registries to publish
+      publish_crates:
+        description: 'crates.io (iggy, iggy-cli, iggy-bench)'
+        required: false
+        type: boolean
+        default: true
+      publish_dockerhub:
+        description: 'Docker Hub (server, mcp, connectors, bench-dashboard, web-ui)'
+        required: false
+        type: boolean
+        default: true
+      publish_pypi:
+        description: 'PyPI (python-sdk)'
+        required: false
+        type: boolean
+        default: false
+      publish_npm:
+        description: 'npm (node-sdk)'
+        required: false
+        type: boolean
+        default: false
+      publish_maven:
+        description: 'Maven/Nexus (java-sdk)'
+        required: false
+        type: boolean
+        default: false
+      publish_nuget:
+        description: 'NuGet (csharp-sdk)'
+        required: false
+        type: boolean
+        default: false
+      publish_go:
+        description: 'Go (tag only: foreign/go/v<semver>)'
+        required: false
+        type: boolean
+        default: true
+      go_version:
+        description: 'Go module version (required if Go is selected), e.g. 0.7.0'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    name: Plan components
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - id: mk
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const inputs = context.payload.inputs || {};
+            const include = [];
+
+            const add = (arr) => arr.forEach(c => include.push({ component: c }));
+
+            if (inputs.publish_crates === 'true') add(['sdk','cli','iggy-bench']);
+            if (inputs.publish_dockerhub === 'true') add(['server','mcp','connectors','bench-dashboard','web-ui']);
+            if (inputs.publish_pypi === 'true') add(['python-sdk']);
+            if (inputs.publish_npm === 'true') add(['node-sdk']);
+            if (inputs.publish_maven === 'true') add(['java-sdk']);
+            if (inputs.publish_nuget === 'true') add(['csharp-sdk']);
+            if (inputs.publish_go === 'true') add(['go-sdk']);
+
+            // De-dup
+            const seen = new Set();
+            const unique = include.filter(i => (seen.has(i.component) ? false : seen.add(i.component)));
+
+            const matrix = unique.length ? { include: unique } : { include: [{ component: 'noop' }] };
+            core.setOutput('matrix', JSON.stringify(matrix));
+
+      - name: Summary
+        run: |
+          echo "## 🏷️ Manual Tag Plan" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Commit: \`${{ inputs.commit }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Dry run: \`${{ inputs.dry_run }}\`" >> $GITHUB_STEP_SUMMARY
+
+  tag:
+    name: Tag • ${{ matrix.component }}
+    needs: plan
+    if: ${{ fromJson(needs.plan.outputs.matrix).include[0].component != 'noop' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.commit }}
+
+      - name: Configure Git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Validate Go inputs
+        if: matrix.component == 'go-sdk' && inputs.publish_go == true && inputs.go_version == ''
+        run: |
+          echo "❌ go_version is required when publish_go is selected"
+          exit 1
+
+      - name: Make script executable
+        run: chmod +x .github/scripts/manual-tag.sh
+
+      - name: Create tag for ${{ matrix.component }}
+        env:
+          TARGET_COMPONENT: ${{ matrix.component }}
+          TARGET_COMMIT:  ${{ inputs.commit }}
+          # no global TARGET_VERSION → script will auto-extract from manifest at this commit
+          TARGET_VERSION: ""
+          GO_VERSION_OVERRIDE: ${{ inputs.go_version }}
+          USE_V_PREFIX: "false"  # Go uses 'v' regardless; others no 'v'
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          .github/scripts/manual-tag.sh | tee "manual-tag-${{ matrix.component }}.log"
+
+      - name: Upload tag logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: manual-tag-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: manual-tag-*.log
+          retention-days: 7

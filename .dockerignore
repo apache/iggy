@@ -13,5 +13,8 @@
 /local_data
 /performance_results
 /scripts
-/target
+# Exclude target directory but allow specific binaries for BDD tests
+/target/*
+!/target/debug/iggy-server
+!/target/release/iggy-server
 /web

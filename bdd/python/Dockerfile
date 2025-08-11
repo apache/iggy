@@ -15,7 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM rust:1.89-slim-bookworm
+# syntax=docker/dockerfile:1
+ARG RUST_VERSION=1.89
+FROM rust:${RUST_VERSION}-slim-bookworm
 
 RUN apt-get update && \
     apt-get install -y \

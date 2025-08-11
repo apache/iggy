@@ -175,7 +175,7 @@ The [Model Context Protocol](https://modelcontextprotocol.io) (MCP) is an open p
 
 The official Apache Iggy images can be found in [Docker Hub](https://hub.docker.com/r/apache/iggy), simply type `docker pull apache/iggy` to pull the image.
 
-You can also find the images for all the different tooling such as Connectors, MCP Server etc. [here](https://hub.docker.com/u/apache?page=1&search=iggy).
+You can also find the images for all the different tooling such as Connectors, MCP Server etc. at [Docker Hub](https://hub.docker.com/u/apache?page=1&search=iggy).
 
 Please note that the images tagged as `latest` are based on the official, stable releases, while the `edge` ones are updated directly from latest version of the `master` branch.
 

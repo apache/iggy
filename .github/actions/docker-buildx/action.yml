@@ -1,0 +1,287 @@
+# .github/actions/docker-buildx/action.yml
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: docker-buildx
+description: Multi-arch Docker build and push
+inputs:
+  task:
+    description: "Task to run (build/publish/docker)"
+    required: false
+    default: "build"
+  component:
+    description: "Component to build"
+    required: false
+    default: ""
+  image:
+    description: "Docker image name (can be specified directly)"
+    required: false
+    default: ""
+  version:
+    description: "Version tag"
+    required: false
+    default: "test"
+  context:
+    description: "Build context"
+    required: false
+    default: "."
+  dockerfile:
+    description: "Dockerfile path"
+    required: false
+    default: ""
+  dry_run:
+    description: "Dry run mode"
+    required: false
+    default: "false"
+  platforms:
+    description: "Target platforms (comma-separated)"
+    required: false
+    default: ""
+  push:
+    description: "Whether to push to registry (legacy flag)"
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Determine image configuration
+      id: config
+      run: |
+        # Determine image name and dockerfile based on component or direct image input
+        component="${{ inputs.component }}"
+        image="${{ inputs.image }}"
+        dockerfile="${{ inputs.dockerfile }}"
+
+        # If image is not provided, determine from component
+        if [ -z "$image" ] && [ -n "$component" ]; then
+          case "$component" in
+            server|rust-server)
+              image="apache/iggy"
+              dockerfile="${dockerfile:-Dockerfile.ci}"
+              ;;
+            connectors|connectors-runtime)
+              image="apache/iggy-connectors"
+              dockerfile="${dockerfile:-core/connectors/runtime/Dockerfile}"
+              ;;
+            mcp)
+              image="apache/iggy-mcp"
+              dockerfile="${dockerfile:-core/ai/mcp/Dockerfile}"
+              ;;
+            web-ui)
+              image="apache/iggy-web-ui"
+              dockerfile="${dockerfile:-web/Dockerfile}"
+              ;;
+            *)
+              if [ -n "$component" ]; then
+                echo "⚠️ Unknown component: $component, will use defaults"
+                image="${image:-test-$component}"
+              fi
+              ;;
+          esac
+        fi
+
+        # Default values if still not set
+        image="${image:-test-image}"
+        dockerfile="${dockerfile:-Dockerfile}"
+
+        # Determine if we should push
+        should_push="false"
+        if [ "${{ inputs.task }}" = "publish" ]; then
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "📝 Dry run mode - will build but not push"
+            should_push="false"
+          else
+            should_push="true"
+          fi
+        elif [ "${{ inputs.push }}" = "true" ]; then
+          # Legacy support for push input
+          should_push="true"
+        fi
+
+        echo "image=$image" >> "$GITHUB_OUTPUT"
+        echo "dockerfile=$dockerfile" >> "$GITHUB_OUTPUT"
+        echo "should_push=$should_push" >> "$GITHUB_OUTPUT"
+
+        # Log configuration
+        echo "🐳 Docker build configuration:"
+        echo "  Image: $image"
+        echo "  Dockerfile: $dockerfile"
+        echo "  Task: ${{ inputs.task }}"
+        echo "  Will push: $should_push"
+        echo "  Version: ${{ inputs.version }}"
+      shell: bash
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+      with:
+        platforms: all
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      with:
+        driver-opts: |
+          network=host
+          image=moby/buildkit:latest
+
+    - name: Login to Docker Hub
+      if: steps.config.outputs.should_push == 'true'
+      uses: docker/login-action@v3
+      with:
+        username: ${{ env.DOCKERHUB_USERNAME || env.DOCKERHUB_USER }}
+        password: ${{ env.DOCKERHUB_TOKEN || env.DOCKERHUB_PASSWORD }}
+
+    - name: Docker meta
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ steps.config.outputs.image }}
+        tags: |
+          type=raw,value=latest,enable=${{ steps.config.outputs.should_push == 'true' && inputs.version != 'test' }}
+          type=raw,value=${{ inputs.version }}
+          type=raw,value=edge,enable=${{ github.ref == 'refs/heads/master' }}
+          type=sha,enable=${{ inputs.version == 'test' }}
+
+    - name: Determine platforms
+      id: platforms
+      run: |
+        # Use provided platforms or determine based on context
+        platforms="${{ inputs.platforms }}"
+
+        if [ -z "$platforms" ]; then
+          # Default platforms based on push/publish
+          if [ "${{ steps.config.outputs.should_push }}" = "true" ]; then
+            # Production builds - multi-arch
+            platforms="linux/amd64,linux/arm64"
+            # Could add more: linux/arm/v7,linux/ppc64le,linux/s390x
+          else
+            # Local/test builds - current platform only for speed
+            platforms="linux/amd64"
+          fi
+        fi
+
+        echo "platforms=$platforms" >> "$GITHUB_OUTPUT"
+        echo "🖥️ Target platforms: $platforms"
+      shell: bash
+
+    - name: Set Rust version
+      run: |
+        # Set RUST_VERSION for Docker build args (if rustc is available)
+        if command -v rustc &> /dev/null; then
+          echo "RUST_VERSION=$(rustc -V | awk '{print $2}')" >> "$GITHUB_ENV"
+        else
+          # Default fallback version
+          echo "RUST_VERSION=unknown" >> "$GITHUB_ENV"
+        fi
+      shell: bash
+
+    - name: Build Rust binaries (if needed)
+      if: contains(fromJSON('["server", "rust-server", "connectors", "connectors-runtime", "mcp"]'), inputs.component)
+      run: |
+        echo "🔨 Pre-building Rust binaries for Docker"
+        case "${{ inputs.component }}" in
+          server|rust-server)
+            cargo build --release --bin iggy-server
+            cargo build --release --bin iggy --no-default-features
+            ;;
+          connectors|connectors-runtime)
+            cargo build --release --package connectors-runtime
+            ;;
+          mcp)
+            cargo build --release --package mcp
+            ;;
+        esac
+      shell: bash
+
+    - name: Build and push Docker image
+      id: build
+      uses: docker/build-push-action@v6
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ steps.config.outputs.dockerfile }}
+        platforms: ${{ steps.platforms.outputs.platforms }}
+        push: ${{ steps.config.outputs.should_push }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: |
+          type=registry,ref=${{ steps.config.outputs.image }}:buildcache
+          type=registry,ref=${{ steps.config.outputs.image }}:buildcache-${{ runner.os }}
+          type=registry,ref=${{ steps.config.outputs.image }}:latest
+          type=gha,scope=buildkit-${{ inputs.component }}-${{ runner.os }}
+          type=gha,scope=buildkit-${{ inputs.component }}
+        cache-to: |
+          type=registry,ref=${{ steps.config.outputs.image }}:buildcache,mode=max
+          type=registry,ref=${{ steps.config.outputs.image }}:buildcache-${{ runner.os }},mode=max
+          type=inline
+          type=gha,scope=buildkit-${{ inputs.component }}-${{ runner.os }},mode=max
+        build-args: |
+          VERSION=${{ inputs.version }}
+          BUILD_DATE=${{ github.event.repository.updated_at }}
+          VCS_REF=${{ github.sha }}
+          RUST_VERSION=${{ env.RUST_VERSION }}
+
+    - name: Export image (if not pushing)
+      if: steps.config.outputs.should_push == 'false' && inputs.task != 'publish'
+      run: |
+        echo "💾 Image built locally: ${{ steps.config.outputs.image }}:${{ inputs.version }}"
+        echo "To save: docker save ${{ steps.config.outputs.image }}:${{ inputs.version }} -o image.tar"
+      shell: bash
+
+    - name: Image summary
+      if: always()
+      run: |
+        echo "## 🐳 Docker Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Image | \`${{ steps.config.outputs.image }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Version | \`${{ inputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Dockerfile | \`${{ steps.config.outputs.dockerfile }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Platforms | \`${{ steps.platforms.outputs.platforms }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| Pushed | ${{ steps.config.outputs.should_push }} |" >> $GITHUB_STEP_SUMMARY
+
+        if [ "${{ steps.config.outputs.should_push }}" = "true" ]; then
+          echo "| Digest | \`${{ steps.build.outputs.digest }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Pull Command" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "docker pull ${{ steps.config.outputs.image }}:${{ inputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        fi
+      shell: bash
+
+    - name: Dry run notification
+      if: inputs.task == 'publish' && inputs.dry_run == 'true'
+      run: |
+        echo "🔍 DRY RUN COMPLETE"
+        echo "Would have pushed: ${{ steps.config.outputs.image }}:${{ inputs.version }}"
+        echo "To platforms: ${{ steps.platforms.outputs.platforms }}"
+        echo "Tags that would be created:"
+        echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n' | sed 's/^/  - /'
+      shell: bash
+
+    - name: Verify image (if pushed)
+      if: steps.config.outputs.should_push == 'true'
+      run: |
+        echo "✅ Image successfully pushed to registry"
+        echo "Image: ${{ steps.config.outputs.image }}:${{ inputs.version }}"
+        echo "Digest: ${{ steps.build.outputs.digest }}"
+
+        # Could add actual verification here:
+        # docker pull ${{ steps.config.outputs.image }}:${{ inputs.version }}
+        # docker inspect ${{ steps.config.outputs.image }}:${{ inputs.version }}
+      shell: bash

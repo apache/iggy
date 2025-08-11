@@ -31,6 +31,10 @@ readme = "../../README.md"
 pkg-url = "{ repo }/releases/download/{ name }-{ version }/{ name }-{ target }{ archive-suffix }"
 bin-dir = "{ bin }{ binary-ext }"
 
+[[bin]]
+name = "iggy"
+path = "src/main.rs"
+
 [features]
 default = ["login-session"]
 login-session = ["dep:keyring"]
@@ -50,7 +54,3 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true, default-features = false }
-
-[[bin]]
-name = "iggy"
-path = "src/main.rs"
