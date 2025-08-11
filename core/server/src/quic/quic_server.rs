@@ -43,7 +43,7 @@ pub async fn span_quic_server(shard: Rc<IggyShard>) -> Result<(), iggy_common::I
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         if let Err(e) = default_provider().install_default() {
             warn!(
-                "Failed to install rustls crypto provider. Error: {:?}. This may be normal if another \
+                "Failed to install rustls crypto provider. Error: {:?}. This may be normal if another
             thread installed it first.",
                 e
             );
