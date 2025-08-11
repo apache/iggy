@@ -440,7 +440,7 @@ impl IggyShard {
         self.streams2.with_stream_by_id_mut(id, |stream| {
             stream.set_name(name.clone());
         });
-
+      
         self.streams2.with_index_mut(|index| {
             // Rename the key inside of hashmap
             let idx = index.remove(&old_name).expect("Rename key: key not found");
