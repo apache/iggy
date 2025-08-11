@@ -18,6 +18,8 @@
 
 use super::COMPONENT;
 use crate::shard::IggyShard;
+use crate::slab::traits::Access;
+use crate::slab::traits::AccessMut;
 use crate::streaming::deduplication::message_deduplicator::MessageDeduplicator;
 use crate::streaming::partitions::partition2;
 use crate::streaming::partitions::partition2::SharedPartition;

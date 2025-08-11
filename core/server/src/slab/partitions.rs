@@ -93,6 +93,56 @@ impl Default for Partitions {
     }
 }
 
+pub struct PartitionRef<'partitions> {
+    partition: &'partitions Slab<partition2::Partition>,
+}
+
+impl<'partitions> Decompose for PartitionRef<'partitions> {
+    type Target = &'partitions Slab<partition2::Partition>;
+
+    fn decompose(self) -> Self::Target {
+        self.partition
+    }
+}
+
+impl Project for Partitions {
+    type View<'me>
+        = PartitionRef<'me>
+    where
+        Self: 'me;
+
+    fn project(&self) -> Self::View<'_> {
+        PartitionRef {
+            partition: &self.container,
+        }
+    }
+}
+
+pub struct PartitionRefMut<'partitions> {
+    partition: &'partitions mut Slab<partition2::Partition>,
+}
+
+impl<'partitions> Decompose for PartitionRefMut<'partitions> {
+    type Target = &'partitions mut Slab<partition2::Partition>;
+
+    fn decompose(self) -> Self::Target {
+        self.partition
+    }
+}
+
+impl ProjectMut for Partitions {
+    type ViewMut<'me>
+        = PartitionRefMut<'me>
+    where
+        Self: 'me;
+
+    fn project_mut(&mut self) -> Self::ViewMut<'_> {
+        PartitionRefMut {
+            partition: &mut self.container,
+        }
+    }
+}
+
 impl Partitions {
     pub fn with_stats<T>(&self, f: impl FnOnce(&Slab<Arc<PartitionStats>>) -> T) -> T {
         let stats = &self.stats;
@@ -131,21 +181,6 @@ impl Partitions {
     ) -> T {
         let mut partition_offsets = &mut self.partition_offsets;
         f(&mut partition_offsets)
-    }
-
-    pub async fn with_async<T>(&self, f: impl AsyncFnOnce(&Slab<partition2::Partition>) -> T) -> T {
-        let container = &self.container;
-        f(&container).await
-    }
-
-    pub fn with<T>(&self, f: impl FnOnce(&Slab<partition2::Partition>) -> T) -> T {
-        let container = &self.container;
-        f(&container)
-    }
-
-    pub fn with_mut<T>(&mut self, f: impl FnOnce(&mut Slab<partition2::Partition>) -> T) -> T {
-        let mut container = &mut self.container;
-        f(&mut container)
     }
 
     pub fn with_partition_id<T>(

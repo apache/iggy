@@ -20,6 +20,7 @@ use std::cell::Ref;
 
 use super::COMPONENT;
 use crate::shard::IggyShard;
+use crate::slab::traits::Access;
 use crate::streaming::session::Session;
 use crate::streaming::streams::stream::Stream;
 use crate::streaming::topics::consumer_group::ConsumerGroup;

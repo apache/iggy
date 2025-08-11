@@ -1,7 +1,11 @@
 use ahash::AHashMap;
 use iggy_common::Identifier;
 use slab::Slab;
-use std::{cell::RefCell, sync::Arc};
+use std::{
+    cell::{Ref, RefCell, RefMut},
+    ops::Deref,
+    sync::Arc,
+};
 
 use crate::{
     slab::{Keyed, partitions::Partitions},
@@ -15,6 +19,56 @@ pub struct Topics {
     index: RefCell<AHashMap<<topic2::Topic as Keyed>::Key, usize>>,
     container: RefCell<Slab<topic2::Topic>>,
     stats: RefCell<Slab<Arc<TopicStats>>>,
+}
+
+pub struct TopicRef<'topics> {
+    topic: Ref<'topics, IndexedSlab<topic2::Topic>>,
+}
+
+impl ProjectCell for Topics {
+    type View<'me>
+        = TopicRef<'me>
+    where
+        Self: 'me;
+
+    fn project(&self) -> Self::View<'_> {
+        TopicRef {
+            topic: self.container.borrow(),
+        }
+    }
+}
+
+pub struct TopicRefMut<'topics> {
+    topic: RefMut<'topics, IndexedSlab<topic2::Topic>>,
+}
+
+impl<'topics> Decompose for TopicRefMut<'topics> {
+    type Target = RefMut<'topics, IndexedSlab<topic2::Topic>>;
+
+    fn decompose(self) -> Self::Target {
+        self.topic
+    }
+}
+
+impl ProjectCellMut for Topics {
+    type ViewMut<'me>
+        = TopicRefMut<'me>
+    where
+        Self: 'me;
+
+    fn project_mut(&self) -> Self::ViewMut<'_> {
+        TopicRefMut {
+            topic: self.container.borrow_mut(),
+        }
+    }
+}
+
+impl<'topics> Decompose for TopicRef<'topics> {
+    type Target = Ref<'topics, IndexedSlab<topic2::Topic>>;
+
+    fn decompose(self) -> Self::Target {
+        self.topic
+    }
 }
 
 impl Topics {
@@ -75,7 +129,7 @@ impl Topics {
         let mut index = self.index.borrow_mut();
         f(&mut index)
     }
-
+  
     pub async fn with_topic_by_id_async<T>(
         &self,
         id: &Identifier,
@@ -83,7 +137,6 @@ impl Topics {
     ) -> T {
         let id = self.get_index(id);
         self.with_async(async |topics| topics[id].invoke_async(f).await)
-            .await
     }
 
     pub fn with_topic_stats_by_id<T>(

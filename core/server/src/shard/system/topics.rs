@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use std::ops::DerefMut;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -24,6 +25,7 @@ use crate::shard::namespace::IggyNamespace;
 use crate::shard::transmission::event::ShardEvent;
 use crate::shard::{IggyShard, ShardInfo};
 use crate::shard_info;
+use crate::slab::traits::AccessMut;
 use crate::streaming::partitions::partition2;
 use crate::streaming::partitions::storage2::create_partition_file_hierarchy;
 use crate::streaming::session::Session;
@@ -243,8 +245,8 @@ impl IggyShard {
                 compression,
                 max_topic_size,
             );
-            let topic_id = stream.topics().with_mut(|topics| {
-                let topic_id = topic.insert_into(topics);
+            let topic_id = stream.topics().with_mut(|mut topics| {
+                let topic_id = topic.insert_into(&mut topics);
                 topic_id
             });
 
@@ -632,8 +634,8 @@ impl IggyShard {
             let id = stream
                 .topics()
                 .with_topic_by_id(topic_id, |topic| topic.id());
-            stream.topics().with_mut(|container| {
-                container.try_remove(id).ok_or_else(|| {
+            stream.topics().with_mut(|mut container| {
+                container.deref_mut().try_remove(id).ok_or_else(|| {
                     let topic_name = stream
                         .topics()
                         .with_topic_by_id(topic_id, |topic| topic.name().clone());
@@ -745,8 +747,8 @@ impl IggyShard {
         topic_id: &Identifier,
     ) -> Result<(), IggyError> {
         self.streams2
-            .with_partitions(stream_id, topic_id, |partitions| {
-                //partitions
+            .with_topic_by_id(stream_id, topic_id, |topic| {
+                // TOOD:
             });
 
         Ok(())
