@@ -41,7 +41,7 @@ pub trait ComponentsMapping<T>: private::Sealed {
 
 pub trait ComponentsByIdMapping<T>: private::Sealed {
     // TODO: We will need this to contrain the `EntityRef` and `EntityRefMut` types, so after decomposing they have proper mapping.
-    // Similar mechanism to trait from above, but for (T1, T2) -> (&T1, &T2) mapping rather than (T1, T2) -> (&Slab<T>, &Slab<T2>).
+    // Similar mechanism to trait from above, but for (T1, T2) -> (&T1, &T2) mapping rather than (T1, T2) -> (&Slab<T1>, &Slab<T2>).
     type Ref<'a>;
     type RefMut<'a>;
 }
@@ -195,11 +195,11 @@ pub trait EntityComponentSystemMutCell<Idx>: EntityComponentSystem<Idx, RefCell>
     where
         Self: 'a;
 
-    fn with_mut<O, F>(&mut self, f: F) -> O
+    fn with_mut<O, F>(&self, f: F) -> O
     where
         F: for<'a> FnOnce(Self::EntityRefMut<'a>) -> O;
 
-    fn with_by_id_mut<O, F>(&mut self, id: Idx, f: F) -> O
+    fn with_by_id_mut<O, F>(&self, id: Idx, f: F) -> O
     where
         F: for<'a> FnOnce(ComponentsById<Idx, Self::EntityRefMut<'a>>) -> O,
     {

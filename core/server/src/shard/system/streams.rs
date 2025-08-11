@@ -241,10 +241,14 @@ impl IggyShard {
         if exists {
             return Err(IggyError::StreamNameAlreadyExists(name));
         }
+        let key = name.clone();
         let stream = stream2::Stream::new(name);
         let stream_id = self
             .streams2
             .with_mut(|streams| stream.insert_into(streams));
+        self.streams2.with_index_mut(|index| {
+            index.insert(key, stream_id);
+        });
         self.streams2
             .with_stats_mut(|container| container.insert(stats));
         Ok(stream_id)
@@ -300,7 +304,6 @@ impl IggyShard {
         } else {
             id = stream_id.unwrap();
         }
-        tracing::warn!("CREATED STREAM WITH ID STREAM_IDS: {id}, NAME: {name}");
 
         if self.streams.borrow().contains_key(&id) {
             return Err(IggyError::StreamIdAlreadyExists(id));

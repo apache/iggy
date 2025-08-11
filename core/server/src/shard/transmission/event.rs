@@ -22,7 +22,7 @@ use crate::{
     },
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ShardEvent {
     CreatedShardTableRecords {
         stream_id: u32,
@@ -80,7 +80,7 @@ pub enum ShardEvent {
     DeletedPartitions2 {
         stream_id: Identifier,
         topic_id: Identifier,
-        partition_count: u32,
+        partitions_count: u32,
         partition_ids: Vec<u32>,
     },
     CreatedTopic {

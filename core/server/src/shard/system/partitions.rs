@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use std::error;
 use std::sync::Arc;
 
 use super::COMPONENT;
@@ -157,11 +158,7 @@ impl IggyShard {
                     consumer_offset,
                     consumer_group_offset,
                 );
-                let id = self.insert_partition_mem(
-                    stream_id,
-                    topic_id,
-                    partition.clone(create_message_deduplicator(&self.config.system)),
-                );
+                let id = self.insert_partition_mem(stream_id, topic_id, partition.clone());
                 partition.update_id(id);
                 partition
             })

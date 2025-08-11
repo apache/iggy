@@ -106,7 +106,7 @@ pub async fn start(
             let event = ShardEvent::TcpBound {
                 address: actual_addr,
             };
-            shard.broadcast_event_to_all_shards(Arc::new(event)).await;
+            shard.broadcast_event_to_all_shards(event).await;
         }
 
         let mut current_config = shard.config.clone();

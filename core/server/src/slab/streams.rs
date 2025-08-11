@@ -45,7 +45,7 @@ impl Streams {
             iggy_common::IdKind::Numeric => id.get_u32_value().unwrap() as usize,
             iggy_common::IdKind::String => {
                 let key = id.get_string_value().unwrap();
-                *self.index.borrow().get(&key).expect("Topic not found")
+                *self.index.borrow().get(&key).expect("Stream not found")
             }
         }
     }

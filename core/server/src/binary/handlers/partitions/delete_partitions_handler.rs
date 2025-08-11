@@ -60,7 +60,7 @@ impl ServerCommandHandler for DeletePartitions {
         let event = ShardEvent::DeletedPartitions2 {
             stream_id: self.stream_id.clone(),
             topic_id: self.topic_id.clone(),
-            partition_count: self.partitions_count,
+            partitions_count: self.partitions_count,
             partition_ids: deleted_partition_ids2,
         };
         let _responses = shard.broadcast_event_to_all_shards(event.into()).await;

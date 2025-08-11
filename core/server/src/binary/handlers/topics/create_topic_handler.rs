@@ -55,7 +55,7 @@ impl ServerCommandHandler for CreateTopic {
         debug!("session: {session}, command: {self}");
         let stream_id = self.stream_id.clone();
         let maybe_topic_id = self.topic_id;
-        shard.ensure_stream_exists(&stream_id)?;
+        //shard.ensure_stream_exists(&stream_id)?;
         let parent = shard
             .streams2
             .with_stats_by_id(&stream_id, |stats| stats.clone());

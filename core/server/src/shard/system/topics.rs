@@ -243,9 +243,13 @@ impl IggyShard {
                 compression,
                 max_topic_size,
             );
+            let name = topic.name().clone();
             let topic_id = stream.topics().with_mut(|topics| {
                 let topic_id = topic.insert_into(topics);
                 topic_id
+            });
+            stream.topics().with_mut_index(|index| {
+                index.insert(name, topic_id);
             });
 
             stream.topics().with_stats_mut(|container| {

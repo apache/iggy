@@ -44,6 +44,7 @@ impl Topics {
             iggy_common::IdKind::Numeric => id.get_u32_value().unwrap() as usize,
             iggy_common::IdKind::String => {
                 let key = id.get_string_value().unwrap();
+                tracing::error!("Getting index for topic: {key}, index: {:?}", self.index.borrow());
                 *self.index.borrow().get(&key).expect("Topic not found")
             }
         }

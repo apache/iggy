@@ -51,12 +51,12 @@ impl Partition {
     }
 }
 
-impl Partition {
-    pub fn clone(&self, message_deduplicator: Option<MessageDeduplicator>) -> Self {
+impl Clone for Partition {
+    fn clone(&self) -> Self {
         Self {
             info: self.info.clone(),
             stats: Arc::clone(&self.stats),
-            message_deduplicator,
+            message_deduplicator: self.message_deduplicator.clone(),
             offset: Arc::clone(&self.offset),
             consumer_offset: Arc::clone(&self.consumer_offset),
             consumer_group_offset: Arc::clone(&self.consumer_group_offset),
@@ -108,15 +108,12 @@ impl PartitionInfo {
         self.id
     }
 
-    pub fn insert_into(self, container: &mut Slab<Self>) -> usize {
-        let idx = container.insert(self);
-        let partition = &mut container[idx];
-        partition.id = idx;
-        idx
+    pub fn update_id(&mut self, id: usize) {
+        self.id = id;
     }
 }
 
-// TODO: Probably move this to the `slab/partitions` module 
+// TODO: Probably move this to the `slab` module
 pub struct PartitionRef<'a> {
     info: &'a Slab<PartitionInfo>,
     stats: &'a Slab<Arc<PartitionStats>>,

@@ -55,7 +55,24 @@ impl Insert<SlabId> for Partitions {
     type Item = Partition;
 
     fn insert(&mut self, item: Self::Item) -> SlabId {
-        todo!();
+        let (
+            info,
+            stats,
+            message_deduplicator,
+            offset,
+            consumer_offset,
+            consumer_group_offset,
+        ) = item.into_components();
+
+        let id = self.info.insert(info);
+        let info = &mut self.info[id];
+        info.update_id(id);
+        self.stats.insert(stats);
+        self.message_deduplicator.insert(message_deduplicator);
+        self.offset.insert(offset);
+        self.consumer_offset.insert(consumer_offset);
+        self.consumer_group_offset.insert(consumer_group_offset);
+        id
     }
 }
 

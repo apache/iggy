@@ -17,26 +17,62 @@
  */
 
 use iggy_common::IggyDuration;
-use moka::future::Cache;
+use moka::future::{Cache, CacheBuilder};
 
 #[derive(Debug)]
 pub struct MessageDeduplicator {
+    ttl: Option<IggyDuration>,
+    max_entries: Option<u64>,
     cache: Cache<u128, bool>,
 }
 
+/// Create deep copy of the `MessageDeduplicator` instance.
+/// Regular `Clone` cheap as it only creates thread-safe reference counted
+/// pointers to the shared internal data structures.
+impl Clone for MessageDeduplicator {
+    fn clone(&self) -> Self {
+        let mut builder = Cache::builder();
+        let builder = Self::setup_cache_builder(builder, self.max_entries, self.ttl);
+        let cache = builder.build();
+
+        self.cache.clone();
+        // Transfer data from the original cache to the new one
+        for (key, value) in self.cache.iter() {
+            cache.insert(*key, value);
+        }
+        Self {
+            ttl: self.ttl,
+            max_entries: self.max_entries,
+            cache,
+        }
+    }
+}
+
 impl MessageDeduplicator {
-    /// Creates a new message deduplicator with the given max entries and time to live for each ID.
-    pub fn new(max_entries: Option<u64>, ttl: Option<IggyDuration>) -> Self {
-        let mut cache = Cache::builder();
+    fn setup_cache_builder(
+        mut builder: CacheBuilder<u128, bool, Cache<u128, bool>>,
+        max_entries: Option<u64>,
+        ttl: Option<IggyDuration>,
+    ) -> CacheBuilder<u128, bool, Cache<u128, bool>> {
         if let Some(max_entries) = max_entries {
-            cache = cache.max_capacity(max_entries);
+            builder = builder.max_capacity(max_entries);
         }
         if let Some(ttl) = ttl {
-            cache = cache.time_to_live(ttl.get_duration());
+            builder = builder.time_to_live(ttl.get_duration());
         }
+        builder
+    }
+
+    /// Creates a new message deduplicator with the given max entries and time to live for each ID.
+    pub fn new(max_entries: Option<u64>, ttl: Option<IggyDuration>) -> Self {
+        let mut builder = Cache::builder();
+        let mut builder = Self::setup_cache_builder(builder, max_entries, ttl);
+        let cache = builder.build();
 
         Self {
-            cache: cache.build(),
+            ttl,
+            max_entries,
+            cache,
         }
     }
 
