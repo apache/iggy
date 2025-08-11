@@ -22,6 +22,11 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::configs::quic::QuicConfig;
+use crate::quic::COMPONENT;
+use crate::quic::listener;
+use crate::server_error::QuicError;
+use crate::shard::IggyShard;
 use anyhow::Result;
 use compio_quic::{
     Endpoint, EndpointConfig, IdleTimeout, ServerBuilder, ServerConfig, TransportConfig, VarInt,
@@ -29,24 +34,20 @@ use compio_quic::{
 use error_set::ErrContext;
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tracing::log::warn;
 use tracing::{error, info, trace};
-
-use crate::configs::quic::QuicConfig;
-use crate::quic::COMPONENT;
-use crate::quic::listener;
-use crate::server_error::QuicError;
-use crate::shard::IggyShard;
 
 /// Starts the QUIC server.
 /// Returns the address the server is listening on.
 pub async fn span_quic_server(shard: Rc<IggyShard>) -> Result<(), iggy_common::IggyError> {
-    // Ensure crypto provider is installed (ignore if already installed)
     if rustls::crypto::CryptoProvider::get_default().is_none() {
-        default_provider().install_default()
-            .map_err(|e| {
-                error!("Failed to install crypto provider: {:?}", e);
-                iggy_common::IggyError::QuicError
-            })?;
+        if let Err(e) = default_provider().install_default() {
+            warn!(
+                "Failed to install rustls crypto provider. Error: {:?}. This may be normal if another \
+            thread installed it first.",
+                e
+            );
+        }
     } else {
         trace!("Crypto provider already installed");
     }
