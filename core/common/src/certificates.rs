@@ -23,9 +23,12 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 pub fn generate_self_signed_certificate(
     domain: &str,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), Box<dyn std::error::Error>> {
-    let cert = rcgen::generate_simple_self_signed(vec![domain.to_string()])?;
-    let cert_der = cert.cert.der();
-    let key_der = cert.signing_key.serialize_der();
+    let certified_key = rcgen::generate_simple_self_signed(vec![domain.to_string()])?;
+    let cert_der = certified_key.cert.der().to_vec();
+    let key_der = certified_key.signing_key.serialize_der();
+
+    let cert_der = CertificateDer::from(cert_der);
     let key = PrivateKeyDer::try_from(key_der)?;
-    Ok((vec![cert_der.clone()], key))
+
+    Ok((vec![cert_der], key))
 }

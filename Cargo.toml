@@ -133,6 +133,7 @@ cyper = { git = "https://github.com/krishvishal/cyper.git", rev = "cd75e266df6ab
 ], default-features = false }
 cyper-axum = { git = "https://github.com/krishvishal/cyper", rev = "cd75e266df6ab0a9b9474eb7dda1735650d17db6" }
 compio-net = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be" }
+compio-quic = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be" }
 tokio-rustls = "0.26.2"
 toml = "0.9.4"
 tracing = "0.1.41"
