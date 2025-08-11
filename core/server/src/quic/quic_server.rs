@@ -40,9 +40,15 @@ use crate::shard::IggyShard;
 /// Starts the QUIC server.
 /// Returns the address the server is listening on.
 pub async fn span_quic_server(shard: Rc<IggyShard>) -> Result<(), iggy_common::IggyError> {
-    if let Err(e) = default_provider().install_default() {
-        error!("Failed to install crypto provider: {:?}", e);
-        return Err(iggy_common::IggyError::QuicError);
+    // Ensure crypto provider is installed (ignore if already installed)
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        default_provider().install_default()
+            .map_err(|e| {
+                error!("Failed to install crypto provider: {:?}", e);
+                iggy_common::IggyError::QuicError
+            })?;
+    } else {
+        trace!("Crypto provider already installed");
     }
 
     let config = shard.config.quic.clone();
