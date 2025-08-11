@@ -1,6 +1,3 @@
-<!-- @migration-task Error while migrating Svelte code: This migration would change the name of a slot making the component unusable -->
-<!-- @migration-task Error while migrating Svelte code: This migration would change the name of a slot making the component unusable -->
-<!-- // TODO: check it - Error while migrating Svelte code: This migration would change the name of a slot making the component unusable -->
 <script lang="ts">
   import { tooltip } from '$lib/actions/tooltip';
   import type { Placement } from '@floating-ui/dom';
@@ -33,49 +30,39 @@
     xl: 'px-7 py-4 text-lg'
   };
 
-  interface $$Props extends HTMLButtonAttributes {
+  interface Props extends HTMLButtonAttributes {
     variant: keyof typeof variants;
     tooltipPlacement?: Placement;
     size?: keyof typeof sizes;
     class?: string;
+    children?: import('svelte').Snippet;
+    tooltip?: import('svelte').Snippet;
   }
 
-  export let variant: keyof typeof variants;
-  export let tooltipPlacement: Placement = 'right';
-  export let size: keyof typeof sizes = 'md';
-  let className = '';
-  export { className as class };
+  let { 
+    variant, 
+    tooltipPlacement = 'right', 
+    size = 'md', 
+    class: className = '',
+    children,
+    tooltip: tooltipSnippet,
+    onclick,
+    ...restProps 
+  }: Props = $props();
 </script>
 
-<!-- <div use:tooltip={{ placement: tooltipPlacement }} class="w-full">
-  <button
-    on:click
-    data-trigger
-    class={twMerge(baseClasses, disabledClasses, variants[variant], sizes[size], className)}
-    {...$$restProps}
-  >
-    <slot />
-  </button>
-
-  {#if $$slots.tooltip}
-    <div role="tooltip" class="tooltip">
-      <slot name="tooltip" />
-    </div>
-  {/if}
-</div> -->
-
 <button
-  on:click
+  {onclick}
   data-trigger
   use:tooltip={{ placement: tooltipPlacement, isTrigger: true }}
   class={twMerge(baseClasses, variants[variant], sizes[size], disabledClasses, className, ' ')}
-  {...$$restProps}
+  {...restProps}
 >
-  <slot />
+  {@render children?.()}
 
-  {#if $$slots.tooltip}
+  {#if tooltipSnippet}
     <div role="tooltip" class="tooltip ring-bl">
-      <slot name="tooltip" />
+      {@render tooltipSnippet()}
     </div>
   {/if}
 </button>

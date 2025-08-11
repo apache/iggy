@@ -1,11 +1,9 @@
 <script lang="ts">
   import Button from '$lib/components/Button.svelte';
   import SettingsLayout from '$lib/components/Layouts/SettingsLayout.svelte';
-  import Loader from '$lib/components/Loader.svelte';
 
   import RangeInput from '$lib/components/RangeInput.svelte';
   import Toggler from '$lib/components/Toggler.svelte';
-  import type { Stats } from '$lib/domain/Stats';
 
   interface Props {
     data: any;
@@ -38,8 +36,6 @@
                 <RangeInput
                   className="w-[270px] h-[9px]"
                   size="big"
-                  min={0}
-                  max={100}
                   initValue={50}
                   bind:value={cacheValue}
                 />

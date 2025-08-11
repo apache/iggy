@@ -1,10 +1,7 @@
 <script lang="ts">
-  import Button from '$lib/components/Button.svelte';
   import Icon from '$lib/components/Icon.svelte';
   import Input from '$lib/components/Input.svelte';
-  import { openModal } from '$lib/components/Modals/AppModals.svelte';
-  import { fade } from 'svelte/transition';
-  import { searchQuery, selectedUsersId, usersCount } from './UsersTab.svelte';
+  import { searchQuery, usersCount } from './UsersTab.svelte';
 </script>
 
 <div class="flex flex-col-reverse lg:flex-row gap-3 lg:gap-5 items-center">
@@ -34,7 +31,7 @@
         </Input>
       </div>
       <!-- 
-      <Button variant="contained" on:click={() => openModal('AddUserModal', {streams: })}>
+      <Button variant="contained" onclick={() => openModal('AddUserModal', {streams: })}>
         <Icon name="plus" />
         Add user
       </Button> -->

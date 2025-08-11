@@ -17,7 +17,7 @@
  * under the License.
  */
 
-import { bytesFormatter } from '$lib/utils/formatters/bytesFormatter';
+
 import { formatDate } from '$lib/utils/formatters/dateFormatter';
 
 export type Partition = {
