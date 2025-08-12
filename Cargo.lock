@@ -479,6 +479,7 @@ dependencies = [
  "liblzma",
  "memchr",
  "pin-project-lite",
+ "tokio",
  "zstd",
  "zstd-safe",
 ]
@@ -913,7 +914,7 @@ dependencies = [
  "bench-report",
  "chrono",
  "clap",
- "dashmap",
+ "dashmap 6.1.0",
  "file-operation",
  "notify",
  "octocrab",
@@ -1667,6 +1668,16 @@ dependencies = [
 
 [[package]]
 name = "core-foundation"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91e195e091a93c46f7102ec7818a2aa394e1e1771c3ab4825963fa03e45afb8f"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+]
+
+[[package]]
+name = "core-foundation"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b2a6cd9ae233e7f62ba4e9353e81a88df7fc8a5987b8d445b4d90c879bd156f6"
@@ -1967,6 +1978,19 @@ dependencies = [
  "darling_core 0.21.0",
  "quote",
  "syn 2.0.104",
+]
+
+[[package]]
+name = "dashmap"
+version = "5.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "978747c1d849a7d2ee5e8adc0159961c48fb7e5db2f06af6723b80123bb53856"
+dependencies = [
+ "cfg-if",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core 0.9.11",
 ]
 
 [[package]]
@@ -2280,6 +2304,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "elasticsearch"
+version = "8.18.0-alpha.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "214bc8b9b340dad31583f855a16623fca1f9452fc71fdd2c68d6fab049985d67"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "dyn-clone",
+ "flate2",
+ "lazy_static",
+ "parking_lot 0.12.4",
+ "percent-encoding",
+ "reqwest",
+ "rustc_version",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "tokio",
+ "url",
+ "void",
 ]
 
 [[package]]
@@ -3285,7 +3332,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3cbe789d04bf14543f03c4b60cd494148aa79438c8440ae7d81a7778147745c3"
 dependencies = [
  "cfg-if",
- "dashmap",
+ "dashmap 6.1.0",
  "futures-sink",
  "futures-timer",
  "futures-util",
@@ -3627,6 +3674,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "hyper-tls"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70206fc6890eaca9fde8a0bf71caa2ddfc9fe045ac9e5c70df101a7dbde866e0"
+dependencies = [
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "native-tls",
+ "tokio",
+ "tokio-native-tls",
+ "tower-service",
+]
+
+[[package]]
 name = "hyper-util"
 version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3796,7 +3859,7 @@ dependencies = [
  "async-trait",
  "bon",
  "bytes",
- "dashmap",
+ "dashmap 6.1.0",
  "flume",
  "futures",
  "futures-util",
@@ -3874,7 +3937,7 @@ dependencies = [
  "axum 0.8.4",
  "axum-server",
  "config",
- "dashmap",
+ "dashmap 6.1.0",
  "dlopen2",
  "dotenvy",
  "figlet-rs",
@@ -3967,12 +4030,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "iggy_connector_elasticsearch_source"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "dashmap 5.5.3",
+ "elasticsearch",
+ "humantime",
+ "iggy_connector_sdk",
+ "once_cell",
+ "serde",
+ "serde_json",
+ "sysinfo 0.29.11",
+ "tempfile",
+ "tokio",
+ "tokio-test",
+ "tracing",
+]
+
+[[package]]
 name = "iggy_connector_postgres_sink"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
- "dashmap",
+ "dashmap 6.1.0",
  "futures",
  "iggy_connector_sdk",
  "once_cell",
@@ -3989,7 +4072,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
- "dashmap",
+ "dashmap 6.1.0",
  "futures",
  "humantime",
  "iggy_connector_sdk",
@@ -4008,7 +4091,7 @@ name = "iggy_connector_quickwit_sink"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "dashmap",
+ "dashmap 6.1.0",
  "iggy_connector_sdk",
  "once_cell",
  "reqwest",
@@ -4023,12 +4106,13 @@ name = "iggy_connector_random_source"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "dashmap",
+ "dashmap 6.1.0",
  "humantime",
  "iggy_connector_sdk",
  "once_cell",
  "rand 0.9.2",
  "serde",
+ "serde_json",
  "simd-json",
  "tokio",
  "tracing",
@@ -4042,7 +4126,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chrono",
- "dashmap",
+ "dashmap 6.1.0",
  "flatbuffers",
  "iggy",
  "once_cell",
@@ -4068,7 +4152,7 @@ name = "iggy_connector_stdout_sink"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "dashmap",
+ "dashmap 6.1.0",
  "iggy_connector_sdk",
  "once_cell",
  "serde",
@@ -4982,6 +5066,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a51313c5820b0b02bd422f4b44776fbf47961755c74ce64afc73bfad10226c3"
 dependencies = [
  "getrandom 0.2.16",
+]
+
+[[package]]
+name = "native-tls"
+version = "0.2.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87de3442987e9dbec73158d5c715e7ad9072fda936bb03d19d7fa10e00520f0e"
+dependencies = [
+ "libc",
+ "log",
+ "openssl",
+ "openssl-probe",
+ "openssl-sys",
+ "schannel",
+ "security-framework 2.11.1",
+ "security-framework-sys",
+ "tempfile",
 ]
 
 [[package]]
@@ -6446,6 +6547,7 @@ version = "0.12.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cbc931937e6ca3a06e3b6c0aa7841849b160a90351d6ab467a8b9b9959767531"
 dependencies = [
+ "async-compression",
  "base64 0.22.1",
  "bytes",
  "futures-channel",
@@ -6456,9 +6558,11 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-rustls",
+ "hyper-tls",
  "hyper-util",
  "js-sys",
  "log",
+ "native-tls",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -6469,6 +6573,7 @@ dependencies = [
  "serde_urlencoded",
  "sync_wrapper",
  "tokio",
+ "tokio-native-tls",
  "tokio-rustls",
  "tokio-util",
  "tower 0.5.2",
@@ -6792,7 +6897,7 @@ dependencies = [
  "openssl-probe",
  "rustls-pki-types",
  "schannel",
- "security-framework",
+ "security-framework 3.2.0",
 ]
 
 [[package]]
@@ -6820,7 +6925,7 @@ version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19787cda76408ec5404443dc8b31795c87cd8fec49762dc75fa727740d34acc1"
 dependencies = [
- "core-foundation",
+ "core-foundation 0.10.1",
  "core-foundation-sys",
  "jni",
  "log",
@@ -6829,7 +6934,7 @@ dependencies = [
  "rustls-native-certs",
  "rustls-platform-verifier-android",
  "rustls-webpki",
- "security-framework",
+ "security-framework 3.2.0",
  "security-framework-sys",
  "webpki-root-certs 0.26.11",
  "windows-sys 0.59.0",
@@ -7005,12 +7110,25 @@ dependencies = [
 
 [[package]]
 name = "security-framework"
+version = "2.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "897b2245f0b511c87893af39b033e5ca9cce68824c4d7e7630b5a1d339658d02"
+dependencies = [
+ "bitflags 2.9.1",
+ "core-foundation 0.9.4",
+ "core-foundation-sys",
+ "libc",
+ "security-framework-sys",
+]
+
+[[package]]
+name = "security-framework"
 version = "3.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "271720403f46ca04f7ba6f55d438f8bd878d6b8ca0a1046e8228c4145bcbb316"
 dependencies = [
  "bitflags 2.9.1",
- "core-foundation",
+ "core-foundation 0.10.1",
  "core-foundation-sys",
  "libc",
  "security-framework-sys",
@@ -7229,7 +7347,7 @@ dependencies = [
  "clap",
  "console-subscriber",
  "crossbeam",
- "dashmap",
+ "dashmap 6.1.0",
  "derive_more 2.0.1",
  "dotenvy",
  "enum_dispatch",
@@ -7842,6 +7960,21 @@ dependencies = [
 
 [[package]]
 name = "sysinfo"
+version = "0.29.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd727fc423c2060f6c92d9534cef765c65a6ed3f428a03d7def74a8c4348e666"
+dependencies = [
+ "cfg-if",
+ "core-foundation-sys",
+ "libc",
+ "ntapi",
+ "once_cell",
+ "rayon",
+ "winapi",
+]
+
+[[package]]
+name = "sysinfo"
 version = "0.34.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4b93974b3d3aeaa036504b8eefd4c039dced109171c1ae973f1dc63b2c7e4b2"
@@ -8101,6 +8234,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-native-tls"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbae76ab933c85776efabc971569dd6119c580d8f5d448769dec1764bf796ef2"
+dependencies = [
+ "native-tls",
+ "tokio",
+]
+
+[[package]]
 name = "tokio-rustls"
 version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8119,6 +8262,19 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "tokio-test"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2468baabc3311435b55dd935f702f42cd1b8abb7e754fb7dfb16bd36aa88f9f7"
+dependencies = [
+ "async-stream",
+ "bytes",
+ "futures-core",
+ "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
@@ -8753,6 +8909,12 @@ name = "virtue"
 version = "0.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
+
+[[package]]
+name = "void"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a02e4885ed3bc0f2de90ea6dd45ebcbb66dacffe03547fadbb0eeae2770887d"
 
 [[package]]
 name = "wait-timeout"

@@ -194,7 +194,7 @@ impl FileStateStorage {
     }
     
     fn get_state_path(&self, id: &str) -> std::path::PathBuf {
-        self.base_path.join(format!("{}.json", id))
+        self.base_path.join(format!("{id}.json"))
     }
 }
 
@@ -206,15 +206,15 @@ impl StateStorage for FileStateStorage {
         // Ensure directory exists
         if let Some(parent) = self.base_path.parent() {
             fs::create_dir_all(parent).await
-                .map_err(|e| Error::Storage(format!("Failed to create state directory: {}", e)))?;
+                .map_err(|e| Error::Storage(format!("Failed to create state directory: {e}")))?;
         }
         
         let path = self.get_state_path(&state.id);
         let json = serde_json::to_string_pretty(state)
-            .map_err(|e| Error::Serialization(format!("Failed to serialize source state: {}", e)))?;
+            .map_err(|e| Error::Serialization(format!("Failed to serialize source state: {e}")))?;
         
         fs::write(path, json).await
-            .map_err(|e| Error::Storage(format!("Failed to write state file: {}", e)))?;
+            .map_err(|e| Error::Storage(format!("Failed to write state file: {e}")))?;
         
         Ok(())
     }
@@ -228,10 +228,10 @@ impl StateStorage for FileStateStorage {
         }
         
         let content = fs::read_to_string(path).await
-            .map_err(|e| Error::Storage(format!("Failed to read state file: {}", e)))?;
+            .map_err(|e| Error::Storage(format!("Failed to read state file: {e}")))?;
         
         let state: SourceState = serde_json::from_str(&content)
-            .map_err(|e| Error::Serialization(format!("Failed to deserialize source state: {}", e)))?;
+            .map_err(|e| Error::Serialization(format!("Failed to deserialize source state: {e}")))?;
         
         Ok(Some(state))
     }
@@ -242,15 +242,15 @@ impl StateStorage for FileStateStorage {
         // Ensure directory exists
         if let Some(parent) = self.base_path.parent() {
             fs::create_dir_all(parent).await
-                .map_err(|e| Error::Storage(format!("Failed to create state directory: {}", e)))?;
+                .map_err(|e| Error::Storage(format!("Failed to create state directory: {e}")))?;
         }
         
         let path = self.get_state_path(&state.id);
         let json = serde_json::to_string_pretty(state)
-            .map_err(|e| Error::Serialization(format!("Failed to serialize sink state: {}", e)))?;
+            .map_err(|e| Error::Serialization(format!("Failed to serialize sink state: {e}")))?;
         
         fs::write(path, json).await
-            .map_err(|e| Error::Storage(format!("Failed to write state file: {}", e)))?;
+            .map_err(|e| Error::Storage(format!("Failed to write state file: {e}")))?;
         
         Ok(())
     }
@@ -264,10 +264,10 @@ impl StateStorage for FileStateStorage {
         }
         
         let content = fs::read_to_string(path).await
-            .map_err(|e| Error::Storage(format!("Failed to read state file: {}", e)))?;
+            .map_err(|e| Error::Storage(format!("Failed to read state file: {e}")))?;
         
         let state: SinkState = serde_json::from_str(&content)
-            .map_err(|e| Error::Serialization(format!("Failed to deserialize sink state: {}", e)))?;
+            .map_err(|e| Error::Serialization(format!("Failed to deserialize sink state: {e}")))?;
         
         Ok(Some(state))
     }
@@ -278,7 +278,7 @@ impl StateStorage for FileStateStorage {
         let path = self.get_state_path(id);
         if path.exists() {
             fs::remove_file(path).await
-                .map_err(|e| Error::Storage(format!("Failed to delete state file: {}", e)))?;
+                .map_err(|e| Error::Storage(format!("Failed to delete state file: {e}")))?;
         }
         
         Ok(())
@@ -294,10 +294,10 @@ impl StateStorage for FileStateStorage {
         }
         
         let mut entries = fs::read_dir(&self.base_path).await
-            .map_err(|e| Error::Storage(format!("Failed to read state directory: {}", e)))?;
+            .map_err(|e| Error::Storage(format!("Failed to read state directory: {e}")))?;
         
         while let Some(entry) = entries.next_entry().await
-            .map_err(|e| Error::Storage(format!("Failed to read directory entry: {}", e)))? {
+            .map_err(|e| Error::Storage(format!("Failed to read directory entry: {e}")))? {
             
             if let Some(extension) = entry.path().extension() {
                 if extension == "json" {
