@@ -57,11 +57,11 @@ impl SharedSystem {
         }
     }
 
-    pub async fn read(&self) -> RwLockReadGuard<System> {
+    pub async fn read(&self) -> RwLockReadGuard<'_, System> {
         self.system.read().await
     }
 
-    pub async fn write(&self) -> RwLockWriteGuard<System> {
+    pub async fn write(&self) -> RwLockWriteGuard<'_, System> {
         self.system.write().await
     }
 }

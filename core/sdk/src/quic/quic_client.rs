@@ -533,13 +533,13 @@ fn configure(config: &QuicClientConfig) -> Result<ClientConfig, IggyError> {
         transport.max_idle_timeout(Some(max_idle_timeout.unwrap()));
     }
 
-    if CryptoProvider::get_default().is_none() {
-        if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
-            warn!(
-                "Failed to install rustls crypto provider. Error: {:?}. This may be normal if another thread installed it first.",
-                e
-            );
-        }
+    if CryptoProvider::get_default().is_none()
+        && let Err(e) = rustls::crypto::ring::default_provider().install_default()
+    {
+        warn!(
+            "Failed to install rustls crypto provider. Error: {:?}. This may be normal if another thread installed it first.",
+            e
+        );
     }
     let mut client_config = match config.validate_certificate {
         true => ClientConfig::with_platform_verifier(),

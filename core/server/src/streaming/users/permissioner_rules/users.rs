@@ -49,20 +49,20 @@ impl Permissioner {
     }
 
     fn manager_users(&self, user_id: u32) -> Result<(), IggyError> {
-        if let Some(global_permissions) = self.users_permissions.get(&user_id) {
-            if global_permissions.manage_users {
-                return Ok(());
-            }
+        if let Some(global_permissions) = self.users_permissions.get(&user_id)
+            && global_permissions.manage_users
+        {
+            return Ok(());
         }
 
         Err(IggyError::Unauthorized)
     }
 
     fn read_users(&self, user_id: u32) -> Result<(), IggyError> {
-        if let Some(global_permissions) = self.users_permissions.get(&user_id) {
-            if global_permissions.manage_users || global_permissions.read_users {
-                return Ok(());
-            }
+        if let Some(global_permissions) = self.users_permissions.get(&user_id)
+            && (global_permissions.manage_users || global_permissions.read_users)
+        {
+            return Ok(());
         }
 
         Err(IggyError::Unauthorized)

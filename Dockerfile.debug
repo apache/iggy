@@ -16,7 +16,7 @@
 # under the License.
 
 # Debug/test build for faster compilation during development and testing
-FROM rust:latest AS builder
+FROM rust:1.89 AS builder
 WORKDIR /build
 COPY . /build
 # Build in debug mode for faster compilation times during testing

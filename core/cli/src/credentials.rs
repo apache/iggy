@@ -145,50 +145,49 @@ impl<'a> IggyCredentials<'a> {
     }
 
     pub(crate) async fn login_user(&self) -> anyhow::Result<(), anyhow::Error> {
-        if let Some(client) = self.iggy_client {
-            if self.login_required {
-                let credentials = self.credentials.as_ref().unwrap();
-                match credentials {
-                    Credentials::UserNameAndPassword(username_and_password) => {
-                        let _ = client
-                            .login_user(
-                                &username_and_password.username,
-                                &username_and_password.password,
+        if let Some(client) = self.iggy_client
+            && self.login_required
+        {
+            let credentials = self.credentials.as_ref().unwrap();
+            match credentials {
+                Credentials::UserNameAndPassword(username_and_password) => {
+                    let _ = client
+                        .login_user(
+                            &username_and_password.username,
+                            &username_and_password.password,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "Problem with server login for username: {}",
+                                &username_and_password.username
                             )
-                            .await
-                            .with_context(|| {
-                                format!(
-                                    "Problem with server login for username: {}",
-                                    &username_and_password.username
-                                )
-                            })?;
-                    }
-                    Credentials::PersonalAccessToken(token_value) => {
-                        let _ = client
-                            .login_with_personal_access_token(token_value)
-                            .await
-                            .with_context(|| {
-                                format!("Problem with server login with token: {token_value}")
-                            })?;
-                    }
-                    Credentials::SessionWithToken(token_value, server_address) => {
-                        let login_result =
-                            client.login_with_personal_access_token(token_value).await;
-                        if let Err(err) = login_result {
-                            if matches!(
-                                err,
-                                IggyError::Unauthenticated
-                                    | IggyError::ResourceNotFound(_)
-                                    | IggyError::PersonalAccessTokenExpired(_, _)
-                            ) {
-                                let server_session = ServerSession::new(server_address.clone());
-                                server_session.delete()?;
-                                bail!(
-                                    "Login session expired for Iggy server: {server_address}, please login again or use other authentication method"
-                                );
-                            } else {
-                                bail!("Problem with server login with token: {token_value}");
-                            }
+                        })?;
+                }
+                Credentials::PersonalAccessToken(token_value) => {
+                    let _ = client
+                        .login_with_personal_access_token(token_value)
+                        .await
+                        .with_context(|| {
+                            format!("Problem with server login with token: {token_value}")
+                        })?;
+                }
+                Credentials::SessionWithToken(token_value, server_address) => {
+                    let login_result = client.login_with_personal_access_token(token_value).await;
+                    if let Err(err) = login_result {
+                        if matches!(
+                            err,
+                            IggyError::Unauthenticated
+                                | IggyError::ResourceNotFound(_)
+                                | IggyError::PersonalAccessTokenExpired(_, _)
+                        ) {
+                            let server_session = ServerSession::new(server_address.clone());
+                            server_session.delete()?;
+                            bail!(
+                                "Login session expired for Iggy server: {server_address}, please login again or use other authentication method"
+                            );
+                        } else {
+                            bail!("Problem with server login with token: {token_value}");
                         }
                     }
                 }
@@ -199,13 +198,13 @@ impl<'a> IggyCredentials<'a> {
     }
 
     pub(crate) async fn logout_user(&self) -> anyhow::Result<(), anyhow::Error> {
-        if let Some(client) = self.iggy_client {
-            if self.login_required {
-                client
-                    .logout_user()
-                    .await
-                    .with_context(|| "Problem with server logout".to_string())?;
-            }
+        if let Some(client) = self.iggy_client
+            && self.login_required
+        {
+            client
+                .logout_user()
+                .await
+                .with_context(|| "Problem with server logout".to_string())?;
         }
 
         Ok(())

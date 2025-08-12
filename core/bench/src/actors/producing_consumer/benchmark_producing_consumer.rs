@@ -146,63 +146,63 @@ where
             if is_producer
                 && !self.send_finish_condition.is_done()
                 && (!require_reply || !awaiting_reply)
+                && let Some(batch) = self.producer.produce_batch(&mut batch_generator).await?
             {
-                if let Some(batch) = self.producer.produce_batch(&mut batch_generator).await? {
-                    rl_value += batch.user_data_bytes;
-                    sent_user_bytes += batch.user_data_bytes;
-                    sent_total_bytes += batch.total_bytes;
-                    sent_messages += u64::from(batch.messages);
-                    sent_batches += 1;
-                    awaiting_reply = is_consumer;
+                rl_value += batch.user_data_bytes;
+                sent_user_bytes += batch.user_data_bytes;
+                sent_total_bytes += batch.total_bytes;
+                sent_messages += u64::from(batch.messages);
+                sent_batches += 1;
+                awaiting_reply = is_consumer;
 
-                    if self
-                        .send_finish_condition
-                        .account_and_check(batch.user_data_bytes)
-                    {
-                        info!(
-                            "ProducingConsumer #{actor_id} → finished sending {sent_messages} messages in {sent_batches} batches ({sent_user_bytes} bytes of user data, {sent_total_bytes} bytes of total data), send finish condition: {send_status}, poll finish condition: {poll_status}",
-                            actor_id = self.producer_config.producer_id,
-                            sent_messages = sent_messages.human_count_bare(),
-                            sent_batches = sent_batches.human_count_bare(),
-                            sent_user_bytes = sent_user_bytes.human_count_bytes(),
-                            sent_total_bytes = sent_total_bytes.human_count_bytes(),
-                            send_status = self.send_finish_condition.status(),
-                            poll_status = self.poll_finish_condition.status()
-                        );
-                    }
+                if self
+                    .send_finish_condition
+                    .account_and_check(batch.user_data_bytes)
+                {
+                    info!(
+                        "ProducingConsumer #{actor_id} → finished sending {sent_messages} messages in {sent_batches} batches ({sent_user_bytes} bytes of user data, {sent_total_bytes} bytes of total data), send finish condition: {send_status}, poll finish condition: {poll_status}",
+                        actor_id = self.producer_config.producer_id,
+                        sent_messages = sent_messages.human_count_bare(),
+                        sent_batches = sent_batches.human_count_bare(),
+                        sent_user_bytes = sent_user_bytes.human_count_bytes(),
+                        sent_total_bytes = sent_total_bytes.human_count_bytes(),
+                        send_status = self.send_finish_condition.status(),
+                        poll_status = self.poll_finish_condition.status()
+                    );
                 }
             }
 
-            if is_consumer && !self.poll_finish_condition.is_done() {
-                if let Some(batch) = self.consumer.consume_batch().await? {
-                    rl_value += batch.user_data_bytes;
-                    recv_user_bytes += batch.user_data_bytes;
-                    recv_total_bytes += batch.total_bytes;
-                    recv_messages += u64::from(batch.messages);
-                    recv_batches += 1;
+            if is_consumer
+                && !self.poll_finish_condition.is_done()
+                && let Some(batch) = self.consumer.consume_batch().await?
+            {
+                rl_value += batch.user_data_bytes;
+                recv_user_bytes += batch.user_data_bytes;
+                recv_total_bytes += batch.total_bytes;
+                recv_messages += u64::from(batch.messages);
+                recv_batches += 1;
 
-                    let elapsed = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
-                    let latency = u64::try_from(batch.latency.as_micros()).unwrap_or(u64::MAX);
+                let elapsed = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+                let latency = u64::try_from(batch.latency.as_micros()).unwrap_or(u64::MAX);
 
-                    records.push(BenchmarkRecord {
-                        elapsed_time_us: elapsed,
-                        latency_us: latency,
-                        messages: sent_messages + recv_messages,
-                        message_batches: sent_batches + recv_batches,
-                        user_data_bytes: sent_user_bytes + recv_user_bytes,
-                        total_bytes: sent_total_bytes + recv_total_bytes,
-                    });
+                records.push(BenchmarkRecord {
+                    elapsed_time_us: elapsed,
+                    latency_us: latency,
+                    messages: sent_messages + recv_messages,
+                    message_batches: sent_batches + recv_batches,
+                    user_data_bytes: sent_user_bytes + recv_user_bytes,
+                    total_bytes: sent_total_bytes + recv_total_bytes,
+                });
 
-                    if let Some(limiter) = &rate_limiter {
-                        limiter.wait_until_necessary(rl_value).await;
-                        rl_value = 0;
-                    }
+                if let Some(limiter) = &rate_limiter {
+                    limiter.wait_until_necessary(rl_value).await;
+                    rl_value = 0;
+                }
 
-                    self.poll_finish_condition
-                        .account_and_check(batch.user_data_bytes);
-                    if require_reply {
-                        awaiting_reply = false;
-                    }
+                self.poll_finish_condition
+                    .account_and_check(batch.user_data_bytes);
+                if require_reply {
+                    awaiting_reply = false;
                 }
             }
         }

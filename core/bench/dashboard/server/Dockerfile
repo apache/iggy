@@ -16,7 +16,7 @@
 # under the License.
 
 # Build stage
-FROM rust:1.88.0-slim-bookworm AS builder
+FROM rust:1.89-slim-bookworm AS builder
 
 WORKDIR /usr/src/iggy-bench-dashboard
 

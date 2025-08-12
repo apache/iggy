@@ -55,10 +55,10 @@ impl Default for CreateStream {
 
 impl Validatable<IggyError> for CreateStream {
     fn validate(&self) -> Result<(), IggyError> {
-        if let Some(stream_id) = self.stream_id {
-            if stream_id == 0 {
-                return Err(IggyError::InvalidStreamId);
-            }
+        if let Some(stream_id) = self.stream_id
+            && stream_id == 0
+        {
+            return Err(IggyError::InvalidStreamId);
         }
 
         if self.name.is_empty() || self.name.len() > MAX_NAME_LENGTH {

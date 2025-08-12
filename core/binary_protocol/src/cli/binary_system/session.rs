@@ -57,10 +57,10 @@ impl ServerSession {
     }
 
     pub fn get_token(&self) -> Option<String> {
-        if let Ok(entry) = Entry::new(&self.get_service_name(), &self.get_token_name()) {
-            if let Ok(token) = entry.get_password() {
-                return Some(token);
-            }
+        if let Ok(entry) = Entry::new(&self.get_service_name(), &self.get_token_name())
+            && let Ok(token) = entry.get_password()
+        {
+            return Some(token);
         }
 
         None

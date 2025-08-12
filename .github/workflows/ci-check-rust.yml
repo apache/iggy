@@ -50,31 +50,28 @@ jobs:
         uses: actions/checkout@v4
       - name: Check Rust versions are synchronized
         run: |
-          # Extract version from rust-toolchain.toml
-          TOOLCHAIN_VERSION=$(grep 'channel' rust-toolchain.toml | sed 's/.*"\(.*\)".*/\1/')
-          echo "rust-toolchain.toml version: $TOOLCHAIN_VERSION"
-          
-          # Check bdd/rust/Dockerfile
-          BDD_VERSION=$(grep '^FROM rust:' bdd/rust/Dockerfile | sed 's/FROM rust:\([0-9.]\+\).*/\1/')
-          echo "bdd/rust/Dockerfile version: $BDD_VERSION"
-          
-          # Check core/bench/dashboard/server/Dockerfile
-          BENCH_VERSION=$(grep '^FROM rust:' core/bench/dashboard/server/Dockerfile | sed 's/FROM rust:\([0-9.]\+\).*/\1/')
-          echo "core/bench/dashboard/server/Dockerfile version: $BENCH_VERSION"
-          
-          # Verify all versions match
-          if [ "$TOOLCHAIN_VERSION" != "$BDD_VERSION" ]; then
-            echo "ERROR: bdd/rust/Dockerfile uses Rust $BDD_VERSION but rust-toolchain.toml specifies $TOOLCHAIN_VERSION"
-            echo "Run ./scripts/sync-rust-version.sh to fix this"
+          # rust-toolchain.toml -> 1.89(.0) -> 1.89
+          TOOLCHAIN_VERSION=$(sed -En 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml)
+          to_minor() { echo "$1" | sed -E 's/^([0-9]+)\.([0-9]+).*/\1.\2/'; }
+          TOOLCHAIN_MINOR=$(to_minor "$TOOLCHAIN_VERSION")
+
+          # Extract X[.Y[.Z]] from Dockerfiles (ignores suffixes like -slim-bookworm), then -> X.Y
+          BDD_VERSION=$(sed -En 's/^FROM[[:space:]]+rust:([0-9.]+).*/\1/p' bdd/rust/Dockerfile | head -1)
+          BENCH_VERSION=$(sed -En 's/^FROM[[:space:]]+rust:([0-9.]+).*/\1/p' core/bench/dashboard/server/Dockerfile | head -1)
+          BDD_MINOR=$(to_minor "$BDD_VERSION")
+          BENCH_MINOR=$(to_minor "$BENCH_VERSION")
+
+          # Fail if mismatched
+          if [ "$TOOLCHAIN_MINOR" != "$BDD_MINOR" ]; then
+            echo "ERROR: bdd/rust/Dockerfile uses $BDD_VERSION (-> $BDD_MINOR) but rust-toolchain.toml specifies $TOOLCHAIN_VERSION (-> $TOOLCHAIN_MINOR)" >&2
             exit 1
           fi
-          
-          if [ "$TOOLCHAIN_VERSION" != "$BENCH_VERSION" ]; then
-            echo "ERROR: core/bench/dashboard/server/Dockerfile uses Rust $BENCH_VERSION but rust-toolchain.toml specifies $TOOLCHAIN_VERSION"
-            echo "Run ./scripts/sync-rust-version.sh to fix this"
+
+          if [ "$TOOLCHAIN_MINOR" != "$BENCH_MINOR" ]; then
+            echo "ERROR: core/bench/dashboard/server/Dockerfile uses $BENCH_VERSION (-> $BENCH_MINOR) but rust-toolchain.toml specifies $TOOLCHAIN_VERSION (-> $TOOLCHAIN_MINOR)" >&2
             exit 1
           fi
-          
+
           echo "✓ All Rust versions are synchronized at $TOOLCHAIN_VERSION"
 
   check:
@@ -85,7 +82,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Install toolchain
         run: |
-           echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
+          echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
       - name: Run cargo check
         run: |
           cargo check
@@ -98,7 +95,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Install toolchain
         run: |
-           echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
+          echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
       - name: Run cargo fmt
         run: |
           cargo fmt --all -- --check
@@ -111,7 +108,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Install toolchain
         run: |
-           echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
+          echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
       - name: Run cargo clippy
         run: |
           cargo clippy --all-targets --all-features -- -D warnings
@@ -124,7 +121,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Install toolchain
         run: |
-           echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
+          echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
       - name: Install cargo-sort
         uses: taiki-e/install-action@v2
         with:
@@ -141,7 +138,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Install toolchain
         run: |
-           echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
+          echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
       - name: Run cargo test (doc)
         run: |
           cargo test --doc
@@ -157,7 +154,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Install toolchain
         run: |
-           echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
+          echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
       - name: Install cargo-machete
         uses: taiki-e/install-action@v2
         with:

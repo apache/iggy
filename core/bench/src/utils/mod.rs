@@ -219,16 +219,16 @@ fn add_basic_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
         parts.push(format!("--messages-per-batch {messages_per_batch}"));
     }
 
-    if let Some(message_batches) = args.message_batches() {
-        if message_batches != DEFAULT_MESSAGE_BATCHES {
-            parts.push(format!("--message-batches {message_batches}"));
-        }
+    if let Some(message_batches) = args.message_batches()
+        && message_batches != DEFAULT_MESSAGE_BATCHES
+    {
+        parts.push(format!("--message-batches {message_batches}"));
     }
 
-    if let Some(total_messages_size) = args.total_data() {
-        if total_messages_size != DEFAULT_TOTAL_MESSAGES_SIZE {
-            parts.push(format!("--total-messages-size {total_messages_size}"));
-        }
+    if let Some(total_messages_size) = args.total_data()
+        && total_messages_size != DEFAULT_TOTAL_MESSAGES_SIZE
+    {
+        parts.push(format!("--total-messages-size {total_messages_size}"));
     }
 
     let message_size = args.message_size();

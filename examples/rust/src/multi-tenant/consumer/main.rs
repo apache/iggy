@@ -257,8 +257,7 @@ fn start_consumers(
                     let partition_id = message.partition_id;
                     let offset = message.message.header.offset;
                     let payload = std::str::from_utf8(&message.message.payload);
-                    if payload.is_err() {
-                        let error = payload.unwrap_err();
+                    if let Err(error) = payload {
                         error!(
                             "Error while decoding the message payload at offset: {offset}, partition ID: {partition_id}, perhaps it's encrypted? {error}"
                         );

@@ -947,13 +947,12 @@ impl Stream for IggyConsumer {
                         if let Some(ref encryptor) = self.encryptor {
                             for message in &mut polled_messages.messages {
                                 let payload = encryptor.decrypt(&message.payload);
-                                if payload.is_err() {
+                                if let Err(error) = payload {
                                     self.poll_future = None;
                                     error!(
                                         "Failed to decrypt the message payload at offset: {}, partition ID: {}",
                                         message.header.offset, partition_id
                                     );
-                                    let error = payload.unwrap_err();
                                     return Poll::Ready(Some(Err(error)));
                                 }
 
