@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM rust:latest AS builder
+FROM rust:1.89 AS builder
 WORKDIR /build
 COPY . /build
 RUN cargo build --bin iggy --release

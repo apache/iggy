@@ -50,11 +50,11 @@ resolver = "2"
 
 [workspace.dependencies]
 ahash = { version = "0.8.12", features = ["serde"] }
-anyhow = "1.0.98"
+anyhow = "1.0.99"
 async-broadcast = "0.7.2"
 async-dropper = { version = "0.3.1", features = ["tokio", "simple"] }
 async-trait = "0.1.88"
-async_zip = { version = "0.0.17", features = [
+async_zip = { version = "0.0.18", features = [
     "tokio",
     "lzma",
     "bzip2",
@@ -67,7 +67,7 @@ axum-server = { version = "0.7.2", features = ["tls-rustls"] }
 bcrypt = "0.17.0"
 bincode = { version = "2.0.1", features = ["serde"] }
 blake3 = "1.8.2"
-bon = "3.6.5"
+bon = "3.7.0"
 byte-unit = { version = "5.1.6", default-features = false, features = [
     "serde",
     "byte",
@@ -76,7 +76,7 @@ byte-unit = { version = "5.1.6", default-features = false, features = [
 bytes = "1.10.1"
 charming = "0.6.0"
 chrono = { version = "0.4.41", features = ["serde"] }
-clap = { version = "4.5.42", features = ["derive"] }
+clap = { version = "4.5.44", features = ["derive"] }
 config = { version = "0.15.13" }
 comfy-table = "7.1.4"
 crc32fast = "1.5.0"
@@ -115,12 +115,12 @@ serde_with = { version = "3.14.0", features = ["base64", "macros"] }
 serde_yml = "0.0.12"
 serial_test = "3.2.0"
 simd-json = { version = "0.15.1", features = ["serde_impl"] }
-sysinfo = "0.36.1"
+sysinfo = "0.37.0"
 tempfile = "3.20.0"
-thiserror = "2.0.12"
+thiserror = "2.0.14"
 tokio = { version = "1.47.1", features = ["full"] }
 tokio-rustls = "0.26.2"
-toml = "0.9.4"
+toml = "0.9.5"
 tracing = "0.1.41"
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.19", default-features = false, features = [
@@ -128,7 +128,7 @@ tracing-subscriber = { version = "0.3.19", default-features = false, features = 
     "env-filter",
     "ansi",
 ] }
-uuid = { version = "1.17.0", features = [
+uuid = { version = "1.18.0", features = [
     "v4",
     "v7",
     "fast-rng",

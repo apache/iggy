@@ -80,7 +80,7 @@
       />
     </div>
   {/if}
-  <Button variant="contained" on:click={decode}>Decode</Button>
+  <Button variant="contained" onclick={decode}>Decode</Button>
 {:else}
   {#if decodeState.status === 'error'}
     <div class="bg-red-100 dark:bg-red-900 p-4 rounded-md w-full">
@@ -92,7 +92,7 @@
   {#if decodeState.status === 'success'}
     <div class="flex items-center gap-3">
       <p class="font-bold">Codec: {selectedDecoder}</p>
-      <Button variant="text" on:click={() => (decodeState = { status: 'idle', forceChangeDecoder: true })}>Change decoder</Button>
+      <Button variant="text" onclick={() => (decodeState = { status: 'idle', forceChangeDecoder: true })}>Change decoder</Button>
     </div>
     <div class="w-full mt-2">
       <pre class="bg-gray-100 dark:bg-gray-800 p-1 rounded-md overflow-auto"><code
@@ -102,7 +102,7 @@
   {/if}
 
   <div class="mt-4 mb-2">
-    <Button variant="text" on:click={() => (showRaw = !showRaw)}>
+    <Button variant="text" onclick={() => (showRaw = !showRaw)}>
       {showRaw ? 'Hide' : 'Show'} raw payload (base64)
     </Button>
   </div>

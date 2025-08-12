@@ -21,7 +21,7 @@ on:
   workflow_call:
     inputs:
       tag_name:
-        description: 'The name of the tag to be released'
+        description: "The name of the tag to be released"
         required: true
         type: string
 
@@ -38,15 +38,16 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Create Changelog
-        uses: orhun/git-cliff-action@v4
-        id: changelog
-        with:
-          config: cliff.toml
-          args: -vv --latest
-        env:
-          OUTPUT: CHANGELOG.md
-          GITHUB_REPO: ${{ github.repository }}
+      # Action disallowed
+      # - name: Create Changelog
+      #   uses: orhun/git-cliff-action@v4
+      #   id: changelog
+      #   with:
+      #     config: cliff.toml
+      #     args: -vv --latest
+      #   env:
+      #     OUTPUT: CHANGELOG.md
+      #     GITHUB_REPO: ${{ github.repository }}
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

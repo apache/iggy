@@ -38,6 +38,8 @@ RUN cargo binstall -y trunk
 # Add wasm target
 RUN rustup target add wasm32-unknown-unknown
 
+RUN echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
+
 # Copy the entire workspace
 COPY . .
 
