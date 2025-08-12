@@ -1,6 +1,6 @@
 use crate::{
     slab::{
-        partitions::{Partitions, SlabId},
+        partitions::{self, Partitions, SlabId},
         traits_ext::{EntityMarker, IndexComponents, IntoComponents},
     },
     streaming::{
@@ -15,7 +15,7 @@ use std::sync::{Arc, atomic::AtomicU64};
 
 #[derive(Debug)]
 pub struct Partition {
-    info: PartitionInfo,
+    root: PartitionRoot,
     stats: Arc<PartitionStats>,
     message_deduplicator: Option<MessageDeduplicator>,
     offset: Arc<AtomicU64>,
@@ -25,7 +25,7 @@ pub struct Partition {
 
 impl Partition {
     pub fn new(
-        info: PartitionInfo,
+        root: PartitionRoot,
         stats: Arc<PartitionStats>,
         message_deduplicator: Option<MessageDeduplicator>,
         offset: Arc<AtomicU64>,
@@ -33,7 +33,7 @@ impl Partition {
         consumer_group_offset: Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>,
     ) -> Self {
         Self {
-            info,
+            root,
             stats,
             message_deduplicator,
             offset,
@@ -43,18 +43,18 @@ impl Partition {
     }
 
     pub fn update_id(&mut self, id: usize) {
-        self.info.id = id;
+        self.root.id = id;
     }
 
     pub fn id(&self) -> usize {
-        self.info.id
+        self.root.id
     }
 }
 
 impl Clone for Partition {
     fn clone(&self) -> Self {
         Self {
-            info: self.info.clone(),
+            root: self.root.clone(),
             stats: Arc::clone(&self.stats),
             message_deduplicator: self.message_deduplicator.clone(),
             offset: Arc::clone(&self.offset),
@@ -68,7 +68,7 @@ impl EntityMarker for Partition {}
 
 impl IntoComponents for Partition {
     type Components = (
-        PartitionInfo,
+        PartitionRoot,
         Arc<PartitionStats>,
         Option<MessageDeduplicator>,
         Arc<AtomicU64>,
@@ -78,7 +78,7 @@ impl IntoComponents for Partition {
 
     fn into_components(self) -> Self::Components {
         (
-            self.info,
+            self.root,
             self.stats,
             self.message_deduplicator,
             self.offset,
@@ -89,13 +89,13 @@ impl IntoComponents for Partition {
 }
 
 #[derive(Default, Debug, Clone)]
-pub struct PartitionInfo {
+pub struct PartitionRoot {
     id: usize,
     created_at: IggyTimestamp,
     should_increment_offset: bool,
 }
 
-impl PartitionInfo {
+impl PartitionRoot {
     pub fn new(created_at: IggyTimestamp, should_increment_offset: bool) -> Self {
         Self {
             id: 0,
@@ -115,7 +115,7 @@ impl PartitionInfo {
 
 // TODO: Probably move this to the `slab` module
 pub struct PartitionRef<'a> {
-    info: &'a Slab<PartitionInfo>,
+    root: &'a Slab<PartitionRoot>,
     stats: &'a Slab<Arc<PartitionStats>>,
     message_deduplicator: &'a Slab<Option<MessageDeduplicator>>,
     offset: &'a Slab<Arc<AtomicU64>>,
@@ -125,7 +125,7 @@ pub struct PartitionRef<'a> {
 
 impl<'a> PartitionRef<'a> {
     pub fn new(
-        info: &'a Slab<PartitionInfo>,
+        root: &'a Slab<PartitionRoot>,
         stats: &'a Slab<Arc<PartitionStats>>,
         message_deduplicator: &'a Slab<Option<MessageDeduplicator>>,
         offset: &'a Slab<Arc<AtomicU64>>,
@@ -135,7 +135,7 @@ impl<'a> PartitionRef<'a> {
         >,
     ) -> Self {
         Self {
-            info,
+            root,
             stats,
             message_deduplicator,
             offset,
@@ -147,7 +147,7 @@ impl<'a> PartitionRef<'a> {
 
 impl<'a> IntoComponents for PartitionRef<'a> {
     type Components = (
-        &'a Slab<PartitionInfo>,
+        &'a Slab<PartitionRoot>,
         &'a Slab<Arc<PartitionStats>>,
         &'a Slab<Option<MessageDeduplicator>>,
         &'a Slab<Arc<AtomicU64>>,
@@ -157,7 +157,7 @@ impl<'a> IntoComponents for PartitionRef<'a> {
 
     fn into_components(self) -> Self::Components {
         (
-            self.info,
+            self.root,
             self.stats,
             self.message_deduplicator,
             self.offset,
@@ -167,9 +167,9 @@ impl<'a> IntoComponents for PartitionRef<'a> {
     }
 }
 
-impl<'a> IndexComponents<SlabId> for PartitionRef<'a> {
+impl<'a> IndexComponents<partitions::SlabId> for PartitionRef<'a> {
     type Output = (
-        &'a PartitionInfo,
+        &'a PartitionRoot,
         &'a Arc<PartitionStats>,
         &'a Option<MessageDeduplicator>,
         &'a Arc<AtomicU64>,
@@ -177,9 +177,9 @@ impl<'a> IndexComponents<SlabId> for PartitionRef<'a> {
         &'a Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>,
     );
 
-    fn index(&self, index: SlabId) -> Self::Output {
+    fn index(&self, index: partitions::SlabId) -> Self::Output {
         (
-            &self.info[index],
+            &self.root[index],
             &self.stats[index],
             &self.message_deduplicator[index],
             &self.offset[index],

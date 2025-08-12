@@ -13,6 +13,12 @@ pub struct ConsumerGroups {
     container: Slab<consumer_group2::ConsumerGroup>,
 }
 
+impl Clone for ConsumerGroups {
+    fn clone(&self) -> Self {
+        todo!()
+    }
+}
+
 impl ConsumerGroups {
     pub fn with<T>(&self, f: impl FnOnce(&Slab<consumer_group2::ConsumerGroup>) -> T) -> T {
         f(&self.container)

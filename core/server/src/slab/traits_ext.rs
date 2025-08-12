@@ -22,8 +22,8 @@ pub trait DeleteCell<Idx> {
 }
 
 pub trait IndexComponents<Idx: ?Sized> {
-    type Output;
-    fn index(&self, index: Idx) -> Self::Output;
+    type Output<'a> where Self: 'a;
+    fn index(&self, index: Idx) -> Self::Output<'_>;
 }
 
 pub struct Borrow;
@@ -35,15 +35,15 @@ mod private {
 
 //TODO: Maybe two seperate traits for Ref and RefMut.
 pub trait ComponentsMapping<T>: private::Sealed {
-    type Ref<'a>;
-    type RefMut<'a>;
+    type Ref<'a> where Self: 'a;
+    type RefMut<'a> where Self: 'a;
 }
 
 pub trait ComponentsByIdMapping<T>: private::Sealed {
     // TODO: We will need this to contrain the `EntityRef` and `EntityRefMut` types, so after decomposing they have proper mapping.
     // Similar mechanism to trait from above, but for (T1, T2) -> (&T1, &T2) mapping rather than (T1, T2) -> (&Slab<T1>, &Slab<T2>).
-    type Ref<'a>;
-    type RefMut<'a>;
+    type Ref<'a> where Self: 'a;
+    type RefMut<'a> where Self: 'a;
 }
 
 macro_rules! impl_components_for_slab_as_refs {
@@ -51,31 +51,27 @@ macro_rules! impl_components_for_slab_as_refs {
         impl<$T> private::Sealed for ($T,) {}
 
         impl<$T> ComponentsMapping<Borrow> for ($T,)
-        where for<'a> $T: 'a
         {
-            type Ref<'a> = (&'a ::slab::Slab<$T>,);
-            type RefMut<'a> = (&'a mut ::slab::Slab<$T>,);
+            type Ref<'a> = (&'a ::slab::Slab<$T>,) where Self: 'a;
+            type RefMut<'a> = (&'a mut ::slab::Slab<$T>,) where Self: 'a;
         }
 
         impl<$T> ComponentsMapping<RefCell> for ($T,)
-        where for<'a> $T: 'a
         {
-            type Ref<'a> = (::std::cell::Ref<'a, ::slab::Slab<$T>>,);
-            type RefMut<'a> = (::std::cell::RefMut<'a, ::slab::Slab<$T>>,);
+            type Ref<'a> = (::std::cell::Ref<'a, ::slab::Slab<$T>>,) where Self: 'a;
+            type RefMut<'a> = (::std::cell::RefMut<'a, ::slab::Slab<$T>>,) where Self: 'a;
         }
 
         impl<$T> ComponentsByIdMapping<Borrow> for ($T,)
-        where for<'a> $T: 'a
         {
-            type Ref<'a> = (&'a $T,);
-            type RefMut<'a> = (&'a mut $T,);
+            type Ref<'a> = (&'a $T,) where Self: 'a;
+            type RefMut<'a> = (&'a mut $T,) where Self: 'a;
         }
 
         impl<$T> ComponentsByIdMapping<RefCell> for ($T,)
-        where for<'a> $T: 'a
         {
-            type Ref<'a> = (::std::cell::Ref<'a, $T>,);
-            type RefMut<'a> = (::std::cell::RefMut<'a, $T>,);
+            type Ref<'a> = (::std::cell::Ref<'a, $T>,) where Self: 'a;
+            type RefMut<'a> = (::std::cell::RefMut<'a, $T>,) where Self: 'a;
         }
     };
 
@@ -84,38 +80,30 @@ macro_rules! impl_components_for_slab_as_refs {
 
         impl<$T, $($rest),+> ComponentsMapping<Borrow> for ($T, $($rest),+)
         where
-            for<'a> $T: 'a,
-            $(for<'a> $rest: 'a),+
         {
-            type Ref<'a> = (&'a ::slab::Slab<$T>, $(&'a ::slab::Slab<$rest>),+);
-            type RefMut<'a> = (&'a mut ::slab::Slab<$T>, $(&'a mut ::slab::Slab<$rest>),+);
+            type Ref<'a> = (&'a ::slab::Slab<$T>, $(&'a ::slab::Slab<$rest>),+) where Self: 'a;
+            type RefMut<'a> = (&'a mut ::slab::Slab<$T>, $(&'a mut ::slab::Slab<$rest>),+) where Self: 'a;
         }
 
         impl<$T, $($rest),+> ComponentsMapping<RefCell> for ($T, $($rest),+)
         where
-            for<'a> $T: 'a,
-            $(for<'a> $rest: 'a),+
         {
-            type Ref<'a> = (std::cell::Ref<'a, ::slab::Slab<$T>>, $(::std::cell::Ref<'a, ::slab::Slab<$rest>>),+);
-            type RefMut<'a> = (std::cell::RefMut<'a, ::slab::Slab<$T>>, $(::std::cell::RefMut<'a, ::slab::Slab<$rest>>),+);
+            type Ref<'a> = (std::cell::Ref<'a, ::slab::Slab<$T>>, $(::std::cell::Ref<'a, ::slab::Slab<$rest>>),+) where Self: 'a;
+            type RefMut<'a> = (std::cell::RefMut<'a, ::slab::Slab<$T>>, $(::std::cell::RefMut<'a, ::slab::Slab<$rest>>),+) where Self: 'a;
         }
 
         impl<$T, $($rest),+> ComponentsByIdMapping<Borrow> for ($T, $($rest),+)
         where
-            for<'a> $T: 'a,
-            $(for<'a> $rest: 'a),+
         {
-            type Ref<'a> = (&'a $T, $(&'a $rest),+);
-            type RefMut<'a> = (&'a mut $T, $(&'a mut $rest),+);
+            type Ref<'a> = (&'a $T, $(&'a $rest),+) where Self: 'a;
+            type RefMut<'a> = (&'a mut $T, $(&'a mut $rest),+) where Self: 'a;
         }
 
         impl<$T, $($rest),+> ComponentsByIdMapping<RefCell> for ($T, $($rest),+)
         where
-            for<'a> $T: 'a,
-            $(for<'a> $rest: 'a),+
         {
-            type Ref<'a> = (std::cell::Ref<'a, $T>, $(::std::cell::Ref<'a, $rest>),+);
-            type RefMut<'a> = (std::cell::RefMut<'a, $T>, $(::std::cell::RefMut<'a, $rest>),+);
+            type Ref<'a> = (std::cell::Ref<'a, $T>, $(::std::cell::Ref<'a, $rest>),+) where Self: 'a;
+            type RefMut<'a> = (std::cell::RefMut<'a, $T>, $(::std::cell::RefMut<'a, $rest>),+) where Self: 'a;
         }
         impl_components_for_slab_as_refs!($($rest),+);
     };
@@ -137,17 +125,19 @@ type MappingByIdMut<'a, E, T> =
 // So we lack the ability to immediately discard unnecessary components, which leads to less ergonomic API.
 // Damn tradeoffs.
 pub type Components<T> = <T as IntoComponents>::Components;
-pub type ComponentsById<Idx, T> = <T as IndexComponents<Idx>>::Output;
+pub type ComponentsById<'b, Idx, T> = <T as IndexComponents<Idx>>::Output<'b>;
 
 pub trait EntityComponentSystem<Idx, T>
 where
     <Self::Entity as IntoComponents>::Components: ComponentsMapping<T> + ComponentsByIdMapping<T>,
 {
     type Entity: IntoComponents + EntityMarker;
-    type EntityRef<'a>: IntoComponents<Components = Mapping<'a, Self::Entity, T>>
-        + IndexComponents<Idx, Output = MappingById<'a, Self::Entity, T>>
-    where
-        Self: 'a;
+    type EntityRef<'a>:
+         IntoComponents<Components = Mapping<'a, Self::Entity, T>> 
+        + IndexComponents<Idx, Output<'a> = MappingById<'a, Self::Entity, T>> + 'a
+    where 
+        Self::Entity: 'a;
+
     fn with<O, F>(&self, f: F) -> O
     where
         F: for<'a> FnOnce(Self::EntityRef<'a>) -> O;
@@ -158,24 +148,26 @@ where
 
     fn with_by_id<O, F>(&self, id: Idx, f: F) -> O
     where
-        F: for<'a> FnOnce(ComponentsById<Idx, Self::EntityRef<'a>>) -> O,
+        F: for<'a> FnOnce(ComponentsById<'a, Idx, Self::EntityRef<'a>>) -> O,
     {
         self.with(|components| f(components.index(id)))
     }
 
     fn with_by_id_async<O, F>(&self, id: Idx, f: F) -> impl Future<Output = O>
     where
-        F: for<'a> AsyncFnOnce(ComponentsById<Idx, Self::EntityRef<'a>>) -> O,
+        F: for<'a> AsyncFnOnce(ComponentsById<'a, Idx, Self::EntityRef<'a>>) -> O,
     {
         self.with_async(async |components| f(components.index(id)).await)
     }
 }
 
+/*
 pub trait EntityComponentSystemMut<Idx>: EntityComponentSystem<Idx, Borrow> {
     type EntityRefMut<'a>: IntoComponents<Components = MappingMut<'a, Self::Entity, Borrow>>
-        + IndexComponents<Idx, Output = MappingByIdMut<'a, Self::Entity, Borrow>>
+        + IndexComponents<Idx, Output<'a> = MappingByIdMut<'a, Self::Entity, Borrow>>
     where
-        Self: 'a;
+        Self: 'a,
+        <Self as EntityComponentSystemMut<Idx>>::EntityRefMut<'a>: 'a;
 
     fn with_mut<O, F>(&mut self, f: F) -> O
     where
@@ -183,7 +175,7 @@ pub trait EntityComponentSystemMut<Idx>: EntityComponentSystem<Idx, Borrow> {
 
     fn with_by_id_mut<O, F>(&mut self, id: Idx, f: F) -> O
     where
-        F: for<'a> FnOnce(ComponentsById<Idx, Self::EntityRefMut<'a>>) -> O,
+        F: for<'a> FnOnce(ComponentsById<'a, Idx, Self::EntityRefMut<'a>>) -> O,
     {
         self.with_mut(|components| f(components.index(id)))
     }
@@ -191,7 +183,7 @@ pub trait EntityComponentSystemMut<Idx>: EntityComponentSystem<Idx, Borrow> {
 
 pub trait EntityComponentSystemMutCell<Idx>: EntityComponentSystem<Idx, RefCell> {
     type EntityRefMut<'a>: IntoComponents<Components = MappingMut<'a, Self::Entity, RefCell>>
-        + IndexComponents<Idx, Output = MappingByIdMut<'a, Self::Entity, RefCell>>
+        + IndexComponents<Idx, Output<'a> = MappingByIdMut<'a, Self::Entity, RefCell>>
     where
         Self: 'a;
 
@@ -201,8 +193,9 @@ pub trait EntityComponentSystemMutCell<Idx>: EntityComponentSystem<Idx, RefCell>
 
     fn with_by_id_mut<O, F>(&self, id: Idx, f: F) -> O
     where
-        F: for<'a> FnOnce(ComponentsById<Idx, Self::EntityRefMut<'a>>) -> O,
+        F: for<'a> FnOnce(ComponentsById<'a, Idx, Self::EntityRefMut<'a>>) -> O,
     {
         self.with_mut(|components| f(components.index(id)))
     }
 }
+    */

@@ -1,4 +1,7 @@
-use crate::streaming::stats::stats::PartitionStats;
+use crate::slab::topics;
+use crate::slab::traits_ext::{EntityMarker, IndexComponents, IntoComponents};
+use crate::state::system::TopicState;
+use crate::streaming::stats::stats::{PartitionStats, TopicStats};
 use crate::{
     slab::{
         Keyed,
@@ -9,10 +12,11 @@ use crate::{
 };
 use iggy_common::{CompressionAlgorithm, IggyExpiry, IggyTimestamp, MaxTopicSize};
 use slab::Slab;
+use std::cell::Ref;
 use std::sync::Arc;
 
 #[derive(Default, Debug)]
-pub struct Topic {
+pub struct TopicRoot {
     id: usize,
     // TODO: This property should be removed, we won't use it in our clustering impl.
     replication_factor: u8,
@@ -26,7 +30,88 @@ pub struct Topic {
     consumer_groups: ConsumerGroups,
 }
 
+impl Keyed for TopicRoot {
+    type Key = String;
+
+    fn key(&self) -> &Self::Key {
+        &self.name
+    }
+}
+
+#[derive(Debug)]
+pub struct Topic {
+    root: TopicRoot,
+    stats: Arc<TopicStats>,
+}
+
 impl Topic {
+    pub fn new(
+        name: String,
+        replication_factor: u8,
+        message_expiry: IggyExpiry,
+        compression: CompressionAlgorithm,
+        max_topic_size: MaxTopicSize,
+        stats: Arc<TopicStats>,
+    ) -> Self {
+        let root = TopicRoot::new(
+            name,
+            replication_factor,
+            message_expiry,
+            compression,
+            max_topic_size,
+        );
+        Self {
+            root,
+            stats,
+        }
+    }
+}
+
+impl IntoComponents for Topic{
+    type Components = (TopicRoot, Arc<TopicStats>);
+
+    fn into_components(self) -> Self::Components {
+        (self.root, self.stats)
+    }
+}
+
+impl EntityMarker for Topic {}
+
+pub struct TopicRef<'a> {
+    root: Ref<'a, Slab<TopicRoot>>,
+    stats: Ref<'a, Slab<Arc<TopicStats>>>,
+}
+
+impl<'a> TopicRef<'a> {
+    pub fn new(root: Ref<'a, Slab<TopicRoot>>, stats: Ref<'a, Slab<Arc<TopicStats>>>) -> Self {
+        Self { root, stats }
+    }
+}
+
+impl<'a> IntoComponents for TopicRef<'a> {
+    type Components = (
+        Ref<'a, Slab<TopicRoot>>,
+        Ref<'a, Slab<Arc<TopicStats>>>,
+    );
+
+    fn into_components(self) -> Self::Components {
+        (self.root, self.stats)
+    }
+}
+
+
+impl<'a> IndexComponents<topics::SlabId> for TopicRef<'a> {
+    type Output<'t> = (
+        &'t TopicRoot,
+        &'t Arc<TopicStats>,
+    );
+
+    fn index(&self, index: topics::SlabId) -> Self::Output<'_> {
+        (&self.root[index], &self.stats[index])
+    }
+}
+
+impl TopicRoot {
     pub fn new(
         name: String,
         replication_factor: u8,
@@ -122,10 +207,3 @@ impl Topic {
     }
 }
 
-impl Keyed for Topic {
-    type Key = String;
-
-    fn key(&self) -> &Self::Key {
-        &self.name
-    }
-}

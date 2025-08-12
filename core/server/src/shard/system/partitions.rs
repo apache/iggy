@@ -144,7 +144,7 @@ impl IggyShard {
             .map(|_| {
                 // Areczkuuuu.
                 let stats = Arc::new(PartitionStats::new(parent_stats.clone()));
-                let info = partition2::PartitionInfo::new(created_at, false);
+                let info = partition2::PartitionRoot::new(created_at, false);
                 let deduplicator = create_message_deduplicator(&self.config.system);
                 let offset = Arc::new(AtomicU64::new(0));
                 let consumer_offset = Arc::new(papaya::HashMap::with_capacity(2137));
