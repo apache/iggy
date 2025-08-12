@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM rust:1.87
+FROM rust:1.88.0
 
 WORKDIR /app
 

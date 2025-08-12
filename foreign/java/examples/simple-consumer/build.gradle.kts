@@ -22,7 +22,7 @@ plugins {
 }
 
 group = "org.apache.iggy"
-version = "0.2.0-SNAPSHOT"
+version = "0.5.0"
 
 repositories {
     mavenCentral()

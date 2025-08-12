@@ -1,5 +1,5 @@
 <script lang="ts" module>
-  import type { ComponentProps, ComponentType, SvelteComponent } from 'svelte';
+  import type { ComponentProps } from 'svelte';
   import AddPartitionsModal from './AddPartitionsModal.svelte';
   import AddStreamModal from './AddStreamModal.svelte';
   import AddTopicModal from './AddTopicModal.svelte';
@@ -14,6 +14,7 @@
   import { fade } from 'svelte/transition';
   import { noTypeCheck } from '$lib/utils/noTypeCheck';
   import { writable } from 'svelte/store';
+  import { Keys } from '$lib/utils/constants/keys';
 
   const modals = {
     AddPartitionsModal,
@@ -31,7 +32,7 @@
 
   type DistributiveOmit<T, K extends string> = T extends T ? Omit<T, K> : never;
   type AllModals = keyof typeof modals;
-  type ModalProps<T extends AllModals> = ComponentProps<InstanceType<(typeof modals)[T]>>;
+  type ModalProps<T extends AllModals> = ComponentProps<(typeof modals)[T]>;
   type ExtraProps<T extends AllModals> = DistributiveOmit<ModalProps<T>, 'closeModal'>;
 
   const openedModal = writable<
@@ -68,14 +69,27 @@
 
 <svelte:window
   onkeydown={(e) => {
-    if (e.key === 'Escape' && $openedModal) {
-      $openedModal.props.closeModal();
+    if (e.key === Keys.ESCAPE && $openedModal) {
+      $openedModal?.props.closeModal();
     }
   }}
 />
 
 {#if $openedModal}
-  <div transition:fade={{ duration: 100 }} class="fixed inset-0 bg-black/40 z-[500]" onclick={$openedModal.props.closeModal} role="button" tabindex={1}></div>
+  <div 
+    transition:fade={{ duration: 100 }} 
+    class="fixed inset-0 bg-black/40 z-[500]" 
+    onclick={() => $openedModal.props.closeModal()}
+    onkeydown={(e) => {
+       if (e.key === Keys.ENTER || e.key === Keys.SPACE) {
+         e.preventDefault();
+         $openedModal?.props.closeModal();
+       }
+     }}
+    role="button" 
+    tabindex="0"
+    aria-label="Close modal"
+  ></div>
   {@const SvelteComponent_1 = noTypeCheck(modals[$openedModal.modal])}
   <SvelteComponent_1
     {...$openedModal.props}

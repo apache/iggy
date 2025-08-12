@@ -18,6 +18,7 @@
  */
 
 
+import assert from 'node:assert/strict';
 import { getRawClient } from './client/index.js';
 
 import {
@@ -88,6 +89,7 @@ try {
   // GET_TOPIC
   const t2 = await getTopic(s)({ streamId: topic1.streamId, topicId: topic1.name });
   console.log('RESPONSE_getTopic', t2);
+  assert.ok(t2);
 
   // UPDATE_TOPIC
   const r_updateTopic = await updateTopic(s)({

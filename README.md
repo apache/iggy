@@ -64,6 +64,7 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 - **Multi-tenant** support via abstraction of **streams** which group **topics**
 - **TLS** support for all transport protocols (TCP, QUIC, HTTPS)
 - **[Connectors](https://github.com/apache/iggy/tree/master/core/connectors)** - sinks, sources and data transformations based on the **custom Rust plugins**
+- **[Model Context Protocol](https://github.com/apache/iggy/tree/master/core/ai/mcp)** - provide context to LLM with **MCP server**
 - Optional server-side as well as client-side **data encryption** using AES-256-GCM
 - Optional metadata support in the form of **message headers**
 - Optional **data backups and archiving** to disk or **S3** compatible cloud storage (e.g. AWS S3)
@@ -89,9 +90,9 @@ This is the high-level architecture of the Iggy message streaming server, where 
 
 ## Version
 
-The latest released version is `0.4.300` for Iggy server, which is compatible with `0.6` Rust client SDK and the others.
+The official releases follow the regular semver (`0.5.0`) or have `latest` tag applied (`apache/iggy:latest`).
 
-The recent improvements based on the zero-copy (de)serialization, along with updated SDKs etc. will be available in the upcoming release with Iggy server `0.5.0`, Rust SDK `0.7` and all the other SDKs.
+We do also publish edge/dev/nightly releases (e.g. `0.5.0-edge.1` or `apache/iggy:edge`), for both, SDKs and the Docker images, which are typically compatible with the latest changes, but are not guaranteed to be stable, and as the name states, are not recommended for production use.
 
 ---
 
@@ -102,22 +103,22 @@ The recent improvements based on the zero-copy (de)serialization, along with upd
 
 ---
 
-## Supported languages SDK (work in progress)
+## Supported languages SDK
 
-- Rust
-- C#
-- Java
-- Go
-- Python
-- Node
-- C++
-- Elixir
+- [Rust](https://crates.io/crates/iggy)
+- [C#](https://www.nuget.org/packages/Apache.Iggy/)
+- [Java](https://repository.apache.org/#nexus-search;quick~iggy)
+- [Python](https://pypi.org/project/apache-iggy/)
+- [Node.js (TypeScript)](https://www.npmjs.com/package/apache-iggy)
+- [Go](https://pkg.go.dev/github.com/apache/iggy/foreign/go)
+
+C++ and Elixir are work in progress.
 
 ---
 
 ## CLI
 
-The brand new, rich, interactive CLI is implemented under the `cli` project, to provide the best developer experience. This is a great addition to the Web UI, especially for all the developers who prefer using the console tools.
+The interactive CLI is implemented under the `cli` project, to provide the best developer experience. This is a great addition to the Web UI, especially for all the developers who prefer using the console tools.
 
 Iggy CLI can be installed with `cargo install iggy-cli` and then simply accessed by typing `iggy` in your terminal.
 
@@ -131,9 +132,50 @@ There's a dedicated Web UI for the server, which allows managing the streams, to
 
 ---
 
+## Connectors
+
+The highly performant and modular **[runtime](https://github.com/apache/iggy/tree/master/core/connectors)** for statically typed, yet dynamically loaded connectors. Ingest the data from the external sources and push it further to the Iggy streams, or fetch the data from the Iggy streams and push it further to the external sources. **Create your own Rust plugins** by simply implementing either the `Source` or `Sink` trait and **build custom pipelines for the data processing**.
+
+```toml
+## Configure a sink or source connector, depending on your needs
+[sinks.quickwit]
+enabled = true
+name = "Quickwit sink"
+path = "target/release/libiggy_connector_quickwit_sink"
+config_format = "yaml"
+
+[[sinks.quickwit.streams]]
+stream = "qw"
+topics = ["records"]
+schema = "json"
+batch_length = 1000
+poll_interval = "5ms"
+consumer_group = "qw_sink_connector"
+
+[[sinks.quickwit.transforms.add_fields.fields]]
+key = "random_id"
+value.computed = "uuid_v7"
+
+[sinks.quickwit.transforms.delete_fields]
+enabled = true
+fields = ["email", "created_at"]
+```
+
+---
+
+## Model Context Protocol
+
+The [Model Context Protocol](https://modelcontextprotocol.io) (MCP) is an open protocol that standardizes how applications provide context to LLMs. The **[Iggy MCP Server](https://github.com/apache/iggy/tree/master/core/ai/mcp)** is an implementation of the MCP protocol for the message streaming infrastructure. It can be used to provide context to LLMs in real-time, allowing for more accurate and relevant responses.
+
+![server](assets/iggy_mcp_server.png)
+
+---
+
 ## Docker
 
-The official images can be found [in Docker Hub](https://hub.docker.com/r/apache/iggy), simply type `docker pull apache/iggy` to pull the image.
+The official Apache Iggy images can be found in [Docker Hub](https://hub.docker.com/r/apache/iggy), simply type `docker pull apache/iggy` to pull the image.
+
+You can also find the images for all the different tooling such as Connectors, MCP Server etc. [here](https://hub.docker.com/u/apache?page=1&search=iggy).
 
 Please note that the images tagged as `latest` are based on the official, stable releases, while the `edge` ones are updated directly from latest version of the `master` branch.
 
@@ -259,15 +301,19 @@ let client = IggyClient::from_connection_string("iggy://user:secret@localhost:80
 // Create a producer for the given stream and one of its topics
 let mut producer = client
     .producer("dev01", "events")?
-    .batch_length(1000)
-    .linger_time(IggyDuration::from_str("1ms")?)
+    .direct( // Use either direct (instant) or background message sending
+        DirectConfig::builder()
+            .batch_length(1000)
+            .linger_time(IggyDuration::from_str("1ms")?)
+            .build(),
+    )
     .partitioning(Partitioning::balanced())
     .build();
 
 producer.init().await?;
 
 // Send some messages to the topic
-let messages = vec![Message::from_str("Hello Apache Iggy")?];
+let messages = vec![IggyMessage::from_str("Hello Apache Iggy")?];
 producer.send(messages).await?;
 
 // Create a consumer for the given stream and one of its topics
@@ -299,7 +345,7 @@ while let Some(message) = consumer.next().await {
 **Benchmarks should be the first-class citizens**. We believe that performance is crucial for any system, and we strive to provide the best possible performance for our users. Please check, why we believe that the **[transparent
 benchmarking](https://iggy.apache.org/blogs/2025/02/17/transparent-benchmarks)** is so important.
 
-We've also built the **[benchmarking platform](https://benchmarks.iggy.rs)** where anyone can upload the benchmarks and compare the results with others. Source code for the platform is available in the `core/bench/dashboard` directory.
+We've also built the **[benchmarking platform](https://benchmarks.iggy.apache.org)** where anyone can upload the benchmarks and compare the results with others. Source code for the platform is available in the `core/bench/dashboard` directory.
 
 ![server](assets/benchmarking_platform.png)
 
@@ -365,7 +411,7 @@ Depending on the hardware, transport protocol (`quic`, `tcp` or `http`) and payl
 
 **Iggy is already capable of processing millions of messages per second at the microseconds range for p99+ latency**, and with the upcoming optimizations related to the io_uring support along with the shared-nothing design, it will only get better.
 
-Please refer to the mentioned [benchmarking platform](https://benchmarks.iggy.rs) where you can browse the results achieved on the different hardware configurations, using the different Iggy server versions.
+Please refer to the mentioned [benchmarking platform](https://benchmarks.iggy.apache.org) where you can browse the results achieved on the different hardware configurations, using the different Iggy server versions.
 
 ---
 

@@ -19,7 +19,7 @@
 use iggy::prelude::{IggyMessage as RustReceiveMessage, PollingStrategy as RustPollingStrategy};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_enum, gen_stub_pymethods};
+use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
 
 /// A Python class representing a received message.
 ///
@@ -86,7 +86,7 @@ impl ReceiveMessage {
 }
 
 #[derive(Clone, Copy)]
-#[gen_stub_pyclass_enum]
+#[gen_stub_pyclass_complex_enum]
 #[pyclass]
 pub enum PollingStrategy {
     Offset { value: u64 },
@@ -96,11 +96,13 @@ pub enum PollingStrategy {
     Next {},
 }
 
-impl From<PollingStrategy> for RustPollingStrategy {
-    fn from(value: PollingStrategy) -> Self {
+impl From<&PollingStrategy> for RustPollingStrategy {
+    fn from(value: &PollingStrategy) -> Self {
         match value {
-            PollingStrategy::Offset { value } => RustPollingStrategy::offset(value),
-            PollingStrategy::Timestamp { value } => RustPollingStrategy::timestamp(value.into()),
+            PollingStrategy::Offset { value } => RustPollingStrategy::offset(value.to_owned()),
+            PollingStrategy::Timestamp { value } => {
+                RustPollingStrategy::timestamp(value.to_owned().into())
+            }
             PollingStrategy::First {} => RustPollingStrategy::first(),
             PollingStrategy::Last {} => RustPollingStrategy::last(),
             PollingStrategy::Next {} => RustPollingStrategy::next(),

@@ -25,7 +25,7 @@ use crate::prelude::EncryptorKind;
 use crate::prelude::IggyConsumerBuilder;
 use crate::prelude::IggyError;
 use crate::prelude::IggyProducerBuilder;
-use crate::quic::quick_client::QuicClient;
+use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
 use async_broadcast::Receiver;
 use async_trait::async_trait;
@@ -63,7 +63,7 @@ impl IggyClient {
         IggyClientBuilder::new()
     }
 
-    /// Creates a new `IggyClientBuilder`.
+    /// Creates a new `IggyClientBuilder` from the provided connection string.
     pub fn builder_from_connection_string(
         connection_string: &str,
     ) -> Result<IggyClientBuilder, IggyError> {
@@ -80,6 +80,7 @@ impl IggyClient {
         }
     }
 
+    /// Creates a new `IggyClient` from the provided connection string.
     pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
         match ConnectionStringUtils::parse_protocol(connection_string)? {
             TransportProtocol::Tcp => Ok(IggyClient::new(ClientWrapper::Tcp(

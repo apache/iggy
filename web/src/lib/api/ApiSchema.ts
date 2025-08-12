@@ -137,6 +137,7 @@ type Topics =
         name: string;
         message_expiry: number;
         compression_algorithm: number;
+        max_topic_size: number;
       };
     }
   | {

@@ -42,6 +42,41 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  check-rust-version-sync:
+    name: check Rust version sync
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Check Rust versions are synchronized
+        run: |
+          # Extract version from rust-toolchain.toml
+          TOOLCHAIN_VERSION=$(grep 'channel' rust-toolchain.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "rust-toolchain.toml version: $TOOLCHAIN_VERSION"
+          
+          # Check bdd/rust/Dockerfile
+          BDD_VERSION=$(grep '^FROM rust:' bdd/rust/Dockerfile | sed 's/FROM rust:\([0-9.]\+\).*/\1/')
+          echo "bdd/rust/Dockerfile version: $BDD_VERSION"
+          
+          # Check core/bench/dashboard/server/Dockerfile
+          BENCH_VERSION=$(grep '^FROM rust:' core/bench/dashboard/server/Dockerfile | sed 's/FROM rust:\([0-9.]\+\).*/\1/')
+          echo "core/bench/dashboard/server/Dockerfile version: $BENCH_VERSION"
+          
+          # Verify all versions match
+          if [ "$TOOLCHAIN_VERSION" != "$BDD_VERSION" ]; then
+            echo "ERROR: bdd/rust/Dockerfile uses Rust $BDD_VERSION but rust-toolchain.toml specifies $TOOLCHAIN_VERSION"
+            echo "Run ./scripts/sync-rust-version.sh to fix this"
+            exit 1
+          fi
+          
+          if [ "$TOOLCHAIN_VERSION" != "$BENCH_VERSION" ]; then
+            echo "ERROR: core/bench/dashboard/server/Dockerfile uses Rust $BENCH_VERSION but rust-toolchain.toml specifies $TOOLCHAIN_VERSION"
+            echo "Run ./scripts/sync-rust-version.sh to fix this"
+            exit 1
+          fi
+          
+          echo "✓ All Rust versions are synchronized at $TOOLCHAIN_VERSION"
+
   check:
     name: cargo check
     runs-on: ubuntu-latest
@@ -50,8 +85,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Install toolchain
         run: |
-           rustup toolchain add --profile=minimal stable
-           rustup override set stable
+           echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
       - name: Run cargo check
         run: |
           cargo check
@@ -64,8 +98,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Install toolchain
         run: |
-           rustup toolchain add --profile=minimal stable
-           rustup override set stable
+           echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
       - name: Run cargo fmt
         run: |
           cargo fmt --all -- --check
@@ -78,8 +111,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Install toolchain
         run: |
-           rustup toolchain add --profile=minimal stable
-           rustup override set stable
+           echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
       - name: Run cargo clippy
         run: |
           cargo clippy --all-targets --all-features -- -D warnings
@@ -92,8 +124,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Install toolchain
         run: |
-           rustup toolchain add --profile=minimal stable
-           rustup override set stable
+           echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
       - name: Install cargo-sort
         uses: taiki-e/install-action@v2
         with:
@@ -110,8 +141,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Install toolchain
         run: |
-           rustup toolchain add --profile=minimal stable
-           rustup override set stable
+           echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
       - name: Run cargo test (doc)
         run: |
           cargo test --doc
@@ -127,8 +157,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Install toolchain
         run: |
-           rustup toolchain add --profile=minimal stable
-           rustup override set stable
+           echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
       - name: Install cargo-machete
         uses: taiki-e/install-action@v2
         with:
