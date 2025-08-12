@@ -24,10 +24,14 @@ use crate::shard::namespace::IggyNamespace;
 use crate::shard::transmission::event::ShardEvent;
 use crate::shard::{IggyShard, ShardInfo};
 use crate::shard_info;
+use crate::slab::traits_ext::{
+    Delete, DeleteCell, EntityComponentSystem, EntityMarker, Insert, InsertCell,
+};
+use crate::state::system::StreamState;
 use crate::streaming::partitions::partition2;
 use crate::streaming::partitions::storage2::create_partition_file_hierarchy;
 use crate::streaming::session::Session;
-use crate::streaming::stats::stats::TopicStats;
+use crate::streaming::stats::stats::{StreamStats, TopicStats};
 use crate::streaming::streams::stream::Stream;
 use crate::streaming::topics::storage2::create_topic_file_hierarchy;
 use crate::streaming::topics::topic::Topic;
@@ -35,7 +39,9 @@ use crate::streaming::topics::topic2;
 use clap::Id;
 use error_set::ErrContext;
 use iggy_common::locking::IggyRwLockFn;
-use iggy_common::{CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize};
+use iggy_common::{
+    CompressionAlgorithm, Identifier, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize,
+};
 use tokio_util::io::StreamReader;
 use tracing::info;
 
@@ -152,13 +158,10 @@ impl IggyShard {
         compression: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,
         replication_factor: Option<u8>,
-        stats: Arc<TopicStats>,
-    ) -> Result<usize, IggyError> {
+    ) -> Result<topic2::Topic, IggyError> {
         self.ensure_authenticated(session)?;
         //self.ensure_stream_exists(stream_id)?;
-        let numeric_stream_id = self
-            .streams2
-            .with_stream_by_id(stream_id, |stream| stream.id());
+        let numeric_stream_id = self.streams2.with_root_by_id(stream_id, |root| root.id());
         {
             self.permissioner
             .borrow()
@@ -170,57 +173,41 @@ impl IggyShard {
                     )
                 })?;
         }
-        let topic_id = self.create_topic2_base(
+        let exists = self.streams2.with_topics(stream_id, |topics| {
+            topics.exists(&Identifier::from_str_value(&name).unwrap())
+        });
+        if exists {
+            return Err(IggyError::TopicNameAlreadyExists(
+                name,
+                numeric_stream_id as u32,
+            ));
+        }
+
+        let parent_stats = self
+            .streams2
+            .with_stats_by_id(stream_id, |stats| stats.clone());
+        let topic = self.create_and_insert_topics_mem(
             stream_id,
             name,
             replication_factor.unwrap_or(1),
             message_expiry,
             compression,
             max_topic_size,
-            stats,
-        )?;
-
-        self.streams2.with_topic_by_id(
-            stream_id,
-            &Identifier::numeric(topic_id as u32).unwrap(),
-            |topic| {
-                let message_expiry = match topic.message_expiry() {
-                    IggyExpiry::ServerDefault => self.config.system.segment.message_expiry,
-                    _ => message_expiry,
-                };
-                shard_info!(self.id, "Topic message expiry: {}", message_expiry);
-            },
+            parent_stats,
         );
+        let message_expiry = match topic.root().message_expiry() {
+            IggyExpiry::ServerDefault => self.config.system.segment.message_expiry,
+            _ => message_expiry,
+        };
+        shard_info!(self.id, "Topic message expiry: {}", message_expiry);
 
         // Create file hierarchy for the topic.
-        create_topic_file_hierarchy(self.id, numeric_stream_id, topic_id, &self.config.system)
+        create_topic_file_hierarchy(self.id, numeric_stream_id, topic.id(), &self.config.system)
             .await?;
-        Ok(topic_id)
+        Ok(topic)
     }
 
-    pub fn create_topic2_bypass_auth(
-        &self,
-        stream_id: &Identifier,
-        name: String,
-        replication_factor: Option<u8>,
-        message_expiry: IggyExpiry,
-        compression: CompressionAlgorithm,
-        max_topic_size: MaxTopicSize,
-        stats: Arc<TopicStats>,
-    ) -> Result<usize, IggyError> {
-        let topic_id = self.create_topic2_base(
-            stream_id,
-            name,
-            replication_factor.unwrap_or(1),
-            message_expiry,
-            compression,
-            max_topic_size,
-            stats,
-        )?;
-        Ok(topic_id)
-    }
-
-    fn create_topic2_base(
+    fn create_and_insert_topics_mem(
         &self,
         stream_id: &Identifier,
         name: String,
@@ -228,36 +215,36 @@ impl IggyShard {
         message_expiry: IggyExpiry,
         compression: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,
-        stats: Arc<TopicStats>,
+        parent_stats: Arc<StreamStats>,
+    ) -> topic2::Topic {
+        let stats = Arc::new(TopicStats::new(parent_stats));
+        let now = IggyTimestamp::now();
+        let mut topic = topic2::Topic::new(
+            name,
+            stats,
+            now,
+            replication_factor,
+            message_expiry,
+            compression,
+            max_topic_size,
+        );
+
+        let id = self.insert_topic_mem(stream_id, topic.clone());
+        topic.update_id(id);
+        topic
+    }
+
+    fn insert_topic_mem(&self, stream_id: &Identifier, topic: topic2::Topic) -> usize {
+        self.streams2
+            .with_root_by_id(stream_id, |root| root.topics().insert(topic))
+    }
+
+    pub fn create_topic2_bypass_auth(
+        &self,
+        stream_id: &Identifier,
+        topic: topic2::Topic,
     ) -> Result<usize, IggyError> {
-        let topic_id = self.streams2.with_stream_by_id(stream_id, |stream| {
-            let exists = stream.topics().exists(&Identifier::named(&name).unwrap());
-            if exists {
-                // TODO: Fixme, replace the second argument with identifier, rather than numeric ID.
-                return Err(IggyError::TopicNameAlreadyExists(name.to_owned(), 0));
-            }
-            let topic = topic2::Topic::new(
-                name,
-                replication_factor,
-                message_expiry,
-                compression,
-                max_topic_size,
-            );
-            let name = topic.name().clone();
-            let topic_id = stream.topics().with_mut(|topics| {
-                let topic_id = topic.insert_into(topics);
-                topic_id
-            });
-            stream.topics().with_mut_index(|index| {
-                index.insert(name, topic_id);
-            });
-
-            stream.topics().with_stats_mut(|container| {
-                container.insert(stats);
-            });
-            Ok(topic_id)
-        })?;
-
+        let topic_id = self.insert_topic_mem(stream_id, topic);
         Ok(topic_id)
     }
 
@@ -390,10 +377,10 @@ impl IggyShard {
         {
             let topic_id = self
                 .streams2
-                .with_topic_by_id(stream_id, topic_id, |topic| topic.id());
+                .with_topic_root_by_id(stream_id, topic_id, |topic| topic.id());
             let stream_id = self
                 .streams2
-                .with_stream_by_id(stream_id, |stream| stream.id());
+                .with_root_by_id(stream_id, |stream| stream.id());
             self.permissioner.borrow().update_topic(
                 session.get_user_id(),
                 stream_id as u32,
@@ -407,6 +394,17 @@ impl IggyShard {
                 )
             })?;
         }
+        let exists = self
+            .streams2
+            .with_topic_root_by_id(stream_id, topic_id, |topic| {
+                let old_name = topic.name();
+                old_name == &name
+            });
+        if exists {
+            // TODO: Fix the errors to accept Identifier instead of u32.
+            return Err(IggyError::TopicNameAlreadyExists(name, 0));
+        }
+
         self.update_topic_base2(
             stream_id,
             topic_id,
@@ -453,7 +451,7 @@ impl IggyShard {
     ) {
         let (old_name, new_name) =
             self.streams2
-                .with_topic_by_id_mut(stream_id, topic_id, |topic| {
+                .with_topic_root_by_id_mut(stream_id, topic_id, |topic| {
                     let old_name = topic.name().clone();
                     topic.set_name(name.clone());
                     topic.set_message_expiry(message_expiry);
@@ -465,7 +463,7 @@ impl IggyShard {
                 });
         if old_name != new_name {
             self.streams2.with_topics(stream_id, |topics| {
-                topics.with_mut_index(|index| {
+                topics.with_index_mut(|index| {
                     // Rename the key inside of hashmap
                     let idx = index.remove(&old_name).expect("Rename key: key not found");
                     index.insert(new_name, idx);
@@ -600,10 +598,10 @@ impl IggyShard {
         {
             let topic_id = self
                 .streams2
-                .with_topic_by_id(stream_id, topic_id, |topic| topic.id());
+                .with_topic_root_by_id(stream_id, topic_id, |topic| topic.id());
             let stream_id = self
                 .streams2
-                .with_stream_by_id(stream_id, |stream| stream.id());
+                .with_root_by_id(stream_id, |stream| stream.id());
             self.permissioner
             .borrow()
                 .delete_topic(session.get_user_id(), stream_id as u32, topic_id as u32)
@@ -617,7 +615,7 @@ impl IggyShard {
         let topic = self.delete_topic_base2(stream_id, topic_id).with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to delete topic with ID: {topic_id} in stream with ID: {stream_id}")
         })?;
-        // TODO: Remove partitions.
+        // TODO: Decrease the stats
         Ok(topic)
     }
 
@@ -635,26 +633,12 @@ impl IggyShard {
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<topic2::Topic, IggyError> {
-        let topic = self.streams2.with_stream_by_id(stream_id, |stream| {
-            let id = stream
-                .topics()
-                .with_topic_by_id(topic_id, |topic| topic.id());
-            stream.topics().with_mut(|container| {
-                container.try_remove(id).ok_or_else(|| {
-                    let topic_name = stream
-                        .topics()
-                        .with_topic_by_id(topic_id, |topic| topic.name().clone());
-                    IggyError::TopicNameNotFound(topic_name, stream.name().clone())
-                })
-            })
-        })?;
-        let id = topic.id();
-        self.streams2.with_topics(stream_id, |topics| {
-            topics.with_stats_mut(|container| {
-                container
-                    .try_remove(id)
-                    .expect("Topic delete: topic stats not found");
-            });
+        let topic = self.streams2.with_root_by_id_mut(stream_id, |stream| {
+            let topics = stream.topics();
+            let id = topics.with_root_by_id(topic_id, |topic| topic.id());
+            let topic = topics.delete(id);
+            assert_eq!(topic.id(), id, "delete_topic: topic ID mismatch");
+            topic
         });
         Ok(topic)
     }
@@ -727,10 +711,10 @@ impl IggyShard {
         {
             let topic_id = self
                 .streams2
-                .with_topic_by_id(stream_id, topic_id, |topic| topic.id());
+                .with_topic_root_by_id(stream_id, topic_id, |topic| topic.id());
             let stream_id = self
                 .streams2
-                .with_stream_by_id(stream_id, |stream| stream.id());
+                .with_root_by_id(stream_id, |stream| stream.id());
             self.permissioner.borrow().purge_topic(
                 session.get_user_id(),
                 stream_id as u32,

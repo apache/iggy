@@ -1,29 +1,28 @@
-use bytes::{BufMut, BytesMut};
 use iggy_common::IggyTimestamp;
 use slab::Slab;
+use std::{
+    cell::{Ref, RefMut},
+    sync::Arc,
+};
 
-use crate::slab::{Keyed, topics::Topics};
+use crate::{
+    slab::{
+        Keyed, streams,
+        topics::Topics,
+        traits_ext::{EntityMarker, IntoComponents, IntoComponentsById},
+    },
+    streaming::stats::stats::StreamStats,
+};
 
-#[derive(Debug)]
-pub struct Stream {
+#[derive(Debug, Clone)]
+pub struct StreamRoot {
     id: usize,
     name: String,
     created_at: IggyTimestamp,
     topics: Topics,
 }
 
-impl Default for Stream {
-    fn default() -> Self {
-        Self {
-            id: 0,
-            name: String::new(),
-            created_at: IggyTimestamp::now(),
-            topics: Topics::init(),
-        }
-    }
-}
-
-impl Keyed for Stream {
+impl Keyed for StreamRoot {
     type Key = String;
 
     fn key(&self) -> &Self::Key {
@@ -31,27 +30,14 @@ impl Keyed for Stream {
     }
 }
 
-impl Stream {
-    pub fn new(name: String) -> Self {
-        let now = IggyTimestamp::now();
+impl StreamRoot {
+    pub fn new(name: String, created_at: IggyTimestamp) -> Self {
         Self {
             id: 0,
             name,
-            created_at: now,
-            topics: Topics::init(),
+            created_at,
+            topics: Topics::default(),
         }
-    }
-
-    pub fn invoke<T>(&self, f: impl FnOnce(&Self) -> T) -> T {
-        f(self)
-    }
-
-    pub fn invoke_mut<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
-        f(self)
-    }
-
-    pub async fn invoke_async<T>(&self, f: impl AsyncFnOnce(&Self) -> T) -> T {
-        f(self).await
     }
 
     pub fn id(&self) -> usize {
@@ -70,18 +56,118 @@ impl Stream {
         self.topics.len()
     }
 
-    pub fn insert_into(self, container: &mut Slab<Self>) -> usize {
-        let idx = container.insert(self);
-        let stream = &mut container[idx];
-        stream.id = idx;
-        idx
-    }
-
     pub fn topics(&self) -> &Topics {
         &self.topics
     }
 
     pub fn topics_mut(&mut self) -> &mut Topics {
         &mut self.topics
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Stream {
+    root: StreamRoot,
+    stats: Arc<StreamStats>,
+}
+
+impl IntoComponents for Stream {
+    type Components = (StreamRoot, Arc<StreamStats>);
+
+    fn into_components(self) -> Self::Components {
+        (self.root, self.stats)
+    }
+}
+
+impl EntityMarker for Stream {
+    type Idx = streams::ContainerId;
+
+    fn id(&self) -> Self::Idx {
+        self.root.id
+    }
+
+    fn update_id(&mut self, id: Self::Idx) {
+        self.root.id = id;
+    }
+}
+
+impl Stream {
+    pub fn new(name: String, stats: Arc<StreamStats>, created_at: IggyTimestamp) -> Self {
+        let root = StreamRoot::new(name, created_at);
+        Self { root, stats }
+    }
+
+    pub fn stats(&self) -> &Arc<StreamStats> {
+        &self.stats
+    }
+
+    pub fn root(&self) -> &StreamRoot {
+        &self.root
+    }
+}
+
+pub struct StreamRef<'a> {
+    root: Ref<'a, Slab<StreamRoot>>,
+    stats: Ref<'a, Slab<Arc<StreamStats>>>,
+}
+
+impl<'a> StreamRef<'a> {
+    pub fn new(root: Ref<'a, Slab<StreamRoot>>, stats: Ref<'a, Slab<Arc<StreamStats>>>) -> Self {
+        Self { root, stats }
+    }
+}
+
+impl<'a> IntoComponents for StreamRef<'a> {
+    type Components = (Ref<'a, Slab<StreamRoot>>, Ref<'a, Slab<Arc<StreamStats>>>);
+
+    fn into_components(self) -> Self::Components {
+        (self.root, self.stats)
+    }
+}
+
+impl<'a> IntoComponentsById for StreamRef<'a> {
+    type Idx = streams::ContainerId;
+    type Output = (Ref<'a, StreamRoot>, Ref<'a, Arc<StreamStats>>);
+
+    fn into_components_by_id(self, index: Self::Idx) -> Self::Output {
+        let root = Ref::map(self.root, |r| &r[index]);
+        let stats = Ref::map(self.stats, |s| &s[index]);
+        (root, stats)
+    }
+}
+
+pub struct StreamRefMut<'a> {
+    root: RefMut<'a, Slab<StreamRoot>>,
+    stats: RefMut<'a, Slab<Arc<StreamStats>>>,
+}
+
+impl<'a> StreamRefMut<'a> {
+    pub fn new(
+        root: RefMut<'a, Slab<StreamRoot>>,
+        stats: RefMut<'a, Slab<Arc<StreamStats>>>,
+    ) -> Self {
+        Self { root, stats }
+    }
+}
+
+impl<'a> IntoComponents for StreamRefMut<'a> {
+    type Components = (
+        RefMut<'a, Slab<StreamRoot>>,
+        RefMut<'a, Slab<Arc<StreamStats>>>,
+    );
+
+    fn into_components(self) -> Self::Components {
+        (self.root, self.stats)
+    }
+}
+
+impl<'a> IntoComponentsById for StreamRefMut<'a> {
+    type Idx = streams::ContainerId;
+    type Output = (RefMut<'a, StreamRoot>, RefMut<'a, Arc<StreamStats>>);
+
+    fn into_components_by_id(self, index: Self::Idx) -> Self::Output {
+        let root = RefMut::map(self.root, |r| &mut r[index]);
+        let stats = RefMut::map(self.stats, |s| &mut s[index]);
+        (root, stats)
     }
 }

@@ -19,6 +19,9 @@
 use super::COMPONENT;
 use crate::shard::IggyShard;
 use crate::shard::namespace::IggyNamespace;
+use crate::slab::traits_ext::{
+    DeleteCell, EntityComponentSystem, EntityMarker, Insert, InsertCell, IntoComponents,
+};
 use crate::streaming::partitions::partition;
 use crate::streaming::session::Session;
 use crate::streaming::stats::stats::StreamStats;
@@ -28,7 +31,7 @@ use crate::streaming::streams::stream2;
 use error_set::ErrContext;
 use futures::future::try_join_all;
 use iggy_common::locking::IggyRwLockFn;
-use iggy_common::{IdKind, Identifier, IggyError};
+use iggy_common::{IdKind, Identifier, IggyError, IggyTimestamp};
 use std::cell::{Ref, RefCell, RefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -213,45 +216,38 @@ impl IggyShard {
         session: &Session,
         stream_id: Option<u32>,
         name: String,
-        stats: Arc<StreamStats>,
-    ) -> Result<usize, IggyError> {
+    ) -> Result<stream2::Stream, IggyError> {
         self.ensure_authenticated(session)?;
         self.permissioner
             .borrow()
             .create_stream(session.get_user_id())?;
-        let stream_id = self.create_stream2_base(name, stats).await?;
-        create_stream_file_hierarchy(self.id, stream_id, &self.config.system).await?;
-        Ok(stream_id)
-    }
+        let exists = self
+            .streams2
+            .exists(&Identifier::from_str_value(&name).unwrap());
 
-    pub async fn create_stream2_bypass_auth(
-        &self,
-        name: String,
-        stats: Arc<StreamStats>,
-    ) -> Result<usize, IggyError> {
-        self.create_stream2_base(name, stats).await
-    }
-
-    async fn create_stream2_base(
-        &self,
-        name: String,
-        stats: Arc<StreamStats>,
-    ) -> Result<usize, IggyError> {
-        let exists = self.streams2.exists(&Identifier::named(&name).unwrap());
         if exists {
             return Err(IggyError::StreamNameAlreadyExists(name));
         }
-        let key = name.clone();
-        let stream = stream2::Stream::new(name);
-        let stream_id = self
-            .streams2
-            .with_mut(|streams| stream.insert_into(streams));
-        self.streams2.with_index_mut(|index| {
-            index.insert(key, stream_id);
-        });
-        self.streams2
-            .with_stats_mut(|container| container.insert(stats));
-        Ok(stream_id)
+        let stream = self.create_and_insert_stream_mem(name);
+        create_stream_file_hierarchy(self.id, stream.id(), &self.config.system).await?;
+        Ok(stream)
+    }
+
+    fn create_and_insert_stream_mem(&self, name: String) -> stream2::Stream {
+        let now = IggyTimestamp::now();
+        let stats = Arc::new(StreamStats::new());
+        let mut stream = stream2::Stream::new(name, stats, now);
+        let id = self.insert_stream_mem(stream.clone());
+        stream.update_id(id);
+        stream
+    }
+
+    fn insert_stream_mem(&self, stream: stream2::Stream) -> usize {
+        self.streams2.insert(stream)
+    }
+
+    pub fn create_stream2_bypass_auth(&self, stream: stream2::Stream) -> usize {
+        self.insert_stream_mem(stream)
     }
 
     pub async fn create_stream(
@@ -405,9 +401,7 @@ impl IggyShard {
         name: &str,
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
-        let stream_id = self
-            .streams2
-            .with_stream_by_id(id, |stream| stream.id() as u32);
+        let stream_id = self.streams2.with_root_by_id(id, |root| root.id() as u32);
 
         self.permissioner
             .borrow()
@@ -426,7 +420,7 @@ impl IggyShard {
     fn update_stream2_base(&self, id: &Identifier, name: String) -> Result<String, IggyError> {
         let old_name = self
             .streams2
-            .with_stream_by_id(id, |stream| stream.name().clone());
+            .with_root_by_id(id, |root| root.name().clone());
 
         if old_name == name {
             return Ok(old_name);
@@ -437,10 +431,10 @@ impl IggyShard {
             return Err(IggyError::StreamNameAlreadyExists(name.to_string()));
         }
 
-        self.streams2.with_stream_by_id_mut(id, |stream| {
-            stream.set_name(name.clone());
+        self.streams2.with_root_by_id_mut(id, |root| {
+            root.set_name(name.clone());
         });
-      
+
         self.streams2.with_index_mut(|index| {
             // Rename the key inside of hashmap
             let idx = index.remove(&old_name).expect("Rename key: key not found");
@@ -519,39 +513,21 @@ impl IggyShard {
     }
 
     fn delete_stream2_base(&self, id: &Identifier) -> Result<stream2::Stream, IggyError> {
-        let (stream_id, stream_name) = self
-            .streams2
-            .with_stream_by_id(id, |stream| (stream.id() as u32, stream.name().clone()));
+        let id = self.streams2.get_index(id);
+        let stream = self.streams2.delete(id);
+        let stats = stream.stats();
 
-        let stream = self.streams2.with_mut(|streams| {
-            streams
-                .try_remove(stream_id as usize)
-                .ok_or_else(|| match id.kind {
-                    iggy_common::IdKind::Numeric => IggyError::StreamIdNotFound(stream_id as u32),
-                    iggy_common::IdKind::String => {
-                        IggyError::StreamNameNotFound(stream_name.clone())
-                    }
-                })
-        })?;
+        self.metrics.decrement_streams(1);
+        self.metrics.decrement_topics(0); // TODO: stats doesn't have topic count
+        self.metrics.decrement_partitions(0); // TODO: stats doesn't have partition count
+        self.metrics.decrement_messages(stats.messages_count());
+        self.metrics.decrement_segments(stats.segments_count());
 
-        self.streams2.with_stats_mut(|stats| {
-            if let Some(stream_stats) = stats.try_remove(stream_id as usize) {
-                self.metrics.decrement_streams(1);
-                self.metrics.decrement_topics(0); // TODO: stats doesn't have topic count
-                self.metrics.decrement_partitions(0); // TODO: stats doesn't have partition count
-                self.metrics
-                    .decrement_messages(stream_stats.messages_count());
-                self.metrics
-                    .decrement_segments(stream_stats.segments_count());
-            } else {
-                self.metrics.decrement_streams(1);
-            }
-        });
-
+        /*
         self.client_manager
             .borrow_mut()
             .delete_consumer_groups_for_stream(stream_id as u32);
-
+        */
         Ok(stream)
     }
 
@@ -562,9 +538,7 @@ impl IggyShard {
     ) -> Result<stream2::Stream, IggyError> {
         self.ensure_authenticated(session)?;
         // self.ensure_stream_exists(id)?;
-        let stream_id = self
-            .streams2
-            .with_stream_by_id(id, |stream| stream.id() as u32);
+        let stream_id = self.streams2.with_root_by_id(id, |root| root.id() as u32);
         self.permissioner
             .borrow()
             .delete_stream(session.get_user_id(), stream_id as u32)
@@ -629,9 +603,7 @@ impl IggyShard {
     pub fn purge_stream2(&self, session: &Session, id: &Identifier) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
         // self.ensure_stream_exists(id)?;
-        let stream_id = self
-            .streams2
-            .with_stream_by_id(id, |stream| stream.id() as u32);
+        let stream_id = self.streams2.with_root_by_id(id, |root| root.id() as u32);
         self.permissioner
             .borrow()
             .purge_stream(session.get_user_id(), stream_id)

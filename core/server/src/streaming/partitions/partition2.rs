@@ -1,7 +1,7 @@
 use crate::{
     slab::{
-        partitions::{self, Partitions, SlabId},
-        traits_ext::{EntityMarker, IndexComponents, IntoComponents},
+        partitions::{self, Partitions},
+        traits_ext::{EntityMarker, IntoComponents, IntoComponentsById},
     },
     streaming::{
         deduplication::message_deduplicator::{self, MessageDeduplicator},
@@ -41,14 +41,6 @@ impl Partition {
             consumer_group_offset,
         }
     }
-
-    pub fn update_id(&mut self, id: usize) {
-        self.root.id = id;
-    }
-
-    pub fn id(&self) -> usize {
-        self.root.id
-    }
 }
 
 impl Clone for Partition {
@@ -64,7 +56,17 @@ impl Clone for Partition {
     }
 }
 
-impl EntityMarker for Partition {}
+impl EntityMarker for Partition {
+    type Idx = partitions::ContainerId;
+
+    fn id(&self) -> Self::Idx {
+        self.root.id
+    }
+
+    fn update_id(&mut self, id: Self::Idx) {
+        self.root.id = id;
+    }
+}
 
 impl IntoComponents for Partition {
     type Components = (
@@ -113,7 +115,7 @@ impl PartitionRoot {
     }
 }
 
-// TODO: Probably move this to the `slab` module
+// TODO: Create a macro to impl those PartitionRef/PartitionRefMut structs and it's traits.
 pub struct PartitionRef<'a> {
     root: &'a Slab<PartitionRoot>,
     stats: &'a Slab<Arc<PartitionStats>>,
@@ -167,7 +169,8 @@ impl<'a> IntoComponents for PartitionRef<'a> {
     }
 }
 
-impl<'a> IndexComponents<partitions::SlabId> for PartitionRef<'a> {
+impl<'a> IntoComponentsById for PartitionRef<'a> {
+    type Idx = partitions::ContainerId;
     type Output = (
         &'a PartitionRoot,
         &'a Arc<PartitionStats>,
@@ -177,7 +180,7 @@ impl<'a> IndexComponents<partitions::SlabId> for PartitionRef<'a> {
         &'a Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>,
     );
 
-    fn index(&self, index: partitions::SlabId) -> Self::Output {
+    fn into_components_by_id(self, index: Self::Idx) -> Self::Output {
         (
             &self.root[index],
             &self.stats[index],

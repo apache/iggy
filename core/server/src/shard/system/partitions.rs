@@ -24,6 +24,7 @@ use crate::configs::system::SystemConfig;
 use crate::shard::IggyShard;
 use crate::slab::traits_ext::Delete;
 use crate::slab::traits_ext::EntityComponentSystem;
+use crate::slab::traits_ext::EntityMarker;
 use crate::slab::traits_ext::Insert;
 use crate::streaming::deduplication::message_deduplicator::MessageDeduplicator;
 use crate::streaming::partitions::partition::Partition;
@@ -74,12 +75,16 @@ impl IggyShard {
         partitions_count: u32,
     ) -> Result<Vec<partition2::Partition>, IggyError> {
         self.ensure_authenticated(session)?;
+        /*
+        self.ensure_stream_exists(stream_id)?;
+        self.ensure_topic_exists(stream_id, topic_id)?;
+        */
         let numeric_stream_id =
             self.streams2
-                .with_stream_by_id(stream_id, |stream| stream.id()) as u32;
+                .with_root_by_id(stream_id, |stream| stream.id()) as u32;
         let numeric_topic_id =
             self.streams2
-                .with_topic_by_id(stream_id, topic_id, |topic| topic.id()) as u32;
+                .with_topic_root_by_id(stream_id, topic_id, |topic| topic.id()) as u32;
 
         self.validate_partition_permissions(
             session,
@@ -88,10 +93,9 @@ impl IggyShard {
             "create",
         )?;
 
-        let parent_stats = self.streams2.with_stream_by_id(stream_id, |stream| {
-            stream
-                .topics()
-                .with_topic_stats_by_id(topic_id, |stats| stats)
+        let parent_stats = self.streams2.with_root_by_id(stream_id, |root| {
+            root.topics()
+                .with_stats_by_id(topic_id, |stats| stats.clone())
         });
         let partitions = self.create_and_insert_partitions_mem(
             stream_id,
@@ -172,8 +176,8 @@ impl IggyShard {
         partition: partition2::Partition,
     ) -> usize {
         self.streams2
-            .with_topic_by_id_mut(stream_id, topic_id, |topic| {
-                topic.partitions_mut().insert(partition)
+            .with_partitions_mut(stream_id, topic_id, |partitions| {
+                partitions.insert(partition)
             })
     }
 
@@ -265,10 +269,10 @@ impl IggyShard {
 
         let numeric_stream_id =
             self.streams2
-                .with_stream_by_id(stream_id, |stream| stream.id()) as u32;
+                .with_root_by_id(stream_id, |stream| stream.id()) as u32;
         let numeric_topic_id =
             self.streams2
-                .with_topic_by_id(stream_id, topic_id, |topic| topic.id()) as u32;
+                .with_topic_root_by_id(stream_id, topic_id, |topic| topic.id()) as u32;
 
         self.validate_partition_permissions(
             session,
@@ -290,13 +294,13 @@ impl IggyShard {
     ) -> Vec<u32> {
         let deleted_partition_ids =
             self.streams2
-                .with_topic_by_id_mut(stream_id, topic_id, |topic| {
+                .with_topic_root_by_id_mut(stream_id, topic_id, |topic| {
                     let partitions = topic.partitions_mut();
-                    let current_count = partitions.count() as u32;
+                    let current_count = partitions.len() as u32;
                     let partitions_to_delete = partitions_count.min(current_count);
                     let start_idx = (current_count - partitions_to_delete) as usize;
                     let mut deleted_ids = Vec::with_capacity(partitions_to_delete as usize);
-                    for idx in (start_idx..current_count as usize) {
+                    for idx in start_idx..current_count as usize {
                         let partition = topic.partitions_mut().delete(idx);
                         assert_eq!(partition.id(), idx);
                         deleted_ids.push(partition.id() as u32);

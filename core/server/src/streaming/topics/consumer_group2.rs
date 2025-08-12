@@ -17,7 +17,7 @@ use tracing::trace;
 
 pub const MEMBERS_CAPACITY: usize = 128;
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct ConsumerGroup {
     id: usize,
     name: String,
@@ -154,6 +154,17 @@ pub struct Member {
     client_id: u32,
     partitions: Vec<usize>,
     current_partition_idx: AtomicUsize,
+}
+
+impl Clone for Member {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            client_id: self.client_id.clone(),
+            partitions: self.partitions.clone(),
+            current_partition_idx: AtomicUsize::new(0),
+        }
+    }
 }
 
 impl Member {

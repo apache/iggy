@@ -119,10 +119,10 @@ impl IggyShard {
         {
             let topic_id = self
                 .streams2
-                .with_topic_by_id(stream_id, topic_id, |topic| topic.id());
+                .with_topic_root_by_id(stream_id, topic_id, |topic| topic.id());
             let stream_id = self
                 .streams2
-                .with_stream_by_id(stream_id, |stream| stream.id());
+                .with_root_by_id(stream_id, |stream| stream.id());
             self.permissioner.borrow().create_consumer_group(
                 session.get_user_id(),
                 stream_id as u32,
@@ -151,7 +151,7 @@ impl IggyShard {
     ) -> Result<usize, IggyError> {
         let id = self
             .streams2
-            .with_topic_by_id_mut(stream_id, topic_id, |topic| {
+            .with_topic_root_by_id_mut(stream_id, topic_id, |topic| {
                 let partitions = topic.partitions().with(|partitions| {
                     let (info, _, _, _, _, _) = partitions.into_components();
                     info.iter()
@@ -233,10 +233,10 @@ impl IggyShard {
         {
             let topic_id = self
                 .streams2
-                .with_topic_by_id(stream_id, topic_id, |topic| topic.id());
+                .with_topic_root_by_id(stream_id, topic_id, |topic| topic.id());
             let stream_id = self
                 .streams2
-                .with_stream_by_id(stream_id, |stream| stream.id());
+                .with_root_by_id(stream_id, |stream| stream.id());
             self.permissioner.borrow().delete_consumer_group(
                 session.get_user_id(),
                 stream_id as u32,
@@ -263,20 +263,19 @@ impl IggyShard {
     ) -> Result<consumer_group2::ConsumerGroup, IggyError> {
         let cg = self
             .streams2
-            .with_topic_by_id_mut(stream_id, topic_id, |topic| {
+            .with_topic_root_by_id_mut(stream_id, topic_id, |root| {
                 match group_id.kind {
                     iggy_common::IdKind::Numeric => {
-                        topic.consumer_groups_mut().with_mut(|container| {
+                        root.consumer_groups_mut().with_mut(|container| {
                             container.try_remove(group_id.get_u32_value().unwrap() as usize)
                         })
                     }
                     iggy_common::IdKind::String => {
                         let key = group_id.get_string_value().unwrap();
-                        let id = topic
+                        let id = root
                             .consumer_groups()
                             .with_index(|index| *(index.get(&key).unwrap()));
-                        topic
-                            .consumer_groups_mut()
+                        root.consumer_groups_mut()
                             .with_mut(|container| container.try_remove(id))
                     }
                 }

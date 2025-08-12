@@ -68,7 +68,7 @@ use crate::{
         },
     },
     shard_error, shard_info, shard_warn,
-    slab::streams::Streams,
+    slab::{streams::Streams, traits_ext::EntityMarker},
     state::{
         StateKind,
         system::{StreamState, SystemState, UserState},
@@ -631,7 +631,7 @@ impl IggyShard {
                 partition_ids,
             } => {
                 self.delete_partitions2_bypass_auth(
-                   &stream_id,
+                    &stream_id,
                     &topic_id,
                     partitions_count,
                     partition_ids,
@@ -667,11 +667,13 @@ impl IggyShard {
                         "{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}"
                     )
                 })?;
-                let topic = stream.get_topic_mut(&topic_id).with_error_context(|error| {
-                    format!(
-                        "{COMPONENT} (error: {error}) - failed to get topic with ID: {topic_id}"
-                    )
-                })?;
+                let topic = stream
+                    .get_topic_mut(&topic_id)
+                    .with_error_context(|error| {
+                        format!(
+                            "{COMPONENT} (error: {error}) - failed to get topic with ID: {topic_id}"
+                        )
+                    })?;
                 topic.reassign_consumer_groups();
                 if partitions.len() > 0 {
                     self.metrics.decrement_partitions(partitions_count as u32);
@@ -848,10 +850,8 @@ impl IggyShard {
                 self.tcp_bound_address.set(Some(address));
                 Ok(())
             }
-            ShardEvent::CreatedStream2 { id, name, stats } => {
-                let stream_id = self
-                    .create_stream2_bypass_auth(name.to_owned(), stats.clone())
-                    .await?;
+            ShardEvent::CreatedStream2 { id, stream } => {
+                let stream_id = self.create_stream2_bypass_auth(stream);
                 assert_eq!(stream_id, id);
                 Ok(())
             }
@@ -860,26 +860,8 @@ impl IggyShard {
                 assert_eq!(stream.id(), id);
                 Ok(())
             }
-            ShardEvent::CreatedTopic2 {
-                id,
-                stream_id,
-                name,
-                message_expiry,
-                compression_algorithm,
-                max_topic_size,
-                replication_factor,
-                stats,
-            } => {
-                let topic_id = self.create_topic2_bypass_auth(
-                    &stream_id,
-                    name.to_owned(),
-                    replication_factor,
-                    message_expiry,
-                    compression_algorithm,
-                    max_topic_size,
-                    stats.clone(),
-                )?;
-                assert_eq!(topic_id, id);
+            ShardEvent::CreatedTopic2 { stream_id, topic } => {
+                let _topic_id = self.create_topic2_bypass_auth(&stream_id, topic)?;
                 Ok(())
             }
             ShardEvent::CreatedPartitions2 {
@@ -895,7 +877,9 @@ impl IggyShard {
                 stream_id,
                 topic_id,
             } => {
-                let topic = self.delete_topic_bypass_auth2(&stream_id, &topic_id).await?;
+                let topic = self
+                    .delete_topic_bypass_auth2(&stream_id, &topic_id)
+                    .await?;
                 assert_eq!(topic.id(), id);
                 Ok(())
             }
@@ -916,7 +900,7 @@ impl IggyShard {
                     compression_algorithm,
                     max_topic_size,
                     replication_factor,
-                );
+                )?;
                 Ok(())
             }
             ShardEvent::CreatedConsumerGroup2 {
@@ -929,7 +913,8 @@ impl IggyShard {
                 let id = self.create_consumer_group_bypass_auth2(
                     &stream_id,
                     &topic_id,
-                    members.clone(), name.clone(),
+                    members.clone(),
+                    name.clone(),
                 )?;
                 assert_eq!(id, cg_id);
                 Ok(())
@@ -940,7 +925,8 @@ impl IggyShard {
                 topic_id,
                 group_id,
             } => {
-                let cg = self.delete_consumer_group_bypass_auth2(&stream_id, &topic_id, &group_id)?;
+                let cg =
+                    self.delete_consumer_group_bypass_auth2(&stream_id, &topic_id, &group_id)?;
                 assert_eq!(cg.id(), id);
                 Ok(())
             }

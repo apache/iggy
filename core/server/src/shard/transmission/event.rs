@@ -18,7 +18,8 @@ use crate::{
         personal_access_tokens::personal_access_token::PersonalAccessToken,
         polling_consumer::PollingConsumer,
         stats::stats::{PartitionStats, StreamStats, TopicStats},
-        topics::consumer_group2::Member,
+        streams::stream2,
+        topics::{consumer_group2::Member, topic2},
     },
 };
 
@@ -34,8 +35,7 @@ pub enum ShardEvent {
     },
     CreatedStream2 {
         id: usize,
-        name: String,
-        stats: Arc<StreamStats>,
+        stream: stream2::Stream,
     },
     CreatedStream {
         stream_id: Option<u32>,
@@ -94,14 +94,8 @@ pub enum ShardEvent {
         replication_factor: Option<u8>,
     },
     CreatedTopic2 {
-        id: usize,
         stream_id: Identifier,
-        name: String,
-        message_expiry: IggyExpiry,
-        compression_algorithm: CompressionAlgorithm,
-        max_topic_size: MaxTopicSize,
-        replication_factor: Option<u8>,
-        stats: Arc<TopicStats>,
+        topic: topic2::Topic,
     },
     CreatedConsumerGroup {
         stream_id: Identifier,

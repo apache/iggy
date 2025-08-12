@@ -24,6 +24,7 @@ use crate::shard::IggyShard;
 use crate::shard::namespace::IggyNamespace;
 use crate::shard::transmission::event::ShardEvent;
 use crate::shard_info;
+use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use anyhow::Result;

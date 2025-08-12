@@ -23,6 +23,7 @@ use crate::shard::IggyShard;
 use crate::shard::namespace::IggyNamespace;
 use crate::shard::transmission::event::ShardEvent;
 use crate::shard_info;
+use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
 use crate::streaming::partitions::partition;
 use crate::streaming::session::Session;
@@ -58,8 +59,8 @@ impl ServerCommandHandler for DeleteStream {
                                 })?;
         shard_info!(
             shard.id,
-            "Deleted stream2 with name: {}, ID: {}",
-            stream2.name(),
+            "Deleted stream with name: {}, ID: {}",
+            stream2.root().name(),
             stream2.id()
         );
         let event = ShardEvent::DeletedStream2 {
