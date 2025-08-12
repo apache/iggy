@@ -22,11 +22,6 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::configs::quic::QuicConfig;
-use crate::quic::COMPONENT;
-use crate::quic::listener;
-use crate::server_error::QuicError;
-use crate::shard::IggyShard;
 use anyhow::Result;
 use compio_quic::{
     Endpoint, EndpointConfig, IdleTimeout, ServerBuilder, ServerConfig, TransportConfig, VarInt,
@@ -34,22 +29,28 @@ use compio_quic::{
 use error_set::ErrContext;
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tracing::log::warn;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
+
+use crate::configs::quic::QuicConfig;
+use crate::quic::{COMPONENT, listener, quic_socket};
+use crate::server_error::QuicError;
+use crate::shard::IggyShard;
 
 /// Starts the QUIC server.
 /// Returns the address the server is listening on.
 pub async fn span_quic_server(shard: Rc<IggyShard>) -> Result<(), iggy_common::IggyError> {
+    // Ensure rustls crypto provider is installed (thread-safe, idempotent)
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         if let Err(e) = default_provider().install_default() {
             warn!(
-                "Failed to install rustls crypto provider. Error: {:?}. This may be normal if another
-            thread installed it first.",
+                "Failed to install rustls crypto provider: {:?}. This may be normal if another thread installed it first.",
                 e
             );
+        } else {
+            trace!("Rustls crypto provider installed successfully");
         }
     } else {
-        trace!("Crypto provider already installed");
+        trace!("Rustls crypto provider already installed");
     }
 
     let config = shard.config.quic.clone();
@@ -57,23 +58,28 @@ pub async fn span_quic_server(shard: Rc<IggyShard>) -> Result<(), iggy_common::I
         error!("Failed to parse QUIC address '{}': {}", config.address, e);
         iggy_common::IggyError::QuicError
     })?;
-    info!("Initializing Iggy QUIC server on shard {}...", shard.id);
+    info!(
+        "Initializing Iggy QUIC server on shard {} for address {}",
+        shard.id, addr
+    );
 
     let server_config = configure_quic(&config).map_err(|e| {
-        error!("Failed to configure QUIC: {:?}", e);
+        error!("Failed to configure QUIC server: {:?}", e);
         iggy_common::IggyError::QuicError
     })?;
-    trace!("Binding UDP socket on {}", addr);
+    trace!("Building UDP socket for QUIC endpoint on {}", addr);
 
-    let std_socket = std::net::UdpSocket::bind(addr).map_err(|e| {
-        error!("Failed to bind UDP socket: {}", e);
+    let socket = quic_socket::build(&addr, &config.socket);
+    socket.bind(&addr.into()).map_err(|e| {
+        error!("Failed to bind socket: {}", e);
         iggy_common::IggyError::CannotBindToSocket(addr.to_string())
     })?;
-    std_socket.set_nonblocking(true).map_err(|e| {
-        error!("Failed to set socket to nonblocking mode: {}", e);
+    socket.set_nonblocking(true).map_err(|e| {
+        error!("Failed to set nonblocking: {}", e);
         iggy_common::IggyError::QuicError
     })?;
 
+    let std_socket: std::net::UdpSocket = socket.into();
     let socket = compio_net::UdpSocket::from_std(std_socket).map_err(|e| {
         error!("Failed to convert std socket to compio socket: {:?}", e);
         iggy_common::IggyError::QuicError
@@ -91,7 +97,10 @@ pub async fn span_quic_server(shard: Rc<IggyShard>) -> Result<(), iggy_common::I
         iggy_common::IggyError::CannotBindToSocket(addr.to_string())
     })?;
 
-    info!("Iggy QUIC server has started on: {:?}", actual_addr);
+    info!(
+        "Iggy QUIC server has started for shard {} on {}",
+        shard.id, actual_addr
+    );
     shard.quic_bound_address.set(Some(actual_addr));
     listener::start(endpoint, shard).await
 }

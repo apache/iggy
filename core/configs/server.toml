@@ -271,6 +271,20 @@ cert_file = "core/certs/iggy_cert.pem"
 # Path to the QUIC TLS key file.
 key_file = "core/certs/iggy_key.pem"
 
+# Configuration for the QUIC socket
+[quic.socket]
+# Whether to override the OS-default socket parameters
+override_defaults = false
+
+# SO_RCVBUF: maximum size of the receive buffer, can be clamped by the OS
+recv_buffer_size = "64 KB"
+
+# SO_SNDBUF: maximum size of the send buffer, can be clamped by the OS
+send_buffer_size = "64 KB"
+
+# SO_KEEPALIVE: whether to regularly send a keepalive packet maintaining the connection
+keepalive = false
+
 # Message cleaner configuration.
 [message_cleaner]
 # Enables or disables the background process for deleting expired messages.

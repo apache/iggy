@@ -22,7 +22,7 @@ use super::tcp::TcpSocketConfig;
 use crate::configs::http::{
     HttpConfig, HttpCorsConfig, HttpJwtConfig, HttpMetricsConfig, HttpTlsConfig,
 };
-use crate::configs::quic::{QuicCertificateConfig, QuicConfig};
+use crate::configs::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
 use crate::configs::server::{
     ArchiverConfig, DataMaintenanceConfig, HeartbeatConfig, MessageSaverConfig,
     MessagesMaintenanceConfig, PersonalAccessTokenCleanerConfig, PersonalAccessTokenConfig,
@@ -124,6 +124,18 @@ impl Default for QuicConfig {
             keep_alive_interval: SERVER_CONFIG.quic.keep_alive_interval.parse().unwrap(),
             max_idle_timeout: SERVER_CONFIG.quic.max_idle_timeout.parse().unwrap(),
             certificate: QuicCertificateConfig::default(),
+            socket: QuicSocketConfig::default(),
+        }
+    }
+}
+
+impl Default for QuicSocketConfig {
+    fn default() -> QuicSocketConfig {
+        QuicSocketConfig {
+            override_defaults: SERVER_CONFIG.quic.socket.override_defaults,
+            recv_buffer_size: SERVER_CONFIG.quic.socket.recv_buffer_size.parse().unwrap(),
+            send_buffer_size: SERVER_CONFIG.quic.socket.send_buffer_size.parse().unwrap(),
+            keepalive: SERVER_CONFIG.quic.socket.keepalive,
         }
     }
 }

@@ -29,44 +29,41 @@ use compio_quic::{Connection, Endpoint, RecvStream, SendStream};
 use iggy_common::IggyError;
 use tracing::{error, info, trace};
 
-const LISTENERS_COUNT: u32 = 10;
 const INITIAL_BYTES_LENGTH: usize = 4;
 
 pub async fn start(endpoint: Endpoint, shard: Rc<IggyShard>) -> Result<(), IggyError> {
-    info!("Starting QUIC listener with {} workers", LISTENERS_COUNT);
-    for i in 0..LISTENERS_COUNT {
-        let endpoint = endpoint.clone();
+    info!("Starting QUIC listener for shard {}", shard.id);
+
+    // Since the QUIC Endpoint is internally Arc-wrapped and can be shared,
+    // we only need one worker per shard rather than multiple workers per endpoint.
+    // This avoids the N×workers multiplication when multiple shards are used.
+    while let Some(incoming_conn) = endpoint.wait_incoming().await {
+        let remote_addr = incoming_conn.remote_address();
+        trace!("Incoming connection from client: {}", remote_addr);
         let shard = shard.clone();
 
+        // Spawn each connection handler independently to maintain concurrency
         compio::runtime::spawn(async move {
-            trace!("QUIC listener worker {} waiting for incoming connections...",i);
-            while let Some(incoming_conn) = endpoint.wait_incoming().await {
-                let remote_addr = incoming_conn.remote_address();
-                trace!("Incoming connection from client: {}", remote_addr);
-                let shard = shard.clone();
-                compio::runtime::spawn(async move {
-                    trace!("Accepting connection from {}", remote_addr);
-                    match incoming_conn.await {
-                        Ok(connection) => {
-                            trace!("Connection established from {}", remote_addr);
-                            if let Err(error) = handle_connection(connection, shard).await {
-                                error!("QUIC connection from {} has failed: {error}", remote_addr);
-                            }
-                        }
-                        Err(error) => {
-                            error!(
-                                "Error when accepting incoming connection from {}: {:?}",
-                                remote_addr, error
-                            );
-                        }
+            trace!("Accepting connection from {}", remote_addr);
+            match incoming_conn.await {
+                Ok(connection) => {
+                    trace!("Connection established from {}", remote_addr);
+                    if let Err(error) = handle_connection(connection, shard).await {
+                        error!("QUIC connection from {} has failed: {error}", remote_addr);
                     }
-                })
-                .detach();
+                }
+                Err(error) => {
+                    error!(
+                        "Error when accepting incoming connection from {}: {:?}",
+                        remote_addr, error
+                    );
+                }
             }
-            info!("QUIC listener worker {} stopped", i);
         })
         .detach();
     }
+
+    info!("QUIC listener for shard {} stopped", shard.id);
     Ok(())
 }
 
