@@ -241,4 +241,34 @@ public class TopicsTests(Protocol protocol)
         await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol].GetTopicByIdAsync(Identifier.Numeric(1),
             Identifier.Numeric(TopicRequest.TopicId!.Value)));
     }
+    
+    [Test]
+    [DependsOn(nameof(Get_NonExistingTopic_Should_Throw_InvalidResponse))]
+    public async Task Create_NewTopic_WithoutTopicId_Should_Return_Successfully()
+    {
+        var topicRequestWithoutId = new TopicRequest()
+        {
+            Name = "Test Topic without ID",
+            CompressionAlgorithm = CompressionAlgorithm.Gzip,
+            MessageExpiry = 1000,
+            PartitionsCount = 1,
+            ReplicationFactor = 2,
+            MaxTopicSize = 2_000_000_000
+        };
+
+        var response = await Fixture.Clients[protocol].CreateTopicAsync(Identifier.Numeric(1), topicRequestWithoutId);
+
+        response.ShouldNotBeNull();
+        response.Id.ShouldNotBe(0);
+        response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromSeconds(10));
+        response.Name.ShouldBe(topicRequestWithoutId.Name);
+        response.CompressionAlgorithm.ShouldBe(topicRequestWithoutId.CompressionAlgorithm);
+        response.Partitions!.Count().ShouldBe(topicRequestWithoutId.PartitionsCount);
+        response.MessageExpiry.ShouldBe(topicRequestWithoutId.MessageExpiry);
+        response.Size.ShouldBe(0u);
+        response.PartitionsCount.ShouldBe(topicRequestWithoutId.PartitionsCount);
+        response.ReplicationFactor.ShouldBe(topicRequestWithoutId.ReplicationFactor);
+        response.MaxTopicSize.ShouldBe(topicRequestWithoutId.MaxTopicSize);
+        response.MessagesCount.ShouldBe(0u);
+    }
 }

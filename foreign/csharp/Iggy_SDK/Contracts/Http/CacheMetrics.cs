@@ -19,10 +19,14 @@ namespace Apache.Iggy.Contracts.Http;
 
 public class CacheMetrics
 {
-    public uint StreamId { get; set; }
-    public uint TopicId { get; set; }
-    public uint PartitionId { get; set; }
     public ulong Hits { get; set; }
     public ulong Misses { get; set; }
     public float HitRatio { get; set; }
+}
+
+public struct CacheMetricsKey
+{
+    public uint StreamId { get; set; }
+    public uint TopicId { get; set; }
+    public uint PartitionId { get; set; }
 }

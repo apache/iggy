@@ -16,17 +16,22 @@
 // under the License.
 
 
+using System.Text.Json.Serialization;
 using Apache.Iggy.Enums;
+using Apache.Iggy.JsonConfiguration.Converters;
 
 namespace Apache.Iggy.Contracts.Http;
 
-//[JsonConverter(typeof(TopicResponseConverter))]
 public sealed class TopicResponse
 {
     public required uint Id { get; init; }
+    
+    [JsonConverter(typeof(DateTimeOffsetConverter))]
     public required DateTimeOffset CreatedAt { get; init; }
     public required string Name { get; init; }
-    public CompressionAlgorithm CompressionAlgorithm { get; set; }
+    public CompressionAlgorithm CompressionAlgorithm { get; set; } 
+    
+    [JsonConverter(typeof(SizeConverter))]
     public required ulong Size { get; init; }
     public ulong MessageExpiry { get; init; }
     public required ulong MaxTopicSize { get; init; }

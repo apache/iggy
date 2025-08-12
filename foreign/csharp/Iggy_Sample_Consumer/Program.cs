@@ -28,7 +28,7 @@ using Apache.Iggy.Shared;
 using Microsoft.Extensions.Logging;
 
 var jsonOptions = new JsonSerializerOptions();
-jsonOptions.PropertyNamingPolicy = new ToSnakeCaseNamingPolicy();
+jsonOptions.PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower;
 jsonOptions.WriteIndented = true;
 var protocol = Protocol.Tcp;
 var loggerFactory = LoggerFactory.Create(builder =>

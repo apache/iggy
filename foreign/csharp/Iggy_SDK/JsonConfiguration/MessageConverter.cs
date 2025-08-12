@@ -19,6 +19,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.Headers;
+using Apache.Iggy.JsonConfiguration.Converters;
 using Apache.Iggy.Messages;
 
 namespace Apache.Iggy.JsonConfiguration;

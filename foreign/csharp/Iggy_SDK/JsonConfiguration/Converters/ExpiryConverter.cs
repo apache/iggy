@@ -1,4 +1,4 @@
-// Licensed to the Apache Software Foundation (ASF) under one
+﻿// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -17,30 +17,25 @@
 
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using Apache.Iggy.JsonConfiguration;
+using Apache.Iggy.Extensions;
 
-namespace Apache.Iggy.Shared;
+namespace Apache.Iggy.JsonConfiguration.Converters;
 
-public sealed class Envelope
+public class ExpiryConverter : JsonConverter<DateTimeOffset?>
 {
-    private readonly JsonSerializerOptions _jsonSerializerOptions = new();
-
-    [JsonPropertyName("message_type")] public string MessageType { get; set; } = "";
-
-    [JsonPropertyName("payload")] public string Payload { get; set; } = "";
-
-    public Envelope()
+    public override DateTimeOffset? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
-        _jsonSerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower;
-        _jsonSerializerOptions.WriteIndented = true;
+        return reader.TokenType switch
+        {
+            JsonTokenType.Null => null,
+            JsonTokenType.None => null,
+            JsonTokenType.Number => DateTimeOffsetUtils.FromUnixTimeMicroSeconds(reader.GetUInt64()).LocalDateTime,
+            _ => throw new ArgumentOutOfRangeException()
+        };
     }
 
-    public Envelope New<T>(string messageType, T payload) where T : ISerializableMessage
+    public override void Write(Utf8JsonWriter writer, DateTimeOffset? value, JsonSerializerOptions options)
     {
-        return new Envelope
-        {
-            MessageType = messageType,
-            Payload = JsonSerializer.Serialize(payload, _jsonSerializerOptions)
-        };
+        throw new NotImplementedException();
     }
 }

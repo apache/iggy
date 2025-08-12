@@ -1,4 +1,4 @@
-// Licensed to the Apache Software Foundation (ASF) under one
+﻿// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -16,14 +16,12 @@
 // under the License.
 
 using System.Text.Json;
-using Apache.Iggy.Extensions;
+using Apache.Iggy.Benchmark;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.JsonConfiguration;
+using BenchmarkDotNet.Running;
 
-namespace Apache.Iggy.JsonConfiguration;
+var summary = BenchmarkRunner.Run<JsonConverterBenchmark>();
 
-internal sealed class ToSnakeCaseNamingPolicy : JsonNamingPolicy
-{
-    public override string ConvertName(string name)
-    {
-        return name.ToSnakeCase();
-    }
-}
+Console.WriteLine("Tests");

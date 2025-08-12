@@ -16,7 +16,9 @@
 // under the License.
 
 
+using System.Text.Json.Serialization;
 using Apache.Iggy.Extensions;
+using Apache.Iggy.JsonConfiguration.Converters;
 
 namespace Apache.Iggy.Contracts.Http;
 
@@ -25,13 +27,25 @@ public sealed class StatsResponse
     public required int ProcessId { get; init; }
     public required float CpuUsage { get; init; }
     public required float TotalCpuUsage { get; init; }
+    
+    [JsonConverter(typeof(SizeConverter))]
     public required ulong MemoryUsage { get; init; }
+    
+    [JsonConverter(typeof(SizeConverter))]
     public required ulong TotalMemory { get; init; }
+    
+    [JsonConverter(typeof(SizeConverter))]
     public required ulong AvailableMemory { get; init; }
     public required ulong RunTime { get; init; }
     public required ulong StartTime { get; init; }
+    
+    [JsonConverter(typeof(SizeConverter))]
     public required ulong ReadBytes { get; init; }
+    
+    [JsonConverter(typeof(SizeConverter))]
     public required ulong WrittenBytes { get; init; }
+    
+    [JsonConverter(typeof(SizeConverter))]
     public required ulong MessagesSizeBytes { get; init; }
     public required int StreamsCount { get; init; }
     public required int TopicsCount { get; init; }
@@ -44,9 +58,9 @@ public sealed class StatsResponse
     public required string OsName { get; init; }
     public required string OsVersion { get; init; }
     public required string KernelVersion { get; init; }
-    public required string IggyVersion { get; init; }
+    public required string IggyServerVersion { get; init; }
     public uint IggyServerSemver { get; init; }
-    public List<CacheMetrics> CacheMetrics { get; init; } = [];
+    public Dictionary<CacheMetricsKey, CacheMetrics> CacheMetrics { get; init; } = [];
 
     internal Stats ToStats()
     {
@@ -74,7 +88,7 @@ public sealed class StatsResponse
             OsName = OsName,
             OsVersion = OsVersion,
             KernelVersion = KernelVersion,
-            IggyServerVersion = IggyVersion,
+            IggyServerVersion = IggyServerVersion,
             IggyServerSemver = IggyServerSemver,
             CacheMetrics = CacheMetrics
         };

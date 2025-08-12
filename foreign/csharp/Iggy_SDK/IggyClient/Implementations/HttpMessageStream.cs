@@ -22,6 +22,7 @@ using System.Net.Http.Json;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading.Channels;
 using Apache.Iggy.Configuration;
 using Apache.Iggy.Contracts.Http;
@@ -29,12 +30,12 @@ using Apache.Iggy.Contracts.Http.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Headers;
-using Apache.Iggy.JsonConfiguration;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
 using Apache.Iggy.MessagesDispatcher;
 using Apache.Iggy.StringHandlers;
 using Microsoft.Extensions.Logging;
+using JsonConverterFactory = Apache.Iggy.JsonConfiguration.JsonConverterFactory;
 
 namespace Apache.Iggy.IggyClient.Implementations;
 
@@ -45,6 +46,7 @@ public class HttpMessageStream : IIggyClient
     //TODO - create mechanism for refreshing jwt token
     //TODO - replace the HttpClient with IHttpClientFactory, when implementing support for ASP.NET Core DI
     //TODO - the error handling pattern is pretty ugly, look into moving it into an extension method
+    private readonly JsonSerializerOptions _jsonSerializerOptions;
     private readonly HttpClient _httpClient;
     private readonly ILogger<HttpMessageStream> _logger;
     private readonly IMessageInvoker? _messageInvoker;
@@ -59,6 +61,12 @@ public class HttpMessageStream : IIggyClient
         _messagePollingSettings = messagePollingSettings;
         _messageInvoker = messageInvoker;
         _logger = loggerFactory.CreateLogger<HttpMessageStream>();
+
+        _jsonSerializerOptions = new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+            Converters = { new JsonStringEnumConverter() }
+        };
     }
 
     public async Task<StreamResponse?> CreateStreamAsync(string name, uint? streamId, CancellationToken token = default)
@@ -75,7 +83,7 @@ public class HttpMessageStream : IIggyClient
 
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<StreamResponse>(JsonConverterFactory.StreamResponseOptions, token);
+            return await response.Content.ReadFromJsonAsync<StreamResponse>(_jsonSerializerOptions, cancellationToken: token);
         }
 
         await HandleResponseAsync(response);
@@ -107,7 +115,7 @@ public class HttpMessageStream : IIggyClient
 
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<StreamResponse>(JsonConverterFactory.StreamResponseOptions, token);
+            return await response.Content.ReadFromJsonAsync<StreamResponse>(_jsonSerializerOptions, cancellationToken: token);
         }
 
         await HandleResponseAsync(response);
@@ -135,8 +143,8 @@ public class HttpMessageStream : IIggyClient
         var response = await _httpClient.GetAsync("/streams", token);
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<IReadOnlyList<StreamResponse>>(JsonConverterFactory.StreamResponseOptions,
-                       token)
+            return await response.Content.ReadFromJsonAsync<IReadOnlyList<StreamResponse>>(_jsonSerializerOptions,
+                       cancellationToken: token)
                    ?? Array.Empty<StreamResponse>();
         }
 
@@ -163,7 +171,7 @@ public class HttpMessageStream : IIggyClient
 
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<TopicResponse>(JsonConverterFactory.TopicResponseOptions, token);
+            return await response.Content.ReadFromJsonAsync<TopicResponse>(_jsonSerializerOptions, cancellationToken: token);
         }
 
         await HandleResponseAsync(response);
@@ -209,7 +217,7 @@ public class HttpMessageStream : IIggyClient
         var response = await _httpClient.GetAsync($"/streams/{streamId}/topics", token);
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<IReadOnlyList<TopicResponse>>(JsonConverterFactory.TopicResponseOptions, token)
+            return await response.Content.ReadFromJsonAsync<IReadOnlyList<TopicResponse>>(_jsonSerializerOptions, cancellationToken: token)
                    ?? Array.Empty<TopicResponse>();
         }
 
@@ -223,7 +231,7 @@ public class HttpMessageStream : IIggyClient
 
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<TopicResponse>(JsonConverterFactory.TopicResponseOptions, token);
+            return await response.Content.ReadFromJsonAsync<TopicResponse>(_jsonSerializerOptions, cancellationToken: token);
         }
 
         await HandleResponseAsync(response);
@@ -496,7 +504,7 @@ public class HttpMessageStream : IIggyClient
         var response = await _httpClient.GetAsync("/stats", token);
         if (response.IsSuccessStatusCode)
         {
-            var result = await response.Content.ReadFromJsonAsync<StatsResponse>(JsonConverterFactory.StatsResponseOptions, token);
+            var result = await response.Content.ReadFromJsonAsync<StatsResponse>(_jsonSerializerOptions, cancellationToken: token);
             return result?.ToStats();
         }
 
@@ -724,8 +732,8 @@ public class HttpMessageStream : IIggyClient
         var response = await _httpClient.GetAsync("/personal-access-tokens", token);
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<IReadOnlyList<PersonalAccessTokenResponse>>(JsonConverterFactory.PersonalAccessTokenOptions, token)
-                   ?? Array.Empty<PersonalAccessTokenResponse>();
+            return await response.Content.ReadFromJsonAsync<IReadOnlyList<PersonalAccessTokenResponse>>(_jsonSerializerOptions, token)
+                ?? Array.Empty<PersonalAccessTokenResponse>();
         }
 
         await HandleResponseAsync(response);

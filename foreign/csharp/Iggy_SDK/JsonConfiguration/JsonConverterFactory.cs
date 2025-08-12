@@ -18,6 +18,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.Json.Serialization.Metadata;
+using Apache.Iggy.JsonConfiguration.Converters;
 
 namespace Apache.Iggy.JsonConfiguration;
 
@@ -26,7 +27,7 @@ public static class JsonConverterFactory
     public static JsonSerializerOptions SnakeCaseOptions
         => new()
         {
-            PropertyNamingPolicy = new ToSnakeCaseNamingPolicy(),
+            PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
             WriteIndented = true,
             //This code makes the source generated JsonSerializer work with JsonIgnore
             //attribute for required properties
@@ -57,17 +58,8 @@ public static class JsonConverterFactory
             },
             Converters =
             {
-                new UInt128Converter(),
-                new JsonStringEnumConverter(new ToSnakeCaseNamingPolicy())
-            }
-        };
-
-    public static JsonSerializerOptions StreamResponseOptions
-        => new()
-        {
-            Converters =
-            {
-                new StreamResponseConverter()
+                new UInt128Converter(), 
+                new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower)
             }
         };
 
@@ -79,34 +71,17 @@ public static class JsonConverterFactory
                 new AuthResponseConverter()
             }
         };
-
-    public static JsonSerializerOptions TopicResponseOptions
+    
+    
+    public static JsonSerializerOptions MessageResponseOptions(Func<byte[], byte[]>? decryptor)
         => new()
         {
             Converters =
             {
-                new TopicResponseConverter()
+                new MessageResponseConverter(decryptor)
             }
         };
-
-    public static JsonSerializerOptions StatsResponseOptions
-        => new()
-        {
-            Converters =
-            {
-                new StatsResponseConverter()
-            }
-        };
-
-    public static JsonSerializerOptions CreateTopicOptions
-        => new()
-        {
-            Converters =
-            {
-                new CreateTopicConverter()
-            }
-        };
-
+    
     public static JsonSerializerOptions HttpMessageOptions
         => new()
         {
@@ -124,27 +99,7 @@ public static class JsonConverterFactory
                 new MessagesConverter()
             }
         };
-
-    public static JsonSerializerOptions PersonalAccessTokenOptions
-        => new()
-        {
-            Converters =
-            {
-                new PersonalAccessTokenResponseConverter()
-            }
-        };
-
-    public static JsonSerializerOptions MessageResponseOptions(Func<byte[], byte[]>? decryptor)
-    {
-        return new JsonSerializerOptions
-        {
-            Converters =
-            {
-                new MessageResponseConverter(decryptor)
-            }
-        };
-    }
-
+    
     public static JsonSerializerOptions MessageResponseGenericOptions<TMessage>(Func<byte[], TMessage> serializer, Func<byte[], byte[]>? decryptor)
     {
         return new JsonSerializerOptions

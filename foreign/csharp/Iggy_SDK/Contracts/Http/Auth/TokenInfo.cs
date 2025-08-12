@@ -15,6 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Diagnostics.CodeAnalysis;
+using System.Text.Json.Serialization;
+using Apache.Iggy.JsonConfiguration.Converters;
+
 namespace Apache.Iggy.Contracts.Http.Auth;
 
-public record TokenInfo(string Token, DateTimeOffset Expiry);
+public class TokenInfo
+{
+    public required string Token { get; init; }
+    
+    [JsonConverter(typeof(ExpiryConverter))]    
+    public required DateTimeOffset Expiry { get; init; }
+
+    [SetsRequiredMembers]
+    public TokenInfo(string token, DateTimeOffset expiry)
+    {
+        Token = token;
+        Expiry = expiry;
+    }
+}

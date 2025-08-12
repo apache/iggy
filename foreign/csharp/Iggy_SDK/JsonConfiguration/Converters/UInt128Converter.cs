@@ -18,8 +18,9 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Apache.Iggy.Extensions;
 
-namespace Apache.Iggy.JsonConfiguration;
+namespace Apache.Iggy.JsonConfiguration.Converters;
 
 internal sealed class UInt128Converter : JsonConverter<UInt128>
 {
@@ -36,5 +37,23 @@ internal sealed class UInt128Converter : JsonConverter<UInt128>
     public override void Write(Utf8JsonWriter writer, UInt128 value, JsonSerializerOptions options)
     {
         writer.WriteRawValue(value.ToString());
+    }
+}
+
+internal sealed class DateTimeOffsetConverter : JsonConverter<DateTimeOffset>
+{
+    public override DateTimeOffset Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if(reader.TokenType != JsonTokenType.Number)
+        {
+            throw new JsonException("Expected a number token for DateTimeOffset conversion.");
+        }
+
+        return DateTimeOffsetUtils.FromUnixTimeMicroSeconds(reader.GetUInt64()).LocalDateTime;
+    }
+
+    public override void Write(Utf8JsonWriter writer, DateTimeOffset value, JsonSerializerOptions options)
+    {
+        writer.WriteNumberValue(DateTimeOffsetUtils.ToUnixTimeMicroSeconds(value));
     }
 }
