@@ -25,10 +25,18 @@ if [ -z "$RUST_VERSION" ]; then
     exit 1
 fi
 
-echo "Syncing Rust version $RUST_VERSION to Dockerfiles..."
+# Strip trailing ".0" -> e.g., 1.89.0 -> 1.89 (no change if it doesn't end in .0)
+RUST_TAG=$(echo "$RUST_VERSION" | sed -E 's/^([0-9]+)\.([0-9]+)\.0$/\1.\2/')
 
-# Update Dockerfiles
-sed -i "s/FROM rust:[0-9.]\+/FROM rust:$RUST_VERSION/" bdd/rust/Dockerfile
-sed -i "s/FROM rust:[0-9.]\+-slim-bookworm/FROM rust:$RUST_VERSION-slim-bookworm/" core/bench/dashboard/server/Dockerfile
+echo "Syncing Rust version $RUST_VERSION (using tag: $RUST_TAG) to Dockerfiles..."
 
-echo "Updated Dockerfiles to use Rust $RUST_VERSION"
+# Update regular rust image (no suffix)
+# Matches things like: FROM rust:1.88, FROM rust:1.88.1, etc.
+sed -Ei "s|(FROM[[:space:]]+rust:)[0-9]+(\.[0-9]+){1,2}|\1$RUST_TAG|g" bdd/rust/Dockerfile
+
+# Update slim-bookworm image
+sed -Ei "s|(FROM[[:space:]]+rust:)[0-9]+(\.[0-9]+){1,2}-slim-bookworm|\1$RUST_TAG-slim-bookworm|g" core/bench/dashboard/server/Dockerfile
+
+echo "Updated Dockerfiles to use:"
+echo " - Regular image: rust:$RUST_TAG"
+echo " - Slim bookworm: rust:$RUST_TAG-slim-bookworm"

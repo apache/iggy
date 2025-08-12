@@ -67,7 +67,7 @@ impl IggyIndexes {
     }
 
     /// Gets a view of the index at the specified position
-    pub fn get(&self, position: u32) -> Option<IggyIndexView> {
+    pub fn get(&self, position: u32) -> Option<IggyIndexView<'_>> {
         if position >= self.count() {
             return None;
         }
@@ -120,7 +120,7 @@ impl IggyIndexes {
     /// Finds an index by timestamp using binary search
     /// If an exact match isn't found, returns the index with the nearest timestamp
     /// that is greater than or equal to the requested timestamp
-    pub fn find_by_timestamp(&self, timestamp: u64) -> Option<IggyIndexView> {
+    pub fn find_by_timestamp(&self, timestamp: u64) -> Option<IggyIndexView<'_>> {
         if self.count() == 0 {
             return None;
         }
@@ -141,7 +141,7 @@ impl IggyIndexes {
 
         let mut left = 0;
         let mut right = self.count() as isize - 1;
-        let mut result: Option<IggyIndexView> = None;
+        let mut result: Option<IggyIndexView<'_>> = None;
 
         while left <= right {
             let mid = left + (right - left) / 2;

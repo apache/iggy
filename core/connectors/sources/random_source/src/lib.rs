@@ -142,6 +142,7 @@ impl Source for RandomSource {
     async fn poll(&self) -> Result<ProducedMessages, iggy_connector_sdk::Error> {
         sleep(self.interval).await;
         let mut state = self.state.lock().await;
+<<<<<<< HEAD
         if let Some(max_count) = self.max_count {
             if state.current_number >= max_count {
                 info!(
@@ -154,6 +155,20 @@ impl Source for RandomSource {
                     state: Some(serde_json::to_value(state.current_number).unwrap()),
                 });
             }
+=======
+        if let Some(max_count) = self.max_count
+            && state.current_number >= max_count
+        {
+            info!(
+                "Reached max number of {max_count} messages for random source connector with ID: {}",
+                self.id
+            );
+            return Ok(ProducedMessages {
+                schema: Schema::Json,
+                messages: vec![],
+                state: Some(ConnectorState(state.current_number.to_le_bytes().to_vec())),
+            });
+>>>>>>> f2a3a755 (chore(repo): fix compiler and clippy warnings for Rust 1.89 (#2091))
         }
 
         let messages = self.generate_messages();

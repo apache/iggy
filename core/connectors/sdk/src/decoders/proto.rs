@@ -69,10 +69,10 @@ impl ProtoStreamDecoder {
             file_descriptor_set: None,
         };
 
-        if decoder.config.schema_path.is_some() || decoder.config.descriptor_set.is_some() {
-            if let Err(e) = decoder.load_schema() {
-                tracing::error!("Failed to load schema during decoder creation: {}", e);
-            }
+        if (decoder.config.schema_path.is_some() || decoder.config.descriptor_set.is_some())
+            && let Err(e) = decoder.load_schema()
+        {
+            tracing::error!("Failed to load schema during decoder creation: {}", e);
         }
 
         decoder

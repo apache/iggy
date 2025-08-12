@@ -192,22 +192,22 @@ pub async fn get_proc_info() -> Result<String, std::io::Error> {
     let mut proc_dir = fs::read_dir("/proc").await?;
     while let Ok(Some(entry)) = proc_dir.next_entry().await {
         let file_type = entry.file_type().await?;
-        if file_type.is_dir() {
-            if let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() {
-                let pid_paths = vec![
-                    format!("/proc/{}/cmdline", pid),
-                    format!("/proc/{}/statm", pid),
-                    format!("/proc/{}/cgroup", pid),
-                    format!("/proc/{}/task/{}/stat", pid, pid),
-                    format!("/proc/{}/task/{}/status", pid, pid),
-                    format!("/proc/{}/task/{}/wchan", pid, pid),
-                    format!("/proc/{}/task/{}/syscall", pid, pid),
-                    format!("/proc/{}/task/{}/fd", pid, pid),
-                ];
+        if file_type.is_dir()
+            && let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>()
+        {
+            let pid_paths = vec![
+                format!("/proc/{}/cmdline", pid),
+                format!("/proc/{}/statm", pid),
+                format!("/proc/{}/cgroup", pid),
+                format!("/proc/{}/task/{}/stat", pid, pid),
+                format!("/proc/{}/task/{}/status", pid, pid),
+                format!("/proc/{}/task/{}/wchan", pid, pid),
+                format!("/proc/{}/task/{}/syscall", pid, pid),
+                format!("/proc/{}/task/{}/fd", pid, pid),
+            ];
 
-                for p in pid_paths {
-                    dump_file(&mut result, &p).await?;
-                }
+            for p in pid_paths {
+                dump_file(&mut result, &p).await?;
             }
         }
     }

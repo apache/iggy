@@ -113,7 +113,9 @@ impl Topic {
         }
 
         let mut id;
-        if group_id.is_none() {
+        if let Some(group_id) = group_id {
+            id = group_id;
+        } else {
             id = self
                 .current_consumer_group_id
                 .fetch_add(1, Ordering::SeqCst);
@@ -129,8 +131,6 @@ impl Topic {
                     break;
                 }
             }
-        } else {
-            id = group_id.unwrap();
         }
 
         if self.consumer_groups.contains_key(&id) {

@@ -184,6 +184,7 @@ pub async fn fetch_benchmark_report_full(uuid: &Uuid) -> Result<BenchmarkReport>
         .map_err(|e| IggyBenchDashboardError::Parse(e.to_string()))
 }
 
+#[allow(dead_code)]
 pub async fn fetch_benchmark_trend(
     hardware: &str,
     params_identifier: &str,

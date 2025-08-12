@@ -552,13 +552,12 @@ async fn invoke_request<T: DeserializeOwned>(
     data: Option<serde_json::Value>,
 ) -> T {
     let error_message = format!("Failed to invoke MCP method: {method}",);
-    let mut result = client.invoke(method, data).await.expect(&error_message);
+    let result = client.invoke(method, data).await.expect(&error_message);
 
-    if result.content.is_empty() {
-        panic!("No content returned from MCP for method: {method}");
-    }
-
-    let result = result.content.remove(0);
+    let result = result
+        .content
+        .expect("No content returned from MCP for method: {method}")
+        .remove(0);
     let Some(text) = result.as_text() else {
         panic!("Expected text response for MCP method: {method}");
     };

@@ -86,10 +86,10 @@ impl Default for CreateTopic {
 
 impl Validatable<IggyError> for CreateTopic {
     fn validate(&self) -> Result<(), IggyError> {
-        if let Some(topic_id) = self.topic_id {
-            if topic_id == 0 {
-                return Err(IggyError::InvalidTopicId);
-            }
+        if let Some(topic_id) = self.topic_id
+            && topic_id == 0
+        {
+            return Err(IggyError::InvalidTopicId);
         }
 
         if self.name.is_empty() || self.name.len() > MAX_NAME_LENGTH {
@@ -100,10 +100,10 @@ impl Validatable<IggyError> for CreateTopic {
             return Err(IggyError::TooManyPartitions);
         }
 
-        if let Some(replication_factor) = self.replication_factor {
-            if replication_factor == 0 {
-                return Err(IggyError::InvalidReplicationFactor);
-            }
+        if let Some(replication_factor) = self.replication_factor
+            && replication_factor == 0
+        {
+            return Err(IggyError::InvalidReplicationFactor);
         }
 
         Ok(())
