@@ -22,8 +22,10 @@ use crate::binary::command::{ServerCommand, ServerCommandHandler};
 use crate::binary::sender::SenderKind;
 use crate::server_error::ConnectionError;
 use crate::shard::IggyShard;
+use crate::shard::transmission::event::ShardEvent;
 use crate::streaming::clients::client_manager::Transport;
 use crate::streaming::session::Session;
+use crate::{shard_debug, shard_info};
 use anyhow::anyhow;
 use compio_quic::{Connection, Endpoint, RecvStream, SendStream};
 use iggy_common::IggyError;
@@ -76,6 +78,21 @@ async fn handle_connection(
 
     let session = shard.add_client(&address, Transport::Quic);
     let client_id = session.client_id;
+    shard_debug!(
+        shard.id,
+        "Added {} client with session: {} for IP address: {}",
+        Transport::Quic,
+        session,
+        address
+    );
+
+    // Add session to active sessions and broadcast to all shards
+    shard.add_active_session(session.clone());
+    let event = ShardEvent::NewSession {
+        address,
+        transport: Transport::Quic,
+    };
+    let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
 
     while let Some(stream) = accept_stream(&connection, &shard, client_id).await? {
         let shard = shard.clone();
