@@ -61,13 +61,8 @@ atomic-waker: 1.1.2, "Apache-2.0 OR MIT",
 attohttpc: 0.28.5, "MPL-2.0",
 autocfg: 1.5.0, "Apache-2.0 OR MIT",
 aws-creds: 0.38.0, "MIT",
-<<<<<<< HEAD
 aws-lc-rs: 1.13.3, "(Apache-2.0 OR ISC) AND ISC",
 aws-lc-sys: 0.30.0, "(Apache-2.0 OR ISC) AND ISC AND OpenSSL",
-=======
-aws-lc-rs: 1.13.1, "(Apache-2.0 OR ISC) AND ISC",
-aws-lc-sys: 0.29.0, "(Apache-2.0 OR ISC) AND ISC AND OpenSSL",
->>>>>>> fd9db72e (add deps doc)
 aws-region: 0.26.0, "MIT",
 axum: 0.7.9, "MIT",
 axum: 0.8.4, "MIT",
@@ -789,12 +784,8 @@ tokio-macros: 2.5.0, "MIT",
 tokio-native-tls: 0.3.1, "MIT",
 tokio-rustls: 0.26.2, "Apache-2.0 OR MIT",
 tokio-stream: 0.1.17, "MIT",
-<<<<<<< HEAD
-tokio-util: 0.7.16, "MIT",
-=======
 tokio-test: 0.4.4, "MIT",
 tokio-util: 0.7.15, "MIT",
->>>>>>> fd9db72e (add deps doc)
 toml: 0.8.23, "Apache-2.0 OR MIT",
 toml: 0.9.5, "Apache-2.0 OR MIT",
 toml: 0.9.5, "Apache-2.0 OR MIT",
