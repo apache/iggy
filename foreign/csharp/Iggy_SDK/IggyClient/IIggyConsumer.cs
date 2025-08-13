@@ -23,12 +23,15 @@ namespace Apache.Iggy.IggyClient;
 public interface IIggyConsumer
 {
     Task<PolledMessages> FetchMessagesAsync(MessageFetchRequest request, Func<byte[], byte[]>? decryptor = null,
-        CancellationToken token = default) => FetchMessagesAsync(request.StreamId, request.TopicId, request.PartitionId, request.Consumer, request.PollingStrategy,
-        request.Count, request.AutoCommit, decryptor, token);
+        CancellationToken token = default)
+    {
+        return FetchMessagesAsync(request.StreamId, request.TopicId, request.PartitionId, request.Consumer, request.PollingStrategy,
+            request.Count, request.AutoCommit, decryptor, token);
+    }
 
-    Task<PolledMessages> FetchMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId, Consumer consumer, PollingStrategy pollingStrategy, 
+    Task<PolledMessages> FetchMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId, Consumer consumer, PollingStrategy pollingStrategy,
         int count, bool autoCommit, Func<byte[], byte[]>? decryptor = null, CancellationToken token = default);
-    
+
     Task<PolledMessages<TMessage>> FetchMessagesAsync<TMessage>(MessageFetchRequest request,
         Func<byte[], TMessage> deserializer, Func<byte[], byte[]>? decryptor = null, CancellationToken token = default);
 
@@ -41,5 +44,4 @@ public interface IIggyConsumer
     // IAsyncEnumerable<MessageResponse<TMessage>> PollMessagesAsync<TMessage>(Identifier streamId, Identifier topicId, 
     //     uint? partitionId, Consumer consumer, PollingStrategy pollingStrategy, int count, Func<byte[], TMessage> deserializer, 
     //     Func<byte[], byte[]>? decryptor = null, CancellationToken token = default);
-
 }

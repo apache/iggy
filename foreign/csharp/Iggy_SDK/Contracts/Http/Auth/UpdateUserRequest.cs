@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Text.Json.Serialization;
 using Apache.Iggy.Enums;
 
 namespace Apache.Iggy.Contracts.Http.Auth;

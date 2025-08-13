@@ -22,6 +22,7 @@ using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Extensions;
 
 namespace Apache.Iggy.JsonConfiguration;
+
 public sealed class StreamResponseConverter : JsonConverter<StreamResponse>
 {
     public override StreamResponse? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
@@ -52,7 +53,7 @@ public sealed class StreamResponseConverter : JsonConverter<StreamResponse>
         var messagesCount = root.GetProperty(nameof(StreamResponse.MessagesCount).ToSnakeCase()).GetUInt64();
         var topicsCount = root.GetProperty(nameof(StreamResponse.TopicsCount).ToSnakeCase()).GetInt32();
         root.TryGetProperty(nameof(StreamResponse.Topics).ToSnakeCase(), out var topicsProperty);
-        var topics = topicsProperty.ValueKind switch
+        IEnumerable<TopicResponse>? topics = topicsProperty.ValueKind switch
         {
             JsonValueKind.Null => null,
             JsonValueKind.Undefined => null,

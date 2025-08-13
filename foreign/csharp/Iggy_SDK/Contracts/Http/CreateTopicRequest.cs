@@ -25,14 +25,13 @@ public sealed class CreateTopicRequest
     public uint? TopicId { get; set; }
     public required string Name { get; set; }
     public CompressionAlgorithm CompressionAlgorithm { get; set; } = CompressionAlgorithm.None;
-    public ulong MessageExpiry { get; set; } = 0;
+    public ulong MessageExpiry { get; set; }
     public uint PartitionsCount { get; set; } = 1;
     public byte? ReplicationFactor { get; set; } = 1;
-    public ulong MaxTopicSize { get; set; } = 0;
+    public ulong MaxTopicSize { get; set; }
 
     public CreateTopicRequest()
     {
-        
     }
 
     [SetsRequiredMembers]

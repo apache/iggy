@@ -26,7 +26,7 @@ public sealed class TopicResponse
     public required uint Id { get; init; }
     public required DateTimeOffset CreatedAt { get; init; }
     public required string Name { get; init; }
-    public CompressionAlgorithm CompressionAlgorithm { get; set; } 
+    public CompressionAlgorithm CompressionAlgorithm { get; set; }
     public required ulong Size { get; init; }
     public ulong MessageExpiry { get; init; }
     public required ulong MaxTopicSize { get; init; }

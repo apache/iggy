@@ -18,20 +18,25 @@
 namespace Apache.Iggy.Enums;
 
 /// <summary>
-/// Enum representing the various compression methods available for snapshots
+///     Enum representing the various compression methods available for snapshots
 /// </summary>
 public enum SnapshotCompression
 {
     /// Store the file as is
     Stored,
+
     /// Compress the file using Deflate
     Deflated,
+
     /// Compress the file using BZIP2
     Bzip2,
+
     /// Compress the file using ZStandard
     Zstd,
+
     /// Compress the file using LZMA
     Lzma,
+
     /// Compress the file using XZ
-    Xz,
+    Xz
 }

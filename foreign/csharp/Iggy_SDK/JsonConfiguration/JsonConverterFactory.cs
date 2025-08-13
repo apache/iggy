@@ -24,7 +24,7 @@ namespace Apache.Iggy.JsonConfiguration;
 public static class JsonConverterFactory
 {
     public static JsonSerializerOptions SnakeCaseOptions
-        => new() 
+        => new()
         {
             PropertyNamingPolicy = new ToSnakeCaseNamingPolicy(),
             WriteIndented = true,
@@ -55,30 +55,31 @@ public static class JsonConverterFactory
                     }
                 }
             },
-            Converters = 
+            Converters =
             {
-                new UInt128Converter(), 
+                new UInt128Converter(),
                 new JsonStringEnumConverter(new ToSnakeCaseNamingPolicy())
             }
         };
+
     public static JsonSerializerOptions StreamResponseOptions
-        => new() 
+        => new()
         {
             Converters =
             {
                 new StreamResponseConverter()
             }
         };
-    
+
     public static JsonSerializerOptions AuthResponseOptions
-        => new() 
+        => new()
         {
             Converters =
             {
                 new AuthResponseConverter()
             }
         };
-    
+
     public static JsonSerializerOptions TopicResponseOptions
         => new()
         {
@@ -87,7 +88,7 @@ public static class JsonConverterFactory
                 new TopicResponseConverter()
             }
         };
-    
+
     public static JsonSerializerOptions StatsResponseOptions
         => new()
         {
@@ -96,7 +97,7 @@ public static class JsonConverterFactory
                 new StatsResponseConverter()
             }
         };
-    
+
     public static JsonSerializerOptions CreateTopicOptions
         => new()
         {
@@ -105,16 +106,7 @@ public static class JsonConverterFactory
                 new CreateTopicConverter()
             }
         };
-    
-    public static JsonSerializerOptions MessageResponseOptions(Func<byte[], byte[]>? decryptor)
-        => new()
-        {
-            Converters =
-            {
-                new MessageResponseConverter(decryptor)
-            }
-        };
-    
+
     public static JsonSerializerOptions HttpMessageOptions
         => new()
         {
@@ -123,7 +115,7 @@ public static class JsonConverterFactory
                 new MessageConverter()
             }
         };
-    
+
     public static JsonSerializerOptions MessagesOptions
         => new()
         {
@@ -132,6 +124,7 @@ public static class JsonConverterFactory
                 new MessagesConverter()
             }
         };
+
     public static JsonSerializerOptions PersonalAccessTokenOptions
         => new()
         {
@@ -140,13 +133,26 @@ public static class JsonConverterFactory
                 new PersonalAccessTokenResponseConverter()
             }
         };
-    
+
+    public static JsonSerializerOptions MessageResponseOptions(Func<byte[], byte[]>? decryptor)
+    {
+        return new JsonSerializerOptions
+        {
+            Converters =
+            {
+                new MessageResponseConverter(decryptor)
+            }
+        };
+    }
+
     public static JsonSerializerOptions MessageResponseGenericOptions<TMessage>(Func<byte[], TMessage> serializer, Func<byte[], byte[]>? decryptor)
-        => new()
+    {
+        return new JsonSerializerOptions
         {
             Converters =
             {
                 new MessageResponseGenericConverter<TMessage>(serializer, decryptor)
             }
         };
+    }
 }

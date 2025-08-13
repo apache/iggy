@@ -19,6 +19,6 @@ namespace Apache.Iggy.Contracts.Http.Auth;
 
 public sealed class CreatePersonalAccessTokenRequest
 {
-    public required string Name { get; init; }  
-    public ulong? Expiry { get; init; } 
+    public required string Name { get; init; }
+    public ulong? Expiry { get; init; }
 }

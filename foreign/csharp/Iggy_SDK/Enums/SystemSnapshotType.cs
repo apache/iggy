@@ -18,22 +18,28 @@
 namespace Apache.Iggy.Enums;
 
 /// <summary>
-/// Enum representing the different types of system snapshots that can be taken
+///     Enum representing the different types of system snapshots that can be taken
 /// </summary>
 public enum SystemSnapshotType
 {
     /// Overview of the filesystem.
     FilesystemOverview,
+
     /// List of currently running processes.
     ProcessList,
+
     /// Resource usage statistics of the system.
     ResourceUsage,
+
     /// Test snapshot type for development purposes.
     Test,
+
     /// Server logs
     ServerLogs,
+
     /// Server configuration
     ServerConfig,
+
     /// Everything
-    All,
+    All
 }

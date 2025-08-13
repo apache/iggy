@@ -32,16 +32,16 @@ internal sealed class CreateTopicConverter : JsonConverter<CreateTopicRequest>
     public override void Write(Utf8JsonWriter writer, CreateTopicRequest value, JsonSerializerOptions options)
     {
         writer.WriteStartObject();
-        
+
         // If not provided, the Iggy server will generate one automatically
         if (value.TopicId is not null)
         {
             writer.WriteNumber(nameof(value.TopicId).ToSnakeCase(), (int)value.TopicId);
         }
-        
+
         writer.WriteString(nameof(value.Name).ToSnakeCase(), value.Name);
         writer.WriteString(nameof(value.CompressionAlgorithm).ToSnakeCase(), value.CompressionAlgorithm.ToString());
-        
+
         writer.WriteNumber(nameof(value.MessageExpiry).ToSnakeCase(), (int)value.MessageExpiry);
         writer.WriteNumber(nameof(value.PartitionsCount).ToSnakeCase(), value.PartitionsCount);
         writer.WriteNumber(nameof(value.MaxTopicSize).ToSnakeCase(), value.MaxTopicSize);

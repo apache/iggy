@@ -29,7 +29,7 @@ public readonly struct Identifier : IEquatable<Identifier>
 
     public static Identifier Numeric(int value)
     {
-        byte[] bytes = new byte[4];
+        var bytes = new byte[4];
         BinaryPrimitives.WriteInt32LittleEndian(bytes, value);
 
         return new Identifier
@@ -39,10 +39,10 @@ public readonly struct Identifier : IEquatable<Identifier>
             Value = bytes
         };
     }
-    
+
     public static Identifier Numeric(uint value)
     {
-        byte[] bytes = new byte[4];
+        var bytes = new byte[4];
         BinaryPrimitives.WriteUInt32LittleEndian(bytes, value);
 
         return new Identifier
@@ -59,6 +59,7 @@ public readonly struct Identifier : IEquatable<Identifier>
         {
             throw new ArgumentException("Value has incorrect size, must be between 1 and 255", nameof(value));
         }
+
         return new Identifier
         {
             Kind = IdKind.String,

@@ -22,5 +22,8 @@ namespace Apache.Iggy.JsonConfiguration;
 
 internal sealed class ToSnakeCaseNamingPolicy : JsonNamingPolicy
 {
-    public override string ConvertName(string name) => name.ToSnakeCase();
+    public override string ConvertName(string name)
+    {
+        return name.ToSnakeCase();
+    }
 }

@@ -64,7 +64,7 @@ internal sealed class TopicResponseConverter : JsonConverter<TopicResponse>
         var messagesCount = root.GetProperty(nameof(TopicResponse.MessagesCount).ToSnakeCase()).GetUInt64();
         var partitionsCount = root.GetProperty(nameof(TopicResponse.PartitionsCount).ToSnakeCase()).GetUInt32();
         root.TryGetProperty(nameof(TopicResponse.Partitions).ToSnakeCase(), out var partitionsProperty);
-        var partitions = partitionsProperty.ValueKind switch
+        IEnumerable<PartitionContract>? partitions = partitionsProperty.ValueKind switch
         {
             JsonValueKind.Null => null,
             JsonValueKind.Undefined => null,
@@ -86,6 +86,7 @@ internal sealed class TopicResponseConverter : JsonConverter<TopicResponse>
             Partitions = partitions
         };
     }
+
     private IEnumerable<PartitionContract> DeserializePartitions(JsonElement partitionsElement)
     {
         var partitions = new List<PartitionContract>();
@@ -128,6 +129,7 @@ internal sealed class TopicResponseConverter : JsonConverter<TopicResponse>
                 Size = sizeBytes
             });
         }
+
         return partitions;
     }
 
@@ -154,6 +156,7 @@ internal sealed class TopicResponseConverter : JsonConverter<TopicResponse>
 
             writer.WriteEndArray();
         }
+
         writer.WriteEndObject();
     }
 }

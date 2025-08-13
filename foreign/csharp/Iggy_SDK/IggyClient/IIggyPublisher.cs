@@ -23,6 +23,7 @@ namespace Apache.Iggy.IggyClient;
 public interface IIggyPublisher
 {
     Task SendMessagesAsync(MessageSendRequest request, Func<byte[], byte[]>? encryptor = null, CancellationToken token = default);
+
     Task SendMessagesAsync<TMessage>(MessageSendRequest<TMessage> request, Func<TMessage, byte[]> serializer,
         Func<byte[], byte[]>? encryptor = null, Dictionary<HeaderKey, HeaderValue>? headers = null,
         CancellationToken token = default);

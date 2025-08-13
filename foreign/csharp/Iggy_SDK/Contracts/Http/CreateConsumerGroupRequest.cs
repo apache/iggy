@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Text.Json.Serialization;
-
 namespace Apache.Iggy.Contracts.Http;
 
 public sealed class CreateConsumerGroupRequest
