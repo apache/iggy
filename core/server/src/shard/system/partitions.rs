@@ -176,8 +176,8 @@ impl IggyShard {
         partition: partition2::Partition,
     ) -> usize {
         self.streams2
-            .with_partitions_mut(stream_id, topic_id, |partitions| {
-                partitions.insert(partition)
+            .with_topic_root_by_id_mut(stream_id, topic_id, |root| {
+                root.partitions_mut().insert(partition)
             })
     }
 

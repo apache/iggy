@@ -133,8 +133,8 @@ impl Topic {
             consumer_groups_ids: AHashMap::new(),
             current_consumer_group_id: Arc::new(AtomicU32::new(1)),
             current_partition_id: Arc::new(AtomicU32::new(1)),
-            message_expiry: Topic::get_message_expiry(message_expiry, &config),
-            max_topic_size: Topic::get_max_topic_size(max_topic_size, &config)?,
+            message_expiry: message_expiry,
+            max_topic_size: max_topic_size,
             compression_algorithm,
             replication_factor,
             config,
@@ -226,32 +226,6 @@ impl Topic {
                     partition_id,
                 )))
             }
-        }
-    }
-
-    pub fn get_max_topic_size(
-        max_topic_size: MaxTopicSize,
-        config: &SystemConfig,
-    ) -> Result<MaxTopicSize, IggyError> {
-        match max_topic_size {
-            MaxTopicSize::ServerDefault => Ok(config.topic.max_size),
-            _ => {
-                if max_topic_size.as_bytes_u64() < config.segment.size.as_bytes_u64() {
-                    Err(IggyError::InvalidTopicSize(
-                        max_topic_size,
-                        config.segment.size,
-                    ))
-                } else {
-                    Ok(max_topic_size)
-                }
-            }
-        }
-    }
-
-    pub fn get_message_expiry(message_expiry: IggyExpiry, config: &SystemConfig) -> IggyExpiry {
-        match message_expiry {
-            IggyExpiry::ServerDefault => config.segment.message_expiry,
-            _ => message_expiry,
         }
     }
 }

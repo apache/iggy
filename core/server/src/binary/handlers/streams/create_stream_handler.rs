@@ -23,17 +23,15 @@ use crate::binary::{handlers::streams::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
 use crate::shard_info;
-use crate::slab::traits_ext::EntityMarker;
+use crate::slab::traits_ext::{EntityComponentSystem, EntityMarker};
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateStreamWithId;
 use crate::streaming::session::Session;
-use crate::streaming::stats::stats::StreamStats;
 use anyhow::Result;
 use error_set::ErrContext;
+use iggy_common::IggyError;
 use iggy_common::create_stream::CreateStream;
-use iggy_common::{Identifier, IggyError};
 use std::rc::Rc;
-use std::sync::Arc;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for CreateStream {
@@ -51,55 +49,34 @@ impl ServerCommandHandler for CreateStream {
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
         let stream_id = self.stream_id;
-        let name = self.name.clone();
-
         let stream = shard
             .create_stream2(session, stream_id, self.name.clone())
             .await?;
-        shard_info!(
-            shard.id,
-            "Created stream with new API, Stream ID: {}, name: '{}'.",
-            stream.id(),
-            name
-        );
-        let event = ShardEvent::CreatedStream2 {
-            id: stream.id(),
-            stream,
-        };
-        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
-
-        let created_stream_id = shard
-                .create_stream(session, stream_id, &name)
-                .await
-                .with_error_context(|error| {
-                    format!(
-                        "{COMPONENT} (error: {error}) - failed to create stream with id: {stream_id:?}, session: {session}"
-                    )
-                })?;
+        let created_stream_id = stream.id();
         shard_info!(
             shard.id,
             "Created stream with ID: {}, name: '{}'.",
             created_stream_id,
-            name
+            stream.root().name()
         );
-        let event = ShardEvent::CreatedStream { stream_id, name };
-        // Broadcast the event to all shards.
-        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+        let event = ShardEvent::CreatedStream2 {
+            id: created_stream_id,
+            stream,
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event).await;
 
-        let stream = shard.find_stream(session, &created_stream_id)
-            .with_error_context(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to find created stream with id: {created_stream_id:?}, session: {session}"
-                )
-            })?;
-        let response = mapper::map_stream(&stream);
-
+        let response = shard
+            .streams2
+            .with_by_id(created_stream_id, |(root, stats)| {
+                mapper::map_stream(&root, &stats)
+            });
         shard
             .state
-        .apply(session.get_user_id(), &EntryCommand::CreateStream(CreateStreamWithId {
-            stream_id: stream.stream_id,
-            command: self
-        }))            .await
+            .apply(session.get_user_id(), &EntryCommand::CreateStream(CreateStreamWithId {
+                stream_id: created_stream_id as u32,
+                command: self
+            }))
+            .await
             .with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to apply create stream for id: {stream_id:?}, session: {session}"

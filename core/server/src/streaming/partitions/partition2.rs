@@ -113,6 +113,10 @@ impl PartitionRoot {
     pub fn update_id(&mut self, id: usize) {
         self.id = id;
     }
+
+    pub fn created_at(&self) -> IggyTimestamp {
+        self.created_at
+    }
 }
 
 // TODO: Create a macro to impl those PartitionRef/PartitionRefMut structs and it's traits.

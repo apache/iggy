@@ -1,22 +1,24 @@
+use crate::{
+    slab::{
+        Keyed, helpers,
+        partitions::Partitions,
+        topics::Topics,
+        traits_ext::{
+            Components, ComponentsById, ComponentsByIdMapping, ComponentsMapping, DeleteCell,
+            EntityComponentSystem, EntityComponentSystemMutCell, InsertCell, InteriorMutability,
+            IntoComponents, IntoComponentsById,
+        },
+    },
+    streaming::{
+        stats::stats::StreamStats,
+        streams::stream2::{self, StreamRef, StreamRefMut},
+        topics::topic2::{self, TopicRef, TopicRefMut},
+    },
+};
 use ahash::AHashMap;
 use iggy_common::Identifier;
 use slab::Slab;
 use std::{cell::RefCell, sync::Arc};
-use tokio_rustls::StartHandshake;
-
-use crate::{
-    shard::stats,
-    slab::{
-        Keyed,
-        partitions::Partitions,
-        topics::Topics,
-        traits_ext::{
-            Delete, DeleteCell, EntityComponentSystem, EntityComponentSystemMutCell, Insert,
-            InsertCell, InteriorMutability, IntoComponents,
-        },
-    },
-    streaming::{stats::stats::StreamStats, streams::stream2, topics::topic2},
-};
 
 const CAPACITY: usize = 1024;
 pub type ContainerId = usize;
@@ -74,29 +76,29 @@ impl DeleteCell for Streams {
 impl EntityComponentSystem<InteriorMutability> for Streams {
     type Idx = ContainerId;
     type Entity = stream2::Stream;
-    type EntityRef<'a> = stream2::StreamRef<'a>;
+    type EntityComponents<'a> = stream2::StreamRef<'a>;
 
-    fn with<O, F>(&self, f: F) -> O
+    fn with_components<O, F>(&self, f: F) -> O
     where
-        F: for<'a> FnOnce(Self::EntityRef<'a>) -> O,
+        F: for<'a> FnOnce(Self::EntityComponents<'a>) -> O,
     {
         f(self.into())
     }
 
-    async fn with_async<O, F>(&self, f: F) -> O
+    async fn with_components_async<O, F>(&self, f: F) -> O
     where
-        F: for<'a> AsyncFnOnce(Self::EntityRef<'a>) -> O,
+        F: for<'a> AsyncFnOnce(Self::EntityComponents<'a>) -> O,
     {
         f(self.into()).await
     }
 }
 
 impl EntityComponentSystemMutCell for Streams {
-    type EntityRefMut<'a> = stream2::StreamRefMut<'a>;
+    type EntityComponentsMut<'a> = stream2::StreamRefMut<'a>;
 
-    fn with_mut<O, F>(&self, f: F) -> O
+    fn with_components_mut<O, F>(&self, f: F) -> O
     where
-        F: for<'a> FnOnce(Self::EntityRefMut<'a>) -> O,
+        F: for<'a> FnOnce(Self::EntityComponentsMut<'a>) -> O,
     {
         f(self.into())
     }
@@ -134,60 +136,6 @@ impl Streams {
         }
     }
 
-    pub fn with_root_by_id<T>(
-        &self,
-        id: &Identifier,
-        f: impl FnOnce(&stream2::StreamRoot) -> T,
-    ) -> T {
-        let id = self.get_index(id);
-        self.with_by_id(id, |(root, _)| f(&root))
-    }
-
-    pub async fn with_root_by_id_async<T>(
-        &self,
-        id: &Identifier,
-        f: impl AsyncFnOnce(&stream2::StreamRoot) -> T,
-    ) -> T {
-        let id = self.get_index(id);
-        self.with_by_id_async(id, async |(root, _)| f(&root).await)
-            .await
-    }
-
-    pub fn with_root_by_id_mut<T>(
-        &self,
-        id: &Identifier,
-        f: impl FnOnce(&mut stream2::StreamRoot) -> T,
-    ) -> T {
-        let id = self.get_index(id);
-        self.with_by_id_mut(id, |(mut root, _)| f(&mut root))
-    }
-
-    pub fn with_stats<T>(&self, f: impl FnOnce(&Slab<Arc<StreamStats>>) -> T) -> T {
-        self.with(|components| {
-            let (_, stats) = components.into_components();
-            f(&stats)
-        })
-    }
-
-    pub fn with_stats_by_id<T>(
-        &self,
-        id: &Identifier,
-        f: impl FnOnce(&Arc<StreamStats>) -> T,
-    ) -> T {
-        let id = self.get_index(id);
-        self.with_by_id(id, |(_, stats)| {
-            let stats = stats;
-            f(&stats)
-        })
-    }
-
-    pub fn with_stats_mut<T>(&self, f: impl FnOnce(&mut Slab<Arc<StreamStats>>) -> T) -> T {
-        self.with_mut(|components| {
-            let (_, mut stats) = components.into_components();
-            f(&mut stats)
-        })
-    }
-
     pub fn with_index<T>(
         &self,
         f: impl FnOnce(&AHashMap<<stream2::StreamRoot as Keyed>::Key, usize>) -> T,
@@ -204,9 +152,36 @@ impl Streams {
         f(&mut index)
     }
 
+    pub fn with_stream_by_id<T>(
+        &self,
+        id: &Identifier,
+        f: impl FnOnce(ComponentsById<StreamRef>) -> T,
+    ) -> T {
+        let id = self.get_index(id);
+        self.with_components_by_id(id, |stream| f(stream))
+    }
+
+    pub async fn with_stream_by_id_async<T>(
+        &self,
+        id: &Identifier,
+        f: impl AsyncFnOnce(ComponentsById<StreamRef>) -> T,
+    ) -> T {
+        let id = self.get_index(id);
+        self.with_components_by_id_async(id, async |stream| f(stream).await)
+            .await
+    }
+
+    pub fn with_stream_by_id_mut<T>(
+        &self,
+        id: &Identifier,
+        f: impl FnOnce(ComponentsById<StreamRefMut>) -> T,
+    ) -> T {
+        let id = self.get_index(id);
+        self.with_components_by_id_mut(id, |stream| f(stream))
+    }
+
     pub fn with_topics<T>(&self, stream_id: &Identifier, f: impl FnOnce(&Topics) -> T) -> T {
-        let id = self.get_index(stream_id);
-        self.with_by_id(id, |(root, _)| f(root.topics()))
+        self.with_stream_by_id(stream_id, helpers::topics(f))
     }
 
     pub async fn with_topics_async<T>(
@@ -214,8 +189,7 @@ impl Streams {
         stream_id: &Identifier,
         f: impl AsyncFnOnce(&Topics) -> T,
     ) -> T {
-        let id = self.get_index(stream_id);
-        self.with_by_id_async(id, async |(root, _)| f(root.topics()).await)
+        self.with_stream_by_id_async(stream_id, helpers::topics_async(f).await)
             .await
     }
 
@@ -224,68 +198,52 @@ impl Streams {
         stream_id: &Identifier,
         f: impl FnOnce(&mut Topics) -> T,
     ) -> T {
-        let id = self.get_index(stream_id);
-        self.with_by_id_mut(id, |(mut root, _)| {
-            let topics = root.topics_mut();
-            f(topics)
+        self.with_stream_by_id_mut(stream_id, helpers::topics_mut(f))
+    }
+
+    pub fn with_topic_by_id<T>(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        f: impl FnOnce(ComponentsById<TopicRef>) -> T,
+    ) -> T {
+        self.with_topics(stream_id, |container| {
+            container.with_topic_by_id(topic_id, f)
         })
     }
 
-    pub fn with_topic_root_by_id<T>(
+    pub async fn with_topic_by_id_async<T>(
         &self,
         stream_id: &Identifier,
-        id: &Identifier,
-        f: impl FnOnce(&topic2::TopicRoot) -> T,
+        topic_id: &Identifier,
+        f: impl AsyncFnOnce(ComponentsById<TopicRef>) -> T,
     ) -> T {
-        self.with_topics(stream_id, |topics| {
-            topics.with_root_by_id(id, |root| f(root))
-        })
-    }
-
-    pub async fn with_topic_root_by_id_async<T>(
-        &self,
-        stream_id: &Identifier,
-        id: &Identifier,
-        f: impl AsyncFnOnce(&topic2::TopicRoot) -> T,
-    ) -> T {
-        self.with_topics_async(stream_id, async |topics| {
-            let id = topics.get_index(id);
-            topics
-                .with_by_id_async(id, async |(root, _)| f(&root).await)
-                .await
+        self.with_topics_async(stream_id, async |container| {
+            container.with_topic_by_id_async(topic_id, f).await
         })
         .await
     }
 
-    pub fn with_topic_root_by_id_mut<T>(
+    pub fn with_topic_by_id_mut<T>(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        f: impl FnOnce(&mut topic2::TopicRoot) -> T,
+        f: impl FnOnce(ComponentsById<TopicRefMut>) -> T,
     ) -> T {
-        self.with_topics_mut(stream_id, |topics| {
-            topics.with_root_by_id_mut(topic_id, |root| f(root))
+        self.with_topics_mut(stream_id, |container| {
+            container.with_topic_by_id_mut(topic_id, f)
         })
     }
 
-    pub fn with_partitions(
+    pub fn with_partitions<T>(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        f: impl FnOnce(&Partitions),
-    ) {
-        self.with_topics(stream_id, |topics| {
-            topics.with_partitions(topic_id, f);
-        });
-    }
-
-    pub fn with_partitions_mut<T>(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        f: impl FnOnce(&mut Partitions) -> T,
+        f: impl FnOnce(&Partitions) -> T,
     ) -> T {
-        self.with_topics_mut(stream_id, |topics| topics.with_partitions_mut(topic_id, f))
+        self.with_topics(stream_id, |container| {
+            container.with_partitions(topic_id, f)
+        })
     }
 
     pub async fn with_partitions_async<T>(
@@ -294,10 +252,21 @@ impl Streams {
         topic_id: &Identifier,
         f: impl AsyncFnOnce(&Partitions) -> T,
     ) -> T {
-        self.with_topics_async(stream_id, async |topics| {
-            topics.with_partitions_async(topic_id, f).await
+        self.with_topics_async(stream_id, async |container| {
+            container.with_partitions_async(topic_id, f).await
         })
         .await
+    }
+
+    pub fn with_partitions_mut<T>(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        f: impl FnOnce(&mut Partitions) -> T,
+    ) -> T {
+        self.with_topics_mut(stream_id, |container| {
+            container.with_partitions_mut(topic_id, f)
+        })
     }
 
     pub fn len(&self) -> usize {

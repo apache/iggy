@@ -63,6 +63,10 @@ impl StreamRoot {
     pub fn topics_mut(&mut self) -> &mut Topics {
         &mut self.topics
     }
+
+    pub fn created_at(&self) -> IggyTimestamp {
+        self.created_at
+    }
 }
 
 #[derive(Debug, Clone)]

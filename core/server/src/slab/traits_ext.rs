@@ -157,69 +157,78 @@ type MappingByIdMut<'a, E, T> =
 pub type Components<T> = <T as IntoComponents>::Components;
 pub type ComponentsById<'a, T> = <T as IntoComponentsById>::Output;
 
+// TODO: Not all hope is lost, don't get discouraged by the comment from above
+// I've figured there is actually and ergonomic improvement that can be made here.
+// Observe that the chain of constraints put on the `EntityRef` type is actually wrong.
+// We constraint the `EntityRef` to be IntoComponents + IntoComponentsById,
+// which from composability point of view is not ideal...
+// A better idea is to constraint the `IntoComponents::Output` of the `EntityRef` impl to - `IntoComponentsById`, rather than entire `EntityRef`.
+// This way we can name the type inside of the `with_by_id` methods, without desolving into the tuple mapping madness.
+// in the `stream.rs` `topic.rs` `partitions.rs` files, we need to implement the `IntoComponentsById` trait for the output type of `IntoComponents` implementation, for `EntityRef`.
+// to make our life easier, we can create a type alias for those tuples and maybe even create a macro, to not repeat the type 3 times per entity (TupleEntityType, TupleEntityTypeRef, TupleEntityTypeRefByid).
 pub trait EntityComponentSystem<T>
 where
     <Self::Entity as IntoComponents>::Components: ComponentsMapping<T> + ComponentsByIdMapping<T>,
 {
     type Idx;
     type Entity: IntoComponents + EntityMarker;
-    type EntityRef<'a>: IntoComponents<Components = Mapping<'a, Self::Entity, T>>
+    type EntityComponents<'a>: IntoComponents<Components = Mapping<'a, Self::Entity, T>>
         + IntoComponentsById<Idx = Self::Idx, Output = MappingById<'a, Self::Entity, T>>;
 
-    fn with<O, F>(&self, f: F) -> O
+    fn with_components<O, F>(&self, f: F) -> O
     where
-        F: for<'a> FnOnce(Self::EntityRef<'a>) -> O;
+        F: for<'a> FnOnce(Self::EntityComponents<'a>) -> O;
 
-    fn with_async<O, F>(&self, f: F) -> impl Future<Output = O>
+    fn with_components_async<O, F>(&self, f: F) -> impl Future<Output = O>
     where
-        F: for<'a> AsyncFnOnce(Self::EntityRef<'a>) -> O;
+        F: for<'a> AsyncFnOnce(Self::EntityComponents<'a>) -> O;
 
-    fn with_by_id<O, F>(&self, id: Self::Idx, f: F) -> O
+    fn with_components_by_id<O, F>(&self, id: Self::Idx, f: F) -> O
     where
-        F: for<'a> FnOnce(ComponentsById<'a, Self::EntityRef<'a>>) -> O,
+        F: for<'a> FnOnce(ComponentsById<'a, Self::EntityComponents<'a>>) -> O,
     {
-        self.with(|components| f(components.into_components_by_id(id)))
+        self.with_components(|components| f(components.into_components_by_id(id)))
     }
 
-    fn with_by_id_async<O, F>(&self, id: Self::Idx, f: F) -> impl Future<Output = O>
+    fn with_components_by_id_async<O, F>(&self, id: Self::Idx, f: F) -> impl Future<Output = O>
     where
-        F: for<'a> AsyncFnOnce(ComponentsById<'a, Self::EntityRef<'a>>) -> O,
+        F: for<'a> AsyncFnOnce(ComponentsById<'a, Self::EntityComponents<'a>>) -> O,
     {
-        self.with_async(async |components| f(components.into_components_by_id(id)).await)
+        self.with_components_async(async |components| f(components.into_components_by_id(id)).await)
     }
 }
 
 pub trait EntityComponentSystemMut: EntityComponentSystem<Borrow> {
-    type EntityRefMut<'a>: IntoComponents<Components = MappingMut<'a, Self::Entity, Borrow>>
+    type EntityComponentsMut<'a>: IntoComponents<Components = MappingMut<'a, Self::Entity, Borrow>>
         + IntoComponentsById<Idx = Self::Idx, Output = MappingByIdMut<'a, Self::Entity, Borrow>>;
 
-    fn with_mut<O, F>(&mut self, f: F) -> O
+    fn with_components_mut<O, F>(&mut self, f: F) -> O
     where
-        F: for<'a> FnOnce(Self::EntityRefMut<'a>) -> O;
+        F: for<'a> FnOnce(Self::EntityComponentsMut<'a>) -> O;
 
-    fn with_by_id_mut<O, F>(&mut self, id: Self::Idx, f: F) -> O
+    fn with_components_by_id_mut<O, F>(&mut self, id: Self::Idx, f: F) -> O
     where
-        F: for<'a> FnOnce(ComponentsById<'a, Self::EntityRefMut<'a>>) -> O,
+        F: for<'a> FnOnce(ComponentsById<'a, Self::EntityComponentsMut<'a>>) -> O,
     {
-        self.with_mut(|components| f(components.into_components_by_id(id)))
+        self.with_components_mut(|components| f(components.into_components_by_id(id)))
     }
 }
 
 pub trait EntityComponentSystemMutCell: EntityComponentSystem<InteriorMutability> {
-    type EntityRefMut<'a>: IntoComponents<Components = MappingMut<'a, Self::Entity, InteriorMutability>>
+    type EntityComponentsMut<'a>: IntoComponents<Components = MappingMut<'a, Self::Entity, InteriorMutability>>
         + IntoComponentsById<
             Idx = Self::Idx,
             Output = MappingByIdMut<'a, Self::Entity, InteriorMutability>,
         >;
 
-    fn with_mut<O, F>(&self, f: F) -> O
+    fn with_components_mut<O, F>(&self, f: F) -> O
     where
-        F: for<'a> FnOnce(Self::EntityRefMut<'a>) -> O;
+        F: for<'a> FnOnce(Self::EntityComponentsMut<'a>) -> O;
 
-    fn with_by_id_mut<O, F>(&self, id: Self::Idx, f: F) -> O
+    fn with_components_by_id_mut<O, F>(&self, id: Self::Idx, f: F) -> O
     where
-        F: for<'a> FnOnce(ComponentsById<'a, Self::EntityRefMut<'a>>) -> O,
+        F: for<'a> FnOnce(ComponentsById<'a, Self::EntityComponentsMut<'a>>) -> O,
     {
-        self.with_mut(|components| f(components.into_components_by_id(id)))
+        self.with_components_mut(|components| f(components.into_components_by_id(id)))
     }
 }

@@ -22,6 +22,7 @@ use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
 use crate::shard::IggyShard;
+use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::streaming::session::Session;
 use anyhow::Result;
 use error_set::ErrContext;
@@ -43,10 +44,22 @@ impl ServerCommandHandler for GetStreams {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let streams = shard.find_streams(session).with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to find streams for session: {session}")
-        })?;
-        let response = mapper::map_streams(streams);
+        shard.ensure_authenticated(session)?;
+        shard
+            .permissioner
+            .borrow()
+            .get_streams(session.get_user_id())
+            .with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - permission denied to get streams for user {}",
+                    session.get_user_id()
+                )
+            })?;
+
+        let response = shard.streams2.with(|stream_ref| {
+            let (roots, stats) = stream_ref.into_components();
+            mapper::map_streams(&roots, &stats)
+        });
         sender.send_ok_response(&response).await?;
         Ok(())
     }

@@ -16,6 +16,7 @@
  * under the License.
  */
 
+pub mod helpers;
 pub mod messages;
 pub mod partitions;
 pub mod persistence;

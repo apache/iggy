@@ -5,17 +5,17 @@ use std::{cell::RefCell, sync::Arc};
 
 use crate::{
     slab::{
-        Keyed,
+        Keyed, helpers,
         partitions::Partitions,
         traits_ext::{
-            Delete, DeleteCell, EntityComponentSystem, EntityComponentSystemMutCell, Insert,
-            InsertCell, InteriorMutability, IntoComponents,
+            ComponentsById, Delete, DeleteCell, EntityComponentSystem,
+            EntityComponentSystemMutCell, Insert, InsertCell, InteriorMutability, IntoComponents,
         },
     },
     streaming::{
         partitions::partition2,
         stats::stats::TopicStats,
-        topics::topic2::{self, TopicRef},
+        topics::topic2::{self, TopicRef, TopicRefMut},
     },
 };
 
@@ -86,29 +86,29 @@ impl<'a> From<&'a Topics> for topic2::TopicRefMut<'a> {
 impl EntityComponentSystem<InteriorMutability> for Topics {
     type Idx = ContainerId;
     type Entity = topic2::Topic;
-    type EntityRef<'a> = topic2::TopicRef<'a>;
+    type EntityComponents<'a> = topic2::TopicRef<'a>;
 
-    fn with<O, F>(&self, f: F) -> O
+    fn with_components<O, F>(&self, f: F) -> O
     where
-        F: for<'a> FnOnce(Self::EntityRef<'a>) -> O,
+        F: for<'a> FnOnce(Self::EntityComponents<'a>) -> O,
     {
         f(self.into())
     }
 
-    async fn with_async<O, F>(&self, f: F) -> O
+    async fn with_components_async<O, F>(&self, f: F) -> O
     where
-        F: for<'a> AsyncFnOnce(Self::EntityRef<'a>) -> O,
+        F: for<'a> AsyncFnOnce(Self::EntityComponents<'a>) -> O,
     {
         f(self.into()).await
     }
 }
 
 impl EntityComponentSystemMutCell for Topics {
-    type EntityRefMut<'a> = topic2::TopicRefMut<'a>;
+    type EntityComponentsMut<'a> = topic2::TopicRefMut<'a>;
 
-    fn with_mut<O, F>(&self, f: F) -> O
+    fn with_components_mut<O, F>(&self, f: F) -> O
     where
-        F: for<'a> FnOnce(Self::EntityRefMut<'a>) -> O,
+        F: for<'a> FnOnce(Self::EntityComponentsMut<'a>) -> O,
     {
         f(self.into())
     }
@@ -158,51 +158,36 @@ impl Topics {
         f(&mut index)
     }
 
-    pub fn with_root_by_id<T>(
+    pub fn with_topic_by_id<T>(
         &self,
-        id: &Identifier,
-        f: impl FnOnce(&topic2::TopicRoot) -> T,
+        topic_id: &Identifier,
+        f: impl FnOnce(ComponentsById<TopicRef>) -> T,
     ) -> T {
-        let id = self.get_index(id);
-        self.with_by_id(id, |(root, _)| f(&root))
+        let id = self.get_index(topic_id);
+        self.with_components_by_id(id, |components| f(components))
     }
 
-    pub async fn with_root_by_id_async<T>(
+    pub async fn with_topic_by_id_async<T>(
         &self,
-        id: &Identifier,
-        f: impl AsyncFnOnce(&topic2::TopicRoot) -> T,
+        topic_id: &Identifier,
+        f: impl AsyncFnOnce(ComponentsById<TopicRef>) -> T,
     ) -> T {
-        let id = self.get_index(id);
-        self.with_by_id_async(id, async |(root, _)| f(&root).await)
+        let id = self.get_index(topic_id);
+        self.with_components_by_id_async(id, async |components| f(components).await)
             .await
     }
 
-    pub fn with_root_by_id_mut<T>(
+    pub fn with_topic_by_id_mut<T>(
         &self,
-        id: &Identifier,
-        f: impl FnOnce(&mut topic2::TopicRoot) -> T,
+        topic_id: &Identifier,
+        f: impl FnOnce(ComponentsById<TopicRefMut>) -> T,
     ) -> T {
-        let id = self.get_index(id);
-        self.with_by_id_mut(id, |(mut root, _)| f(&mut root))
+        let id = self.get_index(topic_id);
+        self.with_components_by_id_mut(id, |components| f(components))
     }
 
-    pub fn with_stats<T>(&self, f: impl FnOnce(&Slab<Arc<TopicStats>>) -> T) -> T {
-        self.with(|components| {
-            let (_, stats) = components.into_components();
-            f(&stats)
-        })
-    }
-
-    pub fn with_stats_mut<T>(&self, f: impl FnOnce(&mut Slab<Arc<TopicStats>>) -> T) -> T {
-        self.with_mut(|components| {
-            let (_, mut stats) = components.into_components();
-            f(&mut stats)
-        })
-    }
-
-    pub fn with_stats_by_id<T>(&self, id: &Identifier, f: impl FnOnce(&Arc<TopicStats>) -> T) -> T {
-        let id = self.get_index(id);
-        self.with_by_id(id, |(_, stats)| f(&stats))
+    pub fn with_partitions<T>(&self, topic_id: &Identifier, f: impl FnOnce(&Partitions) -> T) -> T {
+        self.with_topic_by_id(topic_id, helpers::partitions(f))
     }
 
     pub async fn with_partitions_async<T>(
@@ -210,20 +195,8 @@ impl Topics {
         topic_id: &Identifier,
         f: impl AsyncFnOnce(&Partitions) -> T,
     ) -> T {
-        let id = self.get_index(topic_id);
-        self.with_by_id_async(id, async |(root, _)| {
-            let partitions = root.partitions();
-            f(partitions).await
-        })
-        .await
-    }
-
-    pub fn with_partitions(&self, topic_id: &Identifier, f: impl FnOnce(&Partitions)) {
-        let id = self.get_index(topic_id);
-        self.with_by_id(id, |(root, _)| {
-            let partitions = root.partitions();
-            f(partitions)
-        })
+        self.with_topic_by_id_async(topic_id, helpers::partitions_async(f).await)
+            .await
     }
 
     pub fn with_partitions_mut<T>(
@@ -231,10 +204,6 @@ impl Topics {
         topic_id: &Identifier,
         f: impl FnOnce(&mut Partitions) -> T,
     ) -> T {
-        let id = self.get_index(topic_id);
-        self.with_by_id_mut(id, |(mut root, _)| {
-            let partitions = root.partitions_mut();
-            f(partitions)
-        })
+        self.with_topic_by_id_mut(topic_id, helpers::partitions_mut(f))
     }
 }

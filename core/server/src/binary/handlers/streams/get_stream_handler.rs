@@ -21,8 +21,10 @@ use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
 use crate::shard::IggyShard;
+use crate::slab::traits_ext::EntityComponentSystem;
 use crate::streaming::session::Session;
 use anyhow::Result;
+use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::get_stream::GetStream;
 use std::rc::Rc;
@@ -41,17 +43,25 @@ impl ServerCommandHandler for GetStream {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let Ok(stream) = shard.try_find_stream(session, &self.stream_id) else {
-            sender.send_empty_ok_response().await?;
-            return Ok(());
-        };
-
-        let Some(stream) = stream else {
-            sender.send_empty_ok_response().await?;
-            return Ok(());
-        };
-
-        let response = mapper::map_stream(&stream);
+        shard.ensure_authenticated(session)?;
+        shard.ensure_stream_exists(&self.stream_id)?;
+        let stream_id = shard
+            .streams2
+            .with_root_by_id(&self.stream_id, |root| root.id());
+        shard
+            .permissioner
+            .borrow()
+            .get_stream(session.get_user_id(), stream_id as u32)
+            .with_error_context(|_| {
+                format!(
+                    "permission denied to get stream with ID: {} for user with ID: {}",
+                    self.stream_id,
+                    session.get_user_id(),
+                )
+            });
+        let response = shard
+            .streams2
+            .with_by_id(stream_id, |(root, stats)| mapper::map_stream(&root, &stats));
         sender.send_ok_response(&response).await?;
         Ok(())
     }

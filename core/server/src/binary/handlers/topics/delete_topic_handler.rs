@@ -19,23 +19,16 @@
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::topics::COMPONENT, sender::SenderKind};
-use crate::io::fs_utils::remove_dir_all;
 use crate::shard::IggyShard;
-use crate::shard::namespace::IggyNamespace;
 use crate::shard::transmission::event::ShardEvent;
 use crate::shard_info;
-use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use anyhow::Result;
-use compio::driver::op::OpenFile;
-use compio::fs::File;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::delete_topic::DeleteTopic;
-use iggy_common::locking::IggyRwLockFn;
 use std::rc::Rc;
-use std::time::Duration;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for DeleteTopic {
@@ -57,65 +50,36 @@ impl ServerCommandHandler for DeleteTopic {
         // we would end up in a state where the topic is deleted from disk, but during state recreation it would be recreated,
         // without persisted messages in the partitions.
         debug!("session: {session}, command: {self}");
-        let topic2 = shard
+        let topic = shard
             .delete_topic2(session, &self.stream_id, &self.topic_id)
             .await?;
+        let stream_id = shard
+            .streams2
+            .with_root_by_id(&self.stream_id, |root| root.id());
+        let topic_id = topic.root().id();
+        shard_info!(
+            shard.id,
+            "Deleted topic with name: {}, ID: {} in stream with ID: {}",
+            topic.root().name(),
+            topic_id,
+            stream_id
+        );
         let event = ShardEvent::DeletedTopic2 {
-            id: topic2.id(),
+            id: topic_id,
             stream_id: self.stream_id.clone(),
             topic_id: self.topic_id.clone(),
         };
         let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
         // Drop the topic to force readers/writers to be dropped.
-        drop(topic2);
-        // Remove all the files and directories.
-
-        let topic = shard
-                .delete_topic(session, &self.stream_id, &self.topic_id)
-                .await
-                .with_error_context(|error| format!(
-                    "{COMPONENT} (error: {error}) - failed to delete topic with ID: {} in stream with ID: {}, session: {session}",
-                    &self.topic_id, &self.stream_id
-                ))?;
-        shard_info!(
-            shard.id,
-            "Deleted topic with name: {}, ID: {} in stream with ID: {}",
-            topic.name,
-            topic.topic_id,
-            topic.stream_id
-        );
-        let numeric_topic_id = topic.topic_id;
-        let numeric_stream_id = topic.stream_id;
-        let partitions = topic.get_partitions();
-        let mut namespaces = Vec::new();
-        for partition in partitions {
-            let partition_id = partition.read().await.partition_id;
-            let namespace = IggyNamespace::new(numeric_stream_id, topic.topic_id, partition_id);
-            namespaces.push(namespace);
-        }
-        let records = shard.remove_shard_table_records(&namespaces);
-        for (ns, shard_info) in records {
-            if shard_info.id() == shard.id {
-                let partition = topic.get_partition(ns.partition_id).unwrap();
-                let mut partition = partition.write().await;
-                let partition_id = partition.partition_id;
-                partition.delete().await.with_error_context(|error| {
-                        format!("{COMPONENT} (error: {error}) - failed to delete partition in stream: {self}, partition: {partition_id}")
-                    })?;
-            }
-        }
-        let event = ShardEvent::DeletedShardTableRecords { namespaces };
-        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
-        topic.delete().await.with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to delete topic in stream: {self}")
-        })?;
+        drop(topic);
+        // TODO: Remove all the files and directories.
 
         shard
             .state
             .apply(session.get_user_id(), &EntryCommand::DeleteTopic(self))
             .await
             .with_error_context(|error| format!(
-                "{COMPONENT} (error: {error}) - failed to apply delete topic with ID: {numeric_topic_id} in stream with ID: {numeric_stream_id}, session: {session}",
+                "{COMPONENT} (error: {error}) - failed to apply delete topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
             ))?;
         sender.send_empty_ok_response().await?;
         Ok(())

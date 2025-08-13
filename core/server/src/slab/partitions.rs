@@ -100,18 +100,18 @@ impl<'a> From<&'a Partitions> for PartitionRef<'a> {
 impl EntityComponentSystem<Borrow> for Partitions {
     type Idx = ContainerId;
     type Entity = Partition;
-    type EntityRef<'a> = PartitionRef<'a>;
+    type EntityComponents<'a> = PartitionRef<'a>;
 
-    fn with<O, F>(&self, f: F) -> O
+    fn with_components<O, F>(&self, f: F) -> O
     where
-        F: for<'a> FnOnce(Self::EntityRef<'a>) -> O,
+        F: for<'a> FnOnce(Self::EntityComponents<'a>) -> O,
     {
         f(self.into())
     }
 
-    async fn with_async<O, F>(&self, f: F) -> O
+    async fn with_components_async<O, F>(&self, f: F) -> O
     where
-        F: for<'a> AsyncFnOnce(Self::EntityRef<'a>) -> O,
+        F: for<'a> AsyncFnOnce(Self::EntityComponents<'a>) -> O,
     {
         f(self.into()).await
     }
