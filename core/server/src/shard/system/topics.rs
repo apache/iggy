@@ -28,7 +28,6 @@ use crate::slab::traits_ext::{
     Delete, DeleteCell, EntityComponentSystem, EntityMarker, Insert, InsertCell,
 };
 use crate::state::system::StreamState;
-use crate::streaming::diagnostics::metrics::metrics;
 use crate::streaming::partitions::partition2;
 use crate::streaming::partitions::storage2::create_partition_file_hierarchy;
 use crate::streaming::session::Session;
@@ -142,9 +141,9 @@ impl IggyShard {
             replication_factor,
         )?;
 
-        metrics().increment_topics(1);
-        metrics().increment_partitions(partitions_count);
-        metrics().increment_segments(partitions_count);
+        self.metrics.increment_topics(1);
+        self.metrics.increment_partitions(partitions_count);
+        self.metrics.increment_segments(partitions_count);
         Ok(())
     }
 
@@ -302,9 +301,9 @@ impl IggyShard {
             format!("{COMPONENT} (error: {error}) - failed to persist topic: {topic}")
         })?;
 
-        metrics().increment_topics(1);
-        metrics().increment_partitions(partitions_count);
-        metrics().increment_segments(partitions_count);
+        self.metrics.increment_topics(1);
+        self.metrics.increment_partitions(partitions_count);
+        self.metrics.increment_segments(partitions_count);
 
         Ok((topic_id, partition_ids))
     }
@@ -691,10 +690,12 @@ impl IggyShard {
             .delete_topic(topic_id)
             .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to delete topic with ID: {topic_id} in stream with ID: {stream_id}"))?;
         drop(stream);
-        metrics().decrement_topics(1);
-        metrics().decrement_partitions(topic.get_partitions_count());
-        metrics().decrement_messages(topic.get_messages_count());
-        metrics().decrement_segments(topic.get_segments_count().await);
+        self.metrics.decrement_topics(1);
+        self.metrics
+            .decrement_partitions(topic.get_partitions_count());
+        self.metrics.decrement_messages(topic.get_messages_count());
+        self.metrics
+            .decrement_segments(topic.get_segments_count().await);
         self.client_manager
             .borrow_mut()
             .delete_consumer_groups_for_topic(stream_id_value, topic.topic_id);

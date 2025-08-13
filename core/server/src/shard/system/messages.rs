@@ -117,7 +117,7 @@ impl IggyShard {
             })
             .await?;
 
-        crate::streaming::diagnostics::metrics::metrics().increment_messages(messages_count as u64);
+        self.metrics.increment_messages(messages_count as u64);
         Ok(())
     }
 

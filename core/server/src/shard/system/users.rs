@@ -21,7 +21,6 @@ use crate::shard::IggyShard;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateUserWithId;
 use crate::state::system::UserState;
-use crate::streaming::diagnostics::metrics::metrics;
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::session::Session;
 use crate::streaming::users::user::User;
@@ -216,7 +215,7 @@ impl IggyShard {
             .borrow_mut()
             .init_permissions_for_user(user_id, permissions);
         self.users.borrow_mut().insert(user.id, user);
-        metrics().increment_users(1);
+        self.metrics.increment_users(1);
         Ok(user_id)
     }
 
@@ -270,7 +269,7 @@ impl IggyShard {
                     "{COMPONENT} (error: {error}) - failed to delete clients for user with ID: {existing_user_id}"
                 )
             })?;
-        metrics().decrement_users(1);
+        self.metrics.decrement_users(1);
         Ok(user)
     }
 

@@ -22,7 +22,6 @@ use crate::shard::namespace::IggyNamespace;
 use crate::slab::traits_ext::{
     DeleteCell, EntityComponentSystem, EntityMarker, Insert, InsertCell, IntoComponents,
 };
-use crate::streaming::diagnostics::metrics::metrics;
 use crate::streaming::partitions::partition;
 use crate::streaming::session::Session;
 use crate::streaming::stats::stats::StreamStats;
@@ -208,7 +207,7 @@ impl IggyShard {
         let id = stream.stream_id;
         self.streams_ids.borrow_mut().insert(name.to_owned(), id);
         self.streams.borrow_mut().insert(id, stream);
-        metrics().increment_streams(1);
+        self.metrics.increment_streams(1);
         Ok(id)
     }
 
@@ -275,7 +274,7 @@ impl IggyShard {
 
         self.streams_ids.borrow_mut().insert(name.to_owned(), id);
         self.streams.borrow_mut().insert(id, stream);
-        metrics().increment_streams(1);
+        self.metrics.increment_streams(1);
         Ok(Identifier::numeric(id)?)
     }
 
@@ -487,11 +486,12 @@ impl IggyShard {
         let stream = self.streams.borrow_mut().remove(&stream_id).unwrap();
         self.streams_ids.borrow_mut().remove(&stream_name);
 
-        metrics().decrement_streams(1);
-        metrics().decrement_topics(stream.get_topics_count());
-        metrics().decrement_partitions(stream.get_partitions_count());
-        metrics().decrement_messages(stream.get_messages_count());
-        metrics().decrement_segments(stream.get_segments_count());
+        self.metrics.decrement_streams(1);
+        self.metrics.decrement_topics(stream.get_topics_count());
+        self.metrics
+            .decrement_partitions(stream.get_partitions_count());
+        self.metrics.decrement_messages(stream.get_messages_count());
+        self.metrics.decrement_segments(stream.get_segments_count());
         let current_stream_id =
             CURRENT_STREAM_ID.with(|current_id| current_id.load(Ordering::SeqCst));
         if current_stream_id > stream_id {
@@ -517,11 +517,11 @@ impl IggyShard {
         let stream = self.streams2.delete(id);
         let stats = stream.stats();
 
-        metrics().decrement_streams(1);
-        metrics().decrement_topics(0); // TODO: stats doesn't have topic count
-        metrics().decrement_partitions(0); // TODO: stats doesn't have partition count
-        metrics().decrement_messages(stats.messages_count());
-        metrics().decrement_segments(stats.segments_count());
+        self.metrics.decrement_streams(1);
+        self.metrics.decrement_topics(0); // TODO: stats doesn't have topic count
+        self.metrics.decrement_partitions(0); // TODO: stats doesn't have partition count
+        self.metrics.decrement_messages(stats.messages_count());
+        self.metrics.decrement_segments(stats.segments_count());
 
         /*
         self.client_manager

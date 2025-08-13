@@ -52,6 +52,7 @@ use server::state::command::EntryCommand;
 use server::state::file::FileState;
 use server::state::models::CreateUserWithId;
 use server::state::system::SystemState;
+use server::streaming::diagnostics::metrics::Metrics;
 use server::streaming::storage::SystemStorage;
 use server::streaming::utils::MemoryPool;
 use server::versioning::SemanticVersion;
@@ -228,6 +229,8 @@ async fn main() -> Result<(), ServerError> {
         }
     }
 
+    let shared_metrics = Metrics::init();
+
     // TWELFTH DISCRETE LOADING STEP.
     info!("Starting {} shard(s)", shards_set.len());
     let (connections, shutdown_handles) = create_shard_connections(&shards_set);
@@ -241,6 +244,7 @@ async fn main() -> Result<(), ServerError> {
         let encryptor = encryptor.clone();
         let archiver = archiver.clone();
         let init_state = init_state.clone();
+        let shared_metrics = shared_metrics.clone();
         let state_persister = resolve_persister(config.system.state.enforce_fsync);
         let state = StateKind::File(FileState::new(
             &config.system.get_state_messages_file_path(),
@@ -266,6 +270,7 @@ async fn main() -> Result<(), ServerError> {
                         .version(current_version)
                         .state(state)
                         .init_state(init_state)
+                        .metrics(shared_metrics)
                         .build();
                     let shard = Rc::new(shard);
 

@@ -50,7 +50,6 @@ use std::{
 use tracing::{error, info, instrument, warn};
 use transmission::connector::{Receiver, ShardConnector, StopReceiver, StopSender};
 
-use crate::streaming::diagnostics::metrics::metrics;
 use crate::{
     archiver::ArchiverKind,
     configs::server::ServerConfig,
@@ -161,7 +160,7 @@ pub struct IggyShard {
     pub(crate) active_sessions: RefCell<Vec<Rc<Session>>>,
     pub(crate) permissioner: RefCell<Permissioner>,
     pub(crate) users: RefCell<HashMap<UserId, User>>,
-
+    pub(crate) metrics: Arc<Metrics>,
     pub messages_receiver: Cell<Option<Receiver<ShardFrame>>>,
     pub(crate) stop_receiver: StopReceiver,
     pub(crate) stop_sender: StopSender,
@@ -194,9 +193,6 @@ impl IggyShard {
 
         let (stop_sender, stop_receiver) = async_channel::unbounded();
 
-        // Initialize metrics
-        crate::streaming::diagnostics::metrics::Metrics::init();
-
         let shard = Self {
             id: 0,
             shards: Vec::new(),
@@ -216,6 +212,7 @@ impl IggyShard {
             active_sessions: Default::default(),
             permissioner: Default::default(),
             users: Default::default(),
+            metrics: Metrics::init(),
             messages_receiver: Cell::new(None),
             stop_receiver,
             stop_sender,
@@ -337,7 +334,7 @@ impl IggyShard {
         self.permissioner
             .borrow_mut()
             .init(&users.values().collect::<Vec<_>>());
-        metrics().increment_users(users_count as u32);
+        self.metrics.increment_users(users_count as u32);
         shard_info!(self.id, "Initialized {} user(s).", users_count);
         Ok(())
     }
@@ -468,11 +465,12 @@ impl IggyShard {
                 continue;
             }
 
-            metrics().increment_streams(1);
-            metrics().increment_topics(stream.get_topics_count());
-            metrics().increment_partitions(stream.get_partitions_count());
-            metrics().increment_segments(stream.get_segments_count());
-            metrics().increment_messages(stream.get_messages_count());
+            self.metrics.increment_streams(1);
+            self.metrics.increment_topics(stream.get_topics_count());
+            self.metrics
+                .increment_partitions(stream.get_partitions_count());
+            self.metrics.increment_segments(stream.get_segments_count());
+            self.metrics.increment_messages(stream.get_messages_count());
 
             self.streams_ids
                 .borrow_mut()
@@ -620,8 +618,8 @@ impl IggyShard {
                                                                                                         )
                                                                                                     })?;
                 topic.reassign_consumer_groups();
-                metrics().increment_partitions(partitions_count);
-                metrics().increment_segments(partitions_count);
+                self.metrics.increment_partitions(partitions_count);
+                self.metrics.increment_segments(partitions_count);
                 Ok(())
             }
             ShardEvent::DeletedPartitions2 {
@@ -676,9 +674,9 @@ impl IggyShard {
                     })?;
                 topic.reassign_consumer_groups();
                 if partitions.len() > 0 {
-                    metrics().decrement_partitions(partitions_count as u32);
-                    metrics().decrement_segments(segments_count);
-                    metrics().decrement_messages(messages_count);
+                    self.metrics.decrement_partitions(partitions_count as u32);
+                    self.metrics.decrement_segments(segments_count);
+                    self.metrics.decrement_messages(messages_count);
                 }
                 Ok(())
             }

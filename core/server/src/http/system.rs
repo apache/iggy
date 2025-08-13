@@ -59,9 +59,8 @@ pub fn router(state: Arc<AppState>, metrics_config: &HttpMetricsConfig) -> Route
 }
 
 #[debug_handler]
-async fn get_metrics(State(_state): State<Arc<AppState>>) -> Result<String, CustomError> {
-    let metrics_formatted_output =
-        crate::streaming::diagnostics::metrics::metrics().get_formatted_output();
+async fn get_metrics(State(state): State<Arc<AppState>>) -> Result<String, CustomError> {
+    let metrics_formatted_output = state.shard.shard().metrics.get_formatted_output();
     Ok(metrics_formatted_output)
 }
 

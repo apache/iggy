@@ -17,7 +17,6 @@ use crate::shard::IggyShard;
  * under the License.
  */
 use super::COMPONENT;
-use crate::streaming::diagnostics::metrics::metrics;
 use crate::streaming::session::Session;
 use error_set::ErrContext;
 use iggy_common::Identifier;
@@ -123,8 +122,8 @@ impl IggyShard {
             })?;
         topic.reassign_consumer_groups();
 
-        metrics().decrement_segments(deleted_segments_count);
-        metrics().decrement_messages(deleted_messages_count);
+        self.metrics.decrement_segments(deleted_segments_count);
+        self.metrics.decrement_messages(deleted_messages_count);
         Ok(())
     }
 }
