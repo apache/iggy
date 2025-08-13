@@ -16,17 +16,30 @@
 // under the License.
 
 using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Kinds;
 
 namespace Apache.Iggy.IggyClient;
 
 public interface IIggyConsumer
 {
     Task<PolledMessages> FetchMessagesAsync(MessageFetchRequest request, Func<byte[], byte[]>? decryptor = null,
-        CancellationToken token = default);
+        CancellationToken token = default) => FetchMessagesAsync(request.StreamId, request.TopicId, request.PartitionId, request.Consumer, request.PollingStrategy,
+        request.Count, request.AutoCommit, decryptor, token);
+
+    Task<PolledMessages> FetchMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId, Consumer consumer, PollingStrategy pollingStrategy, 
+        int count, bool autoCommit, Func<byte[], byte[]>? decryptor = null, CancellationToken token = default);
+    
     Task<PolledMessages<TMessage>> FetchMessagesAsync<TMessage>(MessageFetchRequest request,
         Func<byte[], TMessage> deserializer, Func<byte[], byte[]>? decryptor = null, CancellationToken token = default);
+
     IAsyncEnumerable<MessageResponse<TMessage>> PollMessagesAsync<TMessage>(PollMessagesRequest request,
-        Func<byte[], TMessage> deserializer, Func<byte[], byte[]>? decryptor = null, 
+        Func<byte[], TMessage> deserializer, Func<byte[], byte[]>? decryptor = null,
         CancellationToken token = default);
+    //     => PollMessagesAsync(request.StreamId, request.TopicId, request.PartitionId, request.Consumer,
+    //     request.PollingStrategy, request.Count, deserializer, decryptor, token);
+    //
+    // IAsyncEnumerable<MessageResponse<TMessage>> PollMessagesAsync<TMessage>(Identifier streamId, Identifier topicId, 
+    //     uint? partitionId, Consumer consumer, PollingStrategy pollingStrategy, int count, Func<byte[], TMessage> deserializer, 
+    //     Func<byte[], byte[]>? decryptor = null, CancellationToken token = default);
 
 }

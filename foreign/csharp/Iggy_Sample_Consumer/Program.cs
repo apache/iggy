@@ -63,18 +63,14 @@ var bus = MessageStreamFactory.CreateMessageStream(options =>
     };
 }, loggerFactory);
 
-var response = await bus.LoginUser(new LoginUserRequest
-{
-    Password = "iggy",
-    Username = "iggy",
-});
+var response = await bus.LoginUser("iggy", "iggy");
 
 Console.WriteLine("Using protocol : {0}", protocol.ToString());
-int streamIdVal = 1;
-int topicIdVal = 1;
+var streamIdVal = 1u;
+var topicIdVal = 1u;
 var streamId = Identifier.Numeric(streamIdVal);
 var topicId = Identifier.Numeric(topicIdVal);
-var partitionId = 3;
+var partitionId = (uint)3;
 var consumerId = 1;
 
 
@@ -181,7 +177,7 @@ void HandleMessage(MessageResponse<Envelope> messageResponse)
 }
 
 
-async Task ValidateSystem(Identifier streamId, Identifier topicId, int partitionId)
+async Task ValidateSystem(Identifier streamId, Identifier topicId, uint partitionId)
 {
     try
     {
@@ -204,23 +200,19 @@ async Task ValidateSystem(Identifier streamId, Identifier topicId, int partition
     catch
     {
         Console.WriteLine($"Creating stream with {streamId}");
-        
-        await bus.CreateStreamAsync(new StreamRequest
-        {
-            StreamId = streamIdVal,
-            Name = "Test Consumer Stream",
-        });
+
+        await bus.CreateStreamAsync("Test Consumer Stream", streamIdVal);
         
         Console.WriteLine($"Creating topic with {topicId}");
         
-        await bus.CreateTopicAsync(streamId, new TopicRequest(
+        await bus.CreateTopicAsync(streamId,
             topicId: topicIdVal,
             name: "Test Consumer Topic",
             compressionAlgorithm: CompressionAlgorithm.None,
             messageExpiry: 0,
             maxTopicSize: 1_000_000_000,
             replicationFactor: 3,
-            partitionsCount: 3));
+            partitionsCount: 3);
         
         var topicRes = await bus.GetTopicByIdAsync(streamId, topicId);
         

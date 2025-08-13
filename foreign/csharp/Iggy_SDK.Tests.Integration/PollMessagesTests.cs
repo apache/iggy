@@ -41,7 +41,7 @@ public class PollMessagesTests(Protocol protocol)
                            Count = 10,
                            PartitionId = 1,
                            PollingStrategy = PollingStrategy.Next(),
-                           StreamId = Identifier.Numeric(Fixture.StreamRequest.StreamId!.Value),
+                           StreamId = Identifier.Numeric(Fixture.StreamId),
                            TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value)
                        }, DummyMessage.DeserializeDummyMessage, token: token))
         {

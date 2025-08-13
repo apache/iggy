@@ -22,11 +22,7 @@ namespace Apache.Iggy.Contracts.Http;
 
 public sealed class StoreOffsetRequest
 {
-    [JsonIgnore]
-    public required Identifier StreamId { get; init; }
-    [JsonIgnore]
-    public required Identifier TopicId { get; init; }
     public required Consumer Consumer { get; init; }
-    public required int PartitionId { get; init; }
+    public required uint? PartitionId { get; init; }
     public required ulong Offset { get; init; }
 }

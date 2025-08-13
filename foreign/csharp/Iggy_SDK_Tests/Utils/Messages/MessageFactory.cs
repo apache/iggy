@@ -211,14 +211,14 @@ internal static class MessageFactory
             Count = Random.Shared.Next(1, 10),
             AutoCommit = true,
             Consumer = Consumer.New(1),
-            PartitionId = Random.Shared.Next(1, 10),
+            PartitionId = (uint)Random.Shared.Next(1, 10),
             PollingStrategy = PollingStrategy.Offset(69420),
             StreamId = Identifier.Numeric(Random.Shared.Next(1, 10)),
             TopicId = Identifier.Numeric(Random.Shared.Next(1, 10)),
         };
     }
     
-    internal static MessageFetchRequest CreateMessageFetchRequestConsumer(int count, int streamId, int topicId, int partitionId, int consumerId = 1)
+    internal static MessageFetchRequest CreateMessageFetchRequestConsumer(int count, int streamId, int topicId, uint partitionId, int consumerId = 1)
     {
         return new MessageFetchRequest
         {
@@ -232,7 +232,7 @@ internal static class MessageFactory
         };
     }
     
-    internal static MessageFetchRequest CreateMessageFetchRequestConsumerGroup(int count, int streamId, int topicId, int partitionId, int consumerGroupId)
+    internal static MessageFetchRequest CreateMessageFetchRequestConsumerGroup(int count, int streamId, int topicId, uint partitionId, int consumerGroupId)
     {
         return new MessageFetchRequest
         {

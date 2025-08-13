@@ -22,8 +22,6 @@ namespace Apache.Iggy.Contracts.Http.Auth;
 
 public sealed class UpdateUserRequest
 {
-    [JsonIgnore]
-    public required Identifier UserId { get; init; }
     public string? Username { get; init; }
     public UserStatus? UserStatus { get; init; }
 }

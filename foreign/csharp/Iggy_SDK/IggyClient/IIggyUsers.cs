@@ -16,6 +16,7 @@
 // under the License.
 
 using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Enums;
 
 namespace Apache.Iggy.IggyClient;
 
@@ -23,11 +24,11 @@ public interface IIggyUsers
 {
     public Task<UserResponse?> GetUser(Identifier userId, CancellationToken token = default);
     public Task<IReadOnlyList<UserResponse>> GetUsers(CancellationToken token = default);
-    public Task<UserResponse?> CreateUser(CreateUserRequest request, CancellationToken token = default);
+    public Task<UserResponse?> CreateUser(string userName, string password, UserStatus status, Permissions? permissions = null, CancellationToken token = default);
     public Task DeleteUser(Identifier userId, CancellationToken token = default);
-    public Task UpdateUser(UpdateUserRequest request, CancellationToken token = default);
-    public Task UpdatePermissions(UpdateUserPermissionsRequest request, CancellationToken token = default);
-    public Task ChangePassword(ChangePasswordRequest request, CancellationToken token = default);
-    public Task<AuthResponse?> LoginUser(LoginUserRequest request, CancellationToken token = default);
+    public Task UpdateUser(Identifier userId, string? userName = null, UserStatus? status = null, CancellationToken token = default);
+    public Task UpdatePermissions(Identifier userId, Permissions? permissions = null, CancellationToken token = default);
+    public Task ChangePassword(Identifier userId, string currentPassword, string newPassword, CancellationToken token = default);
+    public Task<AuthResponse?> LoginUser(string userName, string password, CancellationToken token = default);
     public Task LogoutUser(CancellationToken token = default);
 }

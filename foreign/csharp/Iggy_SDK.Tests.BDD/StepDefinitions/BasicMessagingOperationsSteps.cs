@@ -59,11 +59,7 @@ public class BasicMessagingOperationsSteps
     [Given(@"I am authenticated as the root user")]
     public async Task GivenIAmAuthenticatedAsTheRootUser()
     {
-        var loginResult = await _context.IggyClient.LoginUser(new LoginUserRequest()
-        {
-            Username = "iggy",
-            Password = "iggy"
-        });
+        var loginResult = await _context.IggyClient.LoginUser("iggy", "iggy");
 
         loginResult.ShouldNotBeNull();
         loginResult.UserId.ShouldBe(1);
@@ -79,51 +75,46 @@ public class BasicMessagingOperationsSteps
     }
 
     [When(@"I create a stream with ID (\d+) and name (.*)")]
-    public async Task WhenICreateAStreamWithIdAndName(int streamId, string streamName)
+    public async Task WhenICreateAStreamWithIdAndName(uint streamId, string streamName)
     {
-        _context.CreatedStream = await _context.IggyClient.CreateStreamAsync(new StreamRequest()
-        {
-            Name = streamName,
-            StreamId = streamId
-        });
+        _context.CreatedStream = await _context.IggyClient.CreateStreamAsync(streamName, streamId);
     }
 
     [Then(@"the stream should be created successfully")]
     public void ThenTheStreamShouldBeCreatedSuccessfully()
     {
         _context.CreatedStream.ShouldNotBeNull();
-        _context.CreatedStream.Id.ShouldNotBe(0);
+        _context.CreatedStream.Id.ShouldNotBe(0u);
         _context.CreatedStream.Name.ShouldNotBeNullOrEmpty();
     }
 
     [Then(@"the stream should have ID (\d+) and name (.*)")]
-    public void ThenTheStreamShouldHaveIdAndName(int expectedId, string expectedName)
+    public void ThenTheStreamShouldHaveIdAndName(uint expectedId, string expectedName)
     {
         _context.CreatedStream!.Id.ShouldBe(expectedId);
         _context.CreatedStream!.Name.ShouldBe(expectedName);
     }
 
     [When(@"I create a topic with ID (\d+) and name (.*) in stream (\d+) with (\d+) partitions")]
-    public async Task WhenICreateATopicWithIdAndNameInStreamWithPartitions(int topicId, string topicName, int streamId, int partitions)
+    public async Task WhenICreateATopicWithIdAndNameInStreamWithPartitions(uint topicId, string topicName, uint streamId, uint partitions)
     {
-        _context.CreatedTopic = await _context.IggyClient.CreateTopicAsync(Identifier.Numeric(streamId), new TopicRequest()
-        {
-            TopicId = topicId,
-            Name = topicName,
-            PartitionsCount = partitions
-        });
+        _context.CreatedTopic = await _context.IggyClient.CreateTopicAsync(Identifier.Numeric(streamId), 
+            topicId: topicId,
+            name: topicName,
+            partitionsCount: partitions
+        );
     }
 
     [Then(@"the topic should be created successfully")]
     public void ThenTheTopicShouldBeCreatedSuccessfully()
     {
         _context.CreatedTopic.ShouldNotBeNull();
-        _context.CreatedTopic!.Id.ShouldNotBe(0);
+        _context.CreatedTopic!.Id.ShouldNotBe(0u);
         _context.CreatedTopic.Name.ShouldNotBeNullOrEmpty();
     }
 
     [Then(@"the topic should have ID (\d+) and name (.*)")]
-    public void ThenTheTopicShouldHaveIdAndName(int expectedId, string expectedName)
+    public void ThenTheTopicShouldHaveIdAndName(uint expectedId, string expectedName)
     {
         _context.CreatedTopic!.Id.ShouldBe(expectedId);
         _context.CreatedTopic!.Name.ShouldBe(expectedName);
@@ -131,9 +122,9 @@ public class BasicMessagingOperationsSteps
     }
 
     [Then(@"the topic should have (.*) partitions")]
-    public void ThenTheTopicShouldHavePartitions(int expectedPartitions)
+    public void ThenTheTopicShouldHavePartitions(uint expectedPartitions)
     {
-        _context.CreatedTopic!.Partitions!.Count().ShouldBe(expectedPartitions);
+        _context.CreatedTopic!.Partitions!.Count().ShouldBe((int)expectedPartitions);
         _context.CreatedTopic.PartitionsCount.ShouldBe(expectedPartitions);
     }
 
@@ -162,7 +153,7 @@ public class BasicMessagingOperationsSteps
     }
 
     [When(@"I poll messages from stream (\d+), topic (\d+), partition (\d+) starting from offset (\d+)")]
-    public async Task WhenIPollMessagesFromStreamTopicPartitionStartingFromOffset(int streamId, int topicId, int partitionId, ulong startOffset)
+    public async Task WhenIPollMessagesFromStreamTopicPartitionStartingFromOffset(int streamId, int topicId, uint partitionId, ulong startOffset)
     {
         var messages = await _context.IggyClient.FetchMessagesAsync(new MessageFetchRequest()
         {

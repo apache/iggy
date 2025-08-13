@@ -23,7 +23,7 @@ namespace Apache.Iggy.Contracts.Http;
 //[JsonConverter(typeof(TopicResponseConverter))]
 public sealed class TopicResponse
 {
-    public required int Id { get; init; }
+    public required uint Id { get; init; }
     public required DateTimeOffset CreatedAt { get; init; }
     public required string Name { get; init; }
     public CompressionAlgorithm CompressionAlgorithm { get; set; } 
@@ -31,7 +31,7 @@ public sealed class TopicResponse
     public ulong MessageExpiry { get; init; }
     public required ulong MaxTopicSize { get; init; }
     public required ulong MessagesCount { get; init; }
-    public required int PartitionsCount { get; init; }
-    public required byte ReplicationFactor { get; init; }
+    public required uint PartitionsCount { get; init; }
+    public required byte? ReplicationFactor { get; init; }
     public IEnumerable<PartitionContract>? Partitions { get; init; }
 }

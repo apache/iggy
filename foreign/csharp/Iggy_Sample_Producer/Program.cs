@@ -59,77 +59,19 @@ var bus = MessageStreamFactory.CreateMessageStream(options =>
 
 try
 {
-    var response = await bus.LoginUser(new LoginUserRequest
-    {
-        Password = "iggy",
-        Username = "iggy",
-    });
+    var response = await bus.LoginUser("iggy", "iggy");
 }
 catch
 {
-    await bus.CreateUser(new CreateUserRequest
-    {
-        Username = "pa55w0rD!@",
-        Password = "test_user",
-        Status = UserStatus.Active,
-        /*
-        Permissions = new Permissions
-        {
-            Global = new GlobalPermissions
-            {
-                ManageServers = true,
-                ManageUsers = true,
-                ManageStreams = true,
-                ManageTopics = true,
-                PollMessages = true,
-                ReadServers = true,
-                ReadStreams = true,
-                ReadTopics = true,
-                ReadUsers = true,
-                SendMessages = true
-            },
-            Streams = new Dictionary<int, StreamPermissions>
-            {
-                {
-                    streamId, new StreamPermissions
-                    {
-                        ManageStream = true,
-                        ReadStream = true,
-                        SendMessages = true,
-                        PollMessages = true,
-                        ManageTopics = true,
-                        ReadTopics = true,
-                        Topics = new Dictionary<int, TopicPermissions>
-                        {
-                            {
-                                topicId, new TopicPermissions
-                                {
-                                    ManageTopic = true,
-                                    ReadTopic = true,
-                                    PollMessages = true,
-                                    SendMessages = true
-                                }
-                            }
-                        }
-                        
-                    }
-                }
-            }
-        }
-        */
-    });
+    await bus.CreateUser("test_user", "pa55w0rD!@", UserStatus.Active);
     
-    var response = await bus.LoginUser(new LoginUserRequest
-    {
-        Password = "iggy",
-        Username = "iggy",
-    });
+    var response = await bus.LoginUser("iggy","iggy");
 }
 
 Console.WriteLine("Using protocol : {0}", protocol.ToString());
 
-var streamIdVal = 1;
-var topicIdVal = 1;
+var streamIdVal = 1u;
+var topicIdVal = 1u;
 var streamId = Identifier.Numeric(streamIdVal);
 var topicId = Identifier.Numeric(topicIdVal);
 
@@ -143,21 +85,17 @@ try
 catch
 {
     Console.WriteLine($"Creating stream with id:{streamId}");
-    await bus.CreateStreamAsync(new StreamRequest
-    {
-        StreamId = streamIdVal,
-        Name = "producer-stream",
-    });
+    await bus.CreateStreamAsync("producer-stream", streamIdVal);
 
     Console.WriteLine($"Creating topic with id:{topicId}");
-    await bus.CreateTopicAsync(streamId, new TopicRequest(
+    await bus.CreateTopicAsync(streamId, 
         topicId: topicIdVal,
         name: "producer-topic",
         compressionAlgorithm: CompressionAlgorithm.None,
         messageExpiry: 0,
         maxTopicSize: 0,
         replicationFactor: 3,
-        partitionsCount: 3));
+        partitionsCount: 3);
 }
 
 var actualStream = await bus.GetStreamByIdAsync(streamId);

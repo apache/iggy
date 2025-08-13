@@ -72,7 +72,7 @@ public class SendMessagesTests(Protocol protocol)
         {
             Messages = _messagesWithoutHeaders,
             Partitioning = Partitioning.None(),
-            StreamId = Identifier.Numeric(Fixture.StreamRequest.StreamId!.Value),
+            StreamId = Identifier.Numeric(Fixture.StreamId),
             TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value)
         }));
     }
@@ -85,7 +85,7 @@ public class SendMessagesTests(Protocol protocol)
         {
             Messages = _messagesWithoutHeaders,
             Partitioning = Partitioning.None(),
-            StreamId = Identifier.Numeric(Fixture.StreamRequest.StreamId!.Value),
+            StreamId = Identifier.Numeric(Fixture.StreamId),
             TopicId = Identifier.Numeric(69)
         }));
     }
@@ -98,7 +98,7 @@ public class SendMessagesTests(Protocol protocol)
         {
             Messages = _messagesWithHeaders,
             Partitioning = Partitioning.None(),
-            StreamId = Identifier.Numeric(Fixture.StreamRequest.StreamId!.Value),
+            StreamId = Identifier.Numeric(Fixture.StreamId),
             TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value)
         }));
     }
@@ -111,7 +111,7 @@ public class SendMessagesTests(Protocol protocol)
         {
             Messages = _messagesWithHeaders,
             Partitioning = Partitioning.None(),
-            StreamId = Identifier.Numeric(Fixture.StreamRequest.StreamId!.Value),
+            StreamId = Identifier.Numeric(Fixture.StreamId),
             TopicId = Identifier.Numeric(69)
         }));
     }

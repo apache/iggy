@@ -24,7 +24,7 @@ using Shouldly;
 namespace Apache.Iggy.Tests.Integrations;
 
 [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-public class OffsetTests(Protocol protocol)
+public class  OffsetTests(Protocol protocol)
 {
     private const ulong SetOffset = 2;
 
@@ -34,27 +34,14 @@ public class OffsetTests(Protocol protocol)
     [Test]
     public async Task StoreOffset_IndividualConsumer_Should_StoreOffset_Successfully()
     {
-        await Fixture.Clients[protocol].StoreOffsetAsync(new StoreOffsetRequest
-        {
-            StreamId = Identifier.Numeric(1),
-            TopicId = Identifier.Numeric(1),
-            PartitionId = 1,
-            Offset = SetOffset,
-            Consumer = Consumer.New(1)
-        });
+        await Fixture.Clients[protocol].StoreOffsetAsync(Consumer.New(1), Identifier.Numeric(1), Identifier.Numeric(1), SetOffset, 1);
     }
 
     [Test]
     [DependsOn(nameof(StoreOffset_IndividualConsumer_Should_StoreOffset_Successfully))]
     public async Task GetOffset_IndividualConsumer_Should_GetOffset_Successfully()
     {
-        var offset = await Fixture.Clients[protocol].GetOffsetAsync(new OffsetRequest
-        {
-            Consumer = Consumer.New(1),
-            StreamId = Identifier.Numeric(1),
-            TopicId = Identifier.Numeric(1),
-            PartitionId = 1
-        });
+        var offset = await Fixture.Clients[protocol].GetOffsetAsync(Consumer.New(1), Identifier.Numeric(1), Identifier.Numeric(1), 1);
 
         offset.ShouldNotBeNull();
         offset.StoredOffset.ShouldBe(SetOffset);
@@ -66,35 +53,16 @@ public class OffsetTests(Protocol protocol)
     [DependsOn(nameof(GetOffset_IndividualConsumer_Should_GetOffset_Successfully))]
     public async Task StoreOffset_ConsumerGroup_Should_StoreOffset_Successfully()
     {
-        await Fixture.Clients[protocol].CreateConsumerGroupAsync(new CreateConsumerGroupRequest
-        {
-            Name = "test_consumer_group",
-            StreamId = Identifier.Numeric(1),
-            TopicId = Identifier.Numeric(1),
-            ConsumerGroupId = 1
-        });
+        await Fixture.Clients[protocol].CreateConsumerGroupAsync(Identifier.Numeric(1), Identifier.Numeric(1), "test_consumer_group", 1);
 
-        await Fixture.Clients[protocol].StoreOffsetAsync(new StoreOffsetRequest
-        {
-            StreamId = Identifier.Numeric(1),
-            TopicId = Identifier.Numeric(1),
-            PartitionId = 1,
-            Offset = SetOffset,
-            Consumer = Consumer.Group(1)
-        });
+        await Fixture.Clients[protocol].StoreOffsetAsync(Consumer.Group(1), Identifier.Numeric(1), Identifier.Numeric(1), SetOffset, 1);
     }
 
     [Test]
     [DependsOn(nameof(StoreOffset_ConsumerGroup_Should_StoreOffset_Successfully))]
     public async Task GetOffset_ConsumerGroup_Should_GetOffset_Successfully()
     {
-        var offset = await Fixture.Clients[protocol].GetOffsetAsync(new OffsetRequest
-        {
-            Consumer = Consumer.Group(1),
-            StreamId = Identifier.Numeric(1),
-            TopicId = Identifier.Numeric(1),
-            PartitionId = 1
-        });
+        var offset = await Fixture.Clients[protocol].GetOffsetAsync(Consumer.Group(1), Identifier.Numeric(1), Identifier.Numeric(1), 1);
 
         offset.ShouldNotBeNull();
         offset.StoredOffset.ShouldBe(SetOffset);

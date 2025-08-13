@@ -29,15 +29,10 @@ namespace Apache.Iggy.Tests.Integrations;
 [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
 public class ConsumerGroupTests(Protocol protocol)
 {
-    private static readonly int GroupId = 1;
-
-    private readonly CreateConsumerGroupRequest _createConsumerGroupRequest = new()
-    {
-        StreamId = Identifier.Numeric(1),
-        TopicId = Identifier.Numeric(1),
-        ConsumerGroupId = GroupId,
-        Name = "test_consumer_group"
-    };
+    private static readonly uint GroupId = 1;
+    private static readonly Identifier StreamId = Identifier.Numeric(1);
+    private static readonly Identifier TopicId = Identifier.Numeric(1);
+    private static readonly string GroupName = "test_consumer_group";
 
     [ClassDataSource<ConsumerGroupFixture>(Shared = SharedType.PerClass)]
     public required ConsumerGroupFixture Fixture { get; init; }
@@ -45,34 +40,33 @@ public class ConsumerGroupTests(Protocol protocol)
     [Test]
     public async Task CreateConsumerGroup_HappyPath_Should_CreateConsumerGroup_Successfully()
     {
-        var consumerGroup = await Fixture.Clients[protocol].CreateConsumerGroupAsync(_createConsumerGroupRequest);
+        var consumerGroup = await Fixture.Clients[protocol].CreateConsumerGroupAsync(StreamId, TopicId, GroupName, GroupId);
 
         consumerGroup.ShouldNotBeNull();
-        consumerGroup.Id.ShouldBe(_createConsumerGroupRequest.ConsumerGroupId);
-        consumerGroup.PartitionsCount.ShouldBe(Fixture.TopicRequest.PartitionsCount);
-        consumerGroup.MembersCount.ShouldBe(0);
-        consumerGroup.Name.ShouldBe(_createConsumerGroupRequest.Name);
+        consumerGroup.Id.ShouldBe(GroupId);
+        consumerGroup.PartitionsCount.ShouldBe(Fixture.PartitionsCount);
+        consumerGroup.MembersCount.ShouldBe(0u);
+        consumerGroup.Name.ShouldBe(GroupName);
     }
 
     [Test]
     [DependsOn(nameof(CreateConsumerGroup_HappyPath_Should_CreateConsumerGroup_Successfully))]
     public async Task CreateConsumerGroup_Should_Throw_InvalidResponse()
     {
-        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].CreateConsumerGroupAsync(_createConsumerGroupRequest));
+        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].CreateConsumerGroupAsync(StreamId, TopicId, GroupName, GroupId));
     }
 
     [Test]
     [DependsOn(nameof(CreateConsumerGroup_Should_Throw_InvalidResponse))]
     public async Task GetConsumerGroupById_Should_Return_ValidResponse()
     {
-        var response = await Fixture.Clients[protocol].GetConsumerGroupByIdAsync(_createConsumerGroupRequest.StreamId,
-            _createConsumerGroupRequest.TopicId, Identifier.Numeric(1));
+        var response = await Fixture.Clients[protocol].GetConsumerGroupByIdAsync(StreamId, TopicId, Identifier.Numeric(GroupId));
 
         response.ShouldNotBeNull();
         response.Id.ShouldBe(GroupId);
-        response.Name.ShouldBe(_createConsumerGroupRequest.Name);
-        response.PartitionsCount.ShouldBe(Fixture.TopicRequest.PartitionsCount);
-        response.MembersCount.ShouldBe(0);
+        response.Name.ShouldBe(GroupName);
+        response.PartitionsCount.ShouldBe(Fixture.PartitionsCount);
+        response.MembersCount.ShouldBe(0u);
     }
 
     [Test]
@@ -80,7 +74,7 @@ public class ConsumerGroupTests(Protocol protocol)
     public async Task GetConsumerGroups_Should_Return_ValidResponse()
     {
         IReadOnlyList<ConsumerGroupResponse> response = await Fixture.Clients[protocol].GetConsumerGroupsAsync(
-            _createConsumerGroupRequest.StreamId, _createConsumerGroupRequest.TopicId);
+            StreamId, TopicId);
 
         response.ShouldNotBeNull();
         response.Count.ShouldBe(1);
@@ -88,9 +82,9 @@ public class ConsumerGroupTests(Protocol protocol)
         var group = response.FirstOrDefault();
         group.ShouldNotBeNull();
         group.Id.ShouldBe(GroupId);
-        group.Name.ShouldBe(_createConsumerGroupRequest.Name);
-        group.PartitionsCount.ShouldBe(Fixture.TopicRequest.PartitionsCount);
-        group.MembersCount.ShouldBe(0);
+        group.Name.ShouldBe(GroupName);
+        group.PartitionsCount.ShouldBe(Fixture.PartitionsCount);
+        group.MembersCount.ShouldBe(0u);
     }
 
     [Test]
@@ -98,12 +92,7 @@ public class ConsumerGroupTests(Protocol protocol)
     [DependsOn(nameof(GetConsumerGroups_Should_Return_ValidResponse))]
     public async Task JoinConsumerGroup_Tcp_Should_JoinConsumerGroup_Successfully()
     {
-        await Should.NotThrowAsync(() => Fixture.Clients[protocol].JoinConsumerGroupAsync(new JoinConsumerGroupRequest
-        {
-            TopicId = _createConsumerGroupRequest.TopicId,
-            StreamId = _createConsumerGroupRequest.StreamId,
-            ConsumerGroupId = Identifier.Numeric(GroupId)
-        }));
+        await Should.NotThrowAsync(() => Fixture.Clients[protocol].JoinConsumerGroupAsync(StreamId, TopicId, Identifier.Numeric(GroupId)));
     }
 
     [Test]
@@ -111,12 +100,7 @@ public class ConsumerGroupTests(Protocol protocol)
     [DependsOn(nameof(GetConsumerGroups_Should_Return_ValidResponse))]
     public async Task JoinConsumerGroup_Http_Should_Throw_FeatureUnavailable()
     {
-        await Should.ThrowAsync<FeatureUnavailableException>(() => Fixture.Clients[protocol].JoinConsumerGroupAsync(new JoinConsumerGroupRequest
-        {
-            TopicId = _createConsumerGroupRequest.TopicId,
-            StreamId = _createConsumerGroupRequest.StreamId,
-            ConsumerGroupId = Identifier.Numeric(GroupId)
-        }));
+        await Should.ThrowAsync<FeatureUnavailableException>(() => Fixture.Clients[protocol].JoinConsumerGroupAsync(StreamId, TopicId, Identifier.Numeric(GroupId)));
     }
 
     [Test]
@@ -124,12 +108,7 @@ public class ConsumerGroupTests(Protocol protocol)
     [DependsOn(nameof(JoinConsumerGroup_Tcp_Should_JoinConsumerGroup_Successfully))]
     public async Task LeaveConsumerGroup_Tcp_Should_LeaveConsumerGroup_Successfully()
     {
-        await Should.NotThrowAsync(() => Fixture.Clients[protocol].LeaveConsumerGroupAsync(new LeaveConsumerGroupRequest
-        {
-            TopicId = _createConsumerGroupRequest.TopicId,
-            StreamId = _createConsumerGroupRequest.StreamId,
-            ConsumerGroupId = Identifier.Numeric(GroupId)
-        }));
+        await Should.NotThrowAsync(() => Fixture.Clients[protocol].LeaveConsumerGroupAsync(StreamId, TopicId, Identifier.Numeric(GroupId)));
     }
 
     [Test]
@@ -137,12 +116,7 @@ public class ConsumerGroupTests(Protocol protocol)
     [DependsOn(nameof(JoinConsumerGroup_Http_Should_Throw_FeatureUnavailable))]
     public async Task LeaveConsumerGroup_Http_Should_Throw_FeatureUnavailable()
     {
-        await Should.ThrowAsync<FeatureUnavailableException>(() => Fixture.Clients[protocol].LeaveConsumerGroupAsync(new LeaveConsumerGroupRequest
-        {
-            TopicId = _createConsumerGroupRequest.TopicId,
-            StreamId = _createConsumerGroupRequest.StreamId,
-            ConsumerGroupId = Identifier.Numeric(GroupId)
-        }));
+        await Should.ThrowAsync<FeatureUnavailableException>(() => Fixture.Clients[protocol].LeaveConsumerGroupAsync(StreamId, TopicId, Identifier.Numeric(GroupId)));
     }
 
     [Test]
@@ -156,28 +130,18 @@ public class ConsumerGroupTests(Protocol protocol)
         {
             var client = Fixture.CreateClient(Protocol.Tcp, protocol);
             clients.Add(client);
-            await client.LoginUser(new LoginUserRequest
-            {
-                Username = "iggy",
-                Password = "iggy"
-            });
+            await client.LoginUser("iggy", "iggy");
             var me = await client.GetMeAsync();
             clientIds.Add(me!.ClientId);
-            await client.JoinConsumerGroupAsync(new JoinConsumerGroupRequest
-            {
-                ConsumerGroupId = Identifier.Numeric(_createConsumerGroupRequest.ConsumerGroupId),
-                StreamId = _createConsumerGroupRequest.StreamId,
-                TopicId = _createConsumerGroupRequest.TopicId
-            });
+            await client.JoinConsumerGroupAsync(StreamId, TopicId, Identifier.Numeric(GroupId));
         }
 
-        var response = await Fixture.Clients[protocol].GetConsumerGroupByIdAsync(_createConsumerGroupRequest.StreamId,
-            _createConsumerGroupRequest.TopicId, Identifier.Numeric(1));
+        var response = await Fixture.Clients[protocol].GetConsumerGroupByIdAsync(StreamId, TopicId, Identifier.Numeric(GroupId));
 
         response.ShouldNotBeNull();
         response.Id.ShouldBe(GroupId);
-        response.PartitionsCount.ShouldBe(Fixture.TopicRequest.PartitionsCount);
-        response.MembersCount.ShouldBe(2);
+        response.PartitionsCount.ShouldBe(Fixture.PartitionsCount);
+        response.MembersCount.ShouldBe(2u);
         response.Members.ShouldNotBeNull();
         response.Members.Count.ShouldBe(2);
         response.Members.ShouldAllBe(m => clientIds.Contains(m.Id));
@@ -189,12 +153,7 @@ public class ConsumerGroupTests(Protocol protocol)
     [DependsOn(nameof(GetConsumerGroupById_WithMembers_Should_Return_ValidResponse))]
     public async Task DeleteConsumerGroup_Should_DeleteConsumerGroup_Successfully()
     {
-        await Should.NotThrowAsync(() => Fixture.Clients[protocol].DeleteConsumerGroupAsync(new DeleteConsumerGroupRequest
-        {
-            TopicId = _createConsumerGroupRequest.TopicId,
-            StreamId = _createConsumerGroupRequest.StreamId,
-            ConsumerGroupId = Identifier.Numeric(GroupId)
-        }));
+        await Should.NotThrowAsync(() => Fixture.Clients[protocol].DeleteConsumerGroupAsync(StreamId, TopicId, Identifier.Numeric(GroupId)));
     }
 
     [Test]
@@ -202,12 +161,7 @@ public class ConsumerGroupTests(Protocol protocol)
     [DependsOn(nameof(DeleteConsumerGroup_Should_DeleteConsumerGroup_Successfully))]
     public async Task JoinConsumerGroup_Tcp_Should_Throw_InvalidResponse()
     {
-        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].JoinConsumerGroupAsync(new JoinConsumerGroupRequest
-        {
-            TopicId = _createConsumerGroupRequest.TopicId,
-            StreamId = _createConsumerGroupRequest.StreamId,
-            ConsumerGroupId = Identifier.Numeric(GroupId)
-        }));
+        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].JoinConsumerGroupAsync(StreamId, TopicId, Identifier.Numeric(GroupId)));
     }
 
 
@@ -215,11 +169,6 @@ public class ConsumerGroupTests(Protocol protocol)
     [DependsOn(nameof(JoinConsumerGroup_Tcp_Should_Throw_InvalidResponse))]
     public async Task DeleteConsumerGroup_Should_Throw_InvalidResponse()
     {
-        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].DeleteConsumerGroupAsync(new DeleteConsumerGroupRequest
-        {
-            TopicId = _createConsumerGroupRequest.TopicId,
-            StreamId = _createConsumerGroupRequest.StreamId,
-            ConsumerGroupId = Identifier.Numeric(GroupId)
-        }));
+        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].DeleteConsumerGroupAsync(StreamId, TopicId, Identifier.Numeric(GroupId)));
     }
 }

@@ -28,7 +28,7 @@ const int messagesCount = 1000;
 const int messagesBatch = 1000;
 const int messageSize = 1000;
 const int producerCount = 3;
-const int startingStreamId = 100;
+const uint startingStreamId = 100;
 const int topicId = 1;
 Dictionary<int, IIggyClient> clients = new();
 var loggerFactory = LoggerFactory.Create(builder =>
@@ -62,32 +62,24 @@ for (int i = 0; i < producerCount; i++)
 #endif
     }, loggerFactory);
 
-    await bus.LoginUser(new LoginUserRequest()
-    {
-        Username = "iggy",
-        Password = "iggy"
-    });
+    await bus.LoginUser("iggy", "iggy");
     clients[i] = bus;
 }
 
 try
 {
-    for (int i = 0; i < producerCount; i++)
+    for (uint i = 0; i < producerCount; i++)
     {
-        await clients[0].CreateStreamAsync(new StreamRequest
-        {
-            Name = $"Test bench stream_{i}",
-            StreamId = startingStreamId + i
-        });
+        await clients[0].CreateStreamAsync($"Test bench stream_{i}", startingStreamId + i);
         
-        await clients[0].CreateTopicAsync(Identifier.Numeric(startingStreamId + i), new TopicRequest(
+        await clients[0].CreateTopicAsync(Identifier.Numeric(startingStreamId + i), 
             topicId: topicId,
             name: $"Test bench topic_{i}",
             compressionAlgorithm: CompressionAlgorithm.None,
             messageExpiry: 0,
             maxTopicSize: 2_000_000_000,
             replicationFactor: 3,
-            partitionsCount: 1));
+            partitionsCount: 1);
     }
 }
 catch
@@ -100,7 +92,7 @@ List<Task> tasks = new();
 for (int i = 0; i < producerCount; i++)
 {
     tasks.Add(SendMessage.Create(clients[i], i, producerCount, messagesBatch, messagesCount, messageSize,
-        Identifier.Numeric(startingStreamId + i),
+        Identifier.Numeric(startingStreamId + (uint)i),
         Identifier.Numeric(topicId)));
 }
 
@@ -108,7 +100,7 @@ await Task.WhenAll(tasks);
 
 try
 {
-    for (int i = 0; i < producerCount; i++)
+    for (uint i = 0; i < producerCount; i++)
     {
         await clients[0].DeleteStreamAsync(Identifier.Numeric(startingStreamId + i));
     }

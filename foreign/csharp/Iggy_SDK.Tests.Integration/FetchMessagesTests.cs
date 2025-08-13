@@ -43,7 +43,7 @@ public class FetchMessagesTests(Protocol protocol)
             Consumer = Consumer.New(1),
             PartitionId = 1,
             PollingStrategy = PollingStrategy.Next(),
-            StreamId = Identifier.Numeric(Fixture.StreamRequest.StreamId!.Value),
+            StreamId = Identifier.Numeric(Fixture.StreamId),
             TopicId = Identifier.Numeric(Fixture.TopicDummyRequest.TopicId!.Value)
         }, DummyMessage.DeserializeDummyMessage);
 
@@ -75,7 +75,7 @@ public class FetchMessagesTests(Protocol protocol)
             Consumer = Consumer.New(1),
             PartitionId = 1,
             PollingStrategy = PollingStrategy.Next(),
-            StreamId = Identifier.Numeric(Fixture.StreamRequest.StreamId!.Value),
+            StreamId = Identifier.Numeric(Fixture.StreamId),
             TopicId = Identifier.Numeric(55)
         };
         await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].FetchMessagesAsync(invalidFetchRequest, DummyMessage.DeserializeDummyMessage));
@@ -92,7 +92,7 @@ public class FetchMessagesTests(Protocol protocol)
             Consumer = Consumer.New(1),
             PartitionId = 1,
             PollingStrategy = PollingStrategy.Next(),
-            StreamId = Identifier.Numeric(Fixture.StreamRequest.StreamId!.Value),
+            StreamId = Identifier.Numeric(Fixture.StreamId),
             TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value)
         });
 
@@ -119,7 +119,7 @@ public class FetchMessagesTests(Protocol protocol)
             Consumer = Consumer.New(1),
             PartitionId = 1,
             PollingStrategy = PollingStrategy.Next(),
-            StreamId = Identifier.Numeric(Fixture.StreamRequest.StreamId!.Value),
+            StreamId = Identifier.Numeric(Fixture.StreamId),
             TopicId = Identifier.Numeric(55)
         };
 
@@ -137,7 +137,7 @@ public class FetchMessagesTests(Protocol protocol)
             Consumer = Consumer.New(1),
             PartitionId = 1,
             PollingStrategy = PollingStrategy.Next(),
-            StreamId = Identifier.Numeric(Fixture.StreamRequest.StreamId!.Value),
+            StreamId = Identifier.Numeric(Fixture.StreamId),
             TopicId = Identifier.Numeric(Fixture.HeadersTopicRequest.TopicId!.Value)
         };
 
@@ -166,7 +166,7 @@ public class FetchMessagesTests(Protocol protocol)
             Consumer = Consumer.New(1),
             PartitionId = 1,
             PollingStrategy = PollingStrategy.Next(),
-            StreamId = Identifier.Numeric(Fixture.StreamRequest.StreamId!.Value),
+            StreamId = Identifier.Numeric(Fixture.StreamId),
             TopicId = Identifier.Numeric(Fixture.TopicDummyHeaderRequest.TopicId!.Value)
         };
 

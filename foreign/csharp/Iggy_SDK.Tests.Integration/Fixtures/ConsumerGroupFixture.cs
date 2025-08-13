@@ -22,8 +22,10 @@ namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 public class ConsumerGroupFixture : IggyServerFixture
 {
-    public readonly StreamRequest StreamRequest = StreamFactory.CreateStream();
-    public readonly TopicRequest TopicRequest = TopicFactory.CreateTopic(partitionsCount: 10);
+    public readonly uint StreamId = 1;
+    public readonly uint TopicId = 1;
+    public readonly string Name = "TestTopic";
+    public readonly uint PartitionsCount = 10;
 
     public override async Task InitializeAsync()
     {
@@ -31,8 +33,8 @@ public class ConsumerGroupFixture : IggyServerFixture
 
         foreach (var client in Clients.Values)
         {
-            await client.CreateStreamAsync(StreamRequest);
-            await client.CreateTopicAsync(Identifier.Numeric(StreamRequest.StreamId!.Value), TopicRequest);
+            await client.CreateStreamAsync("Test Stream", StreamId);
+            await client.CreateTopicAsync(Identifier.Numeric(StreamId), Name, PartitionsCount, topicId: TopicId);
         }
     }
 }

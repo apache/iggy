@@ -29,7 +29,7 @@ public sealed class StreamResponseConverter : JsonConverter<StreamResponse>
         using var doc = JsonDocument.ParseValue(ref reader);
         var root = doc.RootElement;
 
-        var id = root.GetProperty(nameof(StreamResponse.Id).ToSnakeCase()).GetInt32();
+        var id = root.GetProperty(nameof(StreamResponse.Id).ToSnakeCase()).GetUInt32();
         var createdAt = root.GetProperty(nameof(StreamResponse.CreatedAt).ToSnakeCase()).GetUInt64();
         var name = root.GetProperty(nameof(StreamResponse.Name).ToSnakeCase()).GetString();
         var sizeBytesString = root.GetProperty(nameof(StreamResponse.Size).ToSnakeCase()).GetString();

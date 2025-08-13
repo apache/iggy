@@ -34,7 +34,7 @@ public class FlushMessagesTests(Protocol protocol)
     {
         await Should.NotThrowAsync(() => Fixture.Clients[protocol].FlushUnsavedBufferAsync(new FlushUnsavedBufferRequest
         {
-            StreamId = Identifier.Numeric(Fixture.StreamRequest.StreamId!.Value),
+            StreamId = Identifier.Numeric(Fixture.StreamId),
             TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value),
             PartitionId = 1,
             Fsync = true
@@ -47,7 +47,7 @@ public class FlushMessagesTests(Protocol protocol)
     {
         await Should.NotThrowAsync(() => Fixture.Clients[protocol].FlushUnsavedBufferAsync(new FlushUnsavedBufferRequest
         {
-            StreamId = Identifier.Numeric(Fixture.StreamRequest.StreamId!.Value),
+            StreamId = Identifier.Numeric(Fixture.StreamId),
             TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value),
             PartitionId = 1,
             Fsync = false
@@ -60,7 +60,7 @@ public class FlushMessagesTests(Protocol protocol)
     {
         await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].FlushUnsavedBufferAsync(new FlushUnsavedBufferRequest
         {
-            StreamId = Identifier.Numeric(Fixture.StreamRequest.StreamId!.Value),
+            StreamId = Identifier.Numeric(Fixture.StreamId),
             TopicId = Identifier.Numeric(55),
             PartitionId = 1,
             Fsync = true

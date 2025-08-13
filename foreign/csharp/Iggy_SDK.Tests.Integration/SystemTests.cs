@@ -95,32 +95,13 @@ public class SystemTests(Protocol protocol)
     public async Task GetClient_WithConsumerGroup_Should_Return_CorrectClient()
     {
         var client = Fixture.CreateClient(Protocol.Tcp, protocol);
-        await client.LoginUser(new LoginUserRequest
-        {
-            Password = "iggy",
-            Username = "iggy"
-        });
-        await client.CreateStreamAsync(StreamFactory.CreateStream());
-        await client.CreateTopicAsync(Identifier.Numeric(1), new TopicRequest
-        {
-            Name = "test_topic",
-            PartitionsCount = 2
-        });
-        var consumerGroup = await client.CreateConsumerGroupAsync(new CreateConsumerGroupRequest
-        {
-            Name = "test_consumer_group",
-            StreamId = Identifier.Numeric(1),
-            TopicId = Identifier.Numeric(1),
-            ConsumerGroupId = 1
-        });
-        await client.JoinConsumerGroupAsync(new JoinConsumerGroupRequest
-        {
-            StreamId = Identifier.Numeric(1),
-            TopicId = Identifier.Numeric(1),
-            ConsumerGroupId = Identifier.Numeric(consumerGroup!.Id)
-        });
+        await client.LoginUser("iggy", "iggy");
+        await client.CreateStreamAsync("TestStream", 1);
+        await client.CreateTopicAsync(Identifier.Numeric(1), "test_topic", 2);
+        
+        var consumerGroup = await client.CreateConsumerGroupAsync(Identifier.Numeric(1), Identifier.Numeric(1), "test_consumer_group", 1); 
+        await client.JoinConsumerGroupAsync(Identifier.Numeric(1), Identifier.Numeric(1), Identifier.Numeric(1));
         var me = await client.GetMeAsync();
-
 
         var response = await Fixture.Clients[protocol].GetClientByIdAsync(me!.ClientId);
         response.ShouldNotBeNull();
@@ -129,7 +110,7 @@ public class SystemTests(Protocol protocol)
         response.Transport.ShouldBe("TCP");
         response.ConsumerGroupsCount.ShouldBe(1);
         response.ConsumerGroups.ShouldNotBeEmpty();
-        response.ConsumerGroups.ShouldContain(x => x.GroupId == consumerGroup.Id);
+        response.ConsumerGroups.ShouldContain(x => x.GroupId == consumerGroup!.Id);
         response.ConsumerGroups.ShouldContain(x => x.TopicId == 1);
         response.ConsumerGroups.ShouldContain(x => x.StreamId == 1);
     }

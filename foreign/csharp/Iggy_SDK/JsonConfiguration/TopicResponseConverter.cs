@@ -30,7 +30,7 @@ internal sealed class TopicResponseConverter : JsonConverter<TopicResponse>
     {
         using var doc = JsonDocument.ParseValue(ref reader);
         var root = doc.RootElement;
-        var id = root.GetProperty(nameof(TopicResponse.Id).ToSnakeCase()).GetInt32();
+        var id = root.GetProperty(nameof(TopicResponse.Id).ToSnakeCase()).GetUInt32();
         var createdAt = root.GetProperty(nameof(TopicResponse.CreatedAt).ToSnakeCase()).GetUInt64();
         var name = root.GetProperty(nameof(TopicResponse.Name).ToSnakeCase()).GetString();
         var compressionAlgorithm = Enum.Parse<CompressionAlgorithm>(root.GetProperty(nameof(TopicResponse.CompressionAlgorithm).ToSnakeCase()).GetString()!, true);
@@ -62,7 +62,7 @@ internal sealed class TopicResponseConverter : JsonConverter<TopicResponse>
             _ => throw new InvalidEnumArgumentException("Error Wrong JsonValueKind when deserializing MessageExpiry")
         };
         var messagesCount = root.GetProperty(nameof(TopicResponse.MessagesCount).ToSnakeCase()).GetUInt64();
-        var partitionsCount = root.GetProperty(nameof(TopicResponse.PartitionsCount).ToSnakeCase()).GetInt32();
+        var partitionsCount = root.GetProperty(nameof(TopicResponse.PartitionsCount).ToSnakeCase()).GetUInt32();
         root.TryGetProperty(nameof(TopicResponse.Partitions).ToSnakeCase(), out var partitionsProperty);
         var partitions = partitionsProperty.ValueKind switch
         {

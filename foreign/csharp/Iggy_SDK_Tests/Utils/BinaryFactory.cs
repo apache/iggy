@@ -58,12 +58,12 @@ internal sealed class BinaryFactory
         
         return payloadBuffer.ToArray();
     }
-    internal static byte[] CreateStreamPayload(int id, int topicsCount, string name, ulong sizeBytes, ulong messagesCount, ulong createdAt)
+    internal static byte[] CreateStreamPayload(uint id, int topicsCount, string name, ulong sizeBytes, ulong messagesCount, ulong createdAt)
     {
         var nameBytes = Encoding.UTF8.GetBytes(name);
         var totalSize = 4 + 4 + 8 + 8 + 1 + 8 + nameBytes.Length;
         var payload = new byte[totalSize];
-        BinaryPrimitives.WriteInt32LittleEndian(payload, id);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload, id);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(4), createdAt);
         BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(12), topicsCount);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(16), sizeBytes);
@@ -73,16 +73,16 @@ internal sealed class BinaryFactory
         return payload;
     }
     
-    internal static byte[] CreateTopicPayload(int id, int partitionsCount, int messageExpiry, string name,
+    internal static byte[] CreateTopicPayload(uint id, uint partitionsCount, uint messageExpiry, string name,
         ulong sizeBytes, ulong messagesCount, ulong createdAt, byte replicationFactor, ulong maxTopicSize, int compressionType)
     {
         var nameBytes = Encoding.UTF8.GetBytes(name);
         int totalSize = 4 + 8 + 4 + 8 + 1 + 8 + 8 + 8 + 1 + 1 + name.Length;     
 
         var payload = new byte[totalSize];
-        BinaryPrimitives.WriteInt32LittleEndian(payload, id);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload, id);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(4), createdAt);
-        BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(12), partitionsCount);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(12), partitionsCount);
         BinaryPrimitives.WriteInt64LittleEndian(payload.AsSpan(16), messageExpiry);
         payload[24] = (byte)compressionType;
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(25), maxTopicSize);
@@ -105,12 +105,12 @@ internal sealed class BinaryFactory
         return payload;
     }
 
-    internal static byte[] CreateGroupPayload(int id, int membersCount, int partitionsCount, string name, List<int>? partitionsOnMember = null)
+    internal static byte[] CreateGroupPayload(uint id, uint membersCount, uint partitionsCount, string name, List<int>? partitionsOnMember = null)
     {
         var payload = new byte[13 + name.Length + ((partitionsOnMember?.Count * 4) + 8 ?? 0)];
-        BinaryPrimitives.WriteInt32LittleEndian(payload, id);
-        BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(4), partitionsCount);
-        BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(8), membersCount);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload, id);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(4), partitionsCount);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(8), membersCount);
         payload[12] = (byte)name.Length;
         var nameBytes = Encoding.UTF8.GetBytes(name);
         nameBytes.CopyTo(payload.AsSpan(13 ));

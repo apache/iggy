@@ -23,7 +23,6 @@ namespace Apache.Iggy;
 
 public readonly struct Identifier : IEquatable<Identifier>
 {
-
     public required IdKind Kind { get; init; }
     public required int Length { get; init; }
     public required byte[] Value { get; init; }
@@ -32,6 +31,19 @@ public readonly struct Identifier : IEquatable<Identifier>
     {
         byte[] bytes = new byte[4];
         BinaryPrimitives.WriteInt32LittleEndian(bytes, value);
+
+        return new Identifier
+        {
+            Kind = IdKind.Numeric,
+            Length = 4,
+            Value = bytes
+        };
+    }
+    
+    public static Identifier Numeric(uint value)
+    {
+        byte[] bytes = new byte[4];
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes, value);
 
         return new Identifier
         {

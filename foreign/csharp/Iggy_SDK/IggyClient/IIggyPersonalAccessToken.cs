@@ -22,7 +22,7 @@ namespace Apache.Iggy.IggyClient;
 public interface IIggyPersonalAccessToken
 {
     public Task<IReadOnlyList<PersonalAccessTokenResponse>> GetPersonalAccessTokensAsync(CancellationToken token = default);
-    public Task<RawPersonalAccessToken?> CreatePersonalAccessTokenAsync(CreatePersonalAccessTokenRequest request, CancellationToken token = default);
-    public Task DeletePersonalAccessTokenAsync(DeletePersonalAccessTokenRequest request, CancellationToken token = default);
-    public Task<AuthResponse?> LoginWithPersonalAccessToken(LoginWithPersonalAccessToken request, CancellationToken token = default);
+    public Task<RawPersonalAccessToken?> CreatePersonalAccessTokenAsync(string name, ulong? expiry = 0, CancellationToken token = default);
+    public Task DeletePersonalAccessTokenAsync(string name, CancellationToken token = default);
+    public Task<AuthResponse?> LoginWithPersonalAccessToken(string token, CancellationToken ct = default);
 }

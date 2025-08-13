@@ -38,20 +38,11 @@ public class SystemFixture : IggyServerFixture
     {
         for (var i = 0; i < TotalClientsCount; i++)
         {
-            await Clients[Protocol.Http].CreateUser(new CreateUserRequest
-            {
-                Username = $"iggy{i}",
-                Password = "iggy",
-                Status = UserStatus.Active
-            });
+            await Clients[Protocol.Http].CreateUser($"iggy{i}", "iggy", UserStatus.Active);
 
             var client = CreateClient(Protocol.Tcp, Protocol.Http);
             AdditionalClients.Add(client);
-            var login = await client.LoginUser(new LoginUserRequest
-            {
-                Password = "iggy",
-                Username = $"iggy{i}"
-            });
+            var login = await client.LoginUser($"iggy{i}", "iggy");
 
             if (login!.UserId == 0)
             {
@@ -64,20 +55,11 @@ public class SystemFixture : IggyServerFixture
         // One client less for tcp due to a default client
         for (var i = 0; i < TotalClientsCount - 1; i++)
         {
-            await Clients[Protocol.Tcp].CreateUser(new CreateUserRequest
-            {
-                Username = $"iggy{i}",
-                Password = "iggy",
-                Status = UserStatus.Active
-            });
+            await Clients[Protocol.Tcp].CreateUser($"iggy{i}", "iggy", UserStatus.Active);
 
             var client = CreateClient(Protocol.Tcp, Protocol.Tcp);
             AdditionalClients.Add(client);
-            var login = await client.LoginUser(new LoginUserRequest
-            {
-                Password = "iggy",
-                Username = $"iggy{i}"
-            });
+            var login = await client.LoginUser($"iggy{i}", "iggy");
             if (login!.UserId == 0)
             {
                 throw new Exception("Failed to login user 'iggy'.");

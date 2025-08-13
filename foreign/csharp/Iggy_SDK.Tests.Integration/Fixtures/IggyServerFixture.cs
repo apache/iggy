@@ -88,11 +88,7 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     {
         var tcpClient = CreateClient(Protocol.Tcp);
 
-        await tcpClient.LoginUser(new LoginUserRequest
-        {
-            Password = "iggy",
-            Username = "iggy"
-        });
+        await tcpClient.LoginUser("iggy", "iggy");
 
         Clients[Protocol.Tcp] = tcpClient;
     }
@@ -101,11 +97,7 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     {
         var client = CreateClient(Protocol.Http);
 
-        await client.LoginUser(new LoginUserRequest
-        {
-            Password = "iggy",
-            Username = "iggy"
-        });
+        await client.LoginUser("iggy", "iggy");
 
         Clients[Protocol.Http] = client;
     }

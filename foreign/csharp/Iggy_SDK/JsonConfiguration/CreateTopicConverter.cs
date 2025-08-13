@@ -22,14 +22,14 @@ using Apache.Iggy.Extensions;
 
 namespace Apache.Iggy.JsonConfiguration;
 
-internal sealed class CreateTopicConverter : JsonConverter<TopicRequest>
+internal sealed class CreateTopicConverter : JsonConverter<CreateTopicRequest>
 {
-    public override TopicRequest? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    public override CreateTopicRequest? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
         throw new NotImplementedException();
     }
 
-    public override void Write(Utf8JsonWriter writer, TopicRequest value, JsonSerializerOptions options)
+    public override void Write(Utf8JsonWriter writer, CreateTopicRequest value, JsonSerializerOptions options)
     {
         writer.WriteStartObject();
         
@@ -45,7 +45,11 @@ internal sealed class CreateTopicConverter : JsonConverter<TopicRequest>
         writer.WriteNumber(nameof(value.MessageExpiry).ToSnakeCase(), (int)value.MessageExpiry);
         writer.WriteNumber(nameof(value.PartitionsCount).ToSnakeCase(), value.PartitionsCount);
         writer.WriteNumber(nameof(value.MaxTopicSize).ToSnakeCase(), value.MaxTopicSize);
-        writer.WriteNumber(nameof(value.ReplicationFactor).ToSnakeCase(), value.ReplicationFactor);
+        if (value.ReplicationFactor is not null)
+        {
+            writer.WriteNumber(nameof(value.ReplicationFactor).ToSnakeCase(), value.ReplicationFactor.Value);
+        }
+
         writer.WriteEndObject();
     }
 }

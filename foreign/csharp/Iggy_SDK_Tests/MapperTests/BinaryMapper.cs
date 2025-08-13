@@ -329,7 +329,7 @@ public sealed class BinaryMapper
     {
         // Arrange
         var (groupId, membersCount, partitionsCount, name) = ConsumerGroupFactory.CreateConsumerGroupResponseFields();
-        var memberPartitions = Enumerable.Range(0, partitionsCount).ToList();
+        var memberPartitions = Enumerable.Range(0, (int)partitionsCount).ToList();
         byte[] groupPayload = BinaryFactory.CreateGroupPayload(groupId, membersCount, partitionsCount, name, memberPartitions);
 
         // Act
@@ -340,7 +340,7 @@ public sealed class BinaryMapper
         Assert.Equal(groupId, response.Id);
         Assert.Equal(membersCount, response.MembersCount);
         Assert.Equal(partitionsCount, response.PartitionsCount);
-        Assert.Equal(memberPartitions.Count, partitionsCount);
+        Assert.Equal(memberPartitions.Count, (int)partitionsCount);
         Assert.NotNull(response.Members);
         Assert.Single(response.Members);
     }
