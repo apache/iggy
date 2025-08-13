@@ -20,6 +20,7 @@
 plugins {
     id("java-library")
     id("maven-publish")
+    id("signing")
     id("org.jreleaser") version ("1.14.0")
     id("checkstyle")
 }
@@ -34,6 +35,11 @@ repositories {
 java {
     withJavadocJar()
     withSourcesJar()
+}
+
+signing {
+    useGpgCmd()
+    sign(publishing.publications)
 }
 
 checkstyle {
