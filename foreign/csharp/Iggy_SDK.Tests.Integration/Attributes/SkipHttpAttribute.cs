@@ -21,7 +21,7 @@ namespace Apache.Iggy.Tests.Integrations.Attributes;
 
 internal class SkipHttpAttribute() : SkipAttribute("This test is skipped for HTTP protocol")
 {
-    public override Task<bool> ShouldSkip(BeforeTestContext context)
+    public override Task<bool> ShouldSkip(TestRegisteredContext context)
     {
         foreach (var argument in context.TestDetails.TestClassArguments)
         {

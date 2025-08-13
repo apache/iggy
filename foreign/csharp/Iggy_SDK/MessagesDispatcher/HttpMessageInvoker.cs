@@ -32,6 +32,7 @@ internal sealed class HttpMessageInvoker : IMessageInvoker
     {
         _client = client;
     }
+    
     public async Task SendMessagesAsync(MessageSendRequest request, CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(request, JsonConverterFactory.MessagesOptions);
@@ -43,6 +44,7 @@ internal sealed class HttpMessageInvoker : IMessageInvoker
             await HandleResponseAsync(response);
         }
     }
+    
     private static async Task HandleResponseAsync(HttpResponseMessage response)
     {
         if ((int)response.StatusCode > 300 && (int)response.StatusCode < 500)
