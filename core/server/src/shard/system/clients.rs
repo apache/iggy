@@ -19,6 +19,7 @@
 use super::COMPONENT;
 use crate::shard::IggyShard;
 use crate::streaming::clients::client_manager::{Client, Transport};
+use crate::streaming::diagnostics::metrics::metrics;
 use crate::streaming::session::Session;
 use error_set::ErrContext;
 use iggy_common::Identifier;
@@ -32,7 +33,7 @@ impl IggyShard {
     pub fn add_client(&self, address: &SocketAddr, transport: Transport) -> Rc<Session> {
         let mut client_manager = self.client_manager.borrow_mut();
         let session = client_manager.add_client(address, transport);
-        self.metrics.increment_clients(1);
+        metrics().increment_clients(1);
         session
     }
 
@@ -47,7 +48,7 @@ impl IggyShard {
                 return;
             }
 
-            self.metrics.decrement_clients(1);
+            metrics().decrement_clients(1);
             let client = client.unwrap();
             consumer_groups = client
                 .consumer_groups

@@ -20,7 +20,10 @@ use prometheus_client::encoding::text::encode;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::registry::Registry;
+use std::sync::OnceLock;
 use tracing::error;
+
+static METRICS: OnceLock<Metrics> = OnceLock::new();
 
 #[derive(Debug)]
 pub(crate) struct Metrics {
@@ -36,29 +39,37 @@ pub(crate) struct Metrics {
 }
 
 impl Metrics {
-    pub fn init() -> Self {
-        let mut metrics = Metrics {
-            registry: <Registry>::default(),
-            http_requests: Counter::default(),
-            streams: Gauge::default(),
-            topics: Gauge::default(),
-            partitions: Gauge::default(),
-            segments: Gauge::default(),
-            messages: Gauge::default(),
-            users: Gauge::default(),
-            clients: Gauge::default(),
-        };
+    pub fn init() -> &'static Self {
+        METRICS.get_or_init(|| {
+            let mut metrics = Metrics {
+                registry: <Registry>::default(),
+                http_requests: Counter::default(),
+                streams: Gauge::default(),
+                topics: Gauge::default(),
+                partitions: Gauge::default(),
+                segments: Gauge::default(),
+                messages: Gauge::default(),
+                users: Gauge::default(),
+                clients: Gauge::default(),
+            };
 
-        metrics.register_counter("http_requests", metrics.http_requests.clone());
-        metrics.register_gauge("streams", metrics.streams.clone());
-        metrics.register_gauge("topics", metrics.topics.clone());
-        metrics.register_gauge("partitions", metrics.partitions.clone());
-        metrics.register_gauge("segments", metrics.segments.clone());
-        metrics.register_gauge("messages", metrics.messages.clone());
-        metrics.register_gauge("users", metrics.users.clone());
-        metrics.register_gauge("clients", metrics.clients.clone());
+            metrics.register_counter("http_requests", metrics.http_requests.clone());
+            metrics.register_gauge("streams", metrics.streams.clone());
+            metrics.register_gauge("topics", metrics.topics.clone());
+            metrics.register_gauge("partitions", metrics.partitions.clone());
+            metrics.register_gauge("segments", metrics.segments.clone());
+            metrics.register_gauge("messages", metrics.messages.clone());
+            metrics.register_gauge("users", metrics.users.clone());
+            metrics.register_gauge("clients", metrics.clients.clone());
 
-        metrics
+            metrics
+        })
+    }
+
+    pub fn global() -> &'static Self {
+        METRICS
+            .get()
+            .expect("Metrics not initialized. Call Metrics::init() first.")
     }
 
     fn register_counter(&mut self, name: &str, counter: Counter) {
@@ -138,4 +149,8 @@ impl Metrics {
     pub fn decrement_clients(&self, count: u32) {
         self.clients.dec_by(count as i64);
     }
+}
+
+pub fn metrics() -> &'static Metrics {
+    Metrics::global()
 }

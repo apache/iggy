@@ -27,6 +27,7 @@ use crate::slab::traits_ext::EntityComponentSystem;
 use crate::slab::traits_ext::EntityMarker;
 use crate::slab::traits_ext::Insert;
 use crate::streaming::deduplication::message_deduplicator::MessageDeduplicator;
+use crate::streaming::diagnostics::metrics::metrics;
 use crate::streaming::partitions::partition::Partition;
 use crate::streaming::partitions::partition2;
 use crate::streaming::partitions::storage2::create_partition_file_hierarchy;
@@ -253,8 +254,8 @@ impl IggyShard {
         })?;
 
         topic.reassign_consumer_groups();
-        self.metrics.increment_partitions(partitions_count);
-        self.metrics.increment_segments(partitions_count);
+        metrics().increment_partitions(partitions_count);
+        metrics().increment_segments(partitions_count);
         Ok(partition_ids)
     }
 
@@ -400,9 +401,9 @@ impl IggyShard {
         })?;
         topic.reassign_consumer_groups();
         if partitions.len() > 0 {
-            self.metrics.decrement_partitions(partitions_count);
-            self.metrics.decrement_segments(segments_count);
-            self.metrics.decrement_messages(messages_count);
+            metrics().decrement_partitions(partitions_count);
+            metrics().decrement_segments(segments_count);
+            metrics().decrement_messages(messages_count);
         }
         Ok(partition_ids)
     }

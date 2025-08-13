@@ -27,10 +27,10 @@ use axum::{
 use std::sync::Arc;
 
 pub async fn metrics(
-    State(state): State<Arc<AppState>>,
+    State(_state): State<Arc<AppState>>,
     request: Request<Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    state.shard.shard().metrics.increment_http_requests();
+    crate::streaming::diagnostics::metrics::metrics().increment_http_requests();
     Ok(next.run(request).await)
 }

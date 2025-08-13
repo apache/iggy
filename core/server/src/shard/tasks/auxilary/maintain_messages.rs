@@ -1,3 +1,4 @@
+use crate::streaming::diagnostics::metrics::metrics;
 use crate::{
     archiver::ArchiverKind, map_toggle_str, shard::IggyShard, shard_debug, shard_error, shard_info,
     shard_trace, streaming::topics::topic::Topic,
@@ -98,12 +99,8 @@ pub async fn spawn_message_maintainance_task(shard: Rc<IggyShard>) -> Result<(),
                             topic.topic_id
                         );
 
-                        shard
-                            .metrics
-                            .decrement_segments(deleted_segments.segments_count);
-                        shard
-                            .metrics
-                            .decrement_messages(deleted_segments.messages_count);
+                        metrics().decrement_segments(deleted_segments.segments_count);
+                        metrics().decrement_messages(deleted_segments.messages_count);
                     }
             }
         }

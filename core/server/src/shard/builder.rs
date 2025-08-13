@@ -117,6 +117,9 @@ impl IggyShardBuilder {
         let shards = connections.into_iter().map(Shard::new).collect();
         let archiver = self.archiver.map(Rc::new);
         let storage = Rc::new(storage);
+
+        // Initialize metrics
+        crate::streaming::diagnostics::metrics::Metrics::init();
         IggyShard {
             id: id,
             shards: shards,
@@ -131,7 +134,6 @@ impl IggyShardBuilder {
             stop_receiver: stop_receiver,
             stop_sender: stop_sender,
             messages_receiver: Cell::new(Some(frame_receiver)),
-            metrics: Metrics::init(),
             task_registry: TaskRegistry::new(),
             is_shutting_down: AtomicBool::new(false),
             tcp_bound_address: Cell::new(None),
