@@ -21,7 +21,7 @@ use crate::streaming::partitions::partition::Partition;
 use crate::streaming::polling_consumer::PollingConsumer;
 use crate::streaming::segments::*;
 use error_set::ErrContext;
-use iggy_common::{IggyError, IggyTimestamp, Sizeable};
+use iggy_common::{IggyByteSize, IggyError, IggyTimestamp, Sizeable};
 use std::sync::atomic::Ordering;
 use tracing::trace;
 
@@ -275,13 +275,13 @@ impl Partition {
             self.current_offset = last_offset;
         }
 
-        self.unsaved_messages_count += batch_messages_count;
-        self.unsaved_messages_size += batch_messages_size;
+        let unsaved_messages_count = last_segment.unsaved_messages_count();
+        let unsaved_messages_size = IggyByteSize::from(last_segment.unsaved_messages_size() as u64);
 
         let unsaved_messages_count_exceeded =
-            self.unsaved_messages_count >= self.config.partition.messages_required_to_save;
+            unsaved_messages_count >= self.config.partition.messages_required_to_save;
         let unsaved_messages_size_exceeded =
-            self.unsaved_messages_size >= self.config.partition.size_of_messages_required_to_save;
+            unsaved_messages_size >= self.config.partition.size_of_messages_required_to_save;
 
         if unsaved_messages_count_exceeded
             || unsaved_messages_size_exceeded
@@ -294,13 +294,12 @@ impl Partition {
                 if unsaved_messages_count_exceeded {
                     format!(
                         "unsaved messages count exceeded: {}, max from config: {}",
-                        self.unsaved_messages_count,
-                        self.config.partition.messages_required_to_save
+                        unsaved_messages_count, self.config.partition.messages_required_to_save
                     )
                 } else if unsaved_messages_size_exceeded {
                     format!(
                         "unsaved messages size exceeded: {}, max from config: {}",
-                        self.unsaved_messages_size,
+                        unsaved_messages_size,
                         self.config.partition.size_of_messages_required_to_save
                     )
                 } else {
@@ -318,8 +317,6 @@ impl Partition {
                     self.partition_id, last_segment.start_offset()
                 )
             })?;
-            self.unsaved_messages_count = 0;
-            self.unsaved_messages_size = 0.into();
         }
 
         Ok(())
@@ -331,7 +328,8 @@ impl Partition {
 
     pub async fn flush_unsaved_buffer(&mut self, fsync: bool) -> Result<(), IggyError> {
         let _fsync = fsync;
-        if self.unsaved_messages_count == 0 {
+        let last_segment = self.segments.last().ok_or(IggyError::SegmentNotFound)?;
+        if last_segment.unsaved_messages_count() == 0 {
             return Ok(());
         }
 
@@ -349,8 +347,6 @@ impl Partition {
             )
         })?;
 
-        self.unsaved_messages_count = 0;
-        self.unsaved_messages_size = 0.into();
         Ok(())
     }
 }

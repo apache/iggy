@@ -50,7 +50,6 @@ impl Partition {
 
     pub async fn purge(&mut self) -> Result<(), IggyError> {
         self.current_offset = 0;
-        self.unsaved_messages_count = 0;
         self.should_increment_offset = false;
         self.consumer_offsets.clear();
         self.consumer_group_offsets.clear();

@@ -106,10 +106,12 @@ async fn should_persist_messages_and_then_load_them_from_disk() {
         .sum::<u32>();
     let batch = IggyMessagesBatchMut::from_messages(&messages, messages_size);
     partition.append_messages(batch).await.unwrap();
+    let last_segment = partition.get_segments().last().unwrap();
     assert_eq!(
-        partition.unsaved_messages_count, 0,
+        last_segment.unsaved_messages_count(),
+        0,
         "Expected unsaved messages count to be 0, but got {}",
-        partition.unsaved_messages_count
+        last_segment.unsaved_messages_count()
     );
 
     let now = IggyTimestamp::now();
