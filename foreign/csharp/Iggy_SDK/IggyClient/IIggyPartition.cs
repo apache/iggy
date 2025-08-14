@@ -19,6 +19,6 @@ namespace Apache.Iggy.IggyClient;
 
 public interface IIggyPartition
 {
-    public Task DeletePartitionsAsync(Identifier streamId, Identifier topicId, uint partitionsCount, CancellationToken token = default);
-    public Task CreatePartitionsAsync(Identifier streamId, Identifier topicId, uint partitionsCount, CancellationToken token = default);
+    Task DeletePartitionsAsync(Identifier streamId, Identifier topicId, uint partitionsCount, CancellationToken token = default);
+    Task CreatePartitionsAsync(Identifier streamId, Identifier topicId, uint partitionsCount, CancellationToken token = default);
 }

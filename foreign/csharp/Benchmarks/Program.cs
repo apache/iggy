@@ -17,8 +17,6 @@
 
 using Apache.Iggy;
 using Apache.Iggy.Benchmarks;
-using Apache.Iggy.Contracts.Http;
-using Apache.Iggy.Contracts.Http.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
 using Apache.Iggy.IggyClient;
@@ -38,7 +36,7 @@ var loggerFactory = LoggerFactory.Create(builder =>
         .AddConsole();
 });
 
-for (int i = 0; i < producerCount; i++)
+for (var i = 0; i < producerCount; i++)
 {
     var bus = MessageStreamFactory.CreateMessageStream(options =>
     {
@@ -51,11 +49,11 @@ for (int i = 0; i < producerCount; i++)
             x.Interval = TimeSpan.Zero;
         };
 #if OS_LINUX
-		options.ReceiveBufferSize = Int32.MaxValue;
-		options.SendBufferSize = Int32.MaxValue;
-#elif OS_WINDOWS
         options.ReceiveBufferSize = Int32.MaxValue;
         options.SendBufferSize = Int32.MaxValue;
+#elif OS_WINDOWS
+        options.ReceiveBufferSize = int.MaxValue;
+        options.SendBufferSize = int.MaxValue;
 #elif OS_MAC
 		options.ReceiveBufferSize = 7280*1024;
 		options.SendBufferSize = 7280*1024;
@@ -71,8 +69,8 @@ try
     for (uint i = 0; i < producerCount; i++)
     {
         await clients[0].CreateStreamAsync($"Test bench stream_{i}", startingStreamId + i);
-        
-        await clients[0].CreateTopicAsync(Identifier.Numeric(startingStreamId + i), 
+
+        await clients[0].CreateTopicAsync(Identifier.Numeric(startingStreamId + i),
             topicId: topicId,
             name: $"Test bench topic_{i}",
             compressionAlgorithm: CompressionAlgorithm.None,
@@ -89,7 +87,7 @@ catch
 
 List<Task> tasks = new();
 
-for (int i = 0; i < producerCount; i++)
+for (var i = 0; i < producerCount; i++)
 {
     tasks.Add(SendMessage.Create(clients[i], i, producerCount, messagesBatch, messagesCount, messageSize,
         Identifier.Numeric(startingStreamId + (uint)i),

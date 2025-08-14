@@ -1,4 +1,4 @@
-﻿// // Licensed to the Apache Software Foundation (ASF) under one
+// // Licensed to the Apache Software Foundation (ASF) under one
 // // or more contributor license agreements.  See the NOTICE file
 // // distributed with this work for additional information
 // // regarding copyright ownership.  The ASF licenses this file
@@ -15,7 +15,6 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
-using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Tests.Integrations.Fixtures;
@@ -24,7 +23,7 @@ using Shouldly;
 namespace Apache.Iggy.Tests.Integrations;
 
 [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-public class  OffsetTests(Protocol protocol)
+public class OffsetTests(Protocol protocol)
 {
     private const ulong SetOffset = 2;
 

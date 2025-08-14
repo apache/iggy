@@ -22,26 +22,28 @@ namespace Apache.Iggy.IggyClient;
 
 public interface IIggyConsumer
 {
-    Task<PolledMessages> FetchMessagesAsync(MessageFetchRequest request, Func<byte[], byte[]>? decryptor = null,
-        CancellationToken token = default)
+    Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId, Consumer consumer, PollingStrategy pollingStrategy,
+        int count, bool autoCommit, Func<byte[], byte[]>? decryptor = null, CancellationToken token = default)
     {
-        return FetchMessagesAsync(request.StreamId, request.TopicId, request.PartitionId, request.Consumer, request.PollingStrategy,
-            request.Count, request.AutoCommit, decryptor, token);
+        return PollMessagesAsync(new MessageFetchRequest
+        {
+            AutoCommit = autoCommit,
+            Consumer = consumer,
+            Count = count,
+            PartitionId = partitionId,
+            PollingStrategy = pollingStrategy,
+            StreamId = streamId,
+            TopicId = topicId
+        }, decryptor, token);
     }
 
-    Task<PolledMessages> FetchMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId, Consumer consumer, PollingStrategy pollingStrategy,
-        int count, bool autoCommit, Func<byte[], byte[]>? decryptor = null, CancellationToken token = default);
+    Task<PolledMessages> PollMessagesAsync(MessageFetchRequest request, Func<byte[], byte[]>? decryptor = null,
+        CancellationToken token = default);
 
-    Task<PolledMessages<TMessage>> FetchMessagesAsync<TMessage>(MessageFetchRequest request,
+    Task<PolledMessages<TMessage>> PollMessagesAsync<TMessage>(MessageFetchRequest request,
         Func<byte[], TMessage> deserializer, Func<byte[], byte[]>? decryptor = null, CancellationToken token = default);
 
     IAsyncEnumerable<MessageResponse<TMessage>> PollMessagesAsync<TMessage>(PollMessagesRequest request,
         Func<byte[], TMessage> deserializer, Func<byte[], byte[]>? decryptor = null,
         CancellationToken token = default);
-    //     => PollMessagesAsync(request.StreamId, request.TopicId, request.PartitionId, request.Consumer,
-    //     request.PollingStrategy, request.Count, deserializer, decryptor, token);
-    //
-    // IAsyncEnumerable<MessageResponse<TMessage>> PollMessagesAsync<TMessage>(Identifier streamId, Identifier topicId, 
-    //     uint? partitionId, Consumer consumer, PollingStrategy pollingStrategy, int count, Func<byte[], TMessage> deserializer, 
-    //     Func<byte[], byte[]>? decryptor = null, CancellationToken token = default);
 }

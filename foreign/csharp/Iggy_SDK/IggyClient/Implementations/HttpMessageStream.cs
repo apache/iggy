@@ -310,12 +310,11 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
-    public async Task<PolledMessages> FetchMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
-        Consumer consumer, PollingStrategy pollingStrategy, int count, bool autoCommit, Func<byte[], byte[]>? decryptor = null,
+    public async Task<PolledMessages> PollMessagesAsync(MessageFetchRequest request, Func<byte[], byte[]>? decryptor = null,
         CancellationToken token = default)
     {
-        var url = CreateUrl($"/streams/{streamId}/topics/{topicId}/messages?consumer_id={consumer.Id}" +
-                            $"&partition_id={partitionId}&kind={pollingStrategy.Kind}&value={pollingStrategy.Value}&count={count}&auto_commit={autoCommit}");
+        var url = CreateUrl($"/streams/{request.StreamId}/topics/{request.TopicId}/messages?consumer_id={request.Consumer.Id}" +
+                            $"&partition_id={request.PartitionId}&kind={request.PollingStrategy.Kind}&value={request.PollingStrategy.Value}&count={request.Count}&auto_commit={request.AutoCommit}");
 
         var response = await _httpClient.GetAsync(url, token);
         if (response.IsSuccessStatusCode)
@@ -328,7 +327,7 @@ public class HttpMessageStream : IIggyClient
         return PolledMessages.Empty;
     }
 
-    public async Task<PolledMessages<TMessage>> FetchMessagesAsync<TMessage>(MessageFetchRequest request,
+    public async Task<PolledMessages<TMessage>> PollMessagesAsync<TMessage>(MessageFetchRequest request,
         Func<byte[], TMessage> serializer, Func<byte[], byte[]>? decryptor = null,
         CancellationToken token = default)
     {
@@ -801,7 +800,7 @@ public class HttpMessageStream : IIggyClient
         {
             try
             {
-                PolledMessages<TMessage> fetchResponse = await FetchMessagesAsync(request, deserializer, decryptor, token);
+                PolledMessages<TMessage> fetchResponse = await PollMessagesAsync(request, deserializer, decryptor, token);
                 if (fetchResponse.Messages.Count == 0)
                 {
                     continue;

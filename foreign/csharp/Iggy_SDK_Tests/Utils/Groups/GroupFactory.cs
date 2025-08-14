@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Contracts.Http;
-
 namespace Apache.Iggy.Tests.Utils.Groups;
 
 internal static class ConsumerGroupFactory

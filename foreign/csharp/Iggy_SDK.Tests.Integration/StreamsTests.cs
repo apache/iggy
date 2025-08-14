@@ -1,4 +1,4 @@
-﻿// // Licensed to the Apache Software Foundation (ASF) under one
+// // Licensed to the Apache Software Foundation (ASF) under one
 // // or more contributor license agreements.  See the NOTICE file
 // // distributed with this work for additional information
 // // regarding copyright ownership.  The ASF licenses this file
@@ -31,7 +31,7 @@ public class StreamsTests(Protocol protocol)
 {
     private const string Name = "test-stream";
     private const uint StreamId = 1;
-    
+
 
     [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerClass)]
     public required IggyServerFixture Fixture { get; init; }
@@ -96,7 +96,7 @@ public class StreamsTests(Protocol protocol)
 
         await Fixture.Clients[protocol].CreateTopicAsync(Identifier.Numeric(StreamId), topicRequest1.Name,
             topicRequest1.PartitionsCount, messageExpiry: topicRequest1.MessageExpiry, topicId: topicRequest1.TopicId);
-        await Fixture.Clients[protocol].CreateTopicAsync(Identifier.Numeric(StreamId), topicRequest2.Name, 
+        await Fixture.Clients[protocol].CreateTopicAsync(Identifier.Numeric(StreamId), topicRequest2.Name,
             topicRequest2.PartitionsCount, messageExpiry: topicRequest2.MessageExpiry, topicId: topicRequest2.TopicId);
 
 
@@ -155,7 +155,7 @@ public class StreamsTests(Protocol protocol)
     [DependsOn(nameof(GetStreamById_WithTopics_Should_ReturnValidResponse))]
     public async Task UpdateStream_Should_UpdateStream_Successfully()
     {
-        await Fixture.Clients[protocol].UpdateStreamAsync(Identifier.Numeric(StreamId),"updated-test-stream");
+        await Fixture.Clients[protocol].UpdateStreamAsync(Identifier.Numeric(StreamId), "updated-test-stream");
 
         var result = await Fixture.Clients[protocol].GetStreamByIdAsync(Identifier.Numeric(StreamId!));
         result.ShouldNotBeNull();

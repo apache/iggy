@@ -345,7 +345,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await CheckResponseAsync(token);
     }
 
-    public async Task<PolledMessages<TMessage>> FetchMessagesAsync<TMessage>(MessageFetchRequest request,
+    public async Task<PolledMessages<TMessage>> PollMessagesAsync<TMessage>(MessageFetchRequest request,
         Func<byte[], TMessage> serializer, Func<byte[], byte[]>? decryptor = null, CancellationToken token = default)
     {
         await SendFetchMessagesRequestPayload(request.Consumer, request.StreamId, request.TopicId, request.PollingStrategy,
@@ -443,11 +443,12 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         }
     }
 
-    public async Task<PolledMessages> FetchMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
-        Consumer consumer, PollingStrategy pollingStrategy, int count, bool autoCommit, Func<byte[], byte[]>? decryptor = null,
+    public async Task<PolledMessages> PollMessagesAsync(MessageFetchRequest request, Func<byte[], byte[]>? decryptor = null,
         CancellationToken token = default)
     {
-        await SendFetchMessagesRequestPayload(consumer, streamId, topicId, pollingStrategy, count, autoCommit, partitionId, token);
+        await SendFetchMessagesRequestPayload(request.Consumer, request.StreamId, request.TopicId, request.PollingStrategy,
+            request.Count, request.AutoCommit, request.PartitionId, token);
+
         var buffer = ArrayPool<byte>.Shared.Rent(BufferSizes.ExpectedResponseSize);
         try
         {
@@ -966,7 +967,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         {
             try
             {
-                PolledMessages<TMessage> fetchResponse = await FetchMessagesAsync(request, deserializer, decryptor, token);
+                PolledMessages<TMessage> fetchResponse = await PollMessagesAsync(request, deserializer, decryptor, token);
                 if (fetchResponse.Messages.Count == 0)
                 {
                     continue;

@@ -24,12 +24,11 @@ namespace Apache.Iggy.Tests.UtilityTests;
 
 public sealed class HeaderValueTests
 {
-
     [Fact]
     public void Raw_ReturnsCorrectValue()
     {
-        byte[] data = new byte[] { 1, 2, 3 };
-        HeaderValue header = HeaderValue.FromBytes(data);
+        var data = new byte[] { 1, 2, 3 };
+        var header = HeaderValue.FromBytes(data);
 
         Assert.Equal(HeaderKind.Raw, header.Kind);
         Assert.Equal(data, header.Value);
@@ -45,8 +44,8 @@ public sealed class HeaderValueTests
     [Fact]
     public void String_ReturnsCorrectValue()
     {
-        string value = "TestString";
-        HeaderValue header = HeaderValue.FromString(value);
+        var value = "TestString";
+        var header = HeaderValue.FromString(value);
 
         Assert.Equal(HeaderKind.String, header.Kind);
         Assert.Equal(value, Encoding.UTF8.GetString(header.Value));
@@ -55,8 +54,8 @@ public sealed class HeaderValueTests
     [Fact]
     public void Bool_ReturnsCorrectValue()
     {
-        bool value = true;
-        HeaderValue header = HeaderValue.FromBool(value);
+        var value = true;
+        var header = HeaderValue.FromBool(value);
 
         Assert.Equal(HeaderKind.Bool, header.Kind);
         Assert.Equal(BitConverter.GetBytes(value), header.Value);
@@ -65,8 +64,8 @@ public sealed class HeaderValueTests
     [Fact]
     public void Int32_ReturnsCorrectValue()
     {
-        int value = 42;
-        HeaderValue header = HeaderValue.FromInt32(value);
+        var value = 42;
+        var header = HeaderValue.FromInt32(value);
 
         Assert.Equal(HeaderKind.Int32, header.Kind);
         Assert.Equal(value, BitConverter.ToInt32(header.Value));
@@ -75,8 +74,8 @@ public sealed class HeaderValueTests
     [Fact]
     public void Int64_ReturnsCorrectValue()
     {
-        long value = 1234567890L;
-        HeaderValue header = HeaderValue.FromInt64(value);
+        var value = 1234567890L;
+        var header = HeaderValue.FromInt64(value);
 
         Assert.Equal(HeaderKind.Int64, header.Kind);
         Assert.Equal(value, BitConverter.ToInt64(header.Value));
@@ -86,8 +85,8 @@ public sealed class HeaderValueTests
     public void Int128_ReturnsCorrectValue()
     {
         // You should provide a valid Int128 value here for testing.
-        Int128 value = new Int128(123, 456);
-        HeaderValue header = HeaderValue.FromInt128(value);
+        var value = new Int128(123, 456);
+        var header = HeaderValue.FromInt128(value);
 
         Assert.Equal(HeaderKind.Int128, header.Kind);
         Assert.Equal(value.GetBytesFromInt128(), header.Value);
@@ -96,15 +95,15 @@ public sealed class HeaderValueTests
     [Fact]
     public void Guid_ReturnsCorrectValue()
     {
-        Guid value = Guid.NewGuid();
-        HeaderValue header = HeaderValue.FromGuid(value);
+        var value = Guid.NewGuid();
+        var header = HeaderValue.FromGuid(value);
 
         Assert.Equal(HeaderKind.Uint128, header.Kind);
-        byte[] guidBytes = value.ToByteArray();
-        byte[] headerValueBytes = header.Value;
+        var guidBytes = value.ToByteArray();
+        var headerValueBytes = header.Value;
 
         Assert.Equal(guidBytes.Length, headerValueBytes.Length);
-        for (int i = 0; i < guidBytes.Length; i++)
+        for (var i = 0; i < guidBytes.Length; i++)
         {
             Assert.Equal(guidBytes[i], headerValueBytes[i]);
         }
@@ -113,8 +112,8 @@ public sealed class HeaderValueTests
     [Fact]
     public void UInt32_ReturnsCorrectValue()
     {
-        uint value = 12345U;
-        HeaderValue header = HeaderValue.FromUInt32(value);
+        var value = 12345U;
+        var header = HeaderValue.FromUInt32(value);
 
         Assert.Equal(HeaderKind.Uint32, header.Kind);
         Assert.Equal(value, BitConverter.ToUInt32(header.Value));
@@ -123,8 +122,8 @@ public sealed class HeaderValueTests
     [Fact]
     public void UInt64_ReturnsCorrectValue()
     {
-        ulong value = 9876543210UL;
-        HeaderValue header = HeaderValue.FromUInt64(value);
+        var value = 9876543210UL;
+        var header = HeaderValue.FromUInt64(value);
 
         Assert.Equal(HeaderKind.Uint64, header.Kind);
         Assert.Equal(value, BitConverter.ToUInt64(header.Value));
@@ -133,8 +132,8 @@ public sealed class HeaderValueTests
     [Fact]
     public void UInt128_ReturnsCorrectValue()
     {
-        UInt128 value = new UInt128(789, 101112);
-        HeaderValue header = HeaderValue.FromUInt128(value);
+        var value = new UInt128(789, 101112);
+        var header = HeaderValue.FromUInt128(value);
 
         Assert.Equal(HeaderKind.Uint128, header.Kind);
         Assert.Equal(value.GetBytesFromUInt128(), header.Value);
@@ -143,8 +142,8 @@ public sealed class HeaderValueTests
     [Fact]
     public void Float32_ReturnsCorrectValue()
     {
-        float value = 3.14f;
-        HeaderValue header = HeaderValue.FromFloat(value);
+        var value = 3.14f;
+        var header = HeaderValue.FromFloat(value);
 
         Assert.Equal(HeaderKind.Float, header.Kind);
         Assert.Equal(value, BitConverter.ToSingle(header.Value));
@@ -153,12 +152,13 @@ public sealed class HeaderValueTests
     [Fact]
     public void Float64_ReturnsCorrectValue()
     {
-        double value = 2.71828;
-        HeaderValue header = HeaderValue.FromDouble(value);
+        var value = 2.71828;
+        var header = HeaderValue.FromDouble(value);
 
         Assert.Equal(HeaderKind.Double, header.Kind);
         Assert.Equal(value, BitConverter.ToDouble(header.Value));
     }
+
     [Fact]
     public void ToBytes_ValidKind_ReturnsValue()
     {
@@ -237,6 +237,7 @@ public sealed class HeaderValueTests
         // Act and Assert
         Assert.Throws<InvalidOperationException>(() => headerValue.ToBool());
     }
+
     [Fact]
     public void ToInt32_ValidKind_ReturnsValue()
     {
@@ -306,7 +307,8 @@ public sealed class HeaderValueTests
         // Act and Assert
         Assert.Throws<InvalidOperationException>(() => headerValue.ToInt64());
     }
-     [Fact]
+
+    [Fact]
     public void ToUInt32_ValidKind_ReturnsValue()
     {
         // Arrange
@@ -345,7 +347,7 @@ public sealed class HeaderValueTests
     public void ToUInt64_ValidKind_ReturnsValue()
     {
         // Arrange
-        ulong ulongValue = 9876543210UL;
+        var ulongValue = 9876543210UL;
         var bytes = new byte[8];
         BinaryPrimitives.WriteUInt64LittleEndian(bytes, ulongValue);
 
@@ -380,7 +382,7 @@ public sealed class HeaderValueTests
     public void ToFloat_ValidKind_ReturnsValue()
     {
         // Arrange
-        float floatValue = 3.14f;
+        var floatValue = 3.14f;
         var bytes = new byte[4];
         BinaryPrimitives.TryWriteSingleLittleEndian(bytes, floatValue);
 
@@ -415,7 +417,7 @@ public sealed class HeaderValueTests
     public void ToDouble_ValidKind_ReturnsValue()
     {
         // Arrange
-        double doubleValue = 3.14159265359;
+        var doubleValue = 3.14159265359;
         var bytes = new byte[8];
         BinaryPrimitives.TryWriteDoubleLittleEndian(bytes, doubleValue);
 

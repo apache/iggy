@@ -1,4 +1,4 @@
-﻿// // Licensed to the Apache Software Foundation (ASF) under one
+// // Licensed to the Apache Software Foundation (ASF) under one
 // // or more contributor license agreements.  See the NOTICE file
 // // distributed with this work for additional information
 // // regarding copyright ownership.  The ASF licenses this file
@@ -16,14 +16,12 @@
 // // under the License.
 
 using Apache.Iggy.Contracts.Http;
-using Apache.Iggy.Contracts.Http.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
-using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
@@ -98,8 +96,8 @@ public class SystemTests(Protocol protocol)
         await client.LoginUser("iggy", "iggy");
         await client.CreateStreamAsync("TestStream", 1);
         await client.CreateTopicAsync(Identifier.Numeric(1), "test_topic", 2);
-        
-        var consumerGroup = await client.CreateConsumerGroupAsync(Identifier.Numeric(1), Identifier.Numeric(1), "test_consumer_group", 1); 
+
+        var consumerGroup = await client.CreateConsumerGroupAsync(Identifier.Numeric(1), Identifier.Numeric(1), "test_consumer_group", 1);
         await client.JoinConsumerGroupAsync(Identifier.Numeric(1), Identifier.Numeric(1), Identifier.Numeric(1));
         var me = await client.GetMeAsync();
 
@@ -128,7 +126,7 @@ public class SystemTests(Protocol protocol)
             Messages = [new Message(Guid.NewGuid(), "Test message"u8.ToArray())]
         });
 
-        await Fixture.Clients[protocol].FetchMessagesAsync(new MessageFetchRequest
+        await Fixture.Clients[protocol].PollMessagesAsync(new MessageFetchRequest
         {
             StreamId = Identifier.Numeric(1),
             TopicId = Identifier.Numeric(1),

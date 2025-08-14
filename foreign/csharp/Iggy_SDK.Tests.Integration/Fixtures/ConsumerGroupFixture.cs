@@ -1,4 +1,4 @@
-﻿// // Licensed to the Apache Software Foundation (ASF) under one
+// // Licensed to the Apache Software Foundation (ASF) under one
 // // or more contributor license agreements.  See the NOTICE file
 // // distributed with this work for additional information
 // // regarding copyright ownership.  The ASF licenses this file
@@ -15,17 +15,14 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
-using Apache.Iggy.Contracts.Http;
-using Apache.Iggy.Tests.Integrations.Helpers;
-
 namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 public class ConsumerGroupFixture : IggyServerFixture
 {
-    public readonly uint StreamId = 1;
-    public readonly uint TopicId = 1;
     public readonly string Name = "TestTopic";
     public readonly uint PartitionsCount = 10;
+    public readonly uint StreamId = 1;
+    public readonly uint TopicId = 1;
 
     public override async Task InitializeAsync()
     {

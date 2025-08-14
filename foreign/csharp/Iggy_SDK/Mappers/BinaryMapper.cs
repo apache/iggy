@@ -530,9 +530,9 @@ internal static class BinaryMapper
             ReadOnlySpan<byte> value = payload[position..(position + valueLength)];
             position += valueLength;
             headers.Add(HeaderKey.New(key), new HeaderValue
-                {
-                    Kind = headerKind, Value = value.ToArray()
-                }
+            {
+                Kind = headerKind, Value = value.ToArray()
+            }
             );
         }
 
@@ -877,12 +877,12 @@ internal static class BinaryMapper
         var name = Encoding.UTF8.GetString(payload[(position + 13)..(position + 13 + nameLength)]);
 
         return (new ConsumerGroupResponse
-            {
-                Id = id,
-                Name = name,
-                MembersCount = membersCount,
-                PartitionsCount = partitionsCount
-            },
+        {
+            Id = id,
+            Name = name,
+            MembersCount = membersCount,
+            PartitionsCount = partitionsCount
+        },
             13 + name.Length);
     }
 }

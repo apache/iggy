@@ -1,4 +1,4 @@
-﻿// // Licensed to the Apache Software Foundation (ASF) under one
+// // Licensed to the Apache Software Foundation (ASF) under one
 // // or more contributor license agreements.  See the NOTICE file
 // // distributed with this work for additional information
 // // regarding copyright ownership.  The ASF licenses this file
@@ -27,9 +27,9 @@ namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 public class FetchMessagesFixture : IggyServerFixture
 {
-    public readonly uint StreamId = 1;
     public readonly CreateTopicRequest HeadersTopicRequest = TopicFactory.CreateTopic(2);
     public readonly int MessageCount = 20;
+    public readonly uint StreamId = 1;
     public readonly CreateTopicRequest TopicDummyHeaderRequest = TopicFactory.CreateTopic(4);
     public readonly CreateTopicRequest TopicDummyRequest = TopicFactory.CreateTopic(3);
     public readonly CreateTopicRequest TopicRequest = TopicFactory.CreateTopic();

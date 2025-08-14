@@ -17,13 +17,13 @@
 
 namespace Apache.Iggy.Tests.Utils;
 
-[AttributeUsage(AttributeTargets.Method, AllowMultiple = false)]
+[AttributeUsage(AttributeTargets.Method)]
 public class TestPriorityAttribute : Attribute
 {
+    public int Priority { get; private set; }
+
     public TestPriorityAttribute(int priority)
     {
         Priority = priority;
     }
-
-    public int Priority { get; private set; }
 }
