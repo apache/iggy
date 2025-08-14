@@ -37,7 +37,7 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    pub fn init() -> Arc<Self> {
+    pub fn init() -> Self {
         let mut metrics = Metrics {
             registry: <Registry>::default(),
             http_requests: Counter::default(),
@@ -59,7 +59,7 @@ impl Metrics {
         metrics.register_gauge("users", metrics.users.clone());
         metrics.register_gauge("clients", metrics.clients.clone());
 
-        Arc::new(metrics)
+        metrics
     }
 
     fn register_counter(&mut self, name: &str, counter: Counter) {
@@ -138,5 +138,32 @@ impl Metrics {
 
     pub fn decrement_clients(&self, count: u32) {
         self.clients.dec_by(count as i64);
+    }
+}
+
+impl Clone for Metrics {
+    fn clone(&self) -> Self {
+        let mut cloned_metrics = Metrics {
+            registry: Registry::default(),
+            http_requests: self.http_requests.clone(),
+            streams: self.streams.clone(),
+            topics: self.topics.clone(),
+            partitions: self.partitions.clone(),
+            segments: self.segments.clone(),
+            messages: self.messages.clone(),
+            users: self.users.clone(),
+            clients: self.clients.clone(),
+        };
+
+        cloned_metrics.register_counter("http_requests", cloned_metrics.http_requests.clone());
+        cloned_metrics.register_gauge("streams", cloned_metrics.streams.clone());
+        cloned_metrics.register_gauge("topics", cloned_metrics.topics.clone());
+        cloned_metrics.register_gauge("partitions", cloned_metrics.partitions.clone());
+        cloned_metrics.register_gauge("segments", cloned_metrics.segments.clone());
+        cloned_metrics.register_gauge("messages", cloned_metrics.messages.clone());
+        cloned_metrics.register_gauge("users", cloned_metrics.users.clone());
+        cloned_metrics.register_gauge("clients", cloned_metrics.clients.clone());
+
+        cloned_metrics
     }
 }

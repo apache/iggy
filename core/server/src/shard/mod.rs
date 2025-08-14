@@ -160,7 +160,7 @@ pub struct IggyShard {
     pub(crate) active_sessions: RefCell<Vec<Rc<Session>>>,
     pub(crate) permissioner: RefCell<Permissioner>,
     pub(crate) users: RefCell<HashMap<UserId, User>>,
-    pub(crate) metrics: Arc<Metrics>,
+    pub(crate) metrics: Metrics,
     pub messages_receiver: Cell<Option<Receiver<ShardFrame>>>,
     pub(crate) stop_receiver: StopReceiver,
     pub(crate) stop_sender: StopSender,

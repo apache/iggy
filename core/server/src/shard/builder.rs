@@ -49,7 +49,7 @@ pub struct IggyShardBuilder {
     archiver: Option<ArchiverKind>,
     state: Option<StateKind>,
     init_state: Option<SystemState>,
-    metrics: Option<Arc<Metrics>>,
+    metrics: Option<Metrics>,
 }
 
 impl IggyShardBuilder {
@@ -97,7 +97,7 @@ impl IggyShardBuilder {
         self
     }
 
-    pub fn metrics(mut self, metrics: Arc<Metrics>) -> Self {
+    pub fn metrics(mut self, metrics: Metrics) -> Self {
         self.metrics = Some(metrics);
         self
     }
