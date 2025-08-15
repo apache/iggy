@@ -15,17 +15,23 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM ubuntu:24.04
+# NOTE: This Dockerfile expects a pre-built server binary to be passed as an argument
+#       via the IGGY_SERVER_PATH environment variable. This way we are able to utilize
+#       sccache / rust-cache in the CI, which is usually problematic inside Dockerfile.
+
+FROM debian:bookworm-slim
+
+# Expects pre-built server binary
+ARG IGGY_SERVER_PATH=target/debug/iggy-server
+RUN test -n "$IGGY_SERVER_PATH" || (echo "IGGY_SERVER_PATH not set" && false)
 
 # Install curl for healthcheck
 RUN apt-get update && \
     apt-get install -y curl && \
     rm -rf /var/lib/apt/lists/*
 
-# Expects pre-built server binary
-# Note: ARG in COPY source path doesn't work reliably, so we use a fixed path
-# The build process should ensure the binary exists at this location
-COPY target/debug/iggy-server /usr/local/bin/iggy-server
+# Copy server binary from build context
+COPY ${IGGY_SERVER_PATH} /usr/local/bin/iggy-server
 RUN chmod +x /usr/local/bin/iggy-server
 
 # Copy configs directory

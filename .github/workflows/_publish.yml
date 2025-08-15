@@ -1,0 +1,367 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: _publish
+on:
+  workflow_call:
+    inputs:
+      commit:
+        type: string
+        required: true
+        description: "Commit SHA to publish from"
+      dry_run:
+        type: boolean
+        required: false
+        default: false
+
+      publish_server:           { type: boolean, default: false }
+      publish_mcp:              { type: boolean, default: false }
+      publish_bench_dashboard:  { type: boolean, default: false }
+      publish_web_ui:           { type: boolean, default: false }
+
+      publish_rust_sdk:         { type: boolean, default: false }
+      publish_cli:              { type: boolean, default: false }
+      publish_rust_bench:       { type: boolean, default: false }
+      publish_connectors:       { type: boolean, default: false }
+
+      publish_python_sdk:       { type: boolean, default: false }
+      publish_node_sdk:         { type: boolean, default: false }
+      publish_java_sdk:         { type: boolean, default: false }
+      publish_csharp_sdk:       { type: boolean, default: false }
+      publish_go_sdk:           { type: string, default: "" }
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+env:
+  IGGY_CI_BUILD: true
+
+jobs:
+  plan:
+    name: Build publish plan
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.mk.outputs.targets }}
+      count:   ${{ steps.mk.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load publish config
+        id: cfg
+        run: |
+          if ! command -v yq &> /dev/null; then
+            wget -qO /tmp/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            chmod +x /tmp/yq && sudo mv /tmp/yq /usr/local/bin/yq
+          fi
+          # Read the components section; tag_pattern is ignored in this flow.
+          echo "components=$(yq -o=json -I=0 '.components' .github/config/publish.yml | jq -c)" >> $GITHUB_OUTPUT
+
+      - name: Build matrix from toggles
+        id: mk
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const cfg = JSON.parse(`${{ steps.cfg.outputs.components }}` || "{}");
+
+            // map toggle -> component key (as in config)
+            const wants = [];
+            if (${{ inputs.publish_server }})          wants.push('rust-server');
+            if (${{ inputs.publish_mcp }})             wants.push('mcp');
+            if (${{ inputs.publish_bench_dashboard }}) wants.push('bench-dashboard');
+            if (${{ inputs.publish_web_ui }})          wants.push('web-ui');
+
+            if (${{ inputs.publish_rust_sdk }})        wants.push('rust-sdk');
+            if (${{ inputs.publish_cli }})             wants.push('cli');
+            if (${{ inputs.publish_rust_bench }})      wants.push('iggy-bench'); // if you keep a separate component for this; else remove
+            if (${{ inputs.publish_connectors }})      wants.push('connectors');
+
+            if (${{ inputs.publish_python_sdk }})      wants.push('python-sdk');
+            if (${{ inputs.publish_node_sdk }})        wants.push('node-sdk');
+            if (${{ inputs.publish_java_sdk }})        wants.push('java-sdk');
+            if (${{ inputs.publish_csharp_sdk }})      wants.push('csharp-sdk');
+            if ('${{ inputs.publish_go_sdk }}' !== '') wants.push('go-sdk'); // virtual target (tag-only)
+
+            // Build targets array with metadata from config where applicable
+            const toType = (entry) => {
+              switch (entry.registry) {
+                case 'dockerhub': return 'docker';
+                case 'crates':    return 'rust';
+                case 'pypi':      return 'python';
+                case 'npm':       return 'node';
+                case 'maven':     return 'java';
+                case 'nuget':     return 'csharp';
+                default:          return 'custom';
+              }
+            };
+
+            const targets = [];
+            for (const key of wants) {
+              if (key === 'go-sdk') {
+                targets.push({ key, type: 'go', name: 'go-sdk' });
+                continue;
+              }
+              const entry = cfg[key];
+              if (!entry) {
+                core.warning(`Requested '${key}' but it's not present in .github/config/publish.yml`);
+                continue;
+              }
+              const t = {
+                key,
+                type: toType(entry),
+                name: key,
+                image: entry.image || '',
+                dockerfile: entry.dockerfile || '',
+                platforms: Array.isArray(entry.platforms) ? entry.platforms.join(',') : (entry.platforms || ''),
+                package: entry.package || ''
+              };
+              targets.push(t);
+            }
+
+            core.setOutput('targets', JSON.stringify(targets.length ? { include: targets } : { include: [{ key: 'noop', type: 'noop', name: 'noop' }] }));
+            core.setOutput('count', String(targets.length));
+
+  publish:
+    name: ${{ matrix.target.name }}
+    needs: plan
+    if: ${{ fromJson(needs.plan.outputs.targets).include[0].key != 'noop' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.targets) }}
+    env:
+      # Registry credentials – available for when you wire up the TODO steps
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      DOCKERHUB_USERNAME:   ${{ secrets.DOCKERHUB_USERNAME || secrets.DOCKERHUB_USER }}
+      DOCKERHUB_TOKEN:      ${{ secrets.DOCKERHUB_TOKEN }}
+      PYPI_API_TOKEN:       ${{ secrets.PYPI_API_TOKEN }}
+      NPM_TOKEN:            ${{ secrets.NPM_TOKEN }}
+      NEXUS_USER:           ${{ secrets.NEXUS_USER || secrets.MAVEN_USERNAME }}
+      NEXUS_PW:             ${{ secrets.NEXUS_PW   || secrets.MAVEN_PASSWORD }}
+      NUGET_API_KEY:        ${{ secrets.NUGET_API_KEY }}
+      DRY_RUN:              ${{ inputs.dry_run }}
+    steps:
+      - name: Checkout code at commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
+          fetch-depth: 0
+
+      # ------------------------------
+      # Version resolution
+      # ------------------------------
+      - name: Setup Rust for version extraction
+        if: matrix.target.type == 'rust' || matrix.target.type == 'docker'
+        uses: ./.github/actions/setup-rust-with-cache
+        with:
+          cache-targets: false
+          show-stats: false
+
+      - name: Resolve version for ${{ matrix.target.name }}
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "🔎 Resolving version for '${{ matrix.target.name }}' at commit ${{ inputs.commit }}"
+
+          case "${{ matrix.target.type }}" in
+            rust)
+              # Extract version using cargo pkgid
+              case "${{ matrix.target.key }}" in
+                rust-sdk)     version=$(cargo pkgid -p iggy | cut -d@ -f2) ;;
+                cli)          version=$(cargo pkgid -p iggy-cli | cut -d@ -f2) ;;
+                iggy-bench)   version=$(cargo pkgid -p iggy-bench | cut -d@ -f2) ;;
+                connectors)   version=$(cargo pkgid -p connectors | cut -d@ -f2) ;;
+                *)            version="0.0.0-unknown" ;;
+              esac
+              ;;
+
+            docker)
+              # Docker images - extract from corresponding Rust package
+              case "${{ matrix.target.key }}" in
+                rust-server)      version=$(cargo pkgid -p server | cut -d@ -f2) ;;
+                mcp)              version=$(cargo pkgid -p iggy-mcp | cut -d@ -f2) ;;
+                bench-dashboard)  version=$(cargo pkgid -p iggy-bench-dashboard-server | cut -d@ -f2) ;;
+                connectors)       version=$(cargo pkgid -p connectors | cut -d@ -f2) ;;
+                web-ui)           version=$(jq -r .version web/package.json) ;;
+                *)                version="0.0.0-unknown" ;;
+              esac
+              ;;
+
+            python)
+              # Python SDK version from pyproject.toml
+              version=$(grep '^version = ' foreign/python/pyproject.toml | cut -d'"' -f2)
+              ;;
+
+            node)
+              # Node SDK version from package.json
+              version=$(jq -r .version foreign/node/package.json)
+              ;;
+
+            java)
+              # Java SDK version from build.gradle.kts
+              version=$(grep '^version = ' foreign/java/java-sdk/build.gradle.kts | cut -d'"' -f2)
+              ;;
+
+            csharp)
+              # C# SDK version from .csproj
+              version=$(grep '<PackageVersion>' foreign/csharp/Iggy_SDK/Iggy_SDK.csproj | sed 's/.*<PackageVersion>\(.*\)<\/PackageVersion>.*/\1/' | xargs)
+              ;;
+
+            go)
+              # Go SDK uses the provided version from input
+              version="${{ inputs.publish_go_sdk }}"
+              if [ -z "$version" ]; then
+                echo "❌ Go version not provided via publish_go_sdk input"
+                exit 1
+              fi
+              ;;
+
+            *)
+              echo "⚠️ Unknown target type: ${{ matrix.target.type }}"
+              version="0.0.0-unknown"
+              ;;
+          esac
+
+          echo "✅ Resolved version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # ------------------------------
+      # Publish placeholders per type
+      # ------------------------------
+      - name: Docker publish (server/web/mcp/bench) — TODO
+        if: matrix.target.type == 'docker'
+        shell: bash
+        run: |
+          echo "🐳 TODO: build & push image for '${{ matrix.target.name }}'"
+          echo "      image:      ${{ matrix.target.image }}"
+          echo "      dockerfile: ${{ matrix.target.dockerfile }}"
+          echo "      platforms:  ${{ matrix.target.platforms }}"
+          echo "      version:    ${{ steps.ver.outputs.version }}"
+          echo "      dry_run:    $DRY_RUN"
+          # When ready, wire to your composite:
+          # uses: ./.github/actions/docker-buildx
+          # with:
+          #   component:  ${{ matrix.target.name }}
+          #   image:      ${{ matrix.target.image }}
+          #   dockerfile: ${{ matrix.target.dockerfile }}
+          #   platforms:  ${{ matrix.target.platforms }}
+          #   version:    ${{ steps.ver.outputs.version }}
+          #   push:       ${{ env.DRY_RUN != 'true' }}
+
+      - name: Rust crate publish — TODO
+        if: matrix.target.type == 'rust'
+        shell: bash
+        run: |
+          echo "🦀 TODO: cargo publish for '${{ matrix.target.package }}' version ${{ steps.ver.outputs.version }} (dry_run=$DRY_RUN)"
+          # When ready, wire to:
+          # uses: ./.github/actions/rust
+          # with:
+          #   task: publish
+          #   package: ${{ matrix.target.package }}
+          #   version: ${{ steps.ver.outputs.version }}
+          #   dry_run: ${{ env.DRY_RUN }}
+
+      - name: Python publish (PyPI) — TODO
+        if: matrix.target.type == 'python'
+        shell: bash
+        run: |
+          echo "🐍 TODO: maturin build/upload for version ${{ steps.ver.outputs.version }} (dry_run=$DRY_RUN)"
+          # uses: ./.github/actions/python-maturin
+          # with:
+          #   task: publish
+          #   version: ${{ steps.ver.outputs.version }}
+          #   dry_run: ${{ env.DRY_RUN }}
+
+      - name: Node publish (npm) — TODO
+        if: matrix.target.type == 'node'
+        shell: bash
+        run: |
+          echo "🟢 TODO: npm publish for version ${{ steps.ver.outputs.version }} (dry_run=$DRY_RUN)"
+          # uses: ./.github/actions/node-npm
+          # with:
+          #   task: publish
+          #   version: ${{ steps.ver.outputs.version }}
+          #   dry_run: ${{ env.DRY_RUN }}
+
+      - name: Java publish (Nexus) — TODO
+        if: matrix.target.type == 'java'
+        shell: bash
+        run: |
+          echo "☕ TODO: gradle publish for version ${{ steps.ver.outputs.version }} (dry_run=$DRY_RUN)"
+          # uses: ./.github/actions/java-gradle
+          # with:
+          #   task: publish
+          #   version: ${{ steps.ver.outputs.version }}
+          #   dry_run: ${{ env.DRY_RUN }}
+
+      - name: C# publish (NuGet) — TODO
+        if: matrix.target.type == 'csharp'
+        shell: bash
+        run: |
+          echo "🔷 TODO: dotnet nuget push for version ${{ steps.ver.outputs.version }} (dry_run=$DRY_RUN)"
+          # uses: ./.github/actions/csharp-dotnet
+          # with:
+          #   task: publish
+          #   version: ${{ steps.ver.outputs.version }}
+          #   dry_run: ${{ env.DRY_RUN }}
+
+      - name: Go SDK tag creation
+        if: matrix.target.type == 'go'
+        shell: bash
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          TAG="foreign/go/v${VERSION}"
+
+          echo "🐹 Go SDK tag creation"
+          echo "   Version: $VERSION"
+          echo "   Tag:     $TAG"
+          echo "   Commit:  ${{ inputs.commit }}"
+          echo "   Dry run: $DRY_RUN"
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "✅ [DRY RUN] Would create tag: $TAG at commit ${{ inputs.commit }}"
+          else
+            echo "Creating and pushing tag: $TAG"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+
+            # Create annotated tag at the specific commit
+            git tag -a "$TAG" "${{ inputs.commit }}" -m "Go SDK release $VERSION"
+
+            # Push the tag
+            git push origin "$TAG"
+            echo "✅ Tag $TAG created and pushed successfully"
+          fi
+
+  summary:
+    name: Publish Summary
+    needs: [plan, publish]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summarize
+        shell: bash
+        run: |
+          echo "# 📦 Publish Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Commit: \`${{ inputs.commit }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Dry run: \`${{ inputs.dry_run }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Targets planned: \`${{ needs.plan.outputs.count }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "_Publishing steps are TODO stubs; wire up version detection and actual publish steps per component._" >> $GITHUB_STEP_SUMMARY

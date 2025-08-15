@@ -39,14 +39,14 @@ echo "Extracted version: $version"
 echo "Executing after success scripts on branch $GITHUB_REF_NAME"
 echo "Triggering Nuget package build"
 
-cd Iggy_SDK
-dotnet pack -c release /p:PackageVersion=$version --no-restore -o .
+cd Iggy_SDK || exit
+dotnet pack -c release /p:PackageVersion="$version" --no-restore -o .
 
 echo "Uploading Iggy package to Nuget using branch $GITHUB_REF_NAME"
 
 case "$GITHUB_REF_NAME" in
   "master")
-    dotnet nuget push *.nupkg -k $NUGET_API_KEY -s https://api.nuget.org/v3/index.json
+    dotnet nuget push ./*.nupkg -k "$NUGET_API_KEY" -s https://api.nuget.org/v3/index.json
     echo "Published package succesfully!"
     ;;
   *)

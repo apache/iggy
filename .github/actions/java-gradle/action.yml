@@ -1,0 +1,149 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: java-gradle
+description: Java Gradle github iggy actions
+inputs:
+  task:
+    description: "Task to run"
+    required: true
+  version:
+    description: "Version for publishing"
+    required: false
+    default: ""
+  dry_run:
+    description: "Dry run mode"
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: "temurin"
+        java-version: "17"
+        cache: "gradle"
+
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
+
+    - name: Grant execute permission for gradlew
+      run: |
+        if [ -f "foreign/java/gradlew" ]; then
+          chmod +x foreign/java/gradlew
+        fi
+      shell: bash
+
+    - name: Lint (Checkstyle)
+      if: inputs.task == 'lint'
+      run: |
+        cd foreign/java
+
+        # Run checkstyle if configured
+        if grep -q "checkstyle" build.gradle 2>/dev/null; then
+          ./gradlew checkstyleMain checkstyleTest --no-daemon
+        else
+          echo "Checkstyle not configured yet, skipping lint task"
+        fi
+      shell: bash
+
+    - name: Test
+      if: inputs.task == 'test'
+      run: |
+        foreign/java/dev-support/checks/build.sh test
+
+        # Copy test reports
+        if [ -d "foreign/java/build/test-results" ]; then
+          mkdir -p reports
+          cp -r foreign/java/build/test-results reports/java-tests
+        fi
+
+        # Generate test report if jacoco is configured
+        if grep -q "jacoco" foreign/java/build.gradle 2>/dev/null; then
+          cd foreign/java
+          ./gradlew jacocoTestReport --no-daemon
+        fi
+      shell: bash
+
+    - name: Build
+      if: inputs.task == 'build' || inputs.task == 'publish'
+      run: |
+        foreign/java/dev-support/checks/build.sh build -x test -x checkstyleMain -x checkstyleTest
+        BUILD_EXIT_CODE=$?
+
+        # List artifacts only if build succeeded
+        if [ $BUILD_EXIT_CODE -eq 0 ]; then
+          echo ""
+          echo "Build artifacts:"
+          find foreign/java -path "*/build/libs/*.jar" -type f 2>/dev/null | head -20 || echo "No jar artifacts found in build/libs directories"
+        fi
+
+        # Exit with build exit code
+        exit $BUILD_EXIT_CODE
+      shell: bash
+
+    - name: Publish to Maven Nexus
+      if: inputs.task == 'publish'
+      env:
+        NEXUS_USER: ${{ env.NEXUS_USER }}
+        NEXUS_PASSWORD: ${{ env.NEXUS_PASSWORD || env.NEXUS_PW }}
+      run: |
+        if [ "${{ inputs.dry_run }}" = "true" ]; then
+          echo "🔍 Dry run - would publish to Maven Nexus:"
+
+          # Extract version from build.gradle.kts
+          version=$(foreign/java/gradlew -p foreign/java properties -q | grep "version:" | cut -d: -f2 | tr -d ' ')
+          echo "Version from gradle: $version"
+          echo "Would publish as: java-sdk-$version"
+        else
+          # Verify version if provided
+          if [ -n "${{ inputs.version }}" ]; then
+            # Extract current version from build.gradle.kts
+            current_version=$(foreign/java/gradlew -p foreign/java properties -q | grep "version:" | cut -d: -f2 | tr -d ' ')
+
+            # Check if provided version matches gradle version
+            if [[ "${{ inputs.version }}" != "$current_version" ]]; then
+              echo "⚠️ Warning: Provided version (${{ inputs.version }}) differs from gradle version ($current_version)"
+              echo "Updating gradle.properties with new version..."
+              echo "version=${{ inputs.version }}" >> foreign/java/gradle.properties
+            fi
+          fi
+
+          echo "📦 Publishing to Maven Nexus using build script..."
+          foreign/java/dev-support/checks/build.sh build -x test -x checkstyleMain -x checkstyleTest publish
+
+        fi
+      shell: bash
+
+    - name: Publish snapshot
+      if: inputs.task == 'publish-snapshot'
+      env:
+        NEXUS_USER: ${{ env.NEXUS_USER }}
+        NEXUS_PASSWORD: ${{ env.NEXUS_PASSWORD || env.NEXUS_PW }}
+      run: |
+        cd foreign/java
+
+        # Ensure version ends with -SNAPSHOT
+        current_version=$(./gradlew properties -q | grep "^version:" | awk '{print $2}')
+        if [[ ! "$current_version" == *"-SNAPSHOT" ]]; then
+          echo "version=${current_version}-SNAPSHOT" >> gradle.properties
+        fi
+
+        ./gradlew publish -Psnapshot --no-daemon
+      shell: bash
