@@ -28,22 +28,23 @@ public sealed class AuthResponseConverter : JsonConverter<AuthResponse>
     {
         using var doc = JsonDocument.ParseValue(ref reader);
         var root = doc.RootElement;
-        
+
         var userId = root.GetProperty(nameof(AuthResponse.UserId).ToSnakeCase()).GetInt32();
         var accessToken = root.GetProperty(nameof(AuthResponse.AccessToken).ToSnakeCase());
         var token = accessToken.GetProperty(nameof(TokenInfo.Token).ToSnakeCase()).GetString();
         var accessTokenExpiry = accessToken.GetProperty(nameof(TokenInfo.Expiry).ToSnakeCase()).GetInt64();
 
-        if(token is null)
+        if (token is null)
         {
             throw new JsonException("Access token is null");
         }
-        
+
         return new AuthResponse(
             userId,
             new TokenInfo(token, DateTimeOffset.FromUnixTimeSeconds(accessTokenExpiry).LocalDateTime)
         );
     }
+
     public override void Write(Utf8JsonWriter writer, AuthResponse value, JsonSerializerOptions options)
     {
         throw new NotImplementedException();

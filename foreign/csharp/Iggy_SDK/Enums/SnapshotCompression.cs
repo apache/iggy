@@ -1,4 +1,4 @@
-﻿// Licensed to the Apache Software Foundation (ASF) under one
+// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -18,20 +18,25 @@
 namespace Apache.Iggy.Enums;
 
 /// <summary>
-/// Enum representing the various compression methods available for snapshots
+///     Enum representing the various compression methods available for snapshots
 /// </summary>
 public enum SnapshotCompression
 {
     /// Store the file as is
     Stored,
+
     /// Compress the file using Deflate
     Deflated,
+
     /// Compress the file using BZIP2
     Bzip2,
+
     /// Compress the file using ZStandard
     Zstd,
+
     /// Compress the file using LZMA
     Lzma,
+
     /// Compress the file using XZ
-    Xz,
+    Xz
 }

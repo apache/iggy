@@ -23,16 +23,17 @@ namespace Apache.Iggy.Tests.Utils.Users;
 
 public static class UsersFactory
 {
-    public static CreateUserRequest CreateUserRequest(string? username = null, string?  password = null, Permissions? permissions = null)
+    public static CreateUserRequest CreateUserRequest(string? username = null, string? password = null, Permissions? permissions = null)
     {
         return new CreateUserRequest
         {
-            Password = username ?? Utility.RandomString(Random.Shared.Next(5,25)),
-            Username = password ?? Utility.RandomString(Random.Shared.Next(5,25)), 
+            Password = username ?? Utility.RandomString(Random.Shared.Next(5, 25)),
+            Username = password ?? Utility.RandomString(Random.Shared.Next(5, 25)),
             Status = UserStatus.Active,
             Permissions = permissions ?? CreatePermissions()
         };
     }
+
     public static Dictionary<int, StreamPermissions> CreateStreamPermissions(int streamId = 1, int topicId = 1)
     {
         var streamsPermission = new Dictionary<int, StreamPermissions>();
@@ -56,6 +57,7 @@ public static class UsersFactory
         });
         return streamsPermission;
     }
+
     public static Permissions CreatePermissions()
     {
         return new Permissions

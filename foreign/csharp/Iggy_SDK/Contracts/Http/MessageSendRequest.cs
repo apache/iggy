@@ -20,7 +20,6 @@ using Apache.Iggy.Messages;
 
 namespace Apache.Iggy.Contracts.Http;
 
-//[JsonConverter(typeof(MessagesConverter))]
 public sealed class MessageSendRequest
 {
     public required Identifier StreamId { get; init; }

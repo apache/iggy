@@ -21,6 +21,5 @@ public sealed class InvalidResponseException : Exception
 {
     internal InvalidResponseException(string message) : base(message)
     {
-
     }
 }

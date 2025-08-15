@@ -23,6 +23,7 @@ public sealed class MessageStreamConfigurator : IMessageStreamConfigurator
 {
     public string BaseAdress { get; set; } = "http://127.0.0.1:3000";
     public Protocol Protocol { get; set; } = Protocol.Http;
+
     public Action<MessagePollingSettings> MessagePollingSettings { get; set; } = options =>
     {
         options.Interval = TimeSpan.FromMilliseconds(100);
@@ -42,6 +43,7 @@ public sealed class MessageStreamConfigurator : IMessageStreamConfigurator
         options.MaxMessagesPerBatch = 1000;
         options.MaxRequests = 4096;
     };
+
     public int ReceiveBufferSize { get; set; } = 4096;
     public int SendBufferSize { get; set; } = 4096;
 }

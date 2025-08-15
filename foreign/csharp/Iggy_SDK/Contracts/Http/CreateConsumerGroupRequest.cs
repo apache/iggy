@@ -15,16 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Text.Json.Serialization;
-
 namespace Apache.Iggy.Contracts.Http;
 
 public sealed class CreateConsumerGroupRequest
 {
-    [JsonIgnore]
-    public required Identifier StreamId { get; init; }
-    [JsonIgnore]
-    public required Identifier TopicId { get; init; }
-    public required int ConsumerGroupId { get; init; }
     public required string Name { get; init; }
+    public uint? ConsumerGroupId { get; init; }
 }

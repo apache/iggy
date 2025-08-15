@@ -32,6 +32,7 @@ public readonly struct Consumer
             Type = ConsumerType.Consumer
         };
     }
+
     public static Consumer New(string id)
     {
         return new Consumer
@@ -49,6 +50,7 @@ public readonly struct Consumer
             Type = ConsumerType.ConsumerGroup
         };
     }
+
     public static Consumer Group(string id)
     {
         return new Consumer

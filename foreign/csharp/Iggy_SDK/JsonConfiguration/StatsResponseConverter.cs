@@ -30,35 +30,35 @@ public class StatsResponseConverter : JsonConverter<StatsResponse>
     {
         using var doc = JsonDocument.ParseValue(ref reader);
         var root = doc.RootElement;
-        
-        int processId = root.GetProperty(nameof(Stats.ProcessId).ToSnakeCase()).GetInt32();
-        float cpuUsage = root.GetProperty(nameof(Stats.CpuUsage).ToSnakeCase()).GetSingle();
-        float totalCpuUsage = root.GetProperty(nameof(Stats.TotalCpuUsage).ToSnakeCase()).GetSingle();
-        
-        ulong memoryUsage = ConvertStringToUlong(root.GetProperty(nameof(Stats.MemoryUsage).ToSnakeCase()).GetString());
-        ulong totalMemoryUsage = ConvertStringToUlong(root.GetProperty(nameof(Stats.TotalMemory).ToSnakeCase()).GetString());
-        ulong availableMemory = ConvertStringToUlong(root.GetProperty(nameof(Stats.AvailableMemory).ToSnakeCase()).GetString());
-        
+
+        var processId = root.GetProperty(nameof(Stats.ProcessId).ToSnakeCase()).GetInt32();
+        var cpuUsage = root.GetProperty(nameof(Stats.CpuUsage).ToSnakeCase()).GetSingle();
+        var totalCpuUsage = root.GetProperty(nameof(Stats.TotalCpuUsage).ToSnakeCase()).GetSingle();
+
+        var memoryUsage = ConvertStringToUlong(root.GetProperty(nameof(Stats.MemoryUsage).ToSnakeCase()).GetString());
+        var totalMemoryUsage = ConvertStringToUlong(root.GetProperty(nameof(Stats.TotalMemory).ToSnakeCase()).GetString());
+        var availableMemory = ConvertStringToUlong(root.GetProperty(nameof(Stats.AvailableMemory).ToSnakeCase()).GetString());
+
         var runtime = root.GetProperty(nameof(Stats.RunTime).ToSnakeCase()).GetUInt64();
-        ulong startTime = root.GetProperty(nameof(Stats.StartTime).ToSnakeCase()).GetUInt64();
-        ulong readBytes = ConvertStringToUlong(root.GetProperty(nameof(Stats.ReadBytes).ToSnakeCase()).GetString());
-        ulong writtenBytes = ConvertStringToUlong(root.GetProperty(nameof(Stats.WrittenBytes).ToSnakeCase()).GetString());
-        ulong messageWrittenSizeBytes = ConvertStringToUlong(root.GetProperty(nameof(Stats.MessagesSizeBytes).ToSnakeCase()).GetString());
-        int streamsCount = root.GetProperty(nameof(Stats.StreamsCount).ToSnakeCase()).GetInt32();
-        int topicsCount = root.GetProperty(nameof(Stats.TopicsCount).ToSnakeCase()).GetInt32();
-        int partitionsCount = root.GetProperty(nameof(Stats.PartitionsCount).ToSnakeCase()).GetInt32();
-        int segmentsCount = root.GetProperty(nameof(Stats.SegmentsCount).ToSnakeCase()).GetInt32();
-        ulong messagesCount = root.GetProperty(nameof(Stats.MessagesCount).ToSnakeCase()).GetUInt64();
-        int clientsCount = root.GetProperty(nameof(Stats.ClientsCount).ToSnakeCase()).GetInt32();
-        int consumerGroupsCount = root.GetProperty(nameof(Stats.ConsumerGroupsCount).ToSnakeCase()).GetInt32();
-        string? hostname = root.GetProperty(nameof(Stats.Hostname).ToSnakeCase()).GetString();
-        string? osName = root.GetProperty(nameof(Stats.OsName).ToSnakeCase()).GetString();
-        string? osVersion = root.GetProperty(nameof(Stats.OsVersion).ToSnakeCase()).GetString();
-        string? kernelVersion = root.GetProperty(nameof(Stats.KernelVersion).ToSnakeCase()).GetString();
-        string? iggyVersion = root.GetProperty(nameof(Stats.IggyServerVersion).ToSnakeCase()).GetString();
-        uint iggyServerSemver = root.GetProperty(nameof(Stats.IggyServerSemver).ToSnakeCase()).GetUInt32();
-        
-        
+        var startTime = root.GetProperty(nameof(Stats.StartTime).ToSnakeCase()).GetUInt64();
+        var readBytes = ConvertStringToUlong(root.GetProperty(nameof(Stats.ReadBytes).ToSnakeCase()).GetString());
+        var writtenBytes = ConvertStringToUlong(root.GetProperty(nameof(Stats.WrittenBytes).ToSnakeCase()).GetString());
+        var messageWrittenSizeBytes = ConvertStringToUlong(root.GetProperty(nameof(Stats.MessagesSizeBytes).ToSnakeCase()).GetString());
+        var streamsCount = root.GetProperty(nameof(Stats.StreamsCount).ToSnakeCase()).GetInt32();
+        var topicsCount = root.GetProperty(nameof(Stats.TopicsCount).ToSnakeCase()).GetInt32();
+        var partitionsCount = root.GetProperty(nameof(Stats.PartitionsCount).ToSnakeCase()).GetInt32();
+        var segmentsCount = root.GetProperty(nameof(Stats.SegmentsCount).ToSnakeCase()).GetInt32();
+        var messagesCount = root.GetProperty(nameof(Stats.MessagesCount).ToSnakeCase()).GetUInt64();
+        var clientsCount = root.GetProperty(nameof(Stats.ClientsCount).ToSnakeCase()).GetInt32();
+        var consumerGroupsCount = root.GetProperty(nameof(Stats.ConsumerGroupsCount).ToSnakeCase()).GetInt32();
+        var hostname = root.GetProperty(nameof(Stats.Hostname).ToSnakeCase()).GetString();
+        var osName = root.GetProperty(nameof(Stats.OsName).ToSnakeCase()).GetString();
+        var osVersion = root.GetProperty(nameof(Stats.OsVersion).ToSnakeCase()).GetString();
+        var kernelVersion = root.GetProperty(nameof(Stats.KernelVersion).ToSnakeCase()).GetString();
+        var iggyVersion = root.GetProperty(nameof(Stats.IggyServerVersion).ToSnakeCase()).GetString();
+        var iggyServerSemver = root.GetProperty(nameof(Stats.IggyServerSemver).ToSnakeCase()).GetUInt32();
+
+
         return new StatsResponse
         {
             AvailableMemory = availableMemory,
@@ -86,44 +86,43 @@ public class StatsResponseConverter : JsonConverter<StatsResponse>
             IggyVersion = iggyVersion ?? string.Empty,
             IggyServerSemver = iggyServerSemver
         };
-
     }
 
     private ulong ConvertStringToUlong(string? usage)
     {
-        if(usage is null)
+        if (usage is null)
         {
             return 0;
         }
-        
+
         var usageStringSplit = usage.Split(' ');
         if (usageStringSplit.Length != 2)
         {
             throw new InvalidEnumArgumentException($"Error Wrong format when deserializing MemoryUsage: {usage}");
         }
-        
+
         var (memoryUsageBytesVal, memoryUnit) = (ParseFloat(usageStringSplit[0]), usageStringSplit[1]);
         return ConvertStringBytesToUlong(memoryUnit, memoryUsageBytesVal);
     }
-    
+
     private static ulong ConvertStringBytesToUlong(string memoryUnit, float memoryUsageBytesVal)
     {
-        float memoryUsage = memoryUnit switch
+        var memoryUsage = memoryUnit switch
         {
             "B" => memoryUsageBytesVal,
-            "KiB" => memoryUsageBytesVal * (ulong)1024,
+            "KiB" => memoryUsageBytesVal * 1024,
             "KB" => memoryUsageBytesVal * (ulong)1e03,
-            "MiB" => memoryUsageBytesVal * (ulong)1024 * 1024,
+            "MiB" => memoryUsageBytesVal * 1024 * 1024,
             "MB" => memoryUsageBytesVal * (ulong)1e06,
-            "GiB" => memoryUsageBytesVal * (ulong)1024 * 1024 * 1024,
+            "GiB" => memoryUsageBytesVal * 1024 * 1024 * 1024,
             "GB" => memoryUsageBytesVal * (ulong)1e09,
-            "TiB" => memoryUsageBytesVal * (ulong)1024 * 1024 * 1024 * 1024,
+            "TiB" => memoryUsageBytesVal * 1024 * 1024 * 1024 * 1024,
             "TB" => memoryUsageBytesVal * (ulong)1e12,
             _ => throw new InvalidEnumArgumentException($"Error Wrong Unit when deserializing MemoryUsage: {memoryUnit}")
         };
         return (ulong)memoryUsage;
     }
-    
+
     private static float ParseFloat(string value)
     {
         return float.Parse(value, NumberStyles.AllowExponent | NumberStyles.Number, CultureInfo.InvariantCulture);

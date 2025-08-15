@@ -19,3 +19,9 @@ from [/foreign/csharp/Iggy_SDK.Tests.BDD](.) run
 ```bash
 dotnet test
 ```
+
+## Troubleshooting
+
+Sometimes tests might be run twice or have errors during build.
+It's because link to .feature files and problem with generated code.
+To fix it, run `dotnet clean`

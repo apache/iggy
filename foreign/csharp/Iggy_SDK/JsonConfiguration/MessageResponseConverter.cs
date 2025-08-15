@@ -27,6 +27,7 @@ namespace Apache.Iggy.JsonConfiguration;
 internal sealed class MessageResponseConverter : JsonConverter<PolledMessages>
 {
     private readonly Func<byte[], byte[]>? _decryptor;
+
     public MessageResponseConverter(Func<byte[], byte[]>? decryptor)
     {
         _decryptor = decryptor;
@@ -48,7 +49,7 @@ internal sealed class MessageResponseConverter : JsonConverter<PolledMessages>
         foreach (var element in messages.EnumerateArray())
         {
             var headerElement = element.GetProperty(nameof(Message.Header).ToSnakeCase());
-            
+
             var checksum = headerElement.GetProperty(nameof(MessageHeader.Checksum).ToSnakeCase()).GetUInt64();
             var id = headerElement.GetProperty(nameof(MessageHeader.Id).ToSnakeCase()).GetUInt128();
             var offset = headerElement.GetProperty(nameof(MessageHeader.Offset).ToSnakeCase()).GetUInt64();
@@ -56,7 +57,7 @@ internal sealed class MessageResponseConverter : JsonConverter<PolledMessages>
             var originTimestamp = headerElement.GetProperty(nameof(MessageHeader.OriginTimestamp).ToSnakeCase()).GetUInt64();
             var headerLength = headerElement.GetProperty(nameof(MessageHeader.UserHeadersLength).ToSnakeCase()).GetInt32();
             var payloadLength = headerElement.GetProperty(nameof(MessageHeader.PayloadLength).ToSnakeCase()).GetInt32();
-            
+
             element.TryGetProperty(nameof(MessageResponse.UserHeaders).ToSnakeCase(), out var headersElement);
 
             var payload = element.GetProperty(nameof(MessageResponse.Payload).ToSnakeCase()).GetBytesFromBase64();
@@ -110,7 +111,7 @@ internal sealed class MessageResponseConverter : JsonConverter<PolledMessages>
 
             messageResponses.Add(new MessageResponse
             {
-                Header = new MessageHeader()
+                Header = new MessageHeader
                 {
                     UserHeadersLength = headerLength,
                     PayloadLength = payloadLength,

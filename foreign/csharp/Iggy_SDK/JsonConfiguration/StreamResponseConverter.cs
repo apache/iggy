@@ -22,6 +22,7 @@ using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Extensions;
 
 namespace Apache.Iggy.JsonConfiguration;
+
 public sealed class StreamResponseConverter : JsonConverter<StreamResponse>
 {
     public override StreamResponse? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
@@ -29,7 +30,7 @@ public sealed class StreamResponseConverter : JsonConverter<StreamResponse>
         using var doc = JsonDocument.ParseValue(ref reader);
         var root = doc.RootElement;
 
-        var id = root.GetProperty(nameof(StreamResponse.Id).ToSnakeCase()).GetInt32();
+        var id = root.GetProperty(nameof(StreamResponse.Id).ToSnakeCase()).GetUInt32();
         var createdAt = root.GetProperty(nameof(StreamResponse.CreatedAt).ToSnakeCase()).GetUInt64();
         var name = root.GetProperty(nameof(StreamResponse.Name).ToSnakeCase()).GetString();
         var sizeBytesString = root.GetProperty(nameof(StreamResponse.Size).ToSnakeCase()).GetString();
@@ -52,7 +53,7 @@ public sealed class StreamResponseConverter : JsonConverter<StreamResponse>
         var messagesCount = root.GetProperty(nameof(StreamResponse.MessagesCount).ToSnakeCase()).GetUInt64();
         var topicsCount = root.GetProperty(nameof(StreamResponse.TopicsCount).ToSnakeCase()).GetInt32();
         root.TryGetProperty(nameof(StreamResponse.Topics).ToSnakeCase(), out var topicsProperty);
-        var topics = topicsProperty.ValueKind switch
+        IEnumerable<TopicResponse>? topics = topicsProperty.ValueKind switch
         {
             JsonValueKind.Null => null,
             JsonValueKind.Undefined => null,

@@ -1,4 +1,4 @@
-﻿// // Licensed to the Apache Software Foundation (ASF) under one
+// // Licensed to the Apache Software Foundation (ASF) under one
 // // or more contributor license agreements.  See the NOTICE file
 // // distributed with this work for additional information
 // // regarding copyright ownership.  The ASF licenses this file
@@ -72,7 +72,7 @@ public class SendMessagesTests(Protocol protocol)
         {
             Messages = _messagesWithoutHeaders,
             Partitioning = Partitioning.None(),
-            StreamId = Identifier.Numeric(Fixture.StreamRequest.StreamId!.Value),
+            StreamId = Identifier.Numeric(Fixture.StreamId),
             TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value)
         }));
     }
@@ -85,7 +85,7 @@ public class SendMessagesTests(Protocol protocol)
         {
             Messages = _messagesWithoutHeaders,
             Partitioning = Partitioning.None(),
-            StreamId = Identifier.Numeric(Fixture.StreamRequest.StreamId!.Value),
+            StreamId = Identifier.Numeric(Fixture.StreamId),
             TopicId = Identifier.Numeric(69)
         }));
     }
@@ -98,7 +98,7 @@ public class SendMessagesTests(Protocol protocol)
         {
             Messages = _messagesWithHeaders,
             Partitioning = Partitioning.None(),
-            StreamId = Identifier.Numeric(Fixture.StreamRequest.StreamId!.Value),
+            StreamId = Identifier.Numeric(Fixture.StreamId),
             TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value)
         }));
     }
@@ -111,7 +111,7 @@ public class SendMessagesTests(Protocol protocol)
         {
             Messages = _messagesWithHeaders,
             Partitioning = Partitioning.None(),
-            StreamId = Identifier.Numeric(Fixture.StreamRequest.StreamId!.Value),
+            StreamId = Identifier.Numeric(Fixture.StreamId),
             TopicId = Identifier.Numeric(69)
         }));
     }

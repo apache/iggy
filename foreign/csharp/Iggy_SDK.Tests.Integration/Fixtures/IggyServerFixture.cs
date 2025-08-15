@@ -1,4 +1,4 @@
-﻿// // Licensed to the Apache Software Foundation (ASF) under one
+// // Licensed to the Apache Software Foundation (ASF) under one
 // // or more contributor license agreements.  See the NOTICE file
 // // distributed with this work for additional information
 // // regarding copyright ownership.  The ASF licenses this file
@@ -16,7 +16,6 @@
 // // under the License.
 
 using Apache.Iggy.Configuration;
-using Apache.Iggy.Contracts.Http.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
 using Apache.Iggy.IggyClient;
@@ -88,11 +87,7 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     {
         var tcpClient = CreateClient(Protocol.Tcp);
 
-        await tcpClient.LoginUser(new LoginUserRequest
-        {
-            Password = "iggy",
-            Username = "iggy"
-        });
+        await tcpClient.LoginUser("iggy", "iggy");
 
         Clients[Protocol.Tcp] = tcpClient;
     }
@@ -101,11 +96,7 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
     {
         var client = CreateClient(Protocol.Http);
 
-        await client.LoginUser(new LoginUserRequest
-        {
-            Password = "iggy",
-            Username = "iggy"
-        });
+        await client.LoginUser("iggy", "iggy");
 
         Clients[Protocol.Http] = client;
     }

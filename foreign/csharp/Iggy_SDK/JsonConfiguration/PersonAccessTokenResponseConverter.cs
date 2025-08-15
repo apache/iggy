@@ -44,6 +44,7 @@ public sealed class PersonalAccessTokenResponseConverter : JsonConverter<Persona
             ExpiryAt = expiry
         };
     }
+
     public override void Write(Utf8JsonWriter writer, PersonalAccessTokenResponse value, JsonSerializerOptions options)
     {
         throw new NotImplementedException();

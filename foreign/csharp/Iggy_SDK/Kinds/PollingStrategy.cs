@@ -32,7 +32,7 @@ public readonly struct PollingStrategy
             Value = value
         };
     }
-    
+
     public static PollingStrategy Timestamp(ulong value)
     {
         return new PollingStrategy

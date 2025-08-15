@@ -1,4 +1,4 @@
-﻿// // Licensed to the Apache Software Foundation (ASF) under one
+// // Licensed to the Apache Software Foundation (ASF) under one
 // // or more contributor license agreements.  See the NOTICE file
 // // distributed with this work for additional information
 // // regarding copyright ownership.  The ASF licenses this file
@@ -36,14 +36,14 @@ public class PollMessagesTests(Protocol protocol)
     {
         var messageCount = 0;
         await foreach (MessageResponse<DummyMessage> msgResponse in Fixture.Clients[protocol].PollMessagesAsync(new PollMessagesRequest
-                       {
-                           Consumer = Consumer.New(1),
-                           Count = 10,
-                           PartitionId = 1,
-                           PollingStrategy = PollingStrategy.Next(),
-                           StreamId = Identifier.Numeric(Fixture.StreamRequest.StreamId!.Value),
-                           TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value)
-                       }, DummyMessage.DeserializeDummyMessage, token: token))
+        {
+            Consumer = Consumer.New(1),
+            Count = 10,
+            PartitionId = 1,
+            PollingStrategy = PollingStrategy.Next(),
+            StreamId = Identifier.Numeric(Fixture.StreamId),
+            TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value)
+        }, DummyMessage.DeserializeDummyMessage, token: token))
         {
             msgResponse.UserHeaders.ShouldNotBeNull();
             msgResponse.UserHeaders.Count.ShouldBe(2);

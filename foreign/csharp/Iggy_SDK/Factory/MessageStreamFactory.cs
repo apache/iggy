@@ -35,7 +35,7 @@ public static class MessageStreamFactory
     {
         var config = new MessageStreamConfigurator();
         options.Invoke(config);
-        
+
         return config.Protocol switch
         {
             Protocol.Http => CreateHttpMessageStream(config, loggerFactory),
@@ -43,7 +43,7 @@ public static class MessageStreamFactory
             _ => throw new InvalidEnumArgumentException()
         };
     }
-    
+
     private static TcpMessageStream CreateTcpMessageStream(IMessageStreamConfigurator options, ILoggerFactory loggerFactory)
     {
         var socket = CreateTcpStream(options);
@@ -81,6 +81,7 @@ public static class MessageStreamFactory
         {
             sslStream.AuthenticateAsClient(tlsSettings.Hostname);
         }
+
         return new TcpTlsConnectionStream(sslStream);
     }
 
@@ -91,6 +92,7 @@ public static class MessageStreamFactory
             .WithSendMessagesDispatcher() //this internally resolves whether the message dispatcher is created or not
             .Build();
     }
+
     private static HttpClient CreateHttpClient(IMessageStreamConfigurator options)
     {
         var client = new HttpClient();

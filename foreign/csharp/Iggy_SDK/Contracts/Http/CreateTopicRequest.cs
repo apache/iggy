@@ -20,28 +20,27 @@ using Apache.Iggy.Enums;
 
 namespace Apache.Iggy.Contracts.Http;
 
-public sealed class TopicRequest
+public sealed class CreateTopicRequest
 {
-    public int? TopicId { get; set; }
+    public uint? TopicId { get; set; }
     public required string Name { get; set; }
     public CompressionAlgorithm CompressionAlgorithm { get; set; } = CompressionAlgorithm.None;
-    public ulong MessageExpiry { get; set; } = 0;
-    public int PartitionsCount { get; set; } = 1;
-    public byte ReplicationFactor { get; set; } = 1;
-    public ulong MaxTopicSize { get; set; } = 0;
+    public ulong MessageExpiry { get; set; }
+    public uint PartitionsCount { get; set; } = 1;
+    public byte? ReplicationFactor { get; set; } = 1;
+    public ulong MaxTopicSize { get; set; }
 
-    public TopicRequest()
+    public CreateTopicRequest()
     {
-        
     }
 
     [SetsRequiredMembers]
-    public TopicRequest(int? topicId,
+    public CreateTopicRequest(uint? topicId,
         string name,
         CompressionAlgorithm compressionAlgorithm,
         ulong messageExpiry,
-        int partitionsCount,
-        byte replicationFactor,
+        uint partitionsCount,
+        byte? replicationFactor,
         ulong maxTopicSize)
     {
         TopicId = topicId;

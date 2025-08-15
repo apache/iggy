@@ -43,7 +43,7 @@ internal static class PermissionsFactory
             Streams = new Dictionary<int, StreamPermissions>
             {
                 {
-                    Random.Shared.Next(1,30),
+                    Random.Shared.Next(1, 30),
                     new StreamPermissions
                     {
                         ManageStream = Random.Shared.Next() % 2 == 0,
@@ -55,7 +55,7 @@ internal static class PermissionsFactory
                         Topics = new Dictionary<int, TopicPermissions>
                         {
                             {
-                                Random.Shared.Next(1,30),
+                                Random.Shared.Next(1, 30),
                                 new TopicPermissions
                                 {
                                     ManageTopic = Random.Shared.Next() % 2 == 0,
@@ -65,7 +65,7 @@ internal static class PermissionsFactory
                                 }
                             },
                             {
-                                Random.Shared.Next(31,69),
+                                Random.Shared.Next(31, 69),
                                 new TopicPermissions
                                 {
                                     ManageTopic = Random.Shared.Next() % 2 == 0,
@@ -78,7 +78,7 @@ internal static class PermissionsFactory
                     }
                 },
                 {
-                    Random.Shared.Next(31,69),
+                    Random.Shared.Next(31, 69),
                     new StreamPermissions
                     {
                         ManageStream = Random.Shared.Next() % 2 == 0,
@@ -92,12 +92,12 @@ internal static class PermissionsFactory
                 }
             }
         };
-
     }
+
     internal static Permissions PermissionsFromBytes(byte[] bytes)
     {
         var streamMap = new Dictionary<int, StreamPermissions>();
-        int index = 0;
+        var index = 0;
 
         var globalPermissions = new GlobalPermissions
         {
@@ -110,7 +110,7 @@ internal static class PermissionsFactory
             ManageTopics = bytes[index++] == 1,
             ReadTopics = bytes[index++] == 1,
             PollMessages = bytes[index++] == 1,
-            SendMessages = bytes[index++] == 1,
+            SendMessages = bytes[index++] == 1
         };
 
         if (bytes[index++] == 1)
@@ -145,11 +145,13 @@ internal static class PermissionsFactory
                             ManageTopic = manageTopic,
                             ReadTopic = readTopic,
                             PollMessages = pollMessagesTopic,
-                            SendMessages = sendMessagesTopic,
+                            SendMessages = sendMessagesTopic
                         });
 
                         if (bytes[index++] == 0)
+                        {
                             break;
+                        }
                     }
                 }
 
@@ -161,17 +163,19 @@ internal static class PermissionsFactory
                     ReadTopics = readTopics,
                     PollMessages = pollMessagesStream,
                     SendMessages = sendMessagesStream,
-                    Topics = topicsMap.Count > 0 ? topicsMap : null,
+                    Topics = topicsMap.Count > 0 ? topicsMap : null
                 });
 
                 if (bytes[index++] == 0)
+                {
                     break;
+                }
             }
         }
 
         return new Permissions
         {
-            Global = globalPermissions, 
+            Global = globalPermissions,
             Streams = streamMap.Count > 0 ? streamMap : null
         };
     }

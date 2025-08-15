@@ -1,4 +1,4 @@
-﻿// // Licensed to the Apache Software Foundation (ASF) under one
+// // Licensed to the Apache Software Foundation (ASF) under one
 // // or more contributor license agreements.  See the NOTICE file
 // // distributed with this work for additional information
 // // regarding copyright ownership.  The ASF licenses this file
@@ -43,7 +43,7 @@ public class UsersTests(Protocol protocol)
             Status = UserStatus.Active
         };
 
-        var result = await Fixture.Clients[protocol].CreateUser(request);
+        var result = await Fixture.Clients[protocol].CreateUser(request.Username, request.Password, request.Status);
         result.ShouldNotBeNull();
         result.Username.ShouldBe(request.Username);
         result.Status.ShouldBe(request.Status);
@@ -62,7 +62,7 @@ public class UsersTests(Protocol protocol)
             Status = UserStatus.Active
         };
 
-        await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol].CreateUser(request));
+        await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol].CreateUser(request.Username, request.Password, request.Status));
     }
 
     [Test]
@@ -96,10 +96,7 @@ public class UsersTests(Protocol protocol)
     [DependsOn(nameof(GetUsers_Should_ReturnValidResponse))]
     public async Task UpdateUser_Should_UpdateUser_Successfully()
     {
-        await Should.NotThrowAsync(Fixture.Clients[protocol].UpdateUser(new UpdateUserRequest
-        {
-            UserId = Identifier.Numeric(2), Username = "new_user_name", UserStatus = UserStatus.Active
-        }));
+        await Should.NotThrowAsync(Fixture.Clients[protocol].UpdateUser(Identifier.Numeric(2), "new_user_name", UserStatus.Active));
 
         var user = await Fixture.Clients[protocol].GetUser(Identifier.Numeric(2));
 
@@ -116,11 +113,7 @@ public class UsersTests(Protocol protocol)
     public async Task UpdatePermissions_Should_UpdatePermissions_Successfully()
     {
         var permissions = CreatePermissions();
-        await Should.NotThrowAsync(Fixture.Clients[protocol].UpdatePermissions(new UpdateUserPermissionsRequest
-        {
-            UserId = Identifier.Numeric(2),
-            Permissions = permissions
-        }));
+        await Should.NotThrowAsync(Fixture.Clients[protocol].UpdatePermissions(Identifier.Numeric(2), permissions));
 
         var user = await Fixture.Clients[protocol].GetUser(Identifier.Numeric(2));
 
@@ -158,24 +151,16 @@ public class UsersTests(Protocol protocol)
     [DependsOn(nameof(UpdatePermissions_Should_UpdatePermissions_Successfully))]
     public async Task ChangePassword_Should_ChangePassword_Successfully()
     {
-        await Should.NotThrowAsync(Fixture.Clients[protocol].ChangePassword(new ChangePasswordRequest
-        {
-            UserId = Identifier.Numeric(2),
-            CurrentPassword = "test_password_1",
-            NewPassword = "user2"
-        }));
+        await Should.NotThrowAsync(Fixture.Clients[protocol]
+            .ChangePassword(Identifier.Numeric(2), "test_password_1", "user2"));
     }
 
     [Test]
     [DependsOn(nameof(ChangePassword_Should_ChangePassword_Successfully))]
     public async Task ChangePassword_WrongCurrentPassword_Should_Throw_InvalidResponse()
     {
-        await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol].ChangePassword(new ChangePasswordRequest
-        {
-            UserId = Identifier.Numeric(2),
-            CurrentPassword = "test_password_1",
-            NewPassword = "user2"
-        }));
+        await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol]
+            .ChangePassword(Identifier.Numeric(2), "test_password_1", "user2"));
     }
 
     [Test]
@@ -184,11 +169,7 @@ public class UsersTests(Protocol protocol)
     {
         var client = Fixture.CreateClient(protocol);
 
-        var response = await client.LoginUser(new LoginUserRequest
-        {
-            Username = NewUsername,
-            Password = "user2"
-        });
+        var response = await client.LoginUser(NewUsername, "user2");
 
         response.ShouldNotBeNull();
         response.UserId.ShouldBe(2);

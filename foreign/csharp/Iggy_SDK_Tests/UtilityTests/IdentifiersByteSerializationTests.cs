@@ -21,12 +21,11 @@ namespace Apache.Iggy.Tests.UtilityTests;
 
 public sealed class IdentifiersByteSerializationTests
 {
-
     [Fact]
     public void StringIdentifer_WithInvalidLength_ShouldThrowArgumentException()
     {
         const char character = 'a';
-        string val = string.Concat(Enumerable.Range(0, 500).Select(_ => character));
+        var val = string.Concat(Enumerable.Range(0, 500).Select(_ => character));
 
         Assert.Throws<ArgumentException>(() => Identifier.String(val));
     }
@@ -35,7 +34,7 @@ public sealed class IdentifiersByteSerializationTests
     public void KeyEntityId_WithInvalidLength_ShouldThrowArgumentException()
     {
         const char character = 'a';
-        string val = string.Concat(Enumerable.Range(0, 500).Select(_ => character));
+        var val = string.Concat(Enumerable.Range(0, 500).Select(_ => character));
 
         Assert.Throws<ArgumentException>(() => Partitioning.EntityIdString(val));
     }
@@ -43,7 +42,7 @@ public sealed class IdentifiersByteSerializationTests
     [Fact]
     public void KeyBytes_WithInvalidLength_ShouldThrowArgumentException()
     {
-        byte[] val = Enumerable.Range(0, 500).Select(x => (byte)x).ToArray();
+        var val = Enumerable.Range(0, 500).Select(x => (byte)x).ToArray();
         Assert.Throws<ArgumentException>(() => Partitioning.EntityIdBytes(val));
     }
 }

@@ -26,14 +26,15 @@ namespace Apache.Iggy.JsonConfiguration;
 
 internal sealed class MessageResponseGenericConverter<TMessage> : JsonConverter<PolledMessages<TMessage>>
 {
-    private readonly Func<byte[], TMessage> _serializer;
     private readonly Func<byte[], byte[]>? _decryptor;
+    private readonly Func<byte[], TMessage> _serializer;
 
     public MessageResponseGenericConverter(Func<byte[], TMessage> serializer, Func<byte[], byte[]>? decryptor)
     {
         _serializer = serializer;
         _decryptor = decryptor;
     }
+
     public override PolledMessages<TMessage>? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
         using var doc = JsonDocument.ParseValue(ref reader);
@@ -49,7 +50,7 @@ internal sealed class MessageResponseGenericConverter<TMessage> : JsonConverter<
         foreach (var element in messages.EnumerateArray())
         {
             var headerElement = element.GetProperty(nameof(Message.Header).ToSnakeCase());
-            
+
             var checksum = headerElement.GetProperty(nameof(MessageHeader.Checksum).ToSnakeCase()).GetUInt64();
             var id = headerElement.GetProperty(nameof(MessageHeader.Id).ToSnakeCase()).GetUInt128();
             var offset = headerElement.GetProperty(nameof(MessageHeader.Offset).ToSnakeCase()).GetUInt64();
@@ -57,7 +58,7 @@ internal sealed class MessageResponseGenericConverter<TMessage> : JsonConverter<
             var originTimestamp = headerElement.GetProperty(nameof(MessageHeader.OriginTimestamp).ToSnakeCase()).GetUInt64();
             var headerLength = headerElement.GetProperty(nameof(MessageHeader.UserHeadersLength).ToSnakeCase()).GetInt32();
             var payloadLength = headerElement.GetProperty(nameof(MessageHeader.PayloadLength).ToSnakeCase()).GetInt32();
-            
+
             element.TryGetProperty(nameof(MessageResponse.UserHeaders).ToSnakeCase(), out var headersElement);
 
             var payload = element.GetProperty(nameof(MessageResponse.Payload).ToSnakeCase()).GetBytesFromBase64();
@@ -94,9 +95,10 @@ internal sealed class MessageResponseGenericConverter<TMessage> : JsonConverter<
                     });
                 }
             }
+
             messageResponses.Add(new MessageResponse<TMessage>
             {
-                Header = new MessageHeader()
+                Header = new MessageHeader
                 {
                     UserHeadersLength = headerLength,
                     PayloadLength = payloadLength,

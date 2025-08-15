@@ -15,15 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Text.Json.Serialization;
 using Apache.Iggy.Enums;
 
 namespace Apache.Iggy.Contracts.Http.Auth;
 
 public sealed class UpdateUserRequest
 {
-    [JsonIgnore]
-    public required Identifier UserId { get; init; }
     public string? Username { get; init; }
     public UserStatus? UserStatus { get; init; }
 }

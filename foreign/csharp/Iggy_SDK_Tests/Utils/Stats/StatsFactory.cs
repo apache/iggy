@@ -19,7 +19,6 @@ namespace Apache.Iggy.Tests.Utils.Stats;
 
 public static class StatsFactory
 {
-
     public static Contracts.Http.Stats CreateFakeStatsObject()
     {
         return new Contracts.Http.Stats
@@ -48,6 +47,5 @@ public static class StatsFactory
             ClientsCount = 69,
             IggyServerVersion = "1234"
         };
-
     }
 }

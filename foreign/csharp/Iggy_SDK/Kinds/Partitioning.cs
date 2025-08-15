@@ -38,14 +38,14 @@ public readonly struct Partitioning
 
     public static Partitioning PartitionId(int value)
     {
-        byte[] bytes = new byte[4];
+        var bytes = new byte[4];
         BinaryPrimitives.WriteInt32LittleEndian(bytes, value);
 
         return new Partitioning
         {
             Kind = Enums.Partitioning.PartitionId,
             Length = 4,
-            Value = bytes,
+            Value = bytes
         };
     }
 

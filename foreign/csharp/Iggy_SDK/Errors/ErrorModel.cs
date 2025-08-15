@@ -29,5 +29,4 @@ public sealed class ErrorModel
         Code = code;
         Reason = reason;
     }
-
 }

@@ -38,7 +38,7 @@ internal sealed class MessagesConverter : JsonConverter<MessageSendRequest>
             writer.WriteStartObject();
             writer.WriteStartObject("partitioning");
 
-            writer.WriteString(nameof(MessageSendRequest.Partitioning.Kind).ToSnakeCase(), value: value.Partitioning.Kind switch
+            writer.WriteString(nameof(MessageSendRequest.Partitioning.Kind).ToSnakeCase(), value.Partitioning.Kind switch
             {
                 Partitioning.Balanced => "balanced",
                 Partitioning.MessageKey => "entity_id",
@@ -53,11 +53,13 @@ internal sealed class MessagesConverter : JsonConverter<MessageSendRequest>
             {
                 JsonSerializer.Serialize(writer, msg, JsonConverterFactory.HttpMessageOptions);
             }
+
             writer.WriteEndArray();
 
             writer.WriteEndObject();
             return;
         }
+
         writer.WriteStringValue("");
     }
 }
