@@ -1,0 +1,71 @@
+amends "package://github.com/jdx/hk/releases/download/v1.2.0/hk@1.2.0#/Config.pkl"
+import "package://github.com/jdx/hk/releases/download/v1.2.0/hk@1.2.0#/Builtins.pkl"
+
+local rust_steps = new Mapping<String, Step> {
+    ["cargo-fmt"] {
+        workspace_indicator = "Cargo.toml"
+        glob = "*.rs"
+        check = "cargo fmt --check --manifest-path {{workspace_indicator}}"
+        fix = "cargo fmt --manifest-path {{workspace_indicator}}"
+    }
+    ["cargo-clippy"] {
+        workspace_indicator = "Cargo.toml"
+        glob = "*.rs"
+        check = "cargo clippy --manifest-path {{workspace_indicator}}"
+        fix = "cargo clippy --fix --manifest-path {{workspace_indicator}}"
+    }
+    ["cargo-check"] {
+        workspace_indicator = "Cargo.toml"
+        glob = "*.rs"
+        check = "cargo check --manifest-path {{workspace_indicator}}"
+    }
+    ["cargo-test"] {
+        workspace_indicator = "Cargo.toml"
+        glob = "*.rs"
+        check = "cargo test --manifest-path {{workspace_indicator}}"
+    }
+}
+
+local python_steps = new Mapping<String, Step> {
+    ["python-maturin-develop"] {
+        glob = "foreign/python/*"
+        dir = "foreign/python"
+        check = "maturin develop"
+        exclusive = true
+    }
+    ["python-cargo-run-stub-gen"] {
+        glob = "foreign/python/*"
+        dir = "foreign/python"
+        check = "cargo run --bin stub_gen"
+        exclusive = true
+    }
+    ["python-pytest"] {
+        glob = "foreign/python/*"
+        dir = "foreign/python"
+        check = "pytest -v"
+        exclusive = true
+    }
+}
+
+local all_steps = new Mapping<String, Step> {
+    ...rust_steps
+    ...python_steps
+}
+
+hooks {
+    ["pre-commit"] {
+        fix = true
+        stash = "git"
+        steps = all_steps
+    }
+    ["pre-push"] {
+        steps = all_steps
+    }
+    ["fix"] {
+        fix = true
+        steps = all_steps
+    }
+    ["check"] {
+        steps = all_steps
+    }
+}
