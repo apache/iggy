@@ -24,25 +24,6 @@ namespace Apache.Iggy.JsonConfiguration;
 
 public static class JsonConverterFactory
 {
-    public static JsonSerializerOptions HttpMessageOptions
-        => new()
-        {
-            Converters =
-            {
-                new MessageConverter()
-            }
-        };
-
-    public static JsonSerializerOptions MessagesOptions
-        => new()
-        {
-            Converters =
-            {
-                new MessagesConverter()
-            }
-        };
-
-
     public static JsonSerializerOptions MessageResponseOptions(Func<byte[], byte[]>? decryptor)
     {
         return new JsonSerializerOptions

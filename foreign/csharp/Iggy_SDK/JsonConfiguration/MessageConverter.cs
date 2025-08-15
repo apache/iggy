@@ -17,9 +17,7 @@
 
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using Apache.Iggy.Extensions;
 using Apache.Iggy.Headers;
-using Apache.Iggy.JsonConfiguration.Converters;
 using Apache.Iggy.Messages;
 
 namespace Apache.Iggy.JsonConfiguration;
@@ -34,52 +32,59 @@ internal sealed class MessageConverter : JsonConverter<Message>
     public override void Write(Utf8JsonWriter writer, Message value, JsonSerializerOptions options)
     {
         writer.WriteStartObject();
-        var jsonOptions = new JsonSerializerOptions();
-        jsonOptions.Converters.Add(new UInt128Converter());
-
-        writer.WritePropertyName(nameof(value.Header.Id).ToSnakeCase());
-        var idJson = JsonSerializer.Serialize(value.Header.Id, jsonOptions);
-        using (var doc = JsonDocument.Parse(idJson))
-        {
-            doc.RootElement.WriteTo(writer);
-        }
-
-        writer.WriteString(nameof(value.Payload).ToSnakeCase(), Convert.ToBase64String(value.Payload));
-
-        if (value.UserHeaders is not null)
-        {
-            writer.WriteStartObject("headers");
-            foreach (var (headerKey, headerValue) in value.UserHeaders)
-            {
-                writer.WriteStartObject(headerKey.Value.ToSnakeCase());
-                var headerKind = headerValue.Kind switch
-                {
-                    HeaderKind.Bool => "bool",
-                    HeaderKind.Int32 => "int32",
-                    HeaderKind.Int64 => "int64",
-                    HeaderKind.Int128 => "int128",
-                    HeaderKind.Uint32 => "uint32",
-                    HeaderKind.Uint64 => "uint64",
-                    HeaderKind.Uint128 => "uint128",
-                    HeaderKind.Float => "float32",
-                    HeaderKind.Double => "float64",
-                    HeaderKind.String => "string",
-                    HeaderKind.Raw => "raw",
-                    _ => throw new ArgumentOutOfRangeException()
-                };
-                writer.WriteString(nameof(headerValue.Kind).ToSnakeCase(), headerKind);
-                writer.WriteBase64String(nameof(headerValue.Value).ToSnakeCase(), headerValue.Value);
-                writer.WriteEndObject();
-            }
-
-            writer.WriteEndObject();
-        }
-        else
-        {
-            writer.WriteNull("headers");
-        }
-
-
+        
+        WriteMessageId(writer, value.Header.Id);
+        WritePayload(writer, value.Payload);
+        WriteHeaders(writer, value.UserHeaders);
+        
         writer.WriteEndObject();
     }
+
+    private static void WriteMessageId(Utf8JsonWriter writer, UInt128 id)
+    {
+        writer.WritePropertyName("id");
+        writer.WriteRawValue(id.ToString());
+    }
+
+    private static void WritePayload(Utf8JsonWriter writer, byte[] payload)
+    {
+        writer.WriteString("payload", Convert.ToBase64String(payload));
+    }
+
+    private static void WriteHeaders(Utf8JsonWriter writer, Dictionary<HeaderKey, HeaderValue>? userHeaders)
+    {
+        if (userHeaders is null)
+        {
+            writer.WriteNull("headers");
+            return;
+        }
+
+        writer.WriteStartObject("headers");
+        
+        foreach (var (headerKey, headerValue) in userHeaders)
+        {
+            writer.WriteStartObject(headerKey.Value);
+            writer.WriteString("kind", GetHeaderKindString(headerValue.Kind));
+            writer.WriteBase64String("value", headerValue.Value);
+            writer.WriteEndObject();
+        }
+        
+        writer.WriteEndObject();
+    }
+
+    private static string GetHeaderKindString(HeaderKind kind) => kind switch
+    {
+        HeaderKind.Bool => "bool",
+        HeaderKind.Int32 => "int32",
+        HeaderKind.Int64 => "int64",
+        HeaderKind.Int128 => "int128",
+        HeaderKind.Uint32 => "uint32",
+        HeaderKind.Uint64 => "uint64",
+        HeaderKind.Uint128 => "uint128",
+        HeaderKind.Float => "float32",
+        HeaderKind.Double => "float64",
+        HeaderKind.String => "string",
+        HeaderKind.Raw => "raw",
+        _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "Invalid header kind")
+    };
 }

@@ -26,6 +26,13 @@ namespace Apache.Iggy.JsonConfiguration;
 
 internal sealed class MessagesConverter : JsonConverter<MessageSendRequest>
 {
+    private static readonly Dictionary<Partitioning, string> PartitioningKindMapping = new()
+    {
+        { Partitioning.Balanced, "balanced" },
+        { Partitioning.MessageKey, "messages_key" },
+        { Partitioning.PartitionId, "partition_id" }
+    };
+
     public override MessageSendRequest? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
         throw new NotImplementedException();
@@ -33,33 +40,38 @@ internal sealed class MessagesConverter : JsonConverter<MessageSendRequest>
 
     public override void Write(Utf8JsonWriter writer, MessageSendRequest value, JsonSerializerOptions options)
     {
-        if (value.Messages.Any())
+        writer.WriteStartObject();
+        
+        WritePartitioning(writer, value.Partitioning);
+        WriteMessages(writer, value.Messages, options);
+        
+        writer.WriteEndObject();
+    }
+
+    private static void WritePartitioning(Utf8JsonWriter writer, Kinds.Partitioning partitioning)
+    {
+        writer.WriteStartObject("partitioning");
+        
+        if (!PartitioningKindMapping.TryGetValue(partitioning.Kind, out var kindString))
         {
-            writer.WriteStartObject();
-            writer.WriteStartObject("partitioning");
-
-            writer.WriteString(nameof(MessageSendRequest.Partitioning.Kind).ToSnakeCase(), value.Partitioning.Kind switch
-            {
-                Partitioning.Balanced => "balanced",
-                Partitioning.MessageKey => "entity_id",
-                Partitioning.PartitionId => "partition_id",
-                _ => throw new InvalidEnumArgumentException()
-            });
-            writer.WriteBase64String(nameof(MessageSendRequest.Partitioning.Value).ToSnakeCase(), value.Partitioning.Value);
-            writer.WriteEndObject();
-
-            writer.WriteStartArray("messages");
-            foreach (var msg in value.Messages)
-            {
-                JsonSerializer.Serialize(writer, msg, JsonConverterFactory.HttpMessageOptions);
-            }
-
-            writer.WriteEndArray();
-
-            writer.WriteEndObject();
-            return;
+            throw new InvalidEnumArgumentException(nameof(partitioning.Kind), (int)partitioning.Kind, typeof(Partitioning));
         }
+        
+        writer.WriteString("kind", kindString);
+        writer.WriteBase64String("value", partitioning.Value);
+        
+        writer.WriteEndObject();
+    }
 
-        writer.WriteStringValue("");
+    private static void WriteMessages(Utf8JsonWriter writer, IList<Messages.Message> messages, JsonSerializerOptions options)
+    {
+        writer.WriteStartArray("messages");
+        
+        foreach (var message in messages)
+        {
+            JsonSerializer.Serialize(writer, message, options);
+        }
+        
+        writer.WriteEndArray();
     }
 }

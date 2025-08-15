@@ -18,24 +18,31 @@
 using System.Net;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Exceptions;
-using JsonConverterFactory = Apache.Iggy.JsonConfiguration.JsonConverterFactory;
+using Apache.Iggy.JsonConfiguration;
 
 namespace Apache.Iggy.MessagesDispatcher;
 
 internal sealed class HttpMessageInvoker : IMessageInvoker
 {
     private readonly HttpClient _client;
+    private readonly JsonSerializerOptions _jsonSerializerOptions;
 
     public HttpMessageInvoker(HttpClient client)
     {
         _client = client;
+        _jsonSerializerOptions = new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
+            Converters = { new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower), new MessageConverter(), new MessagesConverter() }
+        };
     }
 
     public async Task SendMessagesAsync(MessageSendRequest request, CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(request, JsonConverterFactory.MessagesOptions);
+        var json = JsonSerializer.Serialize(request, _jsonSerializerOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
         var response = await _client.PostAsync($"/streams/{request.StreamId}/topics/{request.TopicId}/messages", data, token);
