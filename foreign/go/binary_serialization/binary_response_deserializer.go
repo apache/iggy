@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -271,12 +272,36 @@ func DeserializeToConsumerGroup(payload []byte, position int) (*iggcon.ConsumerG
 }
 
 func DeserializeConsumerGroup(payload []byte) *iggcon.ConsumerGroupDetails {
-	consumerGroup, _ := DeserializeToConsumerGroup(payload, 0)
-	// TODO: implement logic to deserialize the members.
+	consumerGroup, pos := DeserializeToConsumerGroup(payload, 0)
+	members := make([]iggcon.ConsumerGroupMember, 0)
+	for pos < len(payload) {
+		m, readBytes := DeserializeToConsumerGroupMember(payload, pos)
+		members = append(members, m)
+		pos += readBytes
+	}
+	sort.Slice(members, func(i, j int) bool {
+		return members[i].ID < members[j].ID
+	})
 	return &iggcon.ConsumerGroupDetails{
 		ConsumerGroup: *consumerGroup,
-		Members:       nil,
+		Members:       members,
 	}
+}
+
+func DeserializeToConsumerGroupMember(payload []byte, position int) (iggcon.ConsumerGroupMember, int) {
+	id := binary.LittleEndian.Uint32(payload[position : position+4])
+	partitionsCount := binary.LittleEndian.Uint32(payload[position+4 : position+8])
+	var partitions []uint32
+	for i := 0; i < int(partitionsCount); i++ {
+		partitionId := binary.LittleEndian.Uint32(payload[position+8+i*4 : position+12+i*4])
+		partitions = append(partitions, partitionId)
+	}
+	readBytes := 4 + 4 + int(partitionsCount)*4
+	return iggcon.ConsumerGroupMember{
+		ID:              id,
+		PartitionsCount: partitionsCount,
+		Partitions:      partitions,
+	}, readBytes
 }
 
 func DeserializeUsers(payload []byte) ([]iggcon.UserInfo, error) {
