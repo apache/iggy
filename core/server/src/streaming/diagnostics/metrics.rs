@@ -23,9 +23,9 @@ use prometheus_client::registry::Registry;
 use std::sync::Arc;
 use tracing::error;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Metrics {
-    registry: Registry,
+    registry: Arc<Registry>,
     http_requests: Counter,
     streams: Gauge,
     topics: Gauge,
@@ -38,38 +38,47 @@ pub struct Metrics {
 
 impl Metrics {
     pub fn init() -> Self {
-        let mut metrics = Metrics {
-            registry: <Registry>::default(),
-            http_requests: Counter::default(),
-            streams: Gauge::default(),
-            topics: Gauge::default(),
-            partitions: Gauge::default(),
-            segments: Gauge::default(),
-            messages: Gauge::default(),
-            users: Gauge::default(),
-            clients: Gauge::default(),
-        };
+        let mut registry = Registry::default();
 
-        metrics.register_counter("http_requests", metrics.http_requests.clone());
-        metrics.register_gauge("streams", metrics.streams.clone());
-        metrics.register_gauge("topics", metrics.topics.clone());
-        metrics.register_gauge("partitions", metrics.partitions.clone());
-        metrics.register_gauge("segments", metrics.segments.clone());
-        metrics.register_gauge("messages", metrics.messages.clone());
-        metrics.register_gauge("users", metrics.users.clone());
-        metrics.register_gauge("clients", metrics.clients.clone());
+        let http_requests = Counter::default();
+        let streams = Gauge::default();
+        let topics = Gauge::default();
+        let partitions = Gauge::default();
+        let segments = Gauge::default();
+        let messages = Gauge::default();
+        let users = Gauge::default();
+        let clients = Gauge::default();
 
-        metrics
-    }
+        registry.register(
+            "http_requests",
+            "total count of http_requests",
+            http_requests.clone(),
+        );
+        registry.register("streams", "total count of streams", streams.clone());
+        registry.register("topics", "total count of topics", topics.clone());
+        registry.register(
+            "partitions",
+            "total count of partitions",
+            partitions.clone(),
+        );
+        registry.register("segments", "total count of segments", segments.clone());
+        registry.register("messages", "total count of messages", messages.clone());
+        registry.register("users", "total count of users", users.clone());
+        registry.register("clients", "total count of clients", clients.clone());
 
-    fn register_counter(&mut self, name: &str, counter: Counter) {
-        self.registry
-            .register(name, format!("total count of {name}"), counter)
-    }
+        let registry = Arc::new(registry);
 
-    fn register_gauge(&mut self, name: &str, gauge: Gauge) {
-        self.registry
-            .register(name, format!("total count of {name}"), gauge)
+        Metrics {
+            registry,
+            http_requests,
+            streams,
+            topics,
+            partitions,
+            segments,
+            messages,
+            users,
+            clients,
+        }
     }
 
     pub fn get_formatted_output(&self) -> String {
@@ -138,32 +147,5 @@ impl Metrics {
 
     pub fn decrement_clients(&self, count: u32) {
         self.clients.dec_by(count as i64);
-    }
-}
-
-impl Clone for Metrics {
-    fn clone(&self) -> Self {
-        let mut cloned_metrics = Metrics {
-            registry: Registry::default(),
-            http_requests: self.http_requests.clone(),
-            streams: self.streams.clone(),
-            topics: self.topics.clone(),
-            partitions: self.partitions.clone(),
-            segments: self.segments.clone(),
-            messages: self.messages.clone(),
-            users: self.users.clone(),
-            clients: self.clients.clone(),
-        };
-
-        cloned_metrics.register_counter("http_requests", cloned_metrics.http_requests.clone());
-        cloned_metrics.register_gauge("streams", cloned_metrics.streams.clone());
-        cloned_metrics.register_gauge("topics", cloned_metrics.topics.clone());
-        cloned_metrics.register_gauge("partitions", cloned_metrics.partitions.clone());
-        cloned_metrics.register_gauge("segments", cloned_metrics.segments.clone());
-        cloned_metrics.register_gauge("messages", cloned_metrics.messages.clone());
-        cloned_metrics.register_gauge("users", cloned_metrics.users.clone());
-        cloned_metrics.register_gauge("clients", cloned_metrics.clients.clone());
-
-        cloned_metrics
     }
 }

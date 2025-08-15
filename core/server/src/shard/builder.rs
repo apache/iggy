@@ -129,7 +129,7 @@ impl IggyShardBuilder {
         let storage = Rc::new(storage);
 
         // Initialize metrics
-        let metrics = crate::streaming::diagnostics::metrics::Metrics::init();
+        let metrics = self.metrics.unwrap_or_else(|| Metrics::init());
         IggyShard {
             id: id,
             shards: shards,
