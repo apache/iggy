@@ -20,6 +20,8 @@ package tcp_test
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
+	"math"
 )
 
 var _ = ginkgo.Describe("GET STREAM BY ID:", func() {
@@ -42,6 +44,50 @@ var _ = ginkgo.Describe("GET STREAM BY ID:", func() {
 			_, err := client.GetStream(randomU32Identifier())
 
 			itShouldReturnSpecificError(err, "stream_id_not_found")
+		})
+
+		ginkgo.Context("and tries to get stream after creating some topics", func() {
+			client := createAuthorizedConnection()
+			streamId, name := successfullyCreateStream(prefix, client)
+			defer deleteStreamAfterTests(streamId, client)
+			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
+
+			// create two topics
+			t1Id := createRandomUInt32()
+			t1Name := createRandomString(32)
+			t2Id := createRandomUInt32()
+			t2Name := createRandomString(32)
+			_, err := client.CreateTopic(streamIdentifier,
+				t1Name,
+				2,
+				iggcon.CompressionAlgorithmNone,
+				iggcon.Millisecond,
+				math.MaxUint64,
+				nil,
+				&t1Id)
+			itShouldNotReturnError(err)
+			_, err = client.CreateTopic(
+				streamIdentifier,
+				t2Name,
+				2,
+				iggcon.CompressionAlgorithmNone,
+				iggcon.Millisecond,
+				math.MaxUint64,
+				nil,
+				&t2Id)
+			itShouldNotReturnError(err)
+			itShouldSuccessfullyCreateTopic(streamId, t1Id, t1Name, client)
+			itShouldSuccessfullyCreateTopic(streamId, t2Id, t2Name, client)
+
+			// check stream details
+			stream, err := client.GetStream(streamIdentifier)
+			itShouldNotReturnError(err)
+			itShouldReturnSpecificStream(streamId, name, *stream)
+			ginkgo.It("should have exactly 2 topics", func() {
+				gomega.Expect(len(stream.Topics)).To(gomega.Equal(2))
+			})
+			itShouldContainSpecificTopic(t1Id, t1Name, stream.Topics)
+			itShouldContainSpecificTopic(t2Id, t2Name, stream.Topics)
 		})
 	})
 

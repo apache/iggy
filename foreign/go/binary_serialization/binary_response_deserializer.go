@@ -48,13 +48,26 @@ func DeserializeOffset(payload []byte) *iggcon.ConsumerOffsetInfo {
 	}
 }
 
-func DeserializeStream(payload []byte) *iggcon.StreamDetails {
-	stream, _ := DeserializeToStream(payload, 0)
-	// TODO implement deserialize topics
+func DeserializeStream(payload []byte) (*iggcon.StreamDetails, error) {
+	stream, pos := DeserializeToStream(payload, 0)
+	topics := make([]iggcon.Topic, 0)
+	for pos < len(payload) {
+		topic, readBytes, err := DeserializeToTopic(payload, pos)
+		if err != nil {
+			return nil, err
+		}
+		topics = append(topics, topic)
+		pos += readBytes
+	}
+
+	sort.Slice(topics, func(i, j int) bool {
+		return topics[i].Id < topics[j].Id
+	})
+
 	return &iggcon.StreamDetails{
 		Stream: stream,
-		Topics: nil,
-	}
+		Topics: topics,
+	}, nil
 }
 
 func DeserializeStreams(payload []byte) []iggcon.Stream {

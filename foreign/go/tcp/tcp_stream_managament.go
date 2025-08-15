@@ -42,7 +42,11 @@ func (tms *IggyTcpClient) GetStream(streamId iggcon.Identifier) (*iggcon.StreamD
 		return nil, ierror.StreamIdNotFound
 	}
 
-	stream := binaryserialization.DeserializeStream(buffer)
+	stream, err := binaryserialization.DeserializeStream(buffer)
+	if err != nil {
+		return nil, err
+	}
+
 	return stream, nil
 }
 
@@ -55,7 +59,10 @@ func (tms *IggyTcpClient) CreateStream(name string, streamId *uint32) (*iggcon.S
 	if err != nil {
 		return nil, err
 	}
-	stream := binaryserialization.DeserializeStream(buffer)
+	stream, err := binaryserialization.DeserializeStream(buffer)
+	if err != nil {
+		return nil, err
+	}
 
 	return stream, err
 }
