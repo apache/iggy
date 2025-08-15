@@ -65,17 +65,17 @@ public class HttpMessageStream : IIggyClient
         _jsonSerializerOptions = new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
-            Converters = { new JsonStringEnumConverter() }
+            Converters = { new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower) }
         };
     }
 
-    public async Task<StreamResponse?> CreateStreamAsync(string name, uint? streamId, CancellationToken token = default)
+    public async Task<StreamResponse?> CreateStreamAsync(string name, uint? streamId = null, CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(new CreateStreamRequest
         {
             Name = name,
             StreamId = streamId
-        }, JsonConverterFactory.SnakeCaseOptions);
+        }, _jsonSerializerOptions);
 
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
@@ -128,7 +128,7 @@ public class HttpMessageStream : IIggyClient
         var json = JsonSerializer.Serialize(new UpdateStreamRequest
         {
             Name = name
-        }, JsonConverterFactory.SnakeCaseOptions);
+        }, _jsonSerializerOptions);
 
         var data = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PutAsync($"/streams/{streamId}", data, token);
@@ -152,7 +152,7 @@ public class HttpMessageStream : IIggyClient
         return Array.Empty<StreamResponse>();
     }
 
-    public async Task<TopicResponse?> CreateTopicAsync(Identifier streamId, string name, uint partitionCount, CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
+    public async Task<TopicResponse?> CreateTopicAsync(Identifier streamId, string name, uint partitionsCount, CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
         uint? topicId = null, byte? replicationFactor = null, ulong messageExpiry = 0, ulong maxTopicSize = 0, CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(new CreateTopicRequest
@@ -161,7 +161,7 @@ public class HttpMessageStream : IIggyClient
             CompressionAlgorithm = compressionAlgorithm,
             MaxTopicSize = maxTopicSize,
             MessageExpiry = messageExpiry,
-            PartitionsCount = partitionCount,
+            PartitionsCount = partitionsCount,
             ReplicationFactor = replicationFactor,
             TopicId = topicId
         }, _jsonSerializerOptions);
@@ -182,7 +182,7 @@ public class HttpMessageStream : IIggyClient
     public async Task UpdateTopicAsync(Identifier streamId, Identifier topicId, string name, CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
         ulong maxTopicSize = 0, ulong messageExpiry = 0, byte? replicationFactor = null, CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new UpdateTopicRequest(name, compressionAlgorithm, maxTopicSize, messageExpiry, replicationFactor), JsonConverterFactory.SnakeCaseOptions);
+        var json = JsonSerializer.Serialize(new UpdateTopicRequest(name, compressionAlgorithm, maxTopicSize, messageExpiry, replicationFactor), _jsonSerializerOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PutAsync($"/streams/{streamId}/topics/{topicId}", data, token);
         if (!response.IsSuccessStatusCode)
@@ -296,7 +296,7 @@ public class HttpMessageStream : IIggyClient
             catch
             {
                 var partId = BinaryPrimitives.ReadInt32LittleEndian(sendRequest.Partitioning.Value);
-                _logger.LogError("Error encountered while sending messages - Stream ID:{streamId}, Topic ID:{topicId}, Partition ID: {partitionId}",
+                _logger.LogError("Error encountered while sending messages - Stream ID:{StreamId}, Topic ID:{TopicId}, Partition ID: {PartitionId}",
                     sendRequest.StreamId, sendRequest.TopicId, partId);
             }
 
@@ -336,7 +336,7 @@ public class HttpMessageStream : IIggyClient
     }
 
     public async Task<PolledMessages<TMessage>> PollMessagesAsync<TMessage>(MessageFetchRequest request,
-        Func<byte[], TMessage> serializer, Func<byte[], byte[]>? decryptor = null,
+        Func<byte[], TMessage> deserializer, Func<byte[], byte[]>? decryptor = null,
         CancellationToken token = default)
     {
         var url = CreateUrl($"/streams/{request.StreamId}/topics/{request.TopicId}/messages?consumer_id={request.Consumer.Id}" +
@@ -345,7 +345,7 @@ public class HttpMessageStream : IIggyClient
         var response = await _httpClient.GetAsync(url, token);
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<PolledMessages<TMessage>>(JsonConverterFactory.MessageResponseGenericOptions(serializer, decryptor), token)
+            return await response.Content.ReadFromJsonAsync<PolledMessages<TMessage>>(JsonConverterFactory.MessageResponseGenericOptions(deserializer, decryptor), token)
                    ?? PolledMessages<TMessage>.Empty;
         }
 
@@ -391,7 +391,7 @@ public class HttpMessageStream : IIggyClient
                 }
                 catch
                 {
-                    _logger.LogError("Error encountered while saving offset information - Offset: {offset}, Stream ID: {streamId}, Topic ID: {topicId}, Partition ID: {partitionId}",
+                    _logger.LogError("Error encountered while saving offset information - Offset: {Offset}, Stream ID: {StreamId}, Topic ID: {TopicId}, Partition ID: {PartitionId}",
                         currentOffset, request.StreamId, request.TopicId, request.PartitionId);
                 }
             }
@@ -411,7 +411,7 @@ public class HttpMessageStream : IIggyClient
             Consumer = consumer,
             Offset = offset,
             PartitionId = partitionId
-        }, JsonConverterFactory.SnakeCaseOptions);
+        }, _jsonSerializerOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
         var response = await _httpClient.PutAsync($"/streams/{streamId}/topics/{topicId}/consumer-offsets", data, token);
@@ -427,7 +427,7 @@ public class HttpMessageStream : IIggyClient
                                                   $"consumer-offsets?consumer_id={consumer.Id}&partition_id={partitionId}", token);
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<OffsetResponse>(JsonConverterFactory.SnakeCaseOptions, token);
+            return await response.Content.ReadFromJsonAsync<OffsetResponse>(_jsonSerializerOptions, token);
         }
 
         await HandleResponseAsync(response);
@@ -446,7 +446,7 @@ public class HttpMessageStream : IIggyClient
 
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<IReadOnlyList<ConsumerGroupResponse>>(JsonConverterFactory.SnakeCaseOptions, token)
+            return await response.Content.ReadFromJsonAsync<IReadOnlyList<ConsumerGroupResponse>>(_jsonSerializerOptions, token)
                    ?? Array.Empty<ConsumerGroupResponse>();
         }
 
@@ -461,7 +461,7 @@ public class HttpMessageStream : IIggyClient
 
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<ConsumerGroupResponse>(JsonConverterFactory.SnakeCaseOptions, token);
+            return await response.Content.ReadFromJsonAsync<ConsumerGroupResponse>(_jsonSerializerOptions, token);
         }
 
         await HandleResponseAsync(response);
@@ -474,14 +474,14 @@ public class HttpMessageStream : IIggyClient
         {
             Name = name,
             ConsumerGroupId = groupId
-        }, JsonConverterFactory.SnakeCaseOptions);
+        }, _jsonSerializerOptions);
 
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
         var response = await _httpClient.PostAsync($"/streams/{streamId}/topics/{topicId}/consumer-groups", data, token);
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<ConsumerGroupResponse>(JsonConverterFactory.SnakeCaseOptions, token);
+            return await response.Content.ReadFromJsonAsync<ConsumerGroupResponse>(_jsonSerializerOptions, token);
         }
 
         await HandleResponseAsync(response);
@@ -527,7 +527,7 @@ public class HttpMessageStream : IIggyClient
         var response = await _httpClient.GetAsync("/clients", token);
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<IReadOnlyList<ClientResponse>>(JsonConverterFactory.SnakeCaseOptions, token)
+            return await response.Content.ReadFromJsonAsync<IReadOnlyList<ClientResponse>>(_jsonSerializerOptions, token)
                    ?? Array.Empty<ClientResponse>();
         }
 
@@ -540,7 +540,7 @@ public class HttpMessageStream : IIggyClient
         var response = await _httpClient.GetAsync($"/clients/{clientId}", token);
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<ClientResponse>(JsonConverterFactory.SnakeCaseOptions, token);
+            return await response.Content.ReadFromJsonAsync<ClientResponse>(_jsonSerializerOptions, token);
         }
 
         await HandleResponseAsync(response);
@@ -574,7 +574,7 @@ public class HttpMessageStream : IIggyClient
         var json = JsonSerializer.Serialize(new CreatePartitionsRequest
         {
             PartitionsCount = partitionsCount
-        }, JsonConverterFactory.SnakeCaseOptions);
+        }, _jsonSerializerOptions);
 
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
@@ -591,7 +591,7 @@ public class HttpMessageStream : IIggyClient
         var response = await _httpClient.GetAsync($"/users/{userId}", token);
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<UserResponse>(JsonConverterFactory.SnakeCaseOptions, token);
+            return await response.Content.ReadFromJsonAsync<UserResponse>(_jsonSerializerOptions, token);
         }
 
         await HandleResponseAsync(response);
@@ -603,7 +603,7 @@ public class HttpMessageStream : IIggyClient
         var response = await _httpClient.GetAsync("/users", token);
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<IReadOnlyList<UserResponse>>(JsonConverterFactory.SnakeCaseOptions, token)
+            return await response.Content.ReadFromJsonAsync<IReadOnlyList<UserResponse>>(_jsonSerializerOptions, token)
                    ?? Array.Empty<UserResponse>();
         }
 
@@ -619,12 +619,13 @@ public class HttpMessageStream : IIggyClient
             Password = password,
             Status = status,
             Permissions = permissions
-        }, JsonConverterFactory.SnakeCaseOptions);
+        }, _jsonSerializerOptions);
+        
         var content = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PostAsync("/users", content, token);
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<UserResponse>(JsonConverterFactory.SnakeCaseOptions, token);
+            return await response.Content.ReadFromJsonAsync<UserResponse>(_jsonSerializerOptions, token);
         }
 
         await HandleResponseAsync(response);
@@ -646,7 +647,7 @@ public class HttpMessageStream : IIggyClient
         {
             Username = userName,
             UserStatus = status
-        }, JsonConverterFactory.SnakeCaseOptions);
+        }, _jsonSerializerOptions);
         var content = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PutAsync($"/users/{userId}", content, token);
         if (!response.IsSuccessStatusCode)
@@ -660,7 +661,7 @@ public class HttpMessageStream : IIggyClient
         var json = JsonSerializer.Serialize(new UpdateUserPermissionsRequest
         {
             Permissions = permissions
-        }, JsonConverterFactory.SnakeCaseOptions);
+        }, _jsonSerializerOptions);
         var content = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PutAsync($"/users/{userId}/permissions", content, token);
         if (!response.IsSuccessStatusCode)
@@ -675,7 +676,7 @@ public class HttpMessageStream : IIggyClient
         {
             CurrentPassword = currentPassword,
             NewPassword = newPassword
-        }, JsonConverterFactory.SnakeCaseOptions);
+        }, _jsonSerializerOptions);
         var content = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PutAsync($"/users/{userId}/password", content, token);
         if (!response.IsSuccessStatusCode)
@@ -691,13 +692,14 @@ public class HttpMessageStream : IIggyClient
             Username = userName,
             Password = password,
             Context = "csharp-sdk"
-        }, JsonConverterFactory.SnakeCaseOptions);
+        }, _jsonSerializerOptions);
+        
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
         var response = await _httpClient.PostAsync("users/login", data, token);
         if (response.IsSuccessStatusCode)
         {
-            var authResponse = await response.Content.ReadFromJsonAsync<AuthResponse>(JsonConverterFactory.AuthResponseOptions, token);
+            var authResponse = await response.Content.ReadFromJsonAsync<AuthResponse>(_jsonSerializerOptions, token);
             var jwtToken = authResponse!.AccessToken?.Token;
             if (!string.IsNullOrEmpty(authResponse!.AccessToken!.Token))
             {
@@ -746,7 +748,7 @@ public class HttpMessageStream : IIggyClient
         {
             Name = name,
             Expiry = expiry
-        }, JsonConverterFactory.SnakeCaseOptions);
+        }, _jsonSerializerOptions);
 
         var content = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PostAsync("/personal-access-tokens", content, token);
@@ -755,7 +757,7 @@ public class HttpMessageStream : IIggyClient
             await HandleResponseAsync(response);
         }
 
-        return await response.Content.ReadFromJsonAsync<RawPersonalAccessToken>(JsonConverterFactory.SnakeCaseOptions, token);
+        return await response.Content.ReadFromJsonAsync<RawPersonalAccessToken>(_jsonSerializerOptions, token);
     }
 
     public async Task DeletePersonalAccessTokenAsync(string name, CancellationToken token = default)
@@ -772,13 +774,13 @@ public class HttpMessageStream : IIggyClient
         var json = JsonSerializer.Serialize(new LoginWithPersonalAccessToken
         {
             Token = token
-        }, JsonConverterFactory.SnakeCaseOptions);
+        }, _jsonSerializerOptions);
 
         var content = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PostAsync("/personal-access-tokens/login", content, ct);
         if (response.IsSuccessStatusCode)
         {
-            var authResponse = await response.Content.ReadFromJsonAsync<AuthResponse>(JsonConverterFactory.AuthResponseOptions, ct);
+            var authResponse = await response.Content.ReadFromJsonAsync<AuthResponse>(_jsonSerializerOptions, ct);
             var jwtToken = authResponse!.AccessToken?.Token;
             if (!string.IsNullOrEmpty(authResponse!.AccessToken!.Token))
             {

@@ -24,54 +24,6 @@ namespace Apache.Iggy.JsonConfiguration;
 
 public static class JsonConverterFactory
 {
-    public static JsonSerializerOptions SnakeCaseOptions
-        => new()
-        {
-            PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
-            WriteIndented = true,
-            //This code makes the source generated JsonSerializer work with JsonIgnore
-            //attribute for required properties
-            TypeInfoResolver = new DefaultJsonTypeInfoResolver
-            {
-                Modifiers =
-                {
-                    ti =>
-                    {
-                        if (ti.Kind == JsonTypeInfoKind.Object)
-                        {
-                            JsonPropertyInfo[] props = ti.Properties
-                                .Where(prop => prop.AttributeProvider == null || prop.AttributeProvider
-                                    .GetCustomAttributes(typeof(JsonIgnoreAttribute), false).Length == 0)
-                                .ToArray();
-
-                            if (props.Length != ti.Properties.Count)
-                            {
-                                ti.Properties.Clear();
-                                foreach (var prop in props)
-                                {
-                                    ti.Properties.Add(prop);
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            Converters =
-            {
-                new UInt128Converter(),
-                new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower)
-            }
-        };
-
-    public static JsonSerializerOptions AuthResponseOptions
-        => new()
-        {
-            Converters =
-            {
-                new AuthResponseConverter()
-            }
-        };
-
     public static JsonSerializerOptions HttpMessageOptions
         => new()
         {

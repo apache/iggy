@@ -26,8 +26,13 @@ public class TokenInfo
     public required string Token { get; init; }
 
     [JsonConverter(typeof(ExpiryConverter))]
-    public required DateTimeOffset Expiry { get; init; }
+    public required DateTimeOffset? Expiry { get; init; }
 
+    public TokenInfo()
+    {
+        
+    }
+    
     [SetsRequiredMembers]
     public TokenInfo(string token, DateTimeOffset expiry)
     {
