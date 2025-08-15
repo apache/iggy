@@ -530,9 +530,9 @@ internal static class BinaryMapper
             ReadOnlySpan<byte> value = payload[position..(position + valueLength)];
             position += valueLength;
             headers.Add(HeaderKey.New(key), new HeaderValue
-            {
-                Kind = headerKind, Value = value.ToArray()
-            }
+                {
+                    Kind = headerKind, Value = value.ToArray()
+                }
             );
         }
 
@@ -784,24 +784,23 @@ internal static class BinaryMapper
         var cacheMetricsList = new Dictionary<CacheMetricsKey, CacheMetrics>(cacheMetricsLength);
         for (var i = 0; i < cacheMetricsLength; i++)
         {
-            var cacheMetricsKey = new CacheMetricsKey()
+            var cacheMetricsKey = new CacheMetricsKey
             {
                 StreamId = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]),
                 TopicId = BinaryPrimitives.ReadUInt32LittleEndian(payload[(position + 4)..(position + 8)]),
-                PartitionId = BinaryPrimitives.ReadUInt32LittleEndian(payload[(position + 8)..(position + 12)]),
+                PartitionId = BinaryPrimitives.ReadUInt32LittleEndian(payload[(position + 8)..(position + 12)])
             };
-            
-            var cacheMetrics = new CacheMetrics()
+
+            var cacheMetrics = new CacheMetrics
             {
-                
                 Hits = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 12)..(position + 20)]),
                 Misses = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 20)..(position + 28)]),
                 HitRatio = BinaryPrimitives.ReadSingleLittleEndian(payload[(position + 28)..(position + 36)])
             };
-            
+
             cacheMetricsList.Add(cacheMetricsKey, cacheMetrics);
         }
-        
+
         return new Stats
         {
             ProcessId = processId,
@@ -882,12 +881,12 @@ internal static class BinaryMapper
         var name = Encoding.UTF8.GetString(payload[(position + 13)..(position + 13 + nameLength)]);
 
         return (new ConsumerGroupResponse
-        {
-            Id = id,
-            Name = name,
-            MembersCount = membersCount,
-            PartitionsCount = partitionsCount
-        },
+            {
+                Id = id,
+                Name = name,
+                MembersCount = membersCount,
+                PartitionsCount = partitionsCount
+            },
             13 + name.Length);
     }
 }

@@ -4,6 +4,7 @@
         <CentralPackageTransitivePinningEnabled>false</CentralPackageTransitivePinningEnabled>
     </PropertyGroup>
     <ItemGroup>
+        <PackageVersion Include="BenchmarkDotNet" Version="0.15.2" />
         <PackageVersion Include="coverlet.collector" Version="6.0.4" />
         <PackageVersion Include="FluentAssertions" Version="6.12.0" />
         <PackageVersion Include="Microsoft.Extensions.Logging" Version="8.0.1" />

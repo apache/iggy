@@ -1,4 +1,4 @@
-﻿// Licensed to the Apache Software Foundation (ASF) under one
+// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -15,10 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Text.Json;
-using Apache.Iggy.Contracts.Http;
-using Apache.Iggy.Contracts.Http.Auth;
-using Apache.Iggy.JsonConfiguration;
 using BenchmarkDotNet.Attributes;
 
 namespace Apache.Iggy.Benchmark;

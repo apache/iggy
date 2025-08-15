@@ -58,7 +58,7 @@ public static class JsonConverterFactory
             },
             Converters =
             {
-                new UInt128Converter(), 
+                new UInt128Converter(),
                 new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower)
             }
         };
@@ -71,17 +71,7 @@ public static class JsonConverterFactory
                 new AuthResponseConverter()
             }
         };
-    
-    
-    public static JsonSerializerOptions MessageResponseOptions(Func<byte[], byte[]>? decryptor)
-        => new()
-        {
-            Converters =
-            {
-                new MessageResponseConverter(decryptor)
-            }
-        };
-    
+
     public static JsonSerializerOptions HttpMessageOptions
         => new()
         {
@@ -99,7 +89,19 @@ public static class JsonConverterFactory
                 new MessagesConverter()
             }
         };
-    
+
+
+    public static JsonSerializerOptions MessageResponseOptions(Func<byte[], byte[]>? decryptor)
+    {
+        return new JsonSerializerOptions
+        {
+            Converters =
+            {
+                new MessageResponseConverter(decryptor)
+            }
+        };
+    }
+
     public static JsonSerializerOptions MessageResponseGenericOptions<TMessage>(Func<byte[], TMessage> serializer, Func<byte[], byte[]>? decryptor)
     {
         return new JsonSerializerOptions

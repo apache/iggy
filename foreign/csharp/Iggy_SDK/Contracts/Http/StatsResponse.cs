@@ -27,26 +27,28 @@ public sealed class StatsResponse
     public required int ProcessId { get; init; }
     public required float CpuUsage { get; init; }
     public required float TotalCpuUsage { get; init; }
-    
+
     [JsonConverter(typeof(SizeConverter))]
     public required ulong MemoryUsage { get; init; }
-    
+
     [JsonConverter(typeof(SizeConverter))]
     public required ulong TotalMemory { get; init; }
-    
+
     [JsonConverter(typeof(SizeConverter))]
     public required ulong AvailableMemory { get; init; }
+
     public required ulong RunTime { get; init; }
     public required ulong StartTime { get; init; }
-    
+
     [JsonConverter(typeof(SizeConverter))]
     public required ulong ReadBytes { get; init; }
-    
+
     [JsonConverter(typeof(SizeConverter))]
     public required ulong WrittenBytes { get; init; }
-    
+
     [JsonConverter(typeof(SizeConverter))]
     public required ulong MessagesSizeBytes { get; init; }
+
     public required int StreamsCount { get; init; }
     public required int TopicsCount { get; init; }
     public required int PartitionsCount { get; init; }

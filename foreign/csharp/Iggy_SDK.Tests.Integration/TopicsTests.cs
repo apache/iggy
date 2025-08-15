@@ -241,12 +241,12 @@ public class TopicsTests(Protocol protocol)
         await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol].GetTopicByIdAsync(Identifier.Numeric(1),
             Identifier.Numeric(TopicRequest.TopicId!.Value)));
     }
-    
+
     [Test]
     [DependsOn(nameof(Get_NonExistingTopic_Should_Throw_InvalidResponse))]
     public async Task Create_NewTopic_WithoutTopicId_Should_Return_Successfully()
     {
-        var topicRequestWithoutId = new TopicRequest()
+        var topicRequestWithoutId = new CreateTopicRequest
         {
             Name = "Test Topic without ID",
             CompressionAlgorithm = CompressionAlgorithm.Gzip,
@@ -256,14 +256,16 @@ public class TopicsTests(Protocol protocol)
             MaxTopicSize = 2_000_000_000
         };
 
-        var response = await Fixture.Clients[protocol].CreateTopicAsync(Identifier.Numeric(1), topicRequestWithoutId);
+        var response = await Fixture.Clients[protocol].CreateTopicAsync(Identifier.Numeric(1), topicRequestWithoutId.Name,
+            topicRequestWithoutId.PartitionsCount, topicRequestWithoutId.CompressionAlgorithm, topicRequestWithoutId.TopicId, topicRequestWithoutId.ReplicationFactor,
+            topicRequestWithoutId.MessageExpiry, topicRequestWithoutId.MaxTopicSize);
 
         response.ShouldNotBeNull();
-        response.Id.ShouldNotBe(0);
+        response.Id.ShouldNotBe(0u);
         response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromSeconds(10));
         response.Name.ShouldBe(topicRequestWithoutId.Name);
         response.CompressionAlgorithm.ShouldBe(topicRequestWithoutId.CompressionAlgorithm);
-        response.Partitions!.Count().ShouldBe(topicRequestWithoutId.PartitionsCount);
+        response.Partitions!.Count().ShouldBe((int)topicRequestWithoutId.PartitionsCount);
         response.MessageExpiry.ShouldBe(topicRequestWithoutId.MessageExpiry);
         response.Size.ShouldBe(0u);
         response.PartitionsCount.ShouldBe(topicRequestWithoutId.PartitionsCount);

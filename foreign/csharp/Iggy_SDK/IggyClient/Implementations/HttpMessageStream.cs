@@ -42,12 +42,12 @@ namespace Apache.Iggy.IggyClient.Implementations;
 public class HttpMessageStream : IIggyClient
 {
     private readonly Channel<MessageSendRequest>? _channel;
+    private readonly HttpClient _httpClient;
 
     //TODO - create mechanism for refreshing jwt token
     //TODO - replace the HttpClient with IHttpClientFactory, when implementing support for ASP.NET Core DI
     //TODO - the error handling pattern is pretty ugly, look into moving it into an extension method
     private readonly JsonSerializerOptions _jsonSerializerOptions;
-    private readonly HttpClient _httpClient;
     private readonly ILogger<HttpMessageStream> _logger;
     private readonly IMessageInvoker? _messageInvoker;
     private readonly MessagePollingSettings _messagePollingSettings;
@@ -83,7 +83,7 @@ public class HttpMessageStream : IIggyClient
 
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<StreamResponse>(_jsonSerializerOptions, cancellationToken: token);
+            return await response.Content.ReadFromJsonAsync<StreamResponse>(_jsonSerializerOptions, token);
         }
 
         await HandleResponseAsync(response);
@@ -115,7 +115,7 @@ public class HttpMessageStream : IIggyClient
 
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<StreamResponse>(_jsonSerializerOptions, cancellationToken: token);
+            return await response.Content.ReadFromJsonAsync<StreamResponse>(_jsonSerializerOptions, token);
         }
 
         await HandleResponseAsync(response);
@@ -144,7 +144,7 @@ public class HttpMessageStream : IIggyClient
         if (response.IsSuccessStatusCode)
         {
             return await response.Content.ReadFromJsonAsync<IReadOnlyList<StreamResponse>>(_jsonSerializerOptions,
-                       cancellationToken: token)
+                       token)
                    ?? Array.Empty<StreamResponse>();
         }
 
@@ -164,14 +164,14 @@ public class HttpMessageStream : IIggyClient
             PartitionsCount = partitionCount,
             ReplicationFactor = replicationFactor,
             TopicId = topicId
-        }, JsonConverterFactory.CreateTopicOptions);
+        }, _jsonSerializerOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
         var response = await _httpClient.PostAsync($"/streams/{streamId}/topics", data, token);
 
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<TopicResponse>(_jsonSerializerOptions, cancellationToken: token);
+            return await response.Content.ReadFromJsonAsync<TopicResponse>(_jsonSerializerOptions, token);
         }
 
         await HandleResponseAsync(response);
@@ -217,7 +217,7 @@ public class HttpMessageStream : IIggyClient
         var response = await _httpClient.GetAsync($"/streams/{streamId}/topics", token);
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<IReadOnlyList<TopicResponse>>(_jsonSerializerOptions, cancellationToken: token)
+            return await response.Content.ReadFromJsonAsync<IReadOnlyList<TopicResponse>>(_jsonSerializerOptions, token)
                    ?? Array.Empty<TopicResponse>();
         }
 
@@ -231,7 +231,7 @@ public class HttpMessageStream : IIggyClient
 
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<TopicResponse>(_jsonSerializerOptions, cancellationToken: token);
+            return await response.Content.ReadFromJsonAsync<TopicResponse>(_jsonSerializerOptions, token);
         }
 
         await HandleResponseAsync(response);
@@ -504,7 +504,7 @@ public class HttpMessageStream : IIggyClient
         var response = await _httpClient.GetAsync("/stats", token);
         if (response.IsSuccessStatusCode)
         {
-            var result = await response.Content.ReadFromJsonAsync<StatsResponse>(_jsonSerializerOptions, cancellationToken: token);
+            var result = await response.Content.ReadFromJsonAsync<StatsResponse>(_jsonSerializerOptions, token);
             return result?.ToStats();
         }
 
@@ -733,7 +733,7 @@ public class HttpMessageStream : IIggyClient
         if (response.IsSuccessStatusCode)
         {
             return await response.Content.ReadFromJsonAsync<IReadOnlyList<PersonalAccessTokenResponse>>(_jsonSerializerOptions, token)
-                ?? Array.Empty<PersonalAccessTokenResponse>();
+                   ?? Array.Empty<PersonalAccessTokenResponse>();
         }
 
         await HandleResponseAsync(response);

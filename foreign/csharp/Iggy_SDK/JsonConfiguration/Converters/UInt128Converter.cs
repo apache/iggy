@@ -44,7 +44,7 @@ internal sealed class DateTimeOffsetConverter : JsonConverter<DateTimeOffset>
 {
     public override DateTimeOffset Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
-        if(reader.TokenType != JsonTokenType.Number)
+        if (reader.TokenType != JsonTokenType.Number)
         {
             throw new JsonException("Expected a number token for DateTimeOffset conversion.");
         }

@@ -24,12 +24,13 @@ public sealed class PartitionContract
 {
     public required int Id { get; init; }
     public required ulong MessagesCount { get; init; }
-    
+
     [JsonConverter(typeof(DateTimeOffsetConverter))]
     public required DateTimeOffset CreatedAt { get; init; }
+
     public required int SegmentsCount { get; init; }
     public required ulong CurrentOffset { get; init; }
-    
+
     [JsonConverter(typeof(SizeConverter))]
     public required ulong Size { get; init; }
 }

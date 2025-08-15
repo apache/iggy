@@ -25,12 +25,13 @@ public sealed class StreamResponse
 {
     public required uint Id { get; init; }
     public required string Name { get; init; }
-    
+
     [JsonConverter(typeof(SizeConverter))]
     public required ulong Size { get; init; }
-    
+
     [JsonConverter(typeof(DateTimeOffsetConverter))]
     public required DateTimeOffset CreatedAt { get; init; }
+
     public required ulong MessagesCount { get; init; }
     public required int TopicsCount { get; init; }
     public IEnumerable<TopicResponse> Topics { get; init; } = [];

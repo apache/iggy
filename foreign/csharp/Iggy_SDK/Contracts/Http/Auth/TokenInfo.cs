@@ -24,8 +24,8 @@ namespace Apache.Iggy.Contracts.Http.Auth;
 public class TokenInfo
 {
     public required string Token { get; init; }
-    
-    [JsonConverter(typeof(ExpiryConverter))]    
+
+    [JsonConverter(typeof(ExpiryConverter))]
     public required DateTimeOffset Expiry { get; init; }
 
     [SetsRequiredMembers]

@@ -10,11 +10,11 @@
     </PropertyGroup>
 
     <ItemGroup>
-      <PackageReference Include="BenchmarkDotNet" />
+        <ProjectReference Include="..\Iggy_SDK\Iggy_SDK.csproj" />
     </ItemGroup>
 
     <ItemGroup>
-      <ProjectReference Include="..\Iggy_SDK\Iggy_SDK.csproj" />
+        <PackageReference Include="BenchmarkDotNet" />
     </ItemGroup>
 
 </Project>
