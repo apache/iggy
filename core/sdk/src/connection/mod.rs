@@ -1,13 +1,13 @@
 use std::{
     collections::{HashMap, VecDeque}, fmt::Debug, io, net::SocketAddr, ops::Deref, pin::Pin, str::FromStr, sync::{
-        atomic::{AtomicBool, Ordering}, Arc, Mutex
+        atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex
     }, task::{ready, Context, Poll, Waker}, time::Duration
 };
 
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::{Buf, Bytes, BytesMut};
-use futures::{future::poll_fn, AsyncRead, AsyncWrite, FutureExt};
+use futures::{future::poll_fn, task::AtomicWaker, AsyncRead, AsyncWrite, FutureExt};
 use iggy_binary_protocol::{BinaryClient, BinaryTransport, Client};
 use iggy_common::{
     ClientState, Command, DiagnosticEvent, IggyDuration, IggyError, TcpClientConfig,
@@ -17,10 +17,44 @@ use tokio::{
     sync::Mutex as TokioMutex,
     time::{Sleep, sleep},
 };
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tokio_util::compat::{Compat, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::{debug, error, info, trace, warn};
-
 use crate::protocol::{Order, ProtocolCore, ProtocolCoreConfig, Response, TxBuf};
+
+pub trait StreamBuilder {
+    type Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
+
+    fn connect(self, addr: SocketAddr) -> Pin<Box<dyn Future<Output = io::Result<Self::Stream>> + Send>>;
+}
+
+pub struct TokioTcpBuilder {
+    inner: tokio::net::TcpSocket,
+}
+
+impl TokioTcpBuilder {
+    pub fn new_for(addr: &SocketAddr) -> io::Result<Self> {
+        let sock = match addr {
+            SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+            SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+        };
+        sock.set_nodelay(true)?;
+        Ok(Self { inner: sock })
+    }
+}
+
+impl StreamBuilder for TokioTcpBuilder {
+    type Stream = Compat<TcpStream>;
+
+    fn connect(self, addr: SocketAddr) -> Pin<Box<dyn Future<Output = io::Result<Self::Stream>> + Send>> {
+        Box::pin(async move {
+            let s = self.inner.connect(addr).await?;
+            Ok(s.compat())
+        })    
+    }
+}
+
+pub type TokioCompat = Compat<TcpStream>;
+pub type NewTokioTcpClient = NewTcpClient<TokioCompat>;
 
 pub trait SocketFactory<S>: Fn(&SocketAddr) -> io::Result<S> + Send + Sync + 'static {}
 impl<F, S> SocketFactory<S> for F where F: Fn(&SocketAddr) -> io::Result<S> + Send + Sync + 'static {}
@@ -37,7 +71,6 @@ pub enum ClientCommand {
     Connect(SocketAddr),
     Disconnect,
     Shutdown,
-    Message((u32, Bytes)),
 }
 
 pub trait AsyncIO: AsyncWrite + AsyncRead + Unpin {}
@@ -67,7 +100,6 @@ struct SendState {
 #[derive(Debug)]
 pub struct ProtoConnectionState {
     pub core: ProtocolCore,
-    driver: Option<Waker>,
     error: Option<IggyError>,
 }
 
@@ -78,6 +110,29 @@ pub struct ConnectionInner<S: AsyncIO> {
 
 #[derive(Debug)]
 pub struct ConnectionRef<S: AsyncIO>(Arc<ConnectionInner<S>>);
+
+impl<S: AsyncIO> ConnectionRef<S> {
+    fn new(state: ProtoConnectionState, factory: Box<dyn SocketFactory<S>>, config: Arc<TcpClientConfig>) -> Self {
+        Self(Arc::new(ConnectionInner {
+            state: Mutex::new(State {
+                inner: state,
+                driver: None,
+                socket_factory: factory,
+                socket: None,
+                current_send: None,
+                send_offset: 0,
+                recv_buffer: BytesMut::new(),
+                wait_timer: None,
+                ready_responses: HashMap::new(),
+                recv_waiters: HashMap::new(),
+                config,
+                waiters: Arc::new(Waiters { map: Mutex::new(HashMap::new()), next_id: AtomicU64::new(0) }),
+                pending_commands: VecDeque::new(),
+                ready_commands: VecDeque::new(),
+            })
+        }))
+    }
+}
 
 impl<S: AsyncIO> ConnectionRef<S> {
     fn state(&self) -> ClientState {
@@ -99,62 +154,139 @@ impl<S: AsyncIO> Clone for ConnectionRef<S> {
     }
 }
 
-pub struct State<S: AsyncIO, F: SocketFactory<S>> {
+type RequestId = u64;
+
+struct WaitEntry<T> {
+    waker: AtomicWaker,
+    result: Option<T>,
+}
+
+struct Waiters<T> {
+    map: Mutex<HashMap<RequestId, WaitEntry<T>>>,
+    next_id: AtomicU64,
+}
+
+impl<T> Waiters<T> {
+    fn new() -> Self {
+        Self { map: Mutex::new(HashMap::new()), next_id: AtomicU64::new(1) }
+    }
+    fn alloc(&self) -> RequestId {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.map.lock().unwrap().insert(id, WaitEntry { waker: AtomicWaker::new(), result: None });
+        id
+    }
+    fn complete(&self, id: RequestId, val: T) -> bool {
+        if let Some(entry) = self.map.lock().unwrap().get_mut(&id) {
+            entry.result = Some(val);
+            entry.waker.wake();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+struct WaitFuture<T> {
+    waiters: Arc<Waiters<T>>,
+    id: RequestId,
+}
+
+impl<T> Future for WaitFuture<T> {
+    type Output = T;
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+        let mut waiters = self.waiters.map.lock().unwrap();
+        if let Some(val) = {
+            if let Some(e) = waiters.get_mut(&self.id) {
+                e.result.take()
+            } else { None }
+        } {
+            waiters.remove(&self.id);
+            return Poll::Ready(val);
+        }
+
+        {
+            if let Some(e) = waiters.get(&self.id) {
+                e.waker.register(cx.waker());
+            }
+        }
+
+        if let Some(val) = {
+            if let Some(e) = waiters.get_mut(&self.id) {
+                e.result.take()
+            } else { None }
+        } {
+            waiters.remove(&self.id);
+            return Poll::Ready(val);
+        }
+
+        Poll::Pending
+    }
+}
+
+pub struct State<S: AsyncIO> {
     inner: ProtoConnectionState,
     driver: Option<Waker>,
-    socket_factory: F,
+    socket_factory: Box<dyn SocketFactory<S>>,
     socket: Option<S>,
     current_send: Option<TxBuf>,
     send_offset: usize,
     recv_buffer: BytesMut,
     wait_timer: Option<Pin<Box<Sleep>>>,
-    send_buf: Mutex<VecDeque<(u32, Bytes)>>,
     ready_responses: HashMap<u64, Result<Bytes, IggyError>>,
-    ready_commands: VecDeque<Waker>,
     pub recv_waiters: HashMap<u64, Waker>,
-    pub recv_command_waiters: VecDeque<Waker>,
-    client_commands_rx: flume::Receiver<ClientCommand>,
     config: Arc<TcpClientConfig>,
-    pending_requests: VecDeque<ClientCommand>,
+
+    waiters: Arc<Waiters<Result<Bytes, IggyError>>>,
+    pending_commands: VecDeque<(u64, ClientCommand)>,
+    ready_commands: VecDeque<u64>,
 }
 
-impl<S: AsyncIO, F: SocketFactory<S>> State<S, F> {
+impl<S: AsyncIO> Debug for State<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "test"
+        )
+    }
+}
+
+impl<S: AsyncIO> State<S> {
     fn wake(&mut self) {
         if let Some(waker) = self.driver.take() {
             waker.wake();
         }
     }
 
-    fn enqueu_command(&mut self, command: ClientCommand) -> u64 {
-        let id = match &command {
-            ClientCommand::Message((code, payload)) => {
-                let id = self.inner.core.send(*code, payload.clone()).unwrap();
-                id
-            }
-            _ => 0
-        };
-        self.pending_requests.push_back(command);
-        id
+    fn enqueu_command(&mut self, command: ClientCommand) -> WaitFuture<Result<Bytes, IggyError>> {
+        let id = self.waiters.alloc();
+        // TODO перетащить в sans io ядро inner.core
+        self.pending_commands.push_back((id, command));
+        WaitFuture { waiters: self.waiters.clone(), id }
+    }
+
+    fn enqueue_message(&mut self, code: u32, payload: Bytes) -> Result<u64, IggyError> {
+        self.inner.core.send(code, payload)
     }
 
     fn drive_client_commands(&mut self) -> bool {
-        for cmd in self.pending_requests.drain(..) {
+        for (request_id, cmd) in self.pending_commands.drain(..) {
             match cmd {
-                ClientCommand::Connect((server_addr)) => {
-                    // TODO add core.poll
+                ClientCommand::Connect(server_addr) => {
                     let socket = (self.socket_factory)(&server_addr).unwrap();
                     self.socket = Some(socket);
+                    self.ready_commands.push_back(request_id);
+                    self.waiters.complete(request_id, Ok(Bytes::new()));
                 }
                 ClientCommand::Disconnect => {
-                    todo!("disconnect");
+                    // TODO add processing
+                    self.ready_commands.push_back(request_id);
+                    self.waiters.complete(request_id, Ok(Bytes::new()));
                 }
                 ClientCommand::Shutdown => {
-                    todo!("shutdown");
+                    // TODO add processing
+                    self.ready_commands.push_back(request_id);
+                    self.waiters.complete(request_id, Ok(Bytes::new()));
                 }
-                _ => {}
-                // ClientCommand::Message((code, payload)) => {
-                //     let _ = self.inner.core.send(code, payload).unwrap();
-                // }
             }
         }
         true
@@ -197,11 +329,24 @@ impl<S: AsyncIO, F: SocketFactory<S>> State<S, F> {
     }
 
     fn drive_receive(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
+        if self.socket.is_none() {
+            // TODO add return error
+            panic!("socket is none")
+        }
+
         let mut recv_scratch = vec![0u8; 4096];
+
         loop {
-            let n = match self.socket.as_mut().poll_read(cx, &mut recv_scratch)? {
-                Poll::Pending => return Ok(false),
-                Poll::Ready(n) => n,
+            let n = {
+                let socket = self.socket.as_mut().ok_or(io::Error::new(
+                    io::ErrorKind::NotConnected, 
+                    "No socket"
+                ))?;
+                let mut pinned = Pin::new(&mut *socket);
+                match pinned.as_mut().poll_read(cx, &mut recv_scratch)? {
+                    Poll::Pending => return Ok(false),
+                    Poll::Ready(n) => n,
+                }
             };
             self.recv_buffer.extend_from_slice(&recv_scratch[..n]);
             self.process_incoming()?;
@@ -301,148 +446,56 @@ impl<S: AsyncIO> Future for ConnectionDriver<S> {
 }
 
 #[derive(Debug)]
-pub struct TokioTcpTransport {
-    state: Arc<Mutex<ProtoConnectionState>>,
-    runtime: Arc<dyn Runtime>,
-    config: Arc<TcpClientConfig>,
-    socket_handle: Option<tokio::task::JoinHandle<()>>,
-    shutdown: Arc<AtomicBool>,
-}
-
-impl TokioTcpTransport {
-    fn new(config: Arc<TcpClientConfig>, runtime: Arc<dyn Runtime>) -> Self {
-        let core_config = ProtocolCoreConfig {
-            max_retries: config.reconnection.max_retries,
-            reestablish_after: config.reconnection.reestablish_after,
-            auto_login: config.auto_login.clone(),
-        };
-
-        let state = Arc::new(Mutex::new(ProtoConnectionState {
-            core: ProtocolCore::new(core_config),
-            // recv_waiters: HashMap::new(),
-            // ready_responses: HashMap::new(),
-            driver: None,
-            error: None,
-        }));
-
-        Self {
-            state,
-            runtime,
-            config,
-            socket_handle: None,
-            shutdown: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    // async fn run(&mut self) {
-    //     {
-    //         let mut state = self.state.lock().unwrap();
-    //         let order = state.core.poll();
-    //         if !matches!(order, Order::Connect | Order::Wait(_)) {
-    //             debug!("Initial poll returned: {:?}", order);
-    //         }
-    //     }
-
-    //     while !self.shutdown.load(Ordering::Relaxed) {
-    //         let order = {
-    //             let mut state = self.state.lock().unwrap();
-    //             state.core.poll()
-    //         };
-
-    //         match order {
-    //             Order::Connect => match TcpStream::connect(&self.config.server_address).await {
-    //                 Ok(socket) => {
-    //                     info!("Connected to {}", self.config.server_address);
-
-    //                     {
-    //                         let mut state = self.state.lock().unwrap();
-    //                         state.core.on_connected();
-    //                     }
-
-    //                     let socket_compat = socket.compat();
-    //                     let driver = ConnectionDriver::new(self.state.clone(), socket_compat);
-    //                     let state_clone = self.state.clone();
-    //                     let handle = tokio::spawn(async move {
-    //                         if let Err(e) = driver.await {
-    //                             error!("Driver error: {}", e);
-    //                             let mut state = state_clone.lock().unwrap();
-    //                             state.core.on_disconnected();
-    //                         }
-    //                     });
-
-    //                     self.socket_handle = Some(handle);
-    //                 }
-    //                 Err(e) => {
-    //                     error!("Connection failed: {}", e);
-    //                     let mut state = self.state.lock().unwrap();
-    //                     state.core.on_disconnected();
-    //                 }
-    //             },
-
-    //             Order::Wait(duration) => {
-    //                 tokio::select! {
-    //                     _ = sleep(duration.get_duration()) => {}
-    //                     _ = tokio::signal::ctrl_c() => {
-    //                         self.shutdown.store(true, Ordering::Relaxed);
-    //                     }
-    //                 }
-    //             }
-
-    //             _ => {
-    //                 sleep(Duration::from_millis(10)).await;
-    //             }
-    //         }
-    //     }
-    // }
-
-    async fn stop(&mut self) {
-        self.shutdown.store(true, Ordering::Relaxed);
-
-        if let Some(handle) = self.socket_handle.take() {
-            handle.abort();
-        }
-    }
-}
-
-#[derive(Debug)]
 pub struct NewTcpClient<S: AsyncIO> {
-    transport: Arc<TokioMutex<Option<TokioTcpTransport>>>,
+    // transport: Arc<TokioMutex<Option<TokioTcpTransport>>>,
     state: ConnectionRef<S>,
     // state: Arc<Mutex<ProtoConnectionState>>,
     config: Arc<TcpClientConfig>,
     events: (Sender<DiagnosticEvent>, Receiver<DiagnosticEvent>),
-    runtime: Arc<dyn Runtime>,
+    // runtime: Arc<dyn Runtime>,
 }
 
-impl<S: AsyncIO> NewTcpClient<S> {
-    pub fn create(config: Arc<TcpClientConfig>) -> Result<Self, IggyError> {
-        let runtime = Arc::new(TokioRuntime {});
-        let transport = TokioTcpTransport::new(config.clone(), runtime.clone());
-        let state = transport.state.clone();
+impl<S: AsyncIO + Send + Sync + 'static> NewTcpClient<S> {
+    pub fn create(config: Arc<TcpClientConfig>, factory:Box<dyn SocketFactory<S>>) -> Result<Self, IggyError> {
+        // let runtime = Arc::new(TokioRuntime {});
+        // let transport = TokioTcpTransport::new(config.clone(), runtime.clone());
+        // let state = transport.state.clone();
 
         let (tx, rx) = broadcast(1000);
         let (client_tx, client_rx) = flume::unbounded::<ClientCommand>();
+        
+        let proto_config = ProtocolCoreConfig{
+            auto_login: iggy_common::AutoLogin::Disabled,
+            reestablish_after: IggyDuration::new_from_secs(5),
+            max_retries: None,
+        };
+
+        let conn = ConnectionRef::new(ProtoConnectionState { core: ProtocolCore::new(proto_config), error: None }, factory, config.clone());
+        let driver = ConnectionDriver(conn.clone());
+        tokio::spawn(async move {
+            if let Err(e) = driver.await {
+                tracing::error!("I/O error: {e}");
+            }
+        });
 
         Ok(Self {
-            transport: Arc::new(TokioMutex::new(Some(transport))),
-            state,
+            // transport: Arc::new(TokioMutex::new(Some(transport))),
+            state: conn,
             config,
             events: (tx, rx),
-            runtime,
-            client_command_tx: client_tx,
+            // runtime,
         })
     }
 
     async fn send_raw(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
         let id = {
             // TODO вынести в отдельный метод для быстрого деструктурирования
-            let state = self.state.0.state.lock().unwrap();
-            // let id = 
-            state.enqueu_command(ClientCommand::Message((id, code, payload)))
-        };
+            let mut state = self.state.0.state.lock().unwrap();
+            state.enqueue_message(code, payload)
+        }?;
 
         poll_fn(move |cx| {
-            let state = self.state.0.state.lock().unwrap();
+            let mut state = self.state.0.state.lock().unwrap();
 
             // if let Some(ref error) = state.error {
             //     return Poll::Ready(Err(error.clone()));
@@ -458,97 +511,36 @@ impl<S: AsyncIO> NewTcpClient<S> {
             Poll::Pending
         }).await
     }
-
-    // async fn wait_for_connection(&self) -> Result<(), IggyError> {
-    //     poll_fn(|cx| {
-    //         let state = self.state.lock().unwrap();
-
-    //         if let Some(ref error) = state.error {
-    //             return Poll::Ready(Err(error.clone()));
-    //         }
-
-    //         match state.core.state() {
-    //             ClientState::Connected
-    //             | ClientState::Authenticating
-    //             | ClientState::Authenticated => Poll::Ready(Ok(())),
-    //             ClientState::Disconnected if state.core.retry_count > 0 => {
-    //                 Poll::Ready(Err(IggyError::CannotEstablishConnection))
-    //             }
-    //             _ => {
-    //                 cx.waker().wake_by_ref();
-    //                 Poll::Pending
-    //             }
-    //         }
-    //     })
-    //     .await
-    // }
 }
 
 #[async_trait]
-impl<S: AsyncIO + Debug + Send + Sync> Client for NewTcpClient<S> {
+impl<S: AsyncIO + Debug + Send + Sync + 'static> Client for NewTcpClient<S> {
     async fn connect(&self) -> Result<(), IggyError> {
-        // let socket = TcpStream::connect(&self.config.server_address).await.unwrap();
-        // let socket_compat = socket.compat();
-        // let socket = Box::new(socket_compat);
-
         let address = SocketAddr::from_str(&self.config.server_address).unwrap();
-        let id = {
-            // TODO вынести в отдельный метод для быстрого деструктурирования
-            let state = self.state.0.state.lock().unwrap();
+        let fut = {
+            let mut state = self.state.0.state.lock().unwrap();
             state.enqueu_command(ClientCommand::Connect(address))
         };
-
-        poll_fn(move |cx| {
-            let state = self.state.0.state.lock().unwrap();
-
-            // if let Some(ref error) = state.error {
-            //     return Poll::Ready(Err(error.clone()));
-            // }
-
-            if let Some(result) = state.ready_responses.remove(&id) {
-                return Poll::Ready(result);
-            }
-
-            state.recv_command_waiters.push_back(cx.waker().clone());
-            state.wake();
-
-            Poll::Pending
-        }).await
+        fut.await?;
+        Ok(())
     }
 
     async fn disconnect(&self) -> Result<(), IggyError> {
-        let id = {
-            // TODO вынести в отдельный метод для быстрого деструктурирования
-            let state = self.state.0.state.lock().unwrap();
+        let fut = {
+            let mut state = self.state.0.state.lock().unwrap();
             state.enqueu_command(ClientCommand::Disconnect)
         };
-        poll_fn(move |cx| {
-            let state = self.state.0.state.lock().unwrap();
-            if let Some(result) = state.ready_responses.remove(&id) {
-                return Poll::Ready(result);
-            }
-            state.wake();
-
-            Poll::Pending
-        }).await
+        fut.await?;
+        Ok(())
     }
 
     async fn shutdown(&self) -> Result<(), IggyError> {
-        let id = {
-            // TODO вынести в отдельный метод для быстрого деструктурирования
-            let state = self.state.0.state.lock().unwrap();
+        let fut = {
+            let mut state = self.state.0.state.lock().unwrap();
             state.enqueu_command(ClientCommand::Shutdown)
         };
-
-        poll_fn(move |cx| {
-            let state = self.state.0.state.lock().unwrap();
-            if let Some(result) = state.ready_responses.remove(&id) {
-                return Poll::Ready(result);
-            }
-            state.wake();
-
-            Poll::Pending
-        }).await
+        fut.await?;
+        Ok(())
     }
 
     async fn subscribe_events(&self) -> Receiver<DiagnosticEvent> {
@@ -557,7 +549,7 @@ impl<S: AsyncIO + Debug + Send + Sync> Client for NewTcpClient<S> {
 }
 
 #[async_trait]
-impl<S: AsyncIO + Debug + Send + Sync> BinaryTransport for NewTcpClient<S> {
+impl<S: AsyncIO + Debug + Send + Sync + 'static> BinaryTransport for NewTcpClient<S> {
     async fn get_state(&self) -> ClientState {
         self.state.state()
     }
@@ -587,4 +579,4 @@ impl<S: AsyncIO + Debug + Send + Sync> BinaryTransport for NewTcpClient<S> {
     }
 }
 
-impl<S: AsyncIO + Debug + Send + Sync> BinaryClient for NewTcpClient<S> {}
+impl<S: AsyncIO + Debug + Send + Sync + 'static> BinaryClient for NewTcpClient<S> {}
