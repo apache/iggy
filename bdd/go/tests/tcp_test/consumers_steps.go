@@ -136,6 +136,12 @@ func itShouldSuccessfullyJoinConsumer(streamId uint32, topicId uint32, groupId u
 		gomega.Expect(consumer.MembersCount).ToNot(gomega.Equal(0))
 	})
 
+	ginkgo.It("should contain 1 member with 2 partitions", func() {
+		gomega.Expect(len(consumer.Members)).To(gomega.Equal(1))
+		gomega.Expect(consumer.Members[0].PartitionsCount).To(gomega.Equal(uint32(2)))
+		gomega.Expect(len(consumer.Members[0].Partitions)).To(gomega.Equal(2))
+	})
+
 	itShouldNotReturnError(err)
 }
 
