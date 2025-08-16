@@ -469,6 +469,10 @@ pub enum IggyError {
     MaxRetriesExceeded = 10053,
     #[error("Connection timeout")]
     ConnectionTimeout = 10054,
+    #[error("Incorrect connection state")]
+    IncorrectConnectionState = 10055,
+    #[error("Connection missed socket")]
+    ConnectionMissedSocket = 10056,
 }
 
 impl IggyError {

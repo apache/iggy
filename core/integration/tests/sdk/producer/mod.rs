@@ -18,13 +18,14 @@
 
 mod background;
 
+use std::net::SocketAddr;
 use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
-use iggy::clients::client::IggyClient;
+use iggy::{clients::client::IggyClient, connection::tokio_tcp};
 use iggy::prelude::*;
 use integration::test_server::{login_root, TestServer};
-use iggy::connection::{TokioTcpTransport, NewTcpClient, TokioRuntime};
+use iggy::connection::{NewTcpClient, SFut, SocketFactory, TokioCompat, TokioRuntime};
 use tokio::time::sleep;
 
 const STREAM_ID: u32 = 1;
@@ -81,7 +82,10 @@ async fn test_async_send() {
     // let client = ClientWrapper::Tcp(TcpClient::create(Arc::new(tcp_client_config)).unwrap());
     // let client = IggyClient::create(client, None, None);
 
-    let tcp_client = NewTcpClient::create(Arc::new(tcp_client_config)).unwrap();
+    let factory: SocketFactory<TokioCompat> = Arc::new(move |addr: SocketAddr| -> SFut<TokioCompat> {
+        Box::pin(tokio_tcp(addr))
+    });
+    let tcp_client = NewTcpClient::create(Arc::new(tcp_client_config), factory).unwrap();
 
     let client = IggyClient::create(iggy::prelude::ClientWrapper::New(tcp_client), None, None);
 

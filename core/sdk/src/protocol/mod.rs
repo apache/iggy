@@ -1,9 +1,12 @@
 use std::{
-    collections::VecDeque, net::SocketAddr, sync::Arc, time::{Duration, Instant}
+    collections::VecDeque,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use iggy_common::{AutoLogin, ClientState, Credentials, IggyDuration, IggyError};
+use iggy_common::{AutoLogin, ClientState, Credentials, IggyDuration, IggyError, IggyTimestamp};
 use tracing::{debug, info, warn};
 
 const RESPONSE_HEADER_SIZE: usize = 8;
@@ -16,10 +19,9 @@ pub struct ProtocolCoreConfig {
 }
 
 #[derive(Debug)]
-pub enum Order {
+pub enum ControlAction {
     Connect(SocketAddr),
     Wait(IggyDuration),
-    Transmit(TxBuf),
     Authenticate { username: String, password: String },
     Noop,
     Error(IggyError),
@@ -41,7 +43,7 @@ pub struct Response {
 pub struct ProtocolCore {
     state: ClientState,
     config: ProtocolCoreConfig,
-    last_connect_attempt: Option<Instant>,
+    last_connect_attempt: Option<IggyTimestamp>,
     pub retry_count: u32,
     next_request_id: u64,
     pending_sends: VecDeque<(u32, Bytes, u64)>,
@@ -63,6 +65,7 @@ impl ProtocolCore {
             sent_order: VecDeque::new(),
             auth_pending: false,
             auth_request_id: None,
+            server_address: None,
         }
     }
 
@@ -70,74 +73,7 @@ impl ProtocolCore {
         self.state
     }
 
-    pub fn poll(&mut self) -> Order {
-        match self.state {
-            ClientState::Disconnected => self.handle_disconnected(),
-            ClientState::Connecting => Order::Connect,
-            ClientState::Connected => self.handle_connected(),
-            ClientState::Authenticating => Order::Noop,
-            ClientState::Authenticated => self.poll_transmit(),
-            ClientState::Shutdown => Order::Noop,
-        }
-    }
-
-    fn handle_disconnected(&mut self) -> Order {
-        if let Some(last_attempt) = self.last_connect_attempt {
-            let elapsed = last_attempt.elapsed().as_micros() as u64;
-            let interval = self.config.reestablish_after.as_micros();
-
-            if elapsed < interval {
-                let remaining = IggyDuration::from(interval - elapsed);
-                return Order::Wait(remaining);
-            }
-        }
-
-        if let Some(max_retries) = self.config.max_retries {
-            if self.retry_count >= max_retries {
-                return Order::Error(IggyError::MaxRetriesExceeded);
-            }
-        }
-
-        self.retry_count += 1;
-        self.last_connect_attempt = Some(Instant::now());
-        self.state = ClientState::Connecting;
-
-        debug!("Initiating connection (attempt {})", self.retry_count);
-        Order::Connect
-    }
-
-    fn handle_connected(&mut self) -> Order {
-        match &self.config.auto_login {
-            AutoLogin::Disabled => {
-                info!("Automatic sign-in is disabled.");
-                self.state = ClientState::Authenticated;
-            }
-            AutoLogin::Enabled(credentials) => {
-                if !self.auth_pending {
-                    self.state = ClientState::Authenticating;
-                    self.auth_pending = true;
-
-                    match credentials {
-                        Credentials::UsernamePassword(username, password) => {
-                            let auth_payload = encode_auth(&username, &password);
-                            let auth_id = self.queue_send(0x0A, auth_payload);
-                            self.auth_request_id = Some(auth_id);
-
-                            return self.poll_transmit();
-                        }
-                        _ => {
-                            todo!("add PersonalAccessToken")
-                        }
-                    }
-
-                }
-            }
-        }
-
-        self.poll_transmit()
-    }
-
-    fn poll_transmit(&mut self) -> Order {
+    pub fn poll_transmit(&mut self) -> Option<TxBuf> {
         if let Some((code, payload, request_id)) = self.pending_sends.pop_front() {
             let mut buf = BytesMut::new();
             let total_len = (payload.len() + 4) as u32;
@@ -147,12 +83,12 @@ impl ProtocolCore {
 
             self.sent_order.push_back(request_id);
 
-            Order::Transmit(TxBuf {
+            Some(TxBuf {
                 data: buf.freeze(),
                 request_id,
             })
         } else {
-            Order::Noop
+            None
         }
     }
 
@@ -160,10 +96,9 @@ impl ProtocolCore {
         match self.state {
             ClientState::Shutdown => Err(IggyError::ClientShutdown),
             ClientState::Disconnected | ClientState::Connecting => Err(IggyError::NotConnected),
-            ClientState::Connected | ClientState::Authenticating => {
+            ClientState::Connected | ClientState::Authenticating | ClientState::Authenticated => {
                 Ok(self.queue_send(code, payload))
             }
-            ClientState::Authenticated => Ok(self.queue_send(code, payload)),
         }
     }
 
@@ -172,20 +107,6 @@ impl ProtocolCore {
         self.next_request_id += 1;
         self.pending_sends.push_back((code, payload, request_id));
         request_id
-    }
-
-    pub fn on_connected(&mut self) {
-        debug!("Transport connected");
-        self.state = ClientState::Connected;
-        self.retry_count = 0;
-    }
-
-    pub fn on_disconnected(&mut self) {
-        debug!("Transport disconnected");
-        self.state = ClientState::Disconnected;
-        self.auth_pending = false;
-        self.auth_request_id = None;
-        self.sent_order.clear();
     }
 
     pub fn on_response(&mut self, status: u32, _payload: &Bytes) -> Option<u64> {
@@ -205,41 +126,60 @@ impl ProtocolCore {
         Some(request_id)
     }
 
-    fn on_authenticated(&mut self) {
+    pub fn poll(&mut self) -> ControlAction {
+        match self.state {
+            ClientState::Shutdown => ControlAction::Error(IggyError::ClientShutdown),
+            ClientState::Disconnected => ControlAction::Noop,
+            ClientState::Authenticated | ClientState::Authenticating | ClientState::Connected => {
+                ControlAction::Noop
+            }
+            ClientState::Connecting => {
+                let server_address = match self.server_address {
+                    Some(addr) => addr,
+                    None => return ControlAction::Error(IggyError::ConnectionMissedSocket),
+                };
+
+                if let Some(last_attempt) = self.last_connect_attempt {
+                    let elapsed = last_attempt.as_micros() as u64;
+                    let interval = self.config.reestablish_after.as_micros();
+
+                    if elapsed < interval {
+                        let remaining = IggyDuration::from(interval - elapsed);
+                        return ControlAction::Wait(remaining);
+                    }
+                }
+
+                if let Some(max_retries) = self.config.max_retries {
+                    if self.retry_count >= max_retries {
+                        return ControlAction::Error(IggyError::MaxRetriesExceeded);
+                    }
+                }
+
+                self.retry_count += 1;
+                self.last_connect_attempt = Some(IggyTimestamp::now());
+
+                return ControlAction::Connect(server_address);
+            }
+        }
+    }
+
+    pub fn on_authenticated(&mut self) -> Result<(), IggyError> {
         debug!("Authentication successful");
+        if self.state != ClientState::Connected {
+            return Err(IggyError::IncorrectConnectionState);
+        }
         self.state = ClientState::Authenticated;
         self.auth_pending = false;
-    }
-
-    pub fn shutdown(&mut self) {
-        self.state = ClientState::Shutdown;
-    }
-
-    // TODO нужно сопоставить стейты из tcp_client и этим
-    fn is_init(&self) -> bool {
-        return !self.last_connect_attempt.is_none()
-    }
-
-    pub fn poll_new(&mut self) -> Order {
-        match self.state {
-            ClientState::Disconnected => Order::Error(IggyError::Disconnected),
-            ClientState::Shutdown => Order::Error(IggyError::ClientShutdown),
-            ClientState::Connecting => {
-                match self.server_address {
-                    Some(addr) => Order::Connect(addr),
-                    None => Order::Error(IggyError::Disconnected),
-                }
-            }
-            ClientState::Connected | ClientState::Authenticated | ClientState::Authenticating => Order::Noop,
-
-        }
+        Ok(())
     }
 
     pub fn desire_connect(&mut self, server_address: SocketAddr) -> Result<(), IggyError> {
         match self.state {
             ClientState::Shutdown => return Err(IggyError::ClientShutdown),
             ClientState::Connecting => return Ok(()),
-            ClientState::Connected | ClientState::Authenticating | ClientState::Authenticated => return Ok(()),
+            ClientState::Connected | ClientState::Authenticating | ClientState::Authenticated => {
+                return Ok(());
+            }
             _ => {
                 self.state = ClientState::Connecting;
                 self.server_address = Some(server_address);
@@ -249,14 +189,54 @@ impl ProtocolCore {
         Ok(())
     }
 
-    pub fn desire_disconnect(&mut self) {
-        self.state = ClientState::Disconnected;
-        self.server_address = None;
+    pub fn on_connected(&mut self) -> Result<(), IggyError> {
+        debug!("Transport connected");
+        if self.state != ClientState::Connecting {
+            return Err(IggyError::IncorrectConnectionState);
+        }
+        self.state = ClientState::Connected;
+        self.retry_count = 0;
+
+        match &self.config.auto_login {
+            AutoLogin::Disabled => {
+                info!("Automatic sign-in is disabled.");
+                self.state = ClientState::Authenticated;
+            }
+            AutoLogin::Enabled(credentials) => {
+                if !self.auth_pending {
+                    self.state = ClientState::Authenticating;
+                    self.auth_pending = true;
+
+                    match credentials {
+                        Credentials::UsernamePassword(username, password) => {
+                            let auth_payload = encode_auth(&username, &password);
+                            let auth_id = self.queue_send(0x0A, auth_payload);
+                            self.auth_request_id = Some(auth_id);
+                        }
+                        _ => {
+                            todo!("add PersonalAccessToken")
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 
-    pub fn desire_shutdown(&mut self) {
+    pub fn disconnect(&mut self) {
+        debug!("Transport disconnected");
+        self.state = ClientState::Disconnected;
+        self.auth_pending = false;
+        self.auth_request_id = None;
+        self.sent_order.clear();
+    }
+
+    pub fn shutdown(&mut self) {
         self.state = ClientState::Shutdown;
-        self.server_address = None;
+        self.auth_pending = false;
+        self.auth_request_id = None;
+        self.sent_order.clear();
     }
 }
 
