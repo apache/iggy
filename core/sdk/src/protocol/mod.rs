@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque, sync::Arc, time::{Duration, Instant}
+    collections::VecDeque, net::SocketAddr, sync::Arc, time::{Duration, Instant}
 };
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -17,7 +17,7 @@ pub struct ProtocolCoreConfig {
 
 #[derive(Debug)]
 pub enum Order {
-    Connect,
+    Connect(SocketAddr),
     Wait(IggyDuration),
     Transmit(TxBuf),
     Authenticate { username: String, password: String },
@@ -48,6 +48,7 @@ pub struct ProtocolCore {
     sent_order: VecDeque<u64>,
     auth_pending: bool,
     auth_request_id: Option<u64>,
+    server_address: Option<SocketAddr>,
 }
 
 impl ProtocolCore {
@@ -212,6 +213,50 @@ impl ProtocolCore {
 
     pub fn shutdown(&mut self) {
         self.state = ClientState::Shutdown;
+    }
+
+    // TODO нужно сопоставить стейты из tcp_client и этим
+    fn is_init(&self) -> bool {
+        return !self.last_connect_attempt.is_none()
+    }
+
+    pub fn poll_new(&mut self) -> Order {
+        match self.state {
+            ClientState::Disconnected => Order::Error(IggyError::Disconnected),
+            ClientState::Shutdown => Order::Error(IggyError::ClientShutdown),
+            ClientState::Connecting => {
+                match self.server_address {
+                    Some(addr) => Order::Connect(addr),
+                    None => Order::Error(IggyError::Disconnected),
+                }
+            }
+            ClientState::Connected | ClientState::Authenticated | ClientState::Authenticating => Order::Noop,
+
+        }
+    }
+
+    pub fn desire_connect(&mut self, server_address: SocketAddr) -> Result<(), IggyError> {
+        match self.state {
+            ClientState::Shutdown => return Err(IggyError::ClientShutdown),
+            ClientState::Connecting => return Ok(()),
+            ClientState::Connected | ClientState::Authenticating | ClientState::Authenticated => return Ok(()),
+            _ => {
+                self.state = ClientState::Connecting;
+                self.server_address = Some(server_address);
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn desire_disconnect(&mut self) {
+        self.state = ClientState::Disconnected;
+        self.server_address = None;
+    }
+
+    pub fn desire_shutdown(&mut self) {
+        self.state = ClientState::Shutdown;
+        self.server_address = None;
     }
 }
 

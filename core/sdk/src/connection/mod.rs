@@ -223,10 +223,14 @@ impl<T> Future for WaitFuture<T> {
     }
 }
 
-pub struct State<S: AsyncIO> {
+pub struct State<S, B>
+where
+    S: AsyncIO,
+    B: StreamBuilder<Stream = S>
+{
     inner: ProtoConnectionState,
     driver: Option<Waker>,
-    socket_factory: Box<dyn SocketFactory<S>>,
+    socket_factory: B,
     socket: Option<S>,
     current_send: Option<TxBuf>,
     send_offset: usize,
@@ -239,9 +243,14 @@ pub struct State<S: AsyncIO> {
     waiters: Arc<Waiters<Result<Bytes, IggyError>>>,
     pending_commands: VecDeque<(u64, ClientCommand)>,
     ready_commands: VecDeque<u64>,
+    connect_waiters: Vec<u64>,
 }
 
-impl<S: AsyncIO> Debug for State<S> {
+impl<S, B> Debug for State<S, B>
+where
+    S: AsyncIO,
+    B: StreamBuilder<Stream = S>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -250,7 +259,11 @@ impl<S: AsyncIO> Debug for State<S> {
     }
 }
 
-impl<S: AsyncIO> State<S> {
+impl<S, B> State<S, B>
+where
+    S: AsyncIO,
+    B: StreamBuilder<Stream = S>
+{
     fn wake(&mut self) {
         if let Some(waker) = self.driver.take() {
             waker.wake();
@@ -272,10 +285,13 @@ impl<S: AsyncIO> State<S> {
         for (request_id, cmd) in self.pending_commands.drain(..) {
             match cmd {
                 ClientCommand::Connect(server_addr) => {
-                    let socket = (self.socket_factory)(&server_addr).unwrap();
-                    self.socket = Some(socket);
-                    self.ready_commands.push_back(request_id);
-                    self.waiters.complete(request_id, Ok(Bytes::new()));
+                    self.connect_waiters.push(request_id);
+                    self.inner.core.
+                    // let socket = self.socket_factory.connect(server_addr);
+
+                    // self.socket = Some(socket);
+                    // self.ready_commands.push_back(request_id);
+                    // self.waiters.complete(request_id, Ok(Bytes::new()));
                 }
                 ClientCommand::Disconnect => {
                     // TODO add processing
