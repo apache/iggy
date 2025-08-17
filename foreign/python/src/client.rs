@@ -70,6 +70,7 @@ impl IggyClient {
     ///
     /// Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
     /// if the connection fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn ping<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
@@ -83,6 +84,7 @@ impl IggyClient {
     /// Logs in the user with the given credentials.
     ///
     /// Returns `Ok(())` on success, or a PyRuntimeError on failure.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn login_user<'a>(
         &self,
         py: Python<'a>,
@@ -102,6 +104,7 @@ impl IggyClient {
     /// Connects the IggyClient to its service.
     ///
     /// Returns Ok(()) on successful connection or a PyRuntimeError on failure.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn connect<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
@@ -117,6 +120,7 @@ impl IggyClient {
     ///
     /// Returns Ok(()) on successful stream creation or a PyRuntimeError on failure.
     #[pyo3(signature = (name, stream_id = None))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn create_stream<'a>(
         &self,
         py: Python<'a>,
@@ -136,6 +140,7 @@ impl IggyClient {
     /// Gets stream by id.
     ///
     /// Returns Option of stream details or a PyRuntimeError on failure.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[typing.Optional[StreamDetails]]", imports=("collections.abc")))]
     fn get_stream<'a>(
         &self,
         py: Python<'a>,
@@ -160,6 +165,7 @@ impl IggyClient {
         signature = (stream, name, partitions_count, compression_algorithm = None, topic_id = None, replication_factor = None)
     )]
     #[allow(clippy::too_many_arguments)]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn create_topic<'a>(
         &self,
         py: Python<'a>,
@@ -200,6 +206,7 @@ impl IggyClient {
     /// Gets topic by stream and id.
     ///
     /// Returns Option of topic details or a PyRuntimeError on failure.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[typing.Optional[TopicDetails]]", imports=("collections.abc")))]
     fn get_topic<'a>(
         &self,
         py: Python<'a>,
@@ -222,13 +229,14 @@ impl IggyClient {
     /// Sends a list of messages to the specified topic.
     ///
     /// Returns Ok(()) on successful sending or a PyRuntimeError on failure.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn send_messages<'a>(
         &self,
         py: Python<'a>,
         stream: PyIdentifier,
         topic: PyIdentifier,
         partitioning: u32,
-        messages: &Bound<'_, PyList>,
+        #[gen_stub(override_type(type_repr = "list[SendMessage]"))] messages: &Bound<'_, PyList>,
     ) -> PyResult<Bound<'a, PyAny>> {
         let messages: Vec<SendMessage> = messages
             .iter()
@@ -257,6 +265,7 @@ impl IggyClient {
     ///
     /// Returns a list of received messages or a PyRuntimeError on failure.
     #[allow(clippy::too_many_arguments)]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[ReceiveMessage]]", imports=("collections.abc")))]
     fn poll_messages<'a>(
         &self,
         py: Python<'a>,
@@ -316,7 +325,7 @@ impl IggyClient {
         init_retry_interval=None,
         allow_replay=false,
     ))]
-    fn consumer_group<'a>(
+    fn consumer_group(
         &self,
         name: &str,
         stream: &str,

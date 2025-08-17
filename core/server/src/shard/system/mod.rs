@@ -30,5 +30,6 @@ pub mod storage;
 pub mod streams;
 pub mod topics;
 pub mod users;
+pub mod utils;
 
 pub const COMPONENT: &str = "SHARD_SYSTEM";

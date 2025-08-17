@@ -98,12 +98,8 @@ pub async fn spawn_message_maintainance_task(shard: Rc<IggyShard>) -> Result<(),
                             topic.topic_id
                         );
 
-                        shard
-                            .metrics
-                            .decrement_segments(deleted_segments.segments_count);
-                        shard
-                            .metrics
-                            .decrement_messages(deleted_segments.messages_count);
+                        shard.metrics.decrement_segments(deleted_segments.segments_count);
+                        shard.metrics.decrement_messages(deleted_segments.messages_count);
                     }
             }
         }

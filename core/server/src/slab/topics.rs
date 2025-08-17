@@ -1,120 +1,240 @@
+use ahash::AHashMap;
 use iggy_common::Identifier;
 use slab::Slab;
 use std::{cell::RefCell, sync::Arc};
 
 use crate::{
-    slab::{IndexedSlab, partitions::Partitions},
-    streaming::{partitions::partition2, stats::stats::TopicStats, topics::topic2},
+    slab::{
+        Keyed,
+        partitions::Partitions,
+        traits_ext::{
+            Delete, DeleteCell, EntityComponentSystem, EntityComponentSystemMutCell, Insert,
+            InsertCell, InteriorMutability, IntoComponents,
+        },
+    },
+    streaming::{
+        partitions::partition2,
+        stats::stats::TopicStats,
+        topics::topic2::{self, TopicRef},
+    },
 };
 
 const CAPACITY: usize = 1024;
+pub type ContainerId = usize;
 
+#[derive(Debug, Clone)]
 pub struct Topics {
-    container: RefCell<IndexedSlab<topic2::Topic>>,
+    index: RefCell<AHashMap<<topic2::TopicRoot as Keyed>::Key, ContainerId>>,
+    root: RefCell<Slab<topic2::TopicRoot>>,
     stats: RefCell<Slab<Arc<TopicStats>>>,
 }
 
-impl Topics {
-    pub fn init() -> Self {
+impl InsertCell for Topics {
+    type Idx = ContainerId;
+    type Item = topic2::Topic;
+
+    fn insert(&self, item: Self::Item) -> Self::Idx {
+        let (root, stats) = item.into_components();
+        let key = root.key().clone();
+
+        let entity_id = self.root.borrow_mut().insert(root);
+        let id = self.stats.borrow_mut().insert(stats);
+        assert_eq!(
+            entity_id, id,
+            "topic_insert: id mismatch when inserting stats"
+        );
+        self.index.borrow_mut().insert(key, entity_id);
+        entity_id
+    }
+}
+
+impl DeleteCell for Topics {
+    type Idx = ContainerId;
+    type Item = topic2::Topic;
+
+    fn delete(&self, id: Self::Idx) -> Self::Item {
+        todo!()
+    }
+}
+
+//TODO: those from impls could use a macro aswell.
+impl<'a> From<&'a Topics> for topic2::TopicRef<'a> {
+    fn from(value: &'a Topics) -> Self {
+        let root = value.root.borrow();
+        let stats = value.stats.borrow();
+        topic2::TopicRef::new(root, stats)
+    }
+}
+impl Default for Topics {
+    fn default() -> Self {
         Self {
-            container: RefCell::new(IndexedSlab::with_capacity(CAPACITY)),
+            index: RefCell::new(AHashMap::with_capacity(CAPACITY)),
+            root: RefCell::new(Slab::with_capacity(CAPACITY)),
             stats: RefCell::new(Slab::with_capacity(CAPACITY)),
         }
     }
+}
 
+impl<'a> From<&'a Topics> for topic2::TopicRefMut<'a> {
+    fn from(value: &'a Topics) -> Self {
+        let root = value.root.borrow_mut();
+        let stats = value.stats.borrow_mut();
+        topic2::TopicRefMut::new(root, stats)
+    }
+}
+
+impl EntityComponentSystem<InteriorMutability> for Topics {
+    type Idx = ContainerId;
+    type Entity = topic2::Topic;
+    type EntityRef<'a> = topic2::TopicRef<'a>;
+
+    fn with<O, F>(&self, f: F) -> O
+    where
+        F: for<'a> FnOnce(Self::EntityRef<'a>) -> O,
+    {
+        f(self.into())
+    }
+
+    async fn with_async<O, F>(&self, f: F) -> O
+    where
+        F: for<'a> AsyncFnOnce(Self::EntityRef<'a>) -> O,
+    {
+        f(self.into()).await
+    }
+}
+
+impl EntityComponentSystemMutCell for Topics {
+    type EntityRefMut<'a> = topic2::TopicRefMut<'a>;
+
+    fn with_mut<O, F>(&self, f: F) -> O
+    where
+        F: for<'a> FnOnce(Self::EntityRefMut<'a>) -> O,
+    {
+        f(self.into())
+    }
+}
+
+impl Topics {
     pub fn len(&self) -> usize {
-        self.container.borrow().len()
+        self.root.borrow().len()
     }
 
-    pub fn exists(&self, key: &String) -> bool {
-        self.container.borrow().exists(key)
+    pub fn exists(&self, id: &Identifier) -> bool {
+        match id.kind {
+            iggy_common::IdKind::Numeric => {
+                let id = id.get_u32_value().unwrap() as usize;
+                self.root.borrow().contains(id)
+            }
+            iggy_common::IdKind::String => {
+                let key = id.get_string_value().unwrap();
+                self.index.borrow().contains_key(&key)
+            }
+        }
     }
 
-    pub async fn with_async(&self, f: impl AsyncFnOnce(&IndexedSlab<topic2::Topic>)) {
-        let container = self.container.borrow();
-        f(&container).await;
+    pub fn get_index(&self, id: &Identifier) -> usize {
+        match id.kind {
+            iggy_common::IdKind::Numeric => id.get_u32_value().unwrap() as usize,
+            iggy_common::IdKind::String => {
+                let key = id.get_string_value().unwrap();
+                *self.index.borrow().get(&key).expect("Topic not found")
+            }
+        }
+    }
+
+    pub fn with_index<T>(
+        &self,
+        f: impl FnOnce(&AHashMap<<topic2::TopicRoot as Keyed>::Key, usize>) -> T,
+    ) -> T {
+        let index = self.index.borrow();
+        f(&index)
+    }
+
+    pub fn with_index_mut<T>(
+        &self,
+        f: impl FnOnce(&mut AHashMap<<topic2::TopicRoot as Keyed>::Key, usize>) -> T,
+    ) -> T {
+        let mut index = self.index.borrow_mut();
+        f(&mut index)
+    }
+
+    pub fn with_root_by_id<T>(
+        &self,
+        id: &Identifier,
+        f: impl FnOnce(&topic2::TopicRoot) -> T,
+    ) -> T {
+        let id = self.get_index(id);
+        self.with_by_id(id, |(root, _)| f(&root))
+    }
+
+    pub async fn with_root_by_id_async<T>(
+        &self,
+        id: &Identifier,
+        f: impl AsyncFnOnce(&topic2::TopicRoot) -> T,
+    ) -> T {
+        let id = self.get_index(id);
+        self.with_by_id_async(id, async |(root, _)| f(&root).await)
+            .await
+    }
+
+    pub fn with_root_by_id_mut<T>(
+        &self,
+        id: &Identifier,
+        f: impl FnOnce(&mut topic2::TopicRoot) -> T,
+    ) -> T {
+        let id = self.get_index(id);
+        self.with_by_id_mut(id, |(mut root, _)| f(&mut root))
     }
 
     pub fn with_stats<T>(&self, f: impl FnOnce(&Slab<Arc<TopicStats>>) -> T) -> T {
-        let stats = self.stats.borrow();
-        f(&stats)
+        self.with(|components| {
+            let (_, stats) = components.into_components();
+            f(&stats)
+        })
     }
 
     pub fn with_stats_mut<T>(&self, f: impl FnOnce(&mut Slab<Arc<TopicStats>>) -> T) -> T {
-        let mut stats = self.stats.borrow_mut();
-        f(&mut stats)
-    }
-
-    pub fn with<T>(&self, f: impl FnOnce(&IndexedSlab<topic2::Topic>) -> T) -> T {
-        let container = self.container.borrow();
-        f(&container)
-    }
-
-    pub fn with_mut<T>(&self, f: impl FnOnce(&mut IndexedSlab<topic2::Topic>) -> T) -> T {
-        let mut container = self.container.borrow_mut();
-        f(&mut container)
-    }
-
-    pub fn with_topic_by_id<T>(&self, id: &Identifier, f: impl FnOnce(&topic2::Topic) -> T) -> T {
-        self.with(|topics| {
-            let topic = match id.kind {
-                iggy_common::IdKind::Numeric => {
-                    let id = id.get_u32_value().unwrap() as usize;
-                    &topics[id]
-                }
-                iggy_common::IdKind::String => {
-                    let key = id.get_string_value().unwrap();
-                    unsafe { topics.get_by_key_unchecked(&key) }
-                }
-            };
-            f(topic)
+        self.with_mut(|components| {
+            let (_, mut stats) = components.into_components();
+            f(&mut stats)
         })
     }
 
-    pub fn with_topic_by_id_mut<T>(
+    pub fn with_stats_by_id<T>(&self, id: &Identifier, f: impl FnOnce(&Arc<TopicStats>) -> T) -> T {
+        let id = self.get_index(id);
+        self.with_by_id(id, |(_, stats)| f(&stats))
+    }
+
+    pub async fn with_partitions_async<T>(
         &self,
-        id: &Identifier,
-        f: impl FnOnce(&mut topic2::Topic) -> T,
+        topic_id: &Identifier,
+        f: impl AsyncFnOnce(&Partitions) -> T,
     ) -> T {
-        self.with_mut(|topics| {
-            let topic = match id.kind {
-                iggy_common::IdKind::Numeric => {
-                    let id = id.get_u32_value().unwrap() as usize;
-                    &mut topics[id]
-                }
-                iggy_common::IdKind::String => {
-                    let key = id.get_string_value().unwrap();
-                    unsafe { topics.get_by_key_mut_unchecked(&key) }
-                }
-            };
-            f(topic)
+        let id = self.get_index(topic_id);
+        self.with_by_id_async(id, async |(root, _)| {
+            let partitions = root.partitions();
+            f(partitions).await
         })
+        .await
     }
 
     pub fn with_partitions(&self, topic_id: &Identifier, f: impl FnOnce(&Partitions)) {
-        self.with(|topics| {
-            let topic = match topic_id.kind {
-                iggy_common::IdKind::Numeric => {
-                    let id = topic_id.get_u32_value().unwrap() as usize;
-                    &topics[id]
-                }
-                iggy_common::IdKind::String => {
-                    let key = topic_id.get_string_value().unwrap();
-                    unsafe { topics.get_by_key_unchecked(&key) }
-                }
-            };
-            f(topic.partitions());
+        let id = self.get_index(topic_id);
+        self.with_by_id(id, |(root, _)| {
+            let partitions = root.partitions();
+            f(partitions)
         })
     }
 
-    pub fn with_partition_by_id(
+    pub fn with_partitions_mut<T>(
         &self,
-        id: &Identifier,
-        partition_id: usize,
-        f: impl FnOnce(&partition2::Partition),
-    ) {
-        self.with_partitions(id, |partitions| {
-            partitions.with_partition_id(partition_id, f);
-        });
+        topic_id: &Identifier,
+        f: impl FnOnce(&mut Partitions) -> T,
+    ) -> T {
+        let id = self.get_index(topic_id);
+        self.with_by_id_mut(id, |(mut root, _)| {
+            let partitions = root.partitions_mut();
+            f(partitions)
+        })
     }
 }

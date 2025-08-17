@@ -25,6 +25,7 @@ pub mod partitions;
 pub mod persistence;
 pub mod segments;
 pub mod storage;
+pub mod storage2;
 pub mod topic;
 pub mod topic2;
 

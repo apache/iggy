@@ -190,56 +190,56 @@ class IggyClient:
         This initializes a new runtime for asynchronous operations.
         Future versions might utilize asyncio for more Pythonic async.
         """
-    def ping(self) -> typing.Any:
+    def ping(self) -> collections.abc.Awaitable[None]:
         r"""
         Sends a ping request to the server to check connectivity.
         
         Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
         if the connection fails.
         """
-    def login_user(self, username:builtins.str, password:builtins.str) -> typing.Any:
+    def login_user(self, username:builtins.str, password:builtins.str) -> collections.abc.Awaitable[None]:
         r"""
         Logs in the user with the given credentials.
         
         Returns `Ok(())` on success, or a PyRuntimeError on failure.
         """
-    def connect(self) -> typing.Any:
+    def connect(self) -> collections.abc.Awaitable[None]:
         r"""
         Connects the IggyClient to its service.
         
         Returns Ok(()) on successful connection or a PyRuntimeError on failure.
         """
-    def create_stream(self, name:builtins.str, stream_id:typing.Optional[builtins.int]=None) -> typing.Any:
+    def create_stream(self, name:builtins.str, stream_id:typing.Optional[builtins.int]=None) -> collections.abc.Awaitable[None]:
         r"""
         Creates a new stream with the provided ID and name.
         
         Returns Ok(()) on successful stream creation or a PyRuntimeError on failure.
         """
-    def get_stream(self, stream_id:builtins.str | builtins.int) -> typing.Any:
+    def get_stream(self, stream_id:builtins.str | builtins.int) -> collections.abc.Awaitable[typing.Optional[StreamDetails]]:
         r"""
         Gets stream by id.
         
         Returns Option of stream details or a PyRuntimeError on failure.
         """
-    def create_topic(self, stream:builtins.str | builtins.int, name:builtins.str, partitions_count:builtins.int, compression_algorithm:typing.Optional[builtins.str]=None, topic_id:typing.Optional[builtins.int]=None, replication_factor:typing.Optional[builtins.int]=None) -> typing.Any:
+    def create_topic(self, stream:builtins.str | builtins.int, name:builtins.str, partitions_count:builtins.int, compression_algorithm:typing.Optional[builtins.str]=None, topic_id:typing.Optional[builtins.int]=None, replication_factor:typing.Optional[builtins.int]=None) -> collections.abc.Awaitable[None]:
         r"""
         Creates a new topic with the given parameters.
         
         Returns Ok(()) on successful topic creation or a PyRuntimeError on failure.
         """
-    def get_topic(self, stream_id:builtins.str | builtins.int, topic_id:builtins.str | builtins.int) -> typing.Any:
+    def get_topic(self, stream_id:builtins.str | builtins.int, topic_id:builtins.str | builtins.int) -> collections.abc.Awaitable[typing.Optional[TopicDetails]]:
         r"""
         Gets topic by stream and id.
         
         Returns Option of topic details or a PyRuntimeError on failure.
         """
-    def send_messages(self, stream:builtins.str | builtins.int, topic:builtins.str | builtins.int, partitioning:builtins.int, messages:list) -> typing.Any:
+    def send_messages(self, stream:builtins.str | builtins.int, topic:builtins.str | builtins.int, partitioning:builtins.int, messages:list[SendMessage]) -> collections.abc.Awaitable[None]:
         r"""
         Sends a list of messages to the specified topic.
         
         Returns Ok(()) on successful sending or a PyRuntimeError on failure.
         """
-    def poll_messages(self, stream:builtins.str | builtins.int, topic:builtins.str | builtins.int, partition_id:builtins.int, polling_strategy:PollingStrategy, count:builtins.int, auto_commit:builtins.bool) -> typing.Any:
+    def poll_messages(self, stream:builtins.str | builtins.int, topic:builtins.str | builtins.int, partition_id:builtins.int, polling_strategy:PollingStrategy, count:builtins.int, auto_commit:builtins.bool) -> collections.abc.Awaitable[list[ReceiveMessage]]:
         r"""
         Polls for messages from the specified topic and partition.
         
@@ -282,7 +282,7 @@ class IggyConsumer:
         r"""
         Gets the name of the topic this consumer group is configured for.
         """
-    def store_offset(self, offset:builtins.int, partition_id:typing.Optional[builtins.int]) -> typing.Any:
+    def store_offset(self, offset:builtins.int, partition_id:typing.Optional[builtins.int]) -> collections.abc.Awaitable[None]:
         r"""
         Stores the provided offset for the provided partition id or if none is specified
         uses the current partition id for the consumer group.
@@ -290,7 +290,7 @@ class IggyConsumer:
         Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
         if the operation fails.
         """
-    def delete_offset(self, partition_id:typing.Optional[builtins.int]) -> typing.Any:
+    def delete_offset(self, partition_id:typing.Optional[builtins.int]) -> collections.abc.Awaitable[None]:
         r"""
         Deletes the offset for the provided partition id or if none is specified
         uses the current partition id for the consumer group.
@@ -298,7 +298,7 @@ class IggyConsumer:
         Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
         if the operation fails.
         """
-    def consume_messages(self, callback:collections.abc.Callable[[str]], shutdown_event:typing.Optional[asyncio.Event]) -> typing.Any:
+    def consume_messages(self, callback:collections.abc.Callable[[str]], shutdown_event:typing.Optional[asyncio.Event]) -> collections.abc.Awaitable[None]:
         r"""
         Consumes messages continuously using a callback function and an optional `asyncio.Event` for signaling shutdown.
         

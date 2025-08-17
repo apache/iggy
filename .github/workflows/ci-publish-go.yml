@@ -31,7 +31,7 @@ jobs:
 
       - name: Validate tag format
         run: |
-          if [[ ! "$TAG" =~ ^foreign/go/v([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+          if [[ ! "$TAG" =~ ^foreign/go/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
             echo "Tag $TAG does not match required format: foreign/go/vX.Y.Z"
             exit 1
           fi

@@ -34,7 +34,7 @@ use topic::TopicDetails;
 
 /// A Python module implemented in Rust.
 #[pymodule]
-fn iggy_py(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn apache_iggy(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SendMessage>()?;
     m.add_class::<ReceiveMessage>()?;
     m.add_class::<IggyClient>()?;

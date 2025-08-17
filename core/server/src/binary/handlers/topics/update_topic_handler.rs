@@ -44,7 +44,28 @@ impl ServerCommandHandler for UpdateTopic {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
+        shard.update_topic2(
+            session,
+            &self.stream_id,
+            &self.topic_id,
+            self.name.clone(),
+            self.message_expiry,
+            self.compression_algorithm,
+            self.max_topic_size,
+            self.replication_factor,
+        );
+        let event = ShardEvent::UpdatedTopic2 {
+            stream_id: self.stream_id.clone(),
+            topic_id: self.topic_id.clone(),
+            name: self.name.clone(),
+            message_expiry: self.message_expiry,
+            compression_algorithm: self.compression_algorithm,
+            max_topic_size: self.max_topic_size,
+            replication_factor: self.replication_factor,
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
 
+        /*
         shard
                 .update_topic(
                     session,
@@ -96,6 +117,7 @@ impl ServerCommandHandler for UpdateTopic {
             .with_error_context(|error| format!(
                 "{COMPONENT} (error: {error}) - failed to apply update topic with id: {topic_id}, stream_id: {stream_id}, session: {session}"
             ))?;
+        */
         sender.send_empty_ok_response().await?;
         Ok(())
     }

@@ -25,7 +25,9 @@ use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateConsumerGroupWithId;
 use crate::streaming::session::Session;
+use crate::streaming::topics::consumer_group2::MEMBERS_CAPACITY;
 use anyhow::Result;
+use arcshift::ArcShift;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
@@ -46,6 +48,24 @@ impl ServerCommandHandler for CreateConsumerGroup {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
+        let members = ArcShift::new(slab::Slab::with_capacity(MEMBERS_CAPACITY));
+        let cg_id = shard.create_consumer_group2(
+            session,
+            &self.stream_id,
+            &self.topic_id,
+            members.clone(),
+            self.group_id,
+            self.name.clone(),
+        )?;
+        let event = ShardEvent::CreatedConsumerGroup2 {
+            cg_id,
+            stream_id: self.stream_id.clone(),
+            topic_id: self.topic_id.clone(),
+            name: self.name.clone(),
+            members,
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+
         let consumer_group_id = shard
                 .create_consumer_group(
                     session,

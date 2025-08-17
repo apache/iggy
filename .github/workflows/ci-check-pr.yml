@@ -161,7 +161,14 @@ jobs:
   ci-test-bdd:
     name: ci-test-bdd
     needs: pr-file-changes
-    if: ${{ needs.pr-file-changes.outputs.trigger-bdd == 'true' }}
+    if: ${{
+      needs.pr-file-changes.outputs.trigger-rust == 'true' ||
+      needs.pr-file-changes.outputs.trigger-java-sdk == 'true' ||
+      needs.pr-file-changes.outputs.trigger-python-sdk == 'true' ||
+      needs.pr-file-changes.outputs.trigger-go-sdk == 'true' ||
+      needs.pr-file-changes.outputs.trigger-node-sdk == 'true' ||
+      needs.pr-file-changes.outputs.trigger-csharp-sdk == 'true' ||
+      needs.pr-file-changes.outputs.trigger-bdd == 'true' }}
     uses: ./.github/workflows/ci-test-bdd.yml
 
   finalize_pr:

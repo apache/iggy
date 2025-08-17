@@ -19,8 +19,9 @@
 use super::{CONSUMER_GROUP_BASE_ID, CONSUMER_GROUP_NAME_PREFIX};
 use crate::{
     actors::{
-        consumer::BenchmarkConsumer, producer::BenchmarkProducer,
-        producing_consumer::BenchmarkProducingConsumer,
+        consumer::typed_benchmark_consumer::TypedBenchmarkConsumer,
+        producer::typed_benchmark_producer::TypedBenchmarkProducer,
+        producing_consumer::typed_banchmark_producing_consumer::TypedBenchmarkProducingConsumer,
     },
     args::common::IggyBenchArgs,
     utils::finish_condition::{BenchmarkFinishCondition, BenchmarkFinishConditionMode},
@@ -71,8 +72,6 @@ pub async fn init_consumer_groups(
     client_factory: &Arc<dyn ClientFactory>,
     args: &IggyBenchArgs,
 ) -> Result<(), IggyError> {
-    let start_stream_id = args.start_stream_id();
-    let topic_id: u32 = 1;
     let client = client_factory.create_client().await;
     let client = IggyClient::create(client, None, None);
     let cg_count = args.number_of_consumer_groups();
@@ -80,16 +79,18 @@ pub async fn init_consumer_groups(
     login_root(&client).await;
     for i in 1..=cg_count {
         let consumer_group_id = CONSUMER_GROUP_BASE_ID + i;
-        let stream_id = start_stream_id + i;
+        let stream_name = format!("bench-stream-{}", i);
+        let stream_id: Identifier = stream_name.as_str().try_into()?;
+        let topic_id: Identifier = "topic-1".try_into()?;
         let consumer_group_name = format!("{CONSUMER_GROUP_NAME_PREFIX}-{consumer_group_id}");
         info!(
             "Creating test consumer group: name={}, id={}, stream={}, topic={}",
-            consumer_group_name, consumer_group_id, stream_id, topic_id
+            consumer_group_name, consumer_group_id, stream_name, topic_id
         );
         match client
             .create_consumer_group(
-                &stream_id.try_into().unwrap(),
-                &topic_id.try_into().unwrap(),
+                &stream_id,
+                &topic_id,
                 &consumer_group_name,
                 Some(consumer_group_id),
             )
@@ -116,7 +117,6 @@ pub fn build_producer_futures(
 ) -> Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send + use<>> {
     let streams = args.streams();
     let partitions = args.number_of_partitions();
-    let start_stream_id = args.start_stream_id();
     let producers = args.producers();
     let actors = args.producers() + args.consumers();
     let warmup_time = args.warmup_time();
@@ -128,6 +128,7 @@ pub fn build_producer_futures(
     let shared_finish_condition =
         BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::Shared);
     let rate_limit = rate_limit_per_actor(args.rate_limit(), actors);
+    let use_high_level_api = args.high_level_api();
 
     (1..=producers)
         .map(|producer_id| {
@@ -139,10 +140,12 @@ pub fn build_producer_futures(
                 BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::PerProducer)
             };
 
-            let stream_id = start_stream_id + 1 + (producer_id % streams);
+            let stream_idx = 1 + ((producer_id - 1) % streams);
+            let stream_id = format!("bench-stream-{}", stream_idx);
 
             async move {
-                let producer = BenchmarkProducer::new(
+                let producer = TypedBenchmarkProducer::new(
+                    use_high_level_api,
                     client_factory,
                     kind,
                     producer_id,
@@ -166,7 +169,6 @@ pub fn build_consumer_futures(
     client_factory: &Arc<dyn ClientFactory>,
     args: &IggyBenchArgs,
 ) -> Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send + use<>> {
-    let start_stream_id = args.start_stream_id();
     let cg_count = args.number_of_consumer_groups();
     let consumers = args.consumers();
     let actors = args.producers() + args.consumers();
@@ -201,11 +203,12 @@ pub fn build_consumer_futures(
             } else {
                 BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::PerConsumer)
             };
-            let stream_id = if cg_count > 0 {
-                start_stream_id + 1 + (consumer_id % cg_count)
+            let stream_idx = if cg_count > 0 {
+                1 + ((consumer_id - 1) % cg_count)
             } else {
-                start_stream_id + consumer_id
+                consumer_id
             };
+            let stream_id = format!("bench-stream-{}", stream_idx);
             let consumer_group_id = if cg_count > 0 {
                 Some(CONSUMER_GROUP_BASE_ID + 1 + (consumer_id % cg_count))
             } else {
@@ -213,7 +216,8 @@ pub fn build_consumer_futures(
             };
 
             async move {
-                let consumer = BenchmarkConsumer::new(
+                let consumer = TypedBenchmarkConsumer::new(
+                    use_high_level_api,
                     client_factory,
                     kind,
                     consumer_id,
@@ -227,7 +231,6 @@ pub fn build_consumer_futures(
                     polling_kind,
                     rate_limit,
                     origin_timestamp_latency_calculation,
-                    use_high_level_api,
                 );
                 consumer.run().await
             }
@@ -246,14 +249,14 @@ pub fn build_producing_consumers_futures(
     let warmup_time = args.warmup_time();
     let messages_per_batch = args.messages_per_batch();
     let message_size = args.message_size();
-    let start_stream_id = args.start_stream_id();
     let polling_kind = PollingKind::Offset;
 
     (1..=producing_consumers)
         .map(|actor_id| {
             let client_factory_clone = client_factory.clone();
             let args_clone = args.clone();
-            let stream_id = start_stream_id + 1 + (actor_id % streams);
+            let stream_idx = 1 + ((actor_id - 1) % streams);
+            let stream_id = format!("bench-stream-{}", stream_idx);
 
             let send_finish_condition = BenchmarkFinishCondition::new(
                 &args,
@@ -263,7 +266,15 @@ pub fn build_producing_consumers_futures(
                 &args,
                 BenchmarkFinishConditionMode::PerProducingConsumer,
             );
-
+            let origin_timestamp_latency_calculation = match args.kind() {
+                BenchmarkKind::PinnedConsumer
+                | BenchmarkKind::PinnedProducerAndConsumer
+                | BenchmarkKind::BalancedConsumerGroup  // TODO(hubcio): in future, PinnedProducerAndConsumer can also be true
+                | BenchmarkKind::EndToEndProducingConsumer => false,
+                BenchmarkKind::BalancedProducerAndConsumerGroup => true,
+                _ => unreachable!(),
+            };
+            let use_high_level_api = args.high_level_api();
             let rate_limit = rate_limit_per_actor(args.rate_limit(), producing_consumers);
 
             async move {
@@ -271,7 +282,8 @@ pub fn build_producing_consumers_futures(
                     "Executing producing consumer #{}, stream_id={}",
                     actor_id, stream_id
                 );
-                let actor = BenchmarkProducingConsumer::new(
+                let actor = TypedBenchmarkProducingConsumer::new(
+                    use_high_level_api,
                     client_factory_clone,
                     args_clone.kind(),
                     actor_id,
@@ -287,6 +299,7 @@ pub fn build_producing_consumers_futures(
                     args_clone.moving_average_window(),
                     rate_limit,
                     polling_kind,
+                    origin_timestamp_latency_calculation,
                 );
                 actor.run().await
             }
@@ -307,10 +320,9 @@ pub fn build_producing_consumer_groups_futures(
     let warmup_time = args.warmup_time();
     let messages_per_batch = args.messages_per_batch();
     let message_size = args.message_size();
-    let start_stream_id = args.start_stream_id();
     let start_consumer_group_id = CONSUMER_GROUP_BASE_ID;
     let polling_kind = PollingKind::Next;
-
+    let use_high_level_api = args.high_level_api();
     let shared_send_finish_condition =
         BenchmarkFinishCondition::new(&args, BenchmarkFinishConditionMode::SharedHalf);
 
@@ -321,7 +333,8 @@ pub fn build_producing_consumer_groups_futures(
         .map(|actor_id| {
             let client_factory_clone = client_factory.clone();
             let args_clone = args.clone();
-            let stream_id = start_stream_id + 1 + (actor_id % cg_count);
+            let stream_idx = 1 + ((actor_id - 1) % cg_count);
+            let stream_id = format!("bench-stream-{}", stream_idx);
 
             let should_produce = actor_id <= producers;
             let should_consume = actor_id <= consumers;
@@ -349,6 +362,14 @@ pub fn build_producing_consumer_groups_futures(
             } else {
                 None
             };
+            let origin_timestamp_latency_calculation = match args.kind() {
+                BenchmarkKind::PinnedConsumer
+                | BenchmarkKind::PinnedProducerAndConsumer
+                | BenchmarkKind::BalancedConsumerGroup  // TODO(hubcio): in future, PinnedProducerAndConsumer can also be true
+                | BenchmarkKind::EndToEndProducingConsumer => false,
+                BenchmarkKind::BalancedProducerAndConsumerGroup => true,
+                _ => unreachable!(),
+            };
 
             async move {
                 let actor_type = match (should_produce, should_consume) {
@@ -369,7 +390,8 @@ pub fn build_producing_consumer_groups_futures(
                     stream_id,
                     actor_type
                 );
-                let actor = BenchmarkProducingConsumer::new(
+                let actor = TypedBenchmarkProducingConsumer::new(
+                    use_high_level_api,
                     client_factory_clone,
                     args_clone.kind(),
                     actor_id,
@@ -385,7 +407,9 @@ pub fn build_producing_consumer_groups_futures(
                     args_clone.moving_average_window(),
                     rate_limit,
                     polling_kind,
+                    origin_timestamp_latency_calculation,
                 );
+
                 actor.run().await
             }
         })

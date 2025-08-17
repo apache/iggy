@@ -1,62 +1,148 @@
-use std::{cell::RefCell, sync::Arc};
-
-use iggy_common::Partition;
+use crate::{
+    slab::traits_ext::{Borrow, Delete, EntityComponentSystem, Insert, IntoComponents},
+    streaming::{
+        deduplication::message_deduplicator::MessageDeduplicator,
+        partitions::{
+            consumer_offset,
+            partition2::{self, Partition, PartitionRef},
+        },
+        segments,
+        stats::stats::PartitionStats,
+        topics::consumer_group,
+    },
+};
 use slab::Slab;
-
-use crate::streaming::{partitions::partition2, segments, stats::stats::PartitionStats};
+use std::sync::{Arc, atomic::AtomicU64};
 
 // TODO: This could be upper limit of partitions per topic, use that value to validate instead of whathever this thing is in `common` crate.
-const CAPACITY: usize = 16384;
+pub const PARTITIONS_CAPACITY: usize = 16384;
+const SEGMENTS_CAPACITY: usize = 1024;
+pub type ContainerId = usize;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Partitions {
-    container: Slab<partition2::Partition>,
+    root: Slab<partition2::PartitionRoot>,
     stats: Slab<Arc<PartitionStats>>,
     segments: Slab<Vec<segments::Segment2>>,
+    message_deduplicator: Slab<Option<MessageDeduplicator>>,
+    offset: Slab<Arc<AtomicU64>>,
+
+    consumer_offset: Slab<Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>>,
+    consumer_group_offset: Slab<Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>>,
+}
+
+impl Insert for Partitions {
+    type Idx = ContainerId;
+    type Item = Partition;
+
+    fn insert(&mut self, item: Self::Item) -> Self::Idx {
+        let (root, stats, deduplicator, offset, consumer_offset, consumer_group_offset) =
+            item.into_components();
+
+        let entity_id = self.root.insert(root);
+        let id = self.stats.insert(stats);
+        assert_eq!(
+            entity_id, id,
+            "partition_insert: id mismatch when inserting stats"
+        );
+        let id = self.segments.insert(Vec::with_capacity(SEGMENTS_CAPACITY));
+        assert_eq!(
+            entity_id, id,
+            "partition_insert: id mismatch when inserting segments"
+        );
+        let id = self.message_deduplicator.insert(deduplicator);
+        assert_eq!(
+            entity_id, id,
+            "partition_insert: id mismatch when inserting message_deduplicator"
+        );
+        let id = self.offset.insert(offset);
+        assert_eq!(
+            entity_id, id,
+            "partition_insert: id mismatch when inserting offset"
+        );
+        let id = self.consumer_offset.insert(consumer_offset);
+        assert_eq!(
+            entity_id, id,
+            "partition_insert: id mismatch when inserting consumer_offset"
+        );
+        let id = self.consumer_group_offset.insert(consumer_group_offset);
+        assert_eq!(
+            entity_id, id,
+            "partition_insert: id mismatch when inserting consumer_group_offset"
+        );
+        entity_id
+    }
+}
+
+impl Delete for Partitions {
+    type Idx = ContainerId;
+    type Item = Partition;
+
+    fn delete(&mut self, id: Self::Idx) -> Self::Item {
+        todo!()
+    }
+}
+
+//TODO: those from impls could use a macro aswell.
+impl<'a> From<&'a Partitions> for PartitionRef<'a> {
+    fn from(value: &'a Partitions) -> Self {
+        PartitionRef::new(
+            &value.root,
+            &value.stats,
+            &value.message_deduplicator,
+            &value.offset,
+            &value.consumer_offset,
+            &value.consumer_group_offset,
+        )
+    }
+}
+
+impl EntityComponentSystem<Borrow> for Partitions {
+    type Idx = ContainerId;
+    type Entity = Partition;
+    type EntityRef<'a> = PartitionRef<'a>;
+
+    fn with<O, F>(&self, f: F) -> O
+    where
+        F: for<'a> FnOnce(Self::EntityRef<'a>) -> O,
+    {
+        f(self.into())
+    }
+
+    async fn with_async<O, F>(&self, f: F) -> O
+    where
+        F: for<'a> AsyncFnOnce(Self::EntityRef<'a>) -> O,
+    {
+        f(self.into()).await
+    }
 }
 
 impl Default for Partitions {
     fn default() -> Self {
         Self {
-            container: Slab::with_capacity(CAPACITY),
-            stats: Slab::with_capacity(CAPACITY),
-            segments: Slab::with_capacity(CAPACITY),
+            root: Slab::with_capacity(PARTITIONS_CAPACITY),
+            stats: Slab::with_capacity(PARTITIONS_CAPACITY),
+            segments: Slab::with_capacity(PARTITIONS_CAPACITY),
+            message_deduplicator: Slab::with_capacity(PARTITIONS_CAPACITY),
+            offset: Slab::with_capacity(PARTITIONS_CAPACITY),
+            consumer_offset: Slab::with_capacity(PARTITIONS_CAPACITY),
+            consumer_group_offset: Slab::with_capacity(PARTITIONS_CAPACITY),
         }
     }
 }
 
 impl Partitions {
+    pub fn len(&self) -> usize {
+        self.root.len()
+    }
+
     pub fn with_stats<T>(&self, f: impl FnOnce(&Slab<Arc<PartitionStats>>) -> T) -> T {
         let stats = &self.stats;
         f(stats)
     }
 
     pub fn with_stats_mut<T>(&mut self, f: impl FnOnce(&mut Slab<Arc<PartitionStats>>) -> T) -> T {
-        let mut stats = &mut self.stats;
-        f(&mut stats)
-    }
-
-    pub async fn with_async(&self, f: impl AsyncFnOnce(&Slab<partition2::Partition>)) {
-        let container = &self.container;
-        f(&container).await;
-    }
-
-    pub fn with(&self, f: impl FnOnce(&Slab<partition2::Partition>)) {
-        let container = &self.container;
-        f(&container);
-    }
-
-    pub fn with_mut<T>(&mut self, f: impl FnOnce(&mut Slab<partition2::Partition>) -> T) -> T {
-        let mut container = &mut self.container;
-        f(&mut container)
-    }
-
-    pub fn with_partition_id(&self, partition_id: usize, f: impl FnOnce(&partition2::Partition)) {
-        self.with(|partitions| {
-            if let Some(partition) = partitions.get(partition_id) {
-                f(partition);
-            }
-        });
+        f(&mut self.stats)
     }
 
     pub fn with_segments(&self, partition_id: usize, f: impl FnOnce(&Vec<segments::Segment2>)) {
@@ -71,6 +157,7 @@ impl Partitions {
         f: impl FnOnce(&segments::Segment2),
     ) {
         self.with_segments(partition_id, |segments| {
+            // we could binary search for that segment technically, but this is fine for now.
             if let Some(segment) = segments.iter().find(|s| s.id == segment_id) {
                 f(segment);
             }

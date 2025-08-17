@@ -68,7 +68,7 @@ use crate::{
         },
     },
     shard_error, shard_info, shard_warn,
-    slab::streams::Streams,
+    slab::{streams::Streams, traits_ext::EntityMarker},
     state::{
         StateKind,
         system::{StreamState, SystemState, UserState},
@@ -160,7 +160,6 @@ pub struct IggyShard {
     pub(crate) active_sessions: RefCell<Vec<Rc<Session>>>,
     pub(crate) permissioner: RefCell<Permissioner>,
     pub(crate) users: RefCell<HashMap<UserId, User>>,
-
     pub(crate) metrics: Metrics,
     pub messages_receiver: Cell<Option<Receiver<ShardFrame>>>,
     pub(crate) stop_receiver: StopReceiver,
@@ -179,7 +178,6 @@ impl IggyShard {
     pub fn default_from_config(server_config: ServerConfig) -> Self {
         use crate::bootstrap::resolve_persister;
         use crate::state::file::FileState;
-        use crate::streaming::diagnostics::metrics::Metrics;
         use crate::streaming::storage::SystemStorage;
         use crate::versioning::SemanticVersion;
 
@@ -548,10 +546,10 @@ impl IggyShard {
         }
     }
 
-    async fn handle_event(&self, event: Arc<ShardEvent>) -> Result<(), IggyError> {
-        match &*event {
+    async fn handle_event(&self, event: ShardEvent) -> Result<(), IggyError> {
+        match event {
             ShardEvent::CreatedStream { stream_id, name } => {
-                self.create_stream_bypass_auth(*stream_id, name)?;
+                self.create_stream_bypass_auth(stream_id, &name)?;
                 Ok(())
             }
             ShardEvent::CreatedTopic {
@@ -566,23 +564,23 @@ impl IggyShard {
             } => {
                 let topic_id = topic_id.get_u32_value().ok();
                 self.create_topic_bypass_auth(
-                    stream_id,
-                    topic_id,
-                    name,
-                    *partitions_count,
-                    *message_expiry,
-                    *compression_algorithm,
-                    *max_topic_size,
-                    *replication_factor,
+                    &stream_id,
+                    None,
+                    &name,
+                    partitions_count,
+                    message_expiry,
+                    compression_algorithm,
+                    max_topic_size,
+                    replication_factor,
                 )
             }
             ShardEvent::LoginUser {
                 client_id,
                 username,
                 password,
-            } => self.login_user_event(*client_id, username, password),
+            } => self.login_user_event(client_id, &username, &password),
             ShardEvent::NewSession { address, transport } => {
-                let session = self.add_client(address, *transport);
+                let session = self.add_client(&address, transport);
                 self.add_active_session(session);
                 Ok(())
             }
@@ -592,10 +590,10 @@ impl IggyShard {
                 partition_ids,
             } => {
                 let records = self
-                    .create_shard_table_records(&partition_ids, *stream_id, *topic_id)
+                    .create_shard_table_records(&partition_ids, stream_id, topic_id)
                     .collect::<Vec<_>>();
-                let stream = self.get_stream(&Identifier::numeric(*stream_id)?)?;
-                let topic = stream.get_topic(&Identifier::numeric(*topic_id)?)?;
+                let stream = self.get_stream(&Identifier::numeric(stream_id)?)?;
+                let topic = stream.get_topic(&Identifier::numeric(topic_id)?)?;
                 // Open partition and segments for that particular shard.
                 for (ns, shard_info) in records.iter() {
                     if shard_info.id() == self.id {
@@ -603,10 +601,10 @@ impl IggyShard {
                         let partition = topic.get_partition(partition_id)?;
                         let mut partition = partition.write().await;
                         partition.open().await.with_error_context(|error| {
-                                                                            format!(
-                                                                                "{COMPONENT} (error: {error}) - failed to open partition with ID: {partition_id} in topic with ID: {topic_id} for stream with ID: {stream_id}"
-                                                                            )
-                                                                        })?;
+                                                                                                            format!(
+                                                                                                                "{COMPONENT} (error: {error}) - failed to open partition with ID: {partition_id} in topic with ID: {topic_id} for stream with ID: {stream_id}"
+                                                                                                            )
+                                                                                                        })?;
                     }
                 }
                 self.insert_shard_table_records(records);
@@ -617,17 +615,31 @@ impl IggyShard {
                 topic_id,
                 partitions_count,
             } => {
-                let mut stream = self.get_stream_mut(stream_id)?;
-                let topic = stream.get_topic_mut(topic_id)?;
-                topic.add_persisted_partitions(*partitions_count)
-                                                                    .with_error_context(|error| {
-                                                                        format!(
-                                                                            "{COMPONENT} (error: {error}) - failed to create partitions for topic with ID: {topic_id} in stream with ID: {stream_id}"
-                                                                        )
-                                                                    })?;
+                let mut stream = self.get_stream_mut(&stream_id)?;
+                let topic = stream.get_topic_mut(&topic_id)?;
+                topic.add_persisted_partitions(partitions_count)
+                                                                                                    .with_error_context(|error| {
+                                                                                                        format!(
+                                                                                                            "{COMPONENT} (error: {error}) - failed to create partitions for topic with ID: {topic_id} in stream with ID: {stream_id}"
+                                                                                                        )
+                                                                                                    })?;
                 topic.reassign_consumer_groups();
-                self.metrics.increment_partitions(*partitions_count);
-                self.metrics.increment_segments(*partitions_count);
+                self.metrics.increment_partitions(partitions_count);
+                self.metrics.increment_segments(partitions_count);
+                Ok(())
+            }
+            ShardEvent::DeletedPartitions2 {
+                stream_id,
+                topic_id,
+                partitions_count,
+                partition_ids,
+            } => {
+                self.delete_partitions2_bypass_auth(
+                    &stream_id,
+                    &topic_id,
+                    partitions_count,
+                    partition_ids,
+                )?;
                 Ok(())
             }
             ShardEvent::DeletedPartitions {
@@ -635,13 +647,13 @@ impl IggyShard {
                 topic_id,
                 partition_ids,
             } => {
-                let mut stream = self.get_stream_mut(stream_id)?;
-                let topic = stream.get_topic_mut(topic_id)?;
+                let mut stream = self.get_stream_mut(&stream_id)?;
+                let topic = stream.get_topic_mut(&topic_id)?;
                 let partitions = topic
-                                                            .       delete_persisted_partitions_by_ids(partition_ids)
-                                                                    .with_error_context(|error| {
-                                                                        format!("{COMPONENT} (error: {error}) - failed to delete persisted partitions for topic: {topic}")
-                                                                    })?;
+                                                                                            .       delete_persisted_partitions_by_ids(&partition_ids)
+                                                                                                    .with_error_context(|error| {
+                                                                                                        format!("{COMPONENT} (error: {error}) - failed to delete persisted partitions for topic: {topic}")
+                                                                                                    })?;
                 drop(stream);
 
                 let mut segments_count = 0;
@@ -654,16 +666,18 @@ impl IggyShard {
                     messages_count += partition_messages_count;
                 }
 
-                let mut stream = self.get_stream_mut(stream_id).with_error_context(|error| {
+                let mut stream = self.get_stream_mut(&stream_id).with_error_context(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}"
                     )
                 })?;
-                let topic = stream.get_topic_mut(topic_id).with_error_context(|error| {
-                    format!(
-                        "{COMPONENT} (error: {error}) - failed to get topic with ID: {topic_id}"
-                    )
-                })?;
+                let topic = stream
+                    .get_topic_mut(&topic_id)
+                    .with_error_context(|error| {
+                        format!(
+                            "{COMPONENT} (error: {error}) - failed to get topic with ID: {topic_id}"
+                        )
+                    })?;
                 topic.reassign_consumer_groups();
                 if partitions.len() > 0 {
                     self.metrics.decrement_partitions(partitions_count as u32);
@@ -685,27 +699,31 @@ impl IggyShard {
                         let partition = topic.get_partition(ns.partition_id)?;
                         let mut partition = partition.write().await;
                         partition.delete().await.with_error_context(|error| {
-                                                                        format!(
-                                                                            "{COMPONENT} (error: {error}) - failed to delete partition with ID: {} in topic with ID: {}",
-                                                                            ns.partition_id,
-                                                                            topic_id
-                                                                    )
-                                                                    })?;
+                                                                                                        format!(
+                                                                                                            "{COMPONENT} (error: {error}) - failed to delete partition with ID: {} in topic with ID: {}",
+                                                                                                            ns.partition_id,
+                                                                                                            topic_id
+                                                                                                    )
+                                                                                                    })?;
                     }
                 }
                 Ok(())
             }
             ShardEvent::DeletedStream { stream_id } => {
                 let shard_id = self.id;
-                self.delete_stream_bypass_auth(stream_id).with_error_context(|err| {
-                                                                    format!(
-                                                                        "{COMPONENT} (error: {err}) - failed to delete, when handling event on shard: {shard_id} stream with ID: {stream_id}",
-                                                                    )
-                                                                })?;
+                self.delete_stream_bypass_auth(&stream_id).with_error_context(|err| {
+                                                                                                    format!(
+                                                                                                        "{COMPONENT} (error: {err}) - failed to delete, when handling event on shard: {shard_id} stream with ID: {stream_id}",
+                                                                                                    )
+                                                                                                })?;
                 Ok(())
             }
             ShardEvent::UpdatedStream { stream_id, name } => {
-                self.update_stream_bypass_auth(stream_id, name)?;
+                self.update_stream_bypass_auth(&stream_id, &name)?;
+                Ok(())
+            }
+            ShardEvent::UpdatedStream2 { stream_id, name } => {
+                self.update_stream2_bypass_auth(&stream_id, &name)?;
                 Ok(())
             }
             ShardEvent::UpdatedTopic {
@@ -718,39 +736,43 @@ impl IggyShard {
                 replication_factor,
             } => {
                 self.update_topic_bypass_auth(
-                    stream_id,
-                    topic_id,
-                    name,
-                    *message_expiry,
-                    *compression_algorithm,
-                    *max_topic_size,
-                    *replication_factor,
+                    &stream_id,
+                    &topic_id,
+                    &name,
+                    message_expiry,
+                    compression_algorithm,
+                    max_topic_size,
+                    replication_factor,
                 )
                 .await?;
                 Ok(())
             }
             ShardEvent::PurgedStream { stream_id } => {
-                self.purge_stream_bypass_auth(stream_id).await?;
+                self.purge_stream_bypass_auth(&stream_id).await?;
+                Ok(())
+            }
+            ShardEvent::PurgedStream2 { stream_id } => {
+                self.purge_stream2_bypass_auth(&stream_id)?;
                 Ok(())
             }
             ShardEvent::PurgedTopic {
                 stream_id,
                 topic_id,
             } => {
-                self.purge_topic_bypass_auth(stream_id, topic_id).await?;
+                self.purge_topic_bypass_auth(&stream_id, &topic_id).await?;
                 Ok(())
             }
             ShardEvent::DeletedTopic {
                 stream_id,
                 topic_id,
             } => {
-                self.delete_topic_bypass_auth(stream_id, topic_id)
-                                                                    .await
-                                                                    .with_error_context(|err| {
-                                                                        format!(
-                                                                            "{COMPONENT} (error: {err}) - failed to delete topic with ID: {topic_id} in stream with ID: {stream_id}"
-                                                                        )
-                                                                    })?;
+                self.delete_topic_bypass_auth(&stream_id, &topic_id)
+                                                                                                    .await
+                                                                                                    .with_error_context(|err| {
+                                                                                                        format!(
+                                                                                                            "{COMPONENT} (error: {err}) - failed to delete topic with ID: {topic_id} in stream with ID: {stream_id}"
+                                                                                                        )
+                                                                                                    })?;
                 Ok(())
             }
             ShardEvent::CreatedConsumerGroup {
@@ -759,17 +781,17 @@ impl IggyShard {
                 consumer_group_id,
                 name,
             } => self.create_consumer_group_bypass_auth(
-                stream_id,
-                topic_id,
-                *consumer_group_id,
-                name,
+                &stream_id,
+                &topic_id,
+                consumer_group_id,
+                &name,
             ),
             ShardEvent::DeletedConsumerGroup {
                 stream_id,
                 topic_id,
                 consumer_group_id,
             } => {
-                self.delete_consumer_group_bypass_auth(stream_id, topic_id, consumer_group_id)?;
+                self.delete_consumer_group_bypass_auth(&stream_id, &topic_id, &consumer_group_id)?;
                 Ok(())
             }
             ShardEvent::CreatedUser {
@@ -778,16 +800,16 @@ impl IggyShard {
                 status,
                 permissions,
             } => {
-                self.create_user_bypass_auth(username, password, *status, permissions.clone())?;
+                self.create_user_bypass_auth(&username, &password, status, permissions.clone())?;
                 Ok(())
             }
             ShardEvent::DeletedUser { user_id } => {
-                self.delete_user_bypass_auth(user_id)?;
+                self.delete_user_bypass_auth(&user_id)?;
                 Ok(())
             }
             ShardEvent::LogoutUser { client_id } => {
                 let sessions = self.active_sessions.borrow();
-                let session = sessions.iter().find(|s| s.client_id == *client_id).unwrap();
+                let session = sessions.iter().find(|s| s.client_id == client_id).unwrap();
                 self.logout_user(session)?;
                 self.remove_active_session(session.get_user_id());
 
@@ -798,7 +820,7 @@ impl IggyShard {
                 current_password,
                 new_password,
             } => {
-                self.change_password_bypass_auth(user_id, current_password, new_password)?;
+                self.change_password_bypass_auth(&user_id, &current_password, &new_password)?;
                 Ok(())
             }
             ShardEvent::CreatedPersonalAccessToken {
@@ -808,7 +830,7 @@ impl IggyShard {
                 Ok(())
             }
             ShardEvent::DeletedPersonalAccessToken { user_id, name } => {
-                self.delete_personal_access_token_bypass_auth(*user_id, name)?;
+                self.delete_personal_access_token_bypass_auth(user_id, &name)?;
                 Ok(())
             }
             ShardEvent::LoginWithPersonalAccessToken { token: _ } => todo!(),
@@ -817,59 +839,99 @@ impl IggyShard {
                 username,
                 status,
             } => {
-                self.update_user_bypass_auth(user_id, username.to_owned(), *status)?;
+                self.update_user_bypass_auth(&user_id, username.to_owned(), status)?;
                 Ok(())
             }
             ShardEvent::UpdatedPermissions {
                 user_id,
                 permissions,
             } => {
-                self.update_permissions_bypass_auth(user_id, permissions.to_owned())?;
+                self.update_permissions_bypass_auth(&user_id, permissions.to_owned())?;
                 Ok(())
             }
             ShardEvent::TcpBound { address } => {
                 info!("Received TcpBound event with address: {}", address);
-                self.tcp_bound_address.set(Some(*address));
+                self.tcp_bound_address.set(Some(address));
                 Ok(())
             }
-            ShardEvent::CreatedStream2 { id, name, stats } => {
-                let stream_id = self
-                    .create_stream2_bypass_auth(name.to_owned(), stats.clone())
-                    .await?;
-                assert_eq!(stream_id, *id);
+            ShardEvent::CreatedStream2 { id, stream } => {
+                let stream_id = self.create_stream2_bypass_auth(stream);
+                assert_eq!(stream_id, id);
                 Ok(())
             }
-            ShardEvent::CreatedTopic2 {
-                id,
-                stream_id,
-                name,
-                partitions_count,
-                message_expiry,
-                compression_algorithm,
-                max_topic_size,
-                replication_factor,
-                stats,
-            } => {
-                let topic_id = self.create_topic2_bypass_auth(
-                    stream_id,
-                    name.to_owned(),
-                    *partitions_count,
-                    *replication_factor,
-                    *message_expiry,
-                    *compression_algorithm,
-                    *max_topic_size,
-                    stats.clone(),
-                )?;
-                assert_eq!(topic_id, *id);
+            ShardEvent::DeletedStream2 { id, stream_id } => {
+                let stream = self.delete_stream2_bypass_auth(&stream_id)?;
+                assert_eq!(stream.id(), id);
+                Ok(())
+            }
+            ShardEvent::CreatedTopic2 { stream_id, topic } => {
+                let _topic_id = self.create_topic2_bypass_auth(&stream_id, topic)?;
                 Ok(())
             }
             ShardEvent::CreatedPartitions2 {
                 stream_id,
                 topic_id,
-                partitions_count,
+                partitions,
             } => {
-                self.create_partitions2_bypass_auth(stream_id, topic_id, *partitions_count)
+                self.create_partitions2_bypass_auth(&stream_id, &topic_id, partitions)?;
+                Ok(())
+            }
+            ShardEvent::DeletedTopic2 {
+                id,
+                stream_id,
+                topic_id,
+            } => {
+                let topic = self
+                    .delete_topic_bypass_auth2(&stream_id, &topic_id)
                     .await?;
+                assert_eq!(topic.id(), id);
+                Ok(())
+            }
+            ShardEvent::UpdatedTopic2 {
+                stream_id,
+                topic_id,
+                name,
+                message_expiry,
+                compression_algorithm,
+                max_topic_size,
+                replication_factor,
+            } => {
+                self.update_topic_bypass_auth2(
+                    &stream_id,
+                    &topic_id,
+                    name.clone(),
+                    message_expiry,
+                    compression_algorithm,
+                    max_topic_size,
+                    replication_factor,
+                )?;
+                Ok(())
+            }
+            ShardEvent::CreatedConsumerGroup2 {
+                cg_id,
+                stream_id,
+                topic_id,
+                name,
+                members,
+            } => {
+                let id = self.create_consumer_group_bypass_auth2(
+                    &stream_id,
+                    &topic_id,
+                    members.clone(),
+                    name.clone(),
+                )?;
+                assert_eq!(id, cg_id);
+                Ok(())
+            }
+            ShardEvent::DeletedConsumerGroup2 {
+                id,
+                stream_id,
+                topic_id,
+                group_id,
+            } => {
+                let cg =
+                    self.delete_consumer_group_bypass_auth2(&stream_id, &topic_id, &group_id)?;
+                assert_eq!(cg.id(), id);
                 Ok(())
             }
         }
@@ -905,10 +967,7 @@ impl IggyShard {
         }
     }
 
-    pub async fn broadcast_event_to_all_shards(
-        &self,
-        event: Arc<ShardEvent>,
-    ) -> Vec<ShardResponse> {
+    pub async fn broadcast_event_to_all_shards(&self, event: ShardEvent) -> Vec<ShardResponse> {
         let mut responses = Vec::with_capacity(self.get_available_shards_count() as usize);
         for maybe_receiver in self
             .shards
@@ -923,19 +982,26 @@ impl IggyShard {
             .map(|conn| {
                 // TODO: Fixme, maybe we should send response_sender
                 // and propagate errors back.
+                let event = event.clone();
                 if matches!(
-                    *event,
+                    &event,
                     ShardEvent::CreatedShardTableRecords { .. }
                         | ShardEvent::DeletedShardTableRecords { .. }
                         | ShardEvent::CreatedStream2 { .. }
+                        | ShardEvent::DeletedStream2 { .. }
                         | ShardEvent::CreatedTopic2 { .. }
+                        | ShardEvent::DeletedTopic2 { .. }
+                        | ShardEvent::UpdatedTopic2 { .. }
                         | ShardEvent::CreatedPartitions2 { .. }
+                        | ShardEvent::DeletedPartitions2 { .. }
+                        | ShardEvent::CreatedConsumerGroup2 { .. }
+                        | ShardEvent::DeletedConsumerGroup2 { .. }
                 ) {
                     let (sender, receiver) = async_channel::bounded(1);
-                    conn.send(ShardFrame::new(event.clone().into(), Some(sender.clone())));
+                    conn.send(ShardFrame::new(event.into(), Some(sender.clone())));
                     Some(receiver.clone())
                 } else {
-                    conn.send(ShardFrame::new(event.clone().into(), None));
+                    conn.send(ShardFrame::new(event.into(), None));
                     None
                 }
             })

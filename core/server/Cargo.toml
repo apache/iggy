@@ -36,6 +36,7 @@ mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 ahash = { workspace = true }
+arcshift = "0.4.0"
 anyhow = { workspace = true }
 async_zip = { workspace = true }
 axum = { workspace = true }
@@ -94,6 +95,8 @@ opentelemetry_sdk = { version = "0.30.0", features = [
     "experimental_trace_batch_span_processor_with_async_runtime",
 ] }
 prometheus-client = "0.23.1"
+papaya = "0.2.3"
+quinn = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls-no-provider"] }
 ring = "0.17.14"
 rustls = { workspace = true }
@@ -109,11 +112,11 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 compio = { workspace = true }
-compio-quic = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-util = { workspace = true }
 toml = { workspace = true }
 tower-http = { workspace = true }
+test-case = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-opentelemetry = "0.31.0"

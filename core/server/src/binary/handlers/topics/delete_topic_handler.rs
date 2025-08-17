@@ -19,13 +19,17 @@
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::topics::COMPONENT, sender::SenderKind};
+use crate::io::fs_utils::remove_dir_all;
 use crate::shard::IggyShard;
 use crate::shard::namespace::IggyNamespace;
 use crate::shard::transmission::event::ShardEvent;
 use crate::shard_info;
+use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use anyhow::Result;
+use compio::driver::op::OpenFile;
+use compio::fs::File;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::delete_topic::DeleteTopic;
@@ -47,7 +51,25 @@ impl ServerCommandHandler for DeleteTopic {
         session: &Rc<Session>,
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
+        // TODO: There is a correctness bug,
+        // We have to first apply the state, then proceed with deleting the topic from the disk.
+        // Otherwise if we would delete the topic from disk first, and then the state would fail
+        // we would end up in a state where the topic is deleted from disk, but during state recreation it would be recreated,
+        // without persisted messages in the partitions.
         debug!("session: {session}, command: {self}");
+        let topic2 = shard
+            .delete_topic2(session, &self.stream_id, &self.topic_id)
+            .await?;
+        let event = ShardEvent::DeletedTopic2 {
+            id: topic2.id(),
+            stream_id: self.stream_id.clone(),
+            topic_id: self.topic_id.clone(),
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+        // Drop the topic to force readers/writers to be dropped.
+        drop(topic2);
+        // Remove all the files and directories.
+
         let topic = shard
                 .delete_topic(session, &self.stream_id, &self.topic_id)
                 .await

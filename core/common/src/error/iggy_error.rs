@@ -193,6 +193,7 @@ pub enum IggyError {
     CannotDeleteStream(u32) = 1007,
     #[error("Failed to delete stream directory with ID: {0}")]
     CannotDeleteStreamDirectory(u32) = 1008,
+    //TODO: Fix the stream not found errors.
     #[error("Stream with ID: {0} was not found.")]
     StreamIdNotFound(u32) = 1009,
     #[error("Stream with name: {0} was not found.")]

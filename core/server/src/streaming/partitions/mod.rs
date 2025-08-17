@@ -16,6 +16,7 @@
  * under the License.
  */
 
+pub mod consumer_offset;
 pub mod consumer_offsets;
 pub mod messages;
 pub mod partition;
@@ -23,5 +24,6 @@ pub mod partition2;
 pub mod persistence;
 pub mod segments;
 pub mod storage;
+pub mod storage2;
 
 pub const COMPONENT: &str = "STREAMING_PARTITIONS";

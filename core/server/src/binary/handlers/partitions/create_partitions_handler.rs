@@ -28,7 +28,6 @@ use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::create_partitions::CreatePartitions;
 use iggy_common::locking::IggyRwLockFn;
-use std::num;
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -46,7 +45,7 @@ impl ServerCommandHandler for CreatePartitions {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        shard
+        let partitions = shard
             .create_partitions2(
                 session,
                 &self.stream_id,
@@ -57,7 +56,7 @@ impl ServerCommandHandler for CreatePartitions {
         let event = ShardEvent::CreatedPartitions2 {
             stream_id: self.stream_id.clone(),
             topic_id: self.topic_id.clone(),
-            partitions_count: self.partitions_count,
+            partitions,
         };
         let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
 
@@ -92,6 +91,7 @@ impl ServerCommandHandler for CreatePartitions {
         let records = shard
             .create_shard_table_records(&partition_ids, numeric_stream_id, numeric_topic_id)
             .collect::<Vec<_>>();
+
         // Open partition and segments for that particular shard.
         for (ns, shard_info) in records.iter() {
             let partition = topic.get_partition(ns.partition_id).unwrap();

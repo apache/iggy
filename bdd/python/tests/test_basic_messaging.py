@@ -21,7 +21,7 @@ Basic messaging BDD test implementation for Python SDK
 import asyncio
 import socket
 from pytest_bdd import scenarios, given, when, then, parsers
-from iggy_py import IggyClient, SendMessage, PollingStrategy
+from apache_iggy import IggyClient, SendMessage, PollingStrategy
 
 # Load scenarios from the shared feature file
 scenarios('/app/features/basic_messaging.feature')

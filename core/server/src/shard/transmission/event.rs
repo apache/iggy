@@ -1,20 +1,29 @@
-use std::{net::SocketAddr, sync::Arc};
-
-use iggy_common::{
-    CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, Permissions, UserStatus,
+use std::{
+    net::SocketAddr,
+    sync::{Arc, atomic::AtomicU64},
 };
+
+use arcshift::ArcShift;
+use iggy_common::{
+    CompressionAlgorithm, Identifier, IggyExpiry, IggyTimestamp, MaxTopicSize, Permissions,
+    UserStatus,
+};
+use slab::Slab;
 
 use crate::{
     shard::namespace::IggyNamespace,
     streaming::{
         clients::client_manager::Transport,
+        partitions::{partition::ConsumerOffset, partition2},
         personal_access_tokens::personal_access_token::PersonalAccessToken,
         polling_consumer::PollingConsumer,
-        stats::stats::{StreamStats, TopicStats},
+        stats::stats::{PartitionStats, StreamStats, TopicStats},
+        streams::stream2,
+        topics::{consumer_group2::Member, topic2},
     },
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ShardEvent {
     CreatedShardTableRecords {
         stream_id: u32,
@@ -26,8 +35,7 @@ pub enum ShardEvent {
     },
     CreatedStream2 {
         id: usize,
-        name: String,
-        stats: Arc<StreamStats>,
+        stream: stream2::Stream,
     },
     CreatedStream {
         stream_id: Option<u32>,
@@ -36,17 +44,28 @@ pub enum ShardEvent {
     DeletedStream {
         stream_id: Identifier,
     },
+    DeletedStream2 {
+        id: usize,
+        stream_id: Identifier,
+    },
     UpdatedStream {
+        stream_id: Identifier,
+        name: String,
+    },
+    UpdatedStream2 {
         stream_id: Identifier,
         name: String,
     },
     PurgedStream {
         stream_id: Identifier,
     },
+    PurgedStream2 {
+        stream_id: Identifier,
+    },
     CreatedPartitions2 {
         stream_id: Identifier,
         topic_id: Identifier,
-        partitions_count: u32,
+        partitions: Vec<partition2::Partition>,
     },
     CreatedPartitions {
         stream_id: Identifier,
@@ -56,6 +75,12 @@ pub enum ShardEvent {
     DeletedPartitions {
         stream_id: Identifier,
         topic_id: Identifier,
+        partition_ids: Vec<u32>,
+    },
+    DeletedPartitions2 {
+        stream_id: Identifier,
+        topic_id: Identifier,
+        partitions_count: u32,
         partition_ids: Vec<u32>,
     },
     CreatedTopic {
@@ -69,15 +94,8 @@ pub enum ShardEvent {
         replication_factor: Option<u8>,
     },
     CreatedTopic2 {
-        id: usize,
         stream_id: Identifier,
-        name: String,
-        partitions_count: u32,
-        message_expiry: IggyExpiry,
-        compression_algorithm: CompressionAlgorithm,
-        max_topic_size: MaxTopicSize,
-        replication_factor: Option<u8>,
-        stats: Arc<TopicStats>,
+        topic: topic2::Topic,
     },
     CreatedConsumerGroup {
         stream_id: Identifier,
@@ -85,10 +103,32 @@ pub enum ShardEvent {
         consumer_group_id: Option<u32>,
         name: String,
     },
+    CreatedConsumerGroup2 {
+        cg_id: usize,
+        stream_id: Identifier,
+        topic_id: Identifier,
+        name: String,
+        members: ArcShift<Slab<Member>>,
+    },
     DeletedConsumerGroup {
         stream_id: Identifier,
         topic_id: Identifier,
         consumer_group_id: Identifier,
+    },
+    DeletedConsumerGroup2 {
+        id: usize,
+        stream_id: Identifier,
+        topic_id: Identifier,
+        group_id: Identifier,
+    },
+    UpdatedTopic2 {
+        stream_id: Identifier,
+        topic_id: Identifier,
+        name: String,
+        message_expiry: IggyExpiry,
+        compression_algorithm: CompressionAlgorithm,
+        max_topic_size: MaxTopicSize,
+        replication_factor: Option<u8>,
     },
     UpdatedTopic {
         stream_id: Identifier,
@@ -104,6 +144,11 @@ pub enum ShardEvent {
         topic_id: Identifier,
     },
     DeletedTopic {
+        stream_id: Identifier,
+        topic_id: Identifier,
+    },
+    DeletedTopic2 {
+        id: usize,
         stream_id: Identifier,
         topic_id: Identifier,
     },

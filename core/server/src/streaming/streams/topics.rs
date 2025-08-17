@@ -107,7 +107,7 @@ impl Stream {
         compression_algorithm: CompressionAlgorithm,
         max_topic_size: MaxTopicSize,
         replication_factor: u8,
-    ) -> Result<(), IggyError> {
+    ) -> Result<String, IggyError> {
         let message_expiry = Topic::get_message_expiry(message_expiry, &self.config);
         let max_topic_size = Topic::get_max_topic_size(max_topic_size, &self.config)?;
         let topic_id;
@@ -148,10 +148,11 @@ impl Stream {
             topic.replication_factor = replication_factor;
         }
 
+        let temp = name.to_owned();
         self.topics_ids.remove(&old_topic_name.clone());
-        self.topics_ids.insert(name.to_owned(), topic_id);
+        self.topics_ids.insert(temp.clone(), topic_id);
 
-        Ok(())
+        Ok(temp)
     }
 
     pub fn remove_topic(&mut self, identifier: &Identifier) -> Result<Topic, IggyError> {
@@ -197,10 +198,12 @@ impl Stream {
     }
 
     fn get_topic_by_name(&self, name: &str) -> Result<&Topic, IggyError> {
-        self.topics_ids
+        let result = self
+            .topics_ids
             .get(name)
             .map(|topic_id| self.get_topic_by_id(*topic_id))
-            .ok_or_else(|| IggyError::TopicNameNotFound(name.to_string(), self.name.to_owned()))?
+            .ok_or_else(|| IggyError::TopicNameNotFound(name.to_string(), self.name.to_owned()))?;
+        result
     }
 
     fn get_topic_by_id_mut(&mut self, id: u32) -> Result<&mut Topic, IggyError> {

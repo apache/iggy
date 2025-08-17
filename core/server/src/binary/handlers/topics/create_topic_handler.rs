@@ -24,6 +24,7 @@ use crate::shard::namespace::IggyNamespace;
 use crate::shard::transmission::event::ShardEvent;
 use crate::shard::{IggyShard, ShardInfo};
 use crate::shard_info;
+use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateTopicWithId;
 use crate::state::system::TopicState;
@@ -32,9 +33,9 @@ use crate::streaming::stats::stats::TopicStats;
 use crate::streaming::topics::topic::Topic;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy_common::IggyError;
 use iggy_common::create_topic::CreateTopic;
 use iggy_common::locking::IggyRwLockFn;
+use iggy_common::{Identifier, IggyError};
 use std::rc::Rc;
 use std::sync::Arc;
 use tracing::{debug, instrument};
@@ -55,36 +56,34 @@ impl ServerCommandHandler for CreateTopic {
         debug!("session: {session}, command: {self}");
         let stream_id = self.stream_id.clone();
         let maybe_topic_id = self.topic_id;
-        let parent = shard
-            .streams2
-            .with_stats_by_id(&stream_id, |stats| stats.clone());
-        let stats = Arc::new(TopicStats::new(parent));
-        let new_topic_id = shard
+        let topic = shard
             .create_topic2(
                 session,
                 &stream_id,
                 maybe_topic_id,
                 self.name.clone(),
-                self.partitions_count,
                 self.message_expiry,
                 self.compression_algorithm,
                 self.max_topic_size,
                 self.replication_factor,
-                stats.clone(),
             )
             .await?;
+        let topic_id = topic.id();
+        // Send events for topic creation.
         let event = ShardEvent::CreatedTopic2 {
             stream_id: self.stream_id.clone(),
-            id: new_topic_id,
-            name: self.name.clone(),
-            partitions_count: self.partitions_count,
-            message_expiry: self.message_expiry,
-            compression_algorithm: self.compression_algorithm,
-            max_topic_size: self.max_topic_size,
-            replication_factor: self.replication_factor,
-            stats,
+            topic,
         };
-        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+        let _responses = shard.broadcast_event_to_all_shards(event).await;
+
+        shard
+            .create_partitions2(
+                session,
+                &stream_id,
+                &Identifier::numeric(topic_id as u32).unwrap(),
+                self.partitions_count,
+            )
+            .await?;
         let (topic_id, partition_ids) = shard
                 .create_topic(
                     session,

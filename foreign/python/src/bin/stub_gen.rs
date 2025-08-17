@@ -45,7 +45,7 @@ const LICENSE: &str = "# Licensed to the Apache Software Foundation (ASF) under 
 
 fn main() -> Result<()> {
     // `stub_info` is a function defined by `define_stub_info_gatherer!` macro.
-    let stub = iggy_py::client::stub_info()?;
+    let stub = apache_iggy::client::stub_info()?;
     stub.generate()?;
     let path = Path::new(file!())
         .parent()
@@ -54,7 +54,7 @@ fn main() -> Result<()> {
         .unwrap()
         .parent()
         .unwrap()
-        .join("iggy_py.pyi");
+        .join("apache_iggy.pyi");
     let mut f = File::open(&path)?;
     let mut content = LICENSE.as_bytes().to_owned();
     f.read_to_end(&mut content)?;

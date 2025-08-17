@@ -36,7 +36,7 @@ pub enum ShardSendRequestResult {
 #[derive(Debug)]
 pub enum ShardMessage {
     Request(ShardRequest),
-    Event(Arc<ShardEvent>),
+    Event(ShardEvent),
 }
 
 #[derive(Debug)]
@@ -80,8 +80,8 @@ impl From<ShardRequest> for ShardMessage {
     }
 }
 
-impl From<Arc<ShardEvent>> for ShardMessage {
-    fn from(event: Arc<ShardEvent>) -> Self {
+impl From<ShardEvent> for ShardMessage {
+    fn from(event: ShardEvent) -> Self {
         ShardMessage::Event(event)
     }
 }

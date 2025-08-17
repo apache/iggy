@@ -16,7 +16,11 @@
  * under the License.
  */
 
-use std::{cell::Cell, rc::Rc, sync::atomic::AtomicBool};
+use std::{
+    cell::Cell,
+    rc::Rc,
+    sync::{Arc, atomic::AtomicBool},
+};
 
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind};
 use tracing::info;
@@ -45,6 +49,7 @@ pub struct IggyShardBuilder {
     archiver: Option<ArchiverKind>,
     state: Option<StateKind>,
     init_state: Option<SystemState>,
+    metrics: Option<Metrics>,
 }
 
 impl IggyShardBuilder {
@@ -92,6 +97,11 @@ impl IggyShardBuilder {
         self
     }
 
+    pub fn metrics(mut self, metrics: Metrics) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
     // TODO: Too much happens in there, some of those bootstrapping logic should be moved outside.
     pub fn build(self) -> IggyShard {
         let id = self.id.unwrap();
@@ -117,6 +127,9 @@ impl IggyShardBuilder {
         let shards = connections.into_iter().map(Shard::new).collect();
         let archiver = self.archiver.map(Rc::new);
         let storage = Rc::new(storage);
+
+        // Initialize metrics
+        let metrics = self.metrics.unwrap_or_else(|| Metrics::init());
         IggyShard {
             id: id,
             shards: shards,
@@ -131,7 +144,7 @@ impl IggyShardBuilder {
             stop_receiver: stop_receiver,
             stop_sender: stop_sender,
             messages_receiver: Cell::new(Some(frame_receiver)),
-            metrics: Metrics::init(),
+            metrics: metrics,
             task_registry: TaskRegistry::new(),
             is_shutting_down: AtomicBool::new(false),
             tcp_bound_address: Cell::new(None),

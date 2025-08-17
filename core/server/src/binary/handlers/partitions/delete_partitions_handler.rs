@@ -49,6 +49,22 @@ impl ServerCommandHandler for DeletePartitions {
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
 
+        let deleted_partition_ids2 = shard
+            .delete_partitions2(
+                session,
+                &self.stream_id,
+                &self.topic_id,
+                self.partitions_count,
+            )
+            .await?;
+        let event = ShardEvent::DeletedPartitions2 {
+            stream_id: self.stream_id.clone(),
+            topic_id: self.topic_id.clone(),
+            partitions_count: self.partitions_count,
+            partition_ids: deleted_partition_ids2,
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+
         let partition_ids = shard
             .delete_partitions(
                 session,

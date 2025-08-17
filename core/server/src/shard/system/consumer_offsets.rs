@@ -19,7 +19,7 @@
 use super::COMPONENT;
 use crate::{shard::IggyShard, streaming::session::Session};
 use error_set::ErrContext;
-use iggy_common::{Consumer, ConsumerOffsetInfo, Identifier, IggyError};
+use iggy_common::{Consumer, ConsumerOffsetInfo, Identifier, IggyError, store_consumer_offset};
 
 impl IggyShard {
     pub async fn store_consumer_offset(
