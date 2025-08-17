@@ -7514,6 +7514,7 @@ dependencies = [
  "opentelemetry_sdk",
  "papaya",
  "prometheus-client",
+ "quinn",
  "reqwest",
  "ring",
  "rustls",

@@ -50,6 +50,7 @@ clap = { workspace = true }
 cyper = { workspace = true }
 cyper-axum = { workspace = true }
 compio-net = { workspace = true }
+compio-quic = { workspace = true }
 console-subscriber = { workspace = true, optional = true }
 crossbeam = { workspace = true }
 ctrlc = { version = "3.4", features = ["termination"] }
