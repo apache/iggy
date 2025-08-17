@@ -32,7 +32,7 @@ public readonly struct Partitioning
         {
             Kind = Enums.Partitioning.Balanced,
             Length = 0,
-            Value = Array.Empty<byte>()
+            Value = []
         };
     }
 

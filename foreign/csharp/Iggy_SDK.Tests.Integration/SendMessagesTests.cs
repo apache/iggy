@@ -20,6 +20,7 @@ using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Headers;
+using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Shouldly;
@@ -114,5 +115,33 @@ public class SendMessagesTests(Protocol protocol)
             StreamId = Identifier.Numeric(Fixture.StreamId),
             TopicId = Identifier.Numeric(69)
         }));
+    }
+
+    [Test]
+    [DependsOn(nameof(SendMessages_WithHeaders_Should_Throw_InvalidResponse))]
+    public async Task SendMessages_WithEncryptor_Should_SendMessage_Successfully()
+    {
+        await Fixture.Clients[protocol].SendMessagesAsync(Identifier.Numeric(Fixture.StreamId), Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), Partitioning.None(),
+            [new Message(Guid.NewGuid(), "Test message"u8.ToArray())], bytes =>
+            {
+                Array.Reverse(bytes);
+                return bytes;
+            });
+
+        var messageFetchRequest = new MessageFetchRequest
+        {
+            Count = 1,
+            AutoCommit = true,
+            Consumer = Consumer.New(1),
+            PartitionId = 1,
+            PollingStrategy = PollingStrategy.Last(),
+            StreamId = Identifier.Numeric(Fixture.StreamId),
+            TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value)
+        };
+
+        var response = await Fixture.Clients[protocol].PollMessagesAsync(messageFetchRequest);
+
+        response.Messages.Count.ShouldBe(1);
+        Encoding.UTF8.GetString(response.Messages[0].Payload).ShouldBe("egassem tseT");
     }
 }

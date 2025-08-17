@@ -20,9 +20,9 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Enums;
-using Apache.Iggy.Extensions;
+using Apache.Iggy.Messages;
 
-namespace Apache.Iggy.JsonConfiguration;
+namespace Apache.Iggy.JsonConverters;
 
 internal sealed class MessagesConverter : JsonConverter<MessageSendRequest>
 {
@@ -41,37 +41,37 @@ internal sealed class MessagesConverter : JsonConverter<MessageSendRequest>
     public override void Write(Utf8JsonWriter writer, MessageSendRequest value, JsonSerializerOptions options)
     {
         writer.WriteStartObject();
-        
+
         WritePartitioning(writer, value.Partitioning);
         WriteMessages(writer, value.Messages, options);
-        
+
         writer.WriteEndObject();
     }
 
     private static void WritePartitioning(Utf8JsonWriter writer, Kinds.Partitioning partitioning)
     {
         writer.WriteStartObject("partitioning");
-        
+
         if (!PartitioningKindMapping.TryGetValue(partitioning.Kind, out var kindString))
         {
             throw new InvalidEnumArgumentException(nameof(partitioning.Kind), (int)partitioning.Kind, typeof(Partitioning));
         }
-        
+
         writer.WriteString("kind", kindString);
         writer.WriteBase64String("value", partitioning.Value);
-        
+
         writer.WriteEndObject();
     }
 
-    private static void WriteMessages(Utf8JsonWriter writer, IList<Messages.Message> messages, JsonSerializerOptions options)
+    private static void WriteMessages(Utf8JsonWriter writer, IList<Message> messages, JsonSerializerOptions options)
     {
         writer.WriteStartArray("messages");
-        
+
         foreach (var message in messages)
         {
             JsonSerializer.Serialize(writer, message, options);
         }
-        
+
         writer.WriteEndArray();
     }
 }

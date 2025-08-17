@@ -16,7 +16,7 @@
 // under the License.
 
 using System.Text.Json.Serialization;
-using Apache.Iggy.JsonConfiguration.Converters;
+using Apache.Iggy.JsonConverters;
 
 namespace Apache.Iggy.Contracts.Http;
 

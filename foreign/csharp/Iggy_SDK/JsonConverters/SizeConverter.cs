@@ -10,9 +10,9 @@ using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
-namespace Apache.Iggy.JsonConfiguration.Converters;
+namespace Apache.Iggy.JsonConverters;
 
-public class SizeConverter : JsonConverter<ulong>
+internal class SizeConverter : JsonConverter<ulong>
 {
     public override ulong Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {

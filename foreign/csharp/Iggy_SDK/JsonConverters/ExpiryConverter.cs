@@ -15,35 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Collections;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using Apache.Iggy.Extensions;
 
-namespace Apache.Iggy.Tests.UtilityTests;
+namespace Apache.Iggy.JsonConverters;
 
-public sealed class ToSnakeCaseMessagePolicyTests
+internal class ExpiryConverter : JsonConverter<DateTimeOffset?>
 {
-    [Theory]
-    [ClassData(typeof(MyTestDataClass))]
-    public void PascalCaseFieldsWillBecomeSnakeCase(string input, string expected)
+    public override DateTimeOffset? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
-        var actual = input.ToSnakeCase();
-        Assert.Equal(expected, actual);
-    }
-}
-
-public class MyTestDataClass : IEnumerable<object[]>
-{
-    public IEnumerator<object[]> GetEnumerator()
-    {
-        yield return new object[] { "PartitionId", "partition_id" };
-        yield return new object[] { "AnotherStringTest", "another_string_test" };
-        yield return new object[] { "Id", "id" };
-        yield return new object[] { "name", "name" };
-        yield return new object[] { "NameTest", "name_test" };
+        return reader.TokenType switch
+        {
+            JsonTokenType.Null => null,
+            JsonTokenType.None => null,
+            JsonTokenType.Number => DateTimeOffsetUtils.FromUnixTimeMicroSeconds(reader.GetUInt64()).LocalDateTime,
+            _ => throw new ArgumentOutOfRangeException()
+        };
     }
 
-    IEnumerator IEnumerable.GetEnumerator()
+    public override void Write(Utf8JsonWriter writer, DateTimeOffset? value, JsonSerializerOptions options)
     {
-        return GetEnumerator();
+        throw new NotImplementedException();
     }
 }

@@ -20,7 +20,7 @@ using System.Text.Json.Serialization;
 using Apache.Iggy.Headers;
 using Apache.Iggy.Messages;
 
-namespace Apache.Iggy.JsonConfiguration;
+namespace Apache.Iggy.JsonConverters;
 
 internal sealed class MessageConverter : JsonConverter<Message>
 {
@@ -32,11 +32,11 @@ internal sealed class MessageConverter : JsonConverter<Message>
     public override void Write(Utf8JsonWriter writer, Message value, JsonSerializerOptions options)
     {
         writer.WriteStartObject();
-        
+
         WriteMessageId(writer, value.Header.Id);
         WritePayload(writer, value.Payload);
         WriteHeaders(writer, value.UserHeaders);
-        
+
         writer.WriteEndObject();
     }
 
@@ -60,7 +60,7 @@ internal sealed class MessageConverter : JsonConverter<Message>
         }
 
         writer.WriteStartObject("headers");
-        
+
         foreach (var (headerKey, headerValue) in userHeaders)
         {
             writer.WriteStartObject(headerKey.Value);
@@ -68,23 +68,26 @@ internal sealed class MessageConverter : JsonConverter<Message>
             writer.WriteBase64String("value", headerValue.Value);
             writer.WriteEndObject();
         }
-        
+
         writer.WriteEndObject();
     }
 
-    private static string GetHeaderKindString(HeaderKind kind) => kind switch
+    private static string GetHeaderKindString(HeaderKind kind)
     {
-        HeaderKind.Bool => "bool",
-        HeaderKind.Int32 => "int32",
-        HeaderKind.Int64 => "int64",
-        HeaderKind.Int128 => "int128",
-        HeaderKind.Uint32 => "uint32",
-        HeaderKind.Uint64 => "uint64",
-        HeaderKind.Uint128 => "uint128",
-        HeaderKind.Float => "float32",
-        HeaderKind.Double => "float64",
-        HeaderKind.String => "string",
-        HeaderKind.Raw => "raw",
-        _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "Invalid header kind")
-    };
+        return kind switch
+        {
+            HeaderKind.Bool => "bool",
+            HeaderKind.Int32 => "int32",
+            HeaderKind.Int64 => "int64",
+            HeaderKind.Int128 => "int128",
+            HeaderKind.Uint32 => "uint32",
+            HeaderKind.Uint64 => "uint64",
+            HeaderKind.Uint128 => "uint128",
+            HeaderKind.Float => "float32",
+            HeaderKind.Double => "float64",
+            HeaderKind.String => "string",
+            HeaderKind.Raw => "raw",
+            _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "Invalid header kind")
+        };
+    }
 }

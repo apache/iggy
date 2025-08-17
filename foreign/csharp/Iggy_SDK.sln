@@ -25,8 +25,6 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "SolutionFolder", "SolutionF
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Iggy_SDK.Tests.BDD", "Iggy_SDK.Tests.BDD\Iggy_SDK.Tests.BDD.csproj", "{91BFFAE1-1252-4061-BF40-C7E7296F82BC}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Benchmark", "Benchmark\Apache.Iggy.Benchmark.csproj", "{C68783C9-9A64-4DB4-9969-17188E3CB47F}"
-EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -65,9 +63,5 @@ Global
 		{91BFFAE1-1252-4061-BF40-C7E7296F82BC}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{91BFFAE1-1252-4061-BF40-C7E7296F82BC}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{91BFFAE1-1252-4061-BF40-C7E7296F82BC}.Release|Any CPU.Build.0 = Release|Any CPU
-		{C68783C9-9A64-4DB4-9969-17188E3CB47F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{C68783C9-9A64-4DB4-9969-17188E3CB47F}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{C68783C9-9A64-4DB4-9969-17188E3CB47F}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{C68783C9-9A64-4DB4-9969-17188E3CB47F}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal

@@ -19,23 +19,22 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using Apache.Iggy.Extensions;
 
-namespace Apache.Iggy.JsonConfiguration.Converters;
+namespace Apache.Iggy.JsonConverters;
 
-public class ExpiryConverter : JsonConverter<DateTimeOffset?>
+internal sealed class DateTimeOffsetConverter : JsonConverter<DateTimeOffset>
 {
-    public override DateTimeOffset? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    public override DateTimeOffset Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
-        return reader.TokenType switch
+        if (reader.TokenType != JsonTokenType.Number)
         {
-            JsonTokenType.Null => null,
-            JsonTokenType.None => null,
-            JsonTokenType.Number => DateTimeOffsetUtils.FromUnixTimeMicroSeconds(reader.GetUInt64()).LocalDateTime,
-            _ => throw new ArgumentOutOfRangeException()
-        };
+            throw new JsonException("Expected a number token for DateTimeOffset conversion.");
+        }
+
+        return DateTimeOffsetUtils.FromUnixTimeMicroSeconds(reader.GetUInt64()).LocalDateTime;
     }
 
-    public override void Write(Utf8JsonWriter writer, DateTimeOffset? value, JsonSerializerOptions options)
+    public override void Write(Utf8JsonWriter writer, DateTimeOffset value, JsonSerializerOptions options)
     {
-        throw new NotImplementedException();
+        writer.WriteNumberValue(DateTimeOffsetUtils.ToUnixTimeMicroSeconds(value));
     }
 }

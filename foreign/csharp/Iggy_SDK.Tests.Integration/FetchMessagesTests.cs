@@ -15,14 +15,17 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
+using System.Text;
 using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Headers;
 using Apache.Iggy.Kinds;
+using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Apache.Iggy.Tests.Integrations.Models;
 using Shouldly;
+using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.Tests.Integrations;
 
@@ -181,5 +184,37 @@ public class FetchMessagesTests(Protocol protocol)
             responseMessage.UserHeaders[HeaderKey.New("header1")].ToString().ShouldBe("value1");
             responseMessage.UserHeaders[HeaderKey.New("header2")].ToInt32().ShouldBeGreaterThan(0);
         }
+    }
+
+    [Test]
+    [DependsOn(nameof(PollMessagesTMessage_WithHeaders_Should_PollMessages_Successfully))]
+    public async Task PollMessagesMessage_WithEncryptor_Should_PollMessages_Successfully()
+    {
+        await Fixture.Clients[protocol].SendMessagesAsync(Identifier.Numeric(Fixture.StreamId), Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), Partitioning.None(),
+            [new Message(Guid.NewGuid(), "Test message"u8.ToArray())], bytes =>
+            {
+                Array.Reverse(bytes);
+                return bytes;
+            });
+
+        var messageFetchRequest = new MessageFetchRequest
+        {
+            Count = 1,
+            AutoCommit = true,
+            Consumer = Consumer.New(1),
+            PartitionId = 1,
+            PollingStrategy = PollingStrategy.Last(),
+            StreamId = Identifier.Numeric(Fixture.StreamId),
+            TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value)
+        };
+
+        var response = await Fixture.Clients[protocol].PollMessagesAsync(messageFetchRequest, bytes =>
+        {
+            Array.Reverse(bytes);
+            return bytes;
+        }, CancellationToken.None);
+
+        response.Messages.Count.ShouldBe(1);
+        Encoding.UTF8.GetString(response.Messages[0].Payload).ShouldBe("Test message");
     }
 }

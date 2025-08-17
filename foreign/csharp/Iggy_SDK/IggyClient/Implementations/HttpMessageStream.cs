@@ -35,7 +35,6 @@ using Apache.Iggy.Messages;
 using Apache.Iggy.MessagesDispatcher;
 using Apache.Iggy.StringHandlers;
 using Microsoft.Extensions.Logging;
-using JsonConverterFactory = Apache.Iggy.JsonConfiguration.JsonConverterFactory;
 
 namespace Apache.Iggy.IggyClient.Implementations;
 
@@ -327,8 +326,20 @@ public class HttpMessageStream : IIggyClient
         var response = await _httpClient.GetAsync(url, token);
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<PolledMessages>(JsonConverterFactory.MessageResponseOptions(decryptor), token)
-                   ?? PolledMessages.Empty;
+            var pollMessages = await response.Content.ReadFromJsonAsync<PolledMessages>(_jsonSerializerOptions, token)
+                               ?? PolledMessages.Empty;
+
+            if (decryptor is null)
+            {
+                return pollMessages;
+            }
+
+            foreach (var message in pollMessages.Messages)
+            {
+                message.Payload = decryptor(message.Payload);
+            }
+
+            return pollMessages;
         }
 
         await HandleResponseAsync(response);
@@ -345,8 +356,31 @@ public class HttpMessageStream : IIggyClient
         var response = await _httpClient.GetAsync(url, token);
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<PolledMessages<TMessage>>(JsonConverterFactory.MessageResponseGenericOptions(deserializer, decryptor), token)
-                   ?? PolledMessages<TMessage>.Empty;
+            var pollMessages = await response.Content.ReadFromJsonAsync<PolledMessages>(_jsonSerializerOptions, token)
+                               ?? PolledMessages.Empty;
+
+            var messages = new List<MessageResponse<TMessage>>();
+            foreach (var message in pollMessages.Messages)
+            {
+                if (decryptor is not null)
+                {
+                    message.Payload = decryptor(message.Payload);
+                }
+
+                messages.Add(new MessageResponse<TMessage>
+                {
+                    Message = deserializer(message.Payload),
+                    Header = message.Header,
+                    UserHeaders = message.UserHeaders
+                });
+            }
+
+            return new PolledMessages<TMessage>
+            {
+                PartitionId = pollMessages.PartitionId,
+                CurrentOffset = pollMessages.CurrentOffset,
+                Messages = messages
+            };
         }
 
         await HandleResponseAsync(response);
@@ -620,7 +654,7 @@ public class HttpMessageStream : IIggyClient
             Status = status,
             Permissions = permissions
         }, _jsonSerializerOptions);
-        
+
         var content = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PostAsync("/users", content, token);
         if (response.IsSuccessStatusCode)
@@ -693,7 +727,7 @@ public class HttpMessageStream : IIggyClient
             Password = password,
             Context = "csharp-sdk"
         }, _jsonSerializerOptions);
-        
+
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
         var response = await _httpClient.PostAsync("users/login", data, token);

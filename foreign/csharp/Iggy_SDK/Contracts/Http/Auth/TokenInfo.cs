@@ -17,7 +17,7 @@
 
 using System.Diagnostics.CodeAnalysis;
 using System.Text.Json.Serialization;
-using Apache.Iggy.JsonConfiguration.Converters;
+using Apache.Iggy.JsonConverters;
 
 namespace Apache.Iggy.Contracts.Http.Auth;
 
@@ -30,9 +30,8 @@ public class TokenInfo
 
     public TokenInfo()
     {
-        
     }
-    
+
     [SetsRequiredMembers]
     public TokenInfo(string token, DateTimeOffset expiry)
     {

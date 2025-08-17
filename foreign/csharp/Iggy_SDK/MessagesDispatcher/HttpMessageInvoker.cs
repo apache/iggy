@@ -21,7 +21,6 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Exceptions;
-using Apache.Iggy.JsonConfiguration;
 
 namespace Apache.Iggy.MessagesDispatcher;
 
@@ -36,7 +35,7 @@ internal sealed class HttpMessageInvoker : IMessageInvoker
         _jsonSerializerOptions = new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
-            Converters = { new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower), new MessageConverter(), new MessagesConverter() }
+            Converters = { new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower) }
         };
     }
 

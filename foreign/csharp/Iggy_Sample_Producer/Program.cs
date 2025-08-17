@@ -172,12 +172,12 @@ async Task ProduceMessages(IIggyClient bus, StreamResponse? stream, TopicRespons
         try
         {
             await bus.SendMessagesAsync(new MessageSendRequest<Envelope>
-                {
-                    StreamId = streamId,
-                    TopicId = topicId,
-                    Partitioning = Partitioning.PartitionId(3),
-                    Messages = messages
-                },
+            {
+                StreamId = streamId,
+                TopicId = topicId,
+                Partitioning = Partitioning.PartitionId(3),
+                Messages = messages
+            },
                 serializer,
                 encryptor, headers);
         }
