@@ -23,6 +23,7 @@ use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
+use crate::streaming::topics;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
@@ -54,18 +55,16 @@ impl ServerCommandHandler for UpdateTopic {
             self.max_topic_size,
             self.replication_factor,
         );
-        self.message_expiry =
-            shard
-                .streams2
-                .with_topic_root_by_id(&self.stream_id, &self.topic_id, |root| {
-                    root.message_expiry()
-                });
-        self.max_topic_size =
-            shard
-                .streams2
-                .with_topic_root_by_id(&self.stream_id, &self.topic_id, |root| {
-                    root.max_topic_size()
-                });
+        self.message_expiry = shard.streams2.with_topic_by_id(
+            &self.stream_id,
+            &self.topic_id,
+            topics::helpers::get_message_expiry(),
+        );
+        self.max_topic_size = shard.streams2.with_topic_by_id(
+            &self.stream_id,
+            &self.topic_id,
+            topics::helpers::get_max_topic_size(),
+        );
         let event = ShardEvent::UpdatedTopic2 {
             stream_id: self.stream_id.clone(),
             topic_id: self.topic_id.clone(),

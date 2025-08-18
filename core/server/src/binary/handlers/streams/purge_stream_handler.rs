@@ -55,19 +55,6 @@ impl ServerCommandHandler for PurgeStream {
             stream_id: self.stream_id.clone(),
         };
         let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
-
-        shard
-            .purge_stream(session, &self.stream_id)
-            .await
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to purge stream with id: {stream_id}, session: {session}")
-            })?;
-
-        let event = ShardEvent::PurgedStream {
-            stream_id: self.stream_id.clone(),
-        };
-        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
-
         shard
             .state
             .apply(session.get_user_id(), &EntryCommand::PurgeStream(self))

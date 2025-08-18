@@ -5,17 +5,22 @@ use std::{cell::RefCell, sync::Arc};
 
 use crate::{
     slab::{
-        Keyed, helpers,
+        Keyed,
+        consumer_groups::ConsumerGroups,
+        helpers,
         partitions::Partitions,
         traits_ext::{
-            ComponentsById, Delete, DeleteCell, EntityComponentSystem,
+            Components, ComponentsById, Delete, DeleteCell, EntityComponentSystem,
             EntityComponentSystemMutCell, Insert, InsertCell, InteriorMutability, IntoComponents,
         },
     },
     streaming::{
-        partitions::partition2,
+        partitions::partition2::{self, PartitionRef},
         stats::stats::TopicStats,
-        topics::topic2::{self, TopicRef, TopicRefMut},
+        topics::{
+            consumer_group2::{ConsumerGroupRef, ConsumerGroupRefMut},
+            topic2::{self, TopicRef, TopicRefMut},
+        },
     },
 };
 
@@ -53,6 +58,7 @@ impl DeleteCell for Topics {
     type Item = topic2::Topic;
 
     fn delete(&self, id: Self::Idx) -> Self::Item {
+        // TODO: don't forget to remoev from the index
         todo!()
     }
 }
@@ -65,6 +71,15 @@ impl<'a> From<&'a Topics> for topic2::TopicRef<'a> {
         topic2::TopicRef::new(root, stats)
     }
 }
+
+impl<'a> From<&'a Topics> for topic2::TopicRefMut<'a> {
+    fn from(value: &'a Topics) -> Self {
+        let root = value.root.borrow_mut();
+        let stats = value.stats.borrow_mut();
+        topic2::TopicRefMut::new(root, stats)
+    }
+}
+
 impl Default for Topics {
     fn default() -> Self {
         Self {
@@ -72,14 +87,6 @@ impl Default for Topics {
             root: RefCell::new(Slab::with_capacity(CAPACITY)),
             stats: RefCell::new(Slab::with_capacity(CAPACITY)),
         }
-    }
-}
-
-impl<'a> From<&'a Topics> for topic2::TopicRefMut<'a> {
-    fn from(value: &'a Topics) -> Self {
-        let root = value.root.borrow_mut();
-        let stats = value.stats.borrow_mut();
-        topic2::TopicRefMut::new(root, stats)
     }
 }
 
@@ -95,11 +102,11 @@ impl EntityComponentSystem<InteriorMutability> for Topics {
         f(self.into())
     }
 
-    async fn with_components_async<O, F>(&self, f: F) -> O
+    fn with_components_async<O, F>(&self, f: F) -> impl Future<Output = O>
     where
         F: for<'a> AsyncFnOnce(Self::EntityComponents<'a>) -> O,
     {
-        f(self.into()).await
+        f(self.into())
     }
 }
 
@@ -167,14 +174,13 @@ impl Topics {
         self.with_components_by_id(id, |components| f(components))
     }
 
-    pub async fn with_topic_by_id_async<T>(
+    pub fn with_topic_by_id_async<T>(
         &self,
         topic_id: &Identifier,
         f: impl AsyncFnOnce(ComponentsById<TopicRef>) -> T,
-    ) -> T {
+    ) -> impl Future<Output = T> {
         let id = self.get_index(topic_id);
         self.with_components_by_id_async(id, async |components| f(components).await)
-            .await
     }
 
     pub fn with_topic_by_id_mut<T>(
@@ -186,17 +192,73 @@ impl Topics {
         self.with_components_by_id_mut(id, |components| f(components))
     }
 
+    pub fn with_consumer_groups<T>(
+        &self,
+        topic_id: &Identifier,
+        f: impl FnOnce(&ConsumerGroups) -> T,
+    ) -> T {
+        self.with_topic_by_id(topic_id, helpers::consumer_groups(f))
+    }
+
+    pub fn with_consumer_groups_async<T>(
+        &self,
+        topic_id: &Identifier,
+        f: impl AsyncFnOnce(&ConsumerGroups) -> T,
+    ) -> impl Future<Output = T> {
+        self.with_topic_by_id_async(topic_id, helpers::consumer_groups_async(f))
+    }
+
+    pub fn with_consumer_groups_mut<T>(
+        &self,
+        topic_id: &Identifier,
+        f: impl FnOnce(&mut ConsumerGroups) -> T,
+    ) -> T {
+        self.with_topic_by_id_mut(topic_id, helpers::consumer_groups_mut(f))
+    }
+
+    pub fn with_consumer_group_by_id<T>(
+        &self,
+        topic_id: &Identifier,
+        group_id: &Identifier,
+        f: impl FnOnce(ComponentsById<ConsumerGroupRef>) -> T,
+    ) -> T {
+        self.with_consumer_groups(topic_id, |container| {
+            container.with_consumer_group_by_id(group_id, f)
+        })
+    }
+
+    pub fn with_consumer_group_by_id_async<T>(
+        &self,
+        topic_id: &Identifier,
+        group_id: &Identifier,
+        f: impl AsyncFnOnce(ComponentsById<ConsumerGroupRef>) -> T,
+    ) -> impl Future<Output = T> {
+        self.with_consumer_groups_async(topic_id, async |container| {
+            container.with_consumer_group_by_id_async(group_id, f).await
+        })
+    }
+
+    pub fn with_consumer_group_by_id_mut<T>(
+        &self,
+        topic_id: &Identifier,
+        group_id: &Identifier,
+        f: impl FnOnce(ComponentsById<ConsumerGroupRefMut>) -> T,
+    ) -> T {
+        self.with_consumer_groups_mut(topic_id, |container| {
+            container.with_consumer_group_by_id_mut(group_id, f)
+        })
+    }
+
     pub fn with_partitions<T>(&self, topic_id: &Identifier, f: impl FnOnce(&Partitions) -> T) -> T {
         self.with_topic_by_id(topic_id, helpers::partitions(f))
     }
 
-    pub async fn with_partitions_async<T>(
+    pub fn with_partitions_async<T>(
         &self,
         topic_id: &Identifier,
         f: impl AsyncFnOnce(&Partitions) -> T,
-    ) -> T {
-        self.with_topic_by_id_async(topic_id, helpers::partitions_async(f).await)
-            .await
+    ) -> impl Future<Output = T> {
+        self.with_topic_by_id_async(topic_id, helpers::partitions_async(f))
     }
 
     pub fn with_partitions_mut<T>(

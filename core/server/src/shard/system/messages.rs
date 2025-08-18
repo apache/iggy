@@ -46,6 +46,8 @@ impl IggyShard {
         partitioning: &Partitioning,
         batch: IggyMessagesBatchMut,
     ) -> Result<(), IggyError> {
+        todo!();
+        /*
         let stream = self.get_stream(stream_id).with_error_context(|error| {
             format!(
                 "Failed to get stream with ID: {} (error: {})",
@@ -119,6 +121,7 @@ impl IggyShard {
 
         self.metrics.increment_messages(messages_count as u64);
         Ok(())
+        */
     }
 
     pub async fn poll_messages(
@@ -131,6 +134,8 @@ impl IggyShard {
         maybe_partition_id: Option<u32>,
         args: PollingArgs,
     ) -> Result<(IggyPollMetadata, IggyMessagesBatchSet), IggyError> {
+        todo!();
+        /*
         let stream = self.get_stream(stream_id).with_error_context(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - stream not found for stream ID: {}",
@@ -208,6 +213,7 @@ impl IggyShard {
         };
 
         Ok((metadata, batch))
+        */
     }
 
     pub async fn flush_unsaved_buffer(
@@ -219,23 +225,7 @@ impl IggyShard {
         fsync: bool,
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
-        let stream = self.get_stream(&stream_id).with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - stream not found for stream ID: {stream_id}")
-        })?;
-        let stream_id = stream.stream_id;
-        let topic = self.find_topic(session, &stream, &topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic ID: {topic_id}"))?;
-        self.permissioner.borrow().append_messages(
-            session.get_user_id(),
-            topic.stream_id,
-            topic.topic_id
-        ).with_error_context(|error| format!(
-            "{COMPONENT} (error: {error}) - permission denied to append messages for user {} on stream ID: {}, topic ID: {}",
-            session.get_user_id(),
-            topic.stream_id,
-            topic.topic_id
-        ))?;
-        topic.flush_unsaved_buffer(partition_id, fsync).await?;
-        Ok(())
+        todo!();
     }
 
     pub fn maybe_encrypt_messages(

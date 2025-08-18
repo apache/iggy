@@ -48,7 +48,6 @@ impl ServerCommandHandler for CreateConsumerGroup {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let members = ArcShift::new(slab::Slab::with_capacity(MEMBERS_CAPACITY));
         let cg_id = shard.create_consumer_group2(
             session,
             &self.stream_id,
@@ -65,48 +64,6 @@ impl ServerCommandHandler for CreateConsumerGroup {
             members,
         };
         let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
-
-        let consumer_group_id = shard
-                .create_consumer_group(
-                    session,
-                    &self.stream_id,
-                    &self.topic_id,
-                    self.group_id,
-                    &self.name,
-                )
-                .with_error_context(|error| {
-                    format!(
-                        "{COMPONENT} (error: {error}) - failed to create consumer group for stream_id: {}, topic_id: {}, group_id: {:?}, session: {session}",
-                        self.stream_id, self.topic_id, self.group_id
-                    )
-                })?;
-        let event = ShardEvent::CreatedConsumerGroup {
-            stream_id: self.stream_id.clone(),
-            topic_id: self.topic_id.clone(),
-            consumer_group_id: self.group_id,
-            name: self.name.clone(),
-        };
-        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
-
-        let stream = shard.find_stream(session, &self.stream_id)
-            .with_error_context(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to find stream with ID: {} for session: {}",
-                    self.stream_id, session
-                )
-            })?;
-        let consumer_group = shard.get_consumer_group(session, &stream, &self.topic_id, &consumer_group_id)
-            .with_error_context(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to get consumer group for stream_id: {}, topic_id: {}, group_id: {:?}, session: {session}",
-                    self.stream_id, self.topic_id, consumer_group_id
-                )
-            })?.unwrap();
-        let group_id = consumer_group.group_id;
-        let response = mapper::map_consumer_group(&consumer_group);
-
-        let stream_id = self.stream_id.clone();
-        let topic_id = self.topic_id.clone();
 
         shard
             .state

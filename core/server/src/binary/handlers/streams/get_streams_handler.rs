@@ -56,7 +56,7 @@ impl ServerCommandHandler for GetStreams {
                 )
             })?;
 
-        let response = shard.streams2.with(|stream_ref| {
+        let response = shard.streams2.with_components(|stream_ref| {
             let (roots, stats) = stream_ref.into_components();
             mapper::map_streams(&roots, &stats)
         });

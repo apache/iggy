@@ -67,53 +67,10 @@ impl ServerCommandHandler for DeleteStream {
             id: stream2.id(),
             stream_id: self.stream_id.clone(),
         };
-        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
-
-        let stream = shard
-                .delete_stream(session, &self.stream_id)
-                .with_error_context(|error| {
-                    format!("{COMPONENT} (error: {error}) - failed to delete stream with ID: {stream_id}, session: {session}")
-                })?;
-        shard_info!(
-            shard.id,
-            "Deleted stream with name: {}, ID: {}",
-            stream.name,
-            stream.stream_id
-        );
-        // First we have to go over all of the partitions inside of topics
-        // and make sure that they are deleted.
-        for topic in stream.get_topics() {
-            let partitions = topic.get_partitions();
-            let mut namespaces = Vec::new();
-            for partition in partitions {
-                let partition_id = partition.read().await.partition_id;
-                let namespace = IggyNamespace::new(stream.stream_id, topic.topic_id, partition_id);
-                namespaces.push(namespace);
-            }
-            let records = shard.remove_shard_table_records(&namespaces);
-            for (ns, shard_info) in records {
-                if shard_info.id() == shard.id {
-                    let partition = topic.get_partition(ns.partition_id).unwrap();
-                    let mut partition = partition.write().await;
-                    let partition_id = partition.partition_id;
-                    partition.delete().await.with_error_context(|error| {
-                        format!("{COMPONENT} (error: {error}) - failed to delete partition in stream: {self}, partition: {partition_id}")
-                    })?;
-                }
-            }
-            let event = ShardEvent::DeletedShardTableRecords { namespaces };
-            let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
-            topic.delete().await.with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to delete topic in stream: {self}")
-            })?;
-        }
-        if stream.delete().await.is_err() {
-            return Err(IggyError::CannotDeleteStream(stream.stream_id));
-        }
-        let event = ShardEvent::DeletedStream {
-            stream_id: self.stream_id.clone(),
-        };
-        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+        let _responses = shard.broadcast_event_to_all_shards(event).await;
+        // Drop the stream to force readers/writers to be dropped.
+        drop(stream2);
+        // TODO: Remove all the directories and files related to the stream.
 
         shard
             .state

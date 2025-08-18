@@ -1,60 +1,183 @@
-use crate::{
-    binary::handlers::partitions,
-    slab::{Keyed, partitions::PARTITIONS_CAPACITY},
+use crate::slab::{
+    Keyed, consumer_groups, partitions,
+    traits_ext::{EntityMarker, IntoComponents, IntoComponentsById},
 };
-use ahash::AHashMap;
 use arcshift::ArcShift;
-use iggy_common::IggyError;
 use slab::Slab;
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    task::Context,
-};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::trace;
 
 pub const MEMBERS_CAPACITY: usize = 128;
 
-#[derive(Default, Debug, Clone)]
+#[derive(Debug, Clone)]
+pub struct ConsumerGroupMembers {
+    inner: ArcShift<Slab<Member>>,
+}
+
+impl ConsumerGroupMembers {
+    pub fn new(inner: ArcShift<Slab<Member>>) -> Self {
+        Self { inner }
+    }
+
+    pub fn into_inner(self) -> ArcShift<Slab<Member>> {
+        self.inner
+    }
+
+    pub fn inner(&self) -> &ArcShift<Slab<Member>> {
+        &self.inner
+    }
+
+    pub fn inner_mut(&mut self) -> &mut ArcShift<Slab<Member>> {
+        &mut self.inner
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ConsumerGroup {
+    root: ConsumerGroupRoot,
+    members: ConsumerGroupMembers,
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct ConsumerGroupRoot {
     id: usize,
     name: String,
-    partitions: Vec<usize>,
-    members: ArcShift<Slab<Member>>,
+    partitions: Vec<partitions::ContainerId>,
+}
+
+impl ConsumerGroupRoot {
+    pub fn disarray(self) -> (String, Vec<usize>) {
+        (self.name, self.partitions)
+    }
+
+    pub fn partitions(&self) -> &Vec<partitions::ContainerId> {
+        &self.partitions
+    }
+
+    pub fn partitions_mut(&mut self) -> &mut Vec<partitions::ContainerId> {
+        &mut self.partitions
+    }
+
+    pub fn id(&self) -> consumer_groups::ContainerId {
+        self.id
+    }
+}
+
+impl Keyed for ConsumerGroupRoot {
+    type Key = String;
+
+    fn key(&self) -> &Self::Key {
+        &self.name
+    }
+}
+
+impl EntityMarker for ConsumerGroup {
+    type Idx = consumer_groups::ContainerId;
+
+    fn id(&self) -> Self::Idx {
+        self.root.id
+    }
+
+    fn update_id(&mut self, id: Self::Idx) {
+        self.root.id = id;
+    }
+}
+
+impl IntoComponents for ConsumerGroup {
+    type Components = (ConsumerGroupRoot, ConsumerGroupMembers);
+
+    fn into_components(self) -> Self::Components {
+        (self.root, self.members)
+    }
+}
+
+// TODO: Create a macro to impl those ConsumerGroupRef/ConsumerGroupRefMut structs and it's traits.
+pub struct ConsumerGroupRef<'a> {
+    root: &'a Slab<ConsumerGroupRoot>,
+    members: &'a Slab<ConsumerGroupMembers>,
+}
+
+impl<'a> ConsumerGroupRef<'a> {
+    pub fn new(root: &'a Slab<ConsumerGroupRoot>, members: &'a Slab<ConsumerGroupMembers>) -> Self {
+        Self { root, members }
+    }
+}
+
+impl<'a> IntoComponents for ConsumerGroupRef<'a> {
+    type Components = (&'a Slab<ConsumerGroupRoot>, &'a Slab<ConsumerGroupMembers>);
+
+    fn into_components(self) -> Self::Components {
+        (self.root, self.members)
+    }
+}
+
+impl<'a> IntoComponentsById for ConsumerGroupRef<'a> {
+    type Idx = consumer_groups::ContainerId;
+    type Output = (&'a ConsumerGroupRoot, &'a ConsumerGroupMembers);
+
+    fn into_components_by_id(self, index: Self::Idx) -> Self::Output {
+        let root = &self.root[index];
+        let members = &self.members[index];
+        (root, members)
+    }
+}
+
+pub struct ConsumerGroupRefMut<'a> {
+    root: &'a mut Slab<ConsumerGroupRoot>,
+    members: &'a mut Slab<ConsumerGroupMembers>,
+}
+
+impl<'a> ConsumerGroupRefMut<'a> {
+    pub fn new(
+        root: &'a mut Slab<ConsumerGroupRoot>,
+        members: &'a mut Slab<ConsumerGroupMembers>,
+    ) -> Self {
+        Self { root, members }
+    }
+}
+
+impl<'a> IntoComponents for ConsumerGroupRefMut<'a> {
+    type Components = (
+        &'a mut Slab<ConsumerGroupRoot>,
+        &'a mut Slab<ConsumerGroupMembers>,
+    );
+
+    fn into_components(self) -> Self::Components {
+        (self.root, self.members)
+    }
+}
+
+impl<'a> IntoComponentsById for ConsumerGroupRefMut<'a> {
+    type Idx = consumer_groups::ContainerId;
+    type Output = (&'a mut ConsumerGroupRoot, &'a mut ConsumerGroupMembers);
+
+    fn into_components_by_id(self, index: Self::Idx) -> Self::Output {
+        let root = &mut self.root[index];
+        let members = &mut self.members[index];
+        (root, members)
+    }
 }
 
 impl ConsumerGroup {
-    pub fn new(name: String, members: ArcShift<Slab<Member>>, partitions: Vec<usize>) -> Self {
-        ConsumerGroup {
+    pub fn new(
+        name: String,
+        members: ArcShift<Slab<Member>>,
+        partitions: Vec<partitions::ContainerId>,
+    ) -> Self {
+        let root = ConsumerGroupRoot {
             id: 0,
             name,
             partitions,
-            members,
-        }
+        };
+        let members = ConsumerGroupMembers { inner: members };
+        Self { root, members }
     }
 
-    pub fn id(&self) -> usize {
-        self.id
-    }
-
-    pub fn insert_into(self, container: &mut Slab<Self>) -> usize {
-        let idx = container.insert(self);
-        let group = &mut container[idx];
-        group.id = idx;
-        idx
-    }
-
-    pub fn with_members<T>(&self, f: impl FnOnce(&Slab<Member>) -> T) -> T {
-        f(&self.members.shared_get())
-    }
-
-    pub fn reassign_partitions(&mut self, partitions: Vec<usize>) {
-        self.partitions = partitions;
+    pub fn reassign_partitions(&mut self, partitions: Vec<partitions::ContainerId>) {
+        self.root.partitions = partitions;
         self.members.rcu(|members| {
             let mut members = Self::mimic_members(members);
-            let partitions = self.partitions.clone();
+            let partitions = self.root.partitions.clone();
             Self::assign_partitions_to_members(self.id, &mut members, partitions);
             members
         });
@@ -92,68 +215,14 @@ impl ConsumerGroup {
             Some(member.partitions[partition_idx])
         })
     }
-
-    pub fn add_member(&mut self, client_id: u32) {
-        self.members.rcu(|members| {
-            let mut members = Self::mimic_members(members);
-            Member::new(client_id).insert_into(&mut members);
-            let partitions = self.partitions.clone();
-            Self::assign_partitions_to_members(self.id, &mut members, partitions);
-            members
-        });
-    }
-
-    pub fn delete_member(&mut self, client_id: u32) {
-        let member_id = self
-            .members
-            .shared_get()
-            .iter()
-            .find_map(|(_, member)| (member.client_id == client_id).then_some(member.id))
-            .expect("delete_member: find member in consumer group slab");
-        self.members.rcu(|members| {
-            let mut members = Self::mimic_members(members);
-            let partitions = self.partitions.clone();
-            members.remove(member_id);
-            members.compact(|entry, _, idx| {
-                entry.id = idx;
-                true
-            });
-            Self::assign_partitions_to_members(self.id, &mut members, partitions);
-            members
-        });
-    }
-
-    fn mimic_members(members: &Slab<Member>) -> Slab<Member> {
-        let mut container = Slab::with_capacity(members.len());
-        for (_, member) in members {
-            Member::new(member.client_id).insert_into(&mut container);
-        }
-        container
-    }
-
-    fn assign_partitions_to_members(id: usize, members: &mut Slab<Member>, partitions: Vec<usize>) {
-        members
-            .iter_mut()
-            .for_each(|(_, member)| member.partitions.clear());
-        let count = members.len();
-        for (idx, partition) in partitions.iter().enumerate() {
-            let position = idx % count;
-            let member = &mut members[position];
-            member.partitions.push(*partition);
-            trace!(
-                "Assigned partition ID: {} to member with ID: {} in consumer group: {}",
-                partition, member.id, id
-            );
-        }
-    }
 }
 
 #[derive(Debug)]
 pub struct Member {
-    id: usize,
-    client_id: u32,
-    partitions: Vec<usize>,
-    current_partition_idx: AtomicUsize,
+    pub id: usize,
+    pub client_id: u32,
+    pub partitions: Vec<partitions::ContainerId>,
+    pub current_partition_idx: AtomicUsize,
 }
 
 impl Clone for Member {
@@ -193,14 +262,6 @@ impl Member {
     }
 }
 
-impl Keyed for ConsumerGroup {
-    type Key = String;
-
-    fn key(&self) -> &Self::Key {
-        &self.name
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,8 +288,8 @@ mod tests {
     fn test_initial_creation_with_few_members(members_count: usize) {
         let consumer_group = create_test_consumer_group("test_group", members_count);
 
-        assert_eq!(consumer_group.name, "test_group");
-        assert_eq!(consumer_group.id, 0); // Initial ID should be 0
+        assert_eq!(consumer_group.root.name, "test_group");
+        assert_eq!(consumer_group.root.id, 0); // Initial ID should be 0
 
         consumer_group.with_members(|members| {
             assert_eq!(members.len(), members_count);

@@ -16,30 +16,23 @@
  * under the License.
  */
 
-use std::error;
-use std::sync::Arc;
-
 use super::COMPONENT;
 use crate::configs::system::SystemConfig;
 use crate::shard::IggyShard;
-use crate::slab::traits_ext::Delete;
-use crate::slab::traits_ext::EntityComponentSystem;
 use crate::slab::traits_ext::EntityMarker;
-use crate::slab::traits_ext::Insert;
 use crate::streaming::deduplication::message_deduplicator::MessageDeduplicator;
-use crate::streaming::partitions::partition::Partition;
 use crate::streaming::partitions::partition2;
 use crate::streaming::partitions::storage2::create_partition_file_hierarchy;
 use crate::streaming::session::Session;
 use crate::streaming::stats::stats::PartitionStats;
 use crate::streaming::stats::stats::TopicStats;
+use crate::streaming::streams;
+use crate::streaming::topics;
 use error_set::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
-use iggy_common::delete_partitions;
-use iggy_common::locking::IggyRwLockFn;
-use serde::de;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 impl IggyShard {
@@ -75,28 +68,24 @@ impl IggyShard {
         partitions_count: u32,
     ) -> Result<Vec<partition2::Partition>, IggyError> {
         self.ensure_authenticated(session)?;
-        /*
-        self.ensure_stream_exists(stream_id)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
-        */
-        let numeric_stream_id =
-            self.streams2
-                .with_root_by_id(stream_id, |stream| stream.id()) as u32;
+        let numeric_stream_id = self
+            .streams2
+            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
         let numeric_topic_id =
             self.streams2
-                .with_topic_root_by_id(stream_id, topic_id, |topic| topic.id()) as u32;
+                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
 
+        // Claude garbage, rework this.
         self.validate_partition_permissions(
             session,
-            numeric_stream_id,
-            numeric_topic_id,
+            numeric_stream_id as u32,
+            numeric_topic_id as u32,
             "create",
         )?;
-
-        let parent_stats = self.streams2.with_root_by_id(stream_id, |root| {
-            root.topics()
-                .with_stats_by_id(topic_id, |stats| stats.clone())
-        });
+        let parent_stats =
+            self.streams2
+                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_stats());
         let partitions = self.create_and_insert_partitions_mem(
             stream_id,
             topic_id,
@@ -127,18 +116,17 @@ impl IggyShard {
             if !config.message_deduplication.enabled {
                 return None;
             }
-
             let max_entries = if config.message_deduplication.max_entries > 0 {
                 Some(config.message_deduplication.max_entries)
             } else {
                 None
             };
-
             let expiry = if !config.message_deduplication.expiry.is_zero() {
                 Some(config.message_deduplication.expiry)
             } else {
                 None
             };
+
             Some(MessageDeduplicator::new(max_entries, expiry))
         }
 
@@ -175,10 +163,11 @@ impl IggyShard {
         topic_id: &Identifier,
         partition: partition2::Partition,
     ) -> usize {
-        self.streams2
-            .with_topic_root_by_id_mut(stream_id, topic_id, |root| {
-                root.partitions_mut().insert(partition)
-            })
+        self.streams2.with_topic_by_id_mut(
+            stream_id,
+            topic_id,
+            topics::helpers::insert_partition(partition),
+        )
     }
 
     pub fn create_partitions2_bypass_auth(
@@ -198,66 +187,6 @@ impl IggyShard {
         Ok(())
     }
 
-    pub async fn create_partitions(
-        &self,
-        session: &Session,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partitions_count: u32,
-    ) -> Result<Vec<u32>, IggyError> {
-        self.ensure_authenticated(session)?;
-        {
-            let stream = self.get_stream(stream_id).with_error_context(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - stream not found for stream ID: {stream_id}"
-                )
-            })?;
-            let topic = self.find_topic(session, &stream, topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic ID: {topic_id}"))?;
-            self.permissioner.borrow().create_partitions(
-                session.get_user_id(),
-                topic.stream_id,
-                topic.topic_id,
-            ).with_error_context(|error| format!(
-                "{COMPONENT} (error: {error}) - permission denied to create partitions for user {} on stream ID: {}, topic ID: {}",
-                session.get_user_id(),
-                topic.stream_id,
-                topic.topic_id
-            ))?;
-        }
-
-        let partition_ids = {
-            let mut stream = self.get_stream_mut(stream_id).with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
-            })?;
-            let stream_id = stream.stream_id;
-            let topic = stream
-            .get_topic_mut(topic_id)
-            .with_error_context(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to get mutable reference to stream with id: {stream_id}"
-                )
-            })?;
-            let partition_ids = topic
-            .add_persisted_partitions(partitions_count)
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to add persisted partitions, topic: {topic}")
-            })?;
-            partition_ids
-        };
-
-        let mut stream = self.get_stream_mut(stream_id).with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
-        })?;
-        let topic = stream.get_topic_mut(topic_id).with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to get topic with ID: {topic_id} in stream with ID: {stream_id}")
-        })?;
-
-        topic.reassign_consumer_groups();
-        self.metrics.increment_partitions(partitions_count);
-        self.metrics.increment_segments(partitions_count);
-        Ok(partition_ids)
-    }
-
     pub async fn delete_partitions2(
         &self,
         session: &Session,
@@ -266,23 +195,22 @@ impl IggyShard {
         partitions_count: u32,
     ) -> Result<Vec<u32>, IggyError> {
         self.ensure_authenticated(session)?;
-
-        let numeric_stream_id =
-            self.streams2
-                .with_root_by_id(stream_id, |stream| stream.id()) as u32;
+        let numeric_stream_id = self
+            .streams2
+            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
         let numeric_topic_id =
             self.streams2
-                .with_topic_root_by_id(stream_id, topic_id, |topic| topic.id()) as u32;
+                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
 
+        // Claude garbage, rework this.
         self.validate_partition_permissions(
             session,
-            numeric_stream_id,
-            numeric_topic_id,
+            numeric_stream_id as u32,
+            numeric_topic_id as u32,
             "delete",
         )?;
         let deleted_partition_ids =
             self.delete_partitions_base2(stream_id, topic_id, partitions_count);
-
         Ok(deleted_partition_ids)
     }
 
@@ -292,22 +220,11 @@ impl IggyShard {
         topic_id: &Identifier,
         partitions_count: u32,
     ) -> Vec<u32> {
-        let deleted_partition_ids =
-            self.streams2
-                .with_topic_root_by_id_mut(stream_id, topic_id, |topic| {
-                    let partitions = topic.partitions_mut();
-                    let current_count = partitions.len() as u32;
-                    let partitions_to_delete = partitions_count.min(current_count);
-                    let start_idx = (current_count - partitions_to_delete) as usize;
-                    let mut deleted_ids = Vec::with_capacity(partitions_to_delete as usize);
-                    for idx in start_idx..current_count as usize {
-                        let partition = topic.partitions_mut().delete(idx);
-                        assert_eq!(partition.id(), idx);
-                        deleted_ids.push(partition.id() as u32);
-                    }
-                    deleted_ids
-                });
-        deleted_partition_ids
+        self.streams2.with_topic_by_id_mut(
+            stream_id,
+            topic_id,
+            topics::helpers::delete_partitions(partitions_count),
+        )
     }
 
     pub fn delete_partitions2_bypass_auth(
@@ -331,79 +248,5 @@ impl IggyShard {
             );
         }
         Ok(())
-    }
-
-    pub async fn delete_partitions(
-        &self,
-        session: &Session,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partitions_count: u32,
-    ) -> Result<Vec<u32>, IggyError> {
-        self.ensure_authenticated(session)?;
-        {
-            let stream = self.get_stream(stream_id).with_error_context(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - stream not found for stream ID: {stream_id}"
-                )
-            })?;
-            let topic = self.find_topic(session, &stream, topic_id).with_error_context(|error| format!("{COMPONENT} (error: {error}) - topic not found for stream ID: {stream_id}, topic_id: {topic_id}"))?;
-            self.permissioner.borrow().delete_partitions(
-                session.get_user_id(),
-                topic.stream_id,
-                topic.topic_id,
-            ).with_error_context(|error| format!(
-                "{COMPONENT} (error: {error}) - permission denied to delete partitions for user {} on stream ID: {}, topic ID: {}",
-                session.get_user_id(),
-                topic.stream_id,
-                topic.topic_id
-            ))?;
-        }
-
-        let partitions = {
-            let mut stream = self.get_stream_mut(stream_id).with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
-            })?;
-            let topic = stream
-            .get_topic_mut(topic_id)
-            .with_error_context(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to get mutable reference to stream with id: {stream_id}"
-                )
-            })?;
-
-            let partitions = topic
-            .delete_persisted_partitions(partitions_count)
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to delete persisted partitions for topic: {topic}")
-            })?;
-            partitions
-        };
-
-        let mut segments_count = 0;
-        let mut messages_count = 0;
-        let mut partition_ids = Vec::with_capacity(partitions.len());
-        for partition in &partitions {
-            let partition = partition.read().await;
-            let partition_id = partition.partition_id;
-            let partition_messages_count = partition.get_messages_count();
-            segments_count += partition.get_segments_count();
-            messages_count += partition_messages_count;
-            partition_ids.push(partition_id);
-        }
-
-        let mut stream = self.get_stream_mut(stream_id).with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to get stream with ID: {stream_id}")
-        })?;
-        let topic = stream.get_topic_mut(topic_id).with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to get topic with ID: {topic_id}")
-        })?;
-        topic.reassign_consumer_groups();
-        if partitions.len() > 0 {
-            self.metrics.decrement_partitions(partitions_count);
-            self.metrics.decrement_segments(segments_count);
-            self.metrics.decrement_messages(messages_count);
-        }
-        Ok(partition_ids)
     }
 }

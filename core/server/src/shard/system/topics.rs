@@ -18,18 +18,14 @@
 
 use super::COMPONENT;
 use crate::shard::IggyShard;
-use crate::shard::namespace::IggyNamespace;
 use crate::shard_info;
 use crate::slab::traits_ext::{EntityMarker, InsertCell};
 use crate::streaming::session::Session;
 use crate::streaming::stats::stats::{StreamStats, TopicStats};
-use crate::streaming::streams::stream::Stream;
 use crate::streaming::topics::storage2::create_topic_file_hierarchy;
-use crate::streaming::topics::topic::Topic;
 use crate::streaming::topics::topic2::{self, resolve_max_topic_size, resolve_message_expiry};
 use crate::streaming::{streams, topics};
 use error_set::ErrContext;
-use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
     CompressionAlgorithm, Identifier, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize,
 };
@@ -48,7 +44,7 @@ impl IggyShard {
         replication_factor: Option<u8>,
     ) -> Result<topic2::Topic, IggyError> {
         self.ensure_authenticated(session)?;
-        //self.ensure_stream_exists(stream_id)?;
+        self.ensure_stream_exists(stream_id)?;
         let numeric_stream_id = self.streams2.get_index(stream_id);
         {
             self.permissioner
@@ -127,13 +123,8 @@ impl IggyShard {
             .with_topics(stream_id, |topics| topics.insert(topic))
     }
 
-    pub fn create_topic2_bypass_auth(
-        &self,
-        stream_id: &Identifier,
-        topic: topic2::Topic,
-    ) -> Result<usize, IggyError> {
-        let topic_id = self.insert_topic_mem(stream_id, topic);
-        Ok(topic_id)
+    pub fn create_topic2_bypass_auth(&self, stream_id: &Identifier, topic: topic2::Topic) -> usize {
+        self.insert_topic_mem(stream_id, topic)
     }
 
     pub fn update_topic2(
@@ -259,9 +250,7 @@ impl IggyShard {
                     )
                 })?;
         }
-        let topic = self.delete_topic_base2(stream_id, topic_id).with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to delete topic with ID: {topic_id} in stream with ID: {stream_id}")
-        })?;
+        let topic = self.delete_topic_base2(stream_id, topic_id);
         // TODO: Decrease the stats
         Ok(topic)
     }
@@ -270,19 +259,17 @@ impl IggyShard {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-    ) -> Result<topic2::Topic, IggyError> {
-        let topic = self.delete_topic_base2(stream_id, topic_id)?;
-        Ok(topic)
+    ) -> topic2::Topic {
+        self.delete_topic_base2(stream_id, topic_id)
     }
 
     pub fn delete_topic_base2(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-    ) -> Result<topic2::Topic, IggyError> {
-        let delete_topic_closure = topics::helpers::delete_topic(topic_id);
-        let topic = self.streams2.with_topics(stream_id, delete_topic_closure);
-        Ok(topic)
+    ) -> topic2::Topic {
+        self.streams2
+            .with_topics(stream_id, topics::helpers::delete_topic(topic_id))
     }
 
     pub async fn purge_topic2(

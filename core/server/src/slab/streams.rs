@@ -1,18 +1,23 @@
 use crate::{
     slab::{
-        Keyed, helpers,
+        Keyed,
+        consumer_groups::ConsumerGroups,
+        helpers,
         partitions::Partitions,
         topics::Topics,
         traits_ext::{
-            Components, ComponentsById, ComponentsByIdMapping, ComponentsMapping, DeleteCell,
+            ComponentsById, ComponentsByIdMapping, ComponentsMapping, DeleteCell,
             EntityComponentSystem, EntityComponentSystemMutCell, InsertCell, InteriorMutability,
-            IntoComponents, IntoComponentsById,
+            IntoComponents,
         },
     },
     streaming::{
         stats::stats::StreamStats,
         streams::stream2::{self, StreamRef, StreamRefMut},
-        topics::topic2::{self, TopicRef, TopicRefMut},
+        topics::{
+            consumer_group2::{ConsumerGroupRef, ConsumerGroupRefMut},
+            topic2::{self, TopicRef, TopicRefMut},
+        },
     },
 };
 use ahash::AHashMap;
@@ -85,11 +90,11 @@ impl EntityComponentSystem<InteriorMutability> for Streams {
         f(self.into())
     }
 
-    async fn with_components_async<O, F>(&self, f: F) -> O
+    fn with_components_async<O, F>(&self, f: F) -> impl Future<Output = O>
     where
         F: for<'a> AsyncFnOnce(Self::EntityComponents<'a>) -> O,
     {
-        f(self.into()).await
+        f(self.into())
     }
 }
 
@@ -161,14 +166,13 @@ impl Streams {
         self.with_components_by_id(id, |stream| f(stream))
     }
 
-    pub async fn with_stream_by_id_async<T>(
+    pub fn with_stream_by_id_async<T>(
         &self,
         id: &Identifier,
         f: impl AsyncFnOnce(ComponentsById<StreamRef>) -> T,
-    ) -> T {
+    ) -> impl Future<Output = T> {
         let id = self.get_index(id);
         self.with_components_by_id_async(id, async |stream| f(stream).await)
-            .await
     }
 
     pub fn with_stream_by_id_mut<T>(
@@ -184,13 +188,12 @@ impl Streams {
         self.with_stream_by_id(stream_id, helpers::topics(f))
     }
 
-    pub async fn with_topics_async<T>(
+    pub fn with_topics_async<T>(
         &self,
         stream_id: &Identifier,
         f: impl AsyncFnOnce(&Topics) -> T,
-    ) -> T {
-        self.with_stream_by_id_async(stream_id, helpers::topics_async(f).await)
-            .await
+    ) -> impl Future<Output = T> {
+        self.with_stream_by_id_async(stream_id, helpers::topics_async(f))
     }
 
     pub fn with_topics_mut<T>(
@@ -212,16 +215,15 @@ impl Streams {
         })
     }
 
-    pub async fn with_topic_by_id_async<T>(
+    pub fn with_topic_by_id_async<T>(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
         f: impl AsyncFnOnce(ComponentsById<TopicRef>) -> T,
-    ) -> T {
+    ) -> impl Future<Output = T> {
         self.with_topics_async(stream_id, async |container| {
             container.with_topic_by_id_async(topic_id, f).await
         })
-        .await
     }
 
     pub fn with_topic_by_id_mut<T>(
@@ -232,6 +234,75 @@ impl Streams {
     ) -> T {
         self.with_topics_mut(stream_id, |container| {
             container.with_topic_by_id_mut(topic_id, f)
+        })
+    }
+
+    pub fn with_consumer_groups<T>(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        f: impl FnOnce(&ConsumerGroups) -> T,
+    ) -> T {
+        self.with_topics(stream_id, |container| {
+            container.with_consumer_groups(topic_id, f)
+        })
+    }
+
+    pub fn with_consumer_groups_async<T>(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        f: impl AsyncFnOnce(&ConsumerGroups) -> T,
+    ) -> impl Future<Output = T> {
+        self.with_topics_async(stream_id, async |container| {
+            container.with_consumer_groups_async(topic_id, f).await
+        })
+    }
+
+    pub fn with_consumer_group_by_id<T>(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        group_id: &Identifier,
+        f: impl FnOnce(ComponentsById<ConsumerGroupRef>) -> T,
+    ) -> T {
+        self.with_consumer_groups(stream_id, topic_id, |container| {
+            container.with_consumer_group_by_id(group_id, f)
+        })
+    }
+
+    pub fn with_consumer_group_by_id_mut<T>(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        group_id: &Identifier,
+        f: impl FnOnce(ComponentsById<ConsumerGroupRefMut>) -> T,
+    ) -> T {
+        self.with_consumer_groups_mut(stream_id, topic_id, |container| {
+            container.with_consumer_group_by_id_mut(group_id, f)
+        })
+    }
+
+    pub fn with_consumer_group_by_id_async<T>(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        group_id: &Identifier,
+        f: impl AsyncFnOnce(ComponentsById<ConsumerGroupRef>) -> T,
+    ) -> impl Future<Output = T> {
+        self.with_consumer_groups_async(stream_id, topic_id, async move |container| {
+            container.with_consumer_group_by_id_async(group_id, f).await
+        })
+    }
+
+    pub fn with_consumer_groups_mut<T>(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        f: impl FnOnce(&mut ConsumerGroups) -> T,
+    ) -> T {
+        self.with_topics_mut(stream_id, |container| {
+            container.with_consumer_groups_mut(topic_id, f)
         })
     }
 
@@ -246,16 +317,15 @@ impl Streams {
         })
     }
 
-    pub async fn with_partitions_async<T>(
+    pub fn with_partitions_async<T>(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
         f: impl AsyncFnOnce(&Partitions) -> T,
-    ) -> T {
+    ) -> impl Future<Output = T> {
         self.with_topics_async(stream_id, async |container| {
             container.with_partitions_async(topic_id, f).await
         })
-        .await
     }
 
     pub fn with_partitions_mut<T>(

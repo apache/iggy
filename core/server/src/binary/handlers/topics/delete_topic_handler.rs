@@ -24,6 +24,7 @@ use crate::shard::transmission::event::ShardEvent;
 use crate::shard_info;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
+use crate::streaming::streams;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
@@ -55,7 +56,7 @@ impl ServerCommandHandler for DeleteTopic {
             .await?;
         let stream_id = shard
             .streams2
-            .with_root_by_id(&self.stream_id, |root| root.id());
+            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
         let topic_id = topic.root().id();
         shard_info!(
             shard.id,

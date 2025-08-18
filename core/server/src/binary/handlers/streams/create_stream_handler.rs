@@ -67,7 +67,7 @@ impl ServerCommandHandler for CreateStream {
 
         let response = shard
             .streams2
-            .with_by_id(created_stream_id, |(root, stats)| {
+            .with_components_by_id(created_stream_id, |(root, stats)| {
                 mapper::map_stream(&root, &stats)
             });
         shard

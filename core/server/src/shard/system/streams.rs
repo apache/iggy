@@ -34,7 +34,6 @@ use std::cell::{Ref, RefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-
 impl IggyShard {
     pub async fn create_stream2(
         &self,
@@ -88,7 +87,9 @@ impl IggyShard {
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
         self.ensure_stream_exists(stream_id)?;
-        let id = self.streams2.with_stream_by_id(stream_id, streams::helpers::get_stream_id());
+        let id = self
+            .streams2
+            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
 
         self.permissioner
             .borrow()
@@ -116,7 +117,8 @@ impl IggyShard {
             return Err(IggyError::StreamNameAlreadyExists(name.to_string()));
         }
 
-        self.streams2.with_stream_by_id_mut(id, streams::helpers::update_stream_name(name.clone()));
+        self.streams2
+            .with_stream_by_id_mut(id, streams::helpers::update_stream_name(name.clone()));
         self.streams2.with_index_mut(|index| {
             // Rename the key inside of hashmap
             let idx = index.remove(&old_name).expect("Rename key: key not found");
@@ -125,15 +127,11 @@ impl IggyShard {
         Ok(())
     }
 
-    pub fn delete_stream2_bypass_auth(
-        &self,
-        id: &Identifier,
-    ) -> Result<stream2::Stream, IggyError> {
-        let stream = self.delete_stream2_base(id)?;
-        Ok(stream)
+    pub fn delete_stream2_bypass_auth(&self, id: &Identifier) -> stream2::Stream {
+        self.delete_stream2_base(id)
     }
 
-    fn delete_stream2_base(&self, id: &Identifier) -> Result<stream2::Stream, IggyError> {
+    fn delete_stream2_base(&self, id: &Identifier) -> stream2::Stream {
         let id = self.streams2.get_index(id);
         let stream = self.streams2.delete(id);
         let stats = stream.stats();
@@ -151,7 +149,7 @@ impl IggyShard {
             .borrow_mut()
             .delete_consumer_groups_for_stream(stream_id as u32);
         */
-        Ok(stream)
+        stream
     }
 
     pub fn delete_stream2(
@@ -161,7 +159,9 @@ impl IggyShard {
     ) -> Result<stream2::Stream, IggyError> {
         self.ensure_authenticated(session)?;
         self.ensure_stream_exists(id)?;
-        let stream_id = self.streams2.with_stream_by_id(id, streams::helpers::get_stream_id());
+        let stream_id = self
+            .streams2
+            .with_stream_by_id(id, streams::helpers::get_stream_id());
         self.permissioner
             .borrow()
             .delete_stream(session.get_user_id(), stream_id as u32)
@@ -172,7 +172,7 @@ impl IggyShard {
                     stream_id,
                 )
             })?;
-        let stream = self.delete_stream2_base(id)?;
+        let stream = self.delete_stream2_base(id);
         Ok(stream)
     }
 

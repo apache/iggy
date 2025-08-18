@@ -47,7 +47,7 @@ impl ServerCommandHandler for PurgeTopic {
         let stream_id = self.stream_id.clone();
 
         shard
-            .purge_topic(session, &self.stream_id, &self.topic_id)
+            .purge_topic2(session, &self.stream_id, &self.topic_id)
             .await
             .with_error_context(|error| {
                 format!(

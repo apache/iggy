@@ -166,6 +166,9 @@ pub type ComponentsById<'a, T> = <T as IntoComponentsById>::Output;
 // This way we can name the type inside of the `with_by_id` methods, without desolving into the tuple mapping madness.
 // in the `stream.rs` `topic.rs` `partitions.rs` files, we need to implement the `IntoComponentsById` trait for the output type of `IntoComponents` implementation, for `EntityRef`.
 // to make our life easier, we can create a type alias for those tuples and maybe even create a macro, to not repeat the type 3 times per entity (TupleEntityType, TupleEntityTypeRef, TupleEntityTypeRefByid).
+
+// TODO: Since those traits at impl site all they do is call `f(self.into())`
+// we can blanket implement those for all types that implement `From` trait.
 pub trait EntityComponentSystem<T>
 where
     <Self::Entity as IntoComponents>::Components: ComponentsMapping<T> + ComponentsByIdMapping<T>,

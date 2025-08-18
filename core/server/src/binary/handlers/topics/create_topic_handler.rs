@@ -26,6 +26,7 @@ use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateTopicWithId;
 use crate::streaming::session::Session;
+use crate::streaming::streams;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::create_topic::CreateTopic;
@@ -63,7 +64,7 @@ impl ServerCommandHandler for CreateTopic {
 
         let stream_id = shard
             .streams2
-            .with_root_by_id(&self.stream_id, |root| root.id());
+            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
         let topic_id = topic.id();
         // Send events for topic creation.
         let event = ShardEvent::CreatedTopic2 {
@@ -72,7 +73,7 @@ impl ServerCommandHandler for CreateTopic {
         };
         let _responses = shard.broadcast_event_to_all_shards(event).await;
 
-        shard
+        let partitions = shard
             .create_partitions2(
                 session,
                 &self.stream_id,
@@ -80,6 +81,12 @@ impl ServerCommandHandler for CreateTopic {
                 self.partitions_count,
             )
             .await?;
+        let event = ShardEvent::CreatedPartitions2 {
+            stream_id: self.stream_id.clone(),
+            topic_id: Identifier::numeric(topic_id as u32).unwrap(),
+            partitions,
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event).await;
         // TODO: Create shard_table records for partitions.
         let response = shard.streams2.with_topic_by_id(
             &self.stream_id,

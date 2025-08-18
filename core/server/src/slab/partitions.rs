@@ -109,11 +109,11 @@ impl EntityComponentSystem<Borrow> for Partitions {
         f(self.into())
     }
 
-    async fn with_components_async<O, F>(&self, f: F) -> O
+    fn with_components_async<O, F>(&self, f: F) -> impl Future<Output = O>
     where
         F: for<'a> AsyncFnOnce(Self::EntityComponents<'a>) -> O,
     {
-        f(self.into()).await
+        f(self.into())
     }
 }
 

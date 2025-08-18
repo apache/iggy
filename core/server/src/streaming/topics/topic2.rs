@@ -2,7 +2,7 @@ use crate::configs::system::SystemConfig;
 use crate::slab::topics;
 use crate::slab::traits_ext::{EntityMarker, IntoComponents, IntoComponentsById};
 use crate::slab::{Keyed, consumer_groups::ConsumerGroups, partitions::Partitions};
-use crate::streaming::stats::stats::{PartitionStats, TopicStats};
+use crate::streaming::stats::stats::TopicStats;
 use iggy_common::{CompressionAlgorithm, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize};
 use slab::Slab;
 use std::cell::{Ref, RefMut};
@@ -183,11 +183,8 @@ impl TopicRoot {
         f(self).await
     }
 
-    pub fn with_partition_stats_mut<T>(
-        &mut self,
-        f: impl FnOnce(&mut Slab<Arc<PartitionStats>>) -> T,
-    ) -> T {
-        self.partitions.with_stats_mut(f)
+    pub fn id(&self) -> topics::ContainerId {
+        self.id
     }
 
     pub fn message_expiry(&self) -> IggyExpiry {
@@ -196,10 +193,6 @@ impl TopicRoot {
 
     pub fn max_topic_size(&self) -> MaxTopicSize {
         self.max_topic_size
-    }
-
-    pub fn id(&self) -> usize {
-        self.id
     }
 
     pub fn name(&self) -> &String {
@@ -240,13 +233,6 @@ impl TopicRoot {
 
     pub fn consumer_groups_mut(&mut self) -> &mut ConsumerGroups {
         &mut self.consumer_groups
-    }
-
-    pub fn insert_into(self, container: &mut Slab<Self>) -> usize {
-        let idx = container.insert(self);
-        let topic = &mut container[idx];
-        topic.id = idx;
-        idx
     }
 
     pub fn created_at(&self) -> IggyTimestamp {

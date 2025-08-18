@@ -23,6 +23,7 @@ use crate::binary::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::slab::traits_ext::EntityComponentSystem;
 use crate::streaming::session::Session;
+use crate::streaming::streams;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
@@ -47,7 +48,7 @@ impl ServerCommandHandler for GetStream {
         shard.ensure_stream_exists(&self.stream_id)?;
         let stream_id = shard
             .streams2
-            .with_root_by_id(&self.stream_id, |root| root.id());
+            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
         shard
             .permissioner
             .borrow()
@@ -61,7 +62,7 @@ impl ServerCommandHandler for GetStream {
             });
         let response = shard
             .streams2
-            .with_by_id(stream_id, |(root, stats)| mapper::map_stream(&root, &stats));
+            .with_components_by_id(stream_id, |(root, stats)| mapper::map_stream(&root, &stats));
         sender.send_ok_response(&response).await?;
         Ok(())
     }

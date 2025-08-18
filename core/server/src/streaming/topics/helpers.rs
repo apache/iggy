@@ -1,12 +1,33 @@
+use std::sync::{atomic::Ordering, Arc};
+
 use crate::{
+    shard_trace,
     slab::{
         Keyed,
+        consumer_groups::{self, ConsumerGroups},
+        partitions,
         topics::{self, Topics},
-        traits_ext::{ComponentsById, DeleteCell, EntityMarker},
+        traits_ext::{
+            ComponentsById, Delete, DeleteCell, EntityComponentSystem, EntityComponentSystemMut,
+            EntityMarker, Insert, IntoComponents,
+        },
     },
-    streaming::topics::topic2::{Topic, TopicRef, TopicRefMut, TopicRoot},
+    streaming::{
+        partitions::partition2,
+        stats::stats::TopicStats,
+        topics::{
+            consumer_group2::{
+                self, ConsumerGroupMembers, ConsumerGroupRef, ConsumerGroupRefMut,
+                MEMBERS_CAPACITY, Member,
+            },
+            topic2::{Topic, TopicRef, TopicRefMut, TopicRoot},
+        },
+    },
 };
-use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize};
+use iggy_common::{
+    CompressionAlgorithm, ConsumerGroup, ConsumerGroupMember, Identifier, IggyExpiry, MaxTopicSize,
+};
+use slab::Slab;
 
 pub fn rename_index(
     old_name: &<TopicRoot as Keyed>::Key,
@@ -21,21 +42,63 @@ pub fn rename_index(
     }
 }
 
+// Partitions
+pub fn delete_partitions(
+    partitions_count: u32,
+) -> impl FnOnce(ComponentsById<TopicRefMut>) -> Vec<u32> {
+    move |(mut root, _)| {
+        let partitions = root.partitions_mut();
+        let current_count = partitions.len() as u32;
+        let partitions_to_delete = partitions_count.min(current_count);
+        let start_idx = (current_count - partitions_to_delete) as usize;
+        let mut deleted_ids = Vec::with_capacity(partitions_to_delete as usize);
+        for idx in start_idx..current_count as usize {
+            let partition = partitions.delete(idx);
+            assert_eq!(partition.id(), idx);
+            deleted_ids.push(partition.id() as u32);
+        }
+        deleted_ids
+    }
+}
+
+pub fn insert_partition(
+    partition: partition2::Partition,
+) -> impl FnOnce(ComponentsById<TopicRefMut>) -> partitions::ContainerId {
+    move |(mut root, _)| root.partitions_mut().insert(partition)
+}
+
+// Topics
+pub fn get_stats() -> impl FnOnce(ComponentsById<TopicRef>) -> Arc<TopicStats> {
+    |(_, stats)| stats.clone()
+}
+
 pub fn get_topic_id() -> impl FnOnce(ComponentsById<TopicRef>) -> topics::ContainerId {
     |(root, _)| root.id()
 }
 
+pub fn get_message_expiry() -> impl FnOnce(ComponentsById<TopicRef>) -> IggyExpiry {
+    |(root, _)| root.message_expiry()
+}
+
+pub fn get_max_topic_size() -> impl FnOnce(ComponentsById<TopicRef>) -> MaxTopicSize {
+    |(root, _)| root.max_topic_size()
+}
+
 pub fn delete_topic(topic_id: &Identifier) -> impl FnOnce(&Topics) -> Topic {
-    move |topics| {
-        let id = topics.get_index(topic_id);
-        let topic = topics.delete(id);
+    |container| {
+        let id = container.get_index(topic_id);
+        let topic = container.delete(id);
         assert_eq!(topic.id(), id, "delete_topic: topic ID mismatch");
         topic
     }
 }
 
 pub fn exists(identifier: &Identifier) -> impl FnOnce(&Topics) -> bool {
-    move |topics| topics.exists(identifier)
+    |topics| topics.exists(identifier)
+}
+
+pub fn cg_exists(identifier: &Identifier) -> impl FnOnce(ComponentsById<TopicRef>) -> bool {
+    |(root, ..)| root.consumer_groups().exists(identifier)
 }
 
 pub fn update_topic(
@@ -54,5 +117,169 @@ pub fn update_topic(
         root.set_replication_factor(replication_factor);
         (old_name, name)
         // TODO: Set message expiry for all partitions and segments.
+    }
+}
+
+// Consumer Groups
+pub fn delete_consumer_group(
+    group_id: &Identifier,
+) -> impl FnOnce(&mut ConsumerGroups) -> consumer_group2::ConsumerGroup {
+    |container| {
+        let id = container.get_index(group_id);
+        let group = container.delete(id);
+        assert_eq!(group.id(), id, "delete_consumer_group: group ID mismatch");
+        group
+    }
+}
+
+pub fn join_consumer_group(
+    shard_id: u16,
+    client_id: u32,
+) -> impl FnOnce(ComponentsById<ConsumerGroupRefMut>) {
+    move |(root, members)| {
+        let partitions = root.partitions();
+        let id = root.id();
+        add_member(shard_id, id, members, partitions, client_id);
+    }
+}
+
+fn add_member(
+    shard_id: u16,
+    id: usize,
+    members: &mut ConsumerGroupMembers,
+    partitions: &Vec<usize>,
+    client_id: u32,
+) {
+    members.inner_mut().rcu(move |members| {
+        let mut members = mimic_members(members);
+        Member::new(client_id).insert_into(&mut members);
+        assign_partitions_to_members(shard_id, id, &mut members, partitions.clone());
+        members
+    });
+}
+
+fn delete_member(shard_id: u16, id: usize, members: &mut ConsumerGroupMembers, partitions: &Vec<usize>, client_id: u32) {
+    let member_id = members
+        .inner()
+        .shared_get()
+        .iter()
+        .find_map(|(_, member)| (member.client_id == client_id).then_some(member.id))
+        .expect("delete_member: find member in consumer group slab");
+    members.inner_mut().rcu(|members| {
+        let mut members = mimic_members(members);
+        members.remove(member_id);
+        members.compact(|entry, _, idx| {
+            entry.id = idx;
+            true
+        });
+        assign_partitions_to_members(shard_id, id, &mut members, partitions.clone());
+        members
+    });
+}
+
+fn assign_partitions_to_members(
+    shard_id: u16,
+    id: usize,
+    members: &mut Slab<Member>,
+    partitions: Vec<usize>,
+) {
+    members
+        .iter_mut()
+        .for_each(|(_, member)| member.partitions.clear());
+    let count = members.len();
+    for (idx, partition) in partitions.iter().enumerate() {
+        let position = idx % count;
+        let member = &mut members[position];
+        member.partitions.push(*partition);
+        shard_trace!(
+            shard_id,
+            "Assigned partition ID: {} to member with ID: {} in consumer group: {}",
+            partition,
+            member.id,
+            id
+        );
+    }
+}
+fn mimic_members(members: &Slab<Member>) -> Slab<Member> {
+    let mut container = Slab::with_capacity(members.len());
+    for (_, member) in members {
+        Member::new(member.client_id).insert_into(&mut container);
+    }
+    container
+}
+
+pub fn reassign_partitions(
+    shard_id: u16,
+    partitions: Vec<partitions::ContainerId>,
+) -> impl FnOnce(ComponentsById<ConsumerGroupRefMut>) {
+    move |(mut root, members)| {
+        root.partitions_mut() = partitions;
+        let partitions = root.partitions();
+        let id = root.id();
+        reassign_partitions_to_members(shard_id, id, members, partitions);
+    }
+}
+
+fn reassign_partitions_to_members(
+    shard_id: u16,
+    id: usize,
+    members: &mut ConsumerGroupMembers,
+    partitions: &Vec<usize>,
+) {
+    members.inner_mut().rcu(move |members| {
+        let mut members = mimic_members(members);
+        assign_partitions_to_members(shard_id, id, &mut members, partitions.clone());
+        members
+    });
+}
+
+pub fn calculate_partition_id_unchecked(
+    member_id: usize,
+) -> impl FnOnce(ComponentsById<ConsumerGroupRef>) -> Option<usize> {
+    move |(_, members)| {
+            let members = members.inner();
+            let member = &members[member_id];
+            if member.partitions.is_empty() {
+                return None;
+            }
+
+            let partitions_count = member.partitions.len();
+            // It's OK to use `Relaxed` ordering, because we have 1-1 mapping between consumer and member.
+            // We allow only one consumer to access topic in a given shard
+            // therefore there is no contention on the member's current partition index.
+            let current = member
+                .current_partition_idx
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some((current + 1) % partitions_count)
+                })
+                .expect("fetch_and_update partition id for consumer group member");
+            Some(member.partitions[current])
+        }
+}
+
+pub fn get_current_partition_id_unchecked(
+    member_id: usize,
+) -> impl FnOnce(ComponentsById<ConsumerGroupRef>) -> Option<usize> {
+    move |(_, members)| {
+        members.inner().with_shared(|members| {
+            let member = &members[member_id];
+            if member.partitions.is_empty() {
+                return None;
+            }
+
+            let partition_idx = member.current_partition_idx.load(Ordering::Relaxed);
+            Some(member.partitions[partition_idx])
+        })
+    }
+}
+
+pub fn leave_consumer_group(
+    shard_id: u16,
+    client_id: u32,
+) -> impl FnOnce(ComponentsById<ConsumerGroupRefMut>) {
+    move |(root, members)| {
+        let partitions = root.partitions();
+        let id = root.id();
+        delete_member(shard_id, id, members, partitions, client_id);
     }
 }

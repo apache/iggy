@@ -23,6 +23,7 @@ use crate::binary::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::streaming::session::Session;
+use crate::streaming::streams;
 use anyhow::Result;
 use iggy_common::IggyError;
 use iggy_common::get_topics::GetTopics;
@@ -44,18 +45,19 @@ impl ServerCommandHandler for GetTopics {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
         shard.ensure_stream_exists(&self.stream_id)?;
-        shard.streams2.with_root_by_id(&self.stream_id, |root| {
-            shard
-                .permissioner
-                .borrow()
-                .get_topics(session.get_user_id(), root.id() as u32)
-        })?;
+        let numeric_stream_id = shard
+            .streams2
+            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
+        shard
+            .permissioner
+            .borrow()
+            .get_topics(session.get_user_id(), numeric_stream_id as u32);
 
         shard
             .streams2
             .with_topics_async(&self.stream_id, async |topics| {
                 topics
-                    .with_async(async |topics| {
+                    .with_components_async(async |topics| {
                         let (roots, stats) = topics.into_components();
                         let response = mapper::map_topics(&roots, &stats);
                         sender.send_ok_response(&response).await

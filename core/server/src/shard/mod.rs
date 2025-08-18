@@ -525,6 +525,8 @@ impl IggyShard {
     }
 
     async fn handle_request(&self, request: ShardRequest) -> Result<ShardResponse, IggyError> {
+        todo!();
+        /*
         let stream = self.get_stream(&Identifier::numeric(request.stream_id)?)?;
         let topic = stream.get_topic(&Identifier::numeric(request.topic_id)?)?;
         let partition_id = request.partition_id;
@@ -540,13 +542,13 @@ impl IggyShard {
                 Ok(ShardResponse::PollMessages((metadata, batch)))
             }
         }
+        */
     }
 
     async fn handle_event(&self, event: ShardEvent) -> Result<(), IggyError> {
         match event {
             ShardEvent::CreatedStream { stream_id, name } => {
-                self.create_stream_bypass_auth(stream_id, &name)?;
-                Ok(())
+                todo!();
             }
             ShardEvent::CreatedTopic {
                 stream_id,
@@ -576,44 +578,14 @@ impl IggyShard {
                 topic_id,
                 partition_ids,
             } => {
-                let records = self
-                    .create_shard_table_records(&partition_ids, stream_id, topic_id)
-                    .collect::<Vec<_>>();
-                let stream = self.get_stream(&Identifier::numeric(stream_id)?)?;
-                let topic = stream.get_topic(&Identifier::numeric(topic_id)?)?;
-                // Open partition and segments for that particular shard.
-                for (ns, shard_info) in records.iter() {
-                    if shard_info.id() == self.id {
-                        let partition_id = ns.partition_id;
-                        let partition = topic.get_partition(partition_id)?;
-                        let mut partition = partition.write().await;
-                        partition.open().await.with_error_context(|error| {
-                                                                                                            format!(
-                                                                                                                "{COMPONENT} (error: {error}) - failed to open partition with ID: {partition_id} in topic with ID: {topic_id} for stream with ID: {stream_id}"
-                                                                                                            )
-                                                                                                        })?;
-                    }
-                }
-                self.insert_shard_table_records(records);
-                Ok(())
+                todo!();
             }
             ShardEvent::CreatedPartitions {
                 stream_id,
                 topic_id,
                 partitions_count,
             } => {
-                let mut stream = self.get_stream_mut(&stream_id)?;
-                let topic = stream.get_topic_mut(&topic_id)?;
-                topic.add_persisted_partitions(partitions_count)
-                                                                                                    .with_error_context(|error| {
-                                                                                                        format!(
-                                                                                                            "{COMPONENT} (error: {error}) - failed to create partitions for topic with ID: {topic_id} in stream with ID: {stream_id}"
-                                                                                                        )
-                                                                                                    })?;
-                topic.reassign_consumer_groups();
-                self.metrics.increment_partitions(partitions_count);
-                self.metrics.increment_segments(partitions_count);
-                Ok(())
+                todo!();
             }
             ShardEvent::DeletedPartitions2 {
                 stream_id,
@@ -765,7 +737,7 @@ impl IggyShard {
                 Ok(())
             }
             ShardEvent::CreatedTopic2 { stream_id, topic } => {
-                let _topic_id = self.create_topic2_bypass_auth(&stream_id, topic)?;
+                let _topic_id = self.create_topic2_bypass_auth(&stream_id, topic);
                 Ok(())
             }
             ShardEvent::CreatedPartitions2 {

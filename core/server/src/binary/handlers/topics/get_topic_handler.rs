@@ -22,6 +22,7 @@ use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
+use crate::streaming::streams;
 use anyhow::Result;
 use iggy_common::IggyError;
 use iggy_common::get_topic::GetTopic;
@@ -43,15 +44,14 @@ impl ServerCommandHandler for GetTopic {
         debug!("session: {session}, command: {self}");
         shard.ensure_authenticated(session)?;
         shard.ensure_topic_exists(&self.stream_id, &self.topic_id)?;
-        shard
+        let numeric_stream_id = shard
             .streams2
-            .with_root_by_id(&self.stream_id, |stream_root| {
-                shard.permissioner.borrow().get_topic(
-                    session.get_user_id(),
-                    stream_root.id() as u32,
-                    self.topic_id.get_u32_value().unwrap_or(0),
-                )
-            })?;
+            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
+        shard.permissioner.borrow().get_topic(
+            session.get_user_id(),
+            numeric_stream_id as u32,
+            self.topic_id.get_u32_value().unwrap_or(0),
+        );
 
         shard
             .streams2

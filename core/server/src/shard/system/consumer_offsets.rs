@@ -32,6 +32,8 @@ impl IggyShard {
         offset: u64,
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
+        todo!();
+        /*
         let stream = self.get_stream(stream_id).with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - stream with ID: {stream_id} was not found")
         })?;
@@ -46,6 +48,7 @@ impl IggyShard {
         topic
             .store_consumer_offset(consumer, offset, partition_id, session.client_id)
             .await
+            */
     }
 
     pub async fn get_consumer_offset(
@@ -57,6 +60,8 @@ impl IggyShard {
         partition_id: Option<u32>,
     ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
         self.ensure_authenticated(session)?;
+        todo!();
+        /*
         let stream = self.get_stream(stream_id).with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - stream with ID: {stream_id} was not found")
         })?;
@@ -78,6 +83,7 @@ impl IggyShard {
         topic
             .get_consumer_offset(consumer, partition_id, session.client_id)
             .await
+            */
     }
 
     pub async fn delete_consumer_offset(
@@ -89,6 +95,8 @@ impl IggyShard {
         partition_id: Option<u32>,
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
+        todo!();
+        /*
         let stream = self.get_stream(stream_id).with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - stream with ID: {stream_id} was not found")
         })?;
@@ -108,5 +116,6 @@ impl IggyShard {
         topic
             .delete_consumer_offset(consumer, partition_id, session.client_id)
             .await
+            */
     }
 }
