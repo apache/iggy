@@ -29,7 +29,7 @@ repositories {
 }
 
 dependencies {
-    implementation(project(":iggy-java-sdk"))
+    implementation(project(":iggy"))
     implementation("org.slf4j:slf4j-api:2.0.9")
     runtimeOnly("ch.qos.logback:logback-classic:1.4.12")
     runtimeOnly("io.netty:netty-resolver-dns-native-macos:4.2.1.Final:osx-aarch_64")

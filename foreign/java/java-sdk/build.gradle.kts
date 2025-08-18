@@ -73,7 +73,7 @@ publishing {
     publications {
         create<MavenPublication>("maven") {
             groupId = "org.apache.iggy"
-            artifactId = "iggy-java-sdk"
+            artifactId = "iggy"
             version = "0.5.0-SNAPSHOT"
 
             from(components["java"])
