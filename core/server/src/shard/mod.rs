@@ -547,22 +547,6 @@ impl IggyShard {
 
     async fn handle_event(&self, event: ShardEvent) -> Result<(), IggyError> {
         match event {
-            ShardEvent::CreatedStream { stream_id, name } => {
-                todo!();
-            }
-            ShardEvent::CreatedTopic {
-                stream_id,
-                topic_id,
-                name,
-                partitions_count,
-                message_expiry,
-                compression_algorithm,
-                max_topic_size,
-                replication_factor,
-            } => {
-                let topic_id = topic_id.get_u32_value().ok();
-                Ok(())
-            }
             ShardEvent::LoginUser {
                 client_id,
                 username,
@@ -572,20 +556,6 @@ impl IggyShard {
                 let session = self.add_client(&address, transport);
                 self.add_active_session(session);
                 Ok(())
-            }
-            ShardEvent::CreatedShardTableRecords {
-                stream_id,
-                topic_id,
-                partition_ids,
-            } => {
-                todo!();
-            }
-            ShardEvent::CreatedPartitions {
-                stream_id,
-                topic_id,
-                partitions_count,
-            } => {
-                todo!();
             }
             ShardEvent::DeletedPartitions2 {
                 stream_id,
@@ -601,37 +571,9 @@ impl IggyShard {
                 )?;
                 Ok(())
             }
-            ShardEvent::DeletedPartitions {
-                stream_id,
-                topic_id,
-                partition_ids,
-            } => {
-                todo!();
-            }
-            ShardEvent::DeletedShardTableRecords { namespaces } => {
-                todo!();
-            }
-            ShardEvent::DeletedStream { stream_id } => {
-                todo!();
-            }
-            ShardEvent::UpdatedStream { stream_id, name } => {
-                todo!();
-            }
             ShardEvent::UpdatedStream2 { stream_id, name } => {
                 self.update_stream2_bypass_auth(&stream_id, &name)?;
                 Ok(())
-            }
-            ShardEvent::UpdatedTopic {
-                stream_id,
-                topic_id,
-                name,
-                message_expiry,
-                compression_algorithm,
-                max_topic_size,
-                replication_factor,
-            } => Ok(()),
-            ShardEvent::PurgedStream { stream_id } => {
-                todo!();
             }
             ShardEvent::PurgedStream2 { stream_id } => {
                 self.purge_stream2_bypass_auth(&stream_id)?;
@@ -642,29 +584,6 @@ impl IggyShard {
                 topic_id,
             } => {
                 todo!();
-            }
-            ShardEvent::DeletedTopic {
-                stream_id,
-                topic_id,
-            } => Ok(()),
-            ShardEvent::CreatedConsumerGroup {
-                stream_id,
-                topic_id,
-                consumer_group_id,
-                name,
-            } => self.create_consumer_group_bypass_auth(
-                &stream_id,
-                &topic_id,
-                consumer_group_id,
-                &name,
-            ),
-            ShardEvent::DeletedConsumerGroup {
-                stream_id,
-                topic_id,
-                consumer_group_id,
-            } => {
-                self.delete_consumer_group_bypass_auth(&stream_id, &topic_id, &consumer_group_id)?;
-                Ok(())
             }
             ShardEvent::CreatedUser {
                 username,
@@ -732,7 +651,7 @@ impl IggyShard {
                 Ok(())
             }
             ShardEvent::DeletedStream2 { id, stream_id } => {
-                let stream = self.delete_stream2_bypass_auth(&stream_id)?;
+                let stream = self.delete_stream2_bypass_auth(&stream_id);
                 assert_eq!(stream.id(), id);
                 Ok(())
             }
@@ -753,9 +672,7 @@ impl IggyShard {
                 stream_id,
                 topic_id,
             } => {
-                let topic = self
-                    .delete_topic_bypass_auth2(&stream_id, &topic_id)
-                    .await?;
+                let topic = self.delete_topic_bypass_auth2(&stream_id, &topic_id);
                 assert_eq!(topic.id(), id);
                 Ok(())
             }
@@ -780,18 +697,12 @@ impl IggyShard {
                 Ok(())
             }
             ShardEvent::CreatedConsumerGroup2 {
-                cg_id,
                 stream_id,
                 topic_id,
-                name,
-                members,
+                cg,
             } => {
-                let id = self.create_consumer_group_bypass_auth2(
-                    &stream_id,
-                    &topic_id,
-                    members.clone(),
-                    name.clone(),
-                )?;
+                let cg_id = cg.id();
+                let id = self.create_consumer_group_bypass_auth2(&stream_id, &topic_id, cg);
                 assert_eq!(id, cg_id);
                 Ok(())
             }
@@ -801,8 +712,7 @@ impl IggyShard {
                 topic_id,
                 group_id,
             } => {
-                let cg =
-                    self.delete_consumer_group_bypass_auth2(&stream_id, &topic_id, &group_id)?;
+                let cg = self.delete_consumer_group_bypass_auth2(&stream_id, &topic_id, &group_id);
                 assert_eq!(cg.id(), id);
                 Ok(())
             }
@@ -857,9 +767,7 @@ impl IggyShard {
                 let event = event.clone();
                 if matches!(
                     &event,
-                    ShardEvent::CreatedShardTableRecords { .. }
-                        | ShardEvent::DeletedShardTableRecords { .. }
-                        | ShardEvent::CreatedStream2 { .. }
+                    ShardEvent::CreatedStream2 { .. }
                         | ShardEvent::DeletedStream2 { .. }
                         | ShardEvent::CreatedTopic2 { .. }
                         | ShardEvent::DeletedTopic2 { .. }

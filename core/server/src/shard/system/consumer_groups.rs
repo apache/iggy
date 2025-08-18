@@ -19,10 +19,8 @@
 use super::COMPONENT;
 use crate::shard::IggyShard;
 use crate::slab::consumer_groups;
-use crate::slab::traits_ext::EntityComponentSystem;
 use crate::slab::traits_ext::EntityMarker;
 use crate::slab::traits_ext::Insert;
-use crate::slab::traits_ext::IntoComponents;
 use crate::streaming::partitions;
 use crate::streaming::session::Session;
 use crate::streaming::streams;
@@ -195,26 +193,49 @@ impl IggyShard {
         Ok(())
     }
 
-    pub async fn leave_consumer_group(
+    pub fn leave_consumer_group(
         &self,
         session: &Session,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        consumer_group_id: &Identifier,
+        group_id: &Identifier,
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
-        todo!();
+        {
+            let topic_id = self.streams2.with_topic_by_id(
+                stream_id,
+                topic_id,
+                topics::helpers::get_topic_id(),
+            );
+            let stream_id = self
+                .streams2
+                .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
+            self.permissioner.borrow().leave_consumer_group(
+                session.get_user_id(),
+                stream_id as u32,
+                topic_id as u32,
+            ).with_error_context(|error| format!("{COMPONENT} (error: {error}) - permission denied to leave consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), stream_id, topic_id))?;
+        }
+        self.streams2.with_consumer_group_by_id_mut(
+            stream_id,
+            topic_id,
+            group_id,
+            topics::helpers::leave_consumer_group(self.id, session.client_id),
+        );
+
+        // TODO:
+        // self.leave_consumer_group_by_client();
+        Ok(())
     }
 
     pub fn leave_consumer_group_by_client(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        consumer_group_id: &Identifier,
+        group_id: &Identifier,
         client_id: u32,
     ) -> Result<(), IggyError> {
-        todo!();
-
+        // TODO:
         /*
         self.client_manager.borrow_mut().leave_consumer_group(
             client_id,
@@ -223,5 +244,6 @@ impl IggyShard {
             group_id,
         )
         */
+        Ok(())
     }
 }

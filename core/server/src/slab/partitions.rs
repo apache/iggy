@@ -8,7 +8,6 @@ use crate::{
         },
         segments,
         stats::stats::PartitionStats,
-        topics::consumer_group,
     },
 };
 use slab::Slab;

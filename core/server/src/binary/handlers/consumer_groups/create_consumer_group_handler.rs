@@ -22,10 +22,12 @@ use crate::binary::mapper;
 use crate::binary::{handlers::consumer_groups::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
+use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateConsumerGroupWithId;
 use crate::streaming::session::Session;
 use crate::streaming::topics::consumer_group2::MEMBERS_CAPACITY;
+use crate::streaming::{streams, topics};
 use anyhow::Result;
 use arcshift::ArcShift;
 use error_set::ErrContext;
@@ -48,39 +50,39 @@ impl ServerCommandHandler for CreateConsumerGroup {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let cg_id = shard.create_consumer_group2(
+        let cg = shard.create_consumer_group2(
             session,
             &self.stream_id,
             &self.topic_id,
-            members.clone(),
-            self.group_id,
             self.name.clone(),
         )?;
+        let cg_id = cg.id();
         let event = ShardEvent::CreatedConsumerGroup2 {
-            cg_id,
             stream_id: self.stream_id.clone(),
             topic_id: self.topic_id.clone(),
-            name: self.name.clone(),
-            members,
+            cg,
         };
         let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
 
+        let stream_id = self.stream_id.clone();
+        let topic_id = self.topic_id.clone();
         shard
             .state
         .apply(
             session.get_user_id(),
            &EntryCommand::CreateConsumerGroup(CreateConsumerGroupWithId {
-                group_id,
+                group_id: cg_id as u32,
                 command: self
             }),
         )
             .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to apply create consumer group for stream_id: {stream_id}, topic_id: {topic_id}, group_id: {group_id:?}, session: {session}"
+                    "{COMPONENT} (error: {error}) - failed to apply create consumer group for stream_id: {stream_id}, topic_id: {topic_id}, group_id: {cg_id}, session: {session}"
                 )
             })?;
-        sender.send_ok_response(&response).await?;
+        // TODO: Fixme
+        //sender.send_ok_response(&response).await?;
         Ok(())
     }
 }

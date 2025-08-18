@@ -65,6 +65,7 @@ impl ServerCommandHandler for DeletePartitions {
         };
         let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
         // TODO: Delete shard table records.
+        // TODO: Rebalance the consumer group.
 
         shard
         .state

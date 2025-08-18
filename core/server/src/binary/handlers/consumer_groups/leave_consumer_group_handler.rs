@@ -51,7 +51,6 @@ impl ServerCommandHandler for LeaveConsumerGroup {
                 &self.topic_id,
                 &self.group_id,
             )
-            .await
             .with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to leave consumer group for stream_id: {}, topic_id: {}, group_id: {}, session: {}",

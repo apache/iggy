@@ -20,20 +20,16 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::streams::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
-use crate::shard::namespace::IggyNamespace;
 use crate::shard::transmission::event::ShardEvent;
 use crate::shard_info;
 use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
-use crate::streaming::partitions::partition;
 use crate::streaming::session::Session;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::delete_stream::DeleteStream;
-use iggy_common::locking::IggyRwLockFn;
 use std::rc::Rc;
-use std::time::Duration;
 use tracing::{debug, instrument};
 
 impl ServerCommandHandler for DeleteStream {

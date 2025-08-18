@@ -59,7 +59,8 @@ impl ServerCommandHandler for CreatePartitions {
             partitions,
         };
         let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
-        //TODO: Create shard table records.
+        // TODO: Create shard table records.
+        // TODO: Rebalance the consumer group.
 
         let stream_id = shard
             .streams2

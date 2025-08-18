@@ -28,11 +28,8 @@ use crate::{
         transmission::message::{ShardMessage, ShardRequest, ShardRequestPayload},
     },
     streaming::{
-        partitions::partition,
         polling_consumer::PollingConsumer,
         segments::{IggyMessagesBatchMut, IggyMessagesBatchSet},
-        streams::stream::Stream,
-        topics::topic::Topic,
     },
 };
 use std::sync::atomic::Ordering;

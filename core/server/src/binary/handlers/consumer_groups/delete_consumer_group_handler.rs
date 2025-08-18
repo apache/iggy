@@ -21,6 +21,7 @@ use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::consumer_groups::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
+use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use anyhow::Result;
@@ -50,30 +51,16 @@ impl ServerCommandHandler for DeleteConsumerGroup {
                 self.group_id, self.topic_id, self.stream_id, session
             )
         })?;
+        let cg_id = cg.id();
         let event = ShardEvent::DeletedConsumerGroup2 {
-            id: cg.id(),
+            id: cg_id,
             stream_id: self.stream_id.clone(),
             topic_id: self.topic_id.clone(),
             group_id: self.group_id.clone(),
         };
         let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
-
-        shard
-                .delete_consumer_group(
-                    session,
-                    &self.stream_id,
-                    &self.topic_id,
-                    &self.group_id,
-                )
-                .await.with_error_context(|error| format!(
-                    "{COMPONENT} (error: {error}) - failed to delete consumer group with ID: {} for topic with ID: {} in stream with ID: {} for session: {}",
-                    self.group_id, self.topic_id, self.stream_id, session
-                ))?;
-
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
-        let group_id = self.group_id.clone();
-
         shard
             .state
             .apply(
@@ -83,7 +70,8 @@ impl ServerCommandHandler for DeleteConsumerGroup {
             .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to apply delete consumer group for stream_id: {stream_id}, topic_id: {topic_id}, group_id: {group_id:?}, session: {session}"
+                    "{COMPONENT} (error: {error}) - failed to apply delete consumer group for stream_id: {}, topic_id: {}, group_id: {cg_id}, session: {session}",
+                    stream_id, topic_id
                 )
             })?;
         sender.send_empty_ok_response().await?;

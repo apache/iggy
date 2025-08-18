@@ -20,7 +20,6 @@ use crate::binary::handlers::messages::poll_messages_handler::IggyPollMetadata;
 use crate::streaming::polling_consumer::PollingConsumer;
 use crate::streaming::segments::{IggyMessagesBatchMut, IggyMessagesBatchSet};
 use crate::streaming::topics::COMPONENT;
-use crate::streaming::topics::topic::Topic;
 use crate::streaming::utils::hash;
 use ahash::AHashMap;
 use error_set::ErrContext;

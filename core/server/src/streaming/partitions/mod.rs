@@ -20,7 +20,6 @@ pub mod consumer_offset;
 pub mod consumer_offsets;
 pub mod helpers;
 pub mod messages;
-pub mod partition;
 pub mod partition2;
 pub mod persistence;
 pub mod segments;

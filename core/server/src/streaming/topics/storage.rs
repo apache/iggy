@@ -21,8 +21,6 @@ use crate::state::system::TopicState;
 use crate::streaming::partitions::partition::Partition;
 use crate::streaming::storage::TopicStorage;
 use crate::streaming::topics::COMPONENT;
-use crate::streaming::topics::consumer_group::ConsumerGroup;
-use crate::streaming::topics::topic::Topic;
 use ahash::AHashSet;
 use anyhow::Context;
 use compio::fs;

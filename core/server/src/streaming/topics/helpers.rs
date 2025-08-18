@@ -1,4 +1,4 @@
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::{Arc, atomic::Ordering};
 
 use crate::{
     shard_trace,
@@ -121,6 +121,11 @@ pub fn update_topic(
 }
 
 // Consumer Groups
+pub fn get_consumer_group_id()
+-> impl FnOnce(ComponentsById<ConsumerGroupRef>) -> consumer_groups::ContainerId {
+    |(root, _)| root.id()
+}
+
 pub fn delete_consumer_group(
     group_id: &Identifier,
 ) -> impl FnOnce(&mut ConsumerGroups) -> consumer_group2::ConsumerGroup {
@@ -143,6 +148,56 @@ pub fn join_consumer_group(
     }
 }
 
+pub fn leave_consumer_group(
+    shard_id: u16,
+    client_id: u32,
+) -> impl FnOnce(ComponentsById<ConsumerGroupRefMut>) {
+    move |(root, members)| {
+        let partitions = root.partitions();
+        let id = root.id();
+        delete_member(shard_id, id, client_id, members, partitions);
+    }
+}
+
+pub fn calculate_partition_id_unchecked(
+    member_id: usize,
+) -> impl FnOnce(ComponentsById<ConsumerGroupRef>) -> Option<usize> {
+    move |(_, members)| {
+        let members = members.inner().shared_get();
+        let member = &members[member_id];
+        if member.partitions.is_empty() {
+            return None;
+        }
+
+        let partitions_count = member.partitions.len();
+        // It's OK to use `Relaxed` ordering, because we have 1-1 mapping between consumer and member.
+        // We allow only one consumer to access topic in a given shard
+        // therefore there is no contention on the member's current partition index.
+        let current = member
+            .current_partition_idx
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some((current + 1) % partitions_count)
+            })
+            .expect("fetch_and_update partition id for consumer group member");
+        Some(member.partitions[current])
+    }
+}
+
+pub fn get_current_partition_id_unchecked(
+    member_id: usize,
+) -> impl FnOnce(ComponentsById<ConsumerGroupRef>) -> Option<usize> {
+    move |(_, members)| {
+        let members = members.inner().shared_get();
+        let member = &members[member_id];
+        if member.partitions.is_empty() {
+            return None;
+        }
+
+        let partition_idx = member.current_partition_idx.load(Ordering::Relaxed);
+        Some(member.partitions[partition_idx])
+    }
+}
+
 fn add_member(
     shard_id: u16,
     id: usize,
@@ -158,7 +213,13 @@ fn add_member(
     });
 }
 
-fn delete_member(shard_id: u16, id: usize, members: &mut ConsumerGroupMembers, partitions: &Vec<usize>, client_id: u32) {
+fn delete_member(
+    shard_id: u16,
+    id: usize,
+    client_id: u32,
+    members: &mut ConsumerGroupMembers,
+    partitions: &Vec<usize>,
+) {
     let member_id = members
         .inner()
         .shared_get()
@@ -208,12 +269,12 @@ fn mimic_members(members: &Slab<Member>) -> Slab<Member> {
     container
 }
 
-pub fn reassign_partitions(
+fn reassign_partitions(
     shard_id: u16,
     partitions: Vec<partitions::ContainerId>,
 ) -> impl FnOnce(ComponentsById<ConsumerGroupRefMut>) {
-    move |(mut root, members)| {
-        root.partitions_mut() = partitions;
+    move |(root, members)| {
+        root.assign_partitions(partitions);
         let partitions = root.partitions();
         let id = root.id();
         reassign_partitions_to_members(shard_id, id, members, partitions);
@@ -231,55 +292,4 @@ fn reassign_partitions_to_members(
         assign_partitions_to_members(shard_id, id, &mut members, partitions.clone());
         members
     });
-}
-
-pub fn calculate_partition_id_unchecked(
-    member_id: usize,
-) -> impl FnOnce(ComponentsById<ConsumerGroupRef>) -> Option<usize> {
-    move |(_, members)| {
-            let members = members.inner();
-            let member = &members[member_id];
-            if member.partitions.is_empty() {
-                return None;
-            }
-
-            let partitions_count = member.partitions.len();
-            // It's OK to use `Relaxed` ordering, because we have 1-1 mapping between consumer and member.
-            // We allow only one consumer to access topic in a given shard
-            // therefore there is no contention on the member's current partition index.
-            let current = member
-                .current_partition_idx
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                    Some((current + 1) % partitions_count)
-                })
-                .expect("fetch_and_update partition id for consumer group member");
-            Some(member.partitions[current])
-        }
-}
-
-pub fn get_current_partition_id_unchecked(
-    member_id: usize,
-) -> impl FnOnce(ComponentsById<ConsumerGroupRef>) -> Option<usize> {
-    move |(_, members)| {
-        members.inner().with_shared(|members| {
-            let member = &members[member_id];
-            if member.partitions.is_empty() {
-                return None;
-            }
-
-            let partition_idx = member.current_partition_idx.load(Ordering::Relaxed);
-            Some(member.partitions[partition_idx])
-        })
-    }
-}
-
-pub fn leave_consumer_group(
-    shard_id: u16,
-    client_id: u32,
-) -> impl FnOnce(ComponentsById<ConsumerGroupRefMut>) {
-    move |(root, members)| {
-        let partitions = root.partitions();
-        let id = root.id();
-        delete_member(shard_id, id, members, partitions, client_id);
-    }
 }

@@ -255,7 +255,7 @@ impl IggyShard {
         Ok(topic)
     }
 
-    pub async fn delete_topic_bypass_auth2(
+    pub fn delete_topic_bypass_auth2(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,

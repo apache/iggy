@@ -16,18 +16,12 @@
  * under the License.
  */
 
-pub mod consumer_group;
 pub mod consumer_group2;
-pub mod consumer_groups;
 pub mod consumer_offsets;
 pub mod helpers;
 pub mod messages;
-pub mod partitions;
-pub mod persistence;
-pub mod segments;
 pub mod storage;
 pub mod storage2;
-pub mod topic;
 pub mod topic2;
 
 pub const COMPONENT: &str = "STREAMING_TOPICS";

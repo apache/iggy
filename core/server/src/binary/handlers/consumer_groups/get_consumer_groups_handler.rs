@@ -22,7 +22,9 @@ use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
 use crate::shard::IggyShard;
+use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::streaming::session::Session;
+use crate::streaming::{streams, topics};
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
@@ -43,16 +45,30 @@ impl ServerCommandHandler for GetConsumerGroups {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let consumer_groups = shard
-            .get_consumer_groups(session, &self.stream_id, &self.topic_id)
-            .with_error_context(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed on getting consumer groups for stream_id: {}, topic_id: {}, session: {}",
-                    self.stream_id, self.topic_id, session
-                )
-            })?;
-        let consumer_groups = mapper::map_consumer_groups(consumer_groups);
-        sender.send_ok_response(&consumer_groups).await?;
+        shard.ensure_authenticated(session)?;
+        shard.ensure_topic_exists(&self.stream_id, &self.topic_id)?;
+        let numeric_topic_id = shard.streams2.with_topic_by_id(
+            &self.stream_id,
+            &self.topic_id,
+            topics::helpers::get_topic_id(),
+        );
+        let numeric_stream_id = shard
+            .streams2
+            .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
+        shard.permissioner.borrow().get_consumer_groups(
+            session.get_user_id(),
+            numeric_stream_id as u32,
+            numeric_topic_id as u32,
+        );
+
+        shard.streams2.with_consumer_groups_async(&self.stream_id, &self.topic_id, async |cgs| {
+            cgs.with_components_async(async |cgs| {
+                let (roots, members) = cgs.into_components();
+                let consumer_groups = mapper::map_consumer_groups(roots, members);
+                sender.send_ok_response(&consumer_groups).await
+            })
+            .await
+        }).await?;
         Ok(())
     }
 }

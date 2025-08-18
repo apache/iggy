@@ -16,20 +16,19 @@
  * under the License.
  */
 
-use std::cell::Ref;
 use std::sync::{Arc, atomic::AtomicU64};
 
 use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
+use crate::slab::Keyed;
 use crate::streaming::clients::client_manager::{Client, Transport};
 use crate::streaming::partitions::partition2::PartitionRoot;
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::stats::stats::{PartitionStats, StreamStats, TopicStats};
-use crate::streaming::streams::stream::Stream;
 use crate::streaming::streams::stream2;
-use crate::streaming::topics::consumer_group::ConsumerGroup;
-use crate::streaming::topics::topic::Topic;
+use crate::streaming::topics::consumer_group2::{ConsumerGroupMembers, ConsumerGroupRoot, Member};
 use crate::streaming::topics::topic2::{self, TopicRoot};
 use crate::streaming::users::user::User;
+use arcshift::SharedGetGuard;
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_common::{BytesSerializable, ConsumerOffsetInfo, Stats, UserId};
 use slab::Slab;
@@ -202,25 +201,33 @@ pub fn map_topic(root: &topic2::TopicRoot, stats: &TopicStats) -> Bytes {
     bytes.freeze()
 }
 
-pub fn map_consumer_group(consumer_group: &ConsumerGroup) -> Bytes {
+pub fn map_consumer_group(
+    root: &ConsumerGroupRoot,
+    members: &ConsumerGroupMembers,
+) -> Bytes {
     let mut bytes = BytesMut::new();
-    extend_consumer_group(consumer_group, &mut bytes);
-    let members = consumer_group.get_members();
-    for member in members {
-        bytes.put_u32_le(member.id);
-        let partitions = member.get_partitions();
-        bytes.put_u32_le(partitions.len() as u32);
-        for partition in partitions {
-            bytes.put_u32_le(partition);
+    let members = members.inner().shared_get();
+    extend_consumer_group(root, &members, &mut bytes);
+
+    for (_, member) in members.iter() {
+        bytes.put_u32_le(member.id as u32);
+        bytes.put_u32_le(member.client_id);
+        bytes.put_u32_le(member.partitions.len() as u32);
+        for partition in &member.partitions {
+            bytes.put_u32_le(*partition as u32);
         }
     }
     bytes.freeze()
 }
 
-pub fn map_consumer_groups(consumer_groups: Vec<ConsumerGroup>) -> Bytes {
+pub fn map_consumer_groups(roots: &Slab<ConsumerGroupRoot>, members: &Slab<ConsumerGroupMembers>) -> Bytes {
     let mut bytes = BytesMut::new();
-    for consumer_group in consumer_groups {
-        extend_consumer_group(&consumer_group, &mut bytes);
+    for (root, member) in roots
+        .iter()
+        .map(|(_, val)| val)
+        .zip(members.iter().map(|(_, val)| val.inner().shared_get()))
+    {
+        extend_consumer_group(root, &member, &mut bytes);
     }
     bytes.freeze()
 }
@@ -233,34 +240,6 @@ fn extend_stream(root: &stream2::StreamRoot, stats: &StreamStats, bytes: &mut By
     bytes.put_u64_le(stats.messages_count_inconsistent());
     bytes.put_u8(root.name().len() as u8);
     bytes.put_slice(root.name().as_bytes());
-}
-
-fn extend_stream_legacy(stream: &Stream, bytes: &mut BytesMut) {
-    bytes.put_u32_le(stream.stream_id);
-    bytes.put_u64_le(stream.created_at.into());
-    bytes.put_u32_le(stream.get_topics().len() as u32);
-    bytes.put_u64_le(stream.get_size().as_bytes_u64());
-    bytes.put_u64_le(stream.get_messages_count());
-    bytes.put_u8(stream.name.len() as u8);
-    bytes.put_slice(stream.name.as_bytes());
-}
-
-fn extend_topic_legacy(topic: &Topic, bytes: &mut BytesMut) {
-    bytes.put_u32_le(topic.topic_id);
-    bytes.put_u64_le(topic.created_at.into());
-    bytes.put_u32_le(topic.partitions.len() as u32);
-    bytes.put_u64_le(topic.message_expiry.into());
-    bytes.put_u8(topic.compression_algorithm.as_code());
-    bytes.put_u64_le(topic.max_topic_size.into());
-    bytes.put_u8(topic.replication_factor);
-    bytes.put_u64_le(topic.size_bytes.load(std::sync::atomic::Ordering::Relaxed));
-    bytes.put_u64_le(
-        topic
-            .messages_count
-            .load(std::sync::atomic::Ordering::Relaxed),
-    );
-    bytes.put_u8(topic.name.len() as u8);
-    bytes.put_slice(topic.name.as_bytes());
 }
 
 fn extend_topic(root: &TopicRoot, stats: &TopicStats, bytes: &mut BytesMut) {
@@ -291,12 +270,18 @@ fn extend_partition(
     bytes.put_u64_le(stats.messages_count_inconsistent());
 }
 
-fn extend_consumer_group(consumer_group: &ConsumerGroup, bytes: &mut BytesMut) {
-    bytes.put_u32_le(consumer_group.group_id);
-    bytes.put_u32_le(consumer_group.partitions_count);
-    bytes.put_u32_le(consumer_group.get_members().len() as u32);
-    bytes.put_u8(consumer_group.name.len() as u8);
-    bytes.put_slice(consumer_group.name.as_bytes());
+fn extend_consumer_group(
+    root: &ConsumerGroupRoot,
+    members: &SharedGetGuard<'_, Slab<Member>>,
+    bytes: &mut BytesMut,
+) {
+    bytes.put_u32_le(root.id() as u32);
+    bytes.put_u32_le(root.partitions().len() as u32);
+    
+    bytes.put_u32_le(members.len() as u32);
+    
+    bytes.put_u8(root.key().len() as u8);
+    bytes.put_slice(root.key().as_bytes());
 }
 
 fn extend_client(client: &Client, bytes: &mut BytesMut) {

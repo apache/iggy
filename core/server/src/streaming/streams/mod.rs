@@ -20,11 +20,8 @@ pub mod helpers;
 pub mod messages;
 pub mod partitions;
 pub mod persistence;
-pub mod segments;
 pub mod storage;
 pub mod storage2;
-pub mod stream;
 pub mod stream2;
-pub mod topics;
 
 pub const COMPONENT: &str = "STREAMING_STREAMS";
