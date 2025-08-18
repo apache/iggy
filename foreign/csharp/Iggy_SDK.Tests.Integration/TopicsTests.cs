@@ -30,9 +30,14 @@ namespace Apache.Iggy.Tests.Integrations;
 [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
 public class TopicsTests(Protocol protocol)
 {
-    private static readonly CreateTopicRequest TopicRequest = new(1, "Test Topic", CompressionAlgorithm.Gzip, 1000, 1, 2, 2_000_000_000);
-    private static readonly CreateTopicRequest TopicRequestSecond = new(2, "Test Topic 2", CompressionAlgorithm.Gzip, 1000, 1, 2, 2_000_000_000);
-    private static readonly UpdateTopicRequest UpdateTopicRequest = new("Updated Topic", CompressionAlgorithm.Gzip, 3_000_000_000, 2000, 3);
+    private static readonly CreateTopicRequest TopicRequest = new(1, "Test Topic", CompressionAlgorithm.Gzip, 1000, 1,
+        2, 2_000_000_000);
+
+    private static readonly CreateTopicRequest TopicRequestSecond
+        = new(2, "Test Topic 2", CompressionAlgorithm.Gzip, 1000, 1, 2, 2_000_000_000);
+
+    private static readonly UpdateTopicRequest UpdateTopicRequest
+        = new("Updated Topic", CompressionAlgorithm.Gzip, 3_000_000_000, 2000, 3);
 
     [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerClass)]
     public required IggyServerFixture Fixture { get; init; }
@@ -43,7 +48,8 @@ public class TopicsTests(Protocol protocol)
         await Fixture.Clients[protocol].CreateStreamAsync("Test Stream", 1);
 
         var response = await Fixture.Clients[protocol].CreateTopicAsync(Identifier.Numeric(1), TopicRequest.Name,
-            TopicRequest.PartitionsCount, TopicRequest.CompressionAlgorithm, TopicRequest.TopicId, TopicRequest.ReplicationFactor,
+            TopicRequest.PartitionsCount, TopicRequest.CompressionAlgorithm, TopicRequest.TopicId,
+            TopicRequest.ReplicationFactor,
             TopicRequest.MessageExpiry, TopicRequest.MaxTopicSize);
 
         response.ShouldNotBeNull();
@@ -64,7 +70,8 @@ public class TopicsTests(Protocol protocol)
     [DependsOn(nameof(Create_NewTopic_Should_Return_Successfully))]
     public async Task Create_DuplicateTopic_Should_Throw_InvalidResponse()
     {
-        await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol].CreateTopicAsync(Identifier.Numeric(1),
+        await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol].CreateTopicAsync(
+            Identifier.Numeric(1),
             TopicRequest.Name, TopicRequest.PartitionsCount, TopicRequest.CompressionAlgorithm, TopicRequest.TopicId,
             TopicRequest.ReplicationFactor, TopicRequest.MessageExpiry, TopicRequest.MaxTopicSize));
     }
@@ -94,7 +101,8 @@ public class TopicsTests(Protocol protocol)
     public async Task Get_ExistingTopics_Should_ReturnValidResponse()
     {
         await Fixture.Clients[protocol].CreateTopicAsync(Identifier.Numeric(1), TopicRequestSecond.Name,
-            TopicRequestSecond.PartitionsCount, TopicRequestSecond.CompressionAlgorithm, TopicRequestSecond.TopicId, TopicRequestSecond.ReplicationFactor,
+            TopicRequestSecond.PartitionsCount, TopicRequestSecond.CompressionAlgorithm, TopicRequestSecond.TopicId,
+            TopicRequestSecond.ReplicationFactor,
             TopicRequestSecond.MessageExpiry, TopicRequestSecond.MaxTopicSize);
 
         IReadOnlyList<TopicResponse> response = await Fixture.Clients[protocol].GetTopicsAsync(Identifier.Numeric(1));
@@ -187,7 +195,8 @@ public class TopicsTests(Protocol protocol)
     public async Task Update_ExistingTopic_Should_UpdateTopic_Successfully()
     {
         await Should.NotThrowAsync(Fixture.Clients[protocol].UpdateTopicAsync(Identifier.Numeric(1),
-            Identifier.Numeric(TopicRequest.TopicId!.Value), UpdateTopicRequest.Name, UpdateTopicRequest.CompressionAlgorithm,
+            Identifier.Numeric(TopicRequest.TopicId!.Value), UpdateTopicRequest.Name,
+            UpdateTopicRequest.CompressionAlgorithm,
             UpdateTopicRequest.MaxTopicSize, UpdateTopicRequest.MessageExpiry, UpdateTopicRequest.ReplicationFactor));
 
         var result = await Fixture.Clients[protocol].GetTopicByIdAsync(Identifier.Numeric(1),
@@ -204,7 +213,8 @@ public class TopicsTests(Protocol protocol)
     [DependsOn(nameof(Update_ExistingTopic_Should_UpdateTopic_Successfully))]
     public async Task Purge_ExistingTopic_Should_PurgeTopic_Successfully()
     {
-        var beforePurge = await Fixture.Clients[protocol].GetTopicByIdAsync(Identifier.Numeric(1), Identifier.Numeric(TopicRequest.TopicId!.Value));
+        var beforePurge = await Fixture.Clients[protocol]
+            .GetTopicByIdAsync(Identifier.Numeric(1), Identifier.Numeric(TopicRequest.TopicId!.Value));
 
         beforePurge.ShouldNotBeNull();
         beforePurge.MessagesCount.ShouldBe(9u);
@@ -213,7 +223,8 @@ public class TopicsTests(Protocol protocol)
         await Should.NotThrowAsync(Fixture.Clients[protocol].PurgeTopicAsync(Identifier.Numeric(1),
             Identifier.Numeric(TopicRequest.TopicId!.Value)));
 
-        var afterPurge = await Fixture.Clients[protocol].GetTopicByIdAsync(Identifier.Numeric(1), Identifier.Numeric(TopicRequest.TopicId!.Value));
+        var afterPurge = await Fixture.Clients[protocol]
+            .GetTopicByIdAsync(Identifier.Numeric(1), Identifier.Numeric(TopicRequest.TopicId!.Value));
         afterPurge.ShouldNotBeNull();
         afterPurge!.MessagesCount.ShouldBe(0u);
         afterPurge.Size.ShouldBe(0u);
@@ -231,7 +242,8 @@ public class TopicsTests(Protocol protocol)
     [DependsOn(nameof(Delete_ExistingTopic_Should_DeleteTopic_Successfully))]
     public async Task Delete_NonExistingTopic_Should_Throw_InvalidResponse()
     {
-        await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol].DeleteTopicAsync(Identifier.Numeric(1),
+        await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol].DeleteTopicAsync(
+            Identifier.Numeric(1),
             Identifier.Numeric(TopicRequest.TopicId!.Value)));
     }
 
@@ -239,7 +251,8 @@ public class TopicsTests(Protocol protocol)
     [DependsOn(nameof(Delete_NonExistingTopic_Should_Throw_InvalidResponse))]
     public async Task Get_NonExistingTopic_Should_Throw_InvalidResponse()
     {
-        await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol].GetTopicByIdAsync(Identifier.Numeric(1),
+        await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol].GetTopicByIdAsync(
+            Identifier.Numeric(1),
             Identifier.Numeric(TopicRequest.TopicId!.Value)));
     }
 
@@ -257,8 +270,10 @@ public class TopicsTests(Protocol protocol)
             MaxTopicSize = 2_000_000_000
         };
 
-        var response = await Fixture.Clients[protocol].CreateTopicAsync(Identifier.Numeric(1), topicRequestWithoutId.Name,
-            topicRequestWithoutId.PartitionsCount, topicRequestWithoutId.CompressionAlgorithm, topicRequestWithoutId.TopicId, topicRequestWithoutId.ReplicationFactor,
+        var response = await Fixture.Clients[protocol].CreateTopicAsync(Identifier.Numeric(1),
+            topicRequestWithoutId.Name,
+            topicRequestWithoutId.PartitionsCount, topicRequestWithoutId.CompressionAlgorithm,
+            topicRequestWithoutId.TopicId, topicRequestWithoutId.ReplicationFactor,
             topicRequestWithoutId.MessageExpiry, topicRequestWithoutId.MaxTopicSize);
 
         response.ShouldNotBeNull();

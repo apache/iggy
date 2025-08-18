@@ -46,14 +46,16 @@ public class PersonalAccessTokenTests(Protocol protocol)
     [DependsOn(nameof(CreatePersonalAccessToken_HappyPath_Should_CreatePersonalAccessToken_Successfully))]
     public async Task CreatePersonalAccessToken_Duplicate_Should_Throw_InvalidResponse()
     {
-        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].CreatePersonalAccessTokenAsync(Name, Expiry));
+        await Should.ThrowAsync<InvalidResponseException>(() =>
+            Fixture.Clients[protocol].CreatePersonalAccessTokenAsync(Name, Expiry));
     }
 
     [Test]
     [DependsOn(nameof(CreatePersonalAccessToken_Duplicate_Should_Throw_InvalidResponse))]
     public async Task GetPersonalAccessTokens_Should_ReturnValidResponse()
     {
-        IReadOnlyList<PersonalAccessTokenResponse> response = await Fixture.Clients[protocol].GetPersonalAccessTokensAsync();
+        IReadOnlyList<PersonalAccessTokenResponse> response
+            = await Fixture.Clients[protocol].GetPersonalAccessTokensAsync();
 
         response.ShouldNotBeNull();
         response.Count.ShouldBe(1);

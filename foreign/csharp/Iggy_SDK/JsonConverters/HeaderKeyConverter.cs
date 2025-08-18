@@ -33,7 +33,8 @@ internal class HeaderKeyConverter : JsonConverter<HeaderKey>
         writer.WriteStringValue(value.Value);
     }
 
-    public override HeaderKey ReadAsPropertyName(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    public override HeaderKey ReadAsPropertyName(ref Utf8JsonReader reader, Type typeToConvert,
+        JsonSerializerOptions options)
     {
         return HeaderKey.New(reader.GetString() ?? throw new JsonException("Header key cannot be null or empty."));
     }

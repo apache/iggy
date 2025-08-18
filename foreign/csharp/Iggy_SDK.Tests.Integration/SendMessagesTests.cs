@@ -48,19 +48,25 @@ public class SendMessagesTests(Protocol protocol)
                           "completed": false
                         }
                         """;
-        _messagesWithoutHeaders = [new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes(dummyJson)), new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes(dummyJson))];
+        _messagesWithoutHeaders =
+        [
+            new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes(dummyJson)),
+            new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes(dummyJson))
+        ];
         _messagesWithHeaders =
         [
-            new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes(dummyJson), new Dictionary<HeaderKey, HeaderValue>
-            {
-                { HeaderKey.New("header1"), HeaderValue.FromString("value1") },
-                { HeaderKey.New("header2"), HeaderValue.FromInt32(444) }
-            }),
-            new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes(dummyJson), new Dictionary<HeaderKey, HeaderValue>
-            {
-                { HeaderKey.New("header1"), HeaderValue.FromString("value1") },
-                { HeaderKey.New("header2"), HeaderValue.FromInt32(444) }
-            })
+            new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes(dummyJson),
+                new Dictionary<HeaderKey, HeaderValue>
+                {
+                    { HeaderKey.New("header1"), HeaderValue.FromString("value1") },
+                    { HeaderKey.New("header2"), HeaderValue.FromInt32(444) }
+                }),
+            new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes(dummyJson),
+                new Dictionary<HeaderKey, HeaderValue>
+                {
+                    { HeaderKey.New("header1"), HeaderValue.FromString("value1") },
+                    { HeaderKey.New("header2"), HeaderValue.FromInt32(444) }
+                })
         ];
 
         return Task.CompletedTask;
@@ -82,13 +88,14 @@ public class SendMessagesTests(Protocol protocol)
     [DependsOn(nameof(SendMessages_NoHeaders_Should_SendMessages_Successfully))]
     public async Task SendMessages_NoHeaders_Should_Throw_InvalidResponse()
     {
-        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest
-        {
-            Messages = _messagesWithoutHeaders,
-            Partitioning = Partitioning.None(),
-            StreamId = Identifier.Numeric(Fixture.StreamId),
-            TopicId = Identifier.Numeric(69)
-        }));
+        await Should.ThrowAsync<InvalidResponseException>(() =>
+            Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest
+            {
+                Messages = _messagesWithoutHeaders,
+                Partitioning = Partitioning.None(),
+                StreamId = Identifier.Numeric(Fixture.StreamId),
+                TopicId = Identifier.Numeric(69)
+            }));
     }
 
     [Test]
@@ -108,20 +115,22 @@ public class SendMessagesTests(Protocol protocol)
     [DependsOn(nameof(SendMessages_WithHeaders_Should_SendMessages_Successfully))]
     public async Task SendMessages_WithHeaders_Should_Throw_InvalidResponse()
     {
-        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest
-        {
-            Messages = _messagesWithHeaders,
-            Partitioning = Partitioning.None(),
-            StreamId = Identifier.Numeric(Fixture.StreamId),
-            TopicId = Identifier.Numeric(69)
-        }));
+        await Should.ThrowAsync<InvalidResponseException>(() =>
+            Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest
+            {
+                Messages = _messagesWithHeaders,
+                Partitioning = Partitioning.None(),
+                StreamId = Identifier.Numeric(Fixture.StreamId),
+                TopicId = Identifier.Numeric(69)
+            }));
     }
 
     [Test]
     [DependsOn(nameof(SendMessages_WithHeaders_Should_Throw_InvalidResponse))]
     public async Task SendMessages_WithEncryptor_Should_SendMessage_Successfully()
     {
-        await Fixture.Clients[protocol].SendMessagesAsync(Identifier.Numeric(Fixture.StreamId), Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), Partitioning.None(),
+        await Fixture.Clients[protocol].SendMessagesAsync(Identifier.Numeric(Fixture.StreamId),
+            Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), Partitioning.None(),
             [new Message(Guid.NewGuid(), "Test message"u8.ToArray())], bytes =>
             {
                 Array.Reverse(bytes);

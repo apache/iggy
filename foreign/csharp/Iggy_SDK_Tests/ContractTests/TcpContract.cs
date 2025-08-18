@@ -372,7 +372,8 @@ public sealed class TcpContract
     public void TcpContracts_CreateUser_WithPermission_HasCorrectBytes()
     {
         // Arrange
-        var request = new CreateUserRequest("testuser", "testpassword", UserStatus.Active, PermissionsFactory.CreatePermissions());
+        var request = new CreateUserRequest("testuser", "testpassword", UserStatus.Active,
+            PermissionsFactory.CreatePermissions());
 
         // Act
         var result = TcpContracts.CreateUser(request.Username, request.Password, request.Status, request.Permissions);
@@ -414,7 +415,7 @@ public sealed class TcpContract
 
             var permissionsBytes = result[position..(position + permissionsSize)];
             var mappedPermissions = PermissionsFactory.PermissionsFromBytes(permissionsBytes);
-            request.Permissions.Global.Should().BeEquivalentTo(mappedPermissions.Global);
+            request.Permissions!.Global.Should().BeEquivalentTo(mappedPermissions.Global);
 
             if (request.Permissions.Streams != null)
             {
@@ -524,16 +525,15 @@ public sealed class TcpContract
         Assert.Equal(request.StreamId.Length, BytesToIdentifierNumeric(result, 7).Length);
         Assert.Equal(request.TopicId.Length, BytesToIdentifierNumeric(result, 13).Length);
         Assert.Equal(request.PartitionId, BitConverter.ToUInt32(result[19..23]));
-        Assert.Equal(
-            result[23] switch
-            {
-                1 => MessagePolling.Offset,
-                2 => MessagePolling.Timestamp,
-                3 => MessagePolling.First,
-                4 => MessagePolling.Last,
-                5 => MessagePolling.Next,
-                _ => throw new ArgumentOutOfRangeException()
-            }, request.PollingStrategy.Kind);
+        Assert.Equal(result[23] switch
+        {
+            1 => MessagePolling.Offset,
+            2 => MessagePolling.Timestamp,
+            3 => MessagePolling.First,
+            4 => MessagePolling.Last,
+            5 => MessagePolling.Next,
+            _ => throw new ArgumentOutOfRangeException()
+        }, request.PollingStrategy.Kind);
         Assert.Equal(request.PollingStrategy.Value, BitConverter.ToUInt64(result[24..32]));
         Assert.Equal(request.Count, BitConverter.ToInt32(result[32..36]));
         Assert.Equal(request.AutoCommit, result[36] switch
@@ -582,10 +582,15 @@ public sealed class TcpContract
         foreach (var message in request.Messages)
         {
             Assert.Equal(message.Header.Checksum, BitConverter.ToUInt64(result[currentIndex..(currentIndex + 8)]));
-            Assert.Equal(message.Header.Id, BinaryPrimitives.ReadUInt128LittleEndian(result[(currentIndex + 8)..(currentIndex + 24)]));
-            Assert.Equal(message.Header.Offset, BitConverter.ToUInt64(result[(currentIndex + 24)..(currentIndex + 32)]));
-            Assert.Equal(message.Header.Timestamp, DateTimeOffsetUtils.FromUnixTimeMicroSeconds(BitConverter.ToUInt64(result[(currentIndex + 32)..(currentIndex + 40)])));
-            Assert.Equal(message.Header.OriginTimestamp, BitConverter.ToUInt64(result[(currentIndex + 40)..(currentIndex + 48)]));
+            Assert.Equal(message.Header.Id,
+                BinaryPrimitives.ReadUInt128LittleEndian(result[(currentIndex + 8)..(currentIndex + 24)]));
+            Assert.Equal(message.Header.Offset,
+                BitConverter.ToUInt64(result[(currentIndex + 24)..(currentIndex + 32)]));
+            Assert.Equal(message.Header.Timestamp,
+                DateTimeOffsetUtils.FromUnixTimeMicroSeconds(
+                    BitConverter.ToUInt64(result[(currentIndex + 32)..(currentIndex + 40)])));
+            Assert.Equal(message.Header.OriginTimestamp,
+                BitConverter.ToUInt64(result[(currentIndex + 40)..(currentIndex + 48)]));
             var userHeadersLength = BitConverter.ToInt32(result[(currentIndex + 48)..(currentIndex + 52)]);
             Assert.Equal(message.Header.UserHeadersLength, userHeadersLength);
             var payloadLength = BitConverter.ToInt32(result[(currentIndex + 52)..(currentIndex + 56)]);
@@ -973,7 +978,8 @@ public sealed class TcpContract
         };
     }
 
-    private static void WriteBytesFromStreamAndTopicIdToSpan(Identifier streamId, Identifier topicId, Span<byte> bytes, int startPos = 0)
+    private static void WriteBytesFromStreamAndTopicIdToSpan(Identifier streamId, Identifier topicId, Span<byte> bytes,
+        int startPos = 0)
     {
         bytes[startPos] = streamId.Kind switch
         {

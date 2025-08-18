@@ -35,7 +35,8 @@ public class FlushMessageFixture : IggyServerFixture
         foreach (var client in Clients.Values)
         {
             await client.CreateStreamAsync("TestStream", StreamId);
-            await client.CreateTopicAsync(Identifier.Numeric(StreamId), TopicRequest.Name, TopicRequest.PartitionsCount, topicId: TopicRequest.TopicId);
+            await client.CreateTopicAsync(Identifier.Numeric(StreamId), TopicRequest.Name, TopicRequest.PartitionsCount,
+                topicId: TopicRequest.TopicId);
 
             await client.SendMessagesAsync(new MessageSendRequest
             {

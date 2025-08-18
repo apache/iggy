@@ -72,7 +72,8 @@ public class HttpMessageStream : IIggyClient
         };
     }
 
-    public async Task<StreamResponse?> CreateStreamAsync(string name, uint? streamId = null, CancellationToken token = default)
+    public async Task<StreamResponse?> CreateStreamAsync(string name, uint? streamId = null,
+        CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(new CreateStreamRequest(streamId, name), _jsonSerializerOptions);
 
@@ -148,8 +149,10 @@ public class HttpMessageStream : IIggyClient
         return Array.Empty<StreamResponse>();
     }
 
-    public async Task<TopicResponse?> CreateTopicAsync(Identifier streamId, string name, uint partitionsCount, CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
-        uint? topicId = null, byte? replicationFactor = null, ulong messageExpiry = 0, ulong maxTopicSize = 0, CancellationToken token = default)
+    public async Task<TopicResponse?> CreateTopicAsync(Identifier streamId, string name, uint partitionsCount,
+        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
+        uint? topicId = null, byte? replicationFactor = null, ulong messageExpiry = 0, ulong maxTopicSize = 0,
+        CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(new CreateTopicRequest
         {
@@ -175,10 +178,14 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
 
-    public async Task UpdateTopicAsync(Identifier streamId, Identifier topicId, string name, CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
-        ulong maxTopicSize = 0, ulong messageExpiry = 0, byte? replicationFactor = null, CancellationToken token = default)
+    public async Task UpdateTopicAsync(Identifier streamId, Identifier topicId, string name,
+        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
+        ulong maxTopicSize = 0, ulong messageExpiry = 0, byte? replicationFactor = null,
+        CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new UpdateTopicRequest(name, compressionAlgorithm, maxTopicSize, messageExpiry, replicationFactor), _jsonSerializerOptions);
+        var json = JsonSerializer.Serialize(
+            new UpdateTopicRequest(name, compressionAlgorithm, maxTopicSize, messageExpiry, replicationFactor),
+            _jsonSerializerOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PutAsync($"/streams/{streamId}/topics/{topicId}", data, token);
         if (!response.IsSuccessStatusCode)
@@ -208,7 +215,8 @@ public class HttpMessageStream : IIggyClient
             }, token);
     }
 
-    public async Task<IReadOnlyList<TopicResponse>> GetTopicsAsync(Identifier streamId, CancellationToken token = default)
+    public async Task<IReadOnlyList<TopicResponse>> GetTopicsAsync(Identifier streamId,
+        CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync($"/streams/{streamId}/topics", token);
         if (response.IsSuccessStatusCode)
@@ -221,7 +229,8 @@ public class HttpMessageStream : IIggyClient
         return Array.Empty<TopicResponse>();
     }
 
-    public async Task<TopicResponse?> GetTopicByIdAsync(Identifier streamId, Identifier topicId, CancellationToken token = default)
+    public async Task<TopicResponse?> GetTopicByIdAsync(Identifier streamId, Identifier topicId,
+        CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync($"/streams/{streamId}/topics/{topicId}", token);
 
@@ -273,10 +282,7 @@ public class HttpMessageStream : IIggyClient
                 return new Message
                 {
                     // TODO: message id
-                    Header = new MessageHeader
-                    {
-                        Id = 0
-                    },
+                    Header = new MessageHeader { Id = 0 },
                     UserHeaders = headers,
                     Payload = encryptor is not null ? encryptor(serializer(message)) : serializer(message)
                 };
@@ -292,7 +298,8 @@ public class HttpMessageStream : IIggyClient
             catch
             {
                 var partId = BinaryPrimitives.ReadInt32LittleEndian(sendRequest.Partitioning.Value);
-                _logger.LogError("Error encountered while sending messages - Stream ID:{StreamId}, Topic ID:{TopicId}, Partition ID: {PartitionId}",
+                _logger.LogError(
+                    "Error encountered while sending messages - Stream ID:{StreamId}, Topic ID:{TopicId}, Partition ID: {PartitionId}",
                     sendRequest.StreamId, sendRequest.TopicId, partId);
             }
 
@@ -302,7 +309,8 @@ public class HttpMessageStream : IIggyClient
         await _channel!.Writer.WriteAsync(sendRequest, token);
     }
 
-    public async Task FlushUnsavedBufferAsync(Identifier streamId, Identifier topicId, uint partitionId, bool fsync, CancellationToken token = default)
+    public async Task FlushUnsavedBufferAsync(Identifier streamId, Identifier topicId, uint partitionId, bool fsync,
+        CancellationToken token = default)
     {
         var url = CreateUrl($"/streams/{streamId}/topics/{topicId}/messages/flush/{partitionId}/{fsync}");
 
@@ -314,11 +322,13 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
-    public async Task<PolledMessages> PollMessagesAsync(MessageFetchRequest request, Func<byte[], byte[]>? decryptor = null,
+    public async Task<PolledMessages> PollMessagesAsync(MessageFetchRequest request,
+        Func<byte[], byte[]>? decryptor = null,
         CancellationToken token = default)
     {
-        var url = CreateUrl($"/streams/{request.StreamId}/topics/{request.TopicId}/messages?consumer_id={request.Consumer.Id}" +
-                            $"&partition_id={request.PartitionId}&kind={request.PollingStrategy.Kind}&value={request.PollingStrategy.Value}&count={request.Count}&auto_commit={request.AutoCommit}");
+        var url = CreateUrl(
+            $"/streams/{request.StreamId}/topics/{request.TopicId}/messages?consumer_id={request.Consumer.Id}" +
+            $"&partition_id={request.PartitionId}&kind={request.PollingStrategy.Kind}&value={request.PollingStrategy.Value}&count={request.Count}&auto_commit={request.AutoCommit}");
 
         var response = await _httpClient.GetAsync(url, token);
         if (response.IsSuccessStatusCode)
@@ -347,8 +357,9 @@ public class HttpMessageStream : IIggyClient
         Func<byte[], TMessage> deserializer, Func<byte[], byte[]>? decryptor = null,
         CancellationToken token = default)
     {
-        var url = CreateUrl($"/streams/{request.StreamId}/topics/{request.TopicId}/messages?consumer_id={request.Consumer.Id}" +
-                            $"&partition_id={request.PartitionId}&kind={request.PollingStrategy.Kind}&value={request.PollingStrategy.Value}&count={request.Count}&auto_commit={request.AutoCommit}");
+        var url = CreateUrl(
+            $"/streams/{request.StreamId}/topics/{request.TopicId}/messages?consumer_id={request.Consumer.Id}" +
+            $"&partition_id={request.PartitionId}&kind={request.PollingStrategy.Kind}&value={request.PollingStrategy.Value}&count={request.Count}&auto_commit={request.AutoCommit}");
 
         var response = await _httpClient.GetAsync(url, token);
         if (response.IsSuccessStatusCode)
@@ -408,7 +419,8 @@ public class HttpMessageStream : IIggyClient
         };
 
 
-        _ = StartPollingMessagesAsync(fetchRequest, deserializer, _messagePollingSettings.Interval, channel.Writer, decryptor, token);
+        _ = StartPollingMessagesAsync(fetchRequest, deserializer, _messagePollingSettings.Interval, channel.Writer,
+            decryptor, token);
         await foreach (MessageResponse<TMessage> messageResponse in channel.Reader.ReadAllAsync(token))
         {
             yield return messageResponse;
@@ -418,11 +430,13 @@ public class HttpMessageStream : IIggyClient
             {
                 try
                 {
-                    await StoreOffsetAsync(request.Consumer, request.StreamId, request.TopicId, currentOffset, request.PartitionId, token);
+                    await StoreOffsetAsync(request.Consumer, request.StreamId, request.TopicId, currentOffset,
+                        request.PartitionId, token);
                 }
                 catch
                 {
-                    _logger.LogError("Error encountered while saving offset information - Offset: {Offset}, Stream ID: {StreamId}, Topic ID: {TopicId}, Partition ID: {PartitionId}",
+                    _logger.LogError(
+                        "Error encountered while saving offset information - Offset: {Offset}, Stream ID: {StreamId}, Topic ID: {TopicId}, Partition ID: {PartitionId}",
                         currentOffset, request.StreamId, request.TopicId, request.PartitionId);
                 }
             }
@@ -435,22 +449,27 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
-    public async Task StoreOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, ulong offset, uint? partitionId, CancellationToken token = default)
+    public async Task StoreOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, ulong offset,
+        uint? partitionId, CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new StoreOffsetRequest(consumer, partitionId, offset), _jsonSerializerOptions);
+        var json = JsonSerializer.Serialize(new StoreOffsetRequest(consumer, partitionId, offset),
+            _jsonSerializerOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
-        var response = await _httpClient.PutAsync($"/streams/{streamId}/topics/{topicId}/consumer-offsets", data, token);
+        var response
+            = await _httpClient.PutAsync($"/streams/{streamId}/topics/{topicId}/consumer-offsets", data, token);
         if (!response.IsSuccessStatusCode)
         {
             await HandleResponseAsync(response);
         }
     }
 
-    public async Task<OffsetResponse?> GetOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, uint? partitionId, CancellationToken token = default)
+    public async Task<OffsetResponse?> GetOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId,
+        uint? partitionId, CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync($"/streams/{streamId}/topics/{topicId}/" +
-                                                  $"consumer-offsets?consumer_id={consumer.Id}&partition_id={partitionId}", token);
+                                                  $"consumer-offsets?consumer_id={consumer.Id}&partition_id={partitionId}",
+            token);
         if (response.IsSuccessStatusCode)
         {
             return await response.Content.ReadFromJsonAsync<OffsetResponse>(_jsonSerializerOptions, token);
@@ -460,19 +479,23 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
 
-    public async Task DeleteOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, uint? partitionId, CancellationToken token = default)
+    public async Task DeleteOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, uint? partitionId,
+        CancellationToken token = default)
     {
-        var response = await _httpClient.DeleteAsync($"/streams/{streamId}/topics/{topicId}/consumer-offsets/{consumer}?partition_id={partitionId}", token);
+        var response = await _httpClient.DeleteAsync(
+            $"/streams/{streamId}/topics/{topicId}/consumer-offsets/{consumer}?partition_id={partitionId}", token);
         await HandleResponseAsync(response);
     }
 
-    public async Task<IReadOnlyList<ConsumerGroupResponse>> GetConsumerGroupsAsync(Identifier streamId, Identifier topicId, CancellationToken token = default)
+    public async Task<IReadOnlyList<ConsumerGroupResponse>> GetConsumerGroupsAsync(Identifier streamId,
+        Identifier topicId, CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync($"/streams/{streamId}/topics/{topicId}/consumer-groups", token);
 
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<IReadOnlyList<ConsumerGroupResponse>>(_jsonSerializerOptions, token)
+            return await response.Content.ReadFromJsonAsync<IReadOnlyList<ConsumerGroupResponse>>(
+                       _jsonSerializerOptions, token)
                    ?? Array.Empty<ConsumerGroupResponse>();
         }
 
@@ -483,7 +506,8 @@ public class HttpMessageStream : IIggyClient
     public async Task<ConsumerGroupResponse?> GetConsumerGroupByIdAsync(Identifier streamId, Identifier topicId,
         Identifier groupId, CancellationToken token = default)
     {
-        var response = await _httpClient.GetAsync($"/streams/{streamId}/topics/{topicId}/consumer-groups/{groupId}", token);
+        var response
+            = await _httpClient.GetAsync($"/streams/{streamId}/topics/{topicId}/consumer-groups/{groupId}", token);
 
         if (response.IsSuccessStatusCode)
         {
@@ -494,13 +518,15 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
 
-    public async Task<ConsumerGroupResponse?> CreateConsumerGroupAsync(Identifier streamId, Identifier topicId, string name, uint? groupId, CancellationToken token = default)
+    public async Task<ConsumerGroupResponse?> CreateConsumerGroupAsync(Identifier streamId, Identifier topicId,
+        string name, uint? groupId, CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(new CreateConsumerGroupRequest(name, groupId), _jsonSerializerOptions);
 
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
-        var response = await _httpClient.PostAsync($"/streams/{streamId}/topics/{topicId}/consumer-groups", data, token);
+        var response
+            = await _httpClient.PostAsync($"/streams/{streamId}/topics/{topicId}/consumer-groups", data, token);
         if (response.IsSuccessStatusCode)
         {
             return await response.Content.ReadFromJsonAsync<ConsumerGroupResponse>(_jsonSerializerOptions, token);
@@ -510,9 +536,11 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
 
-    public async Task DeleteConsumerGroupAsync(Identifier streamId, Identifier topicId, Identifier groupId, CancellationToken token = default)
+    public async Task DeleteConsumerGroupAsync(Identifier streamId, Identifier topicId, Identifier groupId,
+        CancellationToken token = default)
     {
-        var response = await _httpClient.DeleteAsync($"/streams/{streamId}/topics/{topicId}/consumer-groups/{groupId}", token);
+        var response
+            = await _httpClient.DeleteAsync($"/streams/{streamId}/topics/{topicId}/consumer-groups/{groupId}", token);
         await HandleResponseAsync(response);
     }
 
@@ -548,7 +576,8 @@ public class HttpMessageStream : IIggyClient
         var response = await _httpClient.GetAsync("/clients", token);
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<IReadOnlyList<ClientResponse>>(_jsonSerializerOptions, token)
+            return await response.Content.ReadFromJsonAsync<IReadOnlyList<ClientResponse>>(_jsonSerializerOptions,
+                       token)
                    ?? Array.Empty<ClientResponse>();
         }
 
@@ -569,13 +598,15 @@ public class HttpMessageStream : IIggyClient
     }
 
     [Obsolete("This method is only supported in TCP protocol", true)]
-    public Task JoinConsumerGroupAsync(Identifier streamId, Identifier topicId, Identifier groupId, CancellationToken token = default)
+    public Task JoinConsumerGroupAsync(Identifier streamId, Identifier topicId, Identifier groupId,
+        CancellationToken token = default)
     {
         throw new FeatureUnavailableException();
     }
 
     [Obsolete("This method is only supported in TCP protocol", true)]
-    public Task LeaveConsumerGroupAsync(Identifier streamId, Identifier topicId, Identifier groupId, CancellationToken token = default)
+    public Task LeaveConsumerGroupAsync(Identifier streamId, Identifier topicId, Identifier groupId,
+        CancellationToken token = default)
     {
         throw new FeatureUnavailableException();
     }
@@ -583,14 +614,17 @@ public class HttpMessageStream : IIggyClient
     public async Task DeletePartitionsAsync(Identifier streamId, Identifier topicId, uint partitionsCount,
         CancellationToken token = default)
     {
-        var response = await _httpClient.DeleteAsync($"/streams/{streamId}/topics/{topicId}/partitions?partitions_count={partitionsCount}", token);
+        var response
+            = await _httpClient.DeleteAsync(
+                $"/streams/{streamId}/topics/{topicId}/partitions?partitions_count={partitionsCount}", token);
         if (!response.IsSuccessStatusCode)
         {
             await HandleResponseAsync(response);
         }
     }
 
-    public async Task CreatePartitionsAsync(Identifier streamId, Identifier topicId, uint partitionsCount, CancellationToken token = default)
+    public async Task CreatePartitionsAsync(Identifier streamId, Identifier topicId, uint partitionsCount,
+        CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(new CreatePartitionsRequest(partitionsCount), _jsonSerializerOptions);
 
@@ -629,9 +663,11 @@ public class HttpMessageStream : IIggyClient
         return Array.Empty<UserResponse>();
     }
 
-    public async Task<UserResponse?> CreateUser(string userName, string password, UserStatus status, Permissions? permissions = null, CancellationToken token = default)
+    public async Task<UserResponse?> CreateUser(string userName, string password, UserStatus status,
+        Permissions? permissions = null, CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new CreateUserRequest(userName, password, status, permissions), _jsonSerializerOptions);
+        var json = JsonSerializer.Serialize(new CreateUserRequest(userName, password, status, permissions),
+            _jsonSerializerOptions);
 
         var content = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PostAsync("/users", content, token);
@@ -653,7 +689,8 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
-    public async Task UpdateUser(Identifier userId, string? userName = null, UserStatus? status = null, CancellationToken token = default)
+    public async Task UpdateUser(Identifier userId, string? userName = null, UserStatus? status = null,
+        CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(new UpdateUserRequest(userName, status), _jsonSerializerOptions);
         var content = new StringContent(json, Encoding.UTF8, "application/json");
@@ -664,7 +701,8 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
-    public async Task UpdatePermissions(Identifier userId, Permissions? permissions = null, CancellationToken token = default)
+    public async Task UpdatePermissions(Identifier userId, Permissions? permissions = null,
+        CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(new UpdateUserPermissionsRequest(permissions), _jsonSerializerOptions);
         var content = new StringContent(json, Encoding.UTF8, "application/json");
@@ -675,9 +713,11 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
-    public async Task ChangePassword(Identifier userId, string currentPassword, string newPassword, CancellationToken token = default)
+    public async Task ChangePassword(Identifier userId, string currentPassword, string newPassword,
+        CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new ChangePasswordRequest(currentPassword, newPassword), _jsonSerializerOptions);
+        var json = JsonSerializer.Serialize(new ChangePasswordRequest(currentPassword, newPassword),
+            _jsonSerializerOptions);
         var content = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PutAsync($"/users/{userId}/password", content, token);
         if (!response.IsSuccessStatusCode)
@@ -689,7 +729,8 @@ public class HttpMessageStream : IIggyClient
     public async Task<AuthResponse?> LoginUser(string userName, string password, CancellationToken token = default)
     {
         // TODO: get version 
-        var json = JsonSerializer.Serialize(new LoginUserRequest(userName, password, "", Context), _jsonSerializerOptions);
+        var json = JsonSerializer.Serialize(new LoginUserRequest(userName, password, "", Context),
+            _jsonSerializerOptions);
 
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
@@ -726,12 +767,14 @@ public class HttpMessageStream : IIggyClient
         _httpClient.DefaultRequestHeaders.Authorization = null;
     }
 
-    public async Task<IReadOnlyList<PersonalAccessTokenResponse>> GetPersonalAccessTokensAsync(CancellationToken token = default)
+    public async Task<IReadOnlyList<PersonalAccessTokenResponse>> GetPersonalAccessTokensAsync(
+        CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync("/personal-access-tokens", token);
         if (response.IsSuccessStatusCode)
         {
-            return await response.Content.ReadFromJsonAsync<IReadOnlyList<PersonalAccessTokenResponse>>(_jsonSerializerOptions, token)
+            return await response.Content.ReadFromJsonAsync<IReadOnlyList<PersonalAccessTokenResponse>>(
+                       _jsonSerializerOptions, token)
                    ?? Array.Empty<PersonalAccessTokenResponse>();
         }
 
@@ -739,7 +782,8 @@ public class HttpMessageStream : IIggyClient
         return Array.Empty<PersonalAccessTokenResponse>();
     }
 
-    public async Task<RawPersonalAccessToken?> CreatePersonalAccessTokenAsync(string name, ulong? expiry = null, CancellationToken token = default)
+    public async Task<RawPersonalAccessToken?> CreatePersonalAccessTokenAsync(string name, ulong? expiry = null,
+        CancellationToken token = default)
     {
         var json = JsonSerializer.Serialize(new CreatePersonalAccessTokenRequest(name, expiry), _jsonSerializerOptions);
 
@@ -800,7 +844,8 @@ public class HttpMessageStream : IIggyClient
         {
             try
             {
-                PolledMessages<TMessage> fetchResponse = await PollMessagesAsync(request, deserializer, decryptor, token);
+                PolledMessages<TMessage> fetchResponse
+                    = await PollMessagesAsync(request, deserializer, decryptor, token);
                 if (fetchResponse.Messages.Count == 0)
                 {
                     continue;
@@ -813,7 +858,8 @@ public class HttpMessageStream : IIggyClient
             }
             catch (Exception e)
             {
-                _logger.LogError(e, "Error encountered while polling messages - Stream ID: {StreamId}, Topic ID: {TopicId}, Partition ID: {PartitionId}",
+                _logger.LogError(e,
+                    "Error encountered while polling messages - Stream ID: {StreamId}, Topic ID: {TopicId}, Partition ID: {PartitionId}",
                     request.StreamId, request.TopicId, request.PartitionId);
             }
         }

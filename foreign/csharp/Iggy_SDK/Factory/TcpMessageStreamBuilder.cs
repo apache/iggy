@@ -35,7 +35,8 @@ internal class TcpMessageStreamBuilder
     private TcpMessageInvoker? _messageInvoker;
     private MessageSenderDispatcher? _messageSenderDispatcher;
 
-    internal TcpMessageStreamBuilder(IConnectionStream stream, IMessageStreamConfigurator options, ILoggerFactory loggerFactory)
+    internal TcpMessageStreamBuilder(IConnectionStream stream, IMessageStreamConfigurator options,
+        ILoggerFactory loggerFactory)
     {
         var sendMessagesOptions = new MessageBatchingSettings();
         var messagePollingOptions = new MessagePollingSettings();

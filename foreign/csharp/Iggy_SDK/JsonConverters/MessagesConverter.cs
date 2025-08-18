@@ -33,7 +33,8 @@ internal sealed class MessagesConverter : JsonConverter<MessageSendRequest>
         { Partitioning.PartitionId, "partition_id" }
     };
 
-    public override MessageSendRequest? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    public override MessageSendRequest? Read(ref Utf8JsonReader reader, Type typeToConvert,
+        JsonSerializerOptions options)
     {
         throw new NotImplementedException();
     }
@@ -54,7 +55,8 @@ internal sealed class MessagesConverter : JsonConverter<MessageSendRequest>
 
         if (!PartitioningKindMapping.TryGetValue(partitioning.Kind, out var kindString))
         {
-            throw new InvalidEnumArgumentException(nameof(partitioning.Kind), (int)partitioning.Kind, typeof(Partitioning));
+            throw new InvalidEnumArgumentException(nameof(partitioning.Kind), (int)partitioning.Kind,
+                typeof(Partitioning));
         }
 
         writer.WriteString("kind", kindString);

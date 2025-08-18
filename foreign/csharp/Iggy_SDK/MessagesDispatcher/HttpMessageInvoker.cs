@@ -44,7 +44,8 @@ internal sealed class HttpMessageInvoker : IMessageInvoker
         var json = JsonSerializer.Serialize(request, _jsonSerializerOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
-        var response = await _client.PostAsync($"/streams/{request.StreamId}/topics/{request.TopicId}/messages", data, token);
+        var response = await _client.PostAsync($"/streams/{request.StreamId}/topics/{request.TopicId}/messages", data,
+            token);
         if (!response.IsSuccessStatusCode)
         {
             await HandleResponseAsync(response);

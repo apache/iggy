@@ -24,38 +24,38 @@ namespace Apache.Iggy.Tests.Utils.Users;
 
 public static class UsersFactory
 {
-    public static CreateUserRequest CreateUserRequest(string? username = null, string? password = null, Permissions? permissions = null)
+    public static CreateUserRequest CreateUserRequest(string? username = null, string? password = null,
+        Permissions? permissions = null)
     {
-        return new CreateUserRequest
-        (
-            username ?? Utility.RandomString(Random.Shared.Next(5, 25)),
+        return new CreateUserRequest(username ?? Utility.RandomString(Random.Shared.Next(5, 25)),
             password ?? Utility.RandomString(Random.Shared.Next(5, 25)),
             UserStatus.Active,
-            permissions ?? CreatePermissions()
-        );
+            permissions ?? CreatePermissions());
     }
 
     public static Dictionary<int, StreamPermissions> CreateStreamPermissions(int streamId = 1, int topicId = 1)
     {
         var streamsPermission = new Dictionary<int, StreamPermissions>();
         var topicPermissions = new Dictionary<int, TopicPermissions>();
-        topicPermissions.Add(topicId, new TopicPermissions
-        {
-            ManageTopic = true,
-            PollMessages = true,
-            ReadTopic = Random.Shared.Next(1) == 1,
-            SendMessages = Random.Shared.Next(1) == 1
-        });
-        streamsPermission.Add(streamId, new StreamPermissions
-        {
-            ManageStream = true,
-            ManageTopics = true,
-            ReadStream = true,
-            ReadTopics = Random.Shared.Next(1) == 1,
-            PollMessages = Random.Shared.Next(1) == 1,
-            SendMessages = Random.Shared.Next(1) == 1,
-            Topics = topicPermissions
-        });
+        topicPermissions.Add(topicId,
+            new TopicPermissions
+            {
+                ManageTopic = true,
+                PollMessages = true,
+                ReadTopic = Random.Shared.Next(1) == 1,
+                SendMessages = Random.Shared.Next(1) == 1
+            });
+        streamsPermission.Add(streamId,
+            new StreamPermissions
+            {
+                ManageStream = true,
+                ManageTopics = true,
+                ReadStream = true,
+                ReadTopics = Random.Shared.Next(1) == 1,
+                PollMessages = Random.Shared.Next(1) == 1,
+                SendMessages = Random.Shared.Next(1) == 1,
+                Topics = topicPermissions
+            });
         return streamsPermission;
     }
 

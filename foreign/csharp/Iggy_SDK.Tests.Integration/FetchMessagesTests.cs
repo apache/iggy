@@ -39,16 +39,17 @@ public class FetchMessagesTests(Protocol protocol)
     [Test]
     public async Task PollMessagesTMessage_WithNoHeaders_Should_PollMessages_Successfully()
     {
-        PolledMessages<DummyMessage> response = await Fixture.Clients[protocol].PollMessagesAsync(new MessageFetchRequest
-        {
-            Count = 10,
-            AutoCommit = true,
-            Consumer = Consumer.New(1),
-            PartitionId = 1,
-            PollingStrategy = PollingStrategy.Next(),
-            StreamId = Identifier.Numeric(Fixture.StreamId),
-            TopicId = Identifier.Numeric(Fixture.TopicDummyRequest.TopicId!.Value)
-        }, DummyMessage.DeserializeDummyMessage);
+        PolledMessages<DummyMessage> response = await Fixture.Clients[protocol].PollMessagesAsync(
+            new MessageFetchRequest
+            {
+                Count = 10,
+                AutoCommit = true,
+                Consumer = Consumer.New(1),
+                PartitionId = 1,
+                PollingStrategy = PollingStrategy.Next(),
+                StreamId = Identifier.Numeric(Fixture.StreamId),
+                TopicId = Identifier.Numeric(Fixture.TopicDummyRequest.TopicId!.Value)
+            }, DummyMessage.DeserializeDummyMessage);
 
         response.Messages.Count.ShouldBe(10);
         response.PartitionId.ShouldBe(1);
@@ -81,7 +82,8 @@ public class FetchMessagesTests(Protocol protocol)
             StreamId = Identifier.Numeric(Fixture.StreamId),
             TopicId = Identifier.Numeric(55)
         };
-        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].PollMessagesAsync(invalidFetchRequest, DummyMessage.DeserializeDummyMessage));
+        await Should.ThrowAsync<InvalidResponseException>(() =>
+            Fixture.Clients[protocol].PollMessagesAsync(invalidFetchRequest, DummyMessage.DeserializeDummyMessage));
     }
 
     [Test]
@@ -126,7 +128,8 @@ public class FetchMessagesTests(Protocol protocol)
             TopicId = Identifier.Numeric(55)
         };
 
-        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].PollMessagesAsync(invalidFetchRequest));
+        await Should.ThrowAsync<InvalidResponseException>(() =>
+            Fixture.Clients[protocol].PollMessagesAsync(invalidFetchRequest));
     }
 
     [Test]
@@ -173,7 +176,8 @@ public class FetchMessagesTests(Protocol protocol)
             TopicId = Identifier.Numeric(Fixture.TopicDummyHeaderRequest.TopicId!.Value)
         };
 
-        PolledMessages<DummyMessage> response = await Fixture.Clients[protocol].PollMessagesAsync(headersMessageFetchRequest, DummyMessage.DeserializeDummyMessage);
+        PolledMessages<DummyMessage> response = await Fixture.Clients[protocol]
+            .PollMessagesAsync(headersMessageFetchRequest, DummyMessage.DeserializeDummyMessage);
         response.Messages.Count.ShouldBe(10);
         response.PartitionId.ShouldBe(1);
         response.CurrentOffset.ShouldBe(19u);
@@ -190,7 +194,8 @@ public class FetchMessagesTests(Protocol protocol)
     [DependsOn(nameof(PollMessagesTMessage_WithHeaders_Should_PollMessages_Successfully))]
     public async Task PollMessagesMessage_WithEncryptor_Should_PollMessages_Successfully()
     {
-        await Fixture.Clients[protocol].SendMessagesAsync(Identifier.Numeric(Fixture.StreamId), Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), Partitioning.None(),
+        await Fixture.Clients[protocol].SendMessagesAsync(Identifier.Numeric(Fixture.StreamId),
+            Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), Partitioning.None(),
             [new Message(Guid.NewGuid(), "Test message"u8.ToArray())], bytes =>
             {
                 Array.Reverse(bytes);

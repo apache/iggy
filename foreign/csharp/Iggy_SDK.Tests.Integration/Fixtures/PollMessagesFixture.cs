@@ -37,8 +37,10 @@ public class PollMessagesFixture : IggyServerFixture
         foreach (var client in Clients.Values)
         {
             await client.CreateStreamAsync("Test Stream", StreamId);
-            await client.CreateTopicAsync(Identifier.Numeric(StreamId), TopicRequest.Name, TopicRequest.PartitionsCount, topicId: TopicRequest.TopicId);
-            await client.SendMessagesAsync(new MessageSendRequest<DummyMessage>
+            await client.CreateTopicAsync(Identifier.Numeric(StreamId), TopicRequest.Name, TopicRequest.PartitionsCount,
+                topicId: TopicRequest.TopicId);
+            await client.SendMessagesAsync(
+                new MessageSendRequest<DummyMessage>
                 {
                     Messages = CreateDummyMessagesWithoutHeader(MessageCount),
                     Partitioning = Partitioning.None(),

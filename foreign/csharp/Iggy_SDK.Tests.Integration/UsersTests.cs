@@ -53,7 +53,8 @@ public class UsersTests(Protocol protocol)
     {
         var request = new CreateUserRequest(Username, "test1", UserStatus.Active, null);
 
-        await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol].CreateUser(request.Username, request.Password, request.Status));
+        await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol]
+            .CreateUser(request.Username, request.Password, request.Status));
     }
 
     [Test]
@@ -87,7 +88,8 @@ public class UsersTests(Protocol protocol)
     [DependsOn(nameof(GetUsers_Should_ReturnValidResponse))]
     public async Task UpdateUser_Should_UpdateUser_Successfully()
     {
-        await Should.NotThrowAsync(Fixture.Clients[protocol].UpdateUser(Identifier.Numeric(2), "new_user_name", UserStatus.Active));
+        await Should.NotThrowAsync(Fixture.Clients[protocol]
+            .UpdateUser(Identifier.Numeric(2), "new_user_name", UserStatus.Active));
 
         var user = await Fixture.Clients[protocol].GetUser(Identifier.Numeric(2));
 

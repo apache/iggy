@@ -31,23 +31,26 @@ public class FlushMessagesTests(Protocol protocol)
     [Test]
     public async Task FlushUnsavedBuffer_WithFsync_Should_Flush_Successfully()
     {
-        await Should.NotThrowAsync(() => Fixture.Clients[protocol].FlushUnsavedBufferAsync(Identifier.Numeric(Fixture.StreamId),
-            Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), 1, true));
+        await Should.NotThrowAsync(() =>
+            Fixture.Clients[protocol].FlushUnsavedBufferAsync(Identifier.Numeric(Fixture.StreamId),
+                Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), 1, true));
     }
 
     [Test]
     [DependsOn(nameof(FlushUnsavedBuffer_WithFsync_Should_Flush_Successfully))]
     public async Task FlushUnsavedBuffer_WithOutFsync_Should_Flush_Successfully()
     {
-        await Should.NotThrowAsync(() => Fixture.Clients[protocol].FlushUnsavedBufferAsync(Identifier.Numeric(Fixture.StreamId),
-            Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), 1, false));
+        await Should.NotThrowAsync(() =>
+            Fixture.Clients[protocol].FlushUnsavedBufferAsync(Identifier.Numeric(Fixture.StreamId),
+                Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), 1, false));
     }
 
     [Test]
     [DependsOn(nameof(FlushUnsavedBuffer_WithOutFsync_Should_Flush_Successfully))]
     public async Task FlushUnsavedBuffer_Should_Throw_WhenStream_DoesNotExist()
     {
-        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].FlushUnsavedBufferAsync(Identifier.Numeric(Fixture.StreamId),
-            Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), 55, false));
+        await Should.ThrowAsync<InvalidResponseException>(() =>
+            Fixture.Clients[protocol].FlushUnsavedBufferAsync(Identifier.Numeric(Fixture.StreamId),
+                Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), 55, false));
     }
 }

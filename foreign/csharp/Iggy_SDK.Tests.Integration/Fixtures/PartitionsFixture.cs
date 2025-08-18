@@ -32,7 +32,8 @@ public class PartitionsFixture : IggyServerFixture
         foreach (var client in Clients.Values)
         {
             await client.CreateStreamAsync("Test Stream", StreamId);
-            await client.CreateTopicAsync(Identifier.Numeric(StreamId), TopicRequest.Name, TopicRequest.PartitionsCount, topicId: TopicRequest.TopicId);
+            await client.CreateTopicAsync(Identifier.Numeric(StreamId), TopicRequest.Name, TopicRequest.PartitionsCount,
+                topicId: TopicRequest.TopicId);
         }
     }
 }

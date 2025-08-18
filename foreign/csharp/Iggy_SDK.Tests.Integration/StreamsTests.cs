@@ -191,13 +191,15 @@ public class StreamsTests(Protocol protocol)
     [DependsOn(nameof(DeleteStream_Should_DeleteStream_Successfully))]
     public async Task DeleteStream_NotExists_Should_Throw_InvalidResponse()
     {
-        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].DeleteStreamAsync(Identifier.Numeric(StreamId)));
+        await Should.ThrowAsync<InvalidResponseException>(() =>
+            Fixture.Clients[protocol].DeleteStreamAsync(Identifier.Numeric(StreamId)));
     }
 
     [Test]
     [DependsOn(nameof(DeleteStream_NotExists_Should_Throw_InvalidResponse))]
     public async Task GetStreamById_AfterDelete_Should_Throw_InvalidResponse()
     {
-        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].GetStreamByIdAsync(Identifier.Numeric(StreamId)));
+        await Should.ThrowAsync<InvalidResponseException>(() =>
+            Fixture.Clients[protocol].GetStreamByIdAsync(Identifier.Numeric(StreamId)));
     }
 }

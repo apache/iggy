@@ -97,7 +97,9 @@ public class SystemTests(Protocol protocol)
         await client.CreateStreamAsync("TestStream", 1);
         await client.CreateTopicAsync(Identifier.Numeric(1), "test_topic", 2);
 
-        var consumerGroup = await client.CreateConsumerGroupAsync(Identifier.Numeric(1), Identifier.Numeric(1), "test_consumer_group", 1);
+        var consumerGroup
+            = await client.CreateConsumerGroupAsync(Identifier.Numeric(1), Identifier.Numeric(1), "test_consumer_group",
+                1);
         await client.JoinConsumerGroupAsync(Identifier.Numeric(1), Identifier.Numeric(1), Identifier.Numeric(1));
         var me = await client.GetMeAsync();
 

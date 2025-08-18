@@ -42,7 +42,8 @@ internal sealed class BinaryFactory
         return payload;
     }
 
-    internal static byte[] CreateMessagePayload(ulong offset, ulong timestamp, int headersLength, uint checkSum, Guid guid, ReadOnlySpan<byte> payload)
+    internal static byte[] CreateMessagePayload(ulong offset, ulong timestamp, int headersLength, uint checkSum,
+        Guid guid, ReadOnlySpan<byte> payload)
     {
         var messageLength = payload.Length;
         var totalSize = 56 + payload.Length;
@@ -61,7 +62,8 @@ internal sealed class BinaryFactory
         return payloadBuffer.ToArray();
     }
 
-    internal static byte[] CreateStreamPayload(uint id, int topicsCount, string name, ulong sizeBytes, ulong messagesCount, ulong createdAt)
+    internal static byte[] CreateStreamPayload(uint id, int topicsCount, string name, ulong sizeBytes,
+        ulong messagesCount, ulong createdAt)
     {
         var nameBytes = Encoding.UTF8.GetBytes(name);
         var totalSize = 4 + 4 + 8 + 8 + 1 + 8 + nameBytes.Length;
@@ -77,7 +79,8 @@ internal sealed class BinaryFactory
     }
 
     internal static byte[] CreateTopicPayload(uint id, uint partitionsCount, uint messageExpiry, string name,
-        ulong sizeBytes, ulong messagesCount, ulong createdAt, byte replicationFactor, ulong maxTopicSize, int compressionType)
+        ulong sizeBytes, ulong messagesCount, ulong createdAt, byte replicationFactor, ulong maxTopicSize,
+        int compressionType)
     {
         var nameBytes = Encoding.UTF8.GetBytes(name);
         var totalSize = 4 + 8 + 4 + 8 + 1 + 8 + 8 + 8 + 1 + 1 + name.Length;
@@ -97,7 +100,8 @@ internal sealed class BinaryFactory
         return payload;
     }
 
-    internal static byte[] CreatePartitionPayload(int id, int segmentsCount, int currentOffset, ulong sizeBytes, ulong messagesCount)
+    internal static byte[] CreatePartitionPayload(int id, int segmentsCount, int currentOffset, ulong sizeBytes,
+        ulong messagesCount)
     {
         var payload = new byte[16];
         BinaryPrimitives.WriteInt32LittleEndian(payload, id);
@@ -108,7 +112,8 @@ internal sealed class BinaryFactory
         return payload;
     }
 
-    internal static byte[] CreateGroupPayload(uint id, uint membersCount, uint partitionsCount, string name, List<int>? partitionsOnMember = null)
+    internal static byte[] CreateGroupPayload(uint id, uint membersCount, uint partitionsCount, string name,
+        List<int>? partitionsOnMember = null)
     {
         var payload = new byte[13 + name.Length + (partitionsOnMember?.Count * 4 + 8 ?? 0)];
         BinaryPrimitives.WriteUInt32LittleEndian(payload, id);
@@ -123,7 +128,8 @@ internal sealed class BinaryFactory
             BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(17 + name.Length), partitionsOnMember.Count);
             for (var i = 0; i < partitionsOnMember.Count; i++)
             {
-                BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(21 + name.Length + i * 4), partitionsOnMember[i]);
+                BinaryPrimitives.WriteInt32LittleEndian(payload.AsSpan(21 + name.Length + i * 4),
+                    partitionsOnMember[i]);
             }
         }
 
@@ -140,7 +146,8 @@ internal sealed class BinaryFactory
         BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(20, 8), stats.TotalMemory);
         BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(28, 8), stats.AvailableMemory);
         BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(36, 8), stats.RunTime);
-        BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(44, 8), DateTimeOffsetUtils.ToUnixTimeMicroSeconds(stats.StartTime));
+        BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(44, 8),
+            DateTimeOffsetUtils.ToUnixTimeMicroSeconds(stats.StartTime));
         BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(52, 8), stats.ReadBytes);
         BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(60, 8), stats.WrittenBytes);
         BinaryPrimitives.WriteUInt64LittleEndian(bytes.AsSpan(68, 8), stats.MessagesSizeBytes);
@@ -162,11 +169,14 @@ internal sealed class BinaryFactory
         osNameBytes.CopyTo(bytes, 116 + hostnameBytes.Length);
 
         var osVersionBytes = Encoding.UTF8.GetBytes(stats.OsVersion);
-        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(116 + hostnameBytes.Length + osNameBytes.Length, 4), osVersionBytes.Length);
+        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(116 + hostnameBytes.Length + osNameBytes.Length, 4),
+            osVersionBytes.Length);
         osVersionBytes.CopyTo(bytes, 120 + hostnameBytes.Length + osNameBytes.Length);
 
         var kernelVersionBytes = Encoding.UTF8.GetBytes(stats.KernelVersion);
-        BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(120 + hostnameBytes.Length + osNameBytes.Length + osVersionBytes.Length, 4), kernelVersionBytes.Length);
+        BinaryPrimitives.WriteInt32LittleEndian(
+            bytes.AsSpan(120 + hostnameBytes.Length + osNameBytes.Length + osVersionBytes.Length, 4),
+            kernelVersionBytes.Length);
         kernelVersionBytes.CopyTo(bytes, 124 + hostnameBytes.Length + osNameBytes.Length + osVersionBytes.Length);
 
         return bytes;

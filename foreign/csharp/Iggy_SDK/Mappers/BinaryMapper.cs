@@ -35,10 +35,7 @@ internal static class BinaryMapper
     {
         var tokenLength = payload[0];
         var token = Encoding.UTF8.GetString(payload[1..(1 + tokenLength)]);
-        return new RawPersonalAccessToken
-        {
-            Token = token
-        };
+        return new RawPersonalAccessToken { Token = token };
     }
 
     internal static IReadOnlyList<PersonalAccessTokenResponse> MapPersonalAccessTokens(ReadOnlySpan<byte> payload)
@@ -61,17 +58,19 @@ internal static class BinaryMapper
         return result.AsReadOnly();
     }
 
-    private static (PersonalAccessTokenResponse response, int position) MapToPersonalAccessTokenResponse(ReadOnlySpan<byte> payload, int position)
+    private static (PersonalAccessTokenResponse response, int position) MapToPersonalAccessTokenResponse(
+        ReadOnlySpan<byte> payload, int position)
     {
         var nameLength = (int)payload[position];
         var name = Encoding.UTF8.GetString(payload[(position + 1)..(1 + position + nameLength)]);
         var expiry = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 1 + nameLength)..]);
         var readBytes = 1 + nameLength + 8;
-        return (new PersonalAccessTokenResponse
-        {
-            Name = name,
-            ExpiryAt = expiry == 0 ? null : DateTimeOffsetUtils.FromUnixTimeMicroSeconds(expiry).LocalDateTime
-        }, readBytes);
+        return (
+            new PersonalAccessTokenResponse
+            {
+                Name = name,
+                ExpiryAt = expiry == 0 ? null : DateTimeOffsetUtils.FromUnixTimeMicroSeconds(expiry).LocalDateTime
+            }, readBytes);
     }
 
     internal static IReadOnlyList<UserResponse> MapUsers(ReadOnlySpan<byte> payload)
@@ -169,13 +168,14 @@ internal static class BinaryMapper
                         var pollMessagesTopic = bytes[index++] == 1;
                         var sendMessagesTopic = bytes[index++] == 1;
 
-                        topicsMap.Add(topicId, new TopicPermissions
-                        {
-                            ManageTopic = manageTopic,
-                            ReadTopic = readTopic,
-                            PollMessages = pollMessagesTopic,
-                            SendMessages = sendMessagesTopic
-                        });
+                        topicsMap.Add(topicId,
+                            new TopicPermissions
+                            {
+                                ManageTopic = manageTopic,
+                                ReadTopic = readTopic,
+                                PollMessages = pollMessagesTopic,
+                                SendMessages = sendMessagesTopic
+                            });
 
                         if (bytes[index++] == 0)
                         {
@@ -184,16 +184,17 @@ internal static class BinaryMapper
                     }
                 }
 
-                streamMap.Add(streamId, new StreamPermissions
-                {
-                    ManageStream = manageStream,
-                    ReadStream = readStream,
-                    ManageTopics = manageTopics,
-                    ReadTopics = readTopics,
-                    PollMessages = pollMessagesStream,
-                    SendMessages = sendMessagesStream,
-                    Topics = topicsMap.Count > 0 ? topicsMap : null
-                });
+                streamMap.Add(streamId,
+                    new StreamPermissions
+                    {
+                        ManageStream = manageStream,
+                        ReadStream = readStream,
+                        ManageTopics = manageTopics,
+                        ReadTopics = readTopics,
+                        PollMessages = pollMessagesStream,
+                        SendMessages = sendMessagesStream,
+                        Topics = topicsMap.Count > 0 ? topicsMap : null
+                    });
 
                 if (bytes[index++] == 0)
                 {
@@ -225,12 +226,13 @@ internal static class BinaryMapper
         var readBytes = 4 + 8 + 1 + 1 + usernameLength;
 
         return (new UserResponse
-        {
-            Id = id,
-            CreatedAt = createdAt,
-            Status = userStatus,
-            Username = username
-        }, readBytes);
+            {
+                Id = id,
+                CreatedAt = createdAt,
+                Status = userStatus,
+                Username = username
+            },
+            readBytes);
     }
 
     internal static ClientResponse MapClient(ReadOnlySpan<byte> payload)
@@ -246,12 +248,13 @@ internal static class BinaryMapper
                 var streamId = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
                 var topicId = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 4)..(position + 8)]);
                 var consumerGroupId = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 8)..(position + 12)]);
-                var consumerGroup = new ConsumerGroupInfo
-                {
-                    StreamId = streamId,
-                    TopicId = topicId,
-                    GroupId = consumerGroupId
-                };
+                var consumerGroup
+                    = new ConsumerGroupInfo
+                    {
+                        StreamId = streamId,
+                        TopicId = topicId,
+                        GroupId = consumerGroupId
+                    };
                 consumerGroups.Add(consumerGroup);
                 position += 12;
             }
@@ -360,7 +363,8 @@ internal static class BinaryMapper
             Dictionary<HeaderKey, HeaderValue>? headers = headersLength switch
             {
                 0 => null,
-                > 0 => MapHeaders(payload[(position + 56 + payloadLength)..(position + 56 + payloadLength + headersLength)]),
+                > 0 => MapHeaders(
+                    payload[(position + 56 + payloadLength)..(position + 56 + payloadLength + headersLength)]),
                 < 0 => throw new ArgumentOutOfRangeException()
             };
 
@@ -444,7 +448,8 @@ internal static class BinaryMapper
             Dictionary<HeaderKey, HeaderValue>? headers = headersLength switch
             {
                 0 => null,
-                > 0 => MapHeaders(payload[(position + 56 + payloadLength)..(position + 56 + payloadLength + headersLength)]),
+                > 0 => MapHeaders(
+                    payload[(position + 56 + payloadLength)..(position + 56 + payloadLength + headersLength)]),
                 < 0 => throw new ArgumentOutOfRangeException()
             };
 
@@ -531,7 +536,8 @@ internal static class BinaryMapper
             position += valueLength;
             headers.Add(HeaderKey.New(key), new HeaderValue
             {
-                Kind = headerKind, Value = value.ToArray()
+                Kind = headerKind,
+                Value = value.ToArray()
             });
         }
 
@@ -858,16 +864,18 @@ internal static class BinaryMapper
         var partitions = new List<int>();
         for (var i = 0; i < partitionsCount; i++)
         {
-            var partitionId = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 8 + i * 4)..(position + 8 + (i + 1) * 4)]);
+            var partitionId
+                = BinaryPrimitives.ReadInt32LittleEndian(payload[(position + 8 + i * 4)..(position + 8 + (i + 1) * 4)]);
             partitions.Add(partitionId);
         }
 
         return (new ConsumerGroupMember
-        {
-            Id = id,
-            PartitionsCount = partitionsCount,
-            Partitions = partitions
-        }, 8 + partitionsCount * 4);
+            {
+                Id = id,
+                PartitionsCount = partitionsCount,
+                Partitions = partitions
+            },
+            8 + partitionsCount * 4);
     }
 
     private static (ConsumerGroupResponse consumerGroup, int readBytes) MapToConsumerGroup(ReadOnlySpan<byte> payload,
@@ -880,12 +888,11 @@ internal static class BinaryMapper
         var name = Encoding.UTF8.GetString(payload[(position + 13)..(position + 13 + nameLength)]);
 
         return (new ConsumerGroupResponse
-            {
-                Id = id,
-                Name = name,
-                MembersCount = membersCount,
-                PartitionsCount = partitionsCount
-            },
-            13 + name.Length);
+        {
+            Id = id,
+            Name = name,
+            MembersCount = membersCount,
+            PartitionsCount = partitionsCount
+        }, 13 + name.Length);
     }
 }

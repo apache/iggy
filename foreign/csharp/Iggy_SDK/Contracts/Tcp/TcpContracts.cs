@@ -197,7 +197,8 @@ internal static class TcpContracts
         return bytes.ToArray();
     }
 
-    internal static byte[] CreateUser(string userName, string password, UserStatus status, Permissions? permissions = null)
+    internal static byte[] CreateUser(string userName, string password, UserStatus status,
+        Permissions? permissions = null)
     {
         var capacity = 3 + userName.Length + password.Length
                        + (permissions is not null ? 1 + 4 + CalculatePermissionsSize(permissions) : 1);
@@ -362,7 +363,8 @@ internal static class TcpContracts
         return bytes.ToArray();
     }
 
-    internal static void GetMessages(Span<byte> bytes, Consumer consumer, Identifier streamId, Identifier topicId, PollingStrategy pollingStrategy,
+    internal static void GetMessages(Span<byte> bytes, Consumer consumer, Identifier streamId, Identifier topicId,
+        PollingStrategy pollingStrategy,
         int count, bool autoCommit, uint? partitionId)
     {
         bytes[0] = GetConsumerTypeByte(consumer.Type);
@@ -400,8 +402,10 @@ internal static class TcpContracts
             BinaryPrimitives.WriteUInt64LittleEndian(bytes[position..(position + 8)], message.Header.Checksum);
             BinaryPrimitives.WriteUInt128LittleEndian(bytes[(position + 8)..(position + 24)], message.Header.Id);
             BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 24)..(position + 32)], message.Header.Offset);
-            BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 32)..(position + 40)], DateTimeOffsetUtils.ToUnixTimeMicroSeconds(message.Header.Timestamp));
-            BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 40)..(position + 48)], message.Header.OriginTimestamp);
+            BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 32)..(position + 40)],
+                DateTimeOffsetUtils.ToUnixTimeMicroSeconds(message.Header.Timestamp));
+            BinaryPrimitives.WriteUInt64LittleEndian(bytes[(position + 40)..(position + 48)],
+                message.Header.OriginTimestamp);
             BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 48)..(position + 52)], headersBytes.Length);
             BinaryPrimitives.WriteInt32LittleEndian(bytes[(position + 52)..(position + 56)], message.Payload.Length);
 
@@ -409,7 +413,9 @@ internal static class TcpContracts
             if (headersBytes.Length > 0)
             {
                 headersBytes
-                    .CopyTo(bytes[(position + 56 + message.Header.PayloadLength)..(position + 56 + message.Header.PayloadLength + headersBytes.Length)]);
+                    .CopyTo(bytes[
+                        (position + 56 + message.Header.PayloadLength)..(position + 56 + message.Header.PayloadLength +
+                                                                         headersBytes.Length)]);
             }
 
             position += 56 + message.Header.PayloadLength + headersBytes.Length;
@@ -662,8 +668,8 @@ internal static class TcpContracts
         return bytes.ToArray();
     }
 
-    internal static byte[] UpdateTopic(Identifier streamId, Identifier topicId, string name, CompressionAlgorithm compressionAlgorithm,
-        ulong maxTopicSize, ulong messageExpiry, byte? replicationFactor)
+    internal static byte[] UpdateTopic(Identifier streamId, Identifier topicId, string name,
+        CompressionAlgorithm compressionAlgorithm, ulong maxTopicSize, ulong messageExpiry, byte? replicationFactor)
     {
         Span<byte> bytes = stackalloc byte[4 + streamId.Length + topicId.Length + 19 + name.Length];
         bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId);
@@ -680,8 +686,9 @@ internal static class TcpContracts
         return bytes.ToArray();
     }
 
-    internal static byte[] CreateTopic(Identifier streamId, string name, uint partitionCount, CompressionAlgorithm compressionAlgorithm,
-        uint? topicId, byte? replicationFactor, ulong messageExpiry, ulong maxTopicSize)
+    internal static byte[] CreateTopic(Identifier streamId, string name, uint partitionCount,
+        CompressionAlgorithm compressionAlgorithm, uint? topicId, byte? replicationFactor, ulong messageExpiry,
+        ulong maxTopicSize)
     {
         Span<byte> bytes = stackalloc byte[2 + streamId.Length + 27 + name.Length];
         bytes.WriteBytesFromIdentifier(streamId);
@@ -719,7 +726,8 @@ internal static class TcpContracts
         return bytes.ToArray();
     }
 
-    internal static byte[] UpdateOffset(Identifier streamId, Identifier topicId, Consumer consumer, ulong offset, uint? partitionId)
+    internal static byte[] UpdateOffset(Identifier streamId, Identifier topicId, Consumer consumer, ulong offset,
+        uint? partitionId)
     {
         Span<byte> bytes =
             stackalloc byte[2 + streamId.Length + 2 + topicId.Length + 15 + consumer.Id.Length];

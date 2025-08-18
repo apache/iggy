@@ -18,7 +18,6 @@
 using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Text.Json;
 using Apache.Iggy.Enums;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
@@ -71,7 +70,8 @@ internal static class Extensions
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static void WriteBytesFromStreamAndTopicIdentifiers(this Span<byte> bytes, Identifier streamId, Identifier topicId, int startPos = 0)
+    internal static void WriteBytesFromStreamAndTopicIdentifiers(this Span<byte> bytes, Identifier streamId,
+        Identifier topicId, int startPos = 0)
     {
         bytes[startPos] = streamId.Kind.GetByte();
         bytes[startPos + 1] = (byte)streamId.Length;
