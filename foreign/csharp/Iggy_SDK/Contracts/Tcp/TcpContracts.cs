@@ -18,8 +18,7 @@
 using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using System.Text;
-using Apache.Iggy.Contracts.Http;
-using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.Headers;
@@ -351,14 +350,14 @@ internal static class TcpContracts
         return size;
     }
 
-    public static byte[] FlushUnsavedBuffer(FlushUnsavedBufferRequest request)
+    public static byte[] FlushUnsavedBuffer(Identifier streamId, Identifier topicId, uint partitionId, bool fsync)
     {
-        var length = request.StreamId.Length + 2 + request.TopicId.Length + 2 + 4 + 1;
+        var length = streamId.Length + 2 + topicId.Length + 2 + 4 + 1;
         Span<byte> bytes = stackalloc byte[length];
-        bytes.WriteBytesFromStreamAndTopicIdentifiers(request.StreamId, request.TopicId);
-        var position = request.StreamId.Length + 2 + request.TopicId.Length + 2;
-        BinaryPrimitives.WriteUInt32LittleEndian(bytes[position..(position + 4)], request.PartitionId);
-        bytes[position + 4] = request.Fsync ? (byte)1 : (byte)0;
+        bytes.WriteBytesFromStreamAndTopicIdentifiers(streamId, topicId);
+        var position = streamId.Length + 2 + topicId.Length + 2;
+        BinaryPrimitives.WriteUInt32LittleEndian(bytes[position..(position + 4)], partitionId);
+        bytes[position + 4] = fsync ? (byte)1 : (byte)0;
 
         return bytes.ToArray();
     }

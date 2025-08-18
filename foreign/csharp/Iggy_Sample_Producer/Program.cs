@@ -19,7 +19,7 @@ using System.Buffers.Binary;
 using System.Security.Cryptography;
 using System.Text;
 using Apache.Iggy;
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
 using Apache.Iggy.Headers;
@@ -172,12 +172,12 @@ async Task ProduceMessages(IIggyClient bus, StreamResponse? stream, TopicRespons
         try
         {
             await bus.SendMessagesAsync(new MessageSendRequest<Envelope>
-            {
-                StreamId = streamId,
-                TopicId = topicId,
-                Partitioning = Partitioning.PartitionId(3),
-                Messages = messages
-            },
+                {
+                    StreamId = streamId,
+                    TopicId = topicId,
+                    Partitioning = Partitioning.PartitionId(3),
+                    Messages = messages
+                },
                 serializer,
                 encryptor, headers);
         }

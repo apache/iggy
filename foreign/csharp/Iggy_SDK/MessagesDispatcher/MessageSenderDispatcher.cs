@@ -19,7 +19,7 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Threading.Channels;
 using Apache.Iggy.Configuration;
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Messages;
 using Microsoft.Extensions.Logging;

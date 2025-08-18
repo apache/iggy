@@ -84,11 +84,7 @@ public sealed class TcpContract
     public void TcpContracts_LoginUser_HasCorrectBytes()
     {
         // Arrange
-        var request = new LoginUserRequest
-        {
-            Username = "testuser",
-            Password = "testpassword"
-        };
+        var request = new LoginUserRequest("testuser", "testpassword", null, null);
 
         // Act
         var result = TcpContracts.LoginUser(request.Username, request.Password, request.Version, request.Context);
@@ -117,13 +113,7 @@ public sealed class TcpContract
     public void TcpContracts_LoginUserWithOptional_HasCorrectBytes()
     {
         // Arrange
-        var request = new LoginUserRequest
-        {
-            Username = "testuser",
-            Password = "testpassword",
-            Context = "optional context",
-            Version = "1.0.0"
-        };
+        var request = new LoginUserRequest("testuser", "testpassword", "1.0.0", "optional context");
 
         // Act
         var result = TcpContracts.LoginUser(request.Username, request.Password, request.Version, request.Context);
@@ -165,11 +155,7 @@ public sealed class TcpContract
     {
         // Arrange
         var userId = Identifier.Numeric(1);
-        var request = new UpdateUserRequest
-        {
-            Username = "newusername",
-            UserStatus = UserStatus.Inactive
-        };
+        var request = new UpdateUserRequest("newusername", UserStatus.Inactive);
 
         // Act
         var result = TcpContracts.UpdateUser(userId, request.Username, request.UserStatus);
@@ -222,13 +208,7 @@ public sealed class TcpContract
     public void TcpContracts_CreateUser_NoPermission_HasCorrectBytes()
     {
         // Arrange
-        var request = new CreateUserRequest
-        {
-            Username = "testuser",
-            Password = "testpassword",
-            Status = UserStatus.Active,
-            Permissions = null
-        };
+        var request = new CreateUserRequest("testuser", "testpassword", UserStatus.Active, null);
         // Act
         var result = TcpContracts.CreateUser(request.Username, request.Password, request.Status, request.Permissions);
 
@@ -392,13 +372,8 @@ public sealed class TcpContract
     public void TcpContracts_CreateUser_WithPermission_HasCorrectBytes()
     {
         // Arrange
-        var request = new CreateUserRequest
-        {
-            Username = "testuser",
-            Password = "testpassword",
-            Status = UserStatus.Active,
-            Permissions = PermissionsFactory.CreatePermissions()
-        };
+        var request = new CreateUserRequest("testuser", "testpassword", UserStatus.Active, PermissionsFactory.CreatePermissions());
+
         // Act
         var result = TcpContracts.CreateUser(request.Username, request.Password, request.Status, request.Permissions);
 

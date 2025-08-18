@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
+using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Contracts.Http.Auth;
 using Apache.Iggy.Enums;
 
@@ -26,12 +27,12 @@ public static class UsersFactory
     public static CreateUserRequest CreateUserRequest(string? username = null, string? password = null, Permissions? permissions = null)
     {
         return new CreateUserRequest
-        {
-            Password = username ?? Utility.RandomString(Random.Shared.Next(5, 25)),
-            Username = password ?? Utility.RandomString(Random.Shared.Next(5, 25)),
-            Status = UserStatus.Active,
-            Permissions = permissions ?? CreatePermissions()
-        };
+        (
+            username ?? Utility.RandomString(Random.Shared.Next(5, 25)),
+            password ?? Utility.RandomString(Random.Shared.Next(5, 25)),
+            UserStatus.Active,
+            permissions ?? CreatePermissions()
+        );
     }
 
     public static Dictionary<int, StreamPermissions> CreateStreamPermissions(int streamId = 1, int topicId = 1)

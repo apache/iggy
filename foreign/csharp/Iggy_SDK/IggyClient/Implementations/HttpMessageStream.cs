@@ -25,6 +25,8 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading.Channels;
 using Apache.Iggy.Configuration;
+using Apache.Iggy.Contracts;
+using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Contracts.Http.Auth;
 using Apache.Iggy.Enums;
@@ -40,6 +42,8 @@ namespace Apache.Iggy.IggyClient.Implementations;
 
 public class HttpMessageStream : IIggyClient
 {
+    private const string Context = "csharp-sdk";
+
     private readonly Channel<MessageSendRequest>? _channel;
     private readonly HttpClient _httpClient;
 
@@ -70,11 +74,7 @@ public class HttpMessageStream : IIggyClient
 
     public async Task<StreamResponse?> CreateStreamAsync(string name, uint? streamId = null, CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new CreateStreamRequest
-        {
-            Name = name,
-            StreamId = streamId
-        }, _jsonSerializerOptions);
+        var json = JsonSerializer.Serialize(new CreateStreamRequest(streamId, name), _jsonSerializerOptions);
 
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
@@ -124,10 +124,7 @@ public class HttpMessageStream : IIggyClient
 
     public async Task UpdateStreamAsync(Identifier streamId, string name, CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new UpdateStreamRequest
-        {
-            Name = name
-        }, _jsonSerializerOptions);
+        var json = JsonSerializer.Serialize(new UpdateStreamRequest(name), _jsonSerializerOptions);
 
         var data = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PutAsync($"/streams/{streamId}", data, token);
@@ -305,9 +302,9 @@ public class HttpMessageStream : IIggyClient
         await _channel!.Writer.WriteAsync(sendRequest, token);
     }
 
-    public async Task FlushUnsavedBufferAsync(FlushUnsavedBufferRequest request, CancellationToken token = default)
+    public async Task FlushUnsavedBufferAsync(Identifier streamId, Identifier topicId, uint partitionId, bool fsync, CancellationToken token = default)
     {
-        var url = CreateUrl($"/streams/{request.StreamId}/topics/{request.TopicId}/messages/flush/{request.PartitionId}/{request.Fsync}");
+        var url = CreateUrl($"/streams/{streamId}/topics/{topicId}/messages/flush/{partitionId}/{fsync}");
 
         var response = await _httpClient.GetAsync(url, token);
 
@@ -440,12 +437,7 @@ public class HttpMessageStream : IIggyClient
 
     public async Task StoreOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, ulong offset, uint? partitionId, CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new StoreOffsetRequest
-        {
-            Consumer = consumer,
-            Offset = offset,
-            PartitionId = partitionId
-        }, _jsonSerializerOptions);
+        var json = JsonSerializer.Serialize(new StoreOffsetRequest(consumer, partitionId, offset), _jsonSerializerOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
         var response = await _httpClient.PutAsync($"/streams/{streamId}/topics/{topicId}/consumer-offsets", data, token);
@@ -504,11 +496,7 @@ public class HttpMessageStream : IIggyClient
 
     public async Task<ConsumerGroupResponse?> CreateConsumerGroupAsync(Identifier streamId, Identifier topicId, string name, uint? groupId, CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new CreateConsumerGroupRequest
-        {
-            Name = name,
-            ConsumerGroupId = groupId
-        }, _jsonSerializerOptions);
+        var json = JsonSerializer.Serialize(new CreateConsumerGroupRequest(name, groupId), _jsonSerializerOptions);
 
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
@@ -533,13 +521,12 @@ public class HttpMessageStream : IIggyClient
         throw new FeatureUnavailableException();
     }
 
-    public async Task<Stats?> GetStatsAsync(CancellationToken token = default)
+    public async Task<StatsResponse?> GetStatsAsync(CancellationToken token = default)
     {
         var response = await _httpClient.GetAsync("/stats", token);
         if (response.IsSuccessStatusCode)
         {
-            var result = await response.Content.ReadFromJsonAsync<StatsResponse>(_jsonSerializerOptions, token);
-            return result?.ToStats();
+            return await response.Content.ReadFromJsonAsync<StatsResponse>(_jsonSerializerOptions, token);
         }
 
         await HandleResponseAsync(response);
@@ -605,10 +592,7 @@ public class HttpMessageStream : IIggyClient
 
     public async Task CreatePartitionsAsync(Identifier streamId, Identifier topicId, uint partitionsCount, CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new CreatePartitionsRequest
-        {
-            PartitionsCount = partitionsCount
-        }, _jsonSerializerOptions);
+        var json = JsonSerializer.Serialize(new CreatePartitionsRequest(partitionsCount), _jsonSerializerOptions);
 
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
@@ -647,13 +631,7 @@ public class HttpMessageStream : IIggyClient
 
     public async Task<UserResponse?> CreateUser(string userName, string password, UserStatus status, Permissions? permissions = null, CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new CreateUserRequest
-        {
-            Username = userName,
-            Password = password,
-            Status = status,
-            Permissions = permissions
-        }, _jsonSerializerOptions);
+        var json = JsonSerializer.Serialize(new CreateUserRequest(userName, password, status, permissions), _jsonSerializerOptions);
 
         var content = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PostAsync("/users", content, token);
@@ -677,11 +655,7 @@ public class HttpMessageStream : IIggyClient
 
     public async Task UpdateUser(Identifier userId, string? userName = null, UserStatus? status = null, CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new UpdateUserRequest
-        {
-            Username = userName,
-            UserStatus = status
-        }, _jsonSerializerOptions);
+        var json = JsonSerializer.Serialize(new UpdateUserRequest(userName, status), _jsonSerializerOptions);
         var content = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PutAsync($"/users/{userId}", content, token);
         if (!response.IsSuccessStatusCode)
@@ -692,10 +666,7 @@ public class HttpMessageStream : IIggyClient
 
     public async Task UpdatePermissions(Identifier userId, Permissions? permissions = null, CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new UpdateUserPermissionsRequest
-        {
-            Permissions = permissions
-        }, _jsonSerializerOptions);
+        var json = JsonSerializer.Serialize(new UpdateUserPermissionsRequest(permissions), _jsonSerializerOptions);
         var content = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PutAsync($"/users/{userId}/permissions", content, token);
         if (!response.IsSuccessStatusCode)
@@ -706,11 +677,7 @@ public class HttpMessageStream : IIggyClient
 
     public async Task ChangePassword(Identifier userId, string currentPassword, string newPassword, CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new ChangePasswordRequest
-        {
-            CurrentPassword = currentPassword,
-            NewPassword = newPassword
-        }, _jsonSerializerOptions);
+        var json = JsonSerializer.Serialize(new ChangePasswordRequest(currentPassword, newPassword), _jsonSerializerOptions);
         var content = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PutAsync($"/users/{userId}/password", content, token);
         if (!response.IsSuccessStatusCode)
@@ -721,12 +688,8 @@ public class HttpMessageStream : IIggyClient
 
     public async Task<AuthResponse?> LoginUser(string userName, string password, CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new LoginUserRequest
-        {
-            Username = userName,
-            Password = password,
-            Context = "csharp-sdk"
-        }, _jsonSerializerOptions);
+        // TODO: get version 
+        var json = JsonSerializer.Serialize(new LoginUserRequest(userName, password, "", Context), _jsonSerializerOptions);
 
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
@@ -778,11 +741,7 @@ public class HttpMessageStream : IIggyClient
 
     public async Task<RawPersonalAccessToken?> CreatePersonalAccessTokenAsync(string name, ulong? expiry = null, CancellationToken token = default)
     {
-        var json = JsonSerializer.Serialize(new CreatePersonalAccessTokenRequest
-        {
-            Name = name,
-            Expiry = expiry
-        }, _jsonSerializerOptions);
+        var json = JsonSerializer.Serialize(new CreatePersonalAccessTokenRequest(name, expiry), _jsonSerializerOptions);
 
         var content = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PostAsync("/personal-access-tokens", content, token);
@@ -805,10 +764,7 @@ public class HttpMessageStream : IIggyClient
 
     public async Task<AuthResponse?> LoginWithPersonalAccessToken(string token, CancellationToken ct = default)
     {
-        var json = JsonSerializer.Serialize(new LoginWithPersonalAccessToken
-        {
-            Token = token
-        }, _jsonSerializerOptions);
+        var json = JsonSerializer.Serialize(new LoginWithPersonalAccessToken(token), _jsonSerializerOptions);
 
         var content = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PostAsync("/personal-access-tokens/login", content, ct);

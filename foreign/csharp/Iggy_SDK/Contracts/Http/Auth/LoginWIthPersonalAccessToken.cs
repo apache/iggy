@@ -17,7 +17,4 @@
 
 namespace Apache.Iggy.Contracts.Http.Auth;
 
-public sealed class LoginWithPersonalAccessToken
-{
-    public required string Token { get; init; }
-}
+public sealed record LoginWithPersonalAccessToken(string Token);

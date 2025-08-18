@@ -15,7 +15,7 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Tests.Integrations.Fixtures;
@@ -36,14 +36,14 @@ public class PollMessagesTests(Protocol protocol)
     {
         var messageCount = 0;
         await foreach (MessageResponse<DummyMessage> msgResponse in Fixture.Clients[protocol].PollMessagesAsync(new PollMessagesRequest
-        {
-            Consumer = Consumer.New(1),
-            Count = 10,
-            PartitionId = 1,
-            PollingStrategy = PollingStrategy.Next(),
-            StreamId = Identifier.Numeric(Fixture.StreamId),
-            TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value)
-        }, DummyMessage.DeserializeDummyMessage, token: token))
+                       {
+                           Consumer = Consumer.New(1),
+                           Count = 10,
+                           PartitionId = 1,
+                           PollingStrategy = PollingStrategy.Next(),
+                           StreamId = Identifier.Numeric(Fixture.StreamId),
+                           TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value)
+                       }, DummyMessage.DeserializeDummyMessage, token: token))
         {
             msgResponse.UserHeaders.ShouldNotBeNull();
             msgResponse.UserHeaders.Count.ShouldBe(2);

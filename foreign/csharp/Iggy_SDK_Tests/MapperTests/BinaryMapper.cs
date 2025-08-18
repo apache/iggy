@@ -17,8 +17,8 @@
 
 using System.Buffers.Binary;
 using System.Text;
-using Apache.Iggy.Contracts.Http;
-using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Contracts;
+using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.Tests.Utils;

@@ -19,7 +19,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Apache.Iggy;
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
 using Apache.Iggy.Kinds;
@@ -115,14 +115,14 @@ async Task ConsumeMessages()
         AutoCommit = true
     }, deserializer, decryptor);
     await foreach (MessageResponse<Envelope> msgResponse in bus.PollMessagesAsync(new PollMessagesRequest
-    {
-        Consumer = Consumer.New(consumerId),
-        Count = 1,
-        TopicId = topicId,
-        StreamId = streamId,
-        PartitionId = partitionId,
-        PollingStrategy = PollingStrategy.Next()
-    }, deserializer, decryptor))
+                   {
+                       Consumer = Consumer.New(consumerId),
+                       Count = 1,
+                       TopicId = topicId,
+                       StreamId = streamId,
+                       PartitionId = partitionId,
+                       PollingStrategy = PollingStrategy.Next()
+                   }, deserializer, decryptor))
     {
         HandleMessage(msgResponse);
     }
@@ -139,24 +139,24 @@ void HandleMessage(MessageResponse<Envelope> messageResponse)
     switch (messageResponse.Message.MessageType)
     {
         case "order_created":
-            {
-                var orderCreated = JsonSerializer.Deserialize<OrderCreated>(messageResponse.Message.Payload, jsonOptions);
-                Console.WriteLine(orderCreated);
-                break;
-            }
+        {
+            var orderCreated = JsonSerializer.Deserialize<OrderCreated>(messageResponse.Message.Payload, jsonOptions);
+            Console.WriteLine(orderCreated);
+            break;
+        }
         case "order_confirmed":
-            {
-                var orderConfirmed =
-                    JsonSerializer.Deserialize<OrderConfirmed>(messageResponse.Message.Payload, jsonOptions);
-                Console.WriteLine(orderConfirmed);
-                break;
-            }
+        {
+            var orderConfirmed =
+                JsonSerializer.Deserialize<OrderConfirmed>(messageResponse.Message.Payload, jsonOptions);
+            Console.WriteLine(orderConfirmed);
+            break;
+        }
         case "order_rejected":
-            {
-                var orderRejected = JsonSerializer.Deserialize<OrderRejected>(messageResponse.Message.Payload, jsonOptions);
-                Console.WriteLine(orderRejected);
-                break;
-            }
+        {
+            var orderRejected = JsonSerializer.Deserialize<OrderRejected>(messageResponse.Message.Payload, jsonOptions);
+            Console.WriteLine(orderRejected);
+            break;
+        }
     }
 
 

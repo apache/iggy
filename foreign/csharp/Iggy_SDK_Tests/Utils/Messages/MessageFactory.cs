@@ -18,7 +18,7 @@
 using System.Buffers.Binary;
 using System.Text;
 using System.Text.Json;
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.Headers;

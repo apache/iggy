@@ -15,7 +15,7 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
-using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Tests.Integrations.Fixtures;

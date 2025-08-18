@@ -16,7 +16,7 @@
 // // under the License.
 
 using System.Text;
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
 using Apache.Iggy.Kinds;
@@ -138,7 +138,7 @@ public class BasicMessagingOperationsSteps
             Messages = messages
         });
 
-        _context.LastSendMessage = messages.Last();
+        _context.LastSendMessage = messages[^1];
     }
 
     [Then(@"all messages should be sent successfully")]

@@ -18,7 +18,7 @@
 using System.Buffers;
 using System.Text;
 using Apache.Iggy.ConnectionStream;
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Messages;

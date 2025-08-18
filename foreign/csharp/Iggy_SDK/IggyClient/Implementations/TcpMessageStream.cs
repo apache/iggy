@@ -23,8 +23,8 @@ using System.Text;
 using System.Threading.Channels;
 using Apache.Iggy.Configuration;
 using Apache.Iggy.ConnectionStream;
-using Apache.Iggy.Contracts.Http;
-using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Contracts;
+using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
@@ -333,9 +333,10 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await _channel!.Writer.WriteAsync(sendRequest, token);
     }
 
-    public async Task FlushUnsavedBufferAsync(FlushUnsavedBufferRequest request, CancellationToken token = default)
+    public async Task FlushUnsavedBufferAsync(Identifier streamId, Identifier topicId, uint partitionId, bool fsync, CancellationToken token = default)
     {
-        var message = TcpContracts.FlushUnsavedBuffer(request);
+        var message = TcpContracts.FlushUnsavedBuffer(streamId, topicId, partitionId, fsync);
+        ;
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.FLUSH_UNSAVED_BUFFER_CODE);
 
@@ -675,7 +676,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapClient(responseBuffer);
     }
 
-    public async Task<Stats?> GetStatsAsync(CancellationToken token = default)
+    public async Task<StatsResponse?> GetStatsAsync(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];

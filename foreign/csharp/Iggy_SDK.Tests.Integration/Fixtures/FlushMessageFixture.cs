@@ -15,6 +15,7 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;

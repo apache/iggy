@@ -15,7 +15,6 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
-using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Tests.Integrations.Fixtures;
@@ -32,38 +31,23 @@ public class FlushMessagesTests(Protocol protocol)
     [Test]
     public async Task FlushUnsavedBuffer_WithFsync_Should_Flush_Successfully()
     {
-        await Should.NotThrowAsync(() => Fixture.Clients[protocol].FlushUnsavedBufferAsync(new FlushUnsavedBufferRequest
-        {
-            StreamId = Identifier.Numeric(Fixture.StreamId),
-            TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value),
-            PartitionId = 1,
-            Fsync = true
-        }));
+        await Should.NotThrowAsync(() => Fixture.Clients[protocol].FlushUnsavedBufferAsync(Identifier.Numeric(Fixture.StreamId),
+            Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), 1, true));
     }
 
     [Test]
     [DependsOn(nameof(FlushUnsavedBuffer_WithFsync_Should_Flush_Successfully))]
     public async Task FlushUnsavedBuffer_WithOutFsync_Should_Flush_Successfully()
     {
-        await Should.NotThrowAsync(() => Fixture.Clients[protocol].FlushUnsavedBufferAsync(new FlushUnsavedBufferRequest
-        {
-            StreamId = Identifier.Numeric(Fixture.StreamId),
-            TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value),
-            PartitionId = 1,
-            Fsync = false
-        }));
+        await Should.NotThrowAsync(() => Fixture.Clients[protocol].FlushUnsavedBufferAsync(Identifier.Numeric(Fixture.StreamId),
+            Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), 1, false));
     }
 
     [Test]
     [DependsOn(nameof(FlushUnsavedBuffer_WithOutFsync_Should_Flush_Successfully))]
     public async Task FlushUnsavedBuffer_Should_Throw_WhenStream_DoesNotExist()
     {
-        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].FlushUnsavedBufferAsync(new FlushUnsavedBufferRequest
-        {
-            StreamId = Identifier.Numeric(Fixture.StreamId),
-            TopicId = Identifier.Numeric(55),
-            PartitionId = 1,
-            Fsync = true
-        }));
+        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].FlushUnsavedBufferAsync(Identifier.Numeric(Fixture.StreamId),
+            Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), 55, false));
     }
 }

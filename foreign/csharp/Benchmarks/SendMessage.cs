@@ -17,7 +17,7 @@
 
 using System.Diagnostics;
 using System.Text;
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;

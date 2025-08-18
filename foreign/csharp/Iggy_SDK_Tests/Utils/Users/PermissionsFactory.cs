@@ -16,8 +16,8 @@
 // under the License.
 
 using System.Buffers.Binary;
-using Apache.Iggy.Contracts.Http;
-using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Contracts;
+using Apache.Iggy.Contracts.Auth;
 
 namespace Apache.Iggy.Tests.Utils.Users;
 

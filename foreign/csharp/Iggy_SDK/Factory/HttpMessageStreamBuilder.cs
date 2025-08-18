@@ -17,7 +17,7 @@
 
 using System.Threading.Channels;
 using Apache.Iggy.Configuration;
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.IggyClient.Implementations;
 using Apache.Iggy.MessagesDispatcher;
 using Microsoft.Extensions.Logging;

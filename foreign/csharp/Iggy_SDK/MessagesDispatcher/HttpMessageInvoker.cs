@@ -19,7 +19,7 @@ using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Exceptions;
 
 namespace Apache.Iggy.MessagesDispatcher;

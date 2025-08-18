@@ -15,6 +15,7 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Headers;
 using Apache.Iggy.Kinds;
@@ -38,12 +39,12 @@ public class PollMessagesFixture : IggyServerFixture
             await client.CreateStreamAsync("Test Stream", StreamId);
             await client.CreateTopicAsync(Identifier.Numeric(StreamId), TopicRequest.Name, TopicRequest.PartitionsCount, topicId: TopicRequest.TopicId);
             await client.SendMessagesAsync(new MessageSendRequest<DummyMessage>
-            {
-                Messages = CreateDummyMessagesWithoutHeader(MessageCount),
-                Partitioning = Partitioning.None(),
-                StreamId = Identifier.Numeric(StreamId),
-                TopicId = Identifier.Numeric(TopicRequest.TopicId!.Value)
-            },
+                {
+                    Messages = CreateDummyMessagesWithoutHeader(MessageCount),
+                    Partitioning = Partitioning.None(),
+                    StreamId = Identifier.Numeric(StreamId),
+                    TopicId = Identifier.Numeric(TopicRequest.TopicId!.Value)
+                },
                 message => message.SerializeDummyMessage(),
                 headers: new Dictionary<HeaderKey, HeaderValue>
                 {

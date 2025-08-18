@@ -15,7 +15,8 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
+using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Contracts.Http.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
@@ -36,12 +37,7 @@ public class UsersTests(Protocol protocol)
     [Test]
     public async Task CreateUser_Should_CreateUser_Successfully()
     {
-        var request = new CreateUserRequest
-        {
-            Username = Username,
-            Password = "test_password_1",
-            Status = UserStatus.Active
-        };
+        var request = new CreateUserRequest(Username, "test_password_1", UserStatus.Active, null);
 
         var result = await Fixture.Clients[protocol].CreateUser(request.Username, request.Password, request.Status);
         result.ShouldNotBeNull();
@@ -55,12 +51,7 @@ public class UsersTests(Protocol protocol)
     [DependsOn(nameof(CreateUser_Should_CreateUser_Successfully))]
     public async Task CreateUser_Duplicate_Should_Throw_InvalidResponse()
     {
-        var request = new CreateUserRequest
-        {
-            Username = Username,
-            Password = "test1",
-            Status = UserStatus.Active
-        };
+        var request = new CreateUserRequest(Username, "test1", UserStatus.Active, null);
 
         await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol].CreateUser(request.Username, request.Password, request.Status));
     }

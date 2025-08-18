@@ -30,7 +30,7 @@ internal sealed class DateTimeOffsetConverter : JsonConverter<DateTimeOffset>
             throw new JsonException("Expected a number token for DateTimeOffset conversion.");
         }
 
-        return DateTimeOffsetUtils.FromUnixTimeMicroSeconds(reader.GetUInt64()).LocalDateTime;
+        return DateTimeOffsetUtils.FromUnixTimeMicroSeconds(reader.GetUInt64());
     }
 
     public override void Write(Utf8JsonWriter writer, DateTimeOffset value, JsonSerializerOptions options)

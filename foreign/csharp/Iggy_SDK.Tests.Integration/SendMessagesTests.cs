@@ -16,7 +16,7 @@
 // // under the License.
 
 using System.Text;
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Headers;

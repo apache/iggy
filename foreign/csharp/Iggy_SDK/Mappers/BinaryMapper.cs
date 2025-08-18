@@ -18,8 +18,8 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Text;
-using Apache.Iggy.Contracts.Http;
-using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Contracts;
+using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.Headers;
@@ -737,7 +737,7 @@ internal static class BinaryMapper
         return consumerGroups;
     }
 
-    internal static Stats MapStats(ReadOnlySpan<byte> payload)
+    internal static StatsResponse MapStats(ReadOnlySpan<byte> payload)
     {
         var processId = BinaryPrimitives.ReadInt32LittleEndian(payload[..4]);
         var cpuUsage = BitConverter.ToSingle(payload[4..8]);
@@ -800,7 +800,7 @@ internal static class BinaryMapper
             cacheMetricsList.Add(cacheMetricsKey, cacheMetrics);
         }
 
-        return new Stats
+        return new StatsResponse
         {
             ProcessId = processId,
             Hostname = hostname,
@@ -880,12 +880,12 @@ internal static class BinaryMapper
         var name = Encoding.UTF8.GetString(payload[(position + 13)..(position + 13 + nameLength)]);
 
         return (new ConsumerGroupResponse
-        {
-            Id = id,
-            Name = name,
-            MembersCount = membersCount,
-            PartitionsCount = partitionsCount
-        },
+            {
+                Id = id,
+                Name = name,
+                MembersCount = membersCount,
+                PartitionsCount = partitionsCount
+            },
             13 + name.Length);
     }
 }
