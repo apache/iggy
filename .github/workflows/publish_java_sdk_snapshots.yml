@@ -40,7 +40,7 @@ jobs:
         uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
 
       - name: Build
-        run: foreign/java/dev-support/checks/build.sh build -x test -x checkstyleMain -x checkstyleTest
+        run: foreign/java/dev-support/checks/build.sh build -x test -x checkstyleMain -x checkstyleTest -x sign
 
       - name: Run tests
         run: foreign/java/dev-support/checks/build.sh test
@@ -61,4 +61,4 @@ jobs:
           NEXUS_USER: ${{ secrets.NEXUS_USER }}
           NEXUS_PASSWORD: ${{ secrets.NEXUS_PW }}
         if: steps.extract_version.outputs.snapshot == 'SNAPSHOT'
-        run: foreign/java/dev-support/checks/build.sh build -x test -x checkstyleMain -x checkstyleTest publish
+        run: foreign/java/dev-support/checks/build.sh build -x test -x checkstyleMain -x checkstyleTest -x sign publish
