@@ -190,6 +190,13 @@ class IggyClient:
         This initializes a new runtime for asynchronous operations.
         Future versions might utilize asyncio for more Pythonic async.
         """
+    @classmethod
+    def from_connection_string(cls, connection_string:builtins.str) -> IggyClient:
+        r"""
+        Constructs a new IggyClient from a connection string.
+        
+        Returns an error if the connection string provided is invalid.
+        """
     def ping(self) -> collections.abc.Awaitable[None]:
         r"""
         Sends a ping request to the server to check connectivity.
