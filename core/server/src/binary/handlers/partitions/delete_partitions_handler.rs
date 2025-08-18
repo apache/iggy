@@ -20,15 +20,14 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::partitions::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
-use crate::shard::namespace::IggyNamespace;
 use crate::shard::transmission::event::ShardEvent;
+use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::delete_partitions::DeletePartitions;
-use iggy_common::locking::IggyRwLockFn;
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -49,19 +48,22 @@ impl ServerCommandHandler for DeletePartitions {
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
 
-        let deleted_partition_ids2 = shard
+        let deleted_partition_ids = shard
             .delete_partitions2(
                 session,
                 &self.stream_id,
                 &self.topic_id,
                 self.partitions_count,
-            )
-            .await?;
+            )?
+            .iter()
+            .map(|p| p.id() as u32)
+            .collect();
+
         let event = ShardEvent::DeletedPartitions2 {
             stream_id: self.stream_id.clone(),
             topic_id: self.topic_id.clone(),
             partitions_count: self.partitions_count,
-            partition_ids: deleted_partition_ids2,
+            partition_ids: deleted_partition_ids,
         };
         let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
         // TODO: Delete shard table records.

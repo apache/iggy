@@ -84,6 +84,7 @@ impl IggyShard {
             max_topic_size,
             parent_stats,
         );
+        self.metrics.increment_topics(1);
 
         // Create file hierarchy for the topic.
         create_topic_file_hierarchy(self.id, numeric_stream_id, topic.id(), &self.config.system)
@@ -251,7 +252,7 @@ impl IggyShard {
                 })?;
         }
         let topic = self.delete_topic_base2(stream_id, topic_id);
-        // TODO: Decrease the stats
+        self.metrics.decrement_topics(1);
         Ok(topic)
     }
 

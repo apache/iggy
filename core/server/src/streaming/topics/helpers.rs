@@ -5,7 +5,7 @@ use crate::{
     slab::{
         Keyed,
         consumer_groups::{self, ConsumerGroups},
-        partitions,
+        partitions::{self, Partitions},
         topics::{self, Topics},
         traits_ext::{
             ComponentsById, Delete, DeleteCell, EntityComponentSystem, EntityComponentSystemMut,
@@ -24,9 +24,7 @@ use crate::{
         },
     },
 };
-use iggy_common::{
-    CompressionAlgorithm, ConsumerGroup, ConsumerGroupMember, Identifier, IggyExpiry, MaxTopicSize,
-};
+use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize};
 use slab::Slab;
 
 pub fn rename_index(
@@ -45,19 +43,19 @@ pub fn rename_index(
 // Partitions
 pub fn delete_partitions(
     partitions_count: u32,
-) -> impl FnOnce(ComponentsById<TopicRefMut>) -> Vec<u32> {
-    move |(mut root, _)| {
-        let partitions = root.partitions_mut();
+) -> impl FnOnce(&mut Partitions) -> Vec<partition2::Partition> {
+    move |partitions| {
         let current_count = partitions.len() as u32;
         let partitions_to_delete = partitions_count.min(current_count);
         let start_idx = (current_count - partitions_to_delete) as usize;
-        let mut deleted_ids = Vec::with_capacity(partitions_to_delete as usize);
-        for idx in start_idx..current_count as usize {
-            let partition = partitions.delete(idx);
-            assert_eq!(partition.id(), idx);
-            deleted_ids.push(partition.id() as u32);
-        }
-        deleted_ids
+        let range = start_idx..current_count as usize;
+        range
+            .map(|idx| {
+                let partition = partitions.delete(idx);
+                assert_eq!(partition.id(), idx);
+                partition
+            })
+            .collect()
     }
 }
 

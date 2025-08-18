@@ -59,10 +59,18 @@ impl ServerCommandHandler for GetConsumerGroup {
             numeric_topic_id as u32,
         );
 
-        shard.streams2.with_consumer_group_by_id_async(&self.stream_id, &self.topic_id, &self.group_id, async |(root, members)| {
-            let consumer_group = mapper::map_consumer_group(root, members);
-            sender.send_ok_response(&consumer_group).await
-        }).await?;
+        shard
+            .streams2
+            .with_consumer_group_by_id_async(
+                &self.stream_id,
+                &self.topic_id,
+                &self.group_id,
+                async |(root, members)| {
+                    let consumer_group = mapper::map_consumer_group(root, members);
+                    sender.send_ok_response(&consumer_group).await
+                },
+            )
+            .await?;
         Ok(())
     }
 }

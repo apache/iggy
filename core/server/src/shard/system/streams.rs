@@ -24,7 +24,6 @@ use crate::slab::traits_ext::{DeleteCell, EntityMarker, InsertCell};
 use crate::streaming::session::Session;
 use crate::streaming::stats::stats::StreamStats;
 use crate::streaming::streams::storage2::create_stream_file_hierarchy;
-use crate::streaming::streams::stream::Stream;
 use crate::streaming::streams::{self, stream2};
 use error_set::ErrContext;
 
@@ -53,6 +52,7 @@ impl IggyShard {
             return Err(IggyError::StreamNameAlreadyExists(name));
         }
         let stream = self.create_and_insert_stream_mem(name);
+        self.metrics.increment_streams(1);
         create_stream_file_hierarchy(self.id, stream.id(), &self.config.system).await?;
         Ok(stream)
     }
@@ -173,6 +173,7 @@ impl IggyShard {
                 )
             })?;
         let stream = self.delete_stream2_base(id);
+        self.metrics.decrement_streams(1);
         Ok(stream)
     }
 

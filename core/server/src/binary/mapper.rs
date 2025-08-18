@@ -18,8 +18,8 @@
 
 use std::sync::{Arc, atomic::AtomicU64};
 
-use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::slab::Keyed;
+use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::streaming::clients::client_manager::{Client, Transport};
 use crate::streaming::partitions::partition2::PartitionRoot;
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
@@ -201,17 +201,13 @@ pub fn map_topic(root: &topic2::TopicRoot, stats: &TopicStats) -> Bytes {
     bytes.freeze()
 }
 
-pub fn map_consumer_group(
-    root: &ConsumerGroupRoot,
-    members: &ConsumerGroupMembers,
-) -> Bytes {
+pub fn map_consumer_group(root: &ConsumerGroupRoot, members: &ConsumerGroupMembers) -> Bytes {
     let mut bytes = BytesMut::new();
     let members = members.inner().shared_get();
     extend_consumer_group(root, &members, &mut bytes);
 
     for (_, member) in members.iter() {
         bytes.put_u32_le(member.id as u32);
-        bytes.put_u32_le(member.client_id);
         bytes.put_u32_le(member.partitions.len() as u32);
         for partition in &member.partitions {
             bytes.put_u32_le(*partition as u32);
@@ -220,7 +216,10 @@ pub fn map_consumer_group(
     bytes.freeze()
 }
 
-pub fn map_consumer_groups(roots: &Slab<ConsumerGroupRoot>, members: &Slab<ConsumerGroupMembers>) -> Bytes {
+pub fn map_consumer_groups(
+    roots: &Slab<ConsumerGroupRoot>,
+    members: &Slab<ConsumerGroupMembers>,
+) -> Bytes {
     let mut bytes = BytesMut::new();
     for (root, member) in roots
         .iter()
@@ -277,9 +276,7 @@ fn extend_consumer_group(
 ) {
     bytes.put_u32_le(root.id() as u32);
     bytes.put_u32_le(root.partitions().len() as u32);
-    
     bytes.put_u32_le(members.len() as u32);
-    
     bytes.put_u8(root.key().len() as u8);
     bytes.put_slice(root.key().as_bytes());
 }

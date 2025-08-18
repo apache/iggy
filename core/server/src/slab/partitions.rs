@@ -42,32 +42,32 @@ impl Insert for Partitions {
         let id = self.stats.insert(stats);
         assert_eq!(
             entity_id, id,
-            "partition_insert: id mismatch when inserting stats"
+            "partition_insert: id mismatch when creating stats"
         );
         let id = self.segments.insert(Vec::with_capacity(SEGMENTS_CAPACITY));
         assert_eq!(
             entity_id, id,
-            "partition_insert: id mismatch when inserting segments"
+            "partition_insert: id mismatch when creating segments"
         );
         let id = self.message_deduplicator.insert(deduplicator);
         assert_eq!(
             entity_id, id,
-            "partition_insert: id mismatch when inserting message_deduplicator"
+            "partition_insert: id mismatch when creating message_deduplicator"
         );
         let id = self.offset.insert(offset);
         assert_eq!(
             entity_id, id,
-            "partition_insert: id mismatch when inserting offset"
+            "partition_insert: id mismatch when creating offset"
         );
         let id = self.consumer_offset.insert(consumer_offset);
         assert_eq!(
             entity_id, id,
-            "partition_insert: id mismatch when inserting consumer_offset"
+            "partition_insert: id mismatch when creating consumer_offset"
         );
         let id = self.consumer_group_offset.insert(consumer_group_offset);
         assert_eq!(
             entity_id, id,
-            "partition_insert: id mismatch when inserting consumer_group_offset"
+            "partition_insert: id mismatch when creating consumer_group_offset"
         );
         entity_id
     }

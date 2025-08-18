@@ -41,6 +41,10 @@ impl Partition {
             consumer_group_offset,
         }
     }
+
+    pub fn stats(&self) -> &PartitionStats {
+        &self.stats
+    }
 }
 
 impl Clone for Partition {

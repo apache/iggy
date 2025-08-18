@@ -66,9 +66,8 @@ impl Metrics {
         registry.register("users", "total count of users", users.clone());
         registry.register("clients", "total count of clients", clients.clone());
 
-        let registry = Arc::new(registry);
-
-        Metrics {
+        let registry = registry.into();
+        Self {
             registry,
             http_requests,
             streams,

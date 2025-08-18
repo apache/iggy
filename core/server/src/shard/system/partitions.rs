@@ -92,6 +92,14 @@ impl IggyShard {
             parent_stats,
             partitions_count,
         );
+        let stats = partitions.first().map(|p| p.stats());
+        if let Some(stats) = stats {
+            // One segment per partition created.
+            stats.increment_segments_count(partitions_count);
+        }
+        self.metrics.increment_partitions(partitions_count);
+        self.metrics.increment_segments(partitions_count);
+
         for partition_id in partitions.iter().map(|p| p.id()) {
             create_partition_file_hierarchy(
                 self.id,
@@ -187,13 +195,13 @@ impl IggyShard {
         Ok(())
     }
 
-    pub async fn delete_partitions2(
+    pub fn delete_partitions2(
         &self,
         session: &Session,
         stream_id: &Identifier,
         topic_id: &Identifier,
         partitions_count: u32,
-    ) -> Result<Vec<u32>, IggyError> {
+    ) -> Result<Vec<partition2::Partition>, IggyError> {
         self.ensure_authenticated(session)?;
         let numeric_stream_id = self
             .streams2
@@ -201,7 +209,6 @@ impl IggyShard {
         let numeric_topic_id =
             self.streams2
                 .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-
         // Claude garbage, rework this.
         self.validate_partition_permissions(
             session,
@@ -209,9 +216,37 @@ impl IggyShard {
             numeric_topic_id as u32,
             "delete",
         )?;
-        let deleted_partition_ids =
-            self.delete_partitions_base2(stream_id, topic_id, partitions_count);
-        Ok(deleted_partition_ids)
+
+        let partitions = self.delete_partitions_base2(stream_id, topic_id, partitions_count);
+        // Reassign the partitions count as it could get clamped by the `delete_partitions_base2` method.
+        let partitions_count = partitions.len() as u32;
+        let parent = partitions.first().map(|p| p.stats().parent().clone());
+        // TODO: We could technically do it in a way, when a drop is called for an `Stat`
+        // the parent is decremented automatically.
+        // but it means that we have to do it per `Stat` rather than in bulk like right now
+        // which could lead to a lot of memory barriers.
+        let (messages_count, segments_count, size_bytes) = partitions.iter().fold(
+            (0, 0, 0),
+            |(mut msg_acc, mut seg_acc, mut size_acc), partition| {
+                let stats = partition.stats();
+                let seg = stats.segments_count_inconsistent();
+                let msg = stats.messages_count_inconsistent();
+                let size = stats.size_bytes_inconsistent();
+                msg_acc += msg;
+                seg_acc += seg;
+                size_acc += size;
+                (msg_acc, seg_acc, size_acc)
+            },
+        );
+        self.metrics.decrement_partitions(partitions_count);
+        self.metrics.decrement_segments(segments_count);
+        if let Some(parent) = parent {
+            parent.decrement_messages_count(messages_count);
+            parent.decrement_size_bytes(size_bytes);
+            parent.decrement_segments_count(segments_count);
+        }
+
+        Ok(partitions)
     }
 
     fn delete_partitions_base2(
@@ -219,8 +254,8 @@ impl IggyShard {
         stream_id: &Identifier,
         topic_id: &Identifier,
         partitions_count: u32,
-    ) -> Vec<u32> {
-        self.streams2.with_topic_by_id_mut(
+    ) -> Vec<partition2::Partition> {
+        self.streams2.with_partitions_mut(
             stream_id,
             topic_id,
             topics::helpers::delete_partitions(partitions_count),
@@ -236,10 +271,10 @@ impl IggyShard {
     ) -> Result<(), IggyError> {
         assert_eq!(partitions_count as usize, partition_ids.len());
 
-        let deleted_partition_ids =
-            self.delete_partitions_base2(stream_id, topic_id, partitions_count);
-        for (deleted_partition_id, actual_deleted_partition_id) in deleted_partition_ids
-            .into_iter()
+        let partitions = self.delete_partitions_base2(stream_id, topic_id, partitions_count);
+        for (deleted_partition_id, actual_deleted_partition_id) in partitions
+            .iter()
+            .map(|p| p.id() as u32)
             .zip(partition_ids.into_iter())
         {
             assert_eq!(
