@@ -58,6 +58,9 @@ pub struct Args {
     pub consumer_id: u32,
 
     #[arg(long, default_value = "false")]
+    pub consumer_stop_when_empty: bool,
+
+    #[arg(long, default_value = "false")]
     pub balanced_producer: bool,
 
     #[arg(long, default_value = "1")]
@@ -185,6 +188,7 @@ impl Default for Args {
             compression_algorithm: 1,
             consumer_kind: 1,
             consumer_id: 1,
+            consumer_stop_when_empty: false,
             balanced_producer: false,
             messages_per_batch: 1,
             offset: 0,

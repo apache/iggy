@@ -127,6 +127,7 @@ pub struct IggyConsumer {
     init_retries: Option<u32>,
     init_retry_interval: IggyDuration,
     allow_replay: bool,
+    stop_when_empty: bool,
 }
 
 impl IggyConsumer {
@@ -149,6 +150,7 @@ impl IggyConsumer {
         init_retries: Option<u32>,
         init_retry_interval: IggyDuration,
         allow_replay: bool,
+        stop_when_empty: bool,
     ) -> Self {
         let (store_offset_sender, _) = flume::unbounded();
         Self {
@@ -203,6 +205,7 @@ impl IggyConsumer {
             init_retries,
             init_retry_interval,
             allow_replay,
+            stop_when_empty,
         }
     }
 
@@ -942,7 +945,12 @@ impl Stream for IggyConsumer {
                     let partition_id = polled_messages.partition_id;
                     self.current_partition_id.store(partition_id, ORDERING);
                     if polled_messages.messages.is_empty() {
-                        self.poll_future = Some(Box::pin(self.create_poll_messages_future()));
+                        if self.stop_when_empty {
+                            self.poll_future = None;
+                            return Poll::Ready(None);
+                        } else {
+                            self.poll_future = Some(Box::pin(self.create_poll_messages_future()));
+                        }
                     } else {
                         if let Some(ref encryptor) = self.encryptor {
                             for message in &mut polled_messages.messages {

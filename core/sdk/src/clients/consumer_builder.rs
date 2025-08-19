@@ -41,6 +41,7 @@ pub struct IggyConsumerBuilder {
     init_retries: Option<u32>,
     init_retry_interval: IggyDuration,
     allow_replay: bool,
+    stop_when_empty: bool,
 }
 
 impl IggyConsumerBuilder {
@@ -76,6 +77,7 @@ impl IggyConsumerBuilder {
             init_retries: None,
             init_retry_interval: IggyDuration::ONE_SECOND,
             allow_replay: false,
+            stop_when_empty: false,
         }
     }
 
@@ -216,6 +218,14 @@ impl IggyConsumerBuilder {
         }
     }
 
+    /// Stop consuming when Iggy responds with no messages, `false` by default.
+    pub fn stop_when_empty(self) -> Self {
+        Self {
+            stop_when_empty: true,
+            ..self
+        }
+    }
+
     /// Builds the consumer.
     ///
     /// Note: After building the consumer, `init()` must be invoked before producing messages.
@@ -238,6 +248,7 @@ impl IggyConsumerBuilder {
             self.init_retries,
             self.init_retry_interval,
             self.allow_replay,
+            self.stop_when_empty,
         )
     }
 }

@@ -61,8 +61,11 @@ async fn main() -> anyhow::Result<(), Box<dyn Error>> {
     .auto_join_consumer_group()
     .polling_strategy(PollingStrategy::next())
     .poll_interval(IggyDuration::from_str(&args.interval)?)
-    .batch_length(args.messages_per_batch)
-    .build();
+    .batch_length(args.messages_per_batch);
+    if args.consumer_stop_when_empty {
+        consumer = consumer.stop_when_empty();
+    }
+    let mut consumer = consumer.build();
 
     consumer.init().await?;
     consume_messages(&args, &mut consumer).await?;
