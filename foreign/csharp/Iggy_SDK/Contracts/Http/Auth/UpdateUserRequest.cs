@@ -19,4 +19,4 @@ using Apache.Iggy.Enums;
 
 namespace Apache.Iggy.Contracts.Http.Auth;
 
-public sealed record UpdateUserRequest(string? Username, UserStatus? UserStatus);
+internal sealed record UpdateUserRequest(string? Username, UserStatus? UserStatus);

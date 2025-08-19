@@ -15,9 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Runtime.CompilerServices;
+namespace Apache.Iggy.Contracts.Http.Auth;
 
-//DO NOT REMOVE THIS FILE
-[assembly: InternalsVisibleTo("Apache.Iggy.Tests")]
-[assembly: InternalsVisibleTo("Apache.Iggy.Consumer")]
-[assembly: InternalsVisibleTo("Apache.Iggy.Shared")]
+internal sealed record LoginWithPersonalAccessTokenRequest(string Token);

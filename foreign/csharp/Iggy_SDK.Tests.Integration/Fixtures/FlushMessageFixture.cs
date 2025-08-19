@@ -25,8 +25,8 @@ namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 public class FlushMessageFixture : IggyServerFixture
 {
-    public readonly uint StreamId = 1;
-    public readonly CreateTopicRequest TopicRequest = TopicFactory.CreateTopic();
+    internal readonly uint StreamId = 1;
+    internal readonly CreateTopicRequest TopicRequest = TopicFactory.CreateTopic();
 
     public override async Task InitializeAsync()
     {

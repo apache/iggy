@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Diagnostics.CodeAnalysis;
 using System.Text.Json.Serialization;
 using Apache.Iggy.JsonConverters;
 
@@ -27,15 +26,4 @@ public class TokenInfo
 
     [JsonConverter(typeof(ExpiryConverter))]
     public required DateTimeOffset? Expiry { get; init; }
-
-    public TokenInfo()
-    {
-    }
-
-    [SetsRequiredMembers]
-    public TokenInfo(string token, DateTimeOffset expiry)
-    {
-        Token = token;
-        Expiry = expiry;
-    }
 }

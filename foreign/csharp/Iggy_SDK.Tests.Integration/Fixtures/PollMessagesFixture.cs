@@ -26,9 +26,9 @@ namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 public class PollMessagesFixture : IggyServerFixture
 {
-    public readonly int MessageCount = 10;
-    public readonly uint StreamId = 1;
-    public readonly CreateTopicRequest TopicRequest = TopicFactory.CreateTopic();
+    internal readonly int MessageCount = 10;
+    internal readonly uint StreamId = 1;
+    internal readonly CreateTopicRequest TopicRequest = TopicFactory.CreateTopic();
 
     public override async Task InitializeAsync()
     {

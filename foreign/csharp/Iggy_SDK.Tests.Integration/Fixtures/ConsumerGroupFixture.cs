@@ -19,10 +19,10 @@ namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 public class ConsumerGroupFixture : IggyServerFixture
 {
-    public readonly string Name = "TestTopic";
-    public readonly uint PartitionsCount = 10;
-    public readonly uint StreamId = 1;
-    public readonly uint TopicId = 1;
+    internal readonly string Name = "TestTopic";
+    internal readonly uint PartitionsCount = 10;
+    internal readonly uint StreamId = 1;
+    internal readonly uint TopicId = 1;
 
     public override async Task InitializeAsync()
     {

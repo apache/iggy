@@ -20,4 +20,4 @@ using Apache.Iggy.Enums;
 
 namespace Apache.Iggy.Contracts.Http.Auth;
 
-public sealed record CreateUserRequest(string Username, string Password, UserStatus Status, Permissions? Permissions);
+internal sealed record CreateUserRequest(string Username, string Password, UserStatus Status, Permissions? Permissions);

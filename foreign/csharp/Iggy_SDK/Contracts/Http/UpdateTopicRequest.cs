@@ -19,7 +19,7 @@ using Apache.Iggy.Enums;
 
 namespace Apache.Iggy.Contracts.Http;
 
-public record UpdateTopicRequest(
+internal record UpdateTopicRequest(
     string Name,
     CompressionAlgorithm CompressionAlgorithm,
     ulong MaxTopicSize,

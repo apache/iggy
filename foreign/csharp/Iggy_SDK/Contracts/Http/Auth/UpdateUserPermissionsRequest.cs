@@ -19,4 +19,4 @@ using Apache.Iggy.Contracts.Auth;
 
 namespace Apache.Iggy.Contracts.Http.Auth;
 
-public sealed record UpdateUserPermissionsRequest(Permissions? Permissions);
+internal sealed record UpdateUserPermissionsRequest(Permissions? Permissions);

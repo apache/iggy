@@ -808,7 +808,7 @@ public class HttpMessageStream : IIggyClient
 
     public async Task<AuthResponse?> LoginWithPersonalAccessToken(string token, CancellationToken ct = default)
     {
-        var json = JsonSerializer.Serialize(new LoginWithPersonalAccessToken(token), _jsonSerializerOptions);
+        var json = JsonSerializer.Serialize(new LoginWithPersonalAccessTokenRequest(token), _jsonSerializerOptions);
 
         var content = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await _httpClient.PostAsync("/personal-access-tokens/login", content, ct);

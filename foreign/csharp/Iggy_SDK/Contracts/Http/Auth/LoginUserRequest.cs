@@ -17,4 +17,4 @@
 
 namespace Apache.Iggy.Contracts.Http.Auth;
 
-public sealed record LoginUserRequest(string Username, string Password, string? Version, string? Context);
+internal sealed record LoginUserRequest(string Username, string Password, string? Version, string? Context);

@@ -17,4 +17,4 @@
 
 namespace Apache.Iggy.Contracts.Http.Auth;
 
-public sealed record ChangePasswordRequest(string CurrentPassword, string NewPassword);
+internal sealed record ChangePasswordRequest(string CurrentPassword, string NewPassword);

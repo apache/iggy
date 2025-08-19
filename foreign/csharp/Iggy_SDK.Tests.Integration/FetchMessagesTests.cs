@@ -29,15 +29,15 @@ using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.Tests.Integrations;
 
-[MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-public class FetchMessagesTests(Protocol protocol)
+public class FetchMessagesTests
 {
     [ClassDataSource<FetchMessagesFixture>(Shared = SharedType.PerClass)]
     public required FetchMessagesFixture Fixture { get; init; }
 
 
     [Test]
-    public async Task PollMessagesTMessage_WithNoHeaders_Should_PollMessages_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task PollMessagesTMessage_WithNoHeaders_Should_PollMessages_Successfully(Protocol protocol)
     {
         PolledMessages<DummyMessage> response = await Fixture.Clients[protocol].PollMessagesAsync(
             new MessageFetchRequest
@@ -70,7 +70,8 @@ public class FetchMessagesTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(PollMessagesTMessage_WithNoHeaders_Should_PollMessages_Successfully))]
-    public async Task PollMessagesTMessage_Should_Throw_InvalidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task PollMessagesTMessage_Should_Throw_InvalidResponse(Protocol protocol)
     {
         var invalidFetchRequest = new MessageFetchRequest
         {
@@ -88,7 +89,8 @@ public class FetchMessagesTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(PollMessagesTMessage_Should_Throw_InvalidResponse))]
-    public async Task PollMessages_WithNoHeaders_Should_PollMessages_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task PollMessages_WithNoHeaders_Should_PollMessages_Successfully(Protocol protocol)
     {
         var response = await Fixture.Clients[protocol].PollMessagesAsync(new MessageFetchRequest
         {
@@ -115,7 +117,8 @@ public class FetchMessagesTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(PollMessages_WithNoHeaders_Should_PollMessages_Successfully))]
-    public async Task PollMessages_Should_Throw_InvalidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task PollMessages_Should_Throw_InvalidResponse(Protocol protocol)
     {
         var invalidFetchRequest = new MessageFetchRequest
         {
@@ -134,7 +137,8 @@ public class FetchMessagesTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(PollMessages_Should_Throw_InvalidResponse))]
-    public async Task PollMessages_WithHeaders_Should_PollMessages_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task PollMessages_WithHeaders_Should_PollMessages_Successfully(Protocol protocol)
     {
         var headersMessageFetchRequest = new MessageFetchRequest
         {
@@ -163,7 +167,8 @@ public class FetchMessagesTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(PollMessages_WithHeaders_Should_PollMessages_Successfully))]
-    public async Task PollMessagesTMessage_WithHeaders_Should_PollMessages_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task PollMessagesTMessage_WithHeaders_Should_PollMessages_Successfully(Protocol protocol)
     {
         var headersMessageFetchRequest = new MessageFetchRequest
         {
@@ -192,7 +197,8 @@ public class FetchMessagesTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(PollMessagesTMessage_WithHeaders_Should_PollMessages_Successfully))]
-    public async Task PollMessagesMessage_WithEncryptor_Should_PollMessages_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task PollMessagesMessage_WithEncryptor_Should_PollMessages_Successfully(Protocol protocol)
     {
         await Fixture.Clients[protocol].SendMessagesAsync(Identifier.Numeric(Fixture.StreamId),
             Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), Partitioning.None(),

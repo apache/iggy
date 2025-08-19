@@ -28,8 +28,7 @@ using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.Tests.Integrations;
 
-[MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-public class SendMessagesTests(Protocol protocol)
+public class SendMessagesTests
 {
     private static Message[] _messagesWithoutHeaders = [];
     private static Message[] _messagesWithHeaders = [];
@@ -73,7 +72,8 @@ public class SendMessagesTests(Protocol protocol)
     }
 
     [Test]
-    public async Task SendMessages_NoHeaders_Should_SendMessages_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task SendMessages_NoHeaders_Should_SendMessages_Successfully(Protocol protocol)
     {
         await Should.NotThrowAsync(() => Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest
         {
@@ -86,7 +86,8 @@ public class SendMessagesTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(SendMessages_NoHeaders_Should_SendMessages_Successfully))]
-    public async Task SendMessages_NoHeaders_Should_Throw_InvalidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task SendMessages_NoHeaders_Should_Throw_InvalidResponse(Protocol protocol)
     {
         await Should.ThrowAsync<InvalidResponseException>(() =>
             Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest
@@ -100,7 +101,8 @@ public class SendMessagesTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(SendMessages_NoHeaders_Should_Throw_InvalidResponse))]
-    public async Task SendMessages_WithHeaders_Should_SendMessages_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task SendMessages_WithHeaders_Should_SendMessages_Successfully(Protocol protocol)
     {
         await Should.NotThrowAsync(() => Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest
         {
@@ -113,7 +115,8 @@ public class SendMessagesTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(SendMessages_WithHeaders_Should_SendMessages_Successfully))]
-    public async Task SendMessages_WithHeaders_Should_Throw_InvalidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task SendMessages_WithHeaders_Should_Throw_InvalidResponse(Protocol protocol)
     {
         await Should.ThrowAsync<InvalidResponseException>(() =>
             Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest
@@ -127,7 +130,8 @@ public class SendMessagesTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(SendMessages_WithHeaders_Should_Throw_InvalidResponse))]
-    public async Task SendMessages_WithEncryptor_Should_SendMessage_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task SendMessages_WithEncryptor_Should_SendMessage_Successfully(Protocol protocol)
     {
         await Fixture.Clients[protocol].SendMessagesAsync(Identifier.Numeric(Fixture.StreamId),
             Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), Partitioning.None(),

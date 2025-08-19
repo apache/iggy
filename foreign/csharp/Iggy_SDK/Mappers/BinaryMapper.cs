@@ -648,7 +648,7 @@ internal static class BinaryMapper
     internal static TopicResponse MapTopic(ReadOnlySpan<byte> payload)
     {
         var (topic, position) = MapToTopic(payload, 0);
-        List<PartitionContract> partitions = new();
+        List<PartitionResponse> partitions = new();
         var length = payload.Length;
 
         while (position < length)
@@ -705,7 +705,7 @@ internal static class BinaryMapper
             }, readBytes);
     }
 
-    private static (PartitionContract partition, int readBytes) MapToPartition(ReadOnlySpan<byte>
+    private static (PartitionResponse partition, int readBytes) MapToPartition(ReadOnlySpan<byte>
         payload, int position)
     {
         var id = BinaryPrimitives.ReadInt32LittleEndian(payload[position..(position + 4)]);
@@ -717,7 +717,7 @@ internal static class BinaryMapper
         var readBytes = 4 + 4 + 8 + 8 + 8 + 8;
 
         return (
-            new PartitionContract
+            new PartitionResponse
             {
                 Id = id,
                 SegmentsCount = segmentsCount,

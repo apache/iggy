@@ -22,8 +22,7 @@ using Shouldly;
 
 namespace Apache.Iggy.Tests.Integrations;
 
-[MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-public class OffsetTests(Protocol protocol)
+public class OffsetTests
 {
     private const ulong SetOffset = 2;
 
@@ -31,7 +30,8 @@ public class OffsetTests(Protocol protocol)
     public required OffsetFixtures Fixture { get; init; }
 
     [Test]
-    public async Task StoreOffset_IndividualConsumer_Should_StoreOffset_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task StoreOffset_IndividualConsumer_Should_StoreOffset_Successfully(Protocol protocol)
     {
         await Fixture.Clients[protocol]
             .StoreOffsetAsync(Consumer.New(1), Identifier.Numeric(1), Identifier.Numeric(1), SetOffset, 1);
@@ -39,7 +39,8 @@ public class OffsetTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(StoreOffset_IndividualConsumer_Should_StoreOffset_Successfully))]
-    public async Task GetOffset_IndividualConsumer_Should_GetOffset_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetOffset_IndividualConsumer_Should_GetOffset_Successfully(Protocol protocol)
     {
         var offset = await Fixture.Clients[protocol]
             .GetOffsetAsync(Consumer.New(1), Identifier.Numeric(1), Identifier.Numeric(1), 1);
@@ -52,7 +53,8 @@ public class OffsetTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(GetOffset_IndividualConsumer_Should_GetOffset_Successfully))]
-    public async Task StoreOffset_ConsumerGroup_Should_StoreOffset_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task StoreOffset_ConsumerGroup_Should_StoreOffset_Successfully(Protocol protocol)
     {
         await Fixture.Clients[protocol]
             .CreateConsumerGroupAsync(Identifier.Numeric(1), Identifier.Numeric(1), "test_consumer_group", 1);
@@ -63,7 +65,8 @@ public class OffsetTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(StoreOffset_ConsumerGroup_Should_StoreOffset_Successfully))]
-    public async Task GetOffset_ConsumerGroup_Should_GetOffset_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetOffset_ConsumerGroup_Should_GetOffset_Successfully(Protocol protocol)
     {
         var offset = await Fixture.Clients[protocol]
             .GetOffsetAsync(Consumer.Group(1), Identifier.Numeric(1), Identifier.Numeric(1), 1);

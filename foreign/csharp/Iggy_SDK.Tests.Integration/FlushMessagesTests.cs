@@ -22,14 +22,14 @@ using Shouldly;
 
 namespace Apache.Iggy.Tests.Integrations;
 
-[MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-public class FlushMessagesTests(Protocol protocol)
+public class FlushMessagesTests
 {
     [ClassDataSource<FlushMessageFixture>(Shared = SharedType.PerClass)]
     public required FlushMessageFixture Fixture { get; init; }
 
     [Test]
-    public async Task FlushUnsavedBuffer_WithFsync_Should_Flush_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task FlushUnsavedBuffer_WithFsync_Should_Flush_Successfully(Protocol protocol)
     {
         await Should.NotThrowAsync(() =>
             Fixture.Clients[protocol].FlushUnsavedBufferAsync(Identifier.Numeric(Fixture.StreamId),
@@ -38,7 +38,8 @@ public class FlushMessagesTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(FlushUnsavedBuffer_WithFsync_Should_Flush_Successfully))]
-    public async Task FlushUnsavedBuffer_WithOutFsync_Should_Flush_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task FlushUnsavedBuffer_WithOutFsync_Should_Flush_Successfully(Protocol protocol)
     {
         await Should.NotThrowAsync(() =>
             Fixture.Clients[protocol].FlushUnsavedBufferAsync(Identifier.Numeric(Fixture.StreamId),
@@ -47,7 +48,8 @@ public class FlushMessagesTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(FlushUnsavedBuffer_WithOutFsync_Should_Flush_Successfully))]
-    public async Task FlushUnsavedBuffer_Should_Throw_WhenStream_DoesNotExist()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task FlushUnsavedBuffer_Should_Throw_WhenStream_DoesNotExist(Protocol protocol)
     {
         await Should.ThrowAsync<InvalidResponseException>(() =>
             Fixture.Clients[protocol].FlushUnsavedBufferAsync(Identifier.Numeric(Fixture.StreamId),

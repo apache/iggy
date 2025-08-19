@@ -20,7 +20,7 @@ using Apache.Iggy.JsonConverters;
 
 namespace Apache.Iggy.Contracts;
 
-public sealed class PartitionContract
+public sealed class PartitionResponse
 {
     public required int Id { get; init; }
     public required ulong MessagesCount { get; init; }

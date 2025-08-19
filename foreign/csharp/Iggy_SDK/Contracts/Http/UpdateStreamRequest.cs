@@ -17,4 +17,4 @@
 
 namespace Apache.Iggy.Contracts.Http;
 
-public sealed record UpdateStreamRequest(string Name);
+internal sealed record UpdateStreamRequest(string Name);

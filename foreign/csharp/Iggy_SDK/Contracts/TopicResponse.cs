@@ -40,5 +40,5 @@ public sealed class TopicResponse
     public required ulong MessagesCount { get; init; }
     public required uint PartitionsCount { get; init; }
     public required byte? ReplicationFactor { get; init; }
-    public IEnumerable<PartitionContract>? Partitions { get; init; }
+    public IEnumerable<PartitionResponse>? Partitions { get; init; }
 }

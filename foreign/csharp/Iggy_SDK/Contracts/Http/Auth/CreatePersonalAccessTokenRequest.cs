@@ -17,4 +17,4 @@
 
 namespace Apache.Iggy.Contracts.Http.Auth;
 
-public sealed record CreatePersonalAccessTokenRequest(string Name, ulong? Expiry);
+internal sealed record CreatePersonalAccessTokenRequest(string Name, ulong? Expiry);

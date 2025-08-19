@@ -27,8 +27,7 @@ using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.Tests.Integrations;
 
-[MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-public class TopicsTests(Protocol protocol)
+public class TopicsTests
 {
     private static readonly CreateTopicRequest TopicRequest = new(1, "Test Topic", CompressionAlgorithm.Gzip, 1000, 1,
         2, 2_000_000_000);
@@ -43,7 +42,9 @@ public class TopicsTests(Protocol protocol)
     public required IggyServerFixture Fixture { get; init; }
 
     [Test]
-    public async Task Create_NewTopic_Should_Return_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task Create_NewTopic_Should_Return_Successfully(Protocol protocol)
+
     {
         await Fixture.Clients[protocol].CreateStreamAsync("Test Stream", 1);
 
@@ -68,7 +69,8 @@ public class TopicsTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(Create_NewTopic_Should_Return_Successfully))]
-    public async Task Create_DuplicateTopic_Should_Throw_InvalidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task Create_DuplicateTopic_Should_Throw_InvalidResponse(Protocol protocol)
     {
         await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol].CreateTopicAsync(
             Identifier.Numeric(1),
@@ -78,7 +80,8 @@ public class TopicsTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(Create_DuplicateTopic_Should_Throw_InvalidResponse))]
-    public async Task Get_ExistingTopic_Should_ReturnValidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task Get_ExistingTopic_Should_ReturnValidResponse(Protocol protocol)
     {
         var response = await Fixture.Clients[protocol].GetTopicByIdAsync(Identifier.Numeric(1), Identifier.Numeric(1));
 
@@ -98,7 +101,8 @@ public class TopicsTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(Get_ExistingTopic_Should_ReturnValidResponse))]
-    public async Task Get_ExistingTopics_Should_ReturnValidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task Get_ExistingTopics_Should_ReturnValidResponse(Protocol protocol)
     {
         await Fixture.Clients[protocol].CreateTopicAsync(Identifier.Numeric(1), TopicRequestSecond.Name,
             TopicRequestSecond.PartitionsCount, TopicRequestSecond.CompressionAlgorithm, TopicRequestSecond.TopicId,
@@ -141,7 +145,8 @@ public class TopicsTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(Get_ExistingTopics_Should_ReturnValidResponse))]
-    public async Task Get_Topic_WithPartitions_Should_ReturnValidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task Get_Topic_WithPartitions_Should_ReturnValidResponse(Protocol protocol)
     {
         await Fixture.Clients[protocol].CreatePartitionsAsync(Identifier.Numeric(1), Identifier.Numeric(1), 2);
 
@@ -179,20 +184,10 @@ public class TopicsTests(Protocol protocol)
         response.Partitions.ShouldAllBe(x => x.Id > 0);
     }
 
-    private static List<Message> GetMessages(int count)
-    {
-        var messages = new List<Message>();
-        for (var i = 0; i < count; i++)
-        {
-            messages.Add(new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes($"Test message {i + 1}")));
-        }
-
-        return messages;
-    }
-
     [Test]
     [DependsOn(nameof(Get_Topic_WithPartitions_Should_ReturnValidResponse))]
-    public async Task Update_ExistingTopic_Should_UpdateTopic_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task Update_ExistingTopic_Should_UpdateTopic_Successfully(Protocol protocol)
     {
         await Should.NotThrowAsync(Fixture.Clients[protocol].UpdateTopicAsync(Identifier.Numeric(1),
             Identifier.Numeric(TopicRequest.TopicId!.Value), UpdateTopicRequest.Name,
@@ -211,7 +206,8 @@ public class TopicsTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(Update_ExistingTopic_Should_UpdateTopic_Successfully))]
-    public async Task Purge_ExistingTopic_Should_PurgeTopic_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task Purge_ExistingTopic_Should_PurgeTopic_Successfully(Protocol protocol)
     {
         var beforePurge = await Fixture.Clients[protocol]
             .GetTopicByIdAsync(Identifier.Numeric(1), Identifier.Numeric(TopicRequest.TopicId!.Value));
@@ -232,7 +228,8 @@ public class TopicsTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(Purge_ExistingTopic_Should_PurgeTopic_Successfully))]
-    public async Task Delete_ExistingTopic_Should_DeleteTopic_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task Delete_ExistingTopic_Should_DeleteTopic_Successfully(Protocol protocol)
     {
         await Should.NotThrowAsync(Fixture.Clients[protocol].DeleteTopicAsync(Identifier.Numeric(1),
             Identifier.Numeric(TopicRequest.TopicId!.Value)));
@@ -240,7 +237,8 @@ public class TopicsTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(Delete_ExistingTopic_Should_DeleteTopic_Successfully))]
-    public async Task Delete_NonExistingTopic_Should_Throw_InvalidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task Delete_NonExistingTopic_Should_Throw_InvalidResponse(Protocol protocol)
     {
         await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol].DeleteTopicAsync(
             Identifier.Numeric(1),
@@ -249,7 +247,8 @@ public class TopicsTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(Delete_NonExistingTopic_Should_Throw_InvalidResponse))]
-    public async Task Get_NonExistingTopic_Should_Throw_InvalidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task Get_NonExistingTopic_Should_Throw_InvalidResponse(Protocol protocol)
     {
         await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol].GetTopicByIdAsync(
             Identifier.Numeric(1),
@@ -258,7 +257,8 @@ public class TopicsTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(Get_NonExistingTopic_Should_Throw_InvalidResponse))]
-    public async Task Create_NewTopic_WithoutTopicId_Should_Return_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task Create_NewTopic_WithoutTopicId_Should_Return_Successfully(Protocol protocol)
     {
         var topicRequestWithoutId = new CreateTopicRequest
         {
@@ -288,5 +288,16 @@ public class TopicsTests(Protocol protocol)
         response.ReplicationFactor.ShouldBe(topicRequestWithoutId.ReplicationFactor);
         response.MaxTopicSize.ShouldBe(topicRequestWithoutId.MaxTopicSize);
         response.MessagesCount.ShouldBe(0u);
+    }
+
+    private static List<Message> GetMessages(int count)
+    {
+        var messages = new List<Message>();
+        for (var i = 0; i < count; i++)
+        {
+            messages.Add(new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes($"Test message {i + 1}")));
+        }
+
+        return messages;
     }
 }

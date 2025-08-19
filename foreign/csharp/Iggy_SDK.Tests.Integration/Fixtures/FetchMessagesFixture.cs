@@ -28,12 +28,12 @@ namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 public class FetchMessagesFixture : IggyServerFixture
 {
-    public readonly CreateTopicRequest HeadersTopicRequest = TopicFactory.CreateTopic(2);
-    public readonly int MessageCount = 20;
-    public readonly uint StreamId = 1;
-    public readonly CreateTopicRequest TopicDummyHeaderRequest = TopicFactory.CreateTopic(4);
-    public readonly CreateTopicRequest TopicDummyRequest = TopicFactory.CreateTopic(3);
-    public readonly CreateTopicRequest TopicRequest = TopicFactory.CreateTopic();
+    internal readonly CreateTopicRequest HeadersTopicRequest = TopicFactory.CreateTopic(2);
+    internal readonly int MessageCount = 20;
+    internal readonly uint StreamId = 1;
+    internal readonly CreateTopicRequest TopicDummyHeaderRequest = TopicFactory.CreateTopic(4);
+    internal readonly CreateTopicRequest TopicDummyRequest = TopicFactory.CreateTopic(3);
+    internal readonly CreateTopicRequest TopicRequest = TopicFactory.CreateTopic();
 
     public override async Task InitializeAsync()
     {

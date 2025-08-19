@@ -24,15 +24,15 @@ using Shouldly;
 
 namespace Apache.Iggy.Tests.Integrations;
 
-[MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-public class PollMessagesTests(Protocol protocol)
+public class PollMessagesTests
 {
     [ClassDataSource<PollMessagesFixture>(Shared = SharedType.PerClass)]
     public required PollMessagesFixture Fixture { get; init; }
 
     [Test]
     [Timeout(60_000)]
-    public async Task PollMessagesTMessage_Should_PollMessages_Successfully(CancellationToken token)
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task PollMessagesTMessage_Should_PollMessages_Successfully(Protocol protocol, CancellationToken token)
     {
         var messageCount = 0;
         await foreach (MessageResponse<DummyMessage> msgResponse in Fixture.Clients[protocol].PollMessagesAsync(

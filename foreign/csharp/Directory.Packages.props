@@ -17,7 +17,7 @@
     <PackageVersion Include="Shouldly" Version="4.3.0" />
     <PackageVersion Include="System.IO.Hashing" Version="8.0.0" />
     <PackageVersion Include="Testcontainers" Version="4.6.0" />
-    <PackageVersion Include="TUnit" Version="0.56.44" />
+    <PackageVersion Include="TUnit" Version="0.56.50" />
     <PackageVersion Include="xunit" Version="2.9.3" />
     <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.4">
       <PrivateAssets>all</PrivateAssets>
