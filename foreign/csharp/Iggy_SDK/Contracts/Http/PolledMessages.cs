@@ -28,6 +28,6 @@ public sealed class PolledMessages
         {
             Messages = new List<MessageResponse>().AsReadOnly(),
             CurrentOffset = 0,
-            PartitionId = 0,
+            PartitionId = 0
         };
 }

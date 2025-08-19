@@ -1,4 +1,4 @@
-﻿// Licensed to the Apache Software Foundation (ASF) under one
+// Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
@@ -18,22 +18,28 @@
 namespace Apache.Iggy.Enums;
 
 /// <summary>
-/// Enum representing the different types of system snapshots that can be taken
+///     Enum representing the different types of system snapshots that can be taken
 /// </summary>
 public enum SystemSnapshotType
 {
     /// Overview of the filesystem.
     FilesystemOverview,
+
     /// List of currently running processes.
     ProcessList,
+
     /// Resource usage statistics of the system.
     ResourceUsage,
+
     /// Test snapshot type for development purposes.
     Test,
+
     /// Server logs
     ServerLogs,
+
     /// Server configuration
     ServerConfig,
+
     /// Everything
-    All,
+    All
 }

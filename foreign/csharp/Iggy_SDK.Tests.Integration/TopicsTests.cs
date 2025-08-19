@@ -1,4 +1,4 @@
-﻿// // Licensed to the Apache Software Foundation (ASF) under one
+// // Licensed to the Apache Software Foundation (ASF) under one
 // // or more contributor license agreements.  See the NOTICE file
 // // distributed with this work for additional information
 // // regarding copyright ownership.  The ASF licenses this file
@@ -21,7 +21,6 @@ using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Fixtures;
-using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
@@ -30,8 +29,8 @@ namespace Apache.Iggy.Tests.Integrations;
 [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
 public class TopicsTests(Protocol protocol)
 {
-    private static readonly TopicRequest TopicRequest = new(1, "Test Topic", CompressionAlgorithm.Gzip, 1000, 1, 2, 2_000_000_000);
-    private static readonly TopicRequest TopicRequestSecond = new(2, "Test Topic 2", CompressionAlgorithm.Gzip, 1000, 1, 2, 2_000_000_000);
+    private static readonly CreateTopicRequest TopicRequest = new(1, "Test Topic", CompressionAlgorithm.Gzip, 1000, 1, 2, 2_000_000_000);
+    private static readonly CreateTopicRequest TopicRequestSecond = new(2, "Test Topic 2", CompressionAlgorithm.Gzip, 1000, 1, 2, 2_000_000_000);
     private static readonly UpdateTopicRequest UpdateTopicRequest = new("Updated Topic", CompressionAlgorithm.Gzip, 3_000_000_000, 2000, 3);
 
     [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerClass)]
@@ -40,16 +39,18 @@ public class TopicsTests(Protocol protocol)
     [Test]
     public async Task Create_NewTopic_Should_Return_Successfully()
     {
-        await Fixture.Clients[protocol].CreateStreamAsync(StreamFactory.CreateStream());
+        await Fixture.Clients[protocol].CreateStreamAsync("Test Stream", 1);
 
-        var response = await Fixture.Clients[protocol].CreateTopicAsync(Identifier.Numeric(1), TopicRequest);
+        var response = await Fixture.Clients[protocol].CreateTopicAsync(Identifier.Numeric(1), TopicRequest.Name,
+            TopicRequest.PartitionsCount, TopicRequest.CompressionAlgorithm, TopicRequest.TopicId, TopicRequest.ReplicationFactor,
+            TopicRequest.MessageExpiry, TopicRequest.MaxTopicSize);
 
         response.ShouldNotBeNull();
         response.Id.ShouldBe(TopicRequest.TopicId!.Value);
         response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromSeconds(10));
         response.Name.ShouldBe(TopicRequest.Name);
         response.CompressionAlgorithm.ShouldBe(TopicRequest.CompressionAlgorithm);
-        response.Partitions!.Count().ShouldBe(TopicRequest.PartitionsCount);
+        response.Partitions!.Count().ShouldBe((int)TopicRequest.PartitionsCount);
         response.MessageExpiry.ShouldBe(TopicRequest.MessageExpiry);
         response.Size.ShouldBe(0u);
         response.PartitionsCount.ShouldBe(TopicRequest.PartitionsCount);
@@ -62,7 +63,9 @@ public class TopicsTests(Protocol protocol)
     [DependsOn(nameof(Create_NewTopic_Should_Return_Successfully))]
     public async Task Create_DuplicateTopic_Should_Throw_InvalidResponse()
     {
-        await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol].CreateTopicAsync(Identifier.Numeric(1), TopicRequest));
+        await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol].CreateTopicAsync(Identifier.Numeric(1),
+            TopicRequest.Name, TopicRequest.PartitionsCount, TopicRequest.CompressionAlgorithm, TopicRequest.TopicId,
+            TopicRequest.ReplicationFactor, TopicRequest.MessageExpiry, TopicRequest.MaxTopicSize));
     }
 
     [Test]
@@ -76,7 +79,7 @@ public class TopicsTests(Protocol protocol)
         response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromSeconds(10));
         response.Name.ShouldBe(TopicRequest.Name);
         response.CompressionAlgorithm.ShouldBe(TopicRequest.CompressionAlgorithm);
-        response.Partitions!.Count().ShouldBe(TopicRequest.PartitionsCount);
+        response.Partitions!.Count().ShouldBe((int)TopicRequest.PartitionsCount);
         response.MessageExpiry.ShouldBe(TopicRequest.MessageExpiry);
         response.Size.ShouldBe(0u);
         response.PartitionsCount.ShouldBe(TopicRequest.PartitionsCount);
@@ -89,7 +92,9 @@ public class TopicsTests(Protocol protocol)
     [DependsOn(nameof(Get_ExistingTopic_Should_ReturnValidResponse))]
     public async Task Get_ExistingTopics_Should_ReturnValidResponse()
     {
-        await Fixture.Clients[protocol].CreateTopicAsync(Identifier.Numeric(1), TopicRequestSecond);
+        await Fixture.Clients[protocol].CreateTopicAsync(Identifier.Numeric(1), TopicRequestSecond.Name,
+            TopicRequestSecond.PartitionsCount, TopicRequestSecond.CompressionAlgorithm, TopicRequestSecond.TopicId, TopicRequestSecond.ReplicationFactor,
+            TopicRequestSecond.MessageExpiry, TopicRequestSecond.MaxTopicSize);
 
         IReadOnlyList<TopicResponse> response = await Fixture.Clients[protocol].GetTopicsAsync(Identifier.Numeric(1));
 
@@ -129,12 +134,7 @@ public class TopicsTests(Protocol protocol)
     [DependsOn(nameof(Get_ExistingTopics_Should_ReturnValidResponse))]
     public async Task Get_Topic_WithPartitions_Should_ReturnValidResponse()
     {
-        await Fixture.Clients[protocol].CreatePartitionsAsync(new CreatePartitionsRequest
-        {
-            PartitionsCount = 2,
-            StreamId = Identifier.Numeric(1),
-            TopicId = Identifier.Numeric(1)
-        });
+        await Fixture.Clients[protocol].CreatePartitionsAsync(Identifier.Numeric(1), Identifier.Numeric(1), 2);
 
         for (var i = 0; i < 3; i++)
         {
@@ -157,7 +157,7 @@ public class TopicsTests(Protocol protocol)
         response.Partitions!.Count().ShouldBe(3);
         response.MessageExpiry.ShouldBe(TopicRequest.MessageExpiry);
         response.Size.ShouldBe(630u);
-        response.PartitionsCount.ShouldBe(3);
+        response.PartitionsCount.ShouldBe(3u);
         response.ReplicationFactor.ShouldBe(TopicRequest.ReplicationFactor);
         response.MaxTopicSize.ShouldBe(TopicRequest.MaxTopicSize);
         response.MessagesCount.ShouldBe(9u);
@@ -186,7 +186,8 @@ public class TopicsTests(Protocol protocol)
     public async Task Update_ExistingTopic_Should_UpdateTopic_Successfully()
     {
         await Should.NotThrowAsync(Fixture.Clients[protocol].UpdateTopicAsync(Identifier.Numeric(1),
-            Identifier.Numeric(TopicRequest.TopicId!.Value), UpdateTopicRequest));
+            Identifier.Numeric(TopicRequest.TopicId!.Value), UpdateTopicRequest.Name, UpdateTopicRequest.CompressionAlgorithm,
+            UpdateTopicRequest.MaxTopicSize, UpdateTopicRequest.MessageExpiry, UpdateTopicRequest.ReplicationFactor));
 
         var result = await Fixture.Clients[protocol].GetTopicByIdAsync(Identifier.Numeric(1),
             Identifier.Numeric(TopicRequest.TopicId!.Value));

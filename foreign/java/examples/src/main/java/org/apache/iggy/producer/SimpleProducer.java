@@ -17,36 +17,29 @@
  * under the License.
  */
 
-package org.apache.iggy;
+package org.apache.iggy.producer;
 
-import org.apache.iggy.message.Message;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.apache.iggy.client.blocking.IggyBaseClient;
 import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
-import org.apache.iggy.consumergroup.Consumer;
-import org.apache.iggy.consumergroup.ConsumerGroupDetails;
-import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
-import org.apache.iggy.message.PollingStrategy;
+import org.apache.iggy.message.Message;
+import org.apache.iggy.message.Partitioning;
 import org.apache.iggy.stream.StreamDetails;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.TopicDetails;
 import java.math.BigInteger;
-import java.util.ArrayList;
 import java.util.Optional;
+import static java.util.Collections.singletonList;
 import static java.util.Optional.empty;
 
-public class SimpleConsumer {
-
+public class SimpleProducer {
     private static final String STREAM_NAME = "dev01";
     private static final StreamId STREAM_ID = StreamId.of(STREAM_NAME);
     private static final String TOPIC_NAME = "events";
     private static final TopicId TOPIC_ID = TopicId.of(TOPIC_NAME);
-    private static final String GROUP_NAME = "simple-consumer";
-    private static final ConsumerId GROUP_ID = ConsumerId.of(GROUP_NAME);
-    private static final Logger log = LoggerFactory.getLogger(SimpleConsumer.class);
+    private static final Logger log = LoggerFactory.getLogger(SimpleProducer.class);
 
     public static void main(String[] args) {
         var client = new IggyTcpClient("localhost", 8090);
@@ -54,28 +47,17 @@ public class SimpleConsumer {
 
         createStream(client);
         createTopic(client);
-        createConsumerGroup(client);
-        client.consumerGroups().joinConsumerGroup(STREAM_ID, TOPIC_ID, GROUP_ID);
 
-        var messages = new ArrayList<Message>();
-        while (messages.size() < 1000) {
-            var polledMessages = client.messages()
-                    .pollMessages(STREAM_ID,
-                            TOPIC_ID,
-                            empty(),
-                            Consumer.group(GROUP_ID),
-                            PollingStrategy.next(),
-                            10L,
-                            true);
-            messages.addAll(polledMessages.messages());
-            log.debug("Fetched {} messages from partition {}, current offset {}",
-                    polledMessages.messages().size(),
-                    polledMessages.partitionId(),
-                    polledMessages.currentOffset());
+        int counter = 0;
+        while (counter++ < 1000) {
+            var message = Message.of("message from simple producer " + counter);
+            client.messages().sendMessages(STREAM_ID, TOPIC_ID, Partitioning.balanced(), singletonList(message));
+            log.debug("Message {} sent", counter);
         }
+
     }
 
-    private static void createStream(IggyBaseClient client) {
+    private static void createStream(IggyTcpClient client) {
         Optional<StreamDetails> stream = client.streams().getStream(STREAM_ID);
         if (stream.isPresent()) {
             return;
@@ -83,7 +65,7 @@ public class SimpleConsumer {
         client.streams().createStream(empty(), STREAM_NAME);
     }
 
-    private static void createTopic(IggyBaseClient client) {
+    private static void createTopic(IggyTcpClient client) {
         Optional<TopicDetails> topic = client.topics().getTopic(STREAM_ID, TOPIC_ID);
         if (topic.isPresent()) {
             return;
@@ -97,16 +79,6 @@ public class SimpleConsumer {
                         BigInteger.ZERO,
                         empty(),
                         TOPIC_NAME);
-
-    }
-
-    private static void createConsumerGroup(IggyBaseClient client) {
-        Optional<ConsumerGroupDetails> consumerGroup = client.consumerGroups()
-                .getConsumerGroup(STREAM_ID, TOPIC_ID, GROUP_ID);
-        if (consumerGroup.isPresent()) {
-            return;
-        }
-        client.consumerGroups().createConsumerGroup(STREAM_ID, TOPIC_ID, empty(), GROUP_NAME);
     }
 
 }

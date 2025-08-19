@@ -30,6 +30,7 @@ public sealed class ToSnakeCaseMessagePolicyTests
         Assert.Equal(expected, actual);
     }
 }
+
 public class MyTestDataClass : IEnumerable<object[]>
 {
     public IEnumerator<object[]> GetEnumerator()

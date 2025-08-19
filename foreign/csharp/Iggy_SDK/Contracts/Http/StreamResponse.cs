@@ -20,7 +20,7 @@ namespace Apache.Iggy.Contracts.Http;
 
 public sealed class StreamResponse
 {
-    public required int Id { get; init; }
+    public required uint Id { get; init; }
     public required string Name { get; init; }
     public required ulong Size { get; init; }
     public required DateTimeOffset CreatedAt { get; init; }

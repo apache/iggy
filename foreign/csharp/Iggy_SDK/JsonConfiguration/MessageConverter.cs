@@ -38,13 +38,13 @@ internal sealed class MessageConverter : JsonConverter<Message>
 
         writer.WritePropertyName(nameof(value.Header.Id).ToSnakeCase());
         var idJson = JsonSerializer.Serialize(value.Header.Id, jsonOptions);
-        using (JsonDocument doc = JsonDocument.Parse(idJson))
+        using (var doc = JsonDocument.Parse(idJson))
         {
             doc.RootElement.WriteTo(writer);
         }
-        
+
         writer.WriteString(nameof(value.Payload).ToSnakeCase(), Convert.ToBase64String(value.Payload));
-        
+
         if (value.UserHeaders is not null)
         {
             writer.WriteStartObject("headers");
@@ -70,14 +70,15 @@ internal sealed class MessageConverter : JsonConverter<Message>
                 writer.WriteBase64String(nameof(headerValue.Value).ToSnakeCase(), headerValue.Value);
                 writer.WriteEndObject();
             }
+
             writer.WriteEndObject();
         }
         else
         {
             writer.WriteNull("headers");
         }
-        
-        
+
+
         writer.WriteEndObject();
     }
 }

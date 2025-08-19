@@ -28,6 +28,8 @@ import uuid
 
 import pytest
 
+from .utils import get_server_config, wait_for_ping, wait_for_server
+
 from apache_iggy import IggyClient, PollingStrategy, AutoCommit
 from apache_iggy import SendMessage as Message
 
@@ -44,6 +46,18 @@ class TestConnectivity:
     async def test_client_not_none(self, iggy_client: IggyClient):
         """Test that client fixture is properly initialized."""
         assert iggy_client is not None
+
+    @pytest.mark.asyncio
+    async def test_client_from_connection_string(self):
+        """Test that client can be created and set up with a connection string."""
+        host, port = get_server_config()
+        wait_for_server(host, port)
+
+        client = IggyClient.from_connection_string(
+            f"iggy+tcp://iggy:iggy@{host}:{port}"
+        )
+        await client.connect()
+        await wait_for_ping(client)
 
 
 class TestStreamOperations:

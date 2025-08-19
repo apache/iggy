@@ -18,6 +18,7 @@
 using Apache.Iggy.Contracts.Http;
 
 namespace Apache.Iggy.MessagesDispatcher;
+
 internal interface IMessageInvoker
 {
     internal Task SendMessagesAsync(MessageSendRequest request,

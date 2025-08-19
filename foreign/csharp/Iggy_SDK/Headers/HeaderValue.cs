@@ -42,6 +42,7 @@ public readonly struct HeaderValue
         {
             throw new ArgumentException("Value has incorrect size, must be between 1 and 255", nameof(value));
         }
+
         return new HeaderValue
         {
             Kind = HeaderKind.String,
@@ -150,14 +151,17 @@ public readonly struct HeaderValue
             Value = bytes
         };
     }
+
     public byte[] ToBytes()
     {
         if (Kind is not HeaderKind.Raw)
         {
             throw new InvalidOperationException("Can't convert header");
         }
+
         return Value;
     }
+
     public new string ToString()
     {
         return Kind switch
@@ -170,90 +174,110 @@ public readonly struct HeaderValue
             HeaderKind.Int128 => Value.ToInt128().ToString(),
             HeaderKind.Uint32 => BinaryPrimitives.ReadUInt32LittleEndian(Value).ToString(),
             HeaderKind.Uint64 => BinaryPrimitives.ReadUInt64LittleEndian(Value).ToString(),
-            HeaderKind.Uint128 => Value.ToUInt128().ToString(), 
+            HeaderKind.Uint128 => Value.ToUInt128().ToString(),
             HeaderKind.Float => BinaryPrimitives.ReadSingleLittleEndian(Value).ToString(),
             HeaderKind.Double => BinaryPrimitives.ReadDoubleLittleEndian(Value).ToString(),
             _ => throw new InvalidOperationException("Can't convert header")
         } ?? throw new InvalidOperationException();
     }
+
     public bool ToBool()
     {
         if (Kind is not HeaderKind.Bool)
         {
             throw new InvalidOperationException("Can't convert header");
         }
+
         return BitConverter.ToBoolean(Value, 0);
     }
+
     public int ToInt32()
     {
         if (Kind is not HeaderKind.Int32)
         {
             throw new InvalidOperationException("Can't convert header");
         }
+
         return BitConverter.ToInt32(Value, 0);
     }
+
     public long ToInt64()
     {
         if (Kind is not HeaderKind.Int64)
         {
             throw new InvalidOperationException("Can't convert header");
         }
+
         return BitConverter.ToInt64(Value, 0);
     }
+
     public Int128 ToInt128()
     {
         if (Kind is not HeaderKind.Int128)
         {
             throw new InvalidOperationException("Can't convert header");
         }
+
         return Value.ToInt128();
     }
+
     public Guid ToGuid()
     {
         if (Kind is not HeaderKind.Uint128)
         {
             throw new InvalidOperationException("Can't convert header");
         }
+
         return new Guid(Value);
     }
+
     public uint ToUInt32()
     {
         if (Kind is not HeaderKind.Uint32)
         {
             throw new InvalidOperationException("Can't convert header");
         }
+
         return BitConverter.ToUInt32(Value);
     }
+
     public ulong ToUInt64()
     {
         if (Kind is not HeaderKind.Uint64)
         {
             throw new InvalidOperationException("Can't convert header");
         }
+
         return BitConverter.ToUInt64(Value);
     }
+
     public UInt128 ToUInt128()
     {
         if (Kind is not HeaderKind.Uint128)
         {
             throw new InvalidOperationException("Can't convert header");
         }
+
         return Value.ToUInt128();
     }
+
     public float ToFloat()
     {
         if (Kind is not HeaderKind.Float)
         {
             throw new InvalidOperationException("Can't convert header");
         }
+
         return BitConverter.ToSingle(Value);
     }
+
     public double ToDouble()
     {
         if (Kind is not HeaderKind.Double)
         {
             throw new InvalidOperationException("Can't convert header");
         }
+
         return BitConverter.ToDouble(Value);
     }
 }

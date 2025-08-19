@@ -16,6 +16,7 @@
 // under the License.
 
 namespace Apache.Iggy.Enums;
+
 public enum StoreOffset
 {
     Never,

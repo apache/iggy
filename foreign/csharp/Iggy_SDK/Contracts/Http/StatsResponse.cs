@@ -79,5 +79,4 @@ public sealed class StatsResponse
             CacheMetrics = CacheMetrics
         };
     }
-
 }
