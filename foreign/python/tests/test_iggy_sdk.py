@@ -507,3 +507,40 @@ class TestConsumerGroup:
         shutdown_event.set()
 
         await consumer.consume_messages(take, shutdown_event)
+
+    @pytest.mark.asyncio
+    async def test_stop_when_empty(self, iggy_client: IggyClient, consumer_group_setup):
+        """Test that the consumer group can be signaled to shutdown."""
+        consumer_name = consumer_group_setup['consumer']
+        stream_name = consumer_group_setup['stream']
+        topic_name = consumer_group_setup['topic']
+        partition_id = consumer_group_setup['partition_id']
+        test_messages = consumer_group_setup['messages']
+
+        # Setup
+        shutdown_event = asyncio.Event()
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name,
+            name=topic_name,
+            partitions_count=1
+        )
+
+        await iggy_client.send_messages(stream_name, topic_name, partition_id, [Message(m) for m in test_messages])
+
+        consumer = iggy_client.consumer_group(
+            consumer_name,
+            stream_name,
+            topic_name,
+            partition_id,
+            PollingStrategy.Next(),
+            10,
+            auto_commit=AutoCommit.Interval(timedelta(seconds=5)),
+            poll_interval=timedelta(seconds=1),
+            stop_when_empty=True,
+        )
+
+        async def take(_) -> None:
+            pass
+
+        await consumer.consume_messages(take, shutdown_event)

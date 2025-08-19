@@ -67,13 +67,16 @@ impl IggyClient {
     }
 
     /// Constructs a new IggyClient from a connection string.
-    /// 
+    ///
     /// Returns an error if the connection string provided is invalid.
     // TODO: add examples for connection strings or at least a link to the doc page where
     // connection strings are explained.
     #[classmethod]
     #[pyo3(signature = (connection_string))]
-    fn from_connection_string(_cls: &Bound<'_, PyType>, connection_string: String) -> PyResult<Self> {
+    fn from_connection_string(
+        _cls: &Bound<'_, PyType>,
+        connection_string: String,
+    ) -> PyResult<Self> {
         let client = RustIggyClient::from_connection_string(&connection_string)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?;
         Ok(Self {
@@ -339,6 +342,7 @@ impl IggyClient {
         init_retries=None,
         init_retry_interval=None,
         allow_replay=false,
+        stop_when_empty=false,
     ))]
     fn consumer_group(
         &self,
@@ -356,6 +360,7 @@ impl IggyClient {
         init_retries: Option<u32>,
         init_retry_interval: Option<Py<PyDelta>>,
         allow_replay: bool,
+        stop_when_empty: bool,
     ) -> PyResult<IggyConsumer> {
         let mut builder = self
             .inner
@@ -411,6 +416,9 @@ impl IggyClient {
         }
         if allow_replay {
             builder = builder.allow_replay()
+        }
+        if stop_when_empty {
+            builder = builder.stop_when_empty()
         }
         let consumer = builder.build();
 

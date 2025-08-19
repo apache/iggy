@@ -157,7 +157,7 @@ impl IggyConsumer {
             drop(inner_init);
 
             let task_locals = Python::with_gil(pyo3_async_runtimes::tokio::get_current_locals)?;
-            let handle_consume = get_runtime().spawn(scope(task_locals, async move {
+            let mut handle_consume = get_runtime().spawn(scope(task_locals, async move {
                 let task_locals =
                     Python::with_gil(pyo3_async_runtimes::tokio::get_current_locals).unwrap();
                 let consumer = PyCallbackConsumer {
@@ -190,13 +190,18 @@ impl IggyConsumer {
                     })?;
                     Ok(())
                 }
-                let handle_shutdown: JoinHandle<Result<(), PyErr>> = get_runtime().spawn(scope(
-                    task_locals,
-                    shutdown_impl(shutdown_event, shutdown_tx),
-                ));
-                let shutdown_result;
-                (consume_result, shutdown_result) = tokio::join!(handle_consume, handle_shutdown);
-                shutdown_result.unwrap()?;
+                let mut handle_shutdown: JoinHandle<Result<(), PyErr>> = get_runtime().spawn(
+                    scope(task_locals, shutdown_impl(shutdown_event, shutdown_tx)),
+                );
+                tokio::select! {
+                    consume_result_inner = &mut handle_consume => {
+                        consume_result = consume_result_inner;
+                    }
+                    shutdown_result = &mut handle_shutdown => {
+                        shutdown_result.unwrap()?;
+                        consume_result = handle_consume.await;
+                    }
+                };
             } else {
                 consume_result = handle_consume.await;
             }
