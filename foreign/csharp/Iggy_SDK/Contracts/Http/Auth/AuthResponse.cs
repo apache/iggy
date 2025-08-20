@@ -15,6 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK.Contracts.Http;
+namespace Apache.Iggy.Contracts.Http.Auth;
 
-public record AuthResponse(int UserId, TokenInfo AccessToken);
+public record AuthResponse(int UserId, TokenInfo? AccessToken);

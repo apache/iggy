@@ -54,7 +54,9 @@ impl Stream {
         }
 
         let mut id;
-        if topic_id.is_none() {
+        if let Some(topic_id) = topic_id {
+            id = topic_id;
+        } else {
             id = self.current_topic_id.fetch_add(1, Ordering::SeqCst);
             loop {
                 if self.topics.contains_key(&id) {
@@ -66,8 +68,6 @@ impl Stream {
                     break;
                 }
             }
-        } else {
-            id = topic_id.unwrap();
         }
 
         if self.topics.contains_key(&id) {
@@ -119,13 +119,13 @@ impl Stream {
         }
 
         {
-            if let Some(topic_id_by_name) = self.topics_ids.get(name) {
-                if *topic_id_by_name != topic_id {
-                    return Err(IggyError::TopicNameAlreadyExists(
-                        name.to_owned(),
-                        self.stream_id,
-                    ));
-                }
+            if let Some(topic_id_by_name) = self.topics_ids.get(name)
+                && *topic_id_by_name != topic_id
+            {
+                return Err(IggyError::TopicNameAlreadyExists(
+                    name.to_owned(),
+                    self.stream_id,
+                ));
             }
         }
 
@@ -137,8 +137,6 @@ impl Stream {
         };
 
         {
-            self.topics_ids.remove(&old_topic_name.clone());
-            self.topics_ids.insert(name.to_owned(), topic_id);
             let topic = self.get_topic_mut(id).with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get mutable reference to topic with id {id}")
             })?;
@@ -159,6 +157,11 @@ impl Stream {
                 format!("{COMPONENT} (error: {error}) - failed to persist topic: {topic}")
             })?;
             info!("Updated topic: {topic}");
+        }
+
+        {
+            self.topics_ids.remove(&old_topic_name.clone());
+            self.topics_ids.insert(name.to_owned(), topic_id);
         }
 
         Ok(())

@@ -15,39 +15,40 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Extensions;
-using Iggy_SDK.Headers;
-using Iggy_SDK.Messages;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Apache.Iggy.Extensions;
+using Apache.Iggy.Headers;
+using Apache.Iggy.Messages;
 
-namespace Iggy_SDK.JsonConfiguration;
+namespace Apache.Iggy.JsonConfiguration;
 
-internal sealed class MessageConverter : JsonConverter<HttpMessage>
+internal sealed class MessageConverter : JsonConverter<Message>
 {
-    public override HttpMessage Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    public override Message Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
         throw new NotImplementedException();
     }
 
-    public override void Write(Utf8JsonWriter writer, HttpMessage value, JsonSerializerOptions options)
+    public override void Write(Utf8JsonWriter writer, Message value, JsonSerializerOptions options)
     {
         writer.WriteStartObject();
         var jsonOptions = new JsonSerializerOptions();
         jsonOptions.Converters.Add(new UInt128Converter());
 
-        writer.WritePropertyName(nameof(value.Id).ToSnakeCase());
-        var idJson = JsonSerializer.Serialize(value.Id, jsonOptions);
-        using (JsonDocument doc = JsonDocument.Parse(idJson))
+        writer.WritePropertyName(nameof(value.Header.Id).ToSnakeCase());
+        var idJson = JsonSerializer.Serialize(value.Header.Id, jsonOptions);
+        using (var doc = JsonDocument.Parse(idJson))
         {
             doc.RootElement.WriteTo(writer);
         }
 
-        writer.WriteString(nameof(value.Payload).ToSnakeCase(), value.Payload);
-        if (value.Headers is not null)
+        writer.WriteString(nameof(value.Payload).ToSnakeCase(), Convert.ToBase64String(value.Payload));
+
+        if (value.UserHeaders is not null)
         {
             writer.WriteStartObject("headers");
-            foreach (var (headerKey, headerValue) in value.Headers)
+            foreach (var (headerKey, headerValue) in value.UserHeaders)
             {
                 writer.WriteStartObject(headerKey.Value.ToSnakeCase());
                 var headerKind = headerValue.Kind switch
@@ -69,9 +70,15 @@ internal sealed class MessageConverter : JsonConverter<HttpMessage>
                 writer.WriteBase64String(nameof(headerValue.Value).ToSnakeCase(), headerValue.Value);
                 writer.WriteEndObject();
             }
-            writer.WriteEndObject();
 
+            writer.WriteEndObject();
         }
+        else
+        {
+            writer.WriteNull("headers");
+        }
+
+
         writer.WriteEndObject();
     }
 }

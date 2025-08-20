@@ -15,25 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Configuration;
-using Iggy_SDK.ConnectionStream;
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.IggyClient.Implementations;
-using Iggy_SDK.MessagesDispatcher;
-using Microsoft.Extensions.Logging;
-using System.Net.Sockets;
 using System.Threading.Channels;
-namespace Iggy_SDK.Factory;
+using Apache.Iggy.Configuration;
+using Apache.Iggy.ConnectionStream;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.IggyClient.Implementations;
+using Apache.Iggy.MessagesDispatcher;
+using Microsoft.Extensions.Logging;
+
+namespace Apache.Iggy.Factory;
 
 internal class TcpMessageStreamBuilder
 {
-    private readonly IConnectionStream _stream;
+    private readonly ILoggerFactory _loggerFactory;
     private readonly MessageBatchingSettings _messageBatchingOptions;
     private readonly MessagePollingSettings _messagePollingSettings;
+    private readonly IConnectionStream _stream;
     private Channel<MessageSendRequest>? _channel;
-    private MessageSenderDispatcher? _messageSenderDispatcher;
-    private readonly ILoggerFactory _loggerFactory;
     private TcpMessageInvoker? _messageInvoker;
+    private MessageSenderDispatcher? _messageSenderDispatcher;
 
     internal TcpMessageStreamBuilder(IConnectionStream stream, IMessageStreamConfigurator options, ILoggerFactory loggerFactory)
     {
@@ -46,6 +46,7 @@ internal class TcpMessageStreamBuilder
         _stream = stream;
         _loggerFactory = loggerFactory;
     }
+
     //TODO - this channel will probably need to be refactored, to accept a lambda instead of MessageSendRequest
     internal TcpMessageStreamBuilder WithSendMessagesDispatcher()
     {
@@ -60,8 +61,10 @@ internal class TcpMessageStreamBuilder
         {
             _messageInvoker = new TcpMessageInvoker(_stream);
         }
+
         return this;
     }
+
     internal TcpMessageStream Build()
     {
         _messageSenderDispatcher?.Start();
@@ -71,5 +74,4 @@ internal class TcpMessageStreamBuilder
             false => new TcpMessageStream(_stream, _channel, _messagePollingSettings, _loggerFactory, _messageInvoker)
         };
     }
-    
 }

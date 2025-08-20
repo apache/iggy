@@ -15,17 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Enums;
+using Apache.Iggy.Enums;
 
-namespace Iggy_SDK.Configuration;
+namespace Apache.Iggy.Configuration;
 
 public interface IMessageStreamConfigurator
 {
-    public string BaseAdress { get; set; }
-    public Protocol Protocol { get; set; }
-    public Action<MessageBatchingSettings> MessageBatchingSettings { get; set; }
-    public Action<MessagePollingSettings> MessagePollingSettings { get; set; }
-    public Action<TlsSettings> TlsSettings { get; set; }
-    public int ReceiveBufferSize { get; set; }
-    public int SendBufferSize { get; set; }
+    string BaseAdress { get; set; }
+    Protocol Protocol { get; set; }
+    Action<MessageBatchingSettings> MessageBatchingSettings { get; set; }
+    Action<MessagePollingSettings> MessagePollingSettings { get; set; }
+    Action<TlsSettings> TlsSettings { get; set; }
+    int ReceiveBufferSize { get; set; }
+    int SendBufferSize { get; set; }
 }

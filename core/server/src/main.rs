@@ -72,12 +72,9 @@ async fn main() -> Result<(), ServerError> {
     if args.fresh {
         let system_path = config.system.get_system_path();
         if tokio::fs::metadata(&system_path).await.is_ok() {
-            println!(
-                "Removing system path at: {} because `--fresh` flag was set",
-                system_path
-            );
+            println!("Removing system path at: {system_path} because `--fresh` flag was set");
             if let Err(e) = tokio::fs::remove_dir_all(&system_path).await {
-                eprintln!("Failed to remove system path at {}: {}", system_path, e);
+                eprintln!("Failed to remove system path at {system_path}: {e}");
             }
         }
     }
@@ -144,7 +141,7 @@ async fn main() -> Result<(), ServerError> {
     }
 
     let runtime_path = current_config.system.get_runtime_path();
-    let current_config_path = format!("{}/current_config.toml", runtime_path);
+    let current_config_path = format!("{runtime_path}/current_config.toml");
     let current_config_content =
         toml::to_string(&current_config).expect("Cannot serialize current_config");
     tokio::fs::write(current_config_path, current_config_content).await?;

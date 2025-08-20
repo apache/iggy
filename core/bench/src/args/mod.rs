@@ -20,8 +20,8 @@ pub mod common;
 pub mod defaults;
 pub mod kind;
 pub mod kinds;
+pub mod transport;
 
 mod examples;
 mod output;
 mod props;
-mod transport;

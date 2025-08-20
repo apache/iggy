@@ -1,35 +1,42 @@
 {
-  "name": "@iggy.rs/sdk",
+  "name": "apache-iggy",
   "type": "module",
-  "version": "1.0.6",
-  "description": "Official nodejs iggy.rs binary client",
+  "version": "0.5.0",
+  "description": "Official Apache Iggy NodeJS SDK",
   "keywords": [
     "iggy",
-    "iggy-rs",
     "driver",
+    "sdk",
+    "apache",
+    "messaging",
+    "streaming",
     "client",
     "protocol"
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/iggy-rs/iggy-node-client.git"
+    "url": "git+https://github.com/apache/iggy.git"
   },
   "publishConfig": {
     "access": "public",
     "main": "dist/index.js",
     "types": "dist/index.d.ts"
   },
-  "homepage": "https://iggy.rs",
+  "homepage": "https://iggy.apache.org",
   "files": [
     "dist/**/*.js",
     "dist/**/*.d.ts",
-    "dist/index.d.ts"
+    "dist/index.d.ts",
+    "!dist/bdd/",
+    "!dist/examples/"
   ],
   "types": "dist/index.d.ts",
   "main": "dist/index.js",
   "scripts": {
-    "test": "node --import @swc-node/register/esm-register --test --experimental-test-coverage './src/**/*.test.ts'",
+    "test:unit": "node --import @swc-node/register/esm-register --test --experimental-test-coverage './src/**/*.test.ts'",
     "test:e2e": "node --import @swc-node/register/esm-register --test --experimental-test-coverage --test-force-exit './src/e2e/*.e2e.ts'",
+    "test:bdd": "cucumber-js --exit",
+    "test": "npm run test:unit && npm run test:bdd && npm run test:e2e",
     "clean": "rm -Rf dist/",
     "lint": "eslint src/**/*.ts",
     "commitlint": "commitlint --edit",
@@ -47,6 +54,7 @@
   "devDependencies": {
     "@commitlint/cli": "19.6.1",
     "@commitlint/config-conventional": "19.6.0",
+    "@cucumber/cucumber": "11.3.0",
     "@semantic-release/changelog": "6.0.3",
     "@semantic-release/exec": "6.0.3",
     "@semantic-release/git": "10.0.1",

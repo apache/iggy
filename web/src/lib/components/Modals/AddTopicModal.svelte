@@ -9,11 +9,9 @@
   import type { CloseModalFn } from '$lib/types/utilTypes';
   import type { StreamDetails } from '$lib/domain/StreamDetails';
   import { fetchRouteApi } from '$lib/api/fetchRouteApi';
-  import { intervalToDuration } from 'date-fns';
   import { durationFormatter } from '$lib/utils/formatters/durationFormatter';
   import { numberSizes } from '$lib/utils/constants/numberSizes';
   import { dataHas } from '$lib/utils/dataHas';
-  import { invalidateAll } from '$app/navigation';
   import { showToast } from '../AppToasts.svelte';
   import { customInvalidateAll } from '../PeriodicInvalidator.svelte';
 
@@ -48,6 +46,7 @@
         method: 'POST',
         path: `/streams/${streamDetails.id}/topics`,
         body: {
+          stream_id: streamDetails.id,
           topic_id: form.data.topic_id,
           name: form.data.name,
           partitions_count: form.data.partitions_count,
@@ -140,7 +139,7 @@
     />
 
     <div class="flex justify-end gap-3 mt-auto">
-      <Button variant="text" type="button" class="w-2/5" on:click={() => closeModal()}
+      <Button variant="text" type="button" class="w-2/5" onclick={() => closeModal()}
         >Cancel</Button
       >
       <Button type="submit" variant="contained" class="w-2/5">Create</Button>

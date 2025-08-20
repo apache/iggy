@@ -1,21 +1,20 @@
+# C# SDK for [Iggy](https://github.com/apache/iggy)
+
 <div align="center">
-    
-[![.NET](https://github.com/iggy-rs/iggy-dotnet-client/actions/workflows/dotnet.yml/badge.svg)](https://github.com/iggy-rs/iggy-dotnet-client/actions/workflows/dotnet.yml)
+
 [![Nuget (with prereleases)](https://img.shields.io/nuget/vpre/Iggy)](https://www.nuget.org/packages/Iggy)
 
 </div>
 
-## THE DEVELOPMENT OF SDK IS CURRENTLY ON HALT, DUE TO BIG WORKLOAD IN MAIN REPOSITORY 
-# C# SDK for [Iggy](https://github.com/spetz/iggy)
-
-
-### Getting Started
+## Getting Started
 
 Currently supported transfer protocols
--  TCP
--  HTTP
+
+- TCP
+- HTTP
 
 The whole SDK revolves around `IIggyClient` interface to create an instance of it, use following code
+
 ```c#
 var loggerFactory = LoggerFactory.Create(builder =>
 {
@@ -35,9 +34,12 @@ var bus = MessageStreamFactory.CreateMessageStream(options =>
     };
 }, loggerFactory);
 ```
+
 Iggy necessitates the use of `ILoggerFactory` to generate logs from locations that are inaccessible to the user.
 
-In addition to the basic configuration settings, Iggy provides support for batching send/poll messages at intervals, which effectively decreases the frequency of network calls, this option is enabled by default.
+In addition to the basic configuration settings, Iggy provides support for batching send/poll messages at intervals,
+which effectively decreases the frequency of network calls, this option is enabled by default.
+
 ```c#
 //---Snip---
 var bus = MessageStreamFactory.CreateMessageStream(options =>
@@ -65,8 +67,11 @@ var bus = MessageStreamFactory.CreateMessageStream(options =>
     };
 }, loggerFactory);
 ```
+
 ### Creating and logging in a user
+
 To begin, utilize the root account (note that the root account cannot be removed or updated).
+
 ```c#
 var response = await bus.LoginUser(new LoginUserRequest
 {
@@ -74,7 +79,9 @@ var response = await bus.LoginUser(new LoginUserRequest
     Password = "iggy",
 });
 ```
+
 Furthermore, after logging in, you have the option to create an account with customizable `Permissions`.
+
 ```c#
 //---Snip---
 await bus.CreateUser(new CreateUserRequest
@@ -132,7 +139,9 @@ var response = await bus.LoginUser(new LoginUserRequest
     Password = "pa55w0rD!@",
 });
 ```
+
 Alternatively, once you've logged in, you can create a `Personal Access Token` that can be reused for further logins.
+
 ```c#
 var response = await bus.LoginUser(new LoginUserRequest
 {
@@ -150,8 +159,11 @@ await bus.LoginWithPersonalAccessToken(new LoginWithPersonalAccessToken
     Token = patResponse.Token
 });
 ```
+
 ### Creating first stream and topic
+
 In order to create stream use `CreateStreamAsync` method.
+
 ```c#
 await bus.CreateStreamAsync(new StreamRequest
 {
@@ -159,8 +171,10 @@ await bus.CreateStreamAsync(new StreamRequest
     Name = "first-stream",
 });
 ```
+
 Every stream has a topic to which you can broadcast messages, for the purpose of create one
 use `CreateTopicAsync` method.
+
 ```c#
 var streamId = Identifier.Numeric(1);
 await bus.CreateTopicAsync(streamId, new TopicRequest
@@ -170,28 +184,31 @@ await bus.CreateTopicAsync(streamId, new TopicRequest
     TopicId = 1
 });
 ```
+
 Notice that both Stream aswell as Topic use `-` instead of space in its name, Iggy will replace any spaces in
 name with `-` instead, so keep that in mind.
 
 ### Sending messages
+
 To send messages you can use `SendMessagesAsync` method.
+
 ```c#
 Func<byte[], byte[]> encryptor = static payload =>
 {
     string aes_key = "AXe8YwuIn1zxt3FPWTZFlAa14EHdPAdN9FaZ9RQWihc=";
     string aes_iv = "bsxnWolsAyO7kCfWuyrnqg==";
-    
+
     var key = Convert.FromBase64String(aes_key);
     var iv = Convert.FromBase64String(aes_iv);
-    
+
     using Aes aes = Aes.Create();
     ICryptoTransform encryptor = aes.CreateEncryptor(key, iv);
-    
+
     using MemoryStream memoryStream = new MemoryStream();
     using CryptoStream cryptoStream = new CryptoStream(memoryStream, encryptor, CryptoStreamMode.Write);
     using BinaryWriter streamWriter = new BinaryWriter(cryptoStream);
     streamWriter.Write(payload);
-    
+
     return memoryStream.ToArray();
 };
 
@@ -206,25 +223,41 @@ await bus.SendMessagesAsync(new MessageSendRequest
     TopicId = topicId,
 }, encryptor); //encryptor is optional
 ```
+
 The `Message` struct has two fields `Id` and `Payload`.
+
 ```c#
 struct Message
 {
-    public required Guid Id { get; init; }
+    public required MessageHeader Header { get; init; }
     public required byte[] Payload { get; init; }
+    public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; init; }
+}
+
+public readonly struct MessageHeader
+{
+    public ulong Checksum { get; init; }
+    public UInt128 Id { get; init; }
+    public ulong Offset { get; init; }
+    public DateTimeOffset Timestamp { get; init; }
+    public ulong OriginTimestamp { get; init; }
+    public int UserHeadersLength { get; init; }
+    public int PayloadLength { get; init; }
 }
 ```
+
 Furthermore, there's a generic overload for this method that takes binary serializer as argument.
+
 ```c#
 //---Snip---
 Func<Envelope, byte[]> serializer = static envelope =>
 {
     Span<byte> buffer = stackalloc byte[envelope.MessageType.Length + 4 + envelope.Payload.Length];
-    
+
     BinaryPrimitives.WriteInt32LittleEndian(buffer[..4], envelope.MessageType.Length);
     Encoding.UTF8.GetBytes(envelope.MessageType).CopyTo(buffer[4..(envelope.MessageType.Length + 4)]);
     Encoding.UTF8.GetBytes(envelope.Payload).CopyTo(buffer[(envelope.MessageType.Length + 4)..]);
-    
+
     return buffer.ToArray();
 };
 
@@ -239,7 +272,9 @@ await bus.SendMessagesAsync(new MessageSendRequest<Envelope>
 serializer,
 encryptor);
 ```
+
 Both generic and non generic method accept optional `Headers` dictionary.
+
 ```c#
 //---Snip---
 var headers = new Dictionary<HeaderKey, HeaderValue>
@@ -264,24 +299,27 @@ serializer,
 encryptor,
 headers);
 ```
+
 ### Fetching Messages
+
 Fetching messages is done with `FetchMessagesAsync`.
+
 ```c#
 Func<byte[], byte[]> decryptor = static payload =>
 {
     string aes_key = "AXe8YwuIn1zxt3FPWTZFlAa14EHdPAdN9FaZ9RQWihc=";
     string aes_iv = "bsxnWolsAyO7kCfWuyrnqg==";
-    
+
     var key = Convert.FromBase64String(aes_key);
     var iv = Convert.FromBase64String(aes_iv);
-    
+
     using Aes aes = Aes.Create();
     ICryptoTransform decryptor = aes.CreateDecryptor(key, iv);
-    
+
     using MemoryStream memoryStream = new MemoryStream(payload);
     using CryptoStream cryptoStream = new CryptoStream(memoryStream, decryptor, CryptoStreamMode.Read);
     using BinaryReader binaryReader = new BinaryReader(cryptoStream);
-    
+
     return binaryReader.ReadBytes(payload.Length);
 };
 
@@ -297,7 +335,9 @@ var messages = await bus.FetchMessagesAsync(new MessageFetchRequest
 },
 decryptor);
 ```
+
 Similarly, as with `SendMessagesAsync`, there's a generic overload that accepts a binary deserializer.
+
 ```c#
 //---Snip---
 Func<byte[], Envelope> deserializer = serializedData =>
@@ -320,7 +360,10 @@ var messages = await bus.FetchMessagesAsync<Envelope>(new MessageFetchRequest
     AutoCommit = true
 }, deserializer, decryptor);
 ```
-Beyond the `FetchMessagesAsync` functionality, there's also a `PollMessagesAsync` method that spawns new thread which polls messages in background.
+
+Beyond the `FetchMessagesAsync` functionality, there's also a `PollMessagesAsync` method that spawns new thread which
+polls messages in background.
+
 ```c#
 //---Snip---
 await foreach (var messageResponse in bus.PollMessagesAsync<Envelope>(new PollMessagesRequest
@@ -337,24 +380,25 @@ await foreach (var messageResponse in bus.PollMessagesAsync<Envelope>(new PollMe
 }
 
 ```
-It is worth noting that every method (except `PollMessagesAsync`) will throw an `InvalidResponseException` when encountering an error.<br><br>
+
+It is worth noting that every method (except `PollMessagesAsync`) will throw an `InvalidResponseException` when
+encountering an error.
+
 If you register `IIggyClient` in a dependency injection container, you will have access to interfaces
-that encapsulate smaller parts of the system `IIggyStream` `IIggyTopic` `IIggyPublisher` `IIggyConsumer` `IIggyConsumerGroup` `IIggyOffset`
+that encapsulate smaller parts of the system `IIggyStream` `IIggyTopic` `IIggyPublisher` `IIggyConsumer`
+`IIggyConsumerGroup` `IIggyOffset`
 `IIggyPartition` `IIggyUsers` `IIggyUtils`
 
-For more information about how Iggy works check its [documentation](https://docs.iggy.rs/)
+For more information about how Iggy works check its [documentation](https://iggy.apache.org/docs/)
 
-# Producer / Consumer Sample
+## Producer / Consumer Sample
 
-https://github.com/iggy-rs/iggy-dotnet-client/assets/112548209/3a89d2f5-d066-40d2-8b82-96c3e338007e
-
-To run the samples, first get [Iggy](https://github.com/spetz/iggy), Run the server with `cargo r --bin server`, then get the SDK, cd into `Iggy_SDK`
-and run following commands: `dotnet run -c Release --project Iggy_Sample_Producer` for producer, `dotnet run -c Release --project Iggy_Sample_Consumer`
+To run the samples, first get [Iggy](https://github.com/apache/iggy), Run the server with `cargo run --bin iggy-server`,
+then get the SDK, cd into `Iggy_SDK`
+and run following commands: `dotnet run -c Release --project Iggy_Sample_Producer` for producer,
+`dotnet run -c Release --project Iggy_Sample_Consumer`
 for consumer.
 
-## TODO 
+## TODO
+
 - Add support for `ASP.NET Core` Dependency Injection
-
-
-
-

@@ -15,21 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Configuration;
-using Iggy_SDK.ConnectionStream;
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Contracts.Tcp;
-using Iggy_SDK.Enums;
-using Iggy_SDK.Exceptions;
-using Iggy_SDK.IggyClient;
-using Iggy_SDK.IggyClient.Implementations;
-using Iggy_SDK.Utils;
-using Microsoft.Extensions.Logging;
 using System.ComponentModel;
 using System.Net.Security;
 using System.Net.Sockets;
+using Apache.Iggy.Configuration;
+using Apache.Iggy.ConnectionStream;
+using Apache.Iggy.Enums;
+using Apache.Iggy.Exceptions;
+using Apache.Iggy.IggyClient;
+using Apache.Iggy.IggyClient.Implementations;
+using Microsoft.Extensions.Logging;
 
-namespace Iggy_SDK.Factory;
+namespace Apache.Iggy.Factory;
 
 public static class MessageStreamFactory
 {
@@ -38,7 +35,7 @@ public static class MessageStreamFactory
     {
         var config = new MessageStreamConfigurator();
         options.Invoke(config);
-        
+
         return config.Protocol switch
         {
             Protocol.Http => CreateHttpMessageStream(config, loggerFactory),
@@ -46,7 +43,7 @@ public static class MessageStreamFactory
             _ => throw new InvalidEnumArgumentException()
         };
     }
-    
+
     private static TcpMessageStream CreateTcpMessageStream(IMessageStreamConfigurator options, ILoggerFactory loggerFactory)
     {
         var socket = CreateTcpStream(options);
@@ -84,6 +81,7 @@ public static class MessageStreamFactory
         {
             sslStream.AuthenticateAsClient(tlsSettings.Hostname);
         }
+
         return new TcpTlsConnectionStream(sslStream);
     }
 
@@ -94,6 +92,7 @@ public static class MessageStreamFactory
             .WithSendMessagesDispatcher() //this internally resolves whether the message dispatcher is created or not
             .Build();
     }
+
     private static HttpClient CreateHttpClient(IMessageStreamConfigurator options)
     {
         var client = new HttpClient();

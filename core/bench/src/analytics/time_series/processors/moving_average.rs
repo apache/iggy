@@ -16,6 +16,8 @@
  * under the License.
  */
 
+#![allow(clippy::cast_precision_loss)]
+
 use super::TimeSeriesProcessor;
 use bench_report::time_series::{TimePoint, TimeSeries};
 use std::collections::VecDeque;
@@ -27,7 +29,7 @@ pub struct MovingAverageProcessor {
 }
 
 impl MovingAverageProcessor {
-    pub fn new(window_size: usize) -> Self {
+    pub const fn new(window_size: usize) -> Self {
         Self { window_size }
     }
 }
@@ -41,14 +43,19 @@ impl TimeSeriesProcessor for MovingAverageProcessor {
 
         let mut window: VecDeque<f64> = VecDeque::with_capacity(self.window_size);
         let mut points = Vec::with_capacity(data.points.len());
+        let mut sum = 0.0;
 
         for point in &data.points {
             window.push_back(point.value);
-            if window.len() > self.window_size {
-                window.pop_front();
+            sum += point.value;
+
+            if window.len() > self.window_size
+                && let Some(old_value) = window.pop_front()
+            {
+                sum -= old_value;
             }
 
-            let avg = window.iter().sum::<f64>() / window.len() as f64;
+            let avg = sum / window.len() as f64;
             let rounded_avg = (avg * 1000.0).round() / 1000.0;
             points.push(TimePoint::new(point.time_s, rounded_avg));
         }

@@ -32,6 +32,11 @@ pub mod consumer;
 pub mod consumer_builder;
 pub mod producer;
 pub mod producer_builder;
+pub mod producer_config;
+pub mod producer_dispatcher;
+pub mod producer_error_callback;
+pub mod producer_sharding;
 
 const ORDERING: std::sync::atomic::Ordering = std::sync::atomic::Ordering::SeqCst;
-const MAX_BATCH_SIZE: usize = 1000000;
+const MAX_BATCH_LENGTH: usize = 1000000;
+const MIB: usize = 1_048_576;

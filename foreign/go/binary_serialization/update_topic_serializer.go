@@ -20,14 +20,23 @@ package binaryserialization
 import (
 	"encoding/binary"
 
-	iggcon "github.com/iggy-rs/iggy-go-client/contracts"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
 type TcpUpdateTopicRequest struct {
-	iggcon.UpdateTopicRequest
+	StreamId             iggcon.Identifier           `json:"streamId"`
+	TopicId              iggcon.Identifier           `json:"topicId"`
+	CompressionAlgorithm iggcon.CompressionAlgorithm `json:"compressionAlgorithm"`
+	MessageExpiry        iggcon.Duration             `json:"messageExpiry"`
+	MaxTopicSize         uint64                      `json:"maxTopicSize"`
+	ReplicationFactor    *uint8                      `json:"replicationFactor"`
+	Name                 string                      `json:"name"`
 }
 
 func (request *TcpUpdateTopicRequest) Serialize() []byte {
+	if request.ReplicationFactor == nil {
+		request.ReplicationFactor = new(uint8)
+	}
 	streamIdBytes := SerializeIdentifier(request.StreamId)
 	topicIdBytes := SerializeIdentifier(request.TopicId)
 
@@ -38,16 +47,16 @@ func (request *TcpUpdateTopicRequest) Serialize() []byte {
 	offset += copy(buffer[offset:], streamIdBytes)
 	offset += copy(buffer[offset:], topicIdBytes)
 
-	buffer[offset] = request.CompressionAlgorithm
+	buffer[offset] = byte(request.CompressionAlgorithm)
 	offset++
 
-	binary.LittleEndian.PutUint64(buffer[offset:], uint64(request.MessageExpiry.Microseconds()))
+	binary.LittleEndian.PutUint64(buffer[offset:], uint64(request.MessageExpiry))
 	offset += 8
 
-	binary.LittleEndian.PutUint64(buffer[offset:], uint64(request.MaxTopicSize))
+	binary.LittleEndian.PutUint64(buffer[offset:], request.MaxTopicSize)
 	offset += 8
 
-	buffer[offset] = request.ReplicationFactor
+	buffer[offset] = *request.ReplicationFactor
 	offset++
 
 	buffer[offset] = uint8(len(request.Name))

@@ -16,12 +16,10 @@
  * under the License.
  */
 
-use iggy::messages::poll_messages::PollingStrategy as RustPollingStrategy;
-use iggy::models::messages::MessageState as RustMessageState;
-use iggy::models::messages::PolledMessage as RustReceiveMessage;
+use iggy::prelude::{IggyMessage as RustReceiveMessage, PollingStrategy as RustPollingStrategy};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_enum, gen_stub_pymethods};
+use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen_stub_pymethods};
 
 /// A Python class representing a received message.
 ///
@@ -41,16 +39,6 @@ impl ReceiveMessage {
     }
 }
 
-#[gen_stub_pyclass_enum]
-#[pyclass(eq, eq_int)]
-#[derive(PartialEq)]
-pub enum MessageState {
-    Available,
-    Unavailable,
-    Poisoned,
-    MarkedForDeletion,
-}
-
 #[gen_stub_pymethods]
 #[pymethods]
 impl ReceiveMessage {
@@ -65,52 +53,40 @@ impl ReceiveMessage {
     ///
     /// The offset represents the position of the message within its topic.
     pub fn offset(&self) -> u64 {
-        self.inner.offset
+        self.inner.header.offset
     }
 
     /// Retrieves the timestamp of the received message.
     ///
     /// The timestamp represents the time of the message within its topic.
     pub fn timestamp(&self) -> u64 {
-        self.inner.timestamp
+        self.inner.header.timestamp
     }
 
     /// Retrieves the id of the received message.
     ///
     /// The id represents unique identifier of the message within its topic.
     pub fn id(&self) -> u128 {
-        self.inner.id
+        self.inner.header.id
     }
 
     /// Retrieves the checksum of the received message.
     ///
     /// The checksum represents the integrity of the message within its topic.
-    pub fn checksum(&self) -> u32 {
-        self.inner.checksum
-    }
-
-    /// Retrieves the Message's state of the received message.
-    ///
-    /// State represents the state of the response.
-    pub fn state(&self) -> MessageState {
-        match self.inner.state {
-            RustMessageState::Available => MessageState::Available,
-            RustMessageState::Unavailable => MessageState::Unavailable,
-            RustMessageState::Poisoned => MessageState::Poisoned,
-            RustMessageState::MarkedForDeletion => MessageState::MarkedForDeletion,
-        }
+    pub fn checksum(&self) -> u64 {
+        self.inner.header.checksum
     }
 
     /// Retrieves the length of the received message.
     ///
     /// The length represents the length of the payload.
-    pub fn length(&self) -> u64 {
-        self.inner.length.as_bytes_u64()
+    pub fn length(&self) -> u32 {
+        self.inner.header.payload_length
     }
 }
 
 #[derive(Clone, Copy)]
-#[gen_stub_pyclass_enum]
+#[gen_stub_pyclass_complex_enum]
 #[pyclass]
 pub enum PollingStrategy {
     Offset { value: u64 },
@@ -120,11 +96,13 @@ pub enum PollingStrategy {
     Next {},
 }
 
-impl From<PollingStrategy> for RustPollingStrategy {
-    fn from(value: PollingStrategy) -> Self {
+impl From<&PollingStrategy> for RustPollingStrategy {
+    fn from(value: &PollingStrategy) -> Self {
         match value {
-            PollingStrategy::Offset { value } => RustPollingStrategy::offset(value),
-            PollingStrategy::Timestamp { value } => RustPollingStrategy::timestamp(value.into()),
+            PollingStrategy::Offset { value } => RustPollingStrategy::offset(value.to_owned()),
+            PollingStrategy::Timestamp { value } => {
+                RustPollingStrategy::timestamp(value.to_owned().into())
+            }
             PollingStrategy::First {} => RustPollingStrategy::first(),
             PollingStrategy::Last {} => RustPollingStrategy::last(),
             PollingStrategy::Next {} => RustPollingStrategy::next(),

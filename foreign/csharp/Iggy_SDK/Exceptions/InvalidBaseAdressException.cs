@@ -15,13 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK.Exceptions;
+namespace Apache.Iggy.Exceptions;
 
 internal sealed class InvalidBaseAdressException : Exception
 {
-
     internal InvalidBaseAdressException() : base("Invalid Base Adress, use ':' only to describe the port")
     {
-
     }
 }

@@ -50,11 +50,9 @@ jobs:
         with:
           key: "aarch64-apple-darwin"
       - name: Prepare aarch64-apple-darwin toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-          target: aarch64-apple-darwin
+        run: |
+           rustup target add aarch64-apple-darwin
+           echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
       - name: Set verbose flag
         shell: bash
         run: echo "VERBOSE_FLAG=$([[ "${RUNNER_DEBUG}" = "1" ]] && echo "--verbose" || echo "")" >> $GITHUB_ENV

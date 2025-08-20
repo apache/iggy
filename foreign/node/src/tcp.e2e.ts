@@ -18,7 +18,8 @@
  */
 
 
-import { TcpClient } from './client/index.js';
+import assert from 'node:assert/strict';
+import { getRawClient } from './client/index.js';
 
 import {
   login, logout,
@@ -32,7 +33,14 @@ import {
 
 try {
   // create socket
-  const cli = TcpClient({ host: '127.0.0.1', port: 8090 });
+  const cli = getRawClient({
+    transport: 'TCP' as const,
+    options: {
+      host: '127.0.0.1',
+      port: 8090
+    },
+    credentials: { username: 'iggy', password: 'iggy' }
+  });
   const s = () => Promise.resolve(cli);
 
   // LOGIN
@@ -81,6 +89,7 @@ try {
   // GET_TOPIC
   const t2 = await getTopic(s)({ streamId: topic1.streamId, topicId: topic1.name });
   console.log('RESPONSE_getTopic', t2);
+  assert.ok(t2);
 
   // UPDATE_TOPIC
   const r_updateTopic = await updateTopic(s)({

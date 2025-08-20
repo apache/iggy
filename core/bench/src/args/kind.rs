@@ -100,23 +100,19 @@ pub enum BenchmarkKindCommand {
 impl BenchmarkKindCommand {
     pub fn as_simple_kind(&self) -> BenchmarkKind {
         match self {
-            BenchmarkKindCommand::PinnedProducer(_) => BenchmarkKind::PinnedProducer,
-            BenchmarkKindCommand::PinnedConsumer(_) => BenchmarkKind::PinnedConsumer,
-            BenchmarkKindCommand::PinnedProducerAndConsumer(_) => {
-                BenchmarkKind::PinnedProducerAndConsumer
-            }
-            BenchmarkKindCommand::BalancedProducer(_) => BenchmarkKind::BalancedProducer,
-            BenchmarkKindCommand::BalancedConsumerGroup(_) => BenchmarkKind::BalancedConsumerGroup,
-            BenchmarkKindCommand::BalancedProducerAndConsumerGroup(_) => {
+            Self::PinnedProducer(_) => BenchmarkKind::PinnedProducer,
+            Self::PinnedConsumer(_) => BenchmarkKind::PinnedConsumer,
+            Self::PinnedProducerAndConsumer(_) => BenchmarkKind::PinnedProducerAndConsumer,
+            Self::BalancedProducer(_) => BenchmarkKind::BalancedProducer,
+            Self::BalancedConsumerGroup(_) => BenchmarkKind::BalancedConsumerGroup,
+            Self::BalancedProducerAndConsumerGroup(_) => {
                 BenchmarkKind::BalancedProducerAndConsumerGroup
             }
-            BenchmarkKindCommand::EndToEndProducingConsumer(_) => {
-                BenchmarkKind::EndToEndProducingConsumer
-            }
-            BenchmarkKindCommand::EndToEndProducingConsumerGroup(_) => {
+            Self::EndToEndProducingConsumer(_) => BenchmarkKind::EndToEndProducingConsumer,
+            Self::EndToEndProducingConsumerGroup(_) => {
                 BenchmarkKind::EndToEndProducingConsumerGroup
             }
-            BenchmarkKindCommand::Examples => {
+            Self::Examples => {
                 print_examples();
                 std::process::exit(0);
             }
@@ -155,15 +151,15 @@ impl BenchmarkKindProps for BenchmarkKindCommand {
 
     fn inner(&self) -> &dyn BenchmarkKindProps {
         match self {
-            BenchmarkKindCommand::PinnedProducer(args) => args,
-            BenchmarkKindCommand::PinnedConsumer(args) => args,
-            BenchmarkKindCommand::PinnedProducerAndConsumer(args) => args,
-            BenchmarkKindCommand::BalancedProducer(args) => args,
-            BenchmarkKindCommand::BalancedConsumerGroup(args) => args,
-            BenchmarkKindCommand::BalancedProducerAndConsumerGroup(args) => args,
-            BenchmarkKindCommand::EndToEndProducingConsumer(args) => args,
-            BenchmarkKindCommand::EndToEndProducingConsumerGroup(args) => args,
-            BenchmarkKindCommand::Examples => {
+            Self::PinnedProducer(args) => args,
+            Self::PinnedConsumer(args) => args,
+            Self::PinnedProducerAndConsumer(args) => args,
+            Self::BalancedProducer(args) => args,
+            Self::BalancedConsumerGroup(args) => args,
+            Self::BalancedProducerAndConsumerGroup(args) => args,
+            Self::EndToEndProducingConsumer(args) => args,
+            Self::EndToEndProducingConsumerGroup(args) => args,
+            Self::Examples => {
                 print_examples();
                 std::process::exit(0);
             }
@@ -171,6 +167,6 @@ impl BenchmarkKindProps for BenchmarkKindCommand {
     }
 
     fn validate(&self) {
-        self.inner().validate()
+        self.inner().validate();
     }
 }

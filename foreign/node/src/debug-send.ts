@@ -18,12 +18,10 @@
  */
 
 
-
 import assert from 'node:assert/strict';
-import { Client, SingleClient } from './client/index.js';
-import { uuidv7, uuidv4 } from 'uuidv7'
+import { ClientConfig, SingleClient } from './client/index.js';
 import { groupConsumerStream } from './stream/consumer-stream.js';
-import { PollingStrategy, Partitioning, type PollMessagesResponse } from './wire/index.js';
+import { PollingStrategy, type PollMessagesResponse } from './wire/index.js';
 
 const streamId = 321;
 const topicId = 543;
@@ -42,7 +40,7 @@ const topic = {
   compressionAlgorithm: 1
 };
 
-const opt = {
+const opt: ClientConfig = {
   transport: 'TCP' as const,
   options: {
     port: 8090,
@@ -51,7 +49,12 @@ const opt = {
     // keepAlive: true
   },
   credentials: { username: 'iggy', password: 'iggy' },
-};2
+  reconnect: {
+    enabled: true,
+    interval: 10 * 1000,
+    maxRetries: 10
+  }
+};
 
 const c = new SingleClient(opt);
 
@@ -77,63 +80,58 @@ try {
   console.log('server stream CREATED::', { streamId });
   await c.topic.create(topic);
   console.log('server topic CREATED::', { topicId });
+
   // send
-
-  // setInterval(async () => {
+  setInterval(async () => {
     assert.ok(await c.message.send(msg));
-  //   console.log('message SEND::', { msg })
-  // }, 3000);
+    console.log('message SEND::', { msg })
+  }, 3000);
 
 
-  // // POLL MESSAGE
-  // const pollReq = {
-  //   groupId,
-  //   streamId,
-  //   topicId,
-  //   pollingStrategy: PollingStrategy.Next,
-  //   count: 1,
-  //   interval: 5000
-  // };
+  // POLL MESSAGE
+  const pollReq = {
+    groupId,
+    streamId,
+    topicId,
+    pollingStrategy: PollingStrategy.Next,
+    count: 1,
+    interval: 5000
+  };
 
-  // const cs = await groupConsumerStream(opt)(pollReq);
-  // const dataCb = (d: PollMessagesResponse) => {
-  //   console.log('cli/DATA POLLED:', d);
-  //   // recv += d.count;
-  //   // if (recv === ct)
-  //   //   str.destroy();
-  // };
+  const cs = await groupConsumerStream(opt)(pollReq);
+  const dataCb = (d: PollMessagesResponse) => {
+    console.log('cli/DATA POLLED:', d);
+    // recv += d.count;
+    // if (recv === ct)
+    //   str.destroy();
+  };
 
-  // cs.on('data', dataCb);
+  cs.on('data', dataCb);
 
-  // cs.on('error', (err) => {
-  //   console.error('cli/=>>Stream ERROR:: // DESTROY ', err)
-  //   // cs.destroy(err);
-  // });
+  cs.on('error', (err) => {
+    console.error('cli/=>>Stream ERROR:: // DESTROY ', err)
+    cs.destroy(err);
+  });
 
-  // cs.on('end', async () => {
-  //   console.log('cli/=>>Stream END::')
-  //   cs.destroy();
-  //   await cleanup();
-  // });
+  cs.on('end', async () => {
+    console.log('cli/=>>Stream END::')
+    cs.destroy();
+    await cleanup();
+  });
 
-  // cs.on('close', async () => {
-  //   console.log('cli/=>>Stream CLOSE::')
-  //   // await cleanup();
-  // });
+  cs.on('close', async () => {
+    console.log('cli/=>>Stream CLOSE::')
+    // await cleanup();
+  });
 
 
 } catch (err) {
   console.error('client catchALL END', err)
   await cleanup();
-} finally {
-  console.error('finally::cleanup')
-  await cleanup();
 }
-
 
 // process.on('SIGINT', async () => {
 //   await cleanup();
 //   console.log('cleanup OK, exiting...');
 //   process.exit()
 // });
-

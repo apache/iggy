@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK_Tests.Utils.SpecFlowTypes;
+namespace Apache.Iggy.Tests.Utils.SpecFlowTypes;
 
 public sealed class ConsumerPollStreamTopicId
 {

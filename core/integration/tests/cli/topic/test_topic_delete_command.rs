@@ -117,8 +117,7 @@ impl IggyCmdTestCase for TestTopicDeleteCmd {
         // Topic with ID: 4 in stream with ID: 1 deleted
 
         let message = format!(
-            "Executing delete topic with ID: {} in stream with ID: {}\nTopic with ID: {} in stream with ID: {} deleted\n",
-            topic_id, stream_id, topic_id, stream_id
+            "Executing delete topic with ID: {topic_id} in stream with ID: {stream_id}\nTopic with ID: {topic_id} in stream with ID: {stream_id} deleted\n"
         );
 
         command_state.success().stdout(diff(message));

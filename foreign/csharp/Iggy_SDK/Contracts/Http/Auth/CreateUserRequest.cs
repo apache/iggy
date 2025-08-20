@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Enums;
-namespace Iggy_SDK.Contracts.Http;
+using Apache.Iggy.Enums;
+
+namespace Apache.Iggy.Contracts.Http.Auth;
 
 public sealed class CreateUserRequest
 {

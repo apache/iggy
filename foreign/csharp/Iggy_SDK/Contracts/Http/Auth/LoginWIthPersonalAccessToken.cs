@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK.Contracts.Http;
+namespace Apache.Iggy.Contracts.Http.Auth;
 
 public sealed class LoginWithPersonalAccessToken
 {
-   public required string Token { get; init; } 
+    public required string Token { get; init; }
 }

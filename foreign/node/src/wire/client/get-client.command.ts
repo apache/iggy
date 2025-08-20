@@ -21,6 +21,7 @@
 import type { CommandResponse } from '../../client/client.type.js';
 import { deserializeClient, type Client } from './client.utils.js';
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 
 export type GetClient = {
   clientId: number
@@ -28,13 +29,19 @@ export type GetClient = {
 
 // GET CLIENT by id
 export const GET_CLIENT = {
-  code: 21,
+  code: COMMAND_CODE.GetClient,
+
   serialize: ({ clientId }: GetClient): Buffer => {
     const b = Buffer.alloc(4);
     b.writeUInt32LE(clientId);
     return b;
   },
-  deserialize: (r: CommandResponse) => deserializeClient(r.data).data
+
+  deserialize: (r: CommandResponse) => {
+    if(r.status === 0 && r.length === 0)
+      return null;
+    return deserializeClient(r.data).data
+  }
 };
 
-export const getClient = wrapCommand<GetClient, Client>(GET_CLIENT);
+export const getClient = wrapCommand<GetClient, Client | null>(GET_CLIENT);

@@ -56,7 +56,7 @@ async fn main() -> Result<(), IggyError> {
     });
 
     // Configure logging
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("INFO"));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("INFO"));
     let stdout_layer = fmt::layer().with_ansi(true);
 
     // If output directory is specified, also log to file
@@ -78,7 +78,7 @@ async fn main() -> Result<(), IggyError> {
             .init();
     }
 
-    let mut benchmark_runner = BenchmarkRunner::new(args);
+    let benchmark_runner = BenchmarkRunner::new(args);
 
     info!("Starting the benchmarks...");
     let ctrl_c = tokio::signal::ctrl_c();

@@ -34,11 +34,11 @@ use test_case::test_matrix;
  */
 
 fn msg_size(size: u64) -> IggyByteSize {
-    IggyByteSize::from_str(&format!("{}B", size)).unwrap()
+    IggyByteSize::from_str(&format!("{size}B")).unwrap()
 }
 
 fn segment_size(size: u64) -> IggyByteSize {
-    IggyByteSize::from_str(&format!("{}B", size)).unwrap()
+    IggyByteSize::from_str(&format!("{size}B")).unwrap()
 }
 
 fn msgs_req_to_save(count: u32) -> u32 {
@@ -82,14 +82,13 @@ fn very_large_batches() -> Vec<u32> {
 #[tokio::test]
 async fn test_get_messages_by_offset(
     message_size: IggyByteSize,
-    batch_sizes: Vec<u32>,
+    batch_lengths: Vec<u32>,
     messages_required_to_save: u32,
     segment_size: IggyByteSize,
     cache_indexes: CacheIndexesConfig,
 ) {
     println!(
-        "Running test with message_size: {}, batches: {:?}, messages_required_to_save: {}, segment_size: {}, cache_indexes: {}",
-        message_size, batch_sizes, messages_required_to_save, segment_size, cache_indexes
+        "Running test with message_size: {message_size}, batches: {batch_lengths:?}, messages_required_to_save: {messages_required_to_save}, segment_size: {segment_size}, cache_indexes: {cache_indexes}"
     );
 
     let setup = TestSetup::init().await;
@@ -97,7 +96,7 @@ async fn test_get_messages_by_offset(
     let topic_id = 1;
     let partition_id = 1;
 
-    let total_messages_count = batch_sizes.iter().sum();
+    let total_messages_count = batch_lengths.iter().sum();
 
     let config = Arc::new(SystemConfig {
         path: setup.config.path.to_string(),
@@ -139,7 +138,7 @@ async fn test_get_messages_by_offset(
     // Generate all messages as defined in the test matrix
     for i in 1..=total_messages_count {
         let id = i as u128;
-        let beginning_of_payload = format!("message {}", i);
+        let beginning_of_payload = format!("message {i}");
         let mut payload = BytesMut::new();
         payload.extend_from_slice(beginning_of_payload.as_bytes());
         payload.resize(message_size.as_bytes_usize(), 0xD);
@@ -169,11 +168,11 @@ async fn test_get_messages_by_offset(
     }
 
     // Keep track of offsets after each batch
-    let mut batch_offsets = Vec::with_capacity(batch_sizes.len());
+    let mut batch_offsets = Vec::with_capacity(batch_lengths.len());
     let mut current_pos = 0;
 
     // Append all batches as defined in the test matrix
-    for (batch_idx, &batch_len) in batch_sizes.iter().enumerate() {
+    for (batch_idx, &batch_len) in batch_lengths.iter().enumerate() {
         // If we've generated too many messages, skip the rest
         if current_pos + batch_len as usize > all_messages.len() {
             break;
@@ -182,7 +181,7 @@ async fn test_get_messages_by_offset(
         println!(
             "Appending batch {}/{} with {} messages",
             batch_idx + 1,
-            batch_sizes.len(),
+            batch_lengths.len(),
             batch_len
         );
 
@@ -221,7 +220,7 @@ async fn test_get_messages_by_offset(
     // Test 2: Get messages from middle (after 3rd batch)
     if batch_offsets.len() >= 3 {
         let middle_offset = batch_offsets[2];
-        let prior_batches_sum: u32 = batch_sizes[..3].iter().sum();
+        let prior_batches_sum: u32 = batch_lengths[..3].iter().sum();
         let remaining_messages = total_sent_messages - prior_batches_sum;
 
         let middle_messages = partition
@@ -336,10 +335,7 @@ async fn test_get_messages_by_offset(
     }
 
     // Add sequential read test for all batch sizes
-    println!(
-        "Verifying sequential reads, expecting {} messages",
-        total_sent_messages
-    );
+    println!("Verifying sequential reads, expecting {total_sent_messages} messages");
 
     let chunk_size = 500;
     let mut verified_count = 0;
@@ -355,16 +351,13 @@ async fn test_get_messages_by_offset(
         assert_eq!(
             chunk.count(),
             read_size,
-            "Failed to read chunk at offset {} with size {}",
-            chunk_start,
-            read_size
+            "Failed to read chunk at offset {chunk_start} with size {read_size}"
         );
 
         verified_count += chunk.count();
 
         println!(
-            "Read chunk at offset {} with size {}, verified count: {}",
-            chunk_start, read_size, verified_count
+            "Read chunk at offset {chunk_start} with size {read_size}, verified count: {verified_count}"
         );
     }
 

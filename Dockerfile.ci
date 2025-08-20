@@ -25,7 +25,7 @@ RUN test -n "$IGGY_SERVER_PATH" || (echo "IGGY_SERVER_PATH not set" && false)
 
 WORKDIR /iggy
 
-COPY configs ./configs
+COPY ./core/configs ./configs
 COPY ${IGGY_CMD_PATH} ./
 COPY ${IGGY_SERVER_PATH} ./
 

@@ -84,7 +84,12 @@ impl Partition {
 
     // Retrieves the first messages (up to a specified count).
     pub async fn get_first_messages(&self, count: u32) -> Result<IggyMessagesBatchSet, IggyError> {
-        self.get_messages_by_offset(0, count).await
+        if self.segments.is_empty() {
+            return Ok(IggyMessagesBatchSet::empty());
+        }
+        let oldest_available_offset = self.segments[0].start_offset();
+        self.get_messages_by_offset(oldest_available_offset, count)
+            .await
     }
 
     // Retrieves the last messages (up to a specified count).
@@ -156,9 +161,8 @@ impl Partition {
             .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to get messages from segment, segment: {}, \
-                     offset: {}, count: {}",
-                    segment, current_offset, remaining_count
+                    "{COMPONENT} (error: {error}) - failed to get messages from segment, segment: {segment}, \
+                     offset: {current_offset}, count: {remaining_count}"
                 )
             })?;
 
@@ -201,8 +205,7 @@ impl Partition {
                 .with_error_context(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - failed to get messages from segment by timestamp, \
-                         segment: {}, timestamp: {}, count: {}",
-                        segment, timestamp, remaining_count
+                         segment: {segment}, timestamp: {timestamp}, count: {remaining_count}"
                     )
                 })?;
 
@@ -239,8 +242,7 @@ impl Partition {
                 start_offset, self.partition_id
             );
             self.add_persisted_segment(start_offset).await.with_error_context(|error| format!(
-                    "{COMPONENT} (error: {error}) - failed to add persisted segment, partition: {}, start offset: {}",
-                    self, start_offset,
+                    "{COMPONENT} (error: {error}) - failed to add persisted segment, partition: {self}, start offset: {start_offset}",
                 ))?
         }
 

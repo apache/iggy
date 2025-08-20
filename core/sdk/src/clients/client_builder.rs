@@ -16,22 +16,23 @@
  * under the License.
  */
 
+use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::clients::client::IggyClient;
 use crate::http::http_client::HttpClient;
-use crate::http::http_config::HttpClientConfigBuilder;
 use crate::prelude::{
-    AutoLogin, Client, EncryptorKind, IggyDuration, IggyError, Partitioner, TcpClientConfigBuilder,
+    AutoLogin, EncryptorKind, HttpClientConfigBuilder, IggyDuration, IggyError, Partitioner,
+    QuicClientConfigBuilder, TcpClientConfigBuilder,
 };
-use crate::quic::quick_client::QuicClient;
-use crate::quic::quick_config::QuicClientConfigBuilder;
+use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
+use iggy_common::{ConnectionStringUtils, TransportProtocol};
 use std::sync::Arc;
 use tracing::error;
 
 /// The builder for the `IggyClient` instance, which allows to configure and provide custom implementations for the partitioner, encryptor or message handler.
 #[derive(Debug, Default)]
 pub struct IggyClientBuilder {
-    client: Option<Box<dyn Client>>,
+    client: Option<ClientWrapper>,
     partitioner: Option<Arc<dyn Partitioner>>,
     encryptor: Option<Arc<EncryptorKind>>,
 }
@@ -43,16 +44,33 @@ impl IggyClientBuilder {
         IggyClientBuilder::default()
     }
 
+    /// Creates a new `IggyClientBuilder` from the provided connection string.
     pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
         let mut builder = Self::new();
-        builder.client = Some(Box::new(TcpClient::from_connection_string(
-            connection_string,
-        )?));
+
+        match ConnectionStringUtils::parse_protocol(connection_string)? {
+            TransportProtocol::Tcp => {
+                builder.client = Some(ClientWrapper::Tcp(TcpClient::from_connection_string(
+                    connection_string,
+                )?));
+            }
+            TransportProtocol::Quic => {
+                builder.client = Some(ClientWrapper::Quic(QuicClient::from_connection_string(
+                    connection_string,
+                )?));
+            }
+            TransportProtocol::Http => {
+                builder.client = Some(ClientWrapper::Http(HttpClient::from_connection_string(
+                    connection_string,
+                )?));
+            }
+        }
+
         Ok(builder)
     }
 
     /// Apply the provided client implementation for the specific transport. Setting client clears the client config.
-    pub fn with_client(mut self, client: Box<dyn Client>) -> Self {
+    pub fn with_client(mut self, client: ClientWrapper) -> Self {
         self.client = Some(client);
         self
     }
@@ -166,6 +184,14 @@ impl TcpClientBuilder {
         self
     }
 
+    /// Sets whether to validate the TLS certificate.
+    pub fn with_tls_validate_certificate(mut self, tls_validate_certificate: bool) -> Self {
+        self.config = self
+            .config
+            .with_tls_validate_certificate(tls_validate_certificate);
+        self
+    }
+
     /// Sets the nodelay option for the TCP socket.
     pub fn with_no_delay(mut self) -> Self {
         self.config = self.config.with_no_delay();
@@ -175,7 +201,10 @@ impl TcpClientBuilder {
     /// Builds the parent `IggyClient` with TCP configuration.
     pub fn build(self) -> Result<IggyClient, IggyError> {
         let client = TcpClient::create(Arc::new(self.config.build()?))?;
-        let client = self.parent_builder.with_client(Box::new(client)).build()?;
+        let client = self
+            .parent_builder
+            .with_client(ClientWrapper::Tcp(client))
+            .build()?;
         Ok(client)
     }
 }
@@ -224,7 +253,10 @@ impl QuicClientBuilder {
     /// Builds the parent `IggyClient` with QUIC configuration.
     pub fn build(self) -> Result<IggyClient, IggyError> {
         let client = QuicClient::create(Arc::new(self.config.build()))?;
-        let client = self.parent_builder.with_client(Box::new(client)).build()?;
+        let client = self
+            .parent_builder
+            .with_client(ClientWrapper::Quic(client))
+            .build()?;
         Ok(client)
     }
 }
@@ -251,7 +283,192 @@ impl HttpClientBuilder {
     /// Builds the parent `IggyClient` with HTTP configuration.
     pub fn build(self) -> Result<IggyClient, IggyError> {
         let client = HttpClient::create(Arc::new(self.config.build()))?;
-        let client = self.parent_builder.with_client(Box::new(client)).build()?;
+        let client = self
+            .parent_builder
+            .with_client(ClientWrapper::Http(client))
+            .build()?;
         Ok(client)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_fail_with_empty_connection_string() {
+        let value = "";
+        let client_builder = IggyClientBuilder::from_connection_string(value);
+        assert!(client_builder.is_err());
+    }
+
+    #[test]
+    fn should_fail_without_username() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let client_builder = IggyClientBuilder::from_connection_string(&value);
+        assert!(client_builder.is_err());
+    }
+
+    #[test]
+    fn should_fail_without_password() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let client_builder = IggyClientBuilder::from_connection_string(&value);
+        assert!(client_builder.is_err());
+    }
+
+    #[test]
+    fn should_fail_without_server_address() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let client_builder = IggyClientBuilder::from_connection_string(&value);
+        assert!(client_builder.is_err());
+    }
+
+    #[test]
+    fn should_fail_without_port() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let client_builder = IggyClientBuilder::from_connection_string(&value);
+        assert!(client_builder.is_err());
+    }
+
+    #[test]
+    fn should_fail_with_invalid_prefix() {
+        let connection_string_prefix = "invalid+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let client_builder = IggyClientBuilder::from_connection_string(&value);
+        assert!(client_builder.is_err());
+    }
+
+    #[test]
+    fn should_succeed_with_default_prefix() {
+        let default_connection_string_prefix = "iggy://";
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{default_connection_string_prefix}{username}:{password}@{server_address}:{port}"
+        );
+        let client_builder = IggyClientBuilder::from_connection_string(&value);
+        assert!(client_builder.is_ok());
+    }
+
+    #[test]
+    fn should_succeed_with_tcp_protocol() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let client_builder = IggyClientBuilder::from_connection_string(&value);
+        assert!(client_builder.is_ok());
+    }
+
+    #[test]
+    fn should_succeed_with_tcp_protocol_using_pat() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let pat = "iggypat-1234567890abcdef";
+        let value = format!("{connection_string_prefix}{protocol}://{pat}@{server_address}:{port}");
+        let client_builder = IggyClientBuilder::from_connection_string(&value);
+        assert!(client_builder.is_ok());
+    }
+
+    #[tokio::test]
+    async fn should_succeed_with_quic_protocol() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Quic;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let client_builder = IggyClientBuilder::from_connection_string(&value);
+        assert!(client_builder.is_ok());
+    }
+
+    #[tokio::test]
+    async fn should_succeed_with_quic_protocol_using_pat() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Quic;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let pat = "iggypat-1234567890abcdef";
+        let value = format!("{connection_string_prefix}{protocol}://{pat}@{server_address}:{port}");
+        let client_builder = IggyClientBuilder::from_connection_string(&value);
+        assert!(client_builder.is_ok());
+    }
+
+    #[test]
+    fn should_succeed_with_http_protocol() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Http;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let client_builder = IggyClientBuilder::from_connection_string(&value);
+        assert!(client_builder.is_ok());
+    }
+
+    #[test]
+    fn should_succeed_with_http_protocol_with_pat() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Http;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let pat = "iggypat-1234567890abcdef";
+        let value = format!("{connection_string_prefix}{protocol}://{pat}@{server_address}:{port}");
+        let client_builder = IggyClientBuilder::from_connection_string(&value);
+        assert!(client_builder.is_ok());
     }
 }

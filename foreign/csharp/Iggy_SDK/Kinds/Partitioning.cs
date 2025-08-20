@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Enums;
 using System.Buffers.Binary;
 using System.Text;
 
-namespace Iggy_SDK.Kinds;
+namespace Apache.Iggy.Kinds;
 
 public readonly struct Partitioning
 {
@@ -39,14 +38,14 @@ public readonly struct Partitioning
 
     public static Partitioning PartitionId(int value)
     {
-        byte[] bytes = new byte[4];
+        var bytes = new byte[4];
         BinaryPrimitives.WriteInt32LittleEndian(bytes, value);
 
         return new Partitioning
         {
             Kind = Enums.Partitioning.PartitionId,
             Length = 4,
-            Value = bytes,
+            Value = bytes
         };
     }
 

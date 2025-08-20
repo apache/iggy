@@ -15,12 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK.Exceptions;
+namespace Apache.Iggy.Exceptions;
 
 internal sealed class TcpInvalidStatus : Exception
 {
     internal TcpInvalidStatus() : base("Received an Invalid Response Status")
     {
-
     }
 }

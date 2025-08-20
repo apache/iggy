@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK.Contracts.Http;
+namespace Apache.Iggy.Contracts.Http;
 
-public sealed class StreamRequest
+public sealed class CreateStreamRequest
 {
-    public int? StreamId { get; init; }
+    public uint? StreamId { get; init; }
     public required string Name { get; init; }
 }

@@ -19,7 +19,7 @@
 
 
 import Debug from 'debug';
-import { uint32ToBuf } from '../number.utils.js';
+import { uint32ToBuf, u128ToBuf, uint8ToBuf } from '../number.utils.js';
 import { serializeHeaders, type Headers } from './header.utils.js';
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
 import { serializePartitioning, type Partitioning } from './partitioning.utils.js';
@@ -31,7 +31,7 @@ const debug = Debug('iggy:client');
 /** index size per messages in bit */
 const INDEX_SIZE = 16;
 
-export type MessageIdKind = 0 | 0n | string;
+export type MessageIdKind = number | bigint | string;
 
 export type CreateMessage = {
   id?: MessageIdKind, 
@@ -40,23 +40,37 @@ export type CreateMessage = {
 };
 
 export const isValidMessageId = (x?: unknown): x is MessageIdKind =>
-  x === undefined || x === 0 || x === 0n || 'string' === typeof x;
+  x === undefined ||
+  'string' === typeof x ||
+  'bigint' === typeof x ||
+  'number' === typeof x;
 
 export const serializeMessageId = (id?: unknown) => {
 
   if(!isValidMessageId(id))
-    throw new Error(`invalid message id: '${id}' (use uuid string or 0)`)
+    throw new Error(`invalid message id: '${id}' (use uuid string | number | bigint >= 0)`)
 
-  if(id === undefined || id === 0 || id === 0n) {
+  if(id === undefined)
     return Buffer.alloc(16, 0); // 0u128
+
+  if ('bigint' === typeof id || 'number' === typeof id) {
+    if (id < 0)
+      throw new Error(`invalid message id: '${id}' (numeric id must be >= 0)`)
+
+    const idValue = 'number' === typeof id ? BigInt(id) : id;
+    return u128ToBuf(idValue);
   }
 
   try {
     const uuid = parseUUID(id);
     return Buffer.from(uuid.toHex(), 'hex');
   } catch (err) {
-    throw new Error(`invalid message id: '${id}' (use uuid string or 0)`, { cause: err })
+    throw new Error(
+      `invalid message id: '${id}' (use uuid string | number | bigint >= 0)`,
+      { cause: err }
+    )
   }
+
 }
 
 export const serializeMessage = (msg: CreateMessage) => {
@@ -127,5 +141,24 @@ export const serializeSendMessages = (
     bMessagesCount,
     bMessageIndex,
     ...bMessagesArray
+  ]);
+};
+
+export const serializeFlushUnsavedBuffers = (
+  streamId: Id,
+  topicId: Id,
+  partitionId: number,
+  fsync = false
+) => {
+  const streamIdentifier = serializeIdentifier(streamId);
+  const topicIdentifier = serializeIdentifier(topicId);
+  const bPartitionId = uint32ToBuf(partitionId);
+  const bFSync = uint8ToBuf(fsync ? 1 : 0);
+
+  return Buffer.concat([
+    streamIdentifier,
+    topicIdentifier,
+    bPartitionId,
+    bFSync
   ]);
 };

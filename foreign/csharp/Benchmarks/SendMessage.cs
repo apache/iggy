@@ -15,16 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK;
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.IggyClient;
-using Iggy_SDK.Kinds;
-using Iggy_SDK.Messages;
 using System.Diagnostics;
 using System.Text;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.IggyClient;
+using Apache.Iggy.Kinds;
+using Apache.Iggy.Messages;
 
-namespace Benchmarks;
-
+namespace Apache.Iggy.Benchmarks;
 
 public static class SendMessage
 {
@@ -32,13 +30,13 @@ public static class SendMessage
         int messagesBatch, int messagesCount, int messageSize, Identifier streamId, Identifier topicId)
     {
         long totalMessages = messagesBatch * messagesCount;
-        long totalMessagesBytes = totalMessages * messageSize;
+        var totalMessagesBytes = totalMessages * messageSize;
         Console.WriteLine(
             $"Executing Send Messages command for producer {producerNumber}, stream id {streamId}, messages count {totalMessages}, with size {totalMessagesBytes}");
         Message[] messages = CreateMessages(messagesCount, messageSize);
         List<TimeSpan> latencies = new();
 
-        for (int i = 0; i < messagesBatch; i++)
+        for (var i = 0; i < messagesBatch; i++)
         {
             var startTime = Stopwatch.GetTimestamp();
             await bus.SendMessagesAsync(new MessageSendRequest
@@ -46,7 +44,7 @@ public static class SendMessage
                 StreamId = streamId,
                 TopicId = topicId,
                 Partitioning = Partitioning.PartitionId(1),
-                Messages = messages,
+                Messages = messages
             });
             var diff = Stopwatch.GetElapsedTime(startTime);
             latencies.Add(diff);
@@ -65,13 +63,9 @@ public static class SendMessage
     private static Message[] CreateMessages(int messagesCount, int messageSize)
     {
         var messages = new Message[messagesCount];
-        for (int i = 0; i < messagesCount; i++)
+        for (var i = 0; i < messagesCount; i++)
         {
-            messages[i] = new Message
-            {
-                Id = Guid.NewGuid(),
-                Payload = CreatePayload(messageSize)
-            };
+            messages[i] = new Message(Guid.NewGuid(), CreatePayload(messageSize));
         }
 
         return messages;
@@ -79,14 +73,14 @@ public static class SendMessage
 
     private static byte[] CreatePayload(int size)
     {
-        StringBuilder payloadBuilder = new StringBuilder(size);
+        var payloadBuilder = new StringBuilder(size);
         for (uint i = 0; i < size; i++)
         {
-            char character = (char)((i % 26) + 97);
+            var character = (char)(i % 26 + 97);
             payloadBuilder.Append(character);
         }
 
-        string payloadString = payloadBuilder.ToString();
+        var payloadString = payloadBuilder.ToString();
         return Encoding.UTF8.GetBytes(payloadString);
     }
 }

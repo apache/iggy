@@ -15,15 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Enums;
-using Iggy_SDK.Extensions;
-using Iggy_SDK.Messages;
 using System.ComponentModel;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Enums;
+using Apache.Iggy.Extensions;
 
-namespace Iggy_SDK.JsonConfiguration;
+namespace Apache.Iggy.JsonConfiguration;
 
 internal sealed class MessagesConverter : JsonConverter<MessageSendRequest>
 {
@@ -36,24 +35,12 @@ internal sealed class MessagesConverter : JsonConverter<MessageSendRequest>
     {
         if (value.Messages.Any())
         {
-            var msgList = new List<HttpMessage>();
-            foreach (var message in value.Messages)
-            {
-                var base64 = Convert.ToBase64String(message.Payload);
-                msgList.Add(new HttpMessage
-                {
-                    Id = message.Id.ToUInt128(),
-                    Payload = base64,
-                    Headers = message.Headers,
-                });
-            }
-
             writer.WriteStartObject();
             writer.WriteStartObject("partitioning");
 
-            writer.WriteString(nameof(MessageSendRequest.Partitioning.Kind).ToSnakeCase(), value: value.Partitioning.Kind switch
+            writer.WriteString(nameof(MessageSendRequest.Partitioning.Kind).ToSnakeCase(), value.Partitioning.Kind switch
             {
-                Partitioning.Balanced => "none",
+                Partitioning.Balanced => "balanced",
                 Partitioning.MessageKey => "entity_id",
                 Partitioning.PartitionId => "partition_id",
                 _ => throw new InvalidEnumArgumentException()
@@ -62,15 +49,17 @@ internal sealed class MessagesConverter : JsonConverter<MessageSendRequest>
             writer.WriteEndObject();
 
             writer.WriteStartArray("messages");
-            foreach (var msg in msgList)
+            foreach (var msg in value.Messages)
             {
                 JsonSerializer.Serialize(writer, msg, JsonConverterFactory.HttpMessageOptions);
             }
+
             writer.WriteEndArray();
 
             writer.WriteEndObject();
             return;
         }
+
         writer.WriteStringValue("");
     }
 }

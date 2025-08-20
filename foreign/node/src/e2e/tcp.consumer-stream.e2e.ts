@@ -21,20 +21,23 @@
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Readable } from 'node:stream';
+import { Client } from '../client/client.js';
 import { groupConsumerStream } from '../stream/consumer-stream.js';
-import { Client } from '../client/index.js';
 import {
   PollingStrategy, Partitioning,
   type PollMessagesResponse
 } from '../wire/index.js';
-import { sendSomeMessages } from '../tcp.sm.utils.js';
+import { sendSomeMessages, getIggyAddress } from '../tcp.sm.utils.js';
+
 
 describe('e2e -> consumer-stream', async () => {
 
+  const [host, port] = getIggyAddress();
   const credentials = { username: 'iggy', password: 'iggy' };
+
   const opt = {
     transport: 'TCP' as const,
-    options: { port: 8090, host: '127.0.0.1' },
+    options: { host, port },
     credentials
   };
 
@@ -56,9 +59,9 @@ describe('e2e -> consumer-stream', async () => {
   const ct = 1000;
 
   it('e2e -> consumer-stream::send-messages', async () => {
-    for (let i = 0; i <= ct; i += 100) {
+    for (let i = 0; i < ct; i += 100) {
       await sendSomeMessages(c.clientProvider)(
-        streamId, topicId, Partitioning.MessageKey(`k-${i % 400}`)
+        streamId, topicId, Partitioning.MessageKey(`k-${i % 300}`)
       );
     }
   });
@@ -78,10 +81,12 @@ describe('e2e -> consumer-stream', async () => {
     const s = await pollStream(pollReq);
     const s2 = await pollStream(pollReq);
     let recv = 0;
-    const dataCb = (str: Readable) => (d: PollMessagesResponse) => {      
-      recv += d.count;
-      if (recv === ct)
+    const dataCb = (str: Readable) => (d: PollMessagesResponse) => {
+      recv += d.messages.length;
+      assert.equal(d.messages.length, d.count);
+      if (recv === ct) {
         str.destroy();
+      }
     };
 
     s.on('data', dataCb(s));

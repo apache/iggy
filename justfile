@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Convinience commands for iggy
+# Convenience commands for iggy
 # See https://github.com/casey/just
 #
 # Usage: just <command>
@@ -80,3 +80,6 @@ licenses-list-check:
 
 licenses-list-fix:
   ./scripts/licenses-list.sh --update
+
+markdownlint:
+  markdownlint '**/*.md' --ignore-path .gitignore

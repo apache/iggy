@@ -21,14 +21,17 @@
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { SingleClient } from '../client/client.js';
-import { ConsumerKind, PollingStrategy, Partitioning } from '../wire/index.js';
+import { Consumer, PollingStrategy, Partitioning } from '../wire/index.js';
 import { generateMessages } from '../tcp.sm.utils.js';
+import { getIggyAddress } from '../tcp.sm.utils.js';
 
 describe('e2e -> consumer-group', async () => {
 
+  const [host, port] = getIggyAddress();
+
   const c = new SingleClient({
     transport: 'TCP',
-    options: { port: 8090, host: '127.0.0.1' },
+    options: { host, port },
     credentials: { username: 'iggy', password: 'iggy' }
   });
   
@@ -83,9 +86,10 @@ describe('e2e -> consumer-group', async () => {
     const mn = 200;
     for (let i = 0; i <= ct; i += mn) {
       assert.ok(await c.message.send({
-        streamId, topicId,
+        streamId,
+        topicId,
         messages: generateMessages(mn),
-        partition: Partitioning.MessageKey(`key-${ i % 400 }`)
+        partition: Partitioning.MessageKey(`key-${ i % 300 }`)
       }));
     }
     payloadLength = ct;
@@ -99,17 +103,17 @@ describe('e2e -> consumer-group', async () => {
     const pollReq = {
       streamId,
       topicId,
-      consumer: { kind: ConsumerKind.Group, id: groupId },
+      consumer: Consumer.Group(groupId),
       partitionId: 0,
       pollingStrategy: PollingStrategy.Next,
-      count: 1,
+      count: 100,
       autocommit: true
     };
     let ct = 0;
     while (ct < payloadLength) {
       const { messages, ...resp } = await c.message.poll(pollReq);
       // console.log('POLL', messages.length, 'R/C', resp.count, messages, resp, ct);
-      // assert.equal(messages.length, resp.count);
+      assert.equal(messages.length, resp.count);
       ct += messages.length;
     }
     assert.equal(ct, payloadLength);
@@ -127,8 +131,6 @@ describe('e2e -> consumer-group', async () => {
   });
 
   after(async () => {
-    // await c.group.leave({ streamId, topicId, groupId });
-    // await c.group.delete({ streamId, topicId, groupId });
     assert.ok(await c.stream.delete(stream));
     assert.ok(await c.session.logout());
     c.destroy();

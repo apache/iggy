@@ -16,6 +16,8 @@
  * under the License.
  */
 use crate::types::configuration::auth_config::connection_string::ConnectionString;
+use crate::types::configuration::auth_config::connection_string_options::ConnectionStringOptions;
+use crate::types::configuration::tcp_config::tcp_connection_string_options::TcpConnectionStringOptions;
 use crate::{AutoLogin, IggyDuration, TcpClientReconnectionConfig};
 use std::str::FromStr;
 
@@ -30,6 +32,8 @@ pub struct TcpClientConfig {
     pub tls_domain: String,
     /// The path to the CA file for TLS.
     pub tls_ca_file: Option<String>,
+    /// Whether to validate the TLS certificate.
+    pub tls_validate_certificate: bool,
     /// Whether to automatically login user after establishing connection.
     pub auto_login: AutoLogin,
     /// Whether to automatically reconnect when disconnected.
@@ -47,6 +51,7 @@ impl Default for TcpClientConfig {
             tls_enabled: false,
             tls_domain: "localhost".to_string(),
             tls_ca_file: None,
+            tls_validate_certificate: true,
             heartbeat_interval: IggyDuration::from_str("5s").unwrap(),
             auto_login: AutoLogin::Disabled,
             reconnection: TcpClientReconnectionConfig::default(),
@@ -55,14 +60,16 @@ impl Default for TcpClientConfig {
     }
 }
 
-impl From<ConnectionString> for TcpClientConfig {
-    fn from(connection_string: ConnectionString) -> Self {
+impl From<ConnectionString<TcpConnectionStringOptions>> for TcpClientConfig {
+    fn from(connection_string: ConnectionString<TcpConnectionStringOptions>) -> Self {
         TcpClientConfig {
             server_address: connection_string.server_address().into(),
             auto_login: connection_string.auto_login().to_owned(),
             tls_enabled: connection_string.options().tls_enabled(),
             tls_domain: connection_string.options().tls_domain().into(),
             tls_ca_file: connection_string.options().tls_ca_file().to_owned(),
+            // Always validate TLS certificate for connection strings, we don't want to allow self-signed certificates for connection strings
+            tls_validate_certificate: true,
             reconnection: connection_string.options().reconnection().to_owned(),
             heartbeat_interval: connection_string.options().heartbeat_interval(),
             nodelay: connection_string.options().nodelay(),

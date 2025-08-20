@@ -15,13 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Text.Json.Serialization;
-namespace Iggy_SDK.Contracts.Http;
+namespace Apache.Iggy.Contracts.Http.Auth;
 
 public sealed class ChangePasswordRequest
 {
-    [JsonIgnore]
-    public required Identifier UserId { get; init; }
     public required string CurrentPassword { get; init; }
     public required string NewPassword { get; init; }
 }

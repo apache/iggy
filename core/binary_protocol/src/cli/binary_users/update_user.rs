@@ -55,8 +55,8 @@ impl UpdateUserCmd {
 
     fn get_message(&self) -> String {
         match &self.update_type {
-            UpdateUserType::Name(username) => format!("username: {}", username),
-            UpdateUserType::Status(status) => format!("status: {}", status),
+            UpdateUserType::Name(username) => format!("username: {username}"),
+            UpdateUserType::Status(status) => format!("status: {status}"),
         }
     }
 }

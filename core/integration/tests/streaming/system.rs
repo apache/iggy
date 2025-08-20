@@ -123,7 +123,7 @@ async fn should_delete_persisted_stream() {
 async fn assert_persisted_stream(streams_path: &str, stream_id: u32) {
     let streams_metadata = fs::metadata(streams_path).await.unwrap();
     assert!(streams_metadata.is_dir());
-    let stream_path = format!("{}/{}", streams_path, stream_id);
+    let stream_path = format!("{streams_path}/{stream_id}");
     let stream_metadata = fs::metadata(stream_path).await.unwrap();
     assert!(stream_metadata.is_dir());
 }

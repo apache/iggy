@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK.Configuration;
+namespace Apache.Iggy.Configuration;
 
 public class TlsSettings
 {
-    public bool Enabled { get; set; } 
-    public string Hostname { get; set; }
+    public bool Enabled { get; set; }
+    public string Hostname { get; set; } = string.Empty;
     public bool Authenticate { get; set; } = false;
 }

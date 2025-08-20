@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK.Utils;
+namespace Apache.Iggy.Utils;
 
 internal static class BufferSizes
 {

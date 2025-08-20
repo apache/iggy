@@ -16,6 +16,10 @@
  * under the License.
  */
 
+#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_sign_loss)]
+
 use super::TimeSeriesCalculation;
 use crate::analytics::record::BenchmarkRecord;
 use bench_report::time_series::{TimePoint, TimeSeries, TimeSeriesKind};
@@ -68,7 +72,7 @@ pub struct ThroughputTimeSeriesCalculator<T: ThroughputCalculation> {
 }
 
 impl<T: ThroughputCalculation> ThroughputTimeSeriesCalculator<T> {
-    pub fn new(calculator: T) -> Self {
+    pub const fn new(calculator: T) -> Self {
         Self { calculator }
     }
 }

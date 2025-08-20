@@ -60,8 +60,7 @@ impl ServerCommandHandler for CreateTopic {
                     self.replication_factor,
                 )
                 .await
-                .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to create topic for stream_id: {stream_id}, topic_id: {:?}",
-                    topic_id
+                .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to create topic for stream_id: {stream_id}, topic_id: {topic_id:?}"
                 ))?;
         self.message_expiry = topic.message_expiry;
         self.max_topic_size = topic.max_topic_size;
@@ -77,8 +76,7 @@ impl ServerCommandHandler for CreateTopic {
             }))            .await
             .with_error_context(|error| {
                 format!(
-                "{COMPONENT} (error: {error}) - failed to apply create topic for stream_id: {stream_id}, topic_id: {:?}",
-                topic_id
+                "{COMPONENT} (error: {error}) - failed to apply create topic for stream_id: {stream_id}, topic_id: {topic_id:?}"
             )
             })?;
         sender.send_ok_response(&response).await?;

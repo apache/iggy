@@ -36,7 +36,7 @@
   <div class="px-1 py-1">
     {#each group as { action, icon, className, label }}
       <button
-        on:click={() => {
+        onclick={() => {
           if (action) {
             action(() => tooltipRef.dispatchEvent(new Event('closeTooltip')));
           }

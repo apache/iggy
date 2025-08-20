@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK.Errors;
+namespace Apache.Iggy.Errors;
 
 public sealed class ErrorModel
 {
@@ -29,5 +29,4 @@ public sealed class ErrorModel
         Code = code;
         Reason = reason;
     }
-
 }

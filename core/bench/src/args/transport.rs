@@ -16,7 +16,10 @@
  * under the License.
  */
 
-use super::defaults::*;
+use super::defaults::{
+    DEFAULT_HTTP_SERVER_ADDRESS, DEFAULT_QUIC_CLIENT_ADDRESS, DEFAULT_QUIC_SERVER_ADDRESS,
+    DEFAULT_QUIC_SERVER_NAME, DEFAULT_QUIC_VALIDATE_CERTIFICATE, DEFAULT_TCP_SERVER_ADDRESS,
+};
 use super::{output::BenchmarkOutputCommand, props::BenchmarkTransportProps};
 use clap::{Parser, Subcommand};
 use integration::test_server::Transport;
@@ -35,9 +38,9 @@ impl Serialize for BenchmarkTransportCommand {
         S: Serializer,
     {
         let variant_str = match self {
-            BenchmarkTransportCommand::Http(_) => "http",
-            BenchmarkTransportCommand::Tcp(_) => "tcp",
-            BenchmarkTransportCommand::Quic(_) => "quic",
+            Self::Http(_) => "http",
+            Self::Tcp(_) => "tcp",
+            Self::Quic(_) => "quic",
         };
         serializer.serialize_str(variant_str)
     }
@@ -66,13 +69,13 @@ impl BenchmarkTransportProps for BenchmarkTransportCommand {
 
     fn inner(&self) -> &dyn BenchmarkTransportProps {
         match self {
-            BenchmarkTransportCommand::Http(args) => args,
-            BenchmarkTransportCommand::Tcp(args) => args,
-            BenchmarkTransportCommand::Quic(args) => args,
+            Self::Http(args) => args,
+            Self::Tcp(args) => args,
+            Self::Quic(args) => args,
         }
     }
 
-    fn output_command(&self) -> &Option<BenchmarkOutputCommand> {
+    fn output_command(&self) -> Option<&BenchmarkOutputCommand> {
         self.inner().output_command()
     }
 }
@@ -109,8 +112,8 @@ impl BenchmarkTransportProps for HttpArgs {
         panic!("Setting nodelay for HTTP transport is not supported!")
     }
 
-    fn output_command(&self) -> &Option<BenchmarkOutputCommand> {
-        &self.output
+    fn output_command(&self) -> Option<&BenchmarkOutputCommand> {
+        self.output.as_ref()
     }
 }
 
@@ -123,6 +126,22 @@ pub struct TcpArgs {
     /// Disable Nagle's algorithm
     #[arg(long, default_value_t = false)]
     pub nodelay: bool,
+
+    /// Enable TLS encryption
+    #[arg(long, default_value_t = false)]
+    pub tls: bool,
+
+    /// TLS domain name
+    #[arg(long, default_value_t = String::from("localhost"), requires = "tls")]
+    pub tls_domain: String,
+
+    /// Validate TLS certificate
+    #[arg(long, default_value_t = false, requires = "tls")]
+    pub tls_validate_certificate: bool,
+
+    /// Path to CA certificate file for TLS validation
+    #[arg(long, requires = "tls")]
+    pub tls_ca_file: Option<String>,
 
     /// Optional output command, used to output results (charts, raw json data) to a directory
     #[command(subcommand)]
@@ -139,7 +158,7 @@ impl BenchmarkTransportProps for TcpArgs {
     }
 
     fn validate_certificate(&self) -> bool {
-        panic!("Cannot validate certificate for TCP transport!")
+        self.tls_validate_certificate
     }
 
     fn client_address(&self) -> &str {
@@ -150,8 +169,8 @@ impl BenchmarkTransportProps for TcpArgs {
         self.nodelay
     }
 
-    fn output_command(&self) -> &Option<BenchmarkOutputCommand> {
-        &self.output
+    fn output_command(&self) -> Option<&BenchmarkOutputCommand> {
+        self.output.as_ref()
     }
 }
 
@@ -199,7 +218,7 @@ impl BenchmarkTransportProps for QuicArgs {
         panic!("Setting nodelay for QUIC transport is not supported!")
     }
 
-    fn output_command(&self) -> &Option<BenchmarkOutputCommand> {
-        &self.output
+    fn output_command(&self) -> Option<&BenchmarkOutputCommand> {
+        self.output.as_ref()
     }
 }

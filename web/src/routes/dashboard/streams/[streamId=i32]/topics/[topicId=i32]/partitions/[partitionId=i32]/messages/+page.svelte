@@ -6,9 +6,18 @@
   import { openModal } from '$lib/components/Modals/AppModals.svelte';
   import SortableList from '$lib/components/SortableList.svelte';
   import Paginator from '$lib/components/Paginator.svelte';
+  import type { MessagePartition } from '$lib/domain/Message';
+  import type { TopicDetails } from '$lib/domain/TopicDetails';
 
   interface Props {
-    data: any;
+    data: {
+      partitionMessages: MessagePartition;
+      topic: TopicDetails;
+      pagination: {
+        offset: number;
+        count: number;
+      };
+    };
   }
 
   let { data }: Props = $props();
@@ -18,11 +27,13 @@
 
   let direction = $state(page.url.searchParams.get('direction') || 'desc');
   let currentPage = $state(1);
-  let totalPages = $derived(Math.ceil(partitionMessages.currentOffset / data.pagination.count));
+  let totalPages = $derived(
+    Math.ceil((partitionMessages.currentOffset + 1) / data.pagination.count)
+  );
 
   async function loadPage(page: number) {
     const messagesPerPage = data.pagination.count;
-    const totalMessages = partitionMessages.currentOffset;
+    const totalMessages = partitionMessages.currentOffset + 1;
 
     let offset: number;
     if (direction === 'desc') {
@@ -50,7 +61,7 @@
 </script>
 
 <div class="h-[80px] flex text-xs items-center pl-2 pr-5">
-  <Button variant="rounded" class="mr-5" on:click={() => goto(prevPage)}>
+  <Button variant="rounded" class="mr-5" onclick={() => goto(prevPage)}>
     <Icon name="arrowLeft" class="h-[40px] w-[30px]" />
   </Button>
 
@@ -60,12 +71,12 @@
 
   <div class="flex gap-3 ml-7">
     <div class="chip">
-      <span>Messages: {partitionMessages.currentOffset}</span>
+      <span>Messages: {partitionMessages.messages.length > 0 ? partitionMessages.currentOffset + 1 : 0}</span>
     </div>
   </div>
 
   <div class="flex gap-2 ml-auto">
-    <Button variant="contained" on:click={toggleDirection}>
+    <Button variant="contained" onclick={toggleDirection}>
       <Icon name={direction === 'desc' ? 'arrowDown' : 'arrowUp'} class="h-5 w-5 mr-2" />
       {direction === 'desc' ? 'Newest first' : 'Oldest first'}
     </Button>
@@ -105,3 +116,4 @@
 <div class="mt-2 mb-2">
   <Paginator {currentPage} {totalPages} maxVisiblePages={5} on:pageChange={onPageChange} />
 </div>
+

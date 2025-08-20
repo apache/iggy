@@ -539,8 +539,8 @@ public:
  * This class is used to represent the result of the GetStats call,
  * which gets a snapshot of latest server performance statistics.
  *
- * @see [GetStats definition](https://docs.iggy.rs/specification/binary#get-stats)
- * @see [stats.rs](https://github.com/iggy-rs/iggy/blob/master/iggy/src/models/stats.rs)
+ * @see [GetStats definition](https://iggy.apache.org/docs/server/schema#get-stats)
+ * @see [stats.rs](https://github.com/apache/iggy/blob/master/core/server/src/streaming/systems/stats.rs)
  */
 class Stats : Model {
 private:

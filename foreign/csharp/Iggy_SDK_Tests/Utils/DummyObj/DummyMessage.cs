@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK_Tests.Utils.DummyObj;
+namespace Apache.Iggy.Tests.Utils.DummyObj;
 
 public sealed class DummyMessage
 {

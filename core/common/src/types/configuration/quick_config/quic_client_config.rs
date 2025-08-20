@@ -16,7 +16,10 @@
  * under the License.
  */
 
-use crate::{AutoLogin, IggyDuration, QuicClientReconnectionConfig};
+use crate::{
+    AutoLogin, ConnectionString, ConnectionStringOptions, IggyDuration,
+    QuicClientReconnectionConfig, QuicConnectionStringOptions,
+};
 use std::str::FromStr;
 
 /// Configuration for the QUIC client.
@@ -72,6 +75,28 @@ impl Default for QuicClientConfig {
             keep_alive_interval: 5000,
             max_idle_timeout: 10000,
             validate_certificate: false,
+        }
+    }
+}
+
+impl From<ConnectionString<QuicConnectionStringOptions>> for QuicClientConfig {
+    fn from(connection_string: ConnectionString<QuicConnectionStringOptions>) -> Self {
+        QuicClientConfig {
+            client_address: "127.0.0.1:0".to_string(),
+            server_address: connection_string.server_address().into(),
+            server_name: "localhost".to_string(),
+            auto_login: connection_string.auto_login().to_owned(),
+            reconnection: connection_string.options().reconnection().to_owned(),
+            response_buffer_size: connection_string.options().response_buffer_size(),
+            max_concurrent_bidi_streams: connection_string.options().max_concurrent_bidi_streams(),
+            datagram_send_buffer_size: connection_string.options().datagram_send_buffer_size(),
+            initial_mtu: connection_string.options().initial_mtu(),
+            send_window: connection_string.options().send_window(),
+            receive_window: connection_string.options().receive_window(),
+            keep_alive_interval: connection_string.options().keep_alive_interval(),
+            max_idle_timeout: connection_string.options().max_idle_timeout(),
+            validate_certificate: connection_string.options().validate_certificate(),
+            heartbeat_interval: connection_string.options().heartbeat_interval(),
         }
     }
 }

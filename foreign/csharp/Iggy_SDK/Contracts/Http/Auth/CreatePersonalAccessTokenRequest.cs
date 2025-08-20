@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK.Contracts.Http;
+namespace Apache.Iggy.Contracts.Http.Auth;
 
 public sealed class CreatePersonalAccessTokenRequest
 {
-    public required string Name { get; init; }  
-    public uint? Expiry { get; init; } 
+    public required string Name { get; init; }
+    public ulong? Expiry { get; init; }
 }

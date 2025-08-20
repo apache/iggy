@@ -196,7 +196,7 @@ impl Display for Permissions {
         result.push_str(&format!("send_messages: {}\n", self.global.send_messages));
         if let Some(streams) = &self.streams {
             for (stream_id, stream) in streams {
-                result.push_str(&format!("stream_id: {}\n", stream_id));
+                result.push_str(&format!("stream_id: {stream_id}\n"));
                 result.push_str(&format!("manage_stream: {}\n", stream.manage_stream));
                 result.push_str(&format!("read_stream: {}\n", stream.read_stream));
                 result.push_str(&format!("manage_topics: {}\n", stream.manage_topics));
@@ -205,7 +205,7 @@ impl Display for Permissions {
                 result.push_str(&format!("send_messages: {}\n", stream.send_messages));
                 if let Some(topics) = &stream.topics {
                     for (topic_id, topic) in topics {
-                        result.push_str(&format!("topic_id: {}\n", topic_id));
+                        result.push_str(&format!("topic_id: {topic_id}\n"));
                         result.push_str(&format!("manage_topic: {}\n", topic.manage_topic));
                         result.push_str(&format!("read_topic: {}\n", topic.read_topic));
                         result.push_str(&format!("poll_messages: {}\n", topic.poll_messages));
@@ -215,7 +215,7 @@ impl Display for Permissions {
             }
         }
 
-        write!(f, "{}", result)
+        write!(f, "{result}")
     }
 }
 
@@ -461,8 +461,8 @@ impl From<&StreamPermissions> for Table {
             topics.iter().for_each(|(topic_id, topic_permissions)| {
                 let topic_table: Table = topic_permissions.into();
                 table.add_row(vec![
-                    format!("Topic: {}", topic_id).as_str(),
-                    format!("{}", topic_table).as_str(),
+                    format!("Topic: {topic_id}").as_str(),
+                    format!("{topic_table}").as_str(),
                 ]);
             });
         }

@@ -97,7 +97,7 @@ impl CliCommand for GetConsumerGroupCmd {
                     member
                         .partitions
                         .iter()
-                        .map(|i| format!("{}", i))
+                        .map(|i| format!("{i}"))
                         .collect::<Vec<String>>()
                         .join(", ")
                         .as_str(),

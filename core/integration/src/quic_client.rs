@@ -16,11 +16,10 @@
  * under the License.
  */
 
-use crate::test_server::ClientFactory;
+use crate::test_server::{ClientFactory, Transport};
 use async_trait::async_trait;
-use iggy::prelude::Client;
-use iggy::quic::quick_client::QuicClient;
-use iggy::quic::quick_config::QuicClientConfig;
+use iggy::prelude::{Client, ClientWrapper, QuicClientConfig};
+use iggy::quic::quic_client::QuicClient;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -30,14 +29,22 @@ pub struct QuicClientFactory {
 
 #[async_trait]
 impl ClientFactory for QuicClientFactory {
-    async fn create_client(&self) -> Box<dyn Client> {
+    async fn create_client(&self) -> ClientWrapper {
         let config = QuicClientConfig {
             server_address: self.server_addr.clone(),
             ..QuicClientConfig::default()
         };
         let client = QuicClient::create(Arc::new(config)).unwrap();
         Client::connect(&client).await.unwrap();
-        Box::new(client)
+        ClientWrapper::Quic(client)
+    }
+
+    fn transport(&self) -> Transport {
+        Transport::Quic
+    }
+
+    fn server_addr(&self) -> String {
+        self.server_addr.clone()
     }
 }
 

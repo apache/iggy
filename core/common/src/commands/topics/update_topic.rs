@@ -87,10 +87,10 @@ impl Validatable<IggyError> for UpdateTopic {
             return Err(IggyError::InvalidTopicName);
         }
 
-        if let Some(replication_factor) = self.replication_factor {
-            if replication_factor == 0 {
-                return Err(IggyError::InvalidReplicationFactor);
-            }
+        if let Some(replication_factor) = self.replication_factor
+            && replication_factor == 0
+        {
+            return Err(IggyError::InvalidReplicationFactor);
         }
 
         Ok(())

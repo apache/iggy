@@ -16,7 +16,9 @@
 // under the License.
 
 
-namespace Iggy_SDK.Contracts.Http;
+using Apache.Iggy.Extensions;
+
+namespace Apache.Iggy.Contracts.Http;
 
 public sealed class StatsResponse
 {
@@ -42,6 +44,9 @@ public sealed class StatsResponse
     public required string OsName { get; init; }
     public required string OsVersion { get; init; }
     public required string KernelVersion { get; init; }
+    public required string IggyVersion { get; init; }
+    public uint IggyServerSemver { get; init; }
+    public List<CacheMetrics> CacheMetrics { get; init; } = [];
 
     internal Stats ToStats()
     {
@@ -54,7 +59,7 @@ public sealed class StatsResponse
             TotalMemory = TotalMemory,
             AvailableMemory = AvailableMemory,
             RunTime = RunTime,
-            StartTime = DateTimeOffset.FromUnixTimeSeconds((long)StartTime),
+            StartTime = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(StartTime),
             ReadBytes = ReadBytes,
             WrittenBytes = WrittenBytes,
             MessagesSizeBytes = MessagesSizeBytes,
@@ -68,8 +73,10 @@ public sealed class StatsResponse
             Hostname = Hostname,
             OsName = OsName,
             OsVersion = OsVersion,
-            KernelVersion = KernelVersion
+            KernelVersion = KernelVersion,
+            IggyServerVersion = IggyVersion,
+            IggyServerSemver = IggyServerSemver,
+            CacheMetrics = CacheMetrics
         };
     }
-
 }

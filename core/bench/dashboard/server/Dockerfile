@@ -16,7 +16,7 @@
 # under the License.
 
 # Build stage
-FROM rust:1.86-slim-bookworm as builder
+FROM rust:1.89-slim-bookworm AS builder
 
 WORKDIR /usr/src/iggy-bench-dashboard
 
@@ -38,11 +38,13 @@ RUN cargo binstall -y trunk
 # Add wasm target
 RUN rustup target add wasm32-unknown-unknown
 
+RUN echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
+
 # Copy the entire workspace
 COPY . .
 
 # Build frontend
-RUN cd frontend && trunk build --release
+RUN cd core/bench/dashboard/frontend && trunk build --release
 
 # Build the server with release profile
 RUN cargo build --release --package bench-dashboard-server
@@ -61,8 +63,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the built binary and frontend files
-COPY --from=builder /usr/src/iggy-bench-dashboard/target/release/bench-dashboard-server /app/
-COPY --from=builder /usr/src/iggy-bench-dashboard/frontend/dist /app/frontend/dist
+COPY --from=builder /usr/src/iggy-bench-dashboard/target/release/iggy-bench-dashboard-server /app/
+COPY --from=builder /usr/src/iggy-bench-dashboard/core/bench/dashboard/frontend/dist /app/frontend/dist
 
 # Create data directory and non-root user
 RUN groupadd -r iggy && \
@@ -72,7 +74,7 @@ RUN groupadd -r iggy && \
     chmod -R 755 /data/performance_results
 
 # Copy the entrypoint script
-COPY docker-entrypoint.sh /app/
+COPY core/bench/dashboard/server/docker-entrypoint.sh /app/
 RUN chmod +x /app/docker-entrypoint.sh && \
     chown iggy:iggy /app/docker-entrypoint.sh
 

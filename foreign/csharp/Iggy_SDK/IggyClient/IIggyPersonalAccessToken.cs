@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Contracts.Http;
-namespace Iggy_SDK.IggyClient;
+using Apache.Iggy.Contracts.Http.Auth;
+
+namespace Apache.Iggy.IggyClient;
 
 public interface IIggyPersonalAccessToken
 {
-    public Task<IReadOnlyList<PersonalAccessTokenResponse>> GetPersonalAccessTokensAsync(CancellationToken token = default);
-    public Task<RawPersonalAccessToken?> CreatePersonalAccessTokenAsync(CreatePersonalAccessTokenRequest request, CancellationToken token = default);
-    public Task DeletePersonalAccessTokenAsync(DeletePersonalAccessTokenRequest request, CancellationToken token = default);
-    public Task<AuthResponse?> LoginWithPersonalAccessToken(LoginWithPersonalAccessToken request, CancellationToken token = default);
+    Task<IReadOnlyList<PersonalAccessTokenResponse>> GetPersonalAccessTokensAsync(CancellationToken token = default);
+    Task<RawPersonalAccessToken?> CreatePersonalAccessTokenAsync(string name, ulong? expiry = 0, CancellationToken token = default);
+    Task DeletePersonalAccessTokenAsync(string name, CancellationToken token = default);
+    Task<AuthResponse?> LoginWithPersonalAccessToken(string token, CancellationToken ct = default);
 }

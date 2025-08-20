@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK.Contracts.Http.Auth;
+namespace Apache.Iggy.Contracts.Http.Auth;
 
 public sealed class LoginUserRequest
 {
     public required string Username { get; init; }
     public required string Password { get; init; }
-    
+
     public string? Version { get; init; }
-    
+
     public string? Context { get; init; }
 }

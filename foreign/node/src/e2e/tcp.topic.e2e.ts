@@ -20,16 +20,13 @@
 
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { Client } from '../client/client.js';
+import { getTestClient } from './test-client.utils.js';
+
 
 describe('e2e -> topic', async () => {
-
-  const c = new Client({
-    transport: 'TCP',
-    options: { port: 8090, host: '127.0.0.1' },
-    credentials: { username: 'iggy', password: 'iggy' }
-  });
-
+  
+  const c = getTestClient();
+  
   const streamId = 111;
   const topicId = 123;
 
@@ -75,6 +72,7 @@ describe('e2e -> topic', async () => {
 
   it('e2e -> topic::update', async () => {
     const topic = await c.topic.get({ streamId, topicId });
+    assert.ok(topic);
     const u2 = await c.topic.update({
       streamId, topicId,
       name: topic.name,

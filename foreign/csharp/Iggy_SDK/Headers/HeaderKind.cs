@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK.Headers;
+namespace Apache.Iggy.Headers;
 
 public enum HeaderKind
 {

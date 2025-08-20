@@ -74,11 +74,9 @@ jobs:
           rm -f $HOME/.local/share/keyrings/*
           echo -n "test" | gnome-keyring-daemon --unlock
       - name: Prepare ${{ matrix.platform.target }} toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-          target: ${{ matrix.platform.target }}
+        run: |
+          rustup target add ${{ matrix.platform.target }}
+          echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
       - name: Install cross tool
         uses: taiki-e/install-action@v2
         with:
@@ -98,7 +96,7 @@ jobs:
         with:
           platforms: ${{ matrix.platform.qemu_arch }}
       - name: Set up Docker
-        uses: crazy-max/ghaction-setup-docker@v4
+        uses: docker/setup-docker-action@v4
       - name: Set up Docker buildx
         uses: docker/setup-buildx-action@v3
       - name: Login to Docker Hub

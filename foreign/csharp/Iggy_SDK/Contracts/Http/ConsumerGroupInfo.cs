@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK.Contracts.Http;
+namespace Apache.Iggy.Contracts.Http;
 
 public sealed class ConsumerGroupInfo
 {
     public required int StreamId { get; init; }
     public required int TopicId { get; init; }
-    public required int ConsumerGroupId { get; init; }
+    public required int GroupId { get; init; }
 }

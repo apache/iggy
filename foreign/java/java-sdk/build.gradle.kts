@@ -20,12 +20,13 @@
 plugins {
     id("java-library")
     id("maven-publish")
+    id("signing")
     id("org.jreleaser") version ("1.14.0")
     id("checkstyle")
 }
 
 group = "org.apache.iggy"
-version = "0.2.0-SNAPSHOT"
+version = "0.5.0-SNAPSHOT"
 
 repositories {
     mavenCentral()
@@ -34,6 +35,11 @@ repositories {
 java {
     withJavadocJar()
     withSourcesJar()
+}
+
+signing {
+    useGpgCmd()
+    sign(publishing.publications)
 }
 
 checkstyle {
@@ -67,25 +73,34 @@ publishing {
     publications {
         create<MavenPublication>("maven") {
             groupId = "org.apache.iggy"
-            artifactId = "iggy-java-sdk"
-            version = "0.2.0-SNAPSHOT"
+            artifactId = "iggy"
+            version = "0.5.0-SNAPSHOT"
 
             from(components["java"])
 
             pom {
                 name = "Apache Iggy Java Client SDK"
-                description = "Official Java client SDK for Apache Iggy message streaming"
+                description = "Official Java client SDK for Apache Iggy.\n" +
+                        "Apache Iggy (Incubating) is an effort undergoing incubation at the Apache Software Foundation (ASF), " +
+                        "sponsored by the Apache Incubator PMC."
                 url = "https://github.com/apache/iggy"
+                packaging = "jar"
                 licenses {
                     license {
                         name = "Apache License, Version 2.0"
                         url = "https://www.apache.org/licenses/LICENSE-2.0.txt"
                     }
                 }
-                scm {
-                    url = "https://github.com/apache/iggy"
-                    connection = "scm:git:git://github.com/apache/iggy.git"
-                    developerConnection = "scm:git:git://github.com/apache/iggy.git"
+                developers {
+                    developer {
+                        name = "Apache Iggy"
+                        email = "dev@iggy.apache.org"
+                    }
+                    scm {
+                        url = "https://github.com/apache/iggy"
+                        connection = "scm:git:git://github.com/apache/iggy.git"
+                        developerConnection = "scm:git:git://github.com/apache/iggy.git"
+                    }
                 }
             }
         }
@@ -93,24 +108,14 @@ publishing {
 
     repositories {
         maven {
-            url = uri(layout.buildDirectory.dir("staging-deploy"))
-        }
-    }
-}
+            val releasesRepoUrl = "https://repository.apache.org/service/local/staging/deploy/maven2"
+            val snapshotsRepoUrl = "https://repository.apache.org/content/repositories/snapshots/"
 
-jreleaser {
-    signing {
-        setActive("ALWAYS")
-        armored = true
-    }
-    deploy {
-        maven {
-            mavenCentral {
-                create("sonatype") {
-                    setActive("ALWAYS")
-                    url = "https://central.sonatype.com/api/v1/publisher"
-                    stagingRepository("build/staging-deploy")
-                }
+            url = uri(if ((version as String).endsWith("SNAPSHOT")) snapshotsRepoUrl else releasesRepoUrl)
+
+            credentials {
+                username = System.getenv("NEXUS_USER")
+                password = System.getenv("NEXUS_PASSWORD")
             }
         }
     }

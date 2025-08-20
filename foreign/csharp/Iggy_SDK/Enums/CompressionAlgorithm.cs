@@ -15,18 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK.Enums;
+namespace Apache.Iggy.Enums;
 
 /// <summary>
-/// Supported compression algorithms.
-/// 
-/// OBS.: For now only those, in the future will add snappy, lz4, zstd (same as in confluent kafka)
-/// in addition to that we should consider brotli as well.
+///     Supported compression algorithms.
+///     OBS.: For now only those, in the future will add snappy, lz4, zstd (same as in confluent kafka)
+///     in addition to that we should consider brotli as well.
 /// </summary>
 public enum CompressionAlgorithm
 {
     // No compression
-    None,
+    None = 1,
+
     // Gzip compression algorithm
-    Gzip,
+    Gzip = 2
 }

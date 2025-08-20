@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod certificates;
 mod commands;
 mod error;
 mod traits;
@@ -52,13 +53,17 @@ pub use types::configuration::auth_config::auto_login::*;
 pub use types::configuration::auth_config::connection_string::*;
 pub use types::configuration::auth_config::connection_string_options::*;
 pub use types::configuration::auth_config::credentials::*;
-pub use types::configuration::http_config::config::*;
+pub use types::configuration::http_config::http_client_config::*;
+pub use types::configuration::http_config::http_client_config_builder::*;
+pub use types::configuration::http_config::http_connection_string_options::*;
 pub use types::configuration::quick_config::quic_client_config::*;
 pub use types::configuration::quick_config::quic_client_config_builder::*;
 pub use types::configuration::quick_config::quic_client_reconnection_config::*;
+pub use types::configuration::quick_config::quic_connection_string_options::*;
 pub use types::configuration::tcp_config::tcp_client_config::*;
 pub use types::configuration::tcp_config::tcp_client_config_builder::*;
 pub use types::configuration::tcp_config::tcp_client_reconnection_config::*;
+pub use types::configuration::tcp_config::tcp_connection_string_options::*;
 pub use types::confirmation::*;
 pub use types::consumer::consumer_group::*;
 pub use types::consumer::consumer_kind::*;
@@ -77,6 +82,7 @@ pub use types::user::user_identity_info::*;
 pub use types::user::user_info::*;
 pub use types::user::user_status::*;
 // Utils
+pub use certificates::generate_self_signed_certificate;
 pub use utils::byte_size::IggyByteSize;
 pub use utils::checksum::*;
 pub use utils::crypto::*;

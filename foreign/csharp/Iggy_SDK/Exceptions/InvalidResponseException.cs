@@ -15,12 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK.Exceptions;
+namespace Apache.Iggy.Exceptions;
 
-internal sealed class InvalidResponseException : Exception
+public sealed class InvalidResponseException : Exception
 {
     internal InvalidResponseException(string message) : base(message)
     {
-
     }
 }

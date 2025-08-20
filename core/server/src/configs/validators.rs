@@ -79,10 +79,10 @@ impl Validatable<ConfigError> for ServerConfig {
             return Err(ConfigError::InvalidConfiguration);
         }
 
-        if self.http.enabled {
-            if let IggyExpiry::ServerDefault = self.http.jwt.access_token_expiry {
-                return Err(ConfigError::InvalidConfiguration);
-            }
+        if self.http.enabled
+            && let IggyExpiry::ServerDefault = self.http.jwt.access_token_expiry
+        {
+            return Err(ConfigError::InvalidConfiguration);
         }
 
         if topic_size < self.system.segment.size.as_bytes_u64() {
@@ -99,8 +99,7 @@ impl Validatable<ConfigError> for CompressionConfig {
         if *compression_alg != CompressionAlgorithm::None {
             // TODO(numinex): Change this message once server side compression is fully developed.
             println!(
-                "Server started with server-side compression enabled, using algorithm: {}, this feature is not implemented yet!",
-                compression_alg
+                "Server started with server-side compression enabled, using algorithm: {compression_alg}, this feature is not implemented yet!"
             );
         }
 

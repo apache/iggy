@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK.Contracts.Http;
+namespace Apache.Iggy.Contracts.Http.Auth;
 
 public sealed class PersonalAccessTokenResponse
 {
-   public required string Name { get; init; } 
-   public DateTimeOffset? ExpiryAt { get; init; }
+    public required string Name { get; init; }
+    public DateTimeOffset? ExpiryAt { get; init; }
 }

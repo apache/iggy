@@ -72,7 +72,7 @@ impl System {
         for snapshot_type in snapshot_types {
             match get_command_result(snapshot_type, self.config.clone()).await {
                 Ok(temp_file) => {
-                    let filename = format!("{}.txt", snapshot_type);
+                    let filename = format!("{snapshot_type}.txt");
                     let entry = ZipEntryBuilder::new(filename.clone().into(), compression);
 
                     let mut file = File::open(temp_file.path()).await.map_err(|e| {

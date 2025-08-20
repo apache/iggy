@@ -15,13 +15,57 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Headers;
+using System.Diagnostics.CodeAnalysis;
+using System.IO.Hashing;
+using Apache.Iggy.Extensions;
+using Apache.Iggy.Headers;
 
-namespace Iggy_SDK.Messages;
+namespace Apache.Iggy.Messages;
 
 public readonly struct Message
 {
-    public required Guid Id { get; init; }
+    public required MessageHeader Header { get; init; }
     public required byte[] Payload { get; init; }
-    public Dictionary<HeaderKey, HeaderValue>? Headers { get; init; }
+    public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; init; }
+
+    public Message()
+    {
+    }
+
+    [SetsRequiredMembers]
+    public Message(Guid id, byte[] payload, Dictionary<HeaderKey, HeaderValue>? userHeaders = null)
+    {
+        Header = new MessageHeader
+        {
+            PayloadLength = payload.Length,
+            Id = id.ToUInt128(),
+            Checksum = CalculateChecksum(payload)
+        };
+        Payload = payload;
+        UserHeaders = userHeaders;
+    }
+
+    [SetsRequiredMembers]
+    public Message(UInt128 id, byte[] payload, Dictionary<HeaderKey, HeaderValue>? userHeaders = null)
+    {
+        Header = new MessageHeader
+        {
+            PayloadLength = payload.Length,
+            Id = id,
+            Checksum = CalculateChecksum(payload)
+        };
+        Payload = payload;
+        UserHeaders = userHeaders;
+    }
+
+    public int GetSize()
+    {
+        //return 56 + Payload.Length + (UserHeaders?.Count ?? 0);
+        return 56 + Payload.Length;
+    }
+
+    private ulong CalculateChecksum(byte[] bytes)
+    {
+        return BitConverter.ToUInt64(Crc64.Hash(bytes));
+    }
 }

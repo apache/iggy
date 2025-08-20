@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK_Tests.Utils.Messages;
+using Apache.Iggy.Tests.Utils.Messages;
 
-namespace Iggy_SDK_Tests.Utils.DummyObj;
+namespace Apache.Iggy.Tests.Utils.DummyObj;
 
 internal static class DummyObjFactory
 {
@@ -25,8 +25,8 @@ internal static class DummyObjFactory
     {
         return new DummyObject
         {
-            Id = Random.Shared.Next(1, 10),
-            Text = "TROLOLOLO" + Random.Shared.Next(1, 69)
+            Id = Random.Shared.Next(1, 9),
+            Text = "TROLOLOLO" + Random.Shared.Next(1, 5)
         };
     }
 }

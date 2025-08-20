@@ -37,17 +37,18 @@ pub struct BenchmarkRunner {
 }
 
 impl BenchmarkRunner {
-    pub fn new(args: IggyBenchArgs) -> Self {
+    pub const fn new(args: IggyBenchArgs) -> Self {
         Self {
             args: Some(args),
             test_server: None,
         }
     }
 
-    pub async fn run(&mut self) -> Result<(), IggyError> {
-        let mut args = self.args.take().unwrap();
+    #[allow(clippy::cognitive_complexity)]
+    pub async fn run(mut self) -> Result<(), IggyError> {
+        let args = self.args.take().unwrap();
         let should_open_charts = args.open_charts();
-        self.test_server = start_server_if_needed(&mut args).await;
+        self.test_server = start_server_if_needed(&args).await;
 
         let transport = args.transport();
         let server_addr = args.server_address();
@@ -71,14 +72,13 @@ impl BenchmarkRunner {
         let hardware =
             BenchmarkHardware::get_system_info_with_identifier(benchmark.args().identifier());
         let params = params_from_args_and_metrics(benchmark.args(), &individual_metrics);
-        let transport = params.transport;
-        let server_addr = params.server_address.clone();
 
         let report = BenchmarkReportBuilder::build(
             hardware,
             params,
             individual_metrics,
             benchmark.args().moving_average_window(),
+            benchmark.client_factory(),
         )
         .await;
 
@@ -100,8 +100,7 @@ impl BenchmarkRunner {
             report.dump_to_json(&full_output_path);
 
             if let Err(e) = collect_server_logs_and_save_to_file(
-                &transport,
-                &server_addr,
+                benchmark.client_factory(),
                 Path::new(&full_output_path),
             )
             .await
@@ -113,7 +112,7 @@ impl BenchmarkRunner {
             plot_chart(
                 &report,
                 &full_output_path,
-                ChartType::Throughput,
+                &ChartType::Throughput,
                 should_open_charts,
             )
             .map_err(|e| {
@@ -123,7 +122,7 @@ impl BenchmarkRunner {
             plot_chart(
                 &report,
                 &full_output_path,
-                ChartType::Latency,
+                &ChartType::Latency,
                 should_open_charts,
             )
             .map_err(|e| {

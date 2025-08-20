@@ -16,11 +16,14 @@
  * under the License.
  */
 
+use crate::client_wrappers::client_wrapper::ClientWrapper;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::Stream;
 use futures_util::{FutureExt, StreamExt};
-use iggy_binary_protocol::Client;
+use iggy_binary_protocol::{
+    Client, ConsumerGroupClient, ConsumerOffsetClient, MessageClient, StreamClient, TopicClient,
+};
 use iggy_common::locking::{IggySharedMut, IggySharedMutFn};
 use iggy_common::{
     Consumer, ConsumerKind, DiagnosticEvent, EncryptorKind, IdKind, Identifier, IggyDuration,
@@ -93,7 +96,7 @@ unsafe impl Sync for IggyConsumer {}
 pub struct IggyConsumer {
     initialized: bool,
     can_poll: Arc<AtomicBool>,
-    client: IggySharedMut<Box<dyn Client>>,
+    client: IggySharedMut<ClientWrapper>,
     consumer_name: String,
     consumer: Arc<Consumer>,
     is_consumer_group: bool,
@@ -103,7 +106,7 @@ pub struct IggyConsumer {
     partition_id: Option<u32>,
     polling_strategy: PollingStrategy,
     poll_interval_micros: u64,
-    batch_size: u32,
+    batch_length: u32,
     auto_commit: AutoCommit,
     auto_commit_after_polling: bool,
     auto_join_consumer_group: bool,
@@ -129,7 +132,7 @@ pub struct IggyConsumer {
 impl IggyConsumer {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        client: IggySharedMut<Box<dyn Client>>,
+        client: IggySharedMut<ClientWrapper>,
         consumer_name: String,
         consumer: Consumer,
         stream_id: Identifier,
@@ -137,7 +140,7 @@ impl IggyConsumer {
         partition_id: Option<u32>,
         polling_interval: Option<IggyDuration>,
         polling_strategy: PollingStrategy,
-        batch_size: u32,
+        batch_length: u32,
         auto_commit: AutoCommit,
         auto_join_consumer_group: bool,
         create_consumer_group_if_not_exists: bool,
@@ -165,7 +168,7 @@ impl IggyConsumer {
             last_consumed_offsets: Arc::new(DashMap::new()),
             current_offsets: Arc::new(DashMap::new()),
             poll_future: None,
-            batch_size,
+            batch_length,
             auto_commit,
             auto_commit_after_polling: matches!(
                 auto_commit,
@@ -251,6 +254,13 @@ impl IggyConsumer {
         .await
     }
 
+    /// Retrieves the last consumed offset for the specified partition ID.
+    /// To get the current partition ID use `partition_id()`
+    pub fn get_last_consumed_offset(&self, partition_id: u32) -> Option<u64> {
+        let offset = self.last_consumed_offsets.get(&partition_id)?;
+        Some(offset.load(ORDERING))
+    }
+
     /// Deletes the consumer offset on the server either for the current partition or the provided partition ID.
     pub async fn delete_offset(&self, partition_id: Option<u32>) -> Result<(), IggyError> {
         let client = self.client.read().await;
@@ -262,6 +272,13 @@ impl IggyConsumer {
                 partition_id,
             )
             .await
+    }
+
+    /// Retrieves the last stored offset (on the server) for the specified partition ID.
+    /// To get the current partition ID use `partition_id()`
+    pub fn get_last_stored_offset(&self, partition_id: u32) -> Option<u64> {
+        let offset = self.last_stored_offsets.get(&partition_id)?;
+        Some(offset.load(ORDERING))
     }
 
     /// Initializes the consumer by subscribing to diagnostic events, initializing the consumer group if needed, storing the offsets in the background etc.
@@ -391,7 +408,7 @@ impl IggyConsumer {
 
     #[allow(clippy::too_many_arguments)]
     async fn store_consumer_offset(
-        client: &IggySharedMut<Box<dyn Client>>,
+        client: &IggySharedMut<ClientWrapper>,
         consumer: &Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
@@ -609,7 +626,7 @@ impl IggyConsumer {
         let consumer = self.consumer.clone();
         let polling_strategy = self.polling_strategy;
         let client = self.client.clone();
-        let count = self.batch_size;
+        let count = self.batch_length;
         let auto_commit_after_polling = self.auto_commit_after_polling;
         let auto_commit_enabled = self.auto_commit != AutoCommit::Disabled;
         let interval = self.poll_interval_micros;
@@ -753,6 +770,14 @@ impl IggyConsumer {
         }
 
         let now: u64 = IggyTimestamp::now().into();
+        if now < last_sent_at {
+            warn!(
+                "Returned monotonic time went backwards, now < last_sent_at: ({now} < {last_sent_at})"
+            );
+            sleep(Duration::from_micros(interval)).await;
+            return;
+        }
+
         let elapsed = now - last_sent_at;
         if elapsed >= interval {
             trace!("No need to wait before polling messages. {now} - {last_sent_at} = {elapsed}");
@@ -767,7 +792,7 @@ impl IggyConsumer {
     }
 
     async fn initialize_consumer_group(
-        client: IggySharedMut<Box<dyn Client>>,
+        client: IggySharedMut<ClientWrapper>,
         create_consumer_group_if_not_exists: bool,
         stream_id: Arc<Identifier>,
         topic_id: Arc<Identifier>,
@@ -805,9 +830,19 @@ impl IggyConsumer {
             info!(
                 "Creating consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}"
             );
-            client
+            match client
                 .create_consumer_group(&stream_id, &topic_id, &name, id)
-                .await?;
+                .await
+            {
+                Ok(_) => {}
+                Err(IggyError::ConsumerGroupNameAlreadyExists(_, _)) => {}
+                Err(error) => {
+                    error!(
+                        "Failed to create consumer group {consumer_group_id} for topic: {topic_id}, stream: {stream_id}: {error}"
+                    );
+                    return Err(error);
+                }
+            }
         }
 
         info!(
@@ -912,13 +947,12 @@ impl Stream for IggyConsumer {
                         if let Some(ref encryptor) = self.encryptor {
                             for message in &mut polled_messages.messages {
                                 let payload = encryptor.decrypt(&message.payload);
-                                if payload.is_err() {
+                                if let Err(error) = payload {
                                     self.poll_future = None;
                                     error!(
                                         "Failed to decrypt the message payload at offset: {}, partition ID: {}",
                                         message.header.offset, partition_id
                                     );
-                                    let error = payload.unwrap_err();
                                     return Poll::Ready(Some(Err(error)));
                                 }
 

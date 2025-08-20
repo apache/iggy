@@ -20,6 +20,7 @@
 
 import type { CommandResponse } from '../../client/client.type.js';
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 import { deserializeToStream, type Stream } from './stream.utils.js';
 
 export type CreateStream = {
@@ -28,7 +29,7 @@ export type CreateStream = {
 };
 
 export const CREATE_STREAM = {
-  code: 202,
+  code: COMMAND_CODE.CreateStream,
 
   serialize: ({streamId, name}: CreateStream) => {
     const bName = Buffer.from(name);
@@ -45,10 +46,11 @@ export const CREATE_STREAM = {
       bName
     ]);
   },
-
+  
   deserialize: (r: CommandResponse) => {
     return deserializeToStream(r.data, 0).data
   }
 };
+
 
 export const createStream = wrapCommand<CreateStream, Stream>(CREATE_STREAM);

@@ -15,16 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Kinds;
+using Apache.Iggy.Kinds;
 
-namespace Iggy_SDK.Contracts.Http;
+namespace Apache.Iggy.Contracts.Http;
 
 public sealed class MessageFetchRequest
 {
     public required Consumer Consumer { get; init; }
     public required Identifier StreamId { get; init; }
     public required Identifier TopicId { get; init; }
-    public required int PartitionId { get; init; }
+    public uint? PartitionId { get; init; }
     public required PollingStrategy PollingStrategy { get; init; }
     public required int Count { get; init; }
     public required bool AutoCommit { get; init; }

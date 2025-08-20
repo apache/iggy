@@ -1,10 +1,13 @@
 target*
 .idea/
 .vscode/
+.vs/
+.zed/
 .DS_Store
 .gradle
 local_data*
-bench_*
+local_state*
+/bench_*
 /sdk/errors_table/
 /rust-clippy-results.sarif
 /performance_results*
@@ -13,6 +16,7 @@ bench_*
 /iggy_release_tmp
 /**/obj
 /**/bin
+!/foreign/python/src/bin
 *.iml
 foreign/cpp/build
 foreign/java/**/build
@@ -21,6 +25,7 @@ foreign/node/**/node_modules
 foreign/node/**/dist
 foreign/node/npm-debug.log*
 foreign/node/.npm
+foreign/csharp/**/*.DotSettings.user
 *.exe
 *.exe~
 *.dll
@@ -31,6 +36,5 @@ foreign/node/.npm
 *.a
 *.lib
 *.out
-*.test
 go.work
 core/bench/dashboard/frontend/dist

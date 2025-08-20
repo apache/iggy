@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Kinds;
-namespace Iggy_SDK.Contracts.Http;
+using Apache.Iggy.Kinds;
+
+namespace Apache.Iggy.Contracts.Http;
 
 public sealed class MessageSendRequest<TMessage>
 {

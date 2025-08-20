@@ -186,7 +186,7 @@ impl CliCommand for GetStatsCmd {
                 list.push(format!("Iggy Server Run Time|{}", stats.run_time.as_secs()));
 
                 let start_time_utc = stats.start_time + SystemTime::UNIX_EPOCH;
-                list.push(format!("Start Time (UTC)|{}", start_time_utc));
+                list.push(format!("Start Time (UTC)|{start_time_utc}"));
 
                 list.push(format!("Read Bytes|{}", stats.read_bytes.as_bytes_u64()));
                 list.push(format!(

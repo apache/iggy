@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -53,7 +53,9 @@ pub enum IpAddrKind {
 
 #[async_trait]
 pub trait ClientFactory: Sync + Send {
-    async fn create_client(&self) -> Box<dyn Client>;
+    async fn create_client(&self) -> ClientWrapper;
+    fn transport(&self) -> Transport;
+    fn server_addr(&self) -> String;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Display)]
@@ -169,6 +171,15 @@ impl TestServer {
     pub fn start(&mut self) {
         self.set_server_addrs_from_env();
         self.cleanup();
+
+        // Remove the config file if it exists from a previous run.
+        // Without this, starting the server on existing data will not work, because
+        // port detection mechanism will use port from previous runtime.
+        let config_path = format!("{}/runtime/current_config.toml", self.local_data_path);
+        if Path::new(&config_path).exists() {
+            fs::remove_file(&config_path).ok();
+        }
+
         let files_path = self.local_data_path.clone();
         let mut command = if let Some(server_executable_path) = &self.server_executable_path {
             Command::new(server_executable_path)
@@ -195,16 +206,6 @@ impl TestServer {
 
         let child = command.spawn().unwrap();
         self.child_handle = Some(child);
-
-        if self.child_handle.as_ref().unwrap().stdout.is_some() {
-            let child_stdout = self.child_handle.as_mut().unwrap().stdout.take().unwrap();
-            std::thread::spawn(move || {
-                let reader = BufReader::new(child_stdout);
-                for line in reader.lines() {
-                    println!("{}", line.unwrap());
-                }
-            });
-        }
         self.wait_until_server_has_bound();
     }
 
@@ -317,7 +318,7 @@ impl TestServer {
                     if let Some(exit_status) =
                         self.child_handle.as_mut().unwrap().try_wait().unwrap()
                     {
-                        panic!("Server process has exited with status {}!", exit_status);
+                        panic!("Server process has exited with status {exit_status}!");
                     }
                     sleep(Duration::from_millis(SLEEP_INTERVAL_MS));
                     continue;
@@ -347,8 +348,7 @@ impl TestServer {
             ));
         } else {
             panic!(
-                "Failed to load config from file {} in {} s!",
-                config_path, MAX_PORT_WAIT_DURATION_S
+                "Failed to load config from file {config_path} in {MAX_PORT_WAIT_DURATION_S} s!"
             );
         }
     }

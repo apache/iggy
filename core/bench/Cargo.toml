@@ -16,10 +16,15 @@
 # under the License.
 
 [package]
-name = "bench"
+name = "iggy-bench"
 version = "0.2.4"
 edition = "2024"
 license = "Apache-2.0"
+repository = "https://github.com/apache/iggy"
+homepage = "https://iggy.apache.org"
+description = "Benchmarking CLI for Iggy message streaming platform"
+keywords = ["iggy", "cli", "messaging", "streaming"]
+readme = "../../README.md"
 # Due to dependency to integration, which has a dependency to server, setting
 # mimalloc on server is also setting it on bench.
 
@@ -31,13 +36,15 @@ charming = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
 figlet-rs = { workspace = true }
-governor = "0.10.0"
+futures-util = { workspace = true }
+governor = "0.10.1"
 hostname = "0.4.1"
 human-repr = { workspace = true }
 iggy = { workspace = true }
 integration = { workspace = true }
 nonzero_lit = { workspace = true }
 rand = { workspace = true }
+rayon = "1.10.0"
 serde = { workspace = true }
 sysinfo = { workspace = true }
 tokio = { workspace = true }
@@ -50,3 +57,8 @@ uuid = { workspace = true }
 [[bin]]
 name = "iggy-bench"
 path = "src/main.rs"
+
+[lints.clippy]
+enum_glob_use = "deny"
+pedantic = "deny"
+nursery = "deny"

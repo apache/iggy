@@ -26,8 +26,9 @@ use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_binary_protocol::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
 use iggy_common::{
-    AutoLogin, ClientState, Command, ConnectionString, Credentials, DiagnosticEvent, IggyDuration,
-    IggyError, IggyErrorDiscriminants, IggyTimestamp,
+    AutoLogin, ClientState, Command, ConnectionString, ConnectionStringUtils, Credentials,
+    DiagnosticEvent, IggyDuration, IggyError, IggyErrorDiscriminants, IggyTimestamp,
+    TcpConnectionStringOptions, TransportProtocol,
 };
 use rustls::pki_types::{CertificateDer, ServerName, pem::PemObject};
 use std::net::SocketAddr;
@@ -47,7 +48,7 @@ const NAME: &str = "Iggy";
 /// It requires a valid server address.
 #[derive(Debug)]
 pub struct TcpClient {
-    pub(crate) stream: Mutex<Option<ConnectionStreamKind>>,
+    pub(crate) stream: Arc<Mutex<Option<ConnectionStreamKind>>>,
     pub(crate) config: Arc<TcpClientConfig>,
     pub(crate) state: Mutex<ClientState>,
     client_address: Mutex<Option<SocketAddr>>,
@@ -177,9 +178,14 @@ impl TcpClient {
         }))
     }
 
+    /// Create a new TCP client from the provided connection string.
     pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
+        if ConnectionStringUtils::parse_protocol(connection_string)? != TransportProtocol::Tcp {
+            return Err(IggyError::InvalidConnectionString);
+        }
+
         Self::create(Arc::new(
-            ConnectionString::from_str(connection_string)?.into(),
+            ConnectionString::<TcpConnectionStringOptions>::from_str(connection_string)?.into(),
         ))
     }
 
@@ -188,7 +194,7 @@ impl TcpClient {
         Ok(Self {
             config,
             client_address: Mutex::new(None),
-            stream: Mutex::new(None),
+            stream: Arc::new(Mutex::new(None)),
             state: Mutex::new(ClientState::Disconnected),
             events: broadcast(1000),
             connected_at: Mutex::new(None),
@@ -196,7 +202,6 @@ impl TcpClient {
     }
 
     async fn handle_response(
-        &self,
         status: u32,
         length: u32,
         stream: &mut ConnectionStreamKind,
@@ -344,37 +349,45 @@ impl TcpClient {
                 break;
             }
 
-            let mut root_cert_store = rustls::RootCertStore::empty();
-            if let Some(certificate_path) = &self.config.tls_ca_file {
-                for cert in CertificateDer::pem_file_iter(certificate_path).map_err(|error| {
-                    error!("Failed to read the CA file: {certificate_path}. {error}",);
-                    IggyError::InvalidTlsCertificatePath
-                })? {
-                    let certificate = cert.map_err(|error| {
-                        error!(
-                            "Failed to read a certificate from the CA file: {certificate_path}. {error}",
-                        );
-                        IggyError::InvalidTlsCertificate
-                    })?;
-                    root_cert_store.add(certificate).map_err(|error| {
-                        error!(
-                            "Failed to add a certificate to the root certificate store. {error}",
-                        );
-                        IggyError::InvalidTlsCertificate
-                    })?;
-                }
-            } else {
-                root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            }
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-            let config = rustls::ClientConfig::builder()
-                .with_root_certificates(root_cert_store)
-                .with_no_client_auth();
+            let config = if self.config.tls_validate_certificate {
+                let mut root_cert_store = rustls::RootCertStore::empty();
+                if let Some(certificate_path) = &self.config.tls_ca_file {
+                    for cert in
+                        CertificateDer::pem_file_iter(certificate_path).map_err(|error| {
+                            error!("Failed to read the CA file: {certificate_path}. {error}",);
+                            IggyError::InvalidTlsCertificatePath
+                        })?
+                    {
+                        let certificate = cert.map_err(|error| {
+                            error!(
+                                "Failed to read a certificate from the CA file: {certificate_path}. {error}",
+                            );
+                            IggyError::InvalidTlsCertificate
+                        })?;
+                        root_cert_store.add(certificate).map_err(|error| {
+                            error!(
+                                "Failed to add a certificate to the root certificate store. {error}",
+                            );
+                            IggyError::InvalidTlsCertificate
+                        })?;
+                    }
+                } else {
+                    root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                }
+
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(root_cert_store)
+                    .with_no_client_auth()
+            } else {
+                use crate::tcp::tcp_tls_verifier::NoServerVerification;
+                rustls::ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(NoServerVerification))
+                    .with_no_client_auth()
+            };
             let connector = TlsConnector::from(Arc::new(config));
-            let stream = TcpStream::connect(client_address).await.map_err(|error| {
-                error!("Failed to establish TCP connection to the server: {error}",);
-                IggyError::CannotEstablishConnection
-            })?;
             let tls_domain = self.config.tls_domain.to_owned();
             let domain = ServerName::try_from(tls_domain).map_err(|error| {
                 error!("Failed to create a server name from the domain. {error}",);
@@ -476,45 +489,54 @@ impl TcpClient {
             _ => {}
         }
 
-        let mut stream = self.stream.lock().await;
-        if let Some(stream) = stream.as_mut() {
-            let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
-            trace!("Sending a TCP request of size {payload_length} with code: {code}");
-            stream.write(&(payload_length as u32).to_le_bytes()).await?;
-            stream.write(&code.to_le_bytes()).await?;
-            stream.write(&payload).await?;
-            stream.flush().await?;
-            trace!("Sent a TCP request with code: {code}, waiting for a response...");
-            let mut response_buffer = [0u8; RESPONSE_INITIAL_BYTES_LENGTH];
-            let read_bytes = stream.read(&mut response_buffer).await.map_err(|error| {
-                error!(
-                    "Failed to read response for TCP request with code: {code}: {error}",
-                    code = code,
-                    error = error
-                );
-                IggyError::Disconnected
-            })?;
+        let stream = self.stream.clone();
+        // SAFETY: we run code holding the `stream` lock in a task so we can't be cancelled while holding the lock.
+        tokio::spawn(async move {
+            let mut stream = stream.lock().await;
+            if let Some(stream) = stream.as_mut() {
+                let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
+                trace!("Sending a TCP request of size {payload_length} with code: {code}");
+                stream.write(&(payload_length as u32).to_le_bytes()).await?;
+                stream.write(&code.to_le_bytes()).await?;
+                stream.write(&payload).await?;
+                stream.flush().await?;
+                trace!("Sent a TCP request with code: {code}, waiting for a response...");
+                let mut response_buffer = [0u8; RESPONSE_INITIAL_BYTES_LENGTH];
+                let read_bytes = stream.read(&mut response_buffer).await.map_err(|error| {
+                    error!(
+                        "Failed to read response for TCP request with code: {code}: {error}",
+                        code = code,
+                        error = error
+                    );
+                    IggyError::Disconnected
+                })?;
 
-            if read_bytes != RESPONSE_INITIAL_BYTES_LENGTH {
-                error!("Received an invalid or empty response.");
-                return Err(IggyError::EmptyResponse);
+                if read_bytes != RESPONSE_INITIAL_BYTES_LENGTH {
+                    error!("Received an invalid or empty response.");
+                    return Err(IggyError::EmptyResponse);
+                }
+
+                let status = u32::from_le_bytes(
+                    response_buffer[..4]
+                        .try_into()
+                        .map_err(|_| IggyError::InvalidNumberEncoding)?,
+                );
+                let length = u32::from_le_bytes(
+                    response_buffer[4..]
+                        .try_into()
+                        .map_err(|_| IggyError::InvalidNumberEncoding)?,
+                );
+                return TcpClient::handle_response(status, length, stream).await;
             }
 
-            let status = u32::from_le_bytes(
-                response_buffer[..4]
-                    .try_into()
-                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
-            );
-            let length = u32::from_le_bytes(
-                response_buffer[4..]
-                    .try_into()
-                    .map_err(|_| IggyError::InvalidNumberEncoding)?,
-            );
-            return self.handle_response(status, length, stream).await;
-        }
-
-        error!("Cannot send data. Client is not connected.");
-        Err(IggyError::NotConnected)
+            error!("Cannot send data. Client is not connected.");
+            Err(IggyError::NotConnected)
+        })
+        .await
+        .map_err(|e| {
+            error!("Task execution failed during TCP request: {}", e);
+            IggyError::TcpError
+        })?
     }
 
     async fn get_client_address_value(&self) -> String {
@@ -524,5 +546,279 @@ impl TcpClient {
         } else {
             "unknown".to_string()
         }
+    }
+}
+
+/// Unit tests for TcpClient.
+/// Currently only tests for "from_connection_string()" are implemented.
+/// TODO: Add complete unit tests for TcpClient.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_fail_with_empty_connection_string() {
+        let value = "";
+        let tcp_client = TcpClient::from_connection_string(value);
+        assert!(tcp_client.is_err());
+    }
+
+    #[test]
+    fn should_fail_without_username() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let tcp_client = TcpClient::from_connection_string(&value);
+        assert!(tcp_client.is_err());
+    }
+
+    #[test]
+    fn should_fail_without_password() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let tcp_client = TcpClient::from_connection_string(&value);
+        assert!(tcp_client.is_err());
+    }
+
+    #[test]
+    fn should_fail_without_server_address() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let tcp_client = TcpClient::from_connection_string(&value);
+        assert!(tcp_client.is_err());
+    }
+
+    #[test]
+    fn should_fail_without_port() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let tcp_client = TcpClient::from_connection_string(&value);
+        assert!(tcp_client.is_err());
+    }
+
+    #[test]
+    fn should_fail_with_invalid_prefix() {
+        let connection_string_prefix = "invalid+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let tcp_client = TcpClient::from_connection_string(&value);
+        assert!(tcp_client.is_err());
+    }
+
+    #[test]
+    fn should_fail_with_unmatch_protocol() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Quic;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let tcp_client = TcpClient::from_connection_string(&value);
+        assert!(tcp_client.is_err());
+    }
+
+    #[test]
+    fn should_succeed_with_default_prefix() {
+        let default_connection_string_prefix = "iggy://";
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{default_connection_string_prefix}{username}:{password}@{server_address}:{port}"
+        );
+        let tcp_client = TcpClient::from_connection_string(&value);
+        assert!(tcp_client.is_ok());
+    }
+
+    #[test]
+    fn should_fail_with_invalid_options() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}?invalid_option=invalid"
+        );
+        let tcp_client = TcpClient::from_connection_string(&value);
+        assert!(tcp_client.is_err());
+    }
+
+    #[test]
+    fn should_succeed_without_options() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let tcp_client = TcpClient::from_connection_string(&value);
+        assert!(tcp_client.is_ok());
+
+        let tcp_client_config = tcp_client.unwrap().config;
+        assert_eq!(
+            tcp_client_config.server_address,
+            format!("{server_address}:{port}")
+        );
+        assert_eq!(
+            tcp_client_config.auto_login,
+            AutoLogin::Enabled(Credentials::UsernamePassword(
+                username.to_string(),
+                password.to_string()
+            ))
+        );
+
+        assert!(!tcp_client_config.tls_enabled);
+        assert!(tcp_client_config.tls_domain.is_empty());
+        assert!(tcp_client_config.tls_ca_file.is_none());
+        assert_eq!(
+            tcp_client_config.heartbeat_interval,
+            IggyDuration::from_str("5s").unwrap()
+        );
+
+        assert!(tcp_client_config.reconnection.enabled);
+        assert!(tcp_client_config.reconnection.max_retries.is_none());
+        assert_eq!(
+            tcp_client_config.reconnection.interval,
+            IggyDuration::from_str("1s").unwrap()
+        );
+        assert_eq!(
+            tcp_client_config.reconnection.reestablish_after,
+            IggyDuration::from_str("5s").unwrap()
+        );
+    }
+
+    #[test]
+    fn should_succeed_with_options() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let heartbeat_interval = "10s";
+        let reconnection_retries = "10";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}?heartbeat_interval={heartbeat_interval}&reconnection_retries={reconnection_retries}"
+        );
+        let tcp_client = TcpClient::from_connection_string(&value);
+        assert!(tcp_client.is_ok());
+
+        let tcp_client_config = tcp_client.unwrap().config;
+        assert_eq!(
+            tcp_client_config.server_address,
+            format!("{server_address}:{port}")
+        );
+        assert_eq!(
+            tcp_client_config.auto_login,
+            AutoLogin::Enabled(Credentials::UsernamePassword(
+                username.to_string(),
+                password.to_string()
+            ))
+        );
+
+        assert!(!tcp_client_config.tls_enabled);
+        assert!(tcp_client_config.tls_domain.is_empty());
+        assert!(tcp_client_config.tls_ca_file.is_none());
+        assert_eq!(
+            tcp_client_config.heartbeat_interval,
+            IggyDuration::from_str(heartbeat_interval).unwrap()
+        );
+
+        assert!(tcp_client_config.reconnection.enabled);
+        assert_eq!(
+            tcp_client_config.reconnection.max_retries.unwrap(),
+            reconnection_retries.parse::<u32>().unwrap()
+        );
+        assert_eq!(
+            tcp_client_config.reconnection.interval,
+            IggyDuration::from_str("1s").unwrap()
+        );
+        assert_eq!(
+            tcp_client_config.reconnection.reestablish_after,
+            IggyDuration::from_str("5s").unwrap()
+        );
+    }
+
+    #[test]
+    fn should_succeed_with_pat() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let pat = "iggypat-1234567890abcdef";
+        let value = format!("{connection_string_prefix}{protocol}://{pat}@{server_address}:{port}");
+        let tcp_client = TcpClient::from_connection_string(&value);
+        assert!(tcp_client.is_ok());
+
+        let tcp_client_config = tcp_client.unwrap().config;
+        assert_eq!(
+            tcp_client_config.server_address,
+            format!("{server_address}:{port}")
+        );
+        assert_eq!(
+            tcp_client_config.auto_login,
+            AutoLogin::Enabled(Credentials::PersonalAccessToken(pat.to_string()))
+        );
+
+        assert!(!tcp_client_config.tls_enabled);
+        assert!(tcp_client_config.tls_domain.is_empty());
+        assert!(tcp_client_config.tls_ca_file.is_none());
+        assert_eq!(
+            tcp_client_config.heartbeat_interval,
+            IggyDuration::from_str("5s").unwrap()
+        );
+
+        assert!(tcp_client_config.reconnection.enabled);
+        assert!(tcp_client_config.reconnection.max_retries.is_none());
+        assert_eq!(
+            tcp_client_config.reconnection.interval,
+            IggyDuration::from_str("1s").unwrap()
+        );
+        assert_eq!(
+            tcp_client_config.reconnection.reestablish_after,
+            IggyDuration::from_str("5s").unwrap()
+        );
     }
 }

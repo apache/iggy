@@ -32,7 +32,7 @@ use crate::archiver::s3::S3Archiver;
 
 pub const COMPONENT: &str = "ARCHIVER";
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Default, Display, Copy, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Default, Display, Copy, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum ArchiverKindType {
     #[default]
@@ -46,9 +46,9 @@ impl FromStr for ArchiverKindType {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "disk" => Ok(ArchiverKindType::Disk),
-            "s3" => Ok(ArchiverKindType::S3),
-            _ => Err(format!("Unknown archiver kind: {}", s)),
+            "disk" => Ok(Self::Disk),
+            "s3" => Ok(Self::S3),
+            _ => Err(format!("Unknown archiver kind: {s}")),
         }
     }
 }
@@ -75,15 +75,26 @@ pub enum ArchiverKind {
 }
 
 impl ArchiverKind {
-    pub fn get_disk_archiver(config: DiskArchiverConfig) -> Self {
+    #[must_use]
+    pub const fn get_disk_archiver(config: DiskArchiverConfig) -> Self {
         Self::Disk(DiskArchiver::new(config))
     }
 
+    /// Creates an S3 archiver.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the S3 archiver cannot be initialized.
     pub fn get_s3_archiver(config: S3ArchiverConfig) -> Result<Self, ArchiverError> {
         let archiver = S3Archiver::new(config)?;
         Ok(Self::S3(archiver))
     }
 
+    /// Initializes the archiver.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the archiver cannot be initialized.
     pub async fn init(&self) -> Result<(), ArchiverError> {
         match self {
             Self::Disk(a) => a.init().await,
@@ -91,6 +102,11 @@ impl ArchiverKind {
         }
     }
 
+    /// Checks if a file is archived.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the check cannot be performed.
     pub async fn is_archived(
         &self,
         file: &str,
@@ -102,6 +118,11 @@ impl ArchiverKind {
         }
     }
 
+    /// Archives the specified files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the files cannot be archived.
     pub async fn archive(
         &self,
         files: &[&str],

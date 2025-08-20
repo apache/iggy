@@ -16,15 +16,15 @@
  * under the License.
  */
 
+use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::prelude::{AutoCommit, AutoCommitWhen, IggyConsumer};
-use iggy_binary_protocol::Client;
 use iggy_common::locking::IggySharedMut;
 use iggy_common::{Consumer, EncryptorKind, Identifier, IggyDuration, PollingStrategy};
 use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct IggyConsumerBuilder {
-    client: IggySharedMut<Box<dyn Client>>,
+    client: IggySharedMut<ClientWrapper>,
     consumer_name: String,
     consumer: Consumer,
     stream: Identifier,
@@ -32,7 +32,7 @@ pub struct IggyConsumerBuilder {
     partition: Option<u32>,
     polling_strategy: PollingStrategy,
     polling_interval: Option<IggyDuration>,
-    batch_size: u32,
+    batch_length: u32,
     auto_commit: AutoCommit,
     auto_join_consumer_group: bool,
     create_consumer_group_if_not_exists: bool,
@@ -46,7 +46,7 @@ pub struct IggyConsumerBuilder {
 impl IggyConsumerBuilder {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        client: IggySharedMut<Box<dyn Client>>,
+        client: IggySharedMut<ClientWrapper>,
         consumer_name: String,
         consumer: Consumer,
         stream_id: Identifier,
@@ -63,7 +63,7 @@ impl IggyConsumerBuilder {
             topic: topic_id,
             partition: partition_id,
             polling_strategy: PollingStrategy::next(),
-            batch_size: 1000,
+            batch_length: 1000,
             auto_commit: AutoCommit::IntervalOrWhen(
                 IggyDuration::ONE_SECOND,
                 AutoCommitWhen::PollingMessages,
@@ -103,8 +103,11 @@ impl IggyConsumerBuilder {
     }
 
     /// Sets the batch size for polling messages.
-    pub fn batch_size(self, batch_size: u32) -> Self {
-        Self { batch_size, ..self }
+    pub fn batch_length(self, batch_length: u32) -> Self {
+        Self {
+            batch_length,
+            ..self
+        }
     }
 
     /// Sets the auto-commit configuration for storing the offset on the server.
@@ -226,7 +229,7 @@ impl IggyConsumerBuilder {
             self.partition,
             self.polling_interval,
             self.polling_strategy,
-            self.batch_size,
+            self.batch_length,
             self.auto_commit,
             self.auto_join_consumer_group,
             self.create_consumer_group_if_not_exists,

@@ -15,12 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Extensions;
 using System.Text.Json;
+using Apache.Iggy.Extensions;
 
-namespace Iggy_SDK.JsonConfiguration;
+namespace Apache.Iggy.JsonConfiguration;
 
 internal sealed class ToSnakeCaseNamingPolicy : JsonNamingPolicy
 {
-    public override string ConvertName(string name) => name.ToSnakeCase();
+    public override string ConvertName(string name)
+    {
+        return name.ToSnakeCase();
+    }
 }

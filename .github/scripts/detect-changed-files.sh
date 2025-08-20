@@ -36,7 +36,7 @@ else
 fi
 
 # Check if yq is installed
-if ! command -v python3 &> /dev/null; then
+if ! command -v python3 &>/dev/null; then
     echo "python3 is required but not installed, please install it"
     exit 1
 fi
@@ -63,10 +63,29 @@ else
         fi
         # Get the changed files based on the base and head refs of the pull request
         echo "The script is running in a GitHub Actions environment for a pull request event"
-        CHANGED_FILES=$(git diff --name-only "origin/${GITHUB_BASE_REF}" "HEAD")
+        echo "Base ref: origin/${GITHUB_BASE_REF}, Head ref: HEAD"
+
+        # Fetch the base branch to ensure we have it
+        git fetch origin "${GITHUB_BASE_REF}" --depth=50 || true
+
+        # Get the merge base to ensure we're comparing the right commits
+        MERGE_BASE=$(git merge-base "origin/${GITHUB_BASE_REF}" HEAD)
+        echo "Merge base: ${MERGE_BASE}"
+
+        # Get changed files from the merge base to HEAD
+        CHANGED_FILES=$(git diff --name-only "${MERGE_BASE}" HEAD)
+
+        if [ -z "$CHANGED_FILES" ]; then
+            echo "No changed files detected. Trying alternative method..."
+            # Alternative: compare against the target branch directly
+            CHANGED_FILES=$(git diff --name-only "origin/${GITHUB_BASE_REF}...HEAD")
+        fi
+
+        echo "Changed files detected:"
+        echo "$CHANGED_FILES"
     fi
 fi
 
 # Analyze the changed files
 # shellcheck disable=SC2086
-python3 .github/scripts/analyze_changed_files.py ${VERBOSE_FLAG} "${CHANGED_FILES}" .github/changed-files-config.json
+python3 .github/scripts/analyze_changed_files.py ${VERBOSE_FLAG} "$CHANGED_FILES" .github/changed-files-config.json

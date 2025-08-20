@@ -161,7 +161,7 @@ impl Visitor<'_> for MaxTopicSizeVisitor {
         E: de::Error,
     {
         MaxTopicSize::from_str(value)
-            .map_err(|e| de::Error::custom(format!("Invalid MaxTopicSize: {}", e)))
+            .map_err(|e| de::Error::custom(format!("Invalid MaxTopicSize: {e}")))
     }
 }
 
@@ -177,7 +177,7 @@ impl<'de> Deserialize<'de> for MaxTopicSize {
 impl fmt::Display for MaxTopicSize {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MaxTopicSize::Custom(value) => write!(f, "{}", value),
+            MaxTopicSize::Custom(value) => write!(f, "{value}"),
             MaxTopicSize::Unlimited => write!(f, "unlimited"),
             MaxTopicSize::ServerDefault => write!(f, "server_default"),
         }

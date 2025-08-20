@@ -20,18 +20,15 @@
 
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { Client } from '../client/client.js';
-import { ConsumerKind, PollingStrategy, Partitioning } from '../wire/index.js';
+import { Consumer, PollingStrategy, Partitioning } from '../wire/index.js';
 import { generateMessages } from '../tcp.sm.utils.js';
+import { getTestClient } from './test-client.utils.js';
+
 
 describe('e2e -> message', async () => {
 
-  const c = new Client({
-    transport: 'TCP',
-    options: { port: 8090, host: '127.0.0.1' },
-    credentials: { username: 'iggy', password: 'iggy' }
-  });
-
+  const c = getTestClient();
+  
   const streamId = 934;
   const topicId = 832;
   const partitionId = 1;
@@ -67,64 +64,64 @@ describe('e2e -> message', async () => {
     const pollReq = {
       streamId,
       topicId,
-      consumer: { kind: ConsumerKind.Single, id: 12 },
+      consumer: Consumer.Single,
       partitionId,
       pollingStrategy: PollingStrategy.Last,
-      count: 1,
+      count: 10,
       autocommit: false
     };
     const { messages, ...resp } = await c.message.poll(pollReq);
     assert.equal(messages.length, resp.count);
-    // assert.equal(messages.length, msg.messages.length)
+    assert.equal(messages.length, msg.messages.length)
   });
 
   it('e2e -> message::poll/first', async () => {
     const pollReq = {
       streamId,
       topicId,
-      consumer: { kind: ConsumerKind.Single, id: 12 },
+      consumer: Consumer.Single,
       partitionId,
       pollingStrategy: PollingStrategy.First,
-      count: 1,
+      count: 10,
       autocommit: false
     };
     const { messages, ...resp } = await c.message.poll(pollReq);
     assert.equal(messages.length, resp.count);
-    // assert.equal(messages.length, msg.messages.length)
+    assert.equal(messages.length, msg.messages.length)
   });
 
   it('e2e -> message::poll/next', async () => {
     const pollReq = {
       streamId,
       topicId,
-      consumer: { kind: ConsumerKind.Single, id: 12 },
+      consumer: Consumer.Single,
       partitionId,
       pollingStrategy: PollingStrategy.Next,
-      count: 1,
+      count: 10,
       autocommit: false
     };
     const { messages, ...resp } = await c.message.poll(pollReq);
     assert.equal(messages.length, resp.count);
-    // assert.equal(messages.length, msg.messages.length)
+    assert.equal(messages.length, msg.messages.length)
   });
 
   it('e2e -> message::poll/next+commit', async () => {
     const pollReq = {
       streamId,
       topicId,
-      consumer: { kind: ConsumerKind.Single, id: 12 },
+      consumer: Consumer.Single,
       partitionId,
       pollingStrategy: PollingStrategy.Next,
-      count: 1,
+      count: 10,
       autocommit: true
     };
     const { messages, ...resp } = await c.message.poll(pollReq);
     assert.equal(messages.length, resp.count);
-    // assert.equal(messages.length, msg.messages.length)
+    assert.equal(messages.length, msg.messages.length)
 
-    // const r2 = await c.message.poll(pollReq);
-    // assert.equal(r2.count, 0);
-    // assert.equal(r2.messages.length, 0)
+    const r2 = await c.message.poll(pollReq);
+    assert.equal(r2.count, 0);
+    assert.equal(r2.messages.length, 0)
   });
 
   it('e2e -> message::cleanup', async () => {

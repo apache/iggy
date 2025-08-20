@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Shared;
+namespace Apache.Iggy.Shared;
 
 public interface ISerializableMessage
 {
-    public string ToJson();
-    public byte[] ToBytes();
-    public Envelope ToEnvelope();
+    string ToJson();
+    byte[] ToBytes();
+    Envelope ToEnvelope();
 }

@@ -15,16 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.Headers;
-namespace Iggy_SDK.IggyClient;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Headers;
+using Apache.Iggy.Kinds;
+using Apache.Iggy.Messages;
+
+namespace Apache.Iggy.IggyClient;
 
 public interface IIggyPublisher
 {
-    Task SendMessagesAsync(MessageSendRequest request, Func<byte[], byte[]>?
-        encryptor = null, CancellationToken token = default);
-    Task SendMessagesAsync<TMessage>(MessageSendRequest<TMessage> request,
-         Func<TMessage, byte[]> serializer,
+    Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning, Message[] messages,
+        Func<byte[], byte[]>? encryptor = null, CancellationToken token = default)
+    {
+        return SendMessagesAsync(new MessageSendRequest
+        {
+            Messages = messages,
+            Partitioning = partitioning,
+            StreamId = streamId,
+            TopicId = topicId
+        }, encryptor, token);
+    }
+
+    Task SendMessagesAsync(MessageSendRequest request, Func<byte[], byte[]>? encryptor = null, CancellationToken token = default);
+
+    Task SendMessagesAsync<TMessage>(MessageSendRequest<TMessage> request, Func<TMessage, byte[]> serializer,
         Func<byte[], byte[]>? encryptor = null, Dictionary<HeaderKey, HeaderValue>? headers = null,
         CancellationToken token = default);
+
+    Task FlushUnsavedBufferAsync(FlushUnsavedBufferRequest request, CancellationToken token = default);
 }

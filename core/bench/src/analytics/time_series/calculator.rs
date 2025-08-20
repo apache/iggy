@@ -16,6 +16,8 @@
  * under the License.
  */
 
+#![allow(clippy::cast_precision_loss)]
+
 use super::calculators::{
     LatencyTimeSeriesCalculator, MBThroughputCalculator, MessageThroughputCalculator,
     ThroughputTimeSeriesCalculator, TimeSeriesCalculation,
@@ -23,40 +25,29 @@ use super::calculators::{
 use crate::analytics::record::BenchmarkRecord;
 use bench_report::time_series::{TimePoint, TimeSeries, TimeSeriesKind};
 use iggy::prelude::IggyDuration;
+use rayon::prelude::*;
 use tracing::warn;
 
 /// Calculate time series data from benchmark records
 pub struct TimeSeriesCalculator;
 
 impl TimeSeriesCalculator {
-    pub fn new() -> Self {
-        Self
-    }
-
-    pub fn throughput_mb(
-        &self,
-        records: &[BenchmarkRecord],
-        bucket_size: IggyDuration,
-    ) -> TimeSeries {
+    pub fn throughput_mb(records: &[BenchmarkRecord], bucket_size: IggyDuration) -> TimeSeries {
         let calculator = ThroughputTimeSeriesCalculator::new(MBThroughputCalculator);
         calculator.calculate(records, bucket_size)
     }
 
-    pub fn throughput_msg(
-        &self,
-        records: &[BenchmarkRecord],
-        bucket_size: IggyDuration,
-    ) -> TimeSeries {
+    pub fn throughput_msg(records: &[BenchmarkRecord], bucket_size: IggyDuration) -> TimeSeries {
         let calculator = ThroughputTimeSeriesCalculator::new(MessageThroughputCalculator);
         calculator.calculate(records, bucket_size)
     }
 
-    pub fn latency(&self, records: &[BenchmarkRecord], bucket_size: IggyDuration) -> TimeSeries {
+    pub fn latency(records: &[BenchmarkRecord], bucket_size: IggyDuration) -> TimeSeries {
         let calculator = LatencyTimeSeriesCalculator;
         calculator.calculate(records, bucket_size)
     }
 
-    pub fn aggregate_sum(&self, series: &[TimeSeries]) -> TimeSeries {
+    pub fn aggregate_sum(series: &[TimeSeries]) -> TimeSeries {
         if series.is_empty() {
             warn!("Attempting to aggregate empty series");
             return TimeSeries {
@@ -74,7 +65,7 @@ impl TimeSeriesCalculator {
         all_times.dedup();
 
         let points = all_times
-            .into_iter()
+            .into_par_iter()
             .map(|time| {
                 let sum: f64 = series
                     .iter()
@@ -92,7 +83,7 @@ impl TimeSeriesCalculator {
         TimeSeries { points, kind }
     }
 
-    pub fn aggregate_avg(&self, series: &[TimeSeries]) -> TimeSeries {
+    pub fn aggregate_avg(series: &[TimeSeries]) -> TimeSeries {
         if series.is_empty() {
             warn!("Attempting to aggregate empty series");
             return TimeSeries {
@@ -111,7 +102,7 @@ impl TimeSeriesCalculator {
         all_times.dedup();
 
         let points = all_times
-            .into_iter()
+            .into_par_iter()
             .map(|time| {
                 let matching_values: Vec<f64> = series
                     .iter()

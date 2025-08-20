@@ -20,7 +20,7 @@
 
 import assert from 'node:assert/strict';
 import { v7 } from './wire/uuid.utils.js';
-import { sendMessages, type Partitioning, HeaderValue } from './wire/index.js';
+import { sendMessages, type Partitioning, HeaderValue, type Message } from './wire/index.js';
 import type { ClientProvider } from './client/client.type.js';
 import type { Id } from './wire/identifier.utils.js';
 
@@ -42,12 +42,11 @@ const messages = [
   { payload: 'yolo msg 4', Headers: h2 },
 ];
 
-const someContent = () => messages[Math.floor(Math.random() * messages.length)]
+export const someMessageContent = () => messages[Math.floor(Math.random() * messages.length)]
 
 export const generateMessages = (count = 1) => {
-  return [...Array(count)].map(() => ({ id: v7(), ...someContent() }));
+  return [...Array(count)].map(() => ({ id: v7(), ...someMessageContent() }));
 }
-
 
 export const sendSomeMessages = (s: ClientProvider) =>
   async (streamId: Id, topicId: Id, partition: Partitioning) => {
@@ -57,3 +56,25 @@ export const sendSomeMessages = (s: ClientProvider) =>
     assert.ok(rSend);
     return rSend;
   };
+
+
+export const formatPolledMessages = (msgs: Message[]) =>
+  msgs.map(m => {
+    const { headers: { id, offset, timestamp, checksum }, payload, userHeaders } = m;
+    return {
+      id,
+      offset,
+      headers: userHeaders,
+      payload: payload.toString(),
+      timestamp,
+      checksum
+    };
+  });
+
+export const getIggyAddress = (host = '127.0.0.1', port = 8090): [string, number] => {
+  if (process.env.IGGY_TCP_ADDRESS) {
+    const s = (process.env.IGGY_TCP_ADDRESS || '').split(':');
+    [host, port] = [s[0], s[1] ? parseInt(s[1].toString(), 10) : port];
+  }
+  return [host, port];
+}

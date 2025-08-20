@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Errors;
+using Apache.Iggy.Errors;
 
-namespace Iggy_SDK_Tests.Utils.Errors;
+namespace Apache.Iggy.Tests.Utils.Errors;
 
 public static class ErrorModelFactory
 {

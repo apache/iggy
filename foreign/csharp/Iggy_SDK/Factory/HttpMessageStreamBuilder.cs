@@ -15,24 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Configuration;
-using Iggy_SDK.Contracts.Http;
-using Iggy_SDK.IggyClient.Implementations;
-using Iggy_SDK.MessagesDispatcher;
-using Microsoft.Extensions.Logging;
 using System.Threading.Channels;
-using HttpMessageInvoker = Iggy_SDK.MessagesDispatcher.HttpMessageInvoker;
-namespace Iggy_SDK.Factory;
+using Apache.Iggy.Configuration;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.IggyClient.Implementations;
+using Apache.Iggy.MessagesDispatcher;
+using Microsoft.Extensions.Logging;
+using HttpMessageInvoker = Apache.Iggy.MessagesDispatcher.HttpMessageInvoker;
+
+namespace Apache.Iggy.Factory;
 
 internal class HttpMessageStreamBuilder
 {
     private readonly HttpClient _client;
+    private readonly ILoggerFactory _loggerFactory;
     private readonly MessageBatchingSettings _messageBatchingSettings;
     private readonly MessagePollingSettings _messagePollingSettings;
     private Channel<MessageSendRequest>? _channel;
-    private MessageSenderDispatcher? _messageSenderDispatcher;
-    private readonly ILoggerFactory _loggerFactory;
     private HttpMessageInvoker? _messageInvoker;
+    private MessageSenderDispatcher? _messageSenderDispatcher;
 
     internal HttpMessageStreamBuilder(HttpClient client, IMessageStreamConfigurator options, ILoggerFactory loggerFactory)
     {
@@ -45,22 +46,25 @@ internal class HttpMessageStreamBuilder
         _client = client;
         _loggerFactory = loggerFactory;
     }
+
     //TODO - this channel will probably need to be refactored, to accept a lambda instead of MessageSendRequest
     internal HttpMessageStreamBuilder WithSendMessagesDispatcher()
     {
         if (_messageBatchingSettings.Enabled)
         {
             _channel = Channel.CreateBounded<MessageSendRequest>(_messageBatchingSettings.MaxRequests);
-            _messageInvoker =  new HttpMessageInvoker(_client);
+            _messageInvoker = new HttpMessageInvoker(_client);
             _messageSenderDispatcher =
                 new MessageSenderDispatcher(_messageBatchingSettings, _channel, _messageInvoker, _loggerFactory);
         }
         else
         {
-            _messageInvoker =  new HttpMessageInvoker(_client);
+            _messageInvoker = new HttpMessageInvoker(_client);
         }
+
         return this;
     }
+
     internal HttpMessageStream Build()
     {
         _messageSenderDispatcher?.Start();
@@ -70,5 +74,4 @@ internal class HttpMessageStreamBuilder
             false => new HttpMessageStream(_client, _channel, _messagePollingSettings, _loggerFactory, _messageInvoker)
         };
     }
-    
 }

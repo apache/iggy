@@ -93,7 +93,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
 
     // 7. Try to create the stream with the same ID but the different name and validate that it fails
     let create_stream_result = client
-        .create_stream(&format!("{}-2", STREAM_NAME), Some(STREAM_ID))
+        .create_stream(&format!("{STREAM_NAME}-2"), Some(STREAM_ID))
         .await;
     assert!(create_stream_result.is_err());
 
@@ -195,7 +195,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     let create_topic_result = client
         .create_topic(
             &Identifier::numeric(STREAM_ID).unwrap(),
-            &format!("{}-2", TOPIC_NAME),
+            &format!("{TOPIC_NAME}-2"),
             PARTITIONS_COUNT,
             Default::default(),
             None,
@@ -255,9 +255,9 @@ pub async fn run(client_factory: &dyn ClientFactory) {
 
     // 19. Messages should be also polled in the smaller batches
     let batches_count = 10;
-    let batch_size = MESSAGES_COUNT / batches_count;
+    let batch_length = MESSAGES_COUNT / batches_count;
     for i in 0..batches_count {
-        let start_offset = (i * batch_size) as u64;
+        let start_offset = (i * batch_length) as u64;
         let polled_messages = client
             .poll_messages(
                 &Identifier::numeric(STREAM_ID).unwrap(),
@@ -265,13 +265,13 @@ pub async fn run(client_factory: &dyn ClientFactory) {
                 Some(PARTITION_ID),
                 &consumer,
                 &PollingStrategy::offset(start_offset),
-                batch_size,
+                batch_length,
                 false,
             )
             .await
             .unwrap();
-        assert_eq!(polled_messages.messages.len() as u32, batch_size);
-        for i in 0..batch_size as u64 {
+        assert_eq!(polled_messages.messages.len() as u32, batch_length);
+        for i in 0..batch_length as u64 {
             let offset = start_offset + i;
             let message = polled_messages.messages.get(i as usize).unwrap();
             assert_message(message, offset);
@@ -593,7 +593,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     assert_eq!(topic.partitions_count, PARTITIONS_COUNT);
 
     // 38. Update the existing topic and ensure it's updated
-    let updated_topic_name = format!("{}-updated", TOPIC_NAME);
+    let updated_topic_name = format!("{TOPIC_NAME}-updated");
     let updated_message_expiry = 1000;
     let message_expiry_duration = updated_message_expiry.into();
     let updated_max_topic_size = MaxTopicSize::Custom(IggyByteSize::from_str("2 GB").unwrap());
@@ -658,7 +658,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     assert!(polled_messages.messages.is_empty());
 
     // 40. Update the existing stream and ensure it's updated
-    let updated_stream_name = format!("{}-updated", STREAM_NAME);
+    let updated_stream_name = format!("{STREAM_NAME}-updated");
 
     client
         .update_stream(
@@ -723,7 +723,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     assert!(topics.is_empty());
 
     // 43. Create the stream with automatically generated ID on the server
-    let stream_name = format!("{}-auto", STREAM_NAME);
+    let stream_name = format!("{STREAM_NAME}-auto");
     let stream_id = STREAM_ID + 1;
     client.create_stream(&stream_name, None).await.unwrap();
 
@@ -737,7 +737,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     assert_eq!(stream.name, stream_name);
 
     // 44. Create the topic with automatically generated ID on the server
-    let topic_name = format!("{}-auto", TOPIC_NAME);
+    let topic_name = format!("{TOPIC_NAME}-auto");
     let topic_id = 1;
     client
         .create_topic(
@@ -811,5 +811,5 @@ fn create_messages() -> Vec<IggyMessage> {
 }
 
 fn create_message_payload(offset: u64) -> Bytes {
-    Bytes::from(format!("message {}", offset))
+    Bytes::from(format!("message {offset}"))
 }

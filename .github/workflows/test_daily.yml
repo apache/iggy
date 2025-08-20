@@ -91,11 +91,9 @@ jobs:
         if: ${{ matrix.platform.cross }}
 
       - name: Prepare ${{ matrix.platform.target }} toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-          target: ${{ matrix.platform.target }}
+        run: |
+           rustup target add ${{ matrix.platform.target }}
+           echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
 
       - name: Install cross
         uses: taiki-e/install-action@v2

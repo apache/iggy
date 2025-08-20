@@ -16,11 +16,11 @@
 // under the License.
 
 
-namespace Iggy_SDK.Enums;
+namespace Apache.Iggy.Enums;
 
 public enum Partitioning
 {
-    Balanced,
-    PartitionId,
-    MessageKey
+    Balanced = 1,
+    PartitionId = 2,
+    MessageKey = 3
 }

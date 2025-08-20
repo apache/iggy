@@ -16,15 +16,15 @@
  * under the License.
  */
 
+use crate::client_wrappers::client_wrapper::ClientWrapper;
 #[allow(deprecated)]
 use crate::clients::client::IggyClient;
 use crate::http::http_client::HttpClient;
-use crate::http::http_config::HttpClientConfig;
-use crate::prelude::ClientError;
-use crate::prelude::IggyDuration;
-use crate::prelude::{TcpClientConfig, TcpClientReconnectionConfig};
-use crate::quic::quick_client::QuicClient;
-use crate::quic::quick_config::{QuicClientConfig, QuicClientReconnectionConfig};
+use crate::prelude::{
+    ClientError, HttpClientConfig, IggyDuration, QuicClientConfig, QuicClientReconnectionConfig,
+    TcpClientConfig, TcpClientReconnectionConfig,
+};
+use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
 use iggy_binary_protocol::Client;
 use iggy_common::{AutoLogin, Credentials};
@@ -131,6 +131,7 @@ impl ClientProviderConfig {
                     tls_enabled: args.tcp_tls_enabled,
                     tls_domain: args.tcp_tls_domain,
                     tls_ca_file: args.tcp_tls_ca_file,
+                    tls_validate_certificate: true,
                     nodelay: args.tcp_nodelay,
                     heartbeat_interval: IggyDuration::from_str(&args.tcp_heartbeat_interval)
                         .unwrap(),
@@ -174,7 +175,7 @@ pub async fn get_client(config: Arc<ClientProviderConfig>) -> Result<IggyClient,
 /// Create a `Client` for the specific transport based on the provided configuration.
 pub async fn get_raw_connected_client(
     config: Arc<ClientProviderConfig>,
-) -> Result<Box<dyn Client>, ClientError> {
+) -> Result<ClientWrapper, ClientError> {
     get_raw_client(config, true).await
 }
 
@@ -182,7 +183,7 @@ pub async fn get_raw_connected_client(
 pub async fn get_raw_client(
     config: Arc<ClientProviderConfig>,
     establish_connection: bool,
-) -> Result<Box<dyn Client>, ClientError> {
+) -> Result<ClientWrapper, ClientError> {
     let transport = config.transport.clone();
     match transport.as_str() {
         QUIC_TRANSPORT => {
@@ -191,12 +192,12 @@ pub async fn get_raw_client(
             if establish_connection {
                 Client::connect(&client).await?
             };
-            Ok(Box::new(client))
+            Ok(ClientWrapper::Quic(client))
         }
         HTTP_TRANSPORT => {
             let http_config = config.http.as_ref().unwrap();
             let client = HttpClient::create(http_config.clone())?;
-            Ok(Box::new(client))
+            Ok(ClientWrapper::Http(client))
         }
         TCP_TRANSPORT => {
             let tcp_config = config.tcp.as_ref().unwrap();
@@ -204,7 +205,7 @@ pub async fn get_raw_client(
             if establish_connection {
                 Client::connect(&client).await?
             };
-            Ok(Box::new(client))
+            Ok(ClientWrapper::Tcp(client))
         }
         _ => Err(ClientError::InvalidTransport(transport)),
     }

@@ -18,6 +18,8 @@ A modern, high-performance benchmark results dashboard for Iggy, built with Rust
 - 🚀 High-performance Rust backend
 - ⚡ Fast, modern web frontend built with Yew
 
+![Dashboard](../../../assets/benchmarking_platform.png)
+
 ## Project Structure
 
 The project is organized as a Rust workspace with four main components:
@@ -184,8 +186,10 @@ Access the development version at <http://localhost:8060>
 
 ### Building the Image
 
+Call this from the root of the repository:
+
 ```bash
-docker build -t apache/iggy-bench-dashboard .
+docker build -t iggy-bench-dashboard -f core/bench/dashboard/server/Dockerfile .
 ```
 
 ### Running the Container

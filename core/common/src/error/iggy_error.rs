@@ -16,13 +16,13 @@
  * under the License.
  */
 
-use crate::utils::byte_size::IggyByteSize;
 use crate::utils::topic_size::MaxTopicSize;
-
+use crate::{IggyMessage, utils::byte_size::IggyByteSize};
+use std::sync::Arc;
 use strum::{EnumDiscriminants, FromRepr, IntoStaticStr};
 use thiserror::Error;
 
-#[derive(Clone, Debug, Error, EnumDiscriminants, IntoStaticStr, FromRepr)]
+#[derive(Clone, Debug, Error, EnumDiscriminants, IntoStaticStr, FromRepr, Default)]
 #[repr(u32)]
 #[strum(serialize_all = "snake_case")]
 #[strum_discriminants(
@@ -31,6 +31,7 @@ use thiserror::Error;
     strum(serialize_all = "snake_case")
 )]
 pub enum IggyError {
+    #[default]
     #[error("Error")]
     Error = 1,
     #[error("Invalid configuration")]
@@ -363,6 +364,25 @@ pub enum IggyError {
     TooSmallMessage(u32, u32) = 4037,
     #[error("Cannot sed messages due to client disconnection")]
     CannotSendMessagesDueToClientDisconnection = 4050,
+    #[error("Background send error")]
+    BackgroundSendError = 4051,
+    #[error("Background send timeout")]
+    BackgroundSendTimeout = 4052,
+    #[error("Background send buffer is full")]
+    BackgroundSendBufferFull = 4053,
+    #[error("Background worker disconnected")]
+    BackgroundWorkerDisconnected = 4054,
+    #[error("Background send buffer overflow")]
+    BackgroundSendBufferOverflow = 4055,
+    #[error("Producer send failed")]
+    ProducerSendFailed {
+        cause: Box<IggyError>,
+        failed: Arc<Vec<IggyMessage>>,
+        stream_name: String,
+        topic_name: String,
+    } = 4056,
+    #[error("Producer closed")]
+    ProducerClosed = 4057,
     #[error("Invalid offset: {0}")]
     InvalidOffset(u64) = 4100,
     #[error("Consumer group with ID: {0} for topic with ID: {1} was not found.")]

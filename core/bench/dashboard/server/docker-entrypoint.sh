@@ -35,4 +35,4 @@ else
     echo "Polling GitHub disabled, GITHUB_TOKEN not set"
 fi
 
-exec /app/bench-dashboard-server "${ARGS[@]}"
+exec /app/iggy-bench-dashboard-server "${ARGS[@]}"

@@ -61,6 +61,8 @@ func TranslateErrorCode(code int) string {
 		return "invalid_format"
 	case 5:
 		return "feature_unavailable"
+	case 6:
+		return "invalid_identifier"
 	case 10:
 		return "cannot_create_base_directory"
 	case 20:
@@ -109,6 +111,8 @@ func TranslateErrorCode(code int) string {
 		return "cannot_parse_int"
 	case 204:
 		return "cannot_parse_slice"
+	case 206:
+		return "connection_closed"
 	case 300:
 		return "http_response_error"
 	case 301:
@@ -273,6 +277,10 @@ func TranslateErrorCode(code int) string {
 		return "invalid_message_checksum"
 	case 4028:
 		return "invalid_key_value_length"
+	case 4032:
+		return "non_zero_timestamp"
+	case 4036:
+		return "invalid_messages_size"
 	case 4100:
 		return "invalid_offset"
 	case 4101:

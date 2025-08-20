@@ -15,15 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Iggy_SDK.Enums;
 using System.Runtime.CompilerServices;
+using Apache.Iggy.Enums;
 
-namespace Iggy_SDK.StringHandlers;
+namespace Apache.Iggy.StringHandlers;
 
 [InterpolatedStringHandler]
 internal ref struct MessageRequestInterpolationHandler
 {
     private DefaultInterpolatedStringHandler _innerHandler;
+
     internal MessageRequestInterpolationHandler(int literalLength, int formattedCount)
     {
         _innerHandler = new DefaultInterpolatedStringHandler(literalLength, formattedCount);
@@ -33,6 +34,7 @@ internal ref struct MessageRequestInterpolationHandler
     {
         _innerHandler.AppendLiteral(message);
     }
+
     internal void AppendFormatted<T>(T t)
     {
         switch (t)

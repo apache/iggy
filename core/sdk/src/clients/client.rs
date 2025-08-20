@@ -19,15 +19,20 @@
 use crate::clients::client_builder::IggyClientBuilder;
 use iggy_common::locking::{IggySharedMut, IggySharedMutFn};
 
+use crate::client_wrappers::client_wrapper::ClientWrapper;
+use crate::http::http_client::HttpClient;
 use crate::prelude::EncryptorKind;
 use crate::prelude::IggyConsumerBuilder;
 use crate::prelude::IggyError;
 use crate::prelude::IggyProducerBuilder;
+use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
 use async_broadcast::Receiver;
 use async_trait::async_trait;
-use iggy_binary_protocol::Client;
-use iggy_common::{Consumer, DiagnosticEvent, Partitioner};
+use iggy_binary_protocol::{Client, SystemClient};
+use iggy_common::{
+    ConnectionStringUtils, Consumer, DiagnosticEvent, Partitioner, TransportProtocol,
+};
 use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::spawn;
@@ -41,14 +46,14 @@ use tracing::{debug, error, info};
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct IggyClient {
-    pub(crate) client: IggySharedMut<Box<dyn Client>>,
+    pub(crate) client: IggySharedMut<ClientWrapper>,
     partitioner: Option<Arc<dyn Partitioner>>,
     pub(crate) encryptor: Option<Arc<EncryptorKind>>,
 }
 
 impl Default for IggyClient {
     fn default() -> Self {
-        IggyClient::new(Box::<TcpClient>::default())
+        IggyClient::new(ClientWrapper::Tcp(TcpClient::default()))
     }
 }
 
@@ -58,7 +63,7 @@ impl IggyClient {
         IggyClientBuilder::new()
     }
 
-    /// Creates a new `IggyClientBuilder`.
+    /// Creates a new `IggyClientBuilder` from the provided connection string.
     pub fn builder_from_connection_string(
         connection_string: &str,
     ) -> Result<IggyClientBuilder, IggyError> {
@@ -66,7 +71,7 @@ impl IggyClient {
     }
 
     /// Creates a new `IggyClient` with the provided client implementation for the specific transport.
-    pub fn new(client: Box<dyn Client>) -> Self {
+    pub fn new(client: ClientWrapper) -> Self {
         let client = IggySharedMut::new(client);
         IggyClient {
             client,
@@ -75,14 +80,24 @@ impl IggyClient {
         }
     }
 
+    /// Creates a new `IggyClient` from the provided connection string.
     pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
-        let client = Box::new(TcpClient::from_connection_string(connection_string)?);
-        Ok(IggyClient::new(client))
+        match ConnectionStringUtils::parse_protocol(connection_string)? {
+            TransportProtocol::Tcp => Ok(IggyClient::new(ClientWrapper::Tcp(
+                TcpClient::from_connection_string(connection_string)?,
+            ))),
+            TransportProtocol::Quic => Ok(IggyClient::new(ClientWrapper::Quic(
+                QuicClient::from_connection_string(connection_string)?,
+            ))),
+            TransportProtocol::Http => Ok(IggyClient::new(ClientWrapper::Http(
+                HttpClient::from_connection_string(connection_string)?,
+            ))),
+        }
     }
 
     /// Creates a new `IggyClient` with the provided client implementation for the specific transport and the optional implementations for the `partitioner` and `encryptor`.
     pub fn create(
-        client: Box<dyn Client>,
+        client: ClientWrapper,
         partitioner: Option<Arc<dyn Partitioner>>,
         encryptor: Option<Arc<EncryptorKind>>,
     ) -> Self {
@@ -102,7 +117,7 @@ impl IggyClient {
     }
 
     /// Returns the underlying client implementation for the specific transport.
-    pub fn client(&self) -> IggySharedMut<Box<dyn Client>> {
+    pub fn client(&self) -> IggySharedMut<ClientWrapper> {
         self.client.clone()
     }
 
@@ -198,5 +213,187 @@ impl Client for IggyClient {
 
     async fn subscribe_events(&self) -> Receiver<DiagnosticEvent> {
         self.client.read().await.subscribe_events().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_fail_with_empty_connection_string() {
+        let value = "";
+        let client = IggyClient::from_connection_string(value);
+        assert!(client.is_err());
+    }
+
+    #[test]
+    fn should_fail_without_username() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let client = IggyClient::from_connection_string(&value);
+        assert!(client.is_err());
+    }
+
+    #[test]
+    fn should_fail_without_password() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let client = IggyClient::from_connection_string(&value);
+        assert!(client.is_err());
+    }
+
+    #[test]
+    fn should_fail_without_server_address() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let client = IggyClient::from_connection_string(&value);
+        assert!(client.is_err());
+    }
+
+    #[test]
+    fn should_fail_without_port() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let client = IggyClient::from_connection_string(&value);
+        assert!(client.is_err());
+    }
+
+    #[test]
+    fn should_fail_with_invalid_prefix() {
+        let connection_string_prefix = "invalid+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let client = IggyClient::from_connection_string(&value);
+        assert!(client.is_err());
+    }
+
+    #[test]
+    fn should_succeed_with_default_prefix() {
+        let default_connection_string_prefix = "iggy://";
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{default_connection_string_prefix}{username}:{password}@{server_address}:{port}"
+        );
+        let client = IggyClient::from_connection_string(&value);
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn should_succeed_with_tcp_protocol() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let client = IggyClient::from_connection_string(&value);
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn should_succeed_with_tcp_protocol_using_pat() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Tcp;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let pat = "iggypat-1234567890abcdef";
+        let value = format!("{connection_string_prefix}{protocol}://{pat}@{server_address}:{port}");
+        let client = IggyClient::from_connection_string(&value);
+        assert!(client.is_ok());
+    }
+
+    #[tokio::test]
+    async fn should_succeed_with_quic_protocol() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Quic;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let client = IggyClient::from_connection_string(&value);
+        assert!(client.is_ok());
+    }
+
+    #[tokio::test]
+    async fn should_succeed_with_quic_protocol_using_pat() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Quic;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let pat = "iggypat-1234567890abcdef";
+        let value = format!("{connection_string_prefix}{protocol}://{pat}@{server_address}:{port}");
+        let client = IggyClient::from_connection_string(&value);
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn should_succeed_with_http_protocol() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Http;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let username = "user";
+        let password = "secret";
+        let value = format!(
+            "{connection_string_prefix}{protocol}://{username}:{password}@{server_address}:{port}"
+        );
+        let client = IggyClient::from_connection_string(&value);
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn should_succeed_with_http_protocol_with_pat() {
+        let connection_string_prefix = "iggy+";
+        let protocol = TransportProtocol::Http;
+        let server_address = "127.0.0.1";
+        let port = "1234";
+        let pat = "iggypat-1234567890abcdef";
+        let value = format!("{connection_string_prefix}{protocol}://{pat}@{server_address}:{port}");
+        let client = IggyClient::from_connection_string(&value);
+        assert!(client.is_ok());
     }
 }

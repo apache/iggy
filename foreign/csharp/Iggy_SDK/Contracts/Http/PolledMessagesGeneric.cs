@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK.Contracts.Http;
+namespace Apache.Iggy.Contracts.Http;
 
 public sealed class PolledMessages<T>
 {
@@ -28,6 +28,6 @@ public sealed class PolledMessages<T>
         {
             Messages = Array.Empty<MessageResponse<T>>().AsReadOnly(),
             CurrentOffset = 0,
-            PartitionId = 0,
+            PartitionId = 0
         };
 }

@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-namespace Iggy_SDK.Contracts.Http;
+namespace Apache.Iggy.Contracts.Http;
 
 public sealed class ConsumerGroupMember
 {
-    public required int Id { get; init; }
+    public required uint Id { get; init; }
     public required int PartitionsCount { get; init; }
     public required List<int> Partitions { get; init; }
 }
