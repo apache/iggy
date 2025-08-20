@@ -19,7 +19,9 @@
 use crate::quic::COMPONENT;
 use crate::streaming::utils::PooledBuffer;
 use crate::{binary::sender::Sender, server_error::ServerError};
+use compio::BufResult;
 use compio::buf::IoBufMut;
+use compio::io::AsyncReadExt;
 use compio_quic::{RecvStream, SendStream};
 use error_set::ErrContext;
 use iggy_common::IggyError;
@@ -36,11 +38,12 @@ pub struct QuicSender {
 impl Sender for QuicSender {
     /// Reads data from the QUIC stream directly into the buffer.
     async fn read<B: IoBufMut>(&mut self, buffer: B) -> (Result<(), IggyError>, B) {
-        let mut buffer = buffer;
-        match self.recv.read_exact(buffer.as_mut_slice()).await {
-            Ok(_) => (Ok(()), buffer),
-            Err(error) => {
-                error!("Failed to read from QUIC stream: {:?}", error);
+        let BufResult(result, buffer) =
+            <RecvStream as AsyncReadExt>::read_exact(&mut self.recv, buffer).await;
+        match (result, buffer) {
+            (Ok(_), buffer) => (Ok(()), buffer),
+            (Err(error), buffer) => {
+                error!("Failed to read from the stream: {:?}", error);
                 (Err(IggyError::QuicError), buffer)
             }
         }

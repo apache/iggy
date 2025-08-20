@@ -158,11 +158,6 @@ async fn handle_stream(
         }
     };
 
-    if let Err(e) = command.validate() {
-        sender.send_error_response(e.clone()).await?;
-        return Err(anyhow!("Command validation failed: {e}"));
-    }
-
     trace!("Received a QUIC command: {command}, payload size: {length}");
 
     match command.handle(&mut sender, length, &session, &shard).await {
