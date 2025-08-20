@@ -13,6 +13,8 @@ use iggy_common::IggyTimestamp;
 use slab::Slab;
 use std::sync::{Arc, atomic::AtomicU64};
 
+// TODO: Let's create type aliases for the fields that have maps for consumer/consumer_group offsets,
+// it's really difficult to distinguish between them when using the returned tuple from `into_components`.
 #[derive(Debug)]
 pub struct Partition {
     root: PartitionRoot,
@@ -196,6 +198,83 @@ impl<'a> IntoComponentsById for PartitionRef<'a> {
             &self.offset[index],
             &self.consumer_offset[index],
             &self.consumer_group_offset[index],
+        )
+    }
+}
+
+pub struct PartitionRefMut<'a> {
+    root: &'a mut Slab<PartitionRoot>,
+    stats: &'a mut Slab<Arc<PartitionStats>>,
+    message_deduplicator: &'a mut Slab<Option<MessageDeduplicator>>,
+    offset: &'a mut Slab<Arc<AtomicU64>>,
+    consumer_offset: &'a mut Slab<Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>>,
+    consumer_group_offset:
+        &'a mut Slab<Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>>,
+}
+
+impl<'a> PartitionRefMut<'a> {
+    pub fn new(
+        root: &'a mut Slab<PartitionRoot>,
+        stats: &'a mut Slab<Arc<PartitionStats>>,
+        message_deduplicator: &'a mut Slab<Option<MessageDeduplicator>>,
+        offset: &'a mut Slab<Arc<AtomicU64>>,
+        consumer_offset: &'a mut Slab<Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>>,
+        consumer_group_offset: &'a mut Slab<
+            Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>,
+        >,
+    ) -> Self {
+        Self {
+            root,
+            stats,
+            message_deduplicator,
+            offset,
+            consumer_offset,
+            consumer_group_offset,
+        }
+    }
+}
+
+impl<'a> IntoComponents for PartitionRefMut<'a> {
+    type Components = (
+        &'a mut Slab<PartitionRoot>,
+        &'a mut Slab<Arc<PartitionStats>>,
+        &'a mut Slab<Option<MessageDeduplicator>>,
+        &'a mut Slab<Arc<AtomicU64>>,
+        &'a mut Slab<Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>>,
+        &'a mut Slab<Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>>,
+    );
+
+    fn into_components(self) -> Self::Components {
+        (
+            self.root,
+            self.stats,
+            self.message_deduplicator,
+            self.offset,
+            self.consumer_offset,
+            self.consumer_group_offset,
+        )
+    }
+}
+
+impl<'a> IntoComponentsById for PartitionRefMut<'a> {
+    type Idx = partitions::ContainerId;
+    type Output = (
+        &'a mut PartitionRoot,
+        &'a mut Arc<PartitionStats>,
+        &'a mut Option<MessageDeduplicator>,
+        &'a mut Arc<AtomicU64>,
+        &'a mut Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>,
+        &'a mut Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>,
+    );
+
+    fn into_components_by_id(self, index: Self::Idx) -> Self::Output {
+        (
+            &mut self.root[index],
+            &mut self.stats[index],
+            &mut self.message_deduplicator[index],
+            &mut self.offset[index],
+            &mut self.consumer_offset[index],
+            &mut self.consumer_group_offset[index],
         )
     }
 }

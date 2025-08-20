@@ -40,31 +40,6 @@ pub fn rename_index(
     }
 }
 
-// Partitions
-pub fn delete_partitions(
-    partitions_count: u32,
-) -> impl FnOnce(&mut Partitions) -> Vec<partition2::Partition> {
-    move |partitions| {
-        let current_count = partitions.len() as u32;
-        let partitions_to_delete = partitions_count.min(current_count);
-        let start_idx = (current_count - partitions_to_delete) as usize;
-        let range = start_idx..current_count as usize;
-        range
-            .map(|idx| {
-                let partition = partitions.delete(idx);
-                assert_eq!(partition.id(), idx);
-                partition
-            })
-            .collect()
-    }
-}
-
-pub fn insert_partition(
-    partition: partition2::Partition,
-) -> impl FnOnce(ComponentsById<TopicRefMut>) -> partitions::ContainerId {
-    move |(mut root, _)| root.partitions_mut().insert(partition)
-}
-
 // Topics
 pub fn get_stats() -> impl FnOnce(ComponentsById<TopicRef>) -> Arc<TopicStats> {
     |(_, stats)| stats.clone()
@@ -89,6 +64,10 @@ pub fn delete_topic(topic_id: &Identifier) -> impl FnOnce(&Topics) -> Topic {
         assert_eq!(topic.id(), id, "delete_topic: topic ID mismatch");
         topic
     }
+}
+
+pub fn purge_topic_disk() -> impl AsyncFnOnce(ComponentsById<TopicRef>) {
+    async |(root, ..)| {}
 }
 
 pub fn exists(identifier: &Identifier) -> impl FnOnce(&Topics) -> bool {
@@ -121,7 +100,7 @@ pub fn update_topic(
 // Consumer Groups
 pub fn get_consumer_group_id()
 -> impl FnOnce(ComponentsById<ConsumerGroupRef>) -> consumer_groups::ContainerId {
-    |(root, _)| root.id()
+    |(root, ..)| root.id()
 }
 
 pub fn delete_consumer_group(
@@ -154,6 +133,19 @@ pub fn leave_consumer_group(
         let partitions = root.partitions();
         let id = root.id();
         delete_member(shard_id, id, client_id, members, partitions);
+    }
+}
+
+pub fn get_consumer_group_member_id(
+    client_id: u32,
+) -> impl FnOnce(ComponentsById<ConsumerGroupRef>) -> usize {
+    move |(_, members)| {
+        members
+            .inner()
+            .shared_get()
+            .iter()
+            .find_map(|(_, member)| (member.client_id == client_id).then_some(member.id))
+            .expect("get_member_id: find member in consumer group slab")
     }
 }
 

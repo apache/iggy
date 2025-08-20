@@ -3,7 +3,7 @@ use crate::{
         Keyed,
         consumer_groups::ConsumerGroups,
         helpers,
-        partitions::Partitions,
+        partitions::{self, Partitions},
         topics::Topics,
         traits_ext::{
             ComponentsById, ComponentsByIdMapping, ComponentsMapping, DeleteCell,
@@ -12,6 +12,7 @@ use crate::{
         },
     },
     streaming::{
+        partitions::partition2::{PartitionRef, PartitionRefMut},
         stats::stats::StreamStats,
         streams::stream2::{self, StreamRef, StreamRefMut},
         topics::{
@@ -336,6 +337,42 @@ impl Streams {
     ) -> T {
         self.with_topics_mut(stream_id, |container| {
             container.with_partitions_mut(topic_id, f)
+        })
+    }
+
+    pub fn with_partition_by_id<T>(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        id: partitions::ContainerId,
+        f: impl FnOnce(ComponentsById<PartitionRef>) -> T,
+    ) -> T {
+        self.with_partitions(stream_id, topic_id, |container| {
+            container.with_partition_by_id(id, f)
+        })
+    }
+
+    pub fn with_partition_by_id_async<T>(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        id: partitions::ContainerId,
+        f: impl AsyncFnOnce(ComponentsById<PartitionRef>) -> T,
+    ) -> impl Future<Output = T> {
+        self.with_partitions_async(stream_id, topic_id, async move |container| {
+            container.with_partition_by_id_async(id, f).await
+        })
+    }
+
+    pub fn with_partition_by_id_mut<T>(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        id: partitions::ContainerId,
+        f: impl FnOnce(ComponentsById<PartitionRefMut>) -> T,
+    ) -> T {
+        self.with_partitions_mut(stream_id, topic_id, |container| {
+            container.with_partition_by_id_mut(id, f)
         })
     }
 

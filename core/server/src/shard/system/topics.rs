@@ -24,7 +24,7 @@ use crate::streaming::session::Session;
 use crate::streaming::stats::stats::{StreamStats, TopicStats};
 use crate::streaming::topics::storage2::create_topic_file_hierarchy;
 use crate::streaming::topics::topic2::{self, resolve_max_topic_size, resolve_message_expiry};
-use crate::streaming::{streams, topics};
+use crate::streaming::{partitions, streams, topics};
 use error_set::ErrContext;
 use iggy_common::{
     CompressionAlgorithm, Identifier, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize,
@@ -301,6 +301,19 @@ impl IggyShard {
             })?;
         }
 
+        self.streams2.with_partitions_mut(
+            stream_id,
+            topic_id,
+            partitions::helpers::purge_partitions_mem(),
+        );
+        self.streams2.with_partitions_mut(
+            stream_id,
+            topic_id,
+            partitions::helpers::purge_segments_mem(),
+        );
+        self.streams2
+            .with_topic_by_id_async(stream_id, topic_id, topics::helpers::purge_topic_disk())
+            .await;
         Ok(())
     }
 

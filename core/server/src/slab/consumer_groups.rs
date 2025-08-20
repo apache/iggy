@@ -129,7 +129,7 @@ impl ConsumerGroups {
         f: impl FnOnce(ComponentsById<ConsumerGroupRef>) -> T,
     ) -> T {
         let id = self.get_index(identifier);
-        self.with_components(|components| f(components.into_components_by_id(id)))
+        self.with_components_by_id(id, |components| f(components))
     }
 
     pub fn with_consumer_group_by_id_mut<T>(
@@ -138,7 +138,7 @@ impl ConsumerGroups {
         f: impl FnOnce(ComponentsById<ConsumerGroupRefMut>) -> T,
     ) -> T {
         let id = self.get_index(identifier);
-        self.with_components_mut(|components| f(components.into_components_by_id(id)))
+        self.with_components_mut_by_id(id, |components| f(components))
     }
 
     pub fn with_consumer_group_by_id_async<T>(
@@ -147,9 +147,7 @@ impl ConsumerGroups {
         f: impl AsyncFnOnce(ComponentsById<ConsumerGroupRef>) -> T,
     ) -> impl Future<Output = T> {
         let id = self.get_index(identifier);
-        self.with_components_async(async move |components| {
-            f(components.into_components_by_id(id)).await
-        })
+        self.with_components_by_id_async(id, async |components| f(components).await)
     }
 }
 

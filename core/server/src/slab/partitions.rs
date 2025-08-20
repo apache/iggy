@@ -1,10 +1,13 @@
 use crate::{
-    slab::traits_ext::{Borrow, Delete, EntityComponentSystem, Insert, IntoComponents},
+    slab::traits_ext::{
+        Borrow, ComponentsById, Delete, EntityComponentSystem, EntityComponentSystemMut, Insert,
+        IntoComponents,
+    },
     streaming::{
         deduplication::message_deduplicator::MessageDeduplicator,
         partitions::{
             consumer_offset,
-            partition2::{self, Partition, PartitionRef},
+            partition2::{self, Partition, PartitionRef, PartitionRefMut},
         },
         segments,
         stats::stats::PartitionStats,
@@ -96,6 +99,19 @@ impl<'a> From<&'a Partitions> for PartitionRef<'a> {
     }
 }
 
+impl<'a> From<&'a mut Partitions> for PartitionRefMut<'a> {
+    fn from(value: &'a mut Partitions) -> Self {
+        PartitionRefMut::new(
+            &mut value.root,
+            &mut value.stats,
+            &mut value.message_deduplicator,
+            &mut value.offset,
+            &mut value.consumer_offset,
+            &mut value.consumer_group_offset,
+        )
+    }
+}
+
 impl EntityComponentSystem<Borrow> for Partitions {
     type Idx = ContainerId;
     type Entity = Partition;
@@ -113,6 +129,24 @@ impl EntityComponentSystem<Borrow> for Partitions {
         F: for<'a> AsyncFnOnce(Self::EntityComponents<'a>) -> O,
     {
         f(self.into())
+    }
+}
+
+impl EntityComponentSystemMut for Partitions {
+    type EntityComponentsMut<'a> = PartitionRefMut<'a>;
+
+    fn with_components_mut<O, F>(&mut self, f: F) -> O
+    where
+        F: for<'a> FnOnce(Self::EntityComponentsMut<'a>) -> O,
+    {
+        f(self.into())
+    }
+
+    fn with_components_by_id_mut<O, F>(&mut self, id: Self::Idx, f: F) -> O
+    where
+        F: for<'a> FnOnce(ComponentsById<'a, Self::EntityComponentsMut<'a>>) -> O,
+    {
+        self.with_components_mut(|components| f(components.into_components_by_id(id)))
     }
 }
 
@@ -135,31 +169,27 @@ impl Partitions {
         self.root.len()
     }
 
-    pub fn with_stats<T>(&self, f: impl FnOnce(&Slab<Arc<PartitionStats>>) -> T) -> T {
-        let stats = &self.stats;
-        f(stats)
-    }
-
-    pub fn with_stats_mut<T>(&mut self, f: impl FnOnce(&mut Slab<Arc<PartitionStats>>) -> T) -> T {
-        f(&mut self.stats)
-    }
-
-    pub fn with_segments(&self, partition_id: usize, f: impl FnOnce(&Vec<segments::Segment2>)) {
-        let segments = &self.segments[partition_id];
-        f(segments);
-    }
-
-    pub fn with_segment_id(
+    pub fn with_partition_by_id<T>(
         &self,
-        partition_id: usize,
-        segment_id: usize,
-        f: impl FnOnce(&segments::Segment2),
-    ) {
-        self.with_segments(partition_id, |segments| {
-            // we could binary search for that segment technically, but this is fine for now.
-            if let Some(segment) = segments.iter().find(|s| s.id == segment_id) {
-                f(segment);
-            }
-        });
+        id: ContainerId,
+        f: impl FnOnce(ComponentsById<PartitionRef>) -> T,
+    ) -> T {
+        self.with_components_by_id(id, |components| f(components))
+    }
+
+    pub fn with_partition_by_id_mut<T>(
+        &mut self,
+        id: ContainerId,
+        f: impl FnOnce(ComponentsById<PartitionRefMut>) -> T,
+    ) -> T {
+        self.with_components_by_id_mut(id, |components| f(components))
+    }
+
+    pub fn with_partition_by_id_async<T>(
+        &self,
+        id: ContainerId,
+        f: impl AsyncFnOnce(ComponentsById<PartitionRef>) -> T,
+    ) -> impl Future<Output = T> {
+        self.with_components_by_id_async(id, async move |components| f(components).await)
     }
 }

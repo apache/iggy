@@ -287,7 +287,9 @@ pub enum IggyError {
     #[error("Failed to read consumers offsets from path: {0}")]
     CannotReadConsumerOffsets(String) = 3020,
     #[error("Consumer offset for consumer with ID: {0} was not found.")]
-    ConsumerOffsetNotFound(u32) = 3021,
+    ConsumerOffsetNotFound(usize) = 3021,
+    #[error("Failed to resolve consumer with ID: {0}")]
+    NotResolvedConsumer(Identifier) = 3022,
     #[error("Segment not found")]
     SegmentNotFound = 4000,
     #[error("Segment with start offset: {0} and partition with ID: {1} is closed")]

@@ -20,14 +20,6 @@ use super::persistence::persister::PersisterKind;
 use crate::configs::system::SystemConfig;
 use crate::shard::system::info::SystemInfo;
 use crate::shard::system::storage::FileSystemInfoStorage;
-use crate::state::system::{PartitionState, StreamState, TopicState};
-use crate::streaming::partitions::partition::{ConsumerOffset, Partition};
-use crate::streaming::partitions::storage::FilePartitionStorage;
-use crate::streaming::streams::storage::FileStreamStorage;
-use crate::streaming::streams::stream::Stream;
-use crate::streaming::topics::storage::FileTopicStorage;
-use crate::streaming::topics::topic::Topic;
-use iggy_common::ConsumerKind;
 use iggy_common::IggyError;
 #[cfg(test)]
 use mockall::automock;
@@ -62,84 +54,15 @@ pub enum SystemInfoStorageKind {
     Mock(MockSystemInfoStorage),
 }
 
-#[derive(Debug)]
-pub enum StreamStorageKind {
-    File(FileStreamStorage),
-    #[cfg(test)]
-    Mock(MockStreamStorage),
-}
-
-#[derive(Debug)]
-pub enum TopicStorageKind {
-    File(FileTopicStorage),
-    #[cfg(test)]
-    Mock(MockTopicStorage),
-}
-
-#[derive(Debug)]
-pub enum PartitionStorageKind {
-    File(FilePartitionStorage),
-    #[cfg(test)]
-    Mock(MockPartitionStorage),
-}
-
 #[cfg_attr(test, automock)]
 pub trait SystemInfoStorage {
     fn load(&self) -> impl Future<Output = Result<SystemInfo, IggyError>>;
     fn save(&self, system_info: &SystemInfo) -> impl Future<Output = Result<(), IggyError>>;
 }
 
-#[cfg_attr(test, automock)]
-pub trait StreamStorage {
-    fn load(
-        &self,
-        stream: &mut Stream,
-        state: StreamState,
-    ) -> impl Future<Output = Result<(), IggyError>>;
-    fn save(&self, stream: &Stream) -> impl Future<Output = Result<(), IggyError>>;
-    fn delete(&self, stream: &Stream) -> impl Future<Output = Result<(), IggyError>>;
-}
-
-#[cfg_attr(test, automock)]
-pub trait TopicStorage {
-    fn load(
-        &self,
-        topic: &mut Topic,
-        state: TopicState,
-    ) -> impl Future<Output = Result<(), IggyError>>;
-    fn save(&self, topic: &Topic) -> impl Future<Output = Result<(), IggyError>>;
-    fn delete(&self, topic: &Topic) -> impl Future<Output = Result<(), IggyError>>;
-}
-
-#[cfg_attr(test, automock)]
-pub trait PartitionStorage {
-    fn load(
-        &self,
-        partition: &mut Partition,
-        state: PartitionState,
-    ) -> impl Future<Output = Result<(), IggyError>>;
-    fn save(&self, partition: &mut Partition) -> impl Future<Output = Result<(), IggyError>>;
-    fn delete(&self, partition: &Partition) -> impl Future<Output = Result<(), IggyError>>;
-    fn save_consumer_offset(
-        &self,
-        offset: u64,
-        path: &str,
-    ) -> impl Future<Output = Result<(), IggyError>>;
-    fn load_consumer_offsets(
-        &self,
-        kind: ConsumerKind,
-        path: &str,
-    ) -> impl Future<Output = Result<Vec<ConsumerOffset>, IggyError>>;
-    fn delete_consumer_offsets(&self, path: &str) -> impl Future<Output = Result<(), IggyError>>;
-    fn delete_consumer_offset(&self, path: &str) -> impl Future<Output = Result<(), IggyError>>;
-}
-
 #[derive(Debug, Clone)]
 pub struct SystemStorage {
     pub info: Arc<SystemInfoStorageKind>,
-    pub stream: Arc<StreamStorageKind>,
-    pub topic: Arc<TopicStorageKind>,
-    pub partition: Arc<PartitionStorageKind>,
     pub persister: Arc<PersisterKind>,
 }
 
@@ -148,11 +71,6 @@ impl SystemStorage {
         Self {
             info: Arc::new(SystemInfoStorageKind::File(FileSystemInfoStorage::new(
                 config.get_state_info_path(),
-                persister.clone(),
-            ))),
-            stream: Arc::new(StreamStorageKind::File(FileStreamStorage)),
-            topic: Arc::new(TopicStorageKind::File(FileTopicStorage)),
-            partition: Arc::new(PartitionStorageKind::File(FilePartitionStorage::new(
                 persister.clone(),
             ))),
             persister,
@@ -164,38 +82,5 @@ impl SystemInfoStorageKind {
     forward_async_methods! {
         async fn load(&self) -> Result<SystemInfo, IggyError>;
         async fn save(&self, system_info: &SystemInfo) -> Result<(), IggyError>;
-    }
-}
-
-impl StreamStorageKind {
-    forward_async_methods! {
-        async fn load(&self, stream: &mut Stream, state: StreamState) -> Result<(), IggyError>;
-        async fn save(&self, stream: &Stream) -> Result<(), IggyError>;
-        async fn delete(&self, stream: &Stream) -> Result<(), IggyError>;
-    }
-}
-
-impl TopicStorageKind {
-    forward_async_methods! {
-        async fn load(&self, topic: &mut Topic, state: TopicState) -> Result<(), IggyError>;
-        async fn save(&self, topic: &Topic) -> Result<(), IggyError>;
-        async fn delete(&self, topic: &Topic) -> Result<(), IggyError>;
-    }
-}
-
-impl PartitionStorageKind {
-    forward_async_methods! {
-        async fn load(&self, partition: &mut Partition, state: PartitionState)
-            -> Result<(), IggyError>;
-        async fn save(&self, partition: &mut Partition) -> Result<(), IggyError>;
-        async fn delete(&self, partition: &Partition) -> Result<(), IggyError>;
-        async fn save_consumer_offset(&self, offset: u64, path: &str) -> Result<(), IggyError>;
-        async fn load_consumer_offsets(
-            &self,
-            kind: ConsumerKind,
-            path: &str
-        ) -> Result<Vec<ConsumerOffset>, IggyError>;
-        async fn delete_consumer_offsets(&self, path: &str) -> Result<(), IggyError>;
-        async fn delete_consumer_offset(&self, path: &str) -> Result<(), IggyError>;
     }
 }

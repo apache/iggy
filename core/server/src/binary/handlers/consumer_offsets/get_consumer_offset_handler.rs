@@ -44,7 +44,7 @@ impl ServerCommandHandler for GetConsumerOffset {
         let Ok(offset) = shard
             .get_consumer_offset(
                 session,
-                &self.consumer,
+                self.consumer,
                 &self.stream_id,
                 &self.topic_id,
                 self.partition_id,

@@ -11,11 +11,20 @@ pub struct ConsumerOffset {
 }
 
 impl ConsumerOffset {
-    pub fn new(kind: ConsumerKind, consumer_id: u32, offset: u64, path: &str) -> ConsumerOffset {
-        ConsumerOffset {
-            kind,
+    pub fn default_for_consumer(consumer_id: u32, path: &str) -> Self {
+        Self {
+            kind: ConsumerKind::Consumer,
             consumer_id,
-            offset: AtomicU64::new(offset),
+            offset: AtomicU64::new(0),
+            path: format!("{path}/{consumer_id}"),
+        }
+    }
+
+    pub fn default_for_consumer_group(consumer_id: u32, path: &str) -> Self {
+        Self {
+            kind: ConsumerKind::ConsumerGroup,
+            consumer_id,
+            offset: AtomicU64::new(0),
             path: format!("{path}/{consumer_id}"),
         }
     }

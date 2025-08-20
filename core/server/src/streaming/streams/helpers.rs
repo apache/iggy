@@ -1,7 +1,15 @@
 use crate::{
-    slab::{streams, traits_ext::ComponentsById},
-    streaming::streams::stream2::{StreamRef, StreamRefMut, StreamRoot},
+    configs::system::SystemConfig,
+    slab::{
+        streams,
+        traits_ext::{ComponentsById, EntityComponentSystem},
+    },
+    streaming::{
+        partitions,
+        streams::stream2::{StreamRef, StreamRefMut},
+    },
 };
+use iggy_common::Identifier;
 
 pub fn get_stream_id() -> impl FnOnce(ComponentsById<StreamRef>) -> streams::ContainerId {
     |(root, _)| root.id()
@@ -14,5 +22,59 @@ pub fn get_stream_name() -> impl FnOnce(ComponentsById<StreamRef>) -> String {
 pub fn update_stream_name(name: String) -> impl FnOnce(ComponentsById<StreamRefMut>) {
     move |(mut root, _)| {
         root.set_name(name);
+    }
+}
+
+pub fn store_consumer_offset(
+    consumer_id: usize,
+    topic_id: &Identifier,
+    partition_id: usize,
+    offset: u64,
+    config: &SystemConfig,
+) -> impl FnOnce(ComponentsById<StreamRef>) {
+    let topic_id = *topic_id;
+    move |(root, ..)| {
+        let stream_id = root.id();
+        root.topics().with_topic_by_id(&topic_id, |(root, ..)| {
+            let topic_id = root.id();
+            root.partitions().with_components_by_id(
+                partition_id,
+                partitions::helpers::store_consumer_offset(
+                    consumer_id,
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    offset,
+                    config,
+                ),
+            )
+        })
+    }
+}
+
+pub fn store_consumer_group_member_offset(
+    member_id: usize,
+    topic_id: &Identifier,
+    partition_id: usize,
+    offset: u64,
+    config: &SystemConfig,
+) -> impl FnOnce(ComponentsById<StreamRef>) {
+    let topic_id = *topic_id;
+    move |(root, ..)| {
+        let stream_id = root.id();
+        root.topics().with_topic_by_id(&topic_id, |(root, ..)| {
+            let topic_id = root.id();
+            root.partitions().with_components_by_id(
+                partition_id,
+                partitions::helpers::store_consumer_group_member_offset(
+                    member_id,
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    offset,
+                    config,
+                ),
+            )
+        })
     }
 }

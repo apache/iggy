@@ -21,6 +21,7 @@ use crate::configs::system::SystemConfig;
 use crate::shard::IggyShard;
 use crate::slab::traits_ext::EntityMarker;
 use crate::streaming::deduplication::message_deduplicator::MessageDeduplicator;
+use crate::streaming::partitions;
 use crate::streaming::partitions::partition2;
 use crate::streaming::partitions::storage2::create_partition_file_hierarchy;
 use crate::streaming::session::Session;
@@ -171,10 +172,10 @@ impl IggyShard {
         topic_id: &Identifier,
         partition: partition2::Partition,
     ) -> usize {
-        self.streams2.with_topic_by_id_mut(
+        self.streams2.with_partitions_mut(
             stream_id,
             topic_id,
-            topics::helpers::insert_partition(partition),
+            partitions::helpers::insert_partition(partition),
         )
     }
 
@@ -258,7 +259,7 @@ impl IggyShard {
         self.streams2.with_partitions_mut(
             stream_id,
             topic_id,
-            topics::helpers::delete_partitions(partitions_count),
+            partitions::helpers::delete_partitions(partitions_count),
         )
     }
 

@@ -1,5 +1,8 @@
-use crate::{configs::system::SystemConfig, shard_error, shard_info};
-use compio::fs::create_dir_all;
+use crate::{configs::system::SystemConfig, shard_error, shard_info, shard_trace};
+use compio::{
+    fs::{self, OpenOptions, create_dir_all},
+    io::AsyncWriteAtExt,
+};
 use iggy_common::IggyError;
 use std::path::Path;
 
@@ -88,5 +91,31 @@ pub async fn create_partition_file_hierarchy(
         partition_path
     );
 
+    Ok(())
+}
+
+pub async fn delete_persisted_offset(shard_id: u16, path: &str) -> Result<(), IggyError> {
+    if !Path::new(path).exists() {
+        shard_trace!(shard_id, "Consumer offset file does not exist: {path}.");
+        return Ok(());
+    }
+
+    if fs::remove_file(path).await.is_err() {
+        shard_error!(shard_id, "Cannot delete consumer offset file: {path}.");
+        return Err(IggyError::CannotDeleteConsumerOffsetFile(path.to_owned()));
+    }
+    Ok(())
+}
+
+pub async fn persist_offset(shard_id: u16, path: &str, offset: u64) -> Result<(), IggyError> {
+    let file = OpenOptions::new().write(true).create(true).open(path).await?;
+    let buf = offset.to_le_bytes();
+    file.write_all_at(buf, 0).await?;
+    shard_trace!(
+        shard_id,
+        "Stored consumer offset value: {}, path: {}",
+        offset,
+        path
+    );
     Ok(())
 }
