@@ -1,5 +1,7 @@
 {
   "rust": [
+    "Dockerfile",
+    "Dockerfile.debug",
     "core/(bench|cli|examples|integration|sdk|server|tools|connectors|ai).*\\.rs",
     "bdd/rust/.*\\.rs",
     "core/Cargo.toml",
@@ -9,12 +11,16 @@
     ".github/workflows/ci-check-pr.yml"
   ],
   "shell": [
+    "Dockerfile",
+    "Dockerfile.debug",
     ".github/scripts/.*\\.sh",
     "scripts/.*\\.sh",
     ".github/workflows/ci-.*-shell.yml",
     ".github/workflows/ci-check-pr.yml"
   ],
   "rust-prod": [
+    "Dockerfile",
+    "Dockerfile.debug",
     "core/(bench|cli|examples|integration|sdk|server|tools|connectors|ai).*\\.rs",
     "bdd/rust/.*\\.rs",
     "core/Cargo.toml",
@@ -24,6 +30,8 @@
     ".github/workflows/ci-prod-rust.yml"
   ],
   "go-sdk": [
+    "Dockerfile",
+    "Dockerfile.debug",
     "foreign/go/.*\\.go",
     "foreign/go/go.mod",
     "foreign/go/go.sum",
@@ -36,12 +44,16 @@
     ".github/workflows/ci-check-go-sdk.yml"
   ],
   "java-sdk": [
+    "Dockerfile",
+    "Dockerfile.debug",
     "foreign/java/.*\\.java",
     "foreign/java/.*\\.kts",
     "foreign/java/.*\\.sh",
     ".github/workflows/ci-check-java-sdk.yml"
   ],
   "python-sdk": [
+    "Dockerfile",
+    "Dockerfile.debug",
     "foreign/python/.*\\.py",
     "foreign/python/.*\\.rs",
     "bdd/python/.*\\.py",
@@ -55,17 +67,23 @@
     ".github/workflows/ci-check-python-sdk.yml"
   ],
   "node-sdk": [
+    "Dockerfile",
+    "Dockerfile.debug",
     "foreign/node/.*\\.ts",
     "foreign/node/.*\\.js",
     "foreign/node/.*\\.json",
     ".github/workflows/ci-check-node-sdk.yml"
   ],
   "csharp-sdk": [
+    "Dockerfile",
+    "Dockerfile.debug",
     "foreign/csharp/.*\\.cs",
     "foreign/csharp/.*\\.csproj",
     ".github/workflows/ci-check-csharp-sdk.yml"
   ],
   "bdd": [
+    "Dockerfile",
+    "Dockerfile.debug",
     "bdd/.*\\.feature",
     "bdd/.*\\.py",
     "bdd/.*\\.rs",

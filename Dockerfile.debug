@@ -16,7 +16,8 @@
 # under the License.
 
 # Debug/test build for faster compilation during development and testing
-FROM rust:1.89 AS builder
+FROM rust:1.89.0-alpine3.22 AS builder
+RUN apk add musl-dev
 WORKDIR /build
 COPY . /build
 # Build in debug mode for faster compilation times during testing
