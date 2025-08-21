@@ -47,9 +47,9 @@ impl ServerCommandHandler for DeleteTopic {
     ) -> Result<(), IggyError> {
         // TODO: There is a correctness bug,
         // We have to first apply the state, then proceed with deleting the topic from the disk.
-        // Otherwise if we would delete the topic from disk first, and then the state would fail
-        // we would end up in a state where the topic is deleted from disk, but during state recreation it would be recreated,
-        // without persisted messages in the partitions.
+        // Otherwise if we delete the topic from disk first and the server crashes
+        // we end up in a state where the topic is deleted from the disk, but during state recreation it would be recreated,
+        // without it's segments.
         debug!("session: {session}, command: {self}");
         let topic = shard
             .delete_topic2(session, &self.stream_id, &self.topic_id)
@@ -71,8 +71,6 @@ impl ServerCommandHandler for DeleteTopic {
             topic_id: self.topic_id.clone(),
         };
         let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
-        // Drop the topic to force readers/writers to be dropped.
-        drop(topic);
         // TODO: Remove all the files and directories.
 
         shard

@@ -1,21 +1,21 @@
 /* Licensed to the Apache Software Foundation (ASF) under one
-        polling_consumer: &PollingConsumer,
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
- */
+       polling_consumer: &PollingConsumer,
+* or more contributor license agreements.  See the NOTICE file
+* distributed with this work for additional information
+* regarding copyright ownership.  The ASF licenses this file
+* to you under the Apache License, Version 2.0 (the
+* "License"); you may not use this file except in compliance
+* with the License.  You may obtain a copy of the License at
+*
+*   http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing,
+* software distributed under the License is distributed on an
+* "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+* KIND, either express or implied.  See the License for the
+* specific language governing permissions and limitations
+* under the License.
+*/
 
 use super::COMPONENT;
 use crate::{
@@ -75,12 +75,8 @@ impl IggyShard {
             partition_id,
             offset,
         );
-        self.persist_consumer_offset_to_disk(
-            stream_id,
-            topic_id,
-            &polling_consumer,
-            partition_id,
-        ).await?;
+        self.persist_consumer_offset_to_disk(stream_id, topic_id, &polling_consumer, partition_id)
+            .await?;
         Ok((polling_consumer, partition_id))
     }
 
@@ -105,7 +101,7 @@ impl IggyShard {
                 .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
             self.permissioner.borrow().get_consumer_offset(
                 session.get_user_id(),
-                stream_id as u32,   
+                stream_id as u32,
                 topic_id as u32
             ).with_error_context(|error| {
                 format!(
@@ -184,7 +180,8 @@ impl IggyShard {
         };
 
         self.delete_consumer_offset_base(stream_id, topic_id, &polling_consumer, partition_id)?;
-        self.delete_consumer_offset_from_disk(stream_id, topic_id, &polling_consumer, partition_id).await?;
+        self.delete_consumer_offset_from_disk(stream_id, topic_id, &polling_consumer, partition_id)
+            .await?;
         Ok((polling_consumer, partition_id))
     }
 
@@ -261,20 +258,26 @@ impl IggyShard {
     ) -> Result<(), IggyError> {
         match polling_consumer {
             PollingConsumer::Consumer(id, _) => {
-                self.streams2.with_partition_by_id_async(
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    partitions::helpers::persist_consumer_offset_to_disk(self.id, *id)
-                ).await
+                self.streams2
+                    .with_partition_by_id_async(
+                        stream_id,
+                        topic_id,
+                        partition_id,
+                        partitions::helpers::persist_consumer_offset_to_disk(self.id, *id),
+                    )
+                    .await
             }
             PollingConsumer::ConsumerGroup(_, id) => {
-                self.streams2.with_partition_by_id_async(
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    partitions::helpers::persist_consumer_group_member_offset_to_disk(self.id, *id)
-                ).await
+                self.streams2
+                    .with_partition_by_id_async(
+                        stream_id,
+                        topic_id,
+                        partition_id,
+                        partitions::helpers::persist_consumer_group_member_offset_to_disk(
+                            self.id, *id,
+                        ),
+                    )
+                    .await
             }
         }
     }
@@ -303,7 +306,9 @@ impl IggyShard {
                         stream_id,
                         topic_id,
                         partition_id,
-                        partitions::helpers::delete_consumer_group_member_offset_from_disk(self.id, *id),
+                        partitions::helpers::delete_consumer_group_member_offset_from_disk(
+                            self.id, *id,
+                        ),
                     )
                     .await
             }

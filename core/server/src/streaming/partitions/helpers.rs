@@ -11,12 +11,10 @@ use crate::{
             IntoComponents,
         },
     },
-    streaming::{
-        partitions::{
-            consumer_offset::ConsumerOffset,
-            partition2::{self, PartitionRef, PartitionRefMut},
-            storage2,
-        },
+    streaming::partitions::{
+        consumer_offset::ConsumerOffset,
+        partition2::{self, PartitionRef, PartitionRefMut},
+        storage2,
     },
 };
 
@@ -131,8 +129,7 @@ pub fn persist_consumer_offset_to_disk(
             .get(&id)
             .expect("persist_consumer_offset_to_disk: offset not found");
         let offset = item.offset.load(Ordering::Relaxed);
-        storage2::persist_offset(shard_id, &item.path, offset)
-            .await
+        storage2::persist_offset(shard_id, &item.path, offset).await
     }
 }
 
@@ -193,8 +190,7 @@ pub fn persist_consumer_group_member_offset_to_disk(
             .get(&id)
             .expect("persist_consumer_group_member_offset_to_disk: offset not found");
         let offset = item.offset.load(Ordering::Relaxed);
-        storage2::persist_offset(shard_id, &item.path, offset)
-            .await
+        storage2::persist_offset(shard_id, &item.path, offset).await
     }
 }
 

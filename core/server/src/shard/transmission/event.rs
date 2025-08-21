@@ -43,7 +43,7 @@ pub enum ShardEvent {
         stream_id: Identifier,
         topic_id: Identifier,
         partitions_count: u32,
-        partition_ids: Vec<u32>,
+        partition_ids: Vec<usize>,
     },
     CreatedTopic2 {
         stream_id: Identifier,
@@ -82,14 +82,14 @@ pub enum ShardEvent {
         stream_id: Identifier,
         topic_id: Identifier,
         partition_id: usize,
-        consumer: PollingConsumer,
+        polling_consumer: PollingConsumer,
         offset: u64,
     },
     DeletedOffset {
         stream_id: Identifier,
         topic_id: Identifier,
         partition_id: usize,
-        consumer: PollingConsumer,
+        polling_consumer: PollingConsumer,
     },
     CreatedUser {
         username: String,

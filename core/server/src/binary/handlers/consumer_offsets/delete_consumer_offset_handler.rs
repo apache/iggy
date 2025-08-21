@@ -59,7 +59,7 @@ impl ServerCommandHandler for DeleteConsumerOffset {
             stream_id: self.stream_id,
             topic_id: self.topic_id,
             partition_id,
-            consumer: polling_consumer,
+            polling_consumer,
         };
         let _responses = shard.broadcast_event_to_all_shards(event).await;
         sender.send_empty_ok_response().await?;

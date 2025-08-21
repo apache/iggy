@@ -56,6 +56,10 @@ impl StreamRoot {
         self.topics.len()
     }
 
+    pub fn remove_topics(&mut self) -> Topics {
+        std::mem::take(&mut self.topics)
+    }
+
     pub fn topics(&self) -> &Topics {
         &self.topics
     }
@@ -107,6 +111,10 @@ impl Stream {
 
     pub fn root(&self) -> &StreamRoot {
         &self.root
+    }
+
+    pub fn root_mut(&mut self) -> &mut StreamRoot {
+        &mut self.root
     }
 }
 

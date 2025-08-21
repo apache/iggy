@@ -1,4 +1,7 @@
-use crate::{configs::system::SystemConfig, shard_error, shard_info, shard_trace};
+use crate::{
+    configs::system::SystemConfig, io::fs_utils::remove_dir_all, shard_error, shard_info,
+    shard_trace, streaming::segments::Segment2,
+};
 use compio::{
     fs::{self, OpenOptions, create_dir_all},
     io::AsyncWriteAtExt,
@@ -94,6 +97,32 @@ pub async fn create_partition_file_hierarchy(
     Ok(())
 }
 
+pub async fn delete_partitions_from_disk(
+    shard_id: u16,
+    stream_id: usize,
+    topic_id: usize,
+    segments: Vec<Segment2>,
+    config: &SystemConfig,
+) -> Result<(), IggyError> {
+    for segment in segments.iter_mut() {
+        //TODO:
+        //segment.close().await;
+    }
+
+    for partition_id in segments.iter().map(|s| s.parent_id) {
+        let partition_path = config.get_partition_path(stream_id, topic_id, partition_id);
+        remove_dir_all(&partition_path).await?;
+        shard_info!(
+            shard_id,
+            "Deleted partition files for partition with ID: {} stream with ID: {} and topic with ID: {}.",
+            partition_id,
+            stream_id,
+            topic_id
+        );
+    }
+    Ok(())
+}
+
 pub async fn delete_persisted_offset(shard_id: u16, path: &str) -> Result<(), IggyError> {
     if !Path::new(path).exists() {
         shard_trace!(shard_id, "Consumer offset file does not exist: {path}.");
@@ -108,7 +137,11 @@ pub async fn delete_persisted_offset(shard_id: u16, path: &str) -> Result<(), Ig
 }
 
 pub async fn persist_offset(shard_id: u16, path: &str, offset: u64) -> Result<(), IggyError> {
-    let file = OpenOptions::new().write(true).create(true).open(path).await?;
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open(path)
+        .await?;
     let buf = offset.to_le_bytes();
     file.write_all_at(buf, 0).await?;
     shard_trace!(

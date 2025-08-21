@@ -18,20 +18,17 @@
 
 use super::COMPONENT;
 use crate::shard::IggyShard;
-use crate::shard::namespace::IggyNamespace;
 use crate::slab::traits_ext::{DeleteCell, EntityMarker, InsertCell};
 
 use crate::streaming::session::Session;
 use crate::streaming::stats::stats::StreamStats;
-use crate::streaming::streams::storage2::create_stream_file_hierarchy;
+use crate::streaming::streams::storage2::{create_stream_file_hierarchy, delete_stream_from_disk};
 use crate::streaming::streams::{self, stream2};
 use error_set::ErrContext;
 
 use iggy_common::locking::IggyRwLockFn;
-use iggy_common::{IdKind, Identifier, IggyError, IggyTimestamp};
-use std::cell::{Ref, RefMut};
+use iggy_common::{Identifier, IggyError, IggyTimestamp};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 impl IggyShard {
     pub async fn create_stream2(
@@ -128,12 +125,13 @@ impl IggyShard {
     }
 
     pub fn delete_stream2_bypass_auth(&self, id: &Identifier) -> stream2::Stream {
-        self.delete_stream2_base(id)
+        let stream = self.delete_stream2_base(id);
+        Ok(stream)
     }
 
     fn delete_stream2_base(&self, id: &Identifier) -> stream2::Stream {
-        let id = self.streams2.get_index(id);
-        let stream = self.streams2.delete(id);
+        let stream_index = self.streams2.get_index(id);
+        let stream = self.streams2.delete(stream_index);
         let stats = stream.stats();
 
         self.metrics.decrement_streams(1);
@@ -152,7 +150,7 @@ impl IggyShard {
         stream
     }
 
-    pub fn delete_stream2(
+    pub async fn delete_stream2(
         &self,
         session: &Session,
         id: &Identifier,
@@ -172,8 +170,8 @@ impl IggyShard {
                     stream_id,
                 )
             })?;
-        let stream = self.delete_stream2_base(id);
-        self.metrics.decrement_streams(1);
+        let mut stream = self.delete_stream2_base(id);
+        delete_stream_from_disk(self.id, &mut stream, &self.config.system).await?;
         Ok(stream)
     }
 

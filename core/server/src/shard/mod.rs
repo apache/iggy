@@ -142,9 +142,6 @@ pub struct IggyShard {
 
     // Heart transplant of the old streams structure.
     pub(crate) streams2: Streams,
-
-    pub(crate) streams: RefCell<HashMap<u32, Stream>>,
-    pub(crate) streams_ids: RefCell<HashMap<String, u32>>,
     // TODO: Refactor.
     pub(crate) storage: Rc<SystemStorage>,
 
@@ -199,8 +196,6 @@ impl IggyShard {
             shards_table: Default::default(),
             version,
             streams2: Streams::init(),
-            streams: Default::default(),
-            streams_ids: Default::default(),
             storage,
             state,
             //TODO: Fix
@@ -275,7 +270,9 @@ impl IggyShard {
         }
 
         if self.config.quic.enabled {
-            tasks.push(Box::pin(crate::quic::quic_server::span_quic_server(self.clone())));
+            tasks.push(Box::pin(crate::quic::quic_server::span_quic_server(
+                self.clone(),
+            )));
         }
 
         let stop_receiver = self.get_stop_receiver();
@@ -717,6 +714,36 @@ impl IggyShard {
             } => {
                 let cg = self.delete_consumer_group_bypass_auth2(&stream_id, &topic_id, &group_id);
                 assert_eq!(cg.id(), id);
+                Ok(())
+            }
+            ShardEvent::StoredOffset {
+                stream_id,
+                topic_id,
+                partition_id,
+                polling_consumer,
+                offset,
+            } => {
+                self.store_consumer_offset_bypass_auth(
+                    &stream_id,
+                    &topic_id,
+                    &polling_consumer,
+                    partition_id,
+                    offset,
+                );
+                Ok(())
+            }
+            ShardEvent::DeletedOffset {
+                stream_id,
+                topic_id,
+                partition_id,
+                polling_consumer,
+            } => {
+                self.delete_consumer_offset_bypass_auth(
+                    &stream_id,
+                    &topic_id,
+                    &polling_consumer,
+                    partition_id,
+                );
                 Ok(())
             }
         }

@@ -17,10 +17,8 @@
  */
 
 pub mod consumer_group2;
-pub mod consumer_offsets;
 pub mod helpers;
 pub mod messages;
-pub mod storage;
 pub mod storage2;
 pub mod topic2;
 

@@ -90,6 +90,7 @@ impl IggyShard {
 
         drop(sys);
 
+        //TODO:
         for stream in self.streams.borrow().values() {
             stats.messages_count += stream.get_messages_count();
             stats.segments_count += stream.get_segments_count();

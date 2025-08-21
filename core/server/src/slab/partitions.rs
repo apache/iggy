@@ -169,6 +169,22 @@ impl Partitions {
         self.root.len()
     }
 
+    pub fn segments_for_partition(&self, id: usize) -> &Vec<segments::Segment2> {
+        &self.segments[id]
+    }
+
+    pub fn segments_for_partition_mut(&mut self, id: usize) -> &mut Vec<segments::Segment2> {
+        &mut self.segments[id]
+    }
+
+    pub fn remove_segments_for_partition(&mut self, id: usize) -> Vec<segments::Segment2> {
+        self.segments.remove(id)
+    }
+
+    pub fn remove_segments(&mut self) -> Vec<segments::Segment2> {
+        self.segments.drain().flatten().collect()
+    }
+
     pub fn with_partition_by_id<T>(
         &self,
         id: ContainerId,

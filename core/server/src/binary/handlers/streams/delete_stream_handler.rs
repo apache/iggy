@@ -49,10 +49,11 @@ impl ServerCommandHandler for DeleteStream {
         let stream_id = self.stream_id.clone();
 
         let stream2 = shard
-                                .delete_stream2(session, &self.stream_id)
-                                .with_error_context(|error| {
-                                    format!("{COMPONENT} (error: {error}) - failed to delete stream2 with ID: {stream_id}, session: {session}")
-                                })?;
+            .delete_stream2(session, &self.stream_id)
+            .await
+            .with_error_context(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to delete stream2 with ID: {stream_id}, session: {session}")
+            })?;
         shard_info!(
             shard.id,
             "Deleted stream with name: {}, ID: {}",
@@ -66,7 +67,7 @@ impl ServerCommandHandler for DeleteStream {
         let _responses = shard.broadcast_event_to_all_shards(event).await;
         // Drop the stream to force readers/writers to be dropped.
         drop(stream2);
-        // TODO: Remove all the directories and files related to the stream.
+        // Stream files and directories have been deleted by delete_stream_from_disk
 
         shard
             .state

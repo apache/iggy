@@ -19,11 +19,16 @@
 use super::COMPONENT;
 use crate::configs::system::SystemConfig;
 use crate::shard::IggyShard;
+use crate::slab::traits_ext::EntityComponentSystem;
+use crate::slab::traits_ext::EntityComponentSystemMutCell;
 use crate::slab::traits_ext::EntityMarker;
+use crate::slab::traits_ext::IntoComponents;
+use crate::slab::traits_ext::IntoComponentsById;
 use crate::streaming::deduplication::message_deduplicator::MessageDeduplicator;
 use crate::streaming::partitions;
 use crate::streaming::partitions::partition2;
 use crate::streaming::partitions::storage2::create_partition_file_hierarchy;
+use crate::streaming::partitions::storage2::delete_partitions_from_disk;
 use crate::streaming::session::Session;
 use crate::streaming::stats::stats::PartitionStats;
 use crate::streaming::stats::stats::TopicStats;
@@ -101,6 +106,7 @@ impl IggyShard {
         self.metrics.increment_partitions(partitions_count);
         self.metrics.increment_segments(partitions_count);
 
+        // TODO: Figure out how to do this operation in a batch.
         for partition_id in partitions.iter().map(|p| p.id()) {
             create_partition_file_hierarchy(
                 self.id,
@@ -196,7 +202,7 @@ impl IggyShard {
         Ok(())
     }
 
-    pub fn delete_partitions2(
+    pub async fn delete_partitions2(
         &self,
         session: &Session,
         stream_id: &Identifier,
@@ -219,13 +225,14 @@ impl IggyShard {
         )?;
 
         let partitions = self.delete_partitions_base2(stream_id, topic_id, partitions_count);
+        self.delete_partitions_dirs(numeric_stream_id, numeric_topic_id, &partitions)
+            .await?;
         // Reassign the partitions count as it could get clamped by the `delete_partitions_base2` method.
         let partitions_count = partitions.len() as u32;
-        let parent = partitions.first().map(|p| p.stats().parent().clone());
-        // TODO: We could technically do it in a way, when a drop is called for an `Stat`
-        // the parent is decremented automatically.
-        // but it means that we have to do it per `Stat` rather than in bulk like right now
-        // which could lead to a lot of memory barriers.
+        let parent = partitions
+            .first()
+            .map(|p| p.stats().parent().clone())
+            .expect("delete_partitions: no partitions to deletion");
         let (messages_count, segments_count, size_bytes) = partitions.iter().fold(
             (0, 0, 0),
             |(mut msg_acc, mut seg_acc, mut size_acc), partition| {
@@ -241,13 +248,33 @@ impl IggyShard {
         );
         self.metrics.decrement_partitions(partitions_count);
         self.metrics.decrement_segments(segments_count);
-        if let Some(parent) = parent {
-            parent.decrement_messages_count(messages_count);
-            parent.decrement_size_bytes(size_bytes);
-            parent.decrement_segments_count(segments_count);
-        }
+        parent.decrement_messages_count(messages_count);
+        parent.decrement_size_bytes(size_bytes);
+        parent.decrement_segments_count(segments_count);
 
         Ok(partitions)
+    }
+
+    async fn delete_partitions_dirs(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partitions: &Vec<partition2::Partition>,
+    ) -> Result<(), IggyError> {
+        let ids = partitions.iter().map(|p| p.id());
+        let segments = self.streams2.with_components(|stream| {
+            let (root, ..) = stream.into_components_by_id(stream_id);
+            root.topics()
+                .with_components_by_id_mut(topic_id, |(mut root, ..)| {
+                    let partitions = root.partitions_mut();
+                    ids.map(|id| partitions.remove_segments_for_partition(id))
+                        .flatten()
+                        .collect::<Vec<_>>()
+                })
+        });
+        delete_partitions_from_disk(self.id, stream_id, topic_id, segments, &self.config.system)
+            .await?;
+        Ok(())
     }
 
     fn delete_partitions_base2(
@@ -268,14 +295,14 @@ impl IggyShard {
         stream_id: &Identifier,
         topic_id: &Identifier,
         partitions_count: u32,
-        partition_ids: Vec<u32>,
+        partition_ids: Vec<usize>,
     ) -> Result<(), IggyError> {
         assert_eq!(partitions_count as usize, partition_ids.len());
 
         let partitions = self.delete_partitions_base2(stream_id, topic_id, partitions_count);
         for (deleted_partition_id, actual_deleted_partition_id) in partitions
             .iter()
-            .map(|p| p.id() as u32)
+            .map(|p| p.id())
             .zip(partition_ids.into_iter())
         {
             assert_eq!(

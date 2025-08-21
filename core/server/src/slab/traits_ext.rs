@@ -23,6 +23,16 @@ pub trait InsertCell {
     fn insert(&self, item: Self::Item) -> Self::Idx;
 }
 
+// TODO:
+// Observe the `Delete` and `DeleteCwel` traits,
+// those support only removal of singular `Entity`.
+// We could add a `DeleteMany` method that would return `impl Iterator<Item = Self::Item>`
+//
+// How is that useful ?
+// We support bulk deletes only for partitions for now,
+// but since the partition and it's segments are disjointed (segments are not part of the `Partition` entity),
+// we can use the returned iterator to zip together with segements iterator and drain them together instead of individually, 5Head.
+
 /// Delete trait for deleting an `Entity` from container.
 pub trait Delete {
     type Idx;
@@ -162,7 +172,7 @@ pub type ComponentsById<'a, T> = <T as IntoComponentsById>::Output;
 // Observe that the chain of constraints put on the `EntityRef` type is actually wrong.
 // We constraint the `EntityRef` to be IntoComponents + IntoComponentsById,
 // which from composability point of view is not ideal...
-// A better idea is to constraint the `IntoComponents::Output` of the `EntityRef` impl to - `IntoComponentsById`, rather than entire `EntityRef`.
+// A better idea is to constraint the `IntoComponents::Output` of the `EntityRef` impl to `IntoComponentsById`, rather than entire `EntityRef`.
 // This way we can name the type inside of the `with_by_id` methods, without desolving into the tuple mapping madness.
 // in the `stream.rs` `topic.rs` `partitions.rs` files, we need to implement the `IntoComponentsById` trait for the output type of `IntoComponents` implementation, for `EntityRef`.
 // to make our life easier, we can create a type alias for those tuples and maybe even create a macro, to not repeat the type 3 times per entity (TupleEntityType, TupleEntityTypeRef, TupleEntityTypeRefByid).

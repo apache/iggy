@@ -23,6 +23,7 @@ use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
 use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
+use crate::streaming::partitions::storage2::create_partition_file_hierarchy;
 use crate::streaming::session::Session;
 use anyhow::Result;
 use error_set::ErrContext;
@@ -48,17 +49,15 @@ impl ServerCommandHandler for DeletePartitions {
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
 
-        let deleted_partition_ids = shard
+        let partitions = shard
             .delete_partitions2(
                 session,
                 &self.stream_id,
                 &self.topic_id,
                 self.partitions_count,
-            )?
-            .iter()
-            .map(|p| p.id() as u32)
-            .collect();
-
+            )
+            .await?;
+        let deleted_partition_ids = partitions.iter().map(|p| p.id()).collect::<Vec<_>>();
         let event = ShardEvent::DeletedPartitions2 {
             stream_id: self.stream_id.clone(),
             topic_id: self.topic_id.clone(),

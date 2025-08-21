@@ -22,7 +22,7 @@ use crate::shard_info;
 use crate::slab::traits_ext::{EntityMarker, InsertCell};
 use crate::streaming::session::Session;
 use crate::streaming::stats::stats::{StreamStats, TopicStats};
-use crate::streaming::topics::storage2::create_topic_file_hierarchy;
+use crate::streaming::topics::storage2::{create_topic_file_hierarchy, delete_topic_from_disk};
 use crate::streaming::topics::topic2::{self, resolve_max_topic_size, resolve_message_expiry};
 use crate::streaming::{partitions, streams, topics};
 use error_set::ErrContext;
@@ -232,26 +232,24 @@ impl IggyShard {
     ) -> Result<topic2::Topic, IggyError> {
         self.ensure_authenticated(session)?;
         self.ensure_topic_exists(stream_id, topic_id)?;
-        {
-            let topic_id = self.streams2.with_topic_by_id(
-                stream_id,
-                topic_id,
-                topics::helpers::get_topic_id(),
-            );
-            let stream_id = self
-                .streams2
-                .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-            self.permissioner
+        let numeric_topic_id =
+            self.streams2
+                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
+        let numeric_stream_id = self
+            .streams2
+            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
+        self.permissioner
             .borrow()
-                .delete_topic(session.get_user_id(), stream_id as u32, topic_id as u32)
+                .delete_topic(session.get_user_id(), numeric_stream_id as u32, numeric_topic_id as u32)
                 .with_error_context(|error| {
                     format!(
                         "{COMPONENT} (error: {error}) - permission denied to delete topic with ID: {topic_id} in stream with ID: {stream_id} for user with ID: {}",
                         session.get_user_id(),
                     )
                 })?;
-        }
-        let topic = self.delete_topic_base2(stream_id, topic_id);
+        let mut topic = self.delete_topic_base2(stream_id, topic_id);
+        // We need to borrow topic as mutable, as we are extracting partitions out of it, in order to close them.
+        delete_topic_from_disk(self.id, numeric_stream_id, &mut topic, &self.config.system).await?;
         self.metrics.decrement_topics(1);
         Ok(topic)
     }

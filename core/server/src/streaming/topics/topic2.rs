@@ -61,6 +61,10 @@ impl Topic {
     pub fn root(&self) -> &TopicRoot {
         &self.root
     }
+
+    pub fn root_mut(&mut self) -> &mut TopicRoot {
+        &mut self.root
+    }
 }
 
 impl IntoComponents for Topic {
