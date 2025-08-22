@@ -15,15 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Kinds;
 
 namespace Apache.Iggy.IggyClient;
 
 public interface IIggyConsumer
 {
-    Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId, Consumer consumer, PollingStrategy pollingStrategy,
-        int count, bool autoCommit, Func<byte[], byte[]>? decryptor = null, CancellationToken token = default)
+    Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
+        Consumer consumer, PollingStrategy pollingStrategy, int count, bool autoCommit,
+        Func<byte[], byte[]>? decryptor = null, CancellationToken token = default)
     {
         return PollMessagesAsync(new MessageFetchRequest
         {

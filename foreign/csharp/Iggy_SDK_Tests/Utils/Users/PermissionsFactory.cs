@@ -16,8 +16,8 @@
 // under the License.
 
 using System.Buffers.Binary;
-using Apache.Iggy.Contracts.Http;
-using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Contracts;
+using Apache.Iggy.Contracts.Auth;
 
 namespace Apache.Iggy.Tests.Utils.Users;
 
@@ -27,24 +27,24 @@ internal static class PermissionsFactory
     {
         return new Permissions
         {
-            Global = new GlobalPermissions
-            {
-                ManageServers = Random.Shared.Next() % 2 == 0,
-                ReadServers = Random.Shared.Next() % 2 == 0,
-                ManageUsers = Random.Shared.Next() % 2 == 0,
-                ReadUsers = Random.Shared.Next() % 2 == 0,
-                ManageStreams = Random.Shared.Next() % 2 == 0,
-                ReadStreams = Random.Shared.Next() % 2 == 0,
-                ManageTopics = Random.Shared.Next() % 2 == 0,
-                ReadTopics = Random.Shared.Next() % 2 == 0,
-                PollMessages = Random.Shared.Next() % 2 == 0,
-                SendMessages = Random.Shared.Next() % 2 == 0
-            },
+            Global
+                = new GlobalPermissions
+                {
+                    ManageServers = Random.Shared.Next() % 2 == 0,
+                    ReadServers = Random.Shared.Next() % 2 == 0,
+                    ManageUsers = Random.Shared.Next() % 2 == 0,
+                    ReadUsers = Random.Shared.Next() % 2 == 0,
+                    ManageStreams = Random.Shared.Next() % 2 == 0,
+                    ReadStreams = Random.Shared.Next() % 2 == 0,
+                    ManageTopics = Random.Shared.Next() % 2 == 0,
+                    ReadTopics = Random.Shared.Next() % 2 == 0,
+                    PollMessages = Random.Shared.Next() % 2 == 0,
+                    SendMessages = Random.Shared.Next() % 2 == 0
+                },
             Streams = new Dictionary<int, StreamPermissions>
             {
                 {
-                    Random.Shared.Next(1, 30),
-                    new StreamPermissions
+                    Random.Shared.Next(1, 30), new StreamPermissions
                     {
                         ManageStream = Random.Shared.Next() % 2 == 0,
                         ReadStream = Random.Shared.Next() % 2 == 0,
@@ -78,8 +78,7 @@ internal static class PermissionsFactory
                     }
                 },
                 {
-                    Random.Shared.Next(31, 69),
-                    new StreamPermissions
+                    Random.Shared.Next(31, 69), new StreamPermissions
                     {
                         ManageStream = Random.Shared.Next() % 2 == 0,
                         ReadStream = Random.Shared.Next() % 2 == 0,
@@ -140,13 +139,14 @@ internal static class PermissionsFactory
                         var pollMessagesTopic = bytes[index++] == 1;
                         var sendMessagesTopic = bytes[index++] == 1;
 
-                        topicsMap.Add(topicId, new TopicPermissions
-                        {
-                            ManageTopic = manageTopic,
-                            ReadTopic = readTopic,
-                            PollMessages = pollMessagesTopic,
-                            SendMessages = sendMessagesTopic
-                        });
+                        topicsMap.Add(topicId,
+                            new TopicPermissions
+                            {
+                                ManageTopic = manageTopic,
+                                ReadTopic = readTopic,
+                                PollMessages = pollMessagesTopic,
+                                SendMessages = sendMessagesTopic
+                            });
 
                         if (bytes[index++] == 0)
                         {
@@ -155,16 +155,17 @@ internal static class PermissionsFactory
                     }
                 }
 
-                streamMap.Add(streamId, new StreamPermissions
-                {
-                    ManageStream = manageStream,
-                    ReadStream = readStream,
-                    ManageTopics = manageTopics,
-                    ReadTopics = readTopics,
-                    PollMessages = pollMessagesStream,
-                    SendMessages = sendMessagesStream,
-                    Topics = topicsMap.Count > 0 ? topicsMap : null
-                });
+                streamMap.Add(streamId,
+                    new StreamPermissions
+                    {
+                        ManageStream = manageStream,
+                        ReadStream = readStream,
+                        ManageTopics = manageTopics,
+                        ReadTopics = readTopics,
+                        PollMessages = pollMessagesStream,
+                        SendMessages = sendMessagesStream,
+                        Topics = topicsMap.Count > 0 ? topicsMap : null
+                    });
 
                 if (bytes[index++] == 0)
                 {

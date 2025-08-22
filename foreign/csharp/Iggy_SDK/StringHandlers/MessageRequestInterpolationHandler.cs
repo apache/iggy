@@ -40,19 +40,19 @@ internal ref struct MessageRequestInterpolationHandler
         switch (t)
         {
             case MessagePolling pollingStrat:
+            {
+                var str = pollingStrat switch
                 {
-                    var str = pollingStrat switch
-                    {
-                        MessagePolling.Offset => "offset",
-                        MessagePolling.Timestamp => "timestamp",
-                        MessagePolling.First => "first",
-                        MessagePolling.Last => "last",
-                        MessagePolling.Next => "next",
-                        _ => throw new ArgumentOutOfRangeException()
-                    };
-                    _innerHandler.AppendFormatted(str);
-                    break;
-                }
+                    MessagePolling.Offset => "offset",
+                    MessagePolling.Timestamp => "timestamp",
+                    MessagePolling.First => "first",
+                    MessagePolling.Last => "last",
+                    MessagePolling.Next => "next",
+                    _ => throw new ArgumentOutOfRangeException()
+                };
+                _innerHandler.AppendFormatted(str);
+                break;
+            }
             case bool tBool:
                 _innerHandler.AppendFormatted(tBool.ToString().ToLower());
                 break;

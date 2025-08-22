@@ -35,13 +35,13 @@ internal static class TopicFactory
         var createdAt = (ulong)Random.Shared.Next(69, 42069);
         var maxTopicSize = (ulong)Random.Shared.NextInt64(2_000_000_000, 10_000_000_000);
         var replicationFactor = (byte)Random.Shared.Next(1, 8);
-        return (topicId, partitionsCount, topicName, messageExpiry, sizeBytes, messagesCount, createdAt, replicationFactor, maxTopicSize);
+        return (topicId, partitionsCount, topicName, messageExpiry, sizeBytes, messagesCount, createdAt,
+            replicationFactor, maxTopicSize);
     }
 
     internal static CreateTopicRequest CreateTopicRequest()
     {
-        return new CreateTopicRequest(
-            (uint)Random.Shared.Next(1, 9999),
+        return new CreateTopicRequest((uint)Random.Shared.Next(1, 9999),
             "test_topic" + Random.Shared.Next(1, 69) + Utility.RandomString(12).ToLower(),
             CompressionAlgorithm.Gzip,
             (ulong)Random.Shared.Next(1, 69),

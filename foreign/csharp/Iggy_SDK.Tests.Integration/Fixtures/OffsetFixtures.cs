@@ -15,6 +15,7 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
@@ -24,8 +25,8 @@ namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 public class OffsetFixtures : IggyServerFixture
 {
-    public readonly uint StreamId = 1;
-    public readonly CreateTopicRequest TopicRequest = TopicFactory.CreateTopic();
+    internal readonly uint StreamId = 1;
+    internal readonly CreateTopicRequest TopicRequest = TopicFactory.CreateTopic();
 
     public override async Task InitializeAsync()
     {
@@ -34,7 +35,8 @@ public class OffsetFixtures : IggyServerFixture
         foreach (var client in Clients.Values)
         {
             await client.CreateStreamAsync("TestStream", StreamId);
-            await client.CreateTopicAsync(Identifier.Numeric(StreamId), TopicRequest.Name, TopicRequest.PartitionsCount, topicId: TopicRequest.TopicId);
+            await client.CreateTopicAsync(Identifier.Numeric(StreamId), TopicRequest.Name, TopicRequest.PartitionsCount,
+                topicId: TopicRequest.TopicId);
 
             await client.SendMessagesAsync(new MessageSendRequest
             {

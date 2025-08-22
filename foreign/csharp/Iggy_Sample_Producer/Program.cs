@@ -19,7 +19,7 @@ using System.Buffers.Binary;
 using System.Security.Cryptography;
 using System.Text;
 using Apache.Iggy;
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
 using Apache.Iggy.Headers;
@@ -111,8 +111,7 @@ async Task ProduceMessages(IIggyClient bus, StreamResponse? stream, TopicRespons
     Func<Envelope, byte[]> serializer = static envelope =>
     {
         Span<byte> buffer = stackalloc byte[envelope.MessageType.Length + 4 + envelope.Payload.Length];
-        BinaryPrimitives.WriteInt32LittleEndian(
-            buffer[..4], envelope.MessageType.Length);
+        BinaryPrimitives.WriteInt32LittleEndian(buffer[..4], envelope.MessageType.Length);
         Encoding.UTF8.GetBytes(envelope.MessageType).CopyTo(buffer[4..(envelope.MessageType.Length + 4)]);
         Encoding.UTF8.GetBytes(envelope.Payload).CopyTo(buffer[(envelope.MessageType.Length + 4)..]);
         return buffer.ToArray();
@@ -172,12 +171,12 @@ async Task ProduceMessages(IIggyClient bus, StreamResponse? stream, TopicRespons
         try
         {
             await bus.SendMessagesAsync(new MessageSendRequest<Envelope>
-            {
-                StreamId = streamId,
-                TopicId = topicId,
-                Partitioning = Partitioning.PartitionId(3),
-                Messages = messages
-            },
+                {
+                    StreamId = streamId,
+                    TopicId = topicId,
+                    Partitioning = Partitioning.PartitionId(3),
+                    Messages = messages
+                },
                 serializer,
                 encryptor, headers);
         }
@@ -200,16 +199,16 @@ namespace Apache.Iggy.Producer
     {
         private static readonly byte[] key =
         {
-            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
-            0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c,
-            0xa8, 0x8d, 0x2d, 0x0a, 0x9f, 0x9d, 0xea, 0x43,
-            0x6c, 0x25, 0x17, 0x13, 0x20, 0x45, 0x78, 0xc8
+            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7,
+            0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c, 0xa8, 0x8d, 0x2d, 0x0a,
+            0x9f, 0x9d, 0xea, 0x43, 0x6c, 0x25, 0x17, 0x13, 0x20, 0x45,
+            0x78, 0xc8
         };
 
         private static readonly byte[] iv =
         {
-            0x5f, 0x8a, 0xe4, 0x78, 0x9c, 0x3d, 0x2b, 0x0f,
-            0x12, 0x6a, 0x7e, 0x45, 0x91, 0xba, 0xdf, 0x33
+            0x5f, 0x8a, 0xe4, 0x78, 0x9c, 0x3d, 0x2b, 0x0f, 0x12, 0x6a,
+            0x7e, 0x45, 0x91, 0xba, 0xdf, 0x33
         };
 
         public static byte[] GetKey()

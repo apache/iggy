@@ -22,7 +22,7 @@ namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 public class SystemFixture : IggyServerFixture
 {
-    public readonly int TotalClientsCount = 10;
+    internal readonly int TotalClientsCount = 10;
 
     private List<IIggyClient> AdditionalClients { get; } = new();
 

@@ -16,10 +16,8 @@
 // under the License.
 
 using System.Buffers.Binary;
-using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Text.Json;
 using Apache.Iggy.Enums;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
@@ -27,32 +25,6 @@ namespace Apache.Iggy.Extensions;
 
 internal static class Extensions
 {
-    internal static string ToSnakeCase(this string input)
-    {
-        Debug.Assert(!string.IsNullOrEmpty(input));
-        if (CountUppercaseLetters(input) == 0)
-        {
-            return input.ToLower();
-        }
-
-        var len = input.Length + CountUppercaseLetters(input) - 1;
-        return string.Create(len, input, (span, value) =>
-        {
-            value.AsSpan().CopyTo(span);
-            span[0] = char.ToLower(span[0]);
-
-            for (var i = 0; i < len; ++i)
-            {
-                if (char.IsUpper(span[i]))
-                {
-                    span[i] = char.ToLower(span[i]);
-                    span[i..].ShiftSliceRight();
-                    span[i] = '_';
-                }
-            }
-        });
-    }
-
     internal static UInt128 ToUInt128(this Guid g)
     {
         Span<byte> array = stackalloc byte[16];
@@ -87,38 +59,19 @@ internal static class Extensions
 
     internal static byte[] GetBytesFromUInt128(this UInt128 value)
     {
-        Span<byte> result = stackalloc byte[16];
         ReadOnlySpan<byte> span = MemoryMarshal.Cast<UInt128, byte>(MemoryMarshal.CreateReadOnlySpan(ref value, 1));
         return span.ToArray();
     }
 
     internal static byte[] GetBytesFromInt128(this Int128 value)
     {
-        Span<byte> result = stackalloc byte[16];
         ReadOnlySpan<byte> span = MemoryMarshal.Cast<Int128, byte>(MemoryMarshal.CreateReadOnlySpan(ref value, 1));
         return span.ToArray();
     }
 
-    internal static UInt128 GetUInt128(this JsonElement jsonElement)
-    {
-        return UInt128.Parse(jsonElement.ToString());
-    }
-
-    private static int CountUppercaseLetters(string input)
-    {
-        return input.Count(char.IsUpper);
-    }
-
-    private static void ShiftSliceRight(this Span<char> slice)
-    {
-        for (var i = slice.Length - 2; i >= 0; i--)
-        {
-            slice[i + 1] = slice[i];
-        }
-    }
-
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal static void WriteBytesFromStreamAndTopicIdentifiers(this Span<byte> bytes, Identifier streamId, Identifier topicId, int startPos = 0)
+    internal static void WriteBytesFromStreamAndTopicIdentifiers(this Span<byte> bytes, Identifier streamId,
+        Identifier topicId, int startPos = 0)
     {
         bytes[startPos] = streamId.Kind.GetByte();
         bytes[startPos + 1] = (byte)streamId.Length;

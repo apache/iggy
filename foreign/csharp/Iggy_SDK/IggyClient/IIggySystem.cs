@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 
 namespace Apache.Iggy.IggyClient;
 
@@ -24,6 +24,6 @@ public interface IIggySystem
     Task<IReadOnlyList<ClientResponse>> GetClientsAsync(CancellationToken token = default);
     Task<ClientResponse?> GetClientByIdAsync(uint clientId, CancellationToken token = default);
     Task<ClientResponse?> GetMeAsync(CancellationToken token = default);
-    Task<Stats?> GetStatsAsync(CancellationToken token = default);
+    Task<StatsResponse?> GetStatsAsync(CancellationToken token = default);
     Task PingAsync(CancellationToken token = default);
 }

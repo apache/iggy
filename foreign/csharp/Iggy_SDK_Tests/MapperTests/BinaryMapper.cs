@@ -17,8 +17,8 @@
 
 using System.Buffers.Binary;
 using System.Text;
-using Apache.Iggy.Contracts.Http;
-using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Contracts;
+using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.Tests.Utils;
@@ -79,14 +79,20 @@ public sealed class BinaryMapper
             var id = BinaryPrimitives.ReadInt32LittleEndian(bytes);
             var textLength = BinaryPrimitives.ReadInt32LittleEndian(bytes[4..8]);
             var text = Encoding.UTF8.GetString(bytes[8..(8 + textLength)]);
-            return new DummyMessage { Id = id, Text = text };
+            return new DummyMessage
+            {
+                Id = id,
+                Text = text
+            };
         };
 
-        var (offset, timestamp, guid, headersLength, checkSum, payload) = MessageFactory.CreateMessageResponseFieldsTMessage();
+        var (offset, timestamp, guid, headersLength, checkSum, payload)
+            = MessageFactory.CreateMessageResponseFieldsTMessage();
         var msgOnePayload = BinaryFactory.CreateMessagePayload(offset, timestamp, 0, checkSum,
             guid, payload);
 
-        var (offset1, timestamp1, guid1, headersLength1, checkSum2, payload1) = MessageFactory.CreateMessageResponseFieldsTMessage();
+        var (offset1, timestamp1, guid1, headersLength1, checkSum2, payload1)
+            = MessageFactory.CreateMessageResponseFieldsTMessage();
         var msgTwoPayload = BinaryFactory.CreateMessagePayload(offset1, timestamp1, 0, checkSum2,
             guid1, payload1);
 
@@ -125,7 +131,8 @@ public sealed class BinaryMapper
         var (offset, timestamp, guid, headersLength, checkSum, payload) = MessageFactory.CreateMessageResponseFields();
         var msgOnePayload = BinaryFactory.CreateMessagePayload(offset, timestamp, 0, checkSum,
             guid, payload);
-        var (offset1, timestamp1, guid1, headersLength2, checkSum2, payload1) = MessageFactory.CreateMessageResponseFields();
+        var (offset1, timestamp1, guid1, headersLength2, checkSum2, payload1)
+            = MessageFactory.CreateMessageResponseFields();
         var msgTwoPayload = BinaryFactory.CreateMessagePayload(offset1, timestamp1, 0, checkSum2,
             guid1, payload1);
 
@@ -151,10 +158,13 @@ public sealed class BinaryMapper
     public void MapStreams_ReturnsValidStreamsResponses()
     {
         // Arrange
-        var (id1, topicsCount1, sizeBytes, messagesCount, name1, createdAt) = StreamFactory.CreateStreamsResponseFields();
+        var (id1, topicsCount1, sizeBytes, messagesCount, name1, createdAt)
+            = StreamFactory.CreateStreamsResponseFields();
         var payload1 = BinaryFactory.CreateStreamPayload(id1, topicsCount1, name1, sizeBytes, messagesCount, createdAt);
-        var (id2, topicsCount2, sizeBytes2, messagesCount2, name2, createdAt2) = StreamFactory.CreateStreamsResponseFields();
-        var payload2 = BinaryFactory.CreateStreamPayload(id2, topicsCount2, name2, sizeBytes2, messagesCount2, createdAt2);
+        var (id2, topicsCount2, sizeBytes2, messagesCount2, name2, createdAt2)
+            = StreamFactory.CreateStreamsResponseFields();
+        var payload2
+            = BinaryFactory.CreateStreamPayload(id2, topicsCount2, name2, sizeBytes2, messagesCount2, createdAt2);
 
         var combinedPayload = new byte[payload1.Length + payload2.Length];
         payload1.CopyTo(combinedPayload.AsSpan());
@@ -187,8 +197,10 @@ public sealed class BinaryMapper
     {
         // Arrange
         var (id, topicsCount, sizeBytes, messagesCount, name, createdAt) = StreamFactory.CreateStreamsResponseFields();
-        var streamPayload = BinaryFactory.CreateStreamPayload(id, topicsCount, name, sizeBytes, messagesCount, createdAt);
-        var (topicId1, partitionsCount1, topicName1, messageExpiry1, topicSizeBytes1, messagesCountTopic1, createdAtTopic, replicationFactor, maxTopicSize) =
+        var streamPayload
+            = BinaryFactory.CreateStreamPayload(id, topicsCount, name, sizeBytes, messagesCount, createdAt);
+        var (topicId1, partitionsCount1, topicName1, messageExpiry1, topicSizeBytes1, messagesCountTopic1,
+                createdAtTopic, replicationFactor, maxTopicSize) =
             TopicFactory.CreateTopicResponseFields();
         var topicPayload1 = BinaryFactory.CreateTopicPayload(topicId1,
             partitionsCount1,
@@ -276,8 +288,10 @@ public sealed class BinaryMapper
     public void MapTopic_ReturnsValidTopicResponse()
     {
         // Arrange
-        var (topicId, partitionsCount, topicName, messageExpiry, sizeBytes, messagesCount, createdAt2, replicationFactor, maxTopicSize) = TopicFactory.CreateTopicResponseFields();
-        var topicPayload = BinaryFactory.CreateTopicPayload(topicId, partitionsCount, messageExpiry, topicName, sizeBytes, messagesCount, createdAt2, replicationFactor, maxTopicSize, 1);
+        var (topicId, partitionsCount, topicName, messageExpiry, sizeBytes, messagesCount, createdAt2, replicationFactor
+            , maxTopicSize) = TopicFactory.CreateTopicResponseFields();
+        var topicPayload = BinaryFactory.CreateTopicPayload(topicId, partitionsCount, messageExpiry, topicName,
+            sizeBytes, messagesCount, createdAt2, replicationFactor, maxTopicSize, 1);
 
         var combinedPayload = new byte[topicPayload.Length];
         topicPayload.CopyTo(combinedPayload.AsSpan());
@@ -332,7 +346,8 @@ public sealed class BinaryMapper
         // Arrange
         var (groupId, membersCount, partitionsCount, name) = ConsumerGroupFactory.CreateConsumerGroupResponseFields();
         List<int> memberPartitions = Enumerable.Range(0, (int)partitionsCount).ToList();
-        var groupPayload = BinaryFactory.CreateGroupPayload(groupId, membersCount, partitionsCount, name, memberPartitions);
+        var groupPayload
+            = BinaryFactory.CreateGroupPayload(groupId, membersCount, partitionsCount, name, memberPartitions);
 
         // Act
         var response = Mappers.BinaryMapper.MapConsumerGroup(groupPayload);

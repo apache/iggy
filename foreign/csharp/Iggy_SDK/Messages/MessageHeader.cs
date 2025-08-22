@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Text.Json.Serialization;
+using Apache.Iggy.JsonConverters;
+
 namespace Apache.Iggy.Messages;
 
 public readonly struct MessageHeader
@@ -22,7 +25,10 @@ public readonly struct MessageHeader
     public ulong Checksum { get; init; }
     public UInt128 Id { get; init; }
     public ulong Offset { get; init; }
+
+    [JsonConverter(typeof(DateTimeOffsetConverter))]
     public DateTimeOffset Timestamp { get; init; }
+
     public ulong OriginTimestamp { get; init; }
     public int UserHeadersLength { get; init; }
     public int PayloadLength { get; init; }

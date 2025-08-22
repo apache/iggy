@@ -20,7 +20,7 @@ using Apache.Iggy.Enums;
 
 namespace Apache.Iggy.Contracts.Http;
 
-public sealed class CreateTopicRequest
+internal sealed class CreateTopicRequest
 {
     public uint? TopicId { get; set; }
     public required string Name { get; set; }

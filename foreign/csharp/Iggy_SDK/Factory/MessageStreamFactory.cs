@@ -31,7 +31,8 @@ namespace Apache.Iggy.Factory;
 public static class MessageStreamFactory
 {
     //TODO - this whole setup will have to be refactored later,when adding support for ASP.NET Core DI
-    public static IIggyClient CreateMessageStream(Action<IMessageStreamConfigurator> options, ILoggerFactory loggerFactory)
+    public static IIggyClient CreateMessageStream(Action<IMessageStreamConfigurator> options,
+        ILoggerFactory loggerFactory)
     {
         var config = new MessageStreamConfigurator();
         options.Invoke(config);
@@ -44,7 +45,8 @@ public static class MessageStreamFactory
         };
     }
 
-    private static TcpMessageStream CreateTcpMessageStream(IMessageStreamConfigurator options, ILoggerFactory loggerFactory)
+    private static TcpMessageStream CreateTcpMessageStream(IMessageStreamConfigurator options,
+        ILoggerFactory loggerFactory)
     {
         var socket = CreateTcpStream(options);
         return new TcpMessageStreamBuilder(socket, options, loggerFactory)
@@ -85,7 +87,8 @@ public static class MessageStreamFactory
         return new TcpTlsConnectionStream(sslStream);
     }
 
-    private static HttpMessageStream CreateHttpMessageStream(IMessageStreamConfigurator options, ILoggerFactory loggerFactory)
+    private static HttpMessageStream CreateHttpMessageStream(IMessageStreamConfigurator options,
+        ILoggerFactory loggerFactory)
     {
         var client = CreateHttpClient(options);
         return new HttpMessageStreamBuilder(client, options, loggerFactory)

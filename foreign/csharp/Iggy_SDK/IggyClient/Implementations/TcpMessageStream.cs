@@ -23,8 +23,8 @@ using System.Text;
 using System.Threading.Channels;
 using Apache.Iggy.Configuration;
 using Apache.Iggy.ConnectionStream;
-using Apache.Iggy.Contracts.Http;
-using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Contracts;
+using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
@@ -156,7 +156,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await CheckResponseAsync(token);
     }
 
-    public async Task<IReadOnlyList<TopicResponse>> GetTopicsAsync(Identifier streamId, CancellationToken token = default)
+    public async Task<IReadOnlyList<TopicResponse>> GetTopicsAsync(Identifier streamId,
+        CancellationToken token = default)
     {
         var message = TcpMessageStreamHelpers.GetBytesFromIdentifier(streamId);
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
@@ -175,7 +176,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapTopics(responseBuffer);
     }
 
-    public async Task<TopicResponse?> GetTopicByIdAsync(Identifier streamId, Identifier topicId, CancellationToken token = default)
+    public async Task<TopicResponse?> GetTopicByIdAsync(Identifier streamId, Identifier topicId,
+        CancellationToken token = default)
     {
         var message = TcpContracts.GetTopicById(streamId, topicId);
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
@@ -195,10 +197,13 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     }
 
 
-    public async Task<TopicResponse?> CreateTopicAsync(Identifier streamId, string name, uint partitionsCount, CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
-        uint? topicId = null, byte? replicationFactor = null, ulong messageExpiry = 0, ulong maxTopicSize = 0, CancellationToken token = default)
+    public async Task<TopicResponse?> CreateTopicAsync(Identifier streamId, string name, uint partitionsCount,
+        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
+        uint? topicId = null, byte? replicationFactor = null, ulong messageExpiry = 0, ulong maxTopicSize = 0,
+        CancellationToken token = default)
     {
-        var message = TcpContracts.CreateTopic(streamId, name, partitionsCount, compressionAlgorithm, topicId, replicationFactor, messageExpiry, maxTopicSize);
+        var message = TcpContracts.CreateTopic(streamId, name, partitionsCount, compressionAlgorithm, topicId,
+            replicationFactor, messageExpiry, maxTopicSize);
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CREATE_TOPIC_CODE);
 
@@ -215,10 +220,13 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapTopic(responseBuffer);
     }
 
-    public async Task UpdateTopicAsync(Identifier streamId, Identifier topicId, string name, CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
-        ulong maxTopicSize = 0, ulong messageExpiry = 0, byte? replicationFactor = null, CancellationToken token = default)
+    public async Task UpdateTopicAsync(Identifier streamId, Identifier topicId, string name,
+        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None,
+        ulong maxTopicSize = 0, ulong messageExpiry = 0, byte? replicationFactor = null,
+        CancellationToken token = default)
     {
-        var message = TcpContracts.UpdateTopic(streamId, topicId, name, compressionAlgorithm, maxTopicSize, messageExpiry, replicationFactor);
+        var message = TcpContracts.UpdateTopic(streamId, topicId, name, compressionAlgorithm, maxTopicSize,
+            messageExpiry, replicationFactor);
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.UPDATE_TOPIC_CODE);
 
@@ -333,9 +341,11 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await _channel!.Writer.WriteAsync(sendRequest, token);
     }
 
-    public async Task FlushUnsavedBufferAsync(FlushUnsavedBufferRequest request, CancellationToken token = default)
+    public async Task FlushUnsavedBufferAsync(Identifier streamId, Identifier topicId, uint partitionId, bool fsync,
+        CancellationToken token = default)
     {
-        var message = TcpContracts.FlushUnsavedBuffer(request);
+        var message = TcpContracts.FlushUnsavedBuffer(streamId, topicId, partitionId, fsync);
+        ;
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.FLUSH_UNSAVED_BUFFER_CODE);
 
@@ -348,7 +358,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     public async Task<PolledMessages<TMessage>> PollMessagesAsync<TMessage>(MessageFetchRequest request,
         Func<byte[], TMessage> serializer, Func<byte[], byte[]>? decryptor = null, CancellationToken token = default)
     {
-        await SendFetchMessagesRequestPayload(request.Consumer, request.StreamId, request.TopicId, request.PollingStrategy,
+        await SendFetchMessagesRequestPayload(request.Consumer, request.StreamId, request.TopicId,
+            request.PollingStrategy,
             request.Count, request.AutoCommit, request.PartitionId, token);
         IMemoryOwner<byte> buffer = MemoryPool<byte>.Shared.Rent(BufferSizes.ExpectedResponseSize);
         try
@@ -416,7 +427,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         };
 
 
-        _ = StartPollingMessagesAsync(fetchRequest, deserializer, _messagePollingSettings.Interval, channel.Writer, decryptor, token);
+        _ = StartPollingMessagesAsync(fetchRequest, deserializer, _messagePollingSettings.Interval, channel.Writer,
+            decryptor, token);
         await foreach (MessageResponse<TMessage> messageResponse in channel.Reader.ReadAllAsync(token))
         {
             yield return messageResponse;
@@ -426,11 +438,13 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
             {
                 try
                 {
-                    await StoreOffsetAsync(request.Consumer, request.StreamId, request.TopicId, currentOffset, request.PartitionId, token);
+                    await StoreOffsetAsync(request.Consumer, request.StreamId, request.TopicId, currentOffset,
+                        request.PartitionId, token);
                 }
                 catch
                 {
-                    _logger.LogError("Error encountered while saving offset information - Offset: {offset}, Stream ID: {streamId}, Topic ID: {topicId}, Partition ID: {partitionId}",
+                    _logger.LogError(
+                        "Error encountered while saving offset information - Offset: {offset}, Stream ID: {streamId}, Topic ID: {topicId}, Partition ID: {partitionId}",
                         currentOffset, request.StreamId, request.TopicId, request.PartitionId);
                 }
             }
@@ -443,10 +457,12 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         }
     }
 
-    public async Task<PolledMessages> PollMessagesAsync(MessageFetchRequest request, Func<byte[], byte[]>? decryptor = null,
+    public async Task<PolledMessages> PollMessagesAsync(MessageFetchRequest request,
+        Func<byte[], byte[]>? decryptor = null,
         CancellationToken token = default)
     {
-        await SendFetchMessagesRequestPayload(request.Consumer, request.StreamId, request.TopicId, request.PollingStrategy,
+        await SendFetchMessagesRequestPayload(request.Consumer, request.StreamId, request.TopicId,
+            request.PollingStrategy,
             request.Count, request.AutoCommit, request.PartitionId, token);
 
         var buffer = ArrayPool<byte>.Shared.Rent(BufferSizes.ExpectedResponseSize);
@@ -477,8 +493,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
             try
             {
                 await _stream.ReadAsync(responseBuffer.AsMemory()[..response.Length], token);
-                var result = BinaryMapper.MapMessages(
-                    responseBuffer.AsSpan()[..response.Length], decryptor);
+                var result = BinaryMapper.MapMessages(responseBuffer.AsSpan()[..response.Length], decryptor);
                 return result;
             }
             finally
@@ -492,7 +507,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         }
     }
 
-    public async Task StoreOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, ulong offset, uint? partitionId, CancellationToken token = default)
+    public async Task StoreOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, ulong offset,
+        uint? partitionId, CancellationToken token = default)
     {
         var message = TcpContracts.UpdateOffset(streamId, topicId, consumer, offset, partitionId);
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
@@ -504,7 +520,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await CheckResponseAsync(token);
     }
 
-    public async Task<OffsetResponse?> GetOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, uint? partitionId, CancellationToken token = default)
+    public async Task<OffsetResponse?> GetOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId,
+        uint? partitionId, CancellationToken token = default)
     {
         var message = TcpContracts.GetOffset(streamId, topicId, consumer, partitionId);
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
@@ -523,7 +540,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapOffsets(responseBuffer);
     }
 
-    public async Task DeleteOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, uint? partitionId, CancellationToken token = default)
+    public async Task DeleteOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, uint? partitionId,
+        CancellationToken token = default)
     {
         var message = TcpContracts.DeleteOffset(streamId, topicId, consumer, partitionId);
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
@@ -535,7 +553,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await CheckResponseAsync(token);
     }
 
-    public async Task<IReadOnlyList<ConsumerGroupResponse>> GetConsumerGroupsAsync(Identifier streamId, Identifier topicId,
+    public async Task<IReadOnlyList<ConsumerGroupResponse>> GetConsumerGroupsAsync(Identifier streamId,
+        Identifier topicId,
         CancellationToken token = default)
     {
         var message = TcpContracts.GetGroups(streamId, topicId);
@@ -575,7 +594,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapConsumerGroup(responseBuffer);
     }
 
-    public async Task<ConsumerGroupResponse?> CreateConsumerGroupAsync(Identifier streamId, Identifier topicId, string name, uint? groupId, CancellationToken token = default)
+    public async Task<ConsumerGroupResponse?> CreateConsumerGroupAsync(Identifier streamId, Identifier topicId,
+        string name, uint? groupId, CancellationToken token = default)
     {
         var message = TcpContracts.CreateGroup(streamId, topicId, name, groupId);
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
@@ -594,7 +614,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapConsumerGroup(responseBuffer);
     }
 
-    public async Task DeleteConsumerGroupAsync(Identifier streamId, Identifier topicId, Identifier groupId, CancellationToken token = default)
+    public async Task DeleteConsumerGroupAsync(Identifier streamId, Identifier topicId, Identifier groupId,
+        CancellationToken token = default)
     {
         var message = TcpContracts.DeleteGroup(streamId, topicId, groupId);
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
@@ -606,7 +627,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await CheckResponseAsync(token);
     }
 
-    public async Task JoinConsumerGroupAsync(Identifier streamId, Identifier topicId, Identifier groupId, CancellationToken token = default)
+    public async Task JoinConsumerGroupAsync(Identifier streamId, Identifier topicId, Identifier groupId,
+        CancellationToken token = default)
     {
         var message = TcpContracts.JoinGroup(streamId, topicId, groupId);
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
@@ -618,7 +640,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await CheckResponseAsync(token);
     }
 
-    public async Task LeaveConsumerGroupAsync(Identifier streamId, Identifier topicId, Identifier groupId, CancellationToken token = default)
+    public async Task LeaveConsumerGroupAsync(Identifier streamId, Identifier topicId, Identifier groupId,
+        CancellationToken token = default)
     {
         var message = TcpContracts.LeaveGroup(streamId, topicId, groupId);
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
@@ -675,7 +698,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapClient(responseBuffer);
     }
 
-    public async Task<Stats?> GetStatsAsync(CancellationToken token = default)
+    public async Task<StatsResponse?> GetStatsAsync(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
@@ -782,7 +805,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapUsers(responseBuffer);
     }
 
-    public async Task<UserResponse?> CreateUser(string userName, string password, UserStatus status, Permissions? permissions = null, CancellationToken token = default)
+    public async Task<UserResponse?> CreateUser(string userName, string password, UserStatus status,
+        Permissions? permissions = null, CancellationToken token = default)
     {
         var message = TcpContracts.CreateUser(userName, password, status, permissions);
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
@@ -813,7 +837,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await CheckResponseAsync(token);
     }
 
-    public async Task UpdateUser(Identifier userId, string? userName = null, UserStatus? status = null, CancellationToken token = default)
+    public async Task UpdateUser(Identifier userId, string? userName = null, UserStatus? status = null,
+        CancellationToken token = default)
     {
         var message = TcpContracts.UpdateUser(userId, userName, status);
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
@@ -825,7 +850,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await CheckResponseAsync(token);
     }
 
-    public async Task UpdatePermissions(Identifier userId, Permissions? permissions = null, CancellationToken token = default)
+    public async Task UpdatePermissions(Identifier userId, Permissions? permissions = null,
+        CancellationToken token = default)
     {
         var message = TcpContracts.UpdatePermissions(userId, permissions);
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
@@ -837,7 +863,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await CheckResponseAsync(token);
     }
 
-    public async Task ChangePassword(Identifier userId, string currentPassword, string newPassword, CancellationToken token = default)
+    public async Task ChangePassword(Identifier userId, string currentPassword, string newPassword,
+        CancellationToken token = default)
     {
         var message = TcpContracts.ChangePassword(userId, currentPassword, newPassword);
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
@@ -883,7 +910,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await CheckResponseAsync(token);
     }
 
-    public async Task<IReadOnlyList<PersonalAccessTokenResponse>> GetPersonalAccessTokensAsync(CancellationToken token = default)
+    public async Task<IReadOnlyList<PersonalAccessTokenResponse>> GetPersonalAccessTokensAsync(
+        CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
@@ -902,7 +930,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         return BinaryMapper.MapPersonalAccessTokens(responseBuffer);
     }
 
-    public async Task<RawPersonalAccessToken?> CreatePersonalAccessTokenAsync(string name, ulong? expiry = 0, CancellationToken token = default)
+    public async Task<RawPersonalAccessToken?> CreatePersonalAccessTokenAsync(string name, ulong? expiry = 0,
+        CancellationToken token = default)
     {
         var message = TcpContracts.CreatePersonalAccessToken(name, expiry);
         var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
@@ -967,7 +996,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         {
             try
             {
-                PolledMessages<TMessage> fetchResponse = await PollMessagesAsync(request, deserializer, decryptor, token);
+                PolledMessages<TMessage> fetchResponse
+                    = await PollMessagesAsync(request, deserializer, decryptor, token);
                 if (fetchResponse.Messages.Count == 0)
                 {
                     continue;
@@ -980,7 +1010,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
             }
             catch (InvalidResponseException e)
             {
-                _logger.LogError("Error encountered while polling messages - Stream ID: {streamId}, Topic ID: {topicId}, Partition ID: {partitionId}, error message {message}",
+                _logger.LogError(
+                    "Error encountered while polling messages - Stream ID: {streamId}, Topic ID: {topicId}, Partition ID: {partitionId}, error message {message}",
                     request.StreamId, request.TopicId, request.PartitionId, e.Message);
             }
         }
@@ -988,7 +1019,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         writer.Complete();
     }
 
-    private async Task SendFetchMessagesRequestPayload(Consumer consumer, Identifier streamId, Identifier topicId, PollingStrategy pollingStrategy,
+    private async Task SendFetchMessagesRequestPayload(Consumer consumer, Identifier streamId, Identifier topicId,
+        PollingStrategy pollingStrategy,
         int count, bool autoCommit, uint? partitionId, CancellationToken token)
     {
         var messageBufferSize = CalculateMessageBufferSize(streamId, topicId, consumer);
@@ -998,8 +1030,10 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
 
         try
         {
-            TcpContracts.GetMessages(message.AsSpan()[..messageBufferSize], consumer, streamId, topicId, pollingStrategy, count, autoCommit, partitionId);
-            TcpMessageStreamHelpers.CreatePayload(payload, message.AsSpan()[..messageBufferSize], CommandCodes.POLL_MESSAGES_CODE);
+            TcpContracts.GetMessages(message.AsSpan()[..messageBufferSize], consumer, streamId, topicId,
+                pollingStrategy, count, autoCommit, partitionId);
+            TcpMessageStreamHelpers.CreatePayload(payload, message.AsSpan()[..messageBufferSize],
+                CommandCodes.POLL_MESSAGES_CODE);
 
             await _stream.SendAsync(payload.AsMemory()[..payloadBufferSize], token);
         }

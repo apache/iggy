@@ -17,7 +17,7 @@
 
 using System.Threading.Channels;
 using Apache.Iggy.Configuration;
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.IggyClient.Implementations;
 using Apache.Iggy.MessagesDispatcher;
 using Microsoft.Extensions.Logging;
@@ -35,7 +35,8 @@ internal class HttpMessageStreamBuilder
     private HttpMessageInvoker? _messageInvoker;
     private MessageSenderDispatcher? _messageSenderDispatcher;
 
-    internal HttpMessageStreamBuilder(HttpClient client, IMessageStreamConfigurator options, ILoggerFactory loggerFactory)
+    internal HttpMessageStreamBuilder(HttpClient client, IMessageStreamConfigurator options,
+        ILoggerFactory loggerFactory)
     {
         var sendMessagesOptions = new MessageBatchingSettings();
         var messagePollingOptions = new MessagePollingSettings();

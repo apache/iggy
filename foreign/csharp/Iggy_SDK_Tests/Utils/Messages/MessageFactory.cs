@@ -18,7 +18,7 @@
 using System.Buffers.Binary;
 using System.Text;
 using System.Text.Json;
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.Headers;
@@ -47,10 +47,15 @@ internal static class MessageFactory
             var id = BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan()[..4]);
             var textLength = BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan()[4..8]);
             var text = Encoding.UTF8.GetString(bytes.AsSpan()[8..(8 + textLength)]);
-            return new DummyMessage { Id = id, Text = text };
+            return new DummyMessage
+            {
+                Id = id,
+                Text = text
+            };
         };
 
-    internal static (ulong offset, ulong timestamp, Guid guid, int headersLength, uint checkSum, byte[] payload) CreateMessageResponseFields()
+    internal static (ulong offset, ulong timestamp, Guid guid, int headersLength, uint checkSum, byte[] payload)
+        CreateMessageResponseFields()
     {
         var offset = (ulong)Random.Shared.Next(6, 69);
         var timestamp = (ulong)Random.Shared.Next(420, 69420);
@@ -61,7 +66,8 @@ internal static class MessageFactory
         return (offset, timestamp, guid, headersLength, checkSum, bytes);
     }
 
-    internal static (ulong offset, ulong timestamp, Guid guid, int headersLength, uint checkSum, byte[] payload) CreateMessageResponseFieldsTMessage()
+    internal static (ulong offset, ulong timestamp, Guid guid, int headersLength, uint checkSum, byte[] payload)
+        CreateMessageResponseFieldsTMessage()
     {
         var msg = new DummyMessage
         {
@@ -86,7 +92,8 @@ internal static class MessageFactory
         return (offset, timestamp, guid, bytes);
     }
 
-    internal static (ulong offset, ulong timestamp, Guid guid, byte[] payload) CreateMessageResponseFields<TMessage>(TMessage message, Func<TMessage, byte[]> serializer)
+    internal static (ulong offset, ulong timestamp, Guid guid, byte[] payload) CreateMessageResponseFields<TMessage>(
+        TMessage message, Func<TMessage, byte[]> serializer)
     {
         var offset = (ulong)Random.Shared.Next(6, 69);
         var timestamp = (ulong)Random.Shared.Next(420, 69420);
@@ -144,7 +151,8 @@ internal static class MessageFactory
         };
     }
 
-    internal static MessageSendRequest CreateMessageSendRequest(int streamId, int topicId, int partitionId, IList<Message>? messages = null)
+    internal static MessageSendRequest CreateMessageSendRequest(int streamId, int topicId, int partitionId,
+        IList<Message>? messages = null)
     {
         return new MessageSendRequest
         {
@@ -177,7 +185,11 @@ internal static class MessageFactory
     {
         return Enumerable.Range(1, count).Select(i =>
         {
-            var payload = SerializeDummyMessage(new DummyMessage { Id = Random.Shared.Next(1, 69), Text = Utility.RandomString(Random.Shared.Next(20, 69)) });
+            var payload = SerializeDummyMessage(new DummyMessage
+            {
+                Id = Random.Shared.Next(1, 69),
+                Text = Utility.RandomString(Random.Shared.Next(20, 69))
+            });
             return new Message
             {
                 Header = new MessageHeader
@@ -191,7 +203,8 @@ internal static class MessageFactory
         }).ToList();
     }
 
-    internal static IList<Message> GenerateDummyMessages(int count, int payloadLen, Dictionary<HeaderKey, HeaderValue>? Headers = null)
+    internal static IList<Message> GenerateDummyMessages(int count, int payloadLen,
+        Dictionary<HeaderKey, HeaderValue>? Headers = null)
     {
         return Enumerable.Range(1, count).Select(i =>
         {
@@ -223,7 +236,8 @@ internal static class MessageFactory
         };
     }
 
-    internal static MessageFetchRequest CreateMessageFetchRequestConsumer(int count, int streamId, int topicId, uint partitionId, int consumerId = 1)
+    internal static MessageFetchRequest CreateMessageFetchRequestConsumer(int count, int streamId, int topicId,
+        uint partitionId, int consumerId = 1)
     {
         return new MessageFetchRequest
         {
@@ -237,7 +251,8 @@ internal static class MessageFactory
         };
     }
 
-    internal static MessageFetchRequest CreateMessageFetchRequestConsumerGroup(int count, int streamId, int topicId, uint partitionId, int consumerGroupId)
+    internal static MessageFetchRequest CreateMessageFetchRequestConsumerGroup(int count, int streamId, int topicId,
+        uint partitionId, int consumerGroupId)
     {
         return new MessageFetchRequest
         {
@@ -256,11 +271,11 @@ internal static class MessageFactory
         var headers = new Dictionary<HeaderKey, HeaderValue>();
         for (var i = 0; i < count; i++)
         {
-            headers.Add(
-                HeaderKey.New(Utility.RandomString(Random.Shared.Next(50, 100))),
+            headers.Add(HeaderKey.New(Utility.RandomString(Random.Shared.Next(50, 100))),
                 Random.Shared.Next(1, 12) switch
                 {
-                    1 => HeaderValue.FromBytes(Encoding.UTF8.GetBytes(Utility.RandomString(Random.Shared.Next(50, 100)))),
+                    1 => HeaderValue.FromBytes(
+                        Encoding.UTF8.GetBytes(Utility.RandomString(Random.Shared.Next(50, 100)))),
                     2 => HeaderValue.FromString(Utility.RandomString(Random.Shared.Next(25, 100))),
                     3 => HeaderValue.FromBool(Random.Shared.Next(0, 1) switch { 0 => false, 1 => true, _ => false }),
                     4 => HeaderValue.FromInt32(Random.Shared.Next(69, 420)),

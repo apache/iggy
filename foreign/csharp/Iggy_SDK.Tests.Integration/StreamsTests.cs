@@ -15,7 +15,7 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Messages;
@@ -26,8 +26,7 @@ using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.Tests.Integrations;
 
-[MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-public class StreamsTests(Protocol protocol)
+public class StreamsTests
 {
     private const string Name = "test-stream";
     private const uint StreamId = 1;
@@ -37,7 +36,8 @@ public class StreamsTests(Protocol protocol)
     public required IggyServerFixture Fixture { get; init; }
 
     [Test]
-    public async Task CreateStream_HappyPath_Should_CreateStream_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task CreateStream_HappyPath_Should_CreateStream_Successfully(Protocol protocol)
     {
         var response = await Fixture.Clients[protocol].CreateStreamAsync(Name, StreamId);
 
@@ -53,14 +53,16 @@ public class StreamsTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(CreateStream_HappyPath_Should_CreateStream_Successfully))]
-    public async Task CreateStream_Duplicate_Should_Throw_InvalidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task CreateStream_Duplicate_Should_Throw_InvalidResponse(Protocol protocol)
     {
         await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol].CreateStreamAsync(Name, StreamId));
     }
 
     [Test]
     [DependsOn(nameof(CreateStream_Duplicate_Should_Throw_InvalidResponse))]
-    public async Task GetStreams_Should_ReturnValidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetStreams_Should_ReturnValidResponse(Protocol protocol)
     {
         await Fixture.Clients[protocol].CreateStreamAsync("Test Stream 2", 2);
 
@@ -74,7 +76,8 @@ public class StreamsTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(GetStreams_Should_ReturnValidResponse))]
-    public async Task GetStreamById_Should_ReturnValidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetStreamById_Should_ReturnValidResponse(Protocol protocol)
     {
         var response = await Fixture.Clients[protocol].GetStreamByIdAsync(Identifier.Numeric(StreamId));
         response.ShouldNotBeNull();
@@ -89,7 +92,8 @@ public class StreamsTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(GetStreamById_Should_ReturnValidResponse))]
-    public async Task GetStreamById_WithTopics_Should_ReturnValidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetStreamById_WithTopics_Should_ReturnValidResponse(Protocol protocol)
     {
         var topicRequest1 = TopicFactory.CreateTopic(messageExpiry: 100_000);
         var topicRequest2 = TopicFactory.CreateTopic(2, messageExpiry: 100_000);
@@ -153,7 +157,8 @@ public class StreamsTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(GetStreamById_WithTopics_Should_ReturnValidResponse))]
-    public async Task UpdateStream_Should_UpdateStream_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task UpdateStream_Should_UpdateStream_Successfully(Protocol protocol)
     {
         await Fixture.Clients[protocol].UpdateStreamAsync(Identifier.Numeric(StreamId), "updated-test-stream");
 
@@ -164,7 +169,8 @@ public class StreamsTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(UpdateStream_Should_UpdateStream_Successfully))]
-    public async Task PurgeStream_Should_PurgeStream_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task PurgeStream_Should_PurgeStream_Successfully(Protocol protocol)
     {
         // Ensure the stream has messages (created in previous steps) before purging
         var stream = await Fixture.Clients[protocol].GetStreamByIdAsync(Identifier.Numeric(StreamId!));
@@ -182,22 +188,27 @@ public class StreamsTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(PurgeStream_Should_PurgeStream_Successfully))]
-    public async Task DeleteStream_Should_DeleteStream_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task DeleteStream_Should_DeleteStream_Successfully(Protocol protocol)
     {
         await Should.NotThrowAsync(() => Fixture.Clients[protocol].DeleteStreamAsync(Identifier.Numeric(StreamId)));
     }
 
     [Test]
     [DependsOn(nameof(DeleteStream_Should_DeleteStream_Successfully))]
-    public async Task DeleteStream_NotExists_Should_Throw_InvalidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task DeleteStream_NotExists_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].DeleteStreamAsync(Identifier.Numeric(StreamId)));
+        await Should.ThrowAsync<InvalidResponseException>(() =>
+            Fixture.Clients[protocol].DeleteStreamAsync(Identifier.Numeric(StreamId)));
     }
 
     [Test]
     [DependsOn(nameof(DeleteStream_NotExists_Should_Throw_InvalidResponse))]
-    public async Task GetStreamById_AfterDelete_Should_Throw_InvalidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetStreamById_AfterDelete_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].GetStreamByIdAsync(Identifier.Numeric(StreamId)));
+        await Should.ThrowAsync<InvalidResponseException>(() =>
+            Fixture.Clients[protocol].GetStreamByIdAsync(Identifier.Numeric(StreamId)));
     }
 }

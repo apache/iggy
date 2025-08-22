@@ -19,16 +19,15 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Apache.Iggy;
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
-using Apache.Iggy.JsonConfiguration;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Shared;
 using Microsoft.Extensions.Logging;
 
 var jsonOptions = new JsonSerializerOptions();
-jsonOptions.PropertyNamingPolicy = new ToSnakeCaseNamingPolicy();
+jsonOptions.PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower;
 jsonOptions.WriteIndented = true;
 var protocol = Protocol.Tcp;
 var loggerFactory = LoggerFactory.Create(builder =>
@@ -81,13 +80,15 @@ await ConsumeMessages();
 async Task ConsumeMessages()
 {
     var intervalInMs = 1000;
-    Console.WriteLine($"Messages will be polled from stream {streamId}, topic {topicId}, partition {partitionId} with interval {intervalInMs} ms");
+    Console.WriteLine(
+        $"Messages will be polled from stream {streamId}, topic {topicId}, partition {partitionId} with interval {intervalInMs} ms");
     Func<byte[], Envelope> deserializer = serializedData =>
     {
         var envelope = new Envelope();
         var messageTypeLength = BitConverter.ToInt32(serializedData, 0);
         envelope.MessageType = Encoding.UTF8.GetString(serializedData, 4, messageTypeLength);
-        envelope.Payload = Encoding.UTF8.GetString(serializedData, 4 + messageTypeLength, serializedData.Length - (4 + messageTypeLength));
+        envelope.Payload = Encoding.UTF8.GetString(serializedData, 4 + messageTypeLength,
+            serializedData.Length - (4 + messageTypeLength));
         return envelope;
     };
     Func<byte[], byte[]> decryptor = static payload =>
@@ -115,15 +116,16 @@ async Task ConsumeMessages()
         PollingStrategy = PollingStrategy.Next(),
         AutoCommit = true
     }, deserializer, decryptor);
-    await foreach (MessageResponse<Envelope> msgResponse in bus.PollMessagesAsync(new PollMessagesRequest
-    {
-        Consumer = Consumer.New(consumerId),
-        Count = 1,
-        TopicId = topicId,
-        StreamId = streamId,
-        PartitionId = partitionId,
-        PollingStrategy = PollingStrategy.Next()
-    }, deserializer, decryptor))
+    await foreach (MessageResponse<Envelope> msgResponse in bus.PollMessagesAsync(
+                       new PollMessagesRequest
+                       {
+                           Consumer = Consumer.New(consumerId),
+                           Count = 1,
+                           TopicId = topicId,
+                           StreamId = streamId,
+                           PartitionId = partitionId,
+                           PollingStrategy = PollingStrategy.Next()
+                       }, deserializer, decryptor))
     {
         HandleMessage(msgResponse);
     }
@@ -140,24 +142,24 @@ void HandleMessage(MessageResponse<Envelope> messageResponse)
     switch (messageResponse.Message.MessageType)
     {
         case "order_created":
-            {
-                var orderCreated = JsonSerializer.Deserialize<OrderCreated>(messageResponse.Message.Payload, jsonOptions);
-                Console.WriteLine(orderCreated);
-                break;
-            }
+        {
+            var orderCreated = JsonSerializer.Deserialize<OrderCreated>(messageResponse.Message.Payload, jsonOptions);
+            Console.WriteLine(orderCreated);
+            break;
+        }
         case "order_confirmed":
-            {
-                var orderConfirmed =
-                    JsonSerializer.Deserialize<OrderConfirmed>(messageResponse.Message.Payload, jsonOptions);
-                Console.WriteLine(orderConfirmed);
-                break;
-            }
+        {
+            var orderConfirmed =
+                JsonSerializer.Deserialize<OrderConfirmed>(messageResponse.Message.Payload, jsonOptions);
+            Console.WriteLine(orderConfirmed);
+            break;
+        }
         case "order_rejected":
-            {
-                var orderRejected = JsonSerializer.Deserialize<OrderRejected>(messageResponse.Message.Payload, jsonOptions);
-                Console.WriteLine(orderRejected);
-                break;
-            }
+        {
+            var orderRejected = JsonSerializer.Deserialize<OrderRejected>(messageResponse.Message.Payload, jsonOptions);
+            Console.WriteLine(orderRejected);
+            break;
+        }
     }
 
 

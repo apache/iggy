@@ -47,5 +47,10 @@
             <Link>Properties\DEPENDENCIES.md</Link>
         </Content>
     </ItemGroup>
+    
+    <ItemGroup>
+        <InternalsVisibleTo Include="Apache.Iggy.Tests" />
+        <InternalsVisibleTo Include="Apache.Iggy.Tests.Integrations" />
+    </ItemGroup>
 
 </Project>

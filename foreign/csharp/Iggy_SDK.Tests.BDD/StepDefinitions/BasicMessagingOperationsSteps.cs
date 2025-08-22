@@ -16,7 +16,7 @@
 // // under the License.
 
 using System.Text;
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
 using Apache.Iggy.Kinds;
@@ -92,13 +92,13 @@ public class BasicMessagingOperationsSteps
     }
 
     [When(@"I create a topic with ID (\d+) and name (.*) in stream (\d+) with (\d+) partitions")]
-    public async Task WhenICreateATopicWithIdAndNameInStreamWithPartitions(uint topicId, string topicName, uint streamId, uint partitions)
+    public async Task WhenICreateATopicWithIdAndNameInStreamWithPartitions(uint topicId, string topicName,
+        uint streamId, uint partitions)
     {
         _context.CreatedTopic = await _context.IggyClient.CreateTopicAsync(Identifier.Numeric(streamId),
             topicId: topicId,
             name: topicName,
-            partitionsCount: partitions
-        );
+            partitionsCount: partitions);
     }
 
     [Then(@"the topic should be created successfully")]
@@ -124,7 +124,8 @@ public class BasicMessagingOperationsSteps
     }
 
     [When(@"I send (\d+) messages to stream (\d+), topic (\d+), partition (\d+)")]
-    public async Task WhenISendMessagesToStreamTopicPartition(int messageCount, int streamId, int topicId, int partitionId)
+    public async Task WhenISendMessagesToStreamTopicPartition(int messageCount, int streamId, int topicId,
+        int partitionId)
     {
         List<Message> messages = Enumerable.Range(1, messageCount)
             .Select(i => new Message(1, Encoding.UTF8.GetBytes($"Test message {i}")))
@@ -138,7 +139,7 @@ public class BasicMessagingOperationsSteps
             Messages = messages
         });
 
-        _context.LastSendMessage = messages.Last();
+        _context.LastSendMessage = messages[^1];
     }
 
     [Then(@"all messages should be sent successfully")]
@@ -148,7 +149,8 @@ public class BasicMessagingOperationsSteps
     }
 
     [When(@"I poll messages from stream (\d+), topic (\d+), partition (\d+) starting from offset (\d+)")]
-    public async Task WhenIPollMessagesFromStreamTopicPartitionStartingFromOffset(int streamId, int topicId, uint partitionId, ulong startOffset)
+    public async Task WhenIPollMessagesFromStreamTopicPartitionStartingFromOffset(int streamId, int topicId,
+        uint partitionId, ulong startOffset)
     {
         var messages = await _context.IggyClient.PollMessagesAsync(new MessageFetchRequest
         {

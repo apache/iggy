@@ -23,6 +23,7 @@ namespace Apache.Iggy.Shared;
 public class OrderCreated : ISerializableMessage
 {
     private readonly JsonSerializerOptions _jsonSerializerOptions;
+
     public required int Id { get; init; }
     public required string CurrencyPair { get; init; }
     public required double Price { get; init; }
@@ -72,6 +73,7 @@ public class OrderCreated : ISerializableMessage
 public class OrderConfirmed : ISerializableMessage
 {
     private readonly JsonSerializerOptions _jsonSerializerOptions;
+
     public required int Id { get; init; }
     public required double Price { get; init; }
     public required ulong Timestamp { get; init; }
@@ -118,6 +120,7 @@ public class OrderConfirmed : ISerializableMessage
 public class OrderRejected : ISerializableMessage
 {
     private readonly JsonSerializerOptions _jsonSerializerOptions;
+
     public required int Id { get; init; }
     public required ulong Timestamp { get; init; }
     public required string Reason { get; init; }

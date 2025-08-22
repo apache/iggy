@@ -19,9 +19,4 @@ using Apache.Iggy.Kinds;
 
 namespace Apache.Iggy.Contracts.Http;
 
-public sealed class StoreOffsetRequest
-{
-    public required Consumer Consumer { get; init; }
-    public required uint? PartitionId { get; init; }
-    public required ulong Offset { get; init; }
-}
+internal sealed record StoreOffsetRequest(Consumer Consumer, uint? PartitionId, ulong Offset);

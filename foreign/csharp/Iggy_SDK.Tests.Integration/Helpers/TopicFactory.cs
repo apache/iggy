@@ -21,7 +21,7 @@ namespace Apache.Iggy.Tests.Integrations.Helpers;
 
 public static class TopicFactory
 {
-    public static CreateTopicRequest CreateTopic(uint topicId = 1, uint partitionsCount = 1, ulong messageExpiry = 0)
+    internal static CreateTopicRequest CreateTopic(uint topicId = 1, uint partitionsCount = 1, ulong messageExpiry = 0)
     {
         return new CreateTopicRequest
         {

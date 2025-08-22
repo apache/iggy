@@ -19,7 +19,7 @@ using System.Buffers;
 using System.Buffers.Binary;
 using System.Threading.Channels;
 using Apache.Iggy.Configuration;
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Messages;
 using Microsoft.Extensions.Logging;
@@ -81,7 +81,8 @@ internal sealed class MessageSenderDispatcher
                     catch
                     {
                         var partId = BinaryPrimitives.ReadInt32LittleEndian(messagesSendRequests[i].Partitioning.Value);
-                        _logger.LogError("Error encountered while sending messages - Stream ID:{streamId}, Topic ID:{topicId}, Partition ID: {partitionId}",
+                        _logger.LogError(
+                            "Error encountered while sending messages - Stream ID:{streamId}, Topic ID:{topicId}, Partition ID: {partitionId}",
                             messagesSendRequests[i].StreamId, messagesSendRequests[i].TopicId, partId);
                     }
                 }
@@ -106,7 +107,8 @@ internal sealed class MessageSenderDispatcher
                     catch
                     {
                         var partId = BinaryPrimitives.ReadInt32LittleEndian(messages.Partitioning.Value);
-                        _logger.LogError("Error encountered while sending messages - Stream ID:{streamId}, Topic ID:{topicId}, Partition ID: {partitionId}",
+                        _logger.LogError(
+                            "Error encountered while sending messages - Stream ID:{streamId}, Topic ID:{topicId}, Partition ID: {partitionId}",
                             messages.StreamId, messages.TopicId, partId);
                     }
                 }
