@@ -61,6 +61,13 @@ spec:
             - name: quic
               containerPort: {{ .Values.server.ports.quic }}
               protocol: TCP
+          {{ if .Values.env }}
+          env:
+            {{- range .Values.env }}
+            - name: {{ .name }}
+              value: {{ .value | quote }}
+            {{- end }}
+          {{ end }}
           livenessProbe:
             httpGet:
               path: /
