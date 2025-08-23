@@ -389,7 +389,7 @@ class SendMessage:
     This class wraps a Rust message meant for sending, facilitating
     the creation of such messages from Python and their subsequent use in Rust.
     """
-    def __new__(cls, data:builtins.str) -> SendMessage:
+    def __new__(cls, data:builtins.str | bytes) -> SendMessage:
         r"""
         Constructs a new `SendMessage` instance from a string.
         
