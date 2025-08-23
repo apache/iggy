@@ -17,6 +17,7 @@
  */
 
 use crate::clients::client::IggyClient;
+use crate::connection::{NewTcpClient, NewTokioTcpClient};
 use crate::http::http_client::HttpClient;
 use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
@@ -28,4 +29,5 @@ pub enum ClientWrapper {
     Http(HttpClient),
     Tcp(TcpClient),
     Quic(QuicClient),
+    TcpTokio(NewTokioTcpClient),
 }

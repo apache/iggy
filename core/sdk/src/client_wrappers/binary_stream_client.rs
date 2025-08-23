@@ -29,6 +29,7 @@ impl StreamClient for ClientWrapper {
             ClientWrapper::Http(client) => client.get_stream(stream_id).await,
             ClientWrapper::Tcp(client) => client.get_stream(stream_id).await,
             ClientWrapper::Quic(client) => client.get_stream(stream_id).await,
+            ClientWrapper::TcpTokio(client) => client.get_stream(stream_id).await,
         }
     }
 
@@ -38,6 +39,7 @@ impl StreamClient for ClientWrapper {
             ClientWrapper::Http(client) => client.get_streams().await,
             ClientWrapper::Tcp(client) => client.get_streams().await,
             ClientWrapper::Quic(client) => client.get_streams().await,
+            ClientWrapper::TcpTokio(client) => client.get_streams().await,
         }
     }
 
@@ -51,6 +53,7 @@ impl StreamClient for ClientWrapper {
             ClientWrapper::Http(client) => client.create_stream(name, stream_id).await,
             ClientWrapper::Tcp(client) => client.create_stream(name, stream_id).await,
             ClientWrapper::Quic(client) => client.create_stream(name, stream_id).await,
+            ClientWrapper::TcpTokio(client) => client.create_stream(name, stream_id).await,
         }
     }
 
@@ -60,6 +63,7 @@ impl StreamClient for ClientWrapper {
             ClientWrapper::Http(client) => client.update_stream(stream_id, name).await,
             ClientWrapper::Tcp(client) => client.update_stream(stream_id, name).await,
             ClientWrapper::Quic(client) => client.update_stream(stream_id, name).await,
+            ClientWrapper::TcpTokio(client) => client.update_stream(stream_id, name).await,
         }
     }
 
@@ -69,6 +73,7 @@ impl StreamClient for ClientWrapper {
             ClientWrapper::Http(client) => client.delete_stream(stream_id).await,
             ClientWrapper::Tcp(client) => client.delete_stream(stream_id).await,
             ClientWrapper::Quic(client) => client.delete_stream(stream_id).await,
+            ClientWrapper::TcpTokio(client) => client.delete_stream(stream_id).await,
         }
     }
 
@@ -78,6 +83,7 @@ impl StreamClient for ClientWrapper {
             ClientWrapper::Http(client) => client.purge_stream(stream_id).await,
             ClientWrapper::Tcp(client) => client.purge_stream(stream_id).await,
             ClientWrapper::Quic(client) => client.purge_stream(stream_id).await,
+            ClientWrapper::TcpTokio(client) => client.purge_stream(stream_id).await,
         }
     }
 }

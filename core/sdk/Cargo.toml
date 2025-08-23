@@ -49,14 +49,17 @@ futures-util = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 num_cpus = "1.17.0"
+parking_lot = "0.12.4"
 quinn = { workspace = true }
 reqwest = { workspace = true }
 reqwest-middleware = { workspace = true }
 reqwest-retry = { workspace = true }
+rustc-hash = "2.1.1"
 rustls = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
+tokio-util.workspace = true
 tracing = { workspace = true }
 trait-variant = { workspace = true }
 webpki-roots = { workspace = true }

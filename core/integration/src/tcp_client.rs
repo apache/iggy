@@ -18,7 +18,11 @@
 
 use crate::test_server::{ClientFactory, Transport};
 use async_trait::async_trait;
-use iggy::prelude::{Client, ClientWrapper, TcpClient, TcpClientConfig};
+use iggy::{
+    connection::NewTokioTcpClient,
+    prelude::{Client, ClientWrapper, IggyClient, TcpClient, TcpClientConfig},
+    runtime::TokioRuntime,
+};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Default)]
@@ -43,12 +47,25 @@ impl ClientFactory for TcpClientFactory {
             tls_validate_certificate: self.tls_validate_certificate,
             ..TcpClientConfig::default()
         };
-        let client = TcpClient::create(Arc::new(config)).unwrap_or_else(|e| {
+
+        // let factory: StreamFactory<TokioCompat> = Arc::new(move |addr: SocketAddr| -> SFut<TokioCompat> {
+        //     Box::pin(tokio_tcp(addr))
+        // });
+
+        let tokio_rt = Arc::new(TokioRuntime {});
+        let client = NewTokioTcpClient::create(Arc::new(config), tokio_rt).unwrap_or_else(|e| {
             panic!(
-                "Failed to create TcpClient, iggy-server has address {}, error: {:?}",
+                "Failed to create NewTcpClient, iggy-server has address {}, error: {:?}",
                 self.server_addr, e
             )
         });
+        // let client = TcpClient::create(Arc::new(config)).unwrap_or_else(|e| {
+        //     panic!(
+        //         "Failed to create TcpClient, iggy-server has address {}, error: {:?}",
+        //         self.server_addr, e
+        //     )
+        // });
+
         Client::connect(&client).await.unwrap_or_else(|e| {
             if self.tls_enabled {
                 panic!(
@@ -65,7 +82,7 @@ impl ClientFactory for TcpClientFactory {
                 )
             }
         });
-        ClientWrapper::Tcp(client)
+        ClientWrapper::TcpTokio(client)
     }
 
     fn transport(&self) -> Transport {

@@ -30,6 +30,7 @@ impl Client for ClientWrapper {
             ClientWrapper::Http(client) => client.connect().await,
             ClientWrapper::Tcp(client) => client.connect().await,
             ClientWrapper::Quic(client) => client.connect().await,
+            ClientWrapper::TcpTokio(client) => client.connect().await,
         }
     }
 
@@ -39,6 +40,7 @@ impl Client for ClientWrapper {
             ClientWrapper::Http(client) => client.disconnect().await,
             ClientWrapper::Tcp(client) => client.disconnect().await,
             ClientWrapper::Quic(client) => client.disconnect().await,
+            ClientWrapper::TcpTokio(client) => client.disconnect().await,
         }
     }
 
@@ -48,6 +50,7 @@ impl Client for ClientWrapper {
             ClientWrapper::Http(client) => client.shutdown().await,
             ClientWrapper::Tcp(client) => client.shutdown().await,
             ClientWrapper::Quic(client) => client.shutdown().await,
+            ClientWrapper::TcpTokio(client) => client.shutdown().await,
         }
     }
 
@@ -57,6 +60,7 @@ impl Client for ClientWrapper {
             ClientWrapper::Http(client) => client.subscribe_events().await,
             ClientWrapper::Tcp(client) => client.subscribe_events().await,
             ClientWrapper::Quic(client) => client.subscribe_events().await,
+            ClientWrapper::TcpTokio(client) => client.subscribe_events().await,
         }
     }
 }

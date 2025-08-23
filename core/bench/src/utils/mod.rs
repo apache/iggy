@@ -70,7 +70,11 @@ pub async fn get_server_stats(client_factory: &Arc<dyn ClientFactory>) -> Result
         .login_user(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)
         .await?;
 
-    client.get_stats().await
+    let stats= client.get_stats().await?;
+    let _ = client.disconnect().await;
+
+    drop(client);
+    Ok(stats)
 }
 
 pub async fn collect_server_logs_and_save_to_file(
@@ -92,6 +96,9 @@ pub async fn collect_server_logs_and_save_to_file(
         )
         .await?
         .0;
+
+    // Disconnect the client to ensure proper cleanup
+    let _ = client.disconnect().await;
 
     fs::write(output_dir.join("server_logs.zip"), snapshot).map_err(|e| {
         error!("Failed to write server logs to file: {:?}", e);
