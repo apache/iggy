@@ -185,7 +185,7 @@ class IggyClient:
     """
     def __new__(cls, conn:typing.Optional[builtins.str]=None) -> IggyClient:
         r"""
-        Constructs a new IggyClient.
+        Constructs a new IggyClient from a TCP server address.
         
         This initializes a new runtime for asynchronous operations.
         Future versions might utilize asyncio for more Pythonic async.
