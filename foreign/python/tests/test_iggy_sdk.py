@@ -30,7 +30,7 @@ import pytest
 
 from .utils import get_server_config, wait_for_ping, wait_for_server
 
-from apache_iggy import IggyClient, PollingStrategy, AutoCommit
+from apache_iggy import IggyClient, PollingStrategy, AutoCommit, ReceiveMessage
 from apache_iggy import SendMessage as Message
 
 
@@ -460,7 +460,7 @@ class TestConsumerGroup:
             poll_interval=timedelta(seconds=1),
         )
 
-        async def take(message) -> None:
+        async def take(message: ReceiveMessage) -> None:
             received_messages.append(message.payload().decode())
             if len(received_messages) == 5:
                 shutdown_event.set()

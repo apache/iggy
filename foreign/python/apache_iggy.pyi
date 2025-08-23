@@ -305,7 +305,7 @@ class IggyConsumer:
         Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
         if the operation fails.
         """
-    def consume_messages(self, callback:collections.abc.Callable[[str]], shutdown_event:typing.Optional[asyncio.Event]) -> collections.abc.Awaitable[None]:
+    def consume_messages(self, callback:collections.abc.Callable[[ReceiveMessage], collections.abc.Awaitable[None]], shutdown_event:typing.Optional[asyncio.Event]) -> collections.abc.Awaitable[None]:
         r"""
         Consumes messages continuously using a callback function and an optional `asyncio.Event` for signaling shutdown.
         
