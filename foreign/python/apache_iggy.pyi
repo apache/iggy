@@ -345,7 +345,7 @@ class ReceiveMessage:
     
     This class wraps a Rust message, allowing for access to its payload and offset from Python.
     """
-    def payload(self) -> typing.Any:
+    def payload(self) -> bytes:
         r"""
         Retrieves the payload of the received message.
         

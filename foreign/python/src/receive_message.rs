@@ -45,8 +45,8 @@ impl ReceiveMessage {
     /// Retrieves the payload of the received message.
     ///
     /// The payload is returned as a Python bytes object.
-    pub fn payload(&self, py: Python) -> PyObject {
-        PyBytes::new(py, &self.inner.payload).into()
+    pub fn payload<'a>(&self, py: Python<'a>) -> Bound<'a, PyBytes> {
+        PyBytes::new(py, &self.inner.payload)
     }
 
     /// Retrieves the offset of the received message.
