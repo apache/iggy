@@ -15,7 +15,7 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
@@ -25,8 +25,7 @@ using Shouldly;
 
 namespace Apache.Iggy.Tests.Integrations;
 
-[MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-public class ConsumerGroupTests(Protocol protocol)
+public class ConsumerGroupTests
 {
     private static readonly uint GroupId = 1;
     private static readonly Identifier StreamId = Identifier.Numeric(1);
@@ -37,9 +36,11 @@ public class ConsumerGroupTests(Protocol protocol)
     public required ConsumerGroupFixture Fixture { get; init; }
 
     [Test]
-    public async Task CreateConsumerGroup_HappyPath_Should_CreateConsumerGroup_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task CreateConsumerGroup_HappyPath_Should_CreateConsumerGroup_Successfully(Protocol protocol)
     {
-        var consumerGroup = await Fixture.Clients[protocol].CreateConsumerGroupAsync(StreamId, TopicId, GroupName, GroupId);
+        var consumerGroup
+            = await Fixture.Clients[protocol].CreateConsumerGroupAsync(StreamId, TopicId, GroupName, GroupId);
 
         consumerGroup.ShouldNotBeNull();
         consumerGroup.Id.ShouldBe(GroupId);
@@ -50,16 +51,20 @@ public class ConsumerGroupTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(CreateConsumerGroup_HappyPath_Should_CreateConsumerGroup_Successfully))]
-    public async Task CreateConsumerGroup_Should_Throw_InvalidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task CreateConsumerGroup_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].CreateConsumerGroupAsync(StreamId, TopicId, GroupName, GroupId));
+        await Should.ThrowAsync<InvalidResponseException>(() =>
+            Fixture.Clients[protocol].CreateConsumerGroupAsync(StreamId, TopicId, GroupName, GroupId));
     }
 
     [Test]
     [DependsOn(nameof(CreateConsumerGroup_Should_Throw_InvalidResponse))]
-    public async Task GetConsumerGroupById_Should_Return_ValidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetConsumerGroupById_Should_Return_ValidResponse(Protocol protocol)
     {
-        var response = await Fixture.Clients[protocol].GetConsumerGroupByIdAsync(StreamId, TopicId, Identifier.Numeric(GroupId));
+        var response = await Fixture.Clients[protocol]
+            .GetConsumerGroupByIdAsync(StreamId, TopicId, Identifier.Numeric(GroupId));
 
         response.ShouldNotBeNull();
         response.Id.ShouldBe(GroupId);
@@ -70,10 +75,11 @@ public class ConsumerGroupTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(GetConsumerGroupById_Should_Return_ValidResponse))]
-    public async Task GetConsumerGroups_Should_Return_ValidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetConsumerGroups_Should_Return_ValidResponse(Protocol protocol)
     {
-        IReadOnlyList<ConsumerGroupResponse> response = await Fixture.Clients[protocol].GetConsumerGroupsAsync(
-            StreamId, TopicId);
+        IReadOnlyList<ConsumerGroupResponse> response
+            = await Fixture.Clients[protocol].GetConsumerGroupsAsync(StreamId, TopicId);
 
         response.ShouldNotBeNull();
         response.Count.ShouldBe(1);
@@ -89,39 +95,48 @@ public class ConsumerGroupTests(Protocol protocol)
     [Test]
     [SkipHttp]
     [DependsOn(nameof(GetConsumerGroups_Should_Return_ValidResponse))]
-    public async Task JoinConsumerGroup_Tcp_Should_JoinConsumerGroup_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task JoinConsumerGroup_Tcp_Should_JoinConsumerGroup_Successfully(Protocol protocol)
     {
-        await Should.NotThrowAsync(() => Fixture.Clients[protocol].JoinConsumerGroupAsync(StreamId, TopicId, Identifier.Numeric(GroupId)));
+        await Should.NotThrowAsync(() =>
+            Fixture.Clients[protocol].JoinConsumerGroupAsync(StreamId, TopicId, Identifier.Numeric(GroupId)));
     }
 
     [Test]
     [SkipTcp]
     [DependsOn(nameof(GetConsumerGroups_Should_Return_ValidResponse))]
-    public async Task JoinConsumerGroup_Http_Should_Throw_FeatureUnavailable()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task JoinConsumerGroup_Http_Should_Throw_FeatureUnavailable(Protocol protocol)
     {
-        await Should.ThrowAsync<FeatureUnavailableException>(() => Fixture.Clients[protocol].JoinConsumerGroupAsync(StreamId, TopicId, Identifier.Numeric(GroupId)));
+        await Should.ThrowAsync<FeatureUnavailableException>(() =>
+            Fixture.Clients[protocol].JoinConsumerGroupAsync(StreamId, TopicId, Identifier.Numeric(GroupId)));
     }
 
     [Test]
     [SkipHttp]
     [DependsOn(nameof(JoinConsumerGroup_Tcp_Should_JoinConsumerGroup_Successfully))]
-    public async Task LeaveConsumerGroup_Tcp_Should_LeaveConsumerGroup_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task LeaveConsumerGroup_Tcp_Should_LeaveConsumerGroup_Successfully(Protocol protocol)
     {
-        await Should.NotThrowAsync(() => Fixture.Clients[protocol].LeaveConsumerGroupAsync(StreamId, TopicId, Identifier.Numeric(GroupId)));
+        await Should.NotThrowAsync(() =>
+            Fixture.Clients[protocol].LeaveConsumerGroupAsync(StreamId, TopicId, Identifier.Numeric(GroupId)));
     }
 
     [Test]
     [SkipTcp]
     [DependsOn(nameof(JoinConsumerGroup_Http_Should_Throw_FeatureUnavailable))]
-    public async Task LeaveConsumerGroup_Http_Should_Throw_FeatureUnavailable()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task LeaveConsumerGroup_Http_Should_Throw_FeatureUnavailable(Protocol protocol)
     {
-        await Should.ThrowAsync<FeatureUnavailableException>(() => Fixture.Clients[protocol].LeaveConsumerGroupAsync(StreamId, TopicId, Identifier.Numeric(GroupId)));
+        await Should.ThrowAsync<FeatureUnavailableException>(() =>
+            Fixture.Clients[protocol].LeaveConsumerGroupAsync(StreamId, TopicId, Identifier.Numeric(GroupId)));
     }
 
     [Test]
     [DependsOn(nameof(LeaveConsumerGroup_Http_Should_Throw_FeatureUnavailable))]
     [DependsOn(nameof(LeaveConsumerGroup_Tcp_Should_LeaveConsumerGroup_Successfully))]
-    public async Task GetConsumerGroupById_WithMembers_Should_Return_ValidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetConsumerGroupById_WithMembers_Should_Return_ValidResponse(Protocol protocol)
     {
         var clientIds = new List<uint>();
         var clients = new List<IIggyClient>();
@@ -135,7 +150,8 @@ public class ConsumerGroupTests(Protocol protocol)
             await client.JoinConsumerGroupAsync(StreamId, TopicId, Identifier.Numeric(GroupId));
         }
 
-        var response = await Fixture.Clients[protocol].GetConsumerGroupByIdAsync(StreamId, TopicId, Identifier.Numeric(GroupId));
+        var response = await Fixture.Clients[protocol]
+            .GetConsumerGroupByIdAsync(StreamId, TopicId, Identifier.Numeric(GroupId));
 
         response.ShouldNotBeNull();
         response.Id.ShouldBe(GroupId);
@@ -150,24 +166,30 @@ public class ConsumerGroupTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(GetConsumerGroupById_WithMembers_Should_Return_ValidResponse))]
-    public async Task DeleteConsumerGroup_Should_DeleteConsumerGroup_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task DeleteConsumerGroup_Should_DeleteConsumerGroup_Successfully(Protocol protocol)
     {
-        await Should.NotThrowAsync(() => Fixture.Clients[protocol].DeleteConsumerGroupAsync(StreamId, TopicId, Identifier.Numeric(GroupId)));
+        await Should.NotThrowAsync(() =>
+            Fixture.Clients[protocol].DeleteConsumerGroupAsync(StreamId, TopicId, Identifier.Numeric(GroupId)));
     }
 
     [Test]
     [SkipHttp]
     [DependsOn(nameof(DeleteConsumerGroup_Should_DeleteConsumerGroup_Successfully))]
-    public async Task JoinConsumerGroup_Tcp_Should_Throw_InvalidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task JoinConsumerGroup_Tcp_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].JoinConsumerGroupAsync(StreamId, TopicId, Identifier.Numeric(GroupId)));
+        await Should.ThrowAsync<InvalidResponseException>(() =>
+            Fixture.Clients[protocol].JoinConsumerGroupAsync(StreamId, TopicId, Identifier.Numeric(GroupId)));
     }
 
 
     [Test]
     [DependsOn(nameof(JoinConsumerGroup_Tcp_Should_Throw_InvalidResponse))]
-    public async Task DeleteConsumerGroup_Should_Throw_InvalidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task DeleteConsumerGroup_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].DeleteConsumerGroupAsync(StreamId, TopicId, Identifier.Numeric(GroupId)));
+        await Should.ThrowAsync<InvalidResponseException>(() =>
+            Fixture.Clients[protocol].DeleteConsumerGroupAsync(StreamId, TopicId, Identifier.Numeric(GroupId)));
     }
 }

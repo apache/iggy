@@ -17,8 +17,4 @@
 
 namespace Apache.Iggy.Contracts.Http;
 
-public sealed class CreateConsumerGroupRequest
-{
-    public required string Name { get; init; }
-    public uint? ConsumerGroupId { get; init; }
-}
+internal sealed record CreateConsumerGroupRequest(string Name, uint? ConsumerGroupId);

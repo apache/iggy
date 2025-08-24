@@ -15,6 +15,7 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Headers;
 using Apache.Iggy.Kinds;
@@ -25,9 +26,9 @@ namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 public class PollMessagesFixture : IggyServerFixture
 {
-    public readonly int MessageCount = 10;
-    public readonly uint StreamId = 1;
-    public readonly CreateTopicRequest TopicRequest = TopicFactory.CreateTopic();
+    internal readonly int MessageCount = 10;
+    internal readonly uint StreamId = 1;
+    internal readonly CreateTopicRequest TopicRequest = TopicFactory.CreateTopic();
 
     public override async Task InitializeAsync()
     {
@@ -36,14 +37,16 @@ public class PollMessagesFixture : IggyServerFixture
         foreach (var client in Clients.Values)
         {
             await client.CreateStreamAsync("Test Stream", StreamId);
-            await client.CreateTopicAsync(Identifier.Numeric(StreamId), TopicRequest.Name, TopicRequest.PartitionsCount, topicId: TopicRequest.TopicId);
-            await client.SendMessagesAsync(new MessageSendRequest<DummyMessage>
-            {
-                Messages = CreateDummyMessagesWithoutHeader(MessageCount),
-                Partitioning = Partitioning.None(),
-                StreamId = Identifier.Numeric(StreamId),
-                TopicId = Identifier.Numeric(TopicRequest.TopicId!.Value)
-            },
+            await client.CreateTopicAsync(Identifier.Numeric(StreamId), TopicRequest.Name, TopicRequest.PartitionsCount,
+                topicId: TopicRequest.TopicId);
+            await client.SendMessagesAsync(
+                new MessageSendRequest<DummyMessage>
+                {
+                    Messages = CreateDummyMessagesWithoutHeader(MessageCount),
+                    Partitioning = Partitioning.None(),
+                    StreamId = Identifier.Numeric(StreamId),
+                    TopicId = Identifier.Numeric(TopicRequest.TopicId!.Value)
+                },
                 message => message.SerializeDummyMessage(),
                 headers: new Dictionary<HeaderKey, HeaderValue>
                 {

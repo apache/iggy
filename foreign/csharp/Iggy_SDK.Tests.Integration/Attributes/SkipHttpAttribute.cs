@@ -23,6 +23,14 @@ internal class SkipHttpAttribute() : SkipAttribute("This test is skipped for HTT
 {
     public override Task<bool> ShouldSkip(TestRegisteredContext context)
     {
+        foreach (var argument in context.TestDetails.TestMethodArguments)
+        {
+            if (argument is Protocol.Http)
+            {
+                return Task.FromResult(true);
+            }
+        }
+
         foreach (var argument in context.TestDetails.TestClassArguments)
         {
             if (argument is Protocol.Http)

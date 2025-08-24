@@ -51,8 +51,7 @@ internal static class TcpMessageStreamHelpers
             List<Message> messagesList => CalculateMessageBytesCountList(messagesList),
             _ => messages.Sum(msg => 16 + 56 + msg.Payload.Length + 4 +
                                      (msg.UserHeaders?.Sum(header =>
-                                         4 + header.Key.Value.Length + 1 + 4 + header.Value.Value.Length) ?? 0)
-            )
+                                         4 + header.Key.Value.Length + 1 + 4 + header.Value.Value.Length) ?? 0))
         };
     }
 

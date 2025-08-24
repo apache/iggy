@@ -18,7 +18,7 @@
 using System.Buffers;
 using System.Text;
 using Apache.Iggy.ConnectionStream;
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Messages;
@@ -51,8 +51,8 @@ internal class TcpMessageInvoker : IMessageInvoker
         IMemoryOwner<byte> responseBuffer = MemoryPool<byte>.Shared.Rent(BufferSizes.ExpectedResponseSize);
         try
         {
-            TcpContracts.CreateMessage(messageBuffer.Memory.Span[..messageBufferSize], request.StreamId, request.TopicId,
-                request.Partitioning, messages);
+            TcpContracts.CreateMessage(messageBuffer.Memory.Span[..messageBufferSize], request.StreamId,
+                request.TopicId, request.Partitioning, messages);
 
             TcpMessageStreamHelpers.CreatePayload(payloadBuffer.Memory.Span[..payloadBufferSize],
                 messageBuffer.Memory.Span[..messageBufferSize], CommandCodes.SEND_MESSAGES_CODE);

@@ -17,11 +17,14 @@
 
 using System.Diagnostics.CodeAnalysis;
 using System.IO.Hashing;
+using System.Text.Json.Serialization;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.Headers;
+using Apache.Iggy.JsonConverters;
 
 namespace Apache.Iggy.Messages;
 
+[JsonConverter(typeof(MessageConverter))]
 public readonly struct Message
 {
     public required MessageHeader Header { get; init; }
