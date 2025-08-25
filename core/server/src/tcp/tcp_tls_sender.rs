@@ -20,43 +20,36 @@ use crate::binary::sender::Sender;
 use crate::streaming::utils::PooledBuffer;
 use crate::tcp::COMPONENT;
 use crate::{server_error::ServerError, tcp::sender};
-use bytes::BytesMut;
 use compio::buf::IoBufMut;
 use compio::io::AsyncWrite;
 use compio::net::TcpStream;
+use compio_tls::TlsStream;
 use error_set::ErrContext;
 use iggy_common::IggyError;
-//use tokio_rustls::server::TlsStream;
-use nix::libc;
 
 #[derive(Debug)]
 pub struct TcpTlsSender {
-    pub(crate) stream: TcpStream,
+    pub(crate) stream: TlsStream<TcpStream>,
 }
 
 impl Sender for TcpTlsSender {
     async fn read<B: IoBufMut>(&mut self, buffer: B) -> (Result<(), IggyError>, B) {
-        todo!();
         sender::read(&mut self.stream, buffer).await
     }
 
     async fn send_empty_ok_response(&mut self) -> Result<(), IggyError> {
-        todo!();
         sender::send_empty_ok_response(&mut self.stream).await
     }
 
     async fn send_ok_response(&mut self, payload: &[u8]) -> Result<(), IggyError> {
-        todo!();
         sender::send_ok_response(&mut self.stream, payload).await
     }
 
     async fn send_error_response(&mut self, error: IggyError) -> Result<(), IggyError> {
-        todo!();
         sender::send_error_response(&mut self.stream, error).await
     }
 
     async fn shutdown(&mut self) -> Result<(), ServerError> {
-        todo!();
         self.stream
             .shutdown()
             .await
@@ -71,7 +64,6 @@ impl Sender for TcpTlsSender {
         length: &[u8],
         slices: Vec<PooledBuffer>,
     ) -> Result<(), IggyError> {
-        todo!();
         sender::send_ok_response_vectored(&mut self.stream, length, slices).await
     }
 }

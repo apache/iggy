@@ -17,19 +17,16 @@
  */
 
 use std::future::Future;
-use std::io::IoSlice;
 
 use crate::streaming::utils::PooledBuffer;
 use crate::tcp::tcp_sender::TcpSender;
 use crate::tcp::tcp_tls_sender::TcpTlsSender;
 use crate::{quic::quic_sender::QuicSender, server_error::ServerError};
-use bytes::BytesMut;
-use compio::buf::{IoBuf, IoBufMut};
-use compio::io::{AsyncReadExt, AsyncWriteExt};
+use compio::buf::IoBufMut;
 use compio::net::TcpStream;
 use compio_quic::{RecvStream, SendStream};
+use compio_tls::TlsStream;
 use iggy_common::IggyError;
-use nix::libc;
 
 macro_rules! forward_async_methods {
     (
@@ -82,9 +79,8 @@ impl SenderKind {
         Self::Tcp(TcpSender { stream })
     }
 
-    pub fn get_tcp_tls_sender(stream: ()) -> Self {
-        todo!();
-        //Self::TcpTls(TcpTlsSender { stream })
+    pub fn get_tcp_tls_sender(stream: TlsStream<TcpStream>) -> Self {
+        Self::TcpTls(TcpTlsSender { stream })
     }
 
     pub fn get_quic_sender(send_stream: SendStream, recv_stream: RecvStream) -> Self {
