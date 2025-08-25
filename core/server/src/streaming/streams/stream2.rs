@@ -40,6 +40,10 @@ impl StreamRoot {
         }
     }
 
+    pub fn update_id(&mut self, id: usize) {
+        self.id = id;
+    }
+
     pub fn id(&self) -> usize {
         self.id
     }

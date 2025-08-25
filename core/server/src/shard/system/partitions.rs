@@ -26,6 +26,7 @@ use crate::slab::traits_ext::IntoComponents;
 use crate::slab::traits_ext::IntoComponentsById;
 use crate::streaming::deduplication::message_deduplicator::MessageDeduplicator;
 use crate::streaming::partitions;
+use crate::streaming::partitions::helpers::create_message_deduplicator;
 use crate::streaming::partitions::partition2;
 use crate::streaming::partitions::storage2::create_partition_file_hierarchy;
 use crate::streaming::partitions::storage2::delete_partitions_from_disk;
@@ -127,38 +128,21 @@ impl IggyShard {
         parent_stats: Arc<TopicStats>,
         partitions_count: u32,
     ) -> Vec<partition2::Partition> {
-        fn create_message_deduplicator(config: &SystemConfig) -> Option<MessageDeduplicator> {
-            if !config.message_deduplication.enabled {
-                return None;
-            }
-            let max_entries = if config.message_deduplication.max_entries > 0 {
-                Some(config.message_deduplication.max_entries)
-            } else {
-                None
-            };
-            let expiry = if !config.message_deduplication.expiry.is_zero() {
-                Some(config.message_deduplication.expiry)
-            } else {
-                None
-            };
-
-            Some(MessageDeduplicator::new(max_entries, expiry))
-        }
-
         let range = 0..partitions_count as usize;
         let created_at = IggyTimestamp::now();
         range
             .map(|_| {
                 // Areczkuuuu.
                 let stats = Arc::new(PartitionStats::new(parent_stats.clone()));
-                let info = partition2::PartitionRoot::new(created_at, false);
+                let should_increment_offset = false;
                 let deduplicator = create_message_deduplicator(&self.config.system);
                 let offset = Arc::new(AtomicU64::new(0));
                 let consumer_offset = Arc::new(papaya::HashMap::with_capacity(2137));
                 let consumer_group_offset = Arc::new(papaya::HashMap::with_capacity(2137));
 
                 let mut partition = partition2::Partition::new(
-                    info,
+                    created_at,
+                    should_increment_offset,
                     stats,
                     deduplicator,
                     offset,

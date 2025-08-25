@@ -39,6 +39,12 @@ pub struct SystemState {
     pub users: AHashMap<u32, UserState>,
 }
 
+impl SystemState {
+    pub fn decompose(self) -> (AHashMap<u32, StreamState>, AHashMap<u32, UserState>) {
+        (self.streams, self.users)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StreamState {
     pub id: u32,
