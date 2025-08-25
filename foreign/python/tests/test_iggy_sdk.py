@@ -30,7 +30,7 @@ import pytest
 
 from .utils import get_server_config, wait_for_ping, wait_for_server
 
-from apache_iggy import IggyClient, PollingStrategy, AutoCommit
+from apache_iggy import IggyClient, PollingStrategy, AutoCommit, ReceiveMessage
 from apache_iggy import SendMessage as Message
 
 
@@ -185,6 +185,50 @@ class TestMessageOperations:
 
         # Send messages
         messages = [Message(msg) for msg in test_messages]
+        await iggy_client.send_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partitioning=partition_id,
+            messages=messages
+        )
+
+        # Poll messages
+        polled_messages = await iggy_client.poll_messages(
+            stream=stream_name,
+            topic=topic_name,
+            partition_id=partition_id,
+            polling_strategy=PollingStrategy.First(),
+            count=10,
+            auto_commit=True
+        )
+
+        # Verify we got our messages
+        assert len(polled_messages) >= len(test_messages)
+
+        # Check the first few messages match what we sent
+        for i, expected_msg in enumerate(test_messages):
+            if i < len(polled_messages):
+                actual_payload = polled_messages[i].payload().decode("utf-8")
+                assert actual_payload == expected_msg
+
+    @pytest.mark.asyncio
+    async def test_send_and_poll_messages_as_bytes(self, iggy_client: IggyClient, message_setup):
+        """Test basic message sending and polling with message payload as bytes."""
+        stream_name = message_setup['stream']
+        topic_name = message_setup['topic']
+        partition_id = message_setup['partition_id']
+        test_messages = message_setup['messages']
+
+        # Setup stream and topic
+        await iggy_client.create_stream(stream_name)
+        await iggy_client.create_topic(
+            stream=stream_name,
+            name=topic_name,
+            partitions_count=1
+        )
+
+        # Send messages
+        messages = [Message(msg.encode()) for msg in test_messages]
         await iggy_client.send_messages(
             stream=stream_name,
             topic=topic_name,
@@ -460,7 +504,7 @@ class TestConsumerGroup:
             poll_interval=timedelta(seconds=1),
         )
 
-        async def take(message) -> None:
+        async def take(message: ReceiveMessage) -> None:
             received_messages.append(message.payload().decode())
             if len(received_messages) == 5:
                 shutdown_event.set()

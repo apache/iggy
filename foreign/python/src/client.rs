@@ -67,13 +67,16 @@ impl IggyClient {
     }
 
     /// Constructs a new IggyClient from a connection string.
-    /// 
+    ///
     /// Returns an error if the connection string provided is invalid.
     // TODO: add examples for connection strings or at least a link to the doc page where
     // connection strings are explained.
     #[classmethod]
     #[pyo3(signature = (connection_string))]
-    fn from_connection_string(_cls: &Bound<'_, PyType>, connection_string: String) -> PyResult<Self> {
+    fn from_connection_string(
+        _cls: &Bound<'_, PyType>,
+        connection_string: String,
+    ) -> PyResult<Self> {
         let client = RustIggyClient::from_connection_string(&connection_string)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?;
         Ok(Self {

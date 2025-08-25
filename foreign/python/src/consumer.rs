@@ -136,7 +136,7 @@ impl IggyConsumer {
     fn consume_messages<'a>(
         &self,
         py: Python<'a>,
-        #[gen_stub(override_type(type_repr="collections.abc.Callable[[str]]", imports=("collections.abc")))]
+        #[gen_stub(override_type(type_repr="collections.abc.Callable[[ReceiveMessage], collections.abc.Awaitable[None]]", imports=("collections.abc")))]
         callback: Bound<'a, PyAny>,
         #[gen_stub(override_type(type_repr="typing.Optional[asyncio.Event]", imports=("asyncio")))]
         shutdown_event: Option<Bound<'a, PyAny>>,

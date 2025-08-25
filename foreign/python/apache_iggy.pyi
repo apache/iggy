@@ -185,7 +185,7 @@ class IggyClient:
     """
     def __new__(cls, conn:typing.Optional[builtins.str]=None) -> IggyClient:
         r"""
-        Constructs a new IggyClient.
+        Constructs a new IggyClient from a TCP server address.
         
         This initializes a new runtime for asynchronous operations.
         Future versions might utilize asyncio for more Pythonic async.
@@ -305,7 +305,7 @@ class IggyConsumer:
         Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
         if the operation fails.
         """
-    def consume_messages(self, callback:collections.abc.Callable[[str]], shutdown_event:typing.Optional[asyncio.Event]) -> collections.abc.Awaitable[None]:
+    def consume_messages(self, callback:collections.abc.Callable[[ReceiveMessage], collections.abc.Awaitable[None]], shutdown_event:typing.Optional[asyncio.Event]) -> collections.abc.Awaitable[None]:
         r"""
         Consumes messages continuously using a callback function and an optional `asyncio.Event` for signaling shutdown.
         
@@ -345,7 +345,7 @@ class ReceiveMessage:
     
     This class wraps a Rust message, allowing for access to its payload and offset from Python.
     """
-    def payload(self) -> typing.Any:
+    def payload(self) -> bytes:
         r"""
         Retrieves the payload of the received message.
         
@@ -389,7 +389,7 @@ class SendMessage:
     This class wraps a Rust message meant for sending, facilitating
     the creation of such messages from Python and their subsequent use in Rust.
     """
-    def __new__(cls, data:builtins.str) -> SendMessage:
+    def __new__(cls, data:builtins.str | bytes) -> SendMessage:
         r"""
         Constructs a new `SendMessage` instance from a string.
         
