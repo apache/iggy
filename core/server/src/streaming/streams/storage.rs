@@ -18,10 +18,7 @@
 
 use crate::io::fs_utils;
 use crate::state::system::StreamState;
-use crate::streaming::storage::StreamStorage;
 use crate::streaming::streams::COMPONENT;
-use crate::streaming::streams::stream::Stream;
-use crate::streaming::topics::topic::Topic;
 use ahash::AHashSet;
 use compio::fs;
 use compio::fs::create_dir_all;

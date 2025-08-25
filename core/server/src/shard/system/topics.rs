@@ -114,18 +114,16 @@ impl IggyShard {
             max_topic_size,
         );
 
-        let id = self.insert_topic_mem(stream_id, topic.clone());
+        let id = self
+            .streams2
+            .with_topics(stream_id, |topics| topics.insert(topic.clone()));
         topic.update_id(id);
         topic
     }
 
-    fn insert_topic_mem(&self, stream_id: &Identifier, topic: topic2::Topic) -> usize {
+    pub fn create_topic2_bypass_auth(&self, stream_id: &Identifier, topic: topic2::Topic) -> usize {
         self.streams2
             .with_topics(stream_id, |topics| topics.insert(topic))
-    }
-
-    pub fn create_topic2_bypass_auth(&self, stream_id: &Identifier, topic: topic2::Topic) -> usize {
-        self.insert_topic_mem(stream_id, topic)
     }
 
     pub fn update_topic2(

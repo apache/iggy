@@ -22,7 +22,9 @@ use std::{
     sync::{Arc, atomic::AtomicBool},
 };
 
-use iggy_common::{Aes256GcmEncryptor, EncryptorKind};
+use ahash::HashMap;
+use iggy_common::{Aes256GcmEncryptor, EncryptorKind, UserId};
+use sysinfo::User;
 use tracing::info;
 
 use crate::{
@@ -41,14 +43,15 @@ use super::{IggyShard, transmission::connector::ShardConnector, transmission::fr
 #[derive(Default)]
 pub struct IggyShardBuilder {
     id: Option<u16>,
+    streams: Option<Streams>,
+    state: Option<StateKind>,
+    users: Option<HashMap<UserId, User>>,
     connections: Option<Vec<ShardConnector<ShardFrame>>>,
     config: Option<ServerConfig>,
     encryptor: Option<EncryptorKind>,
     version: Option<SemanticVersion>,
     storage: Option<SystemStorage>,
     archiver: Option<ArchiverKind>,
-    state: Option<StateKind>,
-    init_state: Option<SystemState>,
     metrics: Option<Metrics>,
 }
 
@@ -78,13 +81,18 @@ impl IggyShardBuilder {
         self
     }
 
+    pub fn streams(mut self, streams: Streams) -> Self {
+        self.streams = Some(streams);
+        self
+    }
+
     pub fn state(mut self, state: StateKind) -> Self {
         self.state = Some(state);
         self
     }
 
-    pub fn init_state(mut self, init_state: SystemState) -> Self {
-        self.init_state = Some(init_state);
+    pub fn users(mut self, users: HashMap<UserId, User>) -> Self {
+        self.users = Some(users);
         self
     }
 
@@ -105,11 +113,12 @@ impl IggyShardBuilder {
     // TODO: Too much happens in there, some of those bootstrapping logic should be moved outside.
     pub fn build(self) -> IggyShard {
         let id = self.id.unwrap();
+        let streams = self.streams.unwrap();
+        let state = self.state.unwrap();
+        let users = self.users.unwrap();
         let config = self.config.unwrap();
         let connections = self.connections.unwrap();
         let storage = self.storage.unwrap();
-        let state = self.state.unwrap();
-        let init_state = self.init_state;
         let encryptor = self.encryptor;
         let version = self.version.unwrap();
         let (stop_sender, stop_receiver, frame_receiver) = connections
@@ -134,13 +143,14 @@ impl IggyShardBuilder {
             id: id,
             shards: shards,
             shards_table: Default::default(),
+            streams2: streams,
+            users: users,
             storage: storage,
             encryptor: encryptor,
             archiver: archiver,
-            state: state,
-            init_state: init_state,
             config: config,
             version: version,
+            state: state,
             stop_receiver: stop_receiver,
             stop_sender: stop_sender,
             messages_receiver: Cell::new(Some(frame_receiver)),
@@ -153,8 +163,6 @@ impl IggyShardBuilder {
             streams2: Streams::init(),
             users: Default::default(),
             permissioner: Default::default(),
-            streams: Default::default(),
-            streams_ids: Default::default(),
             client_manager: Default::default(),
             active_sessions: Default::default(),
         }

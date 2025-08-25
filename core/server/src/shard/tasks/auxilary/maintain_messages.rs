@@ -1,6 +1,5 @@
 use crate::{
     archiver::ArchiverKind, map_toggle_str, shard::IggyShard, shard_debug, shard_error, shard_info,
-    shard_trace, streaming::topics::topic::Topic,
 };
 use compio::time;
 use error_set::ErrContext;

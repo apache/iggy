@@ -37,7 +37,7 @@ use tracing::{info, warn};
 const SIZE_16MB: usize = 16 * 1024 * 1024;
 
 #[derive(Debug)]
-pub struct Segment {
+pub struct Segment {;
     pub(super) stream_id: u32,
     pub(super) topic_id: u32,
     pub(super) partition_id: u32,

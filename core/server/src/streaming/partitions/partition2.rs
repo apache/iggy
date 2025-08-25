@@ -1,4 +1,5 @@
 use crate::{
+    configs::system::SystemConfig,
     slab::{
         partitions::{self, Partitions},
         traits_ext::{EntityMarker, IntoComponents, IntoComponentsById},
@@ -27,13 +28,15 @@ pub struct Partition {
 
 impl Partition {
     pub fn new(
-        root: PartitionRoot,
+        created_at: IggyTimestamp,
+        should_increment_offset: bool,
         stats: Arc<PartitionStats>,
         message_deduplicator: Option<MessageDeduplicator>,
         offset: Arc<AtomicU64>,
         consumer_offset: Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>,
         consumer_group_offset: Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>,
     ) -> Self {
+        let root = PartitionRoot::new(created_at, should_increment_offset);
         Self {
             root,
             stats,

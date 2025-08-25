@@ -70,8 +70,7 @@ use crate::{
     shard_error, shard_info, shard_warn,
     slab::{streams::Streams, traits_ext::EntityMarker},
     state::{
-        StateKind,
-        system::{StreamState, SystemState, UserState},
+        file::FileState, system::{StreamState, SystemState, UserState}, StateKind
     },
     streaming::{
         clients::client_manager::ClientManager,
@@ -144,10 +143,9 @@ pub struct IggyShard {
     pub(crate) streams2: Streams,
     // TODO: Refactor.
     pub(crate) storage: Rc<SystemStorage>,
-
     pub(crate) state: StateKind,
+
     // Temporal...
-    pub(crate) init_state: Option<SystemState>,
     pub(crate) encryptor: Option<EncryptorKind>,
     pub(crate) archiver: Option<Rc<ArchiverKind>>,
     pub(crate) config: ServerConfig,
@@ -173,7 +171,6 @@ impl IggyShard {
 
     pub fn default_from_config(server_config: ServerConfig) -> Self {
         use crate::bootstrap::resolve_persister;
-        use crate::state::file::FileState;
         use crate::streaming::storage::SystemStorage;
         use crate::versioning::SemanticVersion;
 
@@ -184,22 +181,21 @@ impl IggyShard {
             persister.clone(),
         ));
 
+        let (stop_sender, stop_receiver) = async_channel::unbounded();
+
         let state_path = server_config.system.get_state_messages_file_path();
         let file_state = FileState::new(&state_path, &version, persister, None);
         let state = crate::state::StateKind::File(file_state);
-
-        let (stop_sender, stop_receiver) = async_channel::unbounded();
 
         let shard = Self {
             id: 0,
             shards: Vec::new(),
             shards_table: Default::default(),
             version,
-            streams2: Streams::init(),
-            storage,
+            streams2: Default::default(),
             state,
+            storage,
             //TODO: Fix
-            init_state: None,
             encryptor: None,
             archiver: None,
             config: server_config,
@@ -229,11 +225,7 @@ impl IggyShard {
     }
 
     pub async fn init(&self) -> Result<(), IggyError> {
-        let system_state = self.init_state.as_ref().unwrap();
-        let SystemState { users, streams } = system_state;
-        let _ = self.load_users(users.values().cloned().collect()).await;
-        let _ = self.load_streams(streams.values().cloned().collect()).await;
-
+        let _ = self.load_users().await;
         if let Some(archiver) = self.archiver.as_ref() {
             archiver
                 .init()
@@ -299,36 +291,7 @@ impl IggyShard {
         Ok(())
     }
 
-    async fn load_users(&self, users: Vec<UserState>) -> Result<(), IggyError> {
-        shard_info!(self.id, "Loading users...");
-        for user_state in users.into_iter() {
-            let mut user = User::with_password(
-                user_state.id,
-                &user_state.username,
-                user_state.password_hash,
-                user_state.status,
-                user_state.permissions,
-            );
-
-            user.created_at = user_state.created_at;
-            user.personal_access_tokens = user_state
-                .personal_access_tokens
-                .into_values()
-                .map(|token| {
-                    (
-                        Arc::new(token.token_hash.clone()),
-                        PersonalAccessToken::raw(
-                            user_state.id,
-                            &token.name,
-                            &token.token_hash,
-                            token.expiry_at,
-                        ),
-                    )
-                })
-                .collect();
-            self.users.borrow_mut().insert(user_state.id, user);
-        }
-
+    async fn load_users(&self) -> Result<(), IggyError> {
         let users = self.users.borrow();
         let users_count = users.len();
         let current_user_id = users.keys().max().unwrap_or(&1);
@@ -341,6 +304,7 @@ impl IggyShard {
         Ok(())
     }
 
+    /*
     async fn load_streams(&self, streams: Vec<StreamState>) -> Result<(), IggyError> {
         shard_info!(self.id, "Loading streams from disk...");
         let mut unloaded_streams = Vec::new();
@@ -487,6 +451,7 @@ impl IggyShard {
         );
         Ok(())
     }
+    */
 
     pub fn assert_init(&self) -> Result<(), IggyError> {
         Ok(())

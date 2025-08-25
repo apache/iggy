@@ -11,14 +11,6 @@ pub struct StreamStats {
 }
 
 impl StreamStats {
-    pub fn new() -> Self {
-        Self {
-            size_bytes: AtomicU64::new(0),
-            messages_count: AtomicU64::new(0),
-            segments_count: AtomicU32::new(0),
-        }
-    }
-
     pub fn increment_size_bytes(&self, size_bytes: u64) {
         self.size_bytes.fetch_add(size_bytes, Ordering::AcqRel);
     }

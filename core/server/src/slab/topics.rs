@@ -40,15 +40,20 @@ impl InsertCell for Topics {
 
     fn insert(&self, item: Self::Item) -> Self::Idx {
         let (root, stats) = item.into_components();
-        let key = root.key().clone();
+        let mut root_container = self.root.borrow_mut();
+        let mut indexes = self.index.borrow_mut();
+        let mut stats_container = self.stats.borrow_mut();
 
-        let entity_id = self.root.borrow_mut().insert(root);
-        let id = self.stats.borrow_mut().insert(stats);
+        let key = root.key().clone();
+        let entity_id = root_container.insert(root);
+        let id = stats_container.insert(stats);
         assert_eq!(
             entity_id, id,
             "topic_insert: id mismatch when inserting stats"
         );
-        self.index.borrow_mut().insert(key, entity_id);
+        let root = root_container.get_mut(entity_id).unwrap();
+        root.update_id(entity_id);
+        indexes.insert(key, entity_id);
         entity_id
     }
 }
