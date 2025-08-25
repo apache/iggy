@@ -1,13 +1,18 @@
+use super::COMPONENT;
 use crate::{
-    configs::system::SystemConfig, io::fs_utils::remove_dir_all, shard_error, shard_info,
-    shard_trace, streaming::segments::Segment2,
+    configs::system::SystemConfig,
+    io::fs_utils::remove_dir_all,
+    shard_error, shard_info, shard_trace,
+    streaming::{partitions::consumer_offset::ConsumerOffset, segments::Segment2},
 };
 use compio::{
     fs::{self, OpenOptions, create_dir_all},
     io::AsyncWriteAtExt,
 };
-use iggy_common::IggyError;
-use std::path::Path;
+use error_set::ErrContext;
+use iggy_common::{ConsumerKind, IggyError};
+use std::{path::Path, sync::Arc};
+use tracing::{error, trace};
 
 pub async fn create_partition_file_hierarchy(
     shard_id: u16,
@@ -151,4 +156,68 @@ pub async fn persist_offset(shard_id: u16, path: &str, offset: u64) -> Result<()
         path
     );
     Ok(())
+}
+
+pub fn load_consumer_offsets(
+    path: &str,
+    kind: ConsumerKind,
+) -> Result<Vec<ConsumerOffset>, IggyError> {
+    trace!("Loading consumer offsets from path: {path}...");
+    let dir_entries = std::fs::read_dir(&path);
+    if dir_entries.is_err() {
+        return Err(IggyError::CannotReadConsumerOffsets(path.to_owned()));
+    }
+
+    let mut consumer_offsets = Vec::new();
+    let mut dir_entries = dir_entries.unwrap();
+    while let Some(dir_entry) = dir_entries.next() {
+        let dir_entry = dir_entry.unwrap();
+        let metadata = dir_entry.metadata();
+        if metadata.is_err() {
+            break;
+        }
+
+        if metadata.unwrap().is_dir() {
+            continue;
+        }
+
+        let name = dir_entry.file_name().into_string().unwrap();
+        let consumer_id = name.parse::<u32>();
+        if consumer_id.is_err() {
+            error!("Invalid consumer ID file with name: '{}'.", name);
+            continue;
+        }
+
+        let path = dir_entry.path();
+        let path = path.to_str();
+        if path.is_none() {
+            error!("Invalid consumer ID path for file with name: '{}'.", name);
+            continue;
+        }
+
+        let path = path.unwrap().to_string();
+        let consumer_id = consumer_id.unwrap();
+        let file = std::fs::File::open(&path)
+            .with_error_context(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to open offset file, path: {path}")
+            })
+            .map_err(|_| IggyError::CannotReadFile)?;
+        let mut cursor = std::io::Cursor::new(file);
+        let offset = cursor
+            .read_u64_le()
+            .with_error_context(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to read consumer offset from file, path: {path}")
+            })
+            .map_err(|_| IggyError::CannotReadFile)?;
+
+        consumer_offsets.push(ConsumerOffset {
+            kind,
+            consumer_id,
+            offset,
+            path,
+        });
+    }
+
+    consumer_offsets.sort_by(|a, b| a.consumer_id.cmp(&b.consumer_id));
+    Ok(consumer_offsets)
 }

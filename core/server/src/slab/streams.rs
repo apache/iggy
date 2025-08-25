@@ -29,10 +29,21 @@ use std::{cell::RefCell, sync::Arc};
 const CAPACITY: usize = 1024;
 pub type ContainerId = usize;
 
+#[derive(Debug, Clone)]
 pub struct Streams {
     index: RefCell<AHashMap<<stream2::StreamRoot as Keyed>::Key, ContainerId>>,
     root: RefCell<Slab<stream2::StreamRoot>>,
     stats: RefCell<Slab<Arc<StreamStats>>>,
+}
+
+impl Default for Streams {
+    fn default() -> Self {
+        Self {
+            index: RefCell::new(AHashMap::with_capacity(CAPACITY)),
+            root: RefCell::new(Slab::with_capacity(CAPACITY)),
+            stats: RefCell::new(Slab::with_capacity(CAPACITY)),
+        }
+    }
 }
 
 impl<'a> From<&'a Streams> for stream2::StreamRef<'a> {
@@ -57,15 +68,20 @@ impl InsertCell for Streams {
 
     fn insert(&self, item: Self::Item) -> Self::Idx {
         let (root, stats) = item.into_components();
-        let key = root.key().clone();
+        let mut root_container = self.root.borrow_mut();
+        let mut indexes = self.index.borrow_mut();
+        let mut stats_container = self.stats.borrow_mut();
 
-        let entity_id = self.root.borrow_mut().insert(root);
-        let id = self.stats.borrow_mut().insert(stats);
+        let key = root.key().clone();
+        let entity_id = root_container.insert(root);
+        let id = stats_container.insert(stats);
         assert_eq!(
             entity_id, id,
             "stream_insert: id mismatch when inserting stats"
         );
-        self.index.borrow_mut().insert(key, entity_id);
+        let root = root_container.get_mut(entity_id).unwrap();
+        root.update_id(entity_id);
+        indexes.insert(key, entity_id);
         entity_id
     }
 }
@@ -111,14 +127,6 @@ impl EntityComponentSystemMutCell for Streams {
 }
 
 impl Streams {
-    pub fn init() -> Self {
-        Self {
-            index: RefCell::new(AHashMap::with_capacity(CAPACITY)),
-            root: RefCell::new(Slab::with_capacity(CAPACITY)),
-            stats: RefCell::new(Slab::with_capacity(CAPACITY)),
-        }
-    }
-
     pub fn exists(&self, id: &Identifier) -> bool {
         match id.kind {
             iggy_common::IdKind::Numeric => {

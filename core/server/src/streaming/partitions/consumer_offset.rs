@@ -28,4 +28,13 @@ impl ConsumerOffset {
             path: format!("{path}/{consumer_id}"),
         }
     }
+
+    pub fn new(kind: ConsumerKind, consumer_id: u32, offset: u64, path: String) -> Self {
+        Self {
+            kind,
+            consumer_id,
+            offset: AtomicU64::new(offset),
+            path,
+        }
+    }
 }

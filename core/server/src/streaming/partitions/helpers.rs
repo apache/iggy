@@ -11,10 +11,13 @@ use crate::{
             IntoComponents,
         },
     },
-    streaming::partitions::{
-        consumer_offset::ConsumerOffset,
-        partition2::{self, PartitionRef, PartitionRefMut},
-        storage2,
+    streaming::{
+        deduplication::message_deduplicator::MessageDeduplicator,
+        partitions::{
+            consumer_offset::ConsumerOffset,
+            partition2::{self, PartitionRef, PartitionRefMut},
+            storage2,
+        },
     },
 };
 
@@ -213,4 +216,22 @@ pub fn purge_segments_mem() -> impl FnOnce(&mut Partitions) {
         // TODO:
         //partitions.segments_mut()
     }
+}
+
+pub fn create_message_deduplicator(config: &SystemConfig) -> Option<MessageDeduplicator> {
+    if !config.message_deduplication.enabled {
+        return None;
+    }
+    let max_entries = if config.message_deduplication.max_entries > 0 {
+        Some(config.message_deduplication.max_entries)
+    } else {
+        None
+    };
+    let expiry = if !config.message_deduplication.expiry.is_zero() {
+        Some(config.message_deduplication.expiry)
+    } else {
+        None
+    };
+
+    Some(MessageDeduplicator::new(max_entries, expiry))
 }

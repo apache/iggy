@@ -30,11 +30,14 @@ use figlet_rs::FIGfont;
 use iggy_common::create_user::CreateUser;
 use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyError};
+use lending_iterator::lending_iterator::constructors::into_lending_iter;
 use server::archiver::{ArchiverKind, ArchiverKindType};
 use server::args::Args;
+use server::binary::handlers::streams;
 use server::bootstrap::{
     create_directories, create_root_user, create_shard_connections, create_shard_executor,
-    load_config, resolve_persister, update_system_info,
+    create_streams, create_users, load_config, load_streams, load_users, resolve_persister,
+    update_system_info,
 };
 use server::configs::config_provider::{self};
 use server::configs::server::ServerConfig;
@@ -207,7 +210,10 @@ async fn main() -> Result<(), ServerError> {
         state_persister,
         encryptor.clone(),
     ));
-    let init_state = SystemState::load(state).await?;
+    let state = SystemState::load(state).await?;
+    let (streams_state, users_state) = state.decompose();
+    let streams = load_streams(streams_state.into_values(), &config.system);
+    let users = load_users(users_state.into_values());
 
     // ELEVENTH DISCRETE LOADING STEP.
     let shards_set = config.system.sharding.cpu_allocation.to_shard_set();
@@ -229,7 +235,14 @@ async fn main() -> Result<(), ServerError> {
         }
     }
 
+    // DISCRETE STEP.
+    // Increment the metrics.
     let shared_metrics = Metrics::init();
+    metrics.increment_streams(1);
+    metrics.increment_topics(stream.get_topics_count());
+    metrics.increment_partitions(stream.get_partitions_count());
+    metrics.increment_segments(stream.get_segments_count());
+    metrics.increment_messages(stream.get_messages_count());
 
     // TWELFTH DISCRETE LOADING STEP.
     info!("Starting {} shard(s)", shards_set.len());
@@ -238,12 +251,13 @@ async fn main() -> Result<(), ServerError> {
 
     for shard_id in shards_set {
         let id = shard_id as u16;
+        let streams = streams.clone();
+        let users = users.clone();
         let storage = storage.clone();
         let connections = connections.clone();
         let config = config.clone();
         let encryptor = encryptor.clone();
         let archiver = archiver.clone();
-        let init_state = init_state.clone();
         let shared_metrics = shared_metrics.clone();
         let state_persister = resolve_persister(config.system.state.enforce_fsync);
         let state = StateKind::File(FileState::new(
@@ -262,14 +276,15 @@ async fn main() -> Result<(), ServerError> {
                     let builder = IggyShard::builder();
                     let shard = builder
                         .id(id)
+                        .streams(streams)
+                        .state(state)
+                        .users(users)
                         .connections(connections)
                         .config(config)
                         .storage(storage)
                         .archiver(archiver)
                         .encryptor(encryptor)
                         .version(current_version)
-                        .state(state)
-                        .init_state(init_state)
                         .metrics(shared_metrics)
                         .build();
                     let shard = Rc::new(shard);
