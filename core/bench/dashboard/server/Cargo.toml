@@ -16,7 +16,7 @@
 # under the License.
 
 [package]
-name = "bench-dashboard-server"
+name = "iggy-bench-dashboard-server"
 license = "Apache-2.0"
 version = "0.4.0"
 edition = "2024"
@@ -43,7 +43,3 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 walkdir = "2.5.0"
 zip = { workspace = true, features = ["deflate"] }
-
-[[bin]]
-name = "iggy-bench-dashboard-server"
-path = "src/main.rs"

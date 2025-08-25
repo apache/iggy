@@ -15,15 +15,15 @@
 # specific language governing permissions and limitations
 # under the License.
 
-import asyncio
-import urllib.parse
-from loguru import logger
 import argparse
-import urllib
+import asyncio
 import typing
+import urllib
+import urllib.parse
 from collections import namedtuple
 
-from apache_iggy import IggyClient, ReceiveMessage, PollingStrategy
+from apache_iggy import IggyClient, PollingStrategy, ReceiveMessage
+from loguru import logger
 
 STREAM_NAME = "sample-stream"
 TOPIC_NAME = "sample-topic"

@@ -15,10 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[profile.release]
-lto = true
-codegen-units = 1
-
 [workspace]
 members = [
     "bdd/rust",
@@ -49,6 +45,7 @@ exclude = ["foreign/python"]
 resolver = "2"
 
 [workspace.dependencies]
+aes-gcm = "0.10.3"
 ahash = { version = "0.8.12", features = ["serde"] }
 anyhow = "1.0.99"
 async-broadcast = "0.7.2"
@@ -64,7 +61,13 @@ async_zip = { version = "0.0.18", features = [
 ] }
 axum = "0.8.4"
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
+base64 = "0.22.1"
 bcrypt = "0.17.0"
+bench-dashboard-frontend = { path = "core/bench/dashboard/frontend" }
+bench-dashboard-server = { path = "core/bench/dashboard/server" }
+bench-dashboard-shared = { path = "core/bench/dashboard/shared" }
+bench-report = { path = "core/bench/report" }
+bench-runner = { path = "core/bench/runner" }
 bincode = { version = "2.0.1", features = ["serde"] }
 blake3 = "1.8.2"
 bon = "3.7.0"
@@ -77,50 +80,78 @@ bytes = "1.10.1"
 charming = "0.6.0"
 chrono = { version = "0.4.41", features = ["serde"] }
 clap = { version = "4.5.44", features = ["derive"] }
-config = { version = "0.15.13" }
+colored = "3.0.0"
 comfy-table = "7.1.4"
+config = { version = "0.15.13" }
+console-subscriber = "0.4.1"
 crc32fast = "1.5.0"
 crossbeam = "0.8.4"
 dashmap = "6.1.0"
+derive-new = "0.7.0"
 derive_builder = "0.20.2"
 derive_more = { version = "2.0.1", features = ["full"] }
-derive-new = "0.7.0"
 dirs = "6.0.0"
 dlopen2 = "0.8.0"
 dotenvy = "0.15.7"
 enum_dispatch = "0.3.13"
+env_logger = "0.11.8"
 figlet-rs = "0.1.5"
 flume = "0.11.1"
 futures = "0.3.31"
 futures-util = "0.3.31"
 human-repr = "1.1.0"
 humantime = "2.2.0"
+iggy = { path = "core/sdk", version = "0.7.0" }
+iggy_binary_protocol = { path = "core/binary_protocol", version = "0.7.0" }
+iggy_common = { path = "core/common", version = "0.7.0" }
+iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.1.0" }
+integration = { path = "core/integration" }
 keyring = { version = "3.6.3", features = ["sync-secret-service", "vendored"] }
+lazy_static = "1.5.0"
+log = "0.4.27"
+mimalloc = "0.1"
+mockall = "0.13.1"
 nonzero_lit = "0.1.2"
 once_cell = "1.21.3"
 passterm = "=2.0.1"
-quinn = "0.11.8"
 postcard = { version = "1.1.3", features = ["alloc"] }
+predicates = "3.1.3"
+quinn = "0.11.8"
 rand = "0.9.2"
+regex = "1.11.1"
 reqwest = { version = "0.12.22", default-features = false, features = [
     "json",
     "rustls-tls",
 ] }
 reqwest-middleware = { version = "0.4.2", features = ["json"] }
 reqwest-retry = "0.7.0"
+rust-s3 = { version = "0.36.0-beta.2", default-features = false, features = [
+    "tokio-rustls-tls",
+    "tags",
+] }
 rustls = { version = "0.23.31", features = ["ring"] }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = "1.0.142"
 serde_with = { version = "3.14.0", features = ["base64", "macros"] }
 serde_yml = "0.0.12"
 serial_test = "3.2.0"
+server = { path = "core/server" }
 simd-json = { version = "0.15.1", features = ["serde_impl"] }
+strum = { version = "0.27.2", features = ["derive"] }
+strum_macros = "0.27.2"
 sysinfo = "0.37.0"
 tempfile = "3.20.0"
+test-case = "3.3.1"
 thiserror = "2.0.14"
 tokio = { version = "1.47.1", features = ["full"] }
 tokio-rustls = "0.26.2"
+tokio-util = { version = "0.7.16", features = ["compat"] }
 toml = "0.9.5"
+tower-http = { version = "0.6.6", features = [
+    "add-extension",
+    "cors",
+    "trace",
+] }
 tracing = "0.1.41"
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "0.3.19", default-features = false, features = [
@@ -128,6 +159,8 @@ tracing-subscriber = { version = "0.3.19", default-features = false, features = 
     "env-filter",
     "ansi",
 ] }
+trait-variant = "0.1.2"
+twox-hash = { version = "2.1.1", features = ["xxhash32"] }
 uuid = { version = "1.18.0", features = [
     "v4",
     "v7",
@@ -135,48 +168,9 @@ uuid = { version = "1.18.0", features = [
     "serde",
     "zerocopy",
 ] }
-rust-s3 = { version = "0.36.0-beta.2", default-features = false, features = [
-    "tokio-rustls-tls",
-    "tags",
-] }
-strum = { version = "0.27.2", features = ["derive"] }
-strum_macros = "0.27.2"
-aes-gcm = "0.10.3"
-base64 = "0.22.1"
-twox-hash = { version = "2.1.1", features = ["xxhash32"] }
-
-# Common dependencies across multiple packages
-colored = "3.0.0"
-env_logger = "0.11.8"
-lazy_static = "1.5.0"
-log = "0.4.27"
-mockall = "0.13.1"
-predicates = "3.1.3"
-regex = "1.11.1"
-test-case = "3.3.1"
-tokio-util = { version = "0.7.16", features = ["compat"] }
-tower-http = { version = "0.6.6", features = [
-    "add-extension",
-    "cors",
-    "trace",
-] }
-trait-variant = "0.1.2"
 webpki-roots = "1.0.2"
 zip = "4.3.0"
 
-# Optional dependencies
-mimalloc = "0.1"
-console-subscriber = "0.4.1"
-
-# Path dependencies
-iggy_binary_protocol = { path = "core/binary_protocol", version = "0.7.0" }
-iggy_common = { path = "core/common", version = "0.7.0" }
-iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.1.0" }
-iggy = { path = "core/sdk", version = "0.7.0" }
-server = { path = "core/server" }
-integration = { path = "core/integration" }
-bench-report = { path = "core/bench/report" }
-bench-runner = { path = "core/bench/runner" }
-bench-dashboard-frontend = { path = "core/bench/dashboard/frontend" }
-bench-dashboard-server = { path = "core/bench/dashboard/server" }
-bench-dashboard-shared = { path = "core/bench/dashboard/shared" }
+[profile.release]
+lto = true
+codegen-units = 1

@@ -21,6 +21,10 @@ license = "Apache-2.0"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "iggy-bench-runner"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
@@ -32,7 +36,3 @@ tempfile = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-
-[[bin]]
-name = "iggy-bench-runner"
-path = "src/main.rs"

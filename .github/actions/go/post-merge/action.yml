@@ -1,0 +1,118 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: go-post-merge
+description: Go post-merge tag preparation github iggy actions
+
+inputs:
+  version:
+    description: "Version for tagging (without 'v' prefix)"
+    required: true
+  dry_run:
+    description: "Dry run mode"
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Validate version format
+      run: |
+        VERSION="${{ inputs.version }}"
+
+        # Check if version matches semantic versioning
+        if ! echo "$VERSION" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?(\+[a-zA-Z0-9.-]+)?$' > /dev/null; then
+          echo "❌ Invalid version format: $VERSION"
+          echo "Expected format: X.Y.Z or X.Y.Z-prerelease+metadata"
+          exit 1
+        fi
+
+        echo "✅ Version format valid: $VERSION"
+      shell: bash
+
+    - name: Prepare Go module for tagging
+      run: |
+        VERSION="${{ inputs.version }}"
+        TAG="foreign/go/v${VERSION}"
+
+        echo "📦 Go Module Publishing Information"
+        echo "===================================="
+        echo "Version: v${VERSION}"
+        echo "Git tag: ${TAG}"
+        echo ""
+
+        if [ "${{ inputs.dry_run }}" = "true" ]; then
+          echo "🔍 DRY RUN MODE - No tag will be created"
+          echo ""
+          echo "Would create tag: ${TAG}"
+          echo ""
+          echo "After tagging, users could import using:"
+          echo "  go get github.com/${{ github.repository }}/foreign/go@v${VERSION}"
+          echo ""
+          echo "Or add to go.mod:"
+          echo "  require github.com/${{ github.repository }}/foreign/go v${VERSION}"
+        else
+          echo "✅ Go module ready for tagging"
+          echo ""
+          echo "Tag will be created: ${TAG}"
+          echo "This will be handled by the create-tags job in the publish workflow"
+          echo ""
+          echo "After the tag is pushed, users can import using:"
+          echo "  go get github.com/${{ github.repository }}/foreign/go@v${VERSION}"
+          echo ""
+          echo "Or add to go.mod:"
+          echo "  require github.com/${{ github.repository }}/foreign/go v${VERSION}"
+        fi
+
+        # Verify the go.mod file exists
+        if [ ! -f "foreign/go/go.mod" ]; then
+          echo "⚠️ Warning: foreign/go/go.mod not found"
+          echo "Make sure the Go module is properly initialized"
+        else
+          echo ""
+          echo "Module information:"
+          grep "^module" foreign/go/go.mod || echo "Module declaration not found"
+        fi
+      shell: bash
+
+    - name: Output tag information
+      id: tag-info
+      run: |
+        VERSION="${{ inputs.version }}"
+        TAG="foreign/go/v${VERSION}"
+
+        # Set outputs for use in other jobs
+        echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+        echo "version=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+        # Summary for GitHub Actions
+        {
+          echo "## 🏷️ Go Module Tag Information"
+          echo ""
+          echo "| Property | Value |"
+          echo "|----------|-------|"
+          echo "| **Version** | \`v${VERSION}\` |"
+          echo "| **Git Tag** | \`${TAG}\` |"
+          echo "| **Import Path** | \`github.com/${{ github.repository }}/foreign/go\` |"
+          echo ""
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "**Note:** This is a dry run - no actual tag will be created"
+          else
+            echo "**Note:** Tag will be created by the publish workflow"
+          fi
+        } >> "$GITHUB_STEP_SUMMARY"
+      shell: bash

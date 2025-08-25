@@ -16,10 +16,11 @@
 # under the License.
 
 import asyncio
-from loguru import logger
 
 # Assuming we have a Python module for iggy with similar functionality as the Rust one.
-from apache_iggy import IggyClient, SendMessage as Message, StreamDetails, TopicDetails
+from apache_iggy import IggyClient, StreamDetails, TopicDetails
+from apache_iggy import SendMessage as Message
+from loguru import logger
 
 STREAM_NAME = "sample-stream"
 TOPIC_NAME = "sample-topic"
@@ -59,11 +60,11 @@ async def init_system(client: IggyClient):
                 stream=STREAM_NAME,  # Assuming a method exists to create a numeric Identifier.
                 partitions_count=1,
                 name=TOPIC_NAME,
-                replication_factor=1
+                replication_factor=1,
             )
-            logger.info(f"Topic was created successfully.")
+            logger.info("Topic was created successfully.")
         else:
-            logger.info(f"Topic {topic.name} already exists with ID {topic.id}")
+            logger.info("Topic {topic.name} already exists with ID {topic.id}")
     except Exception as error:
         logger.error(f"Error creating topic {error}")
         logger.exception(error)
@@ -72,7 +73,8 @@ async def init_system(client: IggyClient):
 async def produce_messages(client: IggyClient):
     interval = 0.5  # 500 milliseconds in seconds for asyncio.sleep
     logger.info(
-        f"Messages will be sent to stream: {STREAM_NAME}, topic: {TOPIC_NAME}, partition: {PARTITION_ID} with interval {interval * 1000} ms.")
+        f"Messages will be sent to stream: {STREAM_NAME}, topic: {TOPIC_NAME}, partition: {PARTITION_ID} with interval {interval * 1000} ms."
+    )
     current_id = 0
     messages_per_batch = 10
     while True:
@@ -80,10 +82,13 @@ async def produce_messages(client: IggyClient):
         for _ in range(messages_per_batch):
             current_id += 1
             payload = f"message-{current_id}"
-            message = Message(payload)  # Assuming a method exists to convert str to Message.
+            message = Message(
+                payload
+            )  # Assuming a method exists to convert str to Message.
             messages.append(message)
         logger.info(
-            f"Attempting to send batch of {messages_per_batch} messages. Batch ID: {current_id // messages_per_batch}")
+            f"Attempting to send batch of {messages_per_batch} messages. Batch ID: {current_id // messages_per_batch}"
+        )
         try:
             await client.send_messages(
                 stream=STREAM_NAME,
@@ -92,7 +97,8 @@ async def produce_messages(client: IggyClient):
                 messages=messages,
             )
             logger.info(
-                f"Successfully sent batch of {messages_per_batch} messages. Batch ID: {current_id // messages_per_batch}")
+                f"Successfully sent batch of {messages_per_batch} messages. Batch ID: {current_id // messages_per_batch}"
+            )
         except Exception as error:
             logger.error(f"Exception type: {type(error).__name__}, message: {error}")
             logger.exception(error)

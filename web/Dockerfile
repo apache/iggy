@@ -16,6 +16,8 @@
 # under the License.
 
 FROM node:lts-alpine AS base
+ARG IGGY_CI_BUILD
+ENV IGGY_CI_BUILD=${IGGY_CI_BUILD}
 ENV NPM_CONFIG_LOGLEVEL=warn
 ENV NPM_CONFIG_COLOR=false
 WORKDIR /home/node/app

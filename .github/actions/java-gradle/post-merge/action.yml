@@ -1,0 +1,133 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: java-gradle-post-merge
+description: Java Gradle post-merge publishing github iggy actions
+
+inputs:
+  version:
+    description: "Version for publishing"
+    required: true
+  dry_run:
+    description: "Dry run mode"
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: "temurin"
+        java-version: "17"
+        cache: "gradle"
+
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
+
+    - name: Grant execute permission for gradlew
+      shell: bash
+      run: |
+        if [ -f "foreign/java/gradlew" ]; then
+          chmod +x foreign/java/gradlew
+        fi
+
+    - name: Build for publishing
+      shell: bash
+      run: |
+        echo "📦 Building Java SDK for publishing..."
+        foreign/java/dev-support/checks/build.sh build -x test -x checkstyleMain -x checkstyleTest
+        BUILD_EXIT_CODE=$?
+
+        # List artifacts only if build succeeded
+        if [ $BUILD_EXIT_CODE -eq 0 ]; then
+          echo ""
+          echo "Build artifacts:"
+          find foreign/java -path "*/build/libs/*.jar" -type f 2>/dev/null | head -20 || echo "No jar artifacts found in build/libs directories"
+        else
+          echo "❌ Build failed with exit code $BUILD_EXIT_CODE"
+          exit $BUILD_EXIT_CODE
+        fi
+
+    - name: Publish to Maven Nexus
+      shell: bash
+      env:
+        NEXUS_USER: ${{ env.NEXUS_USER }}
+        NEXUS_PASSWORD: ${{ env.NEXUS_PASSWORD }}
+      run: |
+        if [ "${{ inputs.dry_run }}" = "true" ]; then
+          echo "🔍 Dry run - would publish to Maven Nexus:"
+          echo ""
+
+          # Extract version from build.gradle.kts
+          gradle_version=$(foreign/java/gradlew -p foreign/java properties -q | grep "version:" | cut -d: -f2 | tr -d ' ')
+          echo "Version from gradle: $gradle_version"
+          echo "Input version: ${{ inputs.version }}"
+
+          # Verify versions match
+          if [ "$gradle_version" != "${{ inputs.version }}" ]; then
+            echo "⚠️ Warning: Gradle version ($gradle_version) doesn't match input version (${{ inputs.version }})"
+          fi
+
+          echo ""
+          echo "Would publish artifacts:"
+          echo "  Group ID: org.apache.iggy"
+          echo "  Artifact ID: iggy"
+          echo "  Version: ${{ inputs.version }}"
+          echo ""
+          echo "Maven coordinates: org.apache.iggy:iggy:${{ inputs.version }}"
+
+          # Show what would be published
+          echo ""
+          echo "Artifacts that would be published:"
+          find foreign/java -path "*/build/libs/*.jar" -type f 2>/dev/null | while read jar; do
+            echo "  - $(basename $jar)"
+          done
+        else
+          if [ -z "$NEXUS_USER" ] || [ -z "$NEXUS_PASSWORD" ]; then
+            echo "❌ NEXUS_USER or NEXUS_PASSWORD not set"
+            exit 1
+          fi
+
+          echo "📦 Publishing to Maven Nexus..."
+          echo "Version: ${{ inputs.version }}"
+          echo ""
+
+          # Run the publish task
+          foreign/java/dev-support/checks/build.sh build -x test -x checkstyleMain -x checkstyleTest publish
+          PUBLISH_EXIT_CODE=$?
+
+          if [ $PUBLISH_EXIT_CODE -eq 0 ]; then
+            echo ""
+            echo "✅ Successfully published to Maven Nexus"
+            echo "Maven coordinates: org.apache.iggy:iggy:${{ inputs.version }}"
+            echo ""
+            echo "Users can now add to their build.gradle:"
+            echo "  implementation 'org.apache.iggy:iggy:${{ inputs.version }}'"
+            echo ""
+            echo "Or to their pom.xml:"
+            echo "  <dependency>"
+            echo "    <groupId>org.apache.iggy</groupId>"
+            echo "    <artifactId>iggy</artifactId>"
+            echo "    <version>${{ inputs.version }}</version>"
+            echo "  </dependency>"
+          else
+            echo "❌ Publishing failed with exit code $PUBLISH_EXIT_CODE"
+            exit $PUBLISH_EXIT_CODE
+          fi
+        fi

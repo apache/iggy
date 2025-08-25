@@ -15,8 +15,12 @@
 # specific language governing permissions and limitations
 # under the License.
 
+ARG RUST_VERSION=1.89
+
 # Build stage
-FROM rust:1.89-slim-bookworm AS builder
+FROM rust:${RUST_VERSION}-slim-trixie AS builder
+ARG IGGY_CI_BUILD
+ENV IGGY_CI_BUILD=${IGGY_CI_BUILD}
 
 WORKDIR /usr/src/iggy-bench-dashboard
 
@@ -47,10 +51,10 @@ COPY . .
 RUN cd core/bench/dashboard/frontend && trunk build --release
 
 # Build the server with release profile
-RUN cargo build --release --package bench-dashboard-server
+RUN cargo build --release --bin iggy-bench-dashboard-server
 
 # Runtime stage
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 WORKDIR /app
 

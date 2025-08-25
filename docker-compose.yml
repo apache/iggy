@@ -17,7 +17,9 @@
 
 services:
   iggy-server:
-    build: .
+    build:
+      context: .
+      dockerfile: core/server/Dockerfile
     container_name: iggy-server
     restart: unless-stopped
     networks:

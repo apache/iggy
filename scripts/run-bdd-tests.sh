@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -16,75 +16,56 @@
 # specific language governing permissions and limitations
 # under the License.
 
-set -e
+set -Eeuo pipefail
 
 SDK=${1:-"all"}
 FEATURE=${2:-"scenarios/basic_messaging.feature"}
 
-echo "🧪 Running BDD tests for SDK: $SDK"
-echo "📁 Feature file: $FEATURE"
+export DOCKER_BUILDKIT=1 FEATURE
 
-# Change to BDD directory
 cd "$(dirname "$0")/../bdd"
 
-case $SDK in
-"rust")
-  echo "🦀 Running Rust BDD tests..."
-  docker compose build --no-cache iggy-server rust-bdd
-  docker compose up --abort-on-container-exit rust-bdd
-  ;;
-"python")
-  echo "🐍 Running Python BDD tests..."
-  docker compose build --no-cache iggy-server python-bdd
-  docker compose up --abort-on-container-exit python-bdd
-  ;;
-"go")
-  echo "🐹 Running Go BDD tests..."
-  docker compose build --no-cache iggy-server go-bdd
-  docker compose up --abort-on-container-exit go-bdd
-  ;;
-"node")
-  echo "🐢🚀 Running node BDD tests..."
-  docker compose build --no-cache iggy-server node-bdd
-  docker compose up --abort-on-container-exit node-bdd
-  ;;
-"csharp")
-  echo "🔷 Running csharp BDD tests..."
-  docker compose build --no-cache iggy-server csharp-bdd
-  docker compose up --abort-on-container-exit csharp-bdd
-  ;;
-"all")
-  echo "🚀 Running all SDK BDD tests..."
-  echo "🦀 Starting with Rust tests..."
-  #docker compose build --no-cache iggy-server rust-bdd python-bdd go-bdd node-bdd csharp-bdd
-  docker compose up --abort-on-container-exit rust-bdd
-  echo "🐍 Now running Python tests..."
-  docker compose up --abort-on-container-exit python-bdd
-  echo "🐹 Now running Go tests..."
-  docker compose up --abort-on-container-exit go-bdd
-  echo "🐢🚀 Now running node BDD tests..."
-  docker compose up --abort-on-container-exit node-bdd
-  echo "🔷 Now running csharp BDD tests..."
-  docker compose up --abort-on-container-exit csharp-bdd
-  ;;
-"clean")
-  echo "🧹 Cleaning up Docker resources..."
-  docker compose down -v
-  docker compose rm -f
-  ;;
-*)
-  echo "❌ Unknown SDK: $SDK"
-  echo "📖 Usage: $0 [rust|python|go|all|clean] [feature_file]"
-  echo "📖 Examples:"
-  echo "   $0 rust                    # Run Rust tests only"
-  echo "   $0 python                  # Run Python tests only"
-  echo "   $0 go                      # Run Go tests only"
-  echo "   $0 node                    # Run Node.js tests only"
-  echo "   $0 csharp                  # Run csharp tests only"
-  echo "   $0 all                     # Run all SDK tests"
-  echo "   $0 clean                   # Clean up Docker resources"
-  exit 1
-  ;;
+log(){ printf "%b\n" "$*"; }
+
+cleanup(){
+  log "🧹  cleaning up containers & volumes…"
+  docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+}
+trap cleanup EXIT INT TERM
+
+log "🧪 Running BDD tests for SDK: ${SDK}"
+log "📁 Feature file: ${FEATURE}"
+
+run_suite(){
+  local svc="$1" emoji="$2" label="$3"
+  log "${emoji}  ${label}…"
+  set +e
+  docker compose up --build --abort-on-container-exit --exit-code-from "$svc" "$svc"
+  local code=$?
+  set -e
+  docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+  return "$code"
+}
+
+case "$SDK" in
+  rust)   run_suite rust-bdd   "🦀"   "Running Rust BDD tests"   ;;
+  python) run_suite python-bdd "🐍"   "Running Python BDD tests" ;;
+  go)     run_suite go-bdd     "🐹"   "Running Go BDD tests"     ;;
+  node)   run_suite node-bdd   "🐢🚀" "Running Node BDD tests"   ;;
+  csharp) run_suite csharp-bdd "🔷"   "Running C# BDD tests"     ;;
+  all)
+    run_suite rust-bdd   "🦀"   "Running Rust BDD tests"   || exit $?
+    run_suite python-bdd "🐍"   "Running Python BDD tests" || exit $?
+    run_suite go-bdd     "🐹"   "Running Go BDD tests"     || exit $?
+    run_suite node-bdd   "🐢🚀" "Running Node BDD tests"   || exit $?
+    run_suite csharp-bdd "🔷"   "Running C# BDD tests"     || exit $?
+    ;;
+  clean)
+    cleanup; exit 0 ;;
+  *)
+    log "❌ Unknown SDK: ${SDK}"
+    log "📖 Usage: $0 [rust|python|go|node|csharp|all|clean] [feature_file]"
+    exit 2 ;;
 esac
 
-echo "✅ BDD tests completed for: $SDK"
+log "✅ BDD tests completed for: ${SDK}"

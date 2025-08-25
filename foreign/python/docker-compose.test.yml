@@ -21,8 +21,9 @@ services:
   iggy-server:
     build:
       context: ../..
-      # Use debug build for faster compilation during testing
-      dockerfile: Dockerfile.debug
+      dockerfile: core/server/Dockerfile
+      args:
+        PROFILE: debug
     container_name: iggy-server-python-test
     networks:
       - python-test-network
@@ -31,7 +32,7 @@ services:
       - "8080:8080"
       - "8090:8090"
     healthcheck:
-      test: ["CMD-SHELL", "timeout 5 bash -c '</dev/tcp/localhost/8090' || exit 1"]
+      test: [ "CMD", "curl", "-f", "http://localhost:3000/stats" ]
       interval: 5s
       timeout: 5s
       retries: 12
