@@ -23,7 +23,7 @@ use iggy::prelude::{
     DirectConfig, HeaderKey, HeaderValue, IggyClient, IggyDuration, IggyError, IggyMessage,
 };
 use iggy_connector_sdk::{
-    ConnectorState, DecodedMessage, Error, ProducedMessages, StreamEncoder, TopicMetadata,
+    DecodedMessage, Error, ProducedMessages, StreamEncoder, TopicMetadata,
     transforms::Transform,
 };
 use once_cell::sync::Lazy;
@@ -170,11 +170,14 @@ fn init_source(
     container: &Container<SourceApi>,
     config: &serde_json::Value,
     id: u32,
-    state: Option<ConnectorState>,
+    state: Option<serde_json::Value>,
 ) {
     let config = serde_json::to_string(config).expect("Invalid source config.");
-    let state_ptr = state.as_ref().map_or(std::ptr::null(), |s| s.0.as_ptr());
-    let state_len = state.as_ref().map_or(0, |s| s.0.len());
+    let state_bytes = state.as_ref().map_or(Vec::new(), |s| {
+        serde_json::to_vec(s).expect("Failed to serialize state")
+    });
+    let state_ptr = state_bytes.as_ptr();
+    let state_len = state_bytes.len();
     (container.open)(id, config.as_ptr(), config.len(), state_ptr, state_len);
 }
 
