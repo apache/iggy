@@ -103,18 +103,16 @@ pub(crate) async fn start(
     }
 
     // Ensure rustls crypto provider is installed
-    if rustls::crypto::CryptoProvider::get_default().is_none() {
-        if let Err(e) = rustls::crypto::ring::default_provider().install_default() {
-            shard_warn!(
-                shard.id,
-                "Failed to install rustls crypto provider: {:?}. This may be normal if another thread installed it first.",
-                e
-            );
-        } else {
-            trace!("Rustls crypto provider installed successfully");
-        }
+    if rustls::crypto::CryptoProvider::get_default().is_none()
+        && let Err(e) = rustls::crypto::ring::default_provider().install_default()
+    {
+        shard_warn!(
+            shard.id,
+            "Failed to install rustls crypto provider: {:?}. This may be normal if another thread installed it first.",
+            e
+        );
     } else {
-        trace!("Rustls crypto provider already installed");
+        trace!("Rustls crypto provider installed or already present");
     }
 
     // Load or generate TLS certificates
