@@ -381,14 +381,10 @@ Arguments:
   <PASSWORD>  Password
 
 Options:
-  -u, --user-status <USER_STATUS>
-          User status [default: active] [possible values: active, inactive]
-  -g, --global-permissions <GLOBAL_PERMISSIONS>
-          Set global permissions for created user
-  -s, --stream-permissions <STREAM_PERMISSIONS>
-          Set stream permissions for created user
-  -h, --help
-          Print help (see more with '--help')
+  -u, --user-status <USER_STATUS>                User status [default: active] [possible values: active, inactive]
+  -g, --global-permissions <GLOBAL_PERMISSIONS>  Set global permissions for created user
+  -s, --stream-permissions <STREAM_PERMISSIONS>  Set stream permissions for created user
+  -h, --help                                     Print help (see more with '--help')
 "#,
             ),
         ))

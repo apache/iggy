@@ -1,0 +1,118 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: _test_examples
+on:
+  workflow_call:
+    inputs:
+      component:
+        type: string
+        required: true
+        description: "Component to test (should be 'examples-suite')"
+      task:
+        type: string
+        required: true
+        description: "Task to run (e.g., 'examples-rust', 'examples-go')"
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      IGGY_CI_BUILD: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Skip noop
+        if: inputs.component == 'noop'
+        run: echo "No changes detected, skipping tests"
+
+      - name: Setup Rust with cache for examples
+        if: inputs.component == 'examples-suite'
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          cache-targets: false  # Only cache registry and git deps, not target dir (sccache handles that)
+
+      - name: Build common binaries for all examples
+        if: inputs.component == 'examples-suite'
+        run: |
+          echo "Building common binaries for all examples tests..."
+          echo "Current directory: $(pwd)"
+
+          # Build server (needed by both Rust and Go examples)
+          echo "Building iggy-server..."
+          cargo build --locked --bin iggy-server
+
+          # For Rust examples, also build CLI and example binaries
+          if [[ "${{ inputs.task }}" == "examples-rust" ]]; then
+            echo "Building additional binaries for Rust examples..."
+            cargo build --locked --bin iggy --examples
+          fi
+
+          # Verify server binary was built (needed by all examples)
+          echo "Verifying server binary:"
+          if [ -f "target/debug/iggy-server" ]; then
+            echo "✅ Server binary found at target/debug/iggy-server"
+            ls -lh target/debug/iggy-server
+          else
+            echo "❌ Server binary NOT found at target/debug/iggy-server"
+            echo "Checking target directory structure:"
+            find target -name "iggy-server" -type f 2>/dev/null || true
+            exit 1
+          fi
+
+          # For Rust examples, verify CLI was built
+          if [[ "${{ inputs.task }}" == "examples-rust" ]]; then
+            if [ -f "target/debug/iggy" ]; then
+              echo "✅ CLI binary found at target/debug/iggy"
+              ls -lh target/debug/iggy
+            else
+              echo "❌ CLI binary NOT found at target/debug/iggy"
+              exit 1
+            fi
+          fi
+
+      - name: Run Rust examples
+        if: inputs.component == 'examples-suite' && inputs.task == 'examples-rust'
+        run: |
+          echo "Running Rust examples tests..."
+          # Run the examples script which will use the prebuilt binaries
+          ./scripts/run-rust-examples-from-readme.sh
+
+      - name: Run Go examples
+        if: inputs.component == 'examples-suite' && inputs.task == 'examples-go'
+        run: |
+          echo "Running Go examples tests..."
+          # Run the examples script which will use the prebuilt server binary
+          ./scripts/run-go-examples-from-readme.sh
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.component }}-${{ inputs.task }}-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            reports/**
+            target/llvm-cov/**
+            coverage.lcov
+          if-no-files-found: ignore
+          retention-days: 7

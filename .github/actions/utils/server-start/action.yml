@@ -1,0 +1,181 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: server-start
+description: Start Iggy server and wait for readiness
+inputs:
+  mode:
+    description: "How to run the server: cargo|bin"
+    required: false
+    default: "cargo"
+  cargo-bin:
+    description: "Cargo binary name (when mode=cargo)"
+    required: false
+    default: "iggy-server"
+  cargo-profile:
+    description: "Cargo profile: release|debug"
+    required: false
+    default: "debug"
+  bin:
+    description: "Path to server binary (when mode=bin)"
+    required: false
+    default: ""
+  working-directory:
+    description: "Working directory for building/running"
+    required: false
+    default: "."
+  host:
+    description: "Bind host to test readiness against"
+    required: false
+    default: "127.0.0.1"
+  port:
+    description: "TCP port to check readiness"
+    required: false
+    default: "8090"
+  wait-timeout-seconds:
+    description: "Max seconds to wait until the server is ready"
+    required: false
+    default: "45"
+  log-file:
+    description: "Where to write server logs"
+    required: false
+    default: ""
+  pid-file:
+    description: "Where to write the PID"
+    required: false
+    default: ""
+  fail-if-busy:
+    description: "Fail if port is already in use"
+    required: false
+    default: "true"
+outputs:
+  pid:
+    description: "PID of the background server process"
+    value: ${{ steps.out.outputs.pid }}
+  pid_file:
+    description: "Path to PID file"
+    value: ${{ steps.out.outputs.pid_file }}
+  log_file:
+    description: "Path to log file"
+    value: ${{ steps.out.outputs.log_file }}
+  address:
+    description: "Host:port used for checks"
+    value: ${{ steps.out.outputs.address }}
+runs:
+  using: "composite"
+  steps:
+    - id: prep
+      shell: bash
+      run: |
+        set -euo pipefail
+        : "${RUNNER_TEMP:?}"
+        LOG_FILE="${{ inputs.log-file || '' }}"
+        PID_FILE="${{ inputs.pid-file || '' }}"
+        [ -n "$LOG_FILE" ] || LOG_FILE="$RUNNER_TEMP/iggy-server.log"
+        [ -n "$PID_FILE" ] || PID_FILE="$RUNNER_TEMP/iggy-server.pid"
+        echo "LOG_FILE=$LOG_FILE" >> "$GITHUB_ENV"
+        echo "PID_FILE=$PID_FILE" >> "$GITHUB_ENV"
+
+    - id: resolve-bin
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+        MODE="${{ inputs.mode }}"
+        BIN_PATH=""
+        if [[ "$MODE" == "cargo" ]]; then
+          PROFILE="${{ inputs.cargo-profile }}"
+          NAME="${{ inputs.cargo-bin }}"
+          if [[ "$PROFILE" == "release" ]]; then
+            OUT="target/release/$NAME"
+          else
+            OUT="target/debug/$NAME"
+          fi
+          if [[ ! -x "$OUT" ]]; then
+            echo "Building $NAME with cargo ($PROFILE)…"
+            cargo build --locked --bin "$NAME" $([[ "$PROFILE" == "release" ]] && echo "--release")
+          fi
+          BIN_PATH="$OUT"
+        else
+          BIN_PATH="${{ inputs.bin }}"
+          [[ -x "$BIN_PATH" ]] || { echo "Binary not found or not executable: $BIN_PATH"; exit 1; }
+        fi
+        echo "bin=$BIN_PATH" >> "$GITHUB_OUTPUT"
+
+    - id: busy
+      shell: bash
+      run: |
+        set -euo pipefail
+        HOST="${{ inputs.host }}"
+        PORT="${{ inputs.port }}"
+        # true if socket is already open
+        if command -v nc >/dev/null 2>&1; then
+          if nc -z "$HOST" "$PORT" 2>/dev/null; then busy=1; else busy=0; fi
+        else
+          if timeout 1 bash -lc ":</dev/tcp/$HOST/$PORT" 2>/dev/null; then busy=1; else busy=0; fi
+        fi
+        echo "BUSY=$busy" >> "$GITHUB_ENV"
+
+    - if: env.BUSY == '1' && inputs.fail-if-busy == 'true'
+      shell: bash
+      run: |
+        echo "Port ${{ inputs.host }}:${{ inputs.port }} is already in use." >&2
+        exit 1
+
+    - name: Start server
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+        nohup "${{ steps.resolve-bin.outputs.bin }}" >"$LOG_FILE" 2>&1 &
+        echo $! > "$PID_FILE"
+        echo "Started server PID $(cat "$PID_FILE") → logs: $LOG_FILE"
+
+    - name: Wait for readiness
+      shell: bash
+      run: |
+        set -euo pipefail
+        HOST="${{ inputs.host }}"
+        PORT="${{ inputs.port }}"
+        DEADLINE=$(( $(date +%s) + ${{ inputs.wait-timeout-seconds }} ))
+        until (( $(date +%s) > DEADLINE )); do
+          if command -v nc >/dev/null 2>&1; then
+            nc -z "$HOST" "$PORT" 2>/dev/null && ready=1 || ready=0
+          else
+            timeout 1 bash -lc ":</dev/tcp/$HOST/$PORT" 2>/dev/null && ready=1 || ready=0
+          fi
+          if [[ "$ready" == "1" ]]; then
+            echo "Server is ready on $HOST:$PORT"
+            break
+          fi
+          sleep 1
+        done
+        if [[ "${ready:-0}" != "1" ]]; then
+          echo "Server did not become ready within ${{ inputs.wait-timeout-seconds }}s." >&2
+          echo "---- last 100 lines of log ----"
+          tail -n 100 "$LOG_FILE" || true
+          kill "$(cat "$PID_FILE")" 2>/dev/null || true
+          exit 1
+        fi
+
+    - id: out
+      shell: bash
+      run: |
+        echo "pid=$(cat "$PID_FILE")" >> "$GITHUB_OUTPUT"
+        echo "pid_file=$PID_FILE" >> "$GITHUB_OUTPUT"
+        echo "log_file=$LOG_FILE" >> "$GITHUB_OUTPUT"
+        echo "address=${{ inputs.host }}:${{ inputs.port }}" >> "$GITHUB_OUTPUT"

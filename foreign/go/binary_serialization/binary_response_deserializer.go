@@ -37,6 +37,10 @@ func DeserializeLogInResponse(payload []byte) *iggcon.IdentityInfo {
 }
 
 func DeserializeOffset(payload []byte) *iggcon.ConsumerOffsetInfo {
+	if len(payload) == 0 {
+		return nil
+	}
+
 	partitionId := binary.LittleEndian.Uint32(payload[0:4])
 	currentOffset := binary.LittleEndian.Uint64(payload[4:12])
 	storedOffset := binary.LittleEndian.Uint64(payload[12:20])
