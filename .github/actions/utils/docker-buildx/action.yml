@@ -127,7 +127,7 @@ runs:
       if: steps.config.outputs.should_push == 'true'
       uses: docker/login-action@v3
       with:
-        username: ${{ env.DOCKERHUB_USERNAME }}
+        username: ${{ env.DOCKERHUB_USER }}
         password: ${{ env.DOCKERHUB_TOKEN }}
 
     - name: Docker meta
