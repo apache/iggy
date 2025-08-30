@@ -28,6 +28,7 @@ from typing import Optional, List
 @dataclass
 class GlobalContext:
     """Global test context similar to Rust implementation."""
+
     client: Optional[object] = None  # Will be IggyClient
     server_addr: Optional[str] = None
     last_stream_id: Optional[int] = None

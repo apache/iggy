@@ -1,0 +1,186 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: node-npm-post-merge
+description: Node.js post-merge npm publishing github iggy actions
+
+inputs:
+  version:
+    description: "Version for publishing"
+    required: true
+  dry_run:
+    description: "Dry run mode"
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: "23"
+        registry-url: "https://registry.npmjs.org"
+        cache: "npm"
+        cache-dependency-path: foreign/node/package-lock.json
+
+    - name: Install dependencies
+      run: |
+        cd foreign/node
+        npm ci --ignore-scripts
+      shell: bash
+
+    - name: Build for publishing
+      run: |
+        cd foreign/node
+        echo "📦 Building Node.js SDK for publishing..."
+        npm run build
+
+        # Verify build output
+        if [ -d "dist" ]; then
+          echo ""
+          echo "Build output:"
+          ls -la dist/
+
+          # Count files
+          FILE_COUNT=$(find dist -type f | wc -l)
+          echo ""
+          echo "Total files in dist: $FILE_COUNT"
+        else
+          echo "❌ Error: dist directory not found after build"
+          exit 1
+        fi
+      shell: bash
+
+    - name: Prepare package version
+      run: |
+        cd foreign/node
+
+        # Get current version from package.json
+        CURRENT_VERSION=$(node -p "require('./package.json').version")
+        NEW_VERSION="${{ inputs.version }}"
+
+        echo "Current package.json version: $CURRENT_VERSION"
+        echo "Target version: $NEW_VERSION"
+
+        if [ "$CURRENT_VERSION" != "$NEW_VERSION" ]; then
+          if [ "${{ inputs.dry_run }}" = "false" ]; then
+            echo "Updating version to $NEW_VERSION..."
+            npm version "$NEW_VERSION" --no-git-tag-version --allow-same-version
+          else
+            echo "Would update version from $CURRENT_VERSION to $NEW_VERSION"
+          fi
+        else
+          echo "Version already matches target"
+        fi
+      shell: bash
+
+    - name: Validate package
+      run: |
+        cd foreign/node
+
+        echo "📋 Package validation:"
+        echo ""
+
+        # Check package.json required fields
+        node -e "
+          const pkg = require('./package.json');
+          const required = ['name', 'version', 'description', 'main', 'types', 'license'];
+          const missing = required.filter(field => !pkg[field]);
+          if (missing.length > 0) {
+            console.error('❌ Missing required fields:', missing.join(', '));
+            process.exit(1);
+          }
+          console.log('✅ All required fields present');
+          console.log('');
+          console.log('Package info:');
+          console.log('  Name:', pkg.name);
+          console.log('  Version:', pkg.version);
+          console.log('  Description:', pkg.description);
+          console.log('  License:', pkg.license);
+          console.log('  Main:', pkg.main);
+          console.log('  Types:', pkg.types);
+        "
+
+        # Check if files to be published exist
+        echo ""
+        echo "Files to be published:"
+        # npm pack might output non-JSON lines before the JSON, so we need to extract only the JSON part
+        npm pack --dry-run --json 2>/dev/null | tail -1 | jq -r '.[0].files[].path' 2>/dev/null | head -20 || echo "  (Unable to list files, but continuing...)"
+      shell: bash
+
+    - name: Publish to npm
+      env:
+        NODE_AUTH_TOKEN: ${{ env.NPM_TOKEN }}
+      run: |
+        cd foreign/node
+
+        if [ "${{ inputs.dry_run }}" = "true" ]; then
+          echo "🔍 Dry run - would publish to npm:"
+          echo ""
+
+          # Show what would be published
+          npm pack --dry-run
+
+          echo ""
+          echo "Package details:"
+          node -e "
+            const pkg = require('./package.json');
+            console.log('  Name: ' + pkg.name);
+            console.log('  Version: ${{ inputs.version }}');
+            console.log('  Registry: https://registry.npmjs.org');
+          "
+
+          echo ""
+          echo "After publishing, users could install with:"
+          echo "  npm install apache-iggy@${{ inputs.version }}"
+          echo ""
+          echo "Or add to package.json:"
+          echo '  "apache-iggy": "^${{ inputs.version }}"'
+        else
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "❌ NPM_TOKEN is not set"
+            exit 1
+          fi
+
+          echo "📦 Publishing to npm registry..."
+          echo "Version: ${{ inputs.version }}"
+          echo ""
+
+          # Publish with provenance for supply chain security
+          npm publish --provenance --access public
+
+          if [ $? -eq 0 ]; then
+            echo ""
+            echo "✅ Successfully published to npm"
+            echo ""
+            echo "Package: apache-iggy@${{ inputs.version }}"
+            echo "Registry: https://registry.npmjs.org/apache-iggy"
+            echo ""
+            echo "Users can now install with:"
+            echo "  npm install apache-iggy@${{ inputs.version }}"
+            echo ""
+            echo "Or add to package.json:"
+            echo '  "apache-iggy": "^${{ inputs.version }}"'
+            echo ""
+            echo "View on npm: https://www.npmjs.com/package/apache-iggy/v/${{ inputs.version }}"
+          else
+            echo "❌ Publishing failed"
+            exit 1
+          fi
+        fi
+      shell: bash

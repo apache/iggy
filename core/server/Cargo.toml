@@ -28,6 +28,10 @@ normal = ["tracing-appender"]
 [package.metadata.cargo-machete]
 ignored = ["rust-s3"]
 
+[[bin]]
+name = "iggy-server"
+path = "src/main.rs"
+
 [features]
 default = ["mimalloc"]
 tokio-console = ["dep:console-subscriber", "tokio/tracing"]
@@ -125,7 +129,3 @@ vergen-git2 = { version = "1.0.7", features = [
 [dev-dependencies]
 mockall = { workspace = true }
 serial_test = { workspace = true }
-
-[[bin]]
-name = "iggy-server"
-path = "src/main.rs"

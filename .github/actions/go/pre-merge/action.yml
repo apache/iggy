@@ -1,0 +1,139 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: go-pre-merge
+description: Go pre-merge testing github iggy actions
+
+inputs:
+  task:
+    description: "Task to run (lint, test, build, e2e)"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: "1.23.0"
+        cache-dependency-path: |
+          foreign/go/go.sum
+          bdd/go/go.sum
+          examples/go/go.sum
+
+    - name: Download dependencies
+      run: |
+        if [ -f "foreign/go/go.mod" ]; then
+          cd foreign/go && go mod download
+          cd ..
+        fi
+
+        if [ -f "bdd/go/go.mod" ]; then
+          cd bdd/go && go mod download
+          cd ..
+        fi
+
+        if [ -f "examples/go/go.mod" ]; then
+          cd examples/go && go mod download
+        fi
+      shell: bash
+
+    - name: Tidy Check
+      shell: bash
+      if: inputs.task == 'test' || inputs.task == 'lint'
+      run: |
+        cd foreign/go
+        go mod tidy
+        git diff --exit-code go.mod go.sum
+
+    - name: Test
+      shell: bash
+      if: inputs.task == 'test'
+      run: |
+        cd foreign/go
+
+        # Create reports directory
+        mkdir -p ../../reports
+
+        # Run tests with coverage
+        go test -v -race -coverprofile=../../reports/go-coverage.out ./...
+
+        # Generate coverage report
+        go tool cover -html=../../reports/go-coverage.out -o ../../reports/go-coverage.html
+
+        # Run tests with JSON output for better reporting
+        go test -v -json ./... > ../../reports/go-tests.json
+
+
+    - name: Lint
+      if: inputs.task == 'lint'
+      uses: golangci/golangci-lint-action@v6
+      with:
+        version: v1.61
+        working-directory: foreign/go
+        args: --timeout=5m
+
+    - name: Lint BDD
+      if: inputs.task == 'lint' && hashFiles('bdd/go/go.mod') != ''
+      uses: golangci/golangci-lint-action@v6
+      with:
+        version: v1.61
+        working-directory: bdd/go
+        args: --timeout=5m
+
+    - name: Lint Examples
+      if: inputs.task == 'lint' && hashFiles('examples/go/go.mod') != ''
+      uses: golangci/golangci-lint-action@v6
+      with:
+        version: v1.61
+        working-directory: examples/go
+        args: --timeout=5m
+
+    - name: Build
+      shell: bash
+      if: inputs.task == 'build'
+      run: |
+        cd foreign/go
+
+        # Build the module
+        go build -v ./...
+
+    - name: Setup server for e2e tests
+      if: inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-start
+
+    - name: Run e2e tests
+      shell: bash
+      if: inputs.task == 'e2e'
+      run: |
+        echo "🧪 Running Go e2e tests..."
+
+        # Install ginkgo
+        echo "Installing ginkgo..."
+        go install github.com/onsi/ginkgo/v2/ginkgo@latest
+
+        # Ensure ginkgo is in PATH
+        export PATH="${PATH}:$(go env GOPATH)/bin"
+
+        # Run foreign/go e2e tests
+        echo "Running foreign/go e2e tests..."
+        cd foreign/go
+        go test -v -race ./...
+
+    - name: Stop server after e2e tests
+      if: always() && inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-stop

@@ -350,14 +350,10 @@ Arguments:
   [MESSAGE_EXPIRY]...      Message expiry time in human-readable format like "unlimited" or "15days 2min 2s" [default: server_default]
 
 Options:
-  -t, --topic-id <TOPIC_ID>
-          Topic ID to create
-  -m, --max-topic-size <MAX_TOPIC_SIZE>
-          Max topic size in human-readable format like "unlimited" or "15GB" [default: server_default]
-  -r, --replication-factor <REPLICATION_FACTOR>
-          Replication factor for the topic [default: 1]
-  -h, --help
-          Print help (see more with '--help')
+  -t, --topic-id <TOPIC_ID>                      Topic ID to create
+  -m, --max-topic-size <MAX_TOPIC_SIZE>          Max topic size in human-readable format like "unlimited" or "15GB" [default: server_default]
+  -r, --replication-factor <REPLICATION_FACTOR>  Replication factor for the topic [default: 1]
+  -h, --help                                     Print help (see more with '--help')
 "#,
             ),
         ))

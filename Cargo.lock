@@ -903,33 +903,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bench-dashboard-server"
-version = "0.4.0"
-dependencies = [
- "actix-cors",
- "actix-files",
- "actix-web",
- "bench-dashboard-shared",
- "bench-report",
- "chrono",
- "clap",
- "dashmap",
- "file-operation",
- "notify",
- "octocrab",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.14",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "walkdir",
- "zip",
-]
-
-[[package]]
 name = "bench-dashboard-shared"
 version = "0.1.0"
 dependencies = [
@@ -3845,6 +3818,33 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "iggy-bench-dashboard-server"
+version = "0.4.0"
+dependencies = [
+ "actix-cors",
+ "actix-files",
+ "actix-web",
+ "bench-dashboard-shared",
+ "bench-report",
+ "chrono",
+ "clap",
+ "dashmap",
+ "file-operation",
+ "notify",
+ "octocrab",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.14",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "walkdir",
+ "zip",
 ]
 
 [[package]]

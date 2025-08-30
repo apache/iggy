@@ -457,12 +457,9 @@ Arguments:
   [MESSAGE_EXPIRY]...      New message expiry time in human-readable format like "unlimited" or "15days 2min 2s" [default: server_default]
 
 Options:
-  -m, --max-topic-size <MAX_TOPIC_SIZE>
-          New max topic size in human-readable format like "unlimited" or "15GB" [default: server_default]
-  -r, --replication-factor <REPLICATION_FACTOR>
-          New replication factor for the topic [default: 1]
-  -h, --help
-          Print help (see more with '--help')
+  -m, --max-topic-size <MAX_TOPIC_SIZE>          New max topic size in human-readable format like "unlimited" or "15GB" [default: server_default]
+  -r, --replication-factor <REPLICATION_FACTOR>  New replication factor for the topic [default: 1]
+  -h, --help                                     Print help (see more with '--help')
 "#,
             ),
         ))

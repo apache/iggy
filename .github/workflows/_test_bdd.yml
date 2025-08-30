@@ -1,0 +1,110 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: _test_bdd
+on:
+  workflow_call:
+    inputs:
+      component:
+        type: string
+        required: true
+        description: "Component to test (e.g., 'bdd-rust', 'bdd-python', etc.)"
+      task:
+        type: string
+        required: true
+        description: "Task to run (e.g., 'bdd-rust', 'bdd-python', etc.)"
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      IGGY_CI_BUILD: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Skip noop
+        if: inputs.component == 'noop'
+        run: echo "No changes detected, skipping tests"
+
+      - name: Setup Rust with cache for BDD
+        if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          cache-targets: false  # Only cache registry and git deps, not target dir (sccache handles that)
+
+      - name: Build server for BDD tests
+        if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
+        run: |
+          echo "Building server binary and CLI for BDD tests with sccache..."
+          cargo build --locked --bin iggy-server --bin iggy
+
+          echo "Server binary built at: target/debug/iggy-server"
+          ls -lh target/debug/iggy-server
+
+          echo "CLI binary built at: target/debug/iggy"
+          ls -lh target/debug/iggy
+
+          # Verify the binary exists and is executable
+          if [ ! -f "target/debug/iggy-server" ]; then
+            echo "ERROR: Server binary not found at target/debug/iggy-server"
+            exit 1
+          fi
+
+          if [ ! -f "target/debug/iggy" ]; then
+            echo "ERROR: CLI binary not found at target/debug/iggy"
+            exit 1
+          fi
+
+      - name: Run BDD tests
+        if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
+        run: |
+          # Extract SDK name from task (format: bdd-<sdk>)
+          SDK_NAME=$(echo "${{ inputs.task }}" | sed 's/bdd-//')
+
+          echo "Running BDD tests for SDK: $SDK_NAME"
+          echo "Current directory: $(pwd)"
+          echo "Server binary location: $(ls -lh target/debug/iggy-server)"
+          echo "CLI binary location: $(ls -lh target/debug/iggy)"
+
+          # Export path to the pre-built server and cli binaries (relative to repo root)
+          export IGGY_SERVER_PATH="target/debug/iggy-server"
+          export IGGY_CLI_PATH="target/debug/iggy"
+          ./scripts/run-bdd-tests.sh "$SDK_NAME"
+
+      - name: Clean up Docker resources (BDD)
+        if: always() && startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
+        run: |
+          ./scripts/run-bdd-tests.sh clean || true
+          docker system prune -f || true
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.component }}-${{ inputs.task }}-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            reports/**
+            target/llvm-cov/**
+            coverage.lcov
+          if-no-files-found: ignore
+          retention-days: 7

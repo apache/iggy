@@ -24,10 +24,11 @@ and connecting to Iggy servers in various configurations.
 
 import asyncio
 import os
-from .utils import get_server_config, wait_for_ping, wait_for_server
-import pytest
 
+import pytest
 from apache_iggy import IggyClient
+
+from .utils import get_server_config, wait_for_ping, wait_for_server
 
 
 @pytest.fixture(scope="session")
@@ -67,7 +68,7 @@ async def iggy_client() -> IggyClient:
 def configure_asyncio():
     """Configure asyncio settings for tests."""
     # Set event loop policy if needed
-    if os.name == 'nt':  # Windows
+    if os.name == "nt":  # Windows
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 
@@ -75,13 +76,9 @@ def configure_asyncio():
 def pytest_configure(config):
     """Configure pytest with custom markers."""
     config.addinivalue_line(
-        "markers",
-        "integration: marks tests as integration tests (may be slow)"
+        "markers", "integration: marks tests as integration tests (may be slow)"
     )
-    config.addinivalue_line(
-        "markers",
-        "unit: marks tests as unit tests (fast)"
-    )
+    config.addinivalue_line("markers", "unit: marks tests as unit tests (fast)")
 
 
 def pytest_collection_modifyitems(config, items):

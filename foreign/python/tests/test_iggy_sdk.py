@@ -23,15 +23,14 @@ Tests are marked as either 'unit' or 'integration' based on their requirements.
 """
 
 import asyncio
-from datetime import timedelta
 import uuid
+from datetime import timedelta
 
 import pytest
+from apache_iggy import AutoCommit, IggyClient, PollingStrategy, ReceiveMessage
+from apache_iggy import SendMessage as Message
 
 from .utils import get_server_config, wait_for_ping, wait_for_server
-
-from apache_iggy import IggyClient, PollingStrategy, AutoCommit, ReceiveMessage
-from apache_iggy import SendMessage as Message
 
 
 class TestConnectivity:
@@ -69,7 +68,9 @@ class TestStreamOperations:
         return f"test-stream-{uuid.uuid4().hex[:8]}"
 
     @pytest.mark.asyncio
-    async def test_create_and_get_stream(self, iggy_client: IggyClient, unique_stream_name):
+    async def test_create_and_get_stream(
+        self, iggy_client: IggyClient, unique_stream_name
+    ):
         """Test stream creation and retrieval."""
         # Create stream
         await iggy_client.create_stream(unique_stream_name)
@@ -102,24 +103,22 @@ class TestTopicOperations:
         """Generate unique stream and topic names."""
         unique_id = uuid.uuid4().hex[:8]
         return {
-            'stream': f"test-stream-{unique_id}",
-            'topic': f"test-topic-{unique_id}"
+            "stream": f"test-stream-{unique_id}",
+            "topic": f"test-topic-{unique_id}",
         }
 
     @pytest.mark.asyncio
     async def test_create_and_get_topic(self, iggy_client: IggyClient, unique_names):
         """Test topic creation and retrieval."""
-        stream_name = unique_names['stream']
-        topic_name = unique_names['topic']
+        stream_name = unique_names["stream"]
+        topic_name = unique_names["topic"]
 
         # Create stream first
         await iggy_client.create_stream(stream_name)
 
         # Create topic
         await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=2
+            stream=stream_name, name=topic_name, partitions_count=2
         )
 
         # Get topic by name
@@ -132,15 +131,13 @@ class TestTopicOperations:
     @pytest.mark.asyncio
     async def test_list_topics(self, iggy_client: IggyClient, unique_names):
         """Test listing topics in a stream."""
-        stream_name = unique_names['stream']
-        topic_name = unique_names['topic']
+        stream_name = unique_names["stream"]
+        topic_name = unique_names["topic"]
 
         # Create stream and topic
         await iggy_client.create_stream(stream_name)
         await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1
+            stream=stream_name, name=topic_name, partitions_count=1
         )
 
         # Get the topic we just created
@@ -159,28 +156,24 @@ class TestMessageOperations:
         """Setup unique names and test data for messaging tests."""
         unique_id = uuid.uuid4().hex[:8]
         return {
-            'stream': f"msg-stream-{unique_id}",
-            'topic': f"msg-topic-{unique_id}",
-            'partition_id': 1,
-            'messages': [
-                f"Test message {i} - {unique_id}" for i in range(1, 4)
-            ]
+            "stream": f"msg-stream-{unique_id}",
+            "topic": f"msg-topic-{unique_id}",
+            "partition_id": 1,
+            "messages": [f"Test message {i} - {unique_id}" for i in range(1, 4)],
         }
 
     @pytest.mark.asyncio
     async def test_send_and_poll_messages(self, iggy_client: IggyClient, message_setup):
         """Test basic message sending and polling."""
-        stream_name = message_setup['stream']
-        topic_name = message_setup['topic']
-        partition_id = message_setup['partition_id']
-        test_messages = message_setup['messages']
+        stream_name = message_setup["stream"]
+        topic_name = message_setup["topic"]
+        partition_id = message_setup["partition_id"]
+        test_messages = message_setup["messages"]
 
         # Setup stream and topic
         await iggy_client.create_stream(stream_name)
         await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1
+            stream=stream_name, name=topic_name, partitions_count=1
         )
 
         # Send messages
@@ -189,7 +182,7 @@ class TestMessageOperations:
             stream=stream_name,
             topic=topic_name,
             partitioning=partition_id,
-            messages=messages
+            messages=messages,
         )
 
         # Poll messages
@@ -199,7 +192,7 @@ class TestMessageOperations:
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=10,
-            auto_commit=True
+            auto_commit=True,
         )
 
         # Verify we got our messages
@@ -212,19 +205,19 @@ class TestMessageOperations:
                 assert actual_payload == expected_msg
 
     @pytest.mark.asyncio
-    async def test_send_and_poll_messages_as_bytes(self, iggy_client: IggyClient, message_setup):
+    async def test_send_and_poll_messages_as_bytes(
+        self, iggy_client: IggyClient, message_setup
+    ):
         """Test basic message sending and polling with message payload as bytes."""
-        stream_name = message_setup['stream']
-        topic_name = message_setup['topic']
-        partition_id = message_setup['partition_id']
-        test_messages = message_setup['messages']
+        stream_name = message_setup["stream"]
+        topic_name = message_setup["topic"]
+        partition_id = message_setup["partition_id"]
+        test_messages = message_setup["messages"]
 
         # Setup stream and topic
         await iggy_client.create_stream(stream_name)
         await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1
+            stream=stream_name, name=topic_name, partitions_count=1
         )
 
         # Send messages
@@ -233,7 +226,7 @@ class TestMessageOperations:
             stream=stream_name,
             topic=topic_name,
             partitioning=partition_id,
-            messages=messages
+            messages=messages,
         )
 
         # Poll messages
@@ -243,7 +236,7 @@ class TestMessageOperations:
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=10,
-            auto_commit=True
+            auto_commit=True,
         )
 
         # Verify we got our messages
@@ -258,16 +251,14 @@ class TestMessageOperations:
     @pytest.mark.asyncio
     async def test_message_properties(self, iggy_client: IggyClient, message_setup):
         """Test access to message properties."""
-        stream_name = message_setup['stream']
-        topic_name = message_setup['topic']
-        partition_id = message_setup['partition_id']
+        stream_name = message_setup["stream"]
+        topic_name = message_setup["topic"]
+        partition_id = message_setup["partition_id"]
 
         # Setup
         await iggy_client.create_stream(stream_name)
         await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1
+            stream=stream_name, name=topic_name, partitions_count=1
         )
 
         # Send a test message
@@ -277,7 +268,7 @@ class TestMessageOperations:
             stream=stream_name,
             topic=topic_name,
             partitioning=partition_id,
-            messages=[message]
+            messages=[message],
         )
 
         # Poll and verify properties
@@ -287,7 +278,7 @@ class TestMessageOperations:
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
             count=1,
-            auto_commit=True
+            auto_commit=True,
         )
 
         assert len(polled_messages) >= 1
@@ -310,26 +301,24 @@ class TestPollingStrategies:
         """Setup for polling strategy tests."""
         unique_id = uuid.uuid4().hex[:8]
         return {
-            'stream': f"poll-stream-{unique_id}",
-            'topic': f"poll-topic-{unique_id}",
-            'partition_id': 1,
-            'messages': [f"Polling test {i} - {unique_id}" for i in range(5)]
+            "stream": f"poll-stream-{unique_id}",
+            "topic": f"poll-topic-{unique_id}",
+            "partition_id": 1,
+            "messages": [f"Polling test {i} - {unique_id}" for i in range(5)],
         }
 
     @pytest.mark.asyncio
     async def test_polling_strategies(self, iggy_client: IggyClient, polling_setup):
         """Test different polling strategies work correctly."""
-        stream_name = polling_setup['stream']
-        topic_name = polling_setup['topic']
-        partition_id = polling_setup['partition_id']
-        test_messages = polling_setup['messages']
+        stream_name = polling_setup["stream"]
+        topic_name = polling_setup["topic"]
+        partition_id = polling_setup["partition_id"]
+        test_messages = polling_setup["messages"]
 
         # Setup
         await iggy_client.create_stream(stream_name)
         await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1
+            stream=stream_name, name=topic_name, partitions_count=1
         )
 
         # Send test messages
@@ -338,7 +327,7 @@ class TestPollingStrategies:
             stream=stream_name,
             topic=topic_name,
             partitioning=partition_id,
-            messages=messages
+            messages=messages,
         )
 
         # Test First strategy
@@ -348,7 +337,7 @@ class TestPollingStrategies:
             partition_id=partition_id,
             polling_strategy=PollingStrategy.First(),
             count=1,
-            auto_commit=False
+            auto_commit=False,
         )
         assert len(first_messages) >= 1
 
@@ -359,7 +348,7 @@ class TestPollingStrategies:
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Last(),
             count=1,
-            auto_commit=False
+            auto_commit=False,
         )
         assert len(last_messages) >= 1
 
@@ -370,7 +359,7 @@ class TestPollingStrategies:
             partition_id=partition_id,
             polling_strategy=PollingStrategy.Next(),
             count=2,
-            auto_commit=False
+            auto_commit=False,
         )
         assert len(next_messages) >= 1
 
@@ -380,9 +369,11 @@ class TestPollingStrategies:
                 stream=stream_name,
                 topic=topic_name,
                 partition_id=partition_id,
-                polling_strategy=PollingStrategy.Offset(value=first_messages[0].offset()),
+                polling_strategy=PollingStrategy.Offset(
+                    value=first_messages[0].offset()
+                ),
                 count=1,
-                auto_commit=False
+                auto_commit=False,
             )
             assert len(offset_messages) >= 1
 
@@ -421,10 +412,9 @@ class TestErrorHandling:
 
         with pytest.raises(RuntimeError):
             await iggy_client.create_topic(
-                stream=nonexistent_stream,
-                name=topic_name,
-                partitions_count=1
+                stream=nonexistent_stream, name=topic_name, partitions_count=1
             )
+
 
 class TestConsumerGroup:
     """Test consumer groups."""
@@ -434,27 +424,25 @@ class TestConsumerGroup:
         """Setup for polling strategy tests."""
         unique_id = uuid.uuid4().hex[:8]
         return {
-            'consumer': f"consumer-group-consumer-{unique_id}",
-            'stream': f"consumer-group-stream-{unique_id}",
-            'topic': f"consumer-group-topic-{unique_id}",
-            'partition_id': 1,
-            'messages': [f"Consumer group test {i} - {unique_id}" for i in range(5)]
+            "consumer": f"consumer-group-consumer-{unique_id}",
+            "stream": f"consumer-group-stream-{unique_id}",
+            "topic": f"consumer-group-topic-{unique_id}",
+            "partition_id": 1,
+            "messages": [f"Consumer group test {i} - {unique_id}" for i in range(5)],
         }
 
     @pytest.mark.asyncio
     async def test_meta(self, iggy_client: IggyClient, consumer_group_setup):
         """Test that meta information can be read about the consumer group."""
-        consumer_name = consumer_group_setup['consumer']
-        stream_name = consumer_group_setup['stream']
-        topic_name = consumer_group_setup['topic']
-        partition_id = consumer_group_setup['partition_id']
+        consumer_name = consumer_group_setup["consumer"]
+        stream_name = consumer_group_setup["stream"]
+        topic_name = consumer_group_setup["topic"]
+        partition_id = consumer_group_setup["partition_id"]
 
         # Setup
         await iggy_client.create_stream(stream_name)
         await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1
+            stream=stream_name, name=topic_name, partitions_count=1
         )
         consumer = iggy_client.consumer_group(
             consumer_name,
@@ -475,22 +463,22 @@ class TestConsumerGroup:
         assert consumer.get_last_stored_offset(partition_id) is None
 
     @pytest.mark.asyncio
-    async def test_consume_messages(self, iggy_client: IggyClient, consumer_group_setup):
+    async def test_consume_messages(
+        self, iggy_client: IggyClient, consumer_group_setup
+    ):
         """Test that the consumer group can consume messages."""
-        consumer_name = consumer_group_setup['consumer']
-        stream_name = consumer_group_setup['stream']
-        topic_name = consumer_group_setup['topic']
-        partition_id = consumer_group_setup['partition_id']
-        test_messages = consumer_group_setup['messages']
+        consumer_name = consumer_group_setup["consumer"]
+        stream_name = consumer_group_setup["stream"]
+        topic_name = consumer_group_setup["topic"]
+        partition_id = consumer_group_setup["partition_id"]
+        test_messages = consumer_group_setup["messages"]
 
         # Setup
         received_messages = []
         shutdown_event = asyncio.Event()
         await iggy_client.create_stream(stream_name)
         await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1
+            stream=stream_name, name=topic_name, partitions_count=1
         )
 
         consumer = iggy_client.consumer_group(
@@ -509,9 +497,13 @@ class TestConsumerGroup:
             if len(received_messages) == 5:
                 shutdown_event.set()
 
-
         async def send() -> None:
-            await iggy_client.send_messages(stream_name, topic_name, partition_id, [Message(m) for m in test_messages])
+            await iggy_client.send_messages(
+                stream_name,
+                topic_name,
+                partition_id,
+                [Message(m) for m in test_messages],
+            )
 
         await asyncio.gather(consumer.consume_messages(take, shutdown_event), send())
 
@@ -520,18 +512,16 @@ class TestConsumerGroup:
     @pytest.mark.asyncio
     async def test_shutdown(self, iggy_client: IggyClient, consumer_group_setup):
         """Test that the consumer group can be signaled to shutdown."""
-        consumer_name = consumer_group_setup['consumer']
-        stream_name = consumer_group_setup['stream']
-        topic_name = consumer_group_setup['topic']
-        partition_id = consumer_group_setup['partition_id']
+        consumer_name = consumer_group_setup["consumer"]
+        stream_name = consumer_group_setup["stream"]
+        topic_name = consumer_group_setup["topic"]
+        partition_id = consumer_group_setup["partition_id"]
 
         # Setup
         shutdown_event = asyncio.Event()
         await iggy_client.create_stream(stream_name)
         await iggy_client.create_topic(
-            stream=stream_name,
-            name=topic_name,
-            partitions_count=1
+            stream=stream_name, name=topic_name, partitions_count=1
         )
 
         consumer = iggy_client.consumer_group(

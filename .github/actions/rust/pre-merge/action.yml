@@ -1,0 +1,110 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: rust-pre-merge
+description: Rust pre-merge testing and linting github iggy actions
+
+inputs:
+  task:
+    description: "Task to run (check, fmt, clippy, sort, machete, doctest, test, compat)"
+    required: true
+  component:
+    description: "Component name (for context)"
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Rust with cache
+      uses: ./.github/actions/utils/setup-rust-with-cache
+      with:
+        cache-targets: false  # Only cache registry and git deps, not target dir (sccache handles that)
+        show-stats: true
+
+    - name: Install tools for specific tasks
+      run: |
+        case "${{ inputs.task }}" in
+          sort)
+            cargo install cargo-sort --locked
+            ;;
+          machete)
+            cargo install cargo-machete --locked
+            ;;
+        esac
+      shell: bash
+
+    # Individual lint tasks for parallel execution
+    - name: Cargo check
+      if: inputs.task == 'check'
+      run: cargo check --all --all-features
+      shell: bash
+
+    - name: Cargo fmt
+      if: inputs.task == 'fmt'
+      run: cargo fmt --all -- --check
+      shell: bash
+
+    - name: Cargo clippy
+      if: inputs.task == 'clippy'
+      run: cargo clippy --all-targets --all-features -- -D warnings
+      shell: bash
+
+    - name: Cargo sort
+      if: inputs.task == 'sort'
+      run: cargo sort --check --workspace
+      shell: bash
+
+    - name: Cargo machete
+      if: inputs.task == 'machete'
+      run: cargo machete --with-metadata
+      shell: bash
+
+    - name: Doc test
+      if: inputs.task == 'doctest'
+      run: |
+        cargo test --locked --doc
+        cargo doc --no-deps --all-features --quiet
+      shell: bash
+
+    - name: Install dependencies for Rust tests
+      if: inputs.task == 'test' && runner.os == 'Linux'
+      run: |
+        sudo apt-get update --yes && sudo apt-get install --yes musl-tools gnome-keyring keyutils
+        rm -f $HOME/.local/share/keyrings/*
+        echo -n "test" | gnome-keyring-daemon --unlock
+      shell: bash
+
+    - name: Build and test
+      if: inputs.task == 'test'
+      run: |
+        # Build all targets first
+        cargo build --locked --all-targets
+
+        # Run tests with nextest for better parallelization and output
+        # nextest automatically uses all available cores and provides better test output
+        cargo nextest run --locked --no-fail-fast
+      shell: bash
+
+    - name: Backwards compatibility check
+      if: inputs.task == 'compat'
+      run: |
+        scripts/check-backwards-compat.sh \
+          --master-ref master \
+          --pr-ref ${{ github.sha }} \
+          --port 8090 --wait-secs 180
+      shell: bash

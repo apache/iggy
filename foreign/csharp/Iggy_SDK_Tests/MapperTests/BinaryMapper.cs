@@ -112,7 +112,7 @@ public sealed class BinaryMapper
                 Text = text
             };
         });
-        //Assert 
+        //Assert
         Assert.NotEmpty(response.Messages);
         Assert.Equal(2, response.Messages.Count);
         // Assert.Equal(response.Messages[0].Id, guid);
