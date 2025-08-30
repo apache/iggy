@@ -19,9 +19,6 @@ name: Pre-merge
 on:
   pull_request:
     branches: [master]
-  # TODO(hubcio): remove push, no need to do it
-  push:
-    branches: [master]
   workflow_dispatch:
 
 env:
