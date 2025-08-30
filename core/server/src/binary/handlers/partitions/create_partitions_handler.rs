@@ -72,8 +72,7 @@ impl ServerCommandHandler for CreatePartitions {
         .await
         .with_error_context(|error| {
             format!(
-                "{COMPONENT} (error: {error}) - failed to apply create partitions for stream_id: {}, topic_id: {}, session: {}",
-                stream_id, topic_id, session
+                "{COMPONENT} (error: {error}) - failed to apply create partitions for stream_id: {stream_id}, topic_id: {topic_id}, session: {session}"
             )
         })?;
         sender.send_empty_ok_response().await?;

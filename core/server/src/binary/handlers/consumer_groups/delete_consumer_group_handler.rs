@@ -70,8 +70,7 @@ impl ServerCommandHandler for DeleteConsumerGroup {
             .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to apply delete consumer group for stream_id: {}, topic_id: {}, group_id: {:?}, session: {}",
-                    stream_id, topic_id, group_id, session
+                    "{COMPONENT} (error: {error}) - failed to apply delete consumer group for stream_id: {stream_id}, topic_id: {topic_id}, group_id: {group_id:?}, session: {session}"
                 )
             })?;
         sender.send_empty_ok_response().await?;

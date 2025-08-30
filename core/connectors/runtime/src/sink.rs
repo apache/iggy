@@ -309,21 +309,51 @@ async fn process_messages(
             continue;
         };
 
+        let Some(id) = message.id else {
+            error!(
+                "ID should be present. Failed to process message for sink connector with ID: {plugin_id}"
+            );
+            continue;
+        };
+
         let Some(offset) = message.offset else {
             error!(
-                "Offset should be present. Failed to process message for sink connector with ID: {plugin_id}"
+                "Offset should be present. Failed to process message with ID: {id} for sink connector with ID: {plugin_id}"
+            );
+            continue;
+        };
+
+        let Some(checksum) = message.checksum else {
+            error!(
+                "Checksum should be present. Failed to process message with ID: {id}, offset: {offset} for sink connector with ID: {plugin_id}"
+            );
+            continue;
+        };
+
+        let Some(timestamp) = message.timestamp else {
+            error!(
+                "Timestamp should be present. Failed to process message with ID: {id}, offset: {offset} for sink connector with ID: {plugin_id}"
+            );
+            continue;
+        };
+
+        let Some(origin_timestamp) = message.origin_timestamp else {
+            error!(
+                "Origin timestamp should be present. Failed to process message with ID: {id}, offset: {offset} for sink connector with ID: {plugin_id}"
             );
             continue;
         };
 
         let Ok(payload) = message.payload.try_into_vec() else {
-            error!("Failed to get message payload for sink connector with ID: {plugin_id}");
+            error!(
+                "Failed to get message payload for message with ID: {id}, offset: {offset} for sink connector with ID: {plugin_id}"
+            );
             continue;
         };
 
         let headers: Result<Vec<u8>, RuntimeError> = if let Some(headers) = message.headers {
             Ok(postcard::to_allocvec(&headers).map_err(|error| {
-                error!("Failed to serialize headers. {error}");
+                error!("Failed to serialize headers for message with ID: {id}, offset: {offset} for sink connector with ID: {plugin_id}. {error}");
                 RuntimeError::FailedToSerializeHeaders
             })?)
         } else {
@@ -331,24 +361,34 @@ async fn process_messages(
         };
 
         let Ok(headers) = headers else {
-            error!("Failed to serialize message headers for sink connector with ID: {plugin_id}");
+            error!(
+                "Failed to serialize message headers for message with ID: {id}, offset: {offset} for sink connector with ID: {plugin_id}"
+            );
             continue;
         };
 
         messages.push(RawMessage {
+            id,
             offset,
+            checksum,
+            timestamp,
+            origin_timestamp,
             headers,
             payload,
         });
     }
 
     let topic_meta = postcard::to_allocvec(topic_metadata).map_err(|error| {
-        error!("Failed to serialize topic metadata. {error}");
+        error!(
+            "Failed to serialize topic metadata for sink connector with ID: {plugin_id}. {error}"
+        );
         RuntimeError::FailedToSerializeTopicMetadata
     })?;
 
     let messages_meta = postcard::to_allocvec(&messages_metadata).map_err(|error| {
-        error!("Failed to serialize messages metadata. {error}");
+        error!(
+            "Failed to serialize messages metadata for sink connector with ID: {plugin_id}. {error}"
+        );
         RuntimeError::FailedToSerializeMessagesMetadata
     })?;
 

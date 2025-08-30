@@ -15,9 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-version: '3.5'
 services:
-
   iggy-server:
     build: .
     container_name: iggy-server

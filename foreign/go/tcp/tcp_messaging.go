@@ -19,22 +19,48 @@ package tcp
 
 import (
 	binaryserialization "github.com/apache/iggy/foreign/go/binary_serialization"
-	. "github.com/apache/iggy/foreign/go/contracts"
+	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
-func (tms *IggyTcpClient) SendMessages(request SendMessagesRequest) error {
-	if len(request.Messages) == 0 {
+func (tms *IggyTcpClient) SendMessages(
+	streamId iggcon.Identifier,
+	topicId iggcon.Identifier,
+	partitioning iggcon.Partitioning,
+	messages []iggcon.IggyMessage,
+) error {
+	if len(messages) == 0 {
 		return ierror.CustomError("messages_count_should_be_greater_than_zero")
 	}
-	serializedRequest := binaryserialization.TcpSendMessagesRequest{SendMessagesRequest: request}
-	_, err := tms.sendAndFetchResponse(serializedRequest.Serialize(tms.MessageCompression), SendMessagesCode)
+	serializedRequest := binaryserialization.TcpSendMessagesRequest{
+		StreamId:     streamId,
+		TopicId:      topicId,
+		Partitioning: partitioning,
+		Messages:     messages,
+	}
+	_, err := tms.sendAndFetchResponse(serializedRequest.Serialize(tms.MessageCompression), iggcon.SendMessagesCode)
 	return err
 }
 
-func (tms *IggyTcpClient) PollMessages(request FetchMessagesRequest) (*FetchMessagesResponse, error) {
-	serializedRequest := binaryserialization.TcpFetchMessagesRequest{FetchMessagesRequest: request}
-	buffer, err := tms.sendAndFetchResponse(serializedRequest.Serialize(), PollMessagesCode)
+func (tms *IggyTcpClient) PollMessages(
+	streamId iggcon.Identifier,
+	topicId iggcon.Identifier,
+	consumer iggcon.Consumer,
+	strategy iggcon.PollingStrategy,
+	count uint32,
+	autoCommit bool,
+	partitionId *uint32,
+) (*iggcon.PolledMessage, error) {
+	serializedRequest := binaryserialization.TcpFetchMessagesRequest{
+		StreamId:    streamId,
+		TopicId:     topicId,
+		Consumer:    consumer,
+		AutoCommit:  autoCommit,
+		Strategy:    strategy,
+		Count:       count,
+		PartitionId: partitionId,
+	}
+	buffer, err := tms.sendAndFetchResponse(serializedRequest.Serialize(), iggcon.PollMessagesCode)
 	if err != nil {
 		return nil, err
 	}

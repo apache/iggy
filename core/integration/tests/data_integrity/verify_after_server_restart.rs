@@ -46,7 +46,9 @@ fn cache_none() -> &'static str {
 }
 
 // TODO(numminex) - Move the message generation method from benchmark run to a special method.
-#[test_matrix([cache_open_segment(), cache_all(), cache_none()])]
+#[test_matrix(
+    [cache_open_segment(), cache_all(), cache_none()]
+)]
 #[tokio::test]
 #[parallel]
 async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) {
@@ -128,7 +130,7 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
     drop(test_server);
 
     // 7. Restart server with same settings
-    let mut test_server = TestServer::new(Some(env_vars), false, None, IpAddrKind::V4);
+    let mut test_server = TestServer::new(Some(env_vars.clone()), false, None, IpAddrKind::V4);
     test_server.start();
     let server_addr = test_server.get_raw_tcp_addr().unwrap();
 

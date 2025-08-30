@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 
 namespace Apache.Iggy.MessagesDispatcher;
+
 internal interface IMessageInvoker
 {
     internal Task SendMessagesAsync(MessageSendRequest request,

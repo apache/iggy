@@ -49,6 +49,10 @@ pub(crate) async fn start(
                 generate_self_signed_cert()
                     .unwrap_or_else(|e| panic!("Failed to generate self-signed certificate: {e}"))
             } else {
+                info!(
+                    "Loading certificates from cert_file: {}, key_file: {}",
+                    config.cert_file, config.key_file
+                );
                 load_certificates(&config.cert_file, &config.key_file)
                     .unwrap_or_else(|e| panic!("Failed to load certificates: {e}"))
             };
@@ -62,7 +66,7 @@ pub(crate) async fn start(
 
         let addr = address.parse();
         if addr.is_err() {
-            panic!("Unable to parse address {:?}", address);
+            panic!("Unable to parse address {address:?}");
         }
 
         let addr = addr.unwrap();

@@ -19,12 +19,11 @@ package binaryserialization
 
 import (
 	"encoding/binary"
-
-	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
 
 type TcpCreateStreamRequest struct {
-	iggcon.CreateStreamRequest
+	Name     string
+	StreamId *uint32
 }
 
 const (
@@ -34,10 +33,14 @@ const (
 )
 
 func (request *TcpCreateStreamRequest) Serialize() []byte {
+	if request.StreamId == nil {
+		request.StreamId = new(uint32)
+	}
+
 	nameLength := len(request.Name)
 	serialized := make([]byte, payloadOffset+nameLength)
 
-	binary.LittleEndian.PutUint32(serialized[streamIDOffset:], uint32(request.StreamId))
+	binary.LittleEndian.PutUint32(serialized[streamIDOffset:], *request.StreamId)
 	serialized[nameLengthOffset] = byte(nameLength)
 	copy(serialized[payloadOffset:], []byte(request.Name))
 

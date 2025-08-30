@@ -96,7 +96,7 @@ impl FromStr for TopicPermissionsArg {
             .ok_or("Missing topic ID".to_string())
             .and_then(|id| {
                 id.parse()
-                    .map_err(|error| format!("Invalid topic ID - {}", error))
+                    .map_err(|error| format!("Invalid topic ID - {error}"))
             })?;
 
         let permissions: Vec<TopicPermission> = match parts.next() {

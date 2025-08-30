@@ -157,8 +157,7 @@ impl JwtManager {
             .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to delete revoked access tokens, IDs {:?}",
-                    tokens_to_delete
+                    "{COMPONENT} (error: {error}) - failed to delete revoked access tokens, IDs {tokens_to_delete:?}"
                 )
             })?;
         let mut revoked_tokens = self.revoked_tokens.write().await;
@@ -279,8 +278,7 @@ impl JwtManager {
             .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to save revoked access token: {}",
-                    token_id
+                    "{COMPONENT} (error: {error}) - failed to save revoked access token: {token_id}"
                 )
             })?;
         info!("Revoked access token with ID: {token_id}");

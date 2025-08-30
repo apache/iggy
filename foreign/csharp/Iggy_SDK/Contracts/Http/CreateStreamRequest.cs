@@ -17,8 +17,4 @@
 
 namespace Apache.Iggy.Contracts.Http;
 
-public sealed class StreamRequest
-{
-    public int? StreamId { get; init; }
-    public required string Name { get; init; }
-}
+internal sealed record CreateStreamRequest(uint? StreamId, string Name);

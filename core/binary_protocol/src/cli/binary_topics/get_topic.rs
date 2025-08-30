@@ -86,7 +86,7 @@ impl CliCommand for GetTopicCmd {
             match topic.message_expiry {
                 IggyExpiry::NeverExpire => String::from("unlimited"),
                 IggyExpiry::ServerDefault => String::from("server_default"),
-                IggyExpiry::ExpireDuration(value) => format!("{}", value),
+                IggyExpiry::ExpireDuration(value) => format!("{value}"),
             }
             .as_str(),
         ]);

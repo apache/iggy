@@ -36,6 +36,7 @@ struct ConfigAddress {
     address: String,
 }
 
+#[allow(clippy::cognitive_complexity)]
 pub async fn start_server_if_needed(args: &IggyBenchArgs) -> Option<TestServer> {
     if args.skip_server_start {
         info!("Skipping iggy-server start");

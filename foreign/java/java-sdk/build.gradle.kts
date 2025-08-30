@@ -20,12 +20,13 @@
 plugins {
     id("java-library")
     id("maven-publish")
+    id("signing")
     id("org.jreleaser") version ("1.14.0")
     id("checkstyle")
 }
 
 group = "org.apache.iggy"
-version = "0.2.0-SNAPSHOT"
+version = "0.5.0-SNAPSHOT"
 
 repositories {
     mavenCentral()
@@ -34,6 +35,11 @@ repositories {
 java {
     withJavadocJar()
     withSourcesJar()
+}
+
+signing {
+    useGpgCmd()
+    sign(publishing.publications)
 }
 
 checkstyle {
@@ -67,8 +73,8 @@ publishing {
     publications {
         create<MavenPublication>("maven") {
             groupId = "org.apache.iggy"
-            artifactId = "iggy-java-sdk"
-            version = "0.2.0-SNAPSHOT"
+            artifactId = "iggy"
+            version = "0.5.0-SNAPSHOT"
 
             from(components["java"])
 
@@ -108,8 +114,8 @@ publishing {
             url = uri(if ((version as String).endsWith("SNAPSHOT")) snapshotsRepoUrl else releasesRepoUrl)
 
             credentials {
-                username = System.getenv("secrets.NEXUS_USER")
-                password = System.getenv("secrets.NEXUS_PASSWORD")
+                username = System.getenv("NEXUS_USER")
+                password = System.getenv("NEXUS_PASSWORD")
             }
         }
     }

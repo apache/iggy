@@ -15,12 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Contracts.Http;
-
 namespace Apache.Iggy.IggyClient;
 
 public interface IIggyPartition
 {
-    public Task DeletePartitionsAsync(DeletePartitionsRequest request, CancellationToken token = default);
-    public Task CreatePartitionsAsync(CreatePartitionsRequest request, CancellationToken token = default);
+    Task DeletePartitionsAsync(Identifier streamId, Identifier topicId, uint partitionsCount,
+        CancellationToken token = default);
+
+    Task CreatePartitionsAsync(Identifier streamId, Identifier topicId, uint partitionsCount,
+        CancellationToken token = default);
 }

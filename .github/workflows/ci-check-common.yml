@@ -99,8 +99,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: |
-           rustup toolchain add --profile=minimal stable
-           rustup override set stable
+           echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
       - run: scripts/licenses-list.sh --check
 
   markdownlint:

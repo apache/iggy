@@ -21,9 +21,9 @@ namespace Apache.Iggy.Producer;
 
 public static class MessageGenerator
 {
-    private static int OrderCreatedId = 0;
-    private static int OrderConfirmedId = 0;
-    private static int OrderRejectedId = 0;
+    private static int OrderCreatedId;
+    private static int OrderConfirmedId;
+    private static int OrderRejectedId;
 
     public static ISerializableMessage GenerateMessage()
     {
@@ -32,9 +32,10 @@ public static class MessageGenerator
             1 => GenerateOrderRejectedMessage(),
             2 => GenerateOrderConfirmedMessage(),
             3 => GenerateOrderCreatedMessage(),
-            _ => GenerateOrderCreatedMessage(),
+            _ => GenerateOrderCreatedMessage()
         };
     }
+
     private static ISerializableMessage GenerateOrderCreatedMessage()
     {
         return new OrderCreated
@@ -55,11 +56,11 @@ public static class MessageGenerator
             },
             Timestamp = (ulong)Random.Shared.Next(420, 69420)
         };
-
     }
+
     private static ISerializableMessage GenerateOrderConfirmedMessage()
     {
-        return new OrderConfirmed()
+        return new OrderConfirmed
         {
             Id = OrderConfirmedId++,
             Price = Random.Shared.Next(69, 420),
@@ -69,7 +70,7 @@ public static class MessageGenerator
 
     private static ISerializableMessage GenerateOrderRejectedMessage()
     {
-        return new OrderRejected()
+        return new OrderRejected
         {
             Id = OrderRejectedId++,
             Timestamp = (ulong)Random.Shared.Next(421, 69420),

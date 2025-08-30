@@ -26,13 +26,13 @@
 
 ---
 
-**Iggy** is the persistent message streaming platform written in Rust, supporting QUIC, TCP (custom binary specification) and HTTP (regular REST API) transport protocols, **capable of processing millions of messages per second at the low latency**.
+**Iggy** is a persistent message streaming platform written in Rust, supporting QUIC, TCP (custom binary specification) and HTTP (regular REST API) transport protocols, **capable of processing millions of messages per second at ultra-low latency**.
 
 Iggy provides **exceptionally high throughput and performance** while utilizing minimal computing resources.
 
-This is **not yet another extension** running on top of the existing infrastructure, such as Kafka or SQL database.
+This is **not yet another extension** running on top of existing infrastructure, such as Kafka or SQL database.
 
-Iggy is the persistent message streaming log **built from the ground up** using the low lvl I/O for speed and efficiency.
+Iggy is a persistent message streaming log **built from the ground up** using low-level I/O for speed and efficiency.
 
 The name is an abbreviation for the Italian Greyhound - small yet extremely fast dogs, the best in their class. See the lovely [Fabio & Cookie](https://www.instagram.com/fabio.and.cookie/) ❤️
 
@@ -40,18 +40,18 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 
 ## Features
 
-- **Highly performant**, persistent append-only log for the message streaming
+- **Highly performant**, persistent append-only log for message streaming
 - **Very high throughput** for both writes and reads
 - **Low latency and predictable resource usage** thanks to the Rust compiled language (no GC)
-- **Users authentication and authorization** with granular permissions and PAT (Personal Access Tokens)
+- **User authentication and authorization** with granular permissions and Personal Access Tokens (PAT)
 - Support for multiple streams, topics and partitions
 - Support for **multiple transport protocols** (QUIC, TCP, HTTP)
 - Fully operational RESTful API which can be optionally enabled
 - Available client SDK in multiple languages
-- **Works directly with the binary data** (lack of enforced schema and serialization/deserialization)
+- **Works directly with binary data**, avoiding enforced schema and serialization/deserialization overhead
 - Custom **zero-copy (de)serialization**, which greatly improves the performance and reduces memory usage.
 - Configurable server features (e.g. caching, segment size, data flush interval, transport protocols etc.)
-- Possibility of storing the **consumer offsets** on the server
+- Server-side storage of **consumer offsets**
 - Multiple ways of polling the messages:
   - By offset (using the indexes)
   - By timestamp (using the time indexes)
@@ -64,9 +64,10 @@ The name is an abbreviation for the Italian Greyhound - small yet extremely fast
 - **Multi-tenant** support via abstraction of **streams** which group **topics**
 - **TLS** support for all transport protocols (TCP, QUIC, HTTPS)
 - **[Connectors](https://github.com/apache/iggy/tree/master/core/connectors)** - sinks, sources and data transformations based on the **custom Rust plugins**
+- **[Model Context Protocol](https://github.com/apache/iggy/tree/master/core/ai/mcp)** - provide context to LLM with **MCP server**
 - Optional server-side as well as client-side **data encryption** using AES-256-GCM
 - Optional metadata support in the form of **message headers**
-- Optional **data backups & archivization** on disk and/or the **S3** compatible cloud storage (e.g. AWS S3)
+- Optional **data backups and archiving** to disk or **S3** compatible cloud storage (e.g. AWS S3)
 - Support for **OpenTelemetry** logs & traces + Prometheus metrics
 - Built-in **CLI** to manage the streaming server installable via `cargo install iggy-cli`
 - Built-in **benchmarking app** to test the performance
@@ -89,9 +90,9 @@ This is the high-level architecture of the Iggy message streaming server, where 
 
 ## Version
 
-The latest released version is `0.4.300` for Iggy server, which is compatible with `0.6` Rust client SDK and the others.
+The official releases follow the regular semver (`0.5.0`) or have `latest` tag applied (`apache/iggy:latest`).
 
-The recent improvements based on the zero-copy (de)serialization, along with updated SDKs etc. will be available in the upcoming release with Iggy server `0.5.0`, Rust SDK `0.7` and all the other SDKs.
+We do also publish edge/dev/nightly releases (e.g. `0.5.0-edge.1` or `apache/iggy:edge`), for both, SDKs and the Docker images, which are typically compatible with the latest changes, but are not guaranteed to be stable, and as the name states, are not recommended for production use.
 
 ---
 
@@ -102,22 +103,22 @@ The recent improvements based on the zero-copy (de)serialization, along with upd
 
 ---
 
-## Supported languages SDK (work in progress)
+## Supported languages SDK
 
-- Rust
-- C#
-- Java
-- Go
-- Python
-- Node
-- C++
-- Elixir
+- [Rust](https://crates.io/crates/iggy)
+- [C#](https://www.nuget.org/packages/Apache.Iggy/)
+- [Java](https://repository.apache.org/#nexus-search;quick~iggy)
+- [Python](https://pypi.org/project/apache-iggy/)
+- [Node.js (TypeScript)](https://www.npmjs.com/package/apache-iggy)
+- [Go](https://pkg.go.dev/github.com/apache/iggy/foreign/go)
+
+C++ and Elixir are work in progress.
 
 ---
 
 ## CLI
 
-The brand new, rich, interactive CLI is implemented under the `cli` project, to provide the best developer experience. This is a great addition to the Web UI, especially for all the developers who prefer using the console tools.
+The interactive CLI is implemented under the `cli` project, to provide the best developer experience. This is a great addition to the Web UI, especially for all the developers who prefer using the console tools.
 
 Iggy CLI can be installed with `cargo install iggy-cli` and then simply accessed by typing `iggy` in your terminal.
 
@@ -125,15 +126,56 @@ Iggy CLI can be installed with `cargo install iggy-cli` and then simply accessed
 
 ## Web UI
 
-There's a dedicated Web UI for the server, which allows managing the streams, topics, partitions, browsing the messages and so on. This is an ongoing effort to build the compressive dashboard for the administrative purposes of the Iggy server. Check the Web UI in the `/web` directory. The [docker image for Web UI](https://hub.docker.com/r/iggyrs/iggy-web-ui) is available, and can be fetched via `docker pull iggyrs/iggy-web-ui`.
+There's a dedicated Web UI for the server, which allows managing the streams, topics, partitions, browsing the messages and so on. This is an ongoing effort to build a comprehensive dashboard for administrative purposes of the Iggy server. Check the Web UI in the `/web` directory. The [docker image for Web UI](https://hub.docker.com/r/iggyrs/iggy-web-ui) is available, and can be fetched via `docker pull iggyrs/iggy-web-ui`.
 
 ![Web UI](assets/web_ui.png)
 
 ---
 
+## Connectors
+
+The highly performant and modular **[runtime](https://github.com/apache/iggy/tree/master/core/connectors)** for statically typed, yet dynamically loaded connectors. Ingest the data from the external sources and push it further to the Iggy streams, or fetch the data from the Iggy streams and push it further to the external sources. **Create your own Rust plugins** by simply implementing either the `Source` or `Sink` trait and **build custom pipelines for the data processing**.
+
+```toml
+## Configure a sink or source connector, depending on your needs
+[sinks.quickwit]
+enabled = true
+name = "Quickwit sink"
+path = "target/release/libiggy_connector_quickwit_sink"
+config_format = "yaml"
+
+[[sinks.quickwit.streams]]
+stream = "qw"
+topics = ["records"]
+schema = "json"
+batch_length = 1000
+poll_interval = "5ms"
+consumer_group = "qw_sink_connector"
+
+[[sinks.quickwit.transforms.add_fields.fields]]
+key = "random_id"
+value.computed = "uuid_v7"
+
+[sinks.quickwit.transforms.delete_fields]
+enabled = true
+fields = ["email", "created_at"]
+```
+
+---
+
+## Model Context Protocol
+
+The [Model Context Protocol](https://modelcontextprotocol.io) (MCP) is an open protocol that standardizes how applications provide context to LLMs. The **[Iggy MCP Server](https://github.com/apache/iggy/tree/master/core/ai/mcp)** is an implementation of the MCP protocol for the message streaming infrastructure. It can be used to provide context to LLMs in real-time, allowing for more accurate and relevant responses.
+
+![server](assets/iggy_mcp_server.png)
+
+---
+
 ## Docker
 
-The official images can be found [in Docker Hub](https://hub.docker.com/r/apache/iggy), simply type `docker pull apache/iggy` to pull the image.
+The official Apache Iggy images can be found in [Docker Hub](https://hub.docker.com/r/apache/iggy), simply type `docker pull apache/iggy` to pull the image.
+
+You can also find the images for all the different tooling such as Connectors, MCP Server etc. [here](https://hub.docker.com/u/apache?page=1&search=iggy).
 
 Please note that the images tagged as `latest` are based on the official, stable releases, while the `edge` ones are updated directly from latest version of the `master` branch.
 
@@ -170,6 +212,21 @@ Run the tests:
 Start the server:
 
 `cargo run --bin iggy-server`
+
+For configuration options and detailed help:
+
+`cargo run --bin iggy-server -- --help`
+
+You can also use environment variables to override any configuration setting:
+
+- Override TCP address
+   `IGGY_TCP_ADDRESS=0.0.0.0:8090 cargo run --bin iggy-server`
+
+- Set custom data path
+   `IGGY_SYSTEM_PATH=/data/iggy cargo run --bin iggy-server`
+
+- Enable HTTP transport
+   `IGGY_HTTP_ENABLED=true cargo run --bin iggy-server`
 
 To quickly generate the sample data:
 
@@ -244,15 +301,19 @@ let client = IggyClient::from_connection_string("iggy://user:secret@localhost:80
 // Create a producer for the given stream and one of its topics
 let mut producer = client
     .producer("dev01", "events")?
-    .batch_length(1000)
-    .linger_time(IggyDuration::from_str("1ms")?)
+    .direct( // Use either direct (instant) or background message sending
+        DirectConfig::builder()
+            .batch_length(1000)
+            .linger_time(IggyDuration::from_str("1ms")?)
+            .build(),
+    )
     .partitioning(Partitioning::balanced())
     .build();
 
 producer.init().await?;
 
 // Send some messages to the topic
-let messages = vec![Message::from_str("Hello Apache Iggy")?];
+let messages = vec![IggyMessage::from_str("Hello Apache Iggy")?];
 producer.send(messages).await?;
 
 // Create a consumer for the given stream and one of its topics
@@ -284,7 +345,7 @@ while let Some(message) = consumer.next().await {
 **Benchmarks should be the first-class citizens**. We believe that performance is crucial for any system, and we strive to provide the best possible performance for our users. Please check, why we believe that the **[transparent
 benchmarking](https://iggy.apache.org/blogs/2025/02/17/transparent-benchmarks)** is so important.
 
-We've also built the **[benchmarking platform](https://benchmarks.iggy.rs)** where anyone can upload the benchmarks and compare the results with others. Source code for the platform is available in the `core/bench/dashboard` directory.
+We've also built the **[benchmarking platform](https://benchmarks.iggy.apache.org)** where anyone can upload the benchmarks and compare the results with others. Source code for the platform is available in the `core/bench/dashboard` directory.
 
 ![server](assets/benchmarking_platform.png)
 
@@ -350,7 +411,7 @@ Depending on the hardware, transport protocol (`quic`, `tcp` or `http`) and payl
 
 **Iggy is already capable of processing millions of messages per second at the microseconds range for p99+ latency**, and with the upcoming optimizations related to the io_uring support along with the shared-nothing design, it will only get better.
 
-Please refer to the mentioned [benchmarking platform](https://benchmarks.iggy.rs) where you can browse the results achieved on the different hardware configurations, using the different Iggy server versions.
+Please refer to the mentioned [benchmarking platform](https://benchmarks.iggy.apache.org) where you can browse the results achieved on the different hardware configurations, using the different Iggy server versions.
 
 ---
 

@@ -30,6 +30,7 @@ pub struct PlotConfig {
     pub is_dark: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum PlotType {
     Latency,
@@ -48,13 +49,11 @@ extern "C" {
 }
 
 pub fn dispose_chart(element_id: &str) {
-    if let Some(window) = web_sys::window() {
-        if let Some(document) = window.document() {
-            if let Some(element) = document.get_element_by_id(element_id) {
-                if let Some(instance) = getInstanceByDom(&element) {
-                    instance.dispose();
-                }
-            }
-        }
+    if let Some(window) = web_sys::window()
+        && let Some(document) = window.document()
+        && let Some(element) = document.get_element_by_id(element_id)
+        && let Some(instance) = getInstanceByDom(&element)
+    {
+        instance.dispose();
     }
 }

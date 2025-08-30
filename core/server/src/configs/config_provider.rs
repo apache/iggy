@@ -82,7 +82,7 @@ impl CustomEnvProvider {
             let new_prefix = if prefix.is_empty() {
                 key.clone()
             } else {
-                format!("{}.{}", prefix, key)
+                format!("{prefix}.{key}")
             };
             match value {
                 TomlValue::Table(inner_table) => {

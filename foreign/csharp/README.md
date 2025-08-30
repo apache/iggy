@@ -1,4 +1,4 @@
-# C# SDK for [Iggy](https://github.com/spetz/iggy)
+# C# SDK for [Iggy](https://github.com/apache/iggy)
 
 <div align="center">
 
@@ -37,7 +37,8 @@ var bus = MessageStreamFactory.CreateMessageStream(options =>
 
 Iggy necessitates the use of `ILoggerFactory` to generate logs from locations that are inaccessible to the user.
 
-In addition to the basic configuration settings, Iggy provides support for batching send/poll messages at intervals, which effectively decreases the frequency of network calls, this option is enabled by default.
+In addition to the basic configuration settings, Iggy provides support for batching send/poll messages at intervals,
+which effectively decreases the frequency of network calls, this option is enabled by default.
 
 ```c#
 //---Snip---
@@ -228,8 +229,20 @@ The `Message` struct has two fields `Id` and `Payload`.
 ```c#
 struct Message
 {
-    public required Guid Id { get; init; }
+    public required MessageHeader Header { get; init; }
     public required byte[] Payload { get; init; }
+    public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; init; }
+}
+
+public readonly struct MessageHeader
+{
+    public ulong Checksum { get; init; }
+    public UInt128 Id { get; init; }
+    public ulong Offset { get; init; }
+    public DateTimeOffset Timestamp { get; init; }
+    public ulong OriginTimestamp { get; init; }
+    public int UserHeadersLength { get; init; }
+    public int PayloadLength { get; init; }
 }
 ```
 
@@ -348,7 +361,8 @@ var messages = await bus.FetchMessagesAsync<Envelope>(new MessageFetchRequest
 }, deserializer, decryptor);
 ```
 
-Beyond the `FetchMessagesAsync` functionality, there's also a `PollMessagesAsync` method that spawns new thread which polls messages in background.
+Beyond the `FetchMessagesAsync` functionality, there's also a `PollMessagesAsync` method that spawns new thread which
+polls messages in background.
 
 ```c#
 //---Snip---
@@ -367,18 +381,22 @@ await foreach (var messageResponse in bus.PollMessagesAsync<Envelope>(new PollMe
 
 ```
 
-It is worth noting that every method (except `PollMessagesAsync`) will throw an `InvalidResponseException` when encountering an error.
+It is worth noting that every method (except `PollMessagesAsync`) will throw an `InvalidResponseException` when
+encountering an error.
 
 If you register `IIggyClient` in a dependency injection container, you will have access to interfaces
-that encapsulate smaller parts of the system `IIggyStream` `IIggyTopic` `IIggyPublisher` `IIggyConsumer` `IIggyConsumerGroup` `IIggyOffset`
+that encapsulate smaller parts of the system `IIggyStream` `IIggyTopic` `IIggyPublisher` `IIggyConsumer`
+`IIggyConsumerGroup` `IIggyOffset`
 `IIggyPartition` `IIggyUsers` `IIggyUtils`
 
 For more information about how Iggy works check its [documentation](https://iggy.apache.org/docs/)
 
 ## Producer / Consumer Sample
 
-To run the samples, first get [Iggy](https://github.com/apache/iggy), Run the server with `cargo run --bin iggy-server`, then get the SDK, cd into `Iggy_SDK`
-and run following commands: `dotnet run -c Release --project Iggy_Sample_Producer` for producer, `dotnet run -c Release --project Iggy_Sample_Consumer`
+To run the samples, first get [Iggy](https://github.com/apache/iggy), Run the server with `cargo run --bin iggy-server`,
+then get the SDK, cd into `Iggy_SDK`
+and run following commands: `dotnet run -c Release --project Iggy_Sample_Producer` for producer,
+`dotnet run -c Release --project Iggy_Sample_Consumer`
 for consumer.
 
 ## TODO

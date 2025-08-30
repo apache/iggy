@@ -43,6 +43,7 @@ internal static class CommandCodes
     internal const int FLUSH_UNSAVED_BUFFER_CODE = 102;
     internal const int GET_CONSUMER_OFFSET_CODE = 120;
     internal const int STORE_CONSUMER_OFFSET_CODE = 121;
+    internal const int DELETE_CONSUMER_OFFSET_CODE = 122;
     internal const int GET_STREAM_CODE = 200;
     internal const int GET_STREAMS_CODE = 201;
     internal const int CREATE_STREAM_CODE = 202;

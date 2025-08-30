@@ -40,7 +40,10 @@ pub trait BenchmarkKindProps {
 pub trait BenchmarkTransportProps {
     fn transport(&self) -> &Transport;
     fn server_address(&self) -> &str;
+    // TODO(hubcio): make benchmark use `client_address` and `validate_certificate`
+    #[allow(dead_code)]
     fn client_address(&self) -> &str;
+    #[allow(dead_code)]
     fn validate_certificate(&self) -> bool;
     fn output_command(&self) -> Option<&BenchmarkOutputCommand>;
     fn nodelay(&self) -> bool;

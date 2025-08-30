@@ -62,7 +62,7 @@ impl UpdateTopicCmd {
 #[async_trait]
 impl CliCommand for UpdateTopicCmd {
     fn explain(&self) -> String {
-        format!("{}", self)
+        format!("{self}")
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {

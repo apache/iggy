@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 
 namespace Apache.Iggy.IggyClient;
 
@@ -23,11 +23,19 @@ public interface IIggyConsumerGroup
 {
     Task<IReadOnlyList<ConsumerGroupResponse>> GetConsumerGroupsAsync(Identifier streamId, Identifier topicId,
         CancellationToken token = default);
+
     Task<ConsumerGroupResponse?> GetConsumerGroupByIdAsync(Identifier streamId, Identifier topicId, Identifier groupId,
         CancellationToken token = default);
-    Task<ConsumerGroupResponse?> CreateConsumerGroupAsync(CreateConsumerGroupRequest request, CancellationToken token = default);
-    Task DeleteConsumerGroupAsync(DeleteConsumerGroupRequest request, CancellationToken token = default);
-    Task JoinConsumerGroupAsync(JoinConsumerGroupRequest request, CancellationToken token = default);
-    Task LeaveConsumerGroupAsync(LeaveConsumerGroupRequest request, CancellationToken token = default);
 
+    Task<ConsumerGroupResponse?> CreateConsumerGroupAsync(Identifier streamId, Identifier topicId, string name,
+        uint? groupId, CancellationToken token = default);
+
+    Task DeleteConsumerGroupAsync(Identifier streamId, Identifier topicId, Identifier groupId,
+        CancellationToken token = default);
+
+    Task JoinConsumerGroupAsync(Identifier streamId, Identifier topicId, Identifier groupId,
+        CancellationToken token = default);
+
+    Task LeaveConsumerGroupAsync(Identifier streamId, Identifier topicId, Identifier groupId,
+        CancellationToken token = default);
 }

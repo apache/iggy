@@ -1,0 +1,73 @@
+// // Licensed to the Apache Software Foundation (ASF) under one
+// // or more contributor license agreements.  See the NOTICE file
+// // distributed with this work for additional information
+// // regarding copyright ownership.  The ASF licenses this file
+// // to you under the Apache License, Version 2.0 (the
+// // "License"); you may not use this file except in compliance
+// // with the License.  You may obtain a copy of the License at
+// //
+// //   http://www.apache.org/licenses/LICENSE-2.0
+// //
+// // Unless required by applicable law or agreed to in writing,
+// // software distributed under the License is distributed on an
+// // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// // KIND, either express or implied.  See the License for the
+// // specific language governing permissions and limitations
+// // under the License.
+
+using Apache.Iggy.Contracts;
+using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Headers;
+using Apache.Iggy.Kinds;
+using Apache.Iggy.Tests.Integrations.Helpers;
+using Apache.Iggy.Tests.Integrations.Models;
+
+namespace Apache.Iggy.Tests.Integrations.Fixtures;
+
+public class PollMessagesFixture : IggyServerFixture
+{
+    internal readonly int MessageCount = 10;
+    internal readonly uint StreamId = 1;
+    internal readonly CreateTopicRequest TopicRequest = TopicFactory.CreateTopic();
+
+    public override async Task InitializeAsync()
+    {
+        await base.InitializeAsync();
+
+        foreach (var client in Clients.Values)
+        {
+            await client.CreateStreamAsync("Test Stream", StreamId);
+            await client.CreateTopicAsync(Identifier.Numeric(StreamId), TopicRequest.Name, TopicRequest.PartitionsCount,
+                topicId: TopicRequest.TopicId);
+            await client.SendMessagesAsync(
+                new MessageSendRequest<DummyMessage>
+                {
+                    Messages = CreateDummyMessagesWithoutHeader(MessageCount),
+                    Partitioning = Partitioning.None(),
+                    StreamId = Identifier.Numeric(StreamId),
+                    TopicId = Identifier.Numeric(TopicRequest.TopicId!.Value)
+                },
+                message => message.SerializeDummyMessage(),
+                headers: new Dictionary<HeaderKey, HeaderValue>
+                {
+                    { HeaderKey.New("header1"), HeaderValue.FromString("value1") },
+                    { HeaderKey.New("header2"), HeaderValue.FromInt32(14) }
+                });
+        }
+    }
+
+    private static List<DummyMessage> CreateDummyMessagesWithoutHeader(int count)
+    {
+        var messages = new List<DummyMessage>();
+        for (var i = 0; i < count; i++)
+        {
+            messages.Add(new DummyMessage
+            {
+                Text = $"Dummy message {i}",
+                Id = i
+            });
+        }
+
+        return messages;
+    }
+}

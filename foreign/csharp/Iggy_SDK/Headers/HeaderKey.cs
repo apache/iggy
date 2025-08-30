@@ -15,9 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Text.Json.Serialization;
+using Apache.Iggy.JsonConverters;
+
 namespace Apache.Iggy.Headers;
 
-public readonly struct HeaderKey
+[JsonConverter(typeof(HeaderKeyConverter))]
+public readonly struct HeaderKey : IEquatable<HeaderKey>
 {
     public required string Value { get; init; }
 
@@ -34,5 +38,30 @@ public readonly struct HeaderKey
     public override string ToString()
     {
         return Value;
+    }
+
+    public bool Equals(HeaderKey other)
+    {
+        return StringComparer.Ordinal.Equals(Value, other.Value);
+    }
+
+    public override bool Equals(object? obj)
+    {
+        return obj is HeaderKey other && Equals(other);
+    }
+
+    public override int GetHashCode()
+    {
+        return StringComparer.Ordinal.GetHashCode(Value);
+    }
+
+    public static bool operator ==(HeaderKey left, HeaderKey right)
+    {
+        return left.Equals(right);
+    }
+
+    public static bool operator !=(HeaderKey left, HeaderKey right)
+    {
+        return !left.Equals(right);
     }
 }

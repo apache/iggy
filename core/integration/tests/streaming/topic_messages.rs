@@ -198,7 +198,7 @@ async fn given_key_messages_key_messages_should_be_appended_to_the_calculated_pa
 }
 
 fn get_payload(id: u32) -> String {
-    format!("message-{}", id)
+    format!("message-{id}")
 }
 
 async fn assert_messages(topic: &Topic, partition_id: u32, expected_messages: u32) {

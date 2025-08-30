@@ -20,18 +20,14 @@
 
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { Client } from '../client/client.js';
+import { getTestClient } from './test-client.utils.js';
 
 describe('e2e -> parallel', async () => {
 
-  const credentials = { username: 'iggy', password: 'iggy' };
-  const c = new Client({
-    transport: 'TCP',
-    options: { port: 8090, host: '127.0.0.1' },
-    credentials
-  });
-
+  const c = getTestClient();
+  
   const baseGetMe = await c.client.getMe();
+  const credentials = { username: 'iggy', password: 'iggy' };
 
 
   it('e2e -> parallel::mix calls', async () => {

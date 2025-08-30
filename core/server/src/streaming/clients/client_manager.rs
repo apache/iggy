@@ -113,10 +113,10 @@ impl ClientManager {
         let mut clients_to_remove = Vec::new();
         for client in self.clients.values() {
             let client = client.read().await;
-            if let Some(client_user_id) = client.user_id {
-                if client_user_id == user_id {
-                    clients_to_remove.push(client.session.client_id);
-                }
+            if let Some(client_user_id) = client.user_id
+                && client_user_id == user_id
+            {
+                clients_to_remove.push(client.session.client_id);
             }
         }
 

@@ -17,7 +17,4 @@
 
 namespace Apache.Iggy.Contracts.Http;
 
-public sealed class UpdateStreamRequest
-{
-    public required string Name { get; init; }
-}
+internal sealed record UpdateStreamRequest(string Name);

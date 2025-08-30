@@ -15,15 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Text.Json.Serialization;
-
 namespace Apache.Iggy.Contracts.Http;
 
-public sealed class CreatePartitionsRequest
-{
-    [JsonIgnore]
-    public required Identifier StreamId { get; init; }
-    [JsonIgnore]
-    public required Identifier TopicId { get; init; }
-    public required int PartitionsCount { get; init; }
-}
+internal sealed record CreatePartitionsRequest(uint PartitionsCount);

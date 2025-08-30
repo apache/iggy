@@ -22,6 +22,7 @@ import { type Id } from '../identifier.utils.js';
 import { serializeTargetGroup } from './group.utils.js';
 import { deserializeVoidResponse } from '../../client/client.utils.js';
 import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
 
 export type DeleteGroup = {
   streamId: Id,
@@ -30,7 +31,7 @@ export type DeleteGroup = {
 };
 
 export const DELETE_GROUP = {
-  code: 603,
+  code: COMMAND_CODE.DeleteGroup,
 
   serialize: ({streamId, topicId, groupId}: DeleteGroup) => {
     return serializeTargetGroup(streamId, topicId, groupId);

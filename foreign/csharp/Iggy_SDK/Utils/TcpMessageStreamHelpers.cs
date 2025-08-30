@@ -51,11 +51,10 @@ internal static class TcpMessageStreamHelpers
             List<Message> messagesList => CalculateMessageBytesCountList(messagesList),
             _ => messages.Sum(msg => 16 + 56 + msg.Payload.Length + 4 +
                                      (msg.UserHeaders?.Sum(header =>
-                                         4 + header.Key.Value.Length + 1 + 4 + header.Value.Value.Length) ?? 0)
-            )
+                                         4 + header.Key.Value.Length + 1 + 4 + header.Value.Value.Length) ?? 0))
         };
     }
-    
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static byte[] GetBytesFromIdentifier(Identifier identifier)
     {
@@ -67,19 +66,19 @@ internal static class TcpMessageStreamHelpers
             _ => throw new ArgumentOutOfRangeException()
         };
         bytes[1] = (byte)identifier.Length;
-        for (int i = 0; i < identifier.Length; i++)
+        for (var i = 0; i < identifier.Length; i++)
         {
             bytes[i + 2] = identifier.Value[i];
         }
 
         return bytes.ToArray();
     }
-    
+
     private static int CalculateMessageBytesCountArray(Message[] messages)
     {
         ref var start = ref MemoryMarshal.GetArrayDataReference(messages);
         ref var end = ref Unsafe.Add(ref start, messages.Length);
-        int msgBytesSum = 0;
+        var msgBytesSum = 0;
         while (Unsafe.IsAddressLessThan(ref start, ref end))
         {
             if (start.UserHeaders is not null)
@@ -92,7 +91,7 @@ internal static class TcpMessageStreamHelpers
             }
             else
             {
-                msgBytesSum += start.Payload.Length +16 + 56;
+                msgBytesSum += start.Payload.Length + 16 + 56;
             }
 
             start = ref Unsafe.Add(ref start, 1);
@@ -103,7 +102,7 @@ internal static class TcpMessageStreamHelpers
 
     private static int CalculateMessageBytesCountList(List<Message> messages)
     {
-        var messagesSpan = CollectionsMarshal.AsSpan(messages);
+        Span<Message> messagesSpan = CollectionsMarshal.AsSpan(messages);
         ref var start = ref MemoryMarshal.GetReference(messagesSpan);
         ref var end = ref Unsafe.Add(ref start, messagesSpan.Length);
         var msgBytesSum = 0;

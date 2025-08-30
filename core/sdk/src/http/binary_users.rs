@@ -33,7 +33,7 @@ const PATH: &str = "/users";
 #[async_trait]
 impl UserClient for HttpClient {
     async fn get_user(&self, user_id: &Identifier) -> Result<Option<UserInfoDetails>, IggyError> {
-        let response = self.get(&format!("{PATH}/{}", user_id)).await;
+        let response = self.get(&format!("{PATH}/{user_id}")).await;
         if let Err(error) = response {
             if matches!(error, IggyError::ResourceNotFound(_)) {
                 return Ok(None);

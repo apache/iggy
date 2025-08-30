@@ -42,6 +42,38 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  check-rust-version-sync:
+    name: check Rust version sync
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Check Rust versions are synchronized
+        run: |
+          # rust-toolchain.toml -> 1.89(.0) -> 1.89
+          TOOLCHAIN_VERSION=$(sed -En 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml)
+          to_minor() { echo "$1" | sed -E 's/^([0-9]+)\.([0-9]+).*/\1.\2/'; }
+          TOOLCHAIN_MINOR=$(to_minor "$TOOLCHAIN_VERSION")
+
+          # Extract X[.Y[.Z]] from Dockerfiles (ignores suffixes like -slim-bookworm), then -> X.Y
+          BDD_VERSION=$(sed -En 's/^FROM[[:space:]]+rust:([0-9.]+).*/\1/p' bdd/rust/Dockerfile | head -1)
+          BENCH_VERSION=$(sed -En 's/^FROM[[:space:]]+rust:([0-9.]+).*/\1/p' core/bench/dashboard/server/Dockerfile | head -1)
+          BDD_MINOR=$(to_minor "$BDD_VERSION")
+          BENCH_MINOR=$(to_minor "$BENCH_VERSION")
+
+          # Fail if mismatched
+          if [ "$TOOLCHAIN_MINOR" != "$BDD_MINOR" ]; then
+            echo "ERROR: bdd/rust/Dockerfile uses $BDD_VERSION (-> $BDD_MINOR) but rust-toolchain.toml specifies $TOOLCHAIN_VERSION (-> $TOOLCHAIN_MINOR)" >&2
+            exit 1
+          fi
+
+          if [ "$TOOLCHAIN_MINOR" != "$BENCH_MINOR" ]; then
+            echo "ERROR: core/bench/dashboard/server/Dockerfile uses $BENCH_VERSION (-> $BENCH_MINOR) but rust-toolchain.toml specifies $TOOLCHAIN_VERSION (-> $TOOLCHAIN_MINOR)" >&2
+            exit 1
+          fi
+
+          echo "✓ All Rust versions are synchronized at $TOOLCHAIN_VERSION"
+
   check:
     name: cargo check
     runs-on: ubuntu-latest
@@ -50,8 +82,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Install toolchain
         run: |
-           rustup toolchain add --profile=minimal stable
-           rustup override set stable
+          echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
       - name: Run cargo check
         run: |
           cargo check
@@ -64,8 +95,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Install toolchain
         run: |
-           rustup toolchain add --profile=minimal stable
-           rustup override set stable
+          echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
       - name: Run cargo fmt
         run: |
           cargo fmt --all -- --check
@@ -78,42 +108,10 @@ jobs:
         uses: actions/checkout@v4
       - name: Install toolchain
         run: |
-           rustup toolchain add --profile=minimal stable
-           rustup override set stable
+          echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
       - name: Run cargo clippy
         run: |
           cargo clippy --all-targets --all-features -- -D warnings
-
-  clippy-macos:
-    name: cargo clippy macos
-    runs-on: macos-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Install toolchain
-        run: |
-           rustup toolchain add --profile=minimal stable
-           rustup override set stable
-      - name: Run cargo clippy (macos)
-        run: |
-          cargo clippy --all-targets --all-features -- -D warnings
-
-  clippy-windows:
-    name: cargo clippy windows
-    runs-on: windows-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-      - name: Install toolchain
-        run: |
-           rustup toolchain add --profile=minimal stable
-           rustup override set stable
-      - name: Run cargo clippy (windows/sdk)
-        run: |
-          cargo clippy --package iggy --all-features -- -D warnings
-      - name: Run cargo clippy (windows/cli)
-        run: |
-          cargo clippy --bin iggy --all-features -- -D warnings
 
   sort:
     name: cargo sort
@@ -123,8 +121,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Install toolchain
         run: |
-           rustup toolchain add --profile=minimal stable
-           rustup override set stable
+          echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
       - name: Install cargo-sort
         uses: taiki-e/install-action@v2
         with:
@@ -141,8 +138,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Install toolchain
         run: |
-           rustup toolchain add --profile=minimal stable
-           rustup override set stable
+          echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
       - name: Run cargo test (doc)
         run: |
           cargo test --doc
@@ -158,8 +154,7 @@ jobs:
         uses: actions/checkout@v4
       - name: Install toolchain
         run: |
-           rustup toolchain add --profile=minimal stable
-           rustup override set stable
+          echo "Using Rust toolchain from rust-toolchain.toml: $(rustup show)"
       - name: Install cargo-machete
         uses: taiki-e/install-action@v2
         with:

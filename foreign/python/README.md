@@ -1,4 +1,4 @@
-# iggy_py
+# apache-iggy
 
 [![discord-badge](https://img.shields.io/discord/1144142576266530928)](https://discord.gg/C5Sux5NcRa)
 
@@ -9,7 +9,7 @@ Apache Iggy is the persistent message streaming platform written in Rust, suppor
 ### Basic Installation
 
 ```bash
-pip install iggy-py
+pip install apache-iggy
 ```
 
 ### Development Installation
@@ -64,12 +64,12 @@ pytest tests/ -v
 
 ## Examples
 
-Refer to the [python_examples/](python_examples/) directory for usage examples.
+Refer to the [python_examples/](https://github.com/apache/iggy/tree/master/foreign/python/python_examples) directory for usage examples.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
+See [CONTRIBUTING.md](https://github.com/apache/iggy/blob/master/foreign/python/CONTRIBUTING.md) for development setup and guidelines.
 
 ## License
 
-Licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
+Licensed under the Apache License 2.0. See [LICENSE](https://github.com/apache/iggy/blob/master/foreign/python/LICENSE) for details.

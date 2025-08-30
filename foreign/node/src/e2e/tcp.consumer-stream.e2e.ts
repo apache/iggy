@@ -21,20 +21,23 @@
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Readable } from 'node:stream';
+import { Client } from '../client/client.js';
 import { groupConsumerStream } from '../stream/consumer-stream.js';
-import { Client } from '../client/index.js';
 import {
   PollingStrategy, Partitioning,
   type PollMessagesResponse
 } from '../wire/index.js';
-import { sendSomeMessages } from '../tcp.sm.utils.js';
+import { sendSomeMessages, getIggyAddress } from '../tcp.sm.utils.js';
+
 
 describe('e2e -> consumer-stream', async () => {
 
+  const [host, port] = getIggyAddress();
   const credentials = { username: 'iggy', password: 'iggy' };
+
   const opt = {
     transport: 'TCP' as const,
-    options: { port: 8090, host: '127.0.0.1' },
+    options: { host, port },
     credentials
   };
 
@@ -78,7 +81,7 @@ describe('e2e -> consumer-stream', async () => {
     const s = await pollStream(pollReq);
     const s2 = await pollStream(pollReq);
     let recv = 0;
-    const dataCb = (str: Readable) => (d: PollMessagesResponse) => {      
+    const dataCb = (str: Readable) => (d: PollMessagesResponse) => {
       recv += d.messages.length;
       assert.equal(d.messages.length, d.count);
       if (recv === ct) {
