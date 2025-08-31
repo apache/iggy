@@ -17,6 +17,7 @@
  */
 
 use std::ops::{Deref, DerefMut};
+use maybe_async::maybe_async;
 
 /// This module provides a trait and implementations for a shared mutable reference configurable via feature flags.
 #[cfg(feature = "tokio_lock")]
@@ -27,6 +28,8 @@ mod tokio_lock;
 #[cfg(feature = "fast_async_lock")]
 mod fast_async_lock;
 
+mod sync_lock;
+
 #[cfg(feature = "tokio_lock")]
 #[cfg(not(any(feature = "fast_async_lock")))]
 pub type IggySharedMut<T> = tokio_lock::IggyTokioRwLock<T>;
@@ -35,8 +38,17 @@ pub type IggySharedMut<T> = tokio_lock::IggyTokioRwLock<T>;
 #[cfg(feature = "fast_async_lock")]
 pub type IggySharedMut<T> = fast_async_lock::IggyFastAsyncRwLock<T>;
 
+#[cfg(feature = "threaded")]
+pub trait MaybeSendSync: Send + Sync {}
+
+#[cfg(not(feature = "threaded"))]
+pub trait MaybeSendSync {}
+impl<T: ?Sized> MaybeSendSync for T {}
+
+
+#[maybe_async]
 #[allow(async_fn_in_trait)]
-pub trait IggySharedMutFn<T>: Send + Sync {
+pub trait IggySharedMutFn<T>: MaybeSendSync {
     type ReadGuard<'a>: Deref<Target = T> + Send
     where
         T: 'a,

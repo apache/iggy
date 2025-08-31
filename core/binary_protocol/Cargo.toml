@@ -38,6 +38,7 @@ comfy-table = { workspace = true, optional = false }
 dirs = { workspace = true }
 iggy_common = { workspace = true }
 keyring = { workspace = true, optional = false }
+maybe-async = { version = "0.2.10", features = ["is_sync"] }
 passterm = { workspace = true, optional = false }
 serde = { workspace = true }
 serde_json = { workspace = true }

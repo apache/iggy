@@ -28,8 +28,9 @@ repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 
 [features]
-default = ["tokio_lock"]
+default = ["sync_lock"]
 tokio_lock = []
+sync_lock = []
 fast_async_lock = ["dep:fast-async-mutex"]
 
 [dependencies]
@@ -46,6 +47,7 @@ crc32fast = { workspace = true }
 derive_more = { workspace = true }
 fast-async-mutex = { version = "0.6.7", optional = true }
 humantime = { workspace = true }
+maybe-async = { version = "0.2.10", features = ["is_sync"] } # mv to workspace's cargo.toml
 rcgen = "0.14.3"
 rustls = { workspace = true }
 serde = { workspace = true }

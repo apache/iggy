@@ -216,6 +216,19 @@ impl Client for IggyClient {
     }
 }
 
+#[sync_impl]
+impl Client for IggyClient {
+    fn connect(&self) -> Result<(),IggyError> {
+        let heartbeat_interval;
+        {
+            let client = self.client.read();
+            client.connect().await?;
+            heartbeat_interval = client.heartbeat_interval().await;
+        }
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -24,10 +24,13 @@ use async_broadcast::Receiver;
 use async_trait::async_trait;
 use iggy_common::{DiagnosticEvent, IggyError};
 use std::fmt::Debug;
+use maybe_async::maybe_async;
+use maybe_async::sync_impl;
 
 /// The client trait which is the main interface to the Iggy server.
 /// It consists of multiple modules, each of which is responsible for a specific set of commands.
 /// Except the ping, login and get me, all the other methods require authentication.
+#[maybe_async::maybe_async]
 #[async_trait]
 pub trait Client:
     SystemClient
