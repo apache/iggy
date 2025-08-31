@@ -88,7 +88,7 @@ components:
     registry: dockerhub
     image: apache/iggy-web-ui
     dockerfile: web/Dockerfile
-    platforms: ["linux/amd64"]
+    platforms: ["linux/amd64", "linux/arm64"]
     version_file: "web/package.json"
     version_regex: '"version"\s*:\s*"([^"]+)"'
 
