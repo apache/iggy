@@ -19,24 +19,73 @@
 
 package org.apache.iggy.client.blocking;
 
+/**
+ * Base interface for synchronous Iggy clients.
+ * This interface provides access to various synchronous client components.
+ */
 public interface IggyBaseClient {
 
+    /**
+     * Gets the system client.
+     *
+     * @return the system client
+     */
     SystemClient system();
 
+    /**
+     * Gets the streams client.
+     *
+     * @return the streams client
+     */
     StreamsClient streams();
 
+    /**
+     * Gets the users client.
+     *
+     * @return the users client
+     */
     UsersClient users();
 
+    /**
+     * Gets the topics client.
+     *
+     * @return the topics client
+     */
     TopicsClient topics();
 
+    /**
+     * Gets the partitions client.
+     *
+     * @return the partitions client
+     */
     PartitionsClient partitions();
 
+    /**
+     * Gets the consumer groups client.
+     *
+     * @return the consumer groups client
+     */
     ConsumerGroupsClient consumerGroups();
 
+    /**
+     * Gets the consumer offsets client.
+     *
+     * @return the consumer offsets client
+     */
     ConsumerOffsetsClient consumerOffsets();
 
+    /**
+     * Gets the messages client.
+     *
+     * @return the messages client
+     */
     MessagesClient messages();
 
+    /**
+     * Gets the personal access tokens client.
+     *
+     * @return the personal access tokens client
+     */
     PersonalAccessTokensClient personalAccessTokens();
 
 }
