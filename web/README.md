@@ -8,6 +8,8 @@ This project hosts the web user interface for Apache Iggy. The web UI is built u
 
 The Iggy Web UI provides a user-friendly panel for managing various aspects of the Iggy platform, including streams, topics, partitions, and more.
 
+The [docker image](https://hub.docker.com/r/apache/iggy-web-ui) is available, and can be fetched via `docker pull apache/iggy-web-ui`.
+
 ### Getting Started
 
 1. **Run Iggy server first**
@@ -67,8 +69,8 @@ The Iggy Web UI provides a user-friendly panel for managing various aspects of t
 - [ ] Messages management
 - [ ] General UI improvements
 - [ ] Permission management (in progress)
-- [ ] GitHub actions CI/CD
-- [ ] Publish to Dockerhub as separate Image
+- [x] GitHub actions CI/CD
+- [x] Publish to Dockerhub as separate Image
 
 ## Contributing
 

@@ -27,7 +27,7 @@ on:
 
 env:
   REGISTRY: docker.io
-  IMAGE_NAME: iggyrs/iggy-bench-dashboard
+  IMAGE_NAME: apache/iggy-bench-dashboard
 
 jobs:
   docker:
@@ -40,7 +40,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2  # We need at least 2 commits to compare changes
+          fetch-depth: 2 # We need at least 2 commits to compare changes
 
       - name: Check if Cargo.toml version changed
         id: check_version

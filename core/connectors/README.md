@@ -4,6 +4,8 @@ The highly performant and modular runtime for statically typed, yet dynamically 
 
 **This is still WiP, and the runtime can be started only after compilation from the source code (no installable package yet).**
 
+The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available, and can be fetched via `docker pull apache/iggy-connect`.
+
 ## Features
 
 - **High Performance**: Utilizes Rust's performance characteristics to ensure fast data ingestion and egress.

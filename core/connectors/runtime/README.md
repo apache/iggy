@@ -10,6 +10,10 @@ Internally, [dlopen2](https://github.com/OpenByteDev/dlopen2) provides a safe an
 
 By default, runtime will look for the configuration file, to decide which connectors to load and how to configure them.
 
+To start the connector runtime, simply run `cargo run --bin iggy-connectors`.
+
+The [docker image](https://hub.docker.com/r/apache/iggy-connect) is available, and can be fetched via `docker pull apache/iggy-connect`.
+
 The minimal viable configuration requires at least the Iggy credentials, to create 2 separate instances of producer & consumer connections and the state directory path where source connectors can store their optional state.
 
 ```toml
