@@ -45,19 +45,20 @@ jobs:
       matrix:
         target: [x86_64, aarch64]
     steps:
-      - name: Save latest CI and scripts from master
+      - name: Download latest copy script from master
         if: inputs.use_latest_ci
         run: |
-          # Clone master and save CI and scripts
-          bash scripts/copy-latest-from-master.sh save \
-            .github \
-            scripts
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
 
       - uses: actions/checkout@v4
 
-      - name: Apply latest CI and scripts
+      - name: Save and apply latest CI from master
         if: inputs.use_latest_ci
-        run: bash scripts/copy-latest-from-master.sh apply
+        run: |
+          /tmp/copy-latest-from-master.sh save .github scripts
+          /tmp/copy-latest-from-master.sh apply
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -100,19 +101,20 @@ jobs:
       matrix:
         target: [x86_64, aarch64]
     steps:
-      - name: Save latest CI and scripts from master
+      - name: Download latest copy script from master
         if: inputs.use_latest_ci
         run: |
-          # Clone master and save CI and scripts
-          bash scripts/copy-latest-from-master.sh save \
-            .github \
-            scripts
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
 
       - uses: actions/checkout@v4
 
-      - name: Apply latest CI and scripts
+      - name: Save and apply latest CI from master
         if: inputs.use_latest_ci
-        run: bash scripts/copy-latest-from-master.sh apply
+        run: |
+          /tmp/copy-latest-from-master.sh save .github scripts
+          /tmp/copy-latest-from-master.sh apply
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -138,21 +140,22 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - name: Save latest CI and scripts from master
+      - name: Download latest copy script from master
         if: inputs.use_latest_ci
         shell: bash
         run: |
-          # Clone master and save CI and scripts
-          bash scripts/copy-latest-from-master.sh save \
-            .github \
-            scripts
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
 
       - uses: actions/checkout@v4
 
-      - name: Apply latest CI and scripts
+      - name: Save and apply latest CI from master
         if: inputs.use_latest_ci
         shell: bash
-        run: bash scripts/copy-latest-from-master.sh apply
+        run: |
+          /tmp/copy-latest-from-master.sh save .github scripts
+          /tmp/copy-latest-from-master.sh apply
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -179,19 +182,20 @@ jobs:
   sdist:
     runs-on: ubuntu-latest
     steps:
-      - name: Save latest CI and scripts from master
+      - name: Download latest copy script from master
         if: inputs.use_latest_ci
         run: |
-          # Clone master and save CI and scripts
-          bash scripts/copy-latest-from-master.sh save \
-            .github \
-            scripts
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
 
       - uses: actions/checkout@v4
 
-      - name: Apply latest CI and scripts
+      - name: Save and apply latest CI from master
         if: inputs.use_latest_ci
-        run: bash scripts/copy-latest-from-master.sh apply
+        run: |
+          /tmp/copy-latest-from-master.sh save .github scripts
+          /tmp/copy-latest-from-master.sh apply
 
       - name: Build sdist
         uses: PyO3/maturin-action@v1
