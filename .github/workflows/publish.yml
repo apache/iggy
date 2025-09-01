@@ -139,9 +139,29 @@ jobs:
       has_python: ${{ steps.mk.outputs.has_python }}
       has_rust_crates: ${{ steps.mk.outputs.has_rust_crates }}
     steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        run: |
+          # Download the copy script from master branch
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+          echo "✅ Downloaded latest copy script from master"
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Save and apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          # Save latest files from master (including config)
+          /tmp/copy-latest-from-master.sh save \
+            .github \
+            scripts
+
+          # Apply them to current checkout
+          /tmp/copy-latest-from-master.sh apply
 
       - name: Load publish config
         id: cfg
@@ -270,11 +290,24 @@ jobs:
     if: needs.validate.outputs.has_targets == 'true' && fromJson(needs.plan.outputs.targets).include[0].key != 'noop'
     runs-on: ubuntu-latest
     steps:
-      - name: Save latest CI and scripts from master
+      - name: Download latest copy script from master
         if: inputs.use_latest_ci
         run: |
-          # Clone master and save CI, scripts, and Dockerfiles
-          bash scripts/copy-latest-from-master.sh save \
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+          echo "✅ Downloaded latest copy script from master"
+
+      - name: Checkout at commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 0
+
+      - name: Save and apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          /tmp/copy-latest-from-master.sh save \
             .github \
             scripts \
             web/Dockerfile \
@@ -283,15 +316,7 @@ jobs:
             core/connectors/runtime/Dockerfile \
             core/bench/dashboard/server/Dockerfile
 
-      - name: Checkout at commit
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.validate.outputs.commit }}
-          fetch-depth: 0
-
-      - name: Apply latest CI and scripts
-        if: inputs.use_latest_ci
-        run: bash scripts/copy-latest-from-master.sh apply
+          /tmp/copy-latest-from-master.sh apply
 
       - name: Setup yq
         run: |
@@ -441,11 +466,24 @@ jobs:
     outputs:
       status: ${{ steps.final-status.outputs.status }}
     steps:
-      - name: Save latest CI and scripts from master
+      - name: Download latest copy script from master
         if: inputs.use_latest_ci
         run: |
-          # Clone master and save CI, scripts, and Dockerfiles
-          bash scripts/copy-latest-from-master.sh save \
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+          echo "✅ Downloaded latest copy script from master"
+
+      - name: Checkout at commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 0
+
+      - name: Save and apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          /tmp/copy-latest-from-master.sh save \
             .github \
             scripts \
             web/Dockerfile \
@@ -454,15 +492,7 @@ jobs:
             core/connectors/runtime/Dockerfile \
             core/bench/dashboard/server/Dockerfile
 
-      - name: Checkout at commit
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.validate.outputs.commit }}
-          fetch-depth: 0
-
-      - name: Apply latest CI and scripts
-        if: inputs.use_latest_ci
-        run: bash scripts/copy-latest-from-master.sh apply
+          /tmp/copy-latest-from-master.sh apply
 
       - name: Setup Rust with cache
         uses: ./.github/actions/utils/setup-rust-with-cache
@@ -598,22 +628,13 @@ jobs:
       version: ${{ steps.ver.outputs.version }}
       tag: ${{ steps.ver.outputs.tag }}
     steps:
-      - name: Save latest CI and scripts from master
+      - name: Download latest copy script from master
         if: inputs.use_latest_ci
         run: |
-          # Clone master and save CI, scripts, and Dockerfiles
-          bash scripts/copy-latest-from-master.sh save \
-            .github \
-            scripts \
-            web/Dockerfile \
-            core/server/Dockerfile \
-            core/ai/mcp/Dockerfile \
-            core/connectors/runtime/Dockerfile \
-            core/bench/dashboard/server/Dockerfile
-          echo "Scripts:"
-          ls -la /tmp/latest-scripts/
-          echo ".github:"
-          ls -la /tmp/latest-github/
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+          echo "✅ Downloaded latest copy script from master"
 
       - name: Checkout at commit
         uses: actions/checkout@v4
@@ -621,9 +642,19 @@ jobs:
           ref: ${{ needs.validate.outputs.commit }}
           fetch-depth: 0
 
-      - name: Apply latest CI and scripts
+      - name: Save and apply latest CI from master
         if: inputs.use_latest_ci
-        run: bash scripts/copy-latest-from-master.sh apply
+        run: |
+          /tmp/copy-latest-from-master.sh save \
+            .github \
+            scripts \
+            web/Dockerfile \
+            core/server/Dockerfile \
+            core/ai/mcp/Dockerfile \
+            core/connectors/runtime/Dockerfile \
+            core/bench/dashboard/server/Dockerfile
+
+          /tmp/copy-latest-from-master.sh apply
 
       - name: Ensure version extractor is executable
         run: |

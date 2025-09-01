@@ -51,13 +51,26 @@ case "$COMMAND" in
             echo "Usage: $0 save <path1> [path2] ..."
             exit 1
         fi
-        
+
         echo "📦 Cloning master branch..."
         rm -rf "$TMP_REPO" "$TMP_SAVED"
+
+        # Use GITHUB_REPOSITORY if available, otherwise try to detect from git remote
+        if [ -z "${GITHUB_REPOSITORY:-}" ]; then
+            # Try to extract from git remote
+            REPO_URL=$(git remote get-url origin 2>/dev/null || echo "")
+            if [[ "$REPO_URL" =~ github\.com[:/]([^/]+/[^/.]+)(\.git)?$ ]]; then
+                GITHUB_REPOSITORY="${BASH_REMATCH[1]}"
+            else
+                echo "Error: Could not determine repository. Set GITHUB_REPOSITORY environment variable."
+                exit 1
+            fi
+        fi
+
         git clone --depth 1 --branch master "https://github.com/${GITHUB_REPOSITORY}.git" "$TMP_REPO"
-        
+
         mkdir -p "$TMP_SAVED"
-        
+
         echo "💾 Saving specified files from master..."
         for path in "$@"; do
             if [ -e "$TMP_REPO/$path" ]; then
@@ -66,7 +79,7 @@ case "$COMMAND" in
                 if [ "$parent_dir" != "." ]; then
                     mkdir -p "$TMP_SAVED/$parent_dir"
                 fi
-                
+
                 # Copy the file or directory
                 cp -r "$TMP_REPO/$path" "$TMP_SAVED/$path"
                 echo "  ✅ Saved: $path"
@@ -74,50 +87,50 @@ case "$COMMAND" in
                 echo "  ⚠️  Not found in master: $path"
             fi
         done
-        
+
         echo ""
         echo "📋 Summary of saved files:"
         find "$TMP_SAVED" -type f | sed "s|$TMP_SAVED/|  - |"
-        
+
         # Clean up the cloned repo
         rm -rf "$TMP_REPO"
         ;;
-        
+
     apply)
         if [ ! -d "$TMP_SAVED" ]; then
             echo "Error: No saved files found. Run 'save' command first."
             exit 1
         fi
-        
+
         echo "📝 Applying saved files to current directory..."
-        
+
         # Iterate through all saved files
         find "$TMP_SAVED" -type f | while read -r saved_file; do
             # Get relative path by removing the tmp prefix
             rel_path="${saved_file#$TMP_SAVED/}"
             dest_dir=$(dirname "$rel_path")
-            
+
             # Check if destination directory exists
             if [ "$dest_dir" != "." ] && [ ! -d "$dest_dir" ]; then
                 echo "  ℹ️  Skipping $rel_path - destination directory '$dest_dir' does not exist"
                 continue
             fi
-            
+
             # Copy the file
             cp "$saved_file" "$rel_path"
             echo "  ✅ Applied: $rel_path"
-            
+
             # Make scripts executable if they're in scripts/ directory
             if [[ "$rel_path" == scripts/*.sh ]]; then
                 chmod +x "$rel_path"
                 echo "     Made executable: $rel_path"
             fi
         done
-        
+
         echo ""
         echo "✅ All applicable files have been applied"
         ;;
-        
+
     *)
         echo "Error: Unknown command '$COMMAND'"
         echo "Valid commands: save, apply"
