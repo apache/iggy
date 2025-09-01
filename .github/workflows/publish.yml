@@ -29,6 +29,11 @@ on:
         type: boolean
         required: false
         default: true
+      skip_tag_creation:
+        description: "Skip creating git tags (useful for re-publishing or testing)"
+        type: boolean
+        required: false
+        default: false
       commit:
         description: "Commit SHA to publish from"
         type: string
@@ -48,11 +53,6 @@ on:
         type: string
         required: false
         default: ""
-      skip_tag_creation:
-        description: "Skip creating git tags (useful for re-publishing or testing)"
-        type: boolean
-        required: false
-        default: false
 
 env:
   IGGY_CI_BUILD: true

@@ -110,10 +110,10 @@ case "$COMMAND" in
             rel_path="${saved_file#$TMP_SAVED/}"
             dest_dir=$(dirname "$rel_path")
 
-            # Check if destination directory exists
+            # Create destination directory if it doesn't exist
             if [ "$dest_dir" != "." ] && [ ! -d "$dest_dir" ]; then
-                echo "  ℹ️  Skipping $rel_path - destination directory '$dest_dir' does not exist"
-                continue
+                echo "  📁 Creating directory: $dest_dir"
+                mkdir -p "$dest_dir"
             fi
 
             # Copy the file
