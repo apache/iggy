@@ -25,7 +25,7 @@ use iggy::prelude::{
 use requests::*;
 use rmcp::{
     ServerHandler,
-    handler::server::{router::tool::ToolRouter, tool::Parameters},
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Content, ErrorData, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
 };
