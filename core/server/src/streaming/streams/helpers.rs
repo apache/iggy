@@ -32,7 +32,6 @@ pub fn store_consumer_offset(
     offset: u64,
     config: &SystemConfig,
 ) -> impl FnOnce(ComponentsById<StreamRef>) {
-    let topic_id = *topic_id;
     move |(root, ..)| {
         let stream_id = root.id();
         root.topics().with_topic_by_id(&topic_id, |(root, ..)| {
@@ -59,7 +58,6 @@ pub fn store_consumer_group_member_offset(
     offset: u64,
     config: &SystemConfig,
 ) -> impl FnOnce(ComponentsById<StreamRef>) {
-    let topic_id = *topic_id;
     move |(root, ..)| {
         let stream_id = root.id();
         root.topics().with_topic_by_id(&topic_id, |(root, ..)| {

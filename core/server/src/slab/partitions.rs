@@ -1,36 +1,60 @@
 use crate::{
     slab::traits_ext::{
         Borrow, ComponentsById, Delete, EntityComponentSystem, EntityComponentSystemMut, Insert,
-        IntoComponents,
+        IntoComponents, IntoComponentsById,
     },
     streaming::{
         deduplication::message_deduplicator::MessageDeduplicator,
         partitions::{
-            consumer_offset,
-            partition2::{self, Partition, PartitionRef, PartitionRefMut},
+            journal::MemoryMessageJournal,
+            log::SegmentedLog,
+            partition2::{
+                self, ConsumerGroupOffsets, ConsumerOffsets, Partition, PartitionRef,
+                PartitionRefMut,
+            },
         },
-        segments,
         stats::stats::PartitionStats,
     },
 };
 use slab::Slab;
-use std::sync::{Arc, atomic::AtomicU64};
+use std::{
+    future::Future,
+    sync::{Arc, atomic::AtomicU64},
+};
 
 // TODO: This could be upper limit of partitions per topic, use that value to validate instead of whathever this thing is in `common` crate.
 pub const PARTITIONS_CAPACITY: usize = 16384;
-const SEGMENTS_CAPACITY: usize = 1024;
 pub type ContainerId = usize;
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Partitions {
     root: Slab<partition2::PartitionRoot>,
     stats: Slab<Arc<PartitionStats>>,
-    segments: Slab<Vec<segments::Segment2>>,
     message_deduplicator: Slab<Option<MessageDeduplicator>>,
     offset: Slab<Arc<AtomicU64>>,
 
-    consumer_offset: Slab<Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>>,
-    consumer_group_offset: Slab<Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>>,
+    consumer_offset: Slab<Arc<ConsumerOffsets>>,
+    consumer_group_offset: Slab<Arc<ConsumerGroupOffsets>>,
+
+    log: Slab<SegmentedLog<MemoryMessageJournal>>,
+}
+
+/// Clone implementation for partitions, does not copy the actual logs.
+/// Since those are very expensive to clone and we use `Clone` only during initialization
+/// in order to streamline broadcasting entity creation event to other shards.
+/// A better strategy would be to have an `Pool` of Streams/Topics/Partitions and during event broadcast, grab a new `Default` instance from the pool aka ZII.
+impl Clone for Partitions {
+    fn clone(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+            stats: self.stats.clone(),
+            message_deduplicator: self.message_deduplicator.clone(),
+            offset: self.offset.clone(),
+            consumer_offset: self.consumer_offset.clone(),
+            consumer_group_offset: self.consumer_group_offset.clone(),
+            log: Slab::with_capacity(PARTITIONS_CAPACITY),
+        }
+    }
 }
 
 impl Insert for Partitions {
@@ -38,7 +62,7 @@ impl Insert for Partitions {
     type Item = Partition;
 
     fn insert(&mut self, item: Self::Item) -> Self::Idx {
-        let (root, stats, deduplicator, offset, consumer_offset, consumer_group_offset) =
+        let (root, stats, deduplicator, offset, consumer_offset, consumer_group_offset, log) =
             item.into_components();
 
         let entity_id = self.root.insert(root);
@@ -47,10 +71,10 @@ impl Insert for Partitions {
             entity_id, id,
             "partition_insert: id mismatch when creating stats"
         );
-        let id = self.segments.insert(Vec::with_capacity(SEGMENTS_CAPACITY));
+        let id = self.log.insert(log);
         assert_eq!(
             entity_id, id,
-            "partition_insert: id mismatch when creating segments"
+            "partition_insert: id mismatch when creating log"
         );
         let id = self.message_deduplicator.insert(deduplicator);
         assert_eq!(
@@ -95,6 +119,7 @@ impl<'a> From<&'a Partitions> for PartitionRef<'a> {
             &value.offset,
             &value.consumer_offset,
             &value.consumer_group_offset,
+            &value.log,
         )
     }
 }
@@ -108,6 +133,7 @@ impl<'a> From<&'a mut Partitions> for PartitionRefMut<'a> {
             &mut value.offset,
             &mut value.consumer_offset,
             &mut value.consumer_group_offset,
+            &mut value.log,
         )
     }
 }
@@ -141,13 +167,6 @@ impl EntityComponentSystemMut for Partitions {
     {
         f(self.into())
     }
-
-    fn with_components_by_id_mut<O, F>(&mut self, id: Self::Idx, f: F) -> O
-    where
-        F: for<'a> FnOnce(ComponentsById<'a, Self::EntityComponentsMut<'a>>) -> O,
-    {
-        self.with_components_mut(|components| f(components.into_components_by_id(id)))
-    }
 }
 
 impl Default for Partitions {
@@ -155,7 +174,7 @@ impl Default for Partitions {
         Self {
             root: Slab::with_capacity(PARTITIONS_CAPACITY),
             stats: Slab::with_capacity(PARTITIONS_CAPACITY),
-            segments: Slab::with_capacity(PARTITIONS_CAPACITY),
+            log: Slab::with_capacity(PARTITIONS_CAPACITY),
             message_deduplicator: Slab::with_capacity(PARTITIONS_CAPACITY),
             offset: Slab::with_capacity(PARTITIONS_CAPACITY),
             consumer_offset: Slab::with_capacity(PARTITIONS_CAPACITY),
@@ -167,22 +186,6 @@ impl Default for Partitions {
 impl Partitions {
     pub fn len(&self) -> usize {
         self.root.len()
-    }
-
-    pub fn segments_for_partition(&self, id: usize) -> &Vec<segments::Segment2> {
-        &self.segments[id]
-    }
-
-    pub fn segments_for_partition_mut(&mut self, id: usize) -> &mut Vec<segments::Segment2> {
-        &mut self.segments[id]
-    }
-
-    pub fn remove_segments_for_partition(&mut self, id: usize) -> Vec<segments::Segment2> {
-        self.segments.remove(id)
-    }
-
-    pub fn remove_segments(&mut self) -> Vec<segments::Segment2> {
-        self.segments.drain().flatten().collect()
     }
 
     pub fn with_partition_by_id<T>(

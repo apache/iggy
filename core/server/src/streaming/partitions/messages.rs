@@ -17,7 +17,6 @@
  */
 
 use crate::streaming::partitions::COMPONENT;
-use crate::streaming::partitions::partition::Partition;
 use crate::streaming::polling_consumer::PollingConsumer;
 use crate::streaming::segments::*;
 use error_set::ErrContext;
@@ -25,6 +24,7 @@ use iggy_common::{IggyError, IggyTimestamp, Sizeable};
 use std::sync::atomic::Ordering;
 use tracing::trace;
 
+/*
 impl Partition {
     /// Retrieves messages by timestamp (up to a specified count).
     pub async fn get_messages_by_timestamp(
@@ -754,3 +754,5 @@ mod tests {
             .expect("Failed to create message with ID")
     }
 }
+
+*/

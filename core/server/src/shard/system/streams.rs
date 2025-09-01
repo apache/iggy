@@ -56,7 +56,7 @@ impl IggyShard {
 
     fn create_and_insert_stream_mem(&self, name: String) -> stream2::Stream {
         let now = IggyTimestamp::now();
-        let stats = Arc::new(StreamStats::new());
+        let stats = Arc::new(Default::default());
         let mut stream = stream2::Stream::new(name, stats, now);
         let id = self.streams2.insert(stream.clone());
         stream.update_id(id);
@@ -122,7 +122,7 @@ impl IggyShard {
 
     pub fn delete_stream2_bypass_auth(&self, id: &Identifier) -> stream2::Stream {
         let stream = self.delete_stream2_base(id);
-        Ok(stream)
+        stream
     }
 
     fn delete_stream2_base(&self, id: &Identifier) -> stream2::Stream {
@@ -171,7 +171,7 @@ impl IggyShard {
         Ok(stream)
     }
 
-    pub fn purge_stream2(&self, session: &Session, id: &Identifier) -> Result<(), IggyError> {
+    pub async fn purge_stream2(&self, session: &Session, id: &Identifier) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
         // self.ensure_stream_exists(id)?;
         let get_stream_id = crate::streaming::streams::helpers::get_stream_id();

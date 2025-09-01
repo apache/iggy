@@ -63,8 +63,8 @@ impl IggyShard {
             ConsumerKind::Consumer => {
                 let partition_id = partition_id.unwrap_or(1);
                 Some((
-                    PollingConsumer::consumer(&consumer.id, partition_id),
-                    partition_id,
+                    PollingConsumer::consumer(&consumer.id, partition_id as usize),
+                    partition_id as usize,
                 ))
             }
             ConsumerKind::ConsumerGroup => {
@@ -83,7 +83,7 @@ impl IggyShard {
                 if let Some(partition_id) = partition_id {
                     return Some((
                         PollingConsumer::consumer_group(cg_id, member_id),
-                        partition_id,
+                        partition_id as usize,
                     ));
                 }
 

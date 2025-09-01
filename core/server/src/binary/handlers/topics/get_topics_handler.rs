@@ -58,7 +58,7 @@ impl ServerCommandHandler for GetTopics {
             .with_topics_async(&self.stream_id, async |topics| {
                 topics
                     .with_components_async(async |topics| {
-                        let (roots, stats) = topics.into_components();
+                        let (roots, _, stats) = topics.into_components();
                         let response = mapper::map_topics(&roots, &stats);
                         sender.send_ok_response(&response).await
                     })

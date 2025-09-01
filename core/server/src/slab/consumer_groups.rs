@@ -138,7 +138,7 @@ impl ConsumerGroups {
         f: impl FnOnce(ComponentsById<ConsumerGroupRefMut>) -> T,
     ) -> T {
         let id = self.get_index(identifier);
-        self.with_components_mut_by_id(id, |components| f(components))
+        self.with_components_by_id_mut(id, |components| f(components))
     }
 
     pub fn with_consumer_group_by_id_async<T>(

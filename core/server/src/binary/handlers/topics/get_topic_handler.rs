@@ -55,7 +55,7 @@ impl ServerCommandHandler for GetTopic {
 
         shard
             .streams2
-            .with_topic_by_id_async(&self.stream_id, &self.topic_id, async |(root, stats)| {
+            .with_topic_by_id_async(&self.stream_id, &self.topic_id, async |(root, _, stats)| {
                 let response = mapper::map_topic(&root, &stats);
                 sender.send_ok_response(&response).await
             })

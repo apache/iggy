@@ -1,12 +1,33 @@
 use crate::configs::system::SystemConfig;
+use crate::shard_trace;
 use crate::slab::topics;
 use crate::slab::traits_ext::{EntityMarker, IntoComponents, IntoComponentsById};
 use crate::slab::{Keyed, consumer_groups::ConsumerGroups, partitions::Partitions};
+use crate::streaming::partitions::log::SegmentedLog;
 use crate::streaming::stats::stats::TopicStats;
 use iggy_common::{CompressionAlgorithm, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize};
 use slab::Slab;
 use std::cell::{Ref, RefMut};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[derive(Debug, Clone)]
+pub struct TopicAuxilary {
+    current_partition_id: Arc<AtomicUsize>,
+}
+
+impl TopicAuxilary {
+    pub fn get_next_partition_id(&self, shard_id: u16, upperbound: usize) -> usize {
+        let mut partition_id = self.current_partition_id.fetch_add(1, Ordering::AcqRel);
+        if partition_id > upperbound {
+            partition_id = 1;
+            self.current_partition_id
+                .swap(partition_id + 1, Ordering::Release);
+        }
+        shard_trace!(shard_id, "Next partition ID: {}", partition_id);
+        partition_id
+    }
+}
 
 #[derive(Default, Debug, Clone)]
 pub struct TopicRoot {
@@ -34,6 +55,7 @@ impl Keyed for TopicRoot {
 #[derive(Debug, Clone)]
 pub struct Topic {
     root: TopicRoot,
+    auxilary: TopicAuxilary,
     stats: Arc<TopicStats>,
 }
 
@@ -55,7 +77,14 @@ impl Topic {
             compression,
             max_topic_size,
         );
-        Self { root, stats }
+        let auxilary = TopicAuxilary {
+            current_partition_id: Arc::new(AtomicUsize::new(0)),
+        };
+        Self {
+            root,
+            auxilary,
+            stats,
+        }
     }
 
     pub fn root(&self) -> &TopicRoot {
@@ -65,13 +94,17 @@ impl Topic {
     pub fn root_mut(&mut self) -> &mut TopicRoot {
         &mut self.root
     }
+
+    pub fn stats(&self) -> &TopicStats {
+        &self.stats
+    }
 }
 
 impl IntoComponents for Topic {
-    type Components = (TopicRoot, Arc<TopicStats>);
+    type Components = (TopicRoot, TopicAuxilary, Arc<TopicStats>);
 
     fn into_components(self) -> Self::Components {
-        (self.root, self.stats)
+        (self.root, self.auxilary, self.stats)
     }
 }
 
@@ -89,67 +122,97 @@ impl EntityMarker for Topic {
 // TODO: Create a macro to impl those TopicRef/TopicRefMut structs and it's traits.
 pub struct TopicRef<'a> {
     root: Ref<'a, Slab<TopicRoot>>,
+    auxilary: Ref<'a, Slab<TopicAuxilary>>,
     stats: Ref<'a, Slab<Arc<TopicStats>>>,
 }
 
 impl<'a> TopicRef<'a> {
-    pub fn new(root: Ref<'a, Slab<TopicRoot>>, stats: Ref<'a, Slab<Arc<TopicStats>>>) -> Self {
-        Self { root, stats }
+    pub fn new(
+        root: Ref<'a, Slab<TopicRoot>>,
+        auxilary: Ref<'a, Slab<TopicAuxilary>>,
+        stats: Ref<'a, Slab<Arc<TopicStats>>>,
+    ) -> Self {
+        Self {
+            root,
+            auxilary,
+            stats,
+        }
     }
 }
 
 impl<'a> IntoComponents for TopicRef<'a> {
-    type Components = (Ref<'a, Slab<TopicRoot>>, Ref<'a, Slab<Arc<TopicStats>>>);
+    type Components = (
+        Ref<'a, Slab<TopicRoot>>,
+        Ref<'a, Slab<TopicAuxilary>>,
+        Ref<'a, Slab<Arc<TopicStats>>>,
+    );
 
     fn into_components(self) -> Self::Components {
-        (self.root, self.stats)
+        (self.root, self.auxilary, self.stats)
     }
 }
 
 impl<'a> IntoComponentsById for TopicRef<'a> {
     type Idx = topics::ContainerId;
-    type Output = (Ref<'a, TopicRoot>, Ref<'a, Arc<TopicStats>>);
+    type Output = (
+        Ref<'a, TopicRoot>,
+        Ref<'a, TopicAuxilary>,
+        Ref<'a, Arc<TopicStats>>,
+    );
 
     fn into_components_by_id(self, index: Self::Idx) -> Self::Output {
         let root = Ref::map(self.root, |r| &r[index]);
+        let auxilary = Ref::map(self.auxilary, |a| &a[index]);
         let stats = Ref::map(self.stats, |s| &s[index]);
-        (root, stats)
+        (root, auxilary, stats)
     }
 }
 
 pub struct TopicRefMut<'a> {
     root: RefMut<'a, Slab<TopicRoot>>,
+    auxilary: RefMut<'a, Slab<TopicAuxilary>>,
     stats: RefMut<'a, Slab<Arc<TopicStats>>>,
 }
 
 impl<'a> TopicRefMut<'a> {
     pub fn new(
         root: RefMut<'a, Slab<TopicRoot>>,
+        auxilary: RefMut<'a, Slab<TopicAuxilary>>,
         stats: RefMut<'a, Slab<Arc<TopicStats>>>,
     ) -> Self {
-        Self { root, stats }
+        Self {
+            root,
+            auxilary,
+            stats,
+        }
     }
 }
 
 impl<'a> IntoComponents for TopicRefMut<'a> {
     type Components = (
         RefMut<'a, Slab<TopicRoot>>,
+        RefMut<'a, Slab<TopicAuxilary>>,
         RefMut<'a, Slab<Arc<TopicStats>>>,
     );
 
     fn into_components(self) -> Self::Components {
-        (self.root, self.stats)
+        (self.root, self.auxilary, self.stats)
     }
 }
 
 impl<'a> IntoComponentsById for TopicRefMut<'a> {
     type Idx = topics::ContainerId;
-    type Output = (RefMut<'a, TopicRoot>, RefMut<'a, Arc<TopicStats>>);
+    type Output = (
+        RefMut<'a, TopicRoot>,
+        RefMut<'a, TopicAuxilary>,
+        RefMut<'a, Arc<TopicStats>>,
+    );
 
     fn into_components_by_id(self, index: Self::Idx) -> Self::Output {
         let root = RefMut::map(self.root, |r| &mut r[index]);
+        let auxilary = RefMut::map(self.auxilary, |a| &mut a[index]);
         let stats = RefMut::map(self.stats, |s| &mut s[index]);
-        (root, stats)
+        (root, auxilary, stats)
     }
 }
 

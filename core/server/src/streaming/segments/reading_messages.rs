@@ -25,6 +25,7 @@ use tracing::{error, trace};
 
 const COMPONENT: &str = "STREAMING_SEGMENT";
 
+/*
 impl Segment {
     pub fn get_messages_size(&self) -> IggyByteSize {
         let on_disk_size = self.messages_size.load(Ordering::Relaxed);
@@ -396,3 +397,5 @@ impl Segment {
             })
     }
 }
+
+*/

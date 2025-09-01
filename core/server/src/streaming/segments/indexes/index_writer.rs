@@ -35,7 +35,7 @@ use crate::streaming::utils::PooledBuffer;
 pub struct IndexWriter {
     file_path: String,
     file: File,
-    index_size_bytes: Arc<AtomicU64>,
+    index_size_bytes: AtomicU64,
     fsync: bool,
 }
 
@@ -43,7 +43,7 @@ impl IndexWriter {
     /// Opens the index file in write mode.
     pub async fn new(
         file_path: &str,
-        index_size_bytes: Arc<AtomicU64>,
+        index_size_bytes: AtomicU64,
         fsync: bool,
         file_exists: bool,
     ) -> Result<Self, IggyError> {
@@ -69,13 +69,11 @@ impl IndexWriter {
                 .map_err(|_| IggyError::CannotReadFileMetadata)?
                 .len();
 
-            index_size_bytes.store(actual_index_size, Ordering::Release);
+            index_size_bytes.store(actual_index_size, Ordering::Relaxed);
         }
 
-        trace!(
-            "Opened index file for writing: {file_path}, size: {}",
-            index_size_bytes.load(Ordering::Acquire)
-        );
+        let size = index_size_bytes.load(Ordering::Relaxed);
+        trace!("Opened index file for writing: {file_path}, size: {}", size);
 
         Ok(Self {
             file_path: file_path.to_string(),
@@ -86,7 +84,7 @@ impl IndexWriter {
     }
 
     /// Appends multiple index buffer to the index file in a single operation.
-    pub async fn save_indexes(&mut self, indexes: PooledBuffer) -> Result<(), IggyError> {
+    pub async fn save_indexes(&self, indexes: PooledBuffer) -> Result<(), IggyError> {
         if indexes.is_empty() {
             return Ok(());
         }
@@ -95,7 +93,8 @@ impl IndexWriter {
         let len = indexes.len();
 
         let position = self.index_size_bytes.load(Ordering::Relaxed);
-        self.file
+        let file = &self.file;
+        (&*file)
             .write_all_at(indexes, position)
             .await
             .0

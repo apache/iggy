@@ -91,7 +91,7 @@ impl ServerCommandHandler for CreateTopic {
         let response = shard.streams2.with_topic_by_id(
             &self.stream_id,
             &Identifier::numeric(topic_id as u32).unwrap(),
-            |(root, stats)| mapper::map_topic(&root, &stats),
+            |(root, _, stats)| mapper::map_topic(&root, &stats),
         );
         shard
             .state

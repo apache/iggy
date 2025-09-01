@@ -19,7 +19,6 @@
 use std::sync::atomic::Ordering;
 
 use crate::streaming::partitions::COMPONENT;
-use crate::streaming::partitions::partition::Partition;
 use crate::streaming::segments::*;
 use error_set::ErrContext;
 use iggy_common::IggyError;
@@ -31,6 +30,7 @@ pub struct DeletedSegment {
     pub messages_count: u32,
 }
 
+/*
 impl Partition {
     pub fn get_segments_count(&self) -> u32 {
         self.segments.len() as u32
@@ -129,3 +129,5 @@ impl Partition {
         Ok(deleted_segment)
     }
 }
+
+*/

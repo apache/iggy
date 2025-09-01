@@ -42,19 +42,19 @@ pub fn rename_index(
 
 // Topics
 pub fn get_stats() -> impl FnOnce(ComponentsById<TopicRef>) -> Arc<TopicStats> {
-    |(_, stats)| stats.clone()
+    |(_, _, stats)| stats.clone()
 }
 
 pub fn get_topic_id() -> impl FnOnce(ComponentsById<TopicRef>) -> topics::ContainerId {
-    |(root, _)| root.id()
+    |(root, _, _)| root.id()
 }
 
 pub fn get_message_expiry() -> impl FnOnce(ComponentsById<TopicRef>) -> IggyExpiry {
-    |(root, _)| root.message_expiry()
+    |(root, _, _)| root.message_expiry()
 }
 
 pub fn get_max_topic_size() -> impl FnOnce(ComponentsById<TopicRef>) -> MaxTopicSize {
-    |(root, _)| root.max_topic_size()
+    |(root, _, _)| root.max_topic_size()
 }
 
 pub fn delete_topic(topic_id: &Identifier) -> impl FnOnce(&Topics) -> Topic {
@@ -85,7 +85,7 @@ pub fn update_topic(
     max_topic_size: MaxTopicSize,
     replication_factor: u8,
 ) -> impl FnOnce(ComponentsById<TopicRefMut>) -> (String, String) {
-    move |(mut root, _)| {
+    move |(mut root, _, _)| {
         let old_name = root.name().clone();
         root.set_name(name.clone());
         root.set_message_expiry(message_expiry);

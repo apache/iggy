@@ -29,6 +29,8 @@ use iggy_common::{IggyTimestamp, PollingStrategy};
 use std::sync::atomic::Ordering;
 use tracing::trace;
 
+/*
+
 impl Topic {
     pub fn get_messages_count(&self) -> u64 {
         self.messages_count.load(Ordering::SeqCst)
@@ -356,3 +358,5 @@ mod tests {
         topic
     }
 }
+
+*/

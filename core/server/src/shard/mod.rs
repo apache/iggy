@@ -51,16 +51,12 @@ use tracing::{error, info, instrument, warn};
 use transmission::connector::{Receiver, ShardConnector, StopReceiver, StopSender};
 
 use crate::{
-    archiver::ArchiverKind,
     configs::server::ServerConfig,
     http::http_server,
     io::fs_utils,
     shard::{
         task_registry::TaskRegistry,
-        tasks::{
-            auxilary::maintain_messages::spawn_message_maintainance_task,
-            messages::spawn_shard_message_task,
-        },
+        tasks::messages::spawn_shard_message_task,
         transmission::{
             event::ShardEvent,
             frame::{ShardFrame, ShardResponse},
@@ -70,7 +66,9 @@ use crate::{
     shard_error, shard_info, shard_warn,
     slab::{streams::Streams, traits_ext::EntityMarker},
     state::{
-        file::FileState, system::{StreamState, SystemState, UserState}, StateKind
+        StateKind,
+        file::FileState,
+        system::{StreamState, SystemState, UserState},
     },
     streaming::{
         clients::client_manager::ClientManager,
@@ -147,7 +145,6 @@ pub struct IggyShard {
 
     // Temporal...
     pub(crate) encryptor: Option<EncryptorKind>,
-    pub(crate) archiver: Option<Rc<ArchiverKind>>,
     pub(crate) config: ServerConfig,
     //TODO: This could be shared.
     pub(crate) client_manager: RefCell<ClientManager>,
@@ -197,7 +194,6 @@ impl IggyShard {
             storage,
             //TODO: Fix
             encryptor: None,
-            archiver: None,
             config: server_config,
             client_manager: Default::default(),
             active_sessions: Default::default(),
@@ -226,12 +222,6 @@ impl IggyShard {
 
     pub async fn init(&self) -> Result<(), IggyError> {
         let _ = self.load_users().await;
-        if let Some(archiver) = self.archiver.as_ref() {
-            archiver
-                .init()
-                .await
-                .expect("Failed to initialize archiver");
-        }
         Ok(())
     }
 
@@ -248,7 +238,6 @@ impl IggyShard {
 
         // Create all tasks (tcp listener, http listener, command processor, in the future also the background jobs).
         let mut tasks: Vec<Task> = vec![Box::pin(spawn_shard_message_task(self.clone()))];
-        tasks.push(Box::pin(spawn_message_maintainance_task(self.clone())));
         if self.config.tcp.enabled {
             tasks.push(Box::pin(spawn_tcp_server(self.clone())));
         }
@@ -303,155 +292,6 @@ impl IggyShard {
         shard_info!(self.id, "Initialized {} user(s).", users_count);
         Ok(())
     }
-
-    /*
-    async fn load_streams(&self, streams: Vec<StreamState>) -> Result<(), IggyError> {
-        shard_info!(self.id, "Loading streams from disk...");
-        let mut unloaded_streams = Vec::new();
-        // Does compio have api for that ?
-        let mut dir_entries =
-            std::fs::read_dir(&self.config.system.get_streams_path()).map_err(|error| {
-                shard_error!(self.id, "Cannot read streams directory: {error}");
-                IggyError::CannotReadStreams
-            })?;
-
-        //TODO: User the dir walk impl from main function, once implemented.
-        while let Some(dir_entry) = dir_entries.next() {
-            let dir_entry = dir_entry.unwrap();
-            let name = dir_entry.file_name().into_string().unwrap();
-            let stream_id = name.parse::<u32>().map_err(|_| {
-                shard_error!(self.id, "Invalid stream ID file with name: '{name}'.");
-                IggyError::InvalidNumberValue
-            })?;
-            let stream_state = streams.iter().find(|s| s.id == stream_id);
-            if stream_state.is_none() {
-                shard_error!(
-                    self.id,
-                    "Stream with ID: '{stream_id}' was not found in state, but exists on disk and will be removed."
-                );
-                if let Err(error) = fs_utils::remove_dir_all(&dir_entry.path()).await {
-                    shard_error!(self.id, "Cannot remove stream directory: {error}");
-                } else {
-                    shard_warn!(self.id, "Stream with ID: '{stream_id}' was removed.");
-                }
-                continue;
-            }
-
-            let stream_state = stream_state.unwrap();
-            let mut stream = Stream::empty(
-                stream_id,
-                &stream_state.name,
-                self.config.system.clone(),
-                self.storage.clone(),
-            );
-            stream.created_at = stream_state.created_at;
-            unloaded_streams.push(stream);
-        }
-
-        let state_stream_ids = streams
-            .iter()
-            .map(|stream| stream.id)
-            .collect::<AHashSet<u32>>();
-        let unloaded_stream_ids = unloaded_streams
-            .iter()
-            .map(|stream| stream.stream_id)
-            .collect::<AHashSet<u32>>();
-        let mut missing_ids = state_stream_ids
-            .difference(&unloaded_stream_ids)
-            .copied()
-            .collect::<AHashSet<u32>>();
-        if missing_ids.is_empty() {
-            shard_info!(self.id, "All streams found on disk were found in state.");
-        } else {
-            warn!("Streams with IDs: '{missing_ids:?}' were not found on disk.");
-            if self.config.system.recovery.recreate_missing_state {
-                shard_info!(
-                    self.id,
-                    "Recreating missing state in recovery config is enabled, missing streams will be created."
-                );
-                for stream_id in missing_ids.iter() {
-                    let stream_id = *stream_id;
-                    let stream_state = streams.iter().find(|s| s.id == stream_id).unwrap();
-                    let stream = Stream::create(
-                        stream_id,
-                        &stream_state.name,
-                        self.config.system.clone(),
-                        self.storage.clone(),
-                    );
-                    stream.persist().await?;
-                    unloaded_streams.push(stream);
-                    info!(
-                        "Missing stream with ID: '{stream_id}', name: {} was recreated.",
-                        stream_state.name
-                    );
-                }
-                missing_ids.clear();
-            } else {
-                shard_warn!(
-                    self.id,
-                    "Recreating missing state in recovery config is disabled, missing streams will not be created."
-                );
-            }
-        }
-
-        //TODO: Refactor...
-        let mut streams_states = streams
-            .into_iter()
-            .filter(|s| !missing_ids.contains(&s.id))
-            .map(|s| (s.id, s))
-            .collect::<AHashMap<_, _>>();
-        let loaded_streams = RefCell::new(Vec::new());
-        let load_stream_tasks = unloaded_streams.into_iter().map(|mut stream| {
-            let state = streams_states.remove(&stream.stream_id).unwrap();
-
-            async {
-                stream.load(state).await?;
-                loaded_streams.borrow_mut().push(stream);
-                Result::<(), IggyError>::Ok(())
-            }
-        });
-        try_join_all(load_stream_tasks).await?;
-
-        for stream in loaded_streams.take() {
-            if self.streams.borrow().contains_key(&stream.stream_id) {
-                shard_error!(
-                    self.id,
-                    "Stream with ID: '{}' already exists.",
-                    &stream.stream_id
-                );
-                continue;
-            }
-
-            if self.streams_ids.borrow().contains_key(&stream.name) {
-                shard_error!(
-                    self.id,
-                    "Stream with name: '{}' already exists.",
-                    &stream.name
-                );
-                continue;
-            }
-
-            self.metrics.increment_streams(1);
-            self.metrics.increment_topics(stream.get_topics_count());
-            self.metrics
-                .increment_partitions(stream.get_partitions_count());
-            self.metrics.increment_segments(stream.get_segments_count());
-            self.metrics.increment_messages(stream.get_messages_count());
-
-            self.streams_ids
-                .borrow_mut()
-                .insert(stream.name.clone(), stream.stream_id);
-            self.streams.borrow_mut().insert(stream.stream_id, stream);
-        }
-
-        shard_info!(
-            self.id,
-            "Loaded {} stream(s) from disk.",
-            self.streams.borrow().len()
-        );
-        Ok(())
-    }
-    */
 
     pub fn assert_init(&self) -> Result<(), IggyError> {
         Ok(())
@@ -825,9 +665,9 @@ impl IggyShard {
 
     pub fn create_shard_table_records(
         &self,
-        partition_ids: &[u32],
-        stream_id: u32,
-        topic_id: u32,
+        partition_ids: &[usize],
+        stream_id: usize,
+        topic_id: usize,
     ) -> impl Iterator<Item = (IggyNamespace, ShardInfo)> {
         let records = partition_ids.iter().map(move |partition_id| {
             let namespace = IggyNamespace::new(stream_id, topic_id, *partition_id);

@@ -41,6 +41,7 @@ struct StreamData {
     created_at: IggyTimestamp,
 }
 
+/*
 impl StreamStorage for FileStreamStorage {
     async fn load(&self, stream: &mut Stream, mut state: StreamState) -> Result<(), IggyError> {
         info!("Loading stream with ID: {} from disk...", stream.stream_id);
@@ -227,3 +228,5 @@ impl StreamStorage for FileStreamStorage {
         Ok(())
     }
 }
+
+*/

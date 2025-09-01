@@ -17,24 +17,22 @@
  */
 
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     rc::Rc,
     sync::{Arc, atomic::AtomicBool},
 };
 
 use ahash::HashMap;
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, UserId};
-use sysinfo::User;
 use tracing::info;
 
 use crate::{
-    archiver::{Archiver, ArchiverKind},
     configs::server::ServerConfig,
     io::storage::Storage,
     shard::{Shard, task_registry::TaskRegistry},
     slab::streams::Streams,
     state::{StateKind, system::SystemState},
-    streaming::{diagnostics::metrics::Metrics, storage::SystemStorage},
+    streaming::{diagnostics::metrics::Metrics, storage::SystemStorage, users::user::User},
     versioning::SemanticVersion,
 };
 
@@ -51,7 +49,6 @@ pub struct IggyShardBuilder {
     encryptor: Option<EncryptorKind>,
     version: Option<SemanticVersion>,
     storage: Option<SystemStorage>,
-    archiver: Option<ArchiverKind>,
     metrics: Option<Metrics>,
 }
 
@@ -96,10 +93,6 @@ impl IggyShardBuilder {
         self
     }
 
-    pub fn archiver(mut self, archiver: Option<ArchiverKind>) -> Self {
-        self.archiver = archiver;
-        self
-    }
     pub fn storage(mut self, storage: SystemStorage) -> Self {
         self.storage = Some(storage);
         self
@@ -134,7 +127,6 @@ impl IggyShardBuilder {
             .next()
             .expect("Failed to find connection with the specified ID");
         let shards = connections.into_iter().map(Shard::new).collect();
-        let archiver = self.archiver.map(Rc::new);
         let storage = Rc::new(storage);
 
         // Initialize metrics
@@ -143,11 +135,11 @@ impl IggyShardBuilder {
             id: id,
             shards: shards,
             shards_table: Default::default(),
-            streams2: streams,
-            users: users,
+            //streams2: streams, // TODO: Fixme
+            streams2: Default::default(),
+            users: RefCell::new(users),
             storage: storage,
             encryptor: encryptor,
-            archiver: archiver,
             config: config,
             version: version,
             state: state,
@@ -160,8 +152,6 @@ impl IggyShardBuilder {
             tcp_bound_address: Cell::new(None),
             quic_bound_address: Cell::new(None),
 
-            streams2: Streams::init(),
-            users: Default::default(),
             permissioner: Default::default(),
             client_manager: Default::default(),
             active_sessions: Default::default(),

@@ -24,10 +24,9 @@ use crate::configs::http::{
 };
 use crate::configs::quic::{QuicCertificateConfig, QuicConfig, QuicSocketConfig};
 use crate::configs::server::{
-    ArchiverConfig, DataMaintenanceConfig, HeartbeatConfig, MessageSaverConfig,
-    MessagesMaintenanceConfig, PersonalAccessTokenCleanerConfig, PersonalAccessTokenConfig,
-    ServerConfig, StateMaintenanceConfig, TelemetryConfig, TelemetryLogsConfig,
-    TelemetryTracesConfig,
+    DataMaintenanceConfig, HeartbeatConfig, MessageSaverConfig, MessagesMaintenanceConfig,
+    PersonalAccessTokenCleanerConfig, PersonalAccessTokenConfig, ServerConfig,
+    StateMaintenanceConfig, TelemetryConfig, TelemetryLogsConfig, TelemetryTracesConfig,
 };
 use crate::configs::system::{
     BackupConfig, CompatibilityConfig, CompressionConfig, EncryptionConfig, LoggingConfig,
@@ -57,22 +56,6 @@ impl Default for ServerConfig {
             tcp: TcpConfig::default(),
             http: HttpConfig::default(),
             telemetry: TelemetryConfig::default(),
-        }
-    }
-}
-
-impl Default for ArchiverConfig {
-    fn default() -> ArchiverConfig {
-        ArchiverConfig {
-            enabled: false,
-            kind: SERVER_CONFIG
-                .data_maintenance
-                .archiver
-                .kind
-                .parse()
-                .unwrap(),
-            disk: None,
-            s3: None,
         }
     }
 }

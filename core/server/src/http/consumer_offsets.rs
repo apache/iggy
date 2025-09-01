@@ -67,7 +67,7 @@ async fn get_consumer_offset(
         .shard
         .get_consumer_offset(
             &session,
-            &consumer,
+            consumer,
             &query.0.stream_id,
             &query.0.topic_id,
             query.0.partition_id,

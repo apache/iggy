@@ -43,12 +43,12 @@ use tracing::{error, trace};
 pub struct IndexReader {
     file_path: String,
     file: File,
-    index_size_bytes: Arc<AtomicU64>,
+    index_size_bytes: AtomicU64,
 }
 
 impl IndexReader {
     /// Opens the index file in read-only mode.
-    pub async fn new(file_path: &str, index_size_bytes: Arc<AtomicU64>) -> Result<Self, IggyError> {
+    pub async fn new(file_path: &str, index_size_bytes: AtomicU64) -> Result<Self, IggyError> {
         let file = OpenOptions::new()
             .read(true)
             .open(file_path)

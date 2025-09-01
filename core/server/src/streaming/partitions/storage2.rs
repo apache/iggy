@@ -3,7 +3,14 @@ use crate::{
     configs::system::SystemConfig,
     io::fs_utils::remove_dir_all,
     shard_error, shard_info, shard_trace,
-    streaming::{partitions::consumer_offset::ConsumerOffset, segments::Segment2},
+    streaming::{
+        partitions::{
+            consumer_offset::ConsumerOffset,
+            journal::MemoryMessageJournal,
+            log::{Log, SegmentedLog},
+        },
+        segments::Segment2,
+    },
 };
 use compio::{
     fs::{self, OpenOptions, create_dir_all},
@@ -11,7 +18,7 @@ use compio::{
 };
 use error_set::ErrContext;
 use iggy_common::{ConsumerKind, IggyError};
-use std::{path::Path, sync::Arc};
+use std::{io::Read, ops::Deref, path::Path, sync::{atomic::AtomicU64, Arc}};
 use tracing::{error, trace};
 
 pub async fn create_partition_file_hierarchy(
@@ -106,25 +113,22 @@ pub async fn delete_partitions_from_disk(
     shard_id: u16,
     stream_id: usize,
     topic_id: usize,
-    segments: Vec<Segment2>,
+    partition_id: usize,
+    log: &mut SegmentedLog<MemoryMessageJournal>,
     config: &SystemConfig,
 ) -> Result<(), IggyError> {
-    for segment in segments.iter_mut() {
-        //TODO:
-        //segment.close().await;
-    }
+    //TODO:
+    //log.close().await;
 
-    for partition_id in segments.iter().map(|s| s.parent_id) {
-        let partition_path = config.get_partition_path(stream_id, topic_id, partition_id);
-        remove_dir_all(&partition_path).await?;
-        shard_info!(
-            shard_id,
-            "Deleted partition files for partition with ID: {} stream with ID: {} and topic with ID: {}.",
-            partition_id,
-            stream_id,
-            topic_id
-        );
-    }
+    let partition_path = config.get_partition_path(stream_id, topic_id, partition_id);
+    remove_dir_all(&partition_path).await.map_err(|_| IggyError::CannotDeletePartitionDirectory(stream_id as u32, topic_id as u32, partition_id as u32))?;
+    shard_info!(
+        shard_id,
+        "Deleted partition files for partition with ID: {} stream with ID: {} and topic with ID: {}.",
+        partition_id,
+        stream_id,
+        topic_id
+    );
     Ok(())
 }
 
@@ -142,13 +146,13 @@ pub async fn delete_persisted_offset(shard_id: u16, path: &str) -> Result<(), Ig
 }
 
 pub async fn persist_offset(shard_id: u16, path: &str, offset: u64) -> Result<(), IggyError> {
-    let file = OpenOptions::new()
+    let mut file = OpenOptions::new()
         .write(true)
         .create(true)
         .open(path)
-        .await?;
+        .await.map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?;
     let buf = offset.to_le_bytes();
-    file.write_all_at(buf, 0).await?;
+    file.write_all_at(buf, 0).await.0.map_err(|_| IggyError::CannotWriteToFile)?;
     shard_trace!(
         shard_id,
         "Stored consumer offset value: {}, path: {}",
@@ -203,12 +207,14 @@ pub fn load_consumer_offsets(
             })
             .map_err(|_| IggyError::CannotReadFile)?;
         let mut cursor = std::io::Cursor::new(file);
-        let offset = cursor
-            .read_u64_le()
+        let mut offset = [0; 8];
+        cursor
+            .get_mut().read_exact(&mut offset)
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to read consumer offset from file, path: {path}")
             })
             .map_err(|_| IggyError::CannotReadFile)?;
+        let offset = AtomicU64::new(u64::from_le_bytes(offset));
 
         consumer_offsets.push(ConsumerOffset {
             kind,

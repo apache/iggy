@@ -246,8 +246,14 @@ impl IggyShard {
                     )
                 })?;
         let mut topic = self.delete_topic_base2(stream_id, topic_id);
+        let parent = topic.stats().parent().clone();
         // We need to borrow topic as mutable, as we are extracting partitions out of it, in order to close them.
-        delete_topic_from_disk(self.id, numeric_stream_id, &mut topic, &self.config.system).await?;
+        let (messages_count, size_bytes, segments_count) =
+            delete_topic_from_disk(self.id, numeric_stream_id, &mut topic, &self.config.system)
+                .await?;
+        parent.decrement_messages_count(messages_count);
+        parent.decrement_size_bytes(size_bytes);
+        parent.decrement_segments_count(segments_count);
         self.metrics.decrement_topics(1);
         Ok(topic)
     }

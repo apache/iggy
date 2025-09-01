@@ -47,7 +47,7 @@ impl ServerCommandHandler for PurgeStream {
         let stream_id = self.stream_id.clone();
 
         shard
-            .purge_stream2(session, &self.stream_id)
+            .purge_stream2(session, &self.stream_id).await
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to purge stream2 with id: {stream_id}, session: {session}")
             })?;

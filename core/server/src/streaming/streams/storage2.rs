@@ -1,4 +1,4 @@
-use crate::slab::traits_ext::{DeleteCell, EntityComponentSystem, IntoComponents};
+use crate::slab::traits_ext::{DeleteCell, EntityComponentSystem, EntityMarker, IntoComponents};
 use crate::streaming::streams::stream2;
 use crate::streaming::topics::storage2::delete_topic_from_disk;
 use crate::{configs::system::SystemConfig, io::fs_utils::remove_dir_all, shard_info};
@@ -38,17 +38,18 @@ pub async fn delete_stream_from_disk(
     // Gather all topic ids.
     let ids = stream.root().topics().with_components(|topics| {
         let (roots, ..) = topics.into_components();
-        roots.iter().map(|(_, root)| root.id())
+        roots.iter().map(|(_, root)| root.id()).collect::<Vec<_>>()
     });
 
     // Delete all topics from the stream.
     for id in ids {
-        let topic = stream.root_mut().topics_mut().delete(id);
+        let mut topic = stream.root_mut().topics_mut().delete(id);
         delete_topic_from_disk(shard_id, stream_id, &mut topic, config).await?;
     }
 
-    // Then delete the stream directory itself
-    remove_dir_all(&stream_path).await?;
+    remove_dir_all(&stream_path)
+        .await
+        .map_err(|_| IggyError::CannotDeleteStreamDirectory(stream_id as u32))?;
     shard_info!(
         shard_id,
         "Deleted stream files for stream with ID: {}.",

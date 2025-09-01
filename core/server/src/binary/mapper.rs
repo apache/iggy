@@ -186,7 +186,7 @@ pub fn map_topic(root: &topic2::TopicRoot, stats: &TopicStats) -> Bytes {
     let mut bytes = BytesMut::new();
     extend_topic(root, stats, &mut bytes);
     root.partitions().with_components(|partitions| {
-        let (roots, stats, _, offsets, _, _) = partitions.into_components();
+        let (roots, stats, _, offsets, _, _, _) = partitions.into_components();
         for (root, stat, offset) in roots
             .iter()
             .map(|(_, val)| val)

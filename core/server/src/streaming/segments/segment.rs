@@ -18,7 +18,6 @@
 
 use super::indexes::*;
 use super::messages::*;
-use super::messages_accumulator::MessagesAccumulator;
 use crate::configs::system::SystemConfig;
 use crate::streaming::segments::*;
 use compio::fs::remove_file;
@@ -37,7 +36,7 @@ use tracing::{info, warn};
 const SIZE_16MB: usize = 16 * 1024 * 1024;
 
 #[derive(Debug)]
-pub struct Segment {;
+pub struct Segment {
     pub(super) stream_id: u32,
     pub(super) topic_id: u32,
     pub(super) partition_id: u32,
@@ -61,12 +60,12 @@ pub struct Segment {;
     pub(super) index_writer: Option<IndexWriter>,
     pub(super) index_reader: Option<IndexReader>,
     pub(super) message_expiry: IggyExpiry,
-    pub(super) accumulator: MessagesAccumulator,
     pub(super) config: Arc<SystemConfig>,
     pub(super) indexes: Option<IggyIndexesMut>,
     pub(super) messages_size: Arc<AtomicU64>,
     pub(super) indexes_size: Arc<AtomicU64>,
 }
+/*
 
 impl Segment {
     #[allow(clippy::too_many_arguments)]
@@ -111,7 +110,6 @@ impl Segment {
             max_size_bytes: config.segment.size,
             message_expiry,
             indexes: None,
-            accumulator: MessagesAccumulator::default(),
             is_closed: false,
             messages_writer: None,
             messages_reader: None,
@@ -307,32 +305,6 @@ impl Segment {
         }
         if let Some(index_reader) = self.index_reader.take() {
             drop(index_reader);
-        }
-    }
-
-    pub async fn shutdown_writing(&mut self) {
-        if let Some(log_writer) = self.messages_writer.take() {
-            //TODO: Fixme not sure whether we should spawn a task here.
-            compio::runtime::spawn(async move {
-                let _ = log_writer.fsync().await;
-            })
-            .detach();
-        } else {
-            warn!(
-                "Log writer already closed when calling close() for {}",
-                self
-            );
-        }
-
-        if let Some(index_writer) = self.index_writer.take() {
-            //TODO: Fixme not sure whether we should spawn a task here.
-            compio::runtime::spawn(async move {
-                let _ = index_writer.fsync().await;
-                drop(index_writer)
-            })
-            .detach();
-        } else {
-            warn!("Index writer already closed when calling close()");
         }
     }
 
@@ -553,3 +525,5 @@ mod tests {
         assert!(segment.indexes.is_none());
     }
 }
+
+*/

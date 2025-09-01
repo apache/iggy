@@ -31,12 +31,11 @@ use iggy_common::create_user::CreateUser;
 use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyError};
 use lending_iterator::lending_iterator::constructors::into_lending_iter;
-use server::archiver::{ArchiverKind, ArchiverKindType};
 use server::args::Args;
 use server::binary::handlers::streams;
 use server::bootstrap::{
     create_directories, create_root_user, create_shard_connections, create_shard_executor,
-    create_streams, create_users, load_config, load_streams, load_users, resolve_persister,
+    load_config, load_streams, load_users, resolve_persister,
     update_system_info,
 };
 use server::configs::config_provider::{self};
@@ -176,31 +175,6 @@ async fn main() -> Result<(), ServerError> {
         )),
         false => None,
     };
-    // NINTH DISCRETE LOADING STEP.
-    let archiver_config = &config.data_maintenance.archiver;
-    let archiver: Option<ArchiverKind> = if archiver_config.enabled {
-        info!("Archiving is enabled, kind: {}", archiver_config.kind);
-        match archiver_config.kind {
-            ArchiverKindType::Disk => Some(ArchiverKind::get_disk_archiver(
-                archiver_config
-                    .disk
-                    .clone()
-                    .expect("Disk archiver config is missing"),
-            )),
-            ArchiverKindType::S3 => Some(
-                ArchiverKind::get_s3_archiver(
-                    archiver_config
-                        .s3
-                        .clone()
-                        .expect("S3 archiver config is missing"),
-                )
-                .expect("Failed to create S3 archiver"),
-            ),
-        }
-    } else {
-        info!("Archiving is disabled.");
-        None
-    };
 
     // TENTH DISCRETE LOADING STEP.
     let state_persister = resolve_persister(config.system.state.enforce_fsync);
@@ -212,7 +186,7 @@ async fn main() -> Result<(), ServerError> {
     ));
     let state = SystemState::load(state).await?;
     let (streams_state, users_state) = state.decompose();
-    let streams = load_streams(streams_state.into_values(), &config.system);
+    let streams = load_streams(streams_state.into_values(), &config.system)?;
     let users = load_users(users_state.into_values());
 
     // ELEVENTH DISCRETE LOADING STEP.
@@ -237,12 +211,7 @@ async fn main() -> Result<(), ServerError> {
 
     // DISCRETE STEP.
     // Increment the metrics.
-    let shared_metrics = Metrics::init();
-    metrics.increment_streams(1);
-    metrics.increment_topics(stream.get_topics_count());
-    metrics.increment_partitions(stream.get_partitions_count());
-    metrics.increment_segments(stream.get_segments_count());
-    metrics.increment_messages(stream.get_messages_count());
+    let metrics = Metrics::init();
 
     // TWELFTH DISCRETE LOADING STEP.
     info!("Starting {} shard(s)", shards_set.len());
@@ -257,8 +226,7 @@ async fn main() -> Result<(), ServerError> {
         let connections = connections.clone();
         let config = config.clone();
         let encryptor = encryptor.clone();
-        let archiver = archiver.clone();
-        let shared_metrics = shared_metrics.clone();
+        let metrics = metrics.clone();
         let state_persister = resolve_persister(config.system.state.enforce_fsync);
         let state = StateKind::File(FileState::new(
             &config.system.get_state_messages_file_path(),
@@ -282,10 +250,9 @@ async fn main() -> Result<(), ServerError> {
                         .connections(connections)
                         .config(config)
                         .storage(storage)
-                        .archiver(archiver)
                         .encryptor(encryptor)
                         .version(current_version)
-                        .metrics(shared_metrics)
+                        .metrics(metrics)
                         .build();
                     let shard = Rc::new(shard);
 

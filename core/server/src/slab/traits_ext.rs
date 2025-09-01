@@ -23,16 +23,6 @@ pub trait InsertCell {
     fn insert(&self, item: Self::Item) -> Self::Idx;
 }
 
-// TODO:
-// Observe the `Delete` and `DeleteCwel` traits,
-// those support only removal of singular `Entity`.
-// We could add a `DeleteMany` method that would return `impl Iterator<Item = Self::Item>`
-//
-// How is that useful ?
-// We support bulk deletes only for partitions for now,
-// but since the partition and it's segments are disjointed (segments are not part of the `Partition` entity),
-// we can use the returned iterator to zip together with segements iterator and drain them together instead of individually, 5Head.
-
 /// Delete trait for deleting an `Entity` from container.
 pub trait Delete {
     type Idx;

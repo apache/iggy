@@ -1,9 +1,12 @@
 use crate::{
     slab::{
-        consumer_groups::ConsumerGroups, partitions::Partitions, topics::Topics,
+        consumer_groups::ConsumerGroups,
+        partitions::{self, ContainerId, Partitions},
+        topics::Topics,
         traits_ext::ComponentsById,
     },
     streaming::{
+        partitions::log::Log,
         streams::stream2::{StreamRef, StreamRefMut},
         topics::topic2::{TopicRef, TopicRefMut},
     },

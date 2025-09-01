@@ -37,8 +37,8 @@ impl PollingConsumer {
 
     pub fn resolve_consumer_id(identifier: &Identifier) -> usize {
         match identifier.kind {
-            IdKind::Numeric => identifier.get_u32_value().unwrap(),
-            IdKind::String => hash::calculate_32(&identifier.value),
+            IdKind::Numeric => identifier.get_u32_value().unwrap() as usize,
+            IdKind::String => hash::calculate_32(&identifier.value) as usize,
         }
     }
 }
@@ -75,7 +75,7 @@ mod tests {
 
         assert_eq!(
             polling_consumer,
-            PollingConsumer::Consumer(consumer_id_value, partition_id)
+            PollingConsumer::Consumer(consumer_id_value as usize, partition_id)
         );
     }
 

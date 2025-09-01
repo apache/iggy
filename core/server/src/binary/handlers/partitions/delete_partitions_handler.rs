@@ -49,7 +49,7 @@ impl ServerCommandHandler for DeletePartitions {
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
 
-        let partitions = shard
+        let deleted_partition_ids = shard
             .delete_partitions2(
                 session,
                 &self.stream_id,
@@ -57,7 +57,6 @@ impl ServerCommandHandler for DeletePartitions {
                 self.partitions_count,
             )
             .await?;
-        let deleted_partition_ids = partitions.iter().map(|p| p.id()).collect::<Vec<_>>();
         let event = ShardEvent::DeletedPartitions2 {
             stream_id: self.stream_id.clone(),
             topic_id: self.topic_id.clone(),

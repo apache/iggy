@@ -19,8 +19,8 @@
 use crate::http::COMPONENT;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
-use crate::http::mapper;
 use crate::http::shared::AppState;
+use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::streaming::session::Session;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -55,45 +55,32 @@ pub fn router(state: Arc<AppState>) -> Router {
 #[debug_handler]
 async fn get_stream(
     State(state): State<Arc<AppState>>,
-    Extension(identity): Extension<Identity>,
     Path(stream_id): Path<String>,
 ) -> Result<Json<StreamDetails>, CustomError> {
     let stream_id = Identifier::from_str_value(&stream_id)?;
-    let Ok(stream) = state.shard.shard().try_find_stream(
-        &Session::stateless(identity.user_id, identity.ip_address),
-        &stream_id,
-    ) else {
-        return Err(CustomError::ResourceNotFound);
-    };
-    let Some(stream) = stream else {
-        return Err(CustomError::ResourceNotFound);
-    };
+    
+    // Use direct slab access for thread-safe stream retrieval
+    let stream_details = SendWrapper::new(|| {
+        state.shard.shard().streams2.with_stream_by_id(&stream_id, |(root, stats)| {
+            crate::http::mapper::map_stream_details(&*root, &**stats)
+        })
+    })();
 
-    let stream = mapper::map_stream(&SendWrapper::new(stream));
-    Ok(Json(stream))
+    Ok(Json(stream_details))
 }
 
 #[debug_handler]
 async fn get_streams(
     State(state): State<Arc<AppState>>,
-    Extension(identity): Extension<Identity>,
 ) -> Result<Json<Vec<Stream>>, CustomError> {
-    let streams: Vec<std::cell::Ref<'_, crate::streaming::streams::stream::Stream>> = state
-        .shard
-        .shard()
-        .find_streams(&Session::stateless(identity.user_id, identity.ip_address))
-        .with_error_context(|error| {
-            format!(
-                "{COMPONENT} (error: {error}) - failed to find streams, user ID: {}",
-                identity.user_id
-            )
-        })?;
-    let stream_refs = {
-        let refs: Vec<&crate::streaming::streams::stream::Stream> =
-            streams.iter().map(|ref_guard| &**ref_guard).collect();
-        refs
-    };
-    let streams = mapper::map_streams(&stream_refs);
+    // Use direct slab access for thread-safe streams retrieval
+    let streams = SendWrapper::new(|| {
+        state.shard.shard().streams2.with_components(|stream_ref| {
+            let (roots, stats) = stream_ref.into_components();
+            crate::http::mapper::map_streams_from_slabs(&*roots, &*stats)
+        })
+    })();
+
     Ok(Json(streams))
 }
 
@@ -106,73 +93,59 @@ async fn create_stream(
 ) -> Result<Json<StreamDetails>, CustomError> {
     command.validate()?;
 
-    let session = Session::stateless(identity.user_id, identity.ip_address);
-    let create_stream_future = SendWrapper::new(state.shard.shard().create_stream(
-        &session,
-        command.stream_id,
-        &command.name,
-    ));
+    let result = SendWrapper::new(async move {
+        let session = Session::stateless(identity.user_id, identity.ip_address);
+        
+        // Create stream using wrapper method
+        let stream = state.shard.create_stream(
+            &session,
+            command.stream_id,
+            command.name.clone(),
+        ).await
+            .with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - failed to create stream, stream ID: {:?}",
+                    command.stream_id
+                )
+            })?;
 
-    let stream_identifier = create_stream_future.await.with_error_context(|error| {
-        format!(
-            "{COMPONENT} (error: {error}) - failed to create stream, stream ID: {:?}",
-            command.stream_id
-        )
-    })?;
+        let created_stream_id = stream.root().id();
 
-    let broadcast_future = SendWrapper::new(async {
-        use crate::shard::transmission::event::ShardEvent;
+        // Send event for stream creation - inlined from wrapper
+        {
+            use crate::shard::transmission::event::ShardEvent;
+            let event = ShardEvent::CreatedStream2 {
+                id: created_stream_id,
+                stream,
+            };
+            let _responses = state.shard.shard().broadcast_event_to_all_shards(event).await;
+        }
 
-        let shard = state.shard.shard();
-
-        let event = ShardEvent::CreatedStream {
-            stream_id: command.stream_id,
-            name: command.name.clone(),
-        };
-        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
-
-        Ok::<(), CustomError>(())
+        // Apply state change using wrapper method
+        let entry_command = EntryCommand::CreateStream(CreateStreamWithId {
+            stream_id: created_stream_id as u32,
+            command,
+        });
+        
+        state.shard.apply_state(identity.user_id, &entry_command).await
+            .with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - failed to apply create stream for id: {:?}",
+                    created_stream_id
+                )
+            })?;
+        
+        // Get the created stream details using direct slab access
+        let response = SendWrapper::new(|| {
+            state.shard.shard().streams2.with_components_by_id(created_stream_id, |(root, stats)| {
+                crate::http::mapper::map_stream_details(&*root, &**stats)
+            })
+        })();
+        
+        Ok::<Json<StreamDetails>, CustomError>(Json(response))
     });
-
-    broadcast_future.await
-        .with_error_context(|error| {
-            format!(
-                "{COMPONENT} (error: {error}) - failed to broadcast stream creation event, stream ID: {stream_identifier}"
-            )
-        })?;
-
-    let stream = state
-        .shard
-        .shard()
-        .find_stream(&Session::stateless(identity.user_id, identity.ip_address), &stream_identifier)
-        .with_error_context(|error| {
-            format!(
-                "{COMPONENT} (error: {error}) - failed to find created stream, stream ID: {stream_identifier}"
-            )
-        })?;
-
-    let response = Json(mapper::map_stream(&SendWrapper::new(stream)));
-
-    let entry_command = EntryCommand::CreateStream(CreateStreamWithId {
-        stream_id: command.stream_id.unwrap(), // TODO: handle unwrap
-        command,
-    });
-    let state_future = SendWrapper::new(
-        state
-            .shard
-            .shard()
-            .state
-            .apply(identity.user_id, &entry_command),
-    );
-
-    state_future
-        .await
-        .with_error_context(|error| {
-            format!(
-                "{COMPONENT} (error: {error}) - failed to apply create stream, stream ID: {stream_identifier}",
-            )
-        })?;
-    Ok(response)
+    
+    result.await
 }
 
 #[debug_handler]
@@ -186,32 +159,29 @@ async fn update_stream(
     command.stream_id = Identifier::from_str_value(&stream_id)?;
     command.validate()?;
 
-    let session = Session::stateless(identity.user_id, identity.ip_address);
-    let update_stream_future = SendWrapper::new(state.shard.shard().update_stream(
-        &session,
-        &command.stream_id,
-        &command.name,
-    ));
+    let result = SendWrapper::new(async move {
+        let session = Session::stateless(identity.user_id, identity.ip_address);
+        
+        // Update stream using wrapper method
+        state.shard.update_stream(
+            &session,
+            &command.stream_id,
+            command.name.clone(),
+        ).with_error_context(|error| {
+            format!("{COMPONENT} (error: {error}) - failed to update stream, stream ID: {stream_id}")
+        })?;
 
-    update_stream_future.await.with_error_context(|error| {
-        format!("{COMPONENT} (error: {error}) - failed to update stream, stream ID: {stream_id}")
-    })?;
-
-    let entry_command = EntryCommand::UpdateStream(command);
-    let state_future = SendWrapper::new(
-        state
-            .shard
-            .shard()
-            .state
-            .apply(identity.user_id, &entry_command),
-    );
-
-    state_future.await.with_error_context(|error| {
-        format!(
-            "{COMPONENT} (error: {error}) - failed to apply update stream, stream ID: {stream_id}"
-        )
-    })?;
-    Ok(StatusCode::NO_CONTENT)
+        // Apply state change using wrapper method
+        let entry_command = EntryCommand::UpdateStream(command);
+        state.shard.apply_state(identity.user_id, &entry_command).await.with_error_context(|error| {
+            format!(
+                "{COMPONENT} (error: {error}) - failed to apply update stream, stream ID: {stream_id}"
+            )
+        })?;
+        Ok::<StatusCode, CustomError>(StatusCode::NO_CONTENT)
+    });
+    
+    result.await
 }
 
 #[debug_handler]
@@ -222,37 +192,33 @@ async fn delete_stream(
     Path(stream_id): Path<String>,
 ) -> Result<StatusCode, CustomError> {
     let identifier_stream_id = Identifier::from_str_value(&stream_id)?;
+    
+    let result = SendWrapper::new(async move {
+        let session = Session::stateless(identity.user_id, identity.ip_address);
+        
+        // Delete stream using wrapper method
+        state.shard.delete_stream(&session, &identifier_stream_id).await
+            .with_error_context(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to delete stream with ID: {stream_id}",)
+            })?;
 
-    state
-        .shard
-        .shard()
-        .delete_stream(
-            &Session::stateless(identity.user_id, identity.ip_address),
-            &identifier_stream_id,
-        )
-        .with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to delete stream with ID: {stream_id}",)
-        })?;
-
-    let entry_command = EntryCommand::DeleteStream(DeleteStream {
-        stream_id: identifier_stream_id,
+        // Apply state change using wrapper method
+        let entry_command = EntryCommand::DeleteStream(DeleteStream {
+            stream_id: identifier_stream_id,
+        });
+        state.shard.apply_state(identity.user_id, &entry_command).await
+            .with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - failed to apply delete stream with ID: {stream_id}",
+                )
+            })?;
+        Ok::<StatusCode, CustomError>(StatusCode::NO_CONTENT)
     });
-    let state_future = SendWrapper::new(
-        state
-            .shard
-            .shard()
-            .state
-            .apply(identity.user_id, &entry_command),
-    );
-
-    state_future.await.with_error_context(|error| {
-        format!(
-            "{COMPONENT} (error: {error}) - failed to apply delete stream with ID: {stream_id}",
-        )
-    })?;
-    Ok(StatusCode::NO_CONTENT)
+    
+    result.await
 }
 
+#[debug_handler]
 #[instrument(skip_all, name = "trace_purge_stream", fields(iggy_user_id = identity.user_id, iggy_stream_id = stream_id))]
 async fn purge_stream(
     State(state): State<Arc<AppState>>,
@@ -260,33 +226,28 @@ async fn purge_stream(
     Path(stream_id): Path<String>,
 ) -> Result<StatusCode, CustomError> {
     let identifier_stream_id = Identifier::from_str_value(&stream_id)?;
-    let session = Session::stateless(identity.user_id, identity.ip_address);
-    let purge_stream_future = SendWrapper::new(
-        state
-            .shard
-            .shard()
-            .purge_stream(&session, &identifier_stream_id),
-    );
+    
+    let result = SendWrapper::new(async move {
+        let session = Session::stateless(identity.user_id, identity.ip_address);
+        
+        // Purge stream using wrapper method
+        state.shard.purge_stream(&session, &identifier_stream_id).await
+            .with_error_context(|error| {
+                format!("{COMPONENT} (error: {error}) - failed to purge stream, stream ID: {stream_id}")
+            })?;
 
-    purge_stream_future.await.with_error_context(|error| {
-        format!("{COMPONENT} (error: {error}) - failed to purge stream, stream ID: {stream_id}")
-    })?;
-
-    let entry_command = EntryCommand::PurgeStream(PurgeStream {
-        stream_id: identifier_stream_id,
+        // Apply state change using wrapper method
+        let entry_command = EntryCommand::PurgeStream(PurgeStream {
+            stream_id: identifier_stream_id,
+        });
+        state.shard.apply_state(identity.user_id, &entry_command).await
+            .with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - failed to apply purge stream, stream ID: {stream_id}"
+                )
+            })?;
+        Ok::<StatusCode, CustomError>(StatusCode::NO_CONTENT)
     });
-    let state_future = SendWrapper::new(
-        state
-            .shard
-            .shard()
-            .state
-            .apply(identity.user_id, &entry_command),
-    );
-
-    state_future.await.with_error_context(|error| {
-        format!(
-            "{COMPONENT} (error: {error}) - failed to apply purge stream, stream ID: {stream_id}"
-        )
-    })?;
-    Ok(StatusCode::NO_CONTENT)
+    
+    result.await
 }

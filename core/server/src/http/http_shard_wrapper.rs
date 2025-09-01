@@ -1,9 +1,8 @@
-use std::cell::Ref;
 use std::rc::Rc;
 
 use iggy_common::{
-    CompressionAlgorithm, Consumer, ConsumerOffsetInfo, Identifier, IggyError, IggyExpiry,
-    MaxTopicSize, Partitioning, Permissions, Stats, UserId, UserStatus,
+    Consumer, ConsumerOffsetInfo, Identifier, IggyError, IggyExpiry,
+    Partitioning, Permissions, Stats, UserId, UserStatus,
 };
 use send_wrapper::SendWrapper;
 
@@ -12,9 +11,6 @@ use crate::shard::system::messages::PollingArgs;
 use crate::state::command::EntryCommand;
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::segments::{IggyMessagesBatchMut, IggyMessagesBatchSet};
-use crate::streaming::streams::stream::Stream;
-use crate::streaming::topics::consumer_group::ConsumerGroup;
-use crate::streaming::topics::topic::Topic;
 use crate::streaming::users::user::User;
 use crate::{shard::IggyShard, streaming::session::Session};
 
@@ -52,7 +48,7 @@ impl HttpSafeShard {
     pub async fn get_consumer_offset(
         &self,
         session: &SendWrapper<Session>,
-        consumer: &Consumer,
+        consumer: Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
         partition_id: Option<u32>,
@@ -84,7 +80,8 @@ impl HttpSafeShard {
             partition_id,
             offset,
         ));
-        future.await
+        let _result = future.await?;
+        Ok(())
     }
 
     pub async fn delete_consumer_offset(
@@ -102,32 +99,27 @@ impl HttpSafeShard {
             topic_id,
             partition_id,
         ));
-        future.await
-    }
-
-    pub fn get_streams(&self) -> Vec<Ref<'_, Stream>> {
-        self.shard().get_streams()
-    }
-
-    pub fn get_stream(&self, stream_id: &Identifier) -> Result<Ref<'_, Stream>, IggyError> {
-        self.shard().get_stream(stream_id)
+        let _result = future.await?;
+        Ok(())
     }
 
     pub async fn delete_stream(
         &self,
         session: &Session,
         stream_id: &Identifier,
-    ) -> Result<Stream, IggyError> {
-        self.shard().delete_stream(session, stream_id)
+    ) -> Result<(), IggyError> {
+        let future = SendWrapper::new(self.shard().delete_stream2(session, stream_id));
+        future.await?;
+        Ok(())
     }
 
-    pub async fn update_stream(
+    pub fn update_stream(
         &self,
         session: &Session,
         stream_id: &Identifier,
-        name: &str,
+        name: String,
     ) -> Result<(), IggyError> {
-        self.shard().update_stream(session, stream_id, name).await
+        self.shard().update_stream2(session, stream_id, name)
     }
 
     pub async fn purge_stream(
@@ -135,99 +127,22 @@ impl HttpSafeShard {
         session: &Session,
         stream_id: &Identifier,
     ) -> Result<(), IggyError> {
-        self.shard().purge_stream(session, stream_id).await
+        let future = SendWrapper::new(self.shard().purge_stream2(session, stream_id));
+        future.await
     }
 
-    // pub fn get_topics(
-    //     &self,
-    //     session: &Session,
-    //     stream_id: &Identifier,
-    // ) -> Result<Vec<&Topic>, IggyError> {
-    //     self.shard().get_topics(session, stream_id)
-    // }
-
-    pub fn find_topic<'topic, 'stream>(
+    pub async fn create_stream(
         &self,
         session: &Session,
-        stream: &'stream Stream,
-        topic_id: &Identifier,
-    ) -> Result<&'topic Topic, IggyError>
-    where
-        'stream: 'topic,
-    {
-        self.shard().find_topic(session, stream, topic_id)
+        stream_id: Option<u32>,
+        name: String,
+    ) -> Result<crate::streaming::streams::stream2::Stream, IggyError> {
+        let future = SendWrapper::new(self.shard().create_stream2(session, stream_id, name));
+        future.await
     }
 
-    pub async fn create_topic(
-        &self,
-        session: &Session,
-        stream_id: &Identifier,
-        topic_id: Option<u32>,
-        name: &str,
-        partitions_count: u32,
-        message_expiry: IggyExpiry,
-        compression_algorithm: CompressionAlgorithm,
-        max_topic_size: MaxTopicSize,
-        replication_factor: Option<u8>,
-    ) -> Result<(Identifier, Vec<u32>), IggyError> {
-        self.shard()
-            .create_topic(
-                session,
-                stream_id,
-                topic_id,
-                name,
-                partitions_count,
-                message_expiry,
-                compression_algorithm,
-                max_topic_size,
-                replication_factor,
-            )
-            .await
-    }
-
-    pub async fn delete_topic(
-        &self,
-        session: &Session,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-    ) -> Result<Topic, IggyError> {
-        self.shard()
-            .delete_topic(session, stream_id, topic_id)
-            .await
-    }
-
-    pub async fn update_topic(
-        &self,
-        session: &Session,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        name: &str,
-        message_expiry: IggyExpiry,
-        compression_algorithm: CompressionAlgorithm,
-        max_topic_size: MaxTopicSize,
-        replication_factor: Option<u8>,
-    ) -> Result<(), IggyError> {
-        self.shard()
-            .update_topic(
-                session,
-                stream_id,
-                topic_id,
-                name,
-                message_expiry,
-                compression_algorithm,
-                max_topic_size,
-                replication_factor,
-            )
-            .await
-    }
-
-    pub async fn purge_topic(
-        &self,
-        session: &Session,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-    ) -> Result<(), IggyError> {
-        self.shard().purge_topic(session, stream_id, topic_id).await
+    pub async fn apply_state(&self, user_id: UserId, command: &EntryCommand) -> Result<(), IggyError> {
+        self.shard().state.apply(user_id, command).await
     }
 
     pub async fn get_users(&self, session: &Session) -> Result<Vec<User>, IggyError> {
@@ -355,59 +270,6 @@ impl HttpSafeShard {
         future.await
     }
 
-    pub fn get_consumer_group<'cg, 'stream>(
-        &self,
-        session: &Session,
-        stream: &'stream Stream,
-        topic_id: &Identifier,
-        group_id: &Identifier,
-    ) -> Result<Option<Ref<'cg, ConsumerGroup>>, IggyError>
-    where
-        'stream: 'cg,
-    {
-        self.shard()
-            .get_consumer_group(session, stream, topic_id, group_id)
-    }
-
-    pub fn get_consumer_groups(
-        &self,
-        session: &Session,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-    ) -> Result<Vec<ConsumerGroup>, IggyError> {
-        self.shard()
-            .get_consumer_groups(session, stream_id, topic_id)
-    }
-
-    pub fn create_consumer_group(
-        &self,
-        session: &Session,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        group_id: Option<u32>,
-        name: &str,
-    ) -> Result<Identifier, IggyError> {
-        self.shard()
-            .create_consumer_group(session, stream_id, topic_id, group_id, name)
-    }
-
-    pub async fn delete_consumer_group(
-        &self,
-        session: &Session,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        consumer_group_id: &Identifier,
-    ) -> Result<(), IggyError> {
-        // Wrap the entire operation in SendWrapper since it's async
-        let future = SendWrapper::new(self.shard().delete_consumer_group(
-            session,
-            stream_id,
-            topic_id,
-            consumer_group_id,
-        ));
-        future.await
-    }
-
     pub async fn append_messages(
         &self,
         user_id: u32,
@@ -424,41 +286,5 @@ impl HttpSafeShard {
             batch,
         ));
         future.await
-    }
-
-    pub async fn create_partitions(
-        &self,
-        session: &Session,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partitions_count: u32,
-    ) -> Result<Vec<u32>, IggyError> {
-        self.shard()
-            .create_partitions(session, stream_id, topic_id, partitions_count)
-            .await
-    }
-
-    pub async fn delete_partitions(
-        &self,
-        session: &Session,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partitions_count: u32,
-    ) -> Result<Vec<u32>, IggyError> {
-        let future = SendWrapper::new(self.shard().delete_partitions(
-            session,
-            stream_id,
-            topic_id,
-            partitions_count,
-        ));
-        future.await
-    }
-
-    pub fn try_find_stream(
-        &self,
-        session: &Session,
-        identifier: &Identifier,
-    ) -> Result<Option<Ref<'_, Stream>>, IggyError> {
-        self.shard().try_find_stream(session, identifier)
     }
 }

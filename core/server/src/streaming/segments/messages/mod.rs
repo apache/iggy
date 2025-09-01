@@ -28,7 +28,7 @@ pub use messages_writer::MessagesWriter;
 
 /// Vectored write a batches of messages to file
 async fn write_batch(
-    file: &mut File,
+    file: &File,
     position: u64,
     mut batches: IggyMessagesBatchSet,
 ) -> Result<usize, IggyError> {
@@ -37,7 +37,10 @@ async fn write_batch(
         .iter_mut()
         .map(|b| b.take_messages())
         .collect::<Vec<_>>();
-    let (result, _) = file.write_vectored_all_at(batches, position).await.into();
+    let (result, _) = (&*file)
+        .write_vectored_all_at(batches, position)
+        .await
+        .into();
     result.map_err(|_| IggyError::CannotWriteToFile)?;
     Ok(total_written)
 }

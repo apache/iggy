@@ -16,7 +16,6 @@
  * under the License.
  */
 
-use crate::archiver::ArchiverKindType;
 use crate::configs::COMPONENT;
 use crate::configs::config_provider::ConfigProviderKind;
 use crate::configs::http::HttpConfig;
@@ -50,17 +49,8 @@ pub struct ServerConfig {
 #[serde_as]
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct DataMaintenanceConfig {
-    pub archiver: ArchiverConfig,
     pub messages: MessagesMaintenanceConfig,
     pub state: StateMaintenanceConfig,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct ArchiverConfig {
-    pub enabled: bool,
-    pub kind: ArchiverKindType,
-    pub disk: Option<DiskArchiverConfig>,
-    pub s3: Option<S3ArchiverConfig>,
 }
 
 #[serde_as]

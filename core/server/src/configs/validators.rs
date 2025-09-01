@@ -19,12 +19,11 @@
 extern crate sysinfo;
 
 use super::server::{
-    ArchiverConfig, DataMaintenanceConfig, MessageSaverConfig, MessagesMaintenanceConfig,
-    StateMaintenanceConfig, TelemetryConfig,
+    DataMaintenanceConfig, MessageSaverConfig, MessagesMaintenanceConfig, StateMaintenanceConfig,
+    TelemetryConfig,
 };
 use super::sharding::{CpuAllocation, ShardingConfig};
 use super::system::{CompressionConfig, MemoryPoolConfig, PartitionConfig};
-use crate::archiver::ArchiverKindType;
 use crate::configs::COMPONENT;
 use crate::configs::server::{PersonalAccessTokenConfig, ServerConfig};
 use crate::configs::system::SegmentConfig;
@@ -210,9 +209,6 @@ impl Validatable<ConfigError> for MessageSaverConfig {
 
 impl Validatable<ConfigError> for DataMaintenanceConfig {
     fn validate(&self) -> Result<(), ConfigError> {
-        self.archiver.validate().with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to validate archiver config")
-        })?;
         self.messages.validate().with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to validate messages maintenance config")
         })?;
@@ -220,57 +216,6 @@ impl Validatable<ConfigError> for DataMaintenanceConfig {
             format!("{COMPONENT} (error: {error}) - failed to validate state maintenance config")
         })?;
         Ok(())
-    }
-}
-
-impl Validatable<ConfigError> for ArchiverConfig {
-    fn validate(&self) -> Result<(), ConfigError> {
-        if !self.enabled {
-            return Ok(());
-        }
-
-        match self.kind {
-            ArchiverKindType::Disk => {
-                if self.disk.is_none() {
-                    return Err(ConfigError::InvalidConfiguration);
-                }
-
-                let disk = self.disk.as_ref().unwrap();
-                if disk.path.is_empty() {
-                    return Err(ConfigError::InvalidConfiguration);
-                }
-                Ok(())
-            }
-            ArchiverKindType::S3 => {
-                if self.s3.is_none() {
-                    return Err(ConfigError::InvalidConfiguration);
-                }
-
-                let s3 = self.s3.as_ref().unwrap();
-                if s3.key_id.is_empty() {
-                    return Err(ConfigError::InvalidConfiguration);
-                }
-
-                if s3.key_secret.is_empty() {
-                    return Err(ConfigError::InvalidConfiguration);
-                }
-
-                if s3.endpoint.is_none() && s3.region.is_none() {
-                    return Err(ConfigError::InvalidConfiguration);
-                }
-
-                if s3.endpoint.as_deref().unwrap_or_default().is_empty()
-                    && s3.region.as_deref().unwrap_or_default().is_empty()
-                {
-                    return Err(ConfigError::InvalidConfiguration);
-                }
-
-                if s3.bucket.is_empty() {
-                    return Err(ConfigError::InvalidConfiguration);
-                }
-                Ok(())
-            }
-        }
     }
 }
 

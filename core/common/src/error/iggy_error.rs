@@ -290,6 +290,8 @@ pub enum IggyError {
     ConsumerOffsetNotFound(usize) = 3021,
     #[error("Failed to resolve consumer with ID: {0}")]
     NotResolvedConsumer(Identifier) = 3022,
+    #[error("Cannot open consumer offsets file for path: {0}")]
+    CannotOpenConsumerOffsetsFile(String) = 3023,
     #[error("Segment not found")]
     SegmentNotFound = 4000,
     #[error("Segment with start offset: {0} and partition with ID: {1} is closed")]
@@ -465,7 +467,7 @@ pub enum IggyError {
     CannotReadIndexTimestamp = 10012,
 
     #[error("Shard not found for stream ID: {0}, topic ID: {1}, partition ID: {2}")]
-    ShardNotFound(u32, u32, u32) = 11000,
+    ShardNotFound(usize, usize, usize) = 11000,
     #[error("Shard communication error, shard ID: {0}")]
     ShardCommunicationError(u16) = 11001,
 

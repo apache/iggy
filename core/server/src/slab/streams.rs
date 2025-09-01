@@ -12,7 +12,11 @@ use crate::{
         },
     },
     streaming::{
-        partitions::partition2::{PartitionRef, PartitionRefMut},
+        partitions::{
+            journal::MemoryMessageJournal,
+            log::{Log, SegmentedLog},
+            partition2::{PartitionRef, PartitionRefMut},
+        },
         stats::stats::StreamStats,
         streams::stream2::{self, StreamRef, StreamRefMut},
         topics::{
@@ -126,6 +130,10 @@ impl EntityComponentSystemMutCell for Streams {
     }
 }
 
+// A mental note:
+// I think we can't expose as an access interface methods such as `get_topic_by_id` or `get_partition_by_id` etc..
+// In a case of a `Stream` module replacement (with a new implementation), the new implementation might not have a notion of `Topic` or `Partition` at all.
+// So we should only expose some generic `get_entity_by_id` methods and rely on it's components accessors to get to the nested entities.
 impl Streams {
     pub fn exists(&self, id: &Identifier) -> bool {
         match id.kind {

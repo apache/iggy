@@ -22,13 +22,13 @@ use std::hash::Hasher as _;
 //TODO: Will probably want to move it to separate crate so we can share it with sdk.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct IggyNamespace {
-    pub(crate) stream_id: u32,
-    pub(crate) topic_id: u32,
-    pub(crate) partition_id: u32,
+    pub(crate) stream_id: usize,
+    pub(crate) topic_id: usize,
+    pub(crate) partition_id: usize,
 }
 
 impl IggyNamespace {
-    pub fn new(stream_id: u32, topic_id: u32, partition_id: u32) -> Self {
+    pub fn new(stream_id: usize, topic_id: usize, partition_id: usize) -> Self {
         Self {
             stream_id,
             topic_id,
@@ -38,9 +38,9 @@ impl IggyNamespace {
 
     pub fn generate_hash(&self) -> u32 {
         let mut hasher = Murmur3Hasher::default();
-        hasher.write_u32(self.stream_id);
-        hasher.write_u32(self.topic_id);
-        hasher.write_u32(self.partition_id);
+        hasher.write_usize(self.stream_id);
+        hasher.write_usize(self.topic_id);
+        hasher.write_usize(self.partition_id);
         hasher.finish32()
     }
 }

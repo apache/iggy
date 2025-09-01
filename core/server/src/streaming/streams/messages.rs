@@ -34,6 +34,7 @@ use crate::{
 };
 use std::sync::atomic::Ordering;
 
+/*
 impl Stream {
     pub fn get_messages_count(&self) -> u64 {
         self.messages_count.load(Ordering::SeqCst)
@@ -109,3 +110,5 @@ impl Stream {
         Ok((metadata, batch))
     }
 }
+
+*/

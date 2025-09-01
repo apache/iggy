@@ -1,0 +1,101 @@
+use crate::{
+    shard_trace,
+    streaming::segments::{IggyMessagesBatchMut, IggyMessagesBatchSet},
+};
+use iggy_common::IggyError;
+use std::fmt::Debug;
+
+// TODO: Will have to revisit this Journal abstraction....
+// I don't like that it has to leak impl detail via the `Inner` struct in order to be functional.
+
+#[derive(Default, Debug)]
+pub struct Inner {
+    pub base_offset: u64,
+    pub current_offset: u64,
+    pub messages_count: u32,
+    pub size: u32,
+}
+
+#[derive(Default, Debug)]
+pub struct MemoryMessageJournal {
+    batches: IggyMessagesBatchSet,
+    inner: Inner,
+}
+
+impl Clone for MemoryMessageJournal {
+    fn clone(&self) -> Self {
+        Self {
+            batches: Default::default(),
+            inner: Default::default(),
+        }
+    }
+}
+
+impl Journal for MemoryMessageJournal {
+    type Container = IggyMessagesBatchSet;
+    type Entry = IggyMessagesBatchMut;
+    type Inner = Inner;
+    type AppendResult = Result<(u32, u32), IggyError>;
+
+    fn append(&mut self, shard_id: u16, entry: Self::Entry) -> Self::AppendResult {
+        let batch_messages_count = entry.count();
+        shard_trace!(
+            shard_id,
+            "Coalescing batch with base_offset: {}, current_offset: {}, self.messages_count: {}, batch.count: {}",
+            self.inner.base_offset,
+            self.inner.current_offset,
+            self.inner.messages_count,
+            batch_messages_count
+        );
+
+        let batch_size = entry.size();
+        self.batches.add_batch(entry);
+
+        self.inner.messages_count += batch_messages_count;
+        self.inner.current_offset = self.inner.base_offset + self.inner.messages_count as u64 - 1;
+        self.inner.size += batch_size;
+
+        Ok((self.inner.messages_count, self.inner.size))
+    }
+
+    async fn flush(&self) -> Result<(), IggyError> {
+        Ok(())
+    }
+
+    fn init(&mut self, inner: Self::Inner) {
+        self.inner = inner
+    }
+
+    fn get<U>(&self, filter: impl FnOnce(&Self::Container) -> U) -> U {
+        filter(&self.batches)
+    }
+
+    fn commit(&mut self) -> Self::Container {
+        self.inner.base_offset = self.inner.current_offset;
+        self.inner.size = 0;
+        self.inner.messages_count = 0;
+        std::mem::take(&mut self.batches)
+    }
+}
+
+pub trait Journal {
+    type Container;
+    type Entry;
+    type Inner;
+    type AppendResult;
+
+    fn init(&mut self, inner: Self::Inner);
+
+    // Temporarely include the `shard_id` parameter, until we make it into a struct that is stored in TLS.
+    fn append(&mut self, shard_id: u16, entry: Self::Entry) -> Self::AppendResult;
+
+    fn get<U>(&self, filter: impl FnOnce(&Self::Container) -> U) -> U;
+
+    fn commit(&mut self) -> Self::Container;
+
+    // `flush` is only useful in case of an journal that has disk backed WAL.
+    // This could be merged together with `append`, but not doing this for two reasons.
+    // 1. In case of the `Journal` being used as part of structure that utilizes interior mutability, async with borrow_mut is not possible.
+    // 2. Having it as separate function allows for more optimal usage patterns, e.g. batching multiple appends before flushing.
+    async fn flush(&self) -> Result<(), IggyError>;
+}

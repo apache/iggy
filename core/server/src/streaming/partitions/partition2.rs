@@ -1,12 +1,11 @@
 use crate::{
-    configs::system::SystemConfig,
     slab::{
-        partitions::{self, Partitions},
+        partitions,
         traits_ext::{EntityMarker, IntoComponents, IntoComponentsById},
     },
     streaming::{
-        deduplication::message_deduplicator::{self, MessageDeduplicator},
-        partitions::consumer_offset,
+        deduplication::message_deduplicator::MessageDeduplicator,
+        partitions::{consumer_offset, journal::MemoryMessageJournal, log::SegmentedLog},
         stats::stats::PartitionStats,
     },
 };
@@ -14,16 +13,79 @@ use iggy_common::IggyTimestamp;
 use slab::Slab;
 use std::sync::{Arc, atomic::AtomicU64};
 
-// TODO: Let's create type aliases for the fields that have maps for consumer/consumer_group offsets,
-// it's really difficult to distinguish between them when using the returned tuple from `into_components`.
+#[derive(Debug, Clone)]
+pub struct ConsumerOffsets(papaya::HashMap<usize, consumer_offset::ConsumerOffset>);
+
+impl ConsumerOffsets {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self(papaya::HashMap::with_capacity(capacity))
+    }
+}
+
+impl<I> From<I> for ConsumerOffsets
+where
+    I: IntoIterator<Item = (usize, consumer_offset::ConsumerOffset)>,
+{
+    fn from(iter: I) -> Self {
+        Self(papaya::HashMap::from_iter(iter))
+    }
+}
+
+impl std::ops::Deref for ConsumerOffsets {
+    type Target = papaya::HashMap<usize, consumer_offset::ConsumerOffset>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ConsumerOffsets {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ConsumerGroupOffsets(papaya::HashMap<usize, consumer_offset::ConsumerOffset>);
+
+impl ConsumerGroupOffsets {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self(papaya::HashMap::with_capacity(capacity))
+    }
+}
+
+impl<I> From<I> for ConsumerGroupOffsets
+where
+    I: IntoIterator<Item = (usize, consumer_offset::ConsumerOffset)>,
+{
+    fn from(iter: I) -> Self {
+        Self(papaya::HashMap::from_iter(iter))
+    }
+}
+
+impl std::ops::Deref for ConsumerGroupOffsets {
+    type Target = papaya::HashMap<usize, consumer_offset::ConsumerOffset>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ConsumerGroupOffsets {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 #[derive(Debug)]
 pub struct Partition {
     root: PartitionRoot,
     stats: Arc<PartitionStats>,
     message_deduplicator: Option<MessageDeduplicator>,
     offset: Arc<AtomicU64>,
-    consumer_offset: Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>,
-    consumer_group_offset: Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>,
+    consumer_offset: Arc<ConsumerOffsets>,
+    consumer_group_offset: Arc<ConsumerGroupOffsets>,
+    log: SegmentedLog<MemoryMessageJournal>,
 }
 
 impl Partition {
@@ -33,8 +95,9 @@ impl Partition {
         stats: Arc<PartitionStats>,
         message_deduplicator: Option<MessageDeduplicator>,
         offset: Arc<AtomicU64>,
-        consumer_offset: Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>,
-        consumer_group_offset: Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>,
+        consumer_offset: Arc<ConsumerOffsets>,
+        consumer_group_offset: Arc<ConsumerGroupOffsets>,
+        log: SegmentedLog<MemoryMessageJournal>,
     ) -> Self {
         let root = PartitionRoot::new(created_at, should_increment_offset);
         Self {
@@ -44,6 +107,7 @@ impl Partition {
             offset,
             consumer_offset,
             consumer_group_offset,
+            log,
         }
     }
 
@@ -61,6 +125,7 @@ impl Clone for Partition {
             offset: Arc::clone(&self.offset),
             consumer_offset: Arc::clone(&self.consumer_offset),
             consumer_group_offset: Arc::clone(&self.consumer_group_offset),
+            log: self.log.clone(),
         }
     }
 }
@@ -83,8 +148,9 @@ impl IntoComponents for Partition {
         Arc<PartitionStats>,
         Option<MessageDeduplicator>,
         Arc<AtomicU64>,
-        Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>,
-        Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>,
+        Arc<ConsumerOffsets>,
+        Arc<ConsumerGroupOffsets>,
+        SegmentedLog<MemoryMessageJournal>,
     );
 
     fn into_components(self) -> Self::Components {
@@ -95,6 +161,7 @@ impl IntoComponents for Partition {
             self.offset,
             self.consumer_offset,
             self.consumer_group_offset,
+            self.log,
         )
     }
 }
@@ -126,6 +193,14 @@ impl PartitionRoot {
     pub fn created_at(&self) -> IggyTimestamp {
         self.created_at
     }
+
+    pub fn should_increment_offset(&self) -> bool {
+        self.should_increment_offset
+    }
+
+    pub fn set_should_increment_offset(&mut self, value: bool) {
+        self.should_increment_offset = value;
+    }
 }
 
 // TODO: Create a macro to impl those PartitionRef/PartitionRefMut structs and it's traits.
@@ -134,8 +209,9 @@ pub struct PartitionRef<'a> {
     stats: &'a Slab<Arc<PartitionStats>>,
     message_deduplicator: &'a Slab<Option<MessageDeduplicator>>,
     offset: &'a Slab<Arc<AtomicU64>>,
-    consumer_offset: &'a Slab<Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>>,
-    consumer_group_offset: &'a Slab<Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>>,
+    consumer_offset: &'a Slab<Arc<ConsumerOffsets>>,
+    consumer_group_offset: &'a Slab<Arc<ConsumerGroupOffsets>>,
+    log: &'a Slab<SegmentedLog<MemoryMessageJournal>>,
 }
 
 impl<'a> PartitionRef<'a> {
@@ -144,10 +220,9 @@ impl<'a> PartitionRef<'a> {
         stats: &'a Slab<Arc<PartitionStats>>,
         message_deduplicator: &'a Slab<Option<MessageDeduplicator>>,
         offset: &'a Slab<Arc<AtomicU64>>,
-        consumer_offset: &'a Slab<Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>>,
-        consumer_group_offset: &'a Slab<
-            Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>,
-        >,
+        consumer_offset: &'a Slab<Arc<ConsumerOffsets>>,
+        consumer_group_offset: &'a Slab<Arc<ConsumerGroupOffsets>>,
+        log: &'a Slab<SegmentedLog<MemoryMessageJournal>>,
     ) -> Self {
         Self {
             root,
@@ -156,6 +231,7 @@ impl<'a> PartitionRef<'a> {
             offset,
             consumer_offset,
             consumer_group_offset,
+            log,
         }
     }
 }
@@ -166,8 +242,9 @@ impl<'a> IntoComponents for PartitionRef<'a> {
         &'a Slab<Arc<PartitionStats>>,
         &'a Slab<Option<MessageDeduplicator>>,
         &'a Slab<Arc<AtomicU64>>,
-        &'a Slab<Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>>,
-        &'a Slab<Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>>,
+        &'a Slab<Arc<ConsumerOffsets>>,
+        &'a Slab<Arc<ConsumerGroupOffsets>>,
+        &'a Slab<SegmentedLog<MemoryMessageJournal>>,
     );
 
     fn into_components(self) -> Self::Components {
@@ -178,6 +255,7 @@ impl<'a> IntoComponents for PartitionRef<'a> {
             self.offset,
             self.consumer_offset,
             self.consumer_group_offset,
+            self.log,
         )
     }
 }
@@ -189,8 +267,9 @@ impl<'a> IntoComponentsById for PartitionRef<'a> {
         &'a Arc<PartitionStats>,
         &'a Option<MessageDeduplicator>,
         &'a Arc<AtomicU64>,
-        &'a Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>,
-        &'a Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>,
+        &'a Arc<ConsumerOffsets>,
+        &'a Arc<ConsumerGroupOffsets>,
+        &'a SegmentedLog<MemoryMessageJournal>,
     );
 
     fn into_components_by_id(self, index: Self::Idx) -> Self::Output {
@@ -201,6 +280,7 @@ impl<'a> IntoComponentsById for PartitionRef<'a> {
             &self.offset[index],
             &self.consumer_offset[index],
             &self.consumer_group_offset[index],
+            &self.log[index],
         )
     }
 }
@@ -210,9 +290,9 @@ pub struct PartitionRefMut<'a> {
     stats: &'a mut Slab<Arc<PartitionStats>>,
     message_deduplicator: &'a mut Slab<Option<MessageDeduplicator>>,
     offset: &'a mut Slab<Arc<AtomicU64>>,
-    consumer_offset: &'a mut Slab<Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>>,
-    consumer_group_offset:
-        &'a mut Slab<Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>>,
+    consumer_offset: &'a mut Slab<Arc<ConsumerOffsets>>,
+    consumer_group_offset: &'a mut Slab<Arc<ConsumerGroupOffsets>>,
+    log: &'a mut Slab<SegmentedLog<MemoryMessageJournal>>,
 }
 
 impl<'a> PartitionRefMut<'a> {
@@ -221,10 +301,9 @@ impl<'a> PartitionRefMut<'a> {
         stats: &'a mut Slab<Arc<PartitionStats>>,
         message_deduplicator: &'a mut Slab<Option<MessageDeduplicator>>,
         offset: &'a mut Slab<Arc<AtomicU64>>,
-        consumer_offset: &'a mut Slab<Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>>,
-        consumer_group_offset: &'a mut Slab<
-            Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>,
-        >,
+        consumer_offset: &'a mut Slab<Arc<ConsumerOffsets>>,
+        consumer_group_offset: &'a mut Slab<Arc<ConsumerGroupOffsets>>,
+        log: &'a mut Slab<SegmentedLog<MemoryMessageJournal>>,
     ) -> Self {
         Self {
             root,
@@ -233,6 +312,7 @@ impl<'a> PartitionRefMut<'a> {
             offset,
             consumer_offset,
             consumer_group_offset,
+            log,
         }
     }
 }
@@ -243,8 +323,9 @@ impl<'a> IntoComponents for PartitionRefMut<'a> {
         &'a mut Slab<Arc<PartitionStats>>,
         &'a mut Slab<Option<MessageDeduplicator>>,
         &'a mut Slab<Arc<AtomicU64>>,
-        &'a mut Slab<Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>>,
-        &'a mut Slab<Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>>,
+        &'a mut Slab<Arc<ConsumerOffsets>>,
+        &'a mut Slab<Arc<ConsumerGroupOffsets>>,
+        &'a mut Slab<SegmentedLog<MemoryMessageJournal>>,
     );
 
     fn into_components(self) -> Self::Components {
@@ -255,6 +336,7 @@ impl<'a> IntoComponents for PartitionRefMut<'a> {
             self.offset,
             self.consumer_offset,
             self.consumer_group_offset,
+            self.log,
         )
     }
 }
@@ -266,8 +348,9 @@ impl<'a> IntoComponentsById for PartitionRefMut<'a> {
         &'a mut Arc<PartitionStats>,
         &'a mut Option<MessageDeduplicator>,
         &'a mut Arc<AtomicU64>,
-        &'a mut Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>,
-        &'a mut Arc<papaya::HashMap<usize, consumer_offset::ConsumerOffset>>,
+        &'a mut Arc<ConsumerOffsets>,
+        &'a mut Arc<ConsumerGroupOffsets>,
+        &'a mut SegmentedLog<MemoryMessageJournal>,
     );
 
     fn into_components_by_id(self, index: Self::Idx) -> Self::Output {
@@ -278,6 +361,7 @@ impl<'a> IntoComponentsById for PartitionRefMut<'a> {
             &mut self.offset[index],
             &mut self.consumer_offset[index],
             &mut self.consumer_group_offset[index],
+            &mut self.log[index],
         )
     }
 }

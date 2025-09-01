@@ -10,12 +10,15 @@ use crate::{
         helpers,
         partitions::Partitions,
         traits_ext::{
-            Components, ComponentsById, Delete, DeleteCell, EntityComponentSystem,
-            EntityComponentSystemMutCell, Insert, InsertCell, InteriorMutability, IntoComponents,
+            ComponentsById, DeleteCell, EntityComponentSystem, EntityComponentSystemMutCell,
+            Insert, InsertCell, InteriorMutability, IntoComponents,
         },
     },
     streaming::{
-        partitions::partition2::{self, PartitionRef},
+        partitions::{
+            journal::MemoryMessageJournal,
+            log::{Log, SegmentedLog},
+        },
         stats::stats::TopicStats,
         topics::{
             consumer_group2::{ConsumerGroupRef, ConsumerGroupRefMut},
@@ -31,6 +34,7 @@ pub type ContainerId = usize;
 pub struct Topics {
     index: RefCell<AHashMap<<topic2::TopicRoot as Keyed>::Key, ContainerId>>,
     root: RefCell<Slab<topic2::TopicRoot>>,
+    auxilaries: RefCell<Slab<topic2::TopicAuxilary>>,
     stats: RefCell<Slab<Arc<TopicStats>>>,
 }
 
@@ -39,8 +43,9 @@ impl InsertCell for Topics {
     type Item = topic2::Topic;
 
     fn insert(&self, item: Self::Item) -> Self::Idx {
-        let (root, stats) = item.into_components();
+        let (root, auxilary, stats) = item.into_components();
         let mut root_container = self.root.borrow_mut();
+        let mut auxilaries = self.auxilaries.borrow_mut();
         let mut indexes = self.index.borrow_mut();
         let mut stats_container = self.stats.borrow_mut();
 
@@ -49,7 +54,12 @@ impl InsertCell for Topics {
         let id = stats_container.insert(stats);
         assert_eq!(
             entity_id, id,
-            "topic_insert: id mismatch when inserting stats"
+            "topic_insert: id mismatch when inserting stats component"
+        );
+        let id = auxilaries.insert(auxilary);
+        assert_eq!(
+            entity_id, id,
+            "topic_insert: id mismatch when inserting auxilary component"
         );
         let root = root_container.get_mut(entity_id).unwrap();
         root.update_id(entity_id);
@@ -72,16 +82,18 @@ impl DeleteCell for Topics {
 impl<'a> From<&'a Topics> for topic2::TopicRef<'a> {
     fn from(value: &'a Topics) -> Self {
         let root = value.root.borrow();
+        let auxilary = value.auxilaries.borrow();
         let stats = value.stats.borrow();
-        topic2::TopicRef::new(root, stats)
+        topic2::TopicRef::new(root, auxilary, stats)
     }
 }
 
 impl<'a> From<&'a Topics> for topic2::TopicRefMut<'a> {
     fn from(value: &'a Topics) -> Self {
         let root = value.root.borrow_mut();
+        let auxilary = value.auxilaries.borrow_mut();
         let stats = value.stats.borrow_mut();
-        topic2::TopicRefMut::new(root, stats)
+        topic2::TopicRefMut::new(root, auxilary, stats)
     }
 }
 
@@ -90,6 +102,7 @@ impl Default for Topics {
         Self {
             index: RefCell::new(AHashMap::with_capacity(CAPACITY)),
             root: RefCell::new(Slab::with_capacity(CAPACITY)),
+            auxilaries: RefCell::new(Slab::with_capacity(CAPACITY)),
             stats: RefCell::new(Slab::with_capacity(CAPACITY)),
         }
     }

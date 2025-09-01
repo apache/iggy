@@ -38,15 +38,12 @@ use tracing::{error, trace};
 pub struct MessagesReader {
     file_path: String,
     file: File,
-    messages_size_bytes: Arc<AtomicU64>,
+    messages_size_bytes: AtomicU64,
 }
 
 impl MessagesReader {
     /// Opens the messages file in read mode.
-    pub async fn new(
-        file_path: &str,
-        messages_size_bytes: Arc<AtomicU64>,
-    ) -> Result<Self, IggyError> {
+    pub async fn new(file_path: &str, messages_size_bytes: AtomicU64) -> Result<Self, IggyError> {
         let file = OpenOptions::new()
             .read(true)
             .open(file_path)
@@ -72,9 +69,10 @@ impl MessagesReader {
             });
         }
 
+        let size_bytes = messages_size_bytes.load(Ordering::Relaxed);
         trace!(
             "Opened messages file for reading: {file_path}, size: {}",
-            messages_size_bytes.load(Ordering::Acquire)
+            size_bytes
         );
 
         Ok(Self {

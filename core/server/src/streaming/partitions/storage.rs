@@ -46,6 +46,7 @@ impl FilePartitionStorage {
         Self { persister }
     }
 }
+/*
 
 impl PartitionStorage for FilePartitionStorage {
     async fn load(
@@ -261,3 +262,5 @@ impl PartitionStorage for FilePartitionStorage {
         Ok(())
     }
 }
+
+*/

@@ -83,7 +83,7 @@ impl MessageDeduplicator {
 
     /// Inserts the given ID.
     pub async fn insert(&self, id: u128) {
-        self.cache.insert(id, true).await;
+        self.cache.insert(id, true).await
     }
 
     /// Tries to insert the given ID, returns false if it already exists.

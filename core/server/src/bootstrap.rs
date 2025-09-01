@@ -13,14 +13,17 @@ use crate::{
     slab::{
         streams::Streams,
         traits_ext::{
-            EntityComponentSystem, EntityComponentSystemMutCell, InsertCell, IntoComponents,
+            EntityComponentSystem, EntityComponentSystemMutCell, Insert, InsertCell, IntoComponents,
         },
     },
     state::system::{StreamState, TopicState, UserState},
     streaming::{
         deduplication::message_deduplicator,
         partitions::{
-            helpers::create_message_deduplicator, partition2, storage2::load_consumer_offsets,
+            consumer_offset::{self, ConsumerOffset},
+            helpers::create_message_deduplicator,
+            partition2::{self, ConsumerGroupOffsets, ConsumerOffsets},
+            storage2::load_consumer_offsets,
         },
         persistence::persister::{FilePersister, FileWithSyncPersister, PersisterKind},
         personal_access_tokens::personal_access_token::PersonalAccessToken,
@@ -57,9 +60,12 @@ pub fn load_streams(
         topics,
     } in state
     {
-        info!("Loading stream with ID: {}, name: {} from state...", id, name);
+        info!(
+            "Loading stream with ID: {}, name: {} from state...",
+            id, name
+        );
         let stream_id = id;
-        let stats = Arc::new(Default::default());
+        let stats = Arc::new(StreamStats::default());
         let stream = stream2::Stream::new(name.clone(), stats.clone(), created_at);
         let new_id = streams.insert(stream);
         assert_eq!(
@@ -67,7 +73,10 @@ pub fn load_streams(
             "load_streams: id mismatch when inserting stream, mismatch for stream with ID: {}, name: {}",
             stream_id, name
         );
-        info!("Loaded stream with ID: {}, name: {} from state...", id, name);
+        info!(
+            "Loaded stream with ID: {}, name: {} from state...",
+            id, name
+        );
 
         let topics = topics.into_values();
         for TopicState {
@@ -82,16 +91,19 @@ pub fn load_streams(
             partitions,
         } in topics
         {
-            info!("Loading topic with ID: {}, name: {} from state...", id, name);
+            info!(
+                "Loading topic with ID: {}, name: {} from state...",
+                id, name
+            );
             let topic_id = id;
             let parent_stats = stats.clone();
             let stats = Arc::new(TopicStats::new(parent_stats));
-            let topic_id = streams.with_components_by_id(stream_id, move |(root, ..)| {
+            let topic_id = streams.with_components_by_id_mut(stream_id as usize, |(mut root, ..)| {
                 let topic = topic2::Topic::new(
                     name.clone(),
                     stats.clone(),
                     created_at,
-                    replication_factor,
+                    replication_factor.unwrap_or(1),
                     message_expiry,
                     compression_algorithm,
                     max_topic_size,
@@ -100,7 +112,7 @@ pub fn load_streams(
                 assert_eq!(
                     new_id, topic_id as usize,
                     "load_streams: topic id mismatch when inserting topic, mismatch for topic with ID: {}, name: {}",
-                    topic_id, name
+                    topic_id, &name
                 );
                 new_id
             });
@@ -110,11 +122,15 @@ pub fn load_streams(
             let cgs = consumer_groups.into_values();
             let partitions = partitions.into_values();
             for partition_state in partitions {
-                info!("Loading partition with ID: {}, for topic with ID: {} from state...", partition_state.id, topic_id);
-                streams.with_components_by_id(stream_id, move |(root, ..)| {
+                info!(
+                    "Loading partition with ID: {}, for topic with ID: {} from state...",
+                    partition_state.id, topic_id
+                );
+                streams.with_components_by_id(stream_id as usize, |(root, ..)| {
+                    let parent_stats = parent_stats.clone();
                     root.topics()
-                        .with_components_by_id_mut(topic_id, move |(root, ..)| {
-                            let stats = PartitionStats::new(parent_stats);
+                        .with_components_by_id_mut(topic_id, |(root, ..)| {
+                            let stats = Arc::new(PartitionStats::new(parent_stats));
                             // TODO: This has to be sampled from segments, if there exists more than 0 segements and the segment has more than 0 messages, then we set it to true.
                             let should_increment_offset = todo!();
                             // TODO: This has to be sampled from segments and it's indexes, offset = segment.start_offset + last_index.offset;
@@ -122,16 +138,17 @@ pub fn load_streams(
                             let message_deduplicator = create_message_deduplicator(config);
                             let id = partition_state.id;
 
-                            let consumer_offset_path = config.get_consumer_offsets_path(stream_id, topic_id, id);
-                            let consumer_group_offsets_path = config.get_consumer_group_offsets_path(stream_id, topic_id, id);
-                            let consumer_offset = load_consumer_offsets(&consumer_offset_path, ConsumerKind::Consumer)?
+                            let consumer_offset_path = config.get_consumer_offsets_path(stream_id as usize, topic_id as usize, id as usize);
+                            let consumer_group_offsets_path = config.get_consumer_group_offsets_path(stream_id as usize, topic_id as usize, id as usize);
+                            let consumer_offset = Arc::new(load_consumer_offsets(&consumer_offset_path, ConsumerKind::Consumer)?
                             .into_iter().map(|offset| {
-                                (offset.consumer_id, offset)
-                            }).collect().into();
-                            let consumer_group_offset = load_consumer_offsets(&consumer_group_offsets_path, ConsumerKind::ConsumerGroup)?.into_iter().map(|offset| {
-                                (offset.consumer_id, offset)
-                            }).collect().into();
+                                (offset.consumer_id as usize, offset)
+                            }).into());
+                            let consumer_group_offset = Arc::new(load_consumer_offsets(&consumer_group_offsets_path, ConsumerKind::ConsumerGroup)?.into_iter().map(|offset| {
+                                (offset.consumer_id as usize, offset)
+                            }).into());
 
+                            let log = Default::default();
                             let partition = partition2::Partition::new(
                                 partition_state.created_at,
                                 should_increment_offset,
@@ -140,6 +157,7 @@ pub fn load_streams(
                                 offset,
                                 consumer_offset,
                                 consumer_group_offset,
+                                log
                             );
                             let new_id = root.partitions_mut().insert(partition);
                             assert_eq!(
@@ -147,11 +165,15 @@ pub fn load_streams(
                                 "load_streams: partition id mismatch when inserting partition, mismatch for partition with ID: {}, for topic with ID: {}, for stream with ID: {}",
                                 id, topic_id, stream_id
                             );
+                            Ok(())
                         })
                 })?;
-                info!("Loaded partition with ID: {}, for topic with ID: {} from state...", partition_state.id, topic_id);
+                info!(
+                    "Loaded partition with ID: {}, for topic with ID: {} from state...",
+                    partition_state.id, topic_id
+                );
             }
-            let partition_ids = streams.with_components_by_id(stream_id, |(root, ..)| {
+            let partition_ids = streams.with_components_by_id(stream_id as usize, |(root, ..)| {
                 root.topics().with_components_by_id(topic_id, |(root, ..)| {
                     root.partitions().with_components(|components| {
                         let (root, ..) = components.into_components();
@@ -161,12 +183,15 @@ pub fn load_streams(
             });
 
             for cg_state in cgs {
-                info!("Loading consumer group with ID: {}, name: {} for topic with ID: {} from state...", cg_state.id, cg_state.name, topic_id);
-                streams.with_components_by_id(stream_id, move |(root, ..)| {
+                info!(
+                    "Loading consumer group with ID: {}, name: {} for topic with ID: {} from state...",
+                    cg_state.id, cg_state.name, topic_id
+                );
+                streams.with_components_by_id(stream_id as usize, |(root, ..)| {
                     root.topics()
-                        .with_components_by_id_mut(topic_id, move |(root, ..)| {
+                        .with_components_by_id_mut(topic_id, |(mut root, ..)| {
                             let id = cg_state.id;
-                            let cg = consumer_group2::ConsumerGroup::new(cg_state.name.clone(), Default::default(), partition_ids);
+                            let cg = consumer_group2::ConsumerGroup::new(cg_state.name.clone(), Default::default(), partition_ids.clone());
                             let new_id = root.consumer_groups_mut().insert(cg);
                             assert_eq!(
                                 new_id, id as usize,
@@ -175,15 +200,18 @@ pub fn load_streams(
                             );
                         });
                 });
-                info!("Loaded consumer group with ID: {}, name: {} for topic with ID: {} from state...", cg_state.id, cg_state.name, topic_id);
+                info!(
+                    "Loaded consumer group with ID: {}, name: {} for topic with ID: {} from state...",
+                    cg_state.id, cg_state.name, topic_id
+                );
             }
         }
     }
-    streams
+    Ok(streams)
 }
 
 pub fn load_users(state: impl IntoIterator<Item = UserState>) -> HashMap<UserId, User> {
-    let mut users = Default::default();
+    let mut users = HashMap::default();
     for user_state in state {
         let UserState {
             id,
@@ -196,8 +224,7 @@ pub fn load_users(state: impl IntoIterator<Item = UserState>) -> HashMap<UserId,
         } = user_state;
         let mut user = User::with_password(id, &username, password_hash, status, permissions);
         user.created_at = created_at;
-        user.personal_access_tokens = user_state
-            .personal_access_tokens
+        user.personal_access_tokens = personal_access_tokens
             .into_values()
             .map(|token| {
                 (

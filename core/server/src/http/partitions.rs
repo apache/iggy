@@ -23,6 +23,7 @@ use crate::http::shared::AppState;
 use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
+use crate::streaming::{streams, topics};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::post;
@@ -59,35 +60,28 @@ async fn create_partitions(
     command.validate()?;
 
     let session = Session::stateless(identity.user_id, identity.ip_address);
-    let create_future = SendWrapper::new(state.shard.shard().create_partitions(
+    let partitions = SendWrapper::new(state.shard.shard().create_partitions2(
         &session,
         &command.stream_id,
         &command.topic_id,
         command.partitions_count,
-    ));
-
-    let partition_ids = create_future.await
-        .with_error_context(|error| {
-            format!(
-                "{COMPONENT} (error: {error}) - failed to create partitions, stream ID: {stream_id}, topic ID: {topic_id}"
-            )
-        })?;
+    )).await?;
 
     let broadcast_future = SendWrapper::new(async {
         let shard = state.shard.shard();
 
-        let event = ShardEvent::CreatedPartitions {
+        let event = ShardEvent::CreatedPartitions2 { 
             stream_id: command.stream_id.clone(),
             topic_id: command.topic_id.clone(),
-            partitions_count: partition_ids.len() as u32,
+            partitions,
         };
         let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
 
-        let stream = shard.get_stream(&command.stream_id)?;
-        let topic = stream.get_topic(&command.topic_id)?;
-        let numeric_stream_id = stream.stream_id;
-        let numeric_topic_id = topic.topic_id;
+        let numeric_stream_id = shard.streams2.with_stream_by_id(&command.stream_id, streams::helpers::get_stream_id());
+        let numeric_topic_id = shard.streams2.with_topic_by_id(&command.stream_id, &command.topic_id, topics::helpers::get_topic_id());
 
+        // TODO: Replace with new mechanism
+        /*
         let records = shard
             .create_shard_table_records(&partition_ids, numeric_stream_id, numeric_topic_id)
             .collect::<Vec<_>>();
@@ -109,6 +103,7 @@ async fn create_partitions(
             partition_ids: partition_ids.clone(),
         };
         let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+        */
 
         Ok::<(), CustomError>(())
     });
@@ -146,7 +141,7 @@ async fn delete_partitions(
     query.validate()?;
 
     let session = Session::stateless(identity.user_id, identity.ip_address);
-    let delete_future = SendWrapper::new(state.shard.shard().delete_partitions(
+    let delete_future = SendWrapper::new(state.shard.shard().delete_partitions2(
         &session,
         &query.stream_id,
         &query.topic_id,
@@ -158,6 +153,8 @@ async fn delete_partitions(
             "{COMPONENT} (error: {error}) - failed to delete partitions for topic with ID: {topic_id} in stream with ID: {stream_id}"
         )
     })?;
+
+    // Broadcast event.
 
     let command = EntryCommand::DeletePartitions(DeletePartitions {
         stream_id: query.stream_id.clone(),

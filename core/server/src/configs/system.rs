@@ -16,6 +16,10 @@
  * under the License.
  */
 
+use crate::slab::partitions;
+use crate::slab::streams;
+use crate::slab::topics;
+
 use super::cache_indexes::CacheIndexesConfig;
 use super::sharding::ShardingConfig;
 use iggy_common::IggyByteSize;
@@ -25,6 +29,8 @@ use iggy_common::{CompressionAlgorithm, IggyDuration};
 use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
+
+const INDEX_EXTENSION: &str = "index";
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct SystemConfig {
@@ -215,9 +221,9 @@ impl SystemConfig {
 
     pub fn get_partition_path(
         &self,
-        stream_id: usize,
-        topic_id: usize,
-        partition_id: usize,
+        stream_id: streams::ContainerId,
+        topic_id: topics::ContainerId,
+        partition_id: partitions::ContainerId,
     ) -> String {
         format!(
             "{}/{}",
@@ -274,5 +280,16 @@ impl SystemConfig {
             self.get_partition_path(stream_id, topic_id, partition_id),
             start_offset
         )
+    }
+
+    pub fn get_index_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        start_offset: u64,
+    ) -> String {
+        let path = self.get_segment_path(stream_id, topic_id, partition_id, start_offset);
+        format!("{path}.{INDEX_EXTENSION}")
     }
 }

@@ -18,15 +18,14 @@
 
 mod indexes;
 mod messages;
-mod messages_accumulator;
 mod reading_messages;
 mod segment;
 mod segment2;
 mod types;
-mod writing_messages;
+
+pub mod storage;
 
 pub use indexes::IggyIndexesMut;
-pub use messages_accumulator::MessagesAccumulator;
 pub use segment::Segment;
 pub use segment2::Segment2;
 pub use types::IggyMessageHeaderViewMut;

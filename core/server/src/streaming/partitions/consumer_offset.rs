@@ -10,6 +10,17 @@ pub struct ConsumerOffset {
     pub path: String,
 }
 
+impl Clone for ConsumerOffset {
+    fn clone(&self) -> Self {
+        Self {
+            kind: self.kind.clone(),
+            consumer_id: self.consumer_id.clone(),
+            offset: AtomicU64::new(0),
+            path: self.path.clone(),
+        }
+    }
+}
+
 impl ConsumerOffset {
     pub fn default_for_consumer(consumer_id: u32, path: &str) -> Self {
         Self {

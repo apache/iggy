@@ -7,15 +7,14 @@ use crate::{
     slab::{
         partitions::{self, Partitions},
         traits_ext::{
-            Components, ComponentsById, Delete, EntityComponentSystem, EntityMarker, Insert,
-            IntoComponents,
+            ComponentsById, Delete, EntityComponentSystem, EntityMarker, Insert, IntoComponents,
         },
     },
     streaming::{
         deduplication::message_deduplicator::MessageDeduplicator,
         partitions::{
             consumer_offset::ConsumerOffset,
-            partition2::{self, PartitionRef, PartitionRefMut},
+            partition2::{self, PartitionRef},
             storage2,
         },
     },
@@ -59,8 +58,9 @@ pub fn insert_partition(
 pub fn purge_partitions_mem() -> impl FnOnce(&mut Partitions) {
     |partitions| {
         partitions.with_components(|components| {
-            let (root, stats, deduplicator, offset, consumer_offset, cg_offset) =
+            let (_root, _stats, _deduplicator, _offset, _consumer_offset, _cg_offset, _log) =
                 components.into_components();
+            // TODO: Implement purge logic
         })
     }
 }
@@ -68,7 +68,7 @@ pub fn purge_partitions_mem() -> impl FnOnce(&mut Partitions) {
 pub fn get_consumer_offset(
     id: usize,
 ) -> impl FnOnce(ComponentsById<PartitionRef>) -> Option<ConsumerOffsetInfo> {
-    move |(root, _, _, current_offset, offsets, _)| {
+    move |(root, _, _, current_offset, offsets, _, _)| {
         offsets.pin().get(&id).map(|item| ConsumerOffsetInfo {
             partition_id: root.id() as u32,
             current_offset: current_offset.load(Ordering::Relaxed),
@@ -80,7 +80,7 @@ pub fn get_consumer_offset(
 pub fn get_consumer_group_member_offset(
     id: usize,
 ) -> impl FnOnce(ComponentsById<PartitionRef>) -> Option<ConsumerOffsetInfo> {
-    move |(root, _, _, current_offset, _, offsets)| {
+    move |(root, _, _, current_offset, _, offsets, _)| {
         offsets.pin().get(&id).map(|item| ConsumerOffsetInfo {
             partition_id: root.id() as u32,
             current_offset: current_offset.load(Ordering::Relaxed),
@@ -97,7 +97,7 @@ pub fn store_consumer_offset(
     offset: u64,
     config: &SystemConfig,
 ) -> impl FnOnce(ComponentsById<PartitionRef>) {
-    move |(.., offsets, _)| {
+    move |(.., offsets, _, _)| {
         let hdl = offsets.pin();
         let item = hdl.get_or_insert(
             id,
@@ -113,7 +113,7 @@ pub fn store_consumer_offset(
 pub fn delete_consumer_offset(
     id: usize,
 ) -> impl FnOnce(ComponentsById<PartitionRef>) -> Result<(), IggyError> {
-    move |(.., offsets, _)| {
+    move |(.., offsets, _, _)| {
         offsets
             .pin()
             .remove(&id)
@@ -126,7 +126,7 @@ pub fn persist_consumer_offset_to_disk(
     shard_id: u16,
     id: usize,
 ) -> impl AsyncFnOnce(ComponentsById<PartitionRef>) -> Result<(), IggyError> {
-    async move |(.., offsets)| {
+    async move |(.., offsets, _, _)| {
         let hdl = offsets.pin();
         let item = hdl
             .get(&id)
@@ -140,7 +140,7 @@ pub fn delete_consumer_offset_from_disk(
     shard_id: u16,
     id: usize,
 ) -> impl AsyncFnOnce(ComponentsById<PartitionRef>) -> Result<(), IggyError> {
-    async move |(.., offsets, _)| {
+    async move |(.., offsets, _, _)| {
         let hdl = offsets.pin();
         let item = hdl
             .get(&id)
@@ -158,7 +158,7 @@ pub fn store_consumer_group_member_offset(
     offset: u64,
     config: &SystemConfig,
 ) -> impl FnOnce(ComponentsById<PartitionRef>) {
-    move |(.., offsets)| {
+    move |(.., offsets, _)| {
         let hdl = offsets.pin();
         let item = hdl.get_or_insert(
             id,
@@ -174,7 +174,7 @@ pub fn store_consumer_group_member_offset(
 pub fn delete_consumer_group_member_offset(
     id: usize,
 ) -> impl FnOnce(ComponentsById<PartitionRef>) -> Result<(), IggyError> {
-    move |(.., offsets)| {
+    move |(.., offsets, _)| {
         offsets
             .pin()
             .remove(&id)
@@ -187,7 +187,7 @@ pub fn persist_consumer_group_member_offset_to_disk(
     shard_id: u16,
     id: usize,
 ) -> impl AsyncFnOnce(ComponentsById<PartitionRef>) -> Result<(), IggyError> {
-    async move |(.., offsets)| {
+    async move |(.., offsets, _)| {
         let hdl = offsets.pin();
         let item = hdl
             .get(&id)
@@ -201,7 +201,7 @@ pub fn delete_consumer_group_member_offset_from_disk(
     shard_id: u16,
     id: usize,
 ) -> impl AsyncFnOnce(ComponentsById<PartitionRef>) -> Result<(), IggyError> {
-    async move |(.., offsets)| {
+    async move |(.., offsets, _)| {
         let hdl = offsets.pin();
         let item = hdl
             .get(&id)

@@ -1,6 +1,6 @@
 pub mod consumer_groups;
 /// General rules how to implement `with_*` methods on any slab"
-/// 1. When implementing method that accepts closure f, make sure that the caller can supply closure with only 1 depth.
+/// 1. When implementing method that accepts closure f, make sure that the caller can supply closure only with 1 depth of callbacks.
 /// for example, observe following code snippet:
 /// ```rust
 /// let topic_id = self.streams2.with_topic_by_id(stream_id, topic_id, get_topic_id());

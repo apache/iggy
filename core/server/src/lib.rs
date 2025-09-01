@@ -28,7 +28,6 @@ static GLOBAL: MiMalloc = MiMalloc;
 #[cfg(windows)]
 compile_error!("iggy-server doesn't support windows.");
 
-pub mod archiver;
 pub mod args;
 pub mod binary;
 pub mod bootstrap;
