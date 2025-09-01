@@ -48,6 +48,11 @@ on:
         type: string
         required: false
         default: ""
+      skip_tag_creation:
+        description: "Skip creating git tags (useful for re-publishing or testing)"
+        type: boolean
+        required: false
+        default: false
 
 env:
   IGGY_CI_BUILD: true
@@ -268,15 +273,15 @@ jobs:
       - name: Save latest CI and scripts from master
         if: inputs.use_latest_ci
         run: |
-          # First checkout master to get latest CI and scripts
-          git clone --depth 1 --branch master https://github.com/${{ github.repository }}.git /tmp/repo-master
-          cp -r /tmp/repo-master/scripts /tmp/latest-scripts
-          cp -r /tmp/repo-master/.github /tmp/latest-github
-          echo "✅ Saved latest CI and scripts from master branch"
-          echo "Scripts:"
-          ls -la /tmp/latest-scripts/
-          echo ".github:"
-          ls -la /tmp/latest-github/
+          # Clone master and save CI, scripts, and Dockerfiles
+          bash scripts/copy-latest-from-master.sh save \
+            .github \
+            scripts \
+            web/Dockerfile \
+            core/server/Dockerfile \
+            core/ai/mcp/Dockerfile \
+            core/connectors/runtime/Dockerfile \
+            core/bench/dashboard/server/Dockerfile
 
       - name: Checkout at commit
         uses: actions/checkout@v4
@@ -286,12 +291,7 @@ jobs:
 
       - name: Apply latest CI and scripts
         if: inputs.use_latest_ci
-        run: |
-          echo "📝 Applying latest CI and scripts from master branch..."
-          cp -r /tmp/latest-scripts/* scripts/
-          cp -r /tmp/latest-github/* .github/
-          chmod +x scripts/*.sh
-          echo "✅ Latest CI and scripts applied"
+        run: bash scripts/copy-latest-from-master.sh apply
 
       - name: Setup yq
         run: |
@@ -307,6 +307,14 @@ jobs:
 
           echo "## 🏷️ Tag Existence Check" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ inputs.skip_tag_creation }}" = "true" ]; then
+            echo "### ℹ️ Tag Creation Disabled" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Tag creation has been explicitly disabled for this run." >> $GITHUB_STEP_SUMMARY
+            echo "Components will be published without creating git tags." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
 
           TARGETS_JSON='${{ needs.plan.outputs.targets }}'
           GO_SDK_VERSION='${{ needs.plan.outputs.go_sdk_version }}'
@@ -375,12 +383,19 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
 
             if [ "${{ inputs.dry_run }}" = "false" ]; then
-              echo "**These components will NOT be republished.** Tags are immutable in git." >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "If you need to republish:" >> $GITHUB_STEP_SUMMARY
-              echo "1. Delete the existing tag: \`git push --delete origin <tag>\`" >> $GITHUB_STEP_SUMMARY
-              echo "2. Bump the version in the source file" >> $GITHUB_STEP_SUMMARY
-              echo "3. Run the publish workflow again" >> $GITHUB_STEP_SUMMARY
+              if [ "${{ inputs.skip_tag_creation }}" = "true" ]; then
+                echo "**Note:** Tag creation is disabled for this run." >> $GITHUB_STEP_SUMMARY
+                echo "Components will be published/republished without updating git tags." >> $GITHUB_STEP_SUMMARY
+              else
+                echo "**These components will NOT be republished.** Tags are immutable in git." >> $GITHUB_STEP_SUMMARY
+                echo "" >> $GITHUB_STEP_SUMMARY
+                echo "If you need to republish:" >> $GITHUB_STEP_SUMMARY
+                echo "1. Delete the existing tag: \`git push --delete origin <tag>\`" >> $GITHUB_STEP_SUMMARY
+                echo "2. Bump the version in the source file" >> $GITHUB_STEP_SUMMARY
+                echo "3. Run the publish workflow again" >> $GITHUB_STEP_SUMMARY
+                echo "" >> $GITHUB_STEP_SUMMARY
+                echo "Alternatively, use \`skip_tag_creation: true\` to republish without tags." >> $GITHUB_STEP_SUMMARY
+              fi
             fi
           fi
 
@@ -388,8 +403,14 @@ jobs:
             echo "### ℹ️ No New Tags to Create" >> $GITHUB_STEP_SUMMARY
             echo "All specified components have already been tagged. Consider bumping versions if you need to publish new releases." >> $GITHUB_STEP_SUMMARY
           elif [ ${#NEW_TAGS[@]} -gt 0 ]; then
-            echo "### ✅ Tags to be Created" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
+            if [ "${{ inputs.skip_tag_creation }}" = "true" ]; then
+              echo "### ℹ️ Tags That Would Be Created (Skipped)" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "The following tags would be created if tag creation wasn't disabled:" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "### ✅ Tags to be Created" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+            fi
             for tag in "${NEW_TAGS[@]}"; do
               echo "- $tag" >> $GITHUB_STEP_SUMMARY
             done
@@ -423,11 +444,15 @@ jobs:
       - name: Save latest CI and scripts from master
         if: inputs.use_latest_ci
         run: |
-          # First checkout master to get latest CI and scripts
-          git clone --depth 1 --branch master https://github.com/${{ github.repository }}.git /tmp/repo-master
-          cp -r /tmp/repo-master/scripts /tmp/latest-scripts
-          cp -r /tmp/repo-master/.github /tmp/latest-github
-          echo "✅ Saved latest CI and scripts from master branch"
+          # Clone master and save CI, scripts, and Dockerfiles
+          bash scripts/copy-latest-from-master.sh save \
+            .github \
+            scripts \
+            web/Dockerfile \
+            core/server/Dockerfile \
+            core/ai/mcp/Dockerfile \
+            core/connectors/runtime/Dockerfile \
+            core/bench/dashboard/server/Dockerfile
 
       - name: Checkout at commit
         uses: actions/checkout@v4
@@ -437,12 +462,7 @@ jobs:
 
       - name: Apply latest CI and scripts
         if: inputs.use_latest_ci
-        run: |
-          echo "📝 Applying latest CI and scripts from master branch..."
-          cp -r /tmp/latest-scripts/* scripts/
-          cp -r /tmp/latest-github/* .github/
-          chmod +x scripts/*.sh
-          echo "✅ Latest CI and scripts applied"
+        run: bash scripts/copy-latest-from-master.sh apply
 
       - name: Setup Rust with cache
         uses: ./.github/actions/utils/setup-rust-with-cache
@@ -581,11 +601,15 @@ jobs:
       - name: Save latest CI and scripts from master
         if: inputs.use_latest_ci
         run: |
-          # First checkout master to get latest CI and scripts
-          git clone --depth 1 --branch master https://github.com/${{ github.repository }}.git /tmp/repo-master
-          cp -r /tmp/repo-master/scripts /tmp/latest-scripts
-          cp -r /tmp/repo-master/.github /tmp/latest-github
-          echo "✅ Saved latest CI and scripts from master branch"
+          # Clone master and save CI, scripts, and Dockerfiles
+          bash scripts/copy-latest-from-master.sh save \
+            .github \
+            scripts \
+            web/Dockerfile \
+            core/server/Dockerfile \
+            core/ai/mcp/Dockerfile \
+            core/connectors/runtime/Dockerfile \
+            core/bench/dashboard/server/Dockerfile
           echo "Scripts:"
           ls -la /tmp/latest-scripts/
           echo ".github:"
@@ -599,12 +623,7 @@ jobs:
 
       - name: Apply latest CI and scripts
         if: inputs.use_latest_ci
-        run: |
-          echo "📝 Applying latest CI and scripts from master branch..."
-          cp -r /tmp/latest-scripts/* scripts/
-          cp -r /tmp/latest-github/* .github/
-          chmod +x scripts/*.sh
-          echo "✅ Latest CI and scripts applied"
+        run: bash scripts/copy-latest-from-master.sh apply
 
       - name: Ensure version extractor is executable
         run: |
@@ -716,6 +735,7 @@ jobs:
       always() &&
       needs.validate.outputs.has_targets == 'true' &&
       inputs.dry_run == false &&
+      inputs.skip_tag_creation == false &&
       (needs.publish.result == 'success' || needs.publish.result == 'skipped') &&
       (needs.publish-rust-crates.result == 'success' || needs.publish-rust-crates.result == 'skipped') &&
       (needs.build-python-wheels.result == 'success' || needs.build-python-wheels.result == 'skipped')
@@ -807,6 +827,7 @@ jobs:
             echo "|---------|-------|"
             echo "| **Commit** | \`${{ needs.validate.outputs.commit }}\` |"
             echo "| **Dry run** | \`${{ inputs.dry_run }}\` |"
+            echo "| **Skip tag creation** | \`${{ inputs.skip_tag_creation }}\` |"
             echo "| **Total components** | ${{ needs.plan.outputs.count }} |"
             echo
 
@@ -923,11 +944,14 @@ jobs:
             if [ "${{ inputs.dry_run }}" = "true" ]; then
               echo
               echo "**ℹ️ This was a dry run - no actual publishing occurred**"
+            elif [ "${{ inputs.skip_tag_creation }}" = "true" ]; then
+              echo
+              echo "**ℹ️ Tag creation was skipped as requested**"
             else
               case "${{ needs.create-tags.result }}" in
                 success)  echo "✅ **Git tags created successfully**" ;;
                 failure)  echo "⚠️ **Tag creation had issues**" ;;
-                skipped)  echo "⏭️ **Tag creation was skipped (dry run or publish failed)**" ;;
+                skipped)  echo "⏭️ **Tag creation was skipped (publish failed)**" ;;
               esac
             fi
             echo
