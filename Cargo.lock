@@ -3675,10 +3675,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "iceberg_sink"
-version = "0.1.0"
-
-[[package]]
 name = "iceberg_source"
 version = "0.1.0"
 
@@ -3971,6 +3967,21 @@ dependencies = [
  "strum",
  "thiserror 2.0.14",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "iggy_connector_iceberg_sink"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "dashmap",
+ "iggy_connector_sdk",
+ "once_cell",
+ "reqwest",
+ "serde",
+ "serde_yml",
+ "simd-json",
  "tracing",
 ]
 

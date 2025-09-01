@@ -1,0 +1,115 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+
+[http_api] # Optional HTTP API configuration
+enabled = true
+address = "127.0.0.1:8081"
+# api_key = "secret" # Optional API key for authentication to be passed as `api-key` header
+
+[http_api.cors] # Optional CORS configuration for HTTP API
+enabled = false
+allowed_methods = ["GET", "POST", "PUT", "DELETE"]
+allowed_origins = ["*"]
+allowed_headers = ["content-type"]
+exposed_headers = [""]
+allow_credentials = false
+allow_private_network = false
+
+[http_api.tls] # Optional TLS configuration for HTTP API
+enabled = false
+cert_file = "core/certs/iggy_cert.pem"
+key_file = "core/certs/iggy_key.pem"
+
+[iggy]
+address = "localhost:8090"
+username = "iggy"
+password = "iggy"
+# token = "secret" # Personal Access Token (PAT) can be used instead of username and password
+
+[state]
+path = "local_state"
+
+[sinks.iceberg]
+enabled = true
+name = "Iceberg sink"
+path = "target/release/libiggy_connector_iceberg_sink"
+
+[[sinks.iceberg.streams]]
+stream = "iceberg"
+topics = ["taxis"]
+# schema = "json"
+batch_length = 10
+poll_interval = "5ms"
+consumer_group = "iceberg_sink_connector"
+
+[sinks.iceberg.catalog]
+tables = ["nyc.taxis"]
+type = "rest"
+uri = "https://localhost"
+credential = "12345"
+warehouse = "warehouse"
+
+
+[sinks.stdout]
+enabled = true
+name = "Stdout sink"
+path = "target/release/libiggy_connector_stdout_sink"
+
+[[sinks.stdout.streams]]
+stream = "example_stream"
+topics = ["example_topic"]
+schema = "json"
+batch_length = 100
+poll_interval = "5ms"
+consumer_group = "stdout_sink_connector"
+
+[sinks.stdout.config]
+print_payload = false
+
+[sinks.stdout.transforms.add_fields]
+enabled = true
+
+[[sinks.stdout.transforms.add_fields.fields]]
+key = "message"
+value.static = "hello"
+
+[sources.random]
+enabled = true
+name = "Random source"
+path = "target/release/libiggy_connector_random_source"
+config_format = "json"
+
+[[sources.random.streams]]
+stream = "example_stream"
+topic = "example_topic"
+schema = "json"
+batch_length = 1000
+linger_time = "5ms"
+
+[sources.random.config]
+interval = "100ms"
+# max_count = 1000
+messages_range = [10, 50]
+payload_size = 200
+
+[sources.random.transforms.add_fields]
+enabled = true
+
+[[sources.random.transforms.add_fields.fields]]
+key = "test_field"
+value.static = "hello!"
