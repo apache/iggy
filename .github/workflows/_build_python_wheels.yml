@@ -48,22 +48,16 @@ jobs:
       - name: Save latest CI and scripts from master
         if: inputs.use_latest_ci
         run: |
-          # First checkout master to get latest CI and scripts
-          git clone --depth 1 --branch master https://github.com/${{ github.repository }}.git /tmp/repo-master
-          cp -r /tmp/repo-master/scripts /tmp/latest-scripts
-          cp -r /tmp/repo-master/.github /tmp/latest-github
-          echo "✅ Saved latest CI and scripts from master branch"
+          # Clone master and save CI and scripts
+          bash scripts/copy-latest-from-master.sh save \
+            .github \
+            scripts
 
       - uses: actions/checkout@v4
 
       - name: Apply latest CI and scripts
         if: inputs.use_latest_ci
-        run: |
-          echo "📝 Applying latest CI and scripts from master branch..."
-          cp -r /tmp/latest-scripts/* scripts/ 2>/dev/null || true
-          cp -r /tmp/latest-github/* .github/
-          if [ -d scripts ]; then chmod +x scripts/*.sh 2>/dev/null || true; fi
-          echo "✅ Latest CI and scripts applied"
+        run: bash scripts/copy-latest-from-master.sh apply
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -109,22 +103,16 @@ jobs:
       - name: Save latest CI and scripts from master
         if: inputs.use_latest_ci
         run: |
-          # First checkout master to get latest CI and scripts
-          git clone --depth 1 --branch master https://github.com/${{ github.repository }}.git /tmp/repo-master
-          cp -r /tmp/repo-master/scripts /tmp/latest-scripts
-          cp -r /tmp/repo-master/.github /tmp/latest-github
-          echo "✅ Saved latest CI and scripts from master branch"
+          # Clone master and save CI and scripts
+          bash scripts/copy-latest-from-master.sh save \
+            .github \
+            scripts
 
       - uses: actions/checkout@v4
 
       - name: Apply latest CI and scripts
         if: inputs.use_latest_ci
-        run: |
-          echo "📝 Applying latest CI and scripts from master branch..."
-          cp -r /tmp/latest-scripts/* scripts/ 2>/dev/null || true
-          cp -r /tmp/latest-github/* .github/
-          if [ -d scripts ]; then chmod +x scripts/*.sh 2>/dev/null || true; fi
-          echo "✅ Latest CI and scripts applied"
+        run: bash scripts/copy-latest-from-master.sh apply
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -154,23 +142,17 @@ jobs:
         if: inputs.use_latest_ci
         shell: bash
         run: |
-          # First checkout master to get latest CI and scripts
-          git clone --depth 1 --branch master https://github.com/${{ github.repository }}.git /tmp/repo-master
-          cp -r /tmp/repo-master/scripts /tmp/latest-scripts
-          cp -r /tmp/repo-master/.github /tmp/latest-github
-          echo "✅ Saved latest CI and scripts from master branch"
+          # Clone master and save CI and scripts
+          bash scripts/copy-latest-from-master.sh save \
+            .github \
+            scripts
 
       - uses: actions/checkout@v4
 
       - name: Apply latest CI and scripts
         if: inputs.use_latest_ci
         shell: bash
-        run: |
-          echo "📝 Applying latest CI and scripts from master branch..."
-          cp -r /tmp/latest-scripts/* scripts/ 2>/dev/null || true
-          cp -r /tmp/latest-github/* .github/
-          if [ -d scripts ]; then chmod +x scripts/*.sh 2>/dev/null || true; fi
-          echo "✅ Latest CI and scripts applied"
+        run: bash scripts/copy-latest-from-master.sh apply
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -200,22 +182,16 @@ jobs:
       - name: Save latest CI and scripts from master
         if: inputs.use_latest_ci
         run: |
-          # First checkout master to get latest CI and scripts
-          git clone --depth 1 --branch master https://github.com/${{ github.repository }}.git /tmp/repo-master
-          cp -r /tmp/repo-master/scripts /tmp/latest-scripts
-          cp -r /tmp/repo-master/.github /tmp/latest-github
-          echo "✅ Saved latest CI and scripts from master branch"
+          # Clone master and save CI and scripts
+          bash scripts/copy-latest-from-master.sh save \
+            .github \
+            scripts
 
       - uses: actions/checkout@v4
 
       - name: Apply latest CI and scripts
         if: inputs.use_latest_ci
-        run: |
-          echo "📝 Applying latest CI and scripts from master branch..."
-          cp -r /tmp/latest-scripts/* scripts/ 2>/dev/null || true
-          cp -r /tmp/latest-github/* .github/
-          if [ -d scripts ]; then chmod +x scripts/*.sh 2>/dev/null || true; fi
-          echo "✅ Latest CI and scripts applied"
+        run: bash scripts/copy-latest-from-master.sh apply
 
       - name: Build sdist
         uses: PyO3/maturin-action@v1
