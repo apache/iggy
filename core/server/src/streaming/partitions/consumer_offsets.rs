@@ -43,7 +43,7 @@ impl Partition {
                 }
             }
             PollingConsumer::ConsumerGroup(consumer_group_id, _) => {
-                let consumer_offset = self.consumer_offsets.get(&consumer_group_id);
+                let consumer_offset = self.consumer_group_offsets.get(&consumer_group_id);
                 if let Some(consumer_offset) = consumer_offset {
                     return Ok(Some(consumer_offset.offset));
                 }
