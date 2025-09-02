@@ -225,20 +225,6 @@ components:
       - "bdd/scenarios/**"
     tasks: ["bdd-csharp"]
 
-  # Meta component for running all BDD tests (used for scripts/docker-compose changes)
-  bdd-suite:
-    depends_on:
-      - "bdd-rust"
-      - "bdd-python"
-      - "bdd-go"
-      - "bdd-node"
-      - "bdd-csharp"
-    paths:
-      - "bdd/docker-compose.yml"
-      - "bdd/Dockerfile"
-      - "scripts/run-bdd-tests.sh"
-    tasks: ["bdd-rust", "bdd-python", "bdd-go", "bdd-node", "bdd-csharp"]
-
   examples-suite:
     depends_on:
       - "rust-sdk"

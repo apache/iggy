@@ -774,10 +774,27 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        run: |
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+          echo "✅ Downloaded latest copy script from master"
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.validate.outputs.commit }}
           fetch-depth: 0
+
+      - name: Save and apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          /tmp/copy-latest-from-master.sh save \
+            .github \
+            scripts
+
+          /tmp/copy-latest-from-master.sh apply
 
       - name: Configure Git
         run: |
@@ -839,9 +856,26 @@ jobs:
     if: always() && needs.validate.outputs.has_targets == 'true'
     runs-on: ubuntu-latest
     steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        run: |
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+          echo "✅ Downloaded latest copy script from master"
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Save and apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          /tmp/copy-latest-from-master.sh save \
+            .github \
+            scripts
+
+          /tmp/copy-latest-from-master.sh apply
 
       - name: Ensure version extractor is executable
         run: |
