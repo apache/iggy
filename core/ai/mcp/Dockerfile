@@ -30,6 +30,8 @@ FROM --platform=$BUILDPLATFORM chef AS builder
 ARG PROFILE=release
 ARG TARGETPLATFORM
 ARG LIBC=musl
+ARG IGGY_CI_BUILD
+ENV IGGY_CI_BUILD=${IGGY_CI_BUILD}
 
 RUN apk add --no-cache zig && \
     cargo install cargo-zigbuild --locked && \
