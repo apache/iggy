@@ -456,6 +456,7 @@ impl System {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::configs::cluster::ClusterConfig;
     use crate::configs::server::{DataMaintenanceConfig, PersonalAccessTokenConfig};
     use crate::configs::system::SystemConfig;
     use crate::state::{MockState, StateKind};
@@ -484,6 +485,7 @@ mod tests {
         let stream_name = "test";
         let mut system = System::create(
             config,
+            ClusterConfig::default(),
             storage,
             Arc::new(StateKind::Mock(MockState::new())),
             None,

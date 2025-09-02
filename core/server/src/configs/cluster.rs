@@ -16,15 +16,26 @@
  * under the License.
  */
 
-pub mod cluster;
-pub mod consumer_groups;
-pub mod consumer_offsets;
-pub mod messages;
-pub mod partitions;
-pub mod personal_access_tokens;
-pub mod segments;
-pub mod streams;
-pub mod system;
-pub mod topics;
-pub mod users;
-mod utils;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ClusterConfig {
+    pub enabled: bool,
+    pub name: String,
+    pub id: u32,
+    pub transport: String,
+    pub node: NodeConfig,
+    pub nodes: Vec<ClusterNodeConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct NodeConfig {
+    pub id: u32,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ClusterNodeConfig {
+    pub id: u32,
+    pub name: String,
+    pub address: String,
+}

@@ -18,6 +18,7 @@
 
 use crate::archiver::ArchiverKindType;
 use crate::configs::COMPONENT;
+use crate::configs::cluster::ClusterConfig;
 use crate::configs::config_provider::ConfigProviderKind;
 use crate::configs::http::HttpConfig;
 use crate::configs::quic::QuicConfig;
@@ -45,6 +46,7 @@ pub struct ServerConfig {
     pub tcp: TcpConfig,
     pub http: HttpConfig,
     pub telemetry: TelemetryConfig,
+    pub cluster: ClusterConfig,
 }
 
 #[serde_as]
