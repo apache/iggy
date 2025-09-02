@@ -307,6 +307,7 @@ fn get_command(
                 get_args.stream_id.clone(),
                 get_args.topic_id.clone(),
                 get_args.partition_id,
+                get_args.kind,
             )),
             ConsumerOffsetAction::Set(set_args) => Box::new(SetConsumerOffsetCmd::new(
                 set_args.consumer_id.clone(),
@@ -314,6 +315,7 @@ fn get_command(
                 set_args.topic_id.clone(),
                 set_args.partition_id,
                 set_args.offset,
+                set_args.kind,
             )),
         },
         Command::Context(command) => match command {

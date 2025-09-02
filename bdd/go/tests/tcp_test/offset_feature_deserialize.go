@@ -123,15 +123,8 @@ var _ = ginkgo.Describe("GET CONSUMER OFFSET:", func() {
 
 			consumer := iggcon.NewGroupConsumer(groupIdentifier)
 			partitionId := uint32(1)
-			testOffset := uint64(0)
 
-			_ = client.StoreConsumerOffset(
-				consumer,
-				streamIdentifier,
-				topicIdentifier,
-				testOffset,
-				&partitionId,
-			)
+			// Don't store any offset - we want to test that a new consumer group has no stored offset
 
 			storedOffset, getErr := client.GetConsumerOffset(
 				consumer,
