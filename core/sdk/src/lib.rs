@@ -20,9 +20,12 @@
 pub mod client_provider;
 pub mod client_wrappers;
 pub mod clients;
+pub mod connection;
 pub mod consumer_ext;
 pub mod http;
 pub mod prelude;
+pub mod protocol;
 pub mod quic;
+pub mod runtime;
 pub mod stream_builder;
 pub mod tcp;

@@ -459,6 +459,20 @@ pub enum IggyError {
     CannotReadIndexPosition = 10011,
     #[error("Cannot read index timestamp")]
     CannotReadIndexTimestamp = 10012,
+    #[error("Send queue is full")]
+    SendQueueFull = 10050,
+    #[error("Too many pending requests")]
+    TooManyPendingRequests = 10051,
+    #[error("IO Error")]
+    IoError = 10052,
+    #[error("Max number of retry has exceeded")]
+    MaxRetriesExceeded = 10053,
+    #[error("Connection timeout")]
+    ConnectionTimeout = 10054,
+    #[error("Incorrect connection state")]
+    IncorrectConnectionState = 10055,
+    #[error("Connection missed socket")]
+    ConnectionMissedSocket = 10056,
 }
 
 impl IggyError {
