@@ -21,6 +21,7 @@ use crate::streaming::create_message;
 use bytes::Bytes;
 use iggy::prelude::locking::IggySharedMutFn;
 use iggy::prelude::*;
+use server::configs::cluster::ClusterConfig;
 use server::configs::server::{DataMaintenanceConfig, PersonalAccessTokenConfig};
 use server::configs::system::{PartitionConfig, SegmentConfig, SystemConfig};
 use server::streaming::segments::*;
@@ -472,6 +473,7 @@ async fn should_delete_persisted_segments() -> Result<(), Box<dyn std::error::Er
     let setup = TestSetup::init_with_config(config).await;
     let mut system = System::new(
         setup.config.clone(),
+        ClusterConfig::default(),
         DataMaintenanceConfig::default(),
         PersonalAccessTokenConfig::default(),
     );

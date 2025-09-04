@@ -17,6 +17,7 @@
  */
 
 use crate::archiver::{ArchiverKind, ArchiverKindType};
+use crate::configs::cluster::ClusterConfig;
 use crate::configs::server::{DataMaintenanceConfig, PersonalAccessTokenConfig};
 use crate::configs::system::SystemConfig;
 use crate::map_toggle_str;
@@ -82,6 +83,7 @@ pub struct System {
     pub(crate) streams_ids: AHashMap<String, u32>,
     pub(crate) users: AHashMap<UserId, User>,
     pub(crate) config: Arc<SystemConfig>,
+    pub(crate) cluster_config: ClusterConfig,
     pub(crate) client_manager: IggySharedMut<ClientManager>,
     pub(crate) encryptor: Option<Arc<EncryptorKind>>,
     pub(crate) metrics: Metrics,
@@ -93,6 +95,7 @@ pub struct System {
 impl System {
     pub fn new(
         config: Arc<SystemConfig>,
+        cluster_config: ClusterConfig,
         data_maintenance_config: DataMaintenanceConfig,
         pat_config: PersonalAccessTokenConfig,
     ) -> System {
@@ -120,6 +123,7 @@ impl System {
         )));
         Self::create(
             config.clone(),
+            cluster_config,
             SystemStorage::new(config, partition_persister),
             state,
             encryptor,
@@ -137,6 +141,7 @@ impl System {
 
     pub fn create(
         system_config: Arc<SystemConfig>,
+        cluster_config: ClusterConfig,
         storage: SystemStorage,
         state: Arc<StateKind>,
         encryptor: Option<Arc<EncryptorKind>>,
@@ -170,6 +175,7 @@ impl System {
 
         System {
             config: system_config,
+            cluster_config,
             streams: AHashMap::new(),
             streams_ids: AHashMap::new(),
             storage: Arc::new(storage),

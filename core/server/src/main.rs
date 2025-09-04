@@ -96,6 +96,7 @@ async fn main() -> Result<(), ServerError> {
 
     let system = SharedSystem::new(System::new(
         config.system.clone(),
+        config.cluster.clone(),
         config.data_maintenance.clone(),
         config.personal_access_token.clone(),
     ));
