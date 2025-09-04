@@ -16,15 +16,4 @@
  * under the License.
  */
 
-pub mod cluster;
-pub mod consumer_groups;
-pub mod consumer_offsets;
-pub mod messages;
-pub mod partitions;
-pub mod personal_access_tokens;
-pub mod segments;
-pub mod streams;
-pub mod system;
-pub mod topics;
-pub mod users;
-mod utils;
+pub mod get_cluster_metadata_handler;
