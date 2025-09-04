@@ -79,9 +79,8 @@ runs:
         echo "ruff format --check $DIRS_TO_CHECK"
         ruff format --check $DIRS_TO_CHECK
 
-        # TODO(hubcio): make this blocking when mypy lints are fixed
         echo "mypy --explicit-package-bases $DIR_SDK"
-        mypy --explicit-package-bases "$DIR_SDK" || true
+        mypy --explicit-package-bases "$DIR_SDK"
         echo "mypy version: $(mypy --version)"
       shell: bash
 
