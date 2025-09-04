@@ -123,6 +123,15 @@ type Client interface {
 	// Authentication is required, and the permission to read the streams or topics.
 	GetConsumerGroups(streamId iggcon.Identifier, topicId iggcon.Identifier) ([]iggcon.ConsumerGroup, error)
 
+	// DeleteConsumerOffset delete the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
+	// Authentication is required, and the permission to poll the messages.
+	DeleteConsumerOffset(
+		consumer iggcon.Consumer,
+		streamId iggcon.Identifier,
+		topicId iggcon.Identifier,
+		partitionId *uint32,
+	) error
+
 	// GetConsumerGroup get the info about a specific consumer group by unique ID or name for the given stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to read the streams or topics.
 	GetConsumerGroup(

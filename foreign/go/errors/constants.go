@@ -38,6 +38,10 @@ var (
 		Code:    2010,
 		Message: "topic_id_not_found",
 	}
+	ConsumerOffsetNotFound = &IggyError{
+		Code:    3021,
+		Message: "consumer_offset_not_found",
+	}
 	InvalidMessagesCount = &IggyError{
 		Code:    4009,
 		Message: "invalid_messages_count",

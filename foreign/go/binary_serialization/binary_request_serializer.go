@@ -62,6 +62,23 @@ func GetOffset(request iggcon.GetConsumerOffsetRequest) []byte {
 	return bytes
 }
 
+func DeleteOffset(request iggcon.DeleteConsumerOffsetRequest) []byte {
+	consumerBytes := SerializeConsumer(request.Consumer)
+	streamIdBytes := SerializeIdentifier(request.StreamId)
+	topicIdBytes := SerializeIdentifier(request.TopicId)
+	bytes := make([]byte, 0, 12+len(consumerBytes)+len(streamIdBytes)+len(topicIdBytes))
+	bytes = append(bytes, consumerBytes...)
+	bytes = append(bytes, streamIdBytes...)
+	bytes = append(bytes, topicIdBytes...)
+	if request.PartitionId != nil {
+		bytes = binary.LittleEndian.AppendUint32(bytes, *request.PartitionId)
+	} else {
+		bytes = binary.LittleEndian.AppendUint32(bytes, 0)
+	}
+
+	return bytes
+}
+
 func CreatePartitions(request iggcon.CreatePartitionsRequest) []byte {
 	bytes := make([]byte, 8+request.StreamId.Length+request.TopicId.Length)
 	position := 4 + request.StreamId.Length + request.TopicId.Length
