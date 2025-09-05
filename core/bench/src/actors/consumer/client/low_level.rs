@@ -114,7 +114,7 @@ impl ConsumerClient for LowLevelConsumerClient {
 impl BenchmarkInit for LowLevelConsumerClient {
     async fn setup(&mut self) -> Result<(), IggyError> {
         let topic_id_str = "topic-1";
-        let default_partition_id = 1u32;
+        let default_partition_id = 0u32;
 
         let client = self.client_factory.create_client().await;
         let client = IggyClient::create(client, None, None);

@@ -61,23 +61,30 @@ async fn get_consumer_group(
     let identifier_stream_id = Identifier::from_str_value(&stream_id)?;
     let identifier_topic_id = Identifier::from_str_value(&topic_id)?;
     let identifier_group_id = Identifier::from_str_value(&group_id)?;
-    
+
     let session = Session::stateless(identity.user_id, identity.ip_address);
 
     // Check permissions and existence
     state.shard.shard().ensure_authenticated(&session)?;
-    state.shard.shard().ensure_consumer_group_exists(&identifier_stream_id, &identifier_topic_id, &identifier_group_id)?;
-    
+    state.shard.shard().ensure_consumer_group_exists(
+        &identifier_stream_id,
+        &identifier_topic_id,
+        &identifier_group_id,
+    )?;
+
     let numeric_topic_id = state.shard.shard().streams2.with_topic_by_id(
         &identifier_stream_id,
         &identifier_topic_id,
         crate::streaming::topics::helpers::get_topic_id(),
     );
-    let numeric_stream_id = state.shard.shard()
-        .streams2
-        .with_stream_by_id(&identifier_stream_id, crate::streaming::streams::helpers::get_stream_id());
-    
-    state.shard.shard()
+    let numeric_stream_id = state.shard.shard().streams2.with_stream_by_id(
+        &identifier_stream_id,
+        crate::streaming::streams::helpers::get_stream_id(),
+    );
+
+    state
+        .shard
+        .shard()
         .permissioner
         .borrow()
         .get_consumer_group(
@@ -87,16 +94,18 @@ async fn get_consumer_group(
         )?;
 
     let consumer_group = {
-        let future = SendWrapper::new(state.shard.shard()
-            .streams2
-            .with_consumer_group_by_id_async(
-                &identifier_stream_id,
-                &identifier_topic_id,
-                &identifier_group_id,
-                async |(root, members)| {
-                    mapper::map_consumer_group(root, members)
-                },
-            ));
+        let future = SendWrapper::new(
+            state
+                .shard
+                .shard()
+                .streams2
+                .with_consumer_group_by_id_async(
+                    &identifier_stream_id,
+                    &identifier_topic_id,
+                    &identifier_group_id,
+                    async |(root, members)| mapper::map_consumer_group(root, members),
+                ),
+        );
         future.await
     };
 
@@ -115,18 +124,24 @@ async fn get_consumer_groups(
 
     // Check permissions and existence
     state.shard.shard().ensure_authenticated(&session)?;
-    state.shard.shard().ensure_topic_exists(&identifier_stream_id, &identifier_topic_id)?;
-    
+    state
+        .shard
+        .shard()
+        .ensure_topic_exists(&identifier_stream_id, &identifier_topic_id)?;
+
     let numeric_topic_id = state.shard.shard().streams2.with_topic_by_id(
         &identifier_stream_id,
         &identifier_topic_id,
         crate::streaming::topics::helpers::get_topic_id(),
     );
-    let numeric_stream_id = state.shard.shard()
-        .streams2
-        .with_stream_by_id(&identifier_stream_id, crate::streaming::streams::helpers::get_stream_id());
-    
-    state.shard.shard()
+    let numeric_stream_id = state.shard.shard().streams2.with_stream_by_id(
+        &identifier_stream_id,
+        crate::streaming::streams::helpers::get_stream_id(),
+    );
+
+    state
+        .shard
+        .shard()
         .permissioner
         .borrow()
         .get_consumer_groups(
@@ -136,15 +151,17 @@ async fn get_consumer_groups(
         )?;
 
     let consumer_groups = {
-        let future = SendWrapper::new(state.shard.shard()
-            .streams2
-            .with_consumer_groups_async(&identifier_stream_id, &identifier_topic_id, async |cgs| {
+        let future = SendWrapper::new(state.shard.shard().streams2.with_consumer_groups_async(
+            &identifier_stream_id,
+            &identifier_topic_id,
+            async |cgs| {
                 cgs.with_components_async(async |cgs| {
                     let (roots, members) = cgs.into_components();
                     mapper::map_consumer_groups(roots, members)
                 })
                 .await
-            }));
+            },
+        ));
         future.await
     };
 
@@ -175,17 +192,21 @@ async fn create_consumer_group(
     .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to create consumer group, stream ID: {}, topic ID: {}, name: {}", stream_id, topic_id, command.name))?;
 
     let group_id = consumer_group.id();
-    
+
     // Send event for consumer group creation
     {
         let broadcast_future = SendWrapper::new(async {
             use crate::shard::transmission::event::ShardEvent;
-            let event = ShardEvent::CreatedConsumerGroup2 { 
-                stream_id: command.stream_id.clone(), 
+            let event = ShardEvent::CreatedConsumerGroup2 {
+                stream_id: command.stream_id.clone(),
                 topic_id: command.topic_id.clone(),
-                cg: consumer_group.clone()
+                cg: consumer_group.clone(),
             };
-            let _responses = state.shard.shard().broadcast_event_to_all_shards(event).await;
+            let _responses = state
+                .shard
+                .shard()
+                .broadcast_event_to_all_shards(event)
+                .await;
         });
         broadcast_future.await;
     }
@@ -193,23 +214,25 @@ async fn create_consumer_group(
     // Get the created consumer group details
     let group_id_identifier = Identifier::numeric(group_id as u32).unwrap();
     let consumer_group_details = {
-        let future = SendWrapper::new(state.shard.shard()
-            .streams2
-            .with_consumer_group_by_id_async(
-                &command.stream_id,
-                &command.topic_id,
-                &group_id_identifier,
-                async |(root, members)| {
-                    mapper::map_consumer_group(root, members)
-                },
-            ));
+        let future = SendWrapper::new(
+            state
+                .shard
+                .shard()
+                .streams2
+                .with_consumer_group_by_id_async(
+                    &command.stream_id,
+                    &command.topic_id,
+                    &group_id_identifier,
+                    async |(root, members)| mapper::map_consumer_group(root, members),
+                ),
+        );
         future.await
     };
 
     // Apply state change
-    let entry_command = EntryCommand::CreateConsumerGroup(CreateConsumerGroupWithId { 
-        group_id: group_id as u32, 
-        command 
+    let entry_command = EntryCommand::CreateConsumerGroup(CreateConsumerGroupWithId {
+        group_id: group_id as u32,
+        command,
     });
     let state_future = SendWrapper::new(
         state
@@ -236,7 +259,7 @@ async fn delete_consumer_group(
     let identifier_group_id = Identifier::from_str_value(&group_id)?;
 
     let session = Session::stateless(identity.user_id, identity.ip_address);
-    
+
     // Delete using the new API
     let consumer_group = state.shard.shard().delete_consumer_group2(
         &session, 
@@ -245,9 +268,9 @@ async fn delete_consumer_group(
         &identifier_group_id
     )
     .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to delete consumer group with ID: {group_id} for topic with ID: {topic_id} in stream with ID: {stream_id}"))?;
-    
+
     let cg_id = consumer_group.id();
-    
+
     // Send event for consumer group deletion
     {
         let broadcast_future = SendWrapper::new(async {
@@ -258,7 +281,11 @@ async fn delete_consumer_group(
                 topic_id: identifier_topic_id.clone(),
                 group_id: identifier_group_id.clone(),
             };
-            let _responses = state.shard.shard().broadcast_event_to_all_shards(event).await;
+            let _responses = state
+                .shard
+                .shard()
+                .broadcast_event_to_all_shards(event)
+                .await;
         });
         broadcast_future.await;
     }

@@ -19,28 +19,55 @@
 use hash32::{Hasher, Murmur3Hasher};
 use std::hash::Hasher as _;
 
-//TODO: Will probably want to move it to separate crate so we can share it with sdk.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub struct IggyNamespace {
-    pub(crate) stream_id: usize,
-    pub(crate) topic_id: usize,
-    pub(crate) partition_id: usize,
+// Packed namespace layout (works only on 64bit platforms, but we won't support 32bit anyway)
+// +----------------+----------------+----------------+----------------+
+// |    stream_id   |    topic_id    |  partition_id  |     unused     |
+// |    STREAM_BITS |    TOPIC_BITS  | PARTITION_BITS |  (64 - total)  |
+// +----------------+----------------+----------------+----------------+
+
+// TODO Use consts from the `slab` module.
+pub const MAX_STREAMS: usize = 4096;
+pub const MAX_TOPICS: usize = 4096;
+pub const MAX_PARTITIONS: usize = 1_000_000;
+
+const fn bits_required(mut n: u64) -> u32 {
+    if n == 0 {
+        return 1;
+    }
+    let mut b = 0;
+    while n > 0 {
+        b += 1;
+        n >>= 1;
+    }
+    b
 }
 
+pub const STREAM_BITS: u32 = bits_required((MAX_STREAMS - 1) as u64);
+pub const TOPIC_BITS: u32 = bits_required((MAX_TOPICS - 1) as u64);
+pub const PARTITION_BITS: u32 = bits_required((MAX_PARTITIONS - 1) as u64);
+
+pub const PARTITION_SHIFT: u32 = 0;
+pub const TOPIC_SHIFT: u32 = PARTITION_SHIFT + PARTITION_BITS;
+pub const STREAM_SHIFT: u32 = TOPIC_SHIFT + TOPIC_BITS;
+
+pub const PARTITION_MASK: u64 = (1u64 << PARTITION_BITS) - 1;
+pub const TOPIC_MASK: u64 = (1u64 << TOPIC_BITS) - 1;
+pub const STREAM_MASK: u64 = (1u64 << STREAM_BITS) - 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct IggyNamespace(u64);
+
 impl IggyNamespace {
-    pub fn new(stream_id: usize, topic_id: usize, partition_id: usize) -> Self {
-        Self {
-            stream_id,
-            topic_id,
-            partition_id,
-        }
+    #[inline]
+    pub fn inner(&self) -> u64 {
+        self.0
     }
 
-    pub fn generate_hash(&self) -> u32 {
-        let mut hasher = Murmur3Hasher::default();
-        hasher.write_usize(self.stream_id);
-        hasher.write_usize(self.topic_id);
-        hasher.write_usize(self.partition_id);
-        hasher.finish32()
+    #[inline]
+    pub fn new(stream: usize, topic: usize, partition: usize) -> Self {
+        let value = ((stream as u64) & STREAM_MASK) << STREAM_SHIFT
+            | ((topic as u64) & TOPIC_MASK) << TOPIC_SHIFT
+            | ((partition as u64) & PARTITION_MASK) << PARTITION_SHIFT;
+        Self(value)
     }
 }

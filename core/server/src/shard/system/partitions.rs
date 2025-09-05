@@ -18,6 +18,8 @@
 
 use super::COMPONENT;
 use crate::shard::IggyShard;
+use crate::shard::ShardInfo;
+use crate::shard::namespace::IggyNamespace;
 use crate::shard_info;
 use crate::slab::traits_ext::EntityComponentSystem;
 use crate::slab::traits_ext::EntityComponentSystemMutCell;
@@ -33,7 +35,6 @@ use crate::streaming::partitions::storage2::create_partition_file_hierarchy;
 use crate::streaming::partitions::storage2::delete_partitions_from_disk;
 use crate::streaming::segments::Segment2;
 use crate::streaming::segments::storage::create_segment_storage;
-
 use crate::streaming::session::Session;
 use crate::streaming::stats::stats::PartitionStats;
 use crate::streaming::stats::stats::TopicStats;
@@ -114,6 +115,13 @@ impl IggyShard {
 
         // TODO: Figure out how to do this operation in a batch.
         for partition_id in partitions.iter().map(|p| p.id()) {
+            // TODO: Create shard table recordsj.
+            let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
+            let shard_id = self.calculate_shard_assignment(&ns);
+            let shard_info = ShardInfo::new(shard_id);
+            let is_current_shard = self.id == shard_info.id;
+            self.insert_shard_table_record(ns, shard_info);
+
             create_partition_file_hierarchy(
                 self.id,
                 numeric_stream_id as usize,
@@ -122,7 +130,9 @@ impl IggyShard {
                 &self.config.system,
             )
             .await?;
-            self.init_log(stream_id, topic_id, partition_id).await?;
+            if is_current_shard {
+                self.init_log(stream_id, topic_id, partition_id).await?;
+            }
         }
         Ok(partitions)
     }
@@ -243,7 +253,7 @@ impl IggyShard {
         Ok(())
     }
 
-    pub fn create_partitions2_bypass_auth(
+    pub async fn create_partitions2_bypass_auth(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
@@ -256,6 +266,7 @@ impl IggyShard {
                 id, actual_id,
                 "create_partitions_bypass_auth: partition mismatch ID, wrong creation order ?!"
             );
+            self.init_log(stream_id, topic_id, id).await?;
         }
         Ok(())
     }
@@ -298,9 +309,11 @@ impl IggyShard {
         for partition in partitions {
             let (root, stats, _, _, _, _, mut log) = partition.into_components();
             let partition_id = root.id();
+            let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
+            self.remove_shard_table_record(&ns);
+
             self.delete_partition_dir(numeric_stream_id, numeric_topic_id, partition_id, &mut log)
                 .await?;
-
             let segments_count = stats.segments_count_inconsistent();
             let messages_count = stats.messages_count_inconsistent();
             let size_bytes = stats.size_bytes_inconsistent();

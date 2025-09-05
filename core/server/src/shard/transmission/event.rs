@@ -1,15 +1,12 @@
-use crate::{
-    shard::namespace::IggyNamespace,
-    streaming::{
-        clients::client_manager::Transport,
-        partitions::partition2,
-        personal_access_tokens::personal_access_token::PersonalAccessToken,
-        polling_consumer::PollingConsumer,
-        streams::stream2,
-        topics::{
-            consumer_group2::{self},
-            topic2,
-        },
+use crate::streaming::{
+    clients::client_manager::Transport,
+    partitions::partition2,
+    personal_access_tokens::personal_access_token::PersonalAccessToken,
+    polling_consumer::PollingConsumer,
+    streams::stream2,
+    topics::{
+        consumer_group2::{self},
+        topic2,
     },
 };
 use iggy_common::{

@@ -24,6 +24,7 @@ use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
 use clap::Parser;
+use dashmap::DashMap;
 use dotenvy::dotenv;
 use error_set::ErrContext;
 use figlet_rs::FIGfont;
@@ -35,8 +36,7 @@ use server::args::Args;
 use server::binary::handlers::streams;
 use server::bootstrap::{
     create_directories, create_root_user, create_shard_connections, create_shard_executor,
-    load_config, load_streams, load_users, resolve_persister,
-    update_system_info,
+    load_config, load_streams, load_users, resolve_persister, update_system_info,
 };
 use server::configs::config_provider::{self};
 use server::configs::server::ServerConfig;
@@ -47,8 +47,9 @@ use server::log::logger::Logging;
 #[cfg(feature = "tokio-console")]
 use server::log::tokio_console::Logging;
 use server::server_error::{ConfigError, ServerError};
-use server::shard::IggyShard;
+use server::shard::namespace::IggyNamespace;
 use server::shard::system::info::SystemInfo;
+use server::shard::{IggyShard, ShardInfo};
 use server::state::StateKind;
 use server::state::command::EntryCommand;
 use server::state::file::FileState;
@@ -57,12 +58,14 @@ use server::state::system::SystemState;
 use server::streaming::diagnostics::metrics::Metrics;
 use server::streaming::storage::SystemStorage;
 use server::streaming::utils::MemoryPool;
+use server::streaming::utils::ptr::EternalPtr;
 use server::versioning::SemanticVersion;
 use server::{IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV, map_toggle_str, shard_info};
 use tokio::time::Instant;
 use tracing::{error, info, instrument};
 
 const COMPONENT: &str = "MAIN";
+const SHARDS_TABLE_CAPACITY: usize = 16384;
 
 #[instrument(skip_all, name = "trace_start_server")]
 #[compio::main]
@@ -218,9 +221,16 @@ async fn main() -> Result<(), ServerError> {
     let (connections, shutdown_handles) = create_shard_connections(&shards_set);
     let mut handles = Vec::with_capacity(shards_set.len());
 
+    // THIRTEENTH DISCRETE LOADING STEP.
+    // Shared resources bootstrap.
+    let shards_table = Box::new(DashMap::with_capacity(SHARDS_TABLE_CAPACITY));
+    let shards_table = Box::leak(shards_table);
+    let shards_table: EternalPtr<DashMap<IggyNamespace, ShardInfo>> = shards_table.into();
+
     for shard_id in shards_set {
         let id = shard_id as u16;
         let streams = streams.clone();
+        let shards_table = shards_table.clone();
         let users = users.clone();
         let storage = storage.clone();
         let connections = connections.clone();
@@ -247,6 +257,7 @@ async fn main() -> Result<(), ServerError> {
                         .streams(streams)
                         .state(state)
                         .users(users)
+                        .shards_table(shards_table)
                         .connections(connections)
                         .config(config)
                         .storage(storage)

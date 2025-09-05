@@ -18,7 +18,12 @@ use compio::{
 };
 use error_set::ErrContext;
 use iggy_common::{ConsumerKind, IggyError};
-use std::{io::Read, ops::Deref, path::Path, sync::{atomic::AtomicU64, Arc}};
+use std::{
+    io::Read,
+    ops::Deref,
+    path::Path,
+    sync::{Arc, atomic::AtomicU64},
+};
 use tracing::{error, trace};
 
 pub async fn create_partition_file_hierarchy(
@@ -121,7 +126,13 @@ pub async fn delete_partitions_from_disk(
     //log.close().await;
 
     let partition_path = config.get_partition_path(stream_id, topic_id, partition_id);
-    remove_dir_all(&partition_path).await.map_err(|_| IggyError::CannotDeletePartitionDirectory(stream_id as u32, topic_id as u32, partition_id as u32))?;
+    remove_dir_all(&partition_path).await.map_err(|_| {
+        IggyError::CannotDeletePartitionDirectory(
+            stream_id as u32,
+            topic_id as u32,
+            partition_id as u32,
+        )
+    })?;
     shard_info!(
         shard_id,
         "Deleted partition files for partition with ID: {} stream with ID: {} and topic with ID: {}.",
@@ -150,9 +161,13 @@ pub async fn persist_offset(shard_id: u16, path: &str, offset: u64) -> Result<()
         .write(true)
         .create(true)
         .open(path)
-        .await.map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?;
+        .await
+        .map_err(|_| IggyError::CannotOpenConsumerOffsetsFile(path.to_owned()))?;
     let buf = offset.to_le_bytes();
-    file.write_all_at(buf, 0).await.0.map_err(|_| IggyError::CannotWriteToFile)?;
+    file.write_all_at(buf, 0)
+        .await
+        .0
+        .map_err(|_| IggyError::CannotWriteToFile)?;
     shard_trace!(
         shard_id,
         "Stored consumer offset value: {}, path: {}",

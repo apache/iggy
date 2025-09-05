@@ -22,11 +22,11 @@ use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::streaming::clients::client_manager::Client;
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::stats::stats::TopicStats;
-use crate::streaming::topics::consumer_group2::{ConsumerGroupRoot, ConsumerGroupMembers};
+use crate::streaming::topics::consumer_group2::{ConsumerGroupMembers, ConsumerGroupRoot};
 use crate::streaming::topics::topic2::TopicRoot;
 use crate::streaming::users::user::User;
 use iggy_common::{ConsumerGroupDetails, ConsumerGroupInfo, ConsumerGroupMember, IggyByteSize};
-use iggy_common::{IdentityInfo, PersonalAccessTokenInfo, TopicDetails, TokenInfo};
+use iggy_common::{IdentityInfo, PersonalAccessTokenInfo, TokenInfo, TopicDetails};
 use iggy_common::{UserInfo, UserInfoDetails};
 use slab::Slab;
 use std::sync::Arc;
@@ -34,10 +34,11 @@ use std::sync::Arc;
 /// Map TopicRoot with partitions to TopicDetails for HTTP responses
 pub fn map_topic_details(root: &TopicRoot, stats: &TopicStats) -> TopicDetails {
     let mut partitions = Vec::new();
-    
+
     // Get partition details similar to binary mapper
     root.partitions().with_components(|partition_components| {
-        let (partition_roots, partition_stats, _, offsets, _, _, _) = partition_components.into_components();
+        let (partition_roots, partition_stats, _, offsets, _, _, _) =
+            partition_components.into_components();
         for (partition_root, partition_stat, offset) in partition_roots
             .iter()
             .map(|(_, val)| val)
@@ -118,7 +119,7 @@ pub fn map_topics_from_components(
         .zip(stats.iter().map(|(_, stat)| stat))
         .map(|(root, stat)| map_topic(root, stat))
         .collect::<Vec<_>>();
-    
+
     topics.sort_by(|a, b| a.id.cmp(&b.id));
     topics
 }
@@ -222,7 +223,10 @@ pub fn map_consumer_groups(
     groups
 }
 
-pub fn map_consumer_group(root: &ConsumerGroupRoot, members: &ConsumerGroupMembers) -> ConsumerGroupDetails {
+pub fn map_consumer_group(
+    root: &ConsumerGroupRoot,
+    members: &ConsumerGroupMembers,
+) -> ConsumerGroupDetails {
     let members_guard = members.inner().shared_get();
     let mut consumer_group_details = ConsumerGroupDetails {
         id: root.id() as u32,
@@ -231,7 +235,7 @@ pub fn map_consumer_group(root: &ConsumerGroupRoot, members: &ConsumerGroupMembe
         members_count: members_guard.len() as u32,
         members: Vec::new(),
     };
-    
+
     for (_, member) in members_guard.iter() {
         consumer_group_details.members.push(ConsumerGroupMember {
             id: member.id as u32,
@@ -253,12 +257,15 @@ pub fn map_generated_access_token_to_identity_info(token: GeneratedToken) -> Ide
 }
 
 /// Map StreamRoot and StreamStats to StreamDetails for HTTP responses
-pub fn map_stream_details(root: &crate::streaming::streams::stream2::StreamRoot, stats: &crate::streaming::stats::stats::StreamStats) -> iggy_common::StreamDetails {
+pub fn map_stream_details(
+    root: &crate::streaming::streams::stream2::StreamRoot,
+    stats: &crate::streaming::stats::stats::StreamStats,
+) -> iggy_common::StreamDetails {
     // Get topics using the new slab-based API
     let topics = root.topics().with_components(|topic_ref| {
         let (topic_roots, _topic_auxiliaries, topic_stats) = topic_ref.into_components();
         let mut topics_vec = Vec::new();
-        
+
         // Iterate over topics in the stream
         for (topic_root, topic_stat) in topic_roots
             .iter()
@@ -267,12 +274,12 @@ pub fn map_stream_details(root: &crate::streaming::streams::stream2::StreamRoot,
         {
             topics_vec.push(map_topic(topic_root, topic_stat));
         }
-        
+
         // Sort topics by ID for consistent ordering
         topics_vec.sort_by(|a, b| a.id.cmp(&b.id));
         topics_vec
     });
-    
+
     iggy_common::StreamDetails {
         id: root.id() as u32,
         created_at: root.created_at(),
@@ -285,7 +292,10 @@ pub fn map_stream_details(root: &crate::streaming::streams::stream2::StreamRoot,
 }
 
 /// Map StreamRoot and StreamStats to Stream for HTTP responses  
-pub fn map_stream(root: &crate::streaming::streams::stream2::StreamRoot, stats: &crate::streaming::stats::stats::StreamStats) -> iggy_common::Stream {
+pub fn map_stream(
+    root: &crate::streaming::streams::stream2::StreamRoot,
+    stats: &crate::streaming::stats::stats::StreamStats,
+) -> iggy_common::Stream {
     iggy_common::Stream {
         id: root.id() as u32,
         created_at: root.created_at(),
@@ -297,7 +307,10 @@ pub fn map_stream(root: &crate::streaming::streams::stream2::StreamRoot, stats: 
 }
 
 /// Map multiple streams from slabs
-pub fn map_streams_from_slabs(roots: &slab::Slab<crate::streaming::streams::stream2::StreamRoot>, stats: &slab::Slab<Arc<crate::streaming::stats::stats::StreamStats>>) -> Vec<iggy_common::Stream> {
+pub fn map_streams_from_slabs(
+    roots: &slab::Slab<crate::streaming::streams::stream2::StreamRoot>,
+    stats: &slab::Slab<Arc<crate::streaming::stats::stats::StreamStats>>,
+) -> Vec<iggy_common::Stream> {
     let mut streams = Vec::new();
     for (root, stat) in roots
         .iter()

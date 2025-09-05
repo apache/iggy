@@ -126,7 +126,7 @@ impl BenchmarkInit for HighLevelConsumerClient {
                     &format!("hl_consumer_{}", self.config.consumer_id),
                     &stream_id_str,
                     &topic_id_str,
-                    1,
+                    0,
                 )?
                 .polling_strategy(PollingStrategy::offset(0))
                 .batch_length(self.config.messages_per_batch.get())

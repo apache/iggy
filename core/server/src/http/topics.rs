@@ -20,7 +20,7 @@ use crate::http::COMPONENT;
 use crate::http::error::CustomError;
 use crate::http::jwt::json_web_token::Identity;
 use crate::http::shared::AppState;
-use crate::slab::traits_ext::{EntityMarker, EntityComponentSystem, IntoComponents};
+use crate::slab::traits_ext::{EntityComponentSystem, EntityMarker, IntoComponents};
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateTopicWithId;
 use crate::streaming::session::Session;
@@ -30,12 +30,12 @@ use axum::http::StatusCode;
 use axum::routing::{delete, get};
 use axum::{Extension, Json, Router, debug_handler};
 use error_set::ErrContext;
+use iggy_common::Identifier;
 use iggy_common::Validatable;
 use iggy_common::create_topic::CreateTopic;
 use iggy_common::delete_topic::DeleteTopic;
 use iggy_common::purge_topic::PurgeTopic;
 use iggy_common::update_topic::UpdateTopic;
-use iggy_common::Identifier;
 use iggy_common::{Topic, TopicDetails};
 use send_wrapper::SendWrapper;
 use std::sync::Arc;
@@ -66,21 +66,31 @@ async fn get_topic(
 ) -> Result<Json<TopicDetails>, CustomError> {
     let identity_stream_id = Identifier::from_str_value(&stream_id)?;
     let identity_topic_id = Identifier::from_str_value(&topic_id)?;
-    
+
     let session = Session::stateless(identity.user_id, identity.ip_address);
 
     // Check permissions and stream existence
     state.shard.shard().ensure_authenticated(&session)?;
-    state.shard.shard().ensure_stream_exists(&identity_stream_id)?;
-    state.shard.shard().ensure_topic_exists(&identity_stream_id, &identity_topic_id)?;
-    
-    let numeric_stream_id = state.shard.shard()
+    state
+        .shard
+        .shard()
+        .ensure_stream_exists(&identity_stream_id)?;
+    state
+        .shard
+        .shard()
+        .ensure_topic_exists(&identity_stream_id, &identity_topic_id)?;
+
+    let numeric_stream_id = state
+        .shard
+        .shard()
         .streams2
         .with_stream_by_id(&identity_stream_id, streams::helpers::get_stream_id());
-    let numeric_topic_id = state.shard.shard()
-        .streams2
-        .with_topic_by_id(&identity_stream_id, &identity_topic_id, topics::helpers::get_topic_id());
-    
+    let numeric_topic_id = state.shard.shard().streams2.with_topic_by_id(
+        &identity_stream_id,
+        &identity_topic_id,
+        topics::helpers::get_topic_id(),
+    );
+
     state.shard.shard()
         .permissioner
         .borrow()
@@ -96,9 +106,7 @@ async fn get_topic(
     let topic_details = state.shard.shard().streams2.with_topic_by_id(
         &identity_stream_id,
         &identity_topic_id,
-        |(root, _, stats)| {
-            crate::http::mapper::map_topic_details(&root, &stats)
-        }
+        |(root, _, stats)| crate::http::mapper::map_topic_details(&root, &stats),
     );
 
     Ok(Json(topic_details))
@@ -116,11 +124,13 @@ async fn get_topics(
     // Check permissions and stream existence
     state.shard.shard().ensure_authenticated(&session)?;
     state.shard.shard().ensure_stream_exists(&stream_id)?;
-    
-    let numeric_stream_id = state.shard.shard()
+
+    let numeric_stream_id = state
+        .shard
+        .shard()
         .streams2
         .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
-    
+
     state.shard.shard()
         .permissioner
         .borrow()
@@ -133,7 +143,9 @@ async fn get_topics(
         })?;
 
     // Get topics using the new API
-    let topics = state.shard.shard()
+    let topics = state
+        .shard
+        .shard()
         .streams2
         .with_topics(&stream_id, |topics| {
             topics.with_components(|topics| {
@@ -179,15 +191,15 @@ async fn create_topic(
     command.max_topic_size = topic.root().max_topic_size();
 
     let topic_id = topic.id();
-    
+
     // Send events for topic creation
     let broadcast_future = SendWrapper::new(async {
         use crate::shard::transmission::event::ShardEvent;
 
         let shard = state.shard.shard();
 
-        let event = ShardEvent::CreatedTopic2 { 
-            stream_id: command.stream_id.clone(), 
+        let event = ShardEvent::CreatedTopic2 {
+            stream_id: command.stream_id.clone(),
             topic,
         };
         let _responses = shard.broadcast_event_to_all_shards(event).await;
@@ -227,7 +239,7 @@ async fn create_topic(
             &topic_identifier,
             |(root, _, stats)| {
                 crate::http::mapper::map_topic_details_empty_partitions(&root, &stats)
-            }
+            },
         );
         Json(topic_response)
     };
@@ -289,7 +301,7 @@ async fn update_topic(
     let (message_expiry, max_topic_size) = state.shard.shard().streams2.with_topic_by_id(
         &command.stream_id,
         &command.topic_id,
-        |(root, _, _)| (root.message_expiry(), root.max_topic_size())
+        |(root, _, _)| (root.message_expiry(), root.max_topic_size()),
     );
 
     command.message_expiry = message_expiry;

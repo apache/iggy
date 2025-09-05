@@ -1,5 +1,5 @@
 /* Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
+inner() * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
  * to you under the Apache License, Version 2.0 (the
@@ -27,18 +27,21 @@ pub mod transmission;
 
 use ahash::{AHashMap, AHashSet, HashMap};
 use builder::IggyShardBuilder;
+use dashmap::DashMap;
 use error_set::ErrContext;
 use futures::future::try_join_all;
+use hash32::{Hasher, Murmur3Hasher};
 use iggy_common::{
     EncryptorKind, Identifier, IggyError, Permissions, UserId, UserStatus,
     defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME},
     locking::IggyRwLockFn,
 };
-use namespace::IggyNamespace;
+use std::hash::Hasher as _;
 use std::{
     cell::{Cell, RefCell},
     future::Future,
     net::SocketAddr,
+    ops::Deref,
     pin::Pin,
     rc::Rc,
     sync::{
@@ -55,6 +58,7 @@ use crate::{
     http::http_server,
     io::fs_utils,
     shard::{
+        namespace::IggyNamespace,
         task_registry::TaskRegistry,
         tasks::messages::spawn_shard_message_task,
         transmission::{
@@ -77,6 +81,7 @@ use crate::{
         session::Session,
         storage::SystemStorage,
         users::{permissioner::Permissioner, user::User},
+        utils::ptr::EternalPtr,
     },
     tcp::tcp_server::spawn_tcp_server,
     versioning::SemanticVersion,
@@ -116,7 +121,8 @@ impl Shard {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+// TODO: Maybe pad to cache line size?
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ShardInfo {
     id: u16,
 }
@@ -134,11 +140,11 @@ impl ShardInfo {
 pub struct IggyShard {
     pub id: u16,
     shards: Vec<Shard>,
-    shards_table: RefCell<HashMap<IggyNamespace, ShardInfo>>,
     version: SemanticVersion,
 
     // Heart transplant of the old streams structure.
     pub(crate) streams2: Streams,
+    shards_table: EternalPtr<DashMap<IggyNamespace, ShardInfo>>,
     // TODO: Refactor.
     pub(crate) storage: Rc<SystemStorage>,
     pub(crate) state: StateKind,
@@ -183,11 +189,13 @@ impl IggyShard {
         let state_path = server_config.system.get_state_messages_file_path();
         let file_state = FileState::new(&state_path, &version, persister, None);
         let state = crate::state::StateKind::File(file_state);
+        let shards_table = Box::new(DashMap::new());
+        let shards_table = Box::leak(shards_table);
 
         let shard = Self {
             id: 0,
             shards: Vec::new(),
-            shards_table: Default::default(),
+            shards_table: shards_table.into(),
             version,
             streams2: Default::default(),
             state,
@@ -314,6 +322,12 @@ impl IggyShard {
 
     pub fn get_available_shards_count(&self) -> u32 {
         self.shards.len() as u32
+    }
+
+    pub fn calculate_shard_assignment(&self, ns: &IggyNamespace) -> u16 {
+        let mut hasher = Murmur3Hasher::default();
+        hasher.write_u64(ns.inner());
+        (hasher.finish32() % self.get_available_shards_count()) as u16
     }
 
     pub async fn handle_shard_message(&self, message: ShardMessage) -> Option<ShardResponse> {
@@ -469,7 +483,8 @@ impl IggyShard {
                 topic_id,
                 partitions,
             } => {
-                self.create_partitions2_bypass_auth(&stream_id, &topic_id, partitions)?;
+                self.create_partitions2_bypass_auth(&stream_id, &topic_id, partitions)
+                    .await?;
                 Ok(())
             }
             ShardEvent::DeletedTopic2 {
@@ -554,6 +569,7 @@ impl IggyShard {
         }
     }
 
+    /*
     pub async fn send_request_to_shard_or_recoil(
         &self,
         namespace: &IggyNamespace,
@@ -583,6 +599,7 @@ impl IggyShard {
             ))
         }
     }
+    */
 
     pub async fn broadcast_event_to_all_shards(&self, event: ShardEvent) -> Vec<ShardResponse> {
         let mut responses = Vec::with_capacity(self.get_available_shards_count() as usize);
@@ -634,9 +651,12 @@ impl IggyShard {
         responses
     }
 
+    pub fn add_active_session(&self, session: Rc<Session>) {
+        self.active_sessions.borrow_mut().push(session);
+    }
+
     fn find_shard(&self, namespace: &IggyNamespace) -> Option<&Shard> {
-        let shards_table = self.shards_table.borrow();
-        shards_table.get(namespace).map(|shard_info| {
+        self.shards_table.get(namespace).map(|shard_info| {
             self.shards
                 .iter()
                 .find(|shard| shard.id == shard_info.id)
@@ -645,49 +665,37 @@ impl IggyShard {
     }
 
     pub fn find_shard_table_record(&self, namespace: &IggyNamespace) -> Option<ShardInfo> {
-        let shards_table = self.shards_table.borrow();
-        shards_table.get(namespace).cloned()
+        self.shards_table.get(namespace).map(|entry| *entry)
+    }
+
+    pub fn remove_shard_table_record(&self, namespace: &IggyNamespace) -> ShardInfo {
+        self.shards_table.remove(namespace).map(|(_, shard_info)| shard_info).expect("remove_shard_table_record: namespace not found")
     }
 
     pub fn remove_shard_table_records(
         &self,
         namespaces: &[IggyNamespace],
     ) -> Vec<(IggyNamespace, ShardInfo)> {
-        let mut shards_table = self.shards_table.borrow_mut();
         namespaces
             .iter()
             .map(|ns| {
-                let shard_info = shards_table.remove(ns).unwrap();
-                (*ns, shard_info)
+                let (ns, shard_info) = self.shards_table.remove(ns).unwrap();
+                (ns, shard_info)
             })
             .collect()
     }
 
-    pub fn create_shard_table_records(
-        &self,
-        partition_ids: &[usize],
-        stream_id: usize,
-        topic_id: usize,
-    ) -> impl Iterator<Item = (IggyNamespace, ShardInfo)> {
-        let records = partition_ids.iter().map(move |partition_id| {
-            let namespace = IggyNamespace::new(stream_id, topic_id, *partition_id);
-            let hash = namespace.generate_hash();
-            let shard_id = hash % self.get_available_shards_count();
-            let shard_info = ShardInfo::new(shard_id as u16);
-            (namespace, shard_info)
-        });
-        records
+    pub fn insert_shard_table_record(&self, ns: IggyNamespace, shard_info: ShardInfo) {
+        self.shards_table.insert(ns, shard_info);
     }
 
     pub fn insert_shard_table_records(
         &self,
         records: impl IntoIterator<Item = (IggyNamespace, ShardInfo)>,
     ) {
-        self.shards_table.borrow_mut().extend(records);
-    }
-
-    pub fn add_active_session(&self, session: Rc<Session>) {
-        self.active_sessions.borrow_mut().push(session);
+        for (ns, shard_info) in records {
+            self.shards_table.insert(ns, shard_info);
+        }
     }
 
     pub fn remove_active_session(&self, user_id: u32) {

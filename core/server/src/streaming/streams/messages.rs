@@ -23,10 +23,7 @@ use tracing::trace;
 use super::COMPONENT;
 use crate::{
     binary::handlers::messages::poll_messages_handler::IggyPollMetadata,
-    shard::{
-        namespace::IggyNamespace,
-        transmission::message::{ShardMessage, ShardRequest, ShardRequestPayload},
-    },
+    shard::transmission::message::{ShardMessage, ShardRequest, ShardRequestPayload},
     streaming::{
         polling_consumer::PollingConsumer,
         segments::{IggyMessagesBatchMut, IggyMessagesBatchSet},

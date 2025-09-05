@@ -65,20 +65,27 @@ async fn create_partitions(
         &command.stream_id,
         &command.topic_id,
         command.partitions_count,
-    )).await?;
+    ))
+    .await?;
 
     let broadcast_future = SendWrapper::new(async {
         let shard = state.shard.shard();
 
-        let event = ShardEvent::CreatedPartitions2 { 
+        let event = ShardEvent::CreatedPartitions2 {
             stream_id: command.stream_id.clone(),
             topic_id: command.topic_id.clone(),
             partitions,
         };
         let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
 
-        let numeric_stream_id = shard.streams2.with_stream_by_id(&command.stream_id, streams::helpers::get_stream_id());
-        let numeric_topic_id = shard.streams2.with_topic_by_id(&command.stream_id, &command.topic_id, topics::helpers::get_topic_id());
+        let numeric_stream_id = shard
+            .streams2
+            .with_stream_by_id(&command.stream_id, streams::helpers::get_stream_id());
+        let numeric_topic_id = shard.streams2.with_topic_by_id(
+            &command.stream_id,
+            &command.topic_id,
+            topics::helpers::get_topic_id(),
+        );
 
         // TODO: Replace with new mechanism
         /*

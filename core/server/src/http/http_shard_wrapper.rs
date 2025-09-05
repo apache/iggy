@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
 use iggy_common::{
-    Consumer, ConsumerOffsetInfo, Identifier, IggyError, IggyExpiry,
-    Partitioning, Permissions, Stats, UserId, UserStatus,
+    Consumer, ConsumerOffsetInfo, Identifier, IggyError, IggyExpiry, Partitioning, Permissions,
+    Stats, UserId, UserStatus,
 };
 use send_wrapper::SendWrapper;
 
@@ -141,7 +141,11 @@ impl HttpSafeShard {
         future.await
     }
 
-    pub async fn apply_state(&self, user_id: UserId, command: &EntryCommand) -> Result<(), IggyError> {
+    pub async fn apply_state(
+        &self,
+        user_id: UserId,
+        command: &EntryCommand,
+    ) -> Result<(), IggyError> {
         self.shard().state.apply(user_id, command).await
     }
 

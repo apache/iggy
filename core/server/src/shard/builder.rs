@@ -23,16 +23,20 @@ use std::{
 };
 
 use ahash::HashMap;
+use dashmap::DashMap;
 use iggy_common::{Aes256GcmEncryptor, EncryptorKind, UserId};
 use tracing::info;
 
 use crate::{
     configs::server::ServerConfig,
     io::storage::Storage,
-    shard::{Shard, task_registry::TaskRegistry},
+    shard::{Shard, ShardInfo, namespace::IggyNamespace, task_registry::TaskRegistry},
     slab::streams::Streams,
     state::{StateKind, system::SystemState},
-    streaming::{diagnostics::metrics::Metrics, storage::SystemStorage, users::user::User},
+    streaming::{
+        diagnostics::metrics::Metrics, storage::SystemStorage, users::user::User,
+        utils::ptr::EternalPtr,
+    },
     versioning::SemanticVersion,
 };
 
@@ -42,6 +46,7 @@ use super::{IggyShard, transmission::connector::ShardConnector, transmission::fr
 pub struct IggyShardBuilder {
     id: Option<u16>,
     streams: Option<Streams>,
+    shards_table: Option<EternalPtr<DashMap<IggyNamespace, ShardInfo>>>,
     state: Option<StateKind>,
     users: Option<HashMap<UserId, User>>,
     connections: Option<Vec<ShardConnector<ShardFrame>>>,
@@ -65,6 +70,14 @@ impl IggyShardBuilder {
 
     pub fn config(mut self, config: ServerConfig) -> Self {
         self.config = Some(config);
+        self
+    }
+
+    pub fn shards_table(
+        mut self,
+        shards_table: EternalPtr<DashMap<IggyNamespace, ShardInfo>>,
+    ) -> Self {
+        self.shards_table = Some(shards_table);
         self
     }
 
@@ -107,6 +120,7 @@ impl IggyShardBuilder {
     pub fn build(self) -> IggyShard {
         let id = self.id.unwrap();
         let streams = self.streams.unwrap();
+        let shards_table = self.shards_table.unwrap();
         let state = self.state.unwrap();
         let users = self.users.unwrap();
         let config = self.config.unwrap();
@@ -134,7 +148,7 @@ impl IggyShardBuilder {
         IggyShard {
             id: id,
             shards: shards,
-            shards_table: Default::default(),
+            shards_table,
             //streams2: streams, // TODO: Fixme
             streams2: Default::default(),
             users: RefCell::new(users),
