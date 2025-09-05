@@ -36,6 +36,10 @@ impl System {
         // TODO(hubcio): Clustering is not yet implemented
         // The leader/follower as well as node status are currently placeholder implementations.
 
+        let name = self.cluster_config.name.clone();
+        let id = self.cluster_config.id;
+        let transport = self.cluster_config.transport;
+
         let nodes: Vec<ClusterNode> = self
             .cluster_config
             .nodes
@@ -60,9 +64,9 @@ impl System {
             .collect();
 
         Ok(ClusterMetadata {
-            name: self.cluster_config.name.clone(),
-            id: self.cluster_config.id,
-            transport: self.cluster_config.transport.clone(),
+            name,
+            id,
+            transport,
             nodes,
         })
     }

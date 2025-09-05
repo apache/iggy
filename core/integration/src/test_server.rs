@@ -30,6 +30,7 @@ use assert_cmd::prelude::CommandCargoExt;
 use async_trait::async_trait;
 use derive_more::Display;
 use futures::executor::block_on;
+use iggy_common::TransportProtocol;
 use uuid::Uuid;
 
 use iggy::prelude::UserStatus::Active;
@@ -54,20 +55,8 @@ pub enum IpAddrKind {
 #[async_trait]
 pub trait ClientFactory: Sync + Send {
     async fn create_client(&self) -> ClientWrapper;
-    fn transport(&self) -> Transport;
+    fn transport(&self) -> TransportProtocol;
     fn server_addr(&self) -> String;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Display)]
-pub enum Transport {
-    #[display("http")]
-    Http,
-
-    #[display("quic")]
-    Quic,
-
-    #[display("tcp")]
-    Tcp,
 }
 
 #[derive(Display, Debug)]

@@ -17,9 +17,9 @@
  */
 
 use crate::binary::sender::SenderKind;
-use crate::streaming::clients::client_manager::Transport;
 use crate::streaming::systems::system::SharedSystem;
 use crate::tcp::connection_handler::{handle_connection, handle_error};
+use iggy_common::TransportProtocol;
 use std::net::SocketAddr;
 use tokio::net::TcpSocket;
 use tokio::sync::oneshot;
@@ -55,7 +55,7 @@ pub async fn start(address: &str, socket: TcpSocket, system: SharedSystem) -> So
                     let session = system
                         .read()
                         .await
-                        .add_client(&address, Transport::Tcp)
+                        .add_client(&address, TransportProtocol::Tcp)
                         .await;
 
                     let client_id = session.client_id;

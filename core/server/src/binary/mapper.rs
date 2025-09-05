@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::streaming::clients::client_manager::{Client, Transport};
+use crate::streaming::clients::client_manager::Client;
 use crate::streaming::partitions::partition::Partition;
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::streams::stream::Stream;
@@ -25,7 +25,9 @@ use crate::streaming::topics::topic::Topic;
 use crate::streaming::users::user::User;
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_common::locking::{IggySharedMut, IggySharedMutFn};
-use iggy_common::{BytesSerializable, ConsumerOffsetInfo, Sizeable, Stats, UserId};
+use iggy_common::{
+    BytesSerializable, ConsumerOffsetInfo, Sizeable, Stats, TransportProtocol, UserId,
+};
 use tokio::sync::RwLock;
 
 pub fn map_stats(stats: &Stats) -> Bytes {
@@ -253,8 +255,9 @@ fn extend_client(client: &Client, bytes: &mut BytesMut) {
     bytes.put_u32_le(client.session.client_id);
     bytes.put_u32_le(client.user_id.unwrap_or(0));
     let transport: u8 = match client.transport {
-        Transport::Tcp => 1,
-        Transport::Quic => 2,
+        TransportProtocol::Tcp => 1,
+        TransportProtocol::Quic => 2,
+        TransportProtocol::Http => 3,
     };
     bytes.put_u8(transport);
     let address = client.session.ip_address.to_string();

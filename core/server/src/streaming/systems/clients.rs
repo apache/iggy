@@ -16,13 +16,14 @@
  * under the License.
  */
 
-use crate::streaming::clients::client_manager::{Client, Transport};
+use crate::streaming::clients::client_manager::Client;
 use crate::streaming::session::Session;
 use crate::streaming::systems::COMPONENT;
 use crate::streaming::systems::system::System;
 use error_set::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
+use iggy_common::TransportProtocol;
 use iggy_common::locking::IggySharedMut;
 use iggy_common::locking::IggySharedMutFn;
 use std::net::SocketAddr;
@@ -30,7 +31,11 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 impl System {
-    pub async fn add_client(&self, address: &SocketAddr, transport: Transport) -> Arc<Session> {
+    pub async fn add_client(
+        &self,
+        address: &SocketAddr,
+        transport: TransportProtocol,
+    ) -> Arc<Session> {
         let mut client_manager = self.client_manager.write().await;
         let session = client_manager.add_client(address, transport);
         info!("Added {transport} client with session: {session} for IP address: {address}");
