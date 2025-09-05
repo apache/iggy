@@ -43,27 +43,17 @@ namespace Apache.Iggy.IggyClient.Implementations;
 public class HttpMessageStream : IIggyClient
 {
     private const string Context = "csharp-sdk";
-
-    private readonly Channel<MessageSendRequest>? _channel;
+    
     private readonly HttpClient _httpClient;
 
     //TODO - create mechanism for refreshing jwt token
     //TODO - replace the HttpClient with IHttpClientFactory, when implementing support for ASP.NET Core DI
     //TODO - the error handling pattern is pretty ugly, look into moving it into an extension method
     private readonly JsonSerializerOptions _jsonSerializerOptions;
-    private readonly ILogger<HttpMessageStream> _logger;
-    private readonly IMessageInvoker? _messageInvoker;
-    private readonly MessagePollingSettings _messagePollingSettings;
 
-    internal HttpMessageStream(HttpClient httpClient, Channel<MessageSendRequest>? channel,
-        MessagePollingSettings messagePollingSettings, ILoggerFactory loggerFactory,
-        IMessageInvoker? messageInvoker = null)
+    internal HttpMessageStream(HttpClient httpClient)
     {
         _httpClient = httpClient;
-        _channel = channel;
-        _messagePollingSettings = messagePollingSettings;
-        _messageInvoker = messageInvoker;
-        _logger = loggerFactory.CreateLogger<HttpMessageStream>();
 
         _jsonSerializerOptions = new JsonSerializerOptions
         {
@@ -256,13 +246,15 @@ public class HttpMessageStream : IIggyClient
             }
         }
 
-        if (_messageInvoker is not null)
-        {
-            await _messageInvoker.SendMessagesAsync(request, token);
-            return;
-        }
+        var json = JsonSerializer.Serialize(request, _jsonSerializerOptions);
+        var data = new StringContent(json, Encoding.UTF8, "application/json");
 
-        await _channel!.Writer.WriteAsync(request, token);
+        var response = await _httpClient.PostAsync($"/streams/{request.StreamId}/topics/{request.TopicId}/messages",
+            data, token);
+        if (!response.IsSuccessStatusCode)
+        {
+            await HandleResponseAsync(response);
+        }
     }
 
     public async Task SendMessagesAsync<TMessage>(MessageSendRequest<TMessage> request,
@@ -289,24 +281,15 @@ public class HttpMessageStream : IIggyClient
             }).ToArray()
         };
 
-        if (_messageInvoker is not null)
+        var json = JsonSerializer.Serialize(request, _jsonSerializerOptions);
+        var data = new StringContent(json, Encoding.UTF8, "application/json");
+
+        var response = await _httpClient.PostAsync($"/streams/{request.StreamId}/topics/{request.TopicId}/messages",
+            data, token);
+        if (!response.IsSuccessStatusCode)
         {
-            try
-            {
-                await _messageInvoker.SendMessagesAsync(sendRequest, token);
-            }
-            catch
-            {
-                var partId = BinaryPrimitives.ReadInt32LittleEndian(sendRequest.Partitioning.Value);
-                _logger.LogError(
-                    "Error encountered while sending messages - Stream ID:{StreamId}, Topic ID:{TopicId}, Partition ID: {PartitionId}",
-                    sendRequest.StreamId, sendRequest.TopicId, partId);
-            }
-
-            return;
+            await HandleResponseAsync(response);
         }
-
-        await _channel!.Writer.WriteAsync(sendRequest, token);
     }
 
     public async Task FlushUnsavedBufferAsync(Identifier streamId, Identifier topicId, uint partitionId, bool fsync,
@@ -393,60 +376,6 @@ public class HttpMessageStream : IIggyClient
 
         await HandleResponseAsync(response);
         return PolledMessages<TMessage>.Empty;
-    }
-
-    public async IAsyncEnumerable<MessageResponse<TMessage>> PollMessagesAsync<TMessage>(PollMessagesRequest request,
-        Func<byte[], TMessage> deserializer, Func<byte[], byte[]>? decryptor = null,
-        [EnumeratorCancellation] CancellationToken token = default)
-    {
-        var channel = Channel.CreateUnbounded<MessageResponse<TMessage>>();
-        var autoCommit = _messagePollingSettings.StoreOffsetStrategy switch
-        {
-            StoreOffset.Never => false,
-            StoreOffset.WhenMessagesAreReceived => true,
-            StoreOffset.AfterProcessingEachMessage => false,
-            _ => throw new ArgumentOutOfRangeException()
-        };
-        var fetchRequest = new MessageFetchRequest
-        {
-            Consumer = request.Consumer,
-            StreamId = request.StreamId,
-            TopicId = request.TopicId,
-            AutoCommit = autoCommit,
-            Count = request.Count,
-            PartitionId = request.PartitionId,
-            PollingStrategy = request.PollingStrategy
-        };
-
-
-        _ = StartPollingMessagesAsync(fetchRequest, deserializer, _messagePollingSettings.Interval, channel.Writer,
-            decryptor, token);
-        await foreach (MessageResponse<TMessage> messageResponse in channel.Reader.ReadAllAsync(token))
-        {
-            yield return messageResponse;
-
-            var currentOffset = messageResponse.Header.Offset;
-            if (_messagePollingSettings.StoreOffsetStrategy is StoreOffset.AfterProcessingEachMessage)
-            {
-                try
-                {
-                    await StoreOffsetAsync(request.Consumer, request.StreamId, request.TopicId, currentOffset,
-                        request.PartitionId, token);
-                }
-                catch
-                {
-                    _logger.LogError(
-                        "Error encountered while saving offset information - Offset: {Offset}, Stream ID: {StreamId}, Topic ID: {TopicId}, Partition ID: {PartitionId}",
-                        currentOffset, request.StreamId, request.TopicId, request.PartitionId);
-                }
-            }
-
-            if (request.PollingStrategy.Kind is MessagePolling.Offset)
-            {
-                //TODO - check with profiler whether this doesn't cause a lot of allocations
-                request.PollingStrategy = PollingStrategy.Offset(currentOffset + 1);
-            }
-        }
     }
 
     public async Task StoreOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, ulong offset,
@@ -834,38 +763,38 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
 
-    private async Task StartPollingMessagesAsync<TMessage>(MessageFetchRequest request,
-        Func<byte[], TMessage> deserializer, TimeSpan interval, ChannelWriter<MessageResponse<TMessage>> writer,
-        Func<byte[], byte[]>? decryptor = null,
-        CancellationToken token = default)
-    {
-        var timer = new PeriodicTimer(interval);
-        while (await timer.WaitForNextTickAsync(token) || token.IsCancellationRequested)
-        {
-            try
-            {
-                PolledMessages<TMessage> fetchResponse
-                    = await PollMessagesAsync(request, deserializer, decryptor, token);
-                if (fetchResponse.Messages.Count == 0)
-                {
-                    continue;
-                }
-
-                foreach (MessageResponse<TMessage> messageResponse in fetchResponse.Messages)
-                {
-                    await writer.WriteAsync(messageResponse, token);
-                }
-            }
-            catch (Exception e)
-            {
-                _logger.LogError(e,
-                    "Error encountered while polling messages - Stream ID: {StreamId}, Topic ID: {TopicId}, Partition ID: {PartitionId}",
-                    request.StreamId, request.TopicId, request.PartitionId);
-            }
-        }
-
-        writer.Complete();
-    }
+    // private async Task StartPollingMessagesAsync<TMessage>(MessageFetchRequest request,
+    //     Func<byte[], TMessage> deserializer, TimeSpan interval, ChannelWriter<MessageResponse<TMessage>> writer,
+    //     Func<byte[], byte[]>? decryptor = null,
+    //     CancellationToken token = default)
+    // {
+    //     var timer = new PeriodicTimer(interval);
+    //     while (await timer.WaitForNextTickAsync(token) || token.IsCancellationRequested)
+    //     {
+    //         try
+    //         {
+    //             PolledMessages<TMessage> fetchResponse
+    //                 = await PollMessagesAsync(request, deserializer, decryptor, token);
+    //             if (fetchResponse.Messages.Count == 0)
+    //             {
+    //                 continue;
+    //             }
+    //
+    //             foreach (MessageResponse<TMessage> messageResponse in fetchResponse.Messages)
+    //             {
+    //                 await writer.WriteAsync(messageResponse, token);
+    //             }
+    //         }
+    //         catch (Exception e)
+    //         {
+    //             _logger.LogError(e,
+    //                 "Error encountered while polling messages - Stream ID: {StreamId}, Topic ID: {TopicId}, Partition ID: {PartitionId}",
+    //                 request.StreamId, request.TopicId, request.PartitionId);
+    //         }
+    //     }
+    //
+    //     writer.Complete();
+    // }
 
     private static async Task HandleResponseAsync(HttpResponseMessage response)
     {

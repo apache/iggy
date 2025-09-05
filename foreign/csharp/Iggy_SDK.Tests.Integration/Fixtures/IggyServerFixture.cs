@@ -21,6 +21,7 @@ using Apache.Iggy.Factory;
 using Apache.Iggy.IggyClient;
 using DotNet.Testcontainers.Builders;
 using DotNet.Testcontainers.Containers;
+using DotNet.Testcontainers.Images;
 using Microsoft.Extensions.Logging.Abstractions;
 using TUnit.Core.Interfaces;
 using TUnit.Core.Logging;
@@ -125,13 +126,19 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
                 : $"http://{_iggyServerHost}:3000";
         }
 
-        return MessageStreamFactory.CreateMessageStream(options =>
+        return IggyClientFactory.CreateClient(new IggyClientConfigurator()
         {
-            options.BaseAdress = address;
-            options.Protocol = protocol;
-            options.MessageBatchingSettings = BatchingSettings;
-            options.MessagePollingSettings = PollingSettings;
-        }, NullLoggerFactory.Instance);
+            BaseAdress = address,
+            Protocol = protocol
+        });
+
+        // return MessageStreamFactory.CreateMessageStream(new MessageStreamConfigurator
+        // {
+        //     BaseAdress = address,
+        //     Protocol = protocol,
+        //     MessageBatchingSettings = BatchingSettings,
+        //     MessagePollingSettings = PollingSettings
+        // });
     }
 
     public static IEnumerable<Func<Protocol>> ProtocolData()

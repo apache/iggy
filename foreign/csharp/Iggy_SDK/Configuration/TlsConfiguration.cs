@@ -21,5 +21,5 @@ public class TlsSettings
 {
     public bool Enabled { get; set; }
     public string Hostname { get; set; } = string.Empty;
-    public bool Authenticate { get; set; } = false;
+    public bool Authenticate { get; set; }
 }

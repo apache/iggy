@@ -97,9 +97,30 @@ public class TopicsTests
         response.MaxTopicSize.ShouldBe(TopicRequest.MaxTopicSize);
         response.MessagesCount.ShouldBe(0u);
     }
-
+    
     [Test]
     [DependsOn(nameof(Get_ExistingTopic_Should_ReturnValidResponse))]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task Get_ExistingTopic_ByName_Should_ReturnValidResponse(Protocol protocol)
+    {
+        var response = await Fixture.Clients[protocol].GetTopicByIdAsync(Identifier.String("Test Stream"), Identifier.String(TopicRequest.Name));
+
+        response.ShouldNotBeNull();
+        response.Id.ShouldBe(TopicRequest.TopicId!.Value);
+        response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromSeconds(10));
+        response.Name.ShouldBe(TopicRequest.Name);
+        response.CompressionAlgorithm.ShouldBe(TopicRequest.CompressionAlgorithm);
+        response.Partitions!.Count().ShouldBe((int)TopicRequest.PartitionsCount);
+        response.MessageExpiry.ShouldBe(TopicRequest.MessageExpiry);
+        response.Size.ShouldBe(0u);
+        response.PartitionsCount.ShouldBe(TopicRequest.PartitionsCount);
+        response.ReplicationFactor.ShouldBe(TopicRequest.ReplicationFactor);
+        response.MaxTopicSize.ShouldBe(TopicRequest.MaxTopicSize);
+        response.MessagesCount.ShouldBe(0u);
+    }
+
+    [Test]
+    [DependsOn(nameof(Get_ExistingTopic_ByName_Should_ReturnValidResponse))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task Get_ExistingTopics_Should_ReturnValidResponse(Protocol protocol)
     {

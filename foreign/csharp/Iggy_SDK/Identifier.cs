@@ -77,6 +77,26 @@ public readonly struct Identifier : IEquatable<Identifier>
             _ => throw new ArgumentOutOfRangeException()
         };
     }
+    
+    public uint GetUInt32()
+    {
+        if (Kind != IdKind.Numeric)
+        {
+            throw new InvalidOperationException("Identifier is not numeric");
+        }
+        
+        return BinaryPrimitives.ReadUInt32LittleEndian(Value);
+    }
+
+    public string GetString()
+    {
+        if (Kind != IdKind.String)
+        {
+            throw new InvalidOperationException("Identifier is not string");
+        }
+        
+        return Encoding.UTF8.GetString(Value);
+    }
 
     public bool Equals(Identifier other)
     {

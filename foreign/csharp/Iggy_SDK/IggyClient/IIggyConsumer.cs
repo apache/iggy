@@ -23,7 +23,7 @@ namespace Apache.Iggy.IggyClient;
 public interface IIggyConsumer
 {
     Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
-        Consumer consumer, PollingStrategy pollingStrategy, int count, bool autoCommit,
+        Consumer consumer, PollingStrategy pollingStrategy, uint count, bool autoCommit,
         Func<byte[], byte[]>? decryptor = null, CancellationToken token = default)
     {
         return PollMessagesAsync(new MessageFetchRequest
@@ -43,8 +43,4 @@ public interface IIggyConsumer
 
     Task<PolledMessages<TMessage>> PollMessagesAsync<TMessage>(MessageFetchRequest request,
         Func<byte[], TMessage> deserializer, Func<byte[], byte[]>? decryptor = null, CancellationToken token = default);
-
-    IAsyncEnumerable<MessageResponse<TMessage>> PollMessagesAsync<TMessage>(PollMessagesRequest request,
-        Func<byte[], TMessage> deserializer, Func<byte[], byte[]>? decryptor = null,
-        CancellationToken token = default);
 }
