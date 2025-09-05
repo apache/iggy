@@ -15,40 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package iggcon
+package binaryserialization
 
-type ConsumerKind uint8
+import iggcon "github.com/apache/iggy/foreign/go/contracts"
 
-const (
-	ConsumerKindSingle ConsumerKind = 1
-	ConsumerKindGroup  ConsumerKind = 2
-)
-
-type Consumer struct {
-	Kind ConsumerKind
-	Id   Identifier
-}
-
-func DefaultConsumer() Consumer {
-	defaultID, _ := NewIdentifier(uint32(1))
-	return Consumer{
-		Kind: ConsumerKindSingle,
-		Id:   defaultID,
-	}
-}
-
-// NewSingleConsumer create a new Consumer whose kind is ConsumerKindSingle from the Identifier
-func NewSingleConsumer(id Identifier) Consumer {
-	return Consumer{
-		Kind: ConsumerKindSingle,
-		Id:   id,
-	}
-}
-
-// NewGroupConsumer create a new Consumer whose kind is ConsumerKindGroup from the Identifier
-func NewGroupConsumer(id Identifier) Consumer {
-	return Consumer{
-		Kind: ConsumerKindGroup,
-		Id:   id,
-	}
+func SerializeConsumer(consumer iggcon.Consumer) []byte {
+	idBytes := SerializeIdentifier(consumer.Id)
+	bytes := make([]byte, 0, 1+len(idBytes))
+	bytes = append(bytes, uint8(consumer.Kind))
+	bytes = append(bytes, idBytes...)
+	return bytes
 }

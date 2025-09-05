@@ -42,6 +42,7 @@ const (
 	SendMessagesCode         CommandCode = 101
 	GetOffsetCode            CommandCode = 120
 	StoreOffsetCode          CommandCode = 121
+	DeleteConsumerOffsetCode CommandCode = 122
 	GetStreamCode            CommandCode = 200
 	GetStreamsCode           CommandCode = 201
 	CreateStreamCode         CommandCode = 202

@@ -64,8 +64,10 @@ runs:
       if: inputs.task == 'lint'
       run: |
         # Build list of directories to check using absolute paths
-        DIRS_TO_CHECK="${GITHUB_WORKSPACE}/foreign/python/tests ${GITHUB_WORKSPACE}/foreign/python"
-        STUB_FILE="${GITHUB_WORKSPACE}/foreign/python/apache_iggy.pyi"
+        DIR_SDK="${GITHUB_WORKSPACE}/foreign/python"
+        DIR_TEST="${DIR_SDK}/tests"
+        DIRS_TO_CHECK="${DIR_TEST} ${DIR_SDK}"
+        STUB_FILE="${DIR_SDK}/apache_iggy.pyi"
 
         echo "Directories to check: $DIRS_TO_CHECK"
         echo "Stub file: $STUB_FILE"
@@ -77,9 +79,8 @@ runs:
         echo "ruff format --check $DIRS_TO_CHECK"
         ruff format --check $DIRS_TO_CHECK
 
-        # TODO(hubcio): make this blocking when mypy lints are fixed
-        echo "mypy --explicit-package-bases $STUB_FILE $DIRS_TO_CHECK"
-        mypy --explicit-package-bases "$STUB_FILE" $DIRS_TO_CHECK || true
+        echo "mypy --explicit-package-bases $DIR_SDK"
+        mypy --explicit-package-bases "$DIR_SDK"
         echo "mypy version: $(mypy --version)"
       shell: bash
 
