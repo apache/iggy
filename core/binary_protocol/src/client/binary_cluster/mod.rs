@@ -16,28 +16,16 @@
  * under the License.
  */
 
-mod binary_cluster;
-mod binary_consumer_group;
-mod binary_consumer_offset;
-mod binary_message;
-mod binary_partitions;
-mod binary_personal_access_tokens;
-mod binary_segments;
-mod binary_streams;
-mod binary_system;
-mod binary_topics;
-mod binary_users;
-pub mod client;
-pub mod client_builder;
-pub mod consumer;
-pub mod consumer_builder;
-pub mod producer;
-pub mod producer_builder;
-pub mod producer_config;
-pub mod producer_dispatcher;
-pub mod producer_error_callback;
-pub mod producer_sharding;
+use crate::utils::auth::fail_if_not_authenticated;
+use crate::utils::mapper;
+use crate::{BinaryClient, ClusterClient};
+use iggy_common::{ClusterMetadata, GetClusterMetadata, IggyError};
 
-const ORDERING: std::sync::atomic::Ordering = std::sync::atomic::Ordering::SeqCst;
-const MAX_BATCH_LENGTH: usize = 1000000;
-const MIB: usize = 1_048_576;
+#[async_trait::async_trait]
+impl<B: BinaryClient> ClusterClient for B {
+    async fn get_cluster_metadata(&self) -> Result<ClusterMetadata, IggyError> {
+        fail_if_not_authenticated(self).await?;
+        let response = self.send_with_response(&GetClusterMetadata {}).await?;
+        mapper::map_cluster_metadata(response)
+    }
+}

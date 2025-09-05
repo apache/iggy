@@ -49,6 +49,10 @@ GET {{url}}/metrics
 GET {{url}}/stats
 
 ###
+GET {{url}}/cluster/metadata
+Authorization: Bearer {{access_token}}
+
+###
 GET {{url}}/clients
 Authorization: Bearer {{access_token}}
 
