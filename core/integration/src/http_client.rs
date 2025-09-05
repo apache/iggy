@@ -16,10 +16,11 @@
  * under the License.
  */
 
-use crate::test_server::{ClientFactory, Transport};
+use crate::test_server::ClientFactory;
 use async_trait::async_trait;
 use iggy::http::http_client::HttpClient;
 use iggy::prelude::{ClientWrapper, HttpClientConfig};
+use iggy_common::TransportProtocol;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -38,8 +39,8 @@ impl ClientFactory for HttpClientFactory {
         ClientWrapper::Http(client)
     }
 
-    fn transport(&self) -> Transport {
-        Transport::Http
+    fn transport(&self) -> TransportProtocol {
+        TransportProtocol::Http
     }
 
     fn server_addr(&self) -> String {

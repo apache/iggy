@@ -21,11 +21,12 @@ mod general;
 mod scenarios;
 mod specific;
 
+use iggy_common::TransportProtocol;
 use integration::{
     http_client::HttpClientFactory,
     quic_client::QuicClientFactory,
     tcp_client::TcpClientFactory,
-    test_server::{ClientFactory, TestServer, Transport},
+    test_server::{ClientFactory, TestServer},
 };
 use scenarios::{
     bench_scenario, consumer_group_join_scenario,
@@ -74,23 +75,23 @@ fn bench_scenario() -> ScenarioFn {
     |factory| Box::pin(bench_scenario::run(factory))
 }
 
-async fn run_scenario(transport: Transport, scenario: ScenarioFn) {
+async fn run_scenario(transport: TransportProtocol, scenario: ScenarioFn) {
     let mut test_server = TestServer::default();
     test_server.start();
 
     let client_factory: Box<dyn ClientFactory> = match transport {
-        Transport::Tcp => {
+        TransportProtocol::Tcp => {
             let server_addr = test_server.get_raw_tcp_addr().unwrap();
             Box::new(TcpClientFactory {
                 server_addr,
                 ..Default::default()
             })
         }
-        Transport::Quic => {
+        TransportProtocol::Quic => {
             let server_addr = test_server.get_quic_udp_addr().unwrap();
             Box::new(QuicClientFactory { server_addr })
         }
-        Transport::Http => {
+        TransportProtocol::Http => {
             let server_addr = test_server.get_http_api_addr().unwrap();
             Box::new(HttpClientFactory { server_addr })
         }

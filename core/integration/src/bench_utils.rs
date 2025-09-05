@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::test_server::Transport;
 use assert_cmd::prelude::CommandCargoExt;
 use iggy::prelude::*;
+use iggy_common::TransportProtocol;
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
@@ -33,7 +33,7 @@ const DEFAULT_NUMBER_OF_STREAMS: u64 = 8;
 
 pub fn run_bench_and_wait_for_finish(
     server_addr: &str,
-    transport: &Transport,
+    transport: &TransportProtocol,
     bench: &str,
     amount_of_data_to_process: IggyByteSize,
 ) {

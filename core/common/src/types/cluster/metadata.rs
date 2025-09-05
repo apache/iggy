@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::{BytesSerializable, IggyError, types::cluster::node::ClusterNode};
+use crate::{BytesSerializable, IggyError, TransportProtocol, types::cluster::node::ClusterNode};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
@@ -28,8 +28,9 @@ pub struct ClusterMetadata {
     pub name: String,
     /// Unique identifier of the cluster.
     pub id: u32,
-    /// Transport used for cluster communication (tcp, quic, http).
-    pub transport: String,
+    /// Transport used for cluster communication (for binary protocol it's u8, 1=TCP, 2=QUIC, 3=HTTP).
+    /// For HTTP it's a string "tcp", "quic", "http".
+    pub transport: TransportProtocol,
     /// List of all nodes in the cluster.
     pub nodes: Vec<ClusterNode>,
 }
@@ -37,11 +38,11 @@ pub struct ClusterMetadata {
 impl BytesSerializable for ClusterMetadata {
     fn to_bytes(&self) -> Bytes {
         let name_bytes = self.name.as_bytes();
-        let transport_bytes = self.transport.as_bytes();
+        let transport = self.transport as u8;
 
         // Calculate size for each node
         let nodes_size: usize = self.nodes.iter().map(|node| node.get_buffer_size()).sum();
-        let size = 4 + name_bytes.len() + 4 + 4 + transport_bytes.len() + 4 + nodes_size; // name_len + name + id + transport_len + transport + nodes_len + nodes
+        let size = 4 + name_bytes.len() + 4 + 1 + 4 + nodes_size; // name_len + name + id + transport + nodes_len + nodes
 
         let mut bytes = BytesMut::with_capacity(size);
 
@@ -52,9 +53,8 @@ impl BytesSerializable for ClusterMetadata {
         // Write cluster id
         bytes.put_u32_le(self.id);
 
-        // Write transport length and transport
-        bytes.put_u32_le(transport_bytes.len() as u32);
-        bytes.put_slice(transport_bytes);
+        // Write transport
+        bytes.put_u8(transport);
 
         // Write nodes count
         bytes.put_u32_le(self.nodes.len() as u32);
@@ -101,24 +101,13 @@ impl BytesSerializable for ClusterMetadata {
         );
         position += 4;
 
-        // Read transport length
-        if bytes.len() < position + 4 {
-            return Err(IggyError::InvalidCommand);
-        }
-        let transport_len = u32::from_le_bytes(
-            bytes[position..position + 4]
-                .try_into()
-                .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        ) as usize;
-        position += 4;
-
         // Read transport
-        if bytes.len() < position + transport_len {
+        if bytes.len() < position + 1 {
             return Err(IggyError::InvalidCommand);
         }
-        let transport = String::from_utf8(bytes[position..position + transport_len].to_vec())
-            .map_err(|_| IggyError::InvalidCommand)?;
-        position += transport_len;
+        let transport_byte = bytes[position];
+        let transport = TransportProtocol::try_from(transport_byte)?;
+        position += 1;
 
         // Read nodes count
         if bytes.len() < position + 4 {
@@ -149,7 +138,7 @@ impl BytesSerializable for ClusterMetadata {
 
     fn write_to_buffer(&self, buf: &mut BytesMut) {
         let name_bytes = self.name.as_bytes();
-        let transport_bytes = self.transport.as_bytes();
+        let transport = self.transport as u8;
 
         // Write name length and name
         buf.put_u32_le(name_bytes.len() as u32);
@@ -158,9 +147,8 @@ impl BytesSerializable for ClusterMetadata {
         // Write cluster id
         buf.put_u32_le(self.id);
 
-        // Write transport length and transport
-        buf.put_u32_le(transport_bytes.len() as u32);
-        buf.put_slice(transport_bytes);
+        // Write transport as u8
+        buf.put_u8(transport);
 
         // Write nodes count
         buf.put_u32_le(self.nodes.len() as u32);
@@ -173,7 +161,7 @@ impl BytesSerializable for ClusterMetadata {
 
     fn get_buffer_size(&self) -> usize {
         let nodes_size: usize = self.nodes.iter().map(|node| node.get_buffer_size()).sum();
-        4 + self.name.len() + 4 + 4 + self.transport.len() + 4 + nodes_size // name_len + name + id + transport_len + transport + nodes_len + nodes
+        4 + self.name.len() + 4 + 1 + 4 + nodes_size // name_len + name + id + transport + nodes_len + nodes
     }
 }
 

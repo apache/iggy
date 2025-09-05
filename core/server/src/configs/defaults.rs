@@ -37,6 +37,8 @@ use crate::configs::system::{
 use crate::configs::tcp::{TcpConfig, TcpTlsConfig};
 use iggy_common::IggyByteSize;
 use iggy_common::IggyDuration;
+use iggy_common::TransportProtocol;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -542,7 +544,7 @@ impl Default for ClusterConfig {
             enabled: SERVER_CONFIG.cluster.enabled,
             id: SERVER_CONFIG.cluster.id as u32,
             name: SERVER_CONFIG.cluster.name.parse().unwrap(),
-            transport: SERVER_CONFIG.cluster.transport.parse().unwrap(),
+            transport: TransportProtocol::from_str(SERVER_CONFIG.cluster.transport).unwrap(),
             node: NodeConfig::default(),
             nodes: vec![
                 ClusterNodeConfig {

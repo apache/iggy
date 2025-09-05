@@ -46,8 +46,9 @@ pub use crate::stream_builder::{IggyProducerConfig, IggyStreamProducer};
 pub use crate::stream_builder::{IggyStream, IggyStreamConfig};
 pub use crate::tcp::tcp_client::TcpClient;
 pub use iggy_binary_protocol::{
-    Client, ConsumerGroupClient, ConsumerOffsetClient, MessageClient, PartitionClient,
-    PersonalAccessTokenClient, SegmentClient, StreamClient, SystemClient, TopicClient, UserClient,
+    Client, ClusterClient, ConsumerGroupClient, ConsumerOffsetClient, MessageClient,
+    PartitionClient, PersonalAccessTokenClient, SegmentClient, StreamClient, SystemClient,
+    TopicClient, UserClient,
 };
 pub use iggy_common::{
     Aes256GcmEncryptor, Args, ArgsOptional, AutoLogin, BytesSerializable, CacheMetrics,
@@ -61,7 +62,8 @@ pub use iggy_common::{
     QuicClientConfig, QuicClientConfigBuilder, QuicClientReconnectionConfig, SendMessages,
     Sizeable, SnapshotCompression, Stats, Stream, StreamDetails, StreamPermissions,
     SystemSnapshotType, TcpClientConfig, TcpClientConfigBuilder, TcpClientReconnectionConfig,
-    Topic, TopicDetails, TopicPermissions, UserId, UserStatus, Validatable, defaults, locking,
+    Topic, TopicDetails, TopicPermissions, TransportProtocol, UserId, UserStatus, Validatable,
+    defaults, locking,
 };
 pub use iggy_common::{
     IGGY_MESSAGE_CHECKSUM_OFFSET_RANGE, IGGY_MESSAGE_HEADER_SIZE,

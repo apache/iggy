@@ -22,7 +22,7 @@ use super::defaults::{
 };
 use super::{output::BenchmarkOutputCommand, props::BenchmarkTransportProps};
 use clap::{Parser, Subcommand};
-use integration::test_server::Transport;
+use iggy::prelude::TransportProtocol;
 use serde::{Serialize, Serializer};
 
 #[derive(Subcommand, Debug, Clone)]
@@ -47,7 +47,7 @@ impl Serialize for BenchmarkTransportCommand {
 }
 
 impl BenchmarkTransportProps for BenchmarkTransportCommand {
-    fn transport(&self) -> &Transport {
+    fn transport(&self) -> &TransportProtocol {
         self.inner().transport()
     }
 
@@ -92,8 +92,8 @@ pub struct HttpArgs {
 }
 
 impl BenchmarkTransportProps for HttpArgs {
-    fn transport(&self) -> &Transport {
-        &Transport::Http
+    fn transport(&self) -> &TransportProtocol {
+        &TransportProtocol::Http
     }
 
     fn server_address(&self) -> &str {
@@ -149,8 +149,8 @@ pub struct TcpArgs {
 }
 
 impl BenchmarkTransportProps for TcpArgs {
-    fn transport(&self) -> &Transport {
-        &Transport::Tcp
+    fn transport(&self) -> &TransportProtocol {
+        &TransportProtocol::Tcp
     }
 
     fn server_address(&self) -> &str {
@@ -198,8 +198,8 @@ pub struct QuicArgs {
 }
 
 impl BenchmarkTransportProps for QuicArgs {
-    fn transport(&self) -> &Transport {
-        &Transport::Quic
+    fn transport(&self) -> &TransportProtocol {
+        &TransportProtocol::Quic
     }
 
     fn server_address(&self) -> &str {

@@ -16,10 +16,11 @@
  * under the License.
  */
 
-use crate::test_server::{ClientFactory, Transport};
+use crate::test_server::ClientFactory;
 use async_trait::async_trait;
 use iggy::prelude::{Client, ClientWrapper, QuicClientConfig};
 use iggy::quic::quic_client::QuicClient;
+use iggy_common::TransportProtocol;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -39,8 +40,8 @@ impl ClientFactory for QuicClientFactory {
         ClientWrapper::Quic(client)
     }
 
-    fn transport(&self) -> Transport {
-        Transport::Quic
+    fn transport(&self) -> TransportProtocol {
+        TransportProtocol::Quic
     }
 
     fn server_addr(&self) -> String {

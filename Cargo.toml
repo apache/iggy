@@ -79,7 +79,7 @@ byte-unit = { version = "5.1.6", default-features = false, features = [
 bytes = "1.10.1"
 charming = "0.6.0"
 chrono = { version = "0.4.41", features = ["serde"] }
-clap = { version = "4.5.46", features = ["derive"] }
+clap = { version = "4.5.47", features = ["derive", "wrap_help"] }
 colored = "3.0.0"
 comfy-table = "7.2.0"
 config = { version = "0.15.15" }

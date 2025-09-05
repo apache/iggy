@@ -19,11 +19,11 @@
 use crate::binary::command::{ServerCommand, ServerCommandHandler};
 use crate::binary::sender::SenderKind;
 use crate::server_error::ConnectionError;
-use crate::streaming::clients::client_manager::Transport;
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::SharedSystem;
 use anyhow::anyhow;
 use iggy_common::IggyError;
+use iggy_common::TransportProtocol;
 use quinn::{Connection, Endpoint, RecvStream, SendStream};
 use tracing::{error, info, trace};
 
@@ -70,7 +70,7 @@ async fn handle_connection(
     let session = system
         .read()
         .await
-        .add_client(&address, Transport::Quic)
+        .add_client(&address, TransportProtocol::Quic)
         .await;
 
     let client_id = session.client_id;

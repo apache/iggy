@@ -27,24 +27,20 @@ use crate::prelude::{
 use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
 use iggy_binary_protocol::Client;
-use iggy_common::{AutoLogin, Credentials};
+use iggy_common::{AutoLogin, Credentials, TransportProtocol};
 use std::str::FromStr;
 use std::sync::Arc;
 
-const QUIC_TRANSPORT: &str = "quic";
-const HTTP_TRANSPORT: &str = "http";
-const TCP_TRANSPORT: &str = "tcp";
-
 /// Configuration for the `ClientProvider`.
 /// It consists of the following fields:
-/// - `transport`: the transport to use. Valid values are `quic`, `http` and `tcp`.
+/// - `transport`: the transport protocol to use (TCP, QUIC, or HTTP).
 /// - `http`: the optional configuration for the HTTP transport.
 /// - `quic`: the optional configuration for the QUIC transport.
 /// - `tcp`: the optional configuration for the TCP transport.
 #[derive(Debug)]
 pub struct ClientProviderConfig {
-    /// The transport to use. Valid values are `quic`, `http` and `tcp`.
-    pub transport: String,
+    /// The transport protocol to use.
+    pub transport: TransportProtocol,
     /// The optional configuration for the HTTP transport.
     pub http: Option<Arc<HttpClientConfig>>,
     /// The optional configuration for the QUIC transport.
@@ -56,7 +52,7 @@ pub struct ClientProviderConfig {
 impl Default for ClientProviderConfig {
     fn default() -> ClientProviderConfig {
         ClientProviderConfig {
-            transport: TCP_TRANSPORT.to_string(),
+            transport: TransportProtocol::Tcp,
             http: Some(Arc::new(HttpClientConfig::default())),
             quic: Some(Arc::new(QuicClientConfig::default())),
             tcp: Some(Arc::new(TcpClientConfig::default())),
@@ -76,15 +72,16 @@ impl ClientProviderConfig {
         args: crate::prelude::Args,
         auto_login: bool,
     ) -> Result<Self, ClientError> {
-        let transport = args.transport;
+        let transport = TransportProtocol::from_str(&args.transport)
+            .map_err(|_| ClientError::InvalidTransport(args.transport.clone()))?;
         let mut config = Self {
             transport,
             http: None,
             quic: None,
             tcp: None,
         };
-        match config.transport.as_str() {
-            QUIC_TRANSPORT => {
+        match config.transport {
+            TransportProtocol::Quic => {
                 config.quic = Some(Arc::new(QuicClientConfig {
                     client_address: args.quic_client_address,
                     server_address: args.quic_server_address,
@@ -119,13 +116,13 @@ impl ClientProviderConfig {
                     validate_certificate: args.quic_validate_certificate,
                 }));
             }
-            HTTP_TRANSPORT => {
+            TransportProtocol::Http => {
                 config.http = Some(Arc::new(HttpClientConfig {
                     api_url: args.http_api_url,
                     retries: args.http_retries,
                 }));
             }
-            TCP_TRANSPORT => {
+            TransportProtocol::Tcp => {
                 config.tcp = Some(Arc::new(TcpClientConfig {
                     server_address: args.tcp_server_address,
                     tls_enabled: args.tcp_tls_enabled,
@@ -154,7 +151,6 @@ impl ClientProviderConfig {
                     },
                 }));
             }
-            _ => return Err(ClientError::InvalidTransport(config.transport.clone())),
         }
 
         Ok(config)
@@ -184,9 +180,8 @@ pub async fn get_raw_client(
     config: Arc<ClientProviderConfig>,
     establish_connection: bool,
 ) -> Result<ClientWrapper, ClientError> {
-    let transport = config.transport.clone();
-    match transport.as_str() {
-        QUIC_TRANSPORT => {
+    match config.transport {
+        TransportProtocol::Quic => {
             let quic_config = config.quic.as_ref().unwrap();
             let client = QuicClient::create(quic_config.clone())?;
             if establish_connection {
@@ -194,12 +189,12 @@ pub async fn get_raw_client(
             };
             Ok(ClientWrapper::Quic(client))
         }
-        HTTP_TRANSPORT => {
+        TransportProtocol::Http => {
             let http_config = config.http.as_ref().unwrap();
             let client = HttpClient::create(http_config.clone())?;
             Ok(ClientWrapper::Http(client))
         }
-        TCP_TRANSPORT => {
+        TransportProtocol::Tcp => {
             let tcp_config = config.tcp.as_ref().unwrap();
             let client = TcpClient::create(tcp_config.clone())?;
             if establish_connection {
@@ -207,6 +202,5 @@ pub async fn get_raw_client(
             };
             Ok(ClientWrapper::Tcp(client))
         }
-        _ => Err(ClientError::InvalidTransport(transport)),
     }
 }
