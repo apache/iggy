@@ -145,6 +145,20 @@ tempfile = "3.21.0"
 test-case = "3.3.1"
 thiserror = "2.0.16"
 tokio = { version = "1.47.1", features = ["full"] }
+compio = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be", features = [
+    "runtime",
+    "macros",
+    "io-uring",
+    "time",
+    "rustls",
+] }
+cyper = { git = "https://github.com/krishvishal/cyper.git", rev = "cd75e266df6ab0a9b9474eb7dda1735650d17db6", features = [
+    "rustls",
+], default-features = false }
+cyper-axum = { git = "https://github.com/krishvishal/cyper", rev = "cd75e266df6ab0a9b9474eb7dda1735650d17db6" }
+compio-net = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be" }
+compio-quic = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be" }
+compio-tls = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be", features = ["rustls"] }
 tokio-rustls = "0.26.2"
 tokio-util = { version = "0.7.16", features = ["compat"] }
 toml = "0.9.5"

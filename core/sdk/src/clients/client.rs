@@ -47,7 +47,7 @@ use tracing::{debug, error, info};
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct IggyClient {
-    pub(crate) client: IggySharedMut<ClientWrapper>,
+    pub(crate) client: IggyRwLock<ClientWrapper>,
     partitioner: Option<Arc<dyn Partitioner>>,
     pub(crate) encryptor: Option<Arc<EncryptorKind>>,
 }
@@ -73,7 +73,7 @@ impl IggyClient {
 
     /// Creates a new `IggyClient` with the provided client implementation for the specific transport.
     pub fn new(client: ClientWrapper) -> Self {
-        let client = IggySharedMut::new(client);
+        let client = IggyRwLock::new(client);
         IggyClient {
             client,
             partitioner: None,
@@ -118,7 +118,7 @@ impl IggyClient {
     }
 
     /// Returns the underlying client implementation for the specific transport.
-    pub fn client(&self) -> IggySharedMut<ClientWrapper> {
+    pub fn client(&self) -> IggyRwLock<ClientWrapper> {
         self.client.clone()
     }
 

@@ -28,5 +28,5 @@ pub fn generate_self_signed_certificate(
     let key_der = cert.signing_key.serialize_der();
     let key = PrivateKeyDer::try_from(key_der)?;
 
-    Ok((vec![cert_der], key))
+    Ok((vec![cert_der.clone()], key))
 }

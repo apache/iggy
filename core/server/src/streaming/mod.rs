@@ -17,6 +17,7 @@
  */
 
 pub mod clients;
+pub mod cluster;
 pub mod deduplication;
 pub mod diagnostics;
 pub mod local_sizeable;

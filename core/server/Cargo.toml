@@ -146,7 +146,3 @@ vergen-git2 = { version = "1.0.7", features = [
 [dev-dependencies]
 mockall = { workspace = true }
 serial_test = { workspace = true }
-
-[[bin]]
-name = "iggy-server"
-path = "src/main.rs"

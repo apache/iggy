@@ -39,11 +39,7 @@ arrayref: 0.3.9, "BSD-2-Clause",
 arrayvec: 0.7.6, "Apache-2.0 OR MIT",
 assert_cmd: 2.0.17, "Apache-2.0 OR MIT",
 async-broadcast: 0.7.2, "Apache-2.0 OR MIT",
-<<<<<<< HEAD
-async-compression: 0.4.27, "Apache-2.0 OR MIT",
-=======
 async-compression: 0.4.30, "Apache-2.0 OR MIT",
->>>>>>> master
 async-dropper: 0.3.1, "MIT",
 async-dropper-derive: 0.3.1, "MIT",
 async-dropper-simple: 0.2.6, "MIT",
@@ -51,14 +47,8 @@ async-lock: 3.4.1, "Apache-2.0 OR MIT",
 async-scoped: 0.9.0, "Apache-2.0 OR MIT",
 async-stream: 0.3.6, "MIT",
 async-stream-impl: 0.3.6, "MIT",
-<<<<<<< HEAD
-async-trait: 0.1.88, "Apache-2.0 OR MIT",
-async_zip: 0.0.17, "MIT",
-atoi: 2.0.0, "MIT",
-=======
 async-trait: 0.1.89, "Apache-2.0 OR MIT",
 async_zip: 0.0.18, "MIT",
->>>>>>> master
 atoi: 2.0.0, "MIT",
 atomic: 0.6.1, "Apache-2.0 OR MIT",
 atomic-polyfill: 1.0.3, "Apache-2.0 OR MIT",
@@ -78,11 +68,7 @@ backtrace: 0.3.75, "Apache-2.0 OR MIT",
 base64: 0.21.7, "Apache-2.0 OR MIT",
 base64: 0.22.1, "Apache-2.0 OR MIT",
 base64ct: 1.8.0, "Apache-2.0 OR MIT",
-<<<<<<< HEAD
-bcrypt: 0.17.0, "MIT",
-=======
 bcrypt: 0.17.1, "MIT",
->>>>>>> master
 bdd: 0.0.1, "Apache-2.0",
 beef: 0.5.2, "Apache-2.0 OR MIT",
 bench-dashboard-frontend: 0.4.1, "Apache-2.0",
@@ -99,13 +85,8 @@ bitvec: 1.0.1, "MIT",
 blake3: 1.8.2, "Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR CC0-1.0",
 block-buffer: 0.10.4, "Apache-2.0 OR MIT",
 blowfish: 0.9.1, "Apache-2.0 OR MIT",
-<<<<<<< HEAD
-bon: 3.6.5, "Apache-2.0 OR MIT",
-bon-macros: 3.6.5, "Apache-2.0 OR MIT",
-=======
 bon: 3.7.1, "Apache-2.0 OR MIT",
 bon-macros: 3.7.1, "Apache-2.0 OR MIT",
->>>>>>> master
 boolinator: 2.4.0, "Apache-2.0 OR MIT",
 borsh: 1.5.7, "Apache-2.0 OR MIT",
 borsh-derive: 1.5.7, "Apache-2.0",
@@ -122,19 +103,11 @@ byteorder: 1.5.0, "MIT OR Unlicense",
 bytes: 1.10.1, "MIT",
 bytestring: 1.4.0, "Apache-2.0 OR MIT",
 bzip2: 0.6.0, "Apache-2.0 OR MIT",
-<<<<<<< HEAD
-camino: 1.1.10, "Apache-2.0 OR MIT",
-cargo-platform: 0.1.9, "Apache-2.0 OR MIT",
-cargo_metadata: 0.19.2, "MIT",
-castaway: 0.2.4, "MIT",
-cc: 1.2.31, "Apache-2.0 OR MIT",
-=======
 camino: 1.1.12, "Apache-2.0 OR MIT",
 cargo-platform: 0.1.9, "Apache-2.0 OR MIT",
 cargo_metadata: 0.19.2, "MIT",
 castaway: 0.2.4, "MIT",
 cc: 1.2.34, "Apache-2.0 OR MIT",
->>>>>>> master
 cesu8: 1.1.0, "Apache-2.0 OR MIT",
 cexpr: 0.6.0, "Apache-2.0 OR MIT",
 cfg-if: 1.0.3, "Apache-2.0 OR MIT",
@@ -144,17 +117,10 @@ charming_macros: 0.1.0, "Apache-2.0 OR MIT",
 chrono: 0.4.41, "Apache-2.0 OR MIT",
 cipher: 0.4.4, "Apache-2.0 OR MIT",
 clang-sys: 1.8.1, "Apache-2.0",
-<<<<<<< HEAD
-clap: 4.5.41, "Apache-2.0 OR MIT",
-clap_builder: 4.5.41, "Apache-2.0 OR MIT",
-clap_complete: 4.5.55, "Apache-2.0 OR MIT",
-clap_derive: 4.5.41, "Apache-2.0 OR MIT",
-=======
 clap: 4.5.46, "Apache-2.0 OR MIT",
 clap_builder: 4.5.46, "Apache-2.0 OR MIT",
 clap_complete: 4.5.57, "Apache-2.0 OR MIT",
 clap_derive: 4.5.45, "Apache-2.0 OR MIT",
->>>>>>> master
 clap_lex: 0.7.5, "Apache-2.0 OR MIT",
 cmake: 0.1.54, "Apache-2.0 OR MIT",
 cobs: 0.3.0, "Apache-2.0 OR MIT",
@@ -166,20 +132,12 @@ compact_str: 0.7.1, "MIT",
 compression-codecs: 0.4.30, "Apache-2.0 OR MIT",
 compression-core: 0.4.29, "Apache-2.0 OR MIT",
 concurrent-queue: 2.5.0, "Apache-2.0 OR MIT",
-<<<<<<< HEAD
-config: 0.15.13, "Apache-2.0 OR MIT",
-=======
 config: 0.15.15, "Apache-2.0 OR MIT",
->>>>>>> master
 console: 0.15.11, "MIT",
 console-api: 0.8.1, "MIT",
 console-subscriber: 0.4.1, "MIT",
 console_error_panic_hook: 0.1.7, "Apache-2.0 OR MIT",
 const-oid: 0.9.6, "Apache-2.0 OR MIT",
-<<<<<<< HEAD
-const-oid: 0.9.6, "Apache-2.0 OR MIT",
-=======
->>>>>>> master
 const-random: 0.1.18, "Apache-2.0 OR MIT",
 const-random-macro: 0.1.16, "Apache-2.0 OR MIT",
 constant_time_eq: 0.3.1, "Apache-2.0 OR CC0-1.0 OR MIT-0",
@@ -203,30 +161,18 @@ crossterm: 0.29.0, "MIT",
 crossterm_winapi: 0.9.1, "MIT",
 crunchy: 0.2.4, "MIT",
 crypto-common: 0.1.6, "Apache-2.0 OR MIT",
-<<<<<<< HEAD
-ctor: 0.4.3, "Apache-2.0 OR MIT",
-=======
 ctor: 0.5.0, "Apache-2.0 OR MIT",
->>>>>>> master
 ctor-proc-macro: 0.0.6, "Apache-2.0 OR MIT",
 ctr: 0.9.2, "Apache-2.0 OR MIT",
 cucumber: 0.21.1, "Apache-2.0 OR MIT",
 cucumber-codegen: 0.21.1, "Apache-2.0 OR MIT",
 cucumber-expressions: 0.3.0, "Apache-2.0 OR MIT",
 darling: 0.20.11, "MIT",
-<<<<<<< HEAD
-darling: 0.21.0, "MIT",
-darling_core: 0.20.11, "MIT",
-darling_core: 0.21.0, "MIT",
-darling_macro: 0.20.11, "MIT",
-darling_macro: 0.21.0, "MIT",
-=======
 darling: 0.21.3, "MIT",
 darling_core: 0.20.11, "MIT",
 darling_core: 0.21.3, "MIT",
 darling_macro: 0.20.11, "MIT",
 darling_macro: 0.21.3, "MIT",
->>>>>>> master
 dashmap: 6.1.0, "MIT",
 dbus: 0.9.9, "Apache-2.0 OR MIT",
 dbus-secret-service: 4.1.0, "Apache-2.0 OR MIT",
@@ -274,10 +220,7 @@ err_trail: 0.8.5, "Apache-2.0",
 errno: 0.3.13, "Apache-2.0 OR MIT",
 error_set: 0.8.5, "Apache-2.0",
 error_set_impl: 0.8.5, "Apache-2.0",
-<<<<<<< HEAD
-=======
 etcetera: 0.8.0, "Apache-2.0 OR MIT",
->>>>>>> master
 event-listener: 5.4.1, "Apache-2.0 OR MIT",
 event-listener-strategy: 0.5.4, "Apache-2.0 OR MIT",
 ext-trait: 1.0.1, "Apache-2.0 OR MIT OR Zlib",
@@ -287,10 +230,7 @@ fast-async-mutex: 0.6.7, "Apache-2.0 OR MIT",
 fastbloom: 0.14.0, "Apache-2.0 OR MIT",
 fastrand: 2.3.0, "Apache-2.0 OR MIT",
 figlet-rs: 0.1.5, "Apache-2.0",
-<<<<<<< HEAD
-=======
 figment: 0.10.19, "Apache-2.0 OR MIT",
->>>>>>> master
 file-operation: 0.8.4, "MIT",
 flatbuffers: 25.2.10, "Apache-2.0",
 flate2: 1.1.2, "Apache-2.0 OR MIT",
@@ -357,15 +297,9 @@ gloo-worker: 0.2.1, "Apache-2.0 OR MIT",
 gloo-worker: 0.4.0, "Apache-2.0 OR MIT",
 gloo-worker: 0.5.0, "Apache-2.0 OR MIT",
 gloo-worker-macros: 0.1.0, "Apache-2.0 OR MIT",
-<<<<<<< HEAD
-governor: 0.10.0, "MIT",
-h2: 0.3.27, "MIT",
-h2: 0.4.11, "MIT",
-=======
 governor: 0.10.1, "MIT",
 h2: 0.3.27, "MIT",
 h2: 0.4.12, "MIT",
->>>>>>> master
 halfbrown: 0.3.0, "Apache-2.0 OR MIT",
 handlebars: 6.3.2, "MIT",
 hash32: 0.2.1, "Apache-2.0 OR MIT",
@@ -410,13 +344,9 @@ idna: 1.1.0, "Apache-2.0 OR MIT",
 idna_adapter: 1.2.1, "Apache-2.0 OR MIT",
 iggy: 0.7.0, "Apache-2.0",
 iggy-bench: 0.2.4, "Apache-2.0",
-<<<<<<< HEAD
-iggy-cli: 0.9.0, "Apache-2.0",
-=======
 iggy-bench-dashboard-server: 0.4.0, "Apache-2.0",
 iggy-cli: 0.9.1, "Apache-2.0",
 iggy-connectors: 0.1.0, "Apache-2.0",
->>>>>>> master
 iggy-mcp: 0.1.0, "Apache-2.0",
 iggy_binary_protocol: 0.7.0, "Apache-2.0",
 iggy_common: 0.7.0, "Apache-2.0",
@@ -432,11 +362,7 @@ impl-more: 0.1.9, "Apache-2.0 OR MIT",
 implicit-clone: 0.4.9, "Apache-2.0 OR MIT",
 implicit-clone-derive: 0.1.2, "Apache-2.0 OR MIT",
 indexmap: 1.9.3, "Apache-2.0 OR MIT",
-<<<<<<< HEAD
-indexmap: 2.10.0, "Apache-2.0 OR MIT",
-=======
 indexmap: 2.11.0, "Apache-2.0 OR MIT",
->>>>>>> master
 indices: 0.3.6, "Apache-2.0",
 inflections: 1.1.1, "MIT",
 inlinable_string: 0.1.15, "Apache-2.0 OR MIT",
@@ -445,13 +371,8 @@ inotify-sys: 0.1.5, "ISC",
 inout: 0.1.4, "Apache-2.0 OR MIT",
 instant: 0.1.13, "BSD-3-Clause",
 integration: 0.0.1, "Apache-2.0",
-<<<<<<< HEAD
-inventory: 0.3.20, "Apache-2.0 OR MIT",
-io-uring: 0.7.9, "Apache-2.0 OR MIT",
-=======
 inventory: 0.3.21, "Apache-2.0 OR MIT",
 io-uring: 0.7.10, "Apache-2.0 OR MIT",
->>>>>>> master
 ipnet: 2.11.0, "Apache-2.0 OR MIT",
 iri-string: 0.7.8, "Apache-2.0 OR MIT",
 is_terminal_polyfill: 1.70.1, "Apache-2.0 OR MIT",
@@ -486,11 +407,8 @@ libloading: 0.8.8, "ISC",
 liblzma: 0.4.4, "Apache-2.0 OR MIT",
 liblzma-sys: 0.4.4, "Apache-2.0 OR MIT",
 libm: 0.2.15, "MIT",
-<<<<<<< HEAD
-=======
 libmimalloc-sys: 0.1.44, "MIT",
 libredox: 0.1.9, "MIT",
->>>>>>> master
 libsqlite3-sys: 0.30.1, "MIT",
 libyml: 0.0.5, "MIT",
 libz-rs-sys: 0.5.1, "Zlib",
@@ -504,24 +422,14 @@ local-channel: 0.1.5, "Apache-2.0 OR MIT",
 local-waker: 0.1.4, "Apache-2.0 OR MIT",
 lock_api: 0.4.13, "Apache-2.0 OR MIT",
 log: 0.4.27, "Apache-2.0 OR MIT",
-<<<<<<< HEAD
-logos: 0.15.0, "Apache-2.0 OR MIT",
-logos-codegen: 0.15.0, "Apache-2.0 OR MIT",
-logos-derive: 0.15.0, "Apache-2.0 OR MIT",
-=======
 logos: 0.15.1, "Apache-2.0 OR MIT",
 logos-codegen: 0.15.1, "Apache-2.0 OR MIT",
 logos-derive: 0.15.1, "Apache-2.0 OR MIT",
->>>>>>> master
 loom: 0.7.2, "MIT",
 lru-slab: 0.1.2, "Apache-2.0 OR MIT OR Zlib",
 macro_rules_attribute: 0.1.3, "MIT",
 macro_rules_attribute-proc_macro: 0.1.3, "MIT",
-<<<<<<< HEAD
-matchers: 0.1.0, "MIT",
-=======
 matchers: 0.2.0, "MIT",
->>>>>>> master
 matchit: 0.7.3, "BSD-3-Clause AND MIT",
 matchit: 0.8.4, "BSD-3-Clause AND MIT",
 maybe-async: 0.2.10, "MIT",
@@ -530,11 +438,7 @@ md5: 0.7.0, "Apache-2.0 OR MIT",
 memchr: 2.7.5, "MIT OR Unlicense",
 miette: 7.6.0, "Apache-2.0",
 miette-derive: 7.6.0, "Apache-2.0",
-<<<<<<< HEAD
-mimalloc: 0.1.47, "MIT",
-=======
 mimalloc: 0.1.48, "MIT",
->>>>>>> master
 mime: 0.3.17, "Apache-2.0 OR MIT",
 mime_guess: 2.0.5, "MIT",
 minidom: 0.16.0, "MPL-2.0",
@@ -560,10 +464,6 @@ ntapi: 0.4.1, "Apache-2.0 OR MIT",
 nu-ansi-term: 0.50.1, "MIT",
 num-bigint: 0.4.6, "Apache-2.0 OR MIT",
 num-bigint-dig: 0.8.4, "Apache-2.0 OR MIT",
-<<<<<<< HEAD
-num-complex: 0.4.6, "Apache-2.0 OR MIT",
-=======
->>>>>>> master
 num-conv: 0.1.0, "Apache-2.0 OR MIT",
 num-integer: 0.1.46, "Apache-2.0 OR MIT",
 num-iter: 0.1.45, "Apache-2.0 OR MIT",
@@ -582,11 +482,7 @@ opaque-debug: 0.3.1, "Apache-2.0 OR MIT",
 openssl: 0.10.73, "Apache-2.0",
 openssl-macros: 0.1.1, "Apache-2.0 OR MIT",
 openssl-probe: 0.1.6, "Apache-2.0 OR MIT",
-<<<<<<< HEAD
-openssl-src: 300.5.1+3.5.1, "Apache-2.0 OR MIT",
-=======
 openssl-src: 300.5.2+3.5.2, "Apache-2.0 OR MIT",
->>>>>>> master
 openssl-sys: 0.9.109, "MIT",
 opentelemetry: 0.30.0, "Apache-2.0",
 opentelemetry-appender-tracing: 0.30.1, "Apache-2.0",
@@ -613,11 +509,7 @@ peg-macros: 0.6.3, "MIT",
 peg-runtime: 0.6.3, "MIT",
 pem: 3.0.5, "MIT",
 pem-rfc7468: 0.7.0, "Apache-2.0 OR MIT",
-<<<<<<< HEAD
-percent-encoding: 2.3.1, "Apache-2.0 OR MIT",
-=======
 percent-encoding: 2.3.2, "Apache-2.0 OR MIT",
->>>>>>> master
 pest: 2.8.1, "Apache-2.0 OR MIT",
 pest_derive: 2.8.1, "Apache-2.0 OR MIT",
 pest_generator: 2.8.1, "Apache-2.0 OR MIT",
@@ -635,22 +527,14 @@ polyval: 0.6.2, "Apache-2.0 OR MIT",
 portable-atomic: 1.11.1, "Apache-2.0 OR MIT",
 portable-atomic-util: 0.2.4, "Apache-2.0 OR MIT",
 postcard: 1.1.3, "Apache-2.0 OR MIT",
-<<<<<<< HEAD
-potential_utf: 0.1.2, "Unicode-3.0",
-=======
 potential_utf: 0.1.3, "Unicode-3.0",
->>>>>>> master
 powerfmt: 0.2.0, "Apache-2.0 OR MIT",
 ppmd-rust: 1.2.1, "CC0-1.0",
 ppv-lite86: 0.2.21, "Apache-2.0 OR MIT",
 predicates: 3.1.3, "Apache-2.0 OR MIT",
 predicates-core: 1.0.9, "Apache-2.0 OR MIT",
 predicates-tree: 1.0.12, "Apache-2.0 OR MIT",
-<<<<<<< HEAD
-prettyplease: 0.2.36, "Apache-2.0 OR MIT",
-=======
 prettyplease: 0.2.37, "Apache-2.0 OR MIT",
->>>>>>> master
 proc-macro-crate: 1.3.1, "Apache-2.0 OR MIT",
 proc-macro-crate: 3.3.0, "Apache-2.0 OR MIT",
 proc-macro-error: 1.0.4, "Apache-2.0 OR MIT",
@@ -687,13 +571,8 @@ rand_chacha: 0.9.0, "Apache-2.0 OR MIT",
 rand_core: 0.6.4, "Apache-2.0 OR MIT",
 rand_core: 0.9.3, "Apache-2.0 OR MIT",
 raw-cpuid: 11.5.0, "MIT",
-<<<<<<< HEAD
-rayon: 1.10.0, "Apache-2.0 OR MIT",
-rayon-core: 1.12.1, "Apache-2.0 OR MIT",
-=======
 rayon: 1.11.0, "Apache-2.0 OR MIT",
 rayon-core: 1.13.0, "Apache-2.0 OR MIT",
->>>>>>> master
 rcgen: 0.14.3, "Apache-2.0 OR MIT",
 redox_syscall: 0.2.16, "MIT",
 redox_syscall: 0.5.17, "MIT",
@@ -706,32 +585,19 @@ regex-lite: 0.1.7, "Apache-2.0 OR MIT",
 regex-syntax: 0.7.5, "Apache-2.0 OR MIT",
 regex-syntax: 0.8.6, "Apache-2.0 OR MIT",
 rend: 0.4.2, "MIT",
-<<<<<<< HEAD
-reqwest: 0.12.22, "Apache-2.0 OR MIT",
-=======
 reqwest: 0.12.23, "Apache-2.0 OR MIT",
->>>>>>> master
 reqwest-middleware: 0.4.2, "Apache-2.0 OR MIT",
 reqwest-retry: 0.7.0, "Apache-2.0 OR MIT",
 retry-policies: 0.4.0, "Apache-2.0 OR MIT",
 ring: 0.17.14, "Apache-2.0 AND ISC",
 rkyv: 0.7.45, "MIT",
 rkyv_derive: 0.7.45, "MIT",
-<<<<<<< HEAD
-rmcp: 0.3.2, "Apache-2.0 OR MIT",
-rmcp-macros: 0.3.2, "Apache-2.0 OR MIT",
-ron: 0.8.1, "Apache-2.0 OR MIT",
-route-recognizer: 0.3.1, "MIT",
-rsa: 0.9.8, "Apache-2.0 OR MIT",
-rust-ini: 0.21.2, "MIT",
-=======
 rmcp: 0.6.1, "MIT",
 rmcp-macros: 0.6.1, "MIT",
 ron: 0.8.1, "Apache-2.0 OR MIT",
 route-recognizer: 0.3.1, "MIT",
 rsa: 0.9.8, "Apache-2.0 OR MIT",
 rust-ini: 0.21.3, "MIT",
->>>>>>> master
 rust-s3: 0.36.0-beta.2, "MIT",
 rust_decimal: 1.37.2, "MIT",
 rustc-demangle: 0.1.26, "Apache-2.0 OR MIT",
@@ -747,11 +613,7 @@ rustls-pki-types: 1.12.0, "Apache-2.0 OR MIT",
 rustls-platform-verifier: 0.6.1, "Apache-2.0 OR MIT",
 rustls-platform-verifier-android: 0.1.1, "Apache-2.0 OR MIT",
 rustls-webpki: 0.103.4, "ISC",
-<<<<<<< HEAD
-rustversion: 1.0.21, "Apache-2.0 OR MIT",
-=======
 rustversion: 1.0.22, "Apache-2.0 OR MIT",
->>>>>>> master
 rxml: 0.11.1, "MIT",
 rxml_validation: 0.11.0, "MIT",
 ryu: 1.0.20, "Apache-2.0 OR BSL-1.0",
@@ -776,11 +638,7 @@ serde-wasm-bindgen: 0.5.0, "MIT",
 serde-wasm-bindgen: 0.6.5, "MIT",
 serde_derive: 1.0.219, "Apache-2.0 OR MIT",
 serde_derive_internals: 0.29.1, "Apache-2.0 OR MIT",
-<<<<<<< HEAD
-serde_json: 1.0.142, "Apache-2.0 OR MIT",
-=======
 serde_json: 1.0.143, "Apache-2.0 OR MIT",
->>>>>>> master
 serde_path_to_error: 0.1.17, "Apache-2.0 OR MIT",
 serde_spanned: 0.6.9, "Apache-2.0 OR MIT",
 serde_spanned: 1.0.0, "Apache-2.0 OR MIT",
@@ -837,11 +695,7 @@ synthez: 0.3.1, "BlueOak-1.0.0",
 synthez-codegen: 0.3.1, "BlueOak-1.0.0",
 synthez-core: 0.3.1, "BlueOak-1.0.0",
 sysinfo: 0.34.2, "MIT",
-<<<<<<< HEAD
-sysinfo: 0.36.1, "MIT",
-=======
 sysinfo: 0.37.0, "MIT",
->>>>>>> master
 tagptr: 0.2.0, "Apache-2.0 OR MIT",
 tap: 1.0.1, "MIT",
 tempfile: 3.21.0, "Apache-2.0 OR MIT",
@@ -869,20 +723,12 @@ tokio-rustls: 0.26.2, "Apache-2.0 OR MIT",
 tokio-stream: 0.1.17, "MIT",
 tokio-util: 0.7.16, "MIT",
 toml: 0.8.23, "Apache-2.0 OR MIT",
-<<<<<<< HEAD
-toml: 0.9.4, "Apache-2.0 OR MIT",
-=======
 toml: 0.9.5, "Apache-2.0 OR MIT",
->>>>>>> master
 toml_datetime: 0.6.11, "Apache-2.0 OR MIT",
 toml_datetime: 0.7.0, "Apache-2.0 OR MIT",
 toml_edit: 0.19.15, "Apache-2.0 OR MIT",
 toml_edit: 0.22.27, "Apache-2.0 OR MIT",
-<<<<<<< HEAD
-toml_parser: 1.0.1, "Apache-2.0 OR MIT",
-=======
 toml_parser: 1.0.2, "Apache-2.0 OR MIT",
->>>>>>> master
 toml_write: 0.1.2, "Apache-2.0 OR MIT",
 toml_writer: 1.0.2, "Apache-2.0 OR MIT",
 tonic: 0.12.3, "MIT",
@@ -942,11 +788,7 @@ wait-timeout: 0.2.1, "Apache-2.0 OR MIT",
 walkdir: 2.5.0, "MIT OR Unlicense",
 want: 0.3.1, "MIT",
 wasi: 0.11.1+wasi-snapshot-preview1, "Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR MIT",
-<<<<<<< HEAD
-wasi: 0.14.2+wasi-0.2.4, "Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR MIT",
-=======
 wasi: 0.14.3+wasi-0.2.4, "Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR MIT",
->>>>>>> master
 wasite: 0.1.0, "Apache-2.0 OR BSL-1.0 OR MIT",
 wasm-bindgen: 0.2.100, "Apache-2.0 OR MIT",
 wasm-bindgen-backend: 0.2.100, "Apache-2.0 OR MIT",
@@ -958,20 +800,11 @@ wasm-streams: 0.4.2, "Apache-2.0 OR MIT",
 wasm-timer: 0.2.5, "MIT",
 web-sys: 0.3.77, "Apache-2.0 OR MIT",
 web-time: 1.1.0, "Apache-2.0 OR MIT",
-<<<<<<< HEAD
-webpki-root-certs: 0.26.11, "CDLA-Permissive-2.0",
-=======
->>>>>>> master
 webpki-root-certs: 1.0.2, "CDLA-Permissive-2.0",
 webpki-roots: 0.26.11, "CDLA-Permissive-2.0",
 webpki-roots: 1.0.2, "CDLA-Permissive-2.0",
 which: 4.4.2, "MIT",
-<<<<<<< HEAD
-whoami: 1.6.0, "Apache-2.0 OR BSL-1.0 OR MIT",
-wide: 0.7.33, "Apache-2.0 OR MIT OR Zlib",
-=======
 whoami: 1.6.1, "Apache-2.0 OR BSL-1.0 OR MIT",
->>>>>>> master
 winapi: 0.3.9, "Apache-2.0 OR MIT",
 winapi-i686-pc-windows-gnu: 0.4.0, "Apache-2.0 OR MIT",
 winapi-util: 0.1.10, "MIT OR Unlicense",
@@ -1032,13 +865,8 @@ windows_x86_64_msvc: 0.48.5, "Apache-2.0 OR MIT",
 windows_x86_64_msvc: 0.52.6, "Apache-2.0 OR MIT",
 windows_x86_64_msvc: 0.53.0, "Apache-2.0 OR MIT",
 winnow: 0.5.40, "MIT",
-<<<<<<< HEAD
-winnow: 0.7.12, "MIT",
-wit-bindgen-rt: 0.39.0, "Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR MIT",
-=======
 winnow: 0.7.13, "MIT",
 wit-bindgen: 0.45.0, "Apache-2.0 OR Apache-2.0 WITH LLVM-exception OR MIT",
->>>>>>> master
 writeable: 0.6.1, "Unicode-3.0",
 wyz: 0.5.1, "MIT",
 yaml-rust2: 0.10.3, "Apache-2.0 OR MIT",
@@ -1060,11 +888,7 @@ zeroize_derive: 1.4.2, "Apache-2.0 OR MIT",
 zerotrie: 0.2.2, "Unicode-3.0",
 zerovec: 0.11.4, "Unicode-3.0",
 zerovec-derive: 0.11.1, "Unicode-3.0",
-<<<<<<< HEAD
-zip: 4.3.0, "MIT",
-=======
 zip: 4.6.0, "MIT",
->>>>>>> master
 zlib-rs: 0.5.1, "Zlib",
 zopfli: 0.8.2, "Apache-2.0",
 zstd: 0.13.3, "MIT",

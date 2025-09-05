@@ -16,11 +16,14 @@
  * under the License.
  */
 
+use std::rc::Rc;
+
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::sender::SenderKind;
+use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use crate::streaming::systems::system::SharedSystem;
+//use crate::streaming::systems::system::SharedSystem;
 use anyhow::Result;
 use iggy_common::get_cluster_metadata::GetClusterMetadata;
 use iggy_common::{BytesSerializable, IggyError};
@@ -36,9 +39,11 @@ impl ServerCommandHandler for GetClusterMetadata {
         self,
         sender: &mut SenderKind,
         _length: u32,
-        session: &Session,
-        system: &SharedSystem,
+        session: &Rc<Session>,
+        system: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
+        // TODO: fix it;
+        /*
         debug!("session: {session}, command: {self}");
 
         let system = system.read().await;
@@ -46,6 +51,7 @@ impl ServerCommandHandler for GetClusterMetadata {
 
         let response = cluster_metadata.to_bytes();
         sender.send_ok_response(&response).await?;
+        */
         Ok(())
     }
 }
