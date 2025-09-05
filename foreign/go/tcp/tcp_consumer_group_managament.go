@@ -40,7 +40,7 @@ func (tms *IggyTcpClient) GetConsumerGroup(streamId, topicId, groupId iggcon.Ide
 		return nil, err
 	}
 	if len(buffer) == 0 {
-		return nil, ierror.ConsumerGroupIdNotFound
+		return nil, ierror.New(ierror.ConsumerGroupIdNotFound)
 	}
 
 	consumerGroupDetails := binaryserialization.DeserializeConsumerGroup(buffer)
@@ -48,8 +48,11 @@ func (tms *IggyTcpClient) GetConsumerGroup(streamId, topicId, groupId iggcon.Ide
 }
 
 func (tms *IggyTcpClient) CreateConsumerGroup(streamId iggcon.Identifier, topicId iggcon.Identifier, name string, groupId *uint32) (*iggcon.ConsumerGroupDetails, error) {
-	if MaxStringLength < len(name) {
-		return nil, ierror.TextTooLong("consumer_group_name")
+	if groupId != nil && *groupId == 0 {
+		return nil, ierror.New(ierror.InvalidConsumerGroupId)
+	}
+	if MaxStringLength < len(name) || len(name) == 0 {
+		return nil, ierror.New(ierror.InvalidConsumerGroupName)
 	}
 	message := binaryserialization.CreateGroup(iggcon.CreateConsumerGroupRequest{
 		StreamId:        streamId,

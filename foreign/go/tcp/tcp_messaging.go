@@ -29,8 +29,12 @@ func (tms *IggyTcpClient) SendMessages(
 	partitioning iggcon.Partitioning,
 	messages []iggcon.IggyMessage,
 ) error {
+	if len(partitioning.Value) > 255 ||
+		(partitioning.Kind != iggcon.Balanced && len(partitioning.Value) == 0) {
+		return ierror.New(ierror.InvalidKeyValueLength)
+	}
 	if len(messages) == 0 {
-		return ierror.CustomError("messages_count_should_be_greater_than_zero")
+		return ierror.New(ierror.InvalidMessagesCount)
 	}
 	serializedRequest := binaryserialization.TcpSendMessagesRequest{
 		StreamId:     streamId,
