@@ -179,6 +179,7 @@ impl TcpClient {
         }))
     }
 
+    /// Create a new TCP client from the provided connection string.
     pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
         if ConnectionStringUtils::parse_protocol(connection_string)? != TransportProtocol::Tcp {
             return Err(IggyError::InvalidConnectionString);

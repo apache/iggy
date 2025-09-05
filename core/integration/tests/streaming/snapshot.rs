@@ -18,6 +18,7 @@
 
 use crate::streaming::common::test_setup::TestSetup;
 use iggy::prelude::{SnapshotCompression, SystemSnapshotType};
+use server::configs::cluster::ClusterConfig;
 use server::configs::server::{DataMaintenanceConfig, PersonalAccessTokenConfig};
 use server::streaming::session::Session;
 use std::io::{Cursor, Read};
@@ -31,6 +32,7 @@ async fn should_create_snapshot_file() {
     let setup = TestSetup::init().await;
     let mut system = System::new(
         setup.config.clone(),
+        ClusterConfig::default(),
         DataMaintenanceConfig::default(),
         PersonalAccessTokenConfig::default(),
     );

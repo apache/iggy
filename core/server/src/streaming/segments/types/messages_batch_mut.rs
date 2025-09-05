@@ -108,12 +108,12 @@ impl IggyMessagesBatchMut {
     }
 
     /// Creates a lending iterator that yields mutable views of messages.
-    pub fn iter_mut(&mut self) -> IggyMessageViewMutIterator {
+    pub fn iter_mut(&mut self) -> IggyMessageViewMutIterator<'_> {
         IggyMessageViewMutIterator::new(&mut self.messages)
     }
 
     /// Creates an iterator that yields immutable views of messages.
-    pub fn iter(&self) -> IggyMessageViewIterator {
+    pub fn iter(&self) -> IggyMessageViewIterator<'_> {
         IggyMessageViewIterator::new(&self.messages)
     }
 
@@ -173,17 +173,17 @@ impl IggyMessagesBatchMut {
                 message.header_mut().set_id(random_id::get_uuid());
             }
 
-            if let Some(deduplicator) = deduplicator {
-                if !deduplicator.try_insert(message.header().id()).await {
-                    warn!(
-                        "Detected duplicate message ID {}, removing...",
-                        message.header().id()
-                    );
-                    invalid_messages_indexes
-                        .as_mut()
-                        .unwrap()
-                        .push(curr_rel_offset);
-                }
+            if let Some(deduplicator) = deduplicator
+                && !deduplicator.try_insert(message.header().id()).await
+            {
+                warn!(
+                    "Detected duplicate message ID {}, removing...",
+                    message.header().id()
+                );
+                invalid_messages_indexes
+                    .as_mut()
+                    .unwrap()
+                    .push(curr_rel_offset);
             }
 
             message.update_checksum();
@@ -475,7 +475,7 @@ impl IggyMessagesBatchMut {
 
     /// Get the message at the specified index.
     /// Returns None if the index is out of bounds or the message cannot be found.
-    pub fn get(&self, index: usize) -> Option<IggyMessageView> {
+    pub fn get(&self, index: usize) -> Option<IggyMessageView<'_>> {
         self.get_message_boundaries(index)
             .map(|(start, end)| IggyMessageView::new(&self.messages[start..end]))
     }
@@ -713,7 +713,7 @@ impl IggyMessagesBatchMut {
     }
 
     /// Validates a specific index entry
-    fn validate_index_at(&self, i: u32) -> Result<IggyIndexView, IggyError> {
+    fn validate_index_at(&self, i: u32) -> Result<IggyIndexView<'_>, IggyError> {
         let index_view = match self.indexes.get(i) {
             Some(view) => view,
             None => {
@@ -744,7 +744,7 @@ impl IggyMessagesBatchMut {
     }
 
     /// Validates a specific message
-    fn validate_message_at(&self, i: u32) -> Result<IggyMessageView, IggyError> {
+    fn validate_message_at(&self, i: u32) -> Result<IggyMessageView<'_>, IggyError> {
         let message = match self.get(i as usize) {
             Some(msg) => msg,
             None => {
@@ -777,15 +777,15 @@ impl IggyMessagesBatchMut {
             ));
         }
 
-        if let Some(user_headers) = message.user_headers() {
-            if user_headers.len() as u32 > MAX_USER_HEADERS_SIZE {
-                error!(
-                    "Message user headers size {} B exceeds maximum size {} B",
-                    user_headers.len(),
-                    MAX_USER_HEADERS_SIZE
-                );
-                return Err(IggyError::TooBigUserHeaders);
-            }
+        if let Some(user_headers) = message.user_headers()
+            && user_headers.len() as u32 > MAX_USER_HEADERS_SIZE
+        {
+            error!(
+                "Message user headers size {} B exceeds maximum size {} B",
+                user_headers.len(),
+                MAX_USER_HEADERS_SIZE
+            );
+            return Err(IggyError::TooBigUserHeaders);
         }
 
         Ok(message)

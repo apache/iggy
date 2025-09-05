@@ -15,17 +15,19 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM rust:1.87
+ARG RUST_VERSION=1.89
+FROM rust:${RUST_VERSION}
 
 WORKDIR /app
 
-# Copy entire repository (needed for workspace)
+# Copy everything
 COPY . .
 
 # Create features directory for BDD feature files
 RUN mkdir -p /app/features
 
-RUN cargo fetch
+# Build tests
+RUN cargo test --no-run -p bdd --features "iggy-server-in-docker bdd"
 
 # Default command will be overridden by docker-compose
 CMD ["cargo", "test", "-p", "bdd", "--features", "iggy-server-in-docker", "--features", "bdd"]

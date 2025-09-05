@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
+using Apache.Iggy.Enums;
 
 namespace Apache.Iggy.IggyClient;
 
@@ -23,8 +24,16 @@ public interface IIggyTopic
 {
     Task<IReadOnlyList<TopicResponse>> GetTopicsAsync(Identifier streamId, CancellationToken token = default);
     Task<TopicResponse?> GetTopicByIdAsync(Identifier streamId, Identifier topicId, CancellationToken token = default);
-    Task<TopicResponse?> CreateTopicAsync(Identifier streamId, TopicRequest topic, CancellationToken token = default);
-    Task UpdateTopicAsync(Identifier streamId, Identifier topicId, UpdateTopicRequest request, CancellationToken token = default);
+
+    Task<TopicResponse?> CreateTopicAsync(Identifier streamId, string name, uint partitionsCount,
+        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None, uint? topicId = null,
+        byte? replicationFactor = null, ulong messageExpiry = 0, ulong maxTopicSize = 0,
+        CancellationToken token = default);
+
+    Task UpdateTopicAsync(Identifier streamId, Identifier topicId, string name,
+        CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None, ulong maxTopicSize = 0,
+        ulong messageExpiry = 0, byte? replicationFactor = null, CancellationToken token = default);
+
     Task DeleteTopicAsync(Identifier streamId, Identifier topicId, CancellationToken token = default);
     Task PurgeTopicAsync(Identifier streamId, Identifier topicId, CancellationToken token = default);
 }

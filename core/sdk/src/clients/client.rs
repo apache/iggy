@@ -18,6 +18,7 @@
 
 use crate::clients::client_builder::IggyClientBuilder;
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
+use iggy_common::Consumer;
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::http::http_client::HttpClient;
@@ -31,7 +32,7 @@ use async_broadcast::Receiver;
 use async_trait::async_trait;
 use iggy_binary_protocol::{Client, SystemClient};
 use iggy_common::{
-    ConnectionStringUtils, Consumer, DiagnosticEvent, Partitioner, TransportProtocol,
+    ConnectionStringUtils, DiagnosticEvent, Partitioner, TransportProtocol,
 };
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -46,7 +47,7 @@ use tracing::{debug, error, info};
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct IggyClient {
-    pub(crate) client: IggyRwLock<ClientWrapper>,
+    pub(crate) client: IggySharedMut<ClientWrapper>,
     partitioner: Option<Arc<dyn Partitioner>>,
     pub(crate) encryptor: Option<Arc<EncryptorKind>>,
 }
@@ -63,7 +64,7 @@ impl IggyClient {
         IggyClientBuilder::new()
     }
 
-    /// Creates a new `IggyClientBuilder`.
+    /// Creates a new `IggyClientBuilder` from the provided connection string.
     pub fn builder_from_connection_string(
         connection_string: &str,
     ) -> Result<IggyClientBuilder, IggyError> {
@@ -72,7 +73,7 @@ impl IggyClient {
 
     /// Creates a new `IggyClient` with the provided client implementation for the specific transport.
     pub fn new(client: ClientWrapper) -> Self {
-        let client = IggyRwLock::new(client);
+        let client = IggySharedMut::new(client);
         IggyClient {
             client,
             partitioner: None,
@@ -80,6 +81,7 @@ impl IggyClient {
         }
     }
 
+    /// Creates a new `IggyClient` from the provided connection string.
     pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
         match ConnectionStringUtils::parse_protocol(connection_string)? {
             TransportProtocol::Tcp => Ok(IggyClient::new(ClientWrapper::Tcp(
@@ -116,7 +118,7 @@ impl IggyClient {
     }
 
     /// Returns the underlying client implementation for the specific transport.
-    pub fn client(&self) -> IggyRwLock<ClientWrapper> {
+    pub fn client(&self) -> IggySharedMut<ClientWrapper> {
         self.client.clone()
     }
 

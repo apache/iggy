@@ -86,10 +86,10 @@ impl Validatable<ConfigError> for ServerConfig {
             return Err(ConfigError::InvalidConfiguration);
         }
 
-        if self.http.enabled {
-            if let IggyExpiry::ServerDefault = self.http.jwt.access_token_expiry {
-                return Err(ConfigError::InvalidConfiguration);
-            }
+        if self.http.enabled
+            && let IggyExpiry::ServerDefault = self.http.jwt.access_token_expiry
+        {
+            return Err(ConfigError::InvalidConfiguration);
         }
 
         if topic_size < self.system.segment.size.as_bytes_u64() {

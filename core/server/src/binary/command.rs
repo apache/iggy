@@ -39,6 +39,7 @@ use iggy_common::delete_topic::DeleteTopic;
 use iggy_common::delete_user::DeleteUser;
 use iggy_common::get_client::GetClient;
 use iggy_common::get_clients::GetClients;
+use iggy_common::get_cluster_metadata::GetClusterMetadata;
 use iggy_common::get_consumer_group::GetConsumerGroup;
 use iggy_common::get_consumer_groups::GetConsumerGroups;
 use iggy_common::get_consumer_offset::GetConsumerOffset;
@@ -77,6 +78,7 @@ define_server_command_enum! {
     GetClient(GetClient), GET_CLIENT_CODE, GET_CLIENT, true;
     GetClients(GetClients), GET_CLIENTS_CODE, GET_CLIENTS, false;
     GetSnapshot(GetSnapshot), GET_SNAPSHOT_FILE_CODE, GET_SNAPSHOT_FILE, false;
+    GetClusterMetadata(GetClusterMetadata), GET_CLUSTER_METADATA_CODE, GET_CLUSTER_METADATA, false;
     PollMessages(PollMessages), POLL_MESSAGES_CODE, POLL_MESSAGES, true;
     FlushUnsavedBuffer(FlushUnsavedBuffer), FLUSH_UNSAVED_BUFFER_CODE, FLUSH_UNSAVED_BUFFER, true;
     GetUser(GetUser), GET_USER_CODE, GET_USER, true;
@@ -170,6 +172,11 @@ mod tests {
             &ServerCommand::GetStats(GetStats::default()),
             GET_STATS_CODE,
             &GetStats::default(),
+        );
+        assert_serialized_as_bytes_and_deserialized_from_bytes(
+            &ServerCommand::GetClusterMetadata(GetClusterMetadata::default()),
+            GET_CLUSTER_METADATA_CODE,
+            &GetClusterMetadata::default(),
         );
         assert_serialized_as_bytes_and_deserialized_from_bytes(
             &ServerCommand::GetMe(GetMe::default()),

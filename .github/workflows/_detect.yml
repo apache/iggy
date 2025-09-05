@@ -1,0 +1,382 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# .github/workflows/_detect.yml
+name: _detect
+on:
+  workflow_call:
+    outputs:
+      rust_matrix:
+        description: "Matrix for Rust components"
+        value: ${{ jobs.detect.outputs.rust_matrix }}
+      python_matrix:
+        description: "Matrix for Python SDK"
+        value: ${{ jobs.detect.outputs.python_matrix }}
+      node_matrix:
+        description: "Matrix for Node SDK"
+        value: ${{ jobs.detect.outputs.node_matrix }}
+      go_matrix:
+        description: "Matrix for Go SDK"
+        value: ${{ jobs.detect.outputs.go_matrix }}
+      java_matrix:
+        description: "Matrix for Java SDK"
+        value: ${{ jobs.detect.outputs.java_matrix }}
+      csharp_matrix:
+        description: "Matrix for C# SDK"
+        value: ${{ jobs.detect.outputs.csharp_matrix }}
+      bdd_matrix:
+        description: "Matrix for BDD tests"
+        value: ${{ jobs.detect.outputs.bdd_matrix }}
+      examples_matrix:
+        description: "Matrix for examples tests"
+        value: ${{ jobs.detect.outputs.examples_matrix }}
+      other_matrix:
+        description: "Matrix for other components"
+        value: ${{ jobs.detect.outputs.other_matrix }}
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    env:
+      IGGY_CI_BUILD: true
+    outputs:
+      rust_matrix: ${{ steps.mk.outputs.rust_matrix }}
+      python_matrix: ${{ steps.mk.outputs.python_matrix }}
+      node_matrix: ${{ steps.mk.outputs.node_matrix }}
+      go_matrix: ${{ steps.mk.outputs.go_matrix }}
+      java_matrix: ${{ steps.mk.outputs.java_matrix }}
+      csharp_matrix: ${{ steps.mk.outputs.csharp_matrix }}
+      bdd_matrix: ${{ steps.mk.outputs.bdd_matrix }}
+      examples_matrix: ${{ steps.mk.outputs.examples_matrix }}
+      other_matrix: ${{ steps.mk.outputs.other_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files (PR or push)
+        id: changed
+        uses: Ana06/get-changed-files@25f79e676e7ea1868813e21465014798211fad8c
+        with:
+          format: json
+
+      - name: Load components config
+        id: config
+        run: |
+          if ! command -v yq &> /dev/null; then
+            YQ_VERSION="v4.47.1"
+            YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
+            wget -qO /tmp/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
+            echo "${YQ_CHECKSUM}  /tmp/yq" | sha256sum -c - || exit 1
+            chmod +x /tmp/yq
+            sudo mv /tmp/yq /usr/local/bin/yq
+          fi
+          echo "components=$(yq -o=json -I=0 '.' .github/config/components.yml | jq -c)" >> $GITHUB_OUTPUT
+
+      - name: Build matrices
+        id: mk
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const componentsJson = `${{ steps.config.outputs.components }}`;
+            const changedFilesJson = `${{ steps.changed.outputs.all || '[]' }}`;
+
+            let componentsCfg = { components: {} };
+            try { componentsCfg = JSON.parse(componentsJson); } catch {}
+            const components = componentsCfg.components || {};
+
+            let changedFiles = [];
+            try { changedFiles = JSON.parse(changedFilesJson); } catch {}
+            const files = changedFiles.map(p => p.replace(/\\/g, '/'));
+
+            const escapeRe = s => s.replace(/([.+^${}()|[\]\\])/g, '\\$1');
+
+            const globToRegex = (pattern) => {
+              // Handle exclusion patterns
+              const isExclusion = pattern.startsWith('!');
+              const cleanPattern = isExclusion ? pattern.slice(1) : pattern;
+
+              let s = escapeRe(cleanPattern);
+
+              // First, replace ** patterns with placeholders to protect them
+              s = s.replace(/\*\*\/+/g, '___DOUBLESTAR_SLASH___');  // '**/' -> placeholder
+              s = s.replace(/\/\*\*$/g, '___SLASH_DOUBLESTAR___');   // '/**' at end -> placeholder
+              s = s.replace(/\*\*/g, '___DOUBLESTAR___');            // remaining '**' -> placeholder
+
+              // Now handle single * and ? (they won't match our placeholders)
+              s = s.replace(/\*/g, '[^/]*');                         // '*' -> match any except /
+              s = s.replace(/\?/g, '[^/]');                          // '?' -> match single char except /
+
+              // Finally, replace placeholders with actual regex patterns
+              s = s.replace(/___DOUBLESTAR_SLASH___/g, '(?:.*/)?');  // '**/' -> any subpath (optional)
+              s = s.replace(/___SLASH_DOUBLESTAR___/g, '(?:/.*)?');  // '/**' at end -> rest of path
+              s = s.replace(/___DOUBLESTAR___/g, '.*');              // remaining '**' -> match anything
+
+              return { regex: new RegExp(`^${s}$`), exclude: isExclusion };
+            };
+
+            const compiled = new Map();
+            const toRx = (p) => {
+              if (!compiled.has(p)) compiled.set(p, globToRegex(p));
+              return compiled.get(p).regex;
+            };
+            const test = (file, patterns) => {
+              const inc = patterns.filter(p => !p.startsWith('!')).map(toRx);
+              const exc = patterns.filter(p =>  p.startsWith('!')).map(p => toRx(p.slice(1)));
+              const included = inc.some(rx => rx.test(file));
+              const excluded = exc.some(rx => rx.test(file));
+              return included && !excluded;
+            };
+
+            // Build dependency graph and resolve affected components
+            const affectedComponents = new Set();
+            const componentTriggers = new Map(); // Track what triggered each component
+            const dependencyGraph = new Map();
+
+            // First pass: build dependency graph
+            for (const [name, cfg] of Object.entries(components)) {
+              if (cfg.depends_on) {
+                dependencyGraph.set(name, cfg.depends_on);
+              }
+            }
+
+            // Second pass: check which components are directly affected by file changes
+            console.log('=== Change Detection ===');
+            console.log(`Analyzing ${files.length} changed files...`);
+            console.log('');
+
+            for (const [name, cfg] of Object.entries(components)) {
+              const pats = (cfg.paths || []);
+              const matchedFiles = files.filter(f => test(f, pats));
+              if (matchedFiles.length > 0) {
+                affectedComponents.add(name);
+                componentTriggers.set(name, {
+                  reason: 'direct',
+                  files: matchedFiles,
+                  dependency: null
+                });
+
+                // Log direct matches
+                console.log(`✓ ${name} directly affected by:`);
+                if (matchedFiles.length <= 5) {
+                  matchedFiles.forEach(f => console.log(`    - ${f}`));
+                } else {
+                  matchedFiles.slice(0, 3).forEach(f => console.log(`    - ${f}`));
+                  console.log(`    ... and ${matchedFiles.length - 3} more files`);
+                }
+              }
+            }
+
+            // Third pass: resolve transitive dependencies
+            console.log('');
+            console.log('=== Dependency Resolution ===');
+
+            const resolveDependent = (componentName, depth = 0) => {
+              for (const [dependent, dependencies] of dependencyGraph.entries()) {
+                if (dependencies.includes(componentName) && !affectedComponents.has(dependent)) {
+                  affectedComponents.add(dependent);
+
+                  // Track why this component was added
+                  if (!componentTriggers.has(dependent)) {
+                    componentTriggers.set(dependent, {
+                      reason: 'dependency',
+                      files: [],
+                      dependency: componentName
+                    });
+                    console.log(`${'  '.repeat(depth)}→ ${dependent} (depends on ${componentName})`);
+                  }
+
+                  resolveDependent(dependent, depth + 1); // Recursively add dependents
+                }
+              }
+            };
+
+            // Apply dependency resolution
+            const initialAffected = [...affectedComponents];
+            for (const comp of initialAffected) {
+              resolveDependent(comp, 1);
+            }
+
+            // Summary output
+            console.log('');
+            console.log('=== Summary ===');
+            console.log(`Initially affected: ${initialAffected.length} components`);
+            console.log(`After dependencies: ${affectedComponents.size} components`);
+
+            if (files.length <= 10) {
+              console.log('');
+              console.log('Changed files:');
+              files.forEach(f => console.log(`  - ${f}`));
+            } else {
+              console.log(`Total files changed: ${files.length}`);
+            }
+
+            const groups = { rust:[], python:[], node:[], go:[], java:[], csharp:[], bdd:[], examples:[], other:[] };
+
+            // Process affected components and generate tasks
+            console.log('');
+            console.log('=== Task Generation ===');
+
+            const skippedComponents = [];
+            const taskedComponents = [];
+
+            for (const name of affectedComponents) {
+              const cfg = components[name];
+              const trigger = componentTriggers.get(name);
+
+              if (!cfg || !cfg.tasks || cfg.tasks.length === 0) {
+                skippedComponents.push(name);
+                continue;
+              }
+
+              const entries = cfg.tasks.map(task => ({ component: name, task }));
+              taskedComponents.push({ name, tasks: cfg.tasks, trigger });
+
+              if (name === 'rust') groups.rust.push(...entries);
+              else if (name === 'sdk-python') groups.python.push(...entries);
+              else if (name === 'sdk-node') groups.node.push(...entries);
+              else if (name === 'sdk-go') groups.go.push(...entries);
+              else if (name === 'sdk-java') groups.java.push(...entries);
+              else if (name === 'sdk-csharp') groups.csharp.push(...entries);
+              else if (name.startsWith('bdd-')) {
+                // Individual BDD tests should run separately with proper Docker setup
+                groups.bdd.push(...entries);
+              }
+              else if (name === 'examples-suite') {
+                // Examples should run separately
+                groups.examples.push(...entries);
+              }
+              else if (name === 'shell-scripts') groups.other.push(...entries);
+              else if (name === 'ci-workflows') groups.other.push(...entries);
+              else groups.other.push(...entries);
+            }
+
+            // Log components with tasks
+            if (taskedComponents.length > 0) {
+              console.log('Components with tasks to run:');
+              taskedComponents.forEach(({ name, tasks, trigger }) => {
+                const reason = trigger.reason === 'direct'
+                  ? `directly triggered by ${trigger.files.length} file(s)`
+                  : `dependency of ${trigger.dependency}`;
+                console.log(`  ✓ ${name}: ${tasks.length} task(s) - ${reason}`);
+              });
+            }
+
+            // Log skipped components (no tasks defined)
+            if (skippedComponents.length > 0) {
+              console.log('');
+              console.log('Components triggered but skipped (no tasks):');
+              skippedComponents.forEach(name => {
+                const trigger = componentTriggers.get(name);
+                const reason = trigger.reason === 'direct'
+                  ? `directly triggered by ${trigger.files.length} file(s)`
+                  : `dependency of ${trigger.dependency}`;
+                console.log(`  ○ ${name} - ${reason}`);
+              });
+            }
+
+            // On master push, run everything
+            if (context.eventName === 'push' && context.ref === 'refs/heads/master') {
+              // Clear existing groups to avoid duplicates - we'll run everything anyway
+              groups.rust = [];
+              groups.python = [];
+              groups.node = [];
+              groups.go = [];
+              groups.java = [];
+              groups.csharp = [];
+              groups.bdd = [];
+              groups.examples = [];
+              groups.other = [];
+
+              for (const [name, cfg] of Object.entries(components)) {
+                if (!cfg.tasks || cfg.tasks.length === 0) continue;
+                const entries = cfg.tasks.map(task => ({ component: name, task }));
+                if (name === 'rust') groups.rust.push(...entries);
+                else if (name === 'sdk-python') groups.python.push(...entries);
+                else if (name === 'sdk-node') groups.node.push(...entries);
+                else if (name === 'sdk-go') groups.go.push(...entries);
+                else if (name === 'sdk-java') groups.java.push(...entries);
+                else if (name === 'sdk-csharp') groups.csharp.push(...entries);
+                else if (name.startsWith('bdd-')) groups.bdd.push(...entries);
+                else if (name === 'examples-suite') groups.examples.push(...entries);
+                else groups.other.push(...entries);
+              }
+            }
+
+            // Deduplicate entries in each group (in case of any edge cases)
+            const dedupeGroup = (group) => {
+              const seen = new Set();
+              return group.filter(item => {
+                const key = `${item.component}-${item.task}`;
+                if (seen.has(key)) return false;
+                seen.add(key);
+                return true;
+              });
+            };
+
+            // Apply deduplication to all groups
+            Object.keys(groups).forEach(key => {
+              groups[key] = dedupeGroup(groups[key]);
+            });
+
+            const matrix = a => a.length ? { include: a } : { include: [{ component: 'noop', task: 'noop' }] };
+
+            // Final summary of what will run
+            console.log('');
+            console.log('=== Test Jobs to Run ===');
+
+            const jobSummary = [
+              { name: 'Rust', tasks: groups.rust },
+              { name: 'Python SDK', tasks: groups.python },
+              { name: 'Node SDK', tasks: groups.node },
+              { name: 'Go SDK', tasks: groups.go },
+              { name: 'Java SDK', tasks: groups.java },
+              { name: 'C# SDK', tasks: groups.csharp },
+              { name: 'BDD Tests', tasks: groups.bdd },
+              { name: 'Examples', tasks: groups.examples },
+              { name: 'Other', tasks: groups.other }
+            ];
+
+            jobSummary.forEach(({ name, tasks }) => {
+              if (tasks.length > 0) {
+                const uniqueTasks = [...new Set(tasks.map(t => t.task))];
+                console.log(`  ✓ ${name}: ${uniqueTasks.join(', ')}`);
+              } else {
+                console.log(`  ✗ ${name}: SKIPPED (no changes detected)`);
+              }
+            });
+
+            // Overall stats
+            const totalTasks = Object.values(groups).reduce((sum, g) => sum + g.length, 0);
+            console.log('');
+            console.log(`Total: ${affectedComponents.size} components affected, ${totalTasks} tasks to run`);
+
+            // Use environment files instead of deprecated setOutput
+            const setOutput = (name, value) => {
+              const output = `${name}=${value}`;
+              require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `${output}\n`);
+            };
+
+            setOutput('rust_matrix', JSON.stringify(matrix(groups.rust)));
+            setOutput('python_matrix', JSON.stringify(matrix(groups.python)));
+            setOutput('node_matrix', JSON.stringify(matrix(groups.node)));
+            setOutput('go_matrix', JSON.stringify(matrix(groups.go)));
+            setOutput('java_matrix', JSON.stringify(matrix(groups.java)));
+            setOutput('csharp_matrix', JSON.stringify(matrix(groups.csharp)));
+            setOutput('bdd_matrix', JSON.stringify(matrix(groups.bdd)));
+            setOutput('examples_matrix', JSON.stringify(matrix(groups.examples)));
+            setOutput('other_matrix', JSON.stringify(matrix(groups.other)));

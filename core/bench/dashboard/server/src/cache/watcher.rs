@@ -66,10 +66,10 @@ impl BenchmarkCache {
         let mut last_reload = self.last_reload_request.lock().await;
 
         // Skip if reloaded recently
-        if let Some(instant) = *last_reload {
-            if instant.elapsed() < Duration::from_secs(10) {
-                return;
-            }
+        if let Some(instant) = *last_reload
+            && instant.elapsed() < Duration::from_secs(10)
+        {
+            return;
         }
 
         *last_reload = Some(Instant::now());

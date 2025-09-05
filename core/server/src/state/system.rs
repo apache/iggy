@@ -446,11 +446,11 @@ impl SystemState {
                         entry.timestamp,
                         command.command.expiry,
                     );
-                    if let Some(expiry_at) = expiry_at {
-                        if expiry_at.as_micros() <= IggyTimestamp::now().as_micros() {
-                            debug!("Personal access token: {token_hash} has already expired.");
-                            continue;
-                        }
+                    if let Some(expiry_at) = expiry_at
+                        && expiry_at.as_micros() <= IggyTimestamp::now().as_micros()
+                    {
+                        debug!("Personal access token: {token_hash} has already expired.");
+                        continue;
                     }
 
                     user.personal_access_tokens.insert(

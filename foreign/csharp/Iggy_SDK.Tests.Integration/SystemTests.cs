@@ -1,4 +1,4 @@
-﻿// // Licensed to the Apache Software Foundation (ASF) under one
+// // Licensed to the Apache Software Foundation (ASF) under one
 // // or more contributor license agreements.  See the NOTICE file
 // // distributed with this work for additional information
 // // regarding copyright ownership.  The ASF licenses this file
@@ -15,28 +15,26 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
-using Apache.Iggy.Contracts.Http;
-using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
-using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.Tests.Integrations;
 
-[MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-public class SystemTests(Protocol protocol)
+public class SystemTests
 {
     [ClassDataSource<SystemFixture>(Shared = SharedType.PerClass)]
     public required SystemFixture Fixture { get; init; }
 
     [Test]
-    public async Task GetClients_Should_Return_CorrectClientsCount()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetClients_Should_Return_CorrectClientsCount(Protocol protocol)
     {
         IReadOnlyList<ClientResponse> clients = await Fixture.Clients[protocol].GetClientsAsync();
 
@@ -52,7 +50,8 @@ public class SystemTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(GetClients_Should_Return_CorrectClientsCount))]
-    public async Task GetClient_Should_Return_CorrectClient()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetClient_Should_Return_CorrectClient(Protocol protocol)
     {
         IReadOnlyList<ClientResponse> clients = await Fixture.Clients[protocol].GetClientsAsync();
 
@@ -71,7 +70,8 @@ public class SystemTests(Protocol protocol)
     [Test]
     [SkipHttp]
     [DependsOn(nameof(GetClient_Should_Return_CorrectClient))]
-    public async Task GetMe_Tcp_Should_Return_MyClient()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetMe_Tcp_Should_Return_MyClient(Protocol protocol)
     {
         var me = await Fixture.Clients[protocol].GetMeAsync();
         me.ShouldNotBeNull();
@@ -84,7 +84,8 @@ public class SystemTests(Protocol protocol)
     [Test]
     [SkipTcp]
     [DependsOn(nameof(GetClient_Should_Return_CorrectClient))]
-    public async Task GetMe_HTTP_Should_Throw_FeatureUnavailableException()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetMe_HTTP_Should_Throw_FeatureUnavailableException(Protocol protocol)
     {
         await Should.ThrowAsync<FeatureUnavailableException>(() => Fixture.Clients[protocol].GetMeAsync());
     }
@@ -92,35 +93,19 @@ public class SystemTests(Protocol protocol)
     [Test]
     [DependsOn(nameof(GetMe_HTTP_Should_Throw_FeatureUnavailableException))]
     [DependsOn(nameof(GetMe_Tcp_Should_Return_MyClient))]
-    public async Task GetClient_WithConsumerGroup_Should_Return_CorrectClient()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetClient_WithConsumerGroup_Should_Return_CorrectClient(Protocol protocol)
     {
         var client = Fixture.CreateClient(Protocol.Tcp, protocol);
-        await client.LoginUser(new LoginUserRequest
-        {
-            Password = "iggy",
-            Username = "iggy"
-        });
-        await client.CreateStreamAsync(StreamFactory.CreateStream());
-        await client.CreateTopicAsync(Identifier.Numeric(1), new TopicRequest
-        {
-            Name = "test_topic",
-            PartitionsCount = 2
-        });
-        var consumerGroup = await client.CreateConsumerGroupAsync(new CreateConsumerGroupRequest
-        {
-            Name = "test_consumer_group",
-            StreamId = Identifier.Numeric(1),
-            TopicId = Identifier.Numeric(1),
-            ConsumerGroupId = 1
-        });
-        await client.JoinConsumerGroupAsync(new JoinConsumerGroupRequest
-        {
-            StreamId = Identifier.Numeric(1),
-            TopicId = Identifier.Numeric(1),
-            ConsumerGroupId = Identifier.Numeric(consumerGroup!.Id)
-        });
-        var me = await client.GetMeAsync();
+        await client.LoginUser("iggy", "iggy");
+        await client.CreateStreamAsync("TestStream", 1);
+        await client.CreateTopicAsync(Identifier.Numeric(1), "test_topic", 2);
 
+        var consumerGroup
+            = await client.CreateConsumerGroupAsync(Identifier.Numeric(1), Identifier.Numeric(1), "test_consumer_group",
+                1);
+        await client.JoinConsumerGroupAsync(Identifier.Numeric(1), Identifier.Numeric(1), Identifier.Numeric(1));
+        var me = await client.GetMeAsync();
 
         var response = await Fixture.Clients[protocol].GetClientByIdAsync(me!.ClientId);
         response.ShouldNotBeNull();
@@ -129,7 +114,7 @@ public class SystemTests(Protocol protocol)
         response.Transport.ShouldBe("TCP");
         response.ConsumerGroupsCount.ShouldBe(1);
         response.ConsumerGroups.ShouldNotBeEmpty();
-        response.ConsumerGroups.ShouldContain(x => x.GroupId == consumerGroup.Id);
+        response.ConsumerGroups.ShouldContain(x => x.GroupId == consumerGroup!.Id);
         response.ConsumerGroups.ShouldContain(x => x.TopicId == 1);
         response.ConsumerGroups.ShouldContain(x => x.StreamId == 1);
     }
@@ -137,7 +122,8 @@ public class SystemTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(GetClient_WithConsumerGroup_Should_Return_CorrectClient))]
-    public async Task GetStats_Should_ReturnValidResponse()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetStats_Should_ReturnValidResponse(Protocol protocol)
     {
         await Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest
         {
@@ -147,7 +133,7 @@ public class SystemTests(Protocol protocol)
             Messages = [new Message(Guid.NewGuid(), "Test message"u8.ToArray())]
         });
 
-        await Fixture.Clients[protocol].FetchMessagesAsync(new MessageFetchRequest
+        await Fixture.Clients[protocol].PollMessagesAsync(new MessageFetchRequest
         {
             StreamId = Identifier.Numeric(1),
             TopicId = Identifier.Numeric(1),
@@ -188,7 +174,8 @@ public class SystemTests(Protocol protocol)
 
     [Test]
     [DependsOn(nameof(GetStats_Should_ReturnValidResponse))]
-    public async Task Ping_Should_Pong()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task Ping_Should_Pong(Protocol protocol)
     {
         await Should.NotThrowAsync(Fixture.Clients[protocol].PingAsync());
     }

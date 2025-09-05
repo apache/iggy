@@ -260,76 +260,76 @@ impl PostgresSource {
     }
 
     fn parse_insert_message(&self, data: &str) -> Option<DatabaseRecord> {
-        if let Some(table_start) = data.find("table ") {
-            if let Some(colon_pos) = data[table_start..].find(':') {
-                let table_part = &data[table_start + 6..table_start + colon_pos];
-                let table_name = table_part
-                    .split('.')
-                    .next_back()
-                    .unwrap_or(table_part)
-                    .to_string();
+        if let Some(table_start) = data.find("table ")
+            && let Some(colon_pos) = data[table_start..].find(':')
+        {
+            let table_part = &data[table_start + 6..table_start + colon_pos];
+            let table_name = table_part
+                .split('.')
+                .next_back()
+                .unwrap_or(table_part)
+                .to_string();
 
-                let data_part = &data[table_start + colon_pos + 1..];
-                let parsed_data = self.parse_record_data(data_part);
+            let data_part = &data[table_start + colon_pos + 1..];
+            let parsed_data = self.parse_record_data(data_part);
 
-                return Some(DatabaseRecord {
-                    table_name,
-                    operation_type: "INSERT".to_string(),
-                    timestamp: Utc::now(),
-                    data: serde_json::Value::Object(parsed_data),
-                    old_data: None,
-                });
-            }
+            return Some(DatabaseRecord {
+                table_name,
+                operation_type: "INSERT".to_string(),
+                timestamp: Utc::now(),
+                data: serde_json::Value::Object(parsed_data),
+                old_data: None,
+            });
         }
         None
     }
 
     fn parse_update_message(&self, data: &str) -> Option<DatabaseRecord> {
-        if let Some(table_start) = data.find("table ") {
-            if let Some(colon_pos) = data[table_start..].find(':') {
-                let table_part = &data[table_start + 6..table_start + colon_pos];
-                let table_name = table_part
-                    .split('.')
-                    .next_back()
-                    .unwrap_or(table_part)
-                    .to_string();
+        if let Some(table_start) = data.find("table ")
+            && let Some(colon_pos) = data[table_start..].find(':')
+        {
+            let table_part = &data[table_start + 6..table_start + colon_pos];
+            let table_name = table_part
+                .split('.')
+                .next_back()
+                .unwrap_or(table_part)
+                .to_string();
 
-                let data_part = &data[table_start + colon_pos + 1..];
-                let parsed_data = self.parse_record_data(data_part);
+            let data_part = &data[table_start + colon_pos + 1..];
+            let parsed_data = self.parse_record_data(data_part);
 
-                return Some(DatabaseRecord {
-                    table_name,
-                    operation_type: "UPDATE".to_string(),
-                    timestamp: Utc::now(),
-                    data: serde_json::Value::Object(parsed_data),
-                    old_data: None,
-                });
-            }
+            return Some(DatabaseRecord {
+                table_name,
+                operation_type: "UPDATE".to_string(),
+                timestamp: Utc::now(),
+                data: serde_json::Value::Object(parsed_data),
+                old_data: None,
+            });
         }
         None
     }
 
     fn parse_delete_message(&self, data: &str) -> Option<DatabaseRecord> {
-        if let Some(table_start) = data.find("table ") {
-            if let Some(colon_pos) = data[table_start..].find(':') {
-                let table_part = &data[table_start + 6..table_start + colon_pos];
-                let table_name = table_part
-                    .split('.')
-                    .next_back()
-                    .unwrap_or(table_part)
-                    .to_string();
+        if let Some(table_start) = data.find("table ")
+            && let Some(colon_pos) = data[table_start..].find(':')
+        {
+            let table_part = &data[table_start + 6..table_start + colon_pos];
+            let table_name = table_part
+                .split('.')
+                .next_back()
+                .unwrap_or(table_part)
+                .to_string();
 
-                let data_part = &data[table_start + colon_pos + 1..];
-                let parsed_data = self.parse_record_data(data_part);
+            let data_part = &data[table_start + colon_pos + 1..];
+            let parsed_data = self.parse_record_data(data_part);
 
-                return Some(DatabaseRecord {
-                    table_name,
-                    operation_type: "DELETE".to_string(),
-                    timestamp: Utc::now(),
-                    data: serde_json::Value::Object(parsed_data),
-                    old_data: None,
-                });
-            }
+            return Some(DatabaseRecord {
+                table_name,
+                operation_type: "DELETE".to_string(),
+                timestamp: Utc::now(),
+                data: serde_json::Value::Object(parsed_data),
+                old_data: None,
+            });
         }
         None
     }
@@ -340,37 +340,34 @@ impl PostgresSource {
         let parts = data.split_whitespace();
 
         for part in parts {
-            if let Some(bracket_pos) = part.find('[') {
-                if let Some(_close_bracket) = part.find(']') {
-                    if let Some(colon_pos) = part.find(':') {
-                        let column_name = &part[..bracket_pos];
-                        let value_str = &part[colon_pos + 1..];
+            if let Some(bracket_pos) = part.find('[')
+                && let Some(_close_bracket) = part.find(']')
+                && let Some(colon_pos) = part.find(':')
+            {
+                let column_name = &part[..bracket_pos];
+                let value_str = &part[colon_pos + 1..];
 
-                        let cleaned_value =
-                            if value_str.starts_with('\'') && value_str.ends_with('\'') {
-                                &value_str[1..value_str.len() - 1]
-                            } else {
-                                value_str
-                            };
+                let cleaned_value = if value_str.starts_with('\'') && value_str.ends_with('\'') {
+                    &value_str[1..value_str.len() - 1]
+                } else {
+                    value_str
+                };
 
-                        let value = if let Ok(num) = cleaned_value.parse::<i64>() {
-                            serde_json::Value::Number(serde_json::Number::from(num))
-                        } else if let Ok(float) = cleaned_value.parse::<f64>() {
-                            serde_json::Value::Number(
-                                serde_json::Number::from_f64(float)
-                                    .unwrap_or(serde_json::Number::from(0)),
-                            )
-                        } else if cleaned_value.eq_ignore_ascii_case("true") {
-                            serde_json::Value::Bool(true)
-                        } else if cleaned_value.eq_ignore_ascii_case("false") {
-                            serde_json::Value::Bool(false)
-                        } else {
-                            serde_json::Value::String(cleaned_value.to_string())
-                        };
+                let value = if let Ok(num) = cleaned_value.parse::<i64>() {
+                    serde_json::Value::Number(serde_json::Number::from(num))
+                } else if let Ok(float) = cleaned_value.parse::<f64>() {
+                    serde_json::Value::Number(
+                        serde_json::Number::from_f64(float).unwrap_or(serde_json::Number::from(0)),
+                    )
+                } else if cleaned_value.eq_ignore_ascii_case("true") {
+                    serde_json::Value::Bool(true)
+                } else if cleaned_value.eq_ignore_ascii_case("false") {
+                    serde_json::Value::Bool(false)
+                } else {
+                    serde_json::Value::String(cleaned_value.to_string())
+                };
 
-                        result.insert(column_name.to_string(), value);
-                    }
-                }
+                result.insert(column_name.to_string(), value);
             }
         }
 

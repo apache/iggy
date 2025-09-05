@@ -32,7 +32,7 @@ assert_cmd = "2.0.17"
 async-trait = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
-ctor = "0.4.3"
+ctor = "0.5.0"
 derive_more = { workspace = true }
 env_logger = { workspace = true }
 futures = { workspace = true }
@@ -42,16 +42,17 @@ iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
 keyring = { workspace = true }
 lazy_static = { workspace = true }
-libc = "0.2.174"
+libc = "0.2.175"
 log = { workspace = true }
 predicates = { workspace = true }
 rand = { workspace = true }
 rcgen = "0.14.3"
 reqwest = { workspace = true }
-rmcp = { version = "0.3.2", features = [
+rmcp = { version = "0.6.1", features = [
     "client",
     "reqwest",
     "transport-streamable-http-client",
+    "transport-streamable-http-client-reqwest",
 ] }
 serial_test = { workspace = true }
 server = { workspace = true }

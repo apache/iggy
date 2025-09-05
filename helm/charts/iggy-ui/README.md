@@ -16,7 +16,7 @@ A Helm chart for Iggy UI
 | affinity | object | `{}` |  |
 | fullnameOverride | string | `""` |  |
 | image.pullPolicy | string | `"IfNotPresent"` |  |
-| image.repository | string | `"iggyrs/iggy-web-ui"` |  |
+| image.repository | string | `"apache/iggy-web-ui"` |  |
 | image.tag | string | `""` |  |
 | imagePullSecrets | list | `[]` |  |
 | ingress.annotations | object | `{}` |  |

@@ -17,7 +17,7 @@
 
 [package]
 name = "iggy-cli"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2024"
 authors = ["bartosz.ciesla@gmail.com"]
 repository = "https://github.com/apache/iggy"
@@ -31,6 +31,10 @@ readme = "../../README.md"
 pkg-url = "{ repo }/releases/download/{ name }-{ version }/{ name }-{ target }{ archive-suffix }"
 bin-dir = "{ bin }{ binary-ext }"
 
+[[bin]]
+name = "iggy"
+path = "src/main.rs"
+
 [features]
 default = ["login-session"]
 login-session = ["dep:keyring"]
@@ -39,7 +43,7 @@ login-session = ["dep:keyring"]
 ahash = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
-clap_complete = "4.5.55"
+clap_complete = "4.5.57"
 figlet-rs = { workspace = true }
 iggy = { workspace = true }
 iggy_binary_protocol = { workspace = true }
@@ -50,7 +54,3 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true, default-features = false }
-
-[[bin]]
-name = "iggy"
-path = "src/main.rs"

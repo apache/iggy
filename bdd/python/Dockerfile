@@ -15,12 +15,14 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM rust:1.87-slim-bookworm
+# syntax=docker/dockerfile:1
+ARG RUST_VERSION=1.89
+FROM rust:${RUST_VERSION}-slim-trixie
 
 RUN apt-get update && \
     apt-get install -y \
-    python3.11 \
-    python3.11-dev \
+    python3 \
+    python3-dev \
     python3-pip \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
@@ -39,7 +41,7 @@ WORKDIR /workspace/foreign/python
 RUN pip3 install --no-cache-dir -r /workspace/bdd/python/requirements.txt
 
 # Build and install the Iggy Python SDK
-RUN maturin build --release --out dist && \
+RUN maturin build --out dist && \
     pip3 install dist/*.whl
 
 # Set up BDD test directory

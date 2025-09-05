@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { updated } from '$app/state';
   import Button from '$lib/components/Button.svelte';
   import Checkbox from '$lib/components/Checkbox.svelte';
   import Icon from '$lib/components/Icon.svelte';
@@ -14,7 +13,7 @@
   }
 
   let { data }: Props = $props();
-  const { form, constraints, errors, message, reset } = superForm(data.form, {});
+  const { form, constraints, errors, message } = superForm(data.form, {});
 
   const remember = persistedStore('rememberMe', { rememberMe: true, username: '', password: '' });
 
@@ -44,7 +43,7 @@
   <Input
     label="Username"
     name="username"
-    errorMessage={$errors?.username?.join(',')}
+    errorMessage={Array.isArray($errors?.username) ? $errors.username.join(',') : String($errors?.username || '')}
     bind:value={$form.username}
     {...$constraints.username}
   />
@@ -52,7 +51,7 @@
   <PasswordInput
     label="Password"
     name="password"
-    errorMessage={$errors.password?.join(',')}
+    errorMessage={Array.isArray($errors?.password) ? $errors.password.join(',') : String($errors?.password || '')}
     bind:value={$form.password}
     {...$constraints.password}
   />

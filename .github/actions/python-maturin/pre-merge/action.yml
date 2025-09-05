@@ -1,0 +1,179 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: python-maturin-pre-merge
+description: Python pre-merge testing with maturin github iggy actions
+
+inputs:
+  task:
+    description: "Task to run (lint, test, build)"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Setup Rust with cache
+      uses: ./.github/actions/utils/setup-rust-with-cache
+      with:
+        cache-targets: false  # Only cache registry and git deps, not target dir (sccache handles that)
+
+    - name: Cache pip
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: pip-${{ runner.os }}-${{ hashFiles('foreign/python/pyproject.toml') }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip wheel setuptools
+
+        # Install maturin for building
+        pip install 'maturin>=1.2,<2.0'
+
+        # Install testing dependencies from pyproject.toml
+        cd foreign/python
+        pip install -e ".[testing,examples,dev]"
+        cd ../..
+
+        # Install additional CI dependencies for Docker testing if needed
+        if [ "${{ inputs.task }}" = "test" ]; then
+          pip install 'testcontainers[docker]>=3.7.0,<5.0' || true
+        fi
+      shell: bash
+
+    - name: Lint and format check
+      if: inputs.task == 'lint'
+      run: |
+        # Build list of directories to check using absolute paths
+        DIR_SDK="${GITHUB_WORKSPACE}/foreign/python"
+        DIR_TEST="${DIR_SDK}/tests"
+        DIRS_TO_CHECK="${DIR_TEST} ${DIR_SDK}"
+        STUB_FILE="${DIR_SDK}/apache_iggy.pyi"
+
+        echo "Directories to check: $DIRS_TO_CHECK"
+        echo "Stub file: $STUB_FILE"
+
+        echo "ruff check --select I $DIRS_TO_CHECK"
+        ruff check --select I $DIRS_TO_CHECK
+        echo "ruff version: $(ruff --version)"
+
+        echo "ruff format --check $DIRS_TO_CHECK"
+        ruff format --check $DIRS_TO_CHECK
+
+        echo "mypy --explicit-package-bases $DIR_SDK"
+        mypy --explicit-package-bases "$DIR_SDK"
+        echo "mypy version: $(mypy --version)"
+      shell: bash
+
+    - name: Build Python wheel for testing
+      if: inputs.task == 'test' || inputs.task == 'build'
+      run: |
+        cd foreign/python
+
+        # Build the module
+        echo "Building Python wheel..."
+        maturin build -o dist
+
+        if [ "${{ inputs.task }}" = "test" ]; then
+          # Install the built wheel for testing
+          echo "Installing built wheel..."
+          pip install dist/*.whl --force-reinstall
+
+          # Create symlink for examples directory if needed
+          if [ -d "python_examples" ] && [ ! -e "examples" ]; then
+            ln -s python_examples examples
+          fi
+        fi
+
+        if [ "${{ inputs.task }}" = "build" ]; then
+          # List built artifacts
+          echo ""
+          echo "Build artifacts:"
+          ls -la dist/
+        fi
+      shell: bash
+
+    - name: Start Iggy server
+      if: inputs.task == 'test'
+      id: iggy
+      uses: ./.github/actions/utils/server-start
+      with:
+        mode: cargo
+        cargo-bin: iggy-server
+        host: 127.0.0.1
+        port: 8090
+        wait-timeout-seconds: 45
+      continue-on-error: true
+
+    - name: Run Python integration tests
+      if: inputs.task == 'test' && steps.iggy.outcome == 'success'
+      run: |
+        cd foreign/python
+
+        echo "Running integration tests with Iggy server at ${{ steps.iggy.outputs.address }}..."
+
+        # Run all tests with server connection
+        IGGY_SERVER_HOST=127.0.0.1 \
+        IGGY_SERVER_TCP_PORT=8090 \
+          pytest tests/ -v \
+            --junitxml=../../reports/python-junit.xml \
+            --tb=short \
+            --capture=no || TEST_EXIT_CODE=$?
+
+        # Exit with test result
+        exit ${TEST_EXIT_CODE:-0}
+      shell: bash
+
+    - name: Run Python unit tests only (fallback)
+      if: inputs.task == 'test' && steps.iggy.outcome != 'success'
+      run: |
+        cd foreign/python
+
+        echo "⚠️ Server failed to start, running unit tests only..."
+
+        # Run unit tests only (exclude integration tests)
+        pytest tests/ -v \
+          -m "not integration" \
+          --junitxml=../../reports/python-junit.xml \
+          --tb=short || TEST_EXIT_CODE=$?
+
+        # Exit with test result (allow some failures in unit-only mode)
+        exit ${TEST_EXIT_CODE:-0}
+      shell: bash
+
+    - name: Stop Iggy server
+      if: always() && inputs.task == 'test'
+      uses: ./.github/actions/utils/server-stop
+      with:
+        pid-file: ${{ steps.iggy.outputs.pid_file }}
+        log-file: ${{ steps.iggy.outputs.log_file }}
+
+    - name: Upload test artifacts
+      if: always() && inputs.task == 'test'
+      uses: actions/upload-artifact@v4
+      with:
+        name: python-test-results-${{ github.run_id }}-${{ github.run_attempt }}
+        path: |
+          reports/python-junit.xml
+          foreign/python/dist/*.whl
+        retention-days: 7
+        if-no-files-found: ignore

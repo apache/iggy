@@ -60,6 +60,19 @@ classifiers = [
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
+include = [
+    { path = "LICENSE", format = [
+        "sdist",
+        "wheel",
+    ] },
+    { path = "NOTICE", format = [
+        "sdist",
+        "wheel",
+    ] },
+    { path = "apache_iggy.pyi", format = [
+        "sdist",
+    ] },
+]
 
 [project.optional-dependencies]
 # Core testing dependencies

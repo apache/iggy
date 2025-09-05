@@ -1,0 +1,67 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: server-stop
+description: Stop Iggy server by PID or PID file
+inputs:
+  pid:
+    description: "PID to stop (optional if pid-file is provided)"
+    required: false
+    default: ""
+  pid-file:
+    description: "Path to PID file"
+    required: false
+    default: ""
+  log-file:
+    description: "Path to log file (for final tail)"
+    required: false
+    default: ""
+  kill-timeout-seconds:
+    description: "Graceful timeout before SIGKILL"
+    required: false
+    default: "10"
+runs:
+  using: "composite"
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        PID_INPUT="${{ inputs.pid }}"
+        PID_FILE="${{ inputs.pid-file }}"
+        LOG_FILE="${{ inputs.log-file }}"
+        if [[ -z "$PID_INPUT" && -n "$PID_FILE" && -f "$PID_FILE" ]]; then
+          PID_INPUT="$(cat "$PID_FILE" || true)"
+        fi
+        if [[ -z "$PID_INPUT" ]]; then
+          echo "No PID provided/found; nothing to stop."
+          exit 0
+        fi
+
+        if ps -p "$PID_INPUT" > /dev/null 2>&1; then
+          kill "$PID_INPUT" || true
+          for i in $(seq 1 ${{ inputs.kill-timeout-seconds }}); do
+            ps -p "$PID_INPUT" > /dev/null 2>&1 || exit 0
+            sleep 1
+          done
+          echo "Process still alive after grace; sending SIGKILL"
+          kill -9 "$PID_INPUT" || true
+        fi
+
+        if [[ -n "$LOG_FILE" && -f "$LOG_FILE" ]]; then
+          echo "---- last 50 lines of server log ----"
+          tail -n 50 "$LOG_FILE" || true
+        fi

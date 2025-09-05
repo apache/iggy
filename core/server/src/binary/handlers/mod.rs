@@ -16,6 +16,7 @@
  * under the License.
  */
 
+pub mod cluster;
 pub mod consumer_groups;
 pub mod consumer_offsets;
 pub mod messages;

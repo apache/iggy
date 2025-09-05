@@ -15,7 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM rust:latest AS builder
+FROM rust:1.89.0-alpine3.22 AS builder
+RUN apk add musl-dev
 WORKDIR /build
 COPY . /build
 RUN cargo build --bin iggy --release

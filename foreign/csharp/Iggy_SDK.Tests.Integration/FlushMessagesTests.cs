@@ -1,4 +1,4 @@
-﻿// // Licensed to the Apache Software Foundation (ASF) under one
+// // Licensed to the Apache Software Foundation (ASF) under one
 // // or more contributor license agreements.  See the NOTICE file
 // // distributed with this work for additional information
 // // regarding copyright ownership.  The ASF licenses this file
@@ -15,7 +15,6 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
-using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Tests.Integrations.Fixtures;
@@ -23,47 +22,37 @@ using Shouldly;
 
 namespace Apache.Iggy.Tests.Integrations;
 
-[MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-public class FlushMessagesTests(Protocol protocol)
+public class FlushMessagesTests
 {
     [ClassDataSource<FlushMessageFixture>(Shared = SharedType.PerClass)]
     public required FlushMessageFixture Fixture { get; init; }
 
     [Test]
-    public async Task FlushUnsavedBuffer_WithFsync_Should_Flush_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task FlushUnsavedBuffer_WithFsync_Should_Flush_Successfully(Protocol protocol)
     {
-        await Should.NotThrowAsync(() => Fixture.Clients[protocol].FlushUnsavedBufferAsync(new FlushUnsavedBufferRequest
-        {
-            StreamId = Identifier.Numeric(Fixture.StreamRequest.StreamId!.Value),
-            TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value),
-            PartitionId = 1,
-            Fsync = true
-        }));
+        await Should.NotThrowAsync(() =>
+            Fixture.Clients[protocol].FlushUnsavedBufferAsync(Identifier.Numeric(Fixture.StreamId),
+                Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), 1, true));
     }
 
     [Test]
     [DependsOn(nameof(FlushUnsavedBuffer_WithFsync_Should_Flush_Successfully))]
-    public async Task FlushUnsavedBuffer_WithOutFsync_Should_Flush_Successfully()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task FlushUnsavedBuffer_WithOutFsync_Should_Flush_Successfully(Protocol protocol)
     {
-        await Should.NotThrowAsync(() => Fixture.Clients[protocol].FlushUnsavedBufferAsync(new FlushUnsavedBufferRequest
-        {
-            StreamId = Identifier.Numeric(Fixture.StreamRequest.StreamId!.Value),
-            TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value),
-            PartitionId = 1,
-            Fsync = false
-        }));
+        await Should.NotThrowAsync(() =>
+            Fixture.Clients[protocol].FlushUnsavedBufferAsync(Identifier.Numeric(Fixture.StreamId),
+                Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), 1, false));
     }
 
     [Test]
     [DependsOn(nameof(FlushUnsavedBuffer_WithOutFsync_Should_Flush_Successfully))]
-    public async Task FlushUnsavedBuffer_Should_Throw_WhenStream_DoesNotExist()
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task FlushUnsavedBuffer_Should_Throw_WhenStream_DoesNotExist(Protocol protocol)
     {
-        await Should.ThrowAsync<InvalidResponseException>(() => Fixture.Clients[protocol].FlushUnsavedBufferAsync(new FlushUnsavedBufferRequest
-        {
-            StreamId = Identifier.Numeric(Fixture.StreamRequest.StreamId!.Value),
-            TopicId = Identifier.Numeric(55),
-            PartitionId = 1,
-            Fsync = true
-        }));
+        await Should.ThrowAsync<InvalidResponseException>(() =>
+            Fixture.Clients[protocol].FlushUnsavedBufferAsync(Identifier.Numeric(Fixture.StreamId),
+                Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), 55, false));
     }
 }

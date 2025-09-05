@@ -1,0 +1,262 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# .github/workflows/_build_python_wheels.yml
+name: _build_python_wheels
+on:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: false
+        default: ""
+      upload_artifacts:
+        type: boolean
+        required: false
+        default: true
+      use_latest_ci:
+        type: boolean
+        required: false
+        default: true
+        description: "Use latest CI configuration and scripts from master branch"
+    outputs:
+      artifact_name:
+        description: "Name of the uploaded artifact containing wheels"
+        value: ${{ jobs.collect.outputs.artifact_name }}
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        run: |
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+
+      - uses: actions/checkout@v4
+
+      - name: Save and apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          /tmp/copy-latest-from-master.sh save .github scripts
+          /tmp/copy-latest-from-master.sh apply
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          cache-targets: false
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          working-directory: foreign/python
+          before-script-linux: |
+            # manylinux_2_28 uses yum, not dnf
+            if command -v dnf &> /dev/null; then
+              dnf install -y perl-IPC-Cmd
+            elif command -v yum &> /dev/null; then
+              yum install -y perl-IPC-Cmd
+            fi
+            python3 -m pip --version || python3 -m ensurepip
+          manylinux: "2_28"
+          args: --release --out dist --interpreter python3.8 python3.9 python3.10 python3.11 python3.12 python3.13
+          sccache: "true"
+
+      - name: Upload wheels
+        if: inputs.upload_artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: foreign/python/dist
+          retention-days: 7
+
+  macos:
+    runs-on: ${{ matrix.target == 'x86_64' && 'macos-13' || 'macos-14' }}
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        run: |
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+
+      - uses: actions/checkout@v4
+
+      - name: Save and apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          /tmp/copy-latest-from-master.sh save .github scripts
+          /tmp/copy-latest-from-master.sh apply
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          working-directory: foreign/python
+          args: --release --out dist --interpreter python3.8 python3.9 python3.10 python3.11 python3.12 python3.13
+          sccache: "true"
+
+      - name: Upload wheels
+        if: inputs.upload_artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: foreign/python/dist
+          retention-days: 7
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        shell: bash
+        run: |
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+
+      - uses: actions/checkout@v4
+
+      - name: Save and apply latest CI from master
+        if: inputs.use_latest_ci
+        shell: bash
+        run: |
+          /tmp/copy-latest-from-master.sh save .github scripts
+          /tmp/copy-latest-from-master.sh apply
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64
+          working-directory: foreign/python
+          args: --release --out dist --interpreter python3.9 python3.10 python3.11 python3.12 python3.13
+          sccache: "true"
+
+      - name: Upload wheels
+        if: inputs.upload_artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-windows-x64
+          path: foreign/python/dist
+          retention-days: 7
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        run: |
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+
+      - uses: actions/checkout@v4
+
+      - name: Save and apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          /tmp/copy-latest-from-master.sh save .github scripts
+          /tmp/copy-latest-from-master.sh apply
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          working-directory: foreign/python
+          args: --out dist
+
+      - name: Upload sdist
+        if: inputs.upload_artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: foreign/python/dist
+          retention-days: 7
+
+  collect:
+    name: Collect all wheels
+    needs: [linux, macos, windows, sdist]
+    runs-on: ubuntu-latest
+    outputs:
+      artifact_name: ${{ steps.output.outputs.artifact_name }}
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: List wheels
+        run: |
+          echo "## 📦 Built Python Wheels" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Platform | Architecture | File |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------------|------|" >> $GITHUB_STEP_SUMMARY
+
+          for wheel in dist/*.whl; do
+            filename=$(basename "$wheel")
+            if [[ "$filename" == *"linux"* ]]; then platform="Linux"
+            elif [[ "$filename" == *"macosx"* ]]; then platform="macOS"
+            elif [[ "$filename" == *"win"* ]]; then platform="Windows"
+            else platform="Universal"; fi
+
+            if [[ "$filename" == *"x86_64"* ]] || [[ "$filename" == *"amd64"* ]]; then arch="x86_64"
+            elif [[ "$filename" == *"aarch64"* ]] || [[ "$filename" == *"arm64"* ]]; then arch="arm64"
+            elif [[ "$filename" == *"i686"* ]]; then arch="x86"
+            else arch="any"; fi
+
+            echo "| $platform | $arch | \`$filename\` |" >> $GITHUB_STEP_SUMMARY
+          done
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Total wheels built:** $(ls -1 dist/*.whl | wc -l)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload combined artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-wheels-all
+          path: dist
+          retention-days: 30
+
+      - id: output
+        run: echo "artifact_name=python-wheels-all" >> $GITHUB_OUTPUT

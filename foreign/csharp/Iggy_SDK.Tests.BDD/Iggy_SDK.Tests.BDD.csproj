@@ -23,7 +23,10 @@
         <PackageReference Include="Reqnroll.xUnit" />
         <PackageReference Include="Shouldly" />
         <PackageReference Include="xunit" />
-        <PackageReference Include="xunit.runner.visualstudio" />
+        <PackageReference Include="xunit.runner.visualstudio">
+          <PrivateAssets>all</PrivateAssets>
+          <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+        </PackageReference>
     </ItemGroup>
 
     <ItemGroup>
@@ -31,14 +34,14 @@
     </ItemGroup>
 
     <ItemGroup>
-      <Content Include="..\..\..\bdd\scenarios\basic_messaging.feature">
-        <Link>Features\basic_messaging.feature</Link>
-        <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-      </Content>
+        <Content Include="..\..\..\bdd\scenarios\basic_messaging.feature">
+            <Link>Features\basic_messaging.feature</Link>
+            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        </Content>
     </ItemGroup>
 
     <ItemGroup>
-      <ProjectReference Include="..\Iggy_SDK\Iggy_SDK.csproj" />
+        <ProjectReference Include="..\Iggy_SDK\Iggy_SDK.csproj" />
     </ItemGroup>
 
 </Project>

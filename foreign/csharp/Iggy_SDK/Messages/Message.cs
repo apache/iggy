@@ -15,27 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Diagnostics.CodeAnalysis;
 using System.IO.Hashing;
+using System.Text.Json.Serialization;
 using Apache.Iggy.Extensions;
 using Apache.Iggy.Headers;
+using Apache.Iggy.JsonConverters;
 
 namespace Apache.Iggy.Messages;
 
+[JsonConverter(typeof(MessageConverter))]
 public readonly struct Message
 {
     public required MessageHeader Header { get; init; }
     public required byte[] Payload { get; init; }
     public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; init; }
-    
+
     public Message()
     {
-
     }
-    
-    [System.Diagnostics.CodeAnalysis.SetsRequiredMembersAttribute]
+
+    [SetsRequiredMembers]
     public Message(Guid id, byte[] payload, Dictionary<HeaderKey, HeaderValue>? userHeaders = null)
     {
-        Header = new MessageHeader()
+        Header = new MessageHeader
         {
             PayloadLength = payload.Length,
             Id = id.ToUInt128(),
@@ -44,11 +47,11 @@ public readonly struct Message
         Payload = payload;
         UserHeaders = userHeaders;
     }
-    
-    [System.Diagnostics.CodeAnalysis.SetsRequiredMembersAttribute]
+
+    [SetsRequiredMembers]
     public Message(UInt128 id, byte[] payload, Dictionary<HeaderKey, HeaderValue>? userHeaders = null)
     {
-        Header = new MessageHeader()
+        Header = new MessageHeader
         {
             PayloadLength = payload.Length,
             Id = id,
@@ -57,7 +60,6 @@ public readonly struct Message
         Payload = payload;
         UserHeaders = userHeaders;
     }
-    
     public int GetSize()
     {
         //return 56 + Payload.Length + (UserHeaders?.Count ?? 0);

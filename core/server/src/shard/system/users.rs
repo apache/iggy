@@ -495,14 +495,14 @@ impl IggyShard {
             return Err(IggyError::UserInactive);
         }
 
-        if let Some(password) = password {
-            if !crypto::verify_password(password, &user.password) {
-                warn!(
-                    "Invalid password for user: {username} with ID: {}.",
-                    user.id
-                );
-                return Err(IggyError::InvalidCredentials);
-            }
+        if let Some(password) = password
+            && !crypto::verify_password(password, &user.password)
+        {
+            warn!(
+                "Invalid password for user: {username} with ID: {}.",
+                user.id
+            );
+            return Err(IggyError::InvalidCredentials);
         }
 
         if session.is_none() {

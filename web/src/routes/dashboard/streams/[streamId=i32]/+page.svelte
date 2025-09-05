@@ -26,12 +26,14 @@
   <Button
     variant="rounded"
     class="ml-3"
-    on:click={() => openModal('StreamSettingsModal', { stream })}
+    onclick={() => openModal('StreamSettingsModal', { stream })}
   >
-    <Icon name="settings" class="dark:text-white" />
+    {#snippet children()}
+      <Icon name="settings" class="dark:text-white" />
+    {/snippet}
     {#snippet tooltip()}
-        <div >Settings</div>
-      {/snippet}
+      <div>Settings</div>
+    {/snippet}
   </Button>
 
   <div class="flex gap-3 ml-7">
@@ -52,7 +54,7 @@
   <Button
     variant="contained"
     class="ml-auto"
-    on:click={() =>
+    onclick={() =>
       openModal('AddTopicModal', {
         streamDetails: stream,
         nextTopicId: arrayMax(data.streamDetails.topics.map((t) => t.id)) + 1
@@ -68,7 +70,7 @@
   rowClass="grid grid-cols-[150px_3fr_2fr_2fr_2fr_2fr_3fr]"
   data={stream.topics}
   hrefBuilder={(topic) =>
-    typedRoute(`/dashboard/streams/${+page.params.streamId}/topics/${topic.id}`)}
+    typedRoute(`/dashboard/streams/${+(page.params.streamId || '')}/topics/${topic.id}`)}
   colNames={{
     id: 'ID',
     name: 'Name',
@@ -80,3 +82,4 @@
     sizeBytes: undefined
   }}
 />
+

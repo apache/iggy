@@ -24,7 +24,7 @@ use iggy::prelude::{
     PollingStrategy as RustPollingStrategy, *,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyDelta, PyList};
+use pyo3::types::{PyDelta, PyList, PyType};
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::define_stub_info_gatherer;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
@@ -49,7 +49,7 @@ pub struct IggyClient {
 #[gen_stub_pymethods]
 #[pymethods]
 impl IggyClient {
-    /// Constructs a new IggyClient.
+    /// Constructs a new IggyClient from a TCP server address.
     ///
     /// This initializes a new runtime for asynchronous operations.
     /// Future versions might utilize asyncio for more Pythonic async.
@@ -64,6 +64,24 @@ impl IggyClient {
         IggyClient {
             inner: Arc::new(client),
         }
+    }
+
+    /// Constructs a new IggyClient from a connection string.
+    ///
+    /// Returns an error if the connection string provided is invalid.
+    // TODO: add examples for connection strings or at least a link to the doc page where
+    // connection strings are explained.
+    #[classmethod]
+    #[pyo3(signature = (connection_string))]
+    fn from_connection_string(
+        _cls: &Bound<'_, PyType>,
+        connection_string: String,
+    ) -> PyResult<Self> {
+        let client = RustIggyClient::from_connection_string(&connection_string)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("{e:?}")))?;
+        Ok(Self {
+            inner: Arc::new(client),
+        })
     }
 
     /// Sends a ping request to the server to check connectivity.

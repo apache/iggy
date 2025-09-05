@@ -18,9 +18,10 @@
 using System.Buffers;
 using System.Text;
 using Apache.Iggy.ConnectionStream;
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.Messages;
 using Apache.Iggy.Utils;
 
 namespace Apache.Iggy.MessagesDispatcher;
@@ -28,41 +29,43 @@ namespace Apache.Iggy.MessagesDispatcher;
 internal class TcpMessageInvoker : IMessageInvoker
 {
     private readonly IConnectionStream _stream;
+
     public TcpMessageInvoker(IConnectionStream stream)
     {
         _stream = stream;
     }
+
     public async Task SendMessagesAsync(MessageSendRequest request,
         CancellationToken token = default)
     {
-        var messages = request.Messages;
+        IList<Message> messages = request.Messages;
         // StreamId, TopicId, Partitioning, message count, metadata field
-        var metadataLength = 2 + request.StreamId.Length + 2 + request.TopicId.Length 
+        var metadataLength = 2 + request.StreamId.Length + 2 + request.TopicId.Length
                              + 2 + request.Partitioning.Length + 4 + 4;
         var messageBufferSize = TcpMessageStreamHelpers.CalculateMessageBytesCount(messages)
-                       +  metadataLength ;
+                                + metadataLength;
         var payloadBufferSize = messageBufferSize + 4 + BufferSizes.InitialBytesLength;
 
-        var messageBuffer = MemoryPool<byte>.Shared.Rent(messageBufferSize);
-        var payloadBuffer = MemoryPool<byte>.Shared.Rent(payloadBufferSize);
-        var responseBuffer = MemoryPool<byte>.Shared.Rent(BufferSizes.ExpectedResponseSize);
+        IMemoryOwner<byte> messageBuffer = MemoryPool<byte>.Shared.Rent(messageBufferSize);
+        IMemoryOwner<byte> payloadBuffer = MemoryPool<byte>.Shared.Rent(payloadBufferSize);
+        IMemoryOwner<byte> responseBuffer = MemoryPool<byte>.Shared.Rent(BufferSizes.ExpectedResponseSize);
         try
         {
-            TcpContracts.CreateMessage(messageBuffer.Memory.Span[..messageBufferSize], request.StreamId, request.TopicId,
-                request.Partitioning, messages);
-            
-            TcpMessageStreamHelpers.CreatePayload(payloadBuffer.Memory.Span[..payloadBufferSize], 
+            TcpContracts.CreateMessage(messageBuffer.Memory.Span[..messageBufferSize], request.StreamId,
+                request.TopicId, request.Partitioning, messages);
+
+            TcpMessageStreamHelpers.CreatePayload(payloadBuffer.Memory.Span[..payloadBufferSize],
                 messageBuffer.Memory.Span[..messageBufferSize], CommandCodes.SEND_MESSAGES_CODE);
 
             await _stream.SendAsync(payloadBuffer.Memory[..payloadBufferSize], token);
             await _stream.FlushAsync(token);
             var readed = await _stream.ReadAsync(responseBuffer.Memory, token);
 
-            if(readed == 0)
+            if (readed == 0)
             {
                 throw new InvalidResponseException("No response received from the server.");
             }
-            
+
             var response = TcpMessageStreamHelpers.GetResponseLengthAndStatus(responseBuffer.Memory.Span);
             if (response.Status != 0)
             {
@@ -70,7 +73,7 @@ internal class TcpMessageInvoker : IMessageInvoker
                 {
                     throw new InvalidResponseException($"Invalid response status code: {response.Status}");
                 }
-            
+
                 var errorBuffer = new byte[response.Length];
                 await _stream.ReadAsync(errorBuffer, token);
                 throw new InvalidResponseException(Encoding.UTF8.GetString(errorBuffer));

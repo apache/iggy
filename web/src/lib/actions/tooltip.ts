@@ -51,7 +51,7 @@ export function tooltip(
   let cleanup: VoidFunction | undefined;
 
   const unsub = openId.subscribe((val) => (val === id ? showTooltip() : hideTooltip()));
-  const openTooltip = () => openId.set(id);
+
   const closeTooltip = () => openId.set(null);
   const toggleOpen = () => openId.update((val) => (val === id ? null : id));
 

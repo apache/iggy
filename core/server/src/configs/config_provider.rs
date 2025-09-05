@@ -26,7 +26,6 @@ use figment::{
 };
 use std::{env, future::Future, path::Path};
 use toml::{Value as TomlValue, map::Map};
-use tracing::debug;
 
 const DEFAULT_CONFIG_PROVIDER: &str = "file";
 const DEFAULT_CONFIG_PATH: &str = "configs/server.toml";
@@ -107,54 +106,171 @@ impl CustomEnvProvider {
             return;
         }
 
-        debug!("Keys for env variable: {:?}", keys);
+        // Detect array patterns (e.g., cluster.nodes.0.id)
+        if let Some((idx_pos, array_index)) = Self::find_array_index(&keys) {
+            Self::handle_array_override(source, target, &keys, idx_pos, array_index, value);
+        } else {
+            Self::handle_dict_override(source, target, &keys, value);
+        }
+    }
 
+    fn find_array_index(keys: &[String]) -> Option<(usize, usize)> {
+        keys.iter()
+            .enumerate()
+            .find_map(|(i, key)| key.parse::<usize>().ok().map(|idx| (i, idx)))
+    }
+
+    fn handle_array_override(
+        source: &Dict,
+        target: &mut Dict,
+        keys: &[String],
+        idx_pos: usize,
+        array_index: usize,
+        value: FigmentValue,
+    ) {
+        let path_to_array = &keys[..idx_pos];
+        let remaining_path = &keys[idx_pos + 1..];
+
+        // Navigate to array container
+        let current_target = match Self::navigate_to_dict(
+            target,
+            &path_to_array[..path_to_array.len().saturating_sub(1)],
+        ) {
+            Some(dict) => dict,
+            None => return,
+        };
+
+        let array_key = match path_to_array.last() {
+            Some(key) => key.clone(),
+            None => return,
+        };
+
+        // Copy existing array from source if needed
+        if !current_target.contains_key(&array_key) {
+            if let Some(existing_array) = Self::find_source_array(source, path_to_array, &array_key)
+            {
+                current_target.insert(array_key.clone(), existing_array);
+            } else {
+                current_target.insert(
+                    array_key.clone(),
+                    FigmentValue::Array(Tag::Default, Vec::new()),
+                );
+            }
+        }
+
+        // Update array element
+        if let Some(FigmentValue::Array(_, arr)) = current_target.get_mut(&array_key) {
+            // Ensure array is large enough
+            while arr.len() <= array_index {
+                arr.push(FigmentValue::Dict(Tag::Default, Dict::new()));
+            }
+
+            if remaining_path.is_empty() {
+                arr[array_index] = value;
+            } else if let FigmentValue::Dict(_, elem_dict) = &mut arr[array_index] {
+                Self::insert_overridden_values_from_env(
+                    &Dict::new(),
+                    elem_dict,
+                    remaining_path.to_vec(),
+                    value,
+                );
+            }
+        }
+    }
+
+    fn handle_dict_override(
+        source: &Dict,
+        target: &mut Dict,
+        keys: &[String],
+        value: FigmentValue,
+    ) {
         let mut current_source = source;
         let mut current_target = target;
         let mut combined_keys = Vec::new();
 
-        for key in keys.iter() {
+        for (i, key) in keys.iter().enumerate() {
             combined_keys.push(key.clone());
             let key_to_check = combined_keys.join("_");
-            debug!("Checking key: {}", key_to_check);
 
             match current_source.get(&key_to_check) {
                 Some(FigmentValue::Dict(_, inner_source_dict)) => {
-                    if !current_target.contains_key(&key_to_check) {
-                        current_target.insert(
-                            key_to_check.clone(),
-                            FigmentValue::Dict(Tag::Default, Dict::new()),
-                        );
-                        debug!(
-                            "Adding empty Dict for key: {} because it was found in current_source",
-                            key_to_check
-                        );
-                    }
+                    current_target
+                        .entry(key_to_check.clone())
+                        .or_insert_with(|| FigmentValue::Dict(Tag::Default, Dict::new()));
 
-                    if let Some(FigmentValue::Dict(_, actual_inner_target_dict)) =
+                    if let Some(FigmentValue::Dict(_, inner_target)) =
                         current_target.get_mut(&key_to_check)
                     {
                         current_source = inner_source_dict;
-                        current_target = actual_inner_target_dict;
+                        current_target = inner_target;
                         combined_keys.clear();
                     } else {
                         return;
                     }
                 }
-                Some(FigmentValue::Bool(_, _))
-                | Some(FigmentValue::String(_, _))
-                | Some(FigmentValue::Num(_, _))
-                | Some(FigmentValue::Array(_, _)) => {
-                    debug!("Overriding key: {} with value {:?}", key_to_check, value);
-                    current_target.insert(key_to_check.clone(), value);
-                    combined_keys.clear();
+                Some(_) => {
+                    current_target.insert(key_to_check, value);
                     return;
                 }
-                _ => {
-                    continue;
+                None if i == keys.len() - 1 => {
+                    current_target.insert(key_to_check, value);
+                    return;
                 }
+                _ => continue,
             }
         }
+    }
+
+    fn navigate_to_dict<'a>(target: &'a mut Dict, path: &[String]) -> Option<&'a mut Dict> {
+        if path.is_empty() {
+            return Some(target);
+        }
+
+        let mut current = target;
+        let mut combined_keys = Vec::new();
+
+        for key in path {
+            combined_keys.push(key.clone());
+            let key_to_check = combined_keys.join("_");
+
+            current
+                .entry(key_to_check.clone())
+                .or_insert_with(|| FigmentValue::Dict(Tag::Default, Dict::new()));
+
+            match current.get_mut(&key_to_check) {
+                Some(FigmentValue::Dict(_, inner)) => {
+                    current = inner;
+                    combined_keys.clear();
+                }
+                _ => return None,
+            }
+        }
+
+        Some(current)
+    }
+
+    fn find_source_array(source: &Dict, path: &[String], array_key: &str) -> Option<FigmentValue> {
+        if path.is_empty() {
+            return None;
+        }
+
+        let mut current = source;
+        let mut combined_keys = Vec::new();
+
+        for key in &path[..path.len() - 1] {
+            combined_keys.push(key.clone());
+            let key_to_check = combined_keys.join("_");
+
+            match current.get(&key_to_check) {
+                Some(FigmentValue::Dict(_, inner)) => {
+                    current = inner;
+                    combined_keys.clear();
+                }
+                _ => return None,
+            }
+        }
+
+        current.get(array_key).cloned()
     }
 
     fn toml_to_figment_value(toml_value: &TomlValue) -> FigmentValue {

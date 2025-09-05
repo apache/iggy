@@ -1,4 +1,4 @@
-﻿// // Licensed to the Apache Software Foundation (ASF) under one
+// // Licensed to the Apache Software Foundation (ASF) under one
 // // or more contributor license agreements.  See the NOTICE file
 // // distributed with this work for additional information
 // // regarding copyright ownership.  The ASF licenses this file
@@ -22,8 +22,8 @@ namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 public class SendMessageFixture : IggyServerFixture
 {
-    public readonly StreamRequest StreamRequest = StreamFactory.CreateStream();
-    public readonly TopicRequest TopicRequest = TopicFactory.CreateTopic();
+    internal readonly uint StreamId = 1;
+    internal readonly CreateTopicRequest TopicRequest = TopicFactory.CreateTopic();
 
     public override async Task InitializeAsync()
     {
@@ -31,8 +31,9 @@ public class SendMessageFixture : IggyServerFixture
 
         foreach (var client in Clients.Values)
         {
-            await client.CreateStreamAsync(StreamRequest);
-            await client.CreateTopicAsync(Identifier.Numeric(StreamRequest.StreamId!.Value), TopicRequest);
+            await client.CreateStreamAsync("Test Stream", StreamId);
+            await client.CreateTopicAsync(Identifier.Numeric(StreamId), TopicRequest.Name, TopicRequest.PartitionsCount,
+                topicId: TopicRequest.TopicId);
         }
     }
 }

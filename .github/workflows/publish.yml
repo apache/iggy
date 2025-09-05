@@ -1,0 +1,1036 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (build/test only, no actual publish)"
+        type: boolean
+        default: true
+      use_latest_ci:
+        description: "Use latest CI configuration and scripts from master branch (recommended for compatibility)"
+        type: boolean
+        required: false
+        default: true
+      skip_tag_creation:
+        description: "Skip creating git tags (useful for re-publishing or testing)"
+        type: boolean
+        required: false
+        default: false
+      commit:
+        description: "Commit SHA to publish from"
+        type: string
+        required: true
+      publish_crates:
+        description: "Rust crates to publish (comma-separated: rust-sdk, rust-cli, rust-binary-protocol, rust-common)"
+        type: string
+        required: false
+        default: ""
+      publish_dockerhub:
+        description: "Docker images to publish (comma-separated: rust-server, rust-mcp, rust-bench-dashboard, rust-connectors, web-ui)"
+        type: string
+        required: false
+        default: ""
+      publish_other:
+        description: "Other SDKs to publish (comma-separated: python, node, java, csharp, go:VERSION)"
+        type: string
+        required: false
+        default: ""
+
+env:
+  IGGY_CI_BUILD: true
+
+permissions:
+  contents: write  # For tag creation
+  packages: write
+  id-token: write
+
+concurrency:
+  group: publish-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate inputs
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.resolve.outputs.commit }}
+      has_targets: ${{ steps.check.outputs.has_targets }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if any targets specified
+        id: check
+        run: |
+          if [ -z "${{ inputs.publish_crates }}" ] && \
+             [ -z "${{ inputs.publish_dockerhub }}" ] && \
+             [ -z "${{ inputs.publish_other }}" ]; then
+            echo "has_targets=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_targets=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve commit
+        id: resolve
+        run: |
+          COMMIT="${{ inputs.commit }}"
+          if [ -z "$COMMIT" ]; then
+            echo "❌ No commit specified"
+            exit 1
+          fi
+
+          if ! git rev-parse --verify "$COMMIT^{commit}" >/dev/null 2>&1; then
+            echo "❌ Invalid commit: $COMMIT"
+            exit 1
+          fi
+
+          # Verify commit is on master branch
+          echo "🔍 Verifying commit is on master branch..."
+          git fetch origin master --depth=1000
+
+          if git merge-base --is-ancestor "$COMMIT" origin/master; then
+            echo "✅ Commit is on master branch"
+          else
+            echo "❌ ERROR: Commit $COMMIT is not on the master branch!"
+            echo ""
+            echo "Publishing is only allowed from commits on the master branch."
+            echo "Please ensure your commit has been merged to master before publishing."
+            echo ""
+            echo "To check which branch contains this commit, run:"
+            echo "  git branch -r --contains $COMMIT"
+            exit 1
+          fi
+
+          echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+          echo "✅ Will publish from commit: $COMMIT"
+          echo
+          echo "Commit details:"
+          git log -1 --pretty=format:"  Author: %an <%ae>%n  Date: %ad%n  Subject: %s" "$COMMIT"
+
+  plan:
+    name: Build publish plan
+    needs: validate
+    if: needs.validate.outputs.has_targets == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.mk.outputs.targets }}
+      non_rust_targets: ${{ steps.mk.outputs.non_rust_targets }}
+      count: ${{ steps.mk.outputs.count }}
+      go_sdk_version: ${{ steps.mk.outputs.go_sdk_version }}
+      has_python: ${{ steps.mk.outputs.has_python }}
+      has_rust_crates: ${{ steps.mk.outputs.has_rust_crates }}
+    steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        run: |
+          # Download the copy script from master branch
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+          echo "✅ Downloaded latest copy script from master"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Save and apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          # Save latest files from master (including config)
+          /tmp/copy-latest-from-master.sh save \
+            .github \
+            scripts
+
+          # Apply them to current checkout
+          /tmp/copy-latest-from-master.sh apply
+
+      - name: Load publish config
+        id: cfg
+        run: |
+          if ! command -v yq &> /dev/null; then
+            YQ_VERSION="v4.47.1"
+            YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
+            wget -qO /tmp/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
+            echo "${YQ_CHECKSUM}  /tmp/yq" | sha256sum -c - || exit 1
+            chmod +x /tmp/yq && sudo mv /tmp/yq /usr/local/bin/yq
+          fi
+          echo "components_b64=$(yq -o=json -I=0 '.components' .github/config/publish.yml | base64 -w0)" >> "$GITHUB_OUTPUT"
+
+      - name: Build matrix from inputs
+        id: mk
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const componentsB64 = '${{ steps.cfg.outputs.components_b64 }}';
+            const cfg = JSON.parse(Buffer.from(componentsB64, 'base64').toString('utf-8') || "{}");
+
+            const wants = [];
+            let goVersion = '';
+
+            // Parse Rust crates
+            ('${{ inputs.publish_crates }}').split(',').map(s => s.trim()).filter(Boolean).forEach(crate => {
+              if (['rust-sdk','rust-cli','rust-binary-protocol','rust-common'].includes(crate)) wants.push(crate);
+              else core.warning(`Unknown crate: ${crate}`);
+            });
+
+            // Parse Docker images
+            ('${{ inputs.publish_dockerhub }}').split(',').map(s => s.trim()).filter(Boolean).forEach(img => {
+              if (['rust-server','rust-mcp','rust-bench-dashboard','rust-connectors','web-ui'].includes(img)) wants.push(img);
+              else core.warning(`Unknown Docker image: ${img}`);
+            });
+
+            // Parse other SDKs
+            ('${{ inputs.publish_other }}').split(',').map(s => s.trim()).filter(Boolean).forEach(sdk => {
+              if (sdk.startsWith('go:')) {
+                goVersion = sdk.substring(3);
+                if (!/^\d+\.\d+\.\d+/.test(goVersion)) {
+                  core.setFailed(`Invalid Go version format: ${goVersion} (expected: X.Y.Z)`);
+                } else {
+                  wants.push('sdk-go');
+                }
+              } else if (['python','node','java','csharp'].includes(sdk)) {
+                wants.push(`sdk-${sdk}`);
+              } else {
+                core.warning(`Unknown SDK: ${sdk}`);
+              }
+            });
+
+            const toType = (entry) => ({
+              dockerhub: 'docker',
+              crates: 'rust',
+              pypi: 'python',
+              npm: 'node',
+              maven: 'java',
+              nuget: 'csharp',
+              none: 'go'
+            }[entry.registry] || 'unknown');
+
+            const targets = [];
+            const nonRustTargets = [];
+            const seen = new Set();
+            let hasRustCrates = false;
+
+            for (const key of wants) {
+              if (seen.has(key)) continue;
+              seen.add(key);
+
+              const entry = cfg[key];
+              if (!entry) { core.warning(`Component '${key}' not found in publish.yml`); continue; }
+
+              const target = {
+                key,
+                name: key,
+                type: toType(entry),
+                registry: entry.registry || '',
+                package: entry.package || '',
+                image: entry.image || '',
+                dockerfile: entry.dockerfile || '',
+                platforms: Array.isArray(entry.platforms) ? entry.platforms.join(',') : '',
+                tag_pattern: entry.tag_pattern || '',
+                version_file: entry.version_file || '',
+                version_regex: entry.version_regex || ''
+              };
+
+              targets.push(target);
+
+              // Separate Rust crates from other targets
+              if (target.type === 'rust') {
+                hasRustCrates = true;
+                // Rust crates are handled by the sequential job
+              } else {
+                nonRustTargets.push(target);
+              }
+            }
+
+            console.log(`Publishing ${targets.length} components:`);
+            targets.forEach(t => console.log(`  - ${t.name} (${t.type}) -> ${t.registry || 'N/A'}`));
+            console.log(`  (${nonRustTargets.length} non-Rust, ${targets.length - nonRustTargets.length} Rust crates)`);
+
+            // Output all targets for reference and tag creation
+            core.setOutput('targets', JSON.stringify(targets.length ? { include: targets } : { include: [{ key: 'noop', type: 'noop' }] }));
+
+            // Output only non-Rust targets for the parallel publish job
+            core.setOutput('non_rust_targets', JSON.stringify(nonRustTargets.length ? { include: nonRustTargets } : { include: [{ key: 'noop', type: 'noop' }] }));
+
+            core.setOutput('count', String(targets.length));
+            core.setOutput('go_sdk_version', goVersion);
+            core.setOutput('has_rust_crates', String(hasRustCrates));
+
+            // Check if Python SDK is in targets and extract version
+            const pythonTarget = targets.find(t => t.key === 'sdk-python');
+            if (pythonTarget) {
+              core.setOutput('has_python', 'true');
+              // Python version will be extracted in the publish job
+            } else {
+              core.setOutput('has_python', 'false');
+            }
+
+  check-tags:
+    name: Check existing tags
+    needs: [validate, plan]
+    if: needs.validate.outputs.has_targets == 'true' && fromJson(needs.plan.outputs.targets).include[0].key != 'noop'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        run: |
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+          echo "✅ Downloaded latest copy script from master"
+
+      - name: Checkout at commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 0
+
+      - name: Save and apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          /tmp/copy-latest-from-master.sh save \
+            .github \
+            scripts \
+            web/Dockerfile \
+            core/server/Dockerfile \
+            core/ai/mcp/Dockerfile \
+            core/connectors/runtime/Dockerfile \
+            core/bench/dashboard/server/Dockerfile
+
+          /tmp/copy-latest-from-master.sh apply
+
+      - name: Setup yq
+        run: |
+          YQ_VERSION="v4.47.1"
+          YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
+          echo "${YQ_CHECKSUM}  /usr/local/bin/yq" | sha256sum -c - || exit 1
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Check for existing tags
+        run: |
+          set -euo pipefail
+
+          echo "## 🏷️ Tag Existence Check" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ inputs.skip_tag_creation }}" = "true" ]; then
+            echo "### ℹ️ Tag Creation Disabled" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Tag creation has been explicitly disabled for this run." >> $GITHUB_STEP_SUMMARY
+            echo "Components will be published without creating git tags." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          TARGETS_JSON='${{ needs.plan.outputs.targets }}'
+          GO_SDK_VERSION='${{ needs.plan.outputs.go_sdk_version }}'
+
+          EXISTING_TAGS=()
+          NEW_TAGS=()
+
+          echo "| Component | Version | Tag | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|---------|-----|--------|" >> $GITHUB_STEP_SUMMARY
+
+          echo "$TARGETS_JSON" | jq -r '.include[] | select(.key!="noop") | @base64' | while read -r row; do
+            _jq() { echo "$row" | base64 -d | jq -r "$1"; }
+
+            KEY=$(_jq '.key')
+            NAME=$(_jq '.name')
+            TAG_PATTERN=$(_jq '.tag_pattern')
+
+            # Skip components without tag patterns
+            if [ -z "$TAG_PATTERN" ] || [ "$TAG_PATTERN" = "null" ]; then
+              echo "Skipping $NAME - no tag pattern defined"
+              continue
+            fi
+
+            # Extract version
+            GO_FLAG=""
+            if [ "$KEY" = "sdk-go" ] && [ -n "$GO_SDK_VERSION" ]; then
+              GO_FLAG="--go-sdk-version $GO_SDK_VERSION"
+            fi
+
+            # Make script executable if needed
+            chmod +x scripts/extract-version.sh || true
+
+            VERSION=$(scripts/extract-version.sh "$KEY" $GO_FLAG 2>/dev/null || echo "ERROR")
+            TAG=$(scripts/extract-version.sh "$KEY" $GO_FLAG --tag 2>/dev/null || echo "ERROR")
+
+            if [ "$VERSION" = "ERROR" ] || [ "$TAG" = "ERROR" ]; then
+              echo "❌ Failed to extract version/tag for $NAME"
+              echo "| $NAME | ERROR | ERROR | ❌ Failed to extract |" >> $GITHUB_STEP_SUMMARY
+              exit 1
+            fi
+
+            # Check if tag exists
+            if git rev-parse "$TAG" >/dev/null 2>&1; then
+              EXISTING_TAGS+=("$TAG")
+              COMMIT_SHA=$(git rev-parse "$TAG" | head -c 8)
+              echo "⚠️  Tag exists: $TAG (points to $COMMIT_SHA)"
+              echo "| $NAME | $VERSION | $TAG | ⚠️ Exists at $COMMIT_SHA |" >> $GITHUB_STEP_SUMMARY
+            else
+              NEW_TAGS+=("$TAG")
+              echo "✅ Tag will be created: $TAG"
+              echo "| $NAME | $VERSION | $TAG | ✅ Will create |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Summary
+          if [ ${#EXISTING_TAGS[@]} -gt 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### ⚠️ Warning: Existing Tags Detected" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The following tags already exist and will be skipped:" >> $GITHUB_STEP_SUMMARY
+            for tag in "${EXISTING_TAGS[@]}"; do
+              echo "- $tag" >> $GITHUB_STEP_SUMMARY
+            done
+            echo "" >> $GITHUB_STEP_SUMMARY
+
+            if [ "${{ inputs.dry_run }}" = "false" ]; then
+              if [ "${{ inputs.skip_tag_creation }}" = "true" ]; then
+                echo "**Note:** Tag creation is disabled for this run." >> $GITHUB_STEP_SUMMARY
+                echo "Components will be published/republished without updating git tags." >> $GITHUB_STEP_SUMMARY
+              else
+                echo "**These components will NOT be republished.** Tags are immutable in git." >> $GITHUB_STEP_SUMMARY
+                echo "" >> $GITHUB_STEP_SUMMARY
+                echo "If you need to republish:" >> $GITHUB_STEP_SUMMARY
+                echo "1. Delete the existing tag: \`git push --delete origin <tag>\`" >> $GITHUB_STEP_SUMMARY
+                echo "2. Bump the version in the source file" >> $GITHUB_STEP_SUMMARY
+                echo "3. Run the publish workflow again" >> $GITHUB_STEP_SUMMARY
+                echo "" >> $GITHUB_STEP_SUMMARY
+                echo "Alternatively, use \`skip_tag_creation: true\` to republish without tags." >> $GITHUB_STEP_SUMMARY
+              fi
+            fi
+          fi
+
+          if [ ${#NEW_TAGS[@]} -eq 0 ] && [ ${#EXISTING_TAGS[@]} -gt 0 ]; then
+            echo "### ℹ️ No New Tags to Create" >> $GITHUB_STEP_SUMMARY
+            echo "All specified components have already been tagged. Consider bumping versions if you need to publish new releases." >> $GITHUB_STEP_SUMMARY
+          elif [ ${#NEW_TAGS[@]} -gt 0 ]; then
+            if [ "${{ inputs.skip_tag_creation }}" = "true" ]; then
+              echo "### ℹ️ Tags That Would Be Created (Skipped)" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "The following tags would be created if tag creation wasn't disabled:" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "### ✅ Tags to be Created" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+            fi
+            for tag in "${NEW_TAGS[@]}"; do
+              echo "- $tag" >> $GITHUB_STEP_SUMMARY
+            done
+          fi
+
+  build-python-wheels:
+    name: Build Python wheels
+    needs: [validate, plan, check-tags]
+    if: |
+      needs.validate.outputs.has_targets == 'true' &&
+      needs.plan.outputs.has_python == 'true'
+    uses: ./.github/workflows/_build_python_wheels.yml
+    with:
+      upload_artifacts: true
+      use_latest_ci: ${{ inputs.use_latest_ci }}
+
+  # Sequential Rust crate publishing to handle dependencies properly
+  publish-rust-crates:
+    name: Publish Rust Crates
+    needs: [validate, plan, check-tags]
+    if: |
+      needs.validate.outputs.has_targets == 'true' &&
+      contains(inputs.publish_crates, 'rust-')
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    outputs:
+      status: ${{ steps.final-status.outputs.status }}
+    steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        run: |
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+          echo "✅ Downloaded latest copy script from master"
+
+      - name: Checkout at commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 0
+
+      - name: Save and apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          /tmp/copy-latest-from-master.sh save \
+            .github \
+            scripts \
+            web/Dockerfile \
+            core/server/Dockerfile \
+            core/ai/mcp/Dockerfile \
+            core/connectors/runtime/Dockerfile \
+            core/bench/dashboard/server/Dockerfile
+
+          /tmp/copy-latest-from-master.sh apply
+
+      - name: Setup Rust with cache
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          cache-targets: false
+          show-stats: false
+
+      - name: Extract versions
+        id: versions
+        run: |
+          # Extract version for each crate
+          chmod +x scripts/extract-version.sh
+
+          echo "common_version=$(scripts/extract-version.sh rust-common)" >> $GITHUB_OUTPUT
+          echo "protocol_version=$(scripts/extract-version.sh rust-binary-protocol)" >> $GITHUB_OUTPUT
+          echo "sdk_version=$(scripts/extract-version.sh rust-sdk)" >> $GITHUB_OUTPUT
+          echo "cli_version=$(scripts/extract-version.sh rust-cli)" >> $GITHUB_OUTPUT
+
+      # Step 1: Publish iggy_common first
+      - name: Publish iggy_common
+        if: contains(inputs.publish_crates, 'rust-common')
+        uses: ./.github/actions/rust/post-merge
+        with:
+          package: iggy_common
+          version: ${{ steps.versions.outputs.common_version }}
+          dry_run: ${{ inputs.dry_run }}
+
+      # Wait for crates.io to index (only in non-dry-run mode)
+      - name: Wait for iggy_common to be available
+        if: |
+          contains(inputs.publish_crates, 'rust-common') &&
+          inputs.dry_run == 'false'
+        run: |
+          echo "⏳ Waiting for iggy_common to be available on crates.io..."
+          for i in {1..30}; do
+            if cargo search iggy_common --limit 1 | grep -q "^iggy_common = \"${{ steps.versions.outputs.common_version }}\""; then
+              echo "✅ iggy_common is now available"
+              break
+            fi
+            echo "Waiting... (attempt $i/30)"
+            sleep 10
+          done
+
+      # Step 2: Publish iggy_binary_protocol (depends on common)
+      - name: Publish iggy_binary_protocol
+        if: contains(inputs.publish_crates, 'rust-binary-protocol')
+        uses: ./.github/actions/rust/post-merge
+        with:
+          package: iggy_binary_protocol
+          version: ${{ steps.versions.outputs.protocol_version }}
+          dry_run: ${{ inputs.dry_run }}
+
+      # Wait for crates.io to index
+      - name: Wait for iggy_binary_protocol to be available
+        if: |
+          contains(inputs.publish_crates, 'rust-binary-protocol') &&
+          inputs.dry_run == 'false'
+        run: |
+          echo "⏳ Waiting for iggy_binary_protocol to be available on crates.io..."
+          for i in {1..30}; do
+            if cargo search iggy_binary_protocol --limit 1 | grep -q "^iggy_binary_protocol = \"${{ steps.versions.outputs.protocol_version }}\""; then
+              echo "✅ iggy_binary_protocol is now available"
+              break
+            fi
+            echo "Waiting... (attempt $i/30)"
+            sleep 10
+          done
+
+      # Step 3: Publish iggy SDK (depends on common and protocol)
+      - name: Publish iggy SDK
+        if: contains(inputs.publish_crates, 'rust-sdk')
+        uses: ./.github/actions/rust/post-merge
+        with:
+          package: iggy
+          version: ${{ steps.versions.outputs.sdk_version }}
+          dry_run: ${{ inputs.dry_run }}
+
+      # Wait for crates.io to index
+      - name: Wait for iggy SDK to be available
+        if: |
+          contains(inputs.publish_crates, 'rust-sdk') &&
+          inputs.dry_run == 'false'
+        run: |
+          echo "⏳ Waiting for iggy to be available on crates.io..."
+          for i in {1..30}; do
+            if cargo search iggy --limit 1 | grep -q "^iggy = \"${{ steps.versions.outputs.sdk_version }}\""; then
+              echo "✅ iggy SDK is now available"
+              break
+            fi
+            echo "Waiting... (attempt $i/30)"
+            sleep 10
+          done
+
+      # Step 4: Publish iggy-cli (depends on SDK and protocol)
+      - name: Publish iggy-cli
+        if: contains(inputs.publish_crates, 'rust-cli')
+        uses: ./.github/actions/rust/post-merge
+        with:
+          package: iggy-cli
+          version: ${{ steps.versions.outputs.cli_version }}
+          dry_run: ${{ inputs.dry_run }}
+
+      - name: Set final status output
+        id: final-status
+        if: always()
+        run: echo "status=${{ job.status }}" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: ${{ matrix.name }}
+    needs: [validate, plan, check-tags, build-python-wheels, publish-rust-crates]
+    if: |
+      always() &&
+      needs.validate.outputs.has_targets == 'true' &&
+      fromJson(needs.plan.outputs.non_rust_targets).include[0].key != 'noop' &&
+      (needs.build-python-wheels.result == 'success' || needs.build-python-wheels.result == 'skipped') &&
+      (needs.publish-rust-crates.result == 'success' || needs.publish-rust-crates.result == 'skipped')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.non_rust_targets) }}
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+      PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      NEXUS_USER: ${{ secrets.NEXUS_USER }}
+      NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+      NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    outputs:
+      status: ${{ steps.status.outputs.status }}
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+    steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        run: |
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+          echo "✅ Downloaded latest copy script from master"
+
+      - name: Checkout at commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 0
+
+      - name: Save and apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          /tmp/copy-latest-from-master.sh save \
+            .github \
+            scripts \
+            web/Dockerfile \
+            core/server/Dockerfile \
+            core/ai/mcp/Dockerfile \
+            core/connectors/runtime/Dockerfile \
+            core/bench/dashboard/server/Dockerfile
+
+          /tmp/copy-latest-from-master.sh apply
+
+      - name: Ensure version extractor is executable
+        run: |
+          test -x scripts/extract-version.sh || chmod +x scripts/extract-version.sh
+
+      - name: Setup Rust toolchain (if needed)
+        if: matrix.type == 'rust' || matrix.type == 'docker' || matrix.type == 'python'
+        uses: ./.github/actions/utils/setup-rust-with-cache
+        with:
+          cache-targets: false
+          show-stats: false
+
+      - name: Debug matrix
+        run: echo '${{ toJson(matrix) }}'
+
+      - name: Extract version & tag
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          GO_FLAG=""
+          if [ "${{ matrix.key }}" = "sdk-go" ] && [ -n "${{ needs.plan.outputs.go_sdk_version }}" ]; then
+            GO_FLAG="--go-sdk-version ${{ needs.plan.outputs.go_sdk_version }}"
+          fi
+          VERSION=$(scripts/extract-version.sh "${{ matrix.key }}" $GO_FLAG)
+          # If a tag pattern exists for this component, ask the script for a tag as well
+          if [ -n "${{ matrix.tag_pattern }}" ] && [ "${{ matrix.tag_pattern }}" != "null" ]; then
+            TAG=$(scripts/extract-version.sh "${{ matrix.key }}" $GO_FLAG --tag)
+          else
+            TAG=""
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"       >> "$GITHUB_OUTPUT"
+          echo "✅ Resolved ${{ matrix.key }} -> version=$VERSION tag=${TAG:-<none>}"
+
+      # ─────────────────────────────────────────
+      # Docker Publishing
+      # ─────────────────────────────────────────
+      - name: Publish Docker image
+        if: matrix.type == 'docker'
+        uses: ./.github/actions/utils/docker-buildx
+        with:
+          task: publish
+          component: ${{ matrix.key }}
+          version: ${{ steps.ver.outputs.version }}
+          dry_run: ${{ inputs.dry_run }}
+
+      # ─────────────────────────────────────────
+      # Python SDK Publishing
+      # ─────────────────────────────────────────
+      - name: Publish Python SDK
+        if: matrix.type == 'python'
+        uses: ./.github/actions/python-maturin/post-merge
+        with:
+          version: ${{ steps.ver.outputs.version }}
+          dry_run: ${{ inputs.dry_run }}
+          wheels_artifact: python-wheels-all
+          wheels_path: dist
+
+      # ─────────────────────────────────────────
+      # Node SDK Publishing
+      # ─────────────────────────────────────────
+      - name: Publish Node SDK
+        if: matrix.type == 'node'
+        uses: ./.github/actions/node-npm/post-merge
+        with:
+          version: ${{ steps.ver.outputs.version }}
+          dry_run: ${{ inputs.dry_run }}
+
+      # ─────────────────────────────────────────
+      # Java SDK Publishing
+      # ─────────────────────────────────────────
+      - name: Publish Java SDK
+        if: matrix.type == 'java'
+        uses: ./.github/actions/java-gradle/post-merge
+        with:
+          version: ${{ steps.ver.outputs.version }}
+          dry_run: ${{ inputs.dry_run }}
+
+      # ─────────────────────────────────────────
+      # C# SDK Publishing
+      # ─────────────────────────────────────────
+      - name: Publish C# SDK
+        if: matrix.type == 'csharp'
+        uses: ./.github/actions/csharp-dotnet/post-merge
+        with:
+          version: ${{ steps.ver.outputs.version }}
+          dry_run: ${{ inputs.dry_run }}
+
+      # ─────────────────────────────────────────
+      # Go Module (Tag-only)
+      # ─────────────────────────────────────────
+      - name: Prepare Go tag
+        if: matrix.type == 'go'
+        uses: ./.github/actions/go/post-merge
+        with:
+          version: ${{ steps.ver.outputs.version }}
+          dry_run: ${{ inputs.dry_run }}
+
+      - name: Set status output
+        id: status
+        if: always()
+        run: echo "status=${{ job.status }}" >> "$GITHUB_OUTPUT"
+
+  create-tags:
+    name: Create Git tags
+    needs: [validate, plan, check-tags, build-python-wheels, publish-rust-crates, publish]
+    if: |
+      always() &&
+      needs.validate.outputs.has_targets == 'true' &&
+      inputs.dry_run == false &&
+      inputs.skip_tag_creation == false &&
+      (needs.publish.result == 'success' || needs.publish.result == 'skipped') &&
+      (needs.publish-rust-crates.result == 'success' || needs.publish-rust-crates.result == 'skipped') &&
+      (needs.build-python-wheels.result == 'success' || needs.build-python-wheels.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        run: |
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+          echo "✅ Downloaded latest copy script from master"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 0
+
+      - name: Save and apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          /tmp/copy-latest-from-master.sh save \
+            .github \
+            scripts
+
+          /tmp/copy-latest-from-master.sh apply
+
+      - name: Configure Git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Ensure version extractor is executable
+        run: |
+          test -x scripts/extract-version.sh || chmod +x scripts/extract-version.sh
+
+      - name: Create and push tags (for tagged components)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGETS_JSON='${{ needs.plan.outputs.targets }}'
+          GO_SDK_VERSION='${{ needs.plan.outputs.go_sdk_version }}'
+
+          echo "$TARGETS_JSON" | jq -r '.include[] | select(.key!="noop") | @base64' | while read -r row; do
+            _jq() { echo "$row" | base64 -d | jq -r "$1"; }
+
+            KEY=$(_jq '.key')
+            NAME=$(_jq '.name')
+            TAG_PATTERN=$(_jq '.tag_pattern')
+
+            # Only components that define tag_pattern will be tagged
+            if [ -z "$TAG_PATTERN" ] || [ "$TAG_PATTERN" = "null" ]; then
+              continue
+            fi
+
+            GO_FLAG=""
+            if [ "$KEY" = "sdk-go" ] && [ -n "$GO_SDK_VERSION" ]; then
+              GO_FLAG="--go-sdk-version $GO_SDK_VERSION"
+            fi
+
+            TAG=$(scripts/extract-version.sh "$KEY" $GO_FLAG --tag)
+
+            echo "Creating tag: $TAG for $NAME"
+
+            if git rev-parse "$TAG" >/dev/null 2>&1; then
+              echo "  ⚠️ Tag $TAG already exists, skipping"
+              continue
+            fi
+
+            git tag -a "$TAG" "${{ needs.validate.outputs.commit }}" \
+              -m "Release $NAME ($TAG)
+            Component: $NAME
+            Tag: $TAG
+            Commit: ${{ needs.validate.outputs.commit }}
+            Released by: GitHub Actions
+            Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+
+            git push origin "$TAG"
+            echo "  ✅ Created and pushed tag: $TAG"
+          done
+
+  summary:
+    name: Publish Summary
+    needs: [validate, plan, check-tags, build-python-wheels, publish-rust-crates, publish, create-tags]
+    if: always() && needs.validate.outputs.has_targets == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download latest copy script from master
+        if: inputs.use_latest_ci
+        run: |
+          curl -sSL "https://raw.githubusercontent.com/${{ github.repository }}/master/scripts/copy-latest-from-master.sh" \
+            -o /tmp/copy-latest-from-master.sh
+          chmod +x /tmp/copy-latest-from-master.sh
+          echo "✅ Downloaded latest copy script from master"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+
+      - name: Save and apply latest CI from master
+        if: inputs.use_latest_ci
+        run: |
+          /tmp/copy-latest-from-master.sh save \
+            .github \
+            scripts
+
+          /tmp/copy-latest-from-master.sh apply
+
+      - name: Ensure version extractor is executable
+        run: |
+          test -x scripts/extract-version.sh || chmod +x scripts/extract-version.sh
+
+      - name: Generate summary
+        run: |
+          {
+            echo "# 📦 Publish Summary"
+            echo
+            echo "## Configuration"
+            echo
+            echo "| Setting | Value |"
+            echo "|---------|-------|"
+            echo "| **Commit** | \`${{ needs.validate.outputs.commit }}\` |"
+            echo "| **Dry run** | \`${{ inputs.dry_run }}\` |"
+            echo "| **Skip tag creation** | \`${{ inputs.skip_tag_creation }}\` |"
+            echo "| **Total components** | ${{ needs.plan.outputs.count }} |"
+            echo
+
+            # Extract version information for all requested components
+            echo "## Component Versions"
+            echo
+            echo "| Component | Version | Tag | Registry | Status |"
+            echo "|-----------|---------|-----|----------|--------|"
+
+            # Parse the targets from plan job
+            TARGETS_JSON='${{ needs.plan.outputs.targets }}'
+            GO_SDK_VERSION='${{ needs.plan.outputs.go_sdk_version }}'
+
+            echo "$TARGETS_JSON" | jq -r '.include[] | select(.key!="noop") | @base64' | while read -r row; do
+              _jq() { echo "$row" | base64 -d | jq -r "$1"; }
+
+              KEY=$(_jq '.key')
+              NAME=$(_jq '.name')
+              REGISTRY=$(_jq '.registry')
+              TAG_PATTERN=$(_jq '.tag_pattern')
+
+              # Extract version using the script
+              GO_FLAG=""
+              if [ "$KEY" = "sdk-go" ] && [ -n "$GO_SDK_VERSION" ]; then
+                GO_FLAG="--go-sdk-version $GO_SDK_VERSION"
+              fi
+
+              VERSION=$(scripts/extract-version.sh "$KEY" $GO_FLAG 2>/dev/null || echo "N/A")
+
+              # Get tag if pattern exists
+              TAG=""
+              if [ -n "$TAG_PATTERN" ] && [ "$TAG_PATTERN" != "null" ]; then
+                TAG=$(scripts/extract-version.sh "$KEY" $GO_FLAG --tag 2>/dev/null || echo "N/A")
+              else
+                TAG="N/A"
+              fi
+
+              # Determine status emoji based on dry run
+              if [ "${{ inputs.dry_run }}" = "true" ]; then
+                STATUS="🔍 Dry run"
+              else
+                STATUS="✅ Published"
+              fi
+
+              # Format registry display
+              case "$REGISTRY" in
+                crates)     REGISTRY_DISPLAY="crates.io" ;;
+                dockerhub)  REGISTRY_DISPLAY="Docker Hub" ;;
+                pypi)       REGISTRY_DISPLAY="PyPI" ;;
+                npm)        REGISTRY_DISPLAY="npm" ;;
+                maven)      REGISTRY_DISPLAY="Maven" ;;
+                nuget)      REGISTRY_DISPLAY="NuGet" ;;
+                none)       REGISTRY_DISPLAY="Tag only" ;;
+                *)          REGISTRY_DISPLAY="$REGISTRY" ;;
+              esac
+
+              echo "| $NAME | \`$VERSION\` | \`$TAG\` | $REGISTRY_DISPLAY | $STATUS |"
+            done
+
+            echo
+
+            if [ -n "${{ inputs.publish_crates }}" ]; then
+              echo "### 🦀 Rust Crates Requested"
+              echo '```'
+              echo "${{ inputs.publish_crates }}"
+              echo '```'
+            fi
+            if [ -n "${{ inputs.publish_dockerhub }}" ]; then
+              echo "### 🐳 Docker Images Requested"
+              echo '```'
+              echo "${{ inputs.publish_dockerhub }}"
+              echo '```'
+            fi
+            if [ -n "${{ inputs.publish_other }}" ]; then
+              echo "### 📦 Other SDKs Requested"
+              echo '```'
+              echo "${{ inputs.publish_other }}"
+              echo '```'
+            fi
+            echo
+            echo "## Results"
+            echo
+
+            # Python wheels building status
+            if [ "${{ needs.plan.outputs.has_python }}" = "true" ]; then
+              echo "### Python Wheels Building"
+              case "${{ needs.build-python-wheels.result }}" in
+                success)   echo "✅ **Python wheels built successfully for all platforms**" ;;
+                failure)   echo "❌ **Python wheel building failed**" ;;
+                skipped)   echo "⏭️ **Python wheel building was skipped**" ;;
+              esac
+              echo
+            fi
+
+            # Rust crates publishing status
+            if [ -n "${{ inputs.publish_crates }}" ]; then
+              echo "### Rust Crates Publishing (Sequential)"
+              case "${{ needs.publish-rust-crates.result }}" in
+                success)   echo "✅ **Rust crates published successfully in dependency order**" ;;
+                failure)   echo "❌ **Rust crates publishing failed - check logs for details**" ;;
+                skipped)   echo "⏭️ **Rust crates publishing was skipped**" ;;
+              esac
+              echo
+            fi
+
+            # Other publishing status
+            echo "### Other Publishing"
+            case "${{ needs.publish.result }}" in
+              success)   echo "✅ **Publishing completed successfully**" ;;
+              failure)   echo "❌ **Publishing failed - check logs for details**" ;;
+              cancelled) echo "🚫 **Publishing was cancelled**" ;;
+              *)         echo "⏭️ **Publishing was skipped**" ;;
+            esac
+            if [ "${{ inputs.dry_run }}" = "true" ]; then
+              echo
+              echo "**ℹ️ This was a dry run - no actual publishing occurred**"
+            elif [ "${{ inputs.skip_tag_creation }}" = "true" ]; then
+              echo
+              echo "**ℹ️ Tag creation was skipped as requested**"
+            else
+              case "${{ needs.create-tags.result }}" in
+                success)  echo "✅ **Git tags created successfully**" ;;
+                failure)  echo "⚠️ **Tag creation had issues**" ;;
+                skipped)  echo "⏭️ **Tag creation was skipped (publish failed)**" ;;
+              esac
+            fi
+            echo
+            echo "---"
+            echo "*Workflow completed at $(date -u +"%Y-%m-%d %H:%M:%S UTC")*"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  notify-failure:
+    name: Notify on failure
+    needs: [validate, plan, build-python-wheels, publish-rust-crates, publish, create-tags, summary]
+    if: failure() && inputs.dry_run == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify failure
+        run: |
+          echo "❌ Publishing workflow failed!"
+          echo "Check the workflow run for details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

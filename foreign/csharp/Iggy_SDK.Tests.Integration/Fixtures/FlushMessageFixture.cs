@@ -1,4 +1,4 @@
-﻿// // Licensed to the Apache Software Foundation (ASF) under one
+// // Licensed to the Apache Software Foundation (ASF) under one
 // // or more contributor license agreements.  See the NOTICE file
 // // distributed with this work for additional information
 // // regarding copyright ownership.  The ASF licenses this file
@@ -15,6 +15,7 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
@@ -24,8 +25,8 @@ namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 public class FlushMessageFixture : IggyServerFixture
 {
-    public readonly StreamRequest StreamRequest = StreamFactory.CreateStream();
-    public readonly TopicRequest TopicRequest = TopicFactory.CreateTopic();
+    internal readonly uint StreamId = 1;
+    internal readonly CreateTopicRequest TopicRequest = TopicFactory.CreateTopic();
 
     public override async Task InitializeAsync()
     {
@@ -33,13 +34,14 @@ public class FlushMessageFixture : IggyServerFixture
 
         foreach (var client in Clients.Values)
         {
-            await client.CreateStreamAsync(StreamRequest);
-            await client.CreateTopicAsync(Identifier.Numeric(StreamRequest.StreamId!.Value), TopicRequest);
+            await client.CreateStreamAsync("TestStream", StreamId);
+            await client.CreateTopicAsync(Identifier.Numeric(StreamId), TopicRequest.Name, TopicRequest.PartitionsCount,
+                topicId: TopicRequest.TopicId);
 
             await client.SendMessagesAsync(new MessageSendRequest
             {
                 Partitioning = Partitioning.None(),
-                StreamId = Identifier.Numeric(StreamRequest.StreamId!.Value),
+                StreamId = Identifier.Numeric(StreamId),
                 TopicId = Identifier.Numeric(TopicRequest.TopicId!.Value),
                 Messages = new List<Message>
                 {

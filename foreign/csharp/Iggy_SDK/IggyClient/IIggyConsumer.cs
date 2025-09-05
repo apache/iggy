@@ -15,18 +15,36 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
+using Apache.Iggy.Kinds;
 
 namespace Apache.Iggy.IggyClient;
 
 public interface IIggyConsumer
 {
-    Task<PolledMessages> FetchMessagesAsync(MessageFetchRequest request, Func<byte[], byte[]>? decryptor = null,
-        CancellationToken token = default);
-    Task<PolledMessages<TMessage>> FetchMessagesAsync<TMessage>(MessageFetchRequest request,
-        Func<byte[], TMessage> deserializer, Func<byte[], byte[]>? decryptor = null, CancellationToken token = default);
-    IAsyncEnumerable<MessageResponse<TMessage>> PollMessagesAsync<TMessage>(PollMessagesRequest request,
-        Func<byte[], TMessage> deserializer, Func<byte[], byte[]>? decryptor = null, 
+    Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
+        Consumer consumer, PollingStrategy pollingStrategy, int count, bool autoCommit,
+        Func<byte[], byte[]>? decryptor = null, CancellationToken token = default)
+    {
+        return PollMessagesAsync(new MessageFetchRequest
+        {
+            AutoCommit = autoCommit,
+            Consumer = consumer,
+            Count = count,
+            PartitionId = partitionId,
+            PollingStrategy = pollingStrategy,
+            StreamId = streamId,
+            TopicId = topicId
+        }, decryptor, token);
+    }
+
+    Task<PolledMessages> PollMessagesAsync(MessageFetchRequest request, Func<byte[], byte[]>? decryptor = null,
         CancellationToken token = default);
 
+    Task<PolledMessages<TMessage>> PollMessagesAsync<TMessage>(MessageFetchRequest request,
+        Func<byte[], TMessage> deserializer, Func<byte[], byte[]>? decryptor = null, CancellationToken token = default);
+
+    IAsyncEnumerable<MessageResponse<TMessage>> PollMessagesAsync<TMessage>(PollMessagesRequest request,
+        Func<byte[], TMessage> deserializer, Func<byte[], byte[]>? decryptor = null,
+        CancellationToken token = default);
 }

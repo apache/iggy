@@ -1,0 +1,109 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: node-npm-pre-merge
+description: Node.js pre-merge testing github iggy actions
+
+inputs:
+  task:
+    description: "Task to run (lint, test, build, e2e)"
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: "23"
+        registry-url: "https://registry.npmjs.org"
+        cache: "npm"
+        cache-dependency-path: foreign/node/package-lock.json
+
+    - name: Setup Rust with cache
+      if: inputs.task == 'e2e'
+      uses: ./.github/actions/utils/setup-rust-with-cache
+      with:
+        cache-targets: false  # Only cache registry and git deps, not target dir (sccache handles that)
+
+    - name: Install netcat
+      if: inputs.task == 'e2e'
+      run: sudo apt-get update && sudo apt-get install -y netcat-openbsd
+      shell: bash
+
+    - name: Install dependencies
+      run: |
+        cd foreign/node
+        npm ci --ignore-scripts
+      shell: bash
+
+    - name: Lint
+      if: inputs.task == 'lint'
+      run: |
+        cd foreign/node
+        npm run lint
+      shell: bash
+
+    - name: Build
+      if: inputs.task == 'build'
+      run: |
+        cd foreign/node
+        npm run build
+
+        # Verify build output
+        if [ -d "dist" ]; then
+          echo "Build output:"
+          ls -la dist/
+        else
+          echo "Warning: dist directory not found after build"
+        fi
+      shell: bash
+
+    - name: Test
+      if: inputs.task == 'test'
+      run: |
+        cd foreign/node
+        npm run test:unit
+      shell: bash
+
+    - name: Start Iggy server
+      id: iggy
+      if: inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-start
+      with:
+        mode: cargo
+        cargo-bin: iggy-server
+        host: 127.0.0.1
+        port: 8090
+        wait-timeout-seconds: 45
+
+    - name: E2E tests
+      if: inputs.task == 'e2e'
+      run: |
+        cd foreign/node
+        npm run test:e2e
+      env:
+        IGGY_SERVER_HOST: 127.0.0.1
+        IGGY_SERVER_TCP_PORT: 8090
+      shell: bash
+
+    - name: Stop Iggy server
+      if: inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-stop
+      with:
+        pid-file: ${{ steps.iggy.outputs.pid_file }}
+        log-file: ${{ steps.iggy.outputs.log_file }}

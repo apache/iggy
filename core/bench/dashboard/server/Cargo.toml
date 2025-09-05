@@ -16,14 +16,14 @@
 # under the License.
 
 [package]
-name = "bench-dashboard-server"
+name = "iggy-bench-dashboard-server"
 license = "Apache-2.0"
 version = "0.4.0"
 edition = "2024"
 
 [dependencies]
 actix-cors = "0.7.1"
-actix-files = "0.6.6"
+actix-files = "0.6.7"
 actix-web = "4.11.0"
 bench-dashboard-shared = { path = "../shared" }
 bench-report = { workspace = true }
@@ -43,7 +43,3 @@ tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 walkdir = "2.5.0"
 zip = { workspace = true, features = ["deflate"] }
-
-[[bin]]
-name = "iggy-bench-dashboard-server"
-path = "src/main.rs"

@@ -114,10 +114,10 @@ impl ClientManager {
     pub fn delete_clients_for_user(&mut self, user_id: UserId) -> Result<(), IggyError> {
         let mut clients_to_remove = Vec::new();
         for client in self.clients.values() {
-            if let Some(client_user_id) = client.user_id {
-                if client_user_id == user_id {
-                    clients_to_remove.push(client.session.client_id);
-                }
+            if let Some(client_user_id) = client.user_id
+                && client_user_id == user_id
+            {
+                clients_to_remove.push(client.session.client_id);
             }
         }
 

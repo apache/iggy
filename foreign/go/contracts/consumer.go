@@ -17,7 +17,7 @@
 
 package iggcon
 
-type ConsumerKind int
+type ConsumerKind uint8
 
 const (
 	ConsumerKindSingle ConsumerKind = 1

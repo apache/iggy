@@ -8,8 +8,6 @@
   };
 
   interface Props {
-    min: number;
-    max: number;
     initValue: number;
     className?: string;
     size?: keyof typeof sizes;
@@ -17,8 +15,6 @@
   }
 
   let {
-    min,
-    max,
     initValue,
     className = '',
     size = 'medium',

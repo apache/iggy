@@ -1,0 +1,264 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+components:
+  # Workspace-level changes that affect all Rust components
+  rust-workspace:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
+
+  # CI/CD infrastructure changes that require full regression
+  ci-infrastructure:
+    paths:
+      - ".github/**"
+
+  # Core library components that others depend on
+  rust-sdk:
+    depends_on:
+      - "rust-workspace"  # SDK is affected by workspace changes
+      - "ci-infrastructure"  # CI changes trigger full regression
+    paths:
+      - "core/sdk/**"
+
+  rust-common:
+    depends_on:
+      - "rust-workspace"  # Common is affected by workspace changes
+      - "ci-infrastructure"  # CI changes trigger full regression
+    paths:
+      - "core/common/**"
+
+  rust-binary-protocol:
+    depends_on:
+      - "rust-workspace"  # Protocol is affected by workspace changes
+      - "ci-infrastructure"  # CI changes trigger full regression
+    paths:
+      - "core/binary_protocol/**"
+
+  rust-server:
+    depends_on:
+      - "rust-workspace"  # Server is affected by workspace changes
+      - "ci-infrastructure"  # CI changes trigger full regression
+      - "rust-common"
+      - "rust-binary-protocol"
+    paths:
+      - "core/server/**"
+
+  # Main Rust workspace testing
+  rust:
+    depends_on:
+      - "rust-workspace"
+      - "rust-sdk"
+      - "rust-common"
+      - "rust-binary-protocol"
+      - "rust-server"
+      - "rust-tools"
+      - "ci-infrastructure"  # CI changes trigger full regression
+    paths:
+      - "Dockerfile*"
+      - "!foreign/**"  # Exclude foreign SDKs
+      - "!web/**"      # Exclude web UI
+    tasks:
+      - "check"
+      - "fmt"
+      - "clippy"
+      - "sort"
+      - "doctest"
+      - "machete"
+      - "test"
+      - "compat"
+
+  # CLI component
+  rust-cli:
+    depends_on:
+      - "rust-sdk"
+      - "rust-binary-protocol"
+    paths:
+      - "core/cli/**"
+
+  # Benchmark component
+  rust-bench:
+    depends_on:
+      - "rust-sdk"
+    paths:
+      - "core/bench/**"
+
+  # Connectors runtime
+  rust-connectors:
+    depends_on:
+      - "rust-sdk"
+    paths:
+      - "core/connectors/**"
+
+  # MCP AI component
+  rust-mcp:
+    depends_on:
+      - "rust-sdk"
+    paths:
+      - "core/ai/mcp/**"
+
+  # Integration tests
+  rust-integration:
+    depends_on:
+      - "rust-sdk"
+      - "rust-common"
+      - "rust-binary-protocol"
+      - "rust-server"
+    paths:
+      - "core/integration/**"
+
+  sdk-python:
+    depends_on:
+      - "rust-sdk"  # Python SDK wraps the Rust SDK
+      - "rust-server"    # For integration tests
+      - "ci-infrastructure"  # CI changes trigger full regression
+    paths:
+      - "foreign/python/**"
+    tasks: ["lint", "test", "build"]
+
+  sdk-node:
+    depends_on:
+      - "rust-sdk"       # Node SDK depends on core SDK
+      - "rust-server"    # For integration tests
+      - "ci-infrastructure"  # CI changes trigger full regression
+    paths:
+      - "foreign/node/**"
+    tasks: ["lint", "test", "build", "e2e"]
+
+  sdk-go:
+    depends_on:
+      - "rust-sdk"       # Go SDK depends on core SDK
+      - "rust-server"    # For integration tests
+      - "ci-infrastructure"  # CI changes trigger full regression
+    paths:
+      - "foreign/go/**"
+      - "bdd/go/**"
+      - "examples/go/**"
+    tasks: ["lint", "test", "build", "e2e"]
+
+  sdk-java:
+    depends_on:
+      - "rust-sdk"       # Java SDK depends on core SDK
+      - "rust-server"    # For integration tests
+      - "ci-infrastructure"  # CI changes trigger full regression
+    paths:
+      - "foreign/java/**"
+    tasks: ["lint", "test", "build"]
+
+  sdk-csharp:
+    depends_on:
+      - "rust-sdk"       # C# SDK depends on core SDK
+      - "rust-server"    # For integration tests
+      - "ci-infrastructure"  # CI changes trigger full regression
+    paths:
+      - "foreign/csharp/**"
+    tasks: ["lint", "test", "build"]
+
+  # Individual BDD tests per SDK - only run when specific SDK changes
+  bdd-rust:
+    depends_on:
+      - "rust-sdk"
+      - "rust-server"
+      - "ci-infrastructure"
+    paths:
+      - "bdd/rust/**"
+      - "bdd/scenarios/**"
+    tasks: ["bdd-rust"]
+
+  bdd-python:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk"  # All SDKs depend on core SDK changes
+      - "sdk-python"
+      - "ci-infrastructure"
+    paths:
+      - "bdd/python/**"
+      - "bdd/scenarios/**"
+    tasks: ["bdd-python"]
+
+  bdd-go:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk"  # All SDKs depend on core SDK changes
+      - "sdk-go"
+      - "ci-infrastructure"
+    paths:
+      - "bdd/go/**"
+      - "bdd/scenarios/**"
+    tasks: ["bdd-go"]
+
+  bdd-node:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk"  # All SDKs depend on core SDK changes
+      - "sdk-node"
+      - "ci-infrastructure"
+    paths:
+      - "bdd/node/**"
+      - "bdd/scenarios/**"
+    tasks: ["bdd-node"]
+
+  bdd-csharp:
+    depends_on:
+      - "rust-server"
+      - "rust-sdk"  # All SDKs depend on core SDK changes
+      - "sdk-csharp"
+      - "ci-infrastructure"
+    paths:
+      - "bdd/csharp/**"
+      - "bdd/scenarios/**"
+    tasks: ["bdd-csharp"]
+
+  examples-suite:
+    depends_on:
+      - "rust-sdk"
+      - "rust-server"
+      - "sdk-go"
+      - "ci-infrastructure"  # CI changes trigger full regression
+    paths:
+      - "examples/**"
+      - "scripts/run-rust-examples-from-readme.sh"
+      - "scripts/run-go-examples-from-readme.sh"
+    tasks: ["examples-rust", "examples-go"]
+
+  web-ui:
+    paths:
+      - "web/**"
+    tasks: ["lint", "build"]
+
+  rust-bench-dashboard:
+    paths:
+      - "core/bench/dashboard/**"
+      - "scripts/dashboard/**"
+    tasks: ["build"]
+
+  # Core tools component
+  rust-tools:
+    depends_on:
+      - "rust-workspace"
+    paths:
+      - "core/tools/**"
+
+  # CI/CD workflow monitoring (informational, no tasks)
+  ci-workflows:
+    paths:
+      - ".github/workflows/**/*.yml"
+      - ".github/actions/**/*.yml"
+      - ".github/ci/**/*.yml"
+    tasks: ["validate"]  # Could run workflow validation

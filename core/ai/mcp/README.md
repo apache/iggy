@@ -4,6 +4,8 @@ The [Model Context Protocol](https://modelcontextprotocol.io) (MCP) is an open p
 
 To start the MCP server, simply run `cargo run --bin iggy-mcp`.
 
+The [docker image](https://hub.docker.com/r/apache/iggy-mcp) is available, and can be fetched via `docker pull apache/iggy-mcp`.
+
 The minimal viable configuration requires at least the Iggy credentials, to create the connection with the running Iggy server using TCP with which the MCP server will communicate. You can choose between HTTP and STDIO transports (e.g. for the local usage with tools such as [Claude Desktop](https://claude.ai/download) choose `stdio`).
 
 ```toml
@@ -60,3 +62,5 @@ Here's the example configuration to be used with Claude Desktop:
 ```
 
 **Remember to use the appropriate Iggy account credentials for your environment** (e.g. create the user with read-only permissions to avoid modifying the data). On top of this, you can also configure the `permissions` for the MCP server to control which operations are allowed (this will be checked first, before forwarding the actual request to the Iggy server).
+
+![MCP](../../../assets/iggy_mcp_server.png)

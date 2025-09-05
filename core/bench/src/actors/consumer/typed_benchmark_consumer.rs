@@ -48,7 +48,7 @@ impl TypedBenchmarkConsumer {
         benchmark_kind: BenchmarkKind,
         consumer_id: u32,
         consumer_group_id: Option<u32>,
-        stream_id: String,
+        stream_id: u32,
         messages_per_batch: BenchmarkNumericParameter,
         finish_condition: Arc<BenchmarkFinishCondition>,
         warmup_time: IggyDuration,

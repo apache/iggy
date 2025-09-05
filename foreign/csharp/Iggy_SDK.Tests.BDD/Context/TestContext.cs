@@ -1,4 +1,4 @@
-﻿// // Licensed to the Apache Software Foundation (ASF) under one
+// // Licensed to the Apache Software Foundation (ASF) under one
 // // or more contributor license agreements.  See the NOTICE file
 // // distributed with this work for additional information
 // // regarding copyright ownership.  The ASF licenses this file
@@ -15,7 +15,7 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
-using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
 
@@ -24,7 +24,7 @@ namespace Apache.Iggy.Tests.BDD.Context;
 public class TestContext
 {
     public IIggyClient IggyClient { get; set; } = null!;
-    public string TcpUrl { get; set; }  = string.Empty;
+    public string TcpUrl { get; set; } = string.Empty;
     public StreamResponse? CreatedStream { get; set; }
     public TopicResponse? CreatedTopic { get; set; }
     public List<MessageResponse> PolledMessages { get; set; } = new();

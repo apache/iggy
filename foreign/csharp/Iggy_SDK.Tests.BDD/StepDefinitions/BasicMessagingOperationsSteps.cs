@@ -1,4 +1,4 @@
-﻿// // Licensed to the Apache Software Foundation (ASF) under one
+// // Licensed to the Apache Software Foundation (ASF) under one
 // // or more contributor license agreements.  See the NOTICE file
 // // distributed with this work for additional information
 // // regarding copyright ownership.  The ASF licenses this file
@@ -16,8 +16,7 @@
 // // under the License.
 
 using System.Text;
-using Apache.Iggy.Contracts.Http;
-using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
 using Apache.Iggy.Kinds;
@@ -47,10 +46,7 @@ public class BasicMessagingOperationsSteps
         {
             configurator.BaseAdress = _context.TcpUrl;
             configurator.Protocol = Protocol.Tcp;
-            configurator.MessageBatchingSettings = settings =>
-            {
-                settings.Enabled = false;
-            };
+            configurator.MessageBatchingSettings = settings => { settings.Enabled = false; };
         }, NullLoggerFactory.Instance);
 
         await _context.IggyClient.PingAsync();
@@ -59,11 +55,7 @@ public class BasicMessagingOperationsSteps
     [Given(@"I am authenticated as the root user")]
     public async Task GivenIAmAuthenticatedAsTheRootUser()
     {
-        var loginResult = await _context.IggyClient.LoginUser(new LoginUserRequest()
-        {
-            Username = "iggy",
-            Password = "iggy"
-        });
+        var loginResult = await _context.IggyClient.LoginUser("iggy", "iggy");
 
         loginResult.ShouldNotBeNull();
         loginResult.UserId.ShouldBe(1);
@@ -72,87 +64,82 @@ public class BasicMessagingOperationsSteps
     [Given(@"I have no streams in the system")]
     public async Task GivenIHaveNoStreamsInTheSystem()
     {
-        var streams = await _context.IggyClient.GetStreamsAsync();
-        
+        IReadOnlyList<StreamResponse> streams = await _context.IggyClient.GetStreamsAsync();
+
         streams.ShouldNotBeNull();
         streams.Count.ShouldBe(0);
     }
 
     [When(@"I create a stream with ID (\d+) and name (.*)")]
-    public async Task WhenICreateAStreamWithIdAndName(int streamId, string streamName)
+    public async Task WhenICreateAStreamWithIdAndName(uint streamId, string streamName)
     {
-        _context.CreatedStream = await _context.IggyClient.CreateStreamAsync(new StreamRequest()
-        {
-            Name = streamName,
-            StreamId = streamId
-        });
+        _context.CreatedStream = await _context.IggyClient.CreateStreamAsync(streamName, streamId);
     }
 
     [Then(@"the stream should be created successfully")]
     public void ThenTheStreamShouldBeCreatedSuccessfully()
     {
         _context.CreatedStream.ShouldNotBeNull();
-        _context.CreatedStream.Id.ShouldNotBe(0);
+        _context.CreatedStream.Id.ShouldNotBe(0u);
         _context.CreatedStream.Name.ShouldNotBeNullOrEmpty();
     }
 
     [Then(@"the stream should have ID (\d+) and name (.*)")]
-    public void ThenTheStreamShouldHaveIdAndName(int expectedId, string expectedName)
+    public void ThenTheStreamShouldHaveIdAndName(uint expectedId, string expectedName)
     {
         _context.CreatedStream!.Id.ShouldBe(expectedId);
         _context.CreatedStream!.Name.ShouldBe(expectedName);
     }
 
     [When(@"I create a topic with ID (\d+) and name (.*) in stream (\d+) with (\d+) partitions")]
-    public async Task WhenICreateATopicWithIdAndNameInStreamWithPartitions(int topicId, string topicName, int streamId, int partitions)
+    public async Task WhenICreateATopicWithIdAndNameInStreamWithPartitions(uint topicId, string topicName,
+        uint streamId, uint partitions)
     {
-        _context.CreatedTopic = await _context.IggyClient.CreateTopicAsync(Identifier.Numeric(streamId), new TopicRequest()
-        {
-            TopicId = topicId,
-            Name = topicName,
-            PartitionsCount = partitions
-        });
+        _context.CreatedTopic = await _context.IggyClient.CreateTopicAsync(Identifier.Numeric(streamId),
+            topicId: topicId,
+            name: topicName,
+            partitionsCount: partitions);
     }
 
     [Then(@"the topic should be created successfully")]
     public void ThenTheTopicShouldBeCreatedSuccessfully()
     {
         _context.CreatedTopic.ShouldNotBeNull();
-        _context.CreatedTopic!.Id.ShouldNotBe(0);
+        _context.CreatedTopic!.Id.ShouldNotBe(0u);
         _context.CreatedTopic.Name.ShouldNotBeNullOrEmpty();
     }
 
     [Then(@"the topic should have ID (\d+) and name (.*)")]
-    public void ThenTheTopicShouldHaveIdAndName(int expectedId, string expectedName)
+    public void ThenTheTopicShouldHaveIdAndName(uint expectedId, string expectedName)
     {
         _context.CreatedTopic!.Id.ShouldBe(expectedId);
         _context.CreatedTopic!.Name.ShouldBe(expectedName);
-        
     }
 
     [Then(@"the topic should have (.*) partitions")]
-    public void ThenTheTopicShouldHavePartitions(int expectedPartitions)
+    public void ThenTheTopicShouldHavePartitions(uint expectedPartitions)
     {
-        _context.CreatedTopic!.Partitions!.Count().ShouldBe(expectedPartitions);
+        _context.CreatedTopic!.Partitions!.Count().ShouldBe((int)expectedPartitions);
         _context.CreatedTopic.PartitionsCount.ShouldBe(expectedPartitions);
     }
 
     [When(@"I send (\d+) messages to stream (\d+), topic (\d+), partition (\d+)")]
-    public async Task WhenISendMessagesToStreamTopicPartition(int messageCount, int streamId, int topicId, int partitionId)
+    public async Task WhenISendMessagesToStreamTopicPartition(int messageCount, int streamId, int topicId,
+        int partitionId)
     {
-        var messages = Enumerable.Range(1, messageCount)
+        List<Message> messages = Enumerable.Range(1, messageCount)
             .Select(i => new Message(1, Encoding.UTF8.GetBytes($"Test message {i}")))
             .ToList();
-        
-        await _context.IggyClient.SendMessagesAsync(new MessageSendRequest()
+
+        await _context.IggyClient.SendMessagesAsync(new MessageSendRequest
         {
             StreamId = Identifier.Numeric(streamId),
             TopicId = Identifier.Numeric(topicId),
             Partitioning = Partitioning.PartitionId(partitionId),
             Messages = messages
         });
-        
-        _context.LastSendMessage = messages.Last();
+
+        _context.LastSendMessage = messages[^1];
     }
 
     [Then(@"all messages should be sent successfully")]
@@ -162,9 +149,10 @@ public class BasicMessagingOperationsSteps
     }
 
     [When(@"I poll messages from stream (\d+), topic (\d+), partition (\d+) starting from offset (\d+)")]
-    public async Task WhenIPollMessagesFromStreamTopicPartitionStartingFromOffset(int streamId, int topicId, int partitionId, ulong startOffset)
+    public async Task WhenIPollMessagesFromStreamTopicPartitionStartingFromOffset(int streamId, int topicId,
+        uint partitionId, ulong startOffset)
     {
-        var messages = await _context.IggyClient.FetchMessagesAsync(new MessageFetchRequest()
+        var messages = await _context.IggyClient.PollMessagesAsync(new MessageFetchRequest
         {
             StreamId = Identifier.Numeric(streamId),
             TopicId = Identifier.Numeric(topicId),
@@ -174,7 +162,6 @@ public class BasicMessagingOperationsSteps
             Count = 100,
             AutoCommit = false
         });
-        
         _context.PolledMessages = messages.Messages.ToList();
     }
 
@@ -187,22 +174,20 @@ public class BasicMessagingOperationsSteps
     [Then(@"the messages should have sequential offsets from (\d+) to (\d+)")]
     public void ThenTheMessagesShouldHaveSequentialOffsetsFromTo(int startOffset, int endOffset)
     {
-        for (int i = startOffset; i < endOffset; i++)
+        for (var i = startOffset; i < endOffset; i++)
         {
             _context.PolledMessages[i].Header.Offset.ShouldBe((ulong)i);
-            
         }
     }
 
     [Then(@"each message should have the expected payload content")]
     public void ThenEachMessageShouldHaveTheExpectedPayloadContent()
     {
-        for (int i = 0; i < _context.PolledMessages.Count; i++)
+        for (var i = 0; i < _context.PolledMessages.Count; i++)
         {
             var message = _context.PolledMessages[i];
             message.Payload.ShouldNotBeNull();
             message.Payload.Length.ShouldBeGreaterThan(0);
-            
             var payloadText = Encoding.UTF8.GetString(message.Payload);
             payloadText.ShouldBe($"Test message {i + 1}");
         }
@@ -212,10 +197,10 @@ public class BasicMessagingOperationsSteps
     public void ThenTheLastPolledMessageShouldMatchTheLastSentMessage()
     {
         var lastPolled = _context.PolledMessages.LastOrDefault();
-        
+
         lastPolled.ShouldNotBeNull();
         _context.LastSendMessage.ShouldNotBeNull();
-        
+
         lastPolled.Header.Id.ShouldBe(_context.LastSendMessage.Value.Header.Id);
         lastPolled.Payload.ShouldBe(_context.LastSendMessage.Value.Payload);
     }

@@ -28,6 +28,10 @@ normal = ["tracing-appender"]
 [package.metadata.cargo-machete]
 ignored = ["rusty-s3"]
 
+[[bin]]
+name = "iggy-server"
+path = "src/main.rs"
+
 [features]
 default = ["mimalloc"]
 tokio-console = ["dep:console-subscriber", "tokio/tracing"]
@@ -96,7 +100,7 @@ opentelemetry_sdk = { version = "0.30.0", features = [
     "experimental_logs_batch_log_processor_with_async_runtime",
     "experimental_trace_batch_span_processor_with_async_runtime",
 ] }
-prometheus-client = "0.23.1"
+prometheus-client = "0.24.0"
 papaya = "0.2.3"
 ringbuffer = "0.16.0"
 quinn = { workspace = true }

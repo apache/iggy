@@ -31,11 +31,12 @@ namespace Apache.Iggy.Factory;
 public static class MessageStreamFactory
 {
     //TODO - this whole setup will have to be refactored later,when adding support for ASP.NET Core DI
-    public static IIggyClient CreateMessageStream(Action<IMessageStreamConfigurator> options, ILoggerFactory loggerFactory)
+    public static IIggyClient CreateMessageStream(Action<IMessageStreamConfigurator> options,
+        ILoggerFactory loggerFactory)
     {
         var config = new MessageStreamConfigurator();
         options.Invoke(config);
-        
+
         return config.Protocol switch
         {
             Protocol.Http => CreateHttpMessageStream(config, loggerFactory),
@@ -43,8 +44,9 @@ public static class MessageStreamFactory
             _ => throw new InvalidEnumArgumentException()
         };
     }
-    
-    private static TcpMessageStream CreateTcpMessageStream(IMessageStreamConfigurator options, ILoggerFactory loggerFactory)
+
+    private static TcpMessageStream CreateTcpMessageStream(IMessageStreamConfigurator options,
+        ILoggerFactory loggerFactory)
     {
         var socket = CreateTcpStream(options);
         return new TcpMessageStreamBuilder(socket, options, loggerFactory)
@@ -81,16 +83,19 @@ public static class MessageStreamFactory
         {
             sslStream.AuthenticateAsClient(tlsSettings.Hostname);
         }
+
         return new TcpTlsConnectionStream(sslStream);
     }
 
-    private static HttpMessageStream CreateHttpMessageStream(IMessageStreamConfigurator options, ILoggerFactory loggerFactory)
+    private static HttpMessageStream CreateHttpMessageStream(IMessageStreamConfigurator options,
+        ILoggerFactory loggerFactory)
     {
         var client = CreateHttpClient(options);
         return new HttpMessageStreamBuilder(client, options, loggerFactory)
             .WithSendMessagesDispatcher() //this internally resolves whether the message dispatcher is created or not
             .Build();
     }
+
     private static HttpClient CreateHttpClient(IMessageStreamConfigurator options)
     {
         var client = new HttpClient();

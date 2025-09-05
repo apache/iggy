@@ -15,21 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using Microsoft.Extensions.Logging;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Apache.Iggy;
-using Apache.Iggy.Contracts.Http;
-using Apache.Iggy.Contracts.Http.Auth;
+using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
-using Apache.Iggy.JsonConfiguration;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Shared;
+using Microsoft.Extensions.Logging;
 
 var jsonOptions = new JsonSerializerOptions();
-jsonOptions.PropertyNamingPolicy = new ToSnakeCaseNamingPolicy();
+jsonOptions.PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower;
 jsonOptions.WriteIndented = true;
 var protocol = Protocol.Tcp;
 var loggerFactory = LoggerFactory.Create(builder =>
@@ -63,18 +61,14 @@ var bus = MessageStreamFactory.CreateMessageStream(options =>
     };
 }, loggerFactory);
 
-var response = await bus.LoginUser(new LoginUserRequest
-{
-    Password = "iggy",
-    Username = "iggy",
-});
+var response = await bus.LoginUser("iggy", "iggy");
 
 Console.WriteLine("Using protocol : {0}", protocol.ToString());
-int streamIdVal = 1;
-int topicIdVal = 1;
+var streamIdVal = 1u;
+var topicIdVal = 1u;
 var streamId = Identifier.Numeric(streamIdVal);
 var topicId = Identifier.Numeric(topicIdVal);
-var partitionId = 3;
+var partitionId = (uint)3;
 var consumerId = 1;
 
 
@@ -85,32 +79,34 @@ await ConsumeMessages();
 
 async Task ConsumeMessages()
 {
-    int intervalInMs = 1000;
-    Console.WriteLine($"Messages will be polled from stream {streamId}, topic {topicId}, partition {partitionId} with interval {intervalInMs} ms");
+    var intervalInMs = 1000;
+    Console.WriteLine(
+        $"Messages will be polled from stream {streamId}, topic {topicId}, partition {partitionId} with interval {intervalInMs} ms");
     Func<byte[], Envelope> deserializer = serializedData =>
     {
-        Envelope envelope = new Envelope();
-        int messageTypeLength = BitConverter.ToInt32(serializedData, 0);
+        var envelope = new Envelope();
+        var messageTypeLength = BitConverter.ToInt32(serializedData, 0);
         envelope.MessageType = Encoding.UTF8.GetString(serializedData, 4, messageTypeLength);
-        envelope.Payload = Encoding.UTF8.GetString(serializedData, 4 + messageTypeLength, serializedData.Length - (4 + messageTypeLength));
+        envelope.Payload = Encoding.UTF8.GetString(serializedData, 4 + messageTypeLength,
+            serializedData.Length - (4 + messageTypeLength));
         return envelope;
     };
     Func<byte[], byte[]> decryptor = static payload =>
     {
-        string aes_key = "AXe8YwuIn1zxt3FPWTZFlAa14EHdPAdN9FaZ9RQWihc=";
-        string aes_iv = "bsxnWolsAyO7kCfWuyrnqg==";
+        var aes_key = "AXe8YwuIn1zxt3FPWTZFlAa14EHdPAdN9FaZ9RQWihc=";
+        var aes_iv = "bsxnWolsAyO7kCfWuyrnqg==";
         var key = Convert.FromBase64String(aes_key);
         var iv = Convert.FromBase64String(aes_iv);
-        
-        using Aes aes = Aes.Create();
-        ICryptoTransform decryptor = aes.CreateDecryptor(key, iv);
-        using MemoryStream memoryStream = new MemoryStream(payload);
-        using CryptoStream cryptoStream = new CryptoStream(memoryStream, decryptor, CryptoStreamMode.Read);
-        using BinaryReader binaryReader = new BinaryReader(cryptoStream);
+
+        using var aes = Aes.Create();
+        var decryptor = aes.CreateDecryptor(key, iv);
+        using var memoryStream = new MemoryStream(payload);
+        using var cryptoStream = new CryptoStream(memoryStream, decryptor, CryptoStreamMode.Read);
+        using var binaryReader = new BinaryReader(cryptoStream);
         return binaryReader.ReadBytes(payload.Length);
     };
-    
-    var messages = await bus.FetchMessagesAsync<Envelope>(new MessageFetchRequest
+
+    PolledMessages<Envelope> messages = await bus.PollMessagesAsync(new MessageFetchRequest
     {
         StreamId = streamId,
         TopicId = topicId,
@@ -120,15 +116,16 @@ async Task ConsumeMessages()
         PollingStrategy = PollingStrategy.Next(),
         AutoCommit = true
     }, deserializer, decryptor);
-    await foreach (var msgResponse in bus.PollMessagesAsync<Envelope>(new PollMessagesRequest
-                   {
-                       Consumer = Consumer.New(consumerId),
-                       Count = 1,
-                       TopicId = topicId,
-                       StreamId = streamId,
-                       PartitionId = partitionId,
-                       PollingStrategy = PollingStrategy.Next(),
-                   }, deserializer, decryptor))
+    await foreach (MessageResponse<Envelope> msgResponse in bus.PollMessagesAsync(
+                       new PollMessagesRequest
+                       {
+                           Consumer = Consumer.New(consumerId),
+                           Count = 1,
+                           TopicId = topicId,
+                           StreamId = streamId,
+                           PartitionId = partitionId,
+                           PollingStrategy = PollingStrategy.Next()
+                       }, deserializer, decryptor))
     {
         HandleMessage(msgResponse);
     }
@@ -145,24 +142,24 @@ void HandleMessage(MessageResponse<Envelope> messageResponse)
     switch (messageResponse.Message.MessageType)
     {
         case "order_created":
-            {
-                var orderCreated = JsonSerializer.Deserialize<OrderCreated>(messageResponse.Message.Payload, jsonOptions);
-                Console.WriteLine(orderCreated);
-                break;
-            }
+        {
+            var orderCreated = JsonSerializer.Deserialize<OrderCreated>(messageResponse.Message.Payload, jsonOptions);
+            Console.WriteLine(orderCreated);
+            break;
+        }
         case "order_confirmed":
-            {
-                var orderConfirmed =
-                    JsonSerializer.Deserialize<OrderConfirmed>(messageResponse.Message.Payload, jsonOptions);
-                Console.WriteLine(orderConfirmed);
-                break;
-            }
+        {
+            var orderConfirmed =
+                JsonSerializer.Deserialize<OrderConfirmed>(messageResponse.Message.Payload, jsonOptions);
+            Console.WriteLine(orderConfirmed);
+            break;
+        }
         case "order_rejected":
-            {
-                var orderRejected = JsonSerializer.Deserialize<OrderRejected>(messageResponse.Message.Payload, jsonOptions);
-                Console.WriteLine(orderRejected);
-                break;
-            }
+        {
+            var orderRejected = JsonSerializer.Deserialize<OrderRejected>(messageResponse.Message.Payload, jsonOptions);
+            Console.WriteLine(orderRejected);
+            break;
+        }
     }
 
 
@@ -174,27 +171,28 @@ void HandleMessage(MessageResponse<Envelope> messageResponse)
         foreach (var (headerKey, headerValue) in messageResponse.UserHeaders)
         {
             Console.WriteLine("Found Header: {0} with value: {1}, ", headerKey.ToString(), headerValue.ToString());
-                }
+        }
+
         Console.WriteLine();
     }
     //await Task.Delay(1000);
 }
 
 
-async Task ValidateSystem(Identifier streamId, Identifier topicId, int partitionId)
+async Task ValidateSystem(Identifier streamId, Identifier topicId, uint partitionId)
 {
     try
     {
         Console.WriteLine($"Validating if stream exists.. {streamId}");
-        
+
         var result = await bus.GetStreamByIdAsync(streamId);
-        
+
         Console.WriteLine(result!.Name);
-        
+
         Console.WriteLine($"Validating if topic exists.. {topicId}");
-        
+
         var topicResult = await bus.GetTopicByIdAsync(streamId, topicId);
-        
+
         if (topicResult!.PartitionsCount < partitionId)
         {
             throw new SystemException(
@@ -204,31 +202,26 @@ async Task ValidateSystem(Identifier streamId, Identifier topicId, int partition
     catch
     {
         Console.WriteLine($"Creating stream with {streamId}");
-        
-        await bus.CreateStreamAsync(new StreamRequest
-        {
-            StreamId = streamIdVal,
-            Name = "Test Consumer Stream",
-        });
-        
+
+        await bus.CreateStreamAsync("Test Consumer Stream", streamIdVal);
+
         Console.WriteLine($"Creating topic with {topicId}");
-        
-        await bus.CreateTopicAsync(streamId, new TopicRequest(
+
+        await bus.CreateTopicAsync(streamId,
             topicId: topicIdVal,
             name: "Test Consumer Topic",
             compressionAlgorithm: CompressionAlgorithm.None,
             messageExpiry: 0,
             maxTopicSize: 1_000_000_000,
             replicationFactor: 3,
-            partitionsCount: 3));
-        
+            partitionsCount: 3);
+
         var topicRes = await bus.GetTopicByIdAsync(streamId, topicId);
-        
+
         if (topicRes!.PartitionsCount < partitionId)
         {
             throw new SystemException(
                 $"Topic {topicId} has only {topicRes.PartitionsCount} partitions, but partition {partitionId} was requested");
         }
     }
-
 }

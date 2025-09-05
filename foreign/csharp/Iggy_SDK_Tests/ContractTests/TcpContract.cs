@@ -17,93 +17,77 @@
 
 using System.Buffers.Binary;
 using System.Text;
-using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Contracts.Http.Auth;
 using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Extensions;
+using Apache.Iggy.Kinds;
 using Apache.Iggy.Tests.Utils;
-using Apache.Iggy.Tests.Utils.Groups;
 using Apache.Iggy.Tests.Utils.Messages;
-using Apache.Iggy.Tests.Utils.Offsets;
-using Apache.Iggy.Tests.Utils.Partitions;
-using Apache.Iggy.Tests.Utils.Streams;
 using Apache.Iggy.Tests.Utils.Topics;
 using Apache.Iggy.Tests.Utils.Users;
 using FluentAssertions;
+using Partitioning = Apache.Iggy.Enums.Partitioning;
 
 namespace Apache.Iggy.Tests.ContractTests;
 
 public sealed class TcpContract
 {
-    
     [Fact]
     public void TcpContracts_DeletePersonalRequestToken_HasValidBytes()
     {
         // Arrange
-        var request = new DeletePersonalAccessTokenRequest
-        {
-            Name = "TestUser"
-        };
+        var name = "TestUser";
 
         // Act
-        byte[] result = TcpContracts.DeletePersonalRequestToken(request);
+        var result = TcpContracts.DeletePersonalRequestToken(name);
 
         // Assert
-        Assert.Equal(5 + request.Name.Length, result.Length);
-        Assert.Equal((byte)request.Name.Length, result[0]);
-        Assert.Equal(Encoding.UTF8.GetBytes(request.Name), result[1..(1 + request.Name.Length)]);
+        Assert.Equal(5 + name.Length, result.Length);
+        Assert.Equal((byte)name.Length, result[0]);
+        Assert.Equal(Encoding.UTF8.GetBytes(name), result[1..(1 + name.Length)]);
     }
+
     [Fact]
     public void TcpContracts_CreatePersonalAccessToken_HasValidBytes_ValidExpiry()
     {
         // Arrange
-        var request = new CreatePersonalAccessTokenRequest
-        {
-            Name = "TestUser",
-            Expiry = 3600 // Valid Expiry Value
-        };
+        var name = "TestUser";
+        var expiry = 3600u;
 
         // Act
-        byte[] result = TcpContracts.CreatePersonalAccessToken(request);
+        var result = TcpContracts.CreatePersonalAccessToken(name, expiry);
 
         // Assert
-        Assert.Equal(9 + request.Name.Length, result.Length); // The expected length
-        Assert.Equal(Encoding.UTF8.GetBytes(request.Name), result[1..(1 + request.Name.Length)]); // The expected length of the name
-        Assert.Equal((uint)3600, BinaryPrimitives.ReadUInt32LittleEndian(result[(1 + request.Name.Length)..]));
+        Assert.Equal(9 + name.Length, result.Length); // The expected length
+        Assert.Equal(Encoding.UTF8.GetBytes(name), result[1..(1 + name.Length)]); // The expected length of the name
+        Assert.Equal((uint)3600, BinaryPrimitives.ReadUInt32LittleEndian(result[(1 + name.Length)..]));
     }
 
     [Fact]
     public void TcpContracts_CreatePersonalAccessToken_HasValidBytes_NullExpiry()
     {
         // Arrange
-        var request = new CreatePersonalAccessTokenRequest
-        {
-            Name = "TestUser",
-            Expiry = null // Null Expiry
-        };
+        var name = "TestUser";
+        ulong? expiry = null;
 
         // Act
-        byte[] result = TcpContracts.CreatePersonalAccessToken(request);
+        var result = TcpContracts.CreatePersonalAccessToken(name, expiry);
 
         // Assert
-        Assert.Equal(9 + request.Name.Length, result.Length); // The expected length
-        Assert.Equal(Encoding.UTF8.GetBytes(request.Name), result[1..(1 + request.Name.Length)]); // The expected length of the name
-        Assert.Equal((uint)0, BinaryPrimitives.ReadUInt64LittleEndian(result[(1 + request.Name.Length)..]));
+        Assert.Equal(9 + name.Length, result.Length); // The expected length
+        Assert.Equal(Encoding.UTF8.GetBytes(name), result[1..(1 + name.Length)]); // The expected length of the name
+        Assert.Equal((uint)0, BinaryPrimitives.ReadUInt64LittleEndian(result[(1 + name.Length)..]));
     }
-    
+
     [Fact]
     public void TcpContracts_LoginUser_HasCorrectBytes()
     {
         // Arrange
-        var request = new LoginUserRequest
-        {
-            Username = "testuser",
-            Password = "testpassword"
-        };
+        var request = new LoginUserRequest("testuser", "testpassword", null, null);
 
         // Act
-        var result = TcpContracts.LoginUser(request);
+        var result = TcpContracts.LoginUser(request.Username, request.Password, request.Version, request.Context);
 
         // Assert
         var expectedLength = request.Username.Length + request.Password.Length + 2 + 4 + 4;
@@ -124,21 +108,15 @@ public sealed class TcpContract
         Assert.Equal(request.Username, decodedUsername);
         Assert.Equal(request.Password, decodedPassword);
     }
-    
+
     [Fact]
     public void TcpContracts_LoginUserWithOptional_HasCorrectBytes()
     {
         // Arrange
-        var request = new LoginUserRequest
-        {
-            Username = "testuser",
-            Password = "testpassword",
-            Context = "optional context",
-            Version = "1.0.0"
-        };
+        var request = new LoginUserRequest("testuser", "testpassword", "1.0.0", "optional context");
 
         // Act
-        var result = TcpContracts.LoginUser(request);
+        var result = TcpContracts.LoginUser(request.Username, request.Password, request.Version, request.Context);
 
         // Assert
         var expectedLength = 51;
@@ -171,29 +149,25 @@ public sealed class TcpContract
         Assert.Equal(request.Version, decodedVersion);
         Assert.Equal(request.Context, decodedContext);
     }
-    
+
     [Fact]
     public void TcpContracts_UpdateUser_HasCorrectBytes()
     {
         // Arrange
-        var request = new UpdateUserRequest
-        {
-            UserId = Identifier.Numeric(1),
-            Username = "newusername",
-            UserStatus = UserStatus.Inactive
-        };
+        var userId = Identifier.Numeric(1);
+        var request = new UpdateUserRequest("newusername", UserStatus.Inactive);
 
         // Act
-        var result = TcpContracts.UpdateUser(request);
+        var result = TcpContracts.UpdateUser(userId, request.Username, request.UserStatus);
 
         // Assert
-        var expectedLength = request.UserId.Length + 2 +
+        var expectedLength = userId.Length + 2 +
                              (request.Username?.Length ?? 0) + 2 + 1 + 1;
         Assert.Equal(expectedLength, result.Length);
 
         var position = 2;
-        var userIdBytes = result[position..(position + request.UserId.Length)];
-        position += request.UserId.Length;
+        var userIdBytes = result[position..(position + userId.Length)];
+        position += userId.Length;
         var usernameFlag = result[position];
         position += 1;
         if (usernameFlag == 1)
@@ -226,24 +200,20 @@ public sealed class TcpContract
         {
             Assert.Null(request.UserStatus);
         }
-        Assert.Equal(request.UserId.Value, userIdBytes);
+
+        Assert.Equal(userId.Value, userIdBytes);
     }
+
     [Fact]
     public void TcpContracts_CreateUser_NoPermission_HasCorrectBytes()
     {
         // Arrange
-        var request = new CreateUserRequest
-        {
-            Username = "testuser",
-            Password = "testpassword",
-            Status = UserStatus.Active,
-            Permissions = null,
-        };
+        var request = new CreateUserRequest("testuser", "testpassword", UserStatus.Active, null);
         // Act
-        var result = TcpContracts.CreateUser(request);
+        var result = TcpContracts.CreateUser(request.Username, request.Password, request.Status, request.Permissions);
 
         // Assert
-        int position = 0;
+        var position = 0;
 
         Assert.Equal((byte)request.Username.Length, result[position]);
         position += 1;
@@ -283,65 +253,59 @@ public sealed class TcpContract
         {
             Assert.Null(request.Permissions);
         }
-
     }
+
     [Fact]
     public void TcpContracts_ChangePassword_HasCorrectBytes()
     {
         // Arrange
-        var request = new ChangePasswordRequest
-        {
-            UserId = Identifier.Numeric(1),
-            CurrentPassword = "oldpassword",
-            NewPassword = "newpassword"
-        };
+        var userId = Identifier.Numeric(1);
+        var currentPassword = "oldpassword";
+        var newPassword = "newpassword";
 
         // Act
-        var result = TcpContracts.ChangePassword(request);
+        var result = TcpContracts.ChangePassword(userId, currentPassword, newPassword);
 
         // Assert
-        int position = 2;
+        var position = 2;
 
-        var userIdBytes = result[position..(position + request.UserId.Length)];
-        position += request.UserId.Length;
-        Assert.Equal(request.UserId.Value, userIdBytes);
+        var userIdBytes = result[position..(position + userId.Length)];
+        position += userId.Length;
+        Assert.Equal(userId.Value, userIdBytes);
 
-        Assert.Equal((byte)request.CurrentPassword.Length, result[position]);
+        Assert.Equal((byte)currentPassword.Length, result[position]);
         position += 1;
 
-        var currentPasswordBytes = result[position..(position + request.CurrentPassword.Length)];
-        position += request.CurrentPassword.Length;
+        var currentPasswordBytes = result[position..(position + currentPassword.Length)];
+        position += currentPassword.Length;
         var decodedCurrentPassword = Encoding.UTF8.GetString(currentPasswordBytes);
-        Assert.Equal(request.CurrentPassword, decodedCurrentPassword);
+        Assert.Equal(currentPassword, decodedCurrentPassword);
 
-        Assert.Equal((byte)request.NewPassword.Length, result[position]);
+        Assert.Equal((byte)newPassword.Length, result[position]);
         position += 1;
 
-        var newPasswordBytes = result[position..(position + request.NewPassword.Length)];
-        position += request.NewPassword.Length;
+        var newPasswordBytes = result[position..(position + newPassword.Length)];
+        position += newPassword.Length;
         var decodedNewPassword = Encoding.UTF8.GetString(newPasswordBytes);
-        Assert.Equal(request.NewPassword, decodedNewPassword);
+        Assert.Equal(newPassword, decodedNewPassword);
     }
 
     [Fact]
     public void TcpContracts_UpdatePermissions_HasCorrectBytes()
     {
         // Arrange
-        var request = new UpdateUserPermissionsRequest
-        {
-            UserId = Identifier.Numeric(1),
-            Permissions = PermissionsFactory.CreatePermissions()
-        };
+        var userId = Identifier.Numeric(1);
+        var permissions = PermissionsFactory.CreatePermissions();
 
         // Act
-        var result = TcpContracts.UpdatePermissions(request);
+        var result = TcpContracts.UpdatePermissions(userId, permissions);
 
         // Assert
-        int position = 2;
+        var position = 2;
 
-        var userIdBytes = result[position..(position + request.UserId.Length)];
-        position += request.UserId.Length;
-        Assert.Equal(request.UserId.Value, userIdBytes);
+        var userIdBytes = result[position..(position + userId.Length)];
+        position += userId.Length;
+        Assert.Equal(userId.Value, userIdBytes);
 
         var permissionsFlag = result[position];
         position += 1;
@@ -354,13 +318,13 @@ public sealed class TcpContract
 
             var mappedPermissions = PermissionsFactory.PermissionsFromBytes(permissionsBytes);
 
-            request.Permissions.Global.Should().BeEquivalentTo(mappedPermissions.Global);
+            permissions.Global.Should().BeEquivalentTo(mappedPermissions.Global);
 
-            if (request.Permissions.Streams != null)
+            if (permissions.Streams != null)
             {
                 Assert.NotNull(mappedPermissions.Streams);
 
-                foreach (var (streamId, stream) in request.Permissions.Streams)
+                foreach (var (streamId, stream) in permissions.Streams)
                 {
                     Assert.True(mappedPermissions.Streams.ContainsKey(streamId));
                     var mappedStream = mappedPermissions.Streams[streamId];
@@ -400,7 +364,7 @@ public sealed class TcpContract
         }
         else
         {
-            Assert.Null(request.Permissions);
+            Assert.Null(permissions);
         }
     }
 
@@ -408,18 +372,14 @@ public sealed class TcpContract
     public void TcpContracts_CreateUser_WithPermission_HasCorrectBytes()
     {
         // Arrange
-        var request = new CreateUserRequest
-        {
-            Username = "testuser",
-            Password = "testpassword",
-            Status = UserStatus.Active,
-            Permissions = PermissionsFactory.CreatePermissions(),
-        };
+        var request = new CreateUserRequest("testuser", "testpassword", UserStatus.Active,
+            PermissionsFactory.CreatePermissions());
+
         // Act
-        var result = TcpContracts.CreateUser(request);
+        var result = TcpContracts.CreateUser(request.Username, request.Password, request.Status, request.Permissions);
 
         // Assert
-        int position = 0;
+        var position = 0;
 
         Assert.Equal((byte)request.Username.Length, result[position]);
         position += 1;
@@ -455,7 +415,7 @@ public sealed class TcpContract
 
             var permissionsBytes = result[position..(position + permissionsSize)];
             var mappedPermissions = PermissionsFactory.PermissionsFromBytes(permissionsBytes);
-            request.Permissions.Global.Should().BeEquivalentTo(mappedPermissions.Global);
+            request.Permissions!.Global.Should().BeEquivalentTo(mappedPermissions.Global);
 
             if (request.Permissions.Streams != null)
             {
@@ -505,25 +465,22 @@ public sealed class TcpContract
     public void TcpContracts_ChangePasswordRequest_HasCorrectBytes()
     {
         // Arrange
-        var request = new ChangePasswordRequest
-        {
-            UserId = Identifier.Numeric(1),
-            CurrentPassword = "oldpassword",
-            NewPassword = "newpassword"
-        };
+        var userId = Identifier.Numeric(1);
+        var currentPassword = "oldpassword";
+        var newPassword = "newpassword";
 
         // Act
-        var result = TcpContracts.ChangePassword(request);
+        var result = TcpContracts.ChangePassword(userId, currentPassword, newPassword);
 
         // Assert
-        var expectedLength = request.UserId.Length + 2 +
-                             request.CurrentPassword.Length + request.NewPassword.Length + 2;
+        var expectedLength = userId.Length + 2 +
+                             currentPassword.Length + newPassword.Length + 2;
         Assert.Equal(expectedLength, result.Length);
 
         // Validate bytes can be translated back to properties
         var position = 2;
-        var userIdBytes = result[position..(position + request.UserId.Length)];
-        position += request.UserId.Length;
+        var userIdBytes = result[position..(position + userId.Length)];
+        position += userId.Length;
         var currentPasswordLength = result[position];
         position += 1;
         var currentPasswordBytes = result[position..(position + currentPasswordLength)];
@@ -536,9 +493,9 @@ public sealed class TcpContract
         var decodedCurrentPassword = Encoding.UTF8.GetString(currentPasswordBytes);
         var decodedNewPassword = Encoding.UTF8.GetString(newPasswordBytes);
 
-        Assert.Equal(request.UserId.Value, userIdBytes);
-        Assert.Equal(request.CurrentPassword, decodedCurrentPassword);
-        Assert.Equal(request.NewPassword, decodedNewPassword);
+        Assert.Equal(userId.Value, userIdBytes);
+        Assert.Equal(currentPassword, decodedCurrentPassword);
+        Assert.Equal(newPassword, decodedNewPassword);
     }
 
     [Fact]
@@ -546,11 +503,12 @@ public sealed class TcpContract
     {
         // Arrange
         var request = MessageFactory.CreateMessageFetchRequestConsumer();
-        int messageBufferSize = 23 + 2 + 4 + 2 + 2 + request.Consumer.Id.Length;
+        var messageBufferSize = 23 + 2 + 4 + 2 + 2 + request.Consumer.Id.Length;
         var result = new byte[messageBufferSize];
 
         // Act
-        TcpContracts.GetMessages(result, request);
+        TcpContracts.GetMessages(result, request.Consumer, request.StreamId, request.TopicId,
+            request.PollingStrategy, request.Count, request.AutoCommit, request.PartitionId);
 
         // Assert
         Assert.Equal(result[0] switch
@@ -566,17 +524,16 @@ public sealed class TcpContract
         Assert.Equal(request.TopicId.Kind, BytesToIdentifierNumeric(result, 13).Kind);
         Assert.Equal(request.StreamId.Length, BytesToIdentifierNumeric(result, 7).Length);
         Assert.Equal(request.TopicId.Length, BytesToIdentifierNumeric(result, 13).Length);
-        Assert.Equal(request.PartitionId, BitConverter.ToInt32(result[19..23]));
-        Assert.Equal(
-            result[23] switch
-            {
-                1 => MessagePolling.Offset,
-                2 => MessagePolling.Timestamp,
-                3 => MessagePolling.First,
-                4 => MessagePolling.Last,
-                5 => MessagePolling.Next,
-                _ => throw new ArgumentOutOfRangeException()
-            }, request.PollingStrategy.Kind);
+        Assert.Equal(request.PartitionId, BitConverter.ToUInt32(result[19..23]));
+        Assert.Equal(result[23] switch
+        {
+            1 => MessagePolling.Offset,
+            2 => MessagePolling.Timestamp,
+            3 => MessagePolling.First,
+            4 => MessagePolling.Last,
+            5 => MessagePolling.Next,
+            _ => throw new ArgumentOutOfRangeException()
+        }, request.PollingStrategy.Kind);
         Assert.Equal(request.PollingStrategy.Value, BitConverter.ToUInt64(result[24..32]));
         Assert.Equal(request.Count, BitConverter.ToInt32(result[32..36]));
         Assert.Equal(request.AutoCommit, result[36] switch
@@ -586,7 +543,6 @@ public sealed class TcpContract
             _ => throw new ArgumentOutOfRangeException()
         });
     }
-
 
 
     [Fact]
@@ -622,21 +578,26 @@ public sealed class TcpContract
         Assert.Equal(request.Partitioning.Length, result[17]);
         Assert.Equal(request.Partitioning.Value.Length, result[18..(18 + request.Partitioning.Length)].Length);
 
-        int currentIndex = 26 + (16 * 2);
+        var currentIndex = 26 + 16 * 2;
         foreach (var message in request.Messages)
         {
             Assert.Equal(message.Header.Checksum, BitConverter.ToUInt64(result[currentIndex..(currentIndex + 8)]));
-            Assert.Equal(message.Header.Id, BinaryPrimitives.ReadUInt128LittleEndian(result[(currentIndex + 8)..(currentIndex + 24)]));
-            Assert.Equal(message.Header.Offset, BitConverter.ToUInt64(result[(currentIndex + 24)..(currentIndex + 32)]));
-            Assert.Equal(message.Header.Timestamp, DateTimeOffsetUtils.FromUnixTimeMicroSeconds(BitConverter.ToUInt64(result[(currentIndex + 32)..(currentIndex + 40)])));
-            Assert.Equal(message.Header.OriginTimestamp, BitConverter.ToUInt64(result[(currentIndex + 40)..(currentIndex + 48)]));
+            Assert.Equal(message.Header.Id,
+                BinaryPrimitives.ReadUInt128LittleEndian(result[(currentIndex + 8)..(currentIndex + 24)]));
+            Assert.Equal(message.Header.Offset,
+                BitConverter.ToUInt64(result[(currentIndex + 24)..(currentIndex + 32)]));
+            Assert.Equal(message.Header.Timestamp,
+                DateTimeOffsetUtils.FromUnixTimeMicroSeconds(
+                    BitConverter.ToUInt64(result[(currentIndex + 32)..(currentIndex + 40)])));
+            Assert.Equal(message.Header.OriginTimestamp,
+                BitConverter.ToUInt64(result[(currentIndex + 40)..(currentIndex + 48)]));
             var userHeadersLength = BitConverter.ToInt32(result[(currentIndex + 48)..(currentIndex + 52)]);
             Assert.Equal(message.Header.UserHeadersLength, userHeadersLength);
             var payloadLength = BitConverter.ToInt32(result[(currentIndex + 52)..(currentIndex + 56)]);
             Assert.Equal(message.Header.PayloadLength, payloadLength);
 
             currentIndex += 56;
-            byte[] payload = result[currentIndex..(currentIndex + payloadLength)].ToArray();
+            var payload = result[currentIndex..(currentIndex + payloadLength)].ToArray();
             currentIndex += payloadLength;
 
             Assert.Equal(message.Payload.Length, payload.Length);
@@ -649,17 +610,18 @@ public sealed class TcpContract
     public void TcpContracts_CreateStream_HasCorrectBytes()
     {
         // Arrange
-        var request = StreamFactory.CreateStreamRequest();
+        var name = "test-stream" + Random.Shared.Next(1, 69) + Utility.RandomString(12).ToLower();
+        var streamId = (uint)Random.Shared.Next(1, 2137);
 
         // Act
-        var result = TcpContracts.CreateStream(request).AsSpan();
+        Span<byte> result = TcpContracts.CreateStream(name, streamId).AsSpan();
 
         // Assert
-        int expectedBytesLength = sizeof(int) + request.Name.Length + 1;
+        var expectedBytesLength = sizeof(int) + name.Length + 1;
 
         Assert.Equal(expectedBytesLength, result.Length);
-        Assert.Equal(request.StreamId, BitConverter.ToInt32(result[..5]));
-        Assert.Equal(request.Name, Encoding.UTF8.GetString(result[5..]));
+        Assert.Equal(streamId, BitConverter.ToUInt32(result[..5]));
+        Assert.Equal(name, Encoding.UTF8.GetString(result[5..]));
     }
 
     [Fact]
@@ -668,18 +630,14 @@ public sealed class TcpContract
         // Arrange
         var streamId = Identifier.String("my-stream");
         var topicId = Identifier.String("my-topic");
-        var request = new CreateConsumerGroupRequest
-        {
-            Name = Utility.RandomString(69),
-            StreamId = streamId,
-            TopicId = topicId,
-            ConsumerGroupId = Random.Shared.Next(1, 69)
-        };
+        var name = Utility.RandomString(69);
+        var consumerGroupId = Random.Shared.Next(1, 69);
+
         // Act
-        var result = TcpContracts.CreateGroup(request).AsSpan();
+        Span<byte> result = TcpContracts.CreateGroup(streamId, topicId, name, (uint)consumerGroupId).AsSpan();
 
         // Assert
-        int expectedBytesLength = 2 + streamId.Length + 2 + topicId.Length + 4 + 1 + request.Name.Length;
+        var expectedBytesLength = 2 + streamId.Length + 2 + topicId.Length + 4 + 1 + name.Length;
 
         Assert.Equal(expectedBytesLength, result.Length);
         Assert.Equal(streamId.Value, BytesToIdentifierString(result, 0).Value);
@@ -689,8 +647,7 @@ public sealed class TcpContract
         Assert.Equal(streamId.Length, BytesToIdentifierString(result, 0).Length);
         Assert.Equal(topicId.Length, BytesToIdentifierString(result, 2 + streamId.Length).Length);
         var position = 2 + streamId.Length + 2 + topicId.Length + 4;
-        Assert.Equal(request.Name.Length, result[position]);
-
+        Assert.Equal(name.Length, result[position]);
     }
 
     [Fact]
@@ -702,10 +659,10 @@ public sealed class TcpContract
         var groupId = Identifier.Numeric(1);
 
         // Act
-        var result = TcpContracts.DeleteGroup(streamId, topicId, groupId).AsSpan();
+        Span<byte> result = TcpContracts.DeleteGroup(streamId, topicId, groupId).AsSpan();
 
         // Assert
-        int expectedBytesLength = 2 + streamId.Length + 2 + topicId.Length + groupId.Length + 2;
+        var expectedBytesLength = 2 + streamId.Length + 2 + topicId.Length + groupId.Length + 2;
 
         Assert.Equal(expectedBytesLength, result.Length);
         Assert.Equal(streamId.Value, BytesToIdentifierNumeric(result, 0).Value);
@@ -721,10 +678,10 @@ public sealed class TcpContract
         var topicId = Identifier.Numeric(1);
 
         // Act
-        var result = TcpContracts.GetGroups(streamId, topicId).AsSpan();
+        Span<byte> result = TcpContracts.GetGroups(streamId, topicId).AsSpan();
 
         // Assert
-        int expectedBytesLength = 2 + streamId.Length + 2 + topicId.Length;
+        var expectedBytesLength = 2 + streamId.Length + 2 + topicId.Length;
 
         Assert.Equal(expectedBytesLength, result.Length);
         Assert.Equal(streamId.Value, BytesToIdentifierString(result, 0).Value);
@@ -735,18 +692,20 @@ public sealed class TcpContract
     public void TcpContracts_JoinGroup_HasCorrectBytes()
     {
         // Arrange
-        var request = ConsumerGroupFactory.CreateJoinGroupRequest();
+        var streamId = Identifier.Numeric(Random.Shared.Next(1, 10));
+        var topicId = Identifier.Numeric(Random.Shared.Next(1, 10));
+        var consumerGroupId = Identifier.Numeric(Random.Shared.Next(1, 10));
 
         // Act
-        var result = TcpContracts.JoinGroup(request).AsSpan();
+        Span<byte> result = TcpContracts.JoinGroup(streamId, topicId, consumerGroupId).AsSpan();
 
         // Assert
-        int expectedBytesLength = 2 + request.StreamId.Length + 2 + request.TopicId.Length + request.ConsumerGroupId.Length + 2;
+        var expectedBytesLength = 2 + streamId.Length + 2 + topicId.Length + consumerGroupId.Length + 2;
 
         Assert.Equal(expectedBytesLength, result.Length);
-        Assert.Equal(request.StreamId.Value, BytesToIdentifierNumeric(result, 0).Value);
-        Assert.Equal(request.TopicId.Value, BytesToIdentifierNumeric(result, 6).Value);
-        Assert.Equal(request.ConsumerGroupId.Value, BytesToIdentifierNumeric(result, 12).Value);
+        Assert.Equal(streamId.Value, BytesToIdentifierNumeric(result, 0).Value);
+        Assert.Equal(topicId.Value, BytesToIdentifierNumeric(result, 6).Value);
+        Assert.Equal(consumerGroupId.Value, BytesToIdentifierNumeric(result, 12).Value);
     }
 
 
@@ -754,18 +713,20 @@ public sealed class TcpContract
     public void TcpContracts_LeaveGroup_HasCorrectBytes()
     {
         // Arrange
-        var request = ConsumerGroupFactory.CreateLeaveGroupRequest();
+        var streamId = Identifier.Numeric(Random.Shared.Next(1, 10));
+        var topicId = Identifier.Numeric(Random.Shared.Next(1, 10));
+        var consumerGroupId = Identifier.Numeric(Random.Shared.Next(1, 10));
 
         // Act
-        var result = TcpContracts.LeaveGroup(request).AsSpan();
+        Span<byte> result = TcpContracts.LeaveGroup(streamId, topicId, consumerGroupId).AsSpan();
 
         // Assert
-        int expectedBytesLength = 2 + request.StreamId.Length + 2 + request.TopicId.Length + request.ConsumerGroupId.Length + 2;
+        var expectedBytesLength = 2 + streamId.Length + 2 + topicId.Length + consumerGroupId.Length + 2;
 
         Assert.Equal(expectedBytesLength, result.Length);
-        Assert.Equal(request.StreamId.Value, BytesToIdentifierNumeric(result, 0).Value);
-        Assert.Equal(request.TopicId.Value, BytesToIdentifierNumeric(result, 6).Value);
-        Assert.Equal(request.ConsumerGroupId.Value, BytesToIdentifierNumeric(result, 12).Value);
+        Assert.Equal(streamId.Value, BytesToIdentifierNumeric(result, 0).Value);
+        Assert.Equal(topicId.Value, BytesToIdentifierNumeric(result, 6).Value);
+        Assert.Equal(consumerGroupId.Value, BytesToIdentifierNumeric(result, 12).Value);
     }
 
 
@@ -775,14 +736,14 @@ public sealed class TcpContract
         // Arrange
         var streamId = Identifier.String("my-stream");
         var topicId = Identifier.Numeric(1);
-        int groupId = 1;
+        var groupId = 1;
         var groupIdentifier = Identifier.Numeric(groupId);
 
         // Act
-        var result = TcpContracts.GetGroup(streamId, topicId, groupIdentifier).AsSpan();
+        Span<byte> result = TcpContracts.GetGroup(streamId, topicId, groupIdentifier).AsSpan();
 
         // Assert
-        int expectedBytesLength = 2 + streamId.Length + 2 + topicId.Length + groupIdentifier.Length + 2;
+        var expectedBytesLength = 2 + streamId.Length + 2 + topicId.Length + groupIdentifier.Length + 2;
 
         Assert.Equal(expectedBytesLength, result.Length);
         Assert.Equal(streamId.Value, BytesToIdentifierString(result, 0).Value);
@@ -804,22 +765,24 @@ public sealed class TcpContract
         var request = TopicFactory.CreateTopicRequest();
 
         // Act
-        var result = TcpContracts.CreateTopic(streamId, request).AsSpan();
+        Span<byte> result = TcpContracts.CreateTopic(streamId, request.Name, request.PartitionsCount,
+            request.CompressionAlgorithm, request.TopicId, request.ReplicationFactor, request.MessageExpiry,
+            request.MaxTopicSize).AsSpan();
 
         // Assert
-        int expectedBytesLength = 2 + streamId.Length + 27 + request.Name.Length; 
-        
+        var expectedBytesLength = 2 + streamId.Length + 27 + request.Name.Length;
+
         Assert.Equal(expectedBytesLength, result.Length);
         Assert.Equal(streamId.Value, BytesToIdentifierNumeric(result, 0).Value);
         Assert.Equal(streamId.Length, BytesToIdentifierNumeric(result, 0).Length);
         Assert.Equal(streamId.Kind, BytesToIdentifierNumeric(result, 0).Kind);
-        Assert.Equal(request.TopicId, BitConverter.ToInt32(result[6..10]));
-        Assert.Equal(request.PartitionsCount, BitConverter.ToInt32(result[10..14]));
+        Assert.Equal(request.TopicId, BitConverter.ToUInt32(result[6..10]));
+        Assert.Equal(request.PartitionsCount, BitConverter.ToUInt32(result[10..14]));
         Assert.Equal((int)request.CompressionAlgorithm, result[14]);
         Assert.Equal(request.MessageExpiry, BitConverter.ToUInt64(result[15..23]));
         Assert.Equal(request.MaxTopicSize, BitConverter.ToUInt64(result[23..31]));
-        Assert.Equal(request.ReplicationFactor, (int)result[31]);
-        Assert.Equal(request.Name.Length, (int)result[32]);
+        Assert.Equal(request.ReplicationFactor, result[31]);
+        Assert.Equal(request.Name.Length, result[32]);
         Assert.Equal(request.Name, Encoding.UTF8.GetString(result[33..]));
     }
 
@@ -832,10 +795,10 @@ public sealed class TcpContract
         var topicId = Identifier.Numeric(1);
 
         // Act
-        var result = TcpContracts.GetTopicById(streamId, topicId).AsSpan();
+        Span<byte> result = TcpContracts.GetTopicById(streamId, topicId).AsSpan();
 
         // Assert
-        int expectedBytesLength = 2 + streamId.Length + 2 + topicId.Length;
+        var expectedBytesLength = 2 + streamId.Length + 2 + topicId.Length;
 
         Assert.Equal(expectedBytesLength, result.Length);
         Assert.Equal(streamId.Value, BytesToIdentifierNumeric(result, 0).Value);
@@ -855,10 +818,10 @@ public sealed class TcpContract
         var topicId = Identifier.Numeric(1);
 
         // Act
-        var result = TcpContracts.DeleteTopic(streamId, topicId).AsSpan();
+        Span<byte> result = TcpContracts.DeleteTopic(streamId, topicId).AsSpan();
 
         // Assert
-        int expectedBytesLength = 2 + streamId.Length + 2 + topicId.Length;
+        var expectedBytesLength = 2 + streamId.Length + 2 + topicId.Length;
 
         Assert.Equal(expectedBytesLength, result.Length);
         Assert.Equal(streamId.Value, BytesToIdentifierNumeric(result, 0).Value);
@@ -873,71 +836,78 @@ public sealed class TcpContract
     public void TcpContracts_UpdateOffset_HasCorrectBytes()
     {
         // Arrange
-        var contract = OffsetFactory.CreateOffsetContract();
+        var streamId = Identifier.Numeric(1);
+        var topicId = Identifier.Numeric(1);
+        var consumer = Consumer.New(1);
+        var offset = (ulong)Random.Shared.Next(1, 10);
+        var partitionId = (uint)Random.Shared.Next(1, 10);
 
         // Act
-        var result = TcpContracts.UpdateOffset(contract).AsSpan();
+        Span<byte> result = TcpContracts.UpdateOffset(streamId, topicId, consumer, offset, partitionId).AsSpan();
 
         // Assert
-        int expectedBytesLength = 2 + contract.StreamId.Length + 2 + contract.TopicId.Length + 5 + 2 + contract.Consumer.Id.Length + 8;
+        var expectedBytesLength = 2 + streamId.Length + 2 + topicId.Length + 5 + 2 + consumer.Id.Length + 8;
 
         Assert.Equal(expectedBytesLength, result.Length);
         Assert.Equal(1, result[0]);
-        Assert.Equal(contract.Consumer.Id.Kind.GetByte(), result[1]);
-        Assert.Equal(contract.StreamId.Value, BytesToIdentifierNumeric(result, 7).Value);
-        Assert.Equal(contract.StreamId.Length, BytesToIdentifierNumeric(result, 7).Length);
-        Assert.Equal(contract.StreamId.Kind, BytesToIdentifierNumeric(result, 7).Kind);
-        Assert.Equal(contract.TopicId.Value, BytesToIdentifierNumeric(result, 13).Value);
-        Assert.Equal(contract.TopicId.Length, BytesToIdentifierNumeric(result, 13).Length);
-        Assert.Equal(contract.TopicId.Kind, BytesToIdentifierNumeric(result, 13).Kind);
-        Assert.Equal(contract.PartitionId, BitConverter.ToInt32(result[19..23]));
-        Assert.Equal(contract.Offset, BitConverter.ToUInt64(result[23..31]));
+        Assert.Equal(consumer.Id.Kind.GetByte(), result[1]);
+        Assert.Equal(streamId.Value, BytesToIdentifierNumeric(result, 7).Value);
+        Assert.Equal(streamId.Length, BytesToIdentifierNumeric(result, 7).Length);
+        Assert.Equal(streamId.Kind, BytesToIdentifierNumeric(result, 7).Kind);
+        Assert.Equal(topicId.Value, BytesToIdentifierNumeric(result, 13).Value);
+        Assert.Equal(topicId.Length, BytesToIdentifierNumeric(result, 13).Length);
+        Assert.Equal(topicId.Kind, BytesToIdentifierNumeric(result, 13).Kind);
+        Assert.Equal(partitionId, BitConverter.ToUInt32(result[19..23]));
+        Assert.Equal(offset, BitConverter.ToUInt64(result[23..31]));
     }
-
 
 
     [Fact]
     public void TcpContracts_GetOffset_HasCorrectBytes()
     {
         // Arrange
-        var request = OffsetFactory.CreateOffsetRequest();
+        var streamId = Identifier.Numeric(Random.Shared.Next(1, 10));
+        var topicId = Identifier.Numeric(Random.Shared.Next(1, 10));
+        var consumer = Consumer.New(1);
+        var partitionId = (uint)Random.Shared.Next(1, 10);
 
         // Act
-        var result = TcpContracts.GetOffset(request).AsSpan();
+        Span<byte> result = TcpContracts.GetOffset(streamId, topicId, consumer, partitionId).AsSpan();
 
         // Assert
-        int expectedBytesLength = 2 + request.StreamId.Length + 2 + request.TopicId.Length + 5 + 2 + request.Consumer.Id.Length;
+        var expectedBytesLength = 2 + streamId.Length + 2 + topicId.Length + 5 + 2 + consumer.Id.Length;
 
         Assert.Equal(expectedBytesLength, result.Length);
         Assert.Equal(1, result[0]);
-        Assert.Equal(request.Consumer.Id.Kind.GetByte(), result[1]);
-        Assert.Equal(request.StreamId.Value, BytesToIdentifierNumeric(result, 7).Value);
-        Assert.Equal(request.StreamId.Length, BytesToIdentifierNumeric(result, 7).Length);
-        Assert.Equal(request.StreamId.Kind, BytesToIdentifierNumeric(result, 7).Kind);
-        Assert.Equal(request.TopicId.Value, BytesToIdentifierNumeric(result, 13).Value);
-        Assert.Equal(request.TopicId.Length, BytesToIdentifierNumeric(result, 13).Length);
-        Assert.Equal(request.TopicId.Kind, BytesToIdentifierNumeric(result, 13).Kind);
-        Assert.Equal(request.PartitionId, BitConverter.ToInt32(result[19..23]));
+        Assert.Equal(consumer.Id.Kind.GetByte(), result[1]);
+        Assert.Equal(streamId.Value, BytesToIdentifierNumeric(result, 7).Value);
+        Assert.Equal(streamId.Length, BytesToIdentifierNumeric(result, 7).Length);
+        Assert.Equal(streamId.Kind, BytesToIdentifierNumeric(result, 7).Kind);
+        Assert.Equal(topicId.Value, BytesToIdentifierNumeric(result, 13).Value);
+        Assert.Equal(topicId.Length, BytesToIdentifierNumeric(result, 13).Length);
+        Assert.Equal(topicId.Kind, BytesToIdentifierNumeric(result, 13).Kind);
+        Assert.Equal(partitionId, BitConverter.ToUInt32(result[19..23]));
     }
 
     [Fact]
     public void TcpContracts_CreatePartitions_HasCorrectBytes()
     {
         // Arrange
-        var request = PartitionFactory.CreatePartitionsRequest();
+        var streamId = Identifier.Numeric(1);
+        var topicId = Identifier.Numeric(1);
+        var partitionsCount = (uint)Random.Shared.Next(1, 69);
 
         // Act
-        var result = TcpContracts.CreatePartitions(request).AsSpan();
+        Span<byte> result = TcpContracts.CreatePartitions(streamId, topicId, partitionsCount).AsSpan();
 
         // Assert
-        Assert.Equal(request.StreamId.Value, BytesToIdentifierNumeric(result, 0).Value);
-        Assert.Equal(request.StreamId.Length, BytesToIdentifierNumeric(result, 0).Length);
-        Assert.Equal(request.StreamId.Kind, BytesToIdentifierNumeric(result, 0).Kind);
-        Assert.Equal(request.TopicId.Value, BytesToIdentifierNumeric(result, 6).Value);
-        Assert.Equal(request.TopicId.Length, BytesToIdentifierNumeric(result, 6).Length);
-        Assert.Equal(request.TopicId.Kind, BytesToIdentifierNumeric(result, 6).Kind);
-        Assert.Equal(request.PartitionsCount, BitConverter.ToInt32(result[12..16]));
-
+        Assert.Equal(streamId.Value, BytesToIdentifierNumeric(result, 0).Value);
+        Assert.Equal(streamId.Length, BytesToIdentifierNumeric(result, 0).Length);
+        Assert.Equal(streamId.Kind, BytesToIdentifierNumeric(result, 0).Kind);
+        Assert.Equal(topicId.Value, BytesToIdentifierNumeric(result, 6).Value);
+        Assert.Equal(topicId.Length, BytesToIdentifierNumeric(result, 6).Length);
+        Assert.Equal(topicId.Kind, BytesToIdentifierNumeric(result, 6).Kind);
+        Assert.Equal(partitionsCount, BitConverter.ToUInt32(result[12..16]));
     }
 
 
@@ -945,22 +915,22 @@ public sealed class TcpContract
     public void TcpContracts_DeletePartitions_HasCorrectBytes()
     {
         // Arrange
-        var request = PartitionFactory.CreateDeletePartitionsRequest();
+        var streamId = Identifier.Numeric(1);
+        var topicId = Identifier.Numeric(1);
+        var partitionsCount = (uint)Random.Shared.Next(1, 69);
 
         // Act
-        var result = TcpContracts.DeletePartitions(request).AsSpan();
+        Span<byte> result = TcpContracts.DeletePartitions(streamId, topicId, partitionsCount).AsSpan();
 
         // Assert
-        Assert.Equal(request.StreamId.Value, BytesToIdentifierNumeric(result, 0).Value);
-        Assert.Equal(request.StreamId.Length, BytesToIdentifierNumeric(result, 0).Length);
-        Assert.Equal(request.StreamId.Kind, BytesToIdentifierNumeric(result, 0).Kind);
-        Assert.Equal(request.TopicId.Value, BytesToIdentifierNumeric(result, 6).Value);
-        Assert.Equal(request.TopicId.Length, BytesToIdentifierNumeric(result, 6).Length);
-        Assert.Equal(request.TopicId.Kind, BytesToIdentifierNumeric(result, 6).Kind);
-        Assert.Equal(request.PartitionsCount, BitConverter.ToInt32(result[12..16]));
-
+        Assert.Equal(streamId.Value, BytesToIdentifierNumeric(result, 0).Value);
+        Assert.Equal(streamId.Length, BytesToIdentifierNumeric(result, 0).Length);
+        Assert.Equal(streamId.Kind, BytesToIdentifierNumeric(result, 0).Kind);
+        Assert.Equal(topicId.Value, BytesToIdentifierNumeric(result, 6).Value);
+        Assert.Equal(topicId.Length, BytesToIdentifierNumeric(result, 6).Length);
+        Assert.Equal(topicId.Kind, BytesToIdentifierNumeric(result, 6).Kind);
+        Assert.Equal(partitionsCount, BitConverter.ToUInt32(result[12..16]));
     }
-
 
     private static Identifier BytesToIdentifierNumeric(Span<byte> bytes, int startPos)
     {
@@ -972,7 +942,7 @@ public sealed class TcpContract
         };
         var identifierLength = (int)bytes[startPos + 1];
         var valueBytes = new byte[identifierLength];
-        for (int i = 0; i < identifierLength; i++)
+        for (var i = 0; i < identifierLength; i++)
         {
             valueBytes[i] = bytes[i + startPos + 2];
         }
@@ -984,6 +954,7 @@ public sealed class TcpContract
             Value = valueBytes
         };
     }
+
     private static Identifier BytesToIdentifierString(Span<byte> bytes, int startPos)
     {
         var idKind = bytes[startPos] switch
@@ -994,7 +965,7 @@ public sealed class TcpContract
         };
         var identifierLength = (int)bytes[startPos + 1];
         var valueBytes = new byte[identifierLength];
-        for (int i = 0; i < identifierLength; i++)
+        for (var i = 0; i < identifierLength; i++)
         {
             valueBytes[i] = bytes[i + startPos + 2];
         }
@@ -1006,7 +977,9 @@ public sealed class TcpContract
             Value = valueBytes
         };
     }
-    private static void WriteBytesFromStreamAndTopicIdToSpan(Identifier streamId, Identifier topicId, Span<byte> bytes, int startPos = 0)
+
+    private static void WriteBytesFromStreamAndTopicIdToSpan(Identifier streamId, Identifier topicId, Span<byte> bytes,
+        int startPos = 0)
     {
         bytes[startPos] = streamId.Kind switch
         {
@@ -1015,12 +988,12 @@ public sealed class TcpContract
             _ => throw new ArgumentOutOfRangeException()
         };
         bytes[startPos + 1] = (byte)streamId.Length;
-        for (int i = 0; i < streamId.Length; i++)
+        for (var i = 0; i < streamId.Length; i++)
         {
             bytes[i + startPos + 2] = streamId.Value[i];
         }
 
-        int position = startPos + 2 + streamId.Length;
+        var position = startPos + 2 + streamId.Length;
         bytes[position] = topicId.Kind switch
         {
             IdKind.Numeric => 1,
@@ -1028,7 +1001,7 @@ public sealed class TcpContract
             _ => throw new ArgumentOutOfRangeException()
         };
         bytes[position + 1] = (byte)topicId.Length;
-        for (int i = 0; i < topicId.Length; i++)
+        for (var i = 0; i < topicId.Length; i++)
         {
             bytes[i + position + 2] = topicId.Value[i];
         }

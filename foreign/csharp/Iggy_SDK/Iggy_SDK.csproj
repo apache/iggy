@@ -7,7 +7,7 @@
         <TargetFramework>net8.0</TargetFramework>
         <AssemblyName>Apache.Iggy</AssemblyName>
         <RootNamespace>Apache.Iggy</RootNamespace>
-        <PackageVersion>0.5.0</PackageVersion>
+        <PackageVersion>0.6.0-edge.1</PackageVersion>
     </PropertyGroup>
 
     <PropertyGroup>
@@ -21,11 +21,11 @@
     </PropertyGroup>
 
     <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
-      <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+        <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     </PropertyGroup>
 
     <PropertyGroup Condition=" '$(Configuration)' == 'Release' ">
-      <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+        <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     </PropertyGroup>
 
     <ItemGroup>
@@ -38,14 +38,19 @@
     </ItemGroup>
 
     <ItemGroup>
-      <PackageReference Include="Microsoft.Extensions.Logging" />
-      <PackageReference Include="System.IO.Hashing" />
+        <PackageReference Include="Microsoft.Extensions.Logging" />
+        <PackageReference Include="System.IO.Hashing" />
     </ItemGroup>
 
     <ItemGroup>
-      <Content Include="..\DEPENDENCIES.md">
-        <Link>Properties\DEPENDENCIES.md</Link>
-      </Content>
+        <Content Include="..\DEPENDENCIES.md">
+            <Link>Properties\DEPENDENCIES.md</Link>
+        </Content>
+    </ItemGroup>
+    
+    <ItemGroup>
+        <InternalsVisibleTo Include="Apache.Iggy.Tests" />
+        <InternalsVisibleTo Include="Apache.Iggy.Tests.Integrations" />
     </ItemGroup>
 
 </Project>

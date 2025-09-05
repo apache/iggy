@@ -32,70 +32,86 @@ class AutoCommit:
         r"""
         The auto-commit is disabled and the offset must be stored manually by the consumer.
         """
+
         __match_args__ = ((),)
         def __new__(cls) -> AutoCommit.Disabled: ...
         def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key:builtins.int) -> typing.Any: ...
-    
+        def __getitem__(self, key: builtins.int) -> typing.Any: ...
+
     class Interval(AutoCommit):
         r"""
         The auto-commit is enabled and the offset is stored on the server after a certain interval.
         """
+
         __match_args__ = ("_0",)
         @property
         def _0(self) -> datetime.timedelta: ...
-        def __new__(cls, _0:datetime.timedelta) -> AutoCommit.Interval: ...
+        def __new__(cls, _0: datetime.timedelta) -> AutoCommit.Interval: ...
         def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key:builtins.int) -> typing.Any: ...
-    
+        def __getitem__(self, key: builtins.int) -> typing.Any: ...
+
     class IntervalOrWhen(AutoCommit):
         r"""
         The auto-commit is enabled and the offset is stored on the server after a certain interval or depending on the mode when consuming the messages.
         """
-        __match_args__ = ("_0", "_1",)
+
+        __match_args__ = (
+            "_0",
+            "_1",
+        )
         @property
         def _0(self) -> datetime.timedelta: ...
         @property
         def _1(self) -> AutoCommitWhen: ...
-        def __new__(cls, _0:datetime.timedelta, _1:AutoCommitWhen) -> AutoCommit.IntervalOrWhen: ...
+        def __new__(
+            cls, _0: datetime.timedelta, _1: AutoCommitWhen
+        ) -> AutoCommit.IntervalOrWhen: ...
         def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key:builtins.int) -> typing.Any: ...
-    
+        def __getitem__(self, key: builtins.int) -> typing.Any: ...
+
     class IntervalOrAfter(AutoCommit):
         r"""
         The auto-commit is enabled and the offset is stored on the server after a certain interval or depending on the mode after consuming the messages.
         """
-        __match_args__ = ("_0", "_1",)
+
+        __match_args__ = (
+            "_0",
+            "_1",
+        )
         @property
         def _0(self) -> datetime.timedelta: ...
         @property
         def _1(self) -> AutoCommitAfter: ...
-        def __new__(cls, _0:datetime.timedelta, _1:AutoCommitAfter) -> AutoCommit.IntervalOrAfter: ...
+        def __new__(
+            cls, _0: datetime.timedelta, _1: AutoCommitAfter
+        ) -> AutoCommit.IntervalOrAfter: ...
         def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key:builtins.int) -> typing.Any: ...
-    
+        def __getitem__(self, key: builtins.int) -> typing.Any: ...
+
     class When(AutoCommit):
         r"""
         The auto-commit is enabled and the offset is stored on the server depending on the mode when consuming the messages.
         """
+
         __match_args__ = ("_0",)
         @property
         def _0(self) -> AutoCommitWhen: ...
-        def __new__(cls, _0:AutoCommitWhen) -> AutoCommit.When: ...
+        def __new__(cls, _0: AutoCommitWhen) -> AutoCommit.When: ...
         def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key:builtins.int) -> typing.Any: ...
-    
+        def __getitem__(self, key: builtins.int) -> typing.Any: ...
+
     class After(AutoCommit):
         r"""
         The auto-commit is enabled and the offset is stored on the server depending on the mode after consuming the messages.
         """
+
         __match_args__ = ("_0",)
         @property
         def _0(self) -> AutoCommitAfter: ...
-        def __new__(cls, _0:AutoCommitAfter) -> AutoCommit.After: ...
+        def __new__(cls, _0: AutoCommitAfter) -> AutoCommit.After: ...
         def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key:builtins.int) -> typing.Any: ...
-    
+        def __getitem__(self, key: builtins.int) -> typing.Any: ...
+
     ...
 
 class AutoCommitAfter:
@@ -106,31 +122,36 @@ class AutoCommitAfter:
         r"""
         The offset is stored on the server after all the messages are consumed.
         """
+
         __match_args__ = ((),)
         def __new__(cls) -> AutoCommitAfter.ConsumingAllMessages: ...
         def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key:builtins.int) -> typing.Any: ...
-    
+        def __getitem__(self, key: builtins.int) -> typing.Any: ...
+
     class ConsumingEachMessage(AutoCommitAfter):
         r"""
         The offset is stored on the server after consuming each message.
         """
+
         __match_args__ = ((),)
         def __new__(cls) -> AutoCommitAfter.ConsumingEachMessage: ...
         def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key:builtins.int) -> typing.Any: ...
-    
+        def __getitem__(self, key: builtins.int) -> typing.Any: ...
+
     class ConsumingEveryNthMessage(AutoCommitAfter):
         r"""
         The offset is stored on the server after consuming every Nth message.
         """
+
         __match_args__ = ("_0",)
         @property
         def _0(self) -> builtins.int: ...
-        def __new__(cls, _0:builtins.int) -> AutoCommitAfter.ConsumingEveryNthMessage: ...
+        def __new__(
+            cls, _0: builtins.int
+        ) -> AutoCommitAfter.ConsumingEveryNthMessage: ...
         def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key:builtins.int) -> typing.Any: ...
-    
+        def __getitem__(self, key: builtins.int) -> typing.Any: ...
+
     ...
 
 class AutoCommitWhen:
@@ -141,40 +162,46 @@ class AutoCommitWhen:
         r"""
         The offset is stored on the server when the messages are received.
         """
+
         __match_args__ = ((),)
         def __new__(cls) -> AutoCommitWhen.PollingMessages: ...
         def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key:builtins.int) -> typing.Any: ...
-    
+        def __getitem__(self, key: builtins.int) -> typing.Any: ...
+
     class ConsumingAllMessages(AutoCommitWhen):
         r"""
         The offset is stored on the server when all the messages are consumed.
         """
+
         __match_args__ = ((),)
         def __new__(cls) -> AutoCommitWhen.ConsumingAllMessages: ...
         def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key:builtins.int) -> typing.Any: ...
-    
+        def __getitem__(self, key: builtins.int) -> typing.Any: ...
+
     class ConsumingEachMessage(AutoCommitWhen):
         r"""
         The offset is stored on the server when consuming each message.
         """
+
         __match_args__ = ((),)
         def __new__(cls) -> AutoCommitWhen.ConsumingEachMessage: ...
         def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key:builtins.int) -> typing.Any: ...
-    
+        def __getitem__(self, key: builtins.int) -> typing.Any: ...
+
     class ConsumingEveryNthMessage(AutoCommitWhen):
         r"""
         The offset is stored on the server when consuming every Nth message.
         """
+
         __match_args__ = ("_0",)
         @property
         def _0(self) -> builtins.int: ...
-        def __new__(cls, _0:builtins.int) -> AutoCommitWhen.ConsumingEveryNthMessage: ...
+        def __new__(
+            cls, _0: builtins.int
+        ) -> AutoCommitWhen.ConsumingEveryNthMessage: ...
         def __len__(self) -> builtins.int: ...
-        def __getitem__(self, key:builtins.int) -> typing.Any: ...
-    
+        def __getitem__(self, key: builtins.int) -> typing.Any: ...
+
     ...
 
 class IggyClient:
@@ -183,72 +210,127 @@ class IggyClient:
     It wraps the RustIggyClient and provides asynchronous functionality
     through the contained runtime.
     """
-    def __new__(cls, conn:typing.Optional[builtins.str]=None) -> IggyClient:
+    def __new__(cls, conn: typing.Optional[builtins.str] = None) -> IggyClient:
         r"""
-        Constructs a new IggyClient.
-        
+        Constructs a new IggyClient from a TCP server address.
+
         This initializes a new runtime for asynchronous operations.
         Future versions might utilize asyncio for more Pythonic async.
+        """
+    @classmethod
+    def from_connection_string(cls, connection_string: builtins.str) -> IggyClient:
+        r"""
+        Constructs a new IggyClient from a connection string.
+
+        Returns an error if the connection string provided is invalid.
         """
     def ping(self) -> collections.abc.Awaitable[None]:
         r"""
         Sends a ping request to the server to check connectivity.
-        
+
         Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
         if the connection fails.
         """
-    def login_user(self, username:builtins.str, password:builtins.str) -> collections.abc.Awaitable[None]:
+    def login_user(
+        self, username: builtins.str, password: builtins.str
+    ) -> collections.abc.Awaitable[None]:
         r"""
         Logs in the user with the given credentials.
-        
+
         Returns `Ok(())` on success, or a PyRuntimeError on failure.
         """
     def connect(self) -> collections.abc.Awaitable[None]:
         r"""
         Connects the IggyClient to its service.
-        
+
         Returns Ok(()) on successful connection or a PyRuntimeError on failure.
         """
-    def create_stream(self, name:builtins.str, stream_id:typing.Optional[builtins.int]=None) -> collections.abc.Awaitable[None]:
+    def create_stream(
+        self, name: builtins.str, stream_id: typing.Optional[builtins.int] = None
+    ) -> collections.abc.Awaitable[None]:
         r"""
         Creates a new stream with the provided ID and name.
-        
+
         Returns Ok(()) on successful stream creation or a PyRuntimeError on failure.
         """
-    def get_stream(self, stream_id:builtins.str | builtins.int) -> collections.abc.Awaitable[typing.Optional[StreamDetails]]:
+    def get_stream(
+        self, stream_id: builtins.str | builtins.int
+    ) -> collections.abc.Awaitable[typing.Optional[StreamDetails]]:
         r"""
         Gets stream by id.
-        
+
         Returns Option of stream details or a PyRuntimeError on failure.
         """
-    def create_topic(self, stream:builtins.str | builtins.int, name:builtins.str, partitions_count:builtins.int, compression_algorithm:typing.Optional[builtins.str]=None, topic_id:typing.Optional[builtins.int]=None, replication_factor:typing.Optional[builtins.int]=None) -> collections.abc.Awaitable[None]:
+    def create_topic(
+        self,
+        stream: builtins.str | builtins.int,
+        name: builtins.str,
+        partitions_count: builtins.int,
+        compression_algorithm: typing.Optional[builtins.str] = None,
+        topic_id: typing.Optional[builtins.int] = None,
+        replication_factor: typing.Optional[builtins.int] = None,
+    ) -> collections.abc.Awaitable[None]:
         r"""
         Creates a new topic with the given parameters.
-        
+
         Returns Ok(()) on successful topic creation or a PyRuntimeError on failure.
         """
-    def get_topic(self, stream_id:builtins.str | builtins.int, topic_id:builtins.str | builtins.int) -> collections.abc.Awaitable[typing.Optional[TopicDetails]]:
+    def get_topic(
+        self,
+        stream_id: builtins.str | builtins.int,
+        topic_id: builtins.str | builtins.int,
+    ) -> collections.abc.Awaitable[typing.Optional[TopicDetails]]:
         r"""
         Gets topic by stream and id.
-        
+
         Returns Option of topic details or a PyRuntimeError on failure.
         """
-    def send_messages(self, stream:builtins.str | builtins.int, topic:builtins.str | builtins.int, partitioning:builtins.int, messages:list[SendMessage]) -> collections.abc.Awaitable[None]:
+    def send_messages(
+        self,
+        stream: builtins.str | builtins.int,
+        topic: builtins.str | builtins.int,
+        partitioning: builtins.int,
+        messages: list[SendMessage],
+    ) -> collections.abc.Awaitable[None]:
         r"""
         Sends a list of messages to the specified topic.
-        
+
         Returns Ok(()) on successful sending or a PyRuntimeError on failure.
         """
-    def poll_messages(self, stream:builtins.str | builtins.int, topic:builtins.str | builtins.int, partition_id:builtins.int, polling_strategy:PollingStrategy, count:builtins.int, auto_commit:builtins.bool) -> collections.abc.Awaitable[list[ReceiveMessage]]:
+    def poll_messages(
+        self,
+        stream: builtins.str | builtins.int,
+        topic: builtins.str | builtins.int,
+        partition_id: builtins.int,
+        polling_strategy: PollingStrategy,
+        count: builtins.int,
+        auto_commit: builtins.bool,
+    ) -> collections.abc.Awaitable[list[ReceiveMessage]]:
         r"""
         Polls for messages from the specified topic and partition.
-        
+
         Returns a list of received messages or a PyRuntimeError on failure.
         """
-    def consumer_group(self, name:builtins.str, stream:builtins.str, topic:builtins.str, partition_id:typing.Optional[builtins.int]=None, polling_strategy:typing.Optional[PollingStrategy]=None, batch_length:typing.Optional[builtins.int]=None, auto_commit:typing.Optional[AutoCommit]=None, create_consumer_group_if_not_exists:builtins.bool=True, auto_join_consumer_group:builtins.bool=True, poll_interval:typing.Optional[datetime.timedelta]=None, polling_retry_interval:typing.Optional[datetime.timedelta]=None, init_retries:typing.Optional[builtins.int]=None, init_retry_interval:typing.Optional[datetime.timedelta]=None, allow_replay:builtins.bool=False) -> IggyConsumer:
+    def consumer_group(
+        self,
+        name: builtins.str,
+        stream: builtins.str,
+        topic: builtins.str,
+        partition_id: typing.Optional[builtins.int] = None,
+        polling_strategy: typing.Optional[PollingStrategy] = None,
+        batch_length: typing.Optional[builtins.int] = None,
+        auto_commit: typing.Optional[AutoCommit] = None,
+        create_consumer_group_if_not_exists: builtins.bool = True,
+        auto_join_consumer_group: builtins.bool = True,
+        poll_interval: typing.Optional[datetime.timedelta] = None,
+        polling_retry_interval: typing.Optional[datetime.timedelta] = None,
+        init_retries: typing.Optional[builtins.int] = None,
+        init_retry_interval: typing.Optional[datetime.timedelta] = None,
+        allow_replay: builtins.bool = False,
+    ) -> IggyConsumer:
         r"""
         Creates a new consumer group consumer.
-        
+
         Returns the consumer or a PyRuntimeError on failure.
         """
 
@@ -258,11 +340,15 @@ class IggyConsumer:
     It wraps the RustIggyConsumer and provides asynchronous functionality
     through the contained runtime.
     """
-    def get_last_consumed_offset(self, partition_id:builtins.int) -> typing.Optional[builtins.int]:
+    def get_last_consumed_offset(
+        self, partition_id: builtins.int
+    ) -> typing.Optional[builtins.int]:
         r"""
         Get the last consumed offset or `None` if no offset has been consumed yet.
         """
-    def get_last_stored_offset(self, partition_id:builtins.int) -> typing.Optional[builtins.int]:
+    def get_last_stored_offset(
+        self, partition_id: builtins.int
+    ) -> typing.Optional[builtins.int]:
         r"""
         Get the last stored offset or `None` if no offset has been stored yet.
         """
@@ -282,26 +368,36 @@ class IggyConsumer:
         r"""
         Gets the name of the topic this consumer group is configured for.
         """
-    def store_offset(self, offset:builtins.int, partition_id:typing.Optional[builtins.int]) -> collections.abc.Awaitable[None]:
+    def store_offset(
+        self, offset: builtins.int, partition_id: typing.Optional[builtins.int]
+    ) -> collections.abc.Awaitable[None]:
         r"""
         Stores the provided offset for the provided partition id or if none is specified
         uses the current partition id for the consumer group.
-        
+
         Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
         if the operation fails.
         """
-    def delete_offset(self, partition_id:typing.Optional[builtins.int]) -> collections.abc.Awaitable[None]:
+    def delete_offset(
+        self, partition_id: typing.Optional[builtins.int]
+    ) -> collections.abc.Awaitable[None]:
         r"""
         Deletes the offset for the provided partition id or if none is specified
         uses the current partition id for the consumer group.
-        
+
         Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
         if the operation fails.
         """
-    def consume_messages(self, callback:collections.abc.Callable[[str]], shutdown_event:typing.Optional[asyncio.Event]) -> collections.abc.Awaitable[None]:
+    def consume_messages(
+        self,
+        callback: collections.abc.Callable[
+            [ReceiveMessage], collections.abc.Awaitable[None]
+        ],
+        shutdown_event: typing.Optional[asyncio.Event],
+    ) -> collections.abc.Awaitable[None]:
         r"""
         Consumes messages continuously using a callback function and an optional `asyncio.Event` for signaling shutdown.
-        
+
         Returns an awaitable that completes when shutdown is signaled or a PyRuntimeError on failure.
         """
 
@@ -310,82 +406,77 @@ class PollingStrategy:
         __match_args__ = ("value",)
         @property
         def value(self) -> builtins.int: ...
-        def __new__(cls, value:builtins.int) -> PollingStrategy.Offset: ...
-    
+        def __new__(cls, value: builtins.int) -> PollingStrategy.Offset: ...
+
     class Timestamp(PollingStrategy):
         __match_args__ = ("value",)
         @property
         def value(self) -> builtins.int: ...
-        def __new__(cls, value:builtins.int) -> PollingStrategy.Timestamp: ...
-    
+        def __new__(cls, value: builtins.int) -> PollingStrategy.Timestamp: ...
+
     class First(PollingStrategy):
         __match_args__ = ((),)
         def __new__(cls) -> PollingStrategy.First: ...
-    
+
     class Last(PollingStrategy):
         __match_args__ = ((),)
         def __new__(cls) -> PollingStrategy.Last: ...
-    
+
     class Next(PollingStrategy):
         __match_args__ = ((),)
         def __new__(cls) -> PollingStrategy.Next: ...
-    
+
     ...
 
 class ReceiveMessage:
     r"""
     A Python class representing a received message.
-    
+
     This class wraps a Rust message, allowing for access to its payload and offset from Python.
     """
-    def payload(self) -> typing.Any:
+    def payload(self) -> bytes:
         r"""
         Retrieves the payload of the received message.
-        
+
         The payload is returned as a Python bytes object.
         """
     def offset(self) -> builtins.int:
         r"""
         Retrieves the offset of the received message.
-        
         The offset represents the position of the message within its topic.
         """
     def timestamp(self) -> builtins.int:
         r"""
         Retrieves the timestamp of the received message.
-        
         The timestamp represents the time of the message within its topic.
         """
     def id(self) -> builtins.int:
         r"""
         Retrieves the id of the received message.
-        
         The id represents unique identifier of the message within its topic.
         """
     def checksum(self) -> builtins.int:
         r"""
         Retrieves the checksum of the received message.
-        
         The checksum represents the integrity of the message within its topic.
         """
     def length(self) -> builtins.int:
         r"""
         Retrieves the length of the received message.
-        
         The length represents the length of the payload.
         """
 
 class SendMessage:
     r"""
     A Python class representing a message to be sent.
-    
+
     This class wraps a Rust message meant for sending, facilitating
     the creation of such messages from Python and their subsequent use in Rust.
     """
-    def __new__(cls, data:builtins.str) -> SendMessage:
+    def __new__(cls, data: builtins.str | bytes) -> SendMessage:
         r"""
         Constructs a new `SendMessage` instance from a string.
-        
+
         This method allows for the creation of a `SendMessage` instance
         directly from Python using the provided string data.
         """
@@ -409,4 +500,3 @@ class TopicDetails:
     def messages_count(self) -> builtins.int: ...
     @property
     def partitions_count(self) -> builtins.int: ...
-

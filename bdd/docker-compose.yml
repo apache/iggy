@@ -17,48 +17,95 @@
 
 services:
   iggy-server:
-    image: bdd-iggy-server:latest
+    platform: linux/amd64
     build:
       context: ..
-      dockerfile: bdd/Dockerfile
+      dockerfile: core/server/Dockerfile
+      target: runtime-prebuilt
+      args:
+        PREBUILT_IGGY_SERVER: ${IGGY_SERVER_PATH:-target/debug/iggy-server}
+        PREBUILT_IGGY_CLI: ${IGGY_CLI_PATH:-target/debug/iggy}
+        LIBC: glibc
+        PROFILE: debug
+    command: [ "--fresh" ]
     environment:
       - RUST_LOG=info
       - IGGY_SYSTEM_PATH=local_data
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/stats"]
-      interval: 5s
-      timeout: 10s
-      retries: 10
-      start_period: 30s
     volumes:
       - iggy_data:/app/local_data
+    networks:
+      - iggy-bdd-network
 
   rust-bdd:
     build:
       context: ..
       dockerfile: bdd/rust/Dockerfile
     depends_on:
-      iggy-server:
-        condition: service_healthy
+      - iggy-server
     environment:
       - IGGY_TCP_ADDRESS=iggy-server:8090
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
-    command: ["cargo", "test", "-p", "bdd", "--features", "iggy-server-in-docker", "--features", "bdd"]
+    command: [ "cargo", "test", "-p", "bdd", "--features", "iggy-server-in-docker", "--features", "bdd" ]
+    networks:
+      - iggy-bdd-network
 
   python-bdd:
     build:
       context: ..
       dockerfile: bdd/python/Dockerfile
     depends_on:
-      iggy-server:
-        condition: service_healthy
+      - iggy-server
     environment:
       - IGGY_TCP_ADDRESS=iggy-server:8090
     volumes:
       - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
     working_dir: /app
-    command: ["pytest", "tests/", "-v"]
+    command: [ "pytest", "tests/", "-v" ]
+    networks:
+      - iggy-bdd-network
+
+  go-bdd:
+    build:
+      context: ..
+      dockerfile: bdd/go/Dockerfile
+    depends_on:
+      - iggy-server
+    environment:
+      - IGGY_TCP_ADDRESS=iggy-server:8090
+    volumes:
+      - ./scenarios/basic_messaging.feature:/app/features/basic_messaging.feature
+    command: [ "go", "test", "-v", "./..." ]
+    networks:
+      - iggy-bdd-network
+
+  node-bdd:
+    build:
+      context: ..
+      dockerfile: bdd/node/Dockerfile
+    depends_on:
+      - iggy-server
+    environment:
+      - IGGY_TCP_ADDRESS=iggy-server:8090
+    command: [ "npm", "run", "test:bdd" ]
+    networks:
+      - iggy-bdd-network
+
+  csharp-bdd:
+    build:
+      context: ..
+      dockerfile: bdd/csharp/Dockerfile
+    depends_on:
+      - iggy-server
+    environment:
+      - IGGY_TCP_ADDRESS=iggy-server:8090
+    command: [ "dotnet", "test" ]
+    networks:
+      - iggy-bdd-network
+
+networks:
+  iggy-bdd-network:
+    driver: bridge
 
   go-bdd:
     build:

@@ -556,11 +556,38 @@ size = "4 GiB"
 # Note: This number has to be a power of 2. Minimum value is 128 due to internal implementation details.
 bucket_capacity = 8192
 
-# Sharding configuration
-[system.sharding]
-# CPU allocation - controls the number of shards and their CPU affinity.
-# Possible values:
-# - "all": Use all available CPU cores (default)
-# - numeric value (e.g. 4): Use 4 shards (4 threads pinned to cores 0, 1, 2, 3)
-# - range (e.g. "5..8"): Use 3 shards with affinity to cores 5, 6, 7
-cpu_allocation = "all"
+# Cluster configuration
+[cluster]
+# Enables or disables cluster mode (boolean).
+# When enabled, this node will participate in the cluster and coordinate with other nodes.
+enabled = false
+
+# Unique cluster identifier (u32).
+# All nodes in the same cluster must share the same cluster id.
+id = 1
+
+# Unique cluster name (string).
+# All nodes in the same cluster must share the same name.
+# This prevents accidental cross-cluster communication.
+name = "iggy-cluster"
+
+# Transport protocol used for communication between nodes in the cluster (string).
+# Supported values: "tcp", "quic", "http"
+transport = "tcp"
+
+# Current node configuration
+[cluster.node]
+# This node unique identifier within the cluster (u32).
+# Must be unique across all nodes and match one of the ids in the nodes list.
+id = 1
+
+# All nodes in the cluster.
+[[cluster.nodes]]
+id = 1
+name = "iggy-node-1"
+address = "127.0.0.1:8090"
+
+[[cluster.nodes]]
+id = 2
+name = "iggy-node-2"
+address = "127.0.0.1:8091"

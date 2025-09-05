@@ -1,4 +1,4 @@
-﻿// // Licensed to the Apache Software Foundation (ASF) under one
+// // Licensed to the Apache Software Foundation (ASF) under one
 // // or more contributor license agreements.  See the NOTICE file
 // // distributed with this work for additional information
 // // regarding copyright ownership.  The ASF licenses this file
@@ -31,7 +31,11 @@ public sealed class DummyMessage
             var id = BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan()[..4]);
             var textLength = BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan()[4..8]);
             var text = Encoding.UTF8.GetString(bytes.AsSpan()[8..(8 + textLength)]);
-            return new DummyMessage { Id = id, Text = text };
+            return new DummyMessage
+            {
+                Id = id,
+                Text = text
+            };
         };
 
     internal byte[] SerializeDummyMessage()

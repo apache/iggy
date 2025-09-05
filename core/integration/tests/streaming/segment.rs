@@ -23,8 +23,8 @@ use compio::fs;
 use compio::time::sleep;
 use iggy::prelude::locking::IggyRwLockFn;
 use iggy::prelude::*;
-use log::error;
-use server::configs::server::{DataMaintenanceConfig, PersonalAccessTokenConfig, ServerConfig};
+use server::configs::cluster::ClusterConfig;
+use server::configs::server::{DataMaintenanceConfig, PersonalAccessTokenConfig};
 use server::configs::system::{PartitionConfig, SegmentConfig, SystemConfig};
 use server::shard::IggyShard;
 use server::streaming::segments::*;
@@ -328,12 +328,12 @@ async fn should_delete_persisted_segments() -> Result<(), Box<dyn std::error::Er
         ..Default::default()
     };
     let setup = TestSetup::init_with_config(config).await;
-    let server_config = ServerConfig {
-        system: setup.config.clone(),
-        ..Default::default()
-    };
-    let shard = IggyShard::default_from_config(server_config);
-    shard.init().await.unwrap();
+    let mut system = System::new(
+        setup.config.clone(),
+        ClusterConfig::default(),
+        DataMaintenanceConfig::default(),
+        PersonalAccessTokenConfig::default(),
+    );
 
     // Properties
     let stream_id = Identifier::numeric(1)?;

@@ -1,4 +1,4 @@
-﻿// // Licensed to the Apache Software Foundation (ASF) under one
+// // Licensed to the Apache Software Foundation (ASF) under one
 // // or more contributor license agreements.  See the NOTICE file
 // // distributed with this work for additional information
 // // regarding copyright ownership.  The ASF licenses this file
@@ -15,15 +15,14 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
-using Apache.Iggy.Contracts.Http;
-using Apache.Iggy.Tests.Integrations.Helpers;
-
 namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 public class ConsumerGroupFixture : IggyServerFixture
 {
-    public readonly StreamRequest StreamRequest = StreamFactory.CreateStream();
-    public readonly TopicRequest TopicRequest = TopicFactory.CreateTopic(partitionsCount: 10);
+    internal readonly string Name = "TestTopic";
+    internal readonly uint PartitionsCount = 10;
+    internal readonly uint StreamId = 1;
+    internal readonly uint TopicId = 1;
 
     public override async Task InitializeAsync()
     {
@@ -31,8 +30,8 @@ public class ConsumerGroupFixture : IggyServerFixture
 
         foreach (var client in Clients.Values)
         {
-            await client.CreateStreamAsync(StreamRequest);
-            await client.CreateTopicAsync(Identifier.Numeric(StreamRequest.StreamId!.Value), TopicRequest);
+            await client.CreateStreamAsync("Test Stream", StreamId);
+            await client.CreateTopicAsync(Identifier.Numeric(StreamId), Name, PartitionsCount, topicId: TopicId);
         }
     }
 }
