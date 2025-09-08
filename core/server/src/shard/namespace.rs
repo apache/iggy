@@ -64,6 +64,21 @@ impl IggyNamespace {
     }
 
     #[inline]
+    pub fn stream_id(&self) -> usize {
+        ((self.0 >> STREAM_SHIFT) & STREAM_MASK) as usize
+    }
+
+    #[inline]
+    pub fn topic_id(&self) -> usize {
+        ((self.0 >> TOPIC_SHIFT) & TOPIC_MASK) as usize
+    }
+
+    #[inline]
+    pub fn partition_id(&self) -> usize {
+        ((self.0 >> PARTITION_SHIFT) & PARTITION_MASK) as usize
+    }
+
+    #[inline]
     pub fn new(stream: usize, topic: usize, partition: usize) -> Self {
         let value = ((stream as u64) & STREAM_MASK) << STREAM_SHIFT
             | ((topic as u64) & TOPIC_MASK) << TOPIC_SHIFT

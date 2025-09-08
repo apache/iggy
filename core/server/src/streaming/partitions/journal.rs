@@ -12,6 +12,8 @@ use std::fmt::Debug;
 pub struct Inner {
     pub base_offset: u64,
     pub current_offset: u64,
+    pub first_timestamp: u64,
+    pub end_timestamp: u64,
     pub messages_count: u32,
     pub size: u32,
 }
@@ -49,8 +51,14 @@ impl Journal for MemoryMessageJournal {
         );
 
         let batch_size = entry.size();
+        let first_timestamp = entry.first_timestamp().unwrap();
+        let last_timestamp = entry.last_timestamp().unwrap();
         self.batches.add_batch(entry);
 
+        if self.inner.first_timestamp == 0 {
+            self.inner.first_timestamp = first_timestamp;
+        }
+        self.inner.end_timestamp = last_timestamp;
         self.inner.messages_count += batch_messages_count;
         self.inner.current_offset = self.inner.base_offset + self.inner.messages_count as u64 - 1;
         self.inner.size += batch_size;
@@ -72,9 +80,19 @@ impl Journal for MemoryMessageJournal {
 
     fn commit(&mut self) -> Self::Container {
         self.inner.base_offset = self.inner.current_offset;
+        self.inner.first_timestamp = 0;
+        self.inner.end_timestamp = 0;
         self.inner.size = 0;
         self.inner.messages_count = 0;
         std::mem::take(&mut self.batches)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.batches.is_empty()
+    }
+
+    fn inner(&self) -> &Self::Inner {
+        &self.inner
     }
 }
 
@@ -92,6 +110,10 @@ pub trait Journal {
     fn get<U>(&self, filter: impl FnOnce(&Self::Container) -> U) -> U;
 
     fn commit(&mut self) -> Self::Container;
+
+    fn is_empty(&self) -> bool;
+
+    fn inner(&self) -> &Self::Inner;
 
     // `flush` is only useful in case of an journal that has disk backed WAL.
     // This could be merged together with `append`, but not doing this for two reasons.

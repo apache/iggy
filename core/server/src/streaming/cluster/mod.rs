@@ -16,7 +16,7 @@
  * under the License.
  */
 
- /*
+/*
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::System;
 use iggy_common::IggyError;

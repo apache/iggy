@@ -196,6 +196,10 @@ impl Partitions {
         self.with_components_by_id(id, |components| f(components))
     }
 
+    pub fn exists(&self, id: ContainerId) -> bool {
+        self.root.contains(id)
+    }
+
     pub fn with_partition_by_id_mut<T>(
         &mut self,
         id: ContainerId,

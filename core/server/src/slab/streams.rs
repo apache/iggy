@@ -6,27 +6,23 @@ use crate::{
         partitions::{self, Partitions},
         topics::Topics,
         traits_ext::{
-            ComponentsById, ComponentsByIdMapping, ComponentsMapping, DeleteCell,
-            EntityComponentSystem, EntityComponentSystemMutCell, InsertCell, InteriorMutability,
-            IntoComponents,
+            ComponentsById, DeleteCell, EntityComponentSystem, EntityComponentSystemMutCell,
+            InsertCell, InteriorMutability, IntoComponents,
         },
     },
     streaming::{
-        partitions::{
-            journal::MemoryMessageJournal,
-            log::{Log, SegmentedLog},
-            partition2::{PartitionRef, PartitionRefMut},
-        },
+        partitions::partition2::{PartitionRef, PartitionRefMut},
+        segments::IggyMessagesBatchSet,
         stats::stats::StreamStats,
         streams::stream2::{self, StreamRef, StreamRefMut},
         topics::{
             consumer_group2::{ConsumerGroupRef, ConsumerGroupRefMut},
-            topic2::{self, TopicRef, TopicRefMut},
+            topic2::{TopicRef, TopicRefMut},
         },
     },
 };
 use ahash::AHashMap;
-use iggy_common::Identifier;
+use iggy_common::{Identifier, IggyError};
 use slab::Slab;
 use std::{cell::RefCell, sync::Arc};
 
@@ -394,5 +390,30 @@ impl Streams {
 
     pub fn len(&self) -> usize {
         self.root.borrow().len()
+    }
+
+    pub async fn get_messages_by_offset(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: partitions::ContainerId,
+        offset: u64,
+        count: u32,
+    ) -> Result<IggyMessagesBatchSet, IggyError> {
+        use crate::streaming::partitions::helpers;
+        let range = self.with_partition_by_id(
+            stream_id,
+            topic_id,
+            partition_id,
+            helpers::get_segment_range_by_offset(offset),
+        );
+
+        self.with_partition_by_id_async(
+            stream_id,
+            topic_id,
+            partition_id,
+            helpers::get_messages_by_offset_range(offset, count, range),
+        )
+        .await
     }
 }

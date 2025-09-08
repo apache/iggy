@@ -17,8 +17,8 @@
  */
 
 use crate::clients::client_builder::IggyClientBuilder;
-use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::Consumer;
+use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::http::http_client::HttpClient;
@@ -31,9 +31,7 @@ use crate::tcp::tcp_client::TcpClient;
 use async_broadcast::Receiver;
 use async_trait::async_trait;
 use iggy_binary_protocol::{Client, SystemClient};
-use iggy_common::{
-    ConnectionStringUtils, DiagnosticEvent, Partitioner, TransportProtocol,
-};
+use iggy_common::{ConnectionStringUtils, DiagnosticEvent, Partitioner, TransportProtocol};
 use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::spawn;

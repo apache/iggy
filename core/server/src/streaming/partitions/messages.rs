@@ -32,12 +32,6 @@ impl Partition {
         timestamp: IggyTimestamp,
         count: u32,
     ) -> Result<IggyMessagesBatchSet, IggyError> {
-        trace!(
-            "Getting {count} messages by timestamp: {} for partition: {}...",
-            timestamp.as_micros(),
-            self.partition_id
-        );
-
         if self.segments.is_empty() || count == 0 {
             return Ok(IggyMessagesBatchSet::empty());
         }
@@ -754,5 +748,4 @@ mod tests {
             .expect("Failed to create message with ID")
     }
 }
-
 */

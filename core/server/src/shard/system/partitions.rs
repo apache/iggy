@@ -21,11 +21,8 @@ use crate::shard::IggyShard;
 use crate::shard::ShardInfo;
 use crate::shard::namespace::IggyNamespace;
 use crate::shard_info;
-use crate::slab::traits_ext::EntityComponentSystem;
-use crate::slab::traits_ext::EntityComponentSystemMutCell;
 use crate::slab::traits_ext::EntityMarker;
 use crate::slab::traits_ext::IntoComponents;
-use crate::slab::traits_ext::IntoComponentsById;
 use crate::streaming::partitions;
 use crate::streaming::partitions::helpers::create_message_deduplicator;
 use crate::streaming::partitions::journal::MemoryMessageJournal;
@@ -113,7 +110,6 @@ impl IggyShard {
         self.metrics.increment_partitions(partitions_count);
         self.metrics.increment_segments(partitions_count);
 
-        // TODO: Figure out how to do this operation in a batch.
         for partition_id in partitions.iter().map(|p| p.id()) {
             // TODO: Create shard table recordsj.
             let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
@@ -259,6 +255,12 @@ impl IggyShard {
         topic_id: &Identifier,
         partitions: Vec<partition2::Partition>,
     ) -> Result<(), IggyError> {
+        let numeric_stream_id = self
+            .streams2
+            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
+        let numeric_topic_id =
+            self.streams2
+                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
         for partition in partitions {
             let actual_id = partition.id();
             let id = self.insert_partition_mem(stream_id, topic_id, partition);
@@ -266,7 +268,13 @@ impl IggyShard {
                 id, actual_id,
                 "create_partitions_bypass_auth: partition mismatch ID, wrong creation order ?!"
             );
-            self.init_log(stream_id, topic_id, id).await?;
+            let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, id);
+            let shard_info = self
+                .find_shard_table_record(&ns)
+                .expect("create_partitions_bypass_auth: missing shard table record");
+            if self.id == shard_info.id {
+                self.init_log(stream_id, topic_id, id).await?;
+            }
         }
         Ok(())
     }

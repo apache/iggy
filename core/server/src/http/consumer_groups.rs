@@ -262,9 +262,9 @@ async fn delete_consumer_group(
 
     // Delete using the new API
     let consumer_group = state.shard.shard().delete_consumer_group2(
-        &session, 
-        &identifier_stream_id, 
-        &identifier_topic_id, 
+        &session,
+        &identifier_stream_id,
+        &identifier_topic_id,
         &identifier_group_id
     )
     .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to delete consumer group with ID: {group_id} for topic with ID: {topic_id} in stream with ID: {stream_id}"))?;

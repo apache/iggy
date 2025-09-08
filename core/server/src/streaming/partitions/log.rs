@@ -24,7 +24,7 @@ where
     access_map: AllocRingBuffer<usize>,
     cache: (),
     segments: Vec<Segment2>,
-    indexes: Option<IggyIndexesMut>,
+    indexes: Vec<Option<IggyIndexesMut>>,
     storage: Vec<Storage>,
 }
 
@@ -48,7 +48,7 @@ where
             cache: (),
             segments: Vec::with_capacity(SEGMENTS_CAPACITY),
             storage: Vec::with_capacity(SEGMENTS_CAPACITY),
-            indexes: None,
+            indexes: Vec::with_capacity(SEGMENTS_CAPACITY),
         }
     }
 }
@@ -57,6 +57,18 @@ impl<J> SegmentedLog<J>
 where
     J: Journal + Debug,
 {
+    pub fn has_segments(&self) -> bool {
+        !self.segments.is_empty()
+    }
+
+    pub fn segments(&self) -> &Vec<Segment2> {
+        &self.segments
+    }
+
+    pub fn storages(&self) -> &Vec<Storage> {
+        &self.storage
+    }
+
     pub fn active_segment(&self) -> &Segment2 {
         self.segments
             .last()
@@ -81,28 +93,47 @@ where
             .expect("active storage called on empty log")
     }
 
-    pub fn indexes(&self) -> Option<&IggyIndexesMut> {
-        self.indexes.as_ref()
+    pub fn indexes(&self) -> &Vec<Option<IggyIndexesMut>> {
+        &self.indexes
     }
 
-    pub fn indexes_mut(&mut self) -> Option<&mut IggyIndexesMut> {
-        self.indexes.as_mut()
+    pub fn active_indexes(&self) -> Option<&IggyIndexesMut> {
+        self.indexes
+            .last()
+            .expect("active indexes called on empty log")
+            .as_ref()
     }
 
-    pub fn clear_indexes(&mut self) {
-        self.indexes = None;
+    pub fn active_indexes_mut(&mut self) -> Option<&mut IggyIndexesMut> {
+        self.indexes
+            .last_mut()
+            .expect("active indexes called on empty log")
+            .as_mut()
+    }
+
+    pub fn clear_active_indexes(&mut self) {
+        let indexes = self
+            .indexes
+            .last_mut()
+            .expect("active indexes called on empty log");
+        *indexes = None;
     }
 
     pub fn ensure_indexes(&mut self) {
-        if self.indexes.is_none() {
+        let indexes = self
+            .indexes
+            .last_mut()
+            .expect("active indexes called on empty log");
+        if indexes.is_none() {
             let capacity = SIZE_16MB / INDEX_SIZE;
-            self.indexes = Some(IggyIndexesMut::with_capacity(capacity, 0));
+            *indexes = Some(IggyIndexesMut::with_capacity(capacity, 0));
         }
     }
 
     pub fn add_persisted_segment(&mut self, segment: Segment2, storage: Storage) {
         self.segments.push(segment);
         self.storage.push(storage);
+        self.indexes.push(None);
     }
 }
 
@@ -112,6 +143,10 @@ where
 {
     pub fn journal_mut(&mut self) -> &mut J {
         &mut self.journal
+    }
+
+    pub fn journal(&self) -> &J {
+        &self.journal
     }
 }
 

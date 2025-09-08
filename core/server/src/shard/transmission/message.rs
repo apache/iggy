@@ -41,17 +41,17 @@ pub enum ShardMessage {
 
 #[derive(Debug)]
 pub struct ShardRequest {
-    pub stream_id: u32,
-    pub topic_id: u32,
-    pub partition_id: u32,
+    pub stream_id: usize,
+    pub topic_id: usize,
+    pub partition_id: usize,
     pub payload: ShardRequestPayload,
 }
 
 impl ShardRequest {
     pub fn new(
-        stream_id: u32,
-        topic_id: u32,
-        partition_id: u32,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
         payload: ShardRequestPayload,
     ) -> Self {
         Self {

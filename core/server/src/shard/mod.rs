@@ -80,6 +80,7 @@ use crate::{
         personal_access_tokens::personal_access_token::PersonalAccessToken,
         session::Session,
         storage::SystemStorage,
+        streams, topics,
         users::{permissioner::Permissioner, user::User},
         utils::ptr::EternalPtr,
     },
@@ -124,7 +125,7 @@ impl Shard {
 // TODO: Maybe pad to cache line size?
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct ShardInfo {
-    id: u16,
+    pub id: u16,
 }
 
 impl ShardInfo {
@@ -563,13 +564,12 @@ impl IggyShard {
                     &topic_id,
                     &polling_consumer,
                     partition_id,
-                );
+                )?;
                 Ok(())
             }
         }
     }
 
-    /*
     pub async fn send_request_to_shard_or_recoil(
         &self,
         namespace: &IggyNamespace,
@@ -593,13 +593,12 @@ impl IggyShard {
             Ok(ShardSendRequestResult::Response(response))
         } else {
             Err(IggyError::ShardNotFound(
-                namespace.stream_id,
-                namespace.topic_id,
-                namespace.partition_id,
+                namespace.stream_id(),
+                namespace.topic_id(),
+                namespace.partition_id(),
             ))
         }
     }
-    */
 
     pub async fn broadcast_event_to_all_shards(&self, event: ShardEvent) -> Vec<ShardResponse> {
         let mut responses = Vec::with_capacity(self.get_available_shards_count() as usize);
@@ -669,7 +668,10 @@ impl IggyShard {
     }
 
     pub fn remove_shard_table_record(&self, namespace: &IggyNamespace) -> ShardInfo {
-        self.shards_table.remove(namespace).map(|(_, shard_info)| shard_info).expect("remove_shard_table_record: namespace not found")
+        self.shards_table
+            .remove(namespace)
+            .map(|(_, shard_info)| shard_info)
+            .expect("remove_shard_table_record: namespace not found")
     }
 
     pub fn remove_shard_table_records(
