@@ -27,6 +27,7 @@ use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
 };
+use crate::streaming::partitions::consumer_offset::ConsumerOffset;
 use crate::streaming::partitions::helpers::{
     get_messages_by_timestamp_range, get_segment_range_by_timestamp,
 };
@@ -38,7 +39,7 @@ use crate::streaming::segments::{
 };
 use crate::streaming::session::Session;
 use crate::streaming::utils::{PooledBuffer, hash};
-use crate::streaming::{streams, topics};
+use crate::streaming::{partitions, streams, topics};
 use crate::{shard_info, shard_trace};
 use error_set::ErrContext;
 
@@ -525,7 +526,7 @@ impl IggyShard {
                     let count = args.count;
                     let strategy = args.strategy;
                     let value = strategy.value;
-                    match strategy.kind {
+                    let batches = match strategy.kind {
                         PollingKind::Offset => {
                             let offset = value;
                             // We have to remember to keep the invariant from the if that is on line 496.
@@ -540,7 +541,7 @@ impl IggyShard {
                                     count,
                                 )
                                 .await?;
-                            Ok((metadata, batches))
+                            Ok(batches)
                         }
                         PollingKind::Timestamp => {
                             let timestamp = IggyTimestamp::from(value);
@@ -569,7 +570,7 @@ impl IggyShard {
                                 )
                                 .await?;
 
-                            Ok((metadata, batches))
+                            Ok(batches)
                         }
                         PollingKind::First => {
                             let first_offset = self.streams2.with_partition_by_id(
@@ -594,7 +595,7 @@ impl IggyShard {
                                     count,
                                 )
                                 .await?;
-                            Ok((metadata, batches))
+                            Ok(batches)
                         }
                         PollingKind::Last => {
                             let (start_offset, actual_count) = self.streams2.with_partition_by_id(
@@ -622,7 +623,7 @@ impl IggyShard {
                                     actual_count,
                                 )
                                 .await?;
-                            Ok((metadata, batches))
+                            Ok(batches)
                         }
                         PollingKind::Next => {
                             let (consumer_offset, consumer_id) =
@@ -678,9 +679,73 @@ impl IggyShard {
                                     count,
                                 )
                                 .await?;
-                            Ok((metadata, batches))
+                            Ok(batches)
+                        }
+                    }?;
+
+                    if args.auto_commit && !batches.is_empty() {
+                        let offset = batches
+                            .last_offset()
+                            .expect("Batch set should have at least one batch");
+                        trace!(
+                            "Last offset: {} will be automatically stored for {}, stream: {}, topic: {}, partition: {}",
+                            offset, consumer, numeric_stream_id, numeric_topic_id, partition_id
+                        );
+                        match consumer {
+                            PollingConsumer::Consumer(consumer_id, _) => {
+                                self.streams2.with_partition_by_id(
+                                    stream_id,
+                                    topic_id,
+                                    partition_id,
+                                    partitions::helpers::store_consumer_offset(
+                                        consumer_id,
+                                        numeric_stream_id,
+                                        numeric_topic_id,
+                                        partition_id,
+                                        offset,
+                                        &self.config.system,
+                                    ),
+                                );
+                                self.streams2
+                                    .with_partition_by_id_async(
+                                        stream_id,
+                                        topic_id,
+                                        partition_id,
+                                        partitions::helpers::persist_consumer_offset_to_disk(
+                                            self.id,
+                                            consumer_id,
+                                        ),
+                                    )
+                                    .await?;
+                            }
+                            PollingConsumer::ConsumerGroup(cg_id, _) => {
+                                self.streams2.with_partition_by_id(
+                                    stream_id,
+                                    topic_id,
+                                    partition_id,
+                                    partitions::helpers::store_consumer_group_member_offset(
+                                        cg_id,
+                                        numeric_stream_id,
+                                        numeric_topic_id,
+                                        partition_id,
+                                        offset,
+                                        &self.config.system,
+                                    ),
+                                );
+                                self.streams2.with_partition_by_id_async(
+                                    stream_id,
+                                    topic_id,
+                                    partition_id,
+                                    partitions::helpers::persist_consumer_group_member_offset_to_disk(
+                                        self.id,
+                                        cg_id,
+                                    ),
+                                )
+                                .await?;
+                            }
                         }
                     }
+                    Ok((metadata, batches))
                 } else {
                     unreachable!(
                         "Expected a PollMessages request inside of PollMessages handler, impossible state"
@@ -695,22 +760,6 @@ impl IggyShard {
                 ),
             },
         }?;
-
-        /*
-        if args.auto_commit && !batch.is_empty() {
-            let offset = batch
-                .last_offset()
-                .expect("Batch set should have at least one batch");
-            trace!(
-                "Last offset: {} will be automatically stored for {}, stream: {}, topic: {}, partition: {}",
-                offset, consumer, self.stream_id, topic_id, partition_id
-            );
-            topic
-                .store_consumer_offset_internal(consumer, offset, partition_id)
-                .await
-                .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset internal, polling consumer: {consumer}, offset: {offset}, partition ID: {partition_id}"))?;
-        }
-        */
 
         let batch = if let Some(_encryptor) = &self.encryptor {
             //TODO: Bring back decryptor
