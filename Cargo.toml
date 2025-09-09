@@ -165,6 +165,12 @@ tower-http = { version = "0.6.6", features = [
 trait-variant = "0.1.2"
 webpki-roots = "1.0.2"
 zip = "4.3.0"
+arrow = "55.2.0"
+arrow-json = "55.2.0"
+parquet = "55.2.0"
+arrow-array = "55.2.0"
+iceberg = "0.6.0"
+iceberg-catalog-rest = "0.6.0"
 
 # Optional dependencies
 mimalloc = "0.1"

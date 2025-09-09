@@ -18,7 +18,7 @@
 
 use async_trait::async_trait;
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
+    sink_connector, ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
