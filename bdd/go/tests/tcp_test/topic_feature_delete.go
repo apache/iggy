@@ -46,7 +46,7 @@ var _ = ginkgo.Describe("DELETE TOPIC:", func() {
 			streamIdentifier, _ := iggcon.NewIdentifier(streamId)
 			err := client.DeleteTopic(streamIdentifier, randomU32Identifier())
 
-			itShouldReturnSpecificIggyError(err, ierror.TopicIdNotFound)
+			itShouldReturnErrorWithSpecificCode(err, ierror.TopicIdNotFound)
 		})
 
 		ginkgo.Context("and tries to delete non-existing topic and stream", func() {
@@ -54,7 +54,7 @@ var _ = ginkgo.Describe("DELETE TOPIC:", func() {
 
 			err := client.DeleteTopic(randomU32Identifier(), randomU32Identifier())
 
-			itShouldReturnSpecificIggyError(err, ierror.StreamIdNotFound)
+			itShouldReturnErrorWithSpecificCode(err, ierror.StreamIdNotFound)
 		})
 	})
 

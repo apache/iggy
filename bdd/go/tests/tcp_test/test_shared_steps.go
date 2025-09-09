@@ -23,20 +23,14 @@ import (
 	"github.com/onsi/gomega"
 )
 
-func itShouldReturnSpecificError(err error, errorMessage string) {
-	ginkgo.It("Should return error: "+errorMessage, func() {
-		gomega.Expect(err.Error()).To(gomega.ContainSubstring(errorMessage))
-	})
-}
-
-func itShouldReturnSpecificIggyError(err error, iggyError *ierror.IggyError) {
-	ginkgo.It("Should return error: "+iggyError.Error(), func() {
-		gomega.Expect(err).To(gomega.MatchError(iggyError))
+func itShouldReturnErrorWithSpecificCode(err error, code ierror.ErrCode) {
+	ginkgo.It("Should return error: "+code.String(), func() {
+		gomega.Expect(ierror.Code(err)).To(gomega.Equal(code))
 	})
 }
 
 func itShouldReturnUnauthenticatedError(err error) {
-	itShouldReturnSpecificError(err, "unauthenticated")
+	itShouldReturnErrorWithSpecificCode(err, ierror.Unauthenticated)
 }
 
 func itShouldNotReturnError(err error) {
