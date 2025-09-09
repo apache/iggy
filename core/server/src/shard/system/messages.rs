@@ -20,27 +20,20 @@ use std::sync::atomic::Ordering;
 
 use super::COMPONENT;
 use crate::binary::handlers::messages::poll_messages_handler::IggyPollMetadata;
-use crate::configs::cache_indexes::CacheIndexesConfig;
 use crate::shard::IggyShard;
 use crate::shard::namespace::IggyNamespace;
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
 };
-use crate::streaming::partitions::consumer_offset::ConsumerOffset;
-use crate::streaming::partitions::helpers::{
-    get_messages_by_timestamp_range, get_segment_range_by_timestamp,
-};
-use crate::streaming::partitions::journal::Journal;
 use crate::streaming::polling_consumer::PollingConsumer;
-use crate::streaming::segments::storage::create_segment_storage;
 use crate::streaming::segments::{
-    IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet, Segment2,
+    IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet,
 };
 use crate::streaming::session::Session;
 use crate::streaming::utils::{PooledBuffer, hash};
 use crate::streaming::{partitions, streams, topics};
-use crate::{shard_info, shard_trace};
+use crate::shard_trace;
 use error_set::ErrContext;
 
 use iggy_common::{
@@ -103,10 +96,6 @@ impl IggyShard {
             return Ok(());
         }
 
-        // Encrypt messages if encryptor is enabled in configuration.
-        let mut batch = self.maybe_encrypt_messages(batch)?;
-        let messages_count = batch.count();
-
         let partition_id =
             self.streams2
                 .with_topic_by_id(
@@ -133,308 +122,109 @@ impl IggyShard {
                     },
                 )?;
 
-        // Deduplicate messages and adjust their offsets.
-        let current_offset = self
-            .streams2
-            .with_partition_by_id_async(
-                stream_id,
-                topic_id,
-                partition_id,
-                async |(root, _, deduplicator, offset, _, _, log)| {
-                    let segment = log.active_segment();
-                    let current_offset = if !root.should_increment_offset() {
-                        0
-                    } else {
-                        offset.load(Ordering::Relaxed) + 1
-                    };
-                    batch
-                        .prepare_for_persistence(
-                            segment.start_offset,
-                            current_offset,
-                            segment.size,
-                            deduplicator.as_ref(),
-                        )
-                        .await;
-                    current_offset
-                },
-            )
-            .await;
-
-        // Append to the journal.
-        let (journal_messages_count, journal_size) = self.streams2.with_partition_by_id_mut(
-            stream_id,
-            topic_id,
-            partition_id,
-            |(root, stats, _, offset, .., log)| {
-                let segment = log.active_segment_mut();
-
-                if segment.end_offset == 0 {
-                    segment.start_timestamp = batch.first_timestamp().unwrap();
-                }
-
-                let batch_messages_size = batch.size();
-                let batch_messages_count = batch.count();
-
-                segment.end_timestamp = batch.last_timestamp().unwrap();
-                segment.end_offset = batch.last_offset().unwrap();
-                segment.size += batch_messages_size;
-
-                let (journal_messages_count, journal_size) =
-                    log.journal_mut().append(self.id, batch)?;
-
-                stats.increment_messages_count(batch_messages_count as u64);
-                stats.increment_size_bytes(batch_messages_size as u64);
-
-                let last_offset = if batch_messages_count == 0 {
-                    current_offset
-                } else {
-                    current_offset + batch_messages_count as u64 - 1
-                };
-
-                if root.should_increment_offset() {
-                    offset.store(last_offset, Ordering::Relaxed);
-                } else {
-                    root.set_should_increment_offset(true);
-                    offset.store(last_offset, Ordering::Relaxed);
-                }
-
-                Ok((journal_messages_count, journal_size))
-            },
-        )?;
-
-        let unsaved_messages_count_exceeded =
-            journal_messages_count >= self.config.system.partition.messages_required_to_save;
-        let unsaved_messages_size_exceeded = journal_size
-            >= self
-                .config
-                .system
-                .partition
-                .size_of_messages_required_to_save
-                .as_bytes_u64() as u32;
-
-        let is_full =
-            self.streams2
-                .with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
-                    log.active_segment().is_full()
-                });
-
-        // Try committing the journal
-        if is_full || unsaved_messages_count_exceeded || unsaved_messages_size_exceeded {
-            let batches = self.streams2.with_partition_by_id_mut(
-                stream_id,
-                topic_id,
-                partition_id,
-                |(.., log)| {
-                    let batches = log.journal_mut().commit();
-                    log.ensure_indexes();
-                    batches.append_indexes_to(log.active_indexes_mut().unwrap());
-                    batches
-                },
-            );
-
-            let (saved, batch_count) = self.streams2
-                .with_partition_by_id_async(
-                    stream_id,
-                    topic_id,
+        let namespace = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
+        let payload = ShardRequestPayload::SendMessages { batch: batch };
+        let request = ShardRequest::new(stream_id.clone(), topic_id.clone(), partition_id, payload);
+        let message = ShardMessage::Request(request);
+        match self
+            .send_request_to_shard_or_recoil(&namespace, message)
+            .await?
+        {
+            ShardSendRequestResult::Recoil(message) => {
+                if let ShardMessage::Request(ShardRequest {
                     partition_id,
-                    async |(.., log)| {
-                        let reason = if unsaved_messages_count_exceeded {
-                            format!(
-                                "unsaved messages count exceeded: {}, max from config: {}",
-                                journal_messages_count,
-                                self.config.system.partition.messages_required_to_save,
-                            )
-                        } else if unsaved_messages_size_exceeded {
-                            format!(
-                                "unsaved messages size exceeded: {}, max from config: {}",
-                                journal_size,
-                                self.config.system.partition.size_of_messages_required_to_save,
-                            )
-                        } else {
-                            format!(
-                                "segment is full, current size: {}, max from config: {}",
-                                log.active_segment().size,
-                                self.config.system.segment.size,
-                            )
-                        };
-                        shard_trace!(
-                            self.id,
-                            "Persisting messages on disk for stream ID: {}, topic ID: {}, partition ID: {} because {}...",
-                            stream_id,
-                            topic_id,
-                            partition_id,
-                            reason
-                        );
-
-                        let batch_count = batches.count();
-                        let batch_size = batches.size();
-
-                        let storage = log.active_storage();
-                        let saved = storage
-                            .messages_writer
-                            .as_ref()
-                            .expect("Messages writer not initialized")
-                            .save_batch_set(batches)
-                            .await
-                            .with_error_context(|error| {
-                                let segment = log.active_segment();
-                                format!(
-                                    "Failed to save batch of {batch_count} messages \
-                                    ({batch_size} bytes) to {segment}. {error}",
-                                )
-                            })?;
-
-                        let unsaved_indexes_slice = log.active_indexes().unwrap().unsaved_slice();
-                        let len = unsaved_indexes_slice.len();
-                        storage
-                            .index_writer
-                            .as_ref()
-                            .expect("Index writer not initialized")
-                            .save_indexes(unsaved_indexes_slice)
-                            .await
-                            .with_error_context(|error| {
-                                let segment = log.active_segment();
-                                format!(
-                                    "Failed to save index of {len} indexes to {segment}. {error}",
-                                )
-                            })?;
-
-                        shard_trace!(
-                            self.id,
-                            "Persisted {} messages on disk for stream ID: {}, topic ID: {}, for partition with ID: {}, total bytes written: {}.",
-                            batch_count, stream_id, topic_id, partition_id, saved
-                        );
-
-                        Ok((saved, batch_count))
-                    },
-                )
-                .await?;
-
-            self.streams2.with_partition_by_id_mut(
-                stream_id,
-                topic_id,
-                partition_id,
-                |(_, stats, .., log)| {
-                    log.active_segment_mut().size += saved.as_bytes_u32();
-                    log.active_indexes_mut().unwrap().mark_saved();
-                    if self.config.system.segment.cache_indexes == CacheIndexesConfig::None {
-                        log.active_indexes_mut().unwrap().clear();
-                    }
-                    stats.increment_size_bytes(saved.as_bytes_u64());
-                    stats.increment_messages_count(batch_count as u64);
-                },
-            );
-
-            // Handle possibly full segment after saving.
-            let is_segment_full = self.streams2.with_partition_by_id(
-                stream_id,
-                topic_id,
-                partition_id,
-                |(.., log)| log.active_segment().is_full(),
-            );
-
-            if is_segment_full {
-                let (start_offset, size, end_offset) = self.streams2.with_partition_by_id(
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    |(.., log)| {
-                        (
-                            log.active_segment().start_offset,
-                            log.active_segment().size,
-                            log.active_segment().end_offset,
-                        )
-                    },
-                );
-
-                let numeric_stream_id = self
-                    .streams2
-                    .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-                let numeric_topic_id = self.streams2.with_topic_by_id(
-                    stream_id,
-                    topic_id,
-                    topics::helpers::get_topic_id(),
-                );
-
-                if self.config.system.segment.cache_indexes == CacheIndexesConfig::OpenSegment
-                    || self.config.system.segment.cache_indexes == CacheIndexesConfig::None
+                    payload,
+                    ..
+                }) = message
+                    && let ShardRequestPayload::SendMessages { batch } = payload
                 {
-                    self.streams2.with_partition_by_id_mut(
+                    // Encrypt messages if encryptor is enabled in configuration.
+                    let mut batch = self.maybe_encrypt_messages(batch)?;
+                    let messages_count = batch.count();
+
+                    let current_offset = self.streams2.with_partition_by_id(
                         stream_id,
                         topic_id,
                         partition_id,
-                        |(.., log)| {
-                            log.clear_active_indexes();
-                        },
+                        partitions::helpers::calculate_current_offset(),
+                    );
+
+                    self.streams2
+                        .with_partition_by_id_async(
+                            stream_id,
+                            topic_id,
+                            partition_id,
+                            partitions::helpers::deduplicate_messages(current_offset, &mut batch),
+                        )
+                        .await;
+
+                    let (journal_messages_count, journal_size) =
+                        self.streams2.with_partition_by_id_mut(
+                            stream_id,
+                            topic_id,
+                            partition_id,
+                            partitions::helpers::append_to_journal(self.id, current_offset, batch),
+                        )?;
+
+                    let unsaved_messages_count_exceeded = journal_messages_count
+                        >= self.config.system.partition.messages_required_to_save;
+                    let unsaved_messages_size_exceeded = journal_size
+                        >= self
+                            .config
+                            .system
+                            .partition
+                            .size_of_messages_required_to_save
+                            .as_bytes_u64() as u32;
+
+                    let is_full = self.streams2.with_partition_by_id(
+                        stream_id,
+                        topic_id,
+                        partition_id,
+                        partitions::helpers::is_segment_full(),
+                    );
+
+                    // Try committing the journal
+                    if is_full || unsaved_messages_count_exceeded || unsaved_messages_size_exceeded
+                    {
+                        self.streams2.persist_messages(
+                            self.id,
+                            stream_id,
+                            topic_id,
+                            partition_id,
+                            unsaved_messages_count_exceeded,
+                            unsaved_messages_size_exceeded,
+                            journal_messages_count,
+                            journal_size,
+                            &self.config.system,
+                        ).await?;
+
+                        if is_full {
+                            self.streams2.handle_full_segment(
+                                self.id,
+                                stream_id,
+                                topic_id,
+                                partition_id,
+                                &self.config.system,
+                            ).await?;
+                            self.metrics.increment_messages(messages_count as u64);
+                        }
+                    }
+                    Ok(())
+                } else {
+                    unreachable!(
+                        "Expected a SendMessages request inside of SendMessages handler, impossible state"
                     );
                 }
-
-                self.streams2.with_partition_by_id_mut(
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    |(.., log)| {
-                        log.active_segment_mut().sealed = true;
-                    },
-                );
-                let (log_writer, index_writer) = self.streams2.with_partition_by_id_mut(
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    |(.., log)| log.active_storage_mut().shutdown(),
-                );
-
-                compio::runtime::spawn(async move {
-                    let _ = log_writer.fsync().await;
-                })
-                .detach();
-                compio::runtime::spawn(async move {
-                    let _ = index_writer.fsync().await;
-                    drop(index_writer)
-                })
-                .detach();
-
-                shard_info!(
-                    self.id,
-                    "Closed segment for stream: {}, topic: {} with start offset: {}, end offset: {}, size: {} for partition with ID: {}.",
-                    stream_id,
-                    topic_id,
-                    start_offset,
-                    end_offset,
-                    size,
-                    partition_id
-                );
-
-                let messages_size = 0;
-                let indexes_size = 0;
-                let segment = Segment2::new(
-                    end_offset + 1,
-                    self.config.system.segment.size,
-                    self.config.system.segment.message_expiry,
-                );
-
-                let storage = create_segment_storage(
-                    &self.config.system,
-                    numeric_stream_id,
-                    numeric_topic_id,
-                    partition_id,
-                    messages_size,
-                    indexes_size,
-                    end_offset + 1,
-                )
-                .await?;
-                self.streams2.with_partition_by_id_mut(
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    |(.., log)| {
-                        log.add_persisted_segment(segment, storage);
-                    },
-                );
             }
-        }
+            ShardSendRequestResult::Response(response) => match response {
+                ShardResponse::SendMessages => Ok(()),
+                ShardResponse::ErrorResponse(err) => Err(err),
+                _ => unreachable!(
+                    "Expected a SendMessages response inside of SendMessages handler, impossible state"
+                ),
+            },
+        }?;
 
-        self.metrics.increment_messages(messages_count as u64);
         Ok(())
     }
 
@@ -464,8 +254,6 @@ impl IggyShard {
                 stream_id,
                 numeric_topic_id
             ))?;
-
-        // There might be no partition assigned, if it's the consumer group member without any partitions.
 
         // Resolve partition ID
         let Some((consumer, partition_id)) = self.resolve_consumer_with_partition_id(
@@ -508,7 +296,7 @@ impl IggyShard {
 
         let namespace = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
         let payload = ShardRequestPayload::PollMessages { consumer, args };
-        let request = ShardRequest::new(numeric_stream_id, numeric_topic_id, partition_id, payload);
+        let request = ShardRequest::new(stream_id.clone(), topic_id.clone(), partition_id, payload);
         let message = ShardMessage::Request(request);
         let (metadata, batch) = match self
             .send_request_to_shard_or_recoil(&namespace, message)
@@ -551,25 +339,16 @@ impl IggyShard {
                                 timestamp_ts, partition_id
                             );
 
-                            // First stage: Get segment range filtered by timestamp
-                            let range = self.streams2.with_partition_by_id(
-                                stream_id,
-                                topic_id,
-                                partition_id,
-                                get_segment_range_by_timestamp(timestamp_ts),
-                            );
-
-                            // Second stage: Get messages by timestamp from the range
                             let batches = self
                                 .streams2
-                                .with_partition_by_id_async(
+                                .get_messages_by_timestamp(
                                     stream_id,
                                     topic_id,
                                     partition_id,
-                                    get_messages_by_timestamp_range(timestamp_ts, count, range),
+                                    timestamp_ts,
+                                    count,
                                 )
                                 .await?;
-
                             Ok(batches)
                         }
                         PollingKind::First => {
@@ -626,40 +405,32 @@ impl IggyShard {
                             Ok(batches)
                         }
                         PollingKind::Next => {
-                            let (consumer_offset, consumer_id) =
-                                self.streams2.with_partition_by_id(
-                                    stream_id,
-                                    topic_id,
-                                    partition_id,
-                                    |(.., consumer_offset, cg_offset, _)| match consumer {
-                                        PollingConsumer::Consumer(consumer_id, _) => {
-                                            let hdl = consumer_offset.pin();
-                                            (
-                                                hdl.get(&consumer_id).and_then(|consumer_offset| {
-                                                    Some(
-                                                        consumer_offset
-                                                            .offset
-                                                            .load(Ordering::Relaxed),
-                                                    )
-                                                }),
-                                                consumer_id,
-                                            )
-                                        }
-                                        PollingConsumer::ConsumerGroup(group_id, _) => {
-                                            let hdl = cg_offset.pin();
-                                            (
-                                                hdl.get(&group_id).and_then(|consumer_offset| {
-                                                    Some(
-                                                        consumer_offset
-                                                            .offset
-                                                            .load(Ordering::Relaxed),
-                                                    )
-                                                }),
-                                                group_id,
-                                            )
-                                        }
-                                    },
-                                );
+                            let (consumer_offset, consumer_id) = match consumer {
+                                PollingConsumer::Consumer(consumer_id, _) => (
+                                    self.streams2
+                                        .with_partition_by_id(
+                                            stream_id,
+                                            topic_id,
+                                            partition_id,
+                                            partitions::helpers::get_consumer_offset(consumer_id),
+                                        )
+                                        .map(|c_offset| c_offset.stored_offset),
+                                    consumer_id,
+                                ),
+                                PollingConsumer::ConsumerGroup(cg_id, _) => (
+                                    self.streams2
+                                        .with_partition_by_id(
+                                            stream_id,
+                                            topic_id,
+                                            partition_id,
+                                            partitions::helpers::get_consumer_group_member_offset(
+                                                cg_id,
+                                            ),
+                                        )
+                                        .map(|cg_offset| cg_offset.stored_offset),
+                                    cg_id,
+                                ),
+                            };
 
                             let Some(consumer_offset) = consumer_offset else {
                                 return Err(IggyError::ConsumerOffsetNotFound(consumer_id));

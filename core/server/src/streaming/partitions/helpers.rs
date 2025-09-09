@@ -1,9 +1,11 @@
 use error_set::ErrContext;
-use iggy_common::{ConsumerOffsetInfo, IggyError};
+use iggy_common::{ConsumerOffsetInfo, Identifier, IggyByteSize, IggyError};
 use std::{ops::AsyncFnOnce, sync::atomic::Ordering};
+use sysinfo::Component;
 
 use crate::{
-    configs::system::SystemConfig,
+    configs::{cache_indexes::CacheIndexesConfig, system::SystemConfig},
+    shard_trace,
     slab::{
         partitions::{self, Partitions},
         traits_ext::{
@@ -15,10 +17,10 @@ use crate::{
         partitions::{
             consumer_offset::ConsumerOffset,
             journal::{Journal, MemoryMessageJournal},
-            partition2::{self, PartitionRef},
+            partition2::{self, PartitionRef, PartitionRefMut},
             storage2,
         },
-        segments::{IggyIndexesMut, IggyMessagesBatchSet, storage::Storage},
+        segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet, storage::Storage},
     },
 };
 
@@ -627,5 +629,193 @@ pub fn get_messages_by_timestamp_range(
         }
 
         Ok(batches)
+    }
+}
+
+pub fn calculate_current_offset() -> impl FnOnce(ComponentsById<PartitionRef>) -> u64 {
+    |(root, _, _, offset, ..)| {
+        if !root.should_increment_offset() {
+            0
+        } else {
+            offset.load(Ordering::Relaxed) + 1
+        }
+    }
+}
+
+pub fn deduplicate_messages(
+    current_offset: u64,
+    batch: &mut IggyMessagesBatchMut,
+) -> impl AsyncFnOnce(ComponentsById<PartitionRef>) {
+    async move |(.., deduplicator, _, _, _, log)| {
+        let segment = log.active_segment();
+        batch
+            .prepare_for_persistence(
+                segment.start_offset,
+                current_offset,
+                segment.size,
+                deduplicator.as_ref(),
+            )
+            .await;
+    }
+}
+
+pub fn append_to_journal(
+    shard_id: u16,
+    current_offset: u64,
+    batch: IggyMessagesBatchMut,
+) -> impl FnOnce(ComponentsById<PartitionRefMut>) -> Result<(u32, u32), IggyError> {
+    move |(root, stats, _, offset, .., log)| {
+        let segment = log.active_segment_mut();
+
+        if segment.end_offset == 0 {
+            segment.start_timestamp = batch.first_timestamp().unwrap();
+        }
+
+        let batch_messages_size = batch.size();
+        let batch_messages_count = batch.count();
+
+        segment.end_timestamp = batch.last_timestamp().unwrap();
+        segment.end_offset = batch.last_offset().unwrap();
+        segment.size += batch_messages_size;
+
+        let (journal_messages_count, journal_size) = log.journal_mut().append(shard_id, batch)?;
+
+        stats.increment_messages_count(batch_messages_count as u64);
+        stats.increment_size_bytes(batch_messages_size as u64);
+
+        let last_offset = if batch_messages_count == 0 {
+            current_offset
+        } else {
+            current_offset + batch_messages_count as u64 - 1
+        };
+
+        if root.should_increment_offset() {
+            offset.store(last_offset, Ordering::Relaxed);
+        } else {
+            root.set_should_increment_offset(true);
+            offset.store(last_offset, Ordering::Relaxed);
+        }
+
+        Ok((journal_messages_count, journal_size))
+    }
+}
+
+pub fn commit_journal() -> impl FnOnce(ComponentsById<PartitionRefMut>) -> IggyMessagesBatchSet {
+    |(.., log)| {
+        let batches = log.journal_mut().commit();
+        log.ensure_indexes();
+        batches.append_indexes_to(log.active_indexes_mut().unwrap());
+        batches
+    }
+}
+
+pub fn is_segment_full() -> impl FnOnce(ComponentsById<PartitionRef>) -> bool {
+    |(.., log)| log.active_segment().is_full()
+}
+
+pub fn persist_reason(
+    unsaved_messages_count_exceeded: bool,
+    unsaved_messages_size_exceeded: bool,
+    journal_messages_count: u32,
+    journal_size: u32,
+    config: &SystemConfig,
+) -> impl FnOnce(ComponentsById<PartitionRef>) -> String {
+    move |(.., log)| {
+        if unsaved_messages_count_exceeded {
+            format!(
+                "unsaved messages count exceeded: {}, max from config: {}",
+                journal_messages_count, config.partition.messages_required_to_save,
+            )
+        } else if unsaved_messages_size_exceeded {
+            format!(
+                "unsaved messages size exceeded: {}, max from config: {}",
+                journal_size, config.partition.size_of_messages_required_to_save,
+            )
+        } else {
+            format!(
+                "segment is full, current size: {}, max from config: {}",
+                log.active_segment().size,
+                &config.segment.size,
+            )
+        }
+    }
+}
+
+pub fn persist_batch(
+    shard_id: u16,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    partition_id: usize,
+    batches: IggyMessagesBatchSet,
+    reason: String,
+) -> impl AsyncFnOnce(ComponentsById<PartitionRef>) -> Result<(IggyByteSize, u32), IggyError> {
+    async move |(.., log)| {
+        shard_trace!(
+            shard_id,
+            "Persisting messages on disk for stream ID: {}, topic ID: {}, partition ID: {} because {}...",
+            stream_id,
+            topic_id,
+            partition_id,
+            reason
+        );
+
+        let batch_count = batches.count();
+        let batch_size = batches.size();
+
+        let storage = log.active_storage();
+        let saved = storage
+            .messages_writer
+            .as_ref()
+            .expect("Messages writer not initialized")
+            .save_batch_set(batches)
+            .await
+            .with_error_context(|error| {
+                let segment = log.active_segment();
+                format!(
+                    "Failed to save batch of {batch_count} messages \
+                                    ({batch_size} bytes) to {segment}. {error}",
+                )
+            })?;
+
+        let unsaved_indexes_slice = log.active_indexes().unwrap().unsaved_slice();
+        let len = unsaved_indexes_slice.len();
+        storage
+            .index_writer
+            .as_ref()
+            .expect("Index writer not initialized")
+            .save_indexes(unsaved_indexes_slice)
+            .await
+            .with_error_context(|error| {
+                let segment = log.active_segment();
+                format!("Failed to save index of {len} indexes to {segment}. {error}",)
+            })?;
+
+        shard_trace!(
+            shard_id,
+            "Persisted {} messages on disk for stream ID: {}, topic ID: {}, for partition with ID: {}, total bytes written: {}.",
+            batch_count,
+            stream_id,
+            topic_id,
+            partition_id,
+            saved
+        );
+
+        Ok((saved, batch_count))
+    }
+}
+
+pub fn update_index_and_increment_stats(
+    saved: IggyByteSize,
+    batch_count: u32,
+    config: &SystemConfig,
+) -> impl FnOnce(ComponentsById<PartitionRefMut>) {
+    move |(_, stats, .., log)| {
+        log.active_segment_mut().size += saved.as_bytes_u32();
+        log.active_indexes_mut().unwrap().mark_saved();
+        if config.segment.cache_indexes == CacheIndexesConfig::None {
+            log.active_indexes_mut().unwrap().clear();
+        }
+        stats.increment_size_bytes(saved.as_bytes_u64());
+        stats.increment_messages_count(batch_count as u64);
     }
 }
