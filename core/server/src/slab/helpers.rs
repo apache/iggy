@@ -27,11 +27,11 @@ where
     async |(root, ..)| f(root.topics()).await
 }
 
-pub fn topics_mut<O, F>(f: F) -> impl FnOnce(ComponentsById<StreamRefMut>) -> O
+pub fn topics_mut<O, F>(f: F) -> impl FnOnce(ComponentsById<StreamRef>) -> O
 where
-    F: for<'a> FnOnce(&'a mut Topics) -> O,
+    F: for<'a> FnOnce(&'a Topics) -> O,
 {
-    |(mut root, ..)| f(root.topics_mut())
+    |(root, ..)| f(root.topics())
 }
 
 pub fn partitions<O, F>(f: F) -> impl FnOnce(ComponentsById<TopicRef>) -> O

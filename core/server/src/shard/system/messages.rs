@@ -26,14 +26,12 @@ use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
 };
+use crate::shard_trace;
 use crate::streaming::polling_consumer::PollingConsumer;
-use crate::streaming::segments::{
-    IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet,
-};
+use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet};
 use crate::streaming::session::Session;
 use crate::streaming::utils::{PooledBuffer, hash};
 use crate::streaming::{partitions, streams, topics};
-use crate::shard_trace;
 use error_set::ErrContext;
 
 use iggy_common::{
@@ -186,26 +184,30 @@ impl IggyShard {
                     // Try committing the journal
                     if is_full || unsaved_messages_count_exceeded || unsaved_messages_size_exceeded
                     {
-                        self.streams2.persist_messages(
-                            self.id,
-                            stream_id,
-                            topic_id,
-                            partition_id,
-                            unsaved_messages_count_exceeded,
-                            unsaved_messages_size_exceeded,
-                            journal_messages_count,
-                            journal_size,
-                            &self.config.system,
-                        ).await?;
-
-                        if is_full {
-                            self.streams2.handle_full_segment(
+                        self.streams2
+                            .persist_messages(
                                 self.id,
                                 stream_id,
                                 topic_id,
                                 partition_id,
+                                unsaved_messages_count_exceeded,
+                                unsaved_messages_size_exceeded,
+                                journal_messages_count,
+                                journal_size,
                                 &self.config.system,
-                            ).await?;
+                            )
+                            .await?;
+
+                        if is_full {
+                            self.streams2
+                                .handle_full_segment(
+                                    self.id,
+                                    stream_id,
+                                    topic_id,
+                                    partition_id,
+                                    &self.config.system,
+                                )
+                                .await?;
                             self.metrics.increment_messages(messages_count as u64);
                         }
                     }
@@ -270,7 +272,10 @@ impl IggyShard {
         let has_partition = self
             .streams2
             .with_topic_by_id(stream_id, topic_id, |(root, ..)| {
-                root.partitions().exists(partition_id)
+                let partitions = root.partitions();
+                tracing::warn!("partitions: {:?}, looking for part_id: {}", partitions, partition_id);
+                partitions.exists(partition_id)
+                //root.partitions().exists(partition_id)
             });
         if !has_partition {
             return Err(IggyError::NoPartitions(

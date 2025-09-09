@@ -350,9 +350,9 @@ pub fn create_shard_executor(cpu_set: HashSet<usize>) -> Runtime {
     let mut proactor = compio::driver::ProactorBuilder::new();
 
     proactor
-        .capacity(4096)
+        .capacity(1024)
         .coop_taskrun(true)
-        .taskrun_flag(false); // TODO: Try enabling this.
+        .taskrun_flag(true); // TODO: Try enabling this.
 
     // FIXME(hubcio): Only set thread_pool_limit(0) on non-macOS platforms
     // This causes a freeze on macOS with compio fs operations

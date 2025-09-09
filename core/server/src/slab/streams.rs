@@ -1,18 +1,30 @@
 use crate::{
-    configs::{cache_indexes::CacheIndexesConfig, system::SystemConfig}, slab::{
-        consumer_groups::ConsumerGroups, helpers, partitions::{self, Partitions}, topics::Topics, traits_ext::{
+    configs::{cache_indexes::CacheIndexesConfig, system::SystemConfig},
+    slab::{
+        Keyed,
+        consumer_groups::ConsumerGroups,
+        helpers,
+        partitions::{self, Partitions},
+        topics::Topics,
+        traits_ext::{
             ComponentsById, DeleteCell, EntityComponentSystem, EntityComponentSystemMutCell,
             InsertCell, InteriorMutability, IntoComponents,
-        }, Keyed
-    }, streaming::{
-        partitions::partition2::{PartitionRef, PartitionRefMut},
-        segments::{storage::create_segment_storage, IggyMessagesBatchSet, Segment2},
-        stats::stats::StreamStats,
-        streams::{self, stream2::{self, StreamRef, StreamRefMut}},
-        topics::{
-            self, consumer_group2::{ConsumerGroupRef, ConsumerGroupRefMut}, topic2::{TopicRef, TopicRefMut}
         },
-    }
+    },
+    streaming::{
+        partitions::partition2::{PartitionRef, PartitionRefMut},
+        segments::{IggyMessagesBatchSet, Segment2, storage::create_segment_storage},
+        stats::stats::StreamStats,
+        streams::{
+            self,
+            stream2::{self, StreamRef, StreamRefMut},
+        },
+        topics::{
+            self,
+            consumer_group2::{ConsumerGroupRef, ConsumerGroupRefMut},
+            topic2::{TopicRef, TopicRefMut},
+        },
+    },
 };
 use ahash::AHashMap;
 use iggy_common::{Identifier, IggyError};
@@ -208,9 +220,9 @@ impl Streams {
     pub fn with_topics_mut<T>(
         &self,
         stream_id: &Identifier,
-        f: impl FnOnce(&mut Topics) -> T,
+        f: impl FnOnce(&Topics) -> T,
     ) -> T {
-        self.with_stream_by_id_mut(stream_id, helpers::topics_mut(f))
+        self.with_stream_by_id(stream_id, helpers::topics_mut(f))
     }
 
     pub fn with_topic_by_id<T>(
@@ -446,44 +458,26 @@ impl Streams {
         partition_id: partitions::ContainerId,
         config: &crate::configs::system::SystemConfig,
     ) -> Result<(), IggyError> {
-        let numeric_stream_id = self
-            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-        let numeric_topic_id = self.with_topic_by_id(
-            stream_id,
-            topic_id,
-            topics::helpers::get_topic_id(),
-        );
+        let numeric_stream_id =
+            self.with_stream_by_id(stream_id, streams::helpers::get_stream_id());
+        let numeric_topic_id =
+            self.with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
 
-        if config.segment.cache_indexes
-            == CacheIndexesConfig::OpenSegment
-            || config.segment.cache_indexes
-                == CacheIndexesConfig::None
+        if config.segment.cache_indexes == CacheIndexesConfig::OpenSegment
+            || config.segment.cache_indexes == CacheIndexesConfig::None
         {
-            self.with_partition_by_id_mut(
-                stream_id,
-                topic_id,
-                partition_id,
-                |(.., log)| {
-                    log.clear_active_indexes();
-                },
-            );
+            self.with_partition_by_id_mut(stream_id, topic_id, partition_id, |(.., log)| {
+                log.clear_active_indexes();
+            });
         }
 
-        self.with_partition_by_id_mut(
-            stream_id,
-            topic_id,
-            partition_id,
-            |(.., log)| {
-                log.active_segment_mut().sealed = true;
-            },
-        );
+        self.with_partition_by_id_mut(stream_id, topic_id, partition_id, |(.., log)| {
+            log.active_segment_mut().sealed = true;
+        });
         let (log_writer, index_writer) =
-            self.with_partition_by_id_mut(
-                stream_id,
-                topic_id,
-                partition_id,
-                |(.., log)| log.active_storage_mut().shutdown(),
-            );
+            self.with_partition_by_id_mut(stream_id, topic_id, partition_id, |(.., log)| {
+                log.active_storage_mut().shutdown()
+            });
 
         compio::runtime::spawn(async move {
             let _ = log_writer.fsync().await;
@@ -496,18 +490,13 @@ impl Streams {
         .detach();
 
         let (start_offset, size, end_offset) =
-            self.with_partition_by_id(
-                stream_id,
-                topic_id,
-                partition_id,
-                |(.., log)| {
-                    (
-                        log.active_segment().start_offset,
-                        log.active_segment().size,
-                        log.active_segment().end_offset,
-                    )
-                },
-            );
+            self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
+                (
+                    log.active_segment().start_offset,
+                    log.active_segment().size,
+                    log.active_segment().end_offset,
+                )
+            });
 
         crate::shard_info!(
             shard_id,
@@ -538,14 +527,9 @@ impl Streams {
             end_offset + 1,
         )
         .await?;
-        self.with_partition_by_id_mut(
-            stream_id,
-            topic_id,
-            partition_id,
-            |(.., log)| {
-                log.add_persisted_segment(segment, storage);
-            },
-        );
+        self.with_partition_by_id_mut(stream_id, topic_id, partition_id, |(.., log)| {
+            log.add_persisted_segment(segment, storage);
+        });
 
         Ok(())
     }
