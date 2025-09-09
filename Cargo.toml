@@ -70,7 +70,7 @@ bench-report = { path = "core/bench/report" }
 bench-runner = { path = "core/bench/runner" }
 bincode = { version = "2.0.1", features = ["serde"] }
 blake3 = "1.8.2"
-bon = "3.7.1"
+bon = "3.7.2"
 byte-unit = { version = "5.1.6", default-features = false, features = [
     "serde",
     "byte",
@@ -78,7 +78,7 @@ byte-unit = { version = "5.1.6", default-features = false, features = [
 ] }
 bytes = "1.10.1"
 charming = "0.6.0"
-chrono = { version = "0.4.41", features = ["serde"] }
+chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.47", features = ["derive", "wrap_help"] }
 colored = "3.0.0"
 comfy-table = "7.2.0"
@@ -108,7 +108,7 @@ iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.1.0" }
 integration = { path = "core/integration" }
 keyring = { version = "3.6.3", features = ["sync-secret-service", "vendored"] }
 lazy_static = "1.5.0"
-log = "0.4.27"
+log = "0.4.28"
 mimalloc = "0.1"
 mockall = "0.13.1"
 nonzero_lit = "0.1.2"
@@ -160,8 +160,8 @@ tracing-subscriber = { version = "0.3.20", default-features = false, features = 
     "ansi",
 ] }
 trait-variant = "0.1.2"
-twox-hash = { version = "2.1.1", features = ["xxhash32"] }
-uuid = { version = "1.18.0", features = [
+twox-hash = { version = "2.1.2", features = ["xxhash32"] }
+uuid = { version = "1.18.1", features = [
     "v4",
     "v7",
     "fast-rng",
