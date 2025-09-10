@@ -22,6 +22,7 @@ use compio::io::AsyncWriteAtExt;
 use error_set::ErrContext;
 use iggy_common::INDEX_SIZE;
 use iggy_common::IggyError;
+use std::rc::Rc;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -35,15 +36,18 @@ use crate::streaming::utils::PooledBuffer;
 pub struct IndexWriter {
     file_path: String,
     file: File,
-    index_size_bytes: AtomicU64,
+    index_size_bytes: Rc<AtomicU64>,
     fsync: bool,
 }
+
+// Safety: We are guaranteeing that IndexWriter will never be used from multiple threads
+unsafe impl Send for IndexWriter {}
 
 impl IndexWriter {
     /// Opens the index file in write mode.
     pub async fn new(
         file_path: &str,
-        index_size_bytes: AtomicU64,
+        index_size_bytes: Rc<AtomicU64>,
         fsync: bool,
         file_exists: bool,
     ) -> Result<Self, IggyError> {

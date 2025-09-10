@@ -350,7 +350,7 @@ pub fn create_shard_executor(cpu_set: HashSet<usize>) -> Runtime {
     let mut proactor = compio::driver::ProactorBuilder::new();
 
     proactor
-        .capacity(1024)
+        .capacity(4096)
         .coop_taskrun(true)
         .taskrun_flag(true); // TODO: Try enabling this.
 
@@ -362,7 +362,7 @@ pub fn create_shard_executor(cpu_set: HashSet<usize>) -> Runtime {
 
     compio::runtime::RuntimeBuilder::new()
         .with_proactor(proactor.to_owned())
-        .event_interval(69)
+        .event_interval(128)
         .thread_affinity(cpu_set)
         .build()
         .unwrap()

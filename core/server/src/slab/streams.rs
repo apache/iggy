@@ -217,11 +217,7 @@ impl Streams {
         self.with_stream_by_id_async(stream_id, helpers::topics_async(f))
     }
 
-    pub fn with_topics_mut<T>(
-        &self,
-        stream_id: &Identifier,
-        f: impl FnOnce(&Topics) -> T,
-    ) -> T {
+    pub fn with_topics_mut<T>(&self, stream_id: &Identifier, f: impl FnOnce(&Topics) -> T) -> T {
         self.with_stream_by_id(stream_id, helpers::topics_mut(f))
     }
 

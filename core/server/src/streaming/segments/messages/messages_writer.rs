@@ -20,9 +20,12 @@ use crate::streaming::segments::{IggyMessagesBatchSet, messages::write_batch};
 use compio::fs::{File, OpenOptions};
 use error_set::ErrContext;
 use iggy_common::{IggyByteSize, IggyError};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use tracing::{error, trace};
 
@@ -31,9 +34,12 @@ use tracing::{error, trace};
 pub struct MessagesWriter {
     file_path: String,
     file: File,
-    messages_size_bytes: AtomicU64,
+    messages_size_bytes: Rc<AtomicU64>,
     fsync: bool,
 }
+
+// Safety: We are guaranteeing that MessagesWriter will never be used from multiple threads
+unsafe impl Send for MessagesWriter {}
 
 impl MessagesWriter {
     /// Opens the messages file in write mode.
@@ -43,7 +49,7 @@ impl MessagesWriter {
     /// Otherwise, the file is retained in `self.file` for synchronous writes.
     pub async fn new(
         file_path: &str,
-        messages_size_bytes: AtomicU64,
+        messages_size_bytes: Rc<AtomicU64>,
         fsync: bool,
         file_exists: bool,
     ) -> Result<Self, IggyError> {

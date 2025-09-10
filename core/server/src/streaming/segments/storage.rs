@@ -1,4 +1,5 @@
 use iggy_common::IggyError;
+use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use tracing::warn;
 
@@ -27,25 +28,16 @@ impl Storage {
         index_fsync: bool,
         file_exists: bool,
     ) -> Result<Self, IggyError> {
-        let messages_writer = MessagesWriter::new(
-            messages_path,
-            AtomicU64::new(messages_size),
-            log_fsync,
-            file_exists,
-        )
-        .await?;
+        let size = Rc::new(AtomicU64::new(messages_size));
+        let indexes_size = Rc::new(AtomicU64::new(indexes_size));
+        let messages_writer =
+            MessagesWriter::new(messages_path, size.clone(), log_fsync, file_exists).await?;
 
-        let index_writer = IndexWriter::new(
-            index_path,
-            AtomicU64::new(indexes_size),
-            index_fsync,
-            file_exists,
-        )
-        .await?;
+        let index_writer =
+            IndexWriter::new(index_path, indexes_size.clone(), index_fsync, file_exists).await?;
 
-        let messages_reader =
-            MessagesReader::new(messages_path, AtomicU64::new(messages_size)).await?;
-        let index_reader = IndexReader::new(index_path, AtomicU64::new(indexes_size)).await?;
+        let messages_reader = MessagesReader::new(messages_path, size).await?;
+        let index_reader = IndexReader::new(index_path, indexes_size).await?;
 
         Ok(Self {
             messages_writer: Some(messages_writer),

@@ -31,6 +31,7 @@ use ring::error;
 use std::{
     io::ErrorKind,
     os::unix::fs::FileExt,
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -43,12 +44,15 @@ use tracing::{error, trace};
 pub struct IndexReader {
     file_path: String,
     file: File,
-    index_size_bytes: AtomicU64,
+    index_size_bytes: Rc<AtomicU64>,
 }
+
+// Safety: We are guaranteeing that IndexWriter will never be used from multiple threads
+unsafe impl Send for IndexReader {}
 
 impl IndexReader {
     /// Opens the index file in read-only mode.
-    pub async fn new(file_path: &str, index_size_bytes: AtomicU64) -> Result<Self, IggyError> {
+    pub async fn new(file_path: &str, index_size_bytes: Rc<AtomicU64>) -> Result<Self, IggyError> {
         let file = OpenOptions::new()
             .read(true)
             .open(file_path)

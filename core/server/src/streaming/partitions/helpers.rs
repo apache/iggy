@@ -1,6 +1,9 @@
 use error_set::ErrContext;
 use iggy_common::{ConsumerOffsetInfo, Identifier, IggyByteSize, IggyError};
-use std::{ops::AsyncFnOnce, sync::atomic::Ordering};
+use std::{
+    ops::{AsyncFnOnce, Index},
+    sync::atomic::Ordering,
+};
 use sysinfo::Component;
 
 use crate::{
@@ -361,6 +364,8 @@ async fn load_messages_from_disk_by_offset(
     }
 
     let indexes_to_read = indexes_to_read.unwrap();
+    let first = indexes_to_read.get(0).unwrap();
+    let last = indexes_to_read.last().unwrap();
 
     let batch = storage
         .messages_reader
@@ -401,31 +406,27 @@ pub fn get_messages_by_offset_range(
             .skip(range.start)
             .take(range.end - range.start)
         {
-            if remaining_count == 0 {
-                break;
-            }
-
-            let segment_offset = if current_offset < segment.start_offset {
+            let start_offset = if current_offset < segment.start_offset {
                 segment.start_offset
             } else {
                 current_offset
             };
 
-            let mut end_offset = segment_offset + (remaining_count - 1) as u64;
+            let mut end_offset = start_offset + (remaining_count - 1) as u64;
             if end_offset > segment.end_offset {
                 end_offset = segment.end_offset;
             }
 
             // Calculate the actual count to request from this segment
-            let segment_count = ((end_offset - segment_offset + 1) as u32).min(remaining_count);
+            let count: u32 = ((end_offset - start_offset + 1) as u32).min(remaining_count);
 
             let messages = get_messages_by_offset(
                 storage,
                 journal,
                 index,
-                segment_offset,
+                start_offset,
                 end_offset,
-                segment_count,
+                count,
                 segment.start_offset,
             )
             .await?;
@@ -450,7 +451,6 @@ pub fn get_messages_by_offset_range(
                 break;
             }
         }
-
         Ok(batches)
     }
 }
@@ -676,7 +676,6 @@ pub fn append_to_journal(
 
         segment.end_timestamp = batch.last_timestamp().unwrap();
         segment.end_offset = batch.last_offset().unwrap();
-        segment.size += batch_messages_size;
 
         let (journal_messages_count, journal_size) = log.journal_mut().append(shard_id, batch)?;
 
@@ -777,6 +776,9 @@ pub fn persist_batch(
                 )
             })?;
 
+        let indices = log.active_indexes().unwrap();
+        let first_index = indices.get(0).unwrap();
+        let last_index = indices.last().unwrap();
         let unsaved_indexes_slice = log.active_indexes().unwrap().unsaved_slice();
         let len = unsaved_indexes_slice.len();
         storage
@@ -810,7 +812,8 @@ pub fn update_index_and_increment_stats(
     config: &SystemConfig,
 ) -> impl FnOnce(ComponentsById<PartitionRefMut>) {
     move |(_, stats, .., log)| {
-        log.active_segment_mut().size += saved.as_bytes_u32();
+        let segment = log.active_segment_mut();
+        segment.size += saved.as_bytes_u32();
         log.active_indexes_mut().unwrap().mark_saved();
         if config.segment.cache_indexes == CacheIndexesConfig::None {
             log.active_indexes_mut().unwrap().clear();

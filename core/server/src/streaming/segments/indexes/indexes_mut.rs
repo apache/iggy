@@ -256,7 +256,7 @@ impl IggyIndexesMut {
         if relative_start_offset == 0 {
             Some(IggyIndexesMut::from_bytes(slice, self.base_position))
         } else {
-            let position_offset = self.get(relative_start_offset - 1).unwrap().position();
+            let position_offset: u32 = self.get(relative_start_offset - 1).unwrap().position();
             Some(IggyIndexesMut::from_bytes(slice, position_offset))
         }
     }

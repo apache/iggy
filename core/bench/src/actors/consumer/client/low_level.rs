@@ -89,7 +89,7 @@ impl ConsumerClient for LowLevelConsumerClient {
         if polled.messages.is_empty() {
             return Ok(None);
         }
-        let message_count = u32::try_from(polled.messages.len()).unwrap();
+        let messages_count = polled.messages.len() as u64;
         let latency = if self.config.origin_timestamp_latency_calculation {
             let now = IggyTimestamp::now().as_micros();
             Duration::from_micros(now - polled.messages[0].header.origin_timestamp)
@@ -100,10 +100,16 @@ impl ConsumerClient for LowLevelConsumerClient {
         let user_bytes = batch_user_size_bytes(&polled);
         let total_bytes = batch_total_size_bytes(&polled);
 
-        self.offset += polled.messages.len() as u64;
+        self.offset += messages_count;
+        match self.polling_strategy.kind {
+            PollingKind::Offset => {
+                self.polling_strategy.value += messages_count;
+            }
+            _ => {}
+        }
 
         Ok(Some(BatchMetrics {
-            messages: message_count,
+            messages: messages_count as u32,
             user_data_bytes: user_bytes,
             total_bytes,
             latency,

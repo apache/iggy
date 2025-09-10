@@ -24,6 +24,7 @@ use compio::fs::{File, OpenOptions};
 use compio::io::AsyncReadAtExt;
 use error_set::ErrContext;
 use iggy_common::IggyError;
+use std::rc::Rc;
 use std::{
     io::ErrorKind,
     sync::{
@@ -38,12 +39,18 @@ use tracing::{error, trace};
 pub struct MessagesReader {
     file_path: String,
     file: File,
-    messages_size_bytes: AtomicU64,
+    messages_size_bytes: Rc<AtomicU64>,
 }
+
+// Safety: We are guaranteeing that MessagesReader will never be used from multiple threads
+unsafe impl Send for MessagesReader {}
 
 impl MessagesReader {
     /// Opens the messages file in read mode.
-    pub async fn new(file_path: &str, messages_size_bytes: AtomicU64) -> Result<Self, IggyError> {
+    pub async fn new(
+        file_path: &str,
+        messages_size_bytes: Rc<AtomicU64>,
+    ) -> Result<Self, IggyError> {
         let file = OpenOptions::new()
             .read(true)
             .open(file_path)

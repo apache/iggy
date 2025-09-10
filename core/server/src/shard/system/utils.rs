@@ -61,7 +61,7 @@ impl IggyShard {
     ) -> Option<(PollingConsumer, usize)> {
         match consumer.kind {
             ConsumerKind::Consumer => {
-                let partition_id = partition_id.unwrap_or(1);
+                let partition_id = partition_id.unwrap_or(0);
                 Some((
                     PollingConsumer::consumer(&consumer.id, partition_id as usize),
                     partition_id as usize,

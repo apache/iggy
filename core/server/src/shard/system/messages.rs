@@ -272,10 +272,7 @@ impl IggyShard {
         let has_partition = self
             .streams2
             .with_topic_by_id(stream_id, topic_id, |(root, ..)| {
-                let partitions = root.partitions();
-                tracing::warn!("partitions: {:?}, looking for part_id: {}", partitions, partition_id);
-                partitions.exists(partition_id)
-                //root.partitions().exists(partition_id)
+                root.partitions().exists(partition_id)
             });
         if !has_partition {
             return Err(IggyError::NoPartitions(
