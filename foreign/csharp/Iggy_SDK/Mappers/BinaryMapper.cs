@@ -315,7 +315,7 @@ internal static class BinaryMapper
         {
             ClientId = id,
             UserId = userId,
-            Transport = transport,
+            Transport = Enum.Parse<Protocol>(transport, true),
             Address = address,
             ConsumerGroupsCount = consumerGroupsCount
         }, readBytes);

@@ -42,8 +42,8 @@ public class PollMessagesTests
                                Count = 10,
                                PartitionId = 1,
                                PollingStrategy = PollingStrategy.Next(),
-                               StreamId = Identifier.Numeric(Fixture.StreamId),
-                               TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value)
+                               StreamId = Identifier.String(Fixture.StreamId),
+                               TopicId = Identifier.String(Fixture.TopicRequest.Name)
                            }, DummyMessage.DeserializeDummyMessage, token: token))
         {
             msgResponse.UserHeaders.ShouldNotBeNull();

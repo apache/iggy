@@ -17,29 +17,35 @@
 
 using Apache.Iggy.Enums;
 using Apache.Iggy.IggyClient;
+using TUnit.Core.Interfaces;
 
 namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
-public class SystemFixture : IggyServerFixture
+public class SystemFixture : IAsyncInitializer
 {
     internal readonly int TotalClientsCount = 10;
+    internal readonly string StreamId = "SystemStream";
 
     private List<IIggyClient> AdditionalClients { get; } = new();
 
-    public override async Task InitializeAsync()
+    [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
+    public required IggyServerFixture IggyServerFixture { get; init; }
+    
+    public Dictionary<Protocol, IIggyClient> Clients { get; set; } = new();
+    
+    public async Task InitializeAsync()
     {
-        await base.InitializeAsync();
-
         await CreateClientsAsync();
     }
 
     private async Task CreateClientsAsync()
     {
+        Clients = await IggyServerFixture.CreateClients();
         for (var i = 0; i < TotalClientsCount; i++)
         {
             await Clients[Protocol.Http].CreateUser($"iggy{i}", "iggy", UserStatus.Active);
 
-            var client = CreateClient(Protocol.Tcp, Protocol.Http);
+            var client = IggyServerFixture.CreateClient(Protocol.Tcp, Protocol.Http);
             AdditionalClients.Add(client);
             var login = await client.LoginUser($"iggy{i}", "iggy");
 
@@ -56,7 +62,7 @@ public class SystemFixture : IggyServerFixture
         {
             await Clients[Protocol.Tcp].CreateUser($"iggy{i}", "iggy", UserStatus.Active);
 
-            var client = CreateClient(Protocol.Tcp, Protocol.Tcp);
+            var client = IggyServerFixture.CreateClient(Protocol.Tcp, Protocol.Tcp);
             AdditionalClients.Add(client);
             var login = await client.LoginUser($"iggy{i}", "iggy");
             if (login!.UserId == 0)

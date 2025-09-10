@@ -28,8 +28,8 @@ public class PersonalAccessTokenTests
     private const string Name = "test-pat";
     private const ulong Expiry = 100_000_000;
 
-    [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerClass)]
-    public required IggyServerFixture Fixture { get; init; }
+    [ClassDataSource<PersonalAccessTokenFixture>(Shared = SharedType.PerClass)]
+    public required PersonalAccessTokenFixture Fixture { get; init; }
 
 
     [Test]
@@ -74,7 +74,7 @@ public class PersonalAccessTokenTests
     {
         var response = await Fixture.Clients[protocol].CreatePersonalAccessTokenAsync("test-pat-login", 100_000_000);
 
-        var client = Fixture.CreateClient(protocol);
+        var client = Fixture.IggyServerFixture.CreateClient(protocol);
 
         var authResponse = await client.LoginWithPersonalAccessToken(response!.Token);
 

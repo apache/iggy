@@ -54,7 +54,7 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         .WithCleanUp(true)
         .Build();
 
-    public Dictionary<Protocol, IIggyClient> Clients { get; } = new();
+    //public Dictionary<Protocol, IIggyClient> Clients { get; } = new();
 
     private Action<MessageBatchingSettings> BatchingSettings { get; } = options =>
     {
@@ -83,22 +83,33 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         await CreateHttpClient();
     }
 
-    public async Task CreateTcpClient()
+    public async Task<Dictionary<Protocol, IIggyClient>> CreateClients()
     {
-        var tcpClient = CreateClient(Protocol.Tcp);
+        var dictionary = new Dictionary<Protocol, IIggyClient>();
+        dictionary[Protocol.Tcp] = await CreateTcpClient();
+        dictionary[Protocol.Http] = await CreateHttpClient();
+        
+        return dictionary;
+    }
+    
+    public async Task<IIggyClient> CreateTcpClient()
+    {
+        var client = CreateClient(Protocol.Tcp);
 
-        await tcpClient.LoginUser("iggy", "iggy");
+        await client.LoginUser("iggy", "iggy");
 
-        Clients[Protocol.Tcp] = tcpClient;
+        //Clients[Protocol.Tcp] = tcpClient;
+        return client;
     }
 
-    public async Task CreateHttpClient()
+    public async Task<IIggyClient> CreateHttpClient()
     {
         var client = CreateClient(Protocol.Http);
 
         await client.LoginUser("iggy", "iggy");
 
-        Clients[Protocol.Http] = client;
+        //Clients[Protocol.Http] = client;
+        return client;
     }
 
     public IIggyClient CreateClient(Protocol protocol, Protocol? targetContainer = null)

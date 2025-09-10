@@ -27,11 +27,11 @@ namespace Apache.Iggy.Tests.Integrations;
 
 public class UsersTests
 {
-    private const string Username = "test_user_1";
-    private const string NewUsername = "new_user_name";
+    private const string Username = "fixture_users_user_1";
+    private const string NewUsername = "fixture_users_user_1_new";
 
-    [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerClass)]
-    public required IggyServerFixture Fixture { get; init; }
+    [ClassDataSource<UsersFixture>(Shared = SharedType.PerClass)]
+    public required UsersFixture Fixture { get; init; }
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
@@ -63,10 +63,10 @@ public class UsersTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task GetUser_WithoutPermissions_Should_ReturnValidResponse(Protocol protocol)
     {
-        var response = await Fixture.Clients[protocol].GetUser(Identifier.Numeric(2));
+        var response = await Fixture.Clients[protocol].GetUser(Identifier.String(Username));
 
         response.ShouldNotBeNull();
-        response.Id.ShouldBe((uint)2);
+        response.Id.ShouldBeGreaterThan((uint)1);
         response.Username.ShouldBe(Username);
         response.Status.ShouldBe(UserStatus.Active);
         response.CreatedAt.ShouldBeGreaterThan(0u);
@@ -82,7 +82,7 @@ public class UsersTests
 
         response.ShouldNotBeNull();
         response.ShouldNotBeEmpty();
-        response.ShouldContain(user => user.Id == 2 && user.Username == Username && user.Status == UserStatus.Active);
+        response.ShouldContain(user => user.Username == Username && user.Status == UserStatus.Active);
         response.ShouldAllBe(user => user.CreatedAt > 0u);
         response.ShouldAllBe(user => user.Permissions == null);
     }
@@ -93,16 +93,19 @@ public class UsersTests
     public async Task UpdateUser_Should_UpdateUser_Successfully(Protocol protocol)
     {
         await Should.NotThrowAsync(Fixture.Clients[protocol]
-            .UpdateUser(Identifier.Numeric(2), "new_user_name", UserStatus.Active));
+            .UpdateUser(Identifier.String(Username), NewUsername, UserStatus.Active));
 
-        var user = await Fixture.Clients[protocol].GetUser(Identifier.Numeric(2));
+        var user = await Fixture.Clients[protocol].GetUser(Identifier.String(NewUsername));
 
         user.ShouldNotBeNull();
-        user.Id.ShouldBe(2u);
-        user.Username.ShouldBe("new_user_name");
+        user.Id.ShouldBeGreaterThan(1u);
+        user.Username.ShouldBe(NewUsername);
         user.Status.ShouldBe(UserStatus.Active);
         user.CreatedAt.ShouldBeGreaterThan(0u);
         user.Permissions.ShouldBeNull();
+        
+        await Should.NotThrowAsync(Fixture.Clients[protocol]
+            .UpdateUser(Identifier.String(NewUsername), Username, UserStatus.Active));
     }
 
     [Test]
@@ -111,12 +114,12 @@ public class UsersTests
     public async Task UpdatePermissions_Should_UpdatePermissions_Successfully(Protocol protocol)
     {
         var permissions = CreatePermissions();
-        await Should.NotThrowAsync(Fixture.Clients[protocol].UpdatePermissions(Identifier.Numeric(2), permissions));
+        await Should.NotThrowAsync(Fixture.Clients[protocol].UpdatePermissions(Identifier.String(Username), permissions));
 
-        var user = await Fixture.Clients[protocol].GetUser(Identifier.Numeric(2));
+        var user = await Fixture.Clients[protocol].GetUser(Identifier.String(Username));
 
         user.ShouldNotBeNull();
-        user.Id.ShouldBe(2u);
+        user.Id.ShouldBeGreaterThan(1u);
         user.Permissions.ShouldNotBeNull();
         user.Permissions!.Global.ShouldNotBeNull();
         user.Permissions.Global.ManageServers.ShouldBeTrue();
@@ -151,7 +154,7 @@ public class UsersTests
     public async Task ChangePassword_Should_ChangePassword_Successfully(Protocol protocol)
     {
         await Should.NotThrowAsync(Fixture.Clients[protocol]
-            .ChangePassword(Identifier.Numeric(2), "test_password_1", "user2"));
+            .ChangePassword(Identifier.String(Username), "test_password_1", "user2"));
     }
 
     [Test]
@@ -160,7 +163,7 @@ public class UsersTests
     public async Task ChangePassword_WrongCurrentPassword_Should_Throw_InvalidResponse(Protocol protocol)
     {
         await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol]
-            .ChangePassword(Identifier.Numeric(2), "test_password_1", "user2"));
+            .ChangePassword(Identifier.String(Username), "test_password_1", "user2"));
     }
 
     [Test]
@@ -168,12 +171,12 @@ public class UsersTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task LoginUser_Should_LoginUser_Successfully(Protocol protocol)
     {
-        var client = Fixture.CreateClient(protocol);
+        var client = Fixture.IggyServerFixture.CreateClient(protocol);
 
-        var response = await client.LoginUser(NewUsername, "user2");
+        var response = await client.LoginUser(Username, "user2");
 
         response.ShouldNotBeNull();
-        response.UserId.ShouldBe(2);
+        response.UserId.ShouldBeGreaterThan(1);
         switch (protocol)
         {
             case Protocol.Tcp:
@@ -190,7 +193,7 @@ public class UsersTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DeleteUser_Should_DeleteUser_Successfully(Protocol protocol)
     {
-        await Should.NotThrowAsync(Fixture.Clients[protocol].DeleteUser(Identifier.Numeric(2)));
+        await Should.NotThrowAsync(Fixture.Clients[protocol].DeleteUser(Identifier.String(Username)));
     }
 
     [Test]

@@ -28,8 +28,8 @@ namespace Apache.Iggy.Tests.Integrations;
 public class ConsumerGroupTests
 {
     private static readonly uint GroupId = 1;
-    private static readonly Identifier StreamId = Identifier.Numeric(1);
-    private static readonly Identifier TopicId = Identifier.Numeric(1);
+    private Identifier StreamId => Identifier.String(Fixture.StreamId);
+    private Identifier TopicId => Identifier.String(Fixture.TopicId);
     private static readonly string GroupName = "test_consumer_group";
 
     [ClassDataSource<ConsumerGroupFixture>(Shared = SharedType.PerClass)]
@@ -142,7 +142,7 @@ public class ConsumerGroupTests
         var clients = new List<IIggyClient>();
         for (var i = 0; i < 2; i++)
         {
-            var client = Fixture.CreateClient(Protocol.Tcp, protocol);
+            var client = Fixture.IggyServerFixture.CreateClient(Protocol.Tcp, protocol);
             clients.Add(client);
             await client.LoginUser("iggy", "iggy");
             var me = await client.GetMeAsync();

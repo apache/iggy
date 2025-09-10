@@ -17,32 +17,38 @@
 
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Http;
-using Apache.Iggy.Kinds;
+using Apache.Iggy.Enums;
+using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Helpers;
+using TUnit.Core.Interfaces;
+using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
-public class OffsetFixtures : IggyServerFixture
+public class OffsetFixtures : IAsyncInitializer
 {
-    internal readonly uint StreamId = 1;
-    internal readonly CreateTopicRequest TopicRequest = TopicFactory.CreateTopic();
+    internal readonly string StreamId = "OffsetStream";
+    internal readonly CreateTopicRequest TopicRequest = TopicFactory.CreateTopic("Topic");
+    
+    [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
+    public required IggyServerFixture IggyServerFixture { get; init; }
+    
+    public Dictionary<Protocol, IIggyClient> Clients { get; set; } = new();
 
-    public override async Task InitializeAsync()
+    public async Task InitializeAsync()
     {
-        await base.InitializeAsync();
-
+        Clients = await IggyServerFixture.CreateClients();
         foreach (var client in Clients.Values)
         {
-            await client.CreateStreamAsync("TestStream", StreamId);
-            await client.CreateTopicAsync(Identifier.Numeric(StreamId), TopicRequest.Name, TopicRequest.PartitionsCount,
-                topicId: TopicRequest.TopicId);
+            await client.CreateStreamAsync(StreamId);
+            await client.CreateTopicAsync(Identifier.String(StreamId), TopicRequest.Name, TopicRequest.PartitionsCount);
 
             await client.SendMessagesAsync(new MessageSendRequest
             {
                 Partitioning = Partitioning.None(),
-                StreamId = Identifier.Numeric(StreamId),
-                TopicId = Identifier.Numeric(TopicRequest.TopicId!.Value),
+                StreamId = Identifier.String(StreamId),
+                TopicId = Identifier.String(TopicRequest.Name),
                 Messages = new List<Message>
                 {
                     new(Guid.NewGuid(), "Test message 1"u8.ToArray()),
