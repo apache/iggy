@@ -66,7 +66,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     public async Task<StreamResponse?> CreateStreamAsync(string name, uint? streamId, CancellationToken token = default)
     {
         var message = TcpContracts.CreateStream(name, streamId);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CREATE_STREAM_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -85,7 +85,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     public async Task<StreamResponse?> GetStreamByIdAsync(Identifier streamId, CancellationToken token = default)
     {
         var message = TcpMessageStreamHelpers.GetBytesFromIdentifier(streamId);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_STREAM_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -104,7 +104,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     public async Task<IReadOnlyList<StreamResponse>> GetStreamsAsync(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_STREAMS_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -123,7 +123,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     public async Task UpdateStreamAsync(Identifier streamId, string name, CancellationToken token = default)
     {
         var message = TcpContracts.UpdateStream(streamId, name);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.UPDATE_STREAM_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -135,7 +135,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     public async Task PurgeStreamAsync(Identifier streamId, CancellationToken token = default)
     {
         var message = TcpMessageStreamHelpers.GetBytesFromIdentifier(streamId);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.PURGE_STREAM_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -147,7 +147,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     public async Task DeleteStreamAsync(Identifier streamId, CancellationToken token = default)
     {
         var message = TcpMessageStreamHelpers.GetBytesFromIdentifier(streamId);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.DELETE_STREAM_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -160,7 +160,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         CancellationToken token = default)
     {
         var message = TcpMessageStreamHelpers.GetBytesFromIdentifier(streamId);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_TOPICS_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -180,7 +180,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         CancellationToken token = default)
     {
         var message = TcpContracts.GetTopicById(streamId, topicId);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_TOPIC_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -204,7 +204,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     {
         var message = TcpContracts.CreateTopic(streamId, name, partitionsCount, compressionAlgorithm, topicId,
             replicationFactor, messageExpiry, maxTopicSize);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CREATE_TOPIC_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -227,7 +227,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     {
         var message = TcpContracts.UpdateTopic(streamId, topicId, name, compressionAlgorithm, maxTopicSize,
             messageExpiry, replicationFactor);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.UPDATE_TOPIC_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -239,7 +239,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     public async Task DeleteTopicAsync(Identifier streamId, Identifier topicId, CancellationToken token = default)
     {
         var message = TcpContracts.DeleteTopic(streamId, topicId);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.DELETE_TOPIC_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -251,7 +251,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     public async Task PurgeTopicAsync(Identifier streamId, Identifier topicId, CancellationToken token = default)
     {
         var message = TcpContracts.PurgeTopic(streamId, topicId);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.PURGE_TOPIC_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -346,7 +346,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     {
         var message = TcpContracts.FlushUnsavedBuffer(streamId, topicId, partitionId, fsync);
         ;
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.FLUSH_UNSAVED_BUFFER_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -361,10 +361,10 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendFetchMessagesRequestPayload(request.Consumer, request.StreamId, request.TopicId,
             request.PollingStrategy,
             request.Count, request.AutoCommit, request.PartitionId, token);
-        IMemoryOwner<byte> buffer = MemoryPool<byte>.Shared.Rent(BufferSizes.ExpectedResponseSize);
+        IMemoryOwner<byte> buffer = MemoryPool<byte>.Shared.Rent(BufferSizes.EXPECTED_RESPONSE_SIZE);
         try
         {
-            await _stream.ReadAsync(buffer.Memory[..BufferSizes.ExpectedResponseSize], token);
+            await _stream.ReadAsync(buffer.Memory[..BufferSizes.EXPECTED_RESPONSE_SIZE], token);
             var response = TcpMessageStreamHelpers.GetResponseLengthAndStatus(buffer.Memory.Span);
             if (response.Status != 0)
             {
@@ -465,10 +465,10 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
             request.PollingStrategy,
             request.Count, request.AutoCommit, request.PartitionId, token);
 
-        var buffer = ArrayPool<byte>.Shared.Rent(BufferSizes.ExpectedResponseSize);
+        var buffer = ArrayPool<byte>.Shared.Rent(BufferSizes.EXPECTED_RESPONSE_SIZE);
         try
         {
-            await _stream.ReadAsync(buffer.AsMemory()[..BufferSizes.ExpectedResponseSize], token);
+            await _stream.ReadAsync(buffer.AsMemory()[..BufferSizes.EXPECTED_RESPONSE_SIZE], token);
 
             var response = TcpMessageStreamHelpers.GetResponseLengthAndStatus(buffer);
             if (response.Status != 0)
@@ -511,7 +511,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         uint? partitionId, CancellationToken token = default)
     {
         var message = TcpContracts.UpdateOffset(streamId, topicId, consumer, offset, partitionId);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.STORE_CONSUMER_OFFSET_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -524,7 +524,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         uint? partitionId, CancellationToken token = default)
     {
         var message = TcpContracts.GetOffset(streamId, topicId, consumer, partitionId);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_CONSUMER_OFFSET_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -544,7 +544,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         CancellationToken token = default)
     {
         var message = TcpContracts.DeleteOffset(streamId, topicId, consumer, partitionId);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.DELETE_CONSUMER_OFFSET_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -558,7 +558,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         CancellationToken token = default)
     {
         var message = TcpContracts.GetGroups(streamId, topicId);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_CONSUMER_GROUPS_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -578,7 +578,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         Identifier groupId, CancellationToken token = default)
     {
         var message = TcpContracts.GetGroup(streamId, topicId, groupId);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_CONSUMER_GROUP_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -598,7 +598,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         string name, uint? groupId, CancellationToken token = default)
     {
         var message = TcpContracts.CreateGroup(streamId, topicId, name, groupId);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CREATE_CONSUMER_GROUP_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -618,7 +618,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         CancellationToken token = default)
     {
         var message = TcpContracts.DeleteGroup(streamId, topicId, groupId);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.DELETE_CONSUMER_GROUP_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -631,7 +631,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         CancellationToken token = default)
     {
         var message = TcpContracts.JoinGroup(streamId, topicId, groupId);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.JOIN_CONSUMER_GROUP_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -644,7 +644,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         CancellationToken token = default)
     {
         var message = TcpContracts.LeaveGroup(streamId, topicId, groupId);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.LEAVE_CONSUMER_GROUP_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -657,7 +657,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         CancellationToken token = default)
     {
         var message = TcpContracts.DeletePartitions(streamId, topicId, partitionsCount);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.DELETE_PARTITIONS_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -670,7 +670,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         CancellationToken token = default)
     {
         var message = TcpContracts.CreatePartitions(streamId, topicId, partitionsCount);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CREATE_PARTITIONS_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -682,7 +682,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     public async Task<ClientResponse?> GetMeAsync(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_ME_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -701,7 +701,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     public async Task<StatsResponse?> GetStatsAsync(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_STATS_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -720,7 +720,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     public async Task PingAsync(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.PING_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -732,7 +732,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     public async Task<IReadOnlyList<ClientResponse>> GetClientsAsync(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_CLIENTS_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -751,7 +751,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     public async Task<ClientResponse?> GetClientByIdAsync(uint clientId, CancellationToken token = default)
     {
         var message = TcpContracts.GetClient(clientId);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_CLIENT_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -770,7 +770,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     public async Task<UserResponse?> GetUser(Identifier userId, CancellationToken token = default)
     {
         var message = TcpContracts.GetUser(userId);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_USER_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -789,7 +789,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     public async Task<IReadOnlyList<UserResponse>> GetUsers(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_USERS_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -809,7 +809,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         Permissions? permissions = null, CancellationToken token = default)
     {
         var message = TcpContracts.CreateUser(userName, password, status, permissions);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CREATE_USER_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -828,7 +828,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     public async Task DeleteUser(Identifier userId, CancellationToken token = default)
     {
         var message = TcpContracts.DeleteUser(userId);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.DELETE_USER_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -841,7 +841,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         CancellationToken token = default)
     {
         var message = TcpContracts.UpdateUser(userId, userName, status);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.UPDATE_USER_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -854,7 +854,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         CancellationToken token = default)
     {
         var message = TcpContracts.UpdatePermissions(userId, permissions);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.UPDATE_PERMISSIONS_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -867,7 +867,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         CancellationToken token = default)
     {
         var message = TcpContracts.ChangePassword(userId, currentPassword, newPassword);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CHANGE_PASSWORD_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -879,7 +879,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     public async Task<AuthResponse?> LoginUser(string userName, string password, CancellationToken token = default)
     {
         var message = TcpContracts.LoginUser(userName, password, "0.5.0", "csharp-sdk");
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.LOGIN_USER_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -901,7 +901,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     public async Task LogoutUser(CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.LOGOUT_USER_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -914,7 +914,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         CancellationToken token = default)
     {
         var message = Array.Empty<byte>();
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.GET_PERSONAL_ACCESS_TOKENS_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -934,7 +934,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         CancellationToken token = default)
     {
         var message = TcpContracts.CreatePersonalAccessToken(name, expiry);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.CREATE_PERSONAL_ACCESS_TOKEN_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -953,7 +953,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     public async Task DeletePersonalAccessTokenAsync(string name, CancellationToken token = default)
     {
         var message = TcpContracts.DeletePersonalRequestToken(name);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.DELETE_PERSONAL_ACCESS_TOKEN_CODE);
 
         await _stream.SendAsync(payload, token);
@@ -965,7 +965,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     public async Task<AuthResponse?> LoginWithPersonalAccessToken(string token, CancellationToken ct = default)
     {
         var message = TcpContracts.LoginWithPersonalAccessToken(token);
-        var payload = new byte[4 + BufferSizes.InitialBytesLength + message.Length];
+        var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.LOGIN_WITH_PERSONAL_ACCESS_TOKEN_CODE);
 
         await _stream.SendAsync(payload, ct);
@@ -1046,7 +1046,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
 
     private async Task CheckResponseAsync(CancellationToken token = default)
     {
-        var buffer = new byte[BufferSizes.ExpectedResponseSize];
+        var buffer = new byte[BufferSizes.EXPECTED_RESPONSE_SIZE];
         var readBytes = await _stream.ReadAsync(buffer, token);
 
         if (readBytes == 0)
@@ -1076,7 +1076,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
 
     private async Task<byte[]> GetMessageAsync(CancellationToken token = default)
     {
-        var buffer = new byte[BufferSizes.ExpectedResponseSize];
+        var buffer = new byte[BufferSizes.EXPECTED_RESPONSE_SIZE];
         var readBytes = await _stream.ReadAsync(buffer, token);
 
         if (readBytes == 0)
@@ -1110,7 +1110,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
 
     private static int CalculatePayloadBufferSize(int messageBufferSize)
     {
-        return messageBufferSize + 4 + BufferSizes.InitialBytesLength;
+        return messageBufferSize + 4 + BufferSizes.INITIAL_BYTES_LENGTH;
     }
 
     private static int CalculateMessageBufferSize(Identifier streamId, Identifier topicId, Consumer consumer)
