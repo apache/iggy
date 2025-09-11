@@ -171,6 +171,8 @@ parquet = "55.2.0"
 arrow-array = "55.2.0"
 iceberg = "0.6.0"
 iceberg-catalog-rest = "0.6.0"
+iceberg-catalog-glue = "0.6.0"
+
 
 # Optional dependencies
 mimalloc = "0.1"

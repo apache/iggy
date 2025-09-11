@@ -35,6 +35,7 @@ use iceberg::{
     writer::file_writer::location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
     Catalog,
 };
+use iceberg_catalog_glue::{GlueCatalog, GlueCatalogConfig};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use iggy_connector_sdk::{
     sink_connector, ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
@@ -70,7 +71,8 @@ pub struct IcebergSink {
     id: u32,
     config: IcebergSinkConfig,
     tables: Vec<Table>,
-    catalog: Option<RestCatalog>,
+    catalog: Option<Box<dyn Catalog>>,
+    props: HashMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -92,16 +94,67 @@ pub struct IcebergSinkConfig {
 impl IcebergSink {
     pub fn new(id: u32, config: IcebergSinkConfig) -> Self {
         let tables: Vec<Table> = Vec::with_capacity(config.tables.len());
+        let mut props: HashMap<String, String> = HashMap::new();
+
+        props.insert("s3.region".to_string(), config.store_region.clone());
+        props.insert(
+            "s3.access-key-id".to_string(),
+            config.store_access_key_id.clone(),
+        );
+        props.insert(
+            "s3.secret-access-key".to_string(),
+            config.store_secret_access_key.clone(),
+        );
+        props.insert("s3.endpoint".to_string(), config.store_url.clone());
+
         IcebergSink {
             id,
             config,
             tables,
             catalog: None,
+            props,
         }
     }
 
     fn slice_user_table(&self, table: &String) -> Vec<String> {
         table.split('.').map(|s| s.to_string()).collect()
+    }
+
+    #[inline(always)]
+    fn get_rest_catalog(&self) -> RestCatalog {
+        let catalog_config = RestCatalogConfig::builder()
+            .uri(self.config.uri.clone())
+            .props(self.props.clone())
+            .warehouse(self.config.bucket_name.clone())
+            .build();
+
+        RestCatalog::new(catalog_config)
+    }
+
+    //#[inline(always)]
+    //fn get_hms_catalog(&self) -> HmsCatalog {
+    //    let config = HmsCatalogConfig::builder()
+    //        .props(self.props)
+    //        .warehouse(self.config.bucket_name.clone())
+    //        .address(self.config.uri.clone())
+    //        .thrift_transport(HmsThriftTransport::Buffered)
+    //        .build();
+    //
+    //    HmsCatalog::new(config)
+    //}
+
+    #[inline(always)]
+    async fn get_glue_catalog(&self) -> Result<GlueCatalog, Error> {
+        let config = GlueCatalogConfig::builder()
+            .props(self.props.clone())
+            .warehouse(self.config.bucket_name.clone())
+            .build();
+
+        let catalog = GlueCatalog::new(config).await.map_err(|err| {
+            error!("Failed to apply transaction on table: {}", err);
+            Error::HttpRequestFailed(err.to_string())
+        });
+        return catalog;
     }
 }
 
@@ -121,29 +174,10 @@ impl Sink for IcebergSink {
             self.config.catalog_type
         );
 
-        let mut props: HashMap<String, String> = HashMap::new();
-
-        props.insert("s3.region".to_string(), self.config.store_region.clone());
-        props.insert(
-            "s3.access-key-id".to_string(),
-            self.config.store_access_key_id.clone(),
-        );
-        props.insert(
-            "s3.secret-access-key".to_string(),
-            self.config.store_secret_access_key.clone(),
-        );
-        props.insert("s3.endpoint".to_string(), self.config.store_url.clone());
-
-        let catalog_config = RestCatalogConfig::builder()
-            .uri(self.config.uri.clone())
-            .props(props)
-            .warehouse(self.config.bucket_name.clone())
-            .build();
-
-        let catalog = match self.config.catalog_type {
-            IcebergSinkTypes::rest => RestCatalog::new(catalog_config),
-            IcebergSinkTypes::hive => RestCatalog::new(catalog_config),
-            IcebergSinkTypes::glue => RestCatalog::new(catalog_config),
+        let catalog: Box<dyn Catalog> = match self.config.catalog_type {
+            IcebergSinkTypes::rest => Box::new(self.get_rest_catalog()),
+            IcebergSinkTypes::hive => Box::new(self.get_rest_catalog()),
+            IcebergSinkTypes::glue => Box::new(self.get_glue_catalog().await?),
         };
 
         for declared_table in &self.config.tables {
@@ -177,6 +211,7 @@ impl Sink for IcebergSink {
             messages.len(),
             messages_metadata.schema
         );
+
         for table in &self.tables {
             let location = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
 
@@ -238,7 +273,7 @@ impl Sink for IcebergSink {
             })?;
 
             let _table = tx
-                .commit(self.catalog.as_ref().unwrap())
+                .commit(self.catalog.as_ref().unwrap().as_ref())
                 .await
                 .map_err(|err| {
                     error!("Failed to apply transaction on table: {}", err);

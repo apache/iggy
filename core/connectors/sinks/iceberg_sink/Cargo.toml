@@ -48,6 +48,7 @@ uuid = { workspace = true }
 rust-s3 = { workspace = true }
 iceberg = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
+iceberg-catalog-glue = { workspace = true }
 chrono = { workspace = true }
 
 [lib]
