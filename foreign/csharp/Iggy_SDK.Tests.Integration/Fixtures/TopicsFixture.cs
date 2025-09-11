@@ -15,7 +15,6 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
-using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Enums;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Tests.Integrations.Helpers;
@@ -25,13 +24,20 @@ namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 public class TopicsFixture : IAsyncInitializer
 {
+    internal readonly string StreamId = "TestStream";
+
     [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
     public required IggyServerFixture IggyServerFixture { get; init; }
-    
+
     public Dictionary<Protocol, IIggyClient> Clients { get; set; } = new();
-    
+
     public async Task InitializeAsync()
     {
         Clients = await IggyServerFixture.CreateClients();
+
+        foreach (KeyValuePair<Protocol, IIggyClient> client in Clients)
+        {
+            await client.Value.CreateStreamAsync(StreamId.GetWithProtocol(client.Key));
+        }
     }
 }

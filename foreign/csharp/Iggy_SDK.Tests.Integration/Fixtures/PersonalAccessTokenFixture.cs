@@ -15,10 +15,8 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
-using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Enums;
 using Apache.Iggy.IggyClient;
-using Apache.Iggy.Tests.Integrations.Helpers;
 using TUnit.Core.Interfaces;
 
 namespace Apache.Iggy.Tests.Integrations.Fixtures;
@@ -27,11 +25,20 @@ public class PersonalAccessTokenFixture : IAsyncInitializer
 {
     [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
     public required IggyServerFixture IggyServerFixture { get; init; }
-    
+
     public Dictionary<Protocol, IIggyClient> Clients { get; set; } = new();
-    
+
     public async Task InitializeAsync()
     {
+        var userTcp = "pat_user_tcp";
+        var userHttp = "pat_user_http";
+
         Clients = await IggyServerFixture.CreateClients();
+
+        await Clients[Protocol.Tcp].CreateUser(userTcp, "iggy", UserStatus.Active);
+        await Clients[Protocol.Http].CreateUser(userHttp, "iggy", UserStatus.Active);
+
+        Clients[Protocol.Tcp] = await IggyServerFixture.CreateTcpClient(userTcp);
+        Clients[Protocol.Http] = await IggyServerFixture.CreateTcpClient(userHttp);
     }
 }

@@ -17,6 +17,7 @@
 
 using Apache.Iggy.Enums;
 using Apache.Iggy.IggyClient;
+using Apache.Iggy.Tests.Integrations.Helpers;
 using TUnit.Core.Interfaces;
 
 namespace Apache.Iggy.Tests.Integrations.Fixtures;
@@ -35,11 +36,12 @@ public class ConsumerGroupFixture : IAsyncInitializer
     public async Task InitializeAsync()
     {
         Clients = await IggyServerFixture.CreateClients();
-        
-        foreach (var client in Clients.Values)
+
+        foreach (KeyValuePair<Protocol, IIggyClient> client in Clients)
         {
-            await client.CreateStreamAsync(StreamId);
-            await client.CreateTopicAsync(Identifier.String(StreamId), TopicId, PartitionsCount);
+            await client.Value.CreateStreamAsync(StreamId.GetWithProtocol(client.Key));
+            await client.Value.CreateTopicAsync(Identifier.String(StreamId.GetWithProtocol(client.Key)), TopicId,
+                PartitionsCount);
         }
     }
 }

@@ -30,24 +30,25 @@ public class OffsetFixtures : IAsyncInitializer
 {
     internal readonly string StreamId = "OffsetStream";
     internal readonly CreateTopicRequest TopicRequest = TopicFactory.CreateTopic("Topic");
-    
+
     [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
     public required IggyServerFixture IggyServerFixture { get; init; }
-    
+
     public Dictionary<Protocol, IIggyClient> Clients { get; set; } = new();
 
     public async Task InitializeAsync()
     {
         Clients = await IggyServerFixture.CreateClients();
-        foreach (var client in Clients.Values)
+        foreach (KeyValuePair<Protocol, IIggyClient> client in Clients)
         {
-            await client.CreateStreamAsync(StreamId);
-            await client.CreateTopicAsync(Identifier.String(StreamId), TopicRequest.Name, TopicRequest.PartitionsCount);
+            await client.Value.CreateStreamAsync(StreamId.GetWithProtocol(client.Key));
+            await client.Value.CreateTopicAsync(Identifier.String(StreamId.GetWithProtocol(client.Key)),
+                TopicRequest.Name, TopicRequest.PartitionsCount);
 
-            await client.SendMessagesAsync(new MessageSendRequest
+            await client.Value.SendMessagesAsync(new MessageSendRequest
             {
                 Partitioning = Partitioning.None(),
-                StreamId = Identifier.String(StreamId),
+                StreamId = Identifier.String(StreamId.GetWithProtocol(client.Key)),
                 TopicId = Identifier.String(TopicRequest.Name),
                 Messages = new List<Message>
                 {

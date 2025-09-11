@@ -23,16 +23,16 @@ namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 public class SystemFixture : IAsyncInitializer
 {
-    internal readonly int TotalClientsCount = 10;
     internal readonly string StreamId = "SystemStream";
+    internal readonly int TotalClientsCount = 10;
 
     private List<IIggyClient> AdditionalClients { get; } = new();
 
     [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
     public required IggyServerFixture IggyServerFixture { get; init; }
-    
+
     public Dictionary<Protocol, IIggyClient> Clients { get; set; } = new();
-    
+
     public async Task InitializeAsync()
     {
         await CreateClientsAsync();
@@ -43,11 +43,12 @@ public class SystemFixture : IAsyncInitializer
         Clients = await IggyServerFixture.CreateClients();
         for (var i = 0; i < TotalClientsCount; i++)
         {
-            await Clients[Protocol.Http].CreateUser($"iggy{i}", "iggy", UserStatus.Active);
+            var userName = $"iggy_{Protocol.Http}_{i}";
+            await Clients[Protocol.Http].CreateUser(userName, "iggy", UserStatus.Active);
 
             var client = IggyServerFixture.CreateClient(Protocol.Tcp, Protocol.Http);
             AdditionalClients.Add(client);
-            var login = await client.LoginUser($"iggy{i}", "iggy");
+            var login = await client.LoginUser(userName, "iggy");
 
             if (login!.UserId == 0)
             {
@@ -60,11 +61,12 @@ public class SystemFixture : IAsyncInitializer
         // One client less for tcp due to a default client
         for (var i = 0; i < TotalClientsCount - 1; i++)
         {
-            await Clients[Protocol.Tcp].CreateUser($"iggy{i}", "iggy", UserStatus.Active);
+            var userName = $"iggy_{Protocol.Tcp}_{i}";
+            await Clients[Protocol.Tcp].CreateUser(userName, "iggy", UserStatus.Active);
 
             var client = IggyServerFixture.CreateClient(Protocol.Tcp, Protocol.Tcp);
             AdditionalClients.Add(client);
-            var login = await client.LoginUser($"iggy{i}", "iggy");
+            var login = await client.LoginUser(userName, "iggy");
             if (login!.UserId == 0)
             {
                 throw new Exception("Failed to login user 'iggy'.");

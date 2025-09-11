@@ -21,6 +21,7 @@ using Apache.Iggy.Contracts.Http.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Tests.Integrations.Fixtures;
+using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
 
 namespace Apache.Iggy.Tests.Integrations;
@@ -37,7 +38,8 @@ public class UsersTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task CreateUser_Should_CreateUser_Successfully(Protocol protocol)
     {
-        var request = new CreateUserRequest(Username, "test_password_1", UserStatus.Active, null);
+        var request = new CreateUserRequest(Username.GetWithProtocol(protocol), "test_password_1", UserStatus.Active,
+            null);
 
         var result = await Fixture.Clients[protocol].CreateUser(request.Username, request.Password, request.Status);
         result.ShouldNotBeNull();
@@ -52,7 +54,7 @@ public class UsersTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task CreateUser_Duplicate_Should_Throw_InvalidResponse(Protocol protocol)
     {
-        var request = new CreateUserRequest(Username, "test1", UserStatus.Active, null);
+        var request = new CreateUserRequest(Username.GetWithProtocol(protocol), "test1", UserStatus.Active, null);
 
         await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol]
             .CreateUser(request.Username, request.Password, request.Status));
@@ -63,11 +65,11 @@ public class UsersTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task GetUser_WithoutPermissions_Should_ReturnValidResponse(Protocol protocol)
     {
-        var response = await Fixture.Clients[protocol].GetUser(Identifier.String(Username));
+        var response = await Fixture.Clients[protocol].GetUser(Identifier.String(Username.GetWithProtocol(protocol)));
 
         response.ShouldNotBeNull();
         response.Id.ShouldBeGreaterThan((uint)1);
-        response.Username.ShouldBe(Username);
+        response.Username.ShouldBe(Username.GetWithProtocol(protocol));
         response.Status.ShouldBe(UserStatus.Active);
         response.CreatedAt.ShouldBeGreaterThan(0u);
         response.Permissions.ShouldBeNull();
@@ -82,7 +84,8 @@ public class UsersTests
 
         response.ShouldNotBeNull();
         response.ShouldNotBeEmpty();
-        response.ShouldContain(user => user.Username == Username && user.Status == UserStatus.Active);
+        response.ShouldContain(user =>
+            user.Username == Username.GetWithProtocol(protocol) && user.Status == UserStatus.Active);
         response.ShouldAllBe(user => user.CreatedAt > 0u);
         response.ShouldAllBe(user => user.Permissions == null);
     }
@@ -92,20 +95,21 @@ public class UsersTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task UpdateUser_Should_UpdateUser_Successfully(Protocol protocol)
     {
+        var newUsername = NewUsername.GetWithProtocol(protocol);
         await Should.NotThrowAsync(Fixture.Clients[protocol]
-            .UpdateUser(Identifier.String(Username), NewUsername, UserStatus.Active));
+            .UpdateUser(Identifier.String(Username.GetWithProtocol(protocol)), newUsername, UserStatus.Active));
 
-        var user = await Fixture.Clients[protocol].GetUser(Identifier.String(NewUsername));
+        var user = await Fixture.Clients[protocol].GetUser(Identifier.String(newUsername));
 
         user.ShouldNotBeNull();
         user.Id.ShouldBeGreaterThan(1u);
-        user.Username.ShouldBe(NewUsername);
+        user.Username.ShouldBe(newUsername);
         user.Status.ShouldBe(UserStatus.Active);
         user.CreatedAt.ShouldBeGreaterThan(0u);
         user.Permissions.ShouldBeNull();
-        
+
         await Should.NotThrowAsync(Fixture.Clients[protocol]
-            .UpdateUser(Identifier.String(NewUsername), Username, UserStatus.Active));
+            .UpdateUser(Identifier.String(newUsername), Username.GetWithProtocol(protocol), UserStatus.Active));
     }
 
     [Test]
@@ -114,9 +118,10 @@ public class UsersTests
     public async Task UpdatePermissions_Should_UpdatePermissions_Successfully(Protocol protocol)
     {
         var permissions = CreatePermissions();
-        await Should.NotThrowAsync(Fixture.Clients[protocol].UpdatePermissions(Identifier.String(Username), permissions));
+        await Should.NotThrowAsync(Fixture.Clients[protocol]
+            .UpdatePermissions(Identifier.String(Username.GetWithProtocol(protocol)), permissions));
 
-        var user = await Fixture.Clients[protocol].GetUser(Identifier.String(Username));
+        var user = await Fixture.Clients[protocol].GetUser(Identifier.String(Username.GetWithProtocol(protocol)));
 
         user.ShouldNotBeNull();
         user.Id.ShouldBeGreaterThan(1u);
@@ -154,7 +159,7 @@ public class UsersTests
     public async Task ChangePassword_Should_ChangePassword_Successfully(Protocol protocol)
     {
         await Should.NotThrowAsync(Fixture.Clients[protocol]
-            .ChangePassword(Identifier.String(Username), "test_password_1", "user2"));
+            .ChangePassword(Identifier.String(Username.GetWithProtocol(protocol)), "test_password_1", "user2"));
     }
 
     [Test]
@@ -163,7 +168,7 @@ public class UsersTests
     public async Task ChangePassword_WrongCurrentPassword_Should_Throw_InvalidResponse(Protocol protocol)
     {
         await Should.ThrowAsync<InvalidResponseException>(Fixture.Clients[protocol]
-            .ChangePassword(Identifier.String(Username), "test_password_1", "user2"));
+            .ChangePassword(Identifier.String(Username.GetWithProtocol(protocol)), "test_password_1", "user2"));
     }
 
     [Test]
@@ -173,7 +178,7 @@ public class UsersTests
     {
         var client = Fixture.IggyServerFixture.CreateClient(protocol);
 
-        var response = await client.LoginUser(Username, "user2");
+        var response = await client.LoginUser(Username.GetWithProtocol(protocol), "user2");
 
         response.ShouldNotBeNull();
         response.UserId.ShouldBeGreaterThan(1);
@@ -193,7 +198,8 @@ public class UsersTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DeleteUser_Should_DeleteUser_Successfully(Protocol protocol)
     {
-        await Should.NotThrowAsync(Fixture.Clients[protocol].DeleteUser(Identifier.String(Username)));
+        await Should.NotThrowAsync(Fixture.Clients[protocol]
+            .DeleteUser(Identifier.String(Username.GetWithProtocol(protocol))));
     }
 
     [Test]

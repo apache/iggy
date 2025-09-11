@@ -79,7 +79,7 @@ public class PersonalAccessTokenTests
         var authResponse = await client.LoginWithPersonalAccessToken(response!.Token);
 
         authResponse.ShouldNotBeNull();
-        authResponse.UserId.ShouldBe(1);
+        authResponse.UserId.ShouldBeGreaterThan(1);
     }
 
     [Test]

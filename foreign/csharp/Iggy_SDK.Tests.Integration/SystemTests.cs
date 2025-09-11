@@ -22,6 +22,7 @@ using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
+using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
@@ -42,7 +43,6 @@ public class SystemTests
         foreach (var client in clients)
         {
             client.ClientId.ShouldNotBe(0u);
-            client.UserId.ShouldBeGreaterThanOrEqualTo(0u);
             client.Address.ShouldNotBeNullOrEmpty();
             client.Transport.ShouldBe(Protocol.Tcp);
         }
@@ -56,11 +56,12 @@ public class SystemTests
         IReadOnlyList<ClientResponse> clients = await Fixture.Clients[protocol].GetClientsAsync();
 
         clients.Count.ShouldBeGreaterThanOrEqualTo(Fixture.TotalClientsCount);
-        var id = clients[0].ClientId;
+        var id = clients.First(x => x.UserId != null).ClientId;
         var response = await Fixture.Clients[protocol].GetClientByIdAsync(id);
         response.ShouldNotBeNull();
         response.ClientId.ShouldBe(id);
-        response.UserId.ShouldBeGreaterThanOrEqualTo(0u);
+        response.UserId.ShouldNotBeNull();
+        response.UserId.Value.ShouldBeGreaterThanOrEqualTo(0u);
         response.Address.ShouldNotBeNullOrEmpty();
         response.Transport.ShouldBe(Protocol.Tcp);
         response.ConsumerGroupsCount.ShouldBe(0);
@@ -98,13 +99,14 @@ public class SystemTests
     {
         var client = Fixture.IggyServerFixture.CreateClient(Protocol.Tcp, protocol);
         await client.LoginUser("iggy", "iggy");
-        var stream = await client.CreateStreamAsync(Fixture.StreamId);
-        await client.CreateTopicAsync(Identifier.String(Fixture.StreamId), "test_topic", 2);
+        var stream = await client.CreateStreamAsync(Fixture.StreamId.GetWithProtocol(protocol));
+        await client.CreateTopicAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), "test_topic", 2);
 
         var consumerGroup
-            = await client.CreateConsumerGroupAsync(Identifier.String(Fixture.StreamId), Identifier.Numeric(1), "test_consumer_group",
-                1);
-        await client.JoinConsumerGroupAsync(Identifier.String(Fixture.StreamId), Identifier.Numeric(1), Identifier.Numeric(1));
+            = await client.CreateConsumerGroupAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+                Identifier.Numeric(1), "test_consumer_group", 1);
+        await client.JoinConsumerGroupAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+            Identifier.Numeric(1), Identifier.Numeric(1));
         var me = await client.GetMeAsync();
 
         var response = await Fixture.Clients[protocol].GetClientByIdAsync(me!.ClientId);
@@ -127,7 +129,7 @@ public class SystemTests
     {
         await Fixture.Clients[protocol].SendMessagesAsync(new MessageSendRequest
         {
-            StreamId = Identifier.String(Fixture.StreamId),
+            StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
             TopicId = Identifier.Numeric(1),
             Partitioning = Partitioning.None(),
             Messages = [new Message(Guid.NewGuid(), "Test message"u8.ToArray())]
@@ -135,7 +137,7 @@ public class SystemTests
 
         await Fixture.Clients[protocol].PollMessagesAsync(new MessageFetchRequest
         {
-            StreamId = Identifier.String(Fixture.StreamId),
+            StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
             TopicId = Identifier.Numeric(1),
             AutoCommit = true,
             Consumer = Consumer.New(1),

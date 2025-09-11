@@ -35,23 +35,23 @@ public class PollMessagesFixture : IAsyncInitializer
 
     [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
     public required IggyServerFixture IggyServerFixture { get; init; }
-    
-    public Dictionary<Protocol, IIggyClient> Clients  { get; set; } = new();
-    
-    public  async Task InitializeAsync()
+
+    public Dictionary<Protocol, IIggyClient> Clients { get; set; } = new();
+
+    public async Task InitializeAsync()
     {
         Clients = await IggyServerFixture.CreateClients();
-        foreach (var client in Clients.Values)
+        foreach (KeyValuePair<Protocol, IIggyClient> client in Clients)
         {
-            await client.CreateStreamAsync(StreamId);
-            await client.CreateTopicAsync(Identifier.String(StreamId), TopicRequest.Name, TopicRequest.PartitionsCount,
-                topicId: TopicRequest.TopicId);
-            await client.SendMessagesAsync(
+            await client.Value.CreateStreamAsync(StreamId.GetWithProtocol(client.Key));
+            await client.Value.CreateTopicAsync(Identifier.String(StreamId.GetWithProtocol(client.Key)),
+                TopicRequest.Name, TopicRequest.PartitionsCount, topicId: TopicRequest.TopicId);
+            await client.Value.SendMessagesAsync(
                 new MessageSendRequest<DummyMessage>
                 {
                     Messages = CreateDummyMessagesWithoutHeader(MessageCount),
                     Partitioning = Partitioning.None(),
-                    StreamId = Identifier.String(StreamId),
+                    StreamId = Identifier.String(StreamId.GetWithProtocol(client.Key)),
                     TopicId = Identifier.String(TopicRequest.Name)
                 },
                 message => message.SerializeDummyMessage(),
