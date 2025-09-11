@@ -21,12 +21,11 @@ namespace Apache.Iggy.Tests.Integrations.Helpers;
 
 public static class TopicFactory
 {
-    internal static CreateTopicRequest CreateTopic(uint topicId = 1, uint partitionsCount = 1, ulong messageExpiry = 0)
+    internal static CreateTopicRequest CreateTopic(string topicId, uint partitionsCount = 1, ulong messageExpiry = 0)
     {
         return new CreateTopicRequest
         {
-            TopicId = topicId,
-            Name = $"TestTopic {topicId}",
+            Name = topicId,
             PartitionsCount = partitionsCount,
             MessageExpiry = messageExpiry
         };

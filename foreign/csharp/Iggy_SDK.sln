@@ -21,6 +21,7 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "SolutionFolder", "SolutionF
 		LICENSE = LICENSE
 		NOTICE = NOTICE
 		README.md = README.md
+		.editorconfig = .editorconfig
 	EndProjectSection
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Iggy_SDK.Tests.BDD", "Iggy_SDK.Tests.BDD\Iggy_SDK.Tests.BDD.csproj", "{91BFFAE1-1252-4061-BF40-C7E7296F82BC}"

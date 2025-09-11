@@ -1,27 +1,27 @@
 <Project>
-  <PropertyGroup>
-    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
-    <CentralPackageTransitivePinningEnabled>false</CentralPackageTransitivePinningEnabled>
-  </PropertyGroup>
-  <ItemGroup>
-    <PackageVersion Include="BenchmarkDotNet" Version="0.15.2" />
-    <PackageVersion Include="coverlet.collector" Version="6.0.4" />
-    <PackageVersion Include="FluentAssertions" Version="6.12.0" />
-    <PackageVersion Include="Microsoft.Extensions.Logging" Version="8.0.1" />
-    <PackageVersion Include="Microsoft.Extensions.Logging.Console" Version="8.0.1" />
-    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
-    <PackageVersion Include="Microsoft.Testing.Extensions.CodeCoverage" Version="17.14.2" />
-    <PackageVersion Include="Microsoft.Testing.Extensions.TrxReport" Version="1.8.2" />
-    <PackageVersion Include="Moq" Version="4.20.72" />
-    <PackageVersion Include="Reqnroll.xUnit" Version="2.4.1" />
-    <PackageVersion Include="Shouldly" Version="4.3.0" />
-    <PackageVersion Include="System.IO.Hashing" Version="8.0.0" />
-    <PackageVersion Include="Testcontainers" Version="4.6.0" />
-    <PackageVersion Include="TUnit" Version="0.56.50" />
-    <PackageVersion Include="xunit" Version="2.9.3" />
-    <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.4">
-      <PrivateAssets>all</PrivateAssets>
-      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
-    </PackageVersion>
-  </ItemGroup>
+    <PropertyGroup>
+        <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+        <CentralPackageTransitivePinningEnabled>false</CentralPackageTransitivePinningEnabled>
+    </PropertyGroup>
+    <ItemGroup>
+        <PackageVersion Include="BenchmarkDotNet" Version="0.15.2" />
+        <PackageVersion Include="coverlet.collector" Version="6.0.4" />
+        <PackageVersion Include="FluentAssertions" Version="6.12.0" />
+        <PackageVersion Include="Microsoft.Extensions.Logging" Version="8.0.1" />
+        <PackageVersion Include="Microsoft.Extensions.Logging.Console" Version="8.0.1" />
+        <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+        <PackageVersion Include="Microsoft.Testing.Extensions.CodeCoverage" Version="17.14.2" />
+        <PackageVersion Include="Microsoft.Testing.Extensions.TrxReport" Version="1.8.2" />
+        <PackageVersion Include="Moq" Version="4.20.72" />
+        <PackageVersion Include="Reqnroll.xUnit" Version="2.4.1" />
+        <PackageVersion Include="Shouldly" Version="4.3.0" />
+        <PackageVersion Include="System.IO.Hashing" Version="8.0.0" />
+        <PackageVersion Include="Testcontainers" Version="4.7.0" />
+        <PackageVersion Include="TUnit" Version="0.57.65" />
+        <PackageVersion Include="xunit" Version="2.9.3" />
+        <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.4">
+            <PrivateAssets>all</PrivateAssets>
+            <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+        </PackageVersion>
+    </ItemGroup>
 </Project>

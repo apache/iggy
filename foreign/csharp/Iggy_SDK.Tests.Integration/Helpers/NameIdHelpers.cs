@@ -17,28 +17,17 @@
 
 using Apache.Iggy.Enums;
 
-namespace Apache.Iggy.Tests.Integrations.Attributes;
+namespace Apache.Iggy.Tests.Integrations.Helpers;
 
-internal class SkipHttpAttribute() : SkipAttribute("This test is skipped for HTTP protocol")
+public static class ProtocolHelpers
 {
-    public override Task<bool> ShouldSkip(TestRegisteredContext context)
+    public static string GetWithProtocol(this string name, Protocol protocol)
     {
-        foreach (var argument in context.TestDetails.TestMethodArguments)
-        {
-            if (argument is Protocol.Http)
-            {
-                return Task.FromResult(true);
-            }
-        }
+        return $"{name}_{protocol.ToString().ToLowerInvariant()}";
+    }
 
-        foreach (var argument in context.TestDetails.TestClassArguments)
-        {
-            if (argument is Protocol.Http)
-            {
-                return Task.FromResult(true);
-            }
-        }
-
-        return Task.FromResult(false);
+    public static uint GetWithProtocol(this uint id, Protocol protocol)
+    {
+        return id + (uint)protocol * 10;
     }
 }
