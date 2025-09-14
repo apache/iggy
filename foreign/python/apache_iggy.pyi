@@ -480,10 +480,10 @@ class SendMessage:
     """
     def __new__(cls, data: builtins.str | bytes) -> SendMessage:
         r"""
-        Constructs a new `SendMessage` instance from a string.
+        Constructs a new `SendMessage` instance from a string or bytes.
 
         This method allows for the creation of a `SendMessage` instance
-        directly from Python using the provided string data.
+        directly from Python using the provided string or bytes data.
         """
 
 class StreamDetails:
