@@ -82,4 +82,18 @@ public class OffsetTests
         offset.PartitionId.ShouldBe(1);
         offset.CurrentOffset.ShouldBe(3u);
     }
+    
+    [Test]
+    [DependsOn(nameof(StoreOffset_ConsumerGroup_Should_StoreOffset_Successfully))]
+    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
+    public async Task GetOffset_ConsumerGroup_ByName_Should_GetOffset_Successfully(Protocol protocol)
+    {
+        var offset = await Fixture.Clients[protocol]
+            .GetOffsetAsync(Consumer.Group("test_consumer_group"), Identifier.Numeric(1), Identifier.Numeric(1), 1);
+
+        offset.ShouldNotBeNull();
+        offset.StoredOffset.ShouldBe(SetOffset);
+        offset.PartitionId.ShouldBe(1);
+        offset.CurrentOffset.ShouldBe(3u);
+    }
 }
