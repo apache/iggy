@@ -28,15 +28,7 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen
 #[gen_stub_pyclass]
 pub struct ReceiveMessage {
     pub(crate) inner: RustReceiveMessage,
-}
-
-impl ReceiveMessage {
-    /// Converts a Rust message into its corresponding Python representation.
-    ///
-    /// This is an internal utility function, not exposed to Python.
-    pub(crate) fn from_rust_message(message: RustReceiveMessage) -> Self {
-        Self { inner: message }
-    }
+    pub(crate) partition_id: u32,
 }
 
 #[gen_stub_pymethods]
@@ -82,6 +74,11 @@ impl ReceiveMessage {
     /// The length represents the length of the payload.
     pub fn length(&self) -> u32 {
         self.inner.header.payload_length
+    }
+
+    /// Retrieves the partition this message belongs to.
+    pub fn partition_id(&self) -> u32 {
+        self.partition_id
     }
 }
 
