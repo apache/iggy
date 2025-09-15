@@ -466,6 +466,9 @@ pub enum IggyError {
     #[error("Cannot read index timestamp")]
     CannotReadIndexTimestamp = 10012,
 
+    #[error("Timestamp out of range: {0}")]
+    TimestampOutOfRange(u64) = 10013,
+
     #[error("Shard not found for stream ID: {0}, topic ID: {1}, partition ID: {2}")]
     ShardNotFound(usize, usize, usize) = 11000,
     #[error("Shard communication error, shard ID: {0}")]

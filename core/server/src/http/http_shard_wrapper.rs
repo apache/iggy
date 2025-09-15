@@ -255,8 +255,8 @@ impl HttpSafeShard {
         &self,
         client_id: u32,
         user_id: u32,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
+        stream_id: Identifier,
+        topic_id: Identifier,
         consumer: Consumer,
         maybe_partition_id: Option<u32>,
         args: PollingArgs,
@@ -277,8 +277,8 @@ impl HttpSafeShard {
     pub async fn append_messages(
         &self,
         user_id: u32,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
+        stream_id: Identifier,
+        topic_id: Identifier,
         partitioning: &Partitioning,
         batch: IggyMessagesBatchMut,
     ) -> Result<(), IggyError> {

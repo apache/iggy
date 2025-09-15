@@ -79,7 +79,7 @@ impl Journal for MemoryMessageJournal {
     }
 
     fn commit(&mut self) -> Self::Container {
-        self.inner.base_offset = self.inner.current_offset;
+        self.inner.base_offset = self.inner.current_offset + 1;
         self.inner.first_timestamp = 0;
         self.inner.end_timestamp = 0;
         self.inner.size = 0;

@@ -23,7 +23,7 @@ use crate::slab::traits_ext::{EntityMarker, InsertCell};
 use crate::streaming::session::Session;
 use crate::streaming::stats::stats::{StreamStats, TopicStats};
 use crate::streaming::topics::storage2::{create_topic_file_hierarchy, delete_topic_from_disk};
-use crate::streaming::topics::topic2::{self, resolve_max_topic_size, resolve_message_expiry};
+use crate::streaming::topics::topic2::{self};
 use crate::streaming::{partitions, streams, topics};
 use error_set::ErrContext;
 use iggy_common::{
@@ -72,10 +72,11 @@ impl IggyShard {
         let parent_stats = self
             .streams2
             .with_stream_by_id(stream_id, |(_, stats)| stats.clone());
-        let message_expiry = resolve_message_expiry(message_expiry, config);
+        let message_expiry = config.resolve_message_expiry(message_expiry);
         shard_info!(self.id, "Topic message expiry: {}", message_expiry);
-        let max_topic_size = resolve_max_topic_size(max_topic_size, config)?;
-        let topic = self.create_and_insert_topics_mem(
+        let max_topic_size = config.resolve_max_topic_size(max_topic_size)?;
+        let topic = topic2::create_and_insert_topics_mem(
+            &self.streams2,
             stream_id,
             name,
             replication_factor.unwrap_or(1),

@@ -68,8 +68,8 @@ async fn poll_messages(
     let poll_future = SendWrapper::new(state.shard.poll_messages(
         session.client_id,
         session.get_user_id(),
-        &query.0.stream_id,
-        &query.0.topic_id,
+        query.0.stream_id,
+        query.0.topic_id,
         consumer,
         query.0.partition_id,
         PollingArgs::new(query.0.strategy, query.0.count, query.0.auto_commit),
@@ -106,8 +106,8 @@ async fn send_messages(
 
     let append_future = SendWrapper::new(state.shard.append_messages(
         identity.user_id,
-        &command_stream_id,
-        &command_topic_id,
+        command_stream_id,
+        command_topic_id,
         &partitioning,
         batch,
     ));

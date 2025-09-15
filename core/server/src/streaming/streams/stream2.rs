@@ -7,9 +7,10 @@ use std::{
 
 use crate::{
     slab::{
-        Keyed, streams,
+        Keyed,
+        streams::{self, Streams},
         topics::Topics,
-        traits_ext::{EntityMarker, IntoComponents, IntoComponentsById},
+        traits_ext::{EntityMarker, InsertCell, IntoComponents, IntoComponentsById},
     },
     streaming::stats::stats::StreamStats,
 };
@@ -186,4 +187,14 @@ impl<'a> IntoComponentsById for StreamRefMut<'a> {
         let stats = RefMut::map(self.stats, |s| &mut s[index]);
         (root, stats)
     }
+}
+
+// TODO: Move this to a dedicated module.
+pub fn create_and_insert_stream_mem(streams: &Streams, name: String) -> Stream {
+    let now = IggyTimestamp::now();
+    let stats = Arc::new(Default::default());
+    let mut stream = Stream::new(name, stats, now);
+    let id = streams.insert(stream.clone());
+    stream.update_id(id);
+    stream
 }

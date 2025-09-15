@@ -114,8 +114,8 @@ impl ServerCommandHandler for SendMessages {
         shard
             .append_messages(
                 user_id,
-                &self.stream_id,
-                &self.topic_id,
+                self.stream_id,
+                self.topic_id,
                 &self.partitioning,
                 batch,
             )

@@ -1,15 +1,21 @@
 use crate::{
+    configs::system::SystemConfig,
     slab::{
         partitions,
+        streams::Streams,
         traits_ext::{EntityMarker, IntoComponents, IntoComponentsById},
     },
     streaming::{
+        self,
         deduplication::message_deduplicator::MessageDeduplicator,
-        partitions::{consumer_offset, journal::MemoryMessageJournal, log::SegmentedLog},
-        stats::stats::PartitionStats,
+        partitions::{
+            consumer_offset, helpers::create_message_deduplicator, journal::MemoryMessageJournal,
+            log::SegmentedLog,
+        },
+        stats::stats::{PartitionStats, TopicStats},
     },
 };
-use iggy_common::IggyTimestamp;
+use iggy_common::{Identifier, IggyTimestamp};
 use slab::Slab;
 use std::sync::{Arc, atomic::AtomicU64};
 
@@ -364,4 +370,46 @@ impl<'a> IntoComponentsById for PartitionRefMut<'a> {
             &mut self.log[index],
         )
     }
+}
+
+pub fn create_and_insert_partitions_mem(
+    streams: &Streams,
+    stream_id: &Identifier,
+    topic_id: &Identifier,
+    parent_stats: Arc<TopicStats>,
+    partitions_count: u32,
+    config: &SystemConfig,
+) -> Vec<Partition> {
+    let range = 0..partitions_count as usize;
+    let created_at = IggyTimestamp::now();
+    range
+        .map(|_| {
+            // Areczkuuuu.
+            let stats = Arc::new(PartitionStats::new(parent_stats.clone()));
+            let should_increment_offset = false;
+            let deduplicator = create_message_deduplicator(config);
+            let offset = Arc::new(AtomicU64::new(0));
+            let consumer_offset = Arc::new(ConsumerOffsets::with_capacity(2137));
+            let consumer_group_offset = Arc::new(ConsumerGroupOffsets::with_capacity(2137));
+            let log = Default::default();
+
+            let mut partition = Partition::new(
+                created_at,
+                should_increment_offset,
+                stats,
+                deduplicator,
+                offset,
+                consumer_offset,
+                consumer_group_offset,
+                log,
+            );
+            let id = streams.with_partitions_mut(
+                stream_id,
+                topic_id,
+                streaming::partitions::helpers::insert_partition(partition.clone()),
+            );
+            partition.update_id(id);
+            partition
+        })
+        .collect()
 }

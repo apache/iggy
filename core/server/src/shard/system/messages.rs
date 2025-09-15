@@ -21,7 +21,7 @@ use std::sync::atomic::Ordering;
 use super::COMPONENT;
 use crate::binary::handlers::messages::poll_messages_handler::IggyPollMetadata;
 use crate::shard::IggyShard;
-use crate::shard::namespace::IggyNamespace;
+use crate::shard::namespace::{IggyFullNamespace, IggyNamespace};
 use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
@@ -30,6 +30,7 @@ use crate::shard_trace;
 use crate::streaming::polling_consumer::PollingConsumer;
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet};
 use crate::streaming::session::Session;
+use crate::streaming::traits::MainOps;
 use crate::streaming::utils::{PooledBuffer, hash};
 use crate::streaming::{partitions, streams, topics};
 use error_set::ErrContext;
@@ -44,8 +45,8 @@ impl IggyShard {
     pub async fn append_messages(
         &self,
         user_id: u32,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
+        stream_id: Identifier,
+        topic_id: Identifier,
         partitioning: &Partitioning,
         batch: IggyMessagesBatchMut,
     ) -> Result<(), IggyError> {
@@ -72,11 +73,11 @@ impl IggyShard {
 
         let numeric_stream_id = self
             .streams2
-            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
+            .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
 
         let numeric_topic_id =
             self.streams2
-                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
+                .with_topic_by_id(&stream_id, &topic_id, topics::helpers::get_topic_id());
 
         // Validate permissions for given user on stream and topic.
         self.permissioner
@@ -97,8 +98,8 @@ impl IggyShard {
         let partition_id =
             self.streams2
                 .with_topic_by_id(
-                    stream_id,
-                    topic_id,
+                    &stream_id,
+                    &topic_id,
                     |(root, auxilary, ..)| match partitioning.kind {
                         PartitioningKind::Balanced => {
                             let upperbound = root.partitions().len();
@@ -121,7 +122,7 @@ impl IggyShard {
                 )?;
 
         let namespace = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
-        let payload = ShardRequestPayload::SendMessages { batch: batch };
+        let payload = ShardRequestPayload::SendMessages { batch };
         let request = ShardRequest::new(stream_id.clone(), topic_id.clone(), partition_id, payload);
         let message = ShardMessage::Request(request);
         match self
@@ -130,87 +131,21 @@ impl IggyShard {
         {
             ShardSendRequestResult::Recoil(message) => {
                 if let ShardMessage::Request(ShardRequest {
+                    stream_id,
+                    topic_id,
                     partition_id,
                     payload,
-                    ..
                 }) = message
                     && let ShardRequestPayload::SendMessages { batch } = payload
                 {
+                    let ns = IggyFullNamespace::new(stream_id, topic_id, partition_id);
                     // Encrypt messages if encryptor is enabled in configuration.
-                    let mut batch = self.maybe_encrypt_messages(batch)?;
+                    let batch = self.maybe_encrypt_messages(batch)?;
                     let messages_count = batch.count();
-
-                    let current_offset = self.streams2.with_partition_by_id(
-                        stream_id,
-                        topic_id,
-                        partition_id,
-                        partitions::helpers::calculate_current_offset(),
-                    );
-
                     self.streams2
-                        .with_partition_by_id_async(
-                            stream_id,
-                            topic_id,
-                            partition_id,
-                            partitions::helpers::deduplicate_messages(current_offset, &mut batch),
-                        )
-                        .await;
-
-                    let (journal_messages_count, journal_size) =
-                        self.streams2.with_partition_by_id_mut(
-                            stream_id,
-                            topic_id,
-                            partition_id,
-                            partitions::helpers::append_to_journal(self.id, current_offset, batch),
-                        )?;
-
-                    let unsaved_messages_count_exceeded = journal_messages_count
-                        >= self.config.system.partition.messages_required_to_save;
-                    let unsaved_messages_size_exceeded = journal_size
-                        >= self
-                            .config
-                            .system
-                            .partition
-                            .size_of_messages_required_to_save
-                            .as_bytes_u64() as u32;
-
-                    let is_full = self.streams2.with_partition_by_id(
-                        stream_id,
-                        topic_id,
-                        partition_id,
-                        partitions::helpers::is_segment_full(),
-                    );
-
-                    // Try committing the journal
-                    if is_full || unsaved_messages_count_exceeded || unsaved_messages_size_exceeded
-                    {
-                        self.streams2
-                            .persist_messages(
-                                self.id,
-                                stream_id,
-                                topic_id,
-                                partition_id,
-                                unsaved_messages_count_exceeded,
-                                unsaved_messages_size_exceeded,
-                                journal_messages_count,
-                                journal_size,
-                                &self.config.system,
-                            )
-                            .await?;
-
-                        if is_full {
-                            self.streams2
-                                .handle_full_segment(
-                                    self.id,
-                                    stream_id,
-                                    topic_id,
-                                    partition_id,
-                                    &self.config.system,
-                                )
-                                .await?;
-                            self.metrics.increment_messages(messages_count as u64);
-                        }
-                    }
+                        .append_messages(self.id, &self.config.system, &ns, batch)
+                        .await?;
+                    self.metrics.increment_messages(messages_count as u64);
                     Ok(())
                 } else {
                     unreachable!(
@@ -234,18 +169,18 @@ impl IggyShard {
         &self,
         client_id: u32,
         user_id: u32,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
+        stream_id: Identifier,
+        topic_id: Identifier,
         consumer: Consumer,
         maybe_partition_id: Option<u32>,
         args: PollingArgs,
     ) -> Result<(IggyPollMetadata, IggyMessagesBatchSet), IggyError> {
         let numeric_stream_id = self
             .streams2
-            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
+            .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
         let numeric_topic_id =
             self.streams2
-                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
+                .with_topic_by_id(&stream_id, &topic_id, topics::helpers::get_topic_id());
 
         self.permissioner
             .borrow()
@@ -259,8 +194,8 @@ impl IggyShard {
 
         // Resolve partition ID
         let Some((consumer, partition_id)) = self.resolve_consumer_with_partition_id(
-            stream_id,
-            topic_id,
+            &stream_id,
+            &topic_id,
             &consumer,
             client_id,
             maybe_partition_id,
@@ -271,7 +206,7 @@ impl IggyShard {
 
         let has_partition = self
             .streams2
-            .with_topic_by_id(stream_id, topic_id, |(root, ..)| {
+            .with_topic_by_id(&stream_id, &topic_id, |(root, ..)| {
                 root.partitions().exists(partition_id)
             });
         if !has_partition {
@@ -282,8 +217,8 @@ impl IggyShard {
         }
 
         let current_offset = self.streams2.with_partition_by_id(
-            stream_id,
-            topic_id,
+            &stream_id,
+            &topic_id,
             partition_id,
             |(_, _, _, offset, ..)| offset.load(Ordering::Relaxed),
         );
@@ -312,151 +247,14 @@ impl IggyShard {
                 }) = message
                     && let ShardRequestPayload::PollMessages { consumer, args } = payload
                 {
-                    let metadata = IggyPollMetadata::new(partition_id as u32, current_offset);
-                    let count = args.count;
-                    let strategy = args.strategy;
-                    let value = strategy.value;
-                    let batches = match strategy.kind {
-                        PollingKind::Offset => {
-                            let offset = value;
-                            // We have to remember to keep the invariant from the if that is on line 496.
-                            // Alternatively a better design would be to get rid of that if and move the validations here.
-                            let batches = self
-                                .streams2
-                                .get_messages_by_offset(
-                                    stream_id,
-                                    topic_id,
-                                    partition_id,
-                                    offset,
-                                    count,
-                                )
-                                .await?;
-                            Ok(batches)
-                        }
-                        PollingKind::Timestamp => {
-                            let timestamp = IggyTimestamp::from(value);
-                            let timestamp_ts = timestamp.as_micros();
-                            trace!(
-                                "Getting {count} messages by timestamp: {} for partition: {}...",
-                                timestamp_ts, partition_id
-                            );
+                    let ns = IggyFullNamespace::new(stream_id, topic_id, partition_id);
+                    let auto_commit = args.auto_commit;
+                    let (metadata, batches) =
+                        self.streams2.poll_messages(&ns, consumer, args).await?;
+                    let stream_id = ns.stream_id();
+                    let topic_id = ns.topic_id();
 
-                            let batches = self
-                                .streams2
-                                .get_messages_by_timestamp(
-                                    stream_id,
-                                    topic_id,
-                                    partition_id,
-                                    timestamp_ts,
-                                    count,
-                                )
-                                .await?;
-                            Ok(batches)
-                        }
-                        PollingKind::First => {
-                            let first_offset = self.streams2.with_partition_by_id(
-                                stream_id,
-                                topic_id,
-                                partition_id,
-                                |(_, _, _, _, _, _, log)| {
-                                    log.segments()
-                                        .first()
-                                        .map(|segment| segment.start_offset)
-                                        .unwrap_or(0)
-                                },
-                            );
-
-                            let batches = self
-                                .streams2
-                                .get_messages_by_offset(
-                                    stream_id,
-                                    topic_id,
-                                    partition_id,
-                                    first_offset,
-                                    count,
-                                )
-                                .await?;
-                            Ok(batches)
-                        }
-                        PollingKind::Last => {
-                            let (start_offset, actual_count) = self.streams2.with_partition_by_id(
-                                stream_id,
-                                topic_id,
-                                partition_id,
-                                |(_, _, _, offset, _, _, _)| {
-                                    let current_offset = offset.load(Ordering::Relaxed);
-                                    let mut requested_count = 0;
-                                    if requested_count > current_offset + 1 {
-                                        requested_count = current_offset + 1
-                                    }
-                                    let start_offset = 1 + current_offset - requested_count;
-                                    (start_offset, requested_count as u32)
-                                },
-                            );
-
-                            let batches = self
-                                .streams2
-                                .get_messages_by_offset(
-                                    stream_id,
-                                    topic_id,
-                                    partition_id,
-                                    start_offset,
-                                    actual_count,
-                                )
-                                .await?;
-                            Ok(batches)
-                        }
-                        PollingKind::Next => {
-                            let (consumer_offset, consumer_id) = match consumer {
-                                PollingConsumer::Consumer(consumer_id, _) => (
-                                    self.streams2
-                                        .with_partition_by_id(
-                                            stream_id,
-                                            topic_id,
-                                            partition_id,
-                                            partitions::helpers::get_consumer_offset(consumer_id),
-                                        )
-                                        .map(|c_offset| c_offset.stored_offset),
-                                    consumer_id,
-                                ),
-                                PollingConsumer::ConsumerGroup(cg_id, _) => (
-                                    self.streams2
-                                        .with_partition_by_id(
-                                            stream_id,
-                                            topic_id,
-                                            partition_id,
-                                            partitions::helpers::get_consumer_group_member_offset(
-                                                cg_id,
-                                            ),
-                                        )
-                                        .map(|cg_offset| cg_offset.stored_offset),
-                                    cg_id,
-                                ),
-                            };
-
-                            let Some(consumer_offset) = consumer_offset else {
-                                return Err(IggyError::ConsumerOffsetNotFound(consumer_id));
-                            };
-                            let offset = consumer_offset + 1;
-                            trace!(
-                                "Getting next messages for consumer id: {} for partition: {} from offset: {}...",
-                                consumer_id, partition_id, offset
-                            );
-                            let batches = self
-                                .streams2
-                                .get_messages_by_offset(
-                                    stream_id,
-                                    topic_id,
-                                    partition_id,
-                                    offset,
-                                    count,
-                                )
-                                .await?;
-                            Ok(batches)
-                        }
-                    }?;
-
-                    if args.auto_commit && !batches.is_empty() {
+                    if auto_commit && !batches.is_empty() {
                         let offset = batches
                             .last_offset()
                             .expect("Batch set should have at least one batch");
@@ -467,8 +265,8 @@ impl IggyShard {
                         match consumer {
                             PollingConsumer::Consumer(consumer_id, _) => {
                                 self.streams2.with_partition_by_id(
-                                    stream_id,
-                                    topic_id,
+                                    &stream_id,
+                                    &topic_id,
                                     partition_id,
                                     partitions::helpers::store_consumer_offset(
                                         consumer_id,
@@ -481,8 +279,8 @@ impl IggyShard {
                                 );
                                 self.streams2
                                     .with_partition_by_id_async(
-                                        stream_id,
-                                        topic_id,
+                                        &stream_id,
+                                        &topic_id,
                                         partition_id,
                                         partitions::helpers::persist_consumer_offset_to_disk(
                                             self.id,
@@ -493,8 +291,8 @@ impl IggyShard {
                             }
                             PollingConsumer::ConsumerGroup(cg_id, _) => {
                                 self.streams2.with_partition_by_id(
-                                    stream_id,
-                                    topic_id,
+                                    &stream_id,
+                                    &topic_id,
                                     partition_id,
                                     partitions::helpers::store_consumer_group_member_offset(
                                         cg_id,
@@ -506,8 +304,8 @@ impl IggyShard {
                                     ),
                                 );
                                 self.streams2.with_partition_by_id_async(
-                                    stream_id,
-                                    topic_id,
+                                    &stream_id,
+                                    &topic_id,
                                     partition_id,
                                     partitions::helpers::persist_consumer_group_member_offset_to_disk(
                                         self.id,

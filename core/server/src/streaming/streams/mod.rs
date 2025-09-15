@@ -17,7 +17,6 @@
  */
 
 pub mod helpers;
-pub mod messages;
 pub mod storage;
 pub mod storage2;
 pub mod stream2;

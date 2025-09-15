@@ -18,7 +18,6 @@
 
 pub mod consumer_group2;
 pub mod helpers;
-pub mod messages;
 pub mod storage2;
 pub mod topic2;
 

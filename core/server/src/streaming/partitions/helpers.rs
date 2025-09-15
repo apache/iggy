@@ -295,7 +295,7 @@ pub async fn get_messages_by_offset(
     } else {
         0
     };
-
+    let actual_first_offset_journal = journal.get(|batches| batches.first_offset()).unwrap();
     let mut combined_batch_set = IggyMessagesBatchSet::empty();
 
     // Load messages from disk if needed
@@ -316,10 +316,8 @@ pub async fn get_messages_by_offset(
 
     if remaining_count > 0 {
         let accumulator_start_offset = std::cmp::max(offset, journal_first_offset);
-
         let accumulator_messages =
             journal.get(|batches| batches.get_by_offset(accumulator_start_offset, remaining_count));
-
         if !accumulator_messages.is_empty() {
             combined_batch_set.add_batch_set(accumulator_messages);
         }
@@ -462,10 +460,7 @@ pub fn get_segment_range_by_offset(
         let start = log
             .segments()
             .iter()
-            .enumerate()
-            .filter(|(_, segment)| segment.start_offset <= offset)
-            .map(|(index, _)| index)
-            .next()
+            .rposition(|segment| segment.start_offset <= offset)
             .expect("get_segment_range_by_offset: start segment not found");
         let end = log.segments().len();
         start..end
@@ -474,17 +469,22 @@ pub fn get_segment_range_by_offset(
 
 pub fn get_segment_range_by_timestamp(
     timestamp: u64,
-) -> impl FnOnce(ComponentsById<PartitionRef>) -> std::ops::Range<usize> {
-    move |(.., log)| -> std::ops::Range<usize> {
+) -> impl FnOnce(ComponentsById<PartitionRef>) -> Result<std::ops::Range<usize>, IggyError> {
+    move |(.., log)| -> Result<std::ops::Range<usize>, IggyError> {
+        let segments = log.segments();
+        for seg in segments {
+            tracing::warn!("timestamp: {}, segment: {:?}", timestamp, seg);
+        }
         let start = log
             .segments()
             .iter()
             .enumerate()
-            .find(|(_, segment)| segment.end_timestamp >= timestamp)
+            .filter(|(_, segment)| segment.end_timestamp >= timestamp)
             .map(|(index, _)| index)
-            .expect("get_segment_range_by_timestamp: start segment not found");
+            .next()
+            .ok_or(IggyError::TimestampOutOfRange(timestamp))?;
         let end = log.segments().len();
-        start..end
+        Ok(start..end)
     }
 }
 
@@ -644,6 +644,7 @@ pub fn calculate_current_offset() -> impl FnOnce(ComponentsById<PartitionRef>) -
 
 pub fn deduplicate_messages(
     current_offset: u64,
+    current_position: u32,
     batch: &mut IggyMessagesBatchMut,
 ) -> impl AsyncFnOnce(ComponentsById<PartitionRef>) {
     async move |(.., deduplicator, _, _, _, log)| {
@@ -652,7 +653,7 @@ pub fn deduplicate_messages(
             .prepare_for_persistence(
                 segment.start_offset,
                 current_offset,
-                segment.size,
+                current_position,
                 deduplicator.as_ref(),
             )
             .await;
@@ -704,6 +705,9 @@ pub fn commit_journal() -> impl FnOnce(ComponentsById<PartitionRefMut>) -> IggyM
         let batches = log.journal_mut().commit();
         log.ensure_indexes();
         batches.append_indexes_to(log.active_indexes_mut().unwrap());
+        let indexes = log.active_indexes_mut().unwrap();
+        let first = indexes.get(0).unwrap();
+        let last = indexes.last().unwrap();
         batches
     }
 }
@@ -777,8 +781,6 @@ pub fn persist_batch(
             })?;
 
         let indices = log.active_indexes().unwrap();
-        let first_index = indices.get(0).unwrap();
-        let last_index = indices.last().unwrap();
         let unsaved_indexes_slice = log.active_indexes().unwrap().unsaved_slice();
         let len = unsaved_indexes_slice.len();
         storage

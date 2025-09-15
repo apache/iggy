@@ -96,11 +96,13 @@ impl IggyShard {
         let parent_stats =
             self.streams2
                 .with_topic_by_id(stream_id, topic_id, topics::helpers::get_stats());
-        let partitions = self.create_and_insert_partitions_mem(
+        let partitions = partition2::create_and_insert_partitions_mem(
+            &self.streams2,
             stream_id,
             topic_id,
             parent_stats,
             partitions_count,
+            &self.config.system,
         );
         let stats = partitions.first().map(|p| p.stats());
         if let Some(stats) = stats {
@@ -131,57 +133,6 @@ impl IggyShard {
             }
         }
         Ok(partitions)
-    }
-
-    fn create_and_insert_partitions_mem(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        parent_stats: Arc<TopicStats>,
-        partitions_count: u32,
-    ) -> Vec<partition2::Partition> {
-        let range = 0..partitions_count as usize;
-        let created_at = IggyTimestamp::now();
-        range
-            .map(|_| {
-                // Areczkuuuu.
-                let stats = Arc::new(PartitionStats::new(parent_stats.clone()));
-                let should_increment_offset = false;
-                let deduplicator = create_message_deduplicator(&self.config.system);
-                let offset = Arc::new(AtomicU64::new(0));
-                let consumer_offset = Arc::new(partition2::ConsumerOffsets::with_capacity(2137));
-                let consumer_group_offset =
-                    Arc::new(partition2::ConsumerGroupOffsets::with_capacity(2137));
-                let log = Default::default();
-
-                let mut partition = partition2::Partition::new(
-                    created_at,
-                    should_increment_offset,
-                    stats,
-                    deduplicator,
-                    offset,
-                    consumer_offset,
-                    consumer_group_offset,
-                    log,
-                );
-                let id = self.insert_partition_mem(stream_id, topic_id, partition.clone());
-                partition.update_id(id);
-                partition
-            })
-            .collect()
-    }
-
-    fn insert_partition_mem(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partition: partition2::Partition,
-    ) -> usize {
-        self.streams2.with_partitions_mut(
-            stream_id,
-            topic_id,
-            partitions::helpers::insert_partition(partition),
-        )
     }
 
     async fn init_log(
@@ -263,7 +214,11 @@ impl IggyShard {
                 .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
         for partition in partitions {
             let actual_id = partition.id();
-            let id = self.insert_partition_mem(stream_id, topic_id, partition);
+            let id = self.streams2.with_partitions_mut(
+                stream_id,
+                topic_id,
+                partitions::helpers::insert_partition(partition),
+            );
             assert_eq!(
                 id, actual_id,
                 "create_partitions_bypass_auth: partition mismatch ID, wrong creation order ?!"

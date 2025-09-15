@@ -17,7 +17,10 @@
  */
 
 use hash32::{Hasher, Murmur3Hasher};
+use iggy_common::Identifier;
 use std::hash::Hasher as _;
+
+use crate::slab::partitions;
 
 // Packed namespace layout (works only on 64bit platforms, but we won't support 32bit anyway)
 // +----------------+----------------+----------------+----------------+
@@ -53,6 +56,38 @@ pub const STREAM_SHIFT: u32 = TOPIC_SHIFT + TOPIC_BITS;
 pub const PARTITION_MASK: u64 = (1u64 << PARTITION_BITS) - 1;
 pub const TOPIC_MASK: u64 = (1u64 << TOPIC_BITS) - 1;
 pub const STREAM_MASK: u64 = (1u64 << STREAM_BITS) - 1;
+
+pub struct IggyFullNamespace {
+    stream: Identifier,
+    topic: Identifier,
+    partition: partitions::ContainerId,
+}
+
+impl IggyFullNamespace {
+    pub fn new(stream: Identifier, topic: Identifier, partition: partitions::ContainerId) -> Self {
+        Self {
+            stream,
+            topic,
+            partition,
+        }
+    }
+
+    pub fn stream_id(&self) -> &Identifier {
+        &self.stream
+    }
+
+    pub fn topic_id(&self) -> &Identifier {
+        &self.topic
+    }
+
+    pub fn partition_id(&self) -> partitions::ContainerId {
+        self.partition
+    }
+
+    pub fn decompose(self) -> (Identifier, Identifier, partitions::ContainerId) {
+        (self.stream, self.topic, self.partition)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IggyNamespace(u64);

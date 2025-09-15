@@ -60,7 +60,7 @@ use crate::{
     http::http_server,
     io::fs_utils,
     shard::{
-        namespace::IggyNamespace,
+        namespace::{IggyFullNamespace, IggyNamespace},
         task_registry::TaskRegistry,
         tasks::messages::spawn_shard_message_task,
         transmission::{
@@ -85,6 +85,7 @@ use crate::{
         session::Session,
         storage::SystemStorage,
         streams, topics,
+        traits::MainOps,
         users::{permissioner::Permissioner, user::User},
         utils::ptr::EternalPtr,
     },
@@ -354,79 +355,13 @@ impl IggyShard {
         let partition_id = request.partition_id;
         match request.payload {
             ShardRequestPayload::SendMessages { batch } => {
-                let mut batch = self.maybe_encrypt_messages(batch)?;
+                let ns = IggyFullNamespace::new(stream_id, topic_id, partition_id);
+                let batch = self.maybe_encrypt_messages(batch)?;
                 let messages_count = batch.count();
-
-                let current_offset = self.streams2.with_partition_by_id(
-                    &stream_id,
-                    &topic_id,
-                    partition_id,
-                    partitions::helpers::calculate_current_offset(),
-                );
-
                 self.streams2
-                    .with_partition_by_id_async(
-                        &stream_id,
-                        &topic_id,
-                        partition_id,
-                        partitions::helpers::deduplicate_messages(current_offset, &mut batch),
-                    )
-                    .await;
-
-                let (journal_messages_count, journal_size) =
-                    self.streams2.with_partition_by_id_mut(
-                        &stream_id,
-                        &topic_id,
-                        partition_id,
-                        partitions::helpers::append_to_journal(self.id, current_offset, batch),
-                    )?;
-
-                let unsaved_messages_count_exceeded = journal_messages_count
-                    >= self.config.system.partition.messages_required_to_save;
-                let unsaved_messages_size_exceeded = journal_size
-                    >= self
-                        .config
-                        .system
-                        .partition
-                        .size_of_messages_required_to_save
-                        .as_bytes_u64() as u32;
-
-                let is_full = self.streams2.with_partition_by_id(
-                    &stream_id,
-                    &topic_id,
-                    partition_id,
-                    partitions::helpers::is_segment_full(),
-                );
-
-                // Try committing the journal
-                if is_full || unsaved_messages_count_exceeded || unsaved_messages_size_exceeded {
-                    self.streams2
-                        .persist_messages(
-                            self.id,
-                            &stream_id,
-                            &topic_id,
-                            partition_id,
-                            unsaved_messages_count_exceeded,
-                            unsaved_messages_size_exceeded,
-                            journal_messages_count,
-                            journal_size,
-                            &self.config.system,
-                        )
-                        .await?;
-
-                    if is_full {
-                        self.streams2
-                            .handle_full_segment(
-                                self.id,
-                                &stream_id,
-                                &topic_id,
-                                partition_id,
-                                &self.config.system,
-                            )
-                            .await?;
-                        self.metrics.increment_messages(messages_count as u64);
-                    }
-                }
+                    .append_messages(self.id, &self.config.system, &ns, batch)
+                    .await?;
+                self.metrics.increment_messages(messages_count as u64);
                 Ok(ShardResponse::SendMessages)
             }
             ShardRequestPayload::PollMessages { args, consumer } => {

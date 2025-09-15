@@ -48,19 +48,10 @@ impl IggyShard {
         if exists {
             return Err(IggyError::StreamNameAlreadyExists(name));
         }
-        let stream = self.create_and_insert_stream_mem(name);
+        let stream = stream2::create_and_insert_stream_mem(&self.streams2, name);
         self.metrics.increment_streams(1);
         create_stream_file_hierarchy(self.id, stream.id(), &self.config.system).await?;
         Ok(stream)
-    }
-
-    fn create_and_insert_stream_mem(&self, name: String) -> stream2::Stream {
-        let now = IggyTimestamp::now();
-        let stats = Arc::new(Default::default());
-        let mut stream = stream2::Stream::new(name, stats, now);
-        let id = self.streams2.insert(stream.clone());
-        stream.update_id(id);
-        stream
     }
 
     pub fn create_stream2_bypass_auth(&self, stream: stream2::Stream) -> usize {

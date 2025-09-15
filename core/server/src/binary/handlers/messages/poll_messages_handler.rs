@@ -81,8 +81,8 @@ impl ServerCommandHandler for PollMessages {
             .poll_messages(
                 client_id,
                 user_id,
-                &stream_id,
-                &topic_id,
+                stream_id,
+                topic_id,
                 consumer,
                 partition_id,
                 args,

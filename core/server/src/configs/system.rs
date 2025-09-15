@@ -23,6 +23,7 @@ use crate::slab::topics;
 use super::cache_indexes::CacheIndexesConfig;
 use super::sharding::ShardingConfig;
 use iggy_common::IggyByteSize;
+use iggy_common::IggyError;
 use iggy_common::IggyExpiry;
 use iggy_common::MaxTopicSize;
 use iggy_common::{CompressionAlgorithm, IggyDuration};
@@ -291,5 +292,31 @@ impl SystemConfig {
     ) -> String {
         let path = self.get_segment_path(stream_id, topic_id, partition_id, start_offset);
         format!("{path}.{INDEX_EXTENSION}")
+    }
+
+    pub fn resolve_max_topic_size(
+        &self,
+        max_topic_size: MaxTopicSize,
+    ) -> Result<MaxTopicSize, IggyError> {
+        match max_topic_size {
+            MaxTopicSize::ServerDefault => Ok(self.topic.max_size),
+            _ => {
+                if max_topic_size.as_bytes_u64() < self.segment.size.as_bytes_u64() {
+                    Err(IggyError::InvalidTopicSize(
+                        max_topic_size,
+                        self.segment.size,
+                    ))
+                } else {
+                    Ok(max_topic_size)
+                }
+            }
+        }
+    }
+
+    pub fn resolve_message_expiry(&self, message_expiry: IggyExpiry) -> IggyExpiry {
+        match message_expiry {
+            IggyExpiry::ServerDefault => self.segment.message_expiry,
+            _ => message_expiry,
+        }
     }
 }

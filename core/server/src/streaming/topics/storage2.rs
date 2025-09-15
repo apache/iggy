@@ -39,23 +39,6 @@ pub async fn create_topic_file_hierarchy(
             topic_id as u32,
         ));
     }
-
-    /*
-    shard_info!(shard_id,
-        "Saving {} partition(s) for topic {topic}...",
-        topic.partitions.len()
-    );
-    for (_, partition) in topic.partitions.iter() {
-        let mut partition = partition.write().await;
-        partition.persist().await.with_error_context(|error| {
-            format!(
-                "{COMPONENT} (error: {error}) - failed to persist partition, topic: {topic}"
-            )
-        })?;
-    }
-
-    shard_info!(shard_id, "Saved topic {topic}");
-    */
     Ok(())
 }
 
