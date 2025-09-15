@@ -169,7 +169,7 @@ uuid = { version = "1.18.0", features = [
     "zerocopy",
 ] }
 webpki-roots = "1.0.2"
-zip = "4.6.0"
+zip = "4.6.1"
 
 [profile.release]
 lto = true
