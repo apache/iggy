@@ -111,11 +111,10 @@ async fn main() -> Result<(), RuntimeError> {
     let config_path =
         env::var("IGGY_CONNECTORS_CONFIG_PATH").unwrap_or_else(|_| "config".to_string());
     info!("Starting Iggy Connectors Runtime, loading configuration from: {config_path}...");
-    let builder = Config::builder()
-        .add_source(File::with_name(&config_path))
-        .add_source(Environment::with_prefix("IGGY_CONNECTORS").separator("_"));
-
-    let config: RuntimeConfig = builder
+    let config: RuntimeConfig = Config::builder()
+        .add_source(Config::try_from(&RuntimeConfig::default()).expect("Failed to init config"))
+        .add_source(File::with_name(&config_path).required(false))
+        .add_source(Environment::with_prefix("IGGY_CONNECTORS").separator("_"))
         .build()
         .expect("Failed to build runtime config")
         .try_deserialize()
@@ -213,7 +212,6 @@ async fn main() -> Result<(), RuntimeError> {
 
     iggy_clients.producer.shutdown().await?;
     iggy_clients.consumer.shutdown().await?;
-
     info!("All connectors closed. Runtime shutdown complete.");
     Ok(())
 }

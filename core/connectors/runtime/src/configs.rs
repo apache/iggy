@@ -17,6 +17,7 @@
  */
 
 use crate::api::config::HttpApiConfig;
+use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use iggy_connector_sdk::{Schema, transforms::TransformType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -31,14 +32,15 @@ pub enum ConfigFormat {
     Json,
     #[strum(to_string = "yaml")]
     Yaml,
+    #[default]
     #[strum(to_string = "toml")]
     Toml,
-    #[default]
     #[strum(to_string = "text")]
     Text,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct RuntimeConfig {
     pub http_api: HttpApiConfig,
     pub iggy: IggyConfig,
@@ -55,7 +57,7 @@ pub struct IggyConfig {
     pub token: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SinkConfig {
     pub enabled: bool,
     pub name: String,
@@ -66,7 +68,7 @@ pub struct SinkConfig {
     pub config: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct StreamConsumerConfig {
     pub stream: String,
     pub topics: Vec<String>,
@@ -76,7 +78,7 @@ pub struct StreamConsumerConfig {
     pub consumer_group: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct StreamProducerConfig {
     pub stream: String,
     pub topic: String,
@@ -85,7 +87,7 @@ pub struct StreamProducerConfig {
     pub linger_time: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SourceConfig {
     pub enabled: bool,
     pub name: String,
@@ -102,12 +104,35 @@ pub struct TransformsConfig {
     pub transforms: HashMap<TransformType, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SharedTransformConfig {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct StateConfig {
     pub path: String,
+}
+
+impl Default for IggyConfig {
+    fn default() -> Self {
+        Self {
+            address: "localhost:8090".to_owned(),
+            username: Some(DEFAULT_ROOT_USERNAME.to_owned()),
+            password: Some(DEFAULT_ROOT_PASSWORD.to_owned()),
+            token: None,
+        }
+    }
+}
+
+impl Default for HttpApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            address: "localhost:8081".to_owned(),
+            cors: None,
+            api_key: None,
+            tls: None,
+        }
+    }
 }

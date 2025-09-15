@@ -23,6 +23,7 @@ use strum::Display;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct McpServerConfig {
     pub http: Option<HttpApiConfig>,
     pub iggy: IggyConfig,
