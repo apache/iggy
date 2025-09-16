@@ -44,11 +44,11 @@ internal class TcpMessageInvoker : IMessageInvoker
                              + 2 + request.Partitioning.Length + 4 + 4;
         var messageBufferSize = TcpMessageStreamHelpers.CalculateMessageBytesCount(messages)
                                 + metadataLength;
-        var payloadBufferSize = messageBufferSize + 4 + BufferSizes.InitialBytesLength;
+        var payloadBufferSize = messageBufferSize + 4 + BufferSizes.INITIAL_BYTES_LENGTH;
 
         IMemoryOwner<byte> messageBuffer = MemoryPool<byte>.Shared.Rent(messageBufferSize);
         IMemoryOwner<byte> payloadBuffer = MemoryPool<byte>.Shared.Rent(payloadBufferSize);
-        IMemoryOwner<byte> responseBuffer = MemoryPool<byte>.Shared.Rent(BufferSizes.ExpectedResponseSize);
+        IMemoryOwner<byte> responseBuffer = MemoryPool<byte>.Shared.Rent(BufferSizes.EXPECTED_RESPONSE_SIZE);
         try
         {
             TcpContracts.CreateMessage(messageBuffer.Memory.Span[..messageBufferSize], request.StreamId,

@@ -1,5 +1,6 @@
 # Dependencies
 
+BenchmarkDotNet: "0.15.2", "MIT",
 coverlet.collector: "6.0.4", "MIT",
 FluentAssertions: "6.12.0", "Apache-2.0",
 Microsoft.Extensions.Logging: "8.0.1", "MIT",
@@ -12,6 +13,6 @@ Reqnroll.xUnit: "2.4.1", "BSD-3-Clause",
 Shouldly: "4.3.0", "BSD-3-Clause",
 System.IO.Hashing: "8.0.0", "MIT",
 Testcontainers: "4.6.0", "MIT",
-TUnit: "0.56.50", "MIT",
+TUnit: "0.57.65", "MIT",
 xunit: "2.9.3", "Apache-2.0",
 xunit.runner.visualstudio: "3.1.3", "Apache-2.0",

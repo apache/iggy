@@ -15,23 +15,33 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
+using Apache.Iggy.Enums;
+using Apache.Iggy.IggyClient;
+using Apache.Iggy.Tests.Integrations.Helpers;
+using TUnit.Core.Interfaces;
+
 namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
-public class ConsumerGroupFixture : IggyServerFixture
+public class ConsumerGroupFixture : IAsyncInitializer
 {
-    internal readonly string Name = "TestTopic";
     internal readonly uint PartitionsCount = 10;
-    internal readonly uint StreamId = 1;
-    internal readonly uint TopicId = 1;
+    internal readonly string StreamId = "ConsumerGroupStream";
+    internal readonly string TopicId = "ConsumerGroupTopic";
 
-    public override async Task InitializeAsync()
+    [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
+    public required IggyServerFixture IggyServerFixture { get; init; }
+
+    public Dictionary<Protocol, IIggyClient> Clients { get; set; } = new();
+
+    public async Task InitializeAsync()
     {
-        await base.InitializeAsync();
+        Clients = await IggyServerFixture.CreateClients();
 
-        foreach (var client in Clients.Values)
+        foreach (KeyValuePair<Protocol, IIggyClient> client in Clients)
         {
-            await client.CreateStreamAsync("Test Stream", StreamId);
-            await client.CreateTopicAsync(Identifier.Numeric(StreamId), Name, PartitionsCount, topicId: TopicId);
+            await client.Value.CreateStreamAsync(StreamId.GetWithProtocol(client.Key));
+            await client.Value.CreateTopicAsync(Identifier.String(StreamId.GetWithProtocol(client.Key)), TopicId,
+                PartitionsCount);
         }
     }
 }

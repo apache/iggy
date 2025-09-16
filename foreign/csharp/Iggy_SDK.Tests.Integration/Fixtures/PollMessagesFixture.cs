@@ -17,35 +17,42 @@
 
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Http;
+using Apache.Iggy.Enums;
 using Apache.Iggy.Headers;
-using Apache.Iggy.Kinds;
+using Apache.Iggy.IggyClient;
 using Apache.Iggy.Tests.Integrations.Helpers;
 using Apache.Iggy.Tests.Integrations.Models;
+using TUnit.Core.Interfaces;
+using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
-public class PollMessagesFixture : IggyServerFixture
+public class PollMessagesFixture : IAsyncInitializer
 {
     internal readonly int MessageCount = 10;
-    internal readonly uint StreamId = 1;
-    internal readonly CreateTopicRequest TopicRequest = TopicFactory.CreateTopic();
+    internal readonly string StreamId = "PollMessagesStream";
+    internal readonly CreateTopicRequest TopicRequest = TopicFactory.CreateTopic("Topic");
 
-    public override async Task InitializeAsync()
+    [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
+    public required IggyServerFixture IggyServerFixture { get; init; }
+
+    public Dictionary<Protocol, IIggyClient> Clients { get; set; } = new();
+
+    public async Task InitializeAsync()
     {
-        await base.InitializeAsync();
-
-        foreach (var client in Clients.Values)
+        Clients = await IggyServerFixture.CreateClients();
+        foreach (KeyValuePair<Protocol, IIggyClient> client in Clients)
         {
-            await client.CreateStreamAsync("Test Stream", StreamId);
-            await client.CreateTopicAsync(Identifier.Numeric(StreamId), TopicRequest.Name, TopicRequest.PartitionsCount,
-                topicId: TopicRequest.TopicId);
-            await client.SendMessagesAsync(
+            await client.Value.CreateStreamAsync(StreamId.GetWithProtocol(client.Key));
+            await client.Value.CreateTopicAsync(Identifier.String(StreamId.GetWithProtocol(client.Key)),
+                TopicRequest.Name, TopicRequest.PartitionsCount, topicId: TopicRequest.TopicId);
+            await client.Value.SendMessagesAsync(
                 new MessageSendRequest<DummyMessage>
                 {
                     Messages = CreateDummyMessagesWithoutHeader(MessageCount),
                     Partitioning = Partitioning.None(),
-                    StreamId = Identifier.Numeric(StreamId),
-                    TopicId = Identifier.Numeric(TopicRequest.TopicId!.Value)
+                    StreamId = Identifier.String(StreamId.GetWithProtocol(client.Key)),
+                    TopicId = Identifier.String(TopicRequest.Name)
                 },
                 message => message.SerializeDummyMessage(),
                 headers: new Dictionary<HeaderKey, HeaderValue>

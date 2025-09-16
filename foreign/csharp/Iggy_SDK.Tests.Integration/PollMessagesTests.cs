@@ -19,6 +19,7 @@ using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Tests.Integrations.Fixtures;
+using Apache.Iggy.Tests.Integrations.Helpers;
 using Apache.Iggy.Tests.Integrations.Models;
 using Shouldly;
 
@@ -42,8 +43,8 @@ public class PollMessagesTests
                                Count = 10,
                                PartitionId = 1,
                                PollingStrategy = PollingStrategy.Next(),
-                               StreamId = Identifier.Numeric(Fixture.StreamId),
-                               TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value)
+                               StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+                               TopicId = Identifier.String(Fixture.TopicRequest.Name)
                            }, DummyMessage.DeserializeDummyMessage, token: token))
         {
             msgResponse.UserHeaders.ShouldNotBeNull();
