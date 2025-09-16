@@ -23,38 +23,24 @@ using DotNet.Testcontainers.Builders;
 using DotNet.Testcontainers.Containers;
 using Microsoft.Extensions.Logging.Abstractions;
 using TUnit.Core.Interfaces;
+using TUnit.Core.Logging;
 
 namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
 public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
 {
-    private readonly IContainer _httpContainer = new ContainerBuilder().WithImage("apache/iggy:edge")
-        // Container name is just to be used locally for debbuging effects
-        //.WithName($"SutIggyContainerHTTP")
+    private readonly IContainer _iggyContainer = new ContainerBuilder().WithImage("apache/iggy:edge")
         .WithPortBinding(3000, true)
         .WithPortBinding(8090, true)
         .WithOutputConsumer(Consume.RedirectStdoutAndStderrToConsole())
-        .WithWaitStrategy(Wait.ForUnixContainer().UntilPortIsAvailable(3000))
-        .WithName($"HTTP_{Guid.NewGuid()}")
+        .WithWaitStrategy(Wait.ForUnixContainer().UntilInternalTcpPortIsAvailable(8090))
+        .WithName($"{Guid.NewGuid()}")
         //.WithEnvironment("IGGY_SYSTEM_LOGGING_LEVEL", "trace")
         //.WithEnvironment("RUST_LOG", "trace")
         .WithCleanUp(true)
         .Build();
 
-    private readonly IContainer _tcpContainer = new ContainerBuilder().WithImage("apache/iggy:edge")
-        // Container name is just to be used locally for debbuging effects
-        //.WithName($"SutIggyContainerTCP")
-        .WithPortBinding(3000, true)
-        .WithPortBinding(8090, true)
-        .WithOutputConsumer(Consume.RedirectStdoutAndStderrToConsole())
-        .WithWaitStrategy(Wait.ForUnixContainer().UntilPortIsAvailable(8090))
-        .WithName($"TCP_{Guid.NewGuid()}")
-        //.WithEnvironment("IGGY_SYSTEM_LOGGING_LEVEL", "trace")
-        //.WithEnvironment("RUST_LOG", "trace")
-        .WithCleanUp(true)
-        .Build();
-
-    public Dictionary<Protocol, IIggyClient> Clients { get; } = new();
+    private string? _iggyServerHost;
 
     private Action<MessageBatchingSettings> BatchingSettings { get; } = options =>
     {
@@ -72,52 +58,72 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        await Task.WhenAll(_tcpContainer.StopAsync(), _httpContainer.StopAsync());
+        await _iggyContainer.StopAsync();
     }
 
     public virtual async Task InitializeAsync()
     {
-        await Task.WhenAll(_tcpContainer.StartAsync(), _httpContainer.StartAsync());
+        var logger = TestContext.Current!.GetDefaultLogger();
+        _iggyServerHost = Environment.GetEnvironmentVariable("IGGY_SERVER_HOST");
+
+        await logger.LogInformationAsync($"Iggy server host: {_iggyServerHost}");
+        if (string.IsNullOrEmpty(_iggyServerHost))
+        {
+            await _iggyContainer.StartAsync();
+        }
 
         await CreateTcpClient();
         await CreateHttpClient();
     }
 
-    public async Task CreateTcpClient()
+    public async Task<Dictionary<Protocol, IIggyClient>> CreateClients()
     {
-        var tcpClient = CreateClient(Protocol.Tcp);
+        var dictionary = new Dictionary<Protocol, IIggyClient>();
+        dictionary[Protocol.Tcp] = await CreateTcpClient();
+        dictionary[Protocol.Http] = await CreateHttpClient();
 
-        await tcpClient.LoginUser("iggy", "iggy");
-
-        Clients[Protocol.Tcp] = tcpClient;
+        return dictionary;
     }
 
-    public async Task CreateHttpClient()
+    public async Task<IIggyClient> CreateTcpClient(string userName = "iggy", string password = "iggy")
+    {
+        var client = CreateClient(Protocol.Tcp);
+
+        await client.LoginUser(userName, password);
+        ;
+
+        return client;
+    }
+
+    public async Task<IIggyClient> CreateHttpClient(string userName = "iggy", string password = "iggy")
     {
         var client = CreateClient(Protocol.Http);
 
-        await client.LoginUser("iggy", "iggy");
+        await client.LoginUser(userName, password);
 
-        Clients[Protocol.Http] = client;
+        return client;
     }
 
     public IIggyClient CreateClient(Protocol protocol, Protocol? targetContainer = null)
     {
-        var port = protocol == Protocol.Tcp
-            ? _tcpContainer.GetMappedPublicPort(8090)
-            : _httpContainer.GetMappedPublicPort(3000);
+        string? address;
 
-        if (targetContainer != null
-            && targetContainer != protocol)
+        if (string.IsNullOrEmpty(_iggyServerHost))
         {
-            port = targetContainer == Protocol.Tcp
-                ? _tcpContainer.GetMappedPublicPort(3000)
-                : _httpContainer.GetMappedPublicPort(8090);
-        }
+            var port = protocol == Protocol.Tcp
+                ? _iggyContainer.GetMappedPublicPort(8090)
+                : _iggyContainer.GetMappedPublicPort(3000);
 
-        var address = protocol == Protocol.Tcp
-            ? $"127.0.0.1:{port}"
-            : $"http://127.0.0.1:{port}";
+            address = protocol == Protocol.Tcp
+                ? $"127.0.0.1:{port}"
+                : $"http://127.0.0.1:{port}";
+        }
+        else
+        {
+            address = protocol == Protocol.Tcp
+                ? $"{_iggyServerHost}:8090"
+                : $"http://{_iggyServerHost}:3000";
+        }
 
         return MessageStreamFactory.CreateMessageStream(options =>
         {

@@ -168,7 +168,7 @@ components:
       - "ci-infrastructure"  # CI changes trigger full regression
     paths:
       - "foreign/csharp/**"
-    tasks: ["lint", "test", "build"]
+    tasks: ["lint", "test", "build", "e2e"]
 
   # Individual BDD tests per SDK - only run when specific SDK changes
   bdd-rust:

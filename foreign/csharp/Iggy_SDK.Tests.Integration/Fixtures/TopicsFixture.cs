@@ -16,29 +16,28 @@
 // // under the License.
 
 using Apache.Iggy.Enums;
+using Apache.Iggy.IggyClient;
+using Apache.Iggy.Tests.Integrations.Helpers;
+using TUnit.Core.Interfaces;
 
-namespace Apache.Iggy.Tests.Integrations.Attributes;
+namespace Apache.Iggy.Tests.Integrations.Fixtures;
 
-internal class SkipHttpAttribute() : SkipAttribute("This test is skipped for HTTP protocol")
+public class TopicsFixture : IAsyncInitializer
 {
-    public override Task<bool> ShouldSkip(TestRegisteredContext context)
+    internal readonly string StreamId = "TestStream";
+
+    [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
+    public required IggyServerFixture IggyServerFixture { get; init; }
+
+    public Dictionary<Protocol, IIggyClient> Clients { get; set; } = new();
+
+    public async Task InitializeAsync()
     {
-        foreach (var argument in context.TestDetails.TestMethodArguments)
-        {
-            if (argument is Protocol.Http)
-            {
-                return Task.FromResult(true);
-            }
-        }
+        Clients = await IggyServerFixture.CreateClients();
 
-        foreach (var argument in context.TestDetails.TestClassArguments)
+        foreach (KeyValuePair<Protocol, IIggyClient> client in Clients)
         {
-            if (argument is Protocol.Http)
-            {
-                return Task.FromResult(true);
-            }
+            await client.Value.CreateStreamAsync(StreamId.GetWithProtocol(client.Key));
         }
-
-        return Task.FromResult(false);
     }
 }
