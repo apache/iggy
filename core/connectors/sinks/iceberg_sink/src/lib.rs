@@ -102,6 +102,10 @@ pub struct IcebergSinkConfig {
     pub catalog_type: IcebergSinkTypes,
     pub warehouse: String,
     pub uri: String,
+    pub auto_create: bool,
+    pub evolve_schema: bool,
+    pub dynamic_routing: bool,
+    pub dynamic_route_field: String,
     pub store_url: String,
     pub store_access_key_id: String,
     pub store_secret_access_key: String,
@@ -110,6 +114,13 @@ pub struct IcebergSinkConfig {
 }
 
 impl IcebergSink {
+    async fn create_table(&self, name: String) -> Result<Table, Error> {
+        let table = Table::builder()
+            .build()
+            .map_err(|err| Error::InvalidState)?;
+        return Ok(table);
+    }
+
     #[inline(always)]
     fn get_props_s3(&self) -> Result<HashMap<String, String>, Error> {
         let mut props: HashMap<String, String> = HashMap::new();
@@ -217,16 +228,31 @@ impl Sink for IcebergSink {
 
         for declared_table in &self.config.tables {
             let sliced_table = self.slice_user_table(&declared_table);
-            let table = catalog
-                .load_table(&TableIdent::from_strs(sliced_table).map_err(|err| {
-                    error!("Failed to load table from catalog: {}. ", err);
-                    Error::InitError(err.to_string())
-                })?)
-                .await
-                .map_err(|err| {
-                    error!("Failed to load table from catalog: {}", err);
-                    Error::InitError(err.to_string())
-                })?;
+            let table_ident = &TableIdent::from_strs(sliced_table.clone()).map_err(|err| {
+                error!("Failed to load table from catalog: {}. ", err);
+                Error::InitError(err.to_string())
+            })?;
+            let exists = catalog.table_exists(table_ident).await.map_err(|err| {
+                error!("Failed to load table from catalog: {}", err);
+                Error::InitError(err.to_string())
+            })?;
+
+            if !exists {
+                if self.config.auto_create {
+                    // create table and push
+                    let table = self
+                        .create_table(sliced_table.last().unwrap().to_string())
+                        .await?;
+                    self.tables.push(table);
+                    continue;
+                } else {
+                    continue;
+                }
+            }
+            let table = catalog.load_table(table_ident).await.map_err(|err| {
+                error!("Failed to load table from catalog: {}", err);
+                Error::InitError(err.to_string())
+            })?;
             self.tables.push(table);
         }
 
