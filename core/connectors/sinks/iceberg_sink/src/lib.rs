@@ -24,27 +24,25 @@ use std::sync::Arc;
 use arrow_json::ReaderBuilder;
 use async_trait::async_trait;
 
-use iceberg::TableIdent;
 use iceberg::arrow::schema_to_arrow_schema;
-use iceberg::spec::Struct;
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
+use iceberg::TableIdent;
 use iceberg::{
-    Catalog,
     writer::file_writer::location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
+    Catalog,
 };
 use iceberg_catalog_glue::{GlueCatalog, GlueCatalogConfig};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata, sink_connector,
+    sink_connector, ConsumedMessage, Error, MessagesMetadata, Payload, Sink, TopicMetadata,
 };
-use parquet::data_type::DataType;
 use parquet::file::properties::WriterProperties;
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -58,9 +56,23 @@ pub enum IcebergSinkTypes {
 #[allow(non_camel_case_types)]
 pub enum IcebergSinkStoreClass {
     s3,
-    gcs,
     fs,
+    gcs,
     azdls,
+    oss,
+}
+
+impl fmt::Display for IcebergSinkStoreClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            IcebergSinkStoreClass::s3 => "s3",
+            IcebergSinkStoreClass::fs => "fs",
+            IcebergSinkStoreClass::gcs => "gcs",
+            IcebergSinkStoreClass::oss => "oss",
+            IcebergSinkStoreClass::azdls => "azdls",
+        };
+        write!(f, "{}", s)
+    }
 }
 
 impl fmt::Display for IcebergSinkTypes {
@@ -88,33 +100,35 @@ pub struct IcebergSink {
 pub struct IcebergSinkConfig {
     pub tables: Vec<String>,
     pub catalog_type: IcebergSinkTypes,
-    pub bucket_name: String,
+    pub warehouse: String,
     pub uri: String,
-    pub credential: String,
-    pub auto_create: bool,
-    pub part_size: u32,
     pub store_url: String,
     pub store_access_key_id: String,
     pub store_secret_access_key: String,
     pub store_region: String,
-    pub store_class: String,
+    pub store_class: IcebergSinkStoreClass,
 }
 
 impl IcebergSink {
-    pub fn new(id: u32, config: IcebergSinkConfig) -> Self {
-        let tables: Vec<Table> = Vec::with_capacity(config.tables.len());
+    #[inline(always)]
+    fn get_props_s3(&self) -> Result<HashMap<String, String>, Error> {
         let mut props: HashMap<String, String> = HashMap::new();
-
-        props.insert("s3.region".to_string(), config.store_region.clone());
+        props.insert("s3.region".to_string(), self.config.store_region.clone());
         props.insert(
             "s3.access-key-id".to_string(),
-            config.store_access_key_id.clone(),
+            self.config.store_access_key_id.clone(),
         );
         props.insert(
             "s3.secret-access-key".to_string(),
-            config.store_secret_access_key.clone(),
+            self.config.store_secret_access_key.clone(),
         );
-        props.insert("s3.endpoint".to_string(), config.store_url.clone());
+        props.insert("s3.endpoint".to_string(), self.config.store_url.clone());
+        return Ok(props);
+    }
+
+    pub fn new(id: u32, config: IcebergSinkConfig) -> Self {
+        let tables: Vec<Table> = Vec::with_capacity(config.tables.len());
+        let props = HashMap::new();
 
         IcebergSink {
             id,
@@ -134,7 +148,7 @@ impl IcebergSink {
         let catalog_config = RestCatalogConfig::builder()
             .uri(self.config.uri.clone())
             .props(self.props.clone())
-            .warehouse(self.config.bucket_name.clone())
+            .warehouse(self.config.warehouse.clone())
             .build();
 
         RestCatalog::new(catalog_config)
@@ -156,7 +170,7 @@ impl IcebergSink {
     async fn get_glue_catalog(&self) -> Result<GlueCatalog, Error> {
         let config = GlueCatalogConfig::builder()
             .props(self.props.clone())
-            .warehouse(self.config.bucket_name.clone())
+            .warehouse(self.config.warehouse.clone())
             .build();
 
         let catalog = GlueCatalog::new(config).await.map_err(|err| {
@@ -183,6 +197,19 @@ impl Sink for IcebergSink {
             self.config.catalog_type
         );
 
+        // Insert adequate props for initializing file IO, else fail to open
+        self.props = match self.config.store_class {
+            IcebergSinkStoreClass::s3 => self.get_props_s3()?,
+            IcebergSinkStoreClass::fs => HashMap::new(),
+            _ => {
+                error!(
+                    "Store class {} is not supported yet",
+                    self.config.store_class
+                );
+                return Err(Error::InvalidConfig);
+            }
+        };
+
         let catalog: Box<dyn Catalog> = match self.config.catalog_type {
             IcebergSinkTypes::rest => Box::new(self.get_rest_catalog()),
             IcebergSinkTypes::glue => Box::new(self.get_glue_catalog().await?),
@@ -192,13 +219,13 @@ impl Sink for IcebergSink {
             let sliced_table = self.slice_user_table(&declared_table);
             let table = catalog
                 .load_table(&TableIdent::from_strs(sliced_table).map_err(|err| {
-                    error!("Failed to load table from catalog: {}. Is the table {} a valid Iceberg table?", err, declared_table);
+                    error!("Failed to load table from catalog: {}. ", err);
                     Error::InitError(err.to_string())
                 })?)
                 .await
                 .map_err(|err| {
-                    error!("Failed to load table from catalog: {}. Is the table {} a valid Iceberg table?", err, declared_table);
-                    Error::InitError(err.to_string()) 
+                    error!("Failed to load table from catalog: {}", err);
+                    Error::InitError(err.to_string())
                 })?;
             self.tables.push(table);
         }
@@ -260,10 +287,21 @@ impl Sink for IcebergSink {
                 .iter()
                 .filter_map(|record| match &record.payload {
                     Payload::Json(record) => simd_json::to_string(&record).ok(),
-                    _ => None,
+                    _ => {
+                        warn!("Unsupported payload format: {}", messages_metadata.schema);
+                        None
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
+
+            if json_messages.is_empty() {
+                error!(
+                    "Could not serialize payload, expected JSON format, got {} instead",
+                    messages_metadata.schema
+                );
+                return Err(Error::InvalidPayloadType);
+            }
 
             let cursor = Cursor::new(json_messages);
 
@@ -338,14 +376,5 @@ impl Sink for IcebergSink {
     async fn close(&mut self) -> Result<(), Error> {
         info!("Iceberg sink connector with ID: {} is closed.", self.id);
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-
-    #[test]
-    fn it_works() {
-        assert_eq!(true, true);
     }
 }
