@@ -19,6 +19,7 @@
 use crate::streaming::utils::PooledBuffer;
 use crate::tcp::tcp_sender::TcpSender;
 use crate::tcp::tcp_tls_sender::TcpTlsSender;
+use crate::websocket::websocket_sender::WebSocketSender;
 use crate::{quic::quic_sender::QuicSender, server_error::ServerError};
 use compio::buf::IoBufMut;
 use compio::net::TcpStream;
@@ -45,6 +46,7 @@ macro_rules! forward_async_methods {
                     Self::Tcp(d) => d.$method_name$(::<$($generic),+>)?($( $arg ),*).await,
                     Self::TcpTls(s) => s.$method_name$(::<$($generic),+>)?($( $arg ),*).await,
                     Self::Quic(s) => s.$method_name$(::<$($generic),+>)?($( $arg ),*).await,
+                    Self::WebSocket(s) => s.$method_name$(::<$($generic),+>)?($( $arg ),*).await,
                 }
             }
         )*
@@ -72,6 +74,7 @@ pub enum SenderKind {
     Tcp(TcpSender),
     TcpTls(TcpTlsSender),
     Quic(QuicSender),
+    WebSocket(WebSocketSender),
 }
 
 impl SenderKind {
@@ -88,6 +91,10 @@ impl SenderKind {
             send: send_stream,
             recv: recv_stream,
         })
+    }
+
+    pub fn get_websocket_sender(stream: WebSocketSender) -> Self {
+        Self::WebSocket(stream)
     }
 
     forward_async_methods! {

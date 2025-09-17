@@ -298,6 +298,7 @@ fn extend_client(client: &Client, bytes: &mut BytesMut) {
         TransportProtocol::Tcp => 1,
         TransportProtocol::Quic => 2,
         TransportProtocol::Http => 3,
+        TransportProtocol::WebSocket => 4,
     };
     bytes.put_u8(transport);
     let address = client.session.ip_address.to_string();

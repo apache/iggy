@@ -42,6 +42,7 @@ pub mod state;
 pub mod streaming;
 pub mod tcp;
 pub mod versioning;
+pub mod websocket;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const IGGY_ROOT_USERNAME_ENV: &str = "IGGY_ROOT_USERNAME";

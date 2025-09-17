@@ -35,6 +35,7 @@ use crate::configs::system::{
     StateConfig, StreamConfig, SystemConfig, TopicConfig,
 };
 use crate::configs::tcp::{TcpConfig, TcpTlsConfig};
+use crate::configs::websocket::WebSocketConfig;
 use iggy_common::IggyByteSize;
 use iggy_common::IggyDuration;
 use std::sync::Arc;
@@ -55,6 +56,7 @@ impl Default for ServerConfig {
             system: Arc::new(SystemConfig::default()),
             quic: QuicConfig::default(),
             tcp: TcpConfig::default(),
+            websocket: WebSocketConfig::default(),
             http: HttpConfig::default(),
             telemetry: TelemetryConfig::default(),
             cluster: ClusterConfig::default(),
@@ -167,6 +169,21 @@ impl Default for TcpSocketConfig {
             keepalive: false,
             nodelay: false,
             linger: IggyDuration::new(Duration::new(0, 0)),
+        }
+    }
+}
+
+impl Default for WebSocketConfig {
+    fn default() -> WebSocketConfig {
+        WebSocketConfig {
+            enabled: SERVER_CONFIG.websocket.enabled,
+            address: SERVER_CONFIG.websocket.address.parse().unwrap(),
+            read_buffer_size: None,
+            write_buffer_size: None,
+            max_write_buffer_size: None,
+            max_message_size: None,
+            max_frame_size: None,
+            accept_unmasked_frames: false,
         }
     }
 }

@@ -69,6 +69,8 @@ pub enum IggyError {
     CannotOpenDatabase(String) = 19,
     #[error("Resource with key: {0} was not found.")]
     ResourceNotFound(String) = 20,
+    #[error("Cannot close WebSocket connection")]
+    CannotCloseWebSocketConnection(String) = 21,
     #[error("Stale client")]
     StaleClient = 30,
     #[error("TCP error")]
@@ -175,6 +177,8 @@ pub enum IggyError {
     CannotCreateEndpoint = 305,
     #[error("Cannot parse URL")]
     CannotParseUrl = 306,
+    #[error("WebSocket error")]
+    WebSocketError = 400,
     #[error("Cannot create streams directory, Path: {0}")]
     CannotCreateStreamsDirectory(String) = 1000,
     #[error("Cannot create stream with ID: {0} directory, Path: {1}")]

@@ -23,6 +23,7 @@ use crate::configs::http::HttpConfig;
 use crate::configs::quic::QuicConfig;
 use crate::configs::system::SystemConfig;
 use crate::configs::tcp::TcpConfig;
+use crate::configs::websocket::WebSocketConfig;
 use crate::server_error::ConfigError;
 use derive_more::Display;
 use error_set::ErrContext;
@@ -44,6 +45,7 @@ pub struct ServerConfig {
     pub quic: QuicConfig,
     pub tcp: TcpConfig,
     pub http: HttpConfig,
+    pub websocket: WebSocketConfig,
     pub telemetry: TelemetryConfig,
     pub cluster: ClusterConfig,
 }

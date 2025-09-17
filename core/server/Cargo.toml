@@ -55,6 +55,9 @@ cyper-axum = { workspace = true }
 compio-net = { workspace = true }
 compio-quic = { workspace = true }
 compio-tls = { workspace = true }
+compio-io = { workspace = true }
+compio-ws = { workspace = true }
+tungstenite = { workspace = true }
 console-subscriber = { workspace = true, optional = true }
 crossbeam = { workspace = true }
 ctrlc = { version = "3.4", features = ["termination"] }

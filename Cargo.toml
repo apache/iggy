@@ -157,7 +157,14 @@ cyper = { git = "https://github.com/krishvishal/cyper.git", rev = "cd75e266df6ab
 cyper-axum = { git = "https://github.com/krishvishal/cyper", rev = "cd75e266df6ab0a9b9474eb7dda1735650d17db6" }
 compio-net = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be" }
 compio-quic = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be" }
-compio-tls = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be", features = ["rustls"] }
+compio-tls = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be", features = [
+    "rustls",
+] }
+compio-io = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be" }
+compio-ws = { git = "https://github.com/krishvishal/compio-ws", branch = "main", features = [
+    "rustls",
+] }
+tungstenite = "0.27.0"
 tokio-rustls = "0.26.2"
 tokio-util = { version = "0.7.16", features = ["compat"] }
 toml = "0.9.5"
@@ -188,3 +195,14 @@ zip = "5.1.1"
 [profile.release]
 lto = true
 codegen-units = 1
+
+[patch.crates-io]
+compio = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be" }
+compio-driver = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be" }
+compio-fs = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be" }
+compio-io = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be" }
+compio-net = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be" }
+compio-runtime = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be" }
+compio-tls = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be" }
+compio-quic = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be" }
+compio-buf = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be" }

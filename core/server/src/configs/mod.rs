@@ -28,5 +28,6 @@ pub mod sharding;
 pub mod system;
 pub mod tcp;
 pub mod validators;
+pub mod websocket;
 
 pub const COMPONENT: &str = "CONFIG";
