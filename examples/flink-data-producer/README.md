@@ -47,7 +47,7 @@ cargo run --package flink-data-producer -- \
 
 ## Command Line Options
 
-```
+```text
 Options:
   --stream-id <STRING>         Stream name [default: flink-demo]
   --topic-id <STRING>          Topic name [default: sensor-data]
@@ -89,7 +89,8 @@ The producer generates sensor data with the following structure:
 ### Error: PartitionNotFound
 
 **Problem**: You see an error like:
-```
+
+```text
 ERROR iggy::tcp::tcp_client: Received an invalid response with status: 3007 (partition_not_found)
 ```
 
@@ -100,10 +101,13 @@ ERROR iggy::tcp::tcp_client: Received an invalid response with status: 3007 (par
 **Problem**: Cannot connect to Iggy server.
 
 **Solution**:
+
 1. Make sure Iggy server is running:
+
    ```bash
    ./setup-iggy.sh
    ```
+
 2. Check if ports 8090 (TCP) or 8080 (HTTP) are available
 3. Verify firewall settings
 
@@ -112,6 +116,7 @@ ERROR iggy::tcp::tcp_client: Received an invalid response with status: 3007 (par
 **Problem**: Invalid username or password.
 
 **Solution**: Use the correct credentials (default: iggy/iggy) or specify custom ones:
+
 ```bash
 cargo run --package flink-data-producer -- \
     --username myuser \
@@ -123,11 +128,13 @@ cargo run --package flink-data-producer -- \
 This producer is designed to work with the Flink sink and source connectors:
 
 1. **Start Iggy Server**
+
    ```bash
    ./setup-iggy.sh
    ```
 
 2. **Run the Producer** (generates data)
+
    ```bash
    cargo run --package flink-data-producer -- --continuous
    ```
@@ -170,11 +177,13 @@ struct SensorData {
 ## Performance Tuning
 
 - **Increase batch size** for higher throughput:
+
   ```bash
   cargo run --package flink-data-producer -- --batch-size 1000
   ```
 
 - **Decrease interval** for faster data generation:
+
   ```bash
   cargo run --package flink-data-producer -- --interval-ms 100
   ```

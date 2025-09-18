@@ -2,7 +2,7 @@
 name = "iggy-connector-flink-source"
 version = "0.1.0"
 edition = "2021"
-authors = ["Apache Iggy Contributors"]
+authors = ["chiradip@chiradip.com, research@space-rf.org"]
 license = "Apache-2.0"
 description = "Apache Flink source connector for Iggy message streaming"
 
@@ -11,34 +11,34 @@ crate-type = ["cdylib"]
 name = "iggy_connector_flink_source"
 
 [dependencies]
-async-trait = "0.1"
+async-trait = { workspace = true }
 iggy_connector_sdk = { path = "../../sdk" }
 iggy = { path = "../../../sdk" }
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-simd-json = { version = "0.15", features = ["serde_impl"] }
-tokio = { version = "1.47", features = ["full"] }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+simd-json = { workspace = true }
+tokio = { workspace = true }
 tokio-stream = "0.1"
-toml = "0.8"
-tracing = "0.1"
-uuid = { version = "1.11", features = ["v4", "v7", "serde"] }
-base64 = "0.22"
-futures = "0.3"
-thiserror = "2.0"
-chrono = { version = "0.4", features = ["serde"] }
-postcard = { version = "1.1", features = ["alloc"] }
-dashmap = "6.1"
-once_cell = "1.21"
+toml = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+base64 = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+postcard = { workspace = true }
+dashmap = { workspace = true }
+once_cell = { workspace = true }
 
 # Flink-specific dependencies
 tonic = "0.12"
-prost = "0.14"
+prost = "0.14.1"
 hyper = { version = "1.5", features = ["full"] }
 websocket = "0.27"  # For Flink's WebSocket API
-rand = "0.8"  # For generating mock data
+rand = { workspace = true }
 
 [dev-dependencies]
 mockito = "1.6"
 tokio-test = "0.4"
-tempfile = "3.8"
+tempfile = { workspace = true }

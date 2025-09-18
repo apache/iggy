@@ -165,4 +165,3 @@ mod tests {
         assert!(matches!(config.source_type, SourceType::Kinesis));
     }
 }
-

@@ -111,7 +111,7 @@ mod tests {
 
         let client = reqwest::Client::new();
         let response = client
-            .post(&format!("{}/v1/sources/subscribe", server.url()))
+            .post(format!("{}/v1/sources/subscribe", server.url()))
             .json(&json!({"source": "test"}))
             .send()
             .await

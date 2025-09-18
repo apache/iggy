@@ -134,8 +134,7 @@ async fn build_client(args: &Args) -> Result<IggyClient, Box<dyn std::error::Err
 
     // Build client provider configuration
     let client_provider_config = Arc::new(
-        ClientProviderConfig::from_args(sdk_args)
-            .expect("Failed to create client provider config"),
+        ClientProviderConfig::from_args(sdk_args).expect("Failed to create client provider config"),
     );
 
     // Build client_provider
@@ -144,9 +143,7 @@ async fn build_client(args: &Args) -> Result<IggyClient, Box<dyn std::error::Err
         .expect("Failed to build client provider");
 
     // Build client
-    let client = IggyClient::builder()
-        .with_client(raw_client)
-        .build()?;
+    let client = IggyClient::builder().with_client(raw_client).build()?;
 
     info!("Connected to Iggy server");
     Ok(client)
@@ -190,16 +187,19 @@ async fn setup_stream_and_topic(
                     .create_topic(
                         &stream_name.try_into()?,
                         topic_name,
-                        1,     // partitions (1-indexed in Iggy)
-                        CompressionAlgorithm::None,  // compression algorithm
-                        None,  // replication factor
-                        None,  // topic id
-                        IggyExpiry::NeverExpire,  // message expiry
-                        MaxTopicSize::Unlimited,  // max topic size
+                        1,                          // partitions (1-indexed in Iggy)
+                        CompressionAlgorithm::None, // compression algorithm
+                        None,                       // replication factor
+                        None,                       // topic id
+                        IggyExpiry::NeverExpire,    // message expiry
+                        MaxTopicSize::Unlimited,    // max topic size
                     )
                     .await
                 {
-                    Ok(_) => info!("Topic '{}' created successfully with 1 partition", topic_name),
+                    Ok(_) => info!(
+                        "Topic '{}' created successfully with 1 partition",
+                        topic_name
+                    ),
                     Err(e) => {
                         error!("Failed to create topic '{}': {}", topic_name, e);
                         return Err(Box::new(e));

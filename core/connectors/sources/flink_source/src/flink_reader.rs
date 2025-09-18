@@ -382,5 +382,3 @@ impl FlinkReader {
         }
     }
 }
-
-

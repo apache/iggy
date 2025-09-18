@@ -187,4 +187,3 @@ fn default_max_retries() -> u32 {
 fn default_retry_delay() -> u64 {
     1000
 }
-

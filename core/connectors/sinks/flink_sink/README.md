@@ -100,6 +100,7 @@ schema_registry_url = "http://localhost:8081"
 ```
 
 Supported schema types:
+
 - JSON
 - Avro
 - Protobuf
@@ -197,11 +198,13 @@ cargo test --package iggy-connector-flink-sink
 ## Example Usage
 
 See the `examples/flink-data-producer` directory for a complete example that:
+
 1. Produces sensor data to Iggy
 2. Processes it through the Flink sink connector
 3. Outputs results to various targets
 
 Run the example:
+
 ```bash
 # Start the infrastructure
 docker-compose up -d
@@ -226,6 +229,7 @@ The connector exposes metrics that can be monitored:
 - `checkpoint_count`: Number of checkpoints created
 
 Access metrics via Flink's REST API:
+
 ```bash
 curl http://localhost:8081/v1/jobs/{job_id}/metrics
 ```
@@ -235,6 +239,7 @@ curl http://localhost:8081/v1/jobs/{job_id}/metrics
 ### Connection Issues
 
 1. Verify Flink cluster is running:
+
    ```bash
    curl http://localhost:8081/v1/overview
    ```

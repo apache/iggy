@@ -2,16 +2,19 @@
 name = "flink-data-producer"
 version = "0.1.0"
 edition = "2021"
+authors = ["chiradip@chiradip.com, research@space-rf.org"]
+license = "Apache-2.0"
+description = "Example data producer for testing Apache Flink connectors with Iggy"
 
 [dependencies]
 iggy = { path = "../../core/sdk" }
-bytes = "1.10"
-tokio = { version = "1.35", features = ["full"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-uuid = { version = "1.6", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4.4", features = ["derive"] }
-rand = "0.8"
+bytes = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+rand = { workspace = true }

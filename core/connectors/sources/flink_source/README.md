@@ -166,16 +166,19 @@ type = "json"
 The connector can automatically discover Flink jobs:
 
 1. **By Job ID**: Connect to a specific job
+
    ```toml
    job_id = "abc123def456"
    ```
 
 2. **By Pattern**: Find jobs matching a pattern
+
    ```toml
    job_name_pattern = ".*sensor.*"
    ```
 
 3. **By Source Type**: Find jobs with matching sources
+
    ```toml
    source_type = "kafka"
    source_identifier = "events"
@@ -246,6 +249,7 @@ curl http://localhost:8090/metrics/connectors/flink-source
 ```
 
 Available metrics:
+
 - `messages_read`: Total messages read from Flink
 - `bytes_read`: Total bytes read
 - `batches_processed`: Number of batches processed
@@ -256,15 +260,19 @@ Available metrics:
 ## Performance Tuning
 
 ### Batch Size
+
 - Larger batches = higher throughput, higher latency
 - Smaller batches = lower throughput, lower latency
 
 ### Poll Interval
+
 - Shorter interval = lower latency, higher CPU usage
 - Longer interval = higher latency, lower CPU usage
 
 ### Parallelism
+
 Match the parallelism of your Flink source operators:
+
 ```toml
 parallelism = 4  # Should match Flink source parallelism
 ```
@@ -274,11 +282,13 @@ parallelism = 4  # Should match Flink source parallelism
 ### No Data Being Read
 
 1. Verify Flink job is running:
+
    ```bash
    curl http://localhost:8081/v1/jobs
    ```
 
 2. Check source vertex is producing data:
+
    ```bash
    curl http://localhost:8081/v1/jobs/{job_id}/vertices
    ```
@@ -310,11 +320,13 @@ parallelism = 4  # Should match Flink source parallelism
 ## Example: Kafka to Iggy Pipeline
 
 1. Start infrastructure:
+
    ```bash
    docker-compose up -d
    ```
 
 2. Create Flink job that reads from Kafka:
+
    ```bash
    docker exec -it flink-jobmanager flink run \
      -c com.example.KafkaToFlinkJob \
@@ -324,6 +336,7 @@ parallelism = 4  # Should match Flink source parallelism
    ```
 
 3. Configure source connector:
+
    ```toml
    [source.config]
    flink_cluster_url = "http://localhost:8081"

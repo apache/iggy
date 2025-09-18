@@ -2654,7 +2654,7 @@ dependencies = [
  "chrono",
  "clap",
  "iggy",
- "rand 0.8.5",
+ "rand 0.9.2",
  "serde",
  "serde_json",
  "tokio",
@@ -3819,22 +3819,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hyper-tls"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70206fc6890eaca9fde8a0bf71caa2ddfc9fe045ac9e5c70df101a7dbde866e0"
-dependencies = [
- "bytes 1.10.1",
- "http-body-util",
- "hyper 1.7.0",
- "hyper-util",
- "native-tls",
- "tokio",
- "tokio-native-tls",
- "tower-service",
-]
-
-[[package]]
 name = "hyper-util"
 version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3853,11 +3837,9 @@ dependencies = [
  "percent-encoding 2.3.2",
  "pin-project-lite",
  "socket2 0.6.0",
- "system-configuration",
  "tokio",
  "tower-service",
  "tracing",
- "windows-registry",
 ]
 
 [[package]]
@@ -4140,7 +4122,7 @@ dependencies = [
  "thiserror 2.0.16",
  "tokio",
  "tokio-test",
- "toml 0.8.23",
+ "toml 0.9.5",
  "tonic 0.12.3",
  "tracing",
  "uuid",
@@ -4162,7 +4144,7 @@ dependencies = [
  "once_cell",
  "postcard",
  "prost 0.14.1",
- "rand 0.8.5",
+ "rand 0.9.2",
  "reqwest",
  "serde",
  "serde_json",
@@ -4172,7 +4154,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-test",
- "toml 0.8.23",
+ "toml 0.9.5",
  "tonic 0.12.3",
  "tracing",
  "uuid",
@@ -7030,23 +7012,23 @@ checksum = "d429f34c8092b2d42c7c93cec323bb4adeb7c67698f70839adec842ec10c7ceb"
 dependencies = [
  "base64 0.22.1",
  "bytes 1.10.1",
- "encoding_rs",
  "futures-channel",
  "futures-core",
  "futures-util",
- "h2 0.4.12",
  "http 1.3.1",
  "http-body",
  "http-body-util",
  "hyper 1.7.0",
  "hyper-rustls",
- "hyper-tls",
  "hyper-util",
  "js-sys",
+<<<<<<< HEAD
  "log 0.4.28",
  "mime 0.3.17",
+=======
+ "log 0.4.27",
+>>>>>>> 628b1bc2 (flink source and and sink added)
  "mime_guess",
- "native-tls",
  "percent-encoding 2.3.2",
  "pin-project-lite",
  "quinn",
@@ -7057,7 +7039,6 @@ dependencies = [
  "serde_urlencoded",
  "sync_wrapper",
  "tokio",
- "tokio-native-tls",
  "tokio-rustls",
  "tokio-util",
  "tower 0.5.2",
@@ -8556,27 +8537,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "system-configuration"
-version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c879d448e9d986b661742763247d3693ed13609438cf3d006f51f5368a5ba6b"
-dependencies = [
- "bitflags 2.9.3",
- "core-foundation 0.9.4",
- "system-configuration-sys",
-]
-
-[[package]]
-name = "system-configuration-sys"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
-dependencies = [
- "core-foundation-sys",
- "libc",
-]
-
-[[package]]
 name = "tagptr"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8850,16 +8810,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.106",
-]
-
-[[package]]
-name = "tokio-native-tls"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbae76ab933c85776efabc971569dd6119c580d8f5d448769dec1764bf796ef2"
-dependencies = [
- "native-tls",
- "tokio",
 ]
 
 [[package]]
@@ -10070,6 +10020,7 @@ dependencies = [
 ]
 
 [[package]]
+<<<<<<< HEAD
 name = "windows-registry"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10081,6 +10032,8 @@ dependencies = [
 ]
 
 [[package]]
+=======
+>>>>>>> 628b1bc2 (flink source and and sink added)
 name = "windows-result"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

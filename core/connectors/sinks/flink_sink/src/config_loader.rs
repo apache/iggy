@@ -188,4 +188,3 @@ mod tests {
         assert_eq!(config.flink_cluster_url, "http://localhost:8081");
     }
 }
-

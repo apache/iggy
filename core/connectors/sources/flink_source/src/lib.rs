@@ -287,4 +287,3 @@ impl Source for FlinkSource {
         Ok(())
     }
 }
-

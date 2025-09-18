@@ -63,4 +63,3 @@ impl SourceState {
         self.last_error = None;
     }
 }
-

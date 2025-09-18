@@ -5,7 +5,6 @@ mod tests {
 
     use iggy_connector_sdk::{ConsumedMessage, MessagesMetadata, Payload, Schema, TopicMetadata};
     use serde_json::json;
-    use simd_json;
 
     #[tokio::test]
     async fn test_mockito_server() {
