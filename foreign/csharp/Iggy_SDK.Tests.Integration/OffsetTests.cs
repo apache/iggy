@@ -88,8 +88,9 @@ public class OffsetTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task GetOffset_ConsumerGroup_ByName_Should_GetOffset_Successfully(Protocol protocol)
     {
-        var offset = await Fixture.Clients[protocol]
-            .GetOffsetAsync(Consumer.Group("test_consumer_group"), Identifier.Numeric(1), Identifier.Numeric(1), 1);
+        var offset = await Fixture.Clients[protocol].GetOffsetAsync(Consumer.Group("test_consumer_group"),
+            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), Identifier.String(Fixture.TopicRequest.Name),
+            1);
 
         offset.ShouldNotBeNull();
         offset.StoredOffset.ShouldBe(SetOffset);

@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Buffers;
 using System.Buffers.Binary;
 using System.IO.Hashing;
 using System.Runtime.CompilerServices;
@@ -63,6 +62,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     {
         _stream.Close();
         _stream.Dispose();
+        _semaphore.Dispose();
     }
 
     public async Task<StreamResponse?> CreateStreamAsync(string name, uint? streamId, CancellationToken token = default)
@@ -723,8 +723,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         }
 
         var userId = BinaryPrimitives.ReadInt32LittleEndian(responseBuffer.AsSpan()[..responseBuffer.Length]);
-
-        //TODO: Figure out how to solve this workaround about default of TokenInfo
+        
         return new AuthResponse(userId, null);
     }
 
@@ -843,7 +842,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
             await _stream.SendAsync(payload, token);
             await _stream.FlushAsync(token);
 
-            var buffer = new byte[BufferSizes.ExpectedResponseSize];
+            var buffer = new byte[BufferSizes.EXPECTED_RESPONSE_SIZE];
             var readBytes = await _stream.ReadAsync(buffer, token);
 
             if (readBytes == 0)
