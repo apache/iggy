@@ -16,17 +16,17 @@
  * under the License.
  */
 
-use crate::streaming::common::test_setup::TestSetup;
 use super::bootstrap_test_environment;
+use crate::streaming::common::test_setup::TestSetup;
 use bytes::BytesMut;
 use iggy::prelude::*;
 use server::configs::cache_indexes::CacheIndexesConfig;
 use server::configs::system::{PartitionConfig, SegmentConfig, SystemConfig};
+use server::shard::namespace::IggyFullNamespace;
 use server::shard::system::messages::PollingArgs;
 use server::streaming::polling_consumer::PollingConsumer;
 use server::streaming::segments::IggyMessagesBatchMut;
 use server::streaming::traits::MainOps;
-use server::shard::namespace::IggyFullNamespace;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -117,14 +117,20 @@ async fn test_get_messages_by_timestamp(
     };
 
     // Use the bootstrap method to create streams with proper slab structure
-    let bootstrap_result = bootstrap_test_environment(shard_id as u16, &config).await.unwrap();
+    let bootstrap_result = bootstrap_test_environment(shard_id as u16, &config)
+        .await
+        .unwrap();
     let streams = bootstrap_result.streams;
     let stream_identifier = bootstrap_result.stream_id;
     let topic_identifier = bootstrap_result.topic_id;
     let partition_id = bootstrap_result.partition_id;
-    
+
     // Create namespace for MainOps calls
-    let namespace = IggyFullNamespace::new(stream_identifier.clone(), topic_identifier.clone(), partition_id);
+    let namespace = IggyFullNamespace::new(
+        stream_identifier.clone(),
+        topic_identifier.clone(),
+        partition_id,
+    );
 
     let mut all_messages = Vec::with_capacity(total_messages_count as usize);
 
@@ -193,7 +199,10 @@ async fn test_get_messages_by_timestamp(
 
         let batch = IggyMessagesBatchMut::from_messages(messages_slice_to_append, messages_size);
         assert_eq!(batch.count(), batch_len);
-        streams.append_messages(shard_id as u16, &config, &namespace, batch).await.unwrap();
+        streams
+            .append_messages(shard_id as u16, &config, &namespace, batch)
+            .await
+            .unwrap();
 
         // Capture the timestamp of this batch
         batch_timestamps.push(IggyTimestamp::now());
@@ -209,10 +218,15 @@ async fn test_get_messages_by_timestamp(
     let total_sent_messages = total_messages_count;
 
     // Create a single consumer to reuse throughout the test
-    let consumer = PollingConsumer::consumer(&Identifier::numeric(1).unwrap(), partition_id as usize);
+    let consumer =
+        PollingConsumer::consumer(&Identifier::numeric(1).unwrap(), partition_id as usize);
 
     // Test 1: All messages from initial timestamp
-    let args = PollingArgs::new(PollingStrategy::timestamp(initial_timestamp), total_sent_messages, false);
+    let args = PollingArgs::new(
+        PollingStrategy::timestamp(initial_timestamp),
+        total_sent_messages,
+        false,
+    );
     let (_, all_loaded_messages) = streams
         .poll_messages(&namespace, consumer, args)
         .await
@@ -235,7 +249,11 @@ async fn test_get_messages_by_timestamp(
         let prior_batches_sum: u32 = batch_lengths[..3].iter().sum();
         let remaining_messages = total_sent_messages - prior_batches_sum;
 
-        let args = PollingArgs::new(PollingStrategy::timestamp(middle_timestamp), remaining_messages, false);
+        let args = PollingArgs::new(
+            PollingStrategy::timestamp(middle_timestamp),
+            remaining_messages,
+            false,
+        );
         let (_, middle_messages) = streams
             .poll_messages(&namespace, consumer, args)
             .await
@@ -265,7 +283,11 @@ async fn test_get_messages_by_timestamp(
 
     // Test 4: Small subset from initial timestamp
     let subset_size = std::cmp::min(3, total_sent_messages);
-    let args = PollingArgs::new(PollingStrategy::timestamp(initial_timestamp), subset_size, false);
+    let args = PollingArgs::new(
+        PollingStrategy::timestamp(initial_timestamp),
+        subset_size,
+        false,
+    );
     let (_, subset_messages) = streams
         .poll_messages(&namespace, consumer, args)
         .await

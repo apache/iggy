@@ -472,9 +472,6 @@ pub fn get_segment_range_by_timestamp(
 ) -> impl FnOnce(ComponentsById<PartitionRef>) -> Result<std::ops::Range<usize>, IggyError> {
     move |(.., log)| -> Result<std::ops::Range<usize>, IggyError> {
         let segments = log.segments();
-        for seg in segments {
-            tracing::warn!("timestamp: {}, segment: {:?}", timestamp, seg);
-        }
         let start = log
             .segments()
             .iter()
@@ -705,9 +702,6 @@ pub fn commit_journal() -> impl FnOnce(ComponentsById<PartitionRefMut>) -> IggyM
         let batches = log.journal_mut().commit();
         log.ensure_indexes();
         batches.append_indexes_to(log.active_indexes_mut().unwrap());
-        let indexes = log.active_indexes_mut().unwrap();
-        let first = indexes.get(0).unwrap();
-        let last = indexes.last().unwrap();
         batches
     }
 }

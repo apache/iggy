@@ -4,16 +4,24 @@ use crate::{
     shard::{namespace::IggyFullNamespace, system::messages::PollingArgs},
     shard_info,
     slab::{
-        consumer_groups::ConsumerGroups, helpers, partitions::{self, Partitions}, topics::Topics, traits_ext::{
+        Keyed,
+        consumer_groups::ConsumerGroups,
+        helpers,
+        partitions::{self, Partitions},
+        topics::Topics,
+        traits_ext::{
             ComponentsById, DeleteCell, EntityComponentSystem, EntityComponentSystemMutCell,
             InsertCell, InteriorMutability, IntoComponents,
-        }, Keyed
+        },
     },
     streaming::{
-        partitions::{journal::Journal, partition2::{PartitionRef, PartitionRefMut}},
+        partitions::{
+            journal::Journal,
+            partition2::{PartitionRef, PartitionRefMut},
+        },
         polling_consumer::PollingConsumer,
         segments::{
-            storage::create_segment_storage, IggyMessagesBatchMut, IggyMessagesBatchSet, Segment2
+            IggyMessagesBatchMut, IggyMessagesBatchSet, Segment2, storage::create_segment_storage,
         },
         stats::stats::StreamStats,
         streams::{
@@ -166,14 +174,19 @@ impl MainOps for Streams {
             streaming_partitions::helpers::calculate_current_offset(),
         );
 
-        let current_position = self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
-            log.journal().inner().size + log.active_segment().size
-        });
+        let current_position =
+            self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
+                log.journal().inner().size + log.active_segment().size
+            });
         self.with_partition_by_id_async(
             stream_id,
             topic_id,
             partition_id,
-            streaming_partitions::helpers::deduplicate_messages(current_offset, current_position, &mut input),
+            streaming_partitions::helpers::deduplicate_messages(
+                current_offset,
+                current_position,
+                &mut input,
+            ),
         )
         .await;
 

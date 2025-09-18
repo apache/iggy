@@ -135,6 +135,12 @@ where
         self.storage.push(storage);
         self.indexes.push(None);
     }
+
+    pub fn set_segment_indexes(&mut self, segment_index: usize, indexes: IggyIndexesMut) {
+        if let Some(segment_indexes) = self.indexes.get_mut(segment_index) {
+            *segment_indexes = Some(indexes);
+        }
+    }
 }
 
 impl<J> SegmentedLog<J>

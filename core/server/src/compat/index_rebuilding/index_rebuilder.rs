@@ -18,13 +18,11 @@
 
 use crate::server_error::CompatError;
 use crate::streaming::utils::file;
-use async_zip::tokio::write;
 use compio::{
     fs::File,
-    io::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
+    io::{AsyncBufRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
 };
 use iggy_common::{IGGY_MESSAGE_HEADER_SIZE, IggyMessageHeader};
-use std::io::{Seek, SeekFrom};
 
 pub struct IndexRebuilder {
     pub messages_file_path: String,

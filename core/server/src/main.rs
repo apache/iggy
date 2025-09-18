@@ -189,7 +189,8 @@ async fn main() -> Result<(), ServerError> {
     ));
     let state = SystemState::load(state).await?;
     let (streams_state, users_state) = state.decompose();
-    let streams = load_streams(streams_state.into_values(), &config.system)?;
+    let streams = load_streams(streams_state.into_values(), &config.system).await?;
+    tracing::warn!("Streams: {:?}", streams);
     let users = load_users(users_state.into_values());
 
     // ELEVENTH DISCRETE LOADING STEP.
@@ -329,7 +330,6 @@ async fn main() -> Result<(), ServerError> {
     let _command_handler = BackgroundServerCommandHandler::new(system.clone(), &config)
         .install_handler(SaveMessagesExecutor)
         .install_handler(MaintainMessagesExecutor)
-        .install_handler(ArchiveStateExecutor)
         .install_handler(CleanPersonalAccessTokensExecutor)
         .install_handler(SysInfoPrintExecutor)
         .install_handler(VerifyHeartbeatsExecutor);

@@ -149,8 +149,7 @@ impl IggyShardBuilder {
             id: id,
             shards: shards,
             shards_table,
-            //streams2: streams, // TODO: Fixme
-            streams2: Default::default(),
+            streams2: streams, // TODO: Fixme
             users: RefCell::new(users),
             storage: storage,
             encryptor: encryptor,

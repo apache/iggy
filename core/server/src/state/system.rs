@@ -30,17 +30,18 @@ use iggy_common::MaxTopicSize;
 use iggy_common::create_user::CreateUser;
 use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::{IdKind, Identifier, Permissions, UserStatus};
+use std::collections::BTreeMap;
 use std::fmt::Display;
 use tracing::{debug, error, info};
 
 #[derive(Debug, Clone)]
 pub struct SystemState {
-    pub streams: AHashMap<u32, StreamState>,
+    pub streams: BTreeMap<u32, StreamState>,
     pub users: AHashMap<u32, UserState>,
 }
 
 impl SystemState {
-    pub fn decompose(self) -> (AHashMap<u32, StreamState>, AHashMap<u32, UserState>) {
+    pub fn decompose(self) -> (BTreeMap<u32, StreamState>, AHashMap<u32, UserState>) {
         (self.streams, self.users)
     }
 }
@@ -50,15 +51,15 @@ pub struct StreamState {
     pub id: u32,
     pub name: String,
     pub created_at: IggyTimestamp,
-    pub topics: AHashMap<u32, TopicState>,
+    pub topics: BTreeMap<u32, TopicState>,
 }
 
 #[derive(Debug, Clone)]
 pub struct TopicState {
     pub id: u32,
     pub name: String,
-    pub partitions: AHashMap<u32, PartitionState>,
-    pub consumer_groups: AHashMap<u32, ConsumerGroupState>,
+    pub partitions: BTreeMap<u32, PartitionState>,
+    pub consumer_groups: BTreeMap<u32, ConsumerGroupState>,
     pub compression_algorithm: CompressionAlgorithm,
     pub message_expiry: IggyExpiry,
     pub max_topic_size: MaxTopicSize,
@@ -161,7 +162,7 @@ impl SystemState {
     }
 
     pub async fn init(entries: Vec<StateEntry>) -> Result<Self, IggyError> {
-        let mut streams = AHashMap::new();
+        let mut streams = BTreeMap::new();
         let mut users = AHashMap::new();
         for entry in entries {
             debug!("Processing state entry: {entry}",);
@@ -177,7 +178,7 @@ impl SystemState {
                     let stream = StreamState {
                         id: stream_id,
                         name: command.name.clone(),
-                        topics: AHashMap::new(),
+                        topics: BTreeMap::new(),
                         created_at: entry.timestamp,
                     };
                     streams.insert(stream.id, stream);
@@ -210,15 +211,15 @@ impl SystemState {
                     let topic = TopicState {
                         id: topic_id,
                         name: command.name,
-                        consumer_groups: AHashMap::new(),
+                        consumer_groups: BTreeMap::new(),
                         compression_algorithm: command.compression_algorithm,
                         message_expiry: command.message_expiry,
                         max_topic_size: command.max_topic_size,
                         replication_factor: command.replication_factor,
                         created_at: entry.timestamp,
                         partitions: if command.partitions_count > 0 {
-                            let mut partitions = AHashMap::new();
-                            for i in 1..=command.partitions_count {
+                            let mut partitions = BTreeMap::new();
+                            for i in 0..command.partitions_count {
                                 partitions.insert(
                                     i,
                                     PartitionState {
@@ -229,7 +230,7 @@ impl SystemState {
                             }
                             partitions
                         } else {
-                            AHashMap::new()
+                            BTreeMap::new()
                         },
                     };
                     stream.topics.insert(topic.id, topic);
@@ -488,7 +489,7 @@ impl SystemState {
     }
 }
 
-fn find_stream_id(streams: &AHashMap<u32, StreamState>, stream_id: &Identifier) -> u32 {
+fn find_stream_id(streams: &BTreeMap<u32, StreamState>, stream_id: &Identifier) -> u32 {
     match stream_id.kind {
         IdKind::Numeric => stream_id
             .get_u32_value()
@@ -506,7 +507,7 @@ fn find_stream_id(streams: &AHashMap<u32, StreamState>, stream_id: &Identifier) 
     }
 }
 
-fn find_topic_id(topics: &AHashMap<u32, TopicState>, topic_id: &Identifier) -> u32 {
+fn find_topic_id(topics: &BTreeMap<u32, TopicState>, topic_id: &Identifier) -> u32 {
     match topic_id.kind {
         IdKind::Numeric => topic_id
             .get_u32_value()
@@ -525,7 +526,7 @@ fn find_topic_id(topics: &AHashMap<u32, TopicState>, topic_id: &Identifier) -> u
 }
 
 fn find_consumer_group_id(
-    groups: &AHashMap<u32, ConsumerGroupState>,
+    groups: &BTreeMap<u32, ConsumerGroupState>,
     group_id: &Identifier,
 ) -> u32 {
     match group_id.kind {

@@ -1,5 +1,7 @@
 use crate::{
     IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV,
+    compat::index_rebuilding::index_rebuilder::IndexRebuilder,
+    configs::cache_indexes::CacheIndexesConfig,
     configs::{config_provider::ConfigProviderKind, server::ServerConfig, system::SystemConfig},
     io::fs_utils,
     server_error::ServerError,
@@ -17,12 +19,11 @@ use crate::{
         },
     },
     state::system::{StreamState, TopicState, UserState},
+    streaming::segments::{INDEX_EXTENSION, LOG_EXTENSION, Segment2, storage::Storage},
     streaming::{
-        deduplication::message_deduplicator,
         partitions::{
-            consumer_offset::{self, ConsumerOffset},
-            helpers::create_message_deduplicator,
-            partition2::{self, ConsumerGroupOffsets, ConsumerOffsets},
+            consumer_offset::ConsumerOffset, helpers::create_message_deduplicator,
+            journal::MemoryMessageJournal, log::SegmentedLog, partition2,
             storage2::load_consumer_offsets,
         },
         persistence::persister::{FilePersister, FileWithSyncPersister, PersisterKind},
@@ -38,6 +39,7 @@ use crate::{
 };
 use ahash::HashMap;
 use compio::{fs::create_dir_all, runtime::Runtime};
+use error_set::ErrContext;
 use iggy_common::{
     ConsumerKind, IggyError, UserId,
     defaults::{
@@ -46,9 +48,9 @@ use iggy_common::{
     },
 };
 use std::{collections::HashSet, env, path::Path, sync::Arc};
-use tracing::info;
+use tracing::{info, warn};
 
-pub fn load_streams(
+pub async fn load_streams(
     state: impl IntoIterator<Item = StreamState>,
     config: &SystemConfig,
 ) -> Result<Streams, IggyError> {
@@ -121,56 +123,40 @@ pub fn load_streams(
             let parent_stats = stats.clone();
             let cgs = consumer_groups.into_values();
             let partitions = partitions.into_values();
+
+            // Load each partition asynchronously and insert immediately
             for partition_state in partitions {
                 info!(
                     "Loading partition with ID: {}, for topic with ID: {} from state...",
                     partition_state.id, topic_id
                 );
+
+                let partition_id = partition_state.id;
+                let partition = load_partition_with_segments(
+                    config,
+                    stream_id as usize,
+                    topic_id,
+                    partition_state,
+                    parent_stats.clone(),
+                )
+                .await?;
+
+                // Insert partition into the container
                 streams.with_components_by_id(stream_id as usize, |(root, ..)| {
-                    let parent_stats = parent_stats.clone();
                     root.topics()
-                        .with_components_by_id_mut(topic_id, |(root, ..)| {
-                            let stats = Arc::new(PartitionStats::new(parent_stats));
-                            // TODO: This has to be sampled from segments, if there exists more than 0 segements and the segment has more than 0 messages, then we set it to true.
-                            let should_increment_offset = todo!();
-                            // TODO: This has to be sampled from segments and it's indexes, offset = segment.start_offset + last_index.offset;
-                            let offset = todo!();
-                            let message_deduplicator = create_message_deduplicator(config);
-                            let id = partition_state.id;
-
-                            let consumer_offset_path = config.get_consumer_offsets_path(stream_id as usize, topic_id as usize, id as usize);
-                            let consumer_group_offsets_path = config.get_consumer_group_offsets_path(stream_id as usize, topic_id as usize, id as usize);
-                            let consumer_offset = Arc::new(load_consumer_offsets(&consumer_offset_path, ConsumerKind::Consumer)?
-                            .into_iter().map(|offset| {
-                                (offset.consumer_id as usize, offset)
-                            }).into());
-                            let consumer_group_offset = Arc::new(load_consumer_offsets(&consumer_group_offsets_path, ConsumerKind::ConsumerGroup)?.into_iter().map(|offset| {
-                                (offset.consumer_id as usize, offset)
-                            }).into());
-
-                            let log = Default::default();
-                            let partition = partition2::Partition::new(
-                                partition_state.created_at,
-                                should_increment_offset,
-                                stats,
-                                message_deduplicator,
-                                offset,
-                                consumer_offset,
-                                consumer_group_offset,
-                                log
-                            );
+                        .with_components_by_id_mut(topic_id, |(mut root, ..)| {
                             let new_id = root.partitions_mut().insert(partition);
                             assert_eq!(
-                                new_id, id as usize,
+                                new_id, partition_id as usize,
                                 "load_streams: partition id mismatch when inserting partition, mismatch for partition with ID: {}, for topic with ID: {}, for stream with ID: {}",
-                                id, topic_id, stream_id
+                                partition_id, topic_id, stream_id
                             );
-                            Ok(())
-                        })
-                })?;
+                        });
+                });
+
                 info!(
                     "Loaded partition with ID: {}, for topic with ID: {} from state...",
-                    partition_state.id, topic_id
+                    partition_id, topic_id
                 );
             }
             let partition_ids = streams.with_components_by_id(stream_id as usize, |(root, ..)| {
@@ -383,4 +369,294 @@ pub async fn update_system_info(
     system_info.update_version(version);
     storage.info.save(system_info).await?;
     Ok(())
+}
+
+async fn load_partition_with_segments(
+    config: &SystemConfig,
+    stream_id: usize,
+    topic_id: usize,
+    partition_state: crate::state::system::PartitionState,
+    parent_stats: Arc<TopicStats>,
+) -> Result<partition2::Partition, IggyError> {
+    use std::sync::atomic::AtomicU64;
+
+    let stats = Arc::new(PartitionStats::new(parent_stats));
+    let partition_id = partition_state.id as u32;
+
+    // Load segments from disk to determine should_increment_offset and current offset
+    let partition_path = config.get_partition_path(stream_id, topic_id, partition_id as usize);
+
+    info!(
+        "Loading partition with ID: {} for stream with ID: {} and topic with ID: {}, for path: {} from disk...",
+        partition_id, stream_id, topic_id, partition_path
+    );
+
+    // Read directory entries to find log files using async fs_utils
+    let dir_entries = fs_utils::walk_dir(&partition_path)
+        .await
+        .map_err(|_| IggyError::CannotReadPartitions)?;
+
+    let mut log_files = Vec::new();
+    for entry in dir_entries {
+        if entry.is_dir {
+            continue;
+        }
+
+        let extension = entry.path.extension();
+        if extension.is_none() || extension.unwrap() != LOG_EXTENSION {
+            continue;
+        }
+
+        log_files.push(entry);
+    }
+
+    log_files.sort_by(|a, b| a.path.file_name().cmp(&b.path.file_name()));
+
+    let mut should_increment_offset = false;
+    let mut current_offset = 0u64;
+    let mut log = SegmentedLog::<MemoryMessageJournal>::default();
+
+    for entry in log_files {
+        let log_file_name = entry
+            .path
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let start_offset = log_file_name.parse::<u64>().unwrap();
+
+        // Build file paths directly
+        let messages_file_path = format!("{}/{}.{}", partition_path, start_offset, LOG_EXTENSION);
+        let index_file_path = format!("{}/{}.{}", partition_path, start_offset, INDEX_EXTENSION);
+        let time_index_path = index_file_path.replace(INDEX_EXTENSION, "timeindex");
+
+        // Check if index files exist
+        async fn try_exists(path: &str) -> Result<bool, std::io::Error> {
+            match compio::fs::metadata(path).await {
+                Ok(_) => Ok(true),
+                Err(err) => match err.kind() {
+                    std::io::ErrorKind::NotFound => Ok(false),
+                    _ => Err(err),
+                },
+            }
+        }
+
+        let index_path_exists = try_exists(&index_file_path).await.unwrap();
+        let time_index_path_exists = try_exists(&time_index_path).await.unwrap();
+        let index_cache_enabled = matches!(
+            config.segment.cache_indexes,
+            CacheIndexesConfig::All | CacheIndexesConfig::OpenSegment
+        );
+
+        // Rebuild indexes if index cache is enabled and index at path does not exist
+        if index_cache_enabled && (!index_path_exists || time_index_path_exists) {
+            warn!(
+                "Index at path {} does not exist, rebuilding it based on {}...",
+                index_file_path, messages_file_path
+            );
+            let now = std::time::Instant::now();
+            let index_rebuilder = IndexRebuilder::new(
+                messages_file_path.clone(),
+                index_file_path.clone(),
+                start_offset,
+            );
+            index_rebuilder.rebuild().await.unwrap_or_else(|e| {
+                panic!(
+                    "Failed to rebuild index for partition with ID: {} for stream with ID: {} and topic with ID: {}. Error: {e}",
+                    partition_id, stream_id, topic_id,
+                )
+            });
+            info!(
+                "Rebuilding index for path {} finished, it took {} ms",
+                index_file_path,
+                now.elapsed().as_millis()
+            );
+        }
+
+        if time_index_path_exists {
+            compio::fs::remove_file(&time_index_path).await.unwrap();
+        }
+
+        // Get file metadata to determine segment properties
+        let messages_metadata = compio::fs::metadata(&messages_file_path)
+            .await
+            .map_err(|_| IggyError::CannotReadPartitions)?;
+        let messages_size = messages_metadata.len() as u32;
+
+        let index_size = match compio::fs::metadata(&index_file_path).await {
+            Ok(metadata) => metadata.len() as u32,
+            Err(_) => 0, // Default to 0 if index file doesn't exist
+        };
+
+        // If the first segment has messages, we should increment the offset
+        if !should_increment_offset {
+            should_increment_offset = messages_size > 0;
+        }
+
+        // For segment validation, we'd need to implement checksum validation
+        // directly on the files if needed - skipping for now as it requires
+        // understanding the message format
+        if config.partition.validate_checksum {
+            info!("Checksum validation for segment at offset {}", start_offset);
+        }
+
+        // Create storage for the segment using existing files
+        let storage = Storage::new(
+            &messages_file_path,
+            &index_file_path,
+            messages_size as u64,
+            index_size as u64,
+            config.partition.enforce_fsync,
+            config.partition.enforce_fsync,
+            true, // file_exists = true for existing segments
+        )
+        .await?;
+
+        // Load indexes from disk to calculate the correct end offset and cache them if needed
+        // This matches the logic in Segment::load_from_disk method
+        let loaded_indexes = {
+            storage.
+            index_reader
+            .as_ref()
+            .unwrap()
+            .load_all_indexes_from_disk()
+            .await
+            .with_error_context(|error| format!("Failed to load indexes during startup for stream ID: {}, topic ID: {}, partition_id: {}, {error}", stream_id, topic_id, partition_id))
+            .map_err(|_| IggyError::CannotReadFile)?
+        };
+
+        // Calculate end offset based on loaded indexes
+        let end_offset = if loaded_indexes.count() == 0 {
+            0
+        } else {
+            let last_index_offset = loaded_indexes.last().unwrap().offset() as u64;
+            start_offset + last_index_offset
+        };
+
+        let (start_timestamp, end_timestamp) = if loaded_indexes.count() == 0 {
+            (0, 0)
+        } else {
+            (
+                loaded_indexes.get(0).unwrap().timestamp(),
+                loaded_indexes.last().unwrap().timestamp(),
+            )
+        };
+
+        current_offset = current_offset.max(end_offset);
+
+        // Create the new Segment with proper values from file system
+        let mut segment = Segment2::new(
+            start_offset,
+            config.segment.size,
+            config.segment.message_expiry,
+        );
+
+        // Set properties based on file data
+        segment.start_timestamp = start_timestamp;
+        segment.end_timestamp = end_timestamp;
+        segment.end_offset = end_offset;
+        segment.size = messages_size;
+        segment.sealed = true; // Persisted segments are assumed to be sealed
+
+        // Add segment to log first
+        log.add_persisted_segment(segment, storage);
+
+        // Increment stats for partition - this matches the behavior from partition storage load method
+        stats.increment_segments_count(1);
+        
+        // Increment size and message counts based on the loaded segment data
+        stats.increment_size_bytes(messages_size as u64);
+        
+        // Calculate message count from segment data (end_offset - start_offset + 1 if there are messages)
+        let messages_count = if end_offset > start_offset {
+            (end_offset - start_offset + 1) as u64
+        } else if messages_size > 0 {
+            // Fallback: estimate based on loaded indexes count if available
+            loaded_indexes.count() as u64
+        } else {
+            0
+        };
+        
+        if messages_count > 0 {
+            stats.increment_messages_count(messages_count);
+        }
+
+        // Now handle index caching based on configuration
+        let should_cache_indexes = match config.segment.cache_indexes {
+            CacheIndexesConfig::All => true,
+            CacheIndexesConfig::OpenSegment => false, // Will be handled after all segments are loaded
+            CacheIndexesConfig::None => false,
+        };
+
+        // Set the loaded indexes if we should cache them
+        if should_cache_indexes {
+            let segment_index = log.segments().len() - 1;
+            log.set_segment_indexes(segment_index, loaded_indexes);
+        }
+    }
+
+    // Handle OpenSegment cache configuration: only the last segment should keep its indexes
+    if matches!(
+        config.segment.cache_indexes,
+        CacheIndexesConfig::OpenSegment
+    ) && log.has_segments()
+    {
+        let segments_count = log.segments().len();
+        if segments_count > 0 {
+            // Use the IndexReader from the last segment's storage to load indexes
+            let last_storage = log.storages().last().unwrap();
+            match last_storage.index_reader.as_ref() {
+                Some(index_reader) => {
+                    if let Ok(loaded_indexes) = index_reader.load_all_indexes_from_disk().await {
+                        log.set_segment_indexes(segments_count - 1, loaded_indexes);
+                    }
+                }
+                None => {
+                    warn!("Index reader not available for last segment in OpenSegment mode");
+                }
+            }
+        }
+    }
+
+    // Load consumer offsets
+    let message_deduplicator = create_message_deduplicator(config);
+    let consumer_offset_path =
+        config.get_consumer_offsets_path(stream_id, topic_id, partition_id as usize);
+    let consumer_group_offsets_path =
+        config.get_consumer_group_offsets_path(stream_id, topic_id, partition_id as usize);
+
+    let consumer_offset = Arc::new(
+        load_consumer_offsets(&consumer_offset_path, ConsumerKind::Consumer)?
+            .into_iter()
+            .map(|offset| (offset.consumer_id as usize, offset))
+            .collect::<HashMap<usize, ConsumerOffset>>()
+            .into(),
+    );
+
+    let consumer_group_offset = Arc::new(
+        load_consumer_offsets(&consumer_group_offsets_path, ConsumerKind::ConsumerGroup)?
+            .into_iter()
+            .map(|offset| (offset.consumer_id as usize, offset))
+            .collect::<HashMap<usize, ConsumerOffset>>()
+            .into(),
+    );
+
+    let partition = partition2::Partition::new(
+        partition_state.created_at,
+        should_increment_offset,
+        stats,
+        message_deduplicator,
+        Arc::new(AtomicU64::new(current_offset)),
+        consumer_offset,
+        consumer_group_offset,
+        log
+    );
+
+    info!(
+        "Loaded partition with ID: {} for stream with ID: {} and topic with ID: {}, current offset: {}.",
+        partition_id, stream_id, topic_id, current_offset
+    );
+
+    Ok(partition)
 }

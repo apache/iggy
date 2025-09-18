@@ -36,9 +36,13 @@ impl Storage {
         let index_writer =
             IndexWriter::new(index_path, indexes_size.clone(), index_fsync, file_exists).await?;
 
+        if file_exists {
+            messages_writer.fsync().await?;
+            index_writer.fsync().await?;
+        }
+
         let messages_reader = MessagesReader::new(messages_path, size).await?;
         let index_reader = IndexReader::new(index_path, indexes_size).await?;
-
         Ok(Self {
             messages_writer: Some(messages_writer),
             messages_reader: Some(messages_reader),
