@@ -19,6 +19,7 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/onsi/ginkgo/v2"
 )
 
@@ -40,7 +41,7 @@ var _ = ginkgo.Describe("DELETE STREAM:", func() {
 
 			err := client.DeleteStream(randomU32Identifier())
 
-			itShouldReturnSpecificError(err, "stream_id_not_found")
+			itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
 		})
 	})
 
