@@ -33,13 +33,16 @@ members = [
     "core/connectors/sinks/postgres_sink",
     "core/connectors/sinks/quickwit_sink",
     "core/connectors/sinks/stdout_sink",
+    "core/connectors/sinks/flink_sink",
     "core/connectors/sources/postgres_source",
+    "core/connectors/sources/flink_source",
     "core/connectors/sources/random_source",
     "core/integration",
     "core/sdk",
     "core/server",
     "core/tools",
     "examples/rust",
+    "examples/flink-data-producer",
 ]
 exclude = ["foreign/python"]
 resolver = "2"

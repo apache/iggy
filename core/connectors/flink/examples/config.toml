@@ -1,0 +1,254 @@
+# Example configuration for Iggy Flink Connectors
+# This file demonstrates various configuration options and use cases
+
+# ==============================================================================
+# IGGY CONNECTION SETTINGS
+# ==============================================================================
+[iggy]
+address = "localhost:8090"
+username = "iggy"
+password = "iggy"
+
+[state]
+path = "local_state"
+
+# ==============================================================================
+# EXAMPLE 1: BASIC FLINK SINK - Stream to Kafka via Flink
+# ==============================================================================
+[sinks.flink_kafka]
+enabled = true
+name = "Flink Kafka Sink"
+path = "target/release/libiggy_connector_flink_sink"
+
+[[sinks.flink_kafka.streams]]
+stream = "events"
+topics = ["user_events", "system_events"]
+schema = "json"
+batch_length = 500
+poll_interval = "10ms"
+consumer_group = "flink_kafka_sink"
+
+[sinks.flink_kafka.config]
+flink_cluster_url = "http://localhost:8081"
+job_name = "iggy-to-kafka"
+parallelism = 4
+batch_size = 1000
+auto_flush_interval_ms = 5000
+enable_checkpointing = true
+checkpoint_interval_secs = 30
+sink_type = "kafka"
+target = "processed-events"
+
+[sinks.flink_kafka.config.properties]
+"bootstrap.servers" = "localhost:9092"
+"transaction.timeout.ms" = "900000"
+"enable.idempotence" = "true"
+
+# ==============================================================================
+# EXAMPLE 2: FLINK SOURCE - Kafka to Iggy via Flink
+# ==============================================================================
+[sources.flink_kafka]
+enabled = true
+name = "Flink Kafka Source"
+path = "target/release/libiggy_connector_flink_source"
+
+[[sources.flink_kafka.streams]]
+stream = "kafka_mirror"
+topic = "mirrored_events"
+schema = "json"
+batch_length = 100
+linger_time = "5ms"
+
+[sources.flink_kafka.config]
+flink_cluster_url = "http://localhost:8081"
+source_type = "kafka"
+source_identifier = "input-events"
+source_pattern = "events-*"  # Match multiple topics
+start_position = "latest"
+output_schema = "json"
+batch_size = 100
+poll_interval_ms = 1000
+enable_background_fetch = true
+parallelism = 2
+
+[sources.flink_kafka.config.properties]
+"bootstrap.servers" = "localhost:9092"
+"group.id" = "iggy-flink-source"
+"auto.offset.reset" = "latest"
+"enable.auto.commit" = "false"
+
+[sources.flink_kafka.config.watermark_strategy]
+strategy_type = "bounded_out_of_orderness"
+max_out_of_orderness_ms = 5000
+idle_timeout_ms = 30000
+
+# ==============================================================================
+# EXAMPLE 3: JDBC SINK - Database Integration
+# ==============================================================================
+[sinks.flink_postgres]
+enabled = false
+name = "PostgreSQL Sink"
+path = "target/release/libiggy_connector_flink_sink"
+
+[[sinks.flink_postgres.streams]]
+stream = "transactions"
+topics = ["orders"]
+schema = "json"
+batch_length = 100
+poll_interval = "50ms"
+consumer_group = "postgres_sink"
+
+[sinks.flink_postgres.config]
+flink_cluster_url = "http://localhost:8081"
+job_name = "orders-to-postgres"
+sink_type = "jdbc"
+target = "orders_table"
+batch_size = 50
+exactly_once = true
+
+[sinks.flink_postgres.config.properties]
+"connector.url" = "jdbc:postgresql://localhost:5432/orders_db"
+"connector.table" = "orders"
+"connector.driver" = "org.postgresql.Driver"
+"connector.username" = "postgres"
+"connector.password" = "password"
+"connector.write.flush.max-rows" = "100"
+"connector.write.flush.interval" = "2s"
+
+# ==============================================================================
+# EXAMPLE 4: ELASTICSEARCH SINK - Search & Analytics
+# ==============================================================================
+[sinks.flink_elasticsearch]
+enabled = false
+name = "Elasticsearch Sink"
+path = "target/release/libiggy_connector_flink_sink"
+
+[[sinks.flink_elasticsearch.streams]]
+stream = "logs"
+topics = ["app_logs", "system_logs"]
+schema = "json"
+consumer_group = "elasticsearch_sink"
+
+[sinks.flink_elasticsearch.config]
+flink_cluster_url = "http://localhost:8081"
+job_name = "logs-indexer"
+sink_type = "elasticsearch"
+target = "logs-index"
+batch_size = 500
+skip_errors = true  # Continue on indexing errors
+
+[sinks.flink_elasticsearch.config.properties]
+"elasticsearch.hosts" = "http://localhost:9200"
+"elasticsearch.bulk.flush.max.actions" = "500"
+"elasticsearch.bulk.flush.max.size.mb" = "5"
+"elasticsearch.bulk.flush.interval.ms" = "1000"
+"elasticsearch.format" = "json"
+
+[sinks.flink_elasticsearch.config.auth]
+auth_type = "basic"
+username = "elastic"
+password = "changeme"
+
+# ==============================================================================
+# EXAMPLE 5: KINESIS SOURCE - AWS Integration
+# ==============================================================================
+[sources.flink_kinesis]
+enabled = false
+name = "Kinesis Source"
+path = "target/release/libiggy_connector_flink_source"
+
+[[sources.flink_kinesis.streams]]
+stream = "aws_events"
+topic = "kinesis_data"
+schema = "json"
+
+[sources.flink_kinesis.config]
+flink_cluster_url = "http://localhost:8081"
+source_type = "kinesis"
+source_identifier = "my-data-stream"
+start_position = "latest"
+batch_size = 200
+
+[sources.flink_kinesis.config.properties]
+"aws.region" = "us-east-1"
+"aws.credentials.provider" = "AUTO"
+"flink.stream.initpos" = "LATEST"
+"flink.stream.describe.backoff.base" = "1.0"
+"flink.stream.describe.backoff.max" = "5.0"
+
+# ==============================================================================
+# EXAMPLE 6: SECURED CONNECTION WITH TLS
+# ==============================================================================
+[sinks.flink_secured]
+enabled = false
+name = "Secured Flink Sink"
+path = "target/release/libiggy_connector_flink_sink"
+
+[[sinks.flink_secured.streams]]
+stream = "secure_data"
+topics = ["sensitive"]
+schema = "json"
+consumer_group = "secure_sink"
+
+[sinks.flink_secured.config]
+flink_cluster_url = "https://flink.example.com:8081"
+job_name = "secure-processing"
+sink_type = "kafka"
+target = "secure-output"
+
+[sinks.flink_secured.config.tls]
+enabled = true
+cert_path = "/path/to/client-cert.pem"
+key_path = "/path/to/client-key.pem"
+ca_path = "/path/to/ca-cert.pem"
+verify_hostname = true
+
+[sinks.flink_secured.config.auth]
+auth_type = "bearer"
+token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+
+# ==============================================================================
+# TRANSFORMATIONS EXAMPLE
+# ==============================================================================
+[sinks.flink_with_transforms]
+enabled = false
+name = "Flink with Transformations"
+path = "target/release/libiggy_connector_flink_sink"
+
+[[sinks.flink_with_transforms.streams]]
+stream = "raw_data"
+topics = ["unprocessed"]
+schema = "json"
+consumer_group = "transform_sink"
+
+[sinks.flink_with_transforms.config]
+flink_cluster_url = "http://localhost:8081"
+job_name = "data-transformer"
+sink_type = "kafka"
+target = "transformed-data"
+
+# Add metadata fields
+[sinks.flink_with_transforms.transforms.add_fields]
+enabled = true
+
+[[sinks.flink_with_transforms.transforms.add_fields.fields]]
+key = "processed_by"
+value.static = "iggy-flink-connector"
+
+[[sinks.flink_with_transforms.transforms.add_fields.fields]]
+key = "processing_timestamp"
+value.computed = "timestamp_millis"
+
+[[sinks.flink_with_transforms.transforms.add_fields.fields]]
+key = "connector_version"
+value.static = "0.1.0"
+
+# Remove sensitive fields
+[sinks.flink_with_transforms.transforms.delete_fields]
+enabled = true
+fields = ["password", "ssn", "credit_card", "api_key"]
+
+# Keep only specific fields
+[sinks.flink_with_transforms.transforms.filter_fields]
+enabled = false
+keep = ["id", "timestamp", "event_type", "payload"]

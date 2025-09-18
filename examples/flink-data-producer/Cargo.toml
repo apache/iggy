@@ -1,0 +1,17 @@
+[package]
+name = "flink-data-producer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+iggy = { path = "../../core/sdk" }
+bytes = "1.10"
+tokio = { version = "1.35", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.6", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.4", features = ["derive"] }
+rand = "0.8"
