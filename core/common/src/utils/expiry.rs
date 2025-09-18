@@ -252,7 +252,7 @@ mod tests {
         assert!(x.is_err());
         assert_eq!(
             x.unwrap_err(),
-            "unknown time unit \"se\", supported units: ns, us, ms, sec, min, hours, days, weeks, months, years (and few variations)"
+            "unknown time unit \"se\", supported units: ns, us/µs, ms, sec, min, hours, days, weeks, months, years (and few variations)"
         );
     }
 

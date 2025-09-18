@@ -23,7 +23,7 @@ edition = "2024"
 
 [dependencies]
 actix-cors = "0.7.1"
-actix-files = "0.6.7"
+actix-files = "0.6.8"
 actix-web = "4.11.0"
 bench-dashboard-shared = { path = "../shared" }
 bench-report = { workspace = true }
@@ -32,7 +32,7 @@ clap = { workspace = true }
 dashmap = { workspace = true }
 file-operation = "0.8.4"
 notify = "8.2.0"
-octocrab = "0.44.1"
+octocrab = "0.45.0"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

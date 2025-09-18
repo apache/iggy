@@ -33,13 +33,14 @@ config = { workspace = true }
 dotenvy = { workspace = true }
 figlet-rs = { workspace = true }
 iggy = { workspace = true }
-rmcp = { version = "0.6.1", features = [
+rmcp = { version = "0.6.4", features = [
     "server",
     "transport-io",
     "transport-sse-server",
     "transport-streamable-http-server",
 ] }
 serde = { workspace = true }
+serde_json = { workspace = true }
 strum = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

@@ -190,8 +190,8 @@ impl JwtManager {
         };
 
         let access_token = encode::<JwtClaims>(&header, &claims, &self.issuer.key);
-        if let Err(err) = access_token {
-            error!("Cannot generate JWT token. Error: {}", err);
+        if let Err(error) = access_token {
+            error!("Cannot generate JWT token. Error: {error}");
             return Err(IggyError::CannotGenerateJwt);
         }
 

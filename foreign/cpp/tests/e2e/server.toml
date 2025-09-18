@@ -23,8 +23,8 @@
 enabled = true
 
 # Specifies the network address and port for the HTTP server.
-# The format is "HOST:PORT". For example, "0.0.0.0:3000" listens on all network interfaces on port 3000.
-address = "0.0.0.0:3000"
+# The format is "HOST:PORT". For example, "127.0.0.1:3000" listens on localhost only on port 3000.
+address = "127.0.0.1:3000"
 
 # Maximum size of the request body in bytes. For security reasons, the default limit is 2 MB.
 max_request_size = "2 MB"
@@ -134,8 +134,8 @@ key_file = "core/certs/iggy_key.pem"
 enabled = true
 
 # Defines the network address and port for the TCP server.
-# For example, "0.0.0.0:8090" listens on all network interfaces on port 8090.
-address = "0.0.0.0:8090"
+# For example, "127.0.0.1:8090" listens on localhost only on port 8090.
+address = "127.0.0.1:8090"
 
 # TLS configuration for the TCP server.
 [tcp.tls]
@@ -158,8 +158,8 @@ password = "iggy123"
 enabled = true
 
 # Network address and port for the QUIC server.
-# For example, "0.0.0.0:8080" binds to all interfaces on port 8080.
-address = "0.0.0.0:8080"
+# For example, "127.0.0.1:8080" binds to localhost on port 8080.
+address = "127.0.0.1:8080"
 
 # Maximum number of simultaneous bidirectional streams in QUIC.
 max_concurrent_bidi_streams = 10_000

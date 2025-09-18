@@ -40,6 +40,8 @@ use server::configs::config_provider::{ConfigProvider, FileConfigProvider};
 pub const SYSTEM_PATH_ENV_VAR: &str = "IGGY_SYSTEM_PATH";
 pub const TEST_VERBOSITY_ENV_VAR: &str = "IGGY_TEST_VERBOSE";
 pub const IPV6_ENV_VAR: &str = "IGGY_TCP_IPV6";
+pub const IGGY_ROOT_USERNAME_VAR: &str = "IGGY_ROOT_USERNAME";
+pub const IGGY_ROOT_PASSWORD_VAR: &str = "IGGY_ROOT_PASSWORD";
 const USER_PASSWORD: &str = "secret";
 const SLEEP_INTERVAL_MS: u64 = 20;
 const LOCAL_DATA_PREFIX: &str = "local_data_";
@@ -99,6 +101,20 @@ impl TestServer {
 
         if ip_kind == IpAddrKind::V6 {
             envs.insert(IPV6_ENV_VAR.to_string(), "true".to_string());
+        }
+
+        if !envs.contains_key(IGGY_ROOT_USERNAME_VAR) {
+            envs.insert(
+                IGGY_ROOT_USERNAME_VAR.to_string(),
+                DEFAULT_ROOT_USERNAME.to_string(),
+            );
+        }
+
+        if !envs.contains_key(IGGY_ROOT_PASSWORD_VAR) {
+            envs.insert(
+                IGGY_ROOT_PASSWORD_VAR.to_string(),
+                DEFAULT_ROOT_PASSWORD.to_string(),
+            );
         }
 
         // If IGGY_SYSTEM_PATH is not set, use a random path starting with "local_data_"
