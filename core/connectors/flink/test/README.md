@@ -89,7 +89,7 @@ Tests data flow from external systems to Iggy via Flink:
 
 Full round-trip test:
 
-```
+```text
 Iggy → Flink Sink → Kafka → Flink Source → Iggy
 ```
 
