@@ -40,7 +40,7 @@ mod tests {
             .create_async()
             .await;
 
-        let response = reqwest::get(&format!("{}/v1/overview", server.url()))
+        let response = reqwest::get(format!("{}/v1/overview", server.url()))
             .await
             .unwrap();
 

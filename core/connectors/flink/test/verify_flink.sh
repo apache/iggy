@@ -52,7 +52,8 @@ pretty_json() {
 check_cluster_status() {
     echo -e "${YELLOW}1. Checking Flink Cluster Status...${NC}"
 
-    local overview=$(flink_api "/v1/overview")
+    local overview
+    overview=$(flink_api "/v1/overview")
 
     if [ -z "$overview" ] || [ "$overview" = "{}" ]; then
         echo -e "${RED}   ❌ Cannot connect to Flink at $FLINK_URL${NC}"
@@ -60,11 +61,16 @@ check_cluster_status() {
         return 1
     fi
 
-    local version=$(echo "$overview" | python3 -c "import sys, json; print(json.load(sys.stdin).get('flink-version', 'unknown'))" 2>/dev/null)
-    local running=$(echo "$overview" | python3 -c "import sys, json; print(json.load(sys.stdin).get('jobs-running', 0))" 2>/dev/null)
-    local taskmanagers=$(echo "$overview" | python3 -c "import sys, json; print(json.load(sys.stdin).get('taskmanagers', 0))" 2>/dev/null)
-    local slots_total=$(echo "$overview" | python3 -c "import sys, json; print(json.load(sys.stdin).get('slots-total', 0))" 2>/dev/null)
-    local slots_available=$(echo "$overview" | python3 -c "import sys, json; print(json.load(sys.stdin).get('slots-available', 0))" 2>/dev/null)
+    local version
+    version=$(echo "$overview" | python3 -c "import sys, json; print(json.load(sys.stdin).get('flink-version', 'unknown'))" 2>/dev/null)
+    local running
+    running=$(echo "$overview" | python3 -c "import sys, json; print(json.load(sys.stdin).get('jobs-running', 0))" 2>/dev/null)
+    local taskmanagers
+    taskmanagers=$(echo "$overview" | python3 -c "import sys, json; print(json.load(sys.stdin).get('taskmanagers', 0))" 2>/dev/null)
+    local slots_total
+    slots_total=$(echo "$overview" | python3 -c "import sys, json; print(json.load(sys.stdin).get('slots-total', 0))" 2>/dev/null)
+    local slots_available
+    slots_available=$(echo "$overview" | python3 -c "import sys, json; print(json.load(sys.stdin).get('slots-available', 0))" 2>/dev/null)
 
     echo -e "${GREEN}   ✓ Flink Version: $version${NC}"
     echo -e "${GREEN}   ✓ TaskManagers: $taskmanagers${NC}"
@@ -77,8 +83,10 @@ check_cluster_status() {
 list_jobs() {
     echo -e "${YELLOW}2. Listing All Flink Jobs...${NC}"
 
-    local jobs=$(flink_api "/v1/jobs")
-    local job_count=$(echo "$jobs" | python3 -c "import sys, json; print(len(json.load(sys.stdin).get('jobs', [])))" 2>/dev/null || echo "0")
+    local jobs
+    jobs=$(flink_api "/v1/jobs")
+    local job_count
+    job_count=$(echo "$jobs" | python3 -c "import sys, json; print(len(json.load(sys.stdin).get('jobs', [])))" 2>/dev/null || echo "0")
 
     if [ "$job_count" = "0" ]; then
         echo -e "${YELLOW}   No jobs found in Flink${NC}"
@@ -101,8 +109,10 @@ for job in data.get('jobs', []):
 check_uploaded_jars() {
     echo -e "${YELLOW}3. Checking Uploaded JARs...${NC}"
 
-    local jars=$(flink_api "/v1/jars")
-    local jar_count=$(echo "$jars" | python3 -c "import sys, json; print(len(json.load(sys.stdin).get('files', [])))" 2>/dev/null || echo "0")
+    local jars
+    jars=$(flink_api "/v1/jars")
+    local jar_count
+    jar_count=$(echo "$jars" | python3 -c "import sys, json; print(len(json.load(sys.stdin).get('files', [])))" 2>/dev/null || echo "0")
 
     if [ "$jar_count" = "0" ]; then
         echo -e "${YELLOW}   No JAR files uploaded to Flink${NC}"
@@ -123,8 +133,10 @@ for jar in data.get('files', []):
 check_running_jobs() {
     echo -e "${YELLOW}4. Checking Running Job Details...${NC}"
 
-    local jobs=$(flink_api "/v1/jobs")
-    local running_jobs=$(echo "$jobs" | python3 -c "
+    local jobs
+    jobs=$(flink_api "/v1/jobs")
+    local running_jobs
+    running_jobs=$(echo "$jobs" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 running = [j['id'] for j in data.get('jobs', []) if j['state'] == 'RUNNING']
@@ -141,13 +153,16 @@ print(' '.join(running))
         echo -e "${BLUE}   Job $job_id:${NC}"
 
         # Get job details
-        local job_detail=$(flink_api "/v1/jobs/$job_id")
-        local job_name=$(echo "$job_detail" | python3 -c "import sys, json; print(json.load(sys.stdin).get('name', 'unknown'))" 2>/dev/null)
+        local job_detail
+        job_detail=$(flink_api "/v1/jobs/$job_id")
+        local job_name
+        job_name=$(echo "$job_detail" | python3 -c "import sys, json; print(json.load(sys.stdin).get('name', 'unknown'))" 2>/dev/null)
 
         echo -e "${GREEN}     Name: $job_name${NC}"
 
         # Get vertices (operators) in the job
-        local vertices=$(echo "$job_detail" | python3 -c "
+        local vertices
+        vertices=$(echo "$job_detail" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 for v in data.get('vertices', []):
@@ -162,8 +177,10 @@ for v in data.get('vertices', []):
         fi
 
         # Check for checkpoints
-        local checkpoints=$(flink_api "/v1/jobs/$job_id/checkpoints")
-        local latest_checkpoint=$(echo "$checkpoints" | python3 -c "
+        local checkpoints
+        checkpoints=$(flink_api "/v1/jobs/$job_id/checkpoints")
+        local latest_checkpoint
+        latest_checkpoint=$(echo "$checkpoints" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 latest = data.get('latest', {}).get('completed', {})
@@ -182,8 +199,10 @@ else:
 check_metrics() {
     echo -e "${YELLOW}5. Checking Data Flow Metrics...${NC}"
 
-    local jobs=$(flink_api "/v1/jobs")
-    local running_jobs=$(echo "$jobs" | python3 -c "
+    local jobs
+    jobs=$(flink_api "/v1/jobs")
+    local running_jobs
+    running_jobs=$(echo "$jobs" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
 running = [j['id'] for j in data.get('jobs', []) if j['state'] == 'RUNNING']
@@ -198,7 +217,8 @@ print(' '.join(running))
 
     for job_id in $running_jobs; do
         # Get job metrics
-        local metrics=$(flink_api "/v1/jobs/$job_id/metrics?get=uptime,numRestarts,records-received,records-sent")
+        local metrics
+        metrics=$(flink_api "/v1/jobs/$job_id/metrics?get=uptime,numRestarts,records-received,records-sent")
 
         if [ "$metrics" != "{}" ] && [ -n "$metrics" ]; then
             echo -e "${BLUE}   Job $job_id metrics:${NC}"
@@ -222,7 +242,8 @@ check_connector_activity() {
         echo -e "${GREEN}   Checking Flink logs for connector activity:${NC}"
 
         # Check JobManager logs
-        local jm_logs=$(docker logs flink-jobmanager 2>&1 | tail -20 | grep -i "iggy\|connector\|sink\|source" || true)
+        local jm_logs
+        jm_logs=$(docker logs flink-jobmanager 2>&1 | tail -20 | grep -i "iggy\|connector\|sink\|source" || true)
         if [ -n "$jm_logs" ]; then
             echo -e "${GREEN}   JobManager logs:${NC}"
             echo "$jm_logs" | head -5
@@ -231,7 +252,8 @@ check_connector_activity() {
         fi
 
         # Check TaskManager logs
-        local tm_logs=$(docker logs flink-taskmanager 2>&1 | tail -20 | grep -i "iggy\|connector\|sink\|source" || true)
+        local tm_logs
+        tm_logs=$(docker logs flink-taskmanager 2>&1 | tail -20 | grep -i "iggy\|connector\|sink\|source" || true)
         if [ -n "$tm_logs" ]; then
             echo -e "${GREEN}   TaskManager logs:${NC}"
             echo "$tm_logs" | head -5
@@ -252,7 +274,8 @@ test_connector_endpoints() {
     local endpoints=("/v1/sources/subscribe" "/v1/sink/status" "/v1/kafka/produce/test")
 
     for endpoint in "${endpoints[@]}"; do
-        local response=$(curl -s -o /dev/null -w "%{http_code}" "${FLINK_URL}${endpoint}" 2>/dev/null || echo "000")
+        local response
+        response=$(curl -s -o /dev/null -w "%{http_code}" "${FLINK_URL}${endpoint}" 2>/dev/null || echo "000")
         if [ "$response" != "000" ] && [ "$response" != "404" ]; then
             echo -e "${GREEN}   ✓ Found endpoint: $endpoint (HTTP $response)${NC}"
         fi

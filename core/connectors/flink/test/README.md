@@ -7,9 +7,9 @@ This guide provides instructions for testing the Iggy Flink connectors end-to-en
 Before running the tests, ensure you have:
 
 1. **Docker & Docker Compose** - For running test infrastructure
-2. **Rust & Cargo** (optional) - For building from source
-3. **Python 3.8+** - For running test scripts
-4. **Make** - For using the Makefile commands
+2. **Rust & Cargo** - For building from source
+3. **Bash** - For running test scripts
+4. **Make** (optional) - For using the Makefile commands
 
 ## Quick Start
 
@@ -39,6 +39,7 @@ docker-compose up -d
 ```
 
 This starts:
+
 - Apache Iggy server (ports 8090, 8080)
 - Apache Flink cluster (port 8081)
 - Apache Kafka (port 9092)
@@ -57,14 +58,7 @@ cd ../sources/flink_source
 cargo build --release
 ```
 
-#### 3. Run Python Test Suite
-
-```bash
-cd /Users/chiradip/codes/iggy-my-work/core/connectors/flink
-python3 test/test_runner.py
-```
-
-#### 4. Run Bash Test Script
+#### 3. Run Bash Test Script
 
 ```bash
 ./test/e2e_test.sh
@@ -94,6 +88,7 @@ Tests data flow from external systems to Iggy via Flink:
 ### 3. Bidirectional Test
 
 Full round-trip test:
+
 ```
 Iggy → Flink Sink → Kafka → Flink Source → Iggy
 ```
@@ -101,6 +96,7 @@ Iggy → Flink Sink → Kafka → Flink Source → Iggy
 ### 4. Performance Test
 
 Tests throughput and latency:
+
 - Sends 1000+ messages
 - Measures throughput (messages/second)
 - Monitors resource usage
@@ -174,6 +170,7 @@ target = "test-output"
 ### Common Issues
 
 1. **Docker services not starting**
+
    ```bash
    # Check logs
    docker-compose logs <service-name>
@@ -183,6 +180,7 @@ target = "test-output"
    ```
 
 2. **Connection refused errors**
+
    ```bash
    # Verify services are running
    docker ps
@@ -192,6 +190,7 @@ target = "test-output"
    ```
 
 3. **Build failures**
+
    ```bash
    # Clean and rebuild
    cargo clean
@@ -199,9 +198,10 @@ target = "test-output"
    ```
 
 4. **Test failures**
+
    ```bash
    # Run with debug logging
-   RUST_LOG=debug python3 test/test_runner.py
+   RUST_LOG=debug ./test/e2e_test.sh
    ```
 
 ### Debug Commands
@@ -279,7 +279,7 @@ Test results are output in the following formats:
 
 To add new tests:
 
-1. Add test function to `test_runner.py`
+1. Add test script to the `test/` directory
 2. Update test scenarios in this README
 3. Add corresponding integration test in Rust
 4. Update CI workflow if needed
@@ -287,6 +287,7 @@ To add new tests:
 ## Support
 
 For issues or questions:
+
 - Check logs in `docker-compose logs`
 - Review troubleshooting section above
 - Open an issue on GitHub

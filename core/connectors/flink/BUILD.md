@@ -87,6 +87,7 @@ target/debug/flink-data-producer
 ## Quick Reference
 
 ### Full Clean and Rebuild (Most Common)
+
 ```bash
 cd /Users/chiradip/codes/chiradip-iggy-fork/iggy && \
 cargo clean && \
@@ -97,11 +98,13 @@ cargo build --package iggy-connector-flink-sink \
 ```
 
 ### Run All Tests
+
 ```bash
 cargo test --package iggy-connector-flink-sink --package iggy-connector-flink-source
 ```
 
 ### Quick Build (No Clean)
+
 ```bash
 cargo build --package iggy-connector-flink-sink \
             --package iggy-connector-flink-source \
@@ -112,18 +115,23 @@ cargo build --package iggy-connector-flink-sink \
 ## Troubleshooting
 
 ### Build Warnings
+
 If you encounter warnings during build:
+
 1. Check that all dependencies are up to date
 2. Run `cargo update` to update dependencies
 3. Ensure you're using a compatible Rust version
 
 ### Test Failures
+
 If tests fail:
+
 1. Ensure Iggy server is not running (tests may conflict with a running instance)
 2. Check that required ports are available
 3. Review test output for specific error messages
 
 ### Performance Tips
+
 - Use `--release` flag for production builds (optimized)
 - Use debug builds (no `--release`) during development for faster compilation
 - Use `cargo check` for quick syntax/type checking without full compilation
@@ -132,5 +140,6 @@ If tests fail:
 
 - [Flink Sink Connector README](../sinks/flink_sink/README.md)
 - [Flink Source Connector README](../sources/flink_source/README.md)
+
 - [Flink Data Producer README](../../../examples/flink-data-producer/README.md)
 - [End-to-End Testing Guide](test-e2e.sh)

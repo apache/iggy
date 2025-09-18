@@ -5,6 +5,7 @@ This repository contains Apache Flink connectors for Iggy message streaming plat
 ## Overview
 
 The Flink connectors provide:
+
 - **Sink Connector**: Write data from Iggy to Flink jobs
 - **Source Connector**: Read data from Flink sources into Iggy
 - **Exactly-once semantics** support via Flink checkpointing
@@ -14,7 +15,7 @@ The Flink connectors provide:
 
 ## Architecture
 
-```
+```text
 ┌──────────────┐     ┌─────────────────┐     ┌──────────────┐
 │     Iggy     │────▶│  Flink Sink     │────▶│    Flink     │
 │   Streams    │     │   Connector     │     │    Cluster   │
@@ -38,6 +39,7 @@ The Flink connectors provide:
 ### Installation
 
 1. Build the connectors using cargo:
+
 ```bash
 # Build both connectors
 cd core/connectors/flink
@@ -51,7 +53,7 @@ cd core/connectors/sources/flink_source
 cargo build --release
 ```
 
-2. Configure the runtime (`config.toml`):
+1. Configure the runtime (`config.toml`):
 
 ```toml
 # Flink Sink Configuration
@@ -103,7 +105,8 @@ poll_interval_ms = 1000
 parallelism = 2
 ```
 
-3. Start the connector runtime:
+1. Start the connector runtime:
+
 ```bash
 # Using cargo directly
 cargo run --bin iggy-connectors --release
@@ -498,6 +501,6 @@ Apache License 2.0 - See LICENSE file for details.
 
 ## Support
 
-- GitHub Issues: https://github.com/apache/iggy/issues
-- Discord: https://discord.gg/iggy
-- Documentation: https://iggy.apache.org/docs/
+- GitHub Issues: <https://github.com/apache/iggy/issues>
+- Discord: <https://discord.gg/iggy>
+- Documentation: <https://iggy.apache.org/docs/>

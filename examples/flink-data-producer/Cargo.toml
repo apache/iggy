@@ -24,14 +24,14 @@ license = "Apache-2.0"
 description = "Example data producer for testing Apache Flink connectors with Iggy"
 
 [dependencies]
+chrono = { workspace = true }
+clap = { workspace = true }
 iggy = { path = "../../core/sdk" }
-bytes = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
 uuid = { workspace = true }
-chrono = { workspace = true }
-clap = { workspace = true }
-rand = { workspace = true }
+

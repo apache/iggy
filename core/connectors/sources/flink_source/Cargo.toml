@@ -23,39 +23,32 @@ authors = ["chiradip@chiradip.com, research@space-rf.org"]
 license = "Apache-2.0"
 description = "Apache Flink source connector for Iggy message streaming"
 
+[package.metadata.cargo-machete]
+ignored = ["dashmap", "once_cell"]
+
 [lib]
 crate-type = ["cdylib"]
 name = "iggy_connector_flink_source"
 
 [dependencies]
 async-trait = { workspace = true }
+chrono = { workspace = true }
+dashmap = { workspace = true }
 iggy_connector_sdk = { path = "../../sdk" }
-iggy = { path = "../../../sdk" }
+once_cell = { workspace = true }
+postcard = { workspace = true }
+rand = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-simd-json = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
-tokio-stream = "0.1"
 toml = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
-base64 = { workspace = true }
-futures = { workspace = true }
-thiserror = { workspace = true }
-chrono = { workspace = true }
-postcard = { workspace = true }
-dashmap = { workspace = true }
-once_cell = { workspace = true }
-
-# Flink-specific dependencies
-tonic = "0.12"
-prost = "0.14.1"
-hyper = { version = "1.5", features = ["full"] }
-websocket = "0.27"  # For Flink's WebSocket API
-rand = { workspace = true }
 
 [dev-dependencies]
+# mockito is not in workspace dependencies, kept as explicit version
 mockito = "1.6"
-tokio-test = "0.4"
 tempfile = { workspace = true }
+
