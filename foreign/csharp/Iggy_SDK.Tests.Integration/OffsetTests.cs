@@ -82,7 +82,7 @@ public class OffsetTests
         offset.PartitionId.ShouldBe(1);
         offset.CurrentOffset.ShouldBe(3u);
     }
-    
+
     [Test]
     [DependsOn(nameof(StoreOffset_ConsumerGroup_Should_StoreOffset_Successfully))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]

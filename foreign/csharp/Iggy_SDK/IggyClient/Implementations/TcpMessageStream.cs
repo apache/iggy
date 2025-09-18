@@ -43,8 +43,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
     private readonly ILogger<TcpMessageStream> _logger;
     private readonly IMessageInvoker? _messageInvoker;
     private readonly MessagePollingSettings _messagePollingSettings;
-    private readonly IConnectionStream _stream;
     private readonly SemaphoreSlim _semaphore;
+    private readonly IConnectionStream _stream;
 
     internal TcpMessageStream(IConnectionStream stream, Channel<MessageSendRequest>? channel,
         MessagePollingSettings messagePollingSettings, ILoggerFactory loggerFactory,
@@ -311,7 +311,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         CancellationToken token = default)
     {
         var message = TcpContracts.FlushUnsavedBuffer(streamId, topicId, partitionId, fsync);
-        
+
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
         TcpMessageStreamHelpers.CreatePayload(payload, message, CommandCodes.FLUSH_UNSAVED_BUFFER_CODE);
 
@@ -326,13 +326,14 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         var message = new byte[messageBufferSize];
         var payload = new byte[payloadBufferSize];
 
-        TcpContracts.GetMessages(message.AsSpan()[..messageBufferSize], request.Consumer, request.StreamId, request.TopicId,
+        TcpContracts.GetMessages(message.AsSpan()[..messageBufferSize], request.Consumer, request.StreamId,
+            request.TopicId,
             request.PollingStrategy, request.Count, request.AutoCommit, request.PartitionId);
         TcpMessageStreamHelpers.CreatePayload(payload, message.AsSpan()[..messageBufferSize],
             CommandCodes.POLL_MESSAGES_CODE);
 
-        var responseBuffer = await SendWithResponseAsync(payload, token); 
-        
+        var responseBuffer = await SendWithResponseAsync(payload, token);
+
         return BinaryMapper.MapMessages(responseBuffer, serializer, decryptor);
     }
 
@@ -399,13 +400,13 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         var message = new byte[messageBufferSize];
         var payload = new byte[payloadBufferSize];
 
-        TcpContracts.GetMessages(message.AsSpan()[..messageBufferSize], request.Consumer, request.StreamId, request.TopicId,
-            request.PollingStrategy, request.Count, request.AutoCommit, request.PartitionId);
+        TcpContracts.GetMessages(message.AsSpan()[..messageBufferSize], request.Consumer, request.StreamId,
+            request.TopicId, request.PollingStrategy, request.Count, request.AutoCommit, request.PartitionId);
         TcpMessageStreamHelpers.CreatePayload(payload, message.AsSpan()[..messageBufferSize],
             CommandCodes.POLL_MESSAGES_CODE);
 
-        var responseBuffer = await SendWithResponseAsync(payload, token); 
-        
+        var responseBuffer = await SendWithResponseAsync(payload, token);
+
         return BinaryMapper.MapMessages(responseBuffer, decryptor);
     }
 
@@ -723,7 +724,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         }
 
         var userId = BinaryPrimitives.ReadInt32LittleEndian(responseBuffer.AsSpan()[..responseBuffer.Length]);
-        
+
         return new AuthResponse(userId, null);
     }
 
