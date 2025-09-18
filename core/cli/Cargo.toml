@@ -43,7 +43,7 @@ login-session = ["dep:keyring"]
 ahash = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
-clap_complete = "4.5.57"
+clap_complete = "4.5.58"
 figlet-rs = { workspace = true }
 iggy = { workspace = true }
 iggy_binary_protocol = { workspace = true }

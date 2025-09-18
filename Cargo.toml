@@ -48,6 +48,7 @@ resolver = "2"
 aes-gcm = "0.10.3"
 ahash = { version = "0.8.12", features = ["serde"] }
 anyhow = "1.0.99"
+argon2 = "0.5.3"
 async-broadcast = "0.7.2"
 async-dropper = { version = "0.3.1", features = ["tokio", "simple"] }
 async-trait = "0.1.89"
@@ -62,7 +63,6 @@ async_zip = { version = "0.0.18", features = [
 axum = "0.8.4"
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
 base64 = "0.22.1"
-bcrypt = "0.17.1"
 bench-dashboard-frontend = { path = "core/bench/dashboard/frontend" }
 bench-dashboard-server = { path = "core/bench/dashboard/server" }
 bench-dashboard-shared = { path = "core/bench/dashboard/shared" }
@@ -125,12 +125,12 @@ reqwest = { version = "0.12.23", default-features = false, features = [
 ] }
 reqwest-middleware = { version = "0.4.2", features = ["json"] }
 reqwest-retry = "0.7.0"
-rust-s3 = { version = "0.36.0-beta.2", default-features = false, features = [
+rust-s3 = { version = "0.37.0", default-features = false, features = [
     "tokio-rustls-tls",
     "tags",
 ] }
 rustls = { version = "0.23.31", features = ["ring"] }
-serde = { version = "1.0.224", features = ["derive", "rc"] }
+serde = { version = "1.0.225", features = ["derive", "rc"] }
 serde_json = "1.0.145"
 serde_with = { version = "3.14.0", features = ["base64", "macros"] }
 serde_yml = "0.0.12"
@@ -144,7 +144,7 @@ tempfile = "3.22.0"
 test-case = "3.3.1"
 thiserror = "2.0.16"
 tokio = { version = "1.47.1", features = ["full"] }
-tokio-rustls = "0.26.2"
+tokio-rustls = "0.26.3"
 tokio-util = { version = "0.7.16", features = ["compat"] }
 toml = "0.9.6"
 tower-http = { version = "0.6.6", features = [

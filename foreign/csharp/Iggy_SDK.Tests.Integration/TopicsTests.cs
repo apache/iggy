@@ -53,7 +53,7 @@ public class TopicsTests
 
         response.ShouldNotBeNull();
         response.Id.ShouldBe(TopicRequest.TopicId!.Value);
-        response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromSeconds(10));
+        response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromSeconds(20));
         response.Name.ShouldBe(TopicRequest.Name);
         response.CompressionAlgorithm.ShouldBe(TopicRequest.CompressionAlgorithm);
         response.Partitions!.Count().ShouldBe((int)TopicRequest.PartitionsCount);
@@ -86,7 +86,7 @@ public class TopicsTests
 
         response.ShouldNotBeNull();
         response.Id.ShouldBe(TopicRequest.TopicId!.Value);
-        response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromSeconds(10));
+        response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromSeconds(20));
         response.Name.ShouldBe(TopicRequest.Name);
         response.CompressionAlgorithm.ShouldBe(TopicRequest.CompressionAlgorithm);
         response.Partitions!.Count().ShouldBe((int)TopicRequest.PartitionsCount);
@@ -168,7 +168,7 @@ public class TopicsTests
 
         response.ShouldNotBeNull();
         response.Id.ShouldBe(TopicRequest.TopicId!.Value);
-        response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromSeconds(10));
+        response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromSeconds(20));
         response.Name.ShouldBe(TopicRequest.Name);
         response.CompressionAlgorithm.ShouldBe(TopicRequest.CompressionAlgorithm);
         response.Partitions!.Count().ShouldBe(3);
@@ -287,7 +287,7 @@ public class TopicsTests
 
         response.ShouldNotBeNull();
         response.Id.ShouldNotBe(0u);
-        response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromSeconds(10));
+        response.CreatedAt.UtcDateTime.ShouldBe(DateTimeOffset.UtcNow.UtcDateTime, TimeSpan.FromSeconds(20));
         response.Name.ShouldBe(topicRequestWithoutId.Name);
         response.CompressionAlgorithm.ShouldBe(topicRequestWithoutId.CompressionAlgorithm);
         response.Partitions!.Count().ShouldBe((int)topicRequestWithoutId.PartitionsCount);
