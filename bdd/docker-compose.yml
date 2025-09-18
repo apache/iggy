@@ -33,6 +33,9 @@ services:
       - IGGY_ROOT_PASSWORD=iggy
       - RUST_LOG=info
       - IGGY_SYSTEM_PATH=local_data
+      - IGGY_TCP_ADDRESS=0.0.0.0:8090
+      - IGGY_HTTP_ADDRESS=0.0.0.0:3000
+      - IGGY_QUIC_ADDRESS=0.0.0.0:8080
     volumes:
       - iggy_data:/app/local_data
     networks:
