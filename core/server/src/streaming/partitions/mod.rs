@@ -23,7 +23,6 @@ pub mod log;
 pub mod messages;
 pub mod partition2;
 pub mod segments;
-pub mod storage;
 pub mod storage2;
 
 pub const COMPONENT: &str = "STREAMING_PARTITIONS";

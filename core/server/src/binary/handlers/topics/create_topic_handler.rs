@@ -87,7 +87,6 @@ impl ServerCommandHandler for CreateTopic {
             partitions,
         };
         let _responses = shard.broadcast_event_to_all_shards(event).await;
-        // TODO: Create shard_table records for partitions.
         let response = shard.streams2.with_topic_by_id(
             &self.stream_id,
             &Identifier::numeric(topic_id as u32).unwrap(),

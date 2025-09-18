@@ -131,7 +131,7 @@ impl Clone for Partition {
             offset: Arc::clone(&self.offset),
             consumer_offset: Arc::clone(&self.consumer_offset),
             consumer_group_offset: Arc::clone(&self.consumer_group_offset),
-            log: self.log.clone(),
+            log: Default::default(),
         }
     }
 }

@@ -28,15 +28,6 @@ where
     storage: Vec<Storage>,
 }
 
-impl<J> Clone for SegmentedLog<J>
-where
-    J: Journal + Default + Debug + Clone,
-{
-    fn clone(&self) -> Self {
-        Default::default()
-    }
-}
-
 impl<J> Default for SegmentedLog<J>
 where
     J: Journal + Debug + Default,

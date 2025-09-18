@@ -1,9 +1,13 @@
 use crate::{
     IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV,
     compat::index_rebuilding::index_rebuilder::IndexRebuilder,
-    configs::cache_indexes::CacheIndexesConfig,
-    configs::{config_provider::ConfigProviderKind, server::ServerConfig, system::SystemConfig},
-    io::fs_utils,
+    configs::{
+        cache_indexes::CacheIndexesConfig,
+        config_provider::ConfigProviderKind,
+        server::ServerConfig,
+        system::{INDEX_EXTENSION, LOG_EXTENSION, SystemConfig},
+    },
+    io::fs_utils::{self, DirEntry},
     server_error::ServerError,
     shard::{
         system::info::SystemInfo,
@@ -19,7 +23,6 @@ use crate::{
         },
     },
     state::system::{StreamState, TopicState, UserState},
-    streaming::segments::{INDEX_EXTENSION, LOG_EXTENSION, Segment2, storage::Storage},
     streaming::{
         partitions::{
             consumer_offset::ConsumerOffset, helpers::create_message_deduplicator,
@@ -28,6 +31,7 @@ use crate::{
         },
         persistence::persister::{FilePersister, FileWithSyncPersister, PersisterKind},
         personal_access_tokens::personal_access_token::PersonalAccessToken,
+        segments::{Segment2, storage::Storage},
         stats::stats::{PartitionStats, StreamStats, TopicStats},
         storage::SystemStorage,
         streams::stream2,
@@ -132,7 +136,7 @@ pub async fn load_streams(
                 );
 
                 let partition_id = partition_state.id;
-                let partition = load_partition_with_segments(
+                let partition = load_partition(
                     config,
                     stream_id as usize,
                     topic_id,
@@ -140,7 +144,6 @@ pub async fn load_streams(
                     parent_stats.clone(),
                 )
                 .await?;
-
                 // Insert partition into the container
                 streams.with_components_by_id(stream_id as usize, |(root, ..)| {
                     root.topics()
@@ -371,31 +374,10 @@ pub async fn update_system_info(
     Ok(())
 }
 
-async fn load_partition_with_segments(
-    config: &SystemConfig,
-    stream_id: usize,
-    topic_id: usize,
-    partition_state: crate::state::system::PartitionState,
-    parent_stats: Arc<TopicStats>,
-) -> Result<partition2::Partition, IggyError> {
-    use std::sync::atomic::AtomicU64;
-
-    let stats = Arc::new(PartitionStats::new(parent_stats));
-    let partition_id = partition_state.id as u32;
-
-    // Load segments from disk to determine should_increment_offset and current offset
-    let partition_path = config.get_partition_path(stream_id, topic_id, partition_id as usize);
-
-    info!(
-        "Loading partition with ID: {} for stream with ID: {} and topic with ID: {}, for path: {} from disk...",
-        partition_id, stream_id, topic_id, partition_path
-    );
-
-    // Read directory entries to find log files using async fs_utils
+async fn collect_log_files(partition_path: &str) -> Result<Vec<DirEntry>, IggyError> {
     let dir_entries = fs_utils::walk_dir(&partition_path)
         .await
         .map_err(|_| IggyError::CannotReadPartitions)?;
-
     let mut log_files = Vec::new();
     for entry in dir_entries {
         if entry.is_dir {
@@ -410,12 +392,21 @@ async fn load_partition_with_segments(
         log_files.push(entry);
     }
 
+    Ok(log_files)
+}
+
+pub async fn load_segments(
+    config: &SystemConfig,
+    stream_id: usize,
+    topic_id: usize,
+    partition_id: usize,
+    partition_path: String,
+    stats: Arc<PartitionStats>,
+) -> Result<SegmentedLog<MemoryMessageJournal>, IggyError> {
+    // Read directory entries to find log files using async fs_utils
+    let mut log_files = collect_log_files(&partition_path).await?;
     log_files.sort_by(|a, b| a.path.file_name().cmp(&b.path.file_name()));
-
-    let mut should_increment_offset = false;
-    let mut current_offset = 0u64;
     let mut log = SegmentedLog::<MemoryMessageJournal>::default();
-
     for entry in log_files {
         let log_file_name = entry
             .path
@@ -427,8 +418,8 @@ async fn load_partition_with_segments(
         let start_offset = log_file_name.parse::<u64>().unwrap();
 
         // Build file paths directly
-        let messages_file_path = format!("{}/{}.{}", partition_path, start_offset, LOG_EXTENSION);
-        let index_file_path = format!("{}/{}.{}", partition_path, start_offset, INDEX_EXTENSION);
+        let messages_file_path = format!("{}/{}.{}", partition_path, log_file_name, LOG_EXTENSION);
+        let index_file_path = format!("{}/{}.{}", partition_path, log_file_name, INDEX_EXTENSION);
         let time_index_path = index_file_path.replace(INDEX_EXTENSION, "timeindex");
 
         // Check if index files exist
@@ -489,18 +480,6 @@ async fn load_partition_with_segments(
             Err(_) => 0, // Default to 0 if index file doesn't exist
         };
 
-        // If the first segment has messages, we should increment the offset
-        if !should_increment_offset {
-            should_increment_offset = messages_size > 0;
-        }
-
-        // For segment validation, we'd need to implement checksum validation
-        // directly on the files if needed - skipping for now as it requires
-        // understanding the message format
-        if config.partition.validate_checksum {
-            info!("Checksum validation for segment at offset {}", start_offset);
-        }
-
         // Create storage for the segment using existing files
         let storage = Storage::new(
             &messages_file_path,
@@ -543,8 +522,6 @@ async fn load_partition_with_segments(
             )
         };
 
-        current_offset = current_offset.max(end_offset);
-
         // Create the new Segment with proper values from file system
         let mut segment = Segment2::new(
             start_offset,
@@ -559,15 +536,64 @@ async fn load_partition_with_segments(
         segment.size = messages_size;
         segment.sealed = true; // Persisted segments are assumed to be sealed
 
-        // Add segment to log first
+        if config.partition.validate_checksum {
+            info!(
+                "Validating checksum for segment at offset {} in stream ID: {}, topic ID: {}, partition ID: {}",
+                start_offset, stream_id, topic_id, partition_id
+            );
+            let messages_count = loaded_indexes.count() as u32;
+            if messages_count > 0 {
+                const BATCH_COUNT: u32 = 10000;
+                let mut current_relative_offset = 0u32;
+                let mut processed_count = 0u32;
+
+                while processed_count < messages_count {
+                    let remaining_count = messages_count - processed_count;
+                    let batch_count = std::cmp::min(BATCH_COUNT, remaining_count);
+                    let batch_indexes = loaded_indexes
+                        .slice_by_offset(current_relative_offset, batch_count)
+                        .unwrap();
+
+                    let messages_reader = storage.messages_reader.as_ref().unwrap();
+                    match messages_reader.load_messages_from_disk(batch_indexes).await {
+                        Ok(messages_batch) => {
+                            if let Err(e) = messages_batch.validate_checksums() {
+                                return Err(IggyError::CannotReadPartitions).with_error_context(|_| {
+                                    format!(
+                                        "Failed to validate message checksum for segment at offset {} in stream ID: {}, topic ID: {}, partition ID: {}, error: {}",
+                                        start_offset, stream_id, topic_id, partition_id, e
+                                    )
+                                });
+                            }
+                            processed_count += messages_batch.count();
+                            current_relative_offset += batch_count;
+                        }
+                        Err(e) => {
+                            return Err(e).with_error_context(|_| {
+                                format!(
+                                    "Failed to load messages from disk for checksum validation at offset {} in stream ID: {}, topic ID: {}, partition ID: {}",
+                                    start_offset, stream_id, topic_id, partition_id
+                                )
+                            });
+                        }
+                    }
+                }
+                info!(
+                    "Checksum validation completed for segment at offset {}",
+                    start_offset
+                );
+            }
+        }
+
+        // Add segment to log
         log.add_persisted_segment(segment, storage);
 
         // Increment stats for partition - this matches the behavior from partition storage load method
         stats.increment_segments_count(1);
-        
+
         // Increment size and message counts based on the loaded segment data
         stats.increment_size_bytes(messages_size as u64);
-        
+
         // Calculate message count from segment data (end_offset - start_offset + 1 if there are messages)
         let messages_count = if end_offset > start_offset {
             (end_offset - start_offset + 1) as u64
@@ -577,7 +603,7 @@ async fn load_partition_with_segments(
         } else {
             0
         };
-        
+
         if messages_count > 0 {
             stats.increment_messages_count(messages_count);
         }
@@ -619,6 +645,47 @@ async fn load_partition_with_segments(
         }
     }
 
+    Ok(log)
+}
+
+async fn load_partition(
+    config: &SystemConfig,
+    stream_id: usize,
+    topic_id: usize,
+    partition_state: crate::state::system::PartitionState,
+    parent_stats: Arc<TopicStats>,
+) -> Result<partition2::Partition, IggyError> {
+    use std::sync::atomic::AtomicU64;
+    let stats = Arc::new(PartitionStats::new(parent_stats));
+    let partition_id = partition_state.id as u32;
+
+    // Load segments from disk to determine should_increment_offset and current offset
+    let partition_path = config.get_partition_path(stream_id, topic_id, partition_id as usize);
+    let log_files = collect_log_files(&partition_path).await?;
+    let should_increment_offset = !log_files.is_empty()
+        && log_files
+            .first()
+            .map(|entry| {
+                let log_file_name = entry
+                    .path
+                    .file_stem()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
+
+                let start_offset = log_file_name.parse::<u64>().unwrap();
+
+                // Build file paths directly
+                let messages_file_path =
+                    format!("{}/{}.{}", partition_path, start_offset, LOG_EXTENSION);
+                std::fs::metadata(&messages_file_path).is_ok_and(|metadata| metadata.len() > 0)
+            })
+            .unwrap_or_else(|| false);
+
+    info!(
+        "Loading partition with ID: {} for stream with ID: {} and topic with ID: {}, for path: {} from disk...",
+        partition_id, stream_id, topic_id, partition_path
+    );
     // Load consumer offsets
     let message_deduplicator = create_message_deduplicator(config);
     let consumer_offset_path =
@@ -642,20 +709,21 @@ async fn load_partition_with_segments(
             .into(),
     );
 
+    let log = Default::default();
     let partition = partition2::Partition::new(
         partition_state.created_at,
         should_increment_offset,
         stats,
         message_deduplicator,
-        Arc::new(AtomicU64::new(current_offset)),
+        Arc::new(Default::default()),
         consumer_offset,
         consumer_group_offset,
-        log
+        log,
     );
 
     info!(
-        "Loaded partition with ID: {} for stream with ID: {} and topic with ID: {}, current offset: {}.",
-        partition_id, stream_id, topic_id, current_offset
+        "Loaded partition with ID: {} for stream with ID: {} and topic with ID: {}",
+        partition_id, stream_id, topic_id
     );
 
     Ok(partition)

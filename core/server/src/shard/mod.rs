@@ -70,7 +70,10 @@ use crate::{
         },
     },
     shard_error, shard_info, shard_warn,
-    slab::{streams::Streams, traits_ext::EntityMarker},
+    slab::{
+        streams::Streams,
+        traits_ext::{EntityComponentSystem, EntityMarker, Insert},
+    },
     state::{
         StateKind,
         file::FileState,
@@ -235,6 +238,7 @@ impl IggyShard {
     }
 
     pub async fn init(&self) -> Result<(), IggyError> {
+        self.load_segments().await?;
         let _ = self.load_users().await;
         Ok(())
     }
@@ -244,7 +248,7 @@ impl IggyShard {
         // loads streams and starts accepting connections. This is necessary to
         // have the correct statistics when the server starts.
         let now = Instant::now();
-        //self.get_stats().await?;
+        self.get_stats().await?;
         shard_info!(self.id, "Starting...");
         self.init().await?;
         // TODO: Fixme
@@ -294,6 +298,82 @@ impl IggyShard {
         Ok(())
     }
 
+    async fn load_segments(&self) -> Result<(), IggyError> {
+        use crate::bootstrap::load_segments;
+        use crate::shard::namespace::IggyNamespace;
+        for shard_entry in self.shards_table.iter() {
+            let (namespace, shard_info) = shard_entry.pair();
+
+            if shard_info.id == self.id {
+                let stream_id = namespace.stream_id();
+                let topic_id = namespace.topic_id();
+                let partition_id = namespace.partition_id();
+
+                shard_info!(
+                    self.id,
+                    "Loading segments for stream: {}, topic: {}, partition: {}",
+                    stream_id,
+                    topic_id,
+                    partition_id
+                );
+
+                let partition_path =
+                    self.config
+                        .system
+                        .get_partition_path(stream_id, topic_id, partition_id);
+                let stats = self.streams2.with_partition_by_id(
+                    &Identifier::numeric(stream_id as u32).unwrap(),
+                    &Identifier::numeric(topic_id as u32).unwrap(),
+                    partition_id,
+                    |(_, stats, ..)| stats.clone(),
+                );
+                match load_segments(
+                    &self.config.system,
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    partition_path,
+                    stats,
+                )
+                .await
+                {
+                    Ok(loaded_log) => {
+                        self.streams2.with_partition_by_id_mut(
+                            &Identifier::numeric(stream_id as u32).unwrap(),
+                            &Identifier::numeric(topic_id as u32).unwrap(),
+                            partition_id,
+                            |(_,_,_ , offset,  .., mut log)| {
+                                *log = loaded_log;
+                                let current_offset = log.active_segment().end_offset;
+                                offset.store(current_offset, Ordering::Relaxed);
+                            },
+                        );
+                        shard_info!(
+                            self.id,
+                            "Successfully loaded segments for stream: {}, topic: {}, partition: {}",
+                            stream_id,
+                            topic_id,
+                            partition_id
+                        );
+                    }
+                    Err(e) => {
+                        shard_error!(
+                            self.id,
+                            "Failed to load segments for stream: {}, topic: {}, partition: {}: {}",
+                            stream_id,
+                            topic_id,
+                            partition_id,
+                            e
+                        );
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     async fn load_users(&self) -> Result<(), IggyError> {
         let users = self.users.borrow();
         let users_count = users.len();
@@ -328,12 +408,6 @@ impl IggyShard {
 
     pub fn get_available_shards_count(&self) -> u32 {
         self.shards.len() as u32
-    }
-
-    pub fn calculate_shard_assignment(&self, ns: &IggyNamespace) -> u16 {
-        let mut hasher = Murmur3Hasher::default();
-        hasher.write_u64(ns.inner());
-        (hasher.finish32() % self.get_available_shards_count()) as u16
     }
 
     pub async fn handle_shard_message(&self, message: ShardMessage) -> Option<ShardResponse> {
@@ -954,4 +1028,10 @@ impl IggyShard {
             Err(IggyError::Unauthenticated)
         }
     }
+}
+
+pub fn calculate_shard_assignment(ns: &IggyNamespace, upperbound: u32) -> u16 {
+    let mut hasher = Murmur3Hasher::default();
+    hasher.write_u64(ns.inner());
+    (hasher.finish32() % upperbound) as u16
 }

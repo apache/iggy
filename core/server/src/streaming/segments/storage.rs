@@ -68,7 +68,8 @@ pub async fn create_segment_storage(
     indexes_size: u64,
     start_offset: u64,
 ) -> Result<Storage, IggyError> {
-    let messages_path = config.get_segment_path(stream_id, topic_id, partition_id, start_offset);
+    let messages_path =
+        config.get_messages_file_path(stream_id, topic_id, partition_id, start_offset);
     let index_path = config.get_index_path(stream_id, topic_id, partition_id, start_offset);
     let log_fsync = config.partition.enforce_fsync;
     let index_fsync = config.partition.enforce_fsync;

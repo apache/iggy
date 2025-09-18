@@ -31,7 +31,8 @@ use serde::{Deserialize, Serialize};
 use serde_with::DisplayFromStr;
 use serde_with::serde_as;
 
-const INDEX_EXTENSION: &str = "index";
+pub const INDEX_EXTENSION: &str = "index";
+pub const LOG_EXTENSION: &str = "log";
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct SystemConfig {
@@ -281,6 +282,17 @@ impl SystemConfig {
             self.get_partition_path(stream_id, topic_id, partition_id),
             start_offset
         )
+    }
+
+    pub fn get_messages_file_path(
+        &self,
+        stream_id: usize,
+        topic_id: usize,
+        partition_id: usize,
+        start_offset: u64,
+    ) -> String {
+        let path = self.get_segment_path(stream_id, topic_id, partition_id, start_offset);
+        format!("{path}.{LOG_EXTENSION}")
     }
 
     pub fn get_index_path(

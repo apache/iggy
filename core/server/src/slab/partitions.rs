@@ -52,7 +52,7 @@ impl Clone for Partitions {
             offset: self.offset.clone(),
             consumer_offset: self.consumer_offset.clone(),
             consumer_group_offset: self.consumer_group_offset.clone(),
-            log: Slab::with_capacity(PARTITIONS_CAPACITY),
+            log: Slab::with_capacity(PARTITIONS_CAPACITY), // Empty log, we don't clone the actual logs.
         }
     }
 }
@@ -186,6 +186,10 @@ impl Default for Partitions {
 impl Partitions {
     pub fn len(&self) -> usize {
         self.root.len()
+    }
+
+    pub fn insert_default_log(&mut self) -> ContainerId {
+        self.log.insert(Default::default())
     }
 
     pub fn with_partition_by_id<T>(

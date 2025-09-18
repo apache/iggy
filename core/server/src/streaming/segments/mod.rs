@@ -18,21 +18,16 @@
 
 mod indexes;
 mod messages;
-mod reading_messages;
-mod segment;
 mod segment2;
 mod types;
 
 pub mod storage;
 
 pub use indexes::IggyIndexesMut;
-pub use segment::Segment;
 pub use segment2::Segment2;
 pub use types::IggyMessageHeaderViewMut;
 pub use types::IggyMessageViewMut;
 pub use types::IggyMessagesBatchMut;
 pub use types::IggyMessagesBatchSet;
 
-pub const LOG_EXTENSION: &str = "log";
-pub const INDEX_EXTENSION: &str = "index";
 pub const SEGMENT_MAX_SIZE_BYTES: u64 = 1024 * 1024 * 1024;

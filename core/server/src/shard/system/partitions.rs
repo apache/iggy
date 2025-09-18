@@ -19,6 +19,7 @@
 use super::COMPONENT;
 use crate::shard::IggyShard;
 use crate::shard::ShardInfo;
+use crate::shard::calculate_shard_assignment;
 use crate::shard::namespace::IggyNamespace;
 use crate::shard_info;
 use crate::slab::traits_ext::EntityMarker;
@@ -112,10 +113,11 @@ impl IggyShard {
         self.metrics.increment_partitions(partitions_count);
         self.metrics.increment_segments(partitions_count);
 
+        let shards_count = self.get_available_shards_count();
         for partition_id in partitions.iter().map(|p| p.id()) {
             // TODO: Create shard table recordsj.
             let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
-            let shard_id = self.calculate_shard_assignment(&ns);
+            let shard_id = calculate_shard_assignment(&ns, shards_count);
             let shard_info = ShardInfo::new(shard_id);
             let is_current_shard = self.id == shard_info.id;
             self.insert_shard_table_record(ns, shard_info);

@@ -30,7 +30,7 @@ use error_set::ErrContext;
 use figlet_rs::FIGfont;
 use iggy_common::create_user::CreateUser;
 use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
-use iggy_common::{Aes256GcmEncryptor, EncryptorKind, IggyError};
+use iggy_common::{Aes256GcmEncryptor, EncryptorKind, Identifier, IggyError};
 use lending_iterator::lending_iterator::constructors::into_lending_iter;
 use server::args::Args;
 use server::binary::handlers::streams;
@@ -49,7 +49,8 @@ use server::log::tokio_console::Logging;
 use server::server_error::{ConfigError, ServerError};
 use server::shard::namespace::IggyNamespace;
 use server::shard::system::info::SystemInfo;
-use server::shard::{IggyShard, ShardInfo};
+use server::shard::{IggyShard, ShardInfo, calculate_shard_assignment};
+use server::slab::traits_ext::{EntityComponentSystem, EntityComponentSystemMutCell, IntoComponents};
 use server::state::StateKind;
 use server::state::command::EntryCommand;
 use server::state::file::FileState;
@@ -190,7 +191,6 @@ async fn main() -> Result<(), ServerError> {
     let state = SystemState::load(state).await?;
     let (streams_state, users_state) = state.decompose();
     let streams = load_streams(streams_state.into_values(), &config.system).await?;
-    tracing::warn!("Streams: {:?}", streams);
     let users = load_users(users_state.into_values());
 
     // ELEVENTH DISCRETE LOADING STEP.
@@ -222,11 +222,34 @@ async fn main() -> Result<(), ServerError> {
     let (connections, shutdown_handles) = create_shard_connections(&shards_set);
     let mut handles = Vec::with_capacity(shards_set.len());
 
+    // TODO: Persist the shards table and load it from the disk, so it does not have to be
     // THIRTEENTH DISCRETE LOADING STEP.
     // Shared resources bootstrap.
     let shards_table = Box::new(DashMap::with_capacity(SHARDS_TABLE_CAPACITY));
     let shards_table = Box::leak(shards_table);
     let shards_table: EternalPtr<DashMap<IggyNamespace, ShardInfo>> = shards_table.into();
+    streams.with_components(|components| {
+        let (root, ..) = components.into_components();
+        for (_, stream) in root.iter() {
+            stream.topics().with_components(|components| {
+                let (root, ..) = components.into_components();
+                for (_, topic) in root.iter() {
+                    topic.partitions().with_components(|components| {
+                        let (root, ..) = components.into_components();
+                        for (_, partition) in root.iter() {
+                            let stream_id = stream.id();
+                            let topic_id = topic.id();
+                            let partition_id = partition.id();
+                            let ns = IggyNamespace::new(stream_id, topic_id, partition_id);
+                            let shard_id = calculate_shard_assignment(&ns, shards_set.len() as u32);
+                            let shard_info = ShardInfo::new(shard_id);
+                            shards_table.insert(ns, shard_info);
+                        }
+                    });
+                }
+            })
+        }
+    });
 
     for shard_id in shards_set {
         let id = shard_id as u16;
@@ -245,6 +268,28 @@ async fn main() -> Result<(), ServerError> {
             state_persister,
             encryptor.clone(),
         ));
+
+        // Ergh... I knew this will backfire to include `Log` as part of the `Partition` entity,
+        // We have to initialize with an default log with every partition, once we `Clone` the Streams / Topics / Partitions,
+        // because `Clone` impl for `Partition` does not clone the actual log, just creates an empty one.
+        streams.with_components(|components| {
+            let (root, ..) = components.into_components();
+            for (_, stream) in root.iter() {
+                stream.topics().with_components_mut(|components| {
+                    let (mut root, ..) = components.into_components();
+                    for (_, topic) in root.iter_mut() {
+                        let partitions_count = topic.partitions().len();
+                        for log_id in 0..partitions_count {
+                            let id = topic.partitions_mut().insert_default_log();
+                            assert_eq!(
+                                id, log_id,
+                                "main: partition_insert_default_log: id mismatch when creating default log"
+                            );
+                        }
+                    }
+                })
+            }
+        });
 
         let handle = std::thread::Builder::new()
             .name(format!("shard-{id}"))
