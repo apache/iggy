@@ -34,7 +34,7 @@ runs:
     - name: Setup Rust with cache
       uses: ./.github/actions/utils/setup-rust-with-cache
       with:
-        cache-targets: false  # Only cache registry and git deps, not target dir (sccache handles that)
+        cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
 
     - name: Cache pip
       uses: actions/cache@v4
@@ -123,6 +123,9 @@ runs:
         port: 8090
         wait-timeout-seconds: 45
       continue-on-error: true
+      env:
+        IGGY_ROOT_USERNAME: iggy
+        IGGY_ROOT_PASSWORD: iggy
 
     - name: Run Python integration tests
       if: inputs.task == 'test' && steps.iggy.outcome == 'success'

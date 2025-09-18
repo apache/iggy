@@ -109,7 +109,7 @@ echo "Using server binary at ${SERVER_BIN}"
 
 # Run iggy server using the prebuilt binary
 echo "Starting server from ${SERVER_BIN}..."
-${SERVER_BIN} &>${LOG_FILE} &
+IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy ${SERVER_BIN} &>${LOG_FILE} &
 echo $! >${PID_FILE}
 
 # Wait until "Iggy server has started" string is present inside iggy-server.log

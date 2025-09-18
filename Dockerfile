@@ -31,4 +31,8 @@ COPY ./core/configs ./configs
 COPY --from=builder /build/target/release/iggy .
 COPY --from=builder /build/target/release/iggy-server .
 
+ENV IGGY_HTTP_ADDRESS=0.0.0.0:3000
+ENV IGGY_QUIC_ADDRESS=0.0.0.0:8080
+ENV IGGY_TCP_ADDRESS=0.0.0.0:8090
+
 CMD ["/iggy-server"]
