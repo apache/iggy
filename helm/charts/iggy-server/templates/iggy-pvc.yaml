@@ -4,7 +4,7 @@ apiVersion: v1
 metadata:
   name: {{ template "iggy-server.fullname" . }}-iggy
   labels:
-    {{- include "iggy-server.labels"  ( dict "component" "app"  "rootContext" $ ) | nindent 4 }}
+    {{- include "iggy-server.labels" . | nindent 8 }}
   annotations:
     helm.sh/resource-policy: keep
   {{- with .Values.persistence.annotations }}

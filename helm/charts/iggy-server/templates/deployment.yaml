@@ -71,7 +71,7 @@ spec:
           volumeMounts:
             - name: iggy-server-main
               mountPath: /local_data
-              subPath: {{ ternary "root" (printf "%s/root" .Values.iggy.persistence.subPath) (empty .Values.iggy.persistence.subPath) }}
+              subPath: {{ ternary "root" (printf "%s/root" .Values.persistence.subPath) (empty .Values.persistence.subPath) }}
 
           livenessProbe:
             httpGet:
