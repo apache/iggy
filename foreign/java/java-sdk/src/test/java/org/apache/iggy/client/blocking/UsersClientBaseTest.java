@@ -74,6 +74,7 @@ public abstract class UsersClientBaseTest extends IntegrationTest {
                 "test",
                 UserStatus.Active,
                 Optional.of(new Permissions(createGlobalPermissions(true), Collections.emptyMap())));
+        trackUser(createdUser.id());
 
         // then
         assertThat(createdUser).isNotNull();
@@ -100,6 +101,7 @@ public abstract class UsersClientBaseTest extends IntegrationTest {
         // given
         login();
         UserInfoDetails user = usersClient.createUser("test", "test", UserStatus.Active, Optional.empty());
+        trackUser(user.id());
 
         // when
         usersClient.updateUser(user.id(), Optional.empty(), Optional.of(UserStatus.Inactive));
@@ -115,6 +117,7 @@ public abstract class UsersClientBaseTest extends IntegrationTest {
         var permissions = new Permissions(createGlobalPermissions(true), Collections.emptyMap());
         login();
         UserInfoDetails user = usersClient.createUser("test", "test", UserStatus.Active, Optional.of(permissions));
+        trackUser(user.id());
 
         // when
         usersClient.updatePermissions(user.id(), Optional.of(new Permissions(createGlobalPermissions(false), Collections.emptyMap())));
@@ -141,6 +144,9 @@ public abstract class UsersClientBaseTest extends IntegrationTest {
 
         // then
         assertThat(newLogin).isNotNull();
+
+        // restore original password for other tests
+        usersClient.changePassword(identity.userId(), "new-pass", "iggy");
     }
 
     @Test

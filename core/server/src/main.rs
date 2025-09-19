@@ -41,7 +41,7 @@ use server::streaming::systems::system::{SharedSystem, System};
 use server::streaming::utils::MemoryPool;
 use server::tcp::tcp_server;
 use tokio::time::Instant;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 #[tokio::main]
 #[instrument(skip_all, name = "trace_start_server")]
@@ -67,6 +67,7 @@ async fn main() -> Result<(), ServerError> {
     }
 
     let args = Args::parse();
+
     let config_provider = config_provider::resolve(&args.config_provider)?;
     let config = ServerConfig::load(&config_provider).await?;
     if args.fresh {
@@ -78,6 +79,7 @@ async fn main() -> Result<(), ServerError> {
             }
         }
     }
+
     let mut logging = Logging::new(config.telemetry.clone());
     logging.early_init();
 
@@ -85,10 +87,33 @@ async fn main() -> Result<(), ServerError> {
 
     logging.late_init(config.system.get_system_path(), &config.system.logging)?;
 
+    if args.with_default_root_credentials {
+        let username_set = std::env::var("IGGY_ROOT_USERNAME").is_ok();
+        let password_set = std::env::var("IGGY_ROOT_PASSWORD").is_ok();
+
+        if !username_set || !password_set {
+            if !username_set {
+                unsafe {
+                    std::env::set_var("IGGY_ROOT_USERNAME", "iggy");
+                }
+            }
+            if !password_set {
+                unsafe {
+                    std::env::set_var("IGGY_ROOT_PASSWORD", "iggy");
+                }
+            }
+            info!(
+                "Using default root credentials (username: iggy, password: iggy) - FOR DEVELOPMENT ONLY!"
+            );
+        } else {
+            warn!(
+                "--with-default-root-credentials flag is ignored because root credentials are already set via environment variables"
+            );
+        }
+    }
+
     #[cfg(feature = "disable-mimalloc")]
-    tracing::warn!(
-        "Using default system allocator because code was build with `disable-mimalloc` feature"
-    );
+    warn!("Using default system allocator because code was build with `disable-mimalloc` feature");
     #[cfg(not(feature = "disable-mimalloc"))]
     info!("Using mimalloc allocator");
 
