@@ -34,6 +34,7 @@ use yew_router::prelude::use_navigator;
 
 // Props definitions
 #[derive(Properties, PartialEq)]
+#[allow(dead_code)]
 pub struct AppContentProps {}
 
 #[hook]
