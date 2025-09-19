@@ -61,13 +61,36 @@ spec:
             - name: quic
               containerPort: {{ .Values.server.ports.quic }}
               protocol: TCP
-          {{ if .Values.env }}
           env:
+            {{ if .Values.server.rootUser.existingSecret.name }}
+            - name: IGGY_ROOT_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.server.rootUser.existingSecret.name }}
+                  key: {{ .Values.server.rootUser.existingSecret.usernameKey }}
+            - name: IGGY_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.server.rootUser.existingSecret.name }}
+                  key: {{ .Values.server.rootUser.existingSecret.passwordKey }}
+            {{ else }}{{ if .Values.server.rootUser.createSecret }}
+            - name: IGGY_ROOT_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "iggy-server.fullname" . }}-root-credentials
+                  key: username
+            - name: IGGY_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "iggy-server.fullname" . }}-root-credentials
+                  key: password
+            {{- end }}{{- end}}
+            {{ if .Values.env }}
             {{- range .Values.env }}
             - name: {{ .name }}
               value: {{ .value | quote }}
             {{- end }}
-          {{ end }}
+            {{ end }}
           volumeMounts:
             - name: iggy-server-data
               mountPath: /local_data

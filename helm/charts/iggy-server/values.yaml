@@ -124,6 +124,18 @@ server:
     http: 3000
     quic: 8080
     tcp: 8090
+  rootUser:
+    # -- Create a secret for the root user
+    createSecret: true
+    username: iggy
+    password: changeit
+    # -- Whether to use an existing secret for the root user
+    existingSecret:
+      name: ""
+      # -- Key in the secret to get the root username from
+      usernameKey: username
+      # -- Key in the secret to get the root password from
+      passwordKey: password
 
 # -- Set up environmental variables to be added to the container
 env:
