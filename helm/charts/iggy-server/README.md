@@ -1,8 +1,12 @@
 # iggy-server
 
-![Version: 0.1.0](https://img.shields.io/badge/Version-0.1.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 1.16.0](https://img.shields.io/badge/AppVersion-1.16.0-informational?style=flat-square)
+![Version: 0.1.1](https://img.shields.io/badge/Version-0.1.1-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 0.4.300](https://img.shields.io/badge/AppVersion-0.4.300-informational?style=flat-square)
 
-A Helm chart for Kubernetes
+A Helm chart for Iggy server
+
+## Source Code
+
+* <https://github.com/apache/iggy>
 
 ## Values
 
@@ -16,7 +20,7 @@ A Helm chart for Kubernetes
 | autoscaling.targetCPUUtilizationPercentage | int | `80` |  |
 | fullnameOverride | string | `""` |  |
 | image.pullPolicy | string | `"IfNotPresent"` |  |
-| image.repository | string | `"nginx"` |  |
+| image.repository | string | `"apache/iggy"` |  |
 | image.tag | string | `""` |  |
 | imagePullSecrets | list | `[]` |  |
 | ingress.annotations | object | `{}` |  |
@@ -28,6 +32,10 @@ A Helm chart for Kubernetes
 | ingress.tls | list | `[]` |  |
 | nameOverride | string | `""` |  |
 | nodeSelector | object | `{}` |  |
+| persistence.accessMode | string | `"ReadWriteOnce"` |  |
+| persistence.annotations | object | `{}` |  |
+| persistence.enabled | bool | `false` |  |
+| persistence.size | string | `"8Gi"` |  |
 | podAnnotations | object | `{}` |  |
 | podSecurityContext | object | `{}` |  |
 | replicaCount | int | `1` |  |
@@ -36,12 +44,13 @@ A Helm chart for Kubernetes
 | server.ports.http | int | `3000` |  |
 | server.ports.quic | int | `8080` |  |
 | server.ports.tcp | int | `8090` |  |
+| service.port | int | `3000` |  |
 | service.type | string | `"ClusterIP"` |  |
 | serviceAccount.annotations | object | `{}` |  |
 | serviceAccount.create | bool | `true` |  |
 | serviceAccount.name | string | `""` |  |
 | serviceMonitor.additionalLabels | object | `{}` | Add custom labels to the ServiceMonitor resource |
-| serviceMonitor.enabled | bool | `true` | Enable this if you're using `"https://github.com/coreos/prometheus-operator"` |
+| serviceMonitor.enabled | bool | `true` | Enable this if you're using https://github.com/coreos/prometheus-operator |
 | serviceMonitor.honorLabels | bool | `false` |  |
 | serviceMonitor.interval | string | `"30s"` | Fallback to the prometheus default unless specified |
 | serviceMonitor.namespace | string | `""` | Namespace to deploy the ServiceMonitor |
