@@ -38,14 +38,14 @@ inputs:
     description: "Working directory for building/running"
     required: false
     default: "."
-  host:
-    description: "Bind host to test readiness against"
+  tcp_address:
+    description: "TCP address (host:port)"
     required: false
-    default: "127.0.0.1"
-  port:
-    description: "TCP port to check readiness"
+    default: "127.0.0.1:8090"
+  http_address:
+    description: "HTTP address (host:port)"
     required: false
-    default: "8090"
+    default: "127.0.0.1:3000"
   wait-timeout-seconds:
     description: "Max seconds to wait until the server is ready"
     required: false
@@ -72,9 +72,12 @@ outputs:
   log_file:
     description: "Path to log file"
     value: ${{ steps.out.outputs.log_file }}
-  address:
-    description: "Host:port used for checks"
-    value: ${{ steps.out.outputs.address }}
+  tcp_address:
+    description: "TCP address used"
+    value: ${{ inputs.tcp_address }}
+  http_address:
+    description: "HTTP address used"
+    value: ${{ inputs.http_address }}
 runs:
   using: "composite"
   steps:
@@ -120,8 +123,9 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        HOST="${{ inputs.host }}"
-        PORT="${{ inputs.port }}"
+        TCP_ADDRESS="${{ inputs.tcp_address }}"
+        HOST="${TCP_ADDRESS%:*}"
+        PORT="${TCP_ADDRESS##*:}"
         # true if socket is already open
         if command -v nc >/dev/null 2>&1; then
           if nc -z "$HOST" "$PORT" 2>/dev/null; then busy=1; else busy=0; fi
@@ -133,7 +137,7 @@ runs:
     - if: env.BUSY == '1' && inputs.fail-if-busy == 'true'
       shell: bash
       run: |
-        echo "Port ${{ inputs.host }}:${{ inputs.port }} is already in use." >&2
+        echo "Port ${{ inputs.tcp_address }} is already in use." >&2
         exit 1
 
     - name: Start server
@@ -141,16 +145,22 @@ runs:
       working-directory: ${{ inputs.working-directory }}
       run: |
         set -euo pipefail
+        export IGGY_TCP_ADDRESS="${{ inputs.tcp_address }}"
+        export IGGY_HTTP_ADDRESS="${{ inputs.http_address }}"
+        export IGGY_ROOT_USERNAME="iggy"
+        export IGGY_ROOT_PASSWORD="iggy"
         nohup "${{ steps.resolve-bin.outputs.bin }}" >"$LOG_FILE" 2>&1 &
         echo $! > "$PID_FILE"
         echo "Started server PID $(cat "$PID_FILE") → logs: $LOG_FILE"
+        echo "Server configured with TCP=$IGGY_TCP_ADDRESS, HTTP=$IGGY_HTTP_ADDRESS"
 
     - name: Wait for readiness
       shell: bash
       run: |
         set -euo pipefail
-        HOST="${{ inputs.host }}"
-        PORT="${{ inputs.port }}"
+        TCP_ADDRESS="${{ inputs.tcp_address }}"
+        HOST="${TCP_ADDRESS%:*}"
+        PORT="${TCP_ADDRESS##*:}"
         DEADLINE=$(( $(date +%s) + ${{ inputs.wait-timeout-seconds }} ))
         until (( $(date +%s) > DEADLINE )); do
           if command -v nc >/dev/null 2>&1; then
@@ -159,7 +169,7 @@ runs:
             timeout 1 bash -lc ":</dev/tcp/$HOST/$PORT" 2>/dev/null && ready=1 || ready=0
           fi
           if [[ "$ready" == "1" ]]; then
-            echo "Server is ready on $HOST:$PORT"
+            echo "Server is ready on $TCP_ADDRESS"
             break
           fi
           sleep 1
@@ -178,4 +188,3 @@ runs:
         echo "pid=$(cat "$PID_FILE")" >> "$GITHUB_OUTPUT"
         echo "pid_file=$PID_FILE" >> "$GITHUB_OUTPUT"
         echo "log_file=$LOG_FILE" >> "$GITHUB_OUTPUT"
-        echo "address=${{ inputs.host }}:${{ inputs.port }}" >> "$GITHUB_OUTPUT"

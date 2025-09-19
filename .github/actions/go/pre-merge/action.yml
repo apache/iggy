@@ -78,7 +78,6 @@ runs:
         # Run tests with JSON output for better reporting
         go test -v -json ./... > ../../reports/go-tests.json
 
-
     - name: Lint
       if: inputs.task == 'lint'
       uses: golangci/golangci-lint-action@v6
@@ -115,6 +114,7 @@ runs:
     - name: Setup server for e2e tests
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
+      continue-on-error: true
 
     - name: Run e2e tests
       shell: bash

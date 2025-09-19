@@ -157,7 +157,7 @@ ok "built baseline"
 
 info "Starting iggy-server (baseline)"
 set +e
-( nohup target/debug/iggy-server >"$MASTER_LOG" 2>&1 & echo $! > "$TMP_ROOT/master.pid" )
+( IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy nohup target/debug/iggy-server >"$MASTER_LOG" 2>&1 & echo $! > "$TMP_ROOT/master.pid" )
 set -e
 MASTER_PID="$(cat "$TMP_ROOT/master.pid")"
 ok "iggy-server started (pid $MASTER_PID), logs: $MASTER_LOG"
@@ -222,7 +222,7 @@ ok "restored local_data/"
 # -----------------------------
 info "Starting iggy-server (PR)"
 set +e
-( nohup target/debug/iggy-server >"$PR_LOG" 2>&1 & echo $! > "$TMP_ROOT/pr.pid" )
+( IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy nohup target/debug/iggy-server >"$PR_LOG" 2>&1 & echo $! > "$TMP_ROOT/pr.pid" )
 set -e
 PR_PID="$(cat "$TMP_ROOT/pr.pid")"
 ok "iggy-server (PR) started (pid $PR_PID), logs: $PR_LOG"
