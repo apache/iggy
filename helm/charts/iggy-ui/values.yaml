@@ -102,4 +102,4 @@ ui:
     http: 3050
   extraEnvs: {}
 server:
-  endpoint: http://iggy-server:80
+  endpoint: http://iggy-server:3000
