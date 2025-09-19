@@ -21,7 +21,7 @@ name: iggy-server
 description: A Helm chart for Iggy server
 type: application
 version: 0.1.1
-appVersion: "0.4.300"
+appVersion: "0.5.0"
 sources:
   - https://github.com/apache/iggy
 keywords:

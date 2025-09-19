@@ -69,7 +69,7 @@ spec:
             {{- end }}
           {{ end }}
           volumeMounts:
-            - name: iggy-server-main
+            - name: iggy-server-data
               mountPath: /local_data
               subPath: {{ ternary "root" (printf "%s/root" .Values.persistence.subPath) (empty .Values.persistence.subPath) }}
 
@@ -96,10 +96,10 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       volumes:
-        - name: iggy-server-main
+        - name: iggy-server-data
           {{- if .Values.persistence.enabled }}
           persistentVolumeClaim:
-            claimName: {{ if .Values.persistence.existingClaim }}{{ .Values.persistence.existingClaim }}{{- else }}{{ template "iggy-server.fullname" . }}-iggy{{- end }}
+            claimName: {{ if .Values.persistence.existingClaim }}{{ .Values.persistence.existingClaim }}{{- else }}{{ template "iggy-server.fullname" . }}{{- end }}
           {{- else }}
           emptyDir: {}
           {{- end }}

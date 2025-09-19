@@ -2,7 +2,7 @@
 kind: PersistentVolumeClaim
 apiVersion: v1
 metadata:
-  name: {{ template "iggy-server.fullname" . }}-iggy
+  name: {{ template "iggy-server.fullname" . }}
   labels:
     {{- include "iggy-server.labels" . | nindent 8 }}
   annotations:
