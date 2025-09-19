@@ -75,6 +75,19 @@ impl MessageClient for ClientWrapper {
                     )
                     .await
             }
+            ClientWrapper::TcpSync(client) => {
+                client
+                    .poll_messages(
+                        stream_id,
+                        topic_id,
+                        partition_id,
+                        consumer,
+                        strategy,
+                        count,
+                        auto_commit,
+                    )
+                    .await
+            }
             ClientWrapper::Quic(client) => {
                 client
                     .poll_messages(
@@ -114,6 +127,11 @@ impl MessageClient for ClientWrapper {
                     .send_messages(stream_id, topic_id, partitioning, messages)
                     .await
             }
+            ClientWrapper::TcpSync(client) => {
+                client
+                    .send_messages(stream_id, topic_id, partitioning, messages)
+                    .await
+            }
             ClientWrapper::Quic(client) => {
                 client
                     .send_messages(stream_id, topic_id, partitioning, messages)
@@ -141,6 +159,11 @@ impl MessageClient for ClientWrapper {
                     .await
             }
             ClientWrapper::Tcp(client) => {
+                client
+                    .flush_unsaved_buffer(stream_id, topic_id, partitioning_id, fsync)
+                    .await
+            }
+            ClientWrapper::TcpSync(client) => {
                 client
                     .flush_unsaved_buffer(stream_id, topic_id, partitioning_id, fsync)
                     .await

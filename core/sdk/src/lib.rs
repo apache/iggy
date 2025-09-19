@@ -26,3 +26,5 @@ pub mod prelude;
 pub mod quic;
 pub mod stream_builder;
 pub mod tcp;
+pub mod protocol;
+pub mod connection;

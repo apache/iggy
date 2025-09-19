@@ -27,5 +27,6 @@ pub enum ClientWrapper {
     Iggy(IggyClient),
     Http(HttpClient),
     Tcp(TcpClient),
+    TcpSync(Box<dyn iggy_binary_protocol::Client>),
     Quic(QuicClient),
 }

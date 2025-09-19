@@ -29,6 +29,7 @@ impl Client for ClientWrapper {
             ClientWrapper::Iggy(client) => client.connect().await,
             ClientWrapper::Http(client) => client.connect().await,
             ClientWrapper::Tcp(client) => client.connect().await,
+            ClientWrapper::TcpSync(client) => client.connect().await,
             ClientWrapper::Quic(client) => client.connect().await,
         }
     }
@@ -38,6 +39,7 @@ impl Client for ClientWrapper {
             ClientWrapper::Iggy(client) => client.disconnect().await,
             ClientWrapper::Http(client) => client.disconnect().await,
             ClientWrapper::Tcp(client) => client.disconnect().await,
+            ClientWrapper::TcpSync(client) => client.disconnect().await,
             ClientWrapper::Quic(client) => client.disconnect().await,
         }
     }
@@ -47,6 +49,7 @@ impl Client for ClientWrapper {
             ClientWrapper::Iggy(client) => client.shutdown().await,
             ClientWrapper::Http(client) => client.shutdown().await,
             ClientWrapper::Tcp(client) => client.shutdown().await,
+            ClientWrapper::TcpSync(client) => client.shutdown().await,
             ClientWrapper::Quic(client) => client.shutdown().await,
         }
     }
@@ -56,6 +59,7 @@ impl Client for ClientWrapper {
             ClientWrapper::Iggy(client) => client.subscribe_events().await,
             ClientWrapper::Http(client) => client.subscribe_events().await,
             ClientWrapper::Tcp(client) => client.subscribe_events().await,
+            ClientWrapper::TcpSync(client) => client.subscribe_events().await,
             ClientWrapper::Quic(client) => client.subscribe_events().await,
         }
     }

@@ -46,6 +46,11 @@ impl ConsumerGroupClient for ClientWrapper {
                     .get_consumer_group(stream_id, topic_id, group_id)
                     .await
             }
+            ClientWrapper::TcpSync(client) => {
+                client
+                    .get_consumer_group(stream_id, topic_id, group_id)
+                    .await
+            }
             ClientWrapper::Quic(client) => {
                 client
                     .get_consumer_group(stream_id, topic_id, group_id)
@@ -63,6 +68,7 @@ impl ConsumerGroupClient for ClientWrapper {
             ClientWrapper::Iggy(client) => client.get_consumer_groups(stream_id, topic_id).await,
             ClientWrapper::Http(client) => client.get_consumer_groups(stream_id, topic_id).await,
             ClientWrapper::Tcp(client) => client.get_consumer_groups(stream_id, topic_id).await,
+            ClientWrapper::TcpSync(client) => client.get_consumer_groups(stream_id, topic_id).await,
             ClientWrapper::Quic(client) => client.get_consumer_groups(stream_id, topic_id).await,
         }
     }
@@ -86,6 +92,11 @@ impl ConsumerGroupClient for ClientWrapper {
                     .await
             }
             ClientWrapper::Tcp(client) => {
+                client
+                    .create_consumer_group(stream_id, topic_id, name, group_id)
+                    .await
+            }
+            ClientWrapper::TcpSync(client) => {
                 client
                     .create_consumer_group(stream_id, topic_id, name, group_id)
                     .await
@@ -120,6 +131,11 @@ impl ConsumerGroupClient for ClientWrapper {
                     .delete_consumer_group(stream_id, topic_id, group_id)
                     .await
             }
+            ClientWrapper::TcpSync(client) => {
+                client
+                    .delete_consumer_group(stream_id, topic_id, group_id)
+                    .await
+            }
             ClientWrapper::Quic(client) => {
                 client
                     .delete_consumer_group(stream_id, topic_id, group_id)
@@ -146,6 +162,11 @@ impl ConsumerGroupClient for ClientWrapper {
                     .await
             }
             ClientWrapper::Tcp(client) => {
+                client
+                    .join_consumer_group(stream_id, topic_id, group_id)
+                    .await
+            }
+            ClientWrapper::TcpSync(client) => {
                 client
                     .join_consumer_group(stream_id, topic_id, group_id)
                     .await
@@ -180,6 +201,11 @@ impl ConsumerGroupClient for ClientWrapper {
                     .leave_consumer_group(stream_id, topic_id, group_id)
                     .await
             }
+            ClientWrapper::TcpSync(client) => {
+                client
+                    .leave_consumer_group(stream_id, topic_id, group_id)
+                    .await
+            }
             ClientWrapper::Quic(client) => {
                 client
                     .leave_consumer_group(stream_id, topic_id, group_id)
@@ -200,6 +226,9 @@ impl AsyncDrop for ClientWrapper {
                 let _ = client.logout_user().await;
             }
             ClientWrapper::Tcp(client) => {
+                let _ = client.logout_user().await;
+            }
+            ClientWrapper::TcpSync(client) => {
                 let _ = client.logout_user().await;
             }
             ClientWrapper::Quic(client) => {

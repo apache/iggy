@@ -47,6 +47,11 @@ impl ConsumerOffsetClient for ClientWrapper {
                     .store_consumer_offset(consumer, stream_id, topic_id, partition_id, offset)
                     .await
             }
+            ClientWrapper::TcpSync(client) => {
+                client
+                    .store_consumer_offset(consumer, stream_id, topic_id, partition_id, offset)
+                    .await
+            }
             ClientWrapper::Quic(client) => {
                 client
                     .store_consumer_offset(consumer, stream_id, topic_id, partition_id, offset)
@@ -78,6 +83,11 @@ impl ConsumerOffsetClient for ClientWrapper {
                     .get_consumer_offset(consumer, stream_id, topic_id, partition_id)
                     .await
             }
+            ClientWrapper::TcpSync(client) => {
+                client
+                    .get_consumer_offset(consumer, stream_id, topic_id, partition_id)
+                    .await
+            }
             ClientWrapper::Quic(client) => {
                 client
                     .get_consumer_offset(consumer, stream_id, topic_id, partition_id)
@@ -105,6 +115,11 @@ impl ConsumerOffsetClient for ClientWrapper {
                     .await
             }
             ClientWrapper::Tcp(client) => {
+                client
+                    .delete_consumer_offset(consumer, stream_id, topic_id, partition_id)
+                    .await
+            }
+            ClientWrapper::TcpSync(client) => {
                 client
                     .delete_consumer_offset(consumer, stream_id, topic_id, partition_id)
                     .await

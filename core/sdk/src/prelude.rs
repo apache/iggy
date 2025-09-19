@@ -45,6 +45,7 @@ pub use crate::stream_builder::IggyStreamConsumer;
 pub use crate::stream_builder::{IggyProducerConfig, IggyStreamProducer};
 pub use crate::stream_builder::{IggyStream, IggyStreamConfig};
 pub use crate::tcp::tcp_client::TcpClient;
+pub use crate::tcp::tcp_client_sync::{TcpClientSync, TcpClientSyncTcp, TcpClientSyncTls};
 pub use iggy_binary_protocol::{
     Client, ConsumerGroupClient, ConsumerOffsetClient, MessageClient, PartitionClient,
     PersonalAccessTokenClient, SegmentClient, StreamClient, SystemClient, TopicClient, UserClient,

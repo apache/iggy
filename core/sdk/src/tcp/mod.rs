@@ -22,3 +22,5 @@ pub(crate) mod tcp_connection_stream_kind;
 pub(crate) mod tcp_stream;
 pub(crate) mod tcp_tls_connection_stream;
 pub(crate) mod tcp_tls_verifier;
+
+pub mod tcp_client_sync;

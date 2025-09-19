@@ -24,6 +24,7 @@ pub mod http_client;
 pub mod quic_client;
 #[allow(deprecated)]
 pub mod tcp_client;
+pub mod tcp_client_sync;
 #[allow(deprecated)]
 pub mod test_mcp_server;
 #[allow(deprecated)]

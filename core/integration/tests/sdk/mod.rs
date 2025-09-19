@@ -17,3 +17,4 @@
  */
 
 mod producer;
+mod tcp_client_sync;
