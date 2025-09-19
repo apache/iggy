@@ -14,7 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-
+{{ if .Values.server.enabled }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -38,7 +38,8 @@ spec:
       protocol: TCP
   selector:
     {{- include "iggy.selectorLabels" . | nindent 4 }}
-
+{{- end }}
+{{ if .Values.ui.enabled }}
 ---
 apiVersion: v1
 kind: Service
@@ -55,3 +56,4 @@ spec:
       protocol: TCP
   selector:
     {{ include "iggy-ui.selectorLabels" . | nindent 4 }}
+{{- end }}

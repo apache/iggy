@@ -19,6 +19,7 @@
 
 # Iggy server configuration
 server:
+  enabled: true
   replicaCount: 1
   image:
     repository: apache/iggy
