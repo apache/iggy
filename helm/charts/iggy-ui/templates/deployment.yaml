@@ -67,7 +67,7 @@ spec:
           - name: PUBLIC_IGGY_API_URL
             value: {{ .Values.server.endpoint }}
           {{- with .Values.ui.extraEnvs }}
-          {{- . | toYaml | nindent 12 }}
+          {{- . | toYaml | nindent 10 }}
           {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
