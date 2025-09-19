@@ -16,107 +16,67 @@
  * under the License.
  */
 
-//Todo: Fixme
-/*
-use crate::channels::server_command::BackgroundServerCommand;
-use crate::configs::server::MessageSaverConfig;
-use crate::configs::server::ServerConfig;
-use crate::streaming::systems::system::SharedSystem;
-use flume::{Receiver, Sender};
-use iggy_common::IggyDuration;
-use tokio::time;
-use tracing::{error, info, instrument, warn};
+use crate::{shard::IggyShard, shard_info};
+use iggy_common::{Identifier, IggyError};
+use std::rc::Rc;
+use tracing::{error, info, trace};
 
-pub struct MessagesSaver {
-    enabled: bool,
-    enforce_fsync: bool,
-    interval: IggyDuration,
-    sender: Sender<SaveMessagesCommand>,
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct SaveMessagesCommand {
-    pub enforce_fsync: bool,
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct SaveMessagesExecutor;
-
-impl MessagesSaver {
-    pub fn new(config: &MessageSaverConfig, sender: Sender<SaveMessagesCommand>) -> Self {
-        Self {
-            enabled: config.enabled,
-            enforce_fsync: config.enforce_fsync,
-            interval: config.interval,
-            sender,
-        }
+pub async fn save_messages(shard: Rc<IggyShard>) -> Result<(), IggyError> {
+    let config = &shard.config.message_saver;
+    if !config.enabled {
+        info!("Message saver is disabled.");
+        return Ok(());
     }
 
-    pub fn start(&self) {
-        if !self.enabled {
-            info!("Message saver is disabled.");
-            return;
-        }
+    // TODO: Maybe we should get rid of it in order to not complicate, and use the fsync settings per partition from config.
+    let enforce_fsync = config.enforce_fsync;
+    let interval = config.interval;
+    info!(
+        "Message saver is enabled, buffered messages will be automatically saved every: {interval}, enforce fsync: {enforce_fsync}."
+    );
 
-        let enforce_fsync = self.enforce_fsync;
-        let interval = self.interval;
-        let sender = self.sender.clone();
-        info!(
-            "Message saver is enabled, buffered messages will be automatically saved every: {interval}, enforce fsync: {enforce_fsync}."
-        );
-        tokio::spawn(async move {
-            let mut interval_timer = time::interval(interval.get_duration());
-            loop {
-                interval_timer.tick().await;
-                let command = SaveMessagesCommand { enforce_fsync };
-                sender.send(command).unwrap_or_else(|e| {
-                    error!("Failed to send SaveMessagesCommand. Error: {e}",);
-                });
-            }
-        });
-    }
-}
+    let mut interval_timer = compio::time::interval(interval.get_duration());
+    loop {
+        interval_timer.tick().await;
+        trace!("Saving buffered messages...");
 
-impl BackgroundServerCommand<SaveMessagesCommand> for SaveMessagesExecutor {
-    #[instrument(skip_all, name = "trace_save_messages")]
-    async fn execute(&mut self, system: &SharedSystem, _command: SaveMessagesCommand) {
-        let saved_messages_count = system.read().await.persist_messages().await;
-        match saved_messages_count {
-            Ok(n) => {
-                if n > 0 {
-                    info!("Saved {n} buffered messages on disk.");
+        let namespaces = shard.get_current_shard_namespaces();
+        let mut total_saved_messages = 0u32;
+        let reason = "background saver triggered".to_string();
+
+        for ns in namespaces {
+            let stream_id = Identifier::numeric(ns.stream_id() as u32).unwrap();
+            let topic_id = Identifier::numeric(ns.topic_id() as u32).unwrap();
+            let partition_id = ns.partition_id();
+
+            match shard
+                .streams2
+                .persist_messages(
+                    shard.id,
+                    &stream_id,
+                    &topic_id,
+                    partition_id,
+                    reason.clone(),
+                    &shard.config.system,
+                )
+                .await
+            {
+                Ok(batch_count) => {
+                    total_saved_messages += batch_count;
+                }
+                Err(err) => {
+                    error!(
+                        "Failed to save messages for partition {}: {}",
+                        partition_id, err
+                    );
                 }
             }
-            Err(e) => {
-                error!("Couldn't save buffered messages on disk. Error: {e}");
-            }
         }
-    }
 
-    fn start_command_sender(
-        &mut self,
-        _system: SharedSystem,
-        config: &ServerConfig,
-        sender: Sender<SaveMessagesCommand>,
-    ) {
-        let messages_saver = MessagesSaver::new(&config.message_saver, sender);
-        messages_saver.start();
-    }
+        if total_saved_messages > 0 {
+            shard_info!(shard.id, "Saved {} buffered messages on disk.", total_saved_messages);
+        }
 
-    fn start_command_consumer(
-        mut self,
-        system: SharedSystem,
-        _config: &ServerConfig,
-        receiver: Receiver<SaveMessagesCommand>,
-    ) {
-        tokio::spawn(async move {
-            let system = system.clone();
-            while let Ok(command) = receiver.recv_async().await {
-                self.execute(&system, command).await;
-            }
-            warn!("Server command handler stopped receiving commands.");
-        });
+        trace!("Finished saving buffered messages.");
     }
 }
-
-*/

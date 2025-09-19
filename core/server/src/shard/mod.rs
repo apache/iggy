@@ -153,7 +153,7 @@ pub struct IggyShard {
 
     // Heart transplant of the old streams structure.
     pub(crate) streams2: Streams,
-    shards_table: EternalPtr<DashMap<IggyNamespace, ShardInfo>>,
+    pub(crate) shards_table: EternalPtr<DashMap<IggyNamespace, ShardInfo>>,
     // TODO: Refactor.
     pub(crate) storage: Rc<SystemStorage>,
     pub(crate) state: StateKind,
@@ -274,6 +274,25 @@ impl IggyShard {
             )));
         }
 
+        tasks.push(Box::pin(
+            crate::channels::commands::clean_personal_access_tokens::clear_personal_access_tokens(
+                self.clone(),
+            ),
+        ));
+        // TOOD: Fixme, not always id 0 is the first shard.
+        if self.id == 0 {
+            tasks.push(Box::pin(
+                crate::channels::commands::print_sysinfo::print_sys_info(self.clone()),
+            ));
+        }
+
+        tasks.push(Box::pin(
+            crate::channels::commands::verify_heartbeats::verify_heartbeats(self.clone()),
+        ));
+        tasks.push(Box::pin(
+            crate::channels::commands::save_messages::save_messages(self.clone()),
+        ));
+
         let stop_receiver = self.get_stop_receiver();
         let shard_for_shutdown = self.clone();
 
@@ -300,7 +319,6 @@ impl IggyShard {
 
     async fn load_segments(&self) -> Result<(), IggyError> {
         use crate::bootstrap::load_segments;
-        use crate::shard::namespace::IggyNamespace;
         for shard_entry in self.shards_table.iter() {
             let (namespace, shard_info) = shard_entry.pair();
 
@@ -342,7 +360,7 @@ impl IggyShard {
                             &Identifier::numeric(stream_id as u32).unwrap(),
                             &Identifier::numeric(topic_id as u32).unwrap(),
                             partition_id,
-                            |(_,_,_ , offset,  .., mut log)| {
+                            |(_, _, _, offset, .., log)| {
                                 *log = loaded_log;
                                 let current_offset = log.active_segment().end_offset;
                                 offset.store(current_offset, Ordering::Relaxed);
@@ -990,6 +1008,20 @@ impl IggyShard {
 
     pub fn insert_shard_table_record(&self, ns: IggyNamespace, shard_info: ShardInfo) {
         self.shards_table.insert(ns, shard_info);
+    }
+
+    pub fn get_current_shard_namespaces(&self) -> Vec<IggyNamespace> {
+        self.shards_table
+            .iter()
+            .filter_map(|entry| {
+                let (ns, shard_info) = entry.pair();
+                if shard_info.id == self.id {
+                    Some(*ns)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     pub fn insert_shard_table_records(

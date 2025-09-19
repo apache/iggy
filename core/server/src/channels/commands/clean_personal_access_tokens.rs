@@ -16,77 +16,36 @@
  * under the License.
  */
 
-/*
-use crate::channels::server_command::BackgroundServerCommand;
-use crate::configs::server::PersonalAccessTokenCleanerConfig;
-use crate::streaming::systems::system::SharedSystem;
-use flume::Sender;
-use iggy_common::IggyDuration;
-use iggy_common::IggyTimestamp;
-use tokio::time;
-use tracing::{debug, error, info, instrument};
+use std::rc::Rc;
 
-pub struct PersonalAccessTokenCleaner {
-    enabled: bool,
-    interval: IggyDuration,
-    sender: Sender<CleanPersonalAccessTokensCommand>,
-}
+use crate::shard::IggyShard;
+use iggy_common::{IggyError, IggyTimestamp};
+use tracing::{debug, info, trace};
 
-#[derive(Debug, Default, Clone)]
-pub struct CleanPersonalAccessTokensCommand;
-
-#[derive(Debug, Default, Clone)]
-pub struct CleanPersonalAccessTokensExecutor;
-
-impl PersonalAccessTokenCleaner {
-    pub fn new(
-        config: &PersonalAccessTokenCleanerConfig,
-        sender: Sender<CleanPersonalAccessTokensCommand>,
-    ) -> Self {
-        Self {
-            enabled: config.enabled,
-            interval: config.interval,
-            sender,
-        }
+pub async fn clear_personal_access_tokens(shard: Rc<IggyShard>) -> Result<(), IggyError> {
+    let config = &shard.config.personal_access_token.cleaner;
+    if !config.enabled {
+        info!("Personal access token cleaner is disabled.");
+        return Ok(());
     }
 
-    pub fn start(&self) {
-        if !self.enabled {
-            info!("Personal access token cleaner is disabled.");
-            return;
-        }
+    info!(
+        "Personal access token cleaner is enabled, expired tokens will be deleted every: {}.",
+        config.interval
+    );
 
-        let interval = self.interval;
-        let sender = self.sender.clone();
-        info!(
-            "Personal access token cleaner is enabled, expired tokens will be deleted every: {interval}."
-        );
-        tokio::spawn(async move {
-            let mut interval_timer = time::interval(interval.get_duration());
-            loop {
-                interval_timer.tick().await;
-                sender
-                    .send(CleanPersonalAccessTokensCommand)
-                    .unwrap_or_else(|error| {
-                        error!(
-                            "Failed to send CleanPersonalAccessTokensCommand. Error: {}",
-                            error
-                        );
-                    });
-            }
-        });
-    }
-}
+    let interval = config.interval.get_duration();
+    let mut interval_timer = compio::time::interval(interval);
 
-impl BackgroundServerCommand<CleanPersonalAccessTokensCommand>
-    for CleanPersonalAccessTokensExecutor
-{
-    #[instrument(skip_all, name = "trace_clean_personal_access_tokens")]
-    async fn execute(&mut self, system: &SharedSystem, _command: CleanPersonalAccessTokensCommand) {
-        let system = system.read().await;
+    loop {
+        interval_timer.tick().await;
+        trace!("Cleaning expired personal access tokens...");
+
+        let users = shard.users.borrow();
         let now = IggyTimestamp::now();
         let mut deleted_tokens_count = 0;
-        for (_, user) in system.users.iter() {
+
+        for (_, user) in users.iter() {
             let expired_tokens = user
                 .personal_access_tokens
                 .iter()
@@ -96,45 +55,21 @@ impl BackgroundServerCommand<CleanPersonalAccessTokensCommand>
 
             for token in expired_tokens {
                 debug!(
-                    "Personal access token: {token} for user with ID: {} is expired.",
-                    user.id
+                    "Personal access token: {} for user with ID: {} is expired.",
+                    token, user.id
                 );
                 deleted_tokens_count += 1;
                 user.personal_access_tokens.remove(&token);
                 debug!(
-                    "Deleted personal access token: {token} for user with ID: {}.",
-                    user.id
+                    "Deleted personal access token: {} for user with ID: {}.",
+                    token, user.id
                 );
             }
         }
-        info!("Deleted {deleted_tokens_count} expired personal access tokens.");
-    }
 
-    fn start_command_sender(
-        &mut self,
-        _system: SharedSystem,
-        config: &crate::configs::server::ServerConfig,
-        sender: Sender<CleanPersonalAccessTokensCommand>,
-    ) {
-        let personal_access_token_cleaner =
-            PersonalAccessTokenCleaner::new(&config.personal_access_token.cleaner, sender);
-        personal_access_token_cleaner.start();
-    }
-
-    fn start_command_consumer(
-        mut self,
-        system: SharedSystem,
-        _config: &crate::configs::server::ServerConfig,
-        receiver: flume::Receiver<CleanPersonalAccessTokensCommand>,
-    ) {
-        tokio::spawn(async move {
-            let system = system.clone();
-            while let Ok(command) = receiver.recv_async().await {
-                self.execute(&system, command).await;
-            }
-            info!("Personal access token cleaner receiver stopped.");
-        });
+        info!(
+            "Deleted {} expired personal access tokens.",
+            deleted_tokens_count
+        );
     }
 }
-
-*/

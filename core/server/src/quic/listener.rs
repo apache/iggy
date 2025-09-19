@@ -118,12 +118,12 @@ async fn accept_stream(
     match connection.accept_bi().await {
         Err(compio_quic::ConnectionError::ApplicationClosed { .. }) => {
             info!("Connection closed");
-            shard.delete_client(client_id).await;
+            shard.delete_client(client_id);
             Ok(None)
         }
         Err(error) => {
             error!("Error when handling QUIC stream: {:?}", error);
-            shard.delete_client(client_id).await;
+            shard.delete_client(client_id);
             Err(error.into())
         }
         Ok(stream) => Ok(Some(stream)),

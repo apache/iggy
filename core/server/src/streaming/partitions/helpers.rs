@@ -295,7 +295,6 @@ pub async fn get_messages_by_offset(
     } else {
         0
     };
-    let actual_first_offset_journal = journal.get(|batches| batches.first_offset()).unwrap();
     let mut combined_batch_set = IggyMessagesBatchSet::empty();
 
     // Load messages from disk if needed
@@ -362,9 +361,6 @@ async fn load_messages_from_disk_by_offset(
     }
 
     let indexes_to_read = indexes_to_read.unwrap();
-    let first = indexes_to_read.get(0).unwrap();
-    let last = indexes_to_read.last().unwrap();
-
     let batch = storage
         .messages_reader
         .as_ref()
@@ -774,7 +770,6 @@ pub fn persist_batch(
                 )
             })?;
 
-        let indices = log.active_indexes().unwrap();
         let unsaved_indexes_slice = log.active_indexes().unwrap().unsaved_slice();
         let len = unsaved_indexes_slice.len();
         storage

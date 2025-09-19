@@ -214,18 +214,22 @@ impl MainOps for Streams {
 
         // Try committing the journal
         if is_full || unsaved_messages_count_exceeded || unsaved_messages_size_exceeded {
-            self.persist_messages(
-                shard_id,
+            let reason = self.with_partition_by_id(
                 stream_id,
                 topic_id,
                 partition_id,
-                unsaved_messages_count_exceeded,
-                unsaved_messages_size_exceeded,
-                journal_messages_count,
-                journal_size,
-                config,
-            )
-            .await?;
+                streaming_partitions::helpers::persist_reason(
+                    unsaved_messages_count_exceeded,
+                    unsaved_messages_size_exceeded,
+                    journal_messages_count,
+                    journal_size,
+                    config,
+                ),
+            );
+
+            let _batch_count = self
+                .persist_messages(shard_id, stream_id, topic_id, partition_id, reason, config)
+                .await?;
 
             if is_full {
                 self.handle_full_segment(shard_id, stream_id, topic_id, partition_id, config)
@@ -778,12 +782,16 @@ impl Streams {
         stream_id: &Identifier,
         topic_id: &Identifier,
         partition_id: usize,
-        unsaved_messages_count_exceeded: bool,
-        unsaved_messages_size_exceeded: bool,
-        journal_messages_count: u32,
-        journal_size: u32,
+        reason: String,
         config: &SystemConfig,
-    ) -> Result<(), IggyError> {
+    ) -> Result<u32, IggyError> {
+        let is_empty = self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
+            log.journal().is_empty()
+        });
+        if is_empty {
+            return Ok(0);
+        }
+
         let batches = self.with_partition_by_id_mut(
             stream_id,
             topic_id,
@@ -791,18 +799,6 @@ impl Streams {
             streaming_partitions::helpers::commit_journal(),
         );
 
-        let reason = self.with_partition_by_id(
-            stream_id,
-            topic_id,
-            partition_id,
-            streaming_partitions::helpers::persist_reason(
-                unsaved_messages_count_exceeded,
-                unsaved_messages_size_exceeded,
-                journal_messages_count,
-                journal_size,
-                config,
-            ),
-        );
         let (saved, batch_count) = self
             .with_partition_by_id_async(
                 stream_id,
@@ -830,6 +826,6 @@ impl Streams {
             ),
         );
 
-        Ok(())
+        Ok(batch_count)
     }
 }

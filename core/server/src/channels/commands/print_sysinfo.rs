@@ -16,63 +16,33 @@
  * under the License.
  */
 
-// TODO: Fixme
-/*
-use crate::{
-    channels::server_command::BackgroundServerCommand,
-    configs::server::ServerConfig,
-    streaming::{systems::system::SharedSystem, utils::memory_pool},
-};
-use flume::{Receiver, Sender};
+use std::rc::Rc;
+
+use crate::shard::IggyShard;
+use crate::streaming::utils::memory_pool;
 use human_repr::HumanCount;
-use iggy_common::IggyDuration;
-use tokio::time::{self};
-use tracing::{error, info, warn};
+use iggy_common::IggyError;
+use tracing::{error, info, trace};
 
-#[derive(Debug, Default, Clone)]
-pub struct SysInfoPrintCommand;
+pub async fn print_sys_info(shard: Rc<IggyShard>) -> Result<(), IggyError> {
+    let config = &shard.config.system.logging;
+    let interval = config.sysinfo_print_interval;
 
-pub struct SysInfoPrinter {
-    interval: IggyDuration,
-    sender: Sender<SysInfoPrintCommand>,
-}
-
-pub struct SysInfoPrintExecutor;
-
-impl SysInfoPrinter {
-    pub fn new(interval: IggyDuration, sender: Sender<SysInfoPrintCommand>) -> Self {
-        Self { interval, sender }
+    if interval.is_zero() {
+        info!("SysInfoPrinter is disabled.");
+        return Ok(());
     }
+    info!("SysInfoPrinter is enabled, system information will be printed every {interval}.");
+    let mut interval_timer = compio::time::interval(interval.get_duration());
+    loop {
+        interval_timer.tick().await;
+        trace!("Printing system information...");
 
-    pub fn start(&self) {
-        let interval = self.interval;
-        let sender = self.sender.clone();
-        if interval.is_zero() {
-            info!("SysInfoPrinter is disabled.");
-            return;
-        }
-
-        info!("SysInfoPrinter is enabled, system information will be printed every {interval}.");
-        tokio::spawn(async move {
-            let mut interval_timer = time::interval(interval.get_duration());
-            loop {
-                interval_timer.tick().await;
-                let command = SysInfoPrintCommand {};
-                sender.send(command).unwrap_or_else(|e| {
-                    error!("Failed to send SysInfoPrintCommand. Error: {e}");
-                });
-            }
-        });
-    }
-}
-
-impl BackgroundServerCommand<SysInfoPrintCommand> for SysInfoPrintExecutor {
-    async fn execute(&mut self, system: &SharedSystem, _command: SysInfoPrintCommand) {
-        let stats = match system.read().await.get_stats().await {
+        let stats = match shard.get_stats().await {
             Ok(stats) => stats,
             Err(e) => {
                 error!("Failed to get system information. Error: {e}");
-                return;
+                continue;
             }
         };
 
@@ -97,31 +67,4 @@ impl BackgroundServerCommand<SysInfoPrintCommand> for SysInfoPrintExecutor {
 
         memory_pool().log_stats();
     }
-
-    fn start_command_sender(
-        &mut self,
-        _system: SharedSystem,
-        config: &ServerConfig,
-        sender: Sender<SysInfoPrintCommand>,
-    ) {
-        let printer = SysInfoPrinter::new(config.system.logging.sysinfo_print_interval, sender);
-        printer.start();
-    }
-
-    fn start_command_consumer(
-        mut self,
-        system: SharedSystem,
-        _config: &ServerConfig,
-        receiver: Receiver<SysInfoPrintCommand>,
-    ) {
-        tokio::spawn(async move {
-            let system = system.clone();
-            while let Ok(command) = receiver.recv_async().await {
-                self.execute(&system, command).await;
-            }
-            warn!("Sysinfo printer stopped receiving commands.");
-        });
-    }
 }
-
-*/

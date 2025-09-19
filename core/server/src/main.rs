@@ -50,7 +50,9 @@ use server::server_error::{ConfigError, ServerError};
 use server::shard::namespace::IggyNamespace;
 use server::shard::system::info::SystemInfo;
 use server::shard::{IggyShard, ShardInfo, calculate_shard_assignment};
-use server::slab::traits_ext::{EntityComponentSystem, EntityComponentSystemMutCell, IntoComponents};
+use server::slab::traits_ext::{
+    EntityComponentSystem, EntityComponentSystemMutCell, IntoComponents,
+};
 use server::state::StateKind;
 use server::state::command::EntryCommand;
 use server::state::file::FileState;
@@ -270,7 +272,7 @@ async fn main() -> Result<(), ServerError> {
         ));
 
         // Ergh... I knew this will backfire to include `Log` as part of the `Partition` entity,
-        // We have to initialize with an default log with every partition, once we `Clone` the Streams / Topics / Partitions,
+        // We have to initialize with a default log for every partition, once we `Clone` the Streams / Topics / Partitions,
         // because `Clone` impl for `Partition` does not clone the actual log, just creates an empty one.
         streams.with_components(|components| {
             let (root, ..) = components.into_components();
@@ -356,7 +358,6 @@ async fn main() -> Result<(), ServerError> {
     #[cfg(not(feature = "disable-mimalloc"))]
     info!("Using mimalloc allocator");
 
-
     let system = SharedSystem::new(System::new(
         config.system.clone(),
         config.cluster.clone(),
@@ -365,28 +366,7 @@ async fn main() -> Result<(), ServerError> {
     ));
     */
 
-    // Workaround to ensure that the statistics are initialized before the server
-    // loads streams and starts accepting connections. This is necessary to
-    // have the correct statistics when the server starts.
-    //system.write().await.get_stats().await?;
-    //system.write().await.init().await?;
-
     /*
-    let _command_handler = BackgroundServerCommandHandler::new(system.clone(), &config)
-        .install_handler(SaveMessagesExecutor)
-        .install_handler(MaintainMessagesExecutor)
-        .install_handler(CleanPersonalAccessTokensExecutor)
-        .install_handler(SysInfoPrintExecutor)
-        .install_handler(VerifyHeartbeatsExecutor);
-
-    #[cfg(unix)]
-    let (mut ctrl_c, mut sigterm) = {
-        use tokio::signal::unix::{SignalKind, signal};
-        (
-            signal(SignalKind::interrupt())?,
-            signal(SignalKind::terminate())?,
-        )
-    };
 
     let mut current_config = config.clone();
 

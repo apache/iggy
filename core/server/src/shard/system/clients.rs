@@ -36,7 +36,7 @@ impl IggyShard {
         session
     }
 
-    pub async fn delete_client(&self, client_id: u32) {
+    pub fn delete_client(&self, client_id: u32) {
         let consumer_groups: Vec<(u32, u32, u32)>;
 
         {
