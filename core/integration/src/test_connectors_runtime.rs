@@ -40,8 +40,11 @@ pub struct TestConnectorsRuntime {
 }
 
 impl TestConnectorsRuntime {
-    pub fn with_iggy_address(iggy_tcp_server_address: &str) -> Self {
-        Self::new(iggy_tcp_server_address, None, None)
+    pub fn with_iggy_address(
+        iggy_tcp_server_address: &str,
+        envs: Option<HashMap<String, String>>,
+    ) -> Self {
+        Self::new(iggy_tcp_server_address, envs, None)
     }
 
     pub fn new(

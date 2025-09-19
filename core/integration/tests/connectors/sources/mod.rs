@@ -16,26 +16,4 @@
  * under the License.
  */
 
-use thiserror::Error;
-
-#[derive(Debug, Error)]
-pub enum McpRuntimeError {
-    #[error("Failed to create service")]
-    FailedToCreateService,
-    #[error("Missing configuration")]
-    MissingConfig,
-    #[error("Failed to start HTTP server")]
-    FailedToStartHttpServer,
-    #[error("Iggy client error")]
-    IggyClient(#[from] iggy::prelude::ClientError),
-    #[error("Iggy error")]
-    IggyError(#[from] iggy::prelude::IggyError),
-    #[error("Missing Iggy credentials")]
-    MissingIggyCredentials,
-    #[error("Failed to create Iggy consumer ID")]
-    FailedToCreateConsumerId,
-    #[error("Invalid API path")]
-    InvalidApiPath,
-    #[error("Configuration not found: {0}")]
-    ConfigurationNotFound(String),
-}
+mod postgres;

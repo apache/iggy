@@ -51,7 +51,22 @@ async fn main() -> Result<(), McpRuntimeError> {
         );
     }
 
-    let config_path = env::var("IGGY_MCP_CONFIG_PATH").unwrap_or_else(|_| "config".to_string());
+    let config_path = env::var("IGGY_MCP_CONFIG_PATH");
+    if let Ok(ref path) = config_path {
+        let config_with_extension = if path.contains('.') {
+            path.to_owned()
+        } else {
+            format!("{path}.toml")
+        };
+        eprintln!("Checking if config path exists: {config_with_extension}...");
+        if !std::fs::exists(&config_with_extension).unwrap_or_default() {
+            return Err(McpRuntimeError::ConfigurationNotFound(
+                config_with_extension,
+            ));
+        }
+    }
+
+    let config_path = config_path.unwrap_or_else(|_| "config".to_string());
     eprintln!("Configuration file path: {config_path}");
     let config: McpServerConfig = Config::builder()
         .add_source(Config::try_from(&McpServerConfig::default()).expect("Failed to init config"))
