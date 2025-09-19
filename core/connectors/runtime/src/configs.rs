@@ -42,7 +42,7 @@ pub enum ConfigFormat {
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RuntimeConfig {
-    pub http_api: HttpApiConfig,
+    pub http: HttpApiConfig,
     pub iggy: IggyConfig,
     pub sinks: HashMap<String, SinkConfig>,
     pub sources: HashMap<String, SourceConfig>,
@@ -109,9 +109,17 @@ pub struct SharedTransformConfig {
     pub enabled: bool,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateConfig {
     pub path: String,
+}
+
+impl Default for StateConfig {
+    fn default() -> Self {
+        Self {
+            path: "local_state".to_owned(),
+        }
+    }
 }
 
 impl Default for IggyConfig {

@@ -72,7 +72,7 @@ pub async fn init(config: &HttpApiConfig, context: Arc<RuntimeContext>) {
         let address = listener
             .local_addr()
             .expect("Failed to get local address for HTTP server");
-        info!("Started {NAME} on: {address}");
+        info!("Started {NAME} HTTP API on: {address}");
         spawn(async move {
             if let Err(error) = axum::serve(
                 listener,
@@ -80,7 +80,7 @@ pub async fn init(config: &HttpApiConfig, context: Arc<RuntimeContext>) {
             )
             .await
             {
-                error!("Failed to start {NAME} server, error: {error}");
+                error!("Failed to start {NAME} HTTP API, error: {error}");
             }
         });
         return;
@@ -104,7 +104,7 @@ pub async fn init(config: &HttpApiConfig, context: Arc<RuntimeContext>) {
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
         {
-            error!("Failed to start {NAME} server, error: {error}");
+            error!("Failed to start {NAME} HTTP API, error: {error}");
         }
     });
 }

@@ -169,7 +169,7 @@ async fn main() -> Result<(), RuntimeError> {
 
     let context = context::init(&config, &sink_wrappers, &source_wrappers);
     let context = Arc::new(context);
-    api::init(&config.http_api, context).await;
+    api::init(&config.http, context).await;
 
     source::handle(source_wrappers);
     sink::consume(sink_wrappers);

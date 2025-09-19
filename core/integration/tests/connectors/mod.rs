@@ -22,12 +22,11 @@ use integration::{
 };
 use serial_test::parallel;
 use std::collections::HashMap;
-use tokio::time::timeout;
 
 #[tokio::test]
 #[parallel]
 async fn connectors_runtime_should_start() {
-    let _ = timeout(std::time::Duration::from_secs(3), setup()).await;
+    setup().await;
 }
 
 async fn setup() -> ConnectorsInfra {
