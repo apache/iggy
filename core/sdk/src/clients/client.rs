@@ -63,6 +63,7 @@ impl IggyClient {
     }
 
     /// Creates a new `IggyClientBuilder` from the provided connection string.
+    /// Creates a new `IggyClientBuilder` from the provided connection string.
     pub fn builder_from_connection_string(
         connection_string: &str,
     ) -> Result<IggyClientBuilder, IggyError> {
@@ -79,6 +80,7 @@ impl IggyClient {
         }
     }
 
+    /// Creates a new `IggyClient` from the provided connection string.
     /// Creates a new `IggyClient` from the provided connection string.
     pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
         match ConnectionStringUtils::parse_protocol(connection_string)? {

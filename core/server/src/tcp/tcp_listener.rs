@@ -20,13 +20,12 @@ use crate::binary::sender::SenderKind;
 use crate::configs::tcp::TcpSocketConfig;
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
-use crate::streaming::clients::client_manager::Transport;
 use crate::tcp::connection_handler::{handle_connection, handle_error};
 use crate::{shard_error, shard_info};
 use compio::net::{TcpListener, TcpOpts};
 use error_set::ErrContext;
 use futures::FutureExt;
-use iggy_common::IggyError;
+use iggy_common::{IggyError, TransportProtocol};
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -167,7 +166,7 @@ async fn accept_loop(
                         }
                         let shard_clone = shard.clone();
                         shard_info!(shard.id, "Accepted new TCP connection: {}", address);
-                        let transport = Transport::Tcp;
+                        let transport = TransportProtocol::Tcp;
                         let session = shard_clone.add_client(&address, transport);
                         shard_info!(shard.id, "Added {} client with session: {} for IP address: {}", transport, session, address);
                         //TODO: Those can be shared with other shards.

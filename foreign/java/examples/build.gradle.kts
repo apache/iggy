@@ -1,4 +1,4 @@
-/*
+/**
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -17,20 +17,34 @@
  * under the License.
  */
 
-plugins {
-    id("java")
-}
 
+<<<<<<<< HEAD:foreign/java/examples/build.gradle.kts
 group = "org.apache.iggy"
 version = "0.5.0-SNAPSHOT"
+========
+import { Client } from '../index.js';
+import { getIggyAddress } from '../tcp.sm.utils.js';
+>>>>>>>> master:foreign/node/src/examples/utils.ts
 
-repositories {
-    mavenCentral()
-}
 
+<<<<<<<< HEAD:foreign/java/examples/build.gradle.kts
 dependencies {
     implementation(project(":iggy"))
     implementation("org.slf4j:slf4j-api:2.0.9")
     runtimeOnly("ch.qos.logback:logback-classic:1.4.12")
     runtimeOnly("io.netty:netty-resolver-dns-native-macos:4.2.1.Final:osx-aarch_64")
 }
+========
+export const getClient = () => {
+  const [host, port] = getIggyAddress();
+  const credentials = { username: 'iggy', password: 'iggy' };
+
+  const opt = {
+    transport: 'TCP' as const,
+    options: { host, port },
+    credentials
+  };
+
+  return new Client(opt);
+};
+>>>>>>>> master:foreign/node/src/examples/utils.ts

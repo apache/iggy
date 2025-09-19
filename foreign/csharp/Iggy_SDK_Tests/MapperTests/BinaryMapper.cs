@@ -50,6 +50,7 @@ public sealed class BinaryMapper
         Assert.Equal(name, response[0].Name);
         Assert.Equal(assertExpiry, response[0].ExpiryAt);
     }
+
     [Fact]
     public void MapOffsets_ReturnsValidOffsetResponse()
     {

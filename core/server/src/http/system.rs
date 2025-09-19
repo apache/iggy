@@ -35,8 +35,7 @@ use error_set::ErrContext;
 use iggy_common::Stats;
 use iggy_common::Validatable;
 use iggy_common::get_snapshot::GetSnapshot;
-use iggy_common::locking::IggyRwLockFn;
-use iggy_common::{ClientInfo, ClientInfoDetails};
+use iggy_common::{ClientInfo, ClientInfoDetails, ClusterMetadata};
 use send_wrapper::SendWrapper;
 use std::sync::Arc;
 
@@ -48,6 +47,7 @@ pub fn router(state: Arc<AppState>, metrics_config: &HttpMetricsConfig) -> Route
         .route("/", get(|| async { NAME }))
         .route("/ping", get(|| async { PONG }))
         .route("/stats", get(get_stats))
+        .route("/cluster/metadata", get(get_cluster_metadata))
         .route("/clients", get(get_clients))
         .route("/clients/{client_id}", get(get_client))
         .route("/snapshot", post(get_snapshot));
@@ -73,7 +73,25 @@ async fn get_stats(State(state): State<Arc<AppState>>) -> Result<Json<Stats>, Cu
     Ok(Json(stats))
 }
 
-#[debug_handler]
+async fn get_cluster_metadata(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<Identity>,
+) -> Result<Json<ClusterMetadata>, CustomError> {
+    todo!();
+    /*
+    let shard = state.shard.shard();
+    let cluster_metadata = shard
+        .get_cluster_metadata(&Session::stateless(identity.user_id, identity.ip_address))
+        .with_error_context(|error| {
+            format!(
+                "{COMPONENT} (error: {error}) - failed to get cluster metadata, user ID: {}",
+                identity.user_id
+            )
+        })?;
+    Ok(Json(cluster_metadata))
+    */
+}
+
 async fn get_client(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<Identity>,

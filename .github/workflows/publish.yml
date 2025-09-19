@@ -451,6 +451,7 @@ jobs:
     with:
       upload_artifacts: true
       use_latest_ci: ${{ inputs.use_latest_ci }}
+      commit: ${{ needs.validate.outputs.commit }}
 
   # Sequential Rust crate publishing to handle dependencies properly
   publish-rust-crates:

@@ -15,12 +15,17 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
+<<<<<<<< HEAD:foreign/csharp/Iggy_SDK.Tests.BDD/Context/TestContext.cs
 using Apache.Iggy.Contracts;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
+========
+using Apache.Iggy.Enums;
+>>>>>>>> master:foreign/csharp/Iggy_SDK.Tests.Integration/Helpers/NameIdHelpers.cs
 
 namespace Apache.Iggy.Tests.BDD.Context;
 
+<<<<<<<< HEAD:foreign/csharp/Iggy_SDK.Tests.BDD/Context/TestContext.cs
 public class TestContext
 {
     public IIggyClient IggyClient { get; set; } = null!;
@@ -30,3 +35,17 @@ public class TestContext
     public List<MessageResponse> PolledMessages { get; set; } = new();
     public Message? LastSendMessage { get; set; }
 }
+========
+public static class ProtocolHelpers
+{
+    public static string GetWithProtocol(this string name, Protocol protocol)
+    {
+        return $"{name}_{protocol.ToString().ToLowerInvariant()}";
+    }
+
+    public static uint GetWithProtocol(this uint id, Protocol protocol)
+    {
+        return id + (uint)protocol * 10;
+    }
+}
+>>>>>>>> master:foreign/csharp/Iggy_SDK.Tests.Integration/Helpers/NameIdHelpers.cs

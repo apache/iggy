@@ -18,10 +18,16 @@
  */
 
 
+<<<<<<<< HEAD:foreign/node/src/examples/utils.ts
 import { Client } from '../index.js';
 import { getIggyAddress } from '../tcp.sm.utils.js';
+========
+group = "org.apache.iggy"
+version = "0.5.0-SNAPSHOT"
+>>>>>>>> master:foreign/java/examples/build.gradle.kts
 
 
+<<<<<<<< HEAD:foreign/node/src/examples/utils.ts
 export const getClient = () => {
   const [host, port] = getIggyAddress();
   const credentials = { username: 'iggy', password: 'iggy' };
@@ -34,3 +40,11 @@ export const getClient = () => {
 
   return new Client(opt);
 };
+========
+dependencies {
+    implementation(project(":iggy"))
+    implementation("org.slf4j:slf4j-api:2.0.9")
+    runtimeOnly("ch.qos.logback:logback-classic:1.4.12")
+    runtimeOnly("io.netty:netty-resolver-dns-native-macos:4.2.1.Final:osx-aarch_64")
+}
+>>>>>>>> master:foreign/java/examples/build.gradle.kts

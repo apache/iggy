@@ -65,6 +65,8 @@ get_env_vars() {
     local bench_type="$1"
     local env_vars=()
 
+    env_vars+=("IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy")
+
     # Specific env vars based on bench type
     case "$bench_type" in
     *"no_cache_fsync"*)
@@ -196,7 +198,7 @@ for suite in "${SINGLE_SUITES[@]}"; do
         eval "$ENV_VARS target/release/iggy-server" &>/dev/null &
     else
         echo "target/release/iggy-server"
-        target/release/iggy-server &>/dev/null &
+        IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy target/release/iggy-server &>/dev/null &
     fi
     echo
     sleep 1

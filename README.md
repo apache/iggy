@@ -94,8 +94,6 @@ The official releases follow the regular semver (`0.5.0`) or have `latest` tag a
 
 We do also publish edge/dev/nightly releases (e.g. `0.5.0-edge.1` or `apache/iggy:edge`), for both, SDKs and the Docker images, which are typically compatible with the latest changes, but are not guaranteed to be stable, and as the name states, are not recommended for production use.
 
-You can also find the `edge` versions of SDKs that are compatible with the `edge` version of Iggy Server Docker Image, but should be used with caution as these are not based on the official release.
-
 ---
 
 ## Roadmap

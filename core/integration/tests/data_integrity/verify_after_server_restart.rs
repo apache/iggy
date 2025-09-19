@@ -18,12 +18,11 @@
 
 use iggy::clients::client::IggyClient;
 use iggy::prelude::{Identifier, IggyByteSize, MessageClient, SystemClient};
+use iggy_common::TransportProtocol;
 use integration::bench_utils::run_bench_and_wait_for_finish;
 use integration::{
     tcp_client::TcpClientFactory,
-    test_server::{
-        ClientFactory, IpAddrKind, SYSTEM_PATH_ENV_VAR, TestServer, Transport, login_root,
-    },
+    test_server::{ClientFactory, IpAddrKind, SYSTEM_PATH_ENV_VAR, TestServer, login_root},
 };
 use serial_test::parallel;
 use std::{collections::HashMap, str::FromStr};
@@ -73,7 +72,7 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
     let amount_of_data_to_process = IggyByteSize::from_str("5 MB").unwrap();
     run_bench_and_wait_for_finish(
         &server_addr,
-        &Transport::Tcp,
+        &TransportProtocol::Tcp,
         "pinned-producer",
         amount_of_data_to_process,
     );
@@ -81,7 +80,7 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
     // 3. Run poll bench to check if everything's OK
     run_bench_and_wait_for_finish(
         &server_addr,
-        &Transport::Tcp,
+        &TransportProtocol::Tcp,
         "pinned-consumer",
         amount_of_data_to_process,
     );
@@ -137,7 +136,7 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
     // 8. Run send bench again to add more data
     run_bench_and_wait_for_finish(
         &server_addr,
-        &Transport::Tcp,
+        &TransportProtocol::Tcp,
         "pinned-producer",
         amount_of_data_to_process,
     );
@@ -145,7 +144,7 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
     // 9. Run poll bench again to check if all data is still there
     run_bench_and_wait_for_finish(
         &server_addr,
-        &Transport::Tcp,
+        &TransportProtocol::Tcp,
         "pinned-consumer",
         IggyByteSize::from(amount_of_data_to_process.as_bytes_u64() * 2),
     );
@@ -210,7 +209,7 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
     // 13. Run poll bench to check if all data (10MB total) is still there
     run_bench_and_wait_for_finish(
         &server_addr,
-        &Transport::Tcp,
+        &TransportProtocol::Tcp,
         "pinned-consumer",
         IggyByteSize::from(amount_of_data_to_process.as_bytes_u64() * 2),
     );

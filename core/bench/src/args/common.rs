@@ -31,8 +31,7 @@ use bench_report::benchmark_kind::BenchmarkKind;
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
-use iggy::prelude::{IggyByteSize, IggyDuration};
-use integration::test_server::Transport;
+use iggy::prelude::{IggyByteSize, IggyDuration, TransportProtocol};
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -118,7 +117,7 @@ impl IggyBenchArgs {
         self.benchmark_kind.transport_command()
     }
 
-    pub fn transport(&self) -> &Transport {
+    pub fn transport(&self) -> &TransportProtocol {
         self.benchmark_kind.transport_command().transport()
     }
 

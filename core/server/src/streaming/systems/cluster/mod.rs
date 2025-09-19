@@ -18,19 +18,27 @@
 
 use crate::streaming::session::Session;
 use crate::streaming::systems::system::System;
+use iggy_common::ClusterMetadata;
+use iggy_common::ClusterNode;
+use iggy_common::ClusterNodeRole;
+use iggy_common::ClusterNodeStatus;
 use iggy_common::IggyError;
-use iggy_common::metadata::ClusterMetadata;
-use iggy_common::node::ClusterNode;
-use iggy_common::role::ClusterNodeRole;
-use iggy_common::status::ClusterNodeStatus;
 use tracing::trace;
 
 impl System {
     pub fn get_cluster_metadata(&self, session: &Session) -> Result<ClusterMetadata, IggyError> {
         trace!("Getting cluster metadata for session: {session}");
 
+        if !self.cluster_config.enabled {
+            return Err(IggyError::FeatureUnavailable);
+        }
+
         // TODO(hubcio): Clustering is not yet implemented
         // The leader/follower as well as node status are currently placeholder implementations.
+
+        let name = self.cluster_config.name.clone();
+        let id = self.cluster_config.id;
+        let transport = self.cluster_config.transport;
 
         let nodes: Vec<ClusterNode> = self
             .cluster_config
@@ -43,11 +51,7 @@ impl System {
                     ClusterNodeRole::Follower
                 };
 
-                let status = if self.cluster_config.enabled {
-                    ClusterNodeStatus::Healthy
-                } else {
-                    ClusterNodeStatus::Stopping
-                };
+                let status = ClusterNodeStatus::Healthy;
 
                 ClusterNode {
                     id: node_config.id,
@@ -60,9 +64,9 @@ impl System {
             .collect();
 
         Ok(ClusterMetadata {
-            name: self.cluster_config.name.clone(),
-            id: self.cluster_config.id,
-            transport: self.cluster_config.transport.clone(),
+            name,
+            id,
+            transport,
             nodes,
         })
     }

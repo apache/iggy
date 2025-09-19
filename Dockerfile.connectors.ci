@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+<<<<<<<< HEAD:Dockerfile.connectors.ci
 FROM alpine:latest
 
 ARG IGGY_CONNECTORS_PATH
@@ -30,3 +31,14 @@ RUN chmod +x ./iggy-connectors
 RUN ln -sf /iggy/iggy-connectors /usr/bin/iggy-connectors
 
 CMD ["/iggy/iggy-connectors"]
+========
+FROM mcr.microsoft.com/dotnet/sdk:8.0
+
+COPY ./foreign/csharp ./foreign/csharp
+COPY ./bdd/scenarios ./bdd/scenarios
+
+WORKDIR /foreign/csharp/Iggy_SDK.Tests.BDD
+RUN dotnet build -c Release
+
+CMD ["dotnet", "test"]
+>>>>>>>> master:bdd/csharp/Dockerfile

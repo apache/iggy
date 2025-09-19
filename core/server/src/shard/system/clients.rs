@@ -18,10 +18,10 @@
 
 use super::COMPONENT;
 use crate::shard::IggyShard;
-use crate::streaming::clients::client_manager::{Client, Transport};
+use crate::streaming::clients::client_manager::{Client};
 use crate::streaming::session::Session;
 use error_set::ErrContext;
-use iggy_common::Identifier;
+use iggy_common::{Identifier, TransportProtocol};
 use iggy_common::IggyError;
 use iggy_common::locking::IggyRwLockFn;
 use std::net::SocketAddr;
@@ -29,7 +29,7 @@ use std::rc::Rc;
 use tracing::{error, info};
 
 impl IggyShard {
-    pub fn add_client(&self, address: &SocketAddr, transport: Transport) -> Rc<Session> {
+    pub fn add_client(&self, address: &SocketAddr, transport: TransportProtocol) -> Rc<Session> {
         let mut client_manager = self.client_manager.borrow_mut();
         let session = client_manager.add_client(address, transport);
         self.metrics.increment_clients(1);

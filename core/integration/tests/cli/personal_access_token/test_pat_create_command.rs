@@ -153,7 +153,9 @@ Options:
   -s, --store-token
           Store token in an underlying platform-specific secure store
 {CLAP_INDENT}
-          Generated token is stored in a platform-specific secure storage without revealing its content to the user. It can be used to authenticate on iggy server using associated name and -n/--token-name command line option instead of -u/--username and -p/--password or -t/--token. In quiet mode only the token name is printed. This option can only be used for creating tokens which does not have expiry time set.
+          Generated token is stored in a platform-specific secure storage without revealing its content to the user. It can be used to authenticate on iggy server using associated name and
+          -n/--token-name command line option instead of -u/--username and -p/--password or -t/--token. In quiet mode only the token name is printed. This option can only be used for creating tokens
+          which does not have expiry time set.
 
   -h, --help
           Print help (see a summary with '-h')

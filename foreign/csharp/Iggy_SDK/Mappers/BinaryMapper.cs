@@ -30,6 +30,7 @@ namespace Apache.Iggy.Mappers;
 internal static class BinaryMapper
 {
     private const int PROPERTIES_SIZE = 56;
+
     internal static RawPersonalAccessToken MapRawPersonalAccessToken(ReadOnlySpan<byte> payload)
     {
         var tokenLength = payload[0];
@@ -314,7 +315,7 @@ internal static class BinaryMapper
         {
             ClientId = id,
             UserId = userId,
-            Transport = transport,
+            Transport = Enum.Parse<Protocol>(transport, true),
             Address = address,
             ConsumerGroupsCount = consumerGroupsCount
         }, readBytes);

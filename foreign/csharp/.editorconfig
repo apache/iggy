@@ -2,7 +2,7 @@
 charset = utf-8
 end_of_line = crlf
 trim_trailing_whitespace = false
-insert_final_newline = false
+insert_final_newline = true
 indent_style = space
 indent_size = 4
 
@@ -74,19 +74,19 @@ dotnet_naming_symbols.unity_serialized_field_symbols.applicable_kinds =
 dotnet_naming_symbols.unity_serialized_field_symbols.resharper_applicable_kinds = unity_serialised_field
 dotnet_naming_symbols.unity_serialized_field_symbols.resharper_required_modifiers = instance
 dotnet_naming_symbols.unity_serialized_field_symbols_1.applicable_accessibilities = *
-dotnet_naming_symbols.unity_serialized_field_symbols_1.applicable_kinds = 
+dotnet_naming_symbols.unity_serialized_field_symbols_1.applicable_kinds =
 dotnet_naming_symbols.unity_serialized_field_symbols_1.resharper_applicable_kinds = unity_serialised_field
 dotnet_naming_symbols.unity_serialized_field_symbols_1.resharper_required_modifiers = instance
 dotnet_naming_symbols.unity_serialized_field_symbols_2.applicable_accessibilities = *
-dotnet_naming_symbols.unity_serialized_field_symbols_2.applicable_kinds = 
+dotnet_naming_symbols.unity_serialized_field_symbols_2.applicable_kinds =
 dotnet_naming_symbols.unity_serialized_field_symbols_2.resharper_applicable_kinds = unity_serialised_field
 dotnet_naming_symbols.unity_serialized_field_symbols_2.resharper_required_modifiers = instance
 dotnet_naming_symbols.unity_serialized_field_symbols_3.applicable_accessibilities = *
-dotnet_naming_symbols.unity_serialized_field_symbols_3.applicable_kinds = 
+dotnet_naming_symbols.unity_serialized_field_symbols_3.applicable_kinds =
 dotnet_naming_symbols.unity_serialized_field_symbols_3.resharper_applicable_kinds = unity_serialised_field
 dotnet_naming_symbols.unity_serialized_field_symbols_3.resharper_required_modifiers = instance
 dotnet_naming_symbols.unity_serialized_field_symbols_4.applicable_accessibilities = *
-dotnet_naming_symbols.unity_serialized_field_symbols_4.applicable_kinds = 
+dotnet_naming_symbols.unity_serialized_field_symbols_4.applicable_kinds =
 dotnet_naming_symbols.unity_serialized_field_symbols_4.resharper_applicable_kinds = unity_serialised_field
 dotnet_naming_symbols.unity_serialized_field_symbols_4.resharper_required_modifiers = instance
 dotnet_style_parentheses_in_arithmetic_binary_operators = never_if_unnecessary:none
@@ -99,7 +99,6 @@ dotnet_style_qualification_for_field = false:suggestion
 dotnet_style_qualification_for_method = false:suggestion
 dotnet_style_qualification_for_property = false:suggestion
 dotnet_style_require_accessibility_modifiers = for_non_interface_members:suggestion
-file_header_template = // Licensed to the Apache Software Foundation (ASF) under one\n// or more contributor license agreements.  See the NOTICE file\n// distributed with this work for additional information\n// regarding copyright ownership.  The ASF licenses this file\n// to you under the Apache License, Version 2.0 (the\n// "License"); you may not use this file except in compliance\n// with the License.  You may obtain a copy of the License at\n//\n//   http://www.apache.org/licenses/LICENSE-2.0\n//\n// Unless required by applicable law or agreed to in writing,\n// software distributed under the License is distributed on an\n// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY\n// KIND, either express or implied.  See the License for the\n// specific language governing permissions and limitations\n// under the License. ; you may not use this file except in compliance\n// with the License.  You may obtain a copy of the License at\n//\n//   http://www.apache.org/licenses/LICENSE-2.0\n//\n// Unless required by applicable law or agreed to in writing,\n// software distributed under the License is distributed on an\n// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY\n// KIND, either express or implied.  See the License for the\n// specific language governing permissions and limitations\n// under the License. ; you may not use this file except in compliance\n// with the License.  You may obtain a copy of the License at\n//\n//   http://www.apache.org/licenses/LICENSE-2.0\n//\n// Unless required by applicable law or agreed to in writing,\n// software distributed under the License is distributed on an\n// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY\n// KIND, either express or implied.  See the License for the\n// specific language governing permissions and limitations\n// under the License. ; you may not use this file except in compliance\n// with the License.  You may obtain a copy of the License at\n//\n//   http://www.apache.org/licenses/LICENSE-2.0\n//\n// Unless required by applicable law or agreed to in writing,\n// software distributed under the License is distributed on an\n// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY\n// KIND, either express or implied.  See the License for the\n// specific language governing permissions and limitations\n// under the License. ; you may not use this file except in compliance\n// with the License.  You may obtain a copy of the License at\n//\n//   http://www.apache.org/licenses/LICENSE-2.0\n//\n// Unless required by applicable law or agreed to in writing,\n// software distributed under the License is distributed on an\n// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY\n// KIND, either express or implied.  See the License for the\n// specific language governing permissions and limitations\n// under the License. ; you may not use this file except in compliance\n// with the License.  You may obtain a copy of the License at\n//\n//   http://www.apache.org/licenses/LICENSE-2.0\n//\n// Unless required by applicable law or agreed to in writing,\n// software distributed under the License is distributed on an\n// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY\n// KIND, either express or implied.  See the License for the\n// specific language governing permissions and limitations\n// under the License. ; you may not use this file except in compliance\n// with the License.  You may obtain a copy of the License at\n//\n//   http://www.apache.org/licenses/LICENSE-2.0\n//\n// Unless required by applicable law or agreed to in writing,\n// software distributed under the License is distributed on an\n// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY\n// KIND, either express or implied.  See the License for the\n// specific language governing permissions and limitations\n// under the License. ; you may not use this file except in compliance\n// with the License.  You may obtain a copy of the License at\n//\n//   http://www.apache.org/licenses/LICENSE-2.0\n//\n// Unless required by applicable law or agreed to in writing,\n// software distributed under the License is distributed on an\n// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY\n// KIND, either express or implied.  See the License for the\n// specific language governing permissions and limitations\n// under the License.
 
 # ReSharper properties
 resharper_autodetect_indent_settings = true

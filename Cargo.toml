@@ -48,6 +48,7 @@ resolver = "2"
 aes-gcm = "0.10.3"
 ahash = { version = "0.8.12", features = ["serde"] }
 anyhow = "1.0.99"
+argon2 = "0.5.3"
 async-broadcast = "0.7.2"
 async-dropper = { version = "0.3.1", features = ["tokio", "simple"] }
 async-trait = "0.1.89"
@@ -62,7 +63,6 @@ async_zip = { version = "0.0.18", features = [
 axum = { version = "0.8.4", features = ["macros"] }
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
 base64 = "0.22.1"
-bcrypt = "0.17.1"
 bench-dashboard-frontend = { path = "core/bench/dashboard/frontend" }
 bench-dashboard-server = { path = "core/bench/dashboard/server" }
 bench-dashboard-shared = { path = "core/bench/dashboard/shared" }
@@ -70,7 +70,7 @@ bench-report = { path = "core/bench/report" }
 bench-runner = { path = "core/bench/runner" }
 bincode = { version = "2.0.1", features = ["serde"] }
 blake3 = "1.8.2"
-bon = "3.7.1"
+bon = "3.7.2"
 byte-unit = { version = "5.1.6", default-features = false, features = [
     "serde",
     "byte",
@@ -78,11 +78,11 @@ byte-unit = { version = "5.1.6", default-features = false, features = [
 ] }
 bytes = "1.10.1"
 charming = "0.6.0"
-chrono = { version = "0.4.41", features = ["serde"] }
-clap = { version = "4.5.46", features = ["derive"] }
+chrono = { version = "0.4.42", features = ["serde"] }
+clap = { version = "4.5.47", features = ["derive", "wrap_help"] }
 colored = "3.0.0"
-comfy-table = "7.2.0"
-config = { version = "0.15.15" }
+comfy-table = "7.2.1"
+config = { version = "0.15.16" }
 console-subscriber = "0.4.1"
 crc32fast = "1.5.0"
 crossbeam = "0.8.4"
@@ -101,7 +101,7 @@ async-channel = "2.3.1"
 futures = "0.3.31"
 futures-util = "0.3.31"
 human-repr = "1.1.0"
-humantime = "2.2.0"
+humantime = "2.3.0"
 iggy = { path = "core/sdk", version = "0.7.0" }
 iggy_binary_protocol = { path = "core/binary_protocol", version = "0.7.0" }
 iggy_common = { path = "core/common", version = "0.7.0" }
@@ -109,7 +109,7 @@ iggy_connector_sdk = { path = "core/connectors/sdk", version = "0.1.0" }
 integration = { path = "core/integration" }
 keyring = { version = "3.6.3", features = ["sync-secret-service", "vendored"] }
 lazy_static = "1.5.0"
-log = "0.4.27"
+log = "0.4.28"
 mimalloc = "0.1"
 mockall = "0.13.1"
 nonzero_lit = "0.1.2"
@@ -126,13 +126,13 @@ reqwest = { version = "0.12.23", default-features = false, features = [
 ] }
 reqwest-middleware = { version = "0.4.2", features = ["json"] }
 reqwest-retry = "0.7.0"
-rust-s3 = { version = "0.36.0-beta.2", default-features = false, features = [
+rust-s3 = { version = "0.37.0", default-features = false, features = [
     "tokio-rustls-tls",
     "tags",
 ] }
 rustls = { version = "0.23.31", features = ["ring"] }
-serde = { version = "1.0.219", features = ["derive", "rc"] }
-serde_json = "1.0.143"
+serde = { version = "1.0.225", features = ["derive", "rc"] }
+serde_json = "1.0.145"
 serde_with = { version = "3.14.0", features = ["base64", "macros"] }
 serde_yml = "0.0.12"
 serial_test = "3.2.0"
@@ -175,8 +175,8 @@ tracing-subscriber = { version = "0.3.20", default-features = false, features = 
     "ansi",
 ] }
 trait-variant = "0.1.2"
-twox-hash = { version = "2.1.1", features = ["xxhash32"] }
-uuid = { version = "1.18.0", features = [
+twox-hash = { version = "2.1.2", features = ["xxhash32"] }
+uuid = { version = "1.18.1", features = [
     "v4",
     "v7",
     "fast-rng",
@@ -184,7 +184,7 @@ uuid = { version = "1.18.0", features = [
     "zerocopy",
 ] }
 webpki-roots = "1.0.2"
-zip = "4.6.0"
+zip = "5.1.1"
 
 [profile.release]
 lto = true

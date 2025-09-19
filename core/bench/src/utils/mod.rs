@@ -22,7 +22,7 @@ use bench_report::{
     transport::BenchmarkTransport,
 };
 use iggy::prelude::*;
-use integration::test_server::{ClientFactory, Transport};
+use integration::test_server::ClientFactory;
 use std::{fs, path::Path, sync::Arc};
 use tracing::{error, info};
 
@@ -114,9 +114,9 @@ pub fn params_from_args_and_metrics(
 
     // Ugly conversion but let it stay here to have `bench-report` not depend on `iggy` or `integration`
     let transport = match args.transport() {
-        Transport::Tcp => BenchmarkTransport::Tcp,
-        Transport::Quic => BenchmarkTransport::Quic,
-        Transport::Http => BenchmarkTransport::Http,
+        TransportProtocol::Tcp => BenchmarkTransport::Tcp,
+        TransportProtocol::Quic => BenchmarkTransport::Quic,
+        TransportProtocol::Http => BenchmarkTransport::Http,
     };
     let server_address = args.server_address().to_string();
     let remark = args.remark();

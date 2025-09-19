@@ -632,7 +632,7 @@ impl IggyMessagesBatchMut {
         let indexes_count = self.indexes.count();
         let indexes_size = self.indexes.size();
 
-        if indexes_size % INDEX_SIZE as u32 != 0 {
+        if !indexes_size.is_multiple_of(INDEX_SIZE as u32) {
             error!(
                 "Indexes size {} is not a multiple of index size {}",
                 indexes_size, INDEX_SIZE

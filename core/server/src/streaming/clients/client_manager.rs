@@ -21,6 +21,7 @@ use crate::streaming::utils::hash;
 use ahash::AHashMap;
 use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
+use iggy_common::TransportProtocol;
 use iggy_common::UserId;
 use std::fmt::{Display, Formatter};
 use std::net::SocketAddr;
@@ -35,7 +36,7 @@ pub struct ClientManager {
 pub struct Client {
     pub user_id: Option<u32>,
     pub session: Rc<Session>,
-    pub transport: Transport,
+    pub transport: TransportProtocol,
     pub consumer_groups: Vec<ConsumerGroup>,
     pub last_heartbeat: IggyTimestamp,
 }
@@ -47,23 +48,8 @@ pub struct ConsumerGroup {
     pub group_id: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum Transport {
-    Tcp,
-    Quic,
-}
-
-impl Display for Transport {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Transport::Tcp => write!(f, "TCP"),
-            Transport::Quic => write!(f, "QUIC"),
-        }
-    }
-}
-
 impl ClientManager {
-    pub fn add_client(&mut self, address: &SocketAddr, transport: Transport) -> Rc<Session> {
+    pub fn add_client(&mut self, address: &SocketAddr, transport: TransportProtocol) -> Rc<Session> {
         let client_id = hash::calculate_32(address.to_string().as_bytes());
         let session = Rc::new(Session::from_client_id(client_id, *address));
         let client = Client {

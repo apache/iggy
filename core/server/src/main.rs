@@ -65,7 +65,7 @@ use server::streaming::utils::ptr::EternalPtr;
 use server::versioning::SemanticVersion;
 use server::{IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV, map_toggle_str, shard_info};
 use tokio::time::Instant;
-use tracing::{error, info, instrument};
+use tracing::{error, info, instrument, warn};
 
 const COMPONENT: &str = "MAIN";
 const SHARDS_TABLE_CAPACITY: usize = 16384;
@@ -128,6 +128,56 @@ async fn main() -> Result<(), ServerError> {
 
     // From this point on, we can use tracing macros to log messages.
     logging.late_init(config.system.get_system_path(), &config.system.logging)?;
+
+    if args.with_default_root_credentials {
+        let username_set = std::env::var("IGGY_ROOT_USERNAME").is_ok();
+        let password_set = std::env::var("IGGY_ROOT_PASSWORD").is_ok();
+
+        if !username_set || !password_set {
+            if !username_set {
+                unsafe {
+                    std::env::set_var("IGGY_ROOT_USERNAME", "iggy");
+                }
+            }
+            if !password_set {
+                unsafe {
+                    std::env::set_var("IGGY_ROOT_PASSWORD", "iggy");
+                }
+            }
+            info!(
+                "Using default root credentials (username: iggy, password: iggy) - FOR DEVELOPMENT ONLY!"
+            );
+        } else {
+            warn!(
+                "--with-default-root-credentials flag is ignored because root credentials are already set via environment variables"
+            );
+        }
+    }
+
+    if args.with_default_root_credentials {
+        let username_set = std::env::var("IGGY_ROOT_USERNAME").is_ok();
+        let password_set = std::env::var("IGGY_ROOT_PASSWORD").is_ok();
+
+        if !username_set || !password_set {
+            if !username_set {
+                unsafe {
+                    std::env::set_var("IGGY_ROOT_USERNAME", "iggy");
+                }
+            }
+            if !password_set {
+                unsafe {
+                    std::env::set_var("IGGY_ROOT_PASSWORD", "iggy");
+                }
+            }
+            info!(
+                "Using default root credentials (username: iggy, password: iggy) - FOR DEVELOPMENT ONLY!"
+            );
+        } else {
+            warn!(
+                "--with-default-root-credentials flag is ignored because root credentials are already set via environment variables"
+            );
+        }
+    }
 
     // FOURTH DISCRETE LOADING STEP.
     MemoryPool::init_pool(config.system.clone());
@@ -352,14 +402,13 @@ async fn main() -> Result<(), ServerError> {
 
     /*
     #[cfg(feature = "disable-mimalloc")]
-    tracing::warn!(
-        "Using default system allocator because code was build with `disable-mimalloc` feature"
-    );
+    warn!("Using default system allocator because code was build with `disable-mimalloc` feature");
     #[cfg(not(feature = "disable-mimalloc"))]
     info!("Using mimalloc allocator");
 
     let system = SharedSystem::new(System::new(
         config.system.clone(),
+        config.cluster.clone(),
         config.cluster.clone(),
         config.data_maintenance.clone(),
         config.personal_access_token.clone(),

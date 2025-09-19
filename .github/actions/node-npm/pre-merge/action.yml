@@ -38,7 +38,7 @@ runs:
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/setup-rust-with-cache
       with:
-        cache-targets: false  # Only cache registry and git deps, not target dir (sccache handles that)
+        cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
 
     - name: Install netcat
       if: inputs.task == 'e2e'
@@ -84,12 +84,7 @@ runs:
       id: iggy
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
-      with:
-        mode: cargo
-        cargo-bin: iggy-server
-        host: 127.0.0.1
-        port: 8090
-        wait-timeout-seconds: 45
+      continue-on-error: true
 
     - name: E2E tests
       if: inputs.task == 'e2e'

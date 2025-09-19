@@ -42,10 +42,10 @@ mimalloc = ["dep:mimalloc"]
 ahash = { workspace = true }
 arcshift = "0.4.0"
 anyhow = { workspace = true }
+argon2 = { workspace = true }
 async_zip = { workspace = true }
 axum = { workspace = true }
 axum-server = { workspace = true }
-bcrypt = { workspace = true }
 bincode = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
@@ -104,6 +104,7 @@ prometheus-client = "0.24.0"
 papaya = "0.2.3"
 ringbuffer = "0.16.0"
 quinn = { workspace = true }
+rand = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls-no-provider"] }
 ring = "0.17.14"
 rustls = { workspace = true }

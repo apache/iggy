@@ -20,17 +20,10 @@ use crate::cli::common::{IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpC
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
 use iggy::prelude::Client;
+use iggy_common::TransportProtocol;
 use integration::test_server::TestServer;
 use predicates::str::{contains, diff, starts_with};
 use serial_test::parallel;
-use std::fmt::Display;
-
-#[derive(Debug, Default)]
-pub(super) enum Protocol {
-    #[default]
-    Tcp,
-    Quic,
-}
 
 #[derive(Debug, Default)]
 pub(super) enum Scenario {
@@ -41,32 +34,36 @@ pub(super) enum Scenario {
     FailureDueToSessionTimeout(String),
 }
 
-impl Protocol {
-    fn as_arg(&self) -> Vec<&str> {
-        match self {
-            Self::Tcp => vec!["--transport", "tcp"],
-            Self::Quic => vec!["--transport", "quic"],
-        }
-    }
+// Helper trait to add command-specific methods to TransportProtocol
+trait TransportProtocolExt {
+    fn as_arg(&self) -> Vec<&str>;
 }
 
-impl Display for Protocol {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl TransportProtocolExt for TransportProtocol {
+    fn as_arg(&self) -> Vec<&str> {
         match self {
-            Self::Tcp => write!(f, "TCP"),
-            Self::Quic => write!(f, "QUIC"),
+            TransportProtocol::Tcp => vec!["--transport", "tcp"],
+            TransportProtocol::Quic => vec!["--transport", "quic"],
+            // Note: HTTP is not supported for the 'me' command
+            TransportProtocol::Http => {
+                panic!("HTTP transport is not supported for the 'me' command")
+            }
         }
     }
 }
 
 #[derive(Debug, Default)]
 pub(super) struct TestMeCmd {
-    protocol: Protocol,
+    protocol: TransportProtocol,
     scenario: Scenario,
 }
 
 impl TestMeCmd {
-    pub(super) fn new(protocol: Protocol, scenario: Scenario) -> Self {
+    pub(super) fn new(protocol: TransportProtocol, scenario: Scenario) -> Self {
+        assert!(
+            protocol == TransportProtocol::Tcp || protocol == TransportProtocol::Quic,
+            "Only TCP and QUIC protocols are supported for the 'me' command"
+        );
         Self { protocol, scenario }
     }
 }
@@ -92,7 +89,10 @@ impl IggyCmdTestCase for TestMeCmd {
                 command_state
                     .success()
                     .stdout(starts_with("Executing me command\n"))
-                    .stdout(contains(format!("Transport | {}", self.protocol)));
+                    .stdout(contains(format!(
+                        "Transport | {}",
+                        self.protocol.as_str().to_uppercase()
+                    )));
             }
             Scenario::FailureWithoutCredentials => {
                 command_state
@@ -109,14 +109,17 @@ impl IggyCmdTestCase for TestMeCmd {
 
     fn protocol(&self, server: &TestServer) -> Vec<String> {
         match &self.protocol {
-            Protocol::Tcp => vec![
+            TransportProtocol::Tcp => vec![
                 "--tcp-server-address".into(),
                 server.get_raw_tcp_addr().unwrap(),
             ],
-            Protocol::Quic => vec![
+            TransportProtocol::Quic => vec![
                 "--quic-server-address".into(),
                 server.get_quic_udp_addr().unwrap(),
             ],
+            TransportProtocol::Http => {
+                panic!("HTTP transport is not supported for the 'me' command")
+            }
         }
     }
 }
@@ -138,7 +141,7 @@ pub async fn should_be_successful_using_transport_tcp() {
     iggy_cmd_test.setup().await;
     iggy_cmd_test
         .execute_test(TestMeCmd::new(
-            Protocol::Tcp,
+            TransportProtocol::Tcp,
             Scenario::SuccessWithCredentials,
         ))
         .await;
@@ -152,7 +155,7 @@ pub async fn should_be_successful_using_transport_quic() {
     iggy_cmd_test.setup().await;
     iggy_cmd_test
         .execute_test(TestMeCmd::new(
-            Protocol::Quic,
+            TransportProtocol::Quic,
             Scenario::SuccessWithCredentials,
         ))
         .await;
@@ -166,7 +169,7 @@ pub async fn should_be_unsuccessful_using_transport_tcp() {
     iggy_cmd_test.setup().await;
     iggy_cmd_test
         .execute_test(TestMeCmd::new(
-            Protocol::Tcp,
+            TransportProtocol::Tcp,
             Scenario::FailureWithoutCredentials,
         ))
         .await;

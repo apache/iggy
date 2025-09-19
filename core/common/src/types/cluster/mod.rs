@@ -16,7 +16,12 @@
  * under the License.
  */
 
-pub mod metadata;
-pub mod node;
-pub mod role;
-pub mod status;
+mod metadata;
+mod node;
+mod role;
+mod status;
+
+pub use metadata::ClusterMetadata;
+pub use node::ClusterNode;
+pub use role::ClusterNodeRole;
+pub use status::ClusterNodeStatus;

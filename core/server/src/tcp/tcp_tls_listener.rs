@@ -20,14 +20,13 @@ use crate::binary::sender::SenderKind;
 use crate::configs::tcp::TcpSocketConfig;
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
-use crate::streaming::clients::client_manager::Transport;
 use crate::tcp::connection_handler::{handle_connection, handle_error};
 use crate::{shard_error, shard_info, shard_warn};
 use compio::net::{TcpListener, TcpOpts};
 use compio_tls::TlsAcceptor;
 use error_set::ErrContext;
 use futures::FutureExt;
-use iggy_common::IggyError;
+use iggy_common::{IggyError, TransportProtocol};
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls_pemfile::{certs, private_key};
@@ -225,7 +224,7 @@ async fn accept_loop(
                                 Ok(tls_stream) => {
                                     // TLS handshake successful, now create session
                                     shard_info!(shard_clone.id, "TLS handshake successful, adding TCP client: {}", address);
-                                    let transport = Transport::Tcp;
+                                    let transport = TransportProtocol::Tcp;
                                     let session = shard_clone.add_client(&address, transport);
                                     shard_info!(shard_clone.id, "Added {} client with session: {} for IP address: {}", transport, session, address);
                                     //TODO: Those can be shared with other shards.

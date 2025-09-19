@@ -1,5 +1,4 @@
 use crate::streaming::{
-    clients::client_manager::Transport,
     partitions::partition2,
     personal_access_tokens::personal_access_token::PersonalAccessToken,
     polling_consumer::PollingConsumer,
@@ -10,7 +9,7 @@ use crate::streaming::{
     },
 };
 use iggy_common::{
-    CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, Permissions, UserStatus,
+    CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, Permissions, TransportProtocol, UserStatus
 };
 use std::net::SocketAddr;
 
@@ -131,7 +130,7 @@ pub enum ShardEvent {
     },
     NewSession {
         address: SocketAddr,
-        transport: Transport,
+        transport: TransportProtocol,
     },
     TcpBound {
         address: SocketAddr,

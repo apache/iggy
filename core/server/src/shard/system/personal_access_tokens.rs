@@ -182,7 +182,12 @@ impl IggyShard {
         }
 
         if personal_access_token.is_none() {
-            error!("Personal access token: {} does not exist.", token);
+            let redacted_token = if token.len() > 4 {
+                format!("{}****", &token[..4])
+            } else {
+                "****".to_string()
+            };
+            error!("Personal access token: {redacted_token} does not exist.");
             return Err(IggyError::ResourceNotFound(token.to_owned()));
         }
 

@@ -15,14 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using Apache.Iggy.Enums;
+
 namespace Apache.Iggy.Contracts;
 
 public sealed class ClientResponse
 {
     public required uint ClientId { get; init; }
     public required string Address { get; init; }
-    public required uint UserId { get; init; }
-    public required string Transport { get; init; }
+    public required uint? UserId { get; init; }
+    public required Protocol Transport { get; init; }
     public required int ConsumerGroupsCount { get; init; }
     public IEnumerable<ConsumerGroupInfo> ConsumerGroups { get; init; } = [];
 }

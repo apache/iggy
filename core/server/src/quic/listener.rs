@@ -23,12 +23,12 @@ use crate::binary::sender::SenderKind;
 use crate::server_error::ConnectionError;
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
-use crate::streaming::clients::client_manager::Transport;
 use crate::streaming::session::Session;
 use crate::{shard_debug, shard_info};
 use anyhow::anyhow;
 use compio_quic::{Connection, Endpoint, RecvStream, SendStream};
 use iggy_common::IggyError;
+use iggy_common::TransportProtocol;
 use tracing::{error, info, trace};
 
 const INITIAL_BYTES_LENGTH: usize = 4;
@@ -75,13 +75,15 @@ async fn handle_connection(
 ) -> Result<(), ConnectionError> {
     let address = connection.remote_address();
     info!("Client has connected: {address}");
+    let session = shard
+        .add_client(&address, TransportProtocol::Quic);
 
-    let session = shard.add_client(&address, Transport::Quic);
+    let session = shard.add_client(&address, TransportProtocol::Quic);
     let client_id = session.client_id;
     shard_debug!(
         shard.id,
         "Added {} client with session: {} for IP address: {}",
-        Transport::Quic,
+        TransportProtocol::Quic,
         session,
         address
     );
@@ -90,7 +92,7 @@ async fn handle_connection(
     shard.add_active_session(session.clone());
     let event = ShardEvent::NewSession {
         address,
-        transport: Transport::Quic,
+        transport: TransportProtocol::Quic,
     };
     let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
 

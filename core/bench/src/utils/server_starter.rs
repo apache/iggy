@@ -17,7 +17,8 @@
  */
 
 use crate::args::common::IggyBenchArgs;
-use integration::test_server::{IpAddrKind, SYSTEM_PATH_ENV_VAR, TestServer, Transport};
+use iggy::prelude::TransportProtocol;
+use integration::test_server::{IpAddrKind, SYSTEM_PATH_ENV_VAR, TestServer};
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::{collections::HashMap, time::Instant};
@@ -96,7 +97,7 @@ async fn evaluate_server_start_condition(args: &IggyBenchArgs) -> (bool, HashMap
         toml::from_str(include_str!("../../../configs/server.toml")).unwrap();
 
     match &args.transport() {
-        Transport::Http => {
+        TransportProtocol::Http => {
             let args_http_address = args.server_address().parse::<SocketAddr>().unwrap();
             let config_http_address = default_config.http.address.parse::<SocketAddr>().unwrap();
             let envs = HashMap::from([
@@ -113,7 +114,7 @@ async fn evaluate_server_start_condition(args: &IggyBenchArgs) -> (bool, HashMap
                 envs,
             )
         }
-        Transport::Tcp => {
+        TransportProtocol::Tcp => {
             let args_tcp_address = args.server_address().parse::<SocketAddr>().unwrap();
             let config_tcp_address = default_config.tcp.address.parse::<SocketAddr>().unwrap();
 
@@ -131,7 +132,7 @@ async fn evaluate_server_start_condition(args: &IggyBenchArgs) -> (bool, HashMap
                 envs,
             )
         }
-        Transport::Quic => {
+        TransportProtocol::Quic => {
             let args_quic_address = args.server_address().parse::<SocketAddr>().unwrap();
             let config_quic_address = default_config.quic.address.parse::<SocketAddr>().unwrap();
             let envs = HashMap::from([

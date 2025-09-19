@@ -149,6 +149,8 @@ impl IggyCmdTest {
         command.env("COLUMNS", "500");
         // Set server address for the command - it's randomized for each test
         command.args(test_case.protocol(&self.server));
+        // Set COLUMNS environment variable to 200 to avoid truncation of output
+        command.env("COLUMNS", "200");
 
         // Print used environment variables and command with all arguments.
         // By default, it will not be visible but once test is executed with
@@ -207,8 +209,8 @@ impl IggyCmdTest {
         let command_args = test_case.get_command();
         // Set environment variables for the command
         command.envs(command_args.get_env());
-        // Set a fixed terminal width for consistent help output formatting
-        command.env("COLUMNS", "500");
+        // Set COLUMNS environment variable to 200 to avoid truncation of output
+        command.env("COLUMNS", "200");
 
         // Print used environment variables and command with all arguments.
         // By default, it will not be visible but once test is executed with
