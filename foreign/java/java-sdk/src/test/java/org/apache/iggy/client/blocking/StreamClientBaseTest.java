@@ -39,6 +39,7 @@ public abstract class StreamClientBaseTest extends IntegrationTest {
     void shouldCreateAndDeleteStream() {
         // when
         streamsClient.createStream(Optional.of(42L), "test-stream");
+        trackStream(42L);
         var streamOptional = streamsClient.getStream(42L);
 
         // then
@@ -55,6 +56,7 @@ public abstract class StreamClientBaseTest extends IntegrationTest {
 
         // when
         streamsClient.deleteStream(42L);
+        createdStreamIds.remove(42L); // Remove from tracking since we deleted it
         streams = streamsClient.getStreams();
 
         // then
@@ -65,6 +67,7 @@ public abstract class StreamClientBaseTest extends IntegrationTest {
     void shouldUpdateStream() {
         // given
         streamsClient.createStream(Optional.of(42L), "test-stream");
+        trackStream(42L);
 
         // when
         streamsClient.updateStream(42L, "test-stream-new");

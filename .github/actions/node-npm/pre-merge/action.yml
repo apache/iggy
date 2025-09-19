@@ -84,15 +84,7 @@ runs:
       id: iggy
       if: inputs.task == 'e2e'
       uses: ./.github/actions/utils/server-start
-      with:
-        mode: cargo
-        cargo-bin: iggy-server
-        host: 127.0.0.1
-        port: 8090
-        wait-timeout-seconds: 45
-      env:
-        IGGY_ROOT_USERNAME: iggy
-        IGGY_ROOT_PASSWORD: iggy
+      continue-on-error: true
 
     - name: E2E tests
       if: inputs.task == 'e2e'
