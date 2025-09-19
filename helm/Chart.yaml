@@ -17,7 +17,7 @@
 
 ---
 apiVersion: v2
-name: iggy-server
+name: iggy
 description: A Helm chart for Iggy server
 type: application
 version: 0.1.1

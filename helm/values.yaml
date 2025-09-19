@@ -23,10 +23,16 @@
 replicaCount: 1
 
 image:
-  repository: apache/iggy
-  pullPolicy: IfNotPresent
-  # Overrides the image tag whose default is the chart appVersion.
-  tag: ""
+  server:
+    repository: apache/iggy
+    pullPolicy: IfNotPresent
+    # Overrides the image tag whose default is the chart appVersion.
+    tag: ""
+  ui:
+    repository: apache/iggy-web-ui
+    pullPolicy: IfNotPresent
+    # Overrides the image tag whose default is the chart appVersion.
+    tag: ""
 
 imagePullSecrets: []
 nameOverride: ""
@@ -136,33 +142,34 @@ server:
       usernameKey: username
       # -- Key in the secret to get the root password from
       passwordKey: password
+  # -- Add persistence volume claim configuration
+  persistence:
+    # -- Enable persistence using a PVC
+    enabled: false
+    # -- PVC annotations
+    annotations: { }
+    # -- Persistent Volume Storage Class
+    # If defined, storageClassName: <storageClass>
+    # If set to "-", storageClassName: "", which disables dynamic provisioning
+    # If undefined (the default) or set to null, no storageClassName spec is
+    #   set, choosing the default provisioner.  (gp2 on AWS, standard on
+    #   GKE, AWS & OpenStack)
+    storageClass: ""
 
-# -- Set up environmental variables to be added to the container
-env:
-  - name: RUST_LOG
-    value: info
+    # -- A manually managed Persistent Volume and Claim
+    # Requires persistence.enabled: true
+    # If defined, PVC must be created manually before volume will be bound
+    existingClaim: ""
 
-# -- Add persistence volume claim configuration
-persistence:
-  # -- Enable persistence using a PVC
-  enabled: false
-  # -- PVC annotations
-  annotations: {}
-  # -- Persistent Volume Storage Class
-  # If defined, storageClassName: <storageClass>
-  # If set to "-", storageClassName: "", which disables dynamic provisioning
-  # If undefined (the default) or set to null, no storageClassName spec is
-  #   set, choosing the default provisioner.  (gp2 on AWS, standard on
-  #   GKE, AWS & OpenStack)
-  storageClass: ""
+    # -- PVC Access mode
+    accessMode: ReadWriteOnce
+    # -- PVC claim size
+    size: 8Gi
+  # -- Set up environmental variables to be added to the container
+  env:
+    - name: RUST_LOG
+      value: info
+ui:
+  enabled: true
 
-  # -- A manually managed Persistent Volume and Claim
-  # Requires persistence.enabled: true
-  # If defined, PVC must be created manually before volume will be bound
-  existingClaim: ""
-
-  # -- PVC Access mode
-  accessMode: ReadWriteOnce
-  # -- PVC claim size
-  size: 8Gi
 
