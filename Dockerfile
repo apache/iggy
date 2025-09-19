@@ -15,7 +15,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM rust:1.89.0-alpine3.22 AS builder
+ARG RUST_VERSION=1.90
+ARG ALPINE_VERSION=3.22
+
+FROM rust:${RUST_VERSION}.0-alpine${ALPINE_VERSION} AS builder
 RUN apk add musl-dev
 WORKDIR /build
 COPY . /build

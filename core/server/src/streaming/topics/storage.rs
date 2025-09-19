@@ -29,7 +29,6 @@ use futures::future::join_all;
 use iggy_common::IggyError;
 use iggy_common::locking::IggySharedMut;
 use iggy_common::locking::IggySharedMutFn;
-use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs;
@@ -39,12 +38,6 @@ use tracing::{error, info, warn};
 
 #[derive(Debug)]
 pub struct FileTopicStorage;
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ConsumerGroupData {
-    id: u32,
-    name: String,
-}
 
 impl TopicStorage for FileTopicStorage {
     async fn load(&self, topic: &mut Topic, mut state: TopicState) -> Result<(), IggyError> {

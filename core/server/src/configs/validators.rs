@@ -139,7 +139,7 @@ impl Validatable<ConfigError> for PartitionConfig {
             return Err(ConfigError::InvalidConfiguration);
         }
 
-        if self.messages_required_to_save % 32 != 0 {
+        if !self.messages_required_to_save.is_multiple_of(32) {
             eprintln!(
                 "Configured system.partition.messages_required_to_save {} is not a multiple of 32",
                 self.messages_required_to_save
@@ -155,7 +155,11 @@ impl Validatable<ConfigError> for PartitionConfig {
             return Err(ConfigError::InvalidConfiguration);
         }
 
-        if self.size_of_messages_required_to_save.as_bytes_u64() % 512 != 0 {
+        if !self
+            .size_of_messages_required_to_save
+            .as_bytes_u64()
+            .is_multiple_of(512)
+        {
             eprintln!(
                 "Configured system.partition.size_of_messages_required_to_save {} is not a multiple of 512 B",
                 self.size_of_messages_required_to_save
@@ -178,7 +182,7 @@ impl Validatable<ConfigError> for SegmentConfig {
             return Err(ConfigError::InvalidConfiguration);
         }
 
-        if self.size.as_bytes_u64() % 512 != 0 {
+        if !self.size.as_bytes_u64().is_multiple_of(512) {
             eprintln!(
                 "Configured system.segment.size {} B is not a multiple of 512 B",
                 self.size.as_bytes_u64()
@@ -324,7 +328,7 @@ impl Validatable<ConfigError> for MemoryPoolConfig {
             return Err(ConfigError::InvalidConfiguration);
         }
 
-        if self.enabled && self.size.as_bytes_u64() % DEFAULT_PAGE_SIZE != 0 {
+        if self.enabled && !self.size.as_bytes_u64().is_multiple_of(DEFAULT_PAGE_SIZE) {
             error!(
                 "Configured system.memory_pool.size {} B is not a multiple of default page size {} B",
                 self.size.as_bytes_u64(),

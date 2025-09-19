@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-ARG RUST_VERSION=1.89
+ARG RUST_VERSION=1.90
 
 # Build stage
 FROM rust:${RUST_VERSION}-slim-trixie AS builder

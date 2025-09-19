@@ -27,6 +27,7 @@ use yew::prelude::*;
 use yew_hooks::use_size;
 
 #[derive(Properties, PartialEq)]
+#[allow(dead_code)]
 pub struct TrendChartProps {
     pub params_identifier: String,
     pub measurement_type: MeasurementType,
