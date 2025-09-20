@@ -327,7 +327,7 @@ class IggyClient:
         init_retries: typing.Optional[builtins.int] = None,
         init_retry_interval: typing.Optional[datetime.timedelta] = None,
         allow_replay: builtins.bool = False,
-    ) -> IggyConsumer:
+    ) -> collections.abc.Awaitable[IggyConsumer]:
         r"""
         Creates a new consumer group consumer.
 
@@ -387,6 +387,10 @@ class IggyConsumer:
 
         Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
         if the operation fails.
+        """
+    def iter(self) -> collections.abc.AsyncIterator[ReceiveMessage]:
+        r"""
+        Asynchronously iterate over `ReceiveMessage`s.
         """
     def consume_messages(
         self,
@@ -470,6 +474,10 @@ class ReceiveMessage:
 
         The length represents the length of the payload.
         """
+    def partition_id(self) -> builtins.int:
+        r"""
+        Retrieves the partition this message belongs to.
+        """
 
 class SendMessage:
     r"""
@@ -480,10 +488,10 @@ class SendMessage:
     """
     def __new__(cls, data: builtins.str | bytes) -> SendMessage:
         r"""
-        Constructs a new `SendMessage` instance from a string.
+        Constructs a new `SendMessage` instance from a string or bytes.
 
         This method allows for the creation of a `SendMessage` instance
-        directly from Python using the provided string data.
+        directly from Python using the provided string or bytes data.
         """
 
 class StreamDetails:
