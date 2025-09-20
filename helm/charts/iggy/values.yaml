@@ -36,7 +36,7 @@ server:
     port: 3000
 
   serviceMonitor:
-    # -- Enable this if you're using https://github.com/coreos/prometheus-operator
+    # -- Enable this if you're using [Prometheus Operator](https://github.com/coreos/prometheus-operator)
     enabled: true
     # -- Namespace to deploy the ServiceMonitor
     namespace: ""
