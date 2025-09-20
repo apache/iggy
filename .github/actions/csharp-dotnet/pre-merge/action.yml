@@ -47,36 +47,34 @@ runs:
 
     - name: Restore dependencies
       run: |
-        cd foreign/csharp
-        dotnet restore
+        dotnet restore foreign/csharp/Iggy_SDK.sln
+        dotnet restore examples/csharp/Iggy_SDK.Examples.sln
       shell: bash
 
     - name: Build
       run: |
-        cd foreign/csharp
-        dotnet build --no-restore
+        dotnet build foreign/csharp/Iggy_SDK.sln --no-restore
+        dotnet build examples/csharp/Iggy_SDK.Examples.sln --no-restore
       shell: bash
 
     - name: Lint (Code Analysis)
       if: inputs.task == 'lint'
       run: |
-        cd foreign/csharp
-
         # Run code analysis
-        dotnet build --no-restore /p:EnforceCodeStyleInBuild=true /p:TreatWarningsAsErrors=false
+        dotnet build foreign/csharp/Iggy_SDK.sln --no-restore /p:EnforceCodeStyleInBuild=true /p:TreatWarningsAsErrors=false
+        dotnet build examples/csharp/Iggy_SDK.Examples.sln --no-restore /p:EnforceCodeStyleInBuild=true /p:TreatWarningsAsErrors=false
 
         # TODO: make format check blocking (requires dotnet-format tool)
-        dotnet format --verify-no-changes --verbosity diagnostic || true
+        dotnet format examples/csharp/Iggy_SDK.Examples.sln --verify-no-changes --verbosity diagnostic || true
+        dotnet format foreign/csharp/Iggy_SDK.sln --verify-no-changes --verbosity diagnostic || true
 
       shell: bash
 
     - name: Test
       if: inputs.task == 'test'
       run: |
-        cd foreign/csharp
-
         # Run unit tests
-        dotnet test Iggy_SDK_Tests --no-build --verbosity normal
+        dotnet test foreign/csharp/Iggy_SDK_Tests --no-build --verbosity normal
 
       shell: bash
 
@@ -91,9 +89,7 @@ runs:
       env:
         IGGY_SERVER_HOST: 127.0.0.1
       run: |
-        cd foreign/csharp
-
-        dotnet test Iggy_SDK.Tests.Integration --no-build --verbosity normal
+        dotnet test foreign/csharp/Iggy_SDK.Tests.Integration --no-build --verbosity normal
       shell: bash
 
     - name: Stop Iggy server
@@ -106,10 +102,8 @@ runs:
     - name: Build Release
       if: inputs.task == 'build'
       run: |
-        cd foreign/csharp
-
         # Build in Release mode
-        dotnet build -c Release --no-restore
+        dotnet build foreign/csharp/Iggy_SDK.sln -c Release --no-restore
 
         # List build output
         echo "Build output:"
