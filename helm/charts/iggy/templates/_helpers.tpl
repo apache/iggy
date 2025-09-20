@@ -1,7 +1,7 @@
 {{/*
 Expand the name of the chart.
 */}}
-{{- define "iggy-server.name" -}}
+{{- define "iggy.name" -}}
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
@@ -10,7 +10,7 @@ Create a default fully qualified app name.
 We truncate at 63 chars because some Kubernetes name fields are limited to this (by the DNS naming spec).
 If release name contains chart name it will be used as a full name.
 */}}
-{{- define "iggy-server.fullname" -}}
+{{- define "iggy.fullname" -}}
 {{- if .Values.fullnameOverride }}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
 {{- else }}
@@ -26,16 +26,16 @@ If release name contains chart name it will be used as a full name.
 {{/*
 Create chart name and version as used by the chart label.
 */}}
-{{- define "iggy-server.chart" -}}
+{{- define "iggy.chart" -}}
 {{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
 {{/*
 Common labels
 */}}
-{{- define "iggy-server.labels" -}}
-helm.sh/chart: {{ include "iggy-server.chart" . }}
-{{ include "iggy-server.selectorLabels" . }}
+{{- define "iggy.labels" -}}
+helm.sh/chart: {{ include "iggy.chart" . }}
+{{ include "iggy.selectorLabels" . }}
 {{- if .Chart.AppVersion }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
@@ -50,17 +50,49 @@ app.kubernetes.io/part-of: iggy-server
 {{/*
 Selector labels
 */}}
-{{- define "iggy-server.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "iggy-server.name" . }}
+{{- define "iggy.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "iggy.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/*
+Create chart name and version as used by the chart label.
+*/}}
+{{- define "iggy-ui.chart" -}}
+{{- printf "%s-ui-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Common labels
+*/}}
+{{- define "iggy-ui.labels" -}}
+helm.sh/chart: {{ include "iggy-ui.chart" . }}
+{{ include "iggy-ui.selectorLabels" . }}
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/component: server
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/part-of: iggy-server
+{{- if .Values.additionalLabels }}
+{{ toYaml .Values.additionalLabels }}
+{{- end }}
+{{- end }}
+
+{{/*
+Selector labels
+*/}}
+{{- define "iggy-ui.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "iggy.name" . }}-ui
+app.kubernetes.io/instance: {{ .Release.Name }}-ui
 {{- end }}
 
 {{/*
 Create the name of the service account to use
 */}}
-{{- define "iggy-server.serviceAccountName" -}}
+{{- define "iggy.serviceAccountName" -}}
 {{- if .Values.serviceAccount.create }}
-{{- default (include "iggy-server.fullname" .) .Values.serviceAccount.name }}
+{{- default (include "iggy.fullname" .) .Values.serviceAccount.name }}
 {{- else }}
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}

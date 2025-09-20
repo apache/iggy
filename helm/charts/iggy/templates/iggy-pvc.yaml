@@ -15,16 +15,29 @@
 # specific language governing permissions and limitations
 # under the License.
 
----
-apiVersion: v2
-name: iggy-server
-description: A Helm chart for Iggy server
-type: application
-version: 0.1.0
-appVersion: "0.4.300"
-sources:
-  - https://github.com/apache/iggy
-keywords:
-  - iggy
-  - messages
-  - streaming
+{{- if and .Values.server.persistence.enabled (not .Values.server.persistence.existingClaim) }}
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  name: {{ template "iggy.fullname" . }}
+  labels:
+    {{- include "iggy.labels" . | nindent 8 }}
+  annotations:
+    helm.sh/resource-policy: keep
+  {{- with .Values.server.persistence.annotations }}
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  accessModes:
+    - {{ .Values.server.persistence.accessMode | quote }}
+  resources:
+    requests:
+      storage: {{ .Values.server.persistence.size | quote }}
+  {{- with .Values.server.persistence.storageClass }}
+  {{- if (eq "-" .) }}
+  storageClassName: ""
+  {{- else }}
+  storageClassName: "{{ . }}"
+  {{- end }}
+  {{- end }}
+{{- end }}
