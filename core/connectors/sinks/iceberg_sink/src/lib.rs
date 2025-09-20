@@ -199,7 +199,6 @@ impl Sink for IcebergSink {
         // Insert adequate props for initializing file IO, else fail to open
         self.props = match self.config.store_class {
             IcebergSinkStoreClass::s3 => self.get_props_s3()?,
-            IcebergSinkStoreClass::fs => HashMap::new(),
             _ => {
                 error!(
                     "Store class {} is not supported yet",
@@ -215,10 +214,13 @@ impl Sink for IcebergSink {
         };
 
         if self.config.dynamic_routing {
-            self.router = Some(Box::new(DynamicRouter::new(catalog)))
+            self.router = Some(Box::new(DynamicRouter::new(
+                catalog,
+                self.config.dynamic_route_field.clone(),
+            )))
         } else {
             self.router = Some(Box::new(
-                StaticRouter::new(catalog, &self.config.tables, false).await?,
+                StaticRouter::new(catalog, &self.config.tables, self.config.auto_create).await?,
             ));
         }
 
@@ -240,7 +242,10 @@ impl Sink for IcebergSink {
 
         match &self.router {
             Some(router) => router.route_data(messages_metadata, messages).await?,
-            None => return Err(Error::InvalidConfig),
+            None => {
+                error!("Iceberg connector has no router configured");
+                return Err(Error::InvalidConfig);
+            }
         };
 
         info!("Finished successfully");

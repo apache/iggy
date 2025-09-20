@@ -1,3 +1,22 @@
+/* Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -15,22 +34,225 @@ use iceberg::{
     writer::file_writer::location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
     Catalog,
 };
-use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload};
+use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload, Schema};
 use parquet::file::properties::WriterProperties;
+use simd_json::base::ValueAsObject;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{create_table, slice_user_table};
 
+async fn write_data<I, M>(
+    messages: I,
+    table: &Table,
+    catalog: &dyn Catalog,
+    messages_schema: Schema,
+) -> Result<(), Error>
+where
+    I: IntoIterator<Item = M>,
+    M: std::ops::Deref<Target = ConsumedMessage>,
+{
+    let location = DefaultLocationGenerator::new(table.metadata().clone()).map_err(|err| {
+        error!(
+            "Failed to get location on table: {}. Error: {}",
+            table.metadata().uuid(),
+            err
+        );
+        Error::InvalidConfig
+    })?;
+
+    let file_name_gen = DefaultFileNameGenerator::new(
+        Uuid::new_v4().to_string(),
+        None,
+        iceberg::spec::DataFileFormat::Parquet,
+    );
+
+    let parquet_writer_builder = ParquetWriterBuilder::new(
+        WriterProperties::default(),
+        table.metadata().current_schema().clone(),
+        table.file_io().clone(),
+        location,
+        file_name_gen,
+    );
+
+    let data_file_writer_builder = DataFileWriterBuilder::new(
+        parquet_writer_builder,
+        None,
+        table.metadata().default_partition_spec_id(),
+    );
+
+    let mut writer = data_file_writer_builder.build().await.map_err(|err| {
+        error!("Error while constructing data file writer: {}", err);
+        Error::InitError(err.to_string())
+    })?;
+
+    // Generic iteration works here:
+    let json_messages = messages
+        .into_iter()
+        .filter_map(|record| match &record.payload {
+            Payload::Json(record) => simd_json::to_string(&record).ok(),
+            _ => {
+                warn!("Unsupported payload format: {}", messages_schema);
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if json_messages.is_empty() {
+        error!(
+            "Could not serialize payload, expected JSON format, got {} instead",
+            messages_schema
+        );
+        return Err(Error::InvalidPayloadType);
+    }
+
+    let cursor = Cursor::new(json_messages);
+
+    let mut reader = ReaderBuilder::new(Arc::new(
+        schema_to_arrow_schema(&table.metadata().current_schema().clone()).map_err(|err| {
+            error!(
+                "Error while mapping records to Iceberg table with uuid: {}. Error {}",
+                table.metadata().uuid(),
+                err
+            );
+            Error::InvalidRecord
+        })?,
+    ))
+    .build(cursor)
+    .map_err(|err| {
+        error!(
+            "Error while building Iceberg reader from message payload: {}",
+            err
+        );
+        Error::InitError(err.to_string())
+    })?;
+
+    while let Some(batch) = reader.next() {
+        let batch_data = batch.map_err(|err| {
+            error!("Error while getting record batch: {}", err);
+            Error::InvalidRecord
+        })?;
+        writer.write(batch_data).await.map_err(|err| {
+            error!("Error while writing record batch: {}", err);
+            Error::InvalidRecord
+        })?;
+    }
+
+    let data_files = writer.close().await.map_err(|err| {
+        error!("Error while writing data records to Parquet file: {}", err);
+        Error::InvalidRecord
+    })?;
+
+    let table_commit = Transaction::new(&table);
+
+    let action = table_commit.fast_append().add_data_files(data_files);
+
+    let tx = action.apply(table_commit).map_err(|err| {
+        error!(
+            "Failed to apply transaction on table with UUID: {}, Error: {}",
+            table.metadata().uuid(),
+            err
+        );
+        Error::InvalidRecord
+    })?;
+
+    let _table = tx.commit(catalog).await.map_err(|err| {
+        error!(
+            "Failed to commit transaction on table with UUID: {}, Error: {}",
+            table.metadata().uuid(),
+            err
+        );
+        Error::InvalidRecord
+    })?;
+    Ok(())
+}
+
 #[derive(Debug)]
 pub(crate) struct DynamicRouter {
     catalog: Box<dyn Catalog>,
+    route_field: String,
+}
+
+struct DynamicWriter {
+    pub tables_to_write: HashMap<String, Table>,
+    pub table_to_message: HashMap<String, Vec<Arc<ConsumedMessage>>>,
+}
+
+impl DynamicWriter {
+    pub fn new() -> Self {
+        let tables_to_write = HashMap::new();
+        let table_to_message = HashMap::new();
+        Self {
+            tables_to_write,
+            table_to_message,
+        }
+    }
+
+    fn push_to_existing(&mut self, route_field_val: &str, message: &Arc<ConsumedMessage>) -> bool {
+        if let Some(message_vec) = self.table_to_message.get_mut(route_field_val) {
+            message_vec.push(Arc::clone(message));
+            true
+        } else {
+            false
+        }
+    }
+
+    // This will:
+    // - Check if the table declared on the route field exists in the iceberg catalog.
+    // - If it does, it will try to load it to memory and map the name with the Table object so
+    // that we can dynamically send messages to it's correct destination.
+    async fn ensure_table_exists(
+        &mut self,
+        route_field_val: &str,
+        catalog: &dyn Catalog,
+    ) -> Result<bool, Error> {
+        if !table_exists(route_field_val.to_string()).await? {
+            return Ok(false);
+        }
+
+        let sliced_table = slice_user_table(&route_field_val.to_string());
+        let table_ident = TableIdent::from_strs(sliced_table.clone()).map_err(|err| {
+            error!("Failed to load table from catalog: {}.", err);
+            Error::InitError(err.to_string())
+        })?;
+
+        let table = catalog.load_table(&table_ident).await.map_err(|err| {
+            error!("Failed to load table from catalog: {}", err);
+            Error::InitError(err.to_string())
+        })?;
+
+        self.tables_to_write
+            .insert(route_field_val.to_string(), table);
+
+        Ok(true)
+    }
 }
 
 impl DynamicRouter {
-    pub fn new(catalog: Box<dyn Catalog>) -> Self {
-        Self { catalog }
+    pub fn new(catalog: Box<dyn Catalog>, route_field: String) -> Self {
+        Self {
+            catalog,
+            route_field,
+        }
     }
+
+    fn extract_route_field(&self, message: &ConsumedMessage) -> Option<String> {
+        match &message.payload {
+            Payload::Json(payload) => payload
+                .as_object()
+                .and_then(|obj| obj.get(&self.route_field))
+                .map(|val| val.to_string()),
+            _ => {
+                warn!("Unsupported format for iceberg connector");
+                None
+            }
+        }
+    }
+}
+
+async fn table_exists(table: String) -> Result<bool, Error> {
+    Ok(true)
 }
 
 #[async_trait]
@@ -40,6 +262,47 @@ impl Router for DynamicRouter {
         messages_metadata: MessagesMetadata,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), crate::Error> {
+        let mut writer = DynamicWriter::new();
+        for message in messages {
+            let message = Arc::new(message);
+            let route_field_val = match self.extract_route_field(&message) {
+                Some(val) => val,
+                None => continue,
+            };
+
+            if writer.push_to_existing(&route_field_val, &message) {
+                continue;
+            }
+
+            let route_field_val_cloned = route_field_val.clone();
+
+            if writer
+                .ensure_table_exists(&route_field_val_cloned, self.catalog.as_ref())
+                .await?
+            {
+                if let Some(msgs) = writer.table_to_message.get_mut(&route_field_val_cloned) {
+                    msgs.push(message);
+                } else {
+                    let mut message_vec: Vec<Arc<ConsumedMessage>> = Vec::new();
+                    message_vec.push(message);
+                    writer
+                        .table_to_message
+                        .insert(route_field_val_cloned, message_vec);
+                }
+            }
+        }
+
+        for (table_name, table_obj) in &writer.tables_to_write {
+            let messages = writer.table_to_message.get(table_name).unwrap();
+            write_data(
+                messages.iter().map(|arc| Arc::clone(arc)),
+                table_obj,
+                self.catalog.as_ref(),
+                messages_metadata.schema,
+            )
+            .await?;
+        }
+
         Ok(())
     }
 }
@@ -95,125 +358,17 @@ impl Router for StaticRouter {
         messages_metadata: MessagesMetadata,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), crate::Error> {
-        for table in &self.tables {
-            let location =
-                DefaultLocationGenerator::new(table.metadata().clone()).map_err(|err| {
-                    error!(
-                        "Failed to get location on table: {}. Error: {}",
-                        table.metadata().uuid(),
-                        err
-                    );
-                    Error::InvalidConfig
-                })?;
-
-            let file_name_gen = DefaultFileNameGenerator::new(
-                Uuid::new_v4().to_string(),
-                None,
-                iceberg::spec::DataFileFormat::Parquet,
-            );
-
-            let parquet_writer_builder = ParquetWriterBuilder::new(
-                WriterProperties::default(),
-                table.metadata().current_schema().clone(),
-                table.file_io().clone(),
-                location,
-                file_name_gen,
-            );
-
-            let data_file_writer_builder = DataFileWriterBuilder::new(
-                parquet_writer_builder,
-                None,
-                table.metadata().default_partition_spec_id(),
-            );
-
-            let mut writer = data_file_writer_builder.build().await.map_err(|err| {
-                error!("Error while constructing data file writer: {}", err);
-                Error::InitError(err.to_string())
-            })?;
-
-            let json_messages = messages
-                .iter()
-                .filter_map(|record| match &record.payload {
-                    Payload::Json(record) => simd_json::to_string(&record).ok(),
-                    _ => {
-                        warn!("Unsupported payload format: {}", messages_metadata.schema);
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            if json_messages.is_empty() {
-                error!(
-                    "Could not serialize payload, expected JSON format, got {} instead",
-                    messages_metadata.schema
-                );
-                return Err(Error::InvalidPayloadType);
-            }
-
-            let cursor = Cursor::new(json_messages);
-
-            let mut reader = ReaderBuilder::new(Arc::new(
-                schema_to_arrow_schema(&table.metadata().current_schema().clone()).map_err(
-                    |err| {
-                        error!(
-                            "Error while mapping records to Iceberg table with uuid: {}. Error {}",
-                            table.metadata().uuid(),
-                            err
-                        );
-                        Error::InvalidRecord
-                    },
-                )?,
-            ))
-            .build(cursor)
-            .map_err(|err| {
-                error!(
-                    "Error while building Iceberg reader from message payload: {}",
-                    err
-                );
-                Error::InitError(err.to_string())
-            })?;
-
-            while let Some(batch) = reader.next() {
-                let batch_data = batch.map_err(|err| {
-                    error!("Error while getting record batch: {}", err);
-                    Error::InvalidRecord
-                })?;
-                writer.write(batch_data).await.map_err(|err| {
-                    error!("Error while writing record batch: {}", err);
-                    Error::InvalidRecord
-                })?;
-            }
-
-            let data_files = writer.close().await.map_err(|err| {
-                error!("Error while writing data records to Parquet file: {}", err);
-                Error::InvalidRecord
-            })?;
-
-            let table_commit = Transaction::new(&table);
-
-            let action = table_commit.fast_append().add_data_files(data_files);
-
-            let tx = action.apply(table_commit).map_err(|err| {
-                error!(
-                    "Failed to apply transaction on table with UUID: {}, Error: {}",
-                    table.metadata().uuid(),
-                    err
-                );
-                Error::InvalidRecord
-            })?;
-
-            let _table = tx.commit(self.catalog.as_ref()).await.map_err(|err| {
-                error!(
-                    "Failed to commit transaction on table with UUID: {}, Error: {}",
-                    table.metadata().uuid(),
-                    err
-                );
-                Error::InvalidRecord
-            })?;
-        }
-
         info!("Finished successfully");
+
+        for table in &self.tables {
+            write_data(
+                &messages,
+                table,
+                self.catalog.as_ref(),
+                messages_metadata.schema,
+            )
+            .await?;
+        }
 
         Ok(())
     }
