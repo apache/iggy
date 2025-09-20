@@ -168,6 +168,7 @@ components:
       - "ci-infrastructure"  # CI changes trigger full regression
     paths:
       - "foreign/csharp/**"
+      - "examples/csharp/**"
     tasks: ["lint", "test", "build", "e2e"]
 
   # Individual BDD tests per SDK - only run when specific SDK changes
@@ -230,12 +231,14 @@ components:
       - "rust-sdk"
       - "rust-server"
       - "sdk-go"
+      - "sdk-csharp"
       - "ci-infrastructure"  # CI changes trigger full regression
     paths:
       - "examples/**"
       - "scripts/run-rust-examples-from-readme.sh"
       - "scripts/run-go-examples-from-readme.sh"
-    tasks: ["examples-rust", "examples-go"]
+      - "scripts/run-csharp-examples-from-readme.sh"
+    tasks: ["examples-rust", "examples-go", "examples-csharp"]
 
   web-ui:
     paths:
