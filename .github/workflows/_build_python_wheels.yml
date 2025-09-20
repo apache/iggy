@@ -33,6 +33,11 @@ on:
         required: false
         default: true
         description: "Use latest CI configuration and scripts from master branch"
+      commit:
+        type: string
+        required: false
+        default: ""
+        description: "Specific commit to checkout for building wheels"
     outputs:
       artifact_name:
         description: "Name of the uploaded artifact containing wheels"
@@ -53,6 +58,8 @@ jobs:
           chmod +x /tmp/copy-latest-from-master.sh
 
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
 
       - name: Save and apply latest CI from master
         if: inputs.use_latest_ci
@@ -109,6 +116,8 @@ jobs:
           chmod +x /tmp/copy-latest-from-master.sh
 
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
 
       - name: Save and apply latest CI from master
         if: inputs.use_latest_ci
@@ -149,6 +158,8 @@ jobs:
           chmod +x /tmp/copy-latest-from-master.sh
 
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
 
       - name: Save and apply latest CI from master
         if: inputs.use_latest_ci
@@ -190,6 +201,8 @@ jobs:
           chmod +x /tmp/copy-latest-from-master.sh
 
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit }}
 
       - name: Save and apply latest CI from master
         if: inputs.use_latest_ci

@@ -46,7 +46,7 @@ crc32fast = { workspace = true }
 derive_more = { workspace = true }
 fast-async-mutex = { version = "0.6.7", optional = true }
 humantime = { workspace = true }
-rcgen = "0.14.3"
+rcgen = "0.14.4"
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -15,16 +15,26 @@
 # specific language governing permissions and limitations
 # under the License.
 
+{{- if .Values.server.serviceMonitor.enabled }}
 ---
-apiVersion: v2
-name: iggy-ui
-description: A Helm chart for Iggy UI
-type: application
-version: 0.1.0
-appVersion: "latest"
-sources:
-  - https://github.com/apache/iggy
-keywords:
-  - iggy
-  - messages
-  - streaming
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  labels:
+    {{- include "iggy.labels" . | nindent 4 }}
+    {{- if .Values.server.serviceMonitor.additionalLabels }}
+    {{ toYaml .Values.server.serviceMonitor.additionalLabels }}
+    {{- end }}
+  name: {{ template "iggy.fullname" .  }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  endpoints:
+  - path: {{ .Values.server.serviceMonitor.path }}
+    port: http
+  namespaceSelector:
+    matchNames:
+    - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      {{- include "iggy.selectorLabels" . | nindent 6 }}
+{{- end }}

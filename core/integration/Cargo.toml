@@ -46,9 +46,9 @@ libc = "0.2.175"
 log = { workspace = true }
 predicates = { workspace = true }
 rand = { workspace = true }
-rcgen = "0.14.3"
+rcgen = "0.14.4"
 reqwest = { workspace = true }
-rmcp = { version = "0.6.1", features = [
+rmcp = { version = "0.6.4", features = [
     "client",
     "reqwest",
     "transport-streamable-http-client",

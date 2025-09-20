@@ -190,6 +190,7 @@ impl TestMcpServer {
             client_info: Implementation {
                 name: "test-mcp-client".to_string(),
                 version: "1.0.0".to_string(),
+                ..Default::default()
             },
         };
         client_info

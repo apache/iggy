@@ -15,15 +15,16 @@
 # specific language governing permissions and limitations
 # under the License.
 
-{{- if .Values.serviceAccount.create -}}
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: {{ include "iggy-ui.serviceAccountName" . }}
-  labels:
-    {{- include "iggy-ui.labels" . | nindent 4 }}
-  {{- with .Values.serviceAccount.annotations }}
-  annotations:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
-{{- end }}
+---
+apiVersion: v2
+name: iggy
+description: A Helm chart for Apache Iggy server and web-ui
+type: application
+version: 0.2.0
+appVersion: "0.5.0"
+sources:
+  - https://github.com/apache/iggy
+keywords:
+  - iggy
+  - messages
+  - streaming

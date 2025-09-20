@@ -14,19 +14,46 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-
+{{ if .Values.server.enabled }}
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "iggy-ui.fullname" . }}
+  name: {{ include "iggy.fullname" . }}
   labels:
-    {{- include "iggy-ui.labels" . | nindent 4 }}
+    {{- include "iggy.labels" . | nindent 4 }}
 spec:
-  type: {{ .Values.service.type }}
+  type: {{ .Values.server.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.server.ports.http }}
+      targetPort: http
+      protocol: TCP
+    - name: quic
+      port: {{ .Values.server.ports.quic }}
+      targetPort: quic
+      protocol: TCP
+    - name: tcp
+      port: {{ .Values.server.ports.tcp }}
+      targetPort: tcp
+      protocol: TCP
+  selector:
+    {{- include "iggy.selectorLabels" . | nindent 4 }}
+{{- end }}
+{{ if .Values.ui.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "iggy.fullname" . }}-ui
+  labels:
+    {{ include "iggy-ui.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.ui.service.type }}
   ports:
     - name: http
       port: {{ .Values.ui.ports.http }}
       targetPort: http
       protocol: TCP
   selector:
-    {{- include "iggy-ui.selectorLabels" . | nindent 4 }}
+    {{ include "iggy-ui.selectorLabels" . | nindent 4 }}
+{{- end }}

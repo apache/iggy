@@ -23,14 +23,14 @@ apiVersion: autoscaling/v2beta2
 {{- end }}
 kind: HorizontalPodAutoscaler
 metadata:
-  name: {{ include "iggy-server.fullname" . }}
+  name: {{ include "iggy.fullname" . }}
   labels:
-    {{- include "iggy-server.labels" . | nindent 4 }}
+    {{- include "iggy.labels" . | nindent 4 }}
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: {{ include "iggy-server.fullname" . }}
+    name: {{ include "iggy.fullname" . }}
   minReplicas: {{ .Values.autoscaling.minReplicas }}
   maxReplicas: {{ .Values.autoscaling.maxReplicas }}
   metrics:

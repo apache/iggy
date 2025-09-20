@@ -38,7 +38,7 @@ runs:
       if: inputs.task == 'test' || inputs.task == 'e2e'
       uses: ./.github/actions/utils/setup-rust-with-cache
       with:
-        cache-targets: false  # Only cache registry and git deps, not target dir (sccache handles that)
+        cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
 
     - name: Install netcat
       if: inputs.task == 'e2e'
@@ -52,7 +52,6 @@ runs:
       shell: bash
 
     - name: Build
-      if: inputs.task == 'test' || inputs.task == 'build' || inputs.task == 'lint'
       run: |
         cd foreign/csharp
         dotnet build --no-restore
@@ -79,26 +78,21 @@ runs:
         # Run unit tests
         dotnet test Iggy_SDK_Tests --no-build --verbosity normal
 
-        # Run integration tests
-        dotnet test Iggy_SDK.Tests.Integration --no-build --verbosity normal
-
       shell: bash
 
-    # TODO(hubcio): currently, C# tests don't need server. They use testcontainers with 'edge' image.
-    # instead, they should use server-start/stop action to test the actual code from PR.
-    # - name: Start Iggy server
-    #   id: iggy
-    #   if: inputs.task == 'e2e'
-    #   uses: ./.github/actions/utils/server-start
-    #   with:
-    #     mode: cargo
-    #     cargo-bin: iggy-server
-    #     port: 8090
+    - name: Start Iggy server
+      id: iggy
+      if: inputs.task == 'e2e'
+      uses: ./.github/actions/utils/server-start
+      continue-on-error: true
 
     - name: Run integration tests
       if: inputs.task == 'e2e'
+      env:
+        IGGY_SERVER_HOST: 127.0.0.1
       run: |
         cd foreign/csharp
+
         dotnet test Iggy_SDK.Tests.Integration --no-build --verbosity normal
       shell: bash
 
