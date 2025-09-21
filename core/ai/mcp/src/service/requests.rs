@@ -32,8 +32,6 @@ pub struct GetStream {
 pub struct CreateStream {
     #[schemars(description = "stream name (required, must be unique)")]
     pub name: String,
-    #[schemars(description = "stream identifier (numeric, optional)")]
-    pub stream_id: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -87,9 +85,6 @@ pub struct CreateTopic {
 
     #[schemars(description = "replication factor (optional, must be greater than 0)")]
     pub replication_factor: Option<u8>,
-
-    #[schemars(description = "topic identifier (numeric, optional)")]
-    pub topic_id: Option<u32>,
 
     #[schemars(description = "message expiry (optional)")]
     pub message_expiry: Option<String>,
@@ -282,9 +277,6 @@ pub struct CreateConsumerGroup {
 
     #[schemars(description = "consumer group name (required, must be unique)")]
     pub name: String,
-
-    #[schemars(description = "consumer group identifier (optional, number)")]
-    pub group_id: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

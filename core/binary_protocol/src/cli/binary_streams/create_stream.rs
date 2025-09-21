@@ -28,7 +28,7 @@ pub struct CreateStreamCmd {
 }
 
 impl CreateStreamCmd {
-    pub fn new(_stream_id: Option<u32>, name: String) -> Self {
+    pub fn new(name: String) -> Self {
         Self {
             create_stream: CreateStream { name },
         }

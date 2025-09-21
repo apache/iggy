@@ -78,7 +78,6 @@ async fn init_system(client: &IggyClient) {
     let consumer_group_info = get_consumer_group(client).await;
 
     let client_info = client.get_me().await.unwrap();
-    assert_eq!(consumer_group_info.id, CONSUMER_GROUP_ID);
 
     assert_eq!(consumer_group_info.members_count, 1);
     assert_eq!(consumer_group_info.members.len(), 1);

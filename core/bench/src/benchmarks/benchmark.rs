@@ -106,7 +106,7 @@ pub trait Benchmarkable: Send {
             let stream_id: Identifier = stream_name.as_str().try_into()?;
             if streams.iter().all(|s| s.name != stream_name) {
                 info!("Creating the test stream '{}'", stream_name);
-                client.create_stream(&stream_name, None).await?;
+                client.create_stream(&stream_name).await?;
                 let topic_name = "topic-1".to_string();
                 let max_topic_size = self
                     .args()
@@ -124,7 +124,6 @@ pub trait Benchmarkable: Send {
                         &topic_name,
                         partitions_count,
                         CompressionAlgorithm::default(),
-                        None,
                         None,
                         IggyExpiry::NeverExpire,
                         max_topic_size,

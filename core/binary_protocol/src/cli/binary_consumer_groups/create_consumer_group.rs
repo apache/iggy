@@ -33,7 +33,6 @@ impl CreateConsumerGroupCmd {
         stream_id: Identifier,
         topic_id: Identifier,
         name: String,
-        _group_id: Option<u32>,
     ) -> Self {
         Self {
             create_consumer_group: CreateConsumerGroup {

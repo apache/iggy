@@ -84,15 +84,14 @@ pub async fn init_consumer_groups(
         let topic_id: Identifier = "topic-1".try_into()?;
         let consumer_group_name = format!("{CONSUMER_GROUP_NAME_PREFIX}-{consumer_group_id}");
         info!(
-            "Creating test consumer group: name={}, id={}, stream={}, topic={}",
-            consumer_group_name, consumer_group_id, stream_name, topic_id
+            "Creating test consumer group: name={},  stream={}, topic={}",
+            consumer_group_name, stream_name, topic_id
         );
         match client
             .create_consumer_group(
                 &stream_id,
                 &topic_id,
                 &consumer_group_name,
-                Some(consumer_group_id),
             )
             .await
         {

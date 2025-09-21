@@ -66,7 +66,7 @@ async fn join_consumer_group(client: &IggyClient) {
     client
         .join_consumer_group(
             &Identifier::named(STREAM_NAME).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
         )
         .await
@@ -77,7 +77,7 @@ async fn leave_consumer_group(client: &IggyClient) {
     client
         .leave_consumer_group(
             &Identifier::named(STREAM_NAME).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
         )
         .await
