@@ -17,6 +17,7 @@
 
 mod certificates;
 mod commands;
+mod configs;
 mod error;
 mod traits;
 mod types;
@@ -39,6 +40,8 @@ pub use commands::system::get_cluster_metadata::*;
 pub use commands::system::*;
 pub use commands::topics::*;
 pub use commands::users::*;
+// Configs
+pub use configs::*;
 // Traits
 pub use traits::bytes_serializable::BytesSerializable;
 pub use traits::partitioner::Partitioner;

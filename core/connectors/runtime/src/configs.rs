@@ -17,7 +17,13 @@
  */
 
 use crate::api::config::HttpApiConfig;
+use figment::{
+    Metadata, Profile, Provider,
+    providers::{Format, Toml},
+    value::Dict,
+};
 use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
+use iggy_common::{CustomEnvProvider, FileConfigProvider};
 use iggy_connector_sdk::{Schema, transforms::TransformType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -42,7 +48,7 @@ pub enum ConfigFormat {
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RuntimeConfig {
-    pub http: HttpApiConfig,
+    pub http_api: HttpApiConfig,
     pub iggy: IggyConfig,
     pub sinks: HashMap<String, SinkConfig>,
     pub sources: HashMap<String, SourceConfig>,
@@ -114,6 +120,20 @@ pub struct StateConfig {
     pub path: String,
 }
 
+impl std::fmt::Display for RuntimeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "RuntimeConfig {{ http: {:?}, iggy: {:?}, sinks: {:?}, sources: {:?}, state: {:?} }}",
+            self.http_api,
+            self.iggy,
+            self.sinks.keys(),
+            self.sources.keys(),
+            self.state
+        )
+    }
+}
+
 impl Default for StateConfig {
     fn default() -> Self {
         Self {
@@ -142,5 +162,37 @@ impl Default for HttpApiConfig {
             api_key: None,
             tls: None,
         }
+    }
+}
+
+impl RuntimeConfig {
+    pub fn config_provider(path: String) -> FileConfigProvider<ConnectorsEnvProvider> {
+        let default_config = Toml::string(include_str!("../../../connectors/runtime/config.toml"));
+        FileConfigProvider::new(path, default_config, ConnectorsEnvProvider::default())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ConnectorsEnvProvider {
+    provider: CustomEnvProvider<RuntimeConfig>,
+}
+
+impl Default for ConnectorsEnvProvider {
+    fn default() -> Self {
+        Self {
+            provider: CustomEnvProvider::new("IGGY_CONNECTORS_", &[]),
+        }
+    }
+}
+
+impl Provider for ConnectorsEnvProvider {
+    fn metadata(&self) -> Metadata {
+        Metadata::named("iggy-connectors-config")
+    }
+
+    fn data(&self) -> Result<figment::value::Map<Profile, Dict>, figment::Error> {
+        self.provider.deserialize().map_err(|_| {
+            figment::Error::from("Cannot deserialize environment variables for connectors config")
+        })
     }
 }

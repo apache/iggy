@@ -4043,9 +4043,11 @@ dependencies = [
  "dlopen2",
  "dotenvy",
  "figlet-rs",
+ "figment",
  "flume",
  "futures",
  "iggy",
+ "iggy_common",
  "iggy_connector_sdk",
  "mimalloc",
  "once_cell",
@@ -4120,6 +4122,7 @@ dependencies = [
  "crc32fast",
  "derive_more 2.0.1",
  "fast-async-mutex",
+ "figment",
  "humantime",
  "rcgen",
  "rustls",
@@ -4129,6 +4132,7 @@ dependencies = [
  "strum",
  "thiserror 2.0.16",
  "tokio",
+ "toml 0.9.6",
  "tracing",
 ]
 

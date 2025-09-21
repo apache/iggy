@@ -16,64 +16,92 @@
  * under the License.
  */
 
-use crate::IGGY_ROOT_PASSWORD_ENV;
-use crate::configs::server::ServerConfig;
-use crate::server_error::ConfigError;
 use figment::{
-    Error, Figment, Metadata, Profile, Provider,
-    providers::{Format, Toml},
+    Figment, Profile, Provider,
+    providers::{Data, Format, Toml},
     value::{Dict, Map as FigmentMap, Tag, Value as FigmentValue},
 };
-use std::{env, future::Future, path::Path};
+use serde::{Serialize, de::DeserializeOwned};
+use std::{env, fmt::Display, future::Future, marker::PhantomData, path::Path};
 use toml::{Value as TomlValue, map::Map};
 
-const DEFAULT_CONFIG_PROVIDER: &str = "file";
-const DEFAULT_CONFIG_PATH: &str = "configs/server.toml";
-const SECRET_KEYS: [&str; 6] = [
-    IGGY_ROOT_PASSWORD_ENV,
-    "IGGY_DATA_MAINTENANCE_ARCHIVER_S3_KEY_SECRET",
-    "IGGY_HTTP_JWT_ENCODING_SECRET",
-    "IGGY_HTTP_JWT_DECODING_SECRET",
-    "IGGY_TCP_TLS_PASSWORD",
-    "IGGY_SYSTEM_ENCRYPTION_KEY",
-];
-
-pub enum ConfigProviderKind {
-    File(FileConfigProvider),
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigurationError {
+    CannotLoadConfiguration,
 }
 
-impl ConfigProviderKind {
-    pub async fn load_config(&self) -> Result<ServerConfig, ConfigError> {
-        match self {
-            Self::File(p) => p.load_config().await,
+pub trait ConfigProvider<T: Serialize + DeserializeOwned + Default + Display> {
+    fn load_config(self) -> impl Future<Output = Result<T, ConfigurationError>>;
+}
+
+pub struct FileConfigProvider<T: Provider> {
+    path: String,
+    default_config: Data<Toml>,
+    env_provider: T,
+}
+
+impl<T: Provider> FileConfigProvider<T> {
+    pub fn new(path: String, default_config: Data<Toml>, env_provider: T) -> Self {
+        Self {
+            path,
+            default_config,
+            env_provider,
         }
     }
 }
 
-pub trait ConfigProvider {
-    fn load_config(&self) -> impl Future<Output = Result<ServerConfig, ConfigError>>;
-}
-
-#[derive(Debug)]
-pub struct FileConfigProvider {
-    path: String,
-}
-
-pub struct CustomEnvProvider {
+#[derive(Debug, Clone)]
+pub struct CustomEnvProvider<T: Serialize + DeserializeOwned + Default + Display> {
     prefix: String,
+    secret_keys: Vec<String>,
+    _data: PhantomData<T>,
 }
 
-impl FileConfigProvider {
-    pub fn new(path: String) -> Self {
-        Self { path }
-    }
-}
-
-impl CustomEnvProvider {
-    pub fn new(prefix: &str) -> Self {
+impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
+    pub fn new(prefix: &str, secret_keys: &[&str]) -> Self {
         Self {
             prefix: prefix.to_string(),
+            secret_keys: secret_keys.iter().map(|s| s.to_string()).collect(),
+            _data: PhantomData,
         }
+    }
+
+    pub fn deserialize(&self) -> Result<FigmentMap<Profile, Dict>, ConfigurationError> {
+        let default_config = toml::to_string(&T::default())
+            .expect("Cannot serialize default Config. Something's terribly wrong.");
+        let toml_value: TomlValue = toml::from_str(&default_config)
+            .expect("Cannot parse default Config. Something's terribly wrong.");
+        let mut source_dict = Dict::new();
+        if let TomlValue::Table(table) = toml_value {
+            Self::walk_toml_table_to_dict("", table, &mut source_dict);
+        }
+
+        let mut new_dict = Dict::new();
+        for (key, mut value) in env::vars() {
+            let env_key = key.to_uppercase();
+            if !env_key.starts_with(self.prefix.as_str()) {
+                continue;
+            }
+            let keys: Vec<String> = env_key[self.prefix.len()..]
+                .split('_')
+                .map(|k| k.to_lowercase())
+                .collect();
+            let env_var_value = Self::try_parse_value(&value);
+            if self.secret_keys.contains(&env_key) {
+                value = "******".to_string();
+            }
+
+            println!("{env_key} value changed to: {value} from environment variable");
+            Self::insert_overridden_values_from_env(
+                &source_dict,
+                &mut new_dict,
+                keys.clone(),
+                env_var_value.clone(),
+            );
+        }
+        let mut data = FigmentMap::new();
+        data.insert(Profile::default(), new_dict);
+        Ok(data)
     }
 
     fn walk_toml_table_to_dict(prefix: &str, table: Map<String, TomlValue>, dict: &mut Dict) {
@@ -316,63 +344,6 @@ impl CustomEnvProvider {
     }
 }
 
-impl Provider for CustomEnvProvider {
-    fn metadata(&self) -> Metadata {
-        Metadata::named("iggy-server config")
-    }
-
-    fn data(&self) -> Result<FigmentMap<Profile, Dict>, Error> {
-        let default_config = toml::to_string(&ServerConfig::default())
-            .expect("Cannot serialize default ServerConfig. Something's terribly wrong.");
-        let toml_value: TomlValue = toml::from_str(&default_config).unwrap();
-        let mut source_dict = Dict::new();
-        if let TomlValue::Table(table) = toml_value {
-            Self::walk_toml_table_to_dict("", table, &mut source_dict);
-        }
-
-        let mut new_dict = Dict::new();
-        for (key, mut value) in env::vars() {
-            let env_key = key.to_uppercase();
-            if !env_key.starts_with(self.prefix.as_str()) {
-                continue;
-            }
-            let keys: Vec<String> = env_key[self.prefix.len()..]
-                .split('_')
-                .map(|k| k.to_lowercase())
-                .collect();
-            let env_var_value = Self::try_parse_value(&value);
-            if SECRET_KEYS.contains(&env_key.as_str()) {
-                value = "******".to_string();
-            }
-
-            println!("{env_key} value changed to: {value} from environment variable");
-            Self::insert_overridden_values_from_env(
-                &source_dict,
-                &mut new_dict,
-                keys.clone(),
-                env_var_value.clone(),
-            );
-        }
-        let mut data = FigmentMap::new();
-        data.insert(Profile::default(), new_dict);
-
-        Ok(data)
-    }
-}
-
-pub fn resolve(config_provider_type: &str) -> Result<ConfigProviderKind, ConfigError> {
-    match config_provider_type {
-        DEFAULT_CONFIG_PROVIDER => {
-            let path =
-                env::var("IGGY_CONFIG_PATH").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
-            Ok(ConfigProviderKind::File(FileConfigProvider::new(path)))
-        }
-        _ => Err(ConfigError::InvalidConfigurationProvider {
-            provider_type: config_provider_type.to_string(),
-        }),
-    }
-}
-
 /// This does exactly the same as Figment does internally.
 fn file_exists<P: AsRef<Path>>(path: P) -> bool {
     let path = path.as_ref();
@@ -400,32 +371,31 @@ fn file_exists<P: AsRef<Path>>(path: P) -> bool {
     }
 }
 
-impl ConfigProvider for FileConfigProvider {
-    async fn load_config(&self) -> Result<ServerConfig, ConfigError> {
+impl<T: Serialize + DeserializeOwned + Default + Display, P: Provider + Clone> ConfigProvider<T>
+    for FileConfigProvider<P>
+{
+    async fn load_config(self) -> Result<T, ConfigurationError> {
         println!("Loading config from path: '{}'...", self.path);
 
-        // Include the default configuration from server.toml
-        let embedded_default_config = Toml::string(include_str!("../../../configs/server.toml"));
-
         // Start with the default configuration
-        let mut config_builder = Figment::new().merge(embedded_default_config);
+        let mut config_builder = Figment::new().merge(self.default_config);
 
-        // If the server.toml file exists, merge it into the configuration
+        // If the config file exists, merge it into the configuration
         if file_exists(&self.path) {
             println!("Found configuration file at path: '{}'.", self.path);
             config_builder = config_builder.merge(Toml::file(&self.path));
         } else {
             println!(
-                "Configuration file not found at path: '{}'. Using default configuration from embedded server.toml.",
+                "Configuration file not found at path: '{}'. Using default configuration from embedded config",
                 self.path
             );
         }
 
         // Merge environment variables into the configuration
-        config_builder = config_builder.merge(CustomEnvProvider::new("IGGY_"));
+        config_builder = config_builder.merge(self.env_provider);
 
         // Finally, attempt to extract the final configuration
-        let config_result: Result<ServerConfig, figment::Error> = config_builder.extract();
+        let config_result: Result<T, figment::Error> = config_builder.extract();
 
         match config_result {
             Ok(config) => {
@@ -435,7 +405,7 @@ impl ConfigProvider for FileConfigProvider {
             }
             Err(e) => {
                 println!("Failed to load config: {e}");
-                Err(ConfigError::CannotLoadConfiguration)
+                Err(ConfigurationError::CannotLoadConfiguration)
             }
         }
     }

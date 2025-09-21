@@ -16,11 +16,12 @@
  * under the License.
  */
 
-use crate::connectors::setup;
+use crate::connectors::setup_runtime;
 use iggy_binary_protocol::{StreamClient, TopicClient};
 use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize};
 use std::collections::HashMap;
 use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
+use tokio::time;
 
 #[tokio::test]
 async fn given_valid_configuration_postgres_sink_should_start() {
@@ -34,11 +35,16 @@ async fn given_valid_configuration_postgres_sink_should_start() {
         .expect("Failed to get Postgres port");
 
     let mut envs = HashMap::new();
+    let connection_string = format!("postgres://postgres:postgres@localhost:{host_port}");
     envs.insert(
         "IGGY_CONNECTORS_SINKS_POSTGRES_CONFIG_CONNECTION_STRING".to_owned(),
-        format!("postgres://postgres:postgres@localhost:{host_port}"),
+        connection_string,
     );
-    let mut infra = setup();
+    println!(
+        "Connection string: {}",
+        envs["IGGY_CONNECTORS_SINKS_POSTGRES_CONFIG_CONNECTION_STRING"]
+    );
+    let mut infra = setup_runtime();
     let client = infra.create_client().await;
     let stream_name = "test";
     let topic_name = "test";
@@ -61,6 +67,8 @@ async fn given_valid_configuration_postgres_sink_should_start() {
         .await
         .expect("Failed to create topic");
     infra
-        .start_connectors_runtime(Some("sinks/postgres/postgres.toml"), Some(envs))
+        .start_connectors_runtime(Some("postgres/postgres.toml"), Some(envs))
         .await;
+    time::sleep(std::time::Duration::from_secs(5)).await;
+    println!("Bye");
 }

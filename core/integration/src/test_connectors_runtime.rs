@@ -26,7 +26,11 @@ use std::process::{Child, Command};
 use std::time::Duration;
 use std::{collections::HashMap, net::TcpListener};
 use tokio::time::sleep;
+use uuid::Uuid;
 
+use crate::bench_utils::get_random_path;
+
+const LOCAL_STATE_PREFIX: &str = "local_state_";
 pub const CONSUMER_NAME: &str = "connectors";
 
 #[derive(Debug)]
@@ -67,6 +71,7 @@ impl TestConnectorsRuntime {
             "IGGY_CONNECTORS_IGGY_CONSUMER".to_string(),
             CONSUMER_NAME.to_string(),
         );
+        envs.insert("IGGY_CONNECTORS_STATE_PATH".to_string(), get_random_path());
         Self::create(envs, server_executable_path)
     }
 
@@ -85,7 +90,7 @@ impl TestConnectorsRuntime {
 
     pub fn start(&mut self) {
         self.envs
-            .entry("IGGY_CONNECTORS_HTTP_ADDRESS".to_string())
+            .entry("IGGY_CONNECTORS_HTTP_API_ADDRESS".to_string())
             .or_insert(self.server_address.to_string());
         let mut command = if let Some(server_executable_path) = &self.server_executable_path {
             Command::new(server_executable_path)
@@ -146,6 +151,10 @@ impl TestConnectorsRuntime {
         self.child_handle.as_ref().unwrap().id()
     }
 
+    pub fn get_random_path() -> String {
+        format!("{}{}", LOCAL_STATE_PREFIX, Uuid::now_v7().to_u128_le())
+    }
+
     fn get_http_api_address(&self) -> String {
         format!(
             "http://{}:{}",
@@ -157,7 +166,7 @@ impl TestConnectorsRuntime {
     pub async fn ensure_started(&self) {
         let http_api_address = self.get_http_api_address();
         let client = reqwest::Client::new();
-        let max_retries = 3000;
+        let max_retries = 1000;
         let mut retries = 0;
         while let Err(error) = client.get(&http_api_address).send().await {
             sleep(Duration::from_millis(20)).await;

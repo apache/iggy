@@ -40,7 +40,7 @@ pub fn init(
     RuntimeContext {
         sinks: SinkManager::new(map_sinks(config, sink_wrappers)),
         sources: SourceManager::new(map_sources(config, source_wrappers)),
-        api_key: config.http.api_key.clone(),
+        api_key: config.http_api.api_key.clone(),
     }
 }
 

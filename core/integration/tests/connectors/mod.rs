@@ -23,34 +23,25 @@ use integration::{
     test_connectors_runtime::TestConnectorsRuntime,
     test_server::{ClientFactory, IpAddrKind, TestServer},
 };
-use serial_test::parallel;
 use std::collections::HashMap;
 
-mod sinks;
-mod sources;
+mod postgres;
 
-#[tokio::test]
-#[parallel]
-async fn connectors_runtime_should_start() {
-    let mut infra = setup();
-    infra.start_connectors_runtime(None, None).await;
-}
-
-fn setup() -> ConnectorsInfra {
+fn setup_runtime() -> ConnectorsInfra {
     let mut iggy_envs = HashMap::new();
     iggy_envs.insert("IGGY_QUIC_ENABLED".to_owned(), "false".to_owned());
     let mut test_server = TestServer::new(Some(iggy_envs), true, None, IpAddrKind::V4);
     test_server.start();
     ConnectorsInfra {
         iggy_server: test_server,
-        connectors_runtim: None,
+        connectors_runtime: None,
     }
 }
 
 #[derive(Debug)]
 struct ConnectorsInfra {
     iggy_server: TestServer,
-    connectors_runtim: Option<TestConnectorsRuntime>,
+    connectors_runtime: Option<TestConnectorsRuntime>,
 }
 
 impl ConnectorsInfra {
@@ -59,7 +50,7 @@ impl ConnectorsInfra {
         config_path: Option<&str>,
         envs: Option<HashMap<String, String>>,
     ) {
-        if self.connectors_runtim.is_some() {
+        if self.connectors_runtime.is_some() {
             return;
         }
 
@@ -90,7 +81,7 @@ impl ConnectorsInfra {
             TestConnectorsRuntime::with_iggy_address(&iggy_server_address, all_envs);
         connectors_runtime.start();
         connectors_runtime.ensure_started().await;
-        self.connectors_runtim = Some(connectors_runtime);
+        self.connectors_runtime = Some(connectors_runtime);
     }
 
     pub async fn create_client(&self) -> IggyClient {

@@ -16,13 +16,13 @@
  * under the License.
  */
 
-use config::{Config, Environment, File};
 use configs::{ConfigFormat, RuntimeConfig};
 use dlopen2::wrapper::{Container, WrapperApi};
 use dotenvy::dotenv;
 use error::RuntimeError;
 use figlet_rs::FIGfont;
 use iggy::prelude::{Client, IggyConsumer, IggyProducer};
+use iggy_common::ConfigProvider;
 use iggy_connector_sdk::{
     StreamDecoder, StreamEncoder,
     sink::ConsumeCallback,
@@ -124,14 +124,10 @@ async fn main() -> Result<(), RuntimeError> {
     let config_path = config_path.unwrap_or_else(|_| "config".to_string());
     info!("Starting Iggy Connectors Runtime, loading configuration from: {config_path}...");
 
-    let config: RuntimeConfig = Config::builder()
-        .add_source(Config::try_from(&RuntimeConfig::default()).expect("Failed to init config"))
-        .add_source(File::with_name(&config_path).required(false))
-        .add_source(Environment::with_prefix("IGGY_CONNECTORS").separator("_"))
-        .build()
-        .expect("Failed to build runtime config")
-        .try_deserialize()
-        .expect("Failed to deserialize runtime config");
+    let config: RuntimeConfig = RuntimeConfig::config_provider(config_path)
+        .load_config()
+        .await
+        .expect("Failed to load configuration");
 
     std::fs::create_dir_all(&config.state.path).expect("Failed to create state directory");
 
@@ -182,7 +178,7 @@ async fn main() -> Result<(), RuntimeError> {
 
     let context = context::init(&config, &sink_wrappers, &source_wrappers);
     let context = Arc::new(context);
-    api::init(&config.http, context).await;
+    api::init(&config.http_api, context).await;
 
     source::handle(source_wrappers);
     sink::consume(sink_wrappers);
