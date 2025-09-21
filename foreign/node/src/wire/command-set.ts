@@ -70,6 +70,8 @@ import { deleteSegments } from './segment/delete-segments.command.js';
 import { getStats } from './system/get-stats.command.js';
 import { ping } from './system/ping.command.js';
 
+import { getClusterMetadata } from './cluster/get-cluster-metadata.command.js';
+
 import { getTokens } from './token/get-tokens.command.js';
 import { createToken } from './token/create-token.command.js';
 import { deleteToken } from './token/delete-token.command.js';
@@ -192,6 +194,13 @@ const systemAPI = (c: ClientProvider) => ({
 
 type SystemAPI = ReturnType<typeof systemAPI>;
 
+const clusterAPI = (c: ClientProvider) => ({
+  getClusterMetadata: getClusterMetadata(c)
+});
+
+type ClusterAPI = ReturnType<typeof clusterAPI>;
+
+
 export abstract class AbstractAPI {
   clientProvider: ClientProvider;
 
@@ -213,6 +222,7 @@ export abstract class CommandAPI extends AbstractAPI {
   offset: OffsetAPI = offsetAPI(this.clientProvider);
   message: MessageAPI = messageAPI(this.clientProvider);
   system: SystemAPI = systemAPI(this.clientProvider);
+  cluster: ClusterAPI = clusterAPI(this.clientProvider);
 
   constructor(c: ClientProvider) {
     super(c);

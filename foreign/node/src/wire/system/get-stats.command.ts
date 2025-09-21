@@ -18,7 +18,7 @@
  */
 
 
-import type { CommandResponse } from '../../client/client.type.js';
+import type { CommandResponse } from '../../client/index.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { wrapCommand } from '../command.utils.js';
 
