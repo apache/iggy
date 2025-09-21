@@ -17,8 +17,8 @@
  */
 
 use crate::server::scenarios::{
-    CONSUMER_GROUP_ID, CONSUMER_GROUP_NAME, MESSAGES_COUNT, PARTITIONS_COUNT, STREAM_ID,
-    STREAM_NAME, TOPIC_ID, TOPIC_NAME, cleanup, create_client, get_consumer_group,
+    CONSUMER_GROUP_NAME, MESSAGES_COUNT, PARTITIONS_COUNT, 
+    STREAM_NAME, TOPIC_NAME, cleanup, create_client, get_consumer_group,
     join_consumer_group,
 };
 use iggy::prelude::*;
@@ -58,7 +58,7 @@ async fn init_system(
     // 2. Create the topic
     system_client
         .create_topic(
-            &Identifier::numeric(STREAM_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
             PARTITIONS_COUNT,
             CompressionAlgorithm::default(),
@@ -73,8 +73,8 @@ async fn init_system(
     // 3. Create the consumer group
     system_client
         .create_consumer_group(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             CONSUMER_GROUP_NAME,
             Some(CONSUMER_GROUP_ID),
         )
@@ -117,8 +117,8 @@ async fn execute_using_messages_key_key(
         let mut messages = vec![message];
         system_client
             .send_messages(
-                &Identifier::numeric(STREAM_ID).unwrap(),
-                &Identifier::numeric(TOPIC_ID).unwrap(),
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
                 &Partitioning::messages_key_u32(entity_id),
                 &mut messages,
             )
@@ -141,8 +141,8 @@ async fn poll_messages(client: &IggyClient) -> u32 {
     for _ in 1..=PARTITIONS_COUNT * MESSAGES_COUNT {
         let polled_messages = client
             .poll_messages(
-                &Identifier::numeric(STREAM_ID).unwrap(),
-                &Identifier::numeric(TOPIC_ID).unwrap(),
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
                 None,
                 &consumer,
                 &PollingStrategy::next(),
@@ -181,8 +181,8 @@ async fn execute_using_none_key(
         let mut messages = vec![message];
         system_client
             .send_messages(
-                &Identifier::numeric(STREAM_ID).unwrap(),
-                &Identifier::numeric(TOPIC_ID).unwrap(),
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
                 &Partitioning::balanced(),
                 &mut messages,
             )
@@ -218,8 +218,8 @@ async fn validate_message_polling(client: &IggyClient, consumer_group: &Consumer
     for i in 1..=MESSAGES_COUNT {
         let polled_messages = client
             .poll_messages(
-                &Identifier::numeric(STREAM_ID).unwrap(),
-                &Identifier::numeric(TOPIC_ID).unwrap(),
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
                 None,
                 &consumer,
                 &PollingStrategy::next(),
@@ -242,8 +242,8 @@ async fn validate_message_polling(client: &IggyClient, consumer_group: &Consumer
 
     let polled_messages = client
         .poll_messages(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             None,
             &consumer,
             &PollingStrategy::next(),

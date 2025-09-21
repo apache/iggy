@@ -602,7 +602,7 @@ async fn seed_data(iggy_server_address: &str) {
         .expect("Failed to initialize Iggy client");
 
     iggy_client
-        .create_stream(STREAM_NAME, None)
+        .create_stream(STREAM_NAME)
         .await
         .expect("Failed to create stream");
 
@@ -612,7 +612,6 @@ async fn seed_data(iggy_server_address: &str) {
             TOPIC_NAME,
             1,
             iggy_common::CompressionAlgorithm::None,
-            None,
             None,
             IggyExpiry::ServerDefault,
             MaxTopicSize::ServerDefault,
@@ -646,7 +645,7 @@ async fn seed_data(iggy_server_address: &str) {
         .expect("Failed to store consumer offset");
 
     iggy_client
-        .create_consumer_group(&STREAM_ID, &TOPIC_ID, CONSUMER_GROUP_NAME, None)
+        .create_consumer_group(&STREAM_ID, &TOPIC_ID, CONSUMER_GROUP_NAME)
         .await
         .expect("Failed to create consumer group");
 

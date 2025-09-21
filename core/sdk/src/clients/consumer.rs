@@ -813,7 +813,7 @@ impl IggyConsumer {
         }
 
         let client = client.read().await;
-        let (name, id) = match consumer.id.kind {
+        let (name, _id) = match consumer.id.kind {
             IdKind::Numeric => (consumer_name.to_owned(), Some(consumer.id.get_u32_value()?)),
             IdKind::String => (consumer.id.get_string_value()?, None),
         };
@@ -839,7 +839,7 @@ impl IggyConsumer {
                 "Creating consumer group: {consumer_group_id} for topic: {topic_id}, stream: {stream_id}"
             );
             match client
-                .create_consumer_group(&stream_id, &topic_id, &name, id)
+                .create_consumer_group(&stream_id, &topic_id, &name)
                 .await
             {
                 Ok(_) => {}

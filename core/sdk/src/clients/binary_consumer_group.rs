@@ -56,12 +56,11 @@ impl ConsumerGroupClient for IggyClient {
         stream_id: &Identifier,
         topic_id: &Identifier,
         name: &str,
-        group_id: Option<u32>,
     ) -> Result<ConsumerGroupDetails, IggyError> {
         self.client
             .read()
             .await
-            .create_consumer_group(stream_id, topic_id, name, group_id)
+            .create_consumer_group(stream_id, topic_id, name)
             .await
     }
 

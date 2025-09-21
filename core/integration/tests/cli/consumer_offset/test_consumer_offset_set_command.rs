@@ -98,7 +98,7 @@ impl TestConsumerOffsetSetCmd {
 impl IggyCmdTestCase for TestConsumerOffsetSetCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
         let stream = client
-            .create_stream(&self.stream_name, Some(self.stream_id))
+            .create_stream(&self.stream_name)
             .await;
         assert!(stream.is_ok());
 
@@ -109,7 +109,6 @@ impl IggyCmdTestCase for TestConsumerOffsetSetCmd {
                 1,
                 Default::default(),
                 None,
-                Some(self.topic_id),
                 IggyExpiry::NeverExpire,
                 MaxTopicSize::ServerDefault,
             )

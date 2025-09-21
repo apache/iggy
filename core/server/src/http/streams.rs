@@ -101,12 +101,12 @@ async fn create_stream(
         // Create stream using wrapper method
         let stream = state
             .shard
-            .create_stream(&session, command.stream_id, command.name.clone())
+            .create_stream(&session, command.name.clone())
             .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to create stream, stream ID: {:?}",
-                    command.stream_id
+                    "{COMPONENT} (error: {error}) - failed to create stream with name: {}",
+                    command.name
                 )
             })?;
 

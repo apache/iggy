@@ -35,12 +35,11 @@ impl StreamClient for IggyClient {
     async fn create_stream(
         &self,
         name: &str,
-        stream_id: Option<u32>,
     ) -> Result<StreamDetails, IggyError> {
         self.client
             .read()
             .await
-            .create_stream(name, stream_id)
+            .create_stream(name)
             .await
     }
 

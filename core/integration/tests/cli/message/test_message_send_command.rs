@@ -17,8 +17,7 @@
  */
 
 use crate::cli::common::{
-    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, TestStreamId,
-    TestTopicId, USAGE_PREFIX,
+    CLAP_INDENT, IggyCmdCommand, IggyCmdTest, IggyCmdTestCase, TestHelpCmd, USAGE_PREFIX,
 };
 use assert_cmd::assert::Assert;
 use async_trait::async_trait;
@@ -53,61 +52,57 @@ enum ProvideMessages {
 }
 
 struct TestMessageSendCmd {
-    stream_id: u32,
     stream_name: String,
-    topic_id: u32,
     topic_name: String,
     partitions_count: u32,
     messages: Vec<String>,
     message_input: ProvideMessages,
-    using_stream_id: TestStreamId,
-    using_topic_id: TestTopicId,
     partitioning: PartitionSelection,
     header: Option<HashMap<HeaderKey, HeaderValue>>,
+    // These will be populated after creating the resources
+    actual_stream_id: Option<u32>,
+    actual_topic_id: Option<u32>,
 }
 
 impl TestMessageSendCmd {
-    #[allow(clippy::too_many_arguments)]
     fn new(
-        stream_id: u32,
         stream_name: String,
-        topic_id: u32,
         topic_name: String,
         partitions_count: u32,
         messages: Vec<String>,
         message_input: ProvideMessages,
-        using_stream_id: TestStreamId,
-        using_topic_id: TestTopicId,
         partitioning: PartitionSelection,
         header: Option<HashMap<HeaderKey, HeaderValue>>,
     ) -> Self {
         Self {
-            stream_id,
             stream_name,
-            topic_id,
             topic_name,
             partitions_count,
             messages,
             message_input,
-            using_stream_id,
-            using_topic_id,
             partitioning,
             header,
+            actual_stream_id: None,
+            actual_topic_id: None,
         }
     }
 
     fn to_args(&self) -> Vec<String> {
         let mut command = self.partitioning.to_args();
 
-        command.extend(match self.using_stream_id {
-            TestStreamId::Numeric => vec![format!("{}", self.stream_id)],
-            TestStreamId::Named => vec![self.stream_name.clone()],
-        });
+        // Use actual stream ID if available, otherwise use stream name as fallback
+        if let Some(stream_id) = self.actual_stream_id {
+            command.push(format!("{}", stream_id));
+        } else {
+            command.push(self.stream_name.clone());
+        }
 
-        command.push(match self.using_topic_id {
-            TestTopicId::Numeric => format!("{}", self.topic_id),
-            TestTopicId::Named => self.topic_name.clone(),
-        });
+        // Use actual topic ID if available, otherwise use topic name as fallback
+        if let Some(topic_id) = self.actual_topic_id {
+            command.push(format!("{}", topic_id));
+        } else {
+            command.push(self.topic_name.clone());
+        }
 
         if let Some(header) = &self.header {
             command.push("--headers".to_string());
@@ -154,24 +149,27 @@ impl TestMessageSendCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestMessageSendCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
+        // Create stream and capture its actual ID
         let stream = client
-            .create_stream(&self.stream_name, self.stream_id.into())
-            .await;
-        assert!(stream.is_ok());
+            .create_stream(&self.stream_name)
+            .await
+            .expect("Failed to create stream");
+        self.actual_stream_id = Some(stream.id);
 
+        // Create topic and capture its actual ID
         let topic = client
             .create_topic(
-                &self.stream_id.try_into().unwrap(),
+                &stream.id.try_into().unwrap(),
                 &self.topic_name,
                 self.partitions_count,
                 Default::default(),
                 None,
-                Some(self.topic_id),
                 IggyExpiry::NeverExpire,
                 MaxTopicSize::ServerDefault,
             )
-            .await;
-        assert!(topic.is_ok());
+            .await
+            .expect("Failed to create topic");
+        self.actual_topic_id = Some(topic.id);
     }
 
     fn get_command(&self) -> IggyCmdCommand {
@@ -190,14 +188,16 @@ impl IggyCmdTestCase for TestMessageSendCmd {
     }
 
     fn verify_command(&self, command_state: Assert) {
-        let stream_id = match self.using_stream_id {
-            TestStreamId::Numeric => format!("{}", self.stream_id),
-            TestStreamId::Named => self.stream_name.clone(),
+        let stream_id = if let Some(stream_id) = self.actual_stream_id {
+            format!("{}", stream_id)
+        } else {
+            self.stream_name.clone()
         };
 
-        let topic_id = match self.using_topic_id {
-            TestTopicId::Numeric => format!("{}", self.topic_id),
-            TestTopicId::Named => self.topic_name.clone(),
+        let topic_id = if let Some(topic_id) = self.actual_topic_id {
+            format!("{}", topic_id)
+        } else {
+            self.topic_name.clone()
         };
 
         let message = format!(
@@ -210,8 +210,8 @@ impl IggyCmdTestCase for TestMessageSendCmd {
     async fn verify_server_state(&self, client: &dyn Client) {
         let topic = client
             .get_topic(
-                &self.stream_id.try_into().unwrap(),
-                &self.topic_id.try_into().unwrap(),
+                &self.actual_stream_id.unwrap().try_into().unwrap(),
+                &self.actual_topic_id.unwrap().try_into().unwrap(),
             )
             .await;
         assert!(topic.is_ok());
@@ -220,8 +220,8 @@ impl IggyCmdTestCase for TestMessageSendCmd {
 
         let polled_messages = client
             .poll_messages(
-                &self.stream_id.try_into().unwrap(),
-                &self.topic_id.try_into().unwrap(),
+                &self.actual_stream_id.unwrap().try_into().unwrap(),
+                &self.actual_topic_id.unwrap().try_into().unwrap(),
                 Some(self.get_partition_id()),
                 &Consumer::default(),
                 &PollingStrategy::offset(0),
@@ -251,14 +251,14 @@ impl IggyCmdTestCase for TestMessageSendCmd {
 
         let topic = client
             .delete_topic(
-                &self.stream_id.try_into().unwrap(),
-                &self.topic_id.try_into().unwrap(),
+                &self.actual_stream_id.unwrap().try_into().unwrap(),
+                &self.actual_topic_id.unwrap().try_into().unwrap(),
             )
             .await;
         assert!(topic.is_ok());
 
         let stream = client
-            .delete_stream(&self.stream_id.try_into().unwrap())
+            .delete_stream(&self.actual_stream_id.unwrap().try_into().unwrap())
             .await;
         assert!(stream.is_ok());
     }
@@ -270,87 +270,19 @@ pub async fn should_be_successful() {
     let mut iggy_cmd_test = IggyCmdTest::default();
 
     let test_parameters = vec![
-        (
-            ProvideMessages::AsArgs,
-            TestStreamId::Numeric,
-            TestTopicId::Numeric,
-            PartitionSelection::Balanced,
-        ),
-        (
-            ProvideMessages::ViaStdin,
-            TestStreamId::Numeric,
-            TestTopicId::Named,
-            PartitionSelection::Balanced,
-        ),
-        (
-            ProvideMessages::AsArgs,
-            TestStreamId::Named,
-            TestTopicId::Numeric,
-            PartitionSelection::Balanced,
-        ),
-        (
-            ProvideMessages::ViaStdin,
-            TestStreamId::Named,
-            TestTopicId::Named,
-            PartitionSelection::Balanced,
-        ),
-        (
-            ProvideMessages::ViaStdin,
-            TestStreamId::Numeric,
-            TestTopicId::Numeric,
-            PartitionSelection::Id(1),
-        ),
-        (
-            ProvideMessages::AsArgs,
-            TestStreamId::Named,
-            TestTopicId::Numeric,
-            PartitionSelection::Id(2),
-        ),
-        (
-            ProvideMessages::AsArgs,
-            TestStreamId::Numeric,
-            TestTopicId::Named,
-            PartitionSelection::Id(3),
-        ),
-        (
-            ProvideMessages::ViaStdin,
-            TestStreamId::Named,
-            TestTopicId::Named,
-            PartitionSelection::Id(4),
-        ),
-        (
-            ProvideMessages::AsArgs,
-            TestStreamId::Numeric,
-            TestTopicId::Numeric,
-            PartitionSelection::Key(String::from("some-complex-key")),
-        ),
-        (
-            ProvideMessages::ViaStdin,
-            TestStreamId::Named,
-            TestTopicId::Numeric,
-            PartitionSelection::Key(String::from("another random value")),
-        ),
-        (
-            ProvideMessages::ViaStdin,
-            TestStreamId::Numeric,
-            TestTopicId::Named,
-            PartitionSelection::Key(String::from("some-random-key")),
-        ),
-        (
-            ProvideMessages::AsArgs,
-            TestStreamId::Named,
-            TestTopicId::Named,
-            PartitionSelection::Key(String::from("just a key")),
-        ),
+        (ProvideMessages::AsArgs, PartitionSelection::Balanced),
+        (ProvideMessages::ViaStdin, PartitionSelection::Balanced),
+        (ProvideMessages::ViaStdin, PartitionSelection::Id(1)),
+        (ProvideMessages::AsArgs, PartitionSelection::Id(2)),
+        (ProvideMessages::AsArgs, PartitionSelection::Key(String::from("some-complex-key"))),
+        (ProvideMessages::ViaStdin, PartitionSelection::Key(String::from("another-key"))),
     ];
 
     iggy_cmd_test.setup().await;
-    for (message_input, using_stream_id, using_topic_id, using_partitioning) in test_parameters {
+    for (message_input, using_partitioning) in test_parameters {
         iggy_cmd_test
             .execute_test(TestMessageSendCmd::new(
-                1,
                 String::from("stream"),
-                2,
                 String::from("topic"),
                 4,
                 vec![
@@ -359,8 +291,6 @@ pub async fn should_be_successful() {
                     String::from("test message3"),
                 ],
                 message_input,
-                using_stream_id,
-                using_topic_id,
                 using_partitioning,
                 Some(HashMap::from([
                     (

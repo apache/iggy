@@ -102,7 +102,7 @@ impl TestTopicCreateCmd {
 impl IggyCmdTestCase for TestTopicCreateCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
         let stream = client
-            .create_stream(&self.stream_name, Some(self.stream_id))
+            .create_stream(&self.stream_name)
             .await;
         assert!(stream.is_ok());
     }

@@ -134,10 +134,9 @@ impl HttpSafeShard {
     pub async fn create_stream(
         &self,
         session: &Session,
-        stream_id: Option<u32>,
         name: String,
     ) -> Result<crate::streaming::streams::stream2::Stream, IggyError> {
-        let future = SendWrapper::new(self.shard().create_stream2(session, stream_id, name));
+        let future = SendWrapper::new(self.shard().create_stream2(session, name));
         future.await
     }
 

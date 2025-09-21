@@ -34,7 +34,6 @@ impl IggyShard {
     pub async fn create_stream2(
         &self,
         session: &Session,
-        _stream_id: Option<u32>,
         name: String,
     ) -> Result<stream2::Stream, IggyError> {
         self.ensure_authenticated(session)?;

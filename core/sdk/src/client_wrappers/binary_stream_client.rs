@@ -44,13 +44,12 @@ impl StreamClient for ClientWrapper {
     async fn create_stream(
         &self,
         name: &str,
-        stream_id: Option<u32>,
     ) -> Result<StreamDetails, IggyError> {
         match self {
-            ClientWrapper::Iggy(client) => client.create_stream(name, stream_id).await,
-            ClientWrapper::Http(client) => client.create_stream(name, stream_id).await,
-            ClientWrapper::Tcp(client) => client.create_stream(name, stream_id).await,
-            ClientWrapper::Quic(client) => client.create_stream(name, stream_id).await,
+            ClientWrapper::Iggy(client) => client.create_stream(name).await,
+            ClientWrapper::Http(client) => client.create_stream(name).await,
+            ClientWrapper::Tcp(client) => client.create_stream(name).await,
+            ClientWrapper::Quic(client) => client.create_stream(name).await,
         }
     }
 

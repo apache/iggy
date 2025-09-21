@@ -123,7 +123,7 @@ impl TestTopicUpdateCmd {
 impl IggyCmdTestCase for TestTopicUpdateCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
         let stream = client
-            .create_stream(&self.stream_name, Some(self.stream_id))
+            .create_stream(&self.stream_name)
             .await;
         assert!(stream.is_ok());
 
@@ -144,7 +144,6 @@ impl IggyCmdTestCase for TestTopicUpdateCmd {
                 1,
                 self.compression_algorithm,
                 Some(self.replication_factor),
-                Some(self.topic_id),
                 message_expiry,
                 self.max_topic_size,
             )

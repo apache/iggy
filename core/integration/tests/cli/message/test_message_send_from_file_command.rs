@@ -77,7 +77,7 @@ impl<'a> TestMessageSendFromFileCmd<'a> {
 #[async_trait]
 impl IggyCmdTestCase for TestMessageSendFromFileCmd<'_> {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.stream_name, None).await;
+        let stream = client.create_stream(&self.stream_name).await;
         assert!(stream.is_ok());
 
         let stream_id = Identifier::from_str(self.stream_name.as_str());
@@ -90,7 +90,6 @@ impl IggyCmdTestCase for TestMessageSendFromFileCmd<'_> {
                 &self.topic_name,
                 1,
                 Default::default(),
-                None,
                 None,
                 IggyExpiry::NeverExpire,
                 MaxTopicSize::ServerDefault,

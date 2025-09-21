@@ -48,9 +48,8 @@ impl ServerCommandHandler for CreateStream {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let stream_id = self.stream_id;
         let stream = shard
-            .create_stream2(session, stream_id, self.name.clone())
+            .create_stream2(session, self.name.clone())
             .await?;
         let created_stream_id = stream.id();
         shard_info!(
@@ -79,7 +78,7 @@ impl ServerCommandHandler for CreateStream {
             .await
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to apply create stream for id: {stream_id:?}, session: {session}"
+                    "{COMPONENT} (error: {error}) - failed to apply create stream for id: {created_stream_id}, session: {session}"
                 )
             })?;
         sender.send_ok_response(&response).await?;

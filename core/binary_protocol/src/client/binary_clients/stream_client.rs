@@ -36,7 +36,6 @@ pub trait StreamClient {
     async fn create_stream(
         &self,
         name: &str,
-        stream_id: Option<u32>,
     ) -> Result<StreamDetails, IggyError>;
     /// Update a stream by unique ID or name.
     ///

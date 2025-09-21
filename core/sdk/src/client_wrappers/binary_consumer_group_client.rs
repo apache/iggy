@@ -72,27 +72,26 @@ impl ConsumerGroupClient for ClientWrapper {
         stream_id: &Identifier,
         topic_id: &Identifier,
         name: &str,
-        group_id: Option<u32>,
     ) -> Result<ConsumerGroupDetails, IggyError> {
         match self {
             ClientWrapper::Iggy(client) => {
                 client
-                    .create_consumer_group(stream_id, topic_id, name, group_id)
+                    .create_consumer_group(stream_id, topic_id, name)
                     .await
             }
             ClientWrapper::Http(client) => {
                 client
-                    .create_consumer_group(stream_id, topic_id, name, group_id)
+                    .create_consumer_group(stream_id, topic_id, name)
                     .await
             }
             ClientWrapper::Tcp(client) => {
                 client
-                    .create_consumer_group(stream_id, topic_id, name, group_id)
+                    .create_consumer_group(stream_id, topic_id, name)
                     .await
             }
             ClientWrapper::Quic(client) => {
                 client
-                    .create_consumer_group(stream_id, topic_id, name, group_id)
+                    .create_consumer_group(stream_id, topic_id, name)
                     .await
             }
         }

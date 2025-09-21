@@ -52,7 +52,7 @@ impl TestStreamGetCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestStreamGetCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client.create_stream(&self.name, Some(self.stream_id)).await;
+        let stream = client.create_stream(&self.name).await;
         assert!(stream.is_ok());
     }
 

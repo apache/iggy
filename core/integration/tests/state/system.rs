@@ -55,19 +55,16 @@ async fn should_be_initialized_based_on_state_entries() {
 
     let stream1_id = 1;
     let create_stream1 = CreateStream {
-        stream_id: Some(stream1_id),
         name: "stream1".to_string(),
     };
 
     let create_stream1_clone = CreateStream {
-        stream_id: Some(stream1_id),
         name: "stream1".to_string(),
     };
 
     let topic1_id = 1;
     let create_topic1 = CreateTopic {
         stream_id: stream1_id.try_into().unwrap(),
-        topic_id: Some(topic1_id),
         partitions_count: 1,
         compression_algorithm: Default::default(),
         message_expiry: Default::default(),
@@ -78,7 +75,6 @@ async fn should_be_initialized_based_on_state_entries() {
 
     let create_topic1_clone = CreateTopic {
         stream_id: stream1_id.try_into().unwrap(),
-        topic_id: Some(topic1_id),
         partitions_count: 1,
         compression_algorithm: Default::default(),
         message_expiry: Default::default(),
@@ -89,14 +85,12 @@ async fn should_be_initialized_based_on_state_entries() {
 
     let stream2_id = 2;
     let create_stream2 = CreateStream {
-        stream_id: Some(stream2_id),
         name: "stream2".to_string(),
     };
 
     let topic2_id = 2;
     let create_topic2 = CreateTopic {
         stream_id: stream2_id.try_into().unwrap(),
-        topic_id: Some(topic2_id),
         partitions_count: 1,
         compression_algorithm: Default::default(),
         message_expiry: Default::default(),
@@ -135,14 +129,12 @@ async fn should_be_initialized_based_on_state_entries() {
     let create_consumer_group = CreateConsumerGroup {
         stream_id: stream1_id.try_into().unwrap(),
         topic_id: topic1_id.try_into().unwrap(),
-        group_id: Some(group_id),
         name: "test".to_string(),
     };
 
     let create_consumer_group_clone = CreateConsumerGroup {
         stream_id: stream1_id.try_into().unwrap(),
         topic_id: topic1_id.try_into().unwrap(),
-        group_id: Some(group_id),
         name: "test".to_string(),
     };
 
@@ -250,17 +242,17 @@ async fn should_be_initialized_based_on_state_entries() {
     assert_eq!(system.streams.len(), 1);
     let mut stream = system
         .streams
-        .remove(&create_stream1_clone.stream_id.unwrap())
+        .remove(&stream1_id)
         .unwrap();
-    assert_eq!(stream.id, create_stream1_clone.stream_id.unwrap());
+    assert_eq!(stream.id, stream1_id);
     assert_eq!(stream.name, create_stream1_clone.name);
     assert_eq!(stream.topics.len(), 1);
 
     let mut topic = stream
         .topics
-        .remove(&create_topic1_clone.topic_id.unwrap())
+        .remove(&topic1_id)
         .unwrap();
-    assert_eq!(topic.id, create_topic1_clone.topic_id.unwrap());
+    assert_eq!(topic.id, topic1_id);
     assert_eq!(topic.name, create_topic1_clone.name);
     assert_eq!(topic.partitions.len(), 3);
 
@@ -269,7 +261,7 @@ async fn should_be_initialized_based_on_state_entries() {
 
     assert_eq!(
         consumer_group.id,
-        create_consumer_group_clone.group_id.unwrap()
+        group_id
     );
     assert_eq!(consumer_group.name, create_consumer_group_clone.name);
 }

@@ -17,7 +17,7 @@
  */
 
 use crate::server::scenarios::{
-    CONSUMER_GROUP_ID, CONSUMER_GROUP_NAME, PARTITIONS_COUNT, STREAM_ID, STREAM_NAME, TOPIC_ID,
+    CONSUMER_GROUP_NAME, PARTITIONS_COUNT, STREAM_NAME,
     TOPIC_NAME, USERNAME_1, USERNAME_2, USERNAME_3, cleanup, create_client, join_consumer_group,
 };
 use iggy::clients::client::IggyClient;
@@ -50,7 +50,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     // 2. Create the topic
     system_client
         .create_topic(
-            &Identifier::numeric(STREAM_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
             PARTITIONS_COUNT,
             CompressionAlgorithm::default(),
@@ -65,8 +65,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     // 3. Create the consumer group
     system_client
         .create_consumer_group(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             CONSUMER_GROUP_NAME,
             Some(CONSUMER_GROUP_ID),
         )
@@ -156,9 +156,9 @@ async fn get_consumer_group_and_validate_members(
 ) -> ConsumerGroupDetails {
     let consumer_group = client
         .get_consumer_group(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
-            &Identifier::numeric(CONSUMER_GROUP_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
         )
         .await
         .unwrap()

@@ -37,18 +37,17 @@ pub async fn run(client_factory: &dyn ClientFactory, test_server: &TestServer) {
         .unwrap();
 
     client
-        .create_stream(STREAM_NAME, Some(STREAM_ID))
+        .create_stream(STREAM_NAME)
         .await
         .unwrap();
 
     client
         .create_topic(
-            &Identifier::numeric(STREAM_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
             PARTITION_ID,
             CompressionAlgorithm::None,
             None,
-            Some(TOPIC_ID),
             IggyExpiry::NeverExpire,
             MaxTopicSize::ServerDefault,
         )
@@ -68,8 +67,8 @@ pub async fn run(client_factory: &dyn ClientFactory, test_server: &TestServer) {
         let mut messages = vec![message];
         client
             .send_messages(
-                &Identifier::numeric(STREAM_ID).unwrap(),
-                &Identifier::numeric(TOPIC_ID).unwrap(),
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
                 &Partitioning::partition_id(PARTITION_ID),
                 &mut messages,
             )
@@ -106,8 +105,8 @@ pub async fn run(client_factory: &dyn ClientFactory, test_server: &TestServer) {
     let segments_to_keep = 2u32;
     let result = client
         .delete_segments(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             PARTITION_ID,
             segments_to_keep,
         )
@@ -148,8 +147,8 @@ pub async fn run(client_factory: &dyn ClientFactory, test_server: &TestServer) {
     // Test edge cases
     let result = client
         .delete_segments(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             PARTITION_ID,
             0,
         )
@@ -163,7 +162,7 @@ pub async fn run(client_factory: &dyn ClientFactory, test_server: &TestServer) {
     let result = client
         .delete_segments(
             &Identifier::numeric(999).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             PARTITION_ID,
             1,
         )
@@ -175,7 +174,7 @@ pub async fn run(client_factory: &dyn ClientFactory, test_server: &TestServer) {
 
     let result = client
         .delete_segments(
-            &Identifier::numeric(STREAM_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::numeric(999).unwrap(),
             PARTITION_ID,
             1,
@@ -188,8 +187,8 @@ pub async fn run(client_factory: &dyn ClientFactory, test_server: &TestServer) {
 
     let result = client
         .delete_segments(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
             999,
             1,
         )
@@ -201,14 +200,14 @@ pub async fn run(client_factory: &dyn ClientFactory, test_server: &TestServer) {
 
     client
         .delete_topic(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
         )
         .await
         .unwrap();
 
     client
-        .delete_stream(&Identifier::numeric(STREAM_ID).unwrap())
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
         .await
         .unwrap();
 }

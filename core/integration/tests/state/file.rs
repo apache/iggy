@@ -120,7 +120,6 @@ async fn should_apply_multiple_entries() {
     let create_stream = EntryCommand::CreateStream(CreateStreamWithId {
         stream_id,
         command: CreateStream {
-            stream_id: Some(stream_id),
             name: "test".to_string(),
         },
     });

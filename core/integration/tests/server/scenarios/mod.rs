@@ -33,13 +33,10 @@ pub mod user_scenario;
 use iggy::prelude::*;
 use integration::test_server::{ClientFactory, delete_user};
 
-const STREAM_ID: u32 = 1;
-const TOPIC_ID: u32 = 1;
-const PARTITION_ID: u32 = 1;
+const PARTITION_ID: u32 = 0;
 const STREAM_NAME: &str = "test-stream";
 const TOPIC_NAME: &str = "test-topic";
 const PARTITIONS_COUNT: u32 = 3;
-const CONSUMER_GROUP_ID: u32 = 10;
 const CONSUMER_GROUP_NAME: &str = "test-consumer-group";
 const USERNAME_1: &str = "user1";
 const USERNAME_2: &str = "user2";
@@ -56,9 +53,9 @@ async fn create_client(client_factory: &dyn ClientFactory) -> IggyClient {
 async fn get_consumer_group(client: &IggyClient) -> ConsumerGroupDetails {
     client
         .get_consumer_group(
-            &Identifier::numeric(STREAM_ID).unwrap(),
-            &Identifier::numeric(TOPIC_ID).unwrap(),
-            &Identifier::numeric(CONSUMER_GROUP_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
         )
         .await
         .unwrap()
@@ -68,9 +65,9 @@ async fn get_consumer_group(client: &IggyClient) -> ConsumerGroupDetails {
 async fn join_consumer_group(client: &IggyClient) {
     client
         .join_consumer_group(
-            &Identifier::numeric(STREAM_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::numeric(TOPIC_ID).unwrap(),
-            &Identifier::numeric(CONSUMER_GROUP_ID).unwrap(),
+            &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
         )
         .await
         .unwrap();
@@ -79,9 +76,9 @@ async fn join_consumer_group(client: &IggyClient) {
 async fn leave_consumer_group(client: &IggyClient) {
     client
         .leave_consumer_group(
-            &Identifier::numeric(STREAM_ID).unwrap(),
+            &Identifier::named(STREAM_NAME).unwrap(),
             &Identifier::numeric(TOPIC_ID).unwrap(),
-            &Identifier::numeric(CONSUMER_GROUP_ID).unwrap(),
+            &Identifier::named(CONSUMER_GROUP_NAME).unwrap(),
         )
         .await
         .unwrap();
@@ -94,7 +91,7 @@ async fn cleanup(system_client: &IggyClient, delete_users: bool) {
         delete_user(system_client, USERNAME_3).await;
     }
     system_client
-        .delete_stream(&Identifier::numeric(STREAM_ID).unwrap())
+        .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
         .await
         .unwrap();
 }

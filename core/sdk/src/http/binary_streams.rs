@@ -59,14 +59,12 @@ impl StreamClient for HttpClient {
     async fn create_stream(
         &self,
         name: &str,
-        stream_id: Option<u32>,
     ) -> Result<StreamDetails, IggyError> {
         let response = self
             .post(
                 PATH,
                 &CreateStream {
                     name: name.to_string(),
-                    stream_id,
                 },
             )
             .await?;

@@ -64,7 +64,7 @@ impl TestStatsCmd {
 impl IggyCmdTestCase for TestStatsCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
         let stream_id = Identifier::from_str_value("logs").unwrap();
-        let stream = client.create_stream(&stream_id.as_string(), Some(1)).await;
+        let stream = client.create_stream(&stream_id.as_string()).await;
         assert!(stream.is_ok());
 
         let topic = client
@@ -74,7 +74,6 @@ impl IggyCmdTestCase for TestStatsCmd {
                 5,
                 Default::default(),
                 None,
-                Some(1),
                 IggyExpiry::NeverExpire,
                 MaxTopicSize::ServerDefault,
             )

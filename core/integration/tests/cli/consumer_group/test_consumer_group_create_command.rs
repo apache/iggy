@@ -87,7 +87,7 @@ impl TestConsumerGroupCreateCmd {
 impl IggyCmdTestCase for TestConsumerGroupCreateCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
         let stream = client
-            .create_stream(&self.stream_name, self.stream_id.into())
+            .create_stream(&self.stream_name)
             .await;
         assert!(stream.is_ok());
 
@@ -98,7 +98,6 @@ impl IggyCmdTestCase for TestConsumerGroupCreateCmd {
                 1,
                 Default::default(),
                 None,
-                Some(self.topic_id),
                 IggyExpiry::NeverExpire,
                 MaxTopicSize::ServerDefault,
             )
