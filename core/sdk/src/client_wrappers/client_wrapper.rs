@@ -17,16 +17,32 @@
  */
 
 use crate::clients::client::IggyClient;
-use crate::http::http_client::HttpClient;
-use crate::quic::quic_client::QuicClient;
-use crate::tcp::tcp_client::TcpClient;
 
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug)]
-pub enum ClientWrapper {
-    Iggy(IggyClient),
-    Http(HttpClient),
-    Tcp(TcpClient),
-    TcpSync(Box<dyn iggy_binary_protocol::Client>),
-    Quic(QuicClient),
+#[cfg(feature = "async")]
+pub mod async_impl {
+    use super::*;
+    use crate::http::http_client::HttpClient;
+    use crate::quic::quic_client::QuicClient;
+    use crate::tcp::tcp_client::TcpClient;
+
+    #[allow(clippy::large_enum_variant)]
+    #[derive(Debug)]
+    pub enum ClientWrapper {
+        Iggy(IggyClient),
+        Http(HttpClient),
+        Tcp(TcpClient),
+        Quic(QuicClient),
+    }
+}
+
+#[cfg(feature = "sync")]
+pub mod sync_impl {
+    use super::*;
+
+    #[allow(clippy::large_enum_variant)]
+    #[derive(Debug)]
+    pub enum ClientWrapper {
+        Iggy(IggyClient),
+        TcpSync(Box<dyn iggy_binary_protocol::Client>),
+    }
 }

@@ -19,26 +19,33 @@
 use crate::clients::client_builder::IggyClientBuilder;
 use iggy_common::locking::{IggySharedMut, IggySharedMutFn};
 
-use crate::client_wrappers::client_wrapper::ClientWrapper;
+use crate::client_wrappers::ClientWrapper;
+#[cfg(feature = "async")]
 use crate::http::http_client::HttpClient;
 use crate::prelude::EncryptorKind;
 use crate::prelude::IggyConsumerBuilder;
 use crate::prelude::IggyError;
 use crate::prelude::IggyProducerBuilder;
+#[cfg(feature = "async")]
 use crate::quic::quic_client::QuicClient;
+#[cfg(feature = "async")]
 use crate::tcp::tcp_client::TcpClient;
+#[cfg(feature = "sync")]
+use crate::tcp::tcp_client_sync::TcpClientSync;
+#[cfg(feature = "sync")]
+use crate::connection::transport::TcpTransport;
 use async_broadcast::Receiver;
+#[cfg(feature = "async")]
 use async_trait::async_trait;
 use iggy_binary_protocol::{Client, SystemClient};
+#[cfg(feature = "async")]
+use tokio::{spawn, time::sleep};
 use iggy_common::{
     ConnectionStringUtils, Consumer, DiagnosticEvent, Partitioner, TransportProtocol,
 };
 use std::fmt::Debug;
 use std::sync::Arc;
-use tokio::spawn;
-use tokio::time::sleep;
-use tracing::log::warn;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// The main client struct which implements all the `Client` traits and wraps the underlying low-level client for the specific transport.
 ///
@@ -53,7 +60,14 @@ pub struct IggyClient {
 
 impl Default for IggyClient {
     fn default() -> Self {
-        IggyClient::new(ClientWrapper::Tcp(TcpClient::default()))
+        #[cfg(feature = "async")]
+        {
+            IggyClient::new(ClientWrapper::Tcp(TcpClient::default()))
+        }
+        #[cfg(feature = "sync")]
+        {
+            IggyClient::new(ClientWrapper::TcpSync(Box::new(TcpClientSync::default())))
+        }
     }
 }
 
@@ -83,15 +97,24 @@ impl IggyClient {
     /// Creates a new `IggyClient` from the provided connection string.
     pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
         match ConnectionStringUtils::parse_protocol(connection_string)? {
+            #[cfg(feature = "async")]
             TransportProtocol::Tcp => Ok(IggyClient::new(ClientWrapper::Tcp(
                 TcpClient::from_connection_string(connection_string)?,
             ))),
+            #[cfg(feature = "sync")]
+            TransportProtocol::Tcp => Ok(IggyClient::new(ClientWrapper::TcpSync(Box::new(
+                TcpClientSync::<TcpTransport>::from_connection_string(connection_string)?,
+            )))),
+            #[cfg(feature = "async")]
             TransportProtocol::Quic => Ok(IggyClient::new(ClientWrapper::Quic(
                 QuicClient::from_connection_string(connection_string)?,
             ))),
+            #[cfg(feature = "async")]
             TransportProtocol::Http => Ok(IggyClient::new(ClientWrapper::Http(
                 HttpClient::from_connection_string(connection_string)?,
             ))),
+            #[cfg(feature = "sync")]
+            _ => Err(IggyError::InvalidConfiguration),
         }
     }
 
@@ -174,45 +197,74 @@ impl IggyClient {
     }
 }
 
-#[async_trait]
-impl Client for IggyClient {
-    async fn connect(&self) -> Result<(), IggyError> {
-        let heartbeat_interval;
-        {
-            let client = self.client.read().await;
-            client.connect().await?;
-            heartbeat_interval = client.heartbeat_interval().await;
+#[cfg(feature = "async")]
+mod async_impl {
+    use super::*;
+
+    #[async_trait]
+    impl Client for IggyClient {
+        async fn connect(&self) -> Result<(), IggyError> {
+            let heartbeat_interval;
+            {
+                let client = self.client.read().await;
+                client.connect().await?;
+                heartbeat_interval = client.heartbeat_interval().await;
+            }
+
+            let client = self.client.clone();
+            spawn(async move {
+                loop {
+                    debug!("Sending the heartbeat...");
+                    if let Err(error) = client.read().await.ping().await {
+                        error!("There was an error when sending a heartbeat. {error}");
+                        if error == IggyError::ClientShutdown {
+                            warn!("The client has been shut down - stopping the heartbeat.");
+                            return;
+                        }
+                    } else {
+                        debug!("Heartbeat was sent successfully.");
+                    }
+                    sleep(heartbeat_interval.get_duration()).await
+                }
+            });
+            Ok(())
         }
 
-        let client = self.client.clone();
-        spawn(async move {
-            loop {
-                debug!("Sending the heartbeat...");
-                if let Err(error) = client.read().await.ping().await {
-                    error!("There was an error when sending a heartbeat. {error}");
-                    if error == IggyError::ClientShutdown {
-                        warn!("The client has been shut down - stopping the heartbeat.");
-                        return;
-                    }
-                } else {
-                    debug!("Heartbeat was sent successfully.");
-                }
-                sleep(heartbeat_interval.get_duration()).await
-            }
-        });
-        Ok(())
-    }
+        async fn disconnect(&self) -> Result<(), IggyError> {
+            self.client.read().disconnect().await
+        }
 
-    async fn disconnect(&self) -> Result<(), IggyError> {
-        self.client.read().await.disconnect().await
-    }
+        async fn shutdown(&self) -> Result<(), IggyError> {
+            self.client.read().shutdown().await
+        }
 
-    async fn shutdown(&self) -> Result<(), IggyError> {
-        self.client.read().await.shutdown().await
+        async fn subscribe_events(&self) -> Receiver<DiagnosticEvent> {
+            self.client.read().subscribe_events().await
+        }
     }
+}
 
-    async fn subscribe_events(&self) -> Receiver<DiagnosticEvent> {
-        self.client.read().await.subscribe_events().await
+#[cfg(feature = "sync")]
+mod sync_impl {
+    use super::*;
+
+    impl Client for IggyClient {
+        fn connect(&self) -> Result<(), IggyError> {
+            let client = self.client.read();
+            client.connect()
+        }
+
+        fn disconnect(&self) -> Result<(), IggyError> {
+            self.client.read().disconnect()
+        }
+
+        fn shutdown(&self) -> Result<(), IggyError> {
+            self.client.read().shutdown()
+        }
+
+        fn subscribe_events(&self) -> Receiver<DiagnosticEvent> {
+            self.client.read().subscribe_events()
+        }
     }
 }
 

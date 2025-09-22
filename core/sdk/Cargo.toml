@@ -31,8 +31,8 @@ readme = "../../README.md"
 [features]
 default = ["tokio_lock"]
 tokio_lock = []
-sync = ["maybe-async/is_sync"]
-async = []
+sync = ["maybe-async/is_sync", "iggy_binary_protocol/sync"]
+async = ["iggy_binary_protocol/async"]
 # Moved to common crate. Not sure if this is even needed anymore
 #fast_async_lock = ["dep:fast-async-mutex"]
 
@@ -48,7 +48,7 @@ dashmap = { workspace = true }
 flume = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
-iggy_binary_protocol = { workspace = true }
+iggy_binary_protocol = { workspace = true, features = [] }
 iggy_common = { workspace = true }
 maybe-async = "0.2.10"
 num_cpus = "1.17.0"

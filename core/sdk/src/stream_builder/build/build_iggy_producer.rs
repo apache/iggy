@@ -21,6 +21,7 @@ use crate::clients::producer::IggyProducer;
 use crate::clients::producer_config::DirectConfig;
 use crate::prelude::{IggyError, IggyExpiry, MaxTopicSize};
 use crate::stream_builder::IggyProducerConfig;
+use futures::TryFutureExt;
 use tracing::{error, trace};
 
 /// Build a producer from the stream configuration.

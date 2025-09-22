@@ -16,163 +16,244 @@
  * under the License.
  */
 
-use crate::client_wrappers::client_wrapper::ClientWrapper;
-use async_trait::async_trait;
+use crate::client_wrappers::ClientWrapper;
 use iggy_binary_protocol::UserClient;
 use iggy_common::{
     Identifier, IdentityInfo, IggyError, Permissions, UserInfo, UserInfoDetails, UserStatus,
 };
 
-#[maybe_async::maybe_async]
-#[async_trait]
-impl UserClient for ClientWrapper {
-    async fn get_user(&self, user_id: &Identifier) -> Result<Option<UserInfoDetails>, IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.get_user(user_id).await,
-            ClientWrapper::Http(client) => client.get_user(user_id).await,
-            ClientWrapper::Tcp(client) => client.get_user(user_id).await,
-            ClientWrapper::Quic(client) => client.get_user(user_id).await,
-            ClientWrapper::TcpSync(client) => client.get_user(user_id).await,
-        }
-    }
+#[cfg(feature = "async")]
+pub mod async_impl {
+    use super::*;
+    use async_trait::async_trait;
 
-    async fn get_users(&self) -> Result<Vec<UserInfo>, IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.get_users().await,
-            ClientWrapper::Http(client) => client.get_users().await,
-            ClientWrapper::Tcp(client) => client.get_users().await,
-            ClientWrapper::Quic(client) => client.get_users().await,
-            ClientWrapper::TcpSync(client) => client.get_users().await,
-        }
-    }
-
-    async fn create_user(
-        &self,
-        username: &str,
-        password: &str,
-        status: UserStatus,
-        permissions: Option<Permissions>,
-    ) -> Result<UserInfoDetails, IggyError> {
-        match self {
-            ClientWrapper::Http(client) => {
-                client
-                    .create_user(username, password, status, permissions)
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .create_user(username, password, status, permissions)
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .create_user(username, password, status, permissions)
-                    .await
-            }
-            ClientWrapper::Iggy(client) => {
-                client
-                    .create_user(username, password, status, permissions)
-                    .await
-            }
-            ClientWrapper::TcpSync(client) => {
-                client
-                    .create_user(username, password, status, permissions)
-                    .await
+    #[async_trait]
+    impl UserClient for ClientWrapper {
+        async fn get_user(&self, user_id: &Identifier) -> Result<Option<UserInfoDetails>, IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => client.get_user(user_id).await,
+                ClientWrapper::Http(client) => client.get_user(user_id).await,
+                ClientWrapper::Tcp(client) => client.get_user(user_id).await,
+                ClientWrapper::Quic(client) => client.get_user(user_id).await,
             }
         }
-    }
 
-    async fn delete_user(&self, user_id: &Identifier) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Http(client) => client.delete_user(user_id).await,
-            ClientWrapper::Tcp(client) => client.delete_user(user_id).await,
-            ClientWrapper::Quic(client) => client.delete_user(user_id).await,
-            ClientWrapper::Iggy(client) => client.delete_user(user_id).await,
-            ClientWrapper::TcpSync(client) => client.delete_user(user_id).await,
-        }
-    }
-
-    async fn update_user(
-        &self,
-        user_id: &Identifier,
-        username: Option<&str>,
-        status: Option<UserStatus>,
-    ) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Http(client) => client.update_user(user_id, username, status).await,
-            ClientWrapper::Tcp(client) => client.update_user(user_id, username, status).await,
-            ClientWrapper::Quic(client) => client.update_user(user_id, username, status).await,
-            ClientWrapper::Iggy(client) => client.update_user(user_id, username, status).await,
-            ClientWrapper::TcpSync(client) => client.update_user(user_id, username, status).await,
-        }
-    }
-
-    async fn update_permissions(
-        &self,
-        user_id: &Identifier,
-        permissions: Option<Permissions>,
-    ) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.update_permissions(user_id, permissions).await,
-            ClientWrapper::Http(client) => client.update_permissions(user_id, permissions).await,
-            ClientWrapper::Tcp(client) => client.update_permissions(user_id, permissions).await,
-            ClientWrapper::Quic(client) => client.update_permissions(user_id, permissions).await,
-            ClientWrapper::TcpSync(client) => client.update_permissions(user_id, permissions).await,
-        }
-    }
-
-    async fn change_password(
-        &self,
-        user_id: &Identifier,
-        current_password: &str,
-        new_password: &str,
-    ) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Http(client) => {
-                client
-                    .change_password(user_id, current_password, new_password)
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .change_password(user_id, current_password, new_password)
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .change_password(user_id, current_password, new_password)
-                    .await
-            }
-            ClientWrapper::Iggy(client) => {
-                client
-                    .change_password(user_id, current_password, new_password)
-                    .await
-            }
-            ClientWrapper::TcpSync(client) => {
-                client
-                    .change_password(user_id, current_password, new_password)
-                    .await
+        async fn get_users(&self) -> Result<Vec<UserInfo>, IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => client.get_users().await,
+                ClientWrapper::Http(client) => client.get_users().await,
+                ClientWrapper::Tcp(client) => client.get_users().await,
+                ClientWrapper::Quic(client) => client.get_users().await,
             }
         }
-    }
 
-    async fn login_user(&self, username: &str, password: &str) -> Result<IdentityInfo, IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.login_user(username, password).await,
-            ClientWrapper::Http(client) => client.login_user(username, password).await,
-            ClientWrapper::Tcp(client) => client.login_user(username, password).await,
-            ClientWrapper::Quic(client) => client.login_user(username, password).await,
-            ClientWrapper::TcpSync(client) => client.login_user(username, password).await,
+        async fn create_user(
+            &self,
+            username: &str,
+            password: &str,
+            status: UserStatus,
+            permissions: Option<Permissions>,
+        ) -> Result<UserInfoDetails, IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => {
+                    client
+                        .create_user(username, password, status, permissions)
+                        .await
+                }
+                ClientWrapper::Http(client) => {
+                    client
+                        .create_user(username, password, status, permissions)
+                        .await
+                }
+                ClientWrapper::Tcp(client) => {
+                    client
+                        .create_user(username, password, status, permissions)
+                        .await
+                }
+                ClientWrapper::Quic(client) => {
+                    client
+                        .create_user(username, password, status, permissions)
+                        .await
+                }
+            }
+        }
+
+        async fn delete_user(&self, user_id: &Identifier) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => client.delete_user(user_id).await,
+                ClientWrapper::Http(client) => client.delete_user(user_id).await,
+                ClientWrapper::Tcp(client) => client.delete_user(user_id).await,
+                ClientWrapper::Quic(client) => client.delete_user(user_id).await,
+            }
+        }
+
+        async fn update_user(
+            &self,
+            user_id: &Identifier,
+            username: Option<&str>,
+            status: Option<UserStatus>,
+        ) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => client.update_user(user_id, username, status).await,
+                ClientWrapper::Http(client) => client.update_user(user_id, username, status).await,
+                ClientWrapper::Tcp(client) => client.update_user(user_id, username, status).await,
+                ClientWrapper::Quic(client) => client.update_user(user_id, username, status).await,
+            }
+        }
+
+        async fn update_permissions(
+            &self,
+            user_id: &Identifier,
+            permissions: Option<Permissions>,
+        ) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => client.update_permissions(user_id, permissions).await,
+                ClientWrapper::Http(client) => client.update_permissions(user_id, permissions).await,
+                ClientWrapper::Tcp(client) => client.update_permissions(user_id, permissions).await,
+                ClientWrapper::Quic(client) => client.update_permissions(user_id, permissions).await,
+            }
+        }
+
+        async fn change_password(
+            &self,
+            user_id: &Identifier,
+            current_password: &str,
+            new_password: &str,
+        ) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => {
+                    client
+                        .change_password(user_id, current_password, new_password)
+                        .await
+                }
+                ClientWrapper::Http(client) => {
+                    client
+                        .change_password(user_id, current_password, new_password)
+                        .await
+                }
+                ClientWrapper::Tcp(client) => {
+                    client
+                        .change_password(user_id, current_password, new_password)
+                        .await
+                }
+                ClientWrapper::Quic(client) => {
+                    client
+                        .change_password(user_id, current_password, new_password)
+                        .await
+                }
+            }
+        }
+
+        async fn login_user(&self, username: &str, password: &str) -> Result<IdentityInfo, IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => client.login_user(username, password).await,
+                ClientWrapper::Http(client) => client.login_user(username, password).await,
+                ClientWrapper::Tcp(client) => client.login_user(username, password).await,
+                ClientWrapper::Quic(client) => client.login_user(username, password).await,
+            }
+        }
+
+        async fn logout_user(&self) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => client.logout_user().await,
+                ClientWrapper::Http(client) => client.logout_user().await,
+                ClientWrapper::Tcp(client) => client.logout_user().await,
+                ClientWrapper::Quic(client) => client.logout_user().await,
+            }
         }
     }
+}
 
-    async fn logout_user(&self) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.logout_user().await,
-            ClientWrapper::Http(client) => client.logout_user().await,
-            ClientWrapper::Tcp(client) => client.logout_user().await,
-            ClientWrapper::Quic(client) => client.logout_user().await,
-            ClientWrapper::TcpSync(client) => client.logout_user().await,
+#[cfg(feature = "sync")]
+pub mod sync_impl {
+    use super::*;
+
+    impl UserClient for ClientWrapper {
+        fn get_user(&self, user_id: &Identifier) -> Result<Option<UserInfoDetails>, IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => client.get_user(user_id),
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
+            }
+        }
+
+        fn get_users(&self) -> Result<Vec<UserInfo>, IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => client.get_users(),
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
+            }
+        }
+
+        fn create_user(
+            &self,
+            username: &str,
+            password: &str,
+            status: UserStatus,
+            permissions: Option<Permissions>,
+        ) -> Result<UserInfoDetails, IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => {
+                    client.create_user(username, password, status, permissions)
+                }
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
+            }
+        }
+
+        fn delete_user(&self, user_id: &Identifier) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => client.delete_user(user_id),
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
+            }
+        }
+
+        fn update_user(
+            &self,
+            user_id: &Identifier,
+            username: Option<&str>,
+            status: Option<UserStatus>,
+        ) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => client.update_user(user_id, username, status),
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
+            }
+        }
+
+        fn update_permissions(
+            &self,
+            user_id: &Identifier,
+            permissions: Option<Permissions>,
+        ) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => client.update_permissions(user_id, permissions),
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
+            }
+        }
+
+        fn change_password(
+            &self,
+            user_id: &Identifier,
+            current_password: &str,
+            new_password: &str,
+        ) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => {
+                    client.change_password(user_id, current_password, new_password)
+                }
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
+            }
+        }
+
+        fn login_user(&self, username: &str, password: &str) -> Result<IdentityInfo, IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => client.login_user(username, password),
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
+            }
+        }
+
+        fn logout_user(&self) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => client.logout_user(),
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
+            }
         }
     }
 }

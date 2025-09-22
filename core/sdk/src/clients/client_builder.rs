@@ -16,15 +16,19 @@
  * under the License.
  */
 
-use crate::client_wrappers::client_wrapper::ClientWrapper;
+use crate::client_wrappers::ClientWrapper;
 use crate::clients::client::IggyClient;
+#[cfg(feature = "async")]
 use crate::http::http_client::HttpClient;
-use crate::prelude::{
-    AutoLogin, EncryptorKind, HttpClientConfigBuilder, IggyDuration, IggyError, Partitioner,
-    QuicClientConfigBuilder, TcpClientConfigBuilder,
-};
+use crate::prelude::{AutoLogin, EncryptorKind, IggyDuration, IggyError, Partitioner};
+#[cfg(feature = "async")]
+use crate::prelude::{HttpClientConfigBuilder, QuicClientConfigBuilder, TcpClientConfigBuilder};
+#[cfg(feature = "async")]
 use crate::quic::quic_client::QuicClient;
+#[cfg(feature = "async")]
 use crate::tcp::tcp_client::TcpClient;
+#[cfg(feature = "sync")]
+use crate::tcp::tcp_client_sync::TcpClientSync;
 use iggy_common::{ConnectionStringUtils, TransportProtocol};
 use std::sync::Arc;
 use tracing::error;
@@ -48,6 +52,7 @@ impl IggyClientBuilder {
     pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
         let mut builder = Self::new();
 
+        #[cfg(feature = "async")]
         match ConnectionStringUtils::parse_protocol(connection_string)? {
             TransportProtocol::Tcp => {
                 builder.client = Some(ClientWrapper::Tcp(TcpClient::from_connection_string(
@@ -63,6 +68,18 @@ impl IggyClientBuilder {
                 builder.client = Some(ClientWrapper::Http(HttpClient::from_connection_string(
                     connection_string,
                 )?));
+            }
+        }
+
+        #[cfg(feature = "sync")]
+        match ConnectionStringUtils::parse_protocol(connection_string)? {
+            TransportProtocol::Tcp => {
+                builder.client = Some(ClientWrapper::TcpSync(Box::new(
+                    TcpClientSync::from_connection_string(connection_string)?,
+                )));
+            }
+            _ => {
+                return Err(IggyError::InvalidConfiguration);
             }
         }
 
@@ -90,6 +107,7 @@ impl IggyClientBuilder {
     /// This method provides fluent API for the TCP client configuration.
     /// It returns the `TcpClientBuilder` instance, which allows to configure the TCP client with custom settings or using defaults.
     /// This should be called after the non-protocol specific methods, such as `with_partitioner`, `with_encryptor` or `with_message_handler`.
+    #[cfg(feature = "async")]
     pub fn with_tcp(self) -> TcpClientBuilder {
         TcpClientBuilder {
             config: TcpClientConfigBuilder::default(),
@@ -100,6 +118,7 @@ impl IggyClientBuilder {
     /// This method provides fluent API for the QUIC client configuration.
     /// It returns the `QuicClientBuilder` instance, which allows to configure the QUIC client with custom settings or using defaults.
     /// This should be called after the non-protocol specific methods, such as `with_partitioner`, `with_encryptor` or `with_message_handler`.
+    #[cfg(feature = "async")]
     pub fn with_quic(self) -> QuicClientBuilder {
         QuicClientBuilder {
             config: QuicClientConfigBuilder::default(),
@@ -110,6 +129,7 @@ impl IggyClientBuilder {
     /// This method provides fluent API for the HTTP client configuration.
     /// It returns the `HttpClientBuilder` instance, which allows to configure the HTTP client with custom settings or using defaults.
     /// This should be called after the non-protocol specific methods, such as `with_partitioner`, `with_encryptor` or `with_message_handler`.
+    #[cfg(feature = "async")]
     pub fn with_http(self) -> HttpClientBuilder {
         HttpClientBuilder {
             config: HttpClientConfigBuilder::default(),
@@ -131,12 +151,14 @@ impl IggyClientBuilder {
     }
 }
 
+#[cfg(feature = "async")]
 #[derive(Debug, Default)]
 pub struct TcpClientBuilder {
     config: TcpClientConfigBuilder,
     parent_builder: IggyClientBuilder,
 }
 
+#[cfg(feature = "async")]
 impl TcpClientBuilder {
     /// Sets the server address for the TCP client.
     pub fn with_server_address(mut self, server_address: String) -> Self {
@@ -209,12 +231,14 @@ impl TcpClientBuilder {
     }
 }
 
+#[cfg(feature = "async")]
 #[derive(Debug, Default)]
 pub struct QuicClientBuilder {
     config: QuicClientConfigBuilder,
     parent_builder: IggyClientBuilder,
 }
 
+#[cfg(feature = "async")]
 impl QuicClientBuilder {
     /// Sets the server address for the QUIC client.
     pub fn with_server_address(mut self, server_address: String) -> Self {
@@ -261,12 +285,14 @@ impl QuicClientBuilder {
     }
 }
 
+#[cfg(feature = "async")]
 #[derive(Debug, Default)]
 pub struct HttpClientBuilder {
     config: HttpClientConfigBuilder,
     parent_builder: IggyClientBuilder,
 }
 
+#[cfg(feature = "async")]
 impl HttpClientBuilder {
     /// Sets the server address for the HTTP client.
     pub fn with_api_url(mut self, api_url: String) -> Self {

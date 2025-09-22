@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::client_wrappers::client_wrapper::ClientWrapper;
+use crate::client_wrappers::ClientWrapper;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::Stream;

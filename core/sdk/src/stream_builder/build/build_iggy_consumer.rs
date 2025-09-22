@@ -20,6 +20,7 @@ use crate::clients::client::IggyClient;
 use crate::clients::consumer::IggyConsumer;
 use crate::prelude::{ConsumerKind, IggyError};
 use crate::stream_builder::IggyConsumerConfig;
+use futures::TryFutureExt;
 use tracing::{error, trace};
 
 /// Builds an `IggyConsumer` from the given `IggyClient` and `IggyConsumerConfig`.
@@ -39,6 +40,7 @@ use tracing::{error, trace};
 /// The `IggyConsumerConfig` fields are used to configure the `IggyConsumer`.
 ///
 #[maybe_async::maybe_async]
+#[cfg(feature = "async")]
 pub(crate) async fn build_iggy_consumer(
     client: &IggyClient,
     config: &IggyConsumerConfig,

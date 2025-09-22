@@ -16,238 +16,300 @@
  * under the License.
  */
 
-use crate::client_wrappers::client_wrapper::ClientWrapper;
+use crate::client_wrappers::ClientWrapper;
 use async_dropper::AsyncDrop;
-use async_trait::async_trait;
 use iggy_binary_protocol::{ConsumerGroupClient, UserClient};
 use iggy_common::{ConsumerGroup, ConsumerGroupDetails, Identifier, IggyError};
 
-#[maybe_async::maybe_async]
-#[async_trait]
-impl ConsumerGroupClient for ClientWrapper {
-    async fn get_consumer_group(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        group_id: &Identifier,
-    ) -> Result<Option<ConsumerGroupDetails>, IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => {
-                client
-                    .get_consumer_group(stream_id, topic_id, group_id)
-                    .await
-            }
-            ClientWrapper::Http(client) => {
-                client
-                    .get_consumer_group(stream_id, topic_id, group_id)
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .get_consumer_group(stream_id, topic_id, group_id)
-                    .await
-            }
-            ClientWrapper::TcpSync(client) => {
-                client
-                    .get_consumer_group(stream_id, topic_id, group_id)
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .get_consumer_group(stream_id, topic_id, group_id)
-                    .await
-            }
-        }
-    }
-
-    async fn get_consumer_groups(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-    ) -> Result<Vec<ConsumerGroup>, IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.get_consumer_groups(stream_id, topic_id).await,
-            ClientWrapper::Http(client) => client.get_consumer_groups(stream_id, topic_id).await,
-            ClientWrapper::Tcp(client) => client.get_consumer_groups(stream_id, topic_id).await,
-            ClientWrapper::TcpSync(client) => client.get_consumer_groups(stream_id, topic_id).await,
-            ClientWrapper::Quic(client) => client.get_consumer_groups(stream_id, topic_id).await,
-        }
-    }
-
-    async fn create_consumer_group(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        name: &str,
-        group_id: Option<u32>,
-    ) -> Result<ConsumerGroupDetails, IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => {
-                client
-                    .create_consumer_group(stream_id, topic_id, name, group_id)
-                    .await
-            }
-            ClientWrapper::Http(client) => {
-                client
-                    .create_consumer_group(stream_id, topic_id, name, group_id)
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .create_consumer_group(stream_id, topic_id, name, group_id)
-                    .await
-            }
-            ClientWrapper::TcpSync(client) => {
-                client
-                    .create_consumer_group(stream_id, topic_id, name, group_id)
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .create_consumer_group(stream_id, topic_id, name, group_id)
-                    .await
-            }
-        }
-    }
-
-    async fn delete_consumer_group(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        group_id: &Identifier,
-    ) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => {
-                client
-                    .delete_consumer_group(stream_id, topic_id, group_id)
-                    .await
-            }
-            ClientWrapper::Http(client) => {
-                client
-                    .delete_consumer_group(stream_id, topic_id, group_id)
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .delete_consumer_group(stream_id, topic_id, group_id)
-                    .await
-            }
-            ClientWrapper::TcpSync(client) => {
-                client
-                    .delete_consumer_group(stream_id, topic_id, group_id)
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .delete_consumer_group(stream_id, topic_id, group_id)
-                    .await
-            }
-        }
-    }
-
-    async fn join_consumer_group(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        group_id: &Identifier,
-    ) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => {
-                client
-                    .join_consumer_group(stream_id, topic_id, group_id)
-                    .await
-            }
-            ClientWrapper::Http(client) => {
-                client
-                    .join_consumer_group(stream_id, topic_id, group_id)
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .join_consumer_group(stream_id, topic_id, group_id)
-                    .await
-            }
-            ClientWrapper::TcpSync(client) => {
-                client
-                    .join_consumer_group(stream_id, topic_id, group_id)
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .join_consumer_group(stream_id, topic_id, group_id)
-                    .await
-            }
-        }
-    }
-
-    async fn leave_consumer_group(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        group_id: &Identifier,
-    ) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => {
-                client
-                    .leave_consumer_group(stream_id, topic_id, group_id)
-                    .await
-            }
-            ClientWrapper::Http(client) => {
-                client
-                    .leave_consumer_group(stream_id, topic_id, group_id)
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .leave_consumer_group(stream_id, topic_id, group_id)
-                    .await
-            }
-            ClientWrapper::TcpSync(client) => {
-                client
-                    .leave_consumer_group(stream_id, topic_id, group_id)
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .leave_consumer_group(stream_id, topic_id, group_id)
-                    .await
-            }
-        }
-    }
-}
-
 #[cfg(feature = "async")]
-#[async_trait]
-impl AsyncDrop for ClientWrapper {
-    async fn async_drop(&mut self) {
-        match self {
-            ClientWrapper::Iggy(client) => {
-                let _ = client.logout_user().await;
+pub mod async_impl {
+    use super::*;
+    use async_trait::async_trait;
+
+    #[async_trait]
+    impl ConsumerGroupClient for ClientWrapper {
+        async fn get_consumer_group(
+            &self,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
+            group_id: &Identifier,
+        ) -> Result<Option<ConsumerGroupDetails>, IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => {
+                    client
+                        .get_consumer_group(stream_id, topic_id, group_id)
+                        .await
+                }
+                ClientWrapper::Http(client) => {
+                    client
+                        .get_consumer_group(stream_id, topic_id, group_id)
+                        .await
+                }
+                ClientWrapper::Tcp(client) => {
+                    client
+                        .get_consumer_group(stream_id, topic_id, group_id)
+                        .await
+                }
+                ClientWrapper::Quic(client) => {
+                    client
+                        .get_consumer_group(stream_id, topic_id, group_id)
+                        .await
+                }
             }
-            ClientWrapper::Http(client) => {
-                let _ = client.logout_user().await;
+        }
+
+        async fn get_consumer_groups(
+            &self,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
+        ) -> Result<Vec<ConsumerGroup>, IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => client.get_consumer_groups(stream_id, topic_id).await,
+                ClientWrapper::Http(client) => client.get_consumer_groups(stream_id, topic_id).await,
+                ClientWrapper::Tcp(client) => client.get_consumer_groups(stream_id, topic_id).await,
+                ClientWrapper::Quic(client) => client.get_consumer_groups(stream_id, topic_id).await,
             }
-            ClientWrapper::Tcp(client) => {
-                let _ = client.logout_user().await;
+        }
+
+        async fn create_consumer_group(
+            &self,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
+            name: &str,
+            group_id: Option<u32>,
+        ) -> Result<ConsumerGroupDetails, IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => {
+                    client
+                        .create_consumer_group(stream_id, topic_id, name, group_id)
+                        .await
+                }
+                ClientWrapper::Http(client) => {
+                    client
+                        .create_consumer_group(stream_id, topic_id, name, group_id)
+                        .await
+                }
+                ClientWrapper::Tcp(client) => {
+                    client
+                        .create_consumer_group(stream_id, topic_id, name, group_id)
+                        .await
+                }
+                ClientWrapper::Quic(client) => {
+                    client
+                        .create_consumer_group(stream_id, topic_id, name, group_id)
+                        .await
+                }
             }
-            ClientWrapper::TcpSync(client) => {
-                let _ = client.logout_user().await;
+        }
+
+        async fn delete_consumer_group(
+            &self,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
+            group_id: &Identifier,
+        ) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => {
+                    client
+                        .delete_consumer_group(stream_id, topic_id, group_id)
+                        .await
+                }
+                ClientWrapper::Http(client) => {
+                    client
+                        .delete_consumer_group(stream_id, topic_id, group_id)
+                        .await
+                }
+                ClientWrapper::Tcp(client) => {
+                    client
+                        .delete_consumer_group(stream_id, topic_id, group_id)
+                        .await
+                }
+                ClientWrapper::Quic(client) => {
+                    client
+                        .delete_consumer_group(stream_id, topic_id, group_id)
+                        .await
+                }
             }
-            ClientWrapper::Quic(client) => {
-                let _ = client.logout_user().await;
+        }
+
+        async fn join_consumer_group(
+            &self,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
+            group_id: &Identifier,
+        ) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => {
+                    client
+                        .join_consumer_group(stream_id, topic_id, group_id)
+                        .await
+                }
+                ClientWrapper::Http(client) => {
+                    client
+                        .join_consumer_group(stream_id, topic_id, group_id)
+                        .await
+                }
+                ClientWrapper::Tcp(client) => {
+                    client
+                        .join_consumer_group(stream_id, topic_id, group_id)
+                        .await
+                }
+                ClientWrapper::Quic(client) => {
+                    client
+                        .join_consumer_group(stream_id, topic_id, group_id)
+                        .await
+                }
+            }
+        }
+
+        async fn leave_consumer_group(
+            &self,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
+            group_id: &Identifier,
+        ) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => {
+                    client
+                        .leave_consumer_group(stream_id, topic_id, group_id)
+                        .await
+                }
+                ClientWrapper::Http(client) => {
+                    client
+                        .leave_consumer_group(stream_id, topic_id, group_id)
+                        .await
+                }
+                ClientWrapper::Tcp(client) => {
+                    client
+                        .leave_consumer_group(stream_id, topic_id, group_id)
+                        .await
+                }
+                ClientWrapper::Quic(client) => {
+                    client
+                        .leave_consumer_group(stream_id, topic_id, group_id)
+                        .await
+                }
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AsyncDrop for ClientWrapper {
+        async fn async_drop(&mut self) {
+            match self {
+                ClientWrapper::Iggy(client) => {
+                    let _ = client.logout_user().await;
+                }
+                ClientWrapper::Http(client) => {
+                    let _ = client.logout_user().await;
+                }
+                ClientWrapper::Tcp(client) => {
+                    let _ = client.logout_user().await;
+                }
+                ClientWrapper::Quic(client) => {
+                    let _ = client.logout_user().await;
+                }
             }
         }
     }
 }
 
 #[cfg(feature = "sync")]
-impl Drop for ClientWrapper {
-    fn drop(&mut self) {
-        match self {
-            ClientWrapper::TcpSync(client) => {
-                let _ = client.logout_user();
+pub mod sync_impl {
+    use super::*;
+
+    impl ConsumerGroupClient for ClientWrapper {
+        fn get_consumer_group(
+            &self,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
+            group_id: &Identifier,
+        ) -> Result<Option<ConsumerGroupDetails>, IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => {
+                    client.get_consumer_group(stream_id, topic_id, group_id)
+                }
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
             }
-            _ => return
+        }
+
+        fn get_consumer_groups(
+            &self,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
+        ) -> Result<Vec<ConsumerGroup>, IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => client.get_consumer_groups(stream_id, topic_id),
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
+            }
+        }
+
+        fn create_consumer_group(
+            &self,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
+            name: &str,
+            group_id: Option<u32>,
+        ) -> Result<ConsumerGroupDetails, IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => {
+                    client.create_consumer_group(stream_id, topic_id, name, group_id)
+                }
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
+            }
+        }
+
+        fn delete_consumer_group(
+            &self,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
+            group_id: &Identifier,
+        ) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => {
+                    client.delete_consumer_group(stream_id, topic_id, group_id)
+                }
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
+            }
+        }
+
+        fn join_consumer_group(
+            &self,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
+            group_id: &Identifier,
+        ) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => {
+                    client.join_consumer_group(stream_id, topic_id, group_id)
+                }
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
+            }
+        }
+
+        fn leave_consumer_group(
+            &self,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
+            group_id: &Identifier,
+        ) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => {
+                    client.leave_consumer_group(stream_id, topic_id, group_id)
+                }
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
+            }
+        }
+    }
+
+    impl Drop for ClientWrapper {
+        fn drop(&mut self) {
+            match self {
+                ClientWrapper::TcpSync(client) => {
+                    let _ = client.logout_user();
+                }
+                _ => return
+            }
         }
     }
 }

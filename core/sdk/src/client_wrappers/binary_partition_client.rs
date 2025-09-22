@@ -16,80 +16,109 @@
  * under the License.
  */
 
-use crate::client_wrappers::client_wrapper::ClientWrapper;
-use async_trait::async_trait;
+use crate::client_wrappers::ClientWrapper;
 use iggy_binary_protocol::PartitionClient;
 use iggy_common::{Identifier, IggyError};
 
-#[maybe_async::maybe_async]
-#[async_trait]
-impl PartitionClient for ClientWrapper {
-    async fn create_partitions(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partitions_count: u32,
-    ) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => {
-                client
-                    .create_partitions(stream_id, topic_id, partitions_count)
-                    .await
+#[cfg(feature = "async")]
+pub mod async_impl {
+    use super::*;
+    use async_trait::async_trait;
+
+    #[async_trait]
+    impl PartitionClient for ClientWrapper {
+        async fn create_partitions(
+            &self,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
+            partitions_count: u32,
+        ) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => {
+                    client
+                        .create_partitions(stream_id, topic_id, partitions_count)
+                        .await
+                }
+                ClientWrapper::Http(client) => {
+                    client
+                        .create_partitions(stream_id, topic_id, partitions_count)
+                        .await
+                }
+                ClientWrapper::Tcp(client) => {
+                    client
+                        .create_partitions(stream_id, topic_id, partitions_count)
+                        .await
+                }
+                ClientWrapper::Quic(client) => {
+                    client
+                        .create_partitions(stream_id, topic_id, partitions_count)
+                        .await
+                }
             }
-            ClientWrapper::Http(client) => {
-                client
-                    .create_partitions(stream_id, topic_id, partitions_count)
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .create_partitions(stream_id, topic_id, partitions_count)
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .create_partitions(stream_id, topic_id, partitions_count)
-                    .await
-            }
-            ClientWrapper::TcpSync(client) => {
-                client
-                    .create_partitions(stream_id, topic_id, partitions_count)
-                    .await
+        }
+
+        async fn delete_partitions(
+            &self,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
+            partitions_count: u32,
+        ) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => {
+                    client
+                        .delete_partitions(stream_id, topic_id, partitions_count)
+                        .await
+                }
+                ClientWrapper::Http(client) => {
+                    client
+                        .delete_partitions(stream_id, topic_id, partitions_count)
+                        .await
+                }
+                ClientWrapper::Tcp(client) => {
+                    client
+                        .delete_partitions(stream_id, topic_id, partitions_count)
+                        .await
+                }
+                ClientWrapper::Quic(client) => {
+                    client
+                        .delete_partitions(stream_id, topic_id, partitions_count)
+                        .await
+                }
             }
         }
     }
+}
 
-    async fn delete_partitions(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partitions_count: u32,
-    ) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => {
-                client
-                    .delete_partitions(stream_id, topic_id, partitions_count)
-                    .await
+#[cfg(feature = "sync")]
+pub mod sync_impl {
+    use super::*;
+
+    impl PartitionClient for ClientWrapper {
+        fn create_partitions(
+            &self,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
+            partitions_count: u32,
+        ) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => {
+                    client.create_partitions(stream_id, topic_id, partitions_count)
+                }
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
             }
-            ClientWrapper::Http(client) => {
-                client
-                    .delete_partitions(stream_id, topic_id, partitions_count)
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .delete_partitions(stream_id, topic_id, partitions_count)
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .delete_partitions(stream_id, topic_id, partitions_count)
-                    .await
-            }
-            ClientWrapper::TcpSync(client) => {
-                client
-                    .delete_partitions(stream_id, topic_id, partitions_count)
-                    .await
+        }
+
+        fn delete_partitions(
+            &self,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
+            partitions_count: u32,
+        ) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => {
+                    client.delete_partitions(stream_id, topic_id, partitions_count)
+                }
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
             }
         }
     }

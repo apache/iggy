@@ -16,55 +16,243 @@
  * under the License.
  */
 
-use crate::client_wrappers::client_wrapper::ClientWrapper;
-use async_trait::async_trait;
+use crate::client_wrappers::ClientWrapper;
 use iggy_binary_protocol::TopicClient;
 use iggy_common::{
     CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize, Topic, TopicDetails,
 };
 
-#[maybe_async::maybe_async]
-#[async_trait]
-impl TopicClient for ClientWrapper {
-    async fn get_topic(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-    ) -> Result<Option<TopicDetails>, IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.get_topic(stream_id, topic_id).await,
-            ClientWrapper::Http(client) => client.get_topic(stream_id, topic_id).await,
-            ClientWrapper::Tcp(client) => client.get_topic(stream_id, topic_id).await,
-            ClientWrapper::Quic(client) => client.get_topic(stream_id, topic_id).await,
-            ClientWrapper::TcpSync(client) => client.get_topic(stream_id, topic_id).await,
+#[cfg(feature = "async")]
+pub mod async_impl {
+    use super::*;
+    use async_trait::async_trait;
+
+    #[async_trait]
+    impl TopicClient for ClientWrapper {
+        async fn get_topic(
+            &self,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
+        ) -> Result<Option<TopicDetails>, IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => client.get_topic(stream_id, topic_id).await,
+                ClientWrapper::Http(client) => client.get_topic(stream_id, topic_id).await,
+                ClientWrapper::Tcp(client) => client.get_topic(stream_id, topic_id).await,
+                ClientWrapper::Quic(client) => client.get_topic(stream_id, topic_id).await,
+            }
+        }
+
+        async fn get_topics(&self, stream_id: &Identifier) -> Result<Vec<Topic>, IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => client.get_topics(stream_id).await,
+                ClientWrapper::Http(client) => client.get_topics(stream_id).await,
+                ClientWrapper::Tcp(client) => client.get_topics(stream_id).await,
+                ClientWrapper::Quic(client) => client.get_topics(stream_id).await,
+            }
+        }
+
+        async fn create_topic(
+            &self,
+            stream_id: &Identifier,
+            name: &str,
+            partitions_count: u32,
+            compression_algorithm: CompressionAlgorithm,
+            replication_factor: Option<u8>,
+            topic_id: Option<u32>,
+            message_expiry: IggyExpiry,
+            max_topic_size: MaxTopicSize,
+        ) -> Result<TopicDetails, IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => {
+                    client
+                        .create_topic(
+                            stream_id,
+                            name,
+                            partitions_count,
+                            compression_algorithm,
+                            replication_factor,
+                            topic_id,
+                            message_expiry,
+                            max_topic_size,
+                        )
+                        .await
+                }
+                ClientWrapper::Http(client) => {
+                    client
+                        .create_topic(
+                            stream_id,
+                            name,
+                            partitions_count,
+                            compression_algorithm,
+                            replication_factor,
+                            topic_id,
+                            message_expiry,
+                            max_topic_size,
+                        )
+                        .await
+                }
+                ClientWrapper::Tcp(client) => {
+                    client
+                        .create_topic(
+                            stream_id,
+                            name,
+                            partitions_count,
+                            compression_algorithm,
+                            replication_factor,
+                            topic_id,
+                            message_expiry,
+                            max_topic_size,
+                        )
+                        .await
+                }
+                ClientWrapper::Quic(client) => {
+                    client
+                        .create_topic(
+                            stream_id,
+                            name,
+                            partitions_count,
+                            compression_algorithm,
+                            replication_factor,
+                            topic_id,
+                            message_expiry,
+                            max_topic_size,
+                        )
+                        .await
+                }
+            }
+        }
+
+        async fn update_topic(
+            &self,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
+            name: &str,
+            compression_algorithm: CompressionAlgorithm,
+            replication_factor: Option<u8>,
+            message_expiry: IggyExpiry,
+            max_topic_size: MaxTopicSize,
+        ) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => {
+                    client
+                        .update_topic(
+                            stream_id,
+                            topic_id,
+                            name,
+                            compression_algorithm,
+                            replication_factor,
+                            message_expiry,
+                            max_topic_size,
+                        )
+                        .await
+                }
+                ClientWrapper::Http(client) => {
+                    client
+                        .update_topic(
+                            stream_id,
+                            topic_id,
+                            name,
+                            compression_algorithm,
+                            replication_factor,
+                            message_expiry,
+                            max_topic_size,
+                        )
+                        .await
+                }
+                ClientWrapper::Tcp(client) => {
+                    client
+                        .update_topic(
+                            stream_id,
+                            topic_id,
+                            name,
+                            compression_algorithm,
+                            replication_factor,
+                            message_expiry,
+                            max_topic_size,
+                        )
+                        .await
+                }
+                ClientWrapper::Quic(client) => {
+                    client
+                        .update_topic(
+                            stream_id,
+                            topic_id,
+                            name,
+                            compression_algorithm,
+                            replication_factor,
+                            message_expiry,
+                            max_topic_size,
+                        )
+                        .await
+                }
+            }
+        }
+
+        async fn delete_topic(
+            &self,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
+        ) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => client.delete_topic(stream_id, topic_id).await,
+                ClientWrapper::Http(client) => client.delete_topic(stream_id, topic_id).await,
+                ClientWrapper::Tcp(client) => client.delete_topic(stream_id, topic_id).await,
+                ClientWrapper::Quic(client) => client.delete_topic(stream_id, topic_id).await,
+            }
+        }
+
+        async fn purge_topic(
+            &self,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
+        ) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => client.purge_topic(stream_id, topic_id).await,
+                ClientWrapper::Http(client) => client.purge_topic(stream_id, topic_id).await,
+                ClientWrapper::Tcp(client) => client.purge_topic(stream_id, topic_id).await,
+                ClientWrapper::Quic(client) => client.purge_topic(stream_id, topic_id).await,
+            }
         }
     }
+}
 
-    async fn get_topics(&self, stream_id: &Identifier) -> Result<Vec<Topic>, IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.get_topics(stream_id).await,
-            ClientWrapper::Http(client) => client.get_topics(stream_id).await,
-            ClientWrapper::Tcp(client) => client.get_topics(stream_id).await,
-            ClientWrapper::Quic(client) => client.get_topics(stream_id).await,
-            ClientWrapper::TcpSync(client) => client.get_topics(stream_id).await,
+#[cfg(feature = "sync")]
+pub mod sync_impl {
+    use super::*;
+
+    impl TopicClient for ClientWrapper {
+        fn get_topic(
+            &self,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
+        ) -> Result<Option<TopicDetails>, IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => client.get_topic(stream_id, topic_id),
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
+            }
         }
-    }
 
-    async fn create_topic(
-        &self,
-        stream_id: &Identifier,
-        name: &str,
-        partitions_count: u32,
-        compression_algorithm: CompressionAlgorithm,
-        replication_factor: Option<u8>,
-        topic_id: Option<u32>,
-        message_expiry: IggyExpiry,
-        max_topic_size: MaxTopicSize,
-    ) -> Result<TopicDetails, IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => {
-                client
-                    .create_topic(
+        fn get_topics(&self, stream_id: &Identifier) -> Result<Vec<Topic>, IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => client.get_topics(stream_id),
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
+            }
+        }
+
+        fn create_topic(
+            &self,
+            stream_id: &Identifier,
+            name: &str,
+            partitions_count: u32,
+            compression_algorithm: CompressionAlgorithm,
+            replication_factor: Option<u8>,
+            topic_id: Option<u32>,
+            message_expiry: IggyExpiry,
+            max_topic_size: MaxTopicSize,
+        ) -> Result<TopicDetails, IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => {
+                    client.create_topic(
                         stream_id,
                         name,
                         partitions_count,
@@ -74,81 +262,24 @@ impl TopicClient for ClientWrapper {
                         message_expiry,
                         max_topic_size,
                     )
-                    .await
-            }
-            ClientWrapper::Http(client) => {
-                client
-                    .create_topic(
-                        stream_id,
-                        name,
-                        partitions_count,
-                        compression_algorithm,
-                        replication_factor,
-                        topic_id,
-                        message_expiry,
-                        max_topic_size,
-                    )
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .create_topic(
-                        stream_id,
-                        name,
-                        partitions_count,
-                        compression_algorithm,
-                        replication_factor,
-                        topic_id,
-                        message_expiry,
-                        max_topic_size,
-                    )
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .create_topic(
-                        stream_id,
-                        name,
-                        partitions_count,
-                        compression_algorithm,
-                        replication_factor,
-                        topic_id,
-                        message_expiry,
-                        max_topic_size,
-                    )
-                    .await
-            }
-            ClientWrapper::TcpSync(client) => {
-                client
-                    .create_topic(
-                        stream_id,
-                        name,
-                        partitions_count,
-                        compression_algorithm,
-                        replication_factor,
-                        topic_id,
-                        message_expiry,
-                        max_topic_size,
-                    )
-                    .await
+                }
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
             }
         }
-    }
 
-    async fn update_topic(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        name: &str,
-        compression_algorithm: CompressionAlgorithm,
-        replication_factor: Option<u8>,
-        message_expiry: IggyExpiry,
-        max_topic_size: MaxTopicSize,
-    ) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => {
-                client
-                    .update_topic(
+        fn update_topic(
+            &self,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
+            name: &str,
+            compression_algorithm: CompressionAlgorithm,
+            replication_factor: Option<u8>,
+            message_expiry: IggyExpiry,
+            max_topic_size: MaxTopicSize,
+        ) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => {
+                    client.update_topic(
                         stream_id,
                         topic_id,
                         name,
@@ -157,88 +288,31 @@ impl TopicClient for ClientWrapper {
                         message_expiry,
                         max_topic_size,
                     )
-                    .await
-            }
-            ClientWrapper::Http(client) => {
-                client
-                    .update_topic(
-                        stream_id,
-                        topic_id,
-                        name,
-                        compression_algorithm,
-                        replication_factor,
-                        message_expiry,
-                        max_topic_size,
-                    )
-                    .await
-            }
-            ClientWrapper::Tcp(client) => {
-                client
-                    .update_topic(
-                        stream_id,
-                        topic_id,
-                        name,
-                        compression_algorithm,
-                        replication_factor,
-                        message_expiry,
-                        max_topic_size,
-                    )
-                    .await
-            }
-            ClientWrapper::Quic(client) => {
-                client
-                    .update_topic(
-                        stream_id,
-                        topic_id,
-                        name,
-                        compression_algorithm,
-                        replication_factor,
-                        message_expiry,
-                        max_topic_size,
-                    )
-                    .await
-            }
-            ClientWrapper::TcpSync(client) => {
-                client
-                    .update_topic(
-                        stream_id,
-                        topic_id,
-                        name,
-                        compression_algorithm,
-                        replication_factor,
-                        message_expiry,
-                        max_topic_size,
-                    )
-                    .await
+                }
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
             }
         }
-    }
 
-    async fn delete_topic(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-    ) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.delete_topic(stream_id, topic_id).await,
-            ClientWrapper::Http(client) => client.delete_topic(stream_id, topic_id).await,
-            ClientWrapper::Tcp(client) => client.delete_topic(stream_id, topic_id).await,
-            ClientWrapper::Quic(client) => client.delete_topic(stream_id, topic_id).await,
-            ClientWrapper::TcpSync(client) => client.delete_topic(stream_id, topic_id).await,
+        fn delete_topic(
+            &self,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
+        ) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => client.delete_topic(stream_id, topic_id),
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
+            }
         }
-    }
 
-    async fn purge_topic(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-    ) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.purge_topic(stream_id, topic_id).await,
-            ClientWrapper::Http(client) => client.purge_topic(stream_id, topic_id).await,
-            ClientWrapper::Tcp(client) => client.purge_topic(stream_id, topic_id).await,
-            ClientWrapper::Quic(client) => client.purge_topic(stream_id, topic_id).await,
-            ClientWrapper::TcpSync(client) => client.purge_topic(stream_id, topic_id).await,
+        fn purge_topic(
+            &self,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
+        ) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => client.purge_topic(stream_id, topic_id),
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
+            }
         }
     }
 }

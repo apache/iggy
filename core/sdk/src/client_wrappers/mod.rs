@@ -27,4 +27,11 @@ mod binary_stream_client;
 mod binary_system_client;
 mod binary_topic_client;
 mod binary_user_client;
-pub mod client_wrapper;
+
+mod client_wrapper;
+
+#[cfg(feature = "sync")]
+pub use client_wrapper::sync_impl::ClientWrapper;
+
+#[cfg(feature = "async")]
+pub use client_wrapper::async_impl::ClientWrapper;

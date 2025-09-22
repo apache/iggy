@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::client_wrappers::client_wrapper::ClientWrapper;
+use crate::client_wrappers::ClientWrapper;
 use crate::prelude::{AutoCommit, AutoCommitWhen, IggyConsumer};
 use iggy_common::locking::IggySharedMut;
 use iggy_common::{Consumer, EncryptorKind, Identifier, IggyDuration, PollingStrategy};

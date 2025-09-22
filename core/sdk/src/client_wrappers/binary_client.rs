@@ -16,52 +16,87 @@
  * under the License.
  */
 
-use crate::client_wrappers::client_wrapper::ClientWrapper;
+use crate::client_wrappers::ClientWrapper;
 use async_broadcast::Receiver;
-use async_trait::async_trait;
 use iggy_binary_protocol::Client;
 use iggy_common::{DiagnosticEvent, IggyError};
 
-#[maybe_async::maybe_async]
-#[async_trait]
-impl Client for ClientWrapper {
-    async fn connect(&self) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.connect().await,
-            ClientWrapper::Http(client) => client.connect().await,
-            ClientWrapper::Tcp(client) => client.connect().await,
-            ClientWrapper::TcpSync(client) => client.connect().await,
-            ClientWrapper::Quic(client) => client.connect().await,
+#[cfg(feature = "async")]
+pub mod async_impl {
+    use super::*;
+    use async_trait::async_trait;
+
+    #[async_trait]
+    impl Client for ClientWrapper {
+        async fn connect(&self) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => client.connect().await,
+                ClientWrapper::Http(client) => client.connect().await,
+                ClientWrapper::Tcp(client) => client.connect().await,
+                ClientWrapper::Quic(client) => client.connect().await,
+            }
+        }
+
+        async fn disconnect(&self) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => client.disconnect().await,
+                ClientWrapper::Http(client) => client.disconnect().await,
+                ClientWrapper::Tcp(client) => client.disconnect().await,
+                ClientWrapper::Quic(client) => client.disconnect().await,
+            }
+        }
+
+        async fn shutdown(&self) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::Iggy(client) => client.shutdown().await,
+                ClientWrapper::Http(client) => client.shutdown().await,
+                ClientWrapper::Tcp(client) => client.shutdown().await,
+                ClientWrapper::Quic(client) => client.shutdown().await,
+            }
+        }
+
+        async fn subscribe_events(&self) -> Receiver<DiagnosticEvent> {
+            match self {
+                ClientWrapper::Iggy(client) => client.subscribe_events().await,
+                ClientWrapper::Http(client) => client.subscribe_events().await,
+                ClientWrapper::Tcp(client) => client.subscribe_events().await,
+                ClientWrapper::Quic(client) => client.subscribe_events().await,
+            }
         }
     }
+}
 
-    async fn disconnect(&self) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.disconnect().await,
-            ClientWrapper::Http(client) => client.disconnect().await,
-            ClientWrapper::Tcp(client) => client.disconnect().await,
-            ClientWrapper::TcpSync(client) => client.disconnect().await,
-            ClientWrapper::Quic(client) => client.disconnect().await,
+#[cfg(feature = "sync")]
+pub mod sync_impl {
+    use super::*;
+
+    impl Client for ClientWrapper {
+        fn connect(&self) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => client.connect(),
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
+            }
         }
-    }
 
-    async fn shutdown(&self) -> Result<(), IggyError> {
-        match self {
-            ClientWrapper::Iggy(client) => client.shutdown().await,
-            ClientWrapper::Http(client) => client.shutdown().await,
-            ClientWrapper::Tcp(client) => client.shutdown().await,
-            ClientWrapper::TcpSync(client) => client.shutdown().await,
-            ClientWrapper::Quic(client) => client.shutdown().await,
+        fn disconnect(&self) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => client.disconnect(),
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
+            }
         }
-    }
 
-    async fn subscribe_events(&self) -> Receiver<DiagnosticEvent> {
-        match self {
-            ClientWrapper::Iggy(client) => client.subscribe_events().await,
-            ClientWrapper::Http(client) => client.subscribe_events().await,
-            ClientWrapper::Tcp(client) => client.subscribe_events().await,
-            ClientWrapper::TcpSync(client) => client.subscribe_events().await,
-            ClientWrapper::Quic(client) => client.subscribe_events().await,
+        fn shutdown(&self) -> Result<(), IggyError> {
+            match self {
+                ClientWrapper::TcpSync(client) => client.shutdown(),
+                ClientWrapper::Iggy(_) => Err(IggyError::InvalidConfiguration),
+            }
+        }
+
+        fn subscribe_events(&self) -> Receiver<DiagnosticEvent> {
+            match self {
+                ClientWrapper::TcpSync(client) => client.subscribe_events(),
+                ClientWrapper::Iggy(_) => panic!("add here smth"),
+            }
         }
     }
 }

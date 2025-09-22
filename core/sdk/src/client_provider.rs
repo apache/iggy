@@ -19,13 +19,23 @@
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 #[allow(deprecated)]
 use crate::clients::client::IggyClient;
+
+#[cfg(feature = "async")]
 use crate::http::http_client::HttpClient;
+#[cfg(feature = "async")]
+use crate::quic::quic_client::QuicClient;
+#[cfg(feature = "async")]
+use crate::tcp::tcp_client::TcpClient;
+
 use crate::prelude::{
-    ClientError, HttpClientConfig, IggyDuration, QuicClientConfig, QuicClientReconnectionConfig,
+    ClientError, IggyDuration,
+};
+
+#[cfg(feature = "async")]
+use crate::prelude::{
+    HttpClientConfig, QuicClientConfig, QuicClientReconnectionConfig,
     TcpClientConfig, TcpClientReconnectionConfig,
 };
-use crate::quic::quic_client::QuicClient;
-use crate::tcp::tcp_client::TcpClient;
 use iggy_binary_protocol::Client;
 use iggy_common::{AutoLogin, Credentials};
 use std::str::FromStr;
@@ -46,10 +56,13 @@ pub struct ClientProviderConfig {
     /// The transport to use. Valid values are `quic`, `http` and `tcp`.
     pub transport: String,
     /// The optional configuration for the HTTP transport.
+    #[cfg(feature = "async")]
     pub http: Option<Arc<HttpClientConfig>>,
     /// The optional configuration for the QUIC transport.
+    #[cfg(feature = "async")]
     pub quic: Option<Arc<QuicClientConfig>>,
     /// The optional configuration for the TCP transport.
+    #[cfg(feature = "async")]
     pub tcp: Option<Arc<TcpClientConfig>>,
 }
 
@@ -57,8 +70,11 @@ impl Default for ClientProviderConfig {
     fn default() -> ClientProviderConfig {
         ClientProviderConfig {
             transport: TCP_TRANSPORT.to_string(),
+            #[cfg(feature = "async")]
             http: Some(Arc::new(HttpClientConfig::default())),
+            #[cfg(feature = "async")]
             quic: Some(Arc::new(QuicClientConfig::default())),
+            #[cfg(feature = "async")]
             tcp: Some(Arc::new(TcpClientConfig::default())),
         }
     }
@@ -79,10 +95,14 @@ impl ClientProviderConfig {
         let transport = args.transport;
         let mut config = Self {
             transport,
+            #[cfg(feature = "async")]
             http: None,
+            #[cfg(feature = "async")]
             quic: None,
+            #[cfg(feature = "async")]
             tcp: None,
         };
+        #[cfg(feature = "async")]
         match config.transport.as_str() {
             QUIC_TRANSPORT => {
                 config.quic = Some(Arc::new(QuicClientConfig {
@@ -157,21 +177,29 @@ impl ClientProviderConfig {
             _ => return Err(ClientError::InvalidTransport(config.transport.clone())),
         }
 
+        #[cfg(feature = "sync")]
+        if config.transport != TCP_TRANSPORT {
+            return Err(ClientError::InvalidTransport(config.transport.clone()));
+        }
+
         Ok(config)
     }
 }
 
+#[cfg(feature = "async")]
 /// Create a default `IggyClient` with the default configuration.
 pub async fn get_default_client_() -> Result<IggyClient, ClientError> {
     get_client(Arc::new(ClientProviderConfig::default())).await
 }
 
+#[cfg(feature = "async")]
 /// Create a `IggyClient` for the specific transport based on the provided configuration.
 pub async fn get_client(config: Arc<ClientProviderConfig>) -> Result<IggyClient, ClientError> {
     let client = get_raw_connected_client(config).await?;
     Ok(IggyClient::builder().with_client(client).build()?)
 }
 
+#[cfg(feature = "async")]
 /// Create a `Client` for the specific transport based on the provided configuration.
 pub async fn get_raw_connected_client(
     config: Arc<ClientProviderConfig>,
@@ -179,6 +207,7 @@ pub async fn get_raw_connected_client(
     get_raw_client(config, true).await
 }
 
+#[cfg(feature = "async")]
 /// Create a `Client` for the specific transport based on the provided configuration.
 pub async fn get_raw_client(
     config: Arc<ClientProviderConfig>,
