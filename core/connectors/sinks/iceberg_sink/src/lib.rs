@@ -21,7 +21,6 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 
-use iceberg::table::Table;
 use iceberg::Catalog;
 use iceberg_catalog_glue::{GlueCatalog, GlueCatalogConfig};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
@@ -91,8 +90,6 @@ pub struct IcebergSinkConfig {
     pub catalog_type: IcebergSinkTypes,
     pub warehouse: String,
     pub uri: String,
-    pub auto_create: bool,
-    pub evolve_schema: bool,
     pub dynamic_routing: bool,
     pub dynamic_route_field: String,
     pub store_url: String,
@@ -104,13 +101,6 @@ pub struct IcebergSinkConfig {
 
 pub(self) fn slice_user_table(table: &String) -> Vec<String> {
     table.split('.').map(|s| s.to_string()).collect()
-}
-
-pub(self) async fn create_table(name: String) -> Result<Table, Error> {
-    let table = Table::builder()
-        .build()
-        .map_err(|err| Error::InvalidState)?;
-    return Ok(table);
 }
 
 impl IcebergSink {
@@ -220,7 +210,7 @@ impl Sink for IcebergSink {
             )))
         } else {
             self.router = Some(Box::new(
-                StaticRouter::new(catalog, &self.config.tables, self.config.auto_create).await?,
+                StaticRouter::new(catalog, &self.config.tables).await?,
             ));
         }
 

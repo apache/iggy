@@ -24,6 +24,7 @@ use arrow_json::ReaderBuilder;
 
 use async_trait::async_trait;
 use iceberg::arrow::schema_to_arrow_schema;
+use iceberg::spec::{Literal, PrimitiveLiteral, PrimitiveType, Struct, StructType};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
@@ -40,7 +41,47 @@ use simd_json::base::ValueAsObject;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::{create_table, slice_user_table};
+use crate::slice_user_table;
+
+pub fn primitive_type_to_literal(pt: &PrimitiveType) -> Result<PrimitiveLiteral, Error> {
+    match pt {
+        PrimitiveType::Boolean => Ok(PrimitiveLiteral::Boolean(false)),
+        PrimitiveType::Int => Ok(PrimitiveLiteral::Int(0)),
+        PrimitiveType::Long => Ok(PrimitiveLiteral::Long(0)),
+        PrimitiveType::Decimal { .. } => Ok(PrimitiveLiteral::Int128(0)),
+        PrimitiveType::Date => Ok(PrimitiveLiteral::Int(0)), // e.g. days since epoch
+        PrimitiveType::Time => Ok(PrimitiveLiteral::Long(0)), // microseconds since midnight
+        PrimitiveType::Timestamp => Ok(PrimitiveLiteral::Long(0)), // microseconds since epoch
+        PrimitiveType::Timestamptz => Ok(PrimitiveLiteral::Long(0)),
+        PrimitiveType::TimestampNs => Ok(PrimitiveLiteral::Long(0)),
+        PrimitiveType::TimestamptzNs => Ok(PrimitiveLiteral::Long(0)),
+        PrimitiveType::String => Ok(PrimitiveLiteral::String(String::new())),
+        PrimitiveType::Uuid => Ok(PrimitiveLiteral::Binary(vec![0; 16])),
+        PrimitiveType::Fixed(len) => Ok(PrimitiveLiteral::Binary(vec![0; *len as usize])),
+        PrimitiveType::Binary => Ok(PrimitiveLiteral::Binary(Vec::new())),
+        _ => {
+            error!("Partition type not supported");
+            Err(Error::InvalidConfig)
+        }
+    }
+}
+
+fn get_partition_type_value(default_partition_type: &StructType) -> Result<Option<Struct>, Error> {
+    let mut fields: Vec<Option<Literal>> = Vec::new();
+
+    if default_partition_type.fields().len() == 0 {
+        return Ok(None);
+    };
+
+    for field in default_partition_type.fields() {
+        let t = field.field_type.as_primitive_type().unwrap();
+
+        let value = Some(Literal::Primitive(primitive_type_to_literal(t)?));
+
+        fields.push(value);
+    }
+    Ok(Some(Struct::from_iter(fields)))
+}
 
 async fn write_data<I, M>(
     messages: I,
@@ -77,7 +118,7 @@ where
 
     let data_file_writer_builder = DataFileWriterBuilder::new(
         parquet_writer_builder,
-        None,
+        get_partition_type_value(table.metadata().default_partition_type())?,
         table.metadata().default_partition_spec_id(),
     );
 
@@ -86,7 +127,6 @@ where
         Error::InitError(err.to_string())
     })?;
 
-    // Generic iteration works here:
     let json_messages = messages
         .into_iter()
         .filter_map(|record| match &record.payload {
@@ -207,12 +247,20 @@ impl DynamicWriter {
         route_field_val: &str,
         catalog: &dyn Catalog,
     ) -> Result<bool, Error> {
-        if !table_exists(route_field_val.to_string()).await? {
+        let sliced_table = slice_user_table(&route_field_val.to_string());
+        let table_ident = &TableIdent::from_strs(&sliced_table).map_err(|err| {
+            error!("Failed to load table from catalog: {}. ", err);
+            Error::InitError(err.to_string())
+        })?;
+
+        if !catalog.table_exists(table_ident).await.map_err(|err| {
+            error!("Failed to load table from catalog: {}. ", err);
+            Error::InitError(err.to_string())
+        })? {
             return Ok(false);
         }
 
-        let sliced_table = slice_user_table(&route_field_val.to_string());
-        let table_ident = TableIdent::from_strs(sliced_table.clone()).map_err(|err| {
+        let table_ident = TableIdent::from_strs(&sliced_table).map_err(|err| {
             error!("Failed to load table from catalog: {}.", err);
             Error::InitError(err.to_string())
         })?;
@@ -249,10 +297,6 @@ impl DynamicRouter {
             }
         }
     }
-}
-
-async fn table_exists(table: String) -> Result<bool, Error> {
-    Ok(true)
 }
 
 #[async_trait]
@@ -293,14 +337,22 @@ impl Router for DynamicRouter {
         }
 
         for (table_name, table_obj) in &writer.tables_to_write {
-            let messages = writer.table_to_message.get(table_name).unwrap();
+            let batch_messages = match writer.table_to_message.get(table_name) {
+                Some(m) => m,
+                None => continue,
+            };
             write_data(
-                messages.iter().map(|arc| Arc::clone(arc)),
+                batch_messages.iter().map(|arc| Arc::clone(arc)),
                 table_obj,
                 self.catalog.as_ref(),
                 messages_metadata.schema,
             )
             .await?;
+            info!(
+                "Dynamically routed {} messages to {} iceberg table",
+                batch_messages.len(),
+                table_name
+            );
         }
 
         Ok(())
@@ -317,9 +369,9 @@ impl StaticRouter {
     pub async fn new(
         catalog: Box<dyn Catalog>,
         declared_tables: &Vec<String>,
-        auto_create: bool,
     ) -> Result<Self, Error> {
         let mut tables: Vec<Table> = Vec::with_capacity(declared_tables.len());
+        let mut tables_found = 0;
         for declared_table in declared_tables {
             let sliced_table = slice_user_table(&declared_table);
             let table_ident = &TableIdent::from_strs(sliced_table.clone()).map_err(|err| {
@@ -332,21 +384,21 @@ impl StaticRouter {
             })?;
 
             if !exists {
-                if auto_create {
-                    // create table and push
-                    let table = create_table(sliced_table.last().unwrap().to_string()).await?;
-                    tables.push(table);
-                    continue;
-                } else {
-                    continue;
-                }
-            }
+                continue;
+            };
+
+            tables_found += 1;
             let table = catalog.load_table(table_ident).await.map_err(|err| {
                 error!("Failed to load table from catalog: {}", err);
                 Error::InitError(err.to_string())
             })?;
             tables.push(table);
         }
+        info!(
+            "Static router found {} tables on iceberg catalog from {} tables declared",
+            tables_found,
+            declared_tables.len()
+        );
         Ok(StaticRouter { tables, catalog })
     }
 }
@@ -358,8 +410,6 @@ impl Router for StaticRouter {
         messages_metadata: MessagesMetadata,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), crate::Error> {
-        info!("Finished successfully");
-
         for table in &self.tables {
             write_data(
                 &messages,
@@ -368,6 +418,11 @@ impl Router for StaticRouter {
                 messages_metadata.schema,
             )
             .await?;
+            info!(
+                "Routed {} messages to iceberg table {} successfully",
+                messages.len(),
+                table.identifier().name()
+            );
         }
 
         Ok(())
