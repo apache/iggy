@@ -54,8 +54,8 @@ mod transform;
 static GLOBAL: MiMalloc = MiMalloc;
 
 static PLUGIN_ID: AtomicU32 = AtomicU32::new(1);
-
 const ALLOWED_PLUGIN_EXTENSIONS: [&str; 3] = ["so", "dylib", "dll"];
+const DEFAULT_CONFIG_PATH: &str = "core/connectors/runtime/config.toml";
 
 #[derive(WrapperApi)]
 struct SourceApi {
@@ -108,20 +108,8 @@ async fn main() -> Result<(), RuntimeError> {
         .with(EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("INFO")))
         .init();
 
-    let config_path = env::var("IGGY_CONNECTORS_CONFIG_PATH");
-    if let Ok(ref path) = config_path {
-        let config_with_extension = if path.contains('.') {
-            path.to_owned()
-        } else {
-            format!("{path}.toml")
-        };
-        info!("Checking if config path exists: {config_with_extension}...");
-        if !std::fs::exists(&config_with_extension).unwrap_or_default() {
-            return Err(RuntimeError::ConfigurationNotFound(config_with_extension));
-        }
-    }
-
-    let config_path = config_path.unwrap_or_else(|_| "config".to_string());
+    let config_path =
+        env::var("IGGY_CONNECTORS_CONFIG_PATH").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
     info!("Starting Iggy Connectors Runtime, loading configuration from: {config_path}...");
 
     let config: RuntimeConfig = RuntimeConfig::config_provider(config_path)

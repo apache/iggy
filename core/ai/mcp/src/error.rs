@@ -36,6 +36,4 @@ pub enum McpRuntimeError {
     FailedToCreateConsumerId,
     #[error("Invalid API path")]
     InvalidApiPath,
-    #[error("Configuration not found: {0}")]
-    ConfigurationNotFound(String),
 }

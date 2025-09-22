@@ -197,7 +197,12 @@ impl std::fmt::Display for McpServerConfig {
 impl McpServerConfig {
     pub fn config_provider(path: String) -> FileConfigProvider<McpServerEnvProvider> {
         let default_config = Toml::string(include_str!("../../../ai/mcp/config.toml"));
-        FileConfigProvider::new(path, default_config, McpServerEnvProvider::default())
+        FileConfigProvider::new(
+            path,
+            McpServerEnvProvider::default(),
+            true,
+            Some(default_config),
+        )
     }
 }
 

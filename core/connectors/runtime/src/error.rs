@@ -22,8 +22,6 @@ use thiserror::Error;
 pub enum RuntimeError {
     #[error("Invalid configuration: {0}")]
     InvalidConfiguration(String),
-    #[error("Configuration not found: {0}")]
-    ConfigurationNotFound(String),
     #[error("Failed to serialize topic metadata")]
     FailedToSerializeTopicMetadata,
     #[error("Failed to serialize messages metadata")]

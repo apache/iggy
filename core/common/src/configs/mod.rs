@@ -16,6 +16,15 @@
  * under the License.
  */
 
+//! Configuration module providing flexible configuration loading with file and environment support.
+//!
+//! This module provides a trait-based configuration system that supports:
+//! - Loading configuration from TOML files
+//! - Environment variable overrides with complex path resolution
+//! - Array and HashMap field overrides
+//! - JSON value field handling
+//! - Automatic type conversion and validation
+
 use figment::{
     Figment, Profile, Provider,
     providers::{Data, Format, Toml},
@@ -23,94 +32,166 @@ use figment::{
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{env, fmt::Display, future::Future, marker::PhantomData, path::Path};
-use toml::{Value as TomlValue, map::Map};
+use toml::{Value as TomlValue, map::Map as TomlMap};
 
+// Constants for configuration handling
+const SECRET_MASK: &str = "******";
+const ARRAY_SEPARATOR: char = '_';
+const PATH_SEPARATOR: &str = ".";
+
+/// Type alias for configuration profiles mapping
+type ProfileMap = FigmentMap<Profile, Dict>;
+
+/// Type alias for configuration that can be serialized, deserialized, has defaults, and can be displayed
+pub trait ConfigurationType: Serialize + DeserializeOwned + Default + Display {}
+impl<T: Serialize + DeserializeOwned + Default + Display> ConfigurationType for T {}
+
+/// Errors that can occur during configuration loading and processing
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigurationError {
+    /// Failed to load configuration from file or environment
     CannotLoadConfiguration,
+    /// Failed to serialize default configuration to TOML
+    DefaultSerializationFailed,
+    /// Failed to parse default configuration TOML
+    DefaultParsingFailed,
+    /// Environment variable parsing failed
+    EnvironmentVariableParsingFailed,
 }
 
-pub trait ConfigProvider<T: Serialize + DeserializeOwned + Default + Display> {
-    fn load_config(self) -> impl Future<Output = Result<T, ConfigurationError>>;
-}
-
-pub struct FileConfigProvider<T: Provider> {
-    path: String,
-    default_config: Data<Toml>,
-    env_provider: T,
-}
-
-impl<T: Provider> FileConfigProvider<T> {
-    pub fn new(path: String, default_config: Data<Toml>, env_provider: T) -> Self {
-        Self {
-            path,
-            default_config,
-            env_provider,
+impl Display for ConfigurationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CannotLoadConfiguration => write!(f, "Cannot load configuration"),
+            Self::DefaultSerializationFailed => {
+                write!(f, "Failed to serialize default configuration")
+            }
+            Self::DefaultParsingFailed => write!(f, "Failed to parse default configuration"),
+            Self::EnvironmentVariableParsingFailed => {
+                write!(f, "Failed to parse environment variables")
+            }
         }
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct CustomEnvProvider<T: Serialize + DeserializeOwned + Default + Display> {
-    prefix: String,
-    secret_keys: Vec<String>,
-    _data: PhantomData<T>,
+impl std::error::Error for ConfigurationError {}
+
+/// Trait for configuration providers that can load configuration of a specific type
+pub trait ConfigProvider<T: ConfigurationType> {
+    /// Load configuration asynchronously
+    fn load_config(self) -> impl Future<Output = Result<T, ConfigurationError>>;
 }
 
-impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
+/// File-based configuration provider that combines file, default, and environment configurations
+pub struct FileConfigProvider<P> {
+    file_path: String,
+    default_config: Option<Data<Toml>>,
+    env_provider: P,
+    display_config: bool,
+}
+
+impl<P: Provider> FileConfigProvider<P> {
+    /// Create a new file configuration provider
+    ///
+    /// # Arguments
+    /// * `file_path` - Path to the configuration file
+    /// * `env_provider` - Environment variable provider
+    /// * `default_config` - Optional default configuration data
+    /// * `display_config` - Whether to display the loaded configuration
+    pub fn new(
+        file_path: String,
+        env_provider: P,
+        display_config: bool,
+        default_config: Option<Data<Toml>>,
+    ) -> Self {
+        Self {
+            file_path,
+            env_provider,
+            default_config,
+            display_config,
+        }
+    }
+}
+
+/// Custom environment variable provider with advanced override capabilities
+///
+/// This provider supports:
+/// - Prefix-based filtering of environment variables
+/// - Secret key masking for security
+/// - Complex path resolution for nested structures
+/// - Array index overrides
+/// - HashMap field overrides
+/// - JSON value field handling
+#[derive(Debug, Clone)]
+pub struct CustomEnvProvider<T: ConfigurationType> {
+    prefix: String,
+    secret_keys: Vec<String>,
+    _phantom: PhantomData<T>,
+}
+
+impl<T: ConfigurationType> CustomEnvProvider<T> {
+    /// Create a new custom environment provider
+    ///
+    /// # Arguments
+    /// * `prefix` - Environment variable prefix to filter by
+    /// * `secret_keys` - Keys that should be masked in logs
     pub fn new(prefix: &str, secret_keys: &[&str]) -> Self {
         Self {
             prefix: prefix.to_string(),
             secret_keys: secret_keys.iter().map(|s| s.to_string()).collect(),
-            _data: PhantomData,
+            _phantom: PhantomData,
         }
     }
 
-    pub fn deserialize(&self) -> Result<FigmentMap<Profile, Dict>, ConfigurationError> {
+    /// Deserialize environment variables into a configuration profile map
+    pub fn deserialize(&self) -> Result<ProfileMap, ConfigurationError> {
         let default_config = toml::to_string(&T::default())
-            .expect("Cannot serialize default Config. Something's terribly wrong.");
+            .map_err(|_| ConfigurationError::DefaultSerializationFailed)?;
+
         let toml_value: TomlValue = toml::from_str(&default_config)
-            .expect("Cannot parse default Config. Something's terribly wrong.");
+            .map_err(|_| ConfigurationError::DefaultParsingFailed)?;
+
         let mut source_dict = Dict::new();
         if let TomlValue::Table(table) = toml_value {
             Self::walk_toml_table_to_dict("", table, &mut source_dict);
         }
 
-        let mut new_dict = Dict::new();
+        let mut target_dict = Dict::new();
         for (key, mut value) in env::vars() {
             let env_key = key.to_uppercase();
-            if !env_key.starts_with(self.prefix.as_str()) {
+            if !env_key.starts_with(&self.prefix) {
                 continue;
             }
+
             let keys: Vec<String> = env_key[self.prefix.len()..]
-                .split('_')
+                .split(ARRAY_SEPARATOR)
                 .map(|k| k.to_lowercase())
                 .collect();
-            let env_var_value = Self::try_parse_value(&value);
+
+            let env_var_value = Self::parse_environment_value(&value);
+
             if self.secret_keys.contains(&env_key) {
-                value = "******".to_string();
+                value = SECRET_MASK.to_string();
             }
 
             println!("{env_key} value changed to: {value} from environment variable");
-            Self::insert_overridden_values_from_env(
-                &source_dict,
-                &mut new_dict,
-                keys.clone(),
-                env_var_value.clone(),
-            );
+            Self::insert_environment_override(&source_dict, &mut target_dict, keys, env_var_value);
         }
-        let mut data = FigmentMap::new();
-        data.insert(Profile::default(), new_dict);
+
+        let mut data = ProfileMap::new();
+        data.insert(Profile::default(), target_dict);
         Ok(data)
     }
 
-    fn walk_toml_table_to_dict(prefix: &str, table: Map<String, TomlValue>, dict: &mut Dict) {
+    /// Walk through TOML table and convert to dictionary structure
+    fn walk_toml_table_to_dict(prefix: &str, table: TomlMap<String, TomlValue>, dict: &mut Dict) {
         for (key, value) in table {
             let new_prefix = if prefix.is_empty() {
                 key.clone()
             } else {
-                format!("{prefix}.{key}")
+                format!("{prefix}{PATH_SEPARATOR}{key}")
             };
+
             match value {
                 TomlValue::Table(inner_table) => {
                     let mut nested_dict = Dict::new();
@@ -124,7 +205,8 @@ impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
         }
     }
 
-    fn insert_overridden_values_from_env(
+    /// Insert environment variable override into target dictionary
+    fn insert_environment_override(
         source: &Dict,
         target: &mut Dict,
         keys: Vec<String>,
@@ -138,16 +220,18 @@ impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
         if let Some((idx_pos, array_index)) = Self::find_array_index(&keys) {
             Self::handle_array_override(source, target, &keys, idx_pos, array_index, value);
         } else {
-            Self::handle_dict_override(source, target, &keys, value);
+            Self::handle_dictionary_override(source, target, &keys, value);
         }
     }
 
+    /// Find array index in key path
     fn find_array_index(keys: &[String]) -> Option<(usize, usize)> {
         keys.iter()
             .enumerate()
             .find_map(|(i, key)| key.parse::<usize>().ok().map(|idx| (i, idx)))
     }
 
+    /// Handle array field override with complex path resolution
     fn handle_array_override(
         source: &Dict,
         target: &mut Dict,
@@ -160,7 +244,7 @@ impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
         let remaining_path = &keys[idx_pos + 1..];
 
         // Navigate to array container
-        let current_target = match Self::navigate_to_dict(
+        let current_target = match Self::navigate_to_dictionary(
             target,
             &path_to_array[..path_to_array.len().saturating_sub(1)],
         ) {
@@ -196,7 +280,7 @@ impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
             if remaining_path.is_empty() {
                 arr[array_index] = value;
             } else if let FigmentValue::Dict(_, elem_dict) = &mut arr[array_index] {
-                Self::insert_overridden_values_from_env(
+                Self::insert_environment_override(
                     &Dict::new(),
                     elem_dict,
                     remaining_path.to_vec(),
@@ -206,7 +290,8 @@ impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
         }
     }
 
-    fn handle_dict_override(
+    /// Handle dictionary field override with HashMap detection
+    fn handle_dictionary_override(
         source: &Dict,
         target: &mut Dict,
         keys: &[String],
@@ -262,6 +347,7 @@ impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
         }
     }
 
+    /// Try to handle HashMap override patterns
     fn try_handle_hashmap_override(
         source: &Dict,
         target: &mut Dict,
@@ -277,11 +363,7 @@ impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
         // Check if this is actually a HashMap field in the source
         let source_hashmap = match source.get(potential_hashmap_key) {
             Some(FigmentValue::Dict(_, hashmap_dict)) => {
-                // For it to be a HashMap, it should either:
-                // 1. Have Dict values (actual HashMap entries)
-                // 2. Be empty (empty HashMap)
-                // 3. But NOT have regular struct fields
-
+                // Determine if this is a HashMap or regular struct
                 let has_dict_values = hashmap_dict
                     .values()
                     .any(|v| matches!(v, FigmentValue::Dict(_, _)));
@@ -289,7 +371,7 @@ impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
                     .values()
                     .any(|v| !matches!(v, FigmentValue::Dict(_, _)));
 
-                // If it has non-Dict values mixed with Dict values, it's probably a regular struct, not a HashMap
+                // If it has non-Dict values mixed with Dict values, it's probably a regular struct
                 if has_non_dict_values && has_dict_values {
                     return Some(false);
                 }
@@ -299,7 +381,6 @@ impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
                     return Some(false);
                 }
 
-                // If it's empty or only has Dict values, it could be a HashMap
                 hashmap_dict
             }
             _ => return Some(false),
@@ -307,7 +388,7 @@ impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
 
         // Try to find the best HashMap entry key
         if let Some((entry_key, remaining_keys)) =
-            Self::find_best_hashmap_split(source_hashmap, &keys[1..])
+            Self::find_optimal_hashmap_split(source_hashmap, &keys[1..])
         {
             return Some(Self::apply_hashmap_override(
                 target,
@@ -322,7 +403,8 @@ impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
         Some(false)
     }
 
-    fn find_best_hashmap_split(
+    /// Find optimal HashMap key split for environment variable path
+    fn find_optimal_hashmap_split(
         source_hashmap: &Dict,
         keys: &[String],
     ) -> Option<(String, Vec<String>)> {
@@ -359,6 +441,7 @@ impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
         Some((simple_entry_key, simple_remaining))
     }
 
+    /// Check if a field path is valid within a dictionary structure
     fn is_valid_field_path(dict: &Dict, keys: &[String]) -> bool {
         if keys.is_empty() {
             return true;
@@ -400,6 +483,7 @@ impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
         true
     }
 
+    /// Apply HashMap override to target configuration
     fn apply_hashmap_override(
         target: &mut Dict,
         hashmap_key: &str,
@@ -430,13 +514,13 @@ impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
             } else if let Some(FigmentValue::Dict(_, entry_dict)) =
                 target_hashmap.get_mut(entry_key)
             {
-                // Check if we need special handling for serde_json::Value fields
+                // Check if we need special handling for JSON value fields
                 if let Some((json_field, json_keys)) =
                     Self::find_json_value_field_split(entry_dict, remaining_keys)
                 {
                     Self::handle_json_value_override(entry_dict, &json_field, json_keys, value);
                 } else {
-                    Self::insert_overridden_values_from_env(
+                    Self::insert_environment_override(
                         &Dict::new(),
                         entry_dict,
                         remaining_keys.to_vec(),
@@ -450,6 +534,7 @@ impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
         false
     }
 
+    /// Find JSON value field split in remaining keys
     fn find_json_value_field_split(dict: &Dict, keys: &[String]) -> Option<(String, Vec<String>)> {
         if keys.is_empty() {
             return None;
@@ -475,6 +560,7 @@ impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
         None
     }
 
+    /// Handle JSON value field override
     fn handle_json_value_override(
         entry_dict: &mut Dict,
         json_field: &str,
@@ -504,6 +590,7 @@ impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
         }
     }
 
+    /// Set nested JSON field value
     fn set_nested_json_field(dict: &mut Dict, keys: &[String], value: FigmentValue) {
         if keys.is_empty() {
             return;
@@ -514,7 +601,8 @@ impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
         dict.insert(full_field_name, value);
     }
 
-    fn navigate_to_dict<'a>(target: &'a mut Dict, path: &[String]) -> Option<&'a mut Dict> {
+    /// Navigate to a specific dictionary in the nested structure
+    fn navigate_to_dictionary<'a>(target: &'a mut Dict, path: &[String]) -> Option<&'a mut Dict> {
         if path.is_empty() {
             return Some(target);
         }
@@ -542,6 +630,7 @@ impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
         Some(current)
     }
 
+    /// Find source array value for copying to target
     fn find_source_array(source: &Dict, path: &[String], array_key: &str) -> Option<FigmentValue> {
         if path.is_empty() {
             return None;
@@ -566,6 +655,7 @@ impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
         current.get(array_key).cloned()
     }
 
+    /// Convert TOML value to Figment value
     fn toml_to_figment_value(toml_value: &TomlValue) -> FigmentValue {
         match toml_value {
             TomlValue::String(s) => FigmentValue::from(s.clone()),
@@ -577,39 +667,54 @@ impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
                 FigmentValue::from(vec)
             }
             TomlValue::Table(tbl) => {
-                let mut dict = figment::value::Dict::new();
+                let mut dict = Dict::new();
                 for (key, value) in tbl.iter() {
                     dict.insert(key.clone(), Self::toml_to_figment_value(value));
                 }
                 FigmentValue::from(dict)
             }
-            TomlValue::Datetime(_) => todo!("not implemented yet!"),
+            TomlValue::Datetime(_) => {
+                // For now, convert datetime to string representation
+                FigmentValue::from(toml_value.to_string())
+            }
         }
     }
 
-    fn try_parse_value(value: &str) -> FigmentValue {
+    /// Parse environment variable value with type inference
+    fn parse_environment_value(value: &str) -> FigmentValue {
+        // Handle array syntax
         if value.starts_with('[') && value.ends_with(']') {
-            let value = value.trim_start_matches('[').trim_end_matches(']');
-            let values: Vec<FigmentValue> = value.split(',').map(Self::try_parse_value).collect();
+            let inner_value = value.trim_start_matches('[').trim_end_matches(']');
+            let values: Vec<FigmentValue> = inner_value
+                .split(',')
+                .map(|s| Self::parse_environment_value(s.trim()))
+                .collect();
             return FigmentValue::from(values);
         }
-        if value == "true" {
-            return FigmentValue::from(true);
+
+        // Handle boolean values
+        match value.to_lowercase().as_str() {
+            "true" => return FigmentValue::from(true),
+            "false" => return FigmentValue::from(false),
+            _ => {}
         }
-        if value == "false" {
-            return FigmentValue::from(false);
-        }
+
+        // Try parsing as integer
         if let Ok(int_val) = value.parse::<i64>() {
             return FigmentValue::from(int_val);
         }
+
+        // Try parsing as float
         if let Ok(float_val) = value.parse::<f64>() {
             return FigmentValue::from(float_val);
         }
+
+        // Default to string
         FigmentValue::from(value)
     }
 }
 
-/// This does exactly the same as Figment does internally.
+/// Check if a file exists using the same logic as Figment
 fn file_exists<P: AsRef<Path>>(path: P) -> bool {
     let path = path.as_ref();
 
@@ -636,23 +741,26 @@ fn file_exists<P: AsRef<Path>>(path: P) -> bool {
     }
 }
 
-impl<T: Serialize + DeserializeOwned + Default + Display, P: Provider + Clone> ConfigProvider<T>
-    for FileConfigProvider<P>
-{
+impl<T: ConfigurationType, P: Provider + Clone> ConfigProvider<T> for FileConfigProvider<P> {
     async fn load_config(self) -> Result<T, ConfigurationError> {
-        println!("Loading config from path: '{}'...", self.path);
+        println!("Loading config from path: '{}'...", self.file_path);
 
         // Start with the default configuration
-        let mut config_builder = Figment::new().merge(self.default_config);
+        let mut config_builder = Figment::new();
+        if let Some(default) = self.default_config {
+            config_builder = config_builder.merge(default);
+        } else {
+            println!("No default configuration provided.");
+        }
 
         // If the config file exists, merge it into the configuration
-        if file_exists(&self.path) {
-            println!("Found configuration file at path: '{}'.", self.path);
-            config_builder = config_builder.merge(Toml::file(&self.path));
+        if file_exists(&self.file_path) {
+            println!("Found configuration file at path: '{}'.", self.file_path);
+            config_builder = config_builder.merge(Toml::file(&self.file_path));
         } else {
             println!(
                 "Configuration file not found at path: '{}'. Using default configuration from embedded config",
-                self.path
+                self.file_path
             );
         }
 
@@ -665,7 +773,9 @@ impl<T: Serialize + DeserializeOwned + Default + Display, P: Provider + Clone> C
         match config_result {
             Ok(config) => {
                 println!("Config loaded successfully.");
-                println!("Using Config: {config}");
+                if self.display_config {
+                    println!("Using Config: {config}");
+                }
                 Ok(config)
             }
             Err(e) => {

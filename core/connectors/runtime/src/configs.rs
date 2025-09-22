@@ -164,7 +164,12 @@ impl Default for HttpApiConfig {
 impl RuntimeConfig {
     pub fn config_provider(path: String) -> FileConfigProvider<ConnectorsEnvProvider> {
         let default_config = Toml::string(include_str!("../../../connectors/runtime/config.toml"));
-        FileConfigProvider::new(path, default_config, ConnectorsEnvProvider::default())
+        FileConfigProvider::new(
+            path,
+            ConnectorsEnvProvider::default(),
+            true,
+            Some(default_config),
+        )
     }
 }
 

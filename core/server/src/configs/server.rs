@@ -236,7 +236,12 @@ impl ServerConfig {
 
     pub fn config_provider(path: String) -> FileConfigProvider<ServerEnvProvider> {
         let default_config = Toml::string(include_str!("../../../configs/server.toml"));
-        FileConfigProvider::new(path, default_config, ServerEnvProvider::default())
+        FileConfigProvider::new(
+            path,
+            ServerEnvProvider::default(),
+            true,
+            Some(default_config),
+        )
     }
 }
 
