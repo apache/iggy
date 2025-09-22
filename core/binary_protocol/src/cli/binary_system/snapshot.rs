@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use std::io::Write;
 use std::path::Path;
 
 use crate::Client;
@@ -64,6 +65,7 @@ impl Default for GetSnapshotCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for GetSnapshotCmd {
     fn explain(&self) -> String {
@@ -84,7 +86,14 @@ impl CliCommand for GetSnapshotCmd {
         ));
         let file_size = snapshot_data.0.len();
 
+        #[cfg(not(feature = "sync"))]
         let mut file = tokio::fs::File::create(&file_path)
+            .await
+            .with_context(|| format!("Failed to create file at {file_path:?}"))?;
+
+
+        #[cfg(feature = "sync")]
+        let mut file = std::fs::File::create(&file_path)
             .await
             .with_context(|| format!("Failed to create file at {file_path:?}"))?;
 

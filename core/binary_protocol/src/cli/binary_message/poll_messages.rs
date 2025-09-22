@@ -28,6 +28,7 @@ use iggy_common::{
 use std::collections::{HashMap, HashSet};
 use tokio::io::AsyncWriteExt;
 use tracing::{Level, event};
+use std::io::Write;
 
 pub struct PollMessagesCmd {
     poll_messages: PollMessages,
@@ -160,6 +161,7 @@ impl PollMessagesCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for PollMessagesCmd {
     fn explain(&self) -> String {
@@ -215,12 +217,25 @@ impl CliCommand for PollMessagesCmd {
             event!(target: PRINT_TARGET, Level::INFO, "Storing messages to {output_file} binary file");
 
             let mut saved_size = IggyByteSize::default();
-            let mut file = tokio::fs::OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(output_file)
-                .await
-                .with_context(|| format!("Problem opening file for writing: {output_file}"))?;
+
+            #[cfg(not(feature = "sync"))]
+            let mut file = {
+                tokio::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(output_file)
+                    .await
+                    .with_context(|| format!("Problem opening file for writing: {output_file}"))?
+            };
+
+            #[cfg(feature = "sync")]
+            let mut file = {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(output_file)
+                    .with_context(|| format!("Problem opening file for writing: {output_file}"))?
+            };
 
             for message in polled_messages.messages.iter() {
                 let message = message.to_bytes();

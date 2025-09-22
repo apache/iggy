@@ -22,6 +22,7 @@ use iggy_common::{
 };
 
 /// This trait defines the methods to interact with the user module.
+#[maybe_async::maybe_async]
 #[async_trait]
 pub trait UserClient {
     /// Get the info about a specific user by unique ID or username.

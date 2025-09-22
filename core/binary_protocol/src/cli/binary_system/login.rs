@@ -41,6 +41,7 @@ impl LoginCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for LoginCmd {
     fn explain(&self) -> String {

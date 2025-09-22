@@ -44,7 +44,12 @@ pub use crate::stream_builder::IggyConsumerConfig;
 pub use crate::stream_builder::IggyStreamConsumer;
 pub use crate::stream_builder::{IggyProducerConfig, IggyStreamProducer};
 pub use crate::stream_builder::{IggyStream, IggyStreamConfig};
+// Async-only клиенты
+#[cfg(feature = "async")]
 pub use crate::tcp::tcp_client::TcpClient;
+
+// Sync-only клиенты  
+#[cfg(feature = "sync")]
 pub use crate::tcp::tcp_client_sync::{TcpClientSync, TcpClientSyncTcp, TcpClientSyncTls};
 pub use iggy_binary_protocol::{
     Client, ConsumerGroupClient, ConsumerOffsetClient, MessageClient, PartitionClient,

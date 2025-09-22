@@ -28,6 +28,10 @@ documentation = "https://iggy.apache.org/docs"
 repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 
+[features]
+sync = ["maybe-async/is_sync"]
+async = []
+
 [dependencies]
 anyhow = { workspace = true }
 async-broadcast = { workspace = true }
@@ -44,3 +48,4 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
+maybe-async = "0.2.10"

@@ -24,6 +24,7 @@ use iggy_common::get_consumer_offset::GetConsumerOffset;
 use iggy_common::store_consumer_offset::StoreConsumerOffset;
 use iggy_common::{Consumer, ConsumerOffsetInfo, Identifier, IggyError};
 
+#[maybe_async::maybe_async]
 #[async_trait::async_trait]
 impl<B: BinaryClient> ConsumerOffsetClient for B {
     async fn store_consumer_offset(

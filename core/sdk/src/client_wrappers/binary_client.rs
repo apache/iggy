@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use iggy_binary_protocol::Client;
 use iggy_common::{DiagnosticEvent, IggyError};
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl Client for ClientWrapper {
     async fn connect(&self) -> Result<(), IggyError> {

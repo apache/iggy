@@ -36,6 +36,7 @@ impl PurgeStreamCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for PurgeStreamCmd {
     fn explain(&self) -> String {

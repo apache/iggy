@@ -19,7 +19,8 @@
 use anyhow::{Context, Result, bail};
 use dirs::home_dir;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::{collections::HashMap, env::var, path};
 use tokio::join;
 
@@ -32,6 +33,24 @@ static CONTEXTS_FILE_NAME: &str = "contexts.toml";
 pub(crate) static DEFAULT_CONTEXT_NAME: &str = "default";
 
 pub type ContextsConfigMap = HashMap<String, ContextConfig>;
+
+#[maybe_async::maybe_async]
+async fn read_to_string<P: AsRef<Path>>(path: P) -> Result<String, io::Error> {
+    #[cfg(not(feature = "sync"))]
+    return tokio::fs::read_to_string(path).await;
+
+    #[cfg(feature = "sync")]
+    return std::fs::read_to_string(path);
+}
+
+#[maybe_async::maybe_async]
+async fn write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> Result<(), io::Error> {
+    #[cfg(not(feature = "sync"))]
+    return tokio::fs::write(path, contents).await;
+
+    #[cfg(feature = "sync")]
+    return std::fs::write(path, contents);
+}
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
 pub struct ContextConfig {
@@ -84,6 +103,7 @@ impl ContextManager {
         }
     }
 
+    #[maybe_async::maybe_async]
     pub async fn get_active_context(&mut self) -> Result<ContextConfig> {
         let active_context_key = self.get_active_context_key().await?;
         let contexts = self.get_contexts().await?;
@@ -95,6 +115,7 @@ impl ContextManager {
         Ok(active_context.clone())
     }
 
+    #[maybe_async::maybe_async]
     pub async fn set_active_context_key(&mut self, context_name: &str) -> Result<()> {
         self.get_context_state().await?;
         let cs = self.context_state.take().unwrap();
@@ -116,19 +137,30 @@ impl ContextManager {
         Ok(())
     }
 
+    #[maybe_async::maybe_async]
     pub async fn get_active_context_key(&mut self) -> Result<String> {
         let context_state = self.get_context_state().await?;
         Ok(context_state.active_context.clone())
     }
 
+    #[maybe_async::maybe_async]
     pub async fn get_contexts(&mut self) -> Result<ContextsConfigMap> {
         let context_state = self.get_context_state().await?;
         Ok(context_state.contexts.clone())
     }
 
+    #[maybe_async::maybe_async]
     async fn get_context_state(&mut self) -> Result<&ContextState> {
         if self.context_state.is_none() {
+
+            #[cfg(not(feature = "sync"))]
             let (active_context_res, contexts_res) = join!(
+                self.context_rw.read_active_context(),
+                self.context_rw.read_contexts()
+            );
+
+            #[cfg(feature = "sync")]
+            let (active_context_res, contexts_res) = (
                 self.context_rw.read_active_context(),
                 self.context_rw.read_contexts()
             );
@@ -170,11 +202,12 @@ impl ContextReaderWriter {
         Self { iggy_home }
     }
 
+    #[maybe_async::maybe_async]
     pub async fn read_contexts(&self) -> Result<Option<ContextsConfigMap>> {
         let maybe_contexts_path = &self.contexts_path();
 
         if let Some(contexts_path) = maybe_contexts_path {
-            let maybe_contents = tokio::fs::read_to_string(contexts_path)
+            let maybe_contents = read_to_string(contexts_path)
                 .await
                 .map(Some)
                 .or_else(|err| {
@@ -205,6 +238,7 @@ impl ContextReaderWriter {
         }
     }
 
+    #[maybe_async::maybe_async]
     pub async fn write_contexts(&self, contexts: ContextsConfigMap) -> Result<()> {
         let maybe_contexts_path = self.contexts_path();
 
@@ -214,17 +248,18 @@ impl ContextReaderWriter {
                 contexts_path.display()
             ))?;
 
-            tokio::fs::write(contexts_path, contents).await?;
+            write(contexts_path, contents).await?;
         }
 
         Ok(())
     }
 
+    #[maybe_async::maybe_async]
     pub async fn read_active_context(&self) -> Result<Option<String>> {
         let maybe_active_context_path = self.active_context_path();
 
         if let Some(active_context_path) = maybe_active_context_path {
-            tokio::fs::read_to_string(active_context_path.clone())
+            read_to_string(active_context_path.clone())
                 .await
                 .map(Some)
                 .or_else(|err| {
@@ -243,11 +278,12 @@ impl ContextReaderWriter {
         }
     }
 
+    #[maybe_async::maybe_async]
     pub async fn write_active_context(&self, context_name: &str) -> Result<()> {
         let maybe_active_context_path = self.active_context_path();
 
         if let Some(active_context_path) = maybe_active_context_path {
-            tokio::fs::write(active_context_path.clone(), context_name)
+            write(active_context_path.clone(), context_name)
                 .await
                 .context(format!(
                     "failed writing active context file {}",

@@ -36,6 +36,7 @@ impl GetClientCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for GetClientCmd {
     fn explain(&self) -> String {

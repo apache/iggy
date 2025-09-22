@@ -62,6 +62,7 @@ impl Default for TcpClient {
     }
 }
 
+#[maybe_async::async_impl]
 #[async_trait]
 impl Client for TcpClient {
     async fn connect(&self) -> Result<(), IggyError> {
@@ -81,7 +82,7 @@ impl Client for TcpClient {
     }
 }
 
-#[async_trait]
+#[maybe_async::async_impl]
 #[async_trait]
 impl BinaryTransport for TcpClient {
     async fn get_state(&self) -> ClientState {
@@ -144,6 +145,7 @@ impl BinaryTransport for TcpClient {
     }
 }
 
+#[maybe_async::async_impl]
 impl BinaryClient for TcpClient {}
 
 impl TcpClient {

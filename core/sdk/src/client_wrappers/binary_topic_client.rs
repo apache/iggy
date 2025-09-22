@@ -23,6 +23,7 @@ use iggy_common::{
     CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize, Topic, TopicDetails,
 };
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl TopicClient for ClientWrapper {
     async fn get_topic(

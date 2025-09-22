@@ -40,6 +40,7 @@ use tracing::{trace, warn};
 ///
 /// * `IggyError` - If the iggy stream topic cannot be build.
 ///
+#[maybe_async::maybe_async]
 pub(crate) async fn build_iggy_stream_topic_if_not_exists(
     client: &IggyClient,
     config: &IggyConsumerConfig,

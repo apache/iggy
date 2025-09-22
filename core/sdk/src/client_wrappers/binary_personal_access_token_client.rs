@@ -24,6 +24,7 @@ use iggy_common::{
     RawPersonalAccessToken,
 };
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl PersonalAccessTokenClient for ClientWrapper {
     async fn get_personal_access_tokens(&self) -> Result<Vec<PersonalAccessTokenInfo>, IggyError> {

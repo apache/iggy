@@ -22,6 +22,7 @@ use iggy_common::{
 };
 
 /// This trait defines the methods to interact with the topic module.
+#[maybe_async::maybe_async]
 #[allow(clippy::too_many_arguments)]
 #[async_trait]
 pub trait TopicClient {

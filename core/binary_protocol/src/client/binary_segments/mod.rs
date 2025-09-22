@@ -23,6 +23,7 @@ use crate::utils::auth::fail_if_not_authenticated;
 use iggy_common::delete_segments::DeleteSegments;
 use iggy_common::{Identifier, IggyError};
 
+#[maybe_async::maybe_async]
 #[async_trait::async_trait]
 impl<B: BinaryClient> SegmentClient for B {
     async fn delete_segments(

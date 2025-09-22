@@ -27,6 +27,12 @@ mod tokio_lock;
 #[cfg(feature = "fast_async_lock")]
 mod fast_async_lock;
 
+#[cfg(feature = "std_sync_lock")]
+mod std_sync_lock;
+
+#[cfg(feature = "std_sync_lock")]
+pub type IggySharedMut<T> = std_sync_lock::IggyStdSyncRwLock<T>;
+
 #[cfg(feature = "tokio_lock")]
 #[cfg(not(any(feature = "fast_async_lock")))]
 pub type IggySharedMut<T> = tokio_lock::IggyTokioRwLock<T>;
@@ -35,6 +41,7 @@ pub type IggySharedMut<T> = tokio_lock::IggyTokioRwLock<T>;
 #[cfg(feature = "fast_async_lock")]
 pub type IggySharedMut<T> = fast_async_lock::IggyFastAsyncRwLock<T>;
 
+#[cfg(not(feature = "std_sync_lock"))]
 #[allow(async_fn_in_trait)]
 pub trait IggySharedMutFn<T>: Send + Sync {
     type ReadGuard<'a>: Deref<Target = T> + Send
@@ -55,6 +62,30 @@ pub trait IggySharedMutFn<T>: Send + Sync {
         T: 'a;
 
     async fn write<'a>(&'a self) -> Self::WriteGuard<'a>
+    where
+        T: 'a;
+}
+
+#[cfg(feature = "std_sync_lock")]
+pub trait IggySharedMutFn<T>: Sync {
+    type ReadGuard<'a>: Deref<Target = T>
+    where
+        T: 'a,
+        Self: 'a;
+    type WriteGuard<'a>: DerefMut<Target = T>
+    where
+        T: 'a,
+        Self: 'a;
+
+    fn new(data: T) -> Self
+    where
+        Self: Sized;
+
+    fn read<'a>(&'a self) -> Self::ReadGuard<'a>
+    where
+        T: 'a;
+
+    fn write<'a>(&'a self) -> Self::WriteGuard<'a>
     where
         T: 'a;
 }

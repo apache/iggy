@@ -40,6 +40,7 @@ impl Default for GetMeCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for GetMeCmd {
     fn explain(&self) -> String {

@@ -30,6 +30,7 @@ use iggy_common::{
     SystemSnapshotType,
 };
 
+#[maybe_async::maybe_async]
 #[async_trait::async_trait]
 impl<B: BinaryClient> SystemClient for B {
     async fn get_stats(&self) -> Result<Stats, IggyError> {

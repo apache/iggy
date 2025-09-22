@@ -28,9 +28,10 @@ repository = "https://github.com/apache/iggy"
 readme = "../../README.md"
 
 [features]
-default = ["tokio_lock"]
+default = ["std_sync_lock"]
 tokio_lock = []
 fast_async_lock = ["dep:fast-async-mutex"]
+std_sync_lock = [] # TODO add sync/async feature
 
 [dependencies]
 aes-gcm = { workspace = true }

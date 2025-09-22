@@ -52,6 +52,7 @@ impl Default for GetStreamsCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for GetStreamsCmd {
     fn explain(&self) -> String {

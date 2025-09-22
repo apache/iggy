@@ -52,6 +52,7 @@ impl Default for GetClientsCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for GetClientsCmd {
     fn explain(&self) -> String {

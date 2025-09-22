@@ -40,6 +40,7 @@ impl CreatePartitionsCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for CreatePartitionsCmd {
     fn explain(&self) -> String {

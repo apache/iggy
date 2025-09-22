@@ -38,6 +38,7 @@ impl DeletePersonalAccessTokenCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for DeletePersonalAccessTokenCmd {
     fn explain(&self) -> String {

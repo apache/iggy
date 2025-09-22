@@ -25,6 +25,7 @@ use iggy_common::{
     Consumer, Identifier, IggyError, IggyMessage, Partitioning, PolledMessages, PollingStrategy,
 };
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl MessageClient for IggyClient {
     async fn poll_messages(

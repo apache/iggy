@@ -42,6 +42,7 @@ impl Default for UseContextCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for UseContextCmd {
     fn explain(&self) -> String {

@@ -19,6 +19,7 @@
 use crate::BinaryTransport;
 use iggy_common::{ClientState, IggyError};
 
+#[maybe_async::maybe_async]
 pub(crate) async fn fail_if_not_authenticated<T: BinaryTransport>(
     transport: &T,
 ) -> Result<(), IggyError> {

@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use iggy_binary_protocol::ConsumerOffsetClient;
 use iggy_common::{Consumer, ConsumerOffsetInfo, Identifier, IggyError};
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl ConsumerOffsetClient for ClientWrapper {
     async fn store_consumer_offset(

@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use iggy_binary_protocol::{ConsumerGroupClient, UserClient};
 use iggy_common::{ConsumerGroup, ConsumerGroupDetails, Identifier, IggyError};
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl ConsumerGroupClient for ClientWrapper {
     async fn get_consumer_group(
@@ -215,6 +216,7 @@ impl ConsumerGroupClient for ClientWrapper {
     }
 }
 
+#[cfg(feature = "async")]
 #[async_trait]
 impl AsyncDrop for ClientWrapper {
     async fn async_drop(&mut self) {
@@ -234,6 +236,18 @@ impl AsyncDrop for ClientWrapper {
             ClientWrapper::Quic(client) => {
                 let _ = client.logout_user().await;
             }
+        }
+    }
+}
+
+#[cfg(feature = "sync")]
+impl Drop for ClientWrapper {
+    fn drop(&mut self) {
+        match self {
+            ClientWrapper::TcpSync(client) => {
+                let _ = client.logout_user();
+            }
+            _ => return
         }
     }
 }

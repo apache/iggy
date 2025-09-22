@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use iggy_binary_protocol::StreamClient;
 use iggy_common::{Identifier, IggyError, Stream, StreamDetails};
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl StreamClient for ClientWrapper {
     async fn get_stream(&self, stream_id: &Identifier) -> Result<Option<StreamDetails>, IggyError> {

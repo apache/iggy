@@ -61,6 +61,7 @@ impl GetStatsCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for GetStatsCmd {
     fn explain(&self) -> String {

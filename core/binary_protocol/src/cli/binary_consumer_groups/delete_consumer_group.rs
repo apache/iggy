@@ -40,6 +40,7 @@ impl DeleteConsumerGroupCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for DeleteConsumerGroupCmd {
     fn explain(&self) -> String {

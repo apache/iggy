@@ -22,6 +22,7 @@ use iggy_common::create_partitions::CreatePartitions;
 use iggy_common::delete_partitions::DeletePartitions;
 use iggy_common::{Identifier, IggyError};
 
+#[maybe_async::maybe_async]
 #[async_trait::async_trait]
 impl<B: BinaryClient> PartitionClient for B {
     async fn create_partitions(

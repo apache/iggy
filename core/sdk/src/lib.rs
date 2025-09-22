@@ -21,8 +21,10 @@ pub mod client_provider;
 pub mod client_wrappers;
 pub mod clients;
 pub mod consumer_ext;
+#[cfg(feature = "async")]
 pub mod http;
 pub mod prelude;
+#[cfg(feature = "async")]
 pub mod quic;
 pub mod stream_builder;
 pub mod tcp;

@@ -39,6 +39,7 @@ impl PurgeTopicCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for PurgeTopicCmd {
     fn explain(&self) -> String {

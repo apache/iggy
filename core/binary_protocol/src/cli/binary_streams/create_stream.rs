@@ -42,6 +42,7 @@ impl CreateStreamCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for CreateStreamCmd {
     fn explain(&self) -> String {

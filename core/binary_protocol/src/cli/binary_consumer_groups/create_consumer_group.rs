@@ -53,6 +53,7 @@ impl CreateConsumerGroupCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for CreateConsumerGroupCmd {
     fn explain(&self) -> String {

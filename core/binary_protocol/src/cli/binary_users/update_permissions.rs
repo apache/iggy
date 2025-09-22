@@ -39,6 +39,7 @@ impl UpdatePermissionsCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for UpdatePermissionsCmd {
     fn explain(&self) -> String {

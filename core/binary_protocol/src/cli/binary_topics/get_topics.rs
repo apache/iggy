@@ -56,6 +56,7 @@ impl GetTopicsCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for GetTopicsCmd {
     fn explain(&self) -> String {

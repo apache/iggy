@@ -59,6 +59,7 @@ impl UpdateTopicCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for UpdateTopicCmd {
     fn explain(&self) -> String {

@@ -35,6 +35,7 @@ impl LogoutCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for LogoutCmd {
     fn explain(&self) -> String {

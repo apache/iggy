@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use iggy_binary_protocol::SegmentClient;
 use iggy_common::{Identifier, IggyError};
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl SegmentClient for ClientWrapper {
     async fn delete_segments(

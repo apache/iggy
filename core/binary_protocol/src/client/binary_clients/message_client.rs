@@ -21,6 +21,7 @@ use iggy_common::{
 };
 
 /// This trait defines the methods to interact with the messaging module.
+#[maybe_async::maybe_async]
 #[async_trait]
 pub trait MessageClient {
     /// Poll given amount of messages using the specified consumer and strategy from the specified stream and topic by unique IDs or names.

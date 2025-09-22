@@ -22,6 +22,7 @@ use iggy_binary_protocol::SegmentClient;
 use iggy_common::locking::IggySharedMutFn;
 use iggy_common::{Identifier, IggyError};
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl SegmentClient for IggyClient {
     async fn delete_segments(

@@ -16,11 +16,14 @@
  * under the License.
  */
 
+#[cfg(feature = "async")]
 pub(crate) mod tcp_client;
+
+#[cfg(feature = "sync")]
+pub mod tcp_client_sync;
+
 pub(crate) mod tcp_connection_stream;
 pub(crate) mod tcp_connection_stream_kind;
 pub(crate) mod tcp_stream;
 pub(crate) mod tcp_tls_connection_stream;
 pub(crate) mod tcp_tls_verifier;
-
-pub mod tcp_client_sync;

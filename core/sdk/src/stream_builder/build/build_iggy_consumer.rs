@@ -38,6 +38,7 @@ use tracing::{error, trace};
 /// This function will create a new `IggyConsumer` with the given `IggyClient` and `IggyConsumerConfig`.
 /// The `IggyConsumerConfig` fields are used to configure the `IggyConsumer`.
 ///
+#[maybe_async::maybe_async]
 pub(crate) async fn build_iggy_consumer(
     client: &IggyClient,
     config: &IggyConsumerConfig,

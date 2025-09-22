@@ -23,6 +23,7 @@ use iggy_common::{
 };
 
 /// This trait defines the methods to interact with the personal access token module.
+#[maybe_async::maybe_async]
 #[async_trait]
 pub trait PersonalAccessTokenClient {
     /// Get the info about all the personal access tokens of the currently authenticated user.

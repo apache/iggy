@@ -22,6 +22,7 @@ use iggy_binary_protocol::PartitionClient;
 use iggy_common::locking::IggySharedMutFn;
 use iggy_common::{Identifier, IggyError};
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl PartitionClient for IggyClient {
     async fn create_partitions(

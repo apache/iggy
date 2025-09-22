@@ -52,6 +52,7 @@ impl Default for GetUsersCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for GetUsersCmd {
     fn explain(&self) -> String {

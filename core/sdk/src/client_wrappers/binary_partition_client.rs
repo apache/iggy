@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use iggy_binary_protocol::PartitionClient;
 use iggy_common::{Identifier, IggyError};
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl PartitionClient for ClientWrapper {
     async fn create_partitions(

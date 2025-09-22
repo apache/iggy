@@ -24,6 +24,7 @@ use iggy_common::{
     Identifier, IdentityInfo, IggyError, Permissions, UserInfo, UserInfoDetails, UserStatus,
 };
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl UserClient for IggyClient {
     async fn get_user(&self, user_id: &Identifier) -> Result<Option<UserInfoDetails>, IggyError> {

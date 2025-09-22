@@ -34,7 +34,7 @@ where
     pub(crate) config: Arc<T::Config>,
     inner: Mutex<ProtocolCore>,
     stream: Mutex<Option<T::Stream>>,
-    events: (Sender<DiagnosticEvent>, Receiver<DiagnosticEvent>),
+    events: (Sender<DiagnosticEvent>, Receiver<DiagnosticEvent>), // TODO change async_broadcast to sync crate via feature flag
     recv_buffer: Mutex<BytesMut>,
     client_address: Mutex<Option<SocketAddr>>,
     connected_at: Mutex<Option<IggyTimestamp>>,
@@ -67,7 +67,7 @@ where
         })
     }
 
-    async fn get_client_address_value(&self) -> String {
+    fn get_client_address_value(&self) -> String {
         let client_address = self.client_address.lock().unwrap();
         if let Some(client_address) = &*client_address {
             client_address.to_string()
@@ -77,6 +77,7 @@ where
     }
 }
 
+#[maybe_async::sync_impl]
 #[async_trait]
 impl<T> Client for TcpClientSync<T>
 where
@@ -84,7 +85,7 @@ where
     T::Config: Send + Sync + Debug,
     T::Stream: Send + Sync + Debug,
 {
-    async fn connect(&self) -> Result<(), IggyError> {
+    fn connect(&self) -> Result<(), IggyError> {
         let address = self.config.server_address();
         let config = self.config.clone();
         
@@ -100,39 +101,38 @@ where
             let now = IggyTimestamp::now();
             *self.connected_at.lock().unwrap() = Some(now);
             
-            self.publish_event(DiagnosticEvent::Connected).await;
+            self.publish_event(DiagnosticEvent::Connected);
             
-            let client_address = self.get_client_address_value().await;
+            let client_address = self.get_client_address_value();
             debug!("TcpClientSync client: {client_address} has connected to server at: {now}");
         }
 
         Ok(())
     }
 
-    async fn disconnect(&self) -> Result<(), IggyError> {
-        if self.get_state().await == ClientState::Disconnected {
+    fn disconnect(&self) -> Result<(), IggyError> {
+        if self.get_state() == ClientState::Disconnected {
             return Ok(());
         }
 
-        let client_address = self.get_client_address_value().await;
+        let client_address = self.get_client_address_value();
         debug!("TcpClientSync client: {client_address} is disconnecting from server...");
         
-        // Scope the mutex guards to ensure they're dropped before any await
         {
             let mut core = self.inner.lock().unwrap();
             core.disconnect();
             *self.stream.lock().unwrap() = None;
         }
         
-        self.publish_event(DiagnosticEvent::Disconnected).await;
+        self.publish_event(DiagnosticEvent::Disconnected);
         
         let now = IggyTimestamp::now();
         debug!("TcpClientSync client: {client_address} has disconnected from server at: {now}.");
         Ok(())
     }
 
-    async fn shutdown(&self) -> Result<(), IggyError> {
-        if self.get_state().await == ClientState::Shutdown {
+    fn shutdown(&self) -> Result<(), IggyError> {
+        if self.get_state() == ClientState::Shutdown {
             return Ok(());
         }
 
@@ -147,15 +147,16 @@ where
             core.shutdown();
         }
         
-        self.publish_event(DiagnosticEvent::Shutdown).await;
+        self.publish_event(DiagnosticEvent::Shutdown);
         Ok(())
     }
 
-    async fn subscribe_events(&self) -> async_broadcast::Receiver<iggy_common::DiagnosticEvent> {
+    fn subscribe_events(&self) -> async_broadcast::Receiver<iggy_common::DiagnosticEvent> {
         self.events.1.clone()
     }
 }
 
+#[maybe_async::sync_impl]
 #[async_trait]
 impl<T> BinaryTransport for TcpClientSync<T>
 where
@@ -163,17 +164,17 @@ where
     T::Config: Send + Sync + Debug,
     T::Stream: Send + Sync + Debug,
 {
-    async fn get_state(&self) -> ClientState {
+    fn get_state(&self) -> ClientState {
         self.inner.lock().unwrap().state
     }
 
-    async fn set_state(&self, client_state: ClientState) {
+    fn set_state(&self, client_state: ClientState) {
         let mut core = self.inner.lock().unwrap();
         core.state = client_state
     }
 
-    async fn publish_event(&self, event: DiagnosticEvent) {
-        if let Err(error) = self.events.0.broadcast(event).await {
+    fn publish_event(&self, event: DiagnosticEvent) {
+        if let Err(error) = self.events.0.broadcast(event) {
             error!("Failed to send a TCP diagnostic event: {error}");
         }
     }
@@ -182,21 +183,19 @@ where
         self.config.heartbeat_interval()
     }
 
-    async fn send_with_response<C: Command>(&self, command: &C) -> Result<Bytes, IggyError> {
+    fn send_with_response<C: Command>(&self, command: &C) -> Result<Bytes, IggyError> {
         command.validate()?;
         self.send_raw_with_response(command.code(), command.to_bytes())
-            .await
     }
 
-    async fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
-        let result = self.send_raw(code, payload.clone()).await;
+    fn send_raw_with_response(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+        let result = self.send_raw(code, payload.clone());
         if result.is_ok() {
             return result;
         }
 
         let error = result.unwrap_err();
         
-        // Check if we should attempt reconnection using ProtocolCore logic
         let should_reconnect = {
             let core = self.inner.lock().unwrap();
             core.should_reconnect_for_error(&error)
@@ -206,16 +205,14 @@ where
             return Err(error);
         }
 
-        // Perform reconnection
         let server_address = self.config.server_address();
         {
             let mut core = self.inner.lock().unwrap();
             core.initiate_reconnection(server_address)?;
         }
 
-        // Attempt to reconnect
-        self.connect().await?;
-        self.send_raw(code, payload).await
+        self.connect()?;
+        self.send_raw(code, payload)
     }
 }
 
@@ -301,7 +298,7 @@ where
         Ok(Some(stream))
     }
 
-    async fn send_raw(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
+    fn send_raw(&self, code: u32, payload: Bytes) -> Result<Bytes, IggyError> {
         let mut core = self.inner.lock().unwrap();
         let mut stream = self.stream.lock().unwrap();
         let mut recv_buf = self.recv_buffer.lock().unwrap();
@@ -399,9 +396,7 @@ fn read<T: Transport>(
     }
 }
 
-// Specific implementations for TCP
 impl TcpClientSync<TcpTransport> {
-    /// Create a new TCP client for the provided server address.
     pub fn new(
         server_address: &str,
         auto_sign_in: AutoLogin,
@@ -418,7 +413,6 @@ impl TcpClientSync<TcpTransport> {
         )
     }
 
-    /// Create a new TCP client from the provided connection string.
     pub fn from_connection_string(connection_string: &str) -> Result<Self, IggyError> {
         if ConnectionStringUtils::parse_protocol(connection_string)? != TransportProtocol::Tcp {
             return Err(IggyError::InvalidConnectionString);
@@ -432,7 +426,6 @@ impl TcpClientSync<TcpTransport> {
         )
     }
 
-    /// Create a new TCP client based on the provided configuration.
     pub fn create_tcp(config: Arc<TcpClientConfig>) -> Result<Self, IggyError> {
         Self::create(Arc::new(TcpTransport), config)
     }
@@ -443,7 +436,6 @@ pub type TcpClientSyncTcp = TcpClientSync<TcpTransport>;
 pub type TcpClientSyncTls = TcpClientSync<TcpTlsTransport>;
 
 impl TcpClientSyncTls {
-    /// Create a new TLS TCP client from the provided connection string.
     pub fn from_connection_string_tls(connection_string: &str) -> Result<Self, IggyError> {
         if ConnectionStringUtils::parse_protocol(connection_string)? != TransportProtocol::Tcp {
             return Err(IggyError::InvalidConnectionString);
@@ -457,12 +449,10 @@ impl TcpClientSyncTls {
         )
     }
 
-    /// Create a new TLS TCP client based on the provided configuration.
     pub fn create_tcp_tls(config: Arc<TcpClientConfig>) -> Result<Self, IggyError> {
         Self::create(Arc::new(TcpTlsTransport), config)
     }
 
-    /// Create a new TLS TCP client for the provided server address.
     pub fn new_tls(
         server_address: &str,
         domain: &str,
@@ -489,8 +479,6 @@ impl Default for TcpClientSync<TcpTransport> {
     }
 }
 
-/// Unit tests for TcpClientSync.
-/// Tests connection string parsing, configuration validation, and constructors.
 #[cfg(test)]
 mod tests {
     use super::*;

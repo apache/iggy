@@ -33,6 +33,7 @@ use iggy_common::{
     UserInfoDetails, UserStatus,
 };
 
+#[maybe_async::maybe_async]
 #[async_trait::async_trait]
 impl<B: BinaryClient> UserClient for B {
     async fn get_user(&self, user_id: &Identifier) -> Result<Option<UserInfoDetails>, IggyError> {

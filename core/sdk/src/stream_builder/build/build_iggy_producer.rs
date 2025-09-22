@@ -39,6 +39,7 @@ use tracing::{error, trace};
 /// This function will create a new `IggyProducer` with the given `IggyClient` and `IggyProducerConfig`.
 /// The `IggyProducerConfig` fields are used to configure the `IggyProducer`.
 ///
+#[maybe_async::maybe_async]
 pub(crate) async fn build_iggy_producer(
     client: &IggyClient,
     config: &IggyProducerConfig,

@@ -35,6 +35,7 @@ use iggy_binary_protocol::Client;
 /// If the connection string is invalid or the client cannot be initialized,
 /// an `IggyError` will be returned.
 ///
+#[maybe_async::maybe_async]
 pub(crate) async fn build_iggy_client(connection_string: &str) -> Result<IggyClient, IggyError> {
     let client = IggyClient::from_connection_string(connection_string)?;
     client.connect().await?;

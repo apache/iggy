@@ -24,6 +24,7 @@ use iggy_common::{
     SystemSnapshotType,
 };
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl SystemClient for ClientWrapper {
     async fn get_stats(&self) -> Result<Stats, IggyError> {

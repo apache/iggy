@@ -39,6 +39,7 @@ impl DeleteTopicCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for DeleteTopicCmd {
     fn explain(&self) -> String {

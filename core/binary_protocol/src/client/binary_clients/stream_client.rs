@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use iggy_common::{Identifier, IggyError, Stream, StreamDetails};
 
 /// This trait defines the methods to interact with the stream module.
+#[maybe_async::maybe_async]
 #[async_trait]
 pub trait StreamClient {
     /// Get the info about a specific stream by unique ID or name.

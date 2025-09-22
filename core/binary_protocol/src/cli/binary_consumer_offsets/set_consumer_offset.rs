@@ -52,6 +52,7 @@ impl SetConsumerOffsetCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for SetConsumerOffsetCmd {
     fn explain(&self) -> String {

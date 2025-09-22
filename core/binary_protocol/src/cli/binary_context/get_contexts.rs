@@ -56,6 +56,7 @@ impl Default for GetContextsCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for GetContextsCmd {
     fn explain(&self) -> String {

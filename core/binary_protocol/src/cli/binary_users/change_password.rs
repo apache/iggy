@@ -48,6 +48,7 @@ impl ChangePasswordCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for ChangePasswordCmd {
     fn explain(&self) -> String {

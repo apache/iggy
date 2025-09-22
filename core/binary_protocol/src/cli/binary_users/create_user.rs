@@ -47,6 +47,7 @@ impl CreateUserCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for CreateUserCmd {
     fn explain(&self) -> String {

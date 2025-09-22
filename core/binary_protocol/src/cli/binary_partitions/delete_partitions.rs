@@ -40,6 +40,7 @@ impl DeletePartitionsCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for DeletePartitionsCmd {
     fn explain(&self) -> String {

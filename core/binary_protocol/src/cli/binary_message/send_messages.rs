@@ -83,6 +83,7 @@ impl SendMessagesCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for SendMessagesCmd {
     fn explain(&self) -> String {
@@ -94,11 +95,19 @@ impl CliCommand for SendMessagesCmd {
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         let mut messages = if let Some(input_file) = &self.input_file {
+            #[cfg(not(feature = "sync"))]
             let mut file = tokio::fs::OpenOptions::new()
                 .read(true)
                 .open(input_file)
                 .await
                 .with_context(|| format!("Problem opening file for reading: {input_file}"))?;
+
+            #[cfg(feature = "sync")]
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .open(input_file)
+                .with_context(|| format!("Problem opening file for reading: {input_file}"))?;
+
             let mut buffer = Vec::new();
             file.read_to_end(&mut buffer)
                 .await

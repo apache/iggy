@@ -23,6 +23,7 @@ use iggy_binary_protocol::{ConsumerGroupClient, UserClient};
 use iggy_common::locking::IggySharedMutFn;
 use iggy_common::{ConsumerGroup, ConsumerGroupDetails, Identifier, IggyError};
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl ConsumerGroupClient for IggyClient {
     async fn get_consumer_group(
@@ -104,9 +105,17 @@ impl ConsumerGroupClient for IggyClient {
     }
 }
 
+#[cfg(feature = "async")]
 #[async_trait]
 impl AsyncDrop for IggyClient {
     async fn async_drop(&mut self) {
         let _ = self.client.read().await.logout_user().await;
+    }
+}
+
+#[cfg(feature = "sync")]
+impl Drop for IggyClient {
+    fn drop(&mut self) {
+        let _ = self.client.read().logout_user();
     }
 }

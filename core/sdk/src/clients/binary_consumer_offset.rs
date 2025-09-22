@@ -22,6 +22,7 @@ use iggy_binary_protocol::ConsumerOffsetClient;
 use iggy_common::locking::IggySharedMutFn;
 use iggy_common::{Consumer, ConsumerOffsetInfo, Identifier, IggyError};
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl ConsumerOffsetClient for IggyClient {
     async fn store_consumer_offset(

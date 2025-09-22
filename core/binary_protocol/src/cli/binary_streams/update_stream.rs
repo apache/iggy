@@ -36,6 +36,7 @@ impl UpdateStreamCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for UpdateStreamCmd {
     fn explain(&self) -> String {

@@ -19,7 +19,9 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use iggy_common::{ClientState, Command, DiagnosticEvent, IggyDuration, IggyError};
+use maybe_async::maybe_async;
 
+#[maybe_async(AFIT)]
 #[async_trait]
 pub trait BinaryTransport {
     /// Gets the state of the client.

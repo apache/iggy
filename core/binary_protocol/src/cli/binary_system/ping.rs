@@ -106,6 +106,7 @@ impl Display for PingStats {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for PingCmd {
     fn explain(&self) -> String {

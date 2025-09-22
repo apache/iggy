@@ -23,6 +23,7 @@ use iggy_common::{
 };
 
 /// This trait defines the methods to interact with the system module.
+#[maybe_async::maybe_async]
 #[async_trait]
 pub trait SystemClient {
     /// Get the stats of the system such as PID, memory usage, streams count etc.

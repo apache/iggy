@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use iggy_common::{Identifier, IggyError};
 
 /// This trait defines the methods to interact with the partition module.
+#[maybe_async::maybe_async]
 #[async_trait]
 pub trait SegmentClient {
     /// Delete last N segments for a partition by unique ID or name.

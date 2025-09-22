@@ -46,6 +46,7 @@ impl FlushMessagesCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for FlushMessagesCmd {
     fn explain(&self) -> String {

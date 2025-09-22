@@ -45,6 +45,7 @@ impl DeleteSegmentsCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for DeleteSegmentsCmd {
     fn explain(&self) -> String {

@@ -36,6 +36,7 @@ impl DeleteStreamCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for DeleteStreamCmd {
     fn explain(&self) -> String {

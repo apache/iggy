@@ -57,6 +57,7 @@ impl CreatePersonalAccessTokenCmd {
     }
 }
 
+#[maybe_async::maybe_async]
 #[async_trait]
 impl CliCommand for CreatePersonalAccessTokenCmd {
     fn explain(&self) -> String {
