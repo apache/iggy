@@ -21,7 +21,7 @@ The minimal viable configuration requires at least the Iggy credentials, to crea
 address = "localhost:8090"
 username = "iggy"
 password = "iggy"
-# token = "secret" # Personal Access Token (PAT) can be used instead of username and password
+token = "" # Personal Access Token (PAT) can be used instead of username and password
 
 [state]
 path = "local_state"
@@ -39,7 +39,7 @@ Connector runtime has an optional HTTP API that can be enabled by setting the `e
 [http] # Optional HTTP API configuration
 enabled = true
 address = "127.0.0.1:8081"
-# api_key = "secret" # Optional API key for authentication to be passed as `api-key` header
+api_key = "" # Optional API key for authentication to be passed as `api-key` header
 
 [http.cors] # Optional CORS configuration for HTTP API
 enabled = false

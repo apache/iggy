@@ -325,7 +325,7 @@ impl TestServer {
                     sleep(Duration::from_millis(SLEEP_INTERVAL_MS));
                     continue;
                 }
-                match ServerConfig::config_provider(config_path.clone())
+                match ServerConfig::file_config_provider(config_path.clone())
                     .load_config()
                     .await
                 {

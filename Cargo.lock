@@ -3997,7 +3997,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-connectors"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum 0.8.4",
  "axum-server",
@@ -4028,7 +4028,7 @@ dependencies = [
 
 [[package]]
 name = "iggy-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum 0.8.4",
  "axum-server",

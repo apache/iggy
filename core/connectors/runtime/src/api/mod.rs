@@ -20,7 +20,7 @@ use crate::context::RuntimeContext;
 use auth::resolve_api_key;
 use axum::{Json, Router, middleware, routing::get};
 use axum_server::tls_rustls::RustlsConfig;
-use config::{HttpApiConfig, configure_cors};
+use config::{HttpConfig, configure_cors};
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::spawn;
 use tracing::{error, info};
@@ -34,7 +34,7 @@ mod source;
 
 const NAME: &str = env!("CARGO_PKG_NAME");
 
-pub async fn init(config: &HttpApiConfig, context: Arc<RuntimeContext>) {
+pub async fn init(config: &HttpConfig, context: Arc<RuntimeContext>) {
     if !config.enabled {
         info!("{NAME} HTTP API is disabled");
         return;
@@ -54,18 +54,11 @@ pub async fn init(config: &HttpApiConfig, context: Arc<RuntimeContext>) {
         resolve_api_key,
     ));
 
-    if let Some(cors) = &config.cors
-        && cors.enabled
-    {
-        app = app.layer(configure_cors(cors));
+    if config.cors.enabled {
+        app = app.layer(configure_cors(&config.cors));
     }
 
-    let tls_enabled = config
-        .tls
-        .as_ref()
-        .map(|tls| tls.enabled)
-        .unwrap_or_default();
-    if !tls_enabled {
+    if !config.tls.enabled {
         let listener = tokio::net::TcpListener::bind(&config.address)
             .await
             .unwrap_or_else(|_| panic!("Failed to bind to HTTP address {}", config.address));
@@ -86,13 +79,15 @@ pub async fn init(config: &HttpApiConfig, context: Arc<RuntimeContext>) {
         return;
     }
 
-    let tls = config.tls.as_ref().expect("TLS configuration is required");
-    let tls_config =
-        RustlsConfig::from_pem_file(PathBuf::from(&tls.cert_file), PathBuf::from(&tls.key_file))
-            .await
-            .unwrap();
+    let tls_config = RustlsConfig::from_pem_file(
+        PathBuf::from(&config.tls.cert_file),
+        PathBuf::from(&config.tls.key_file),
+    )
+    .await
+    .expect("Failed to load TLS certificate or key file");
 
-    let listener = std::net::TcpListener::bind(&config.address).unwrap();
+    let listener =
+        std::net::TcpListener::bind(&config.address).expect("Failed to bind TCP listener");
     let address = listener
         .local_addr()
         .expect("Failed to get local address for HTTPS / TLS server");

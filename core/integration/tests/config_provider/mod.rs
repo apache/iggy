@@ -324,5 +324,5 @@ async fn validate_cluster_contiguous_array_override() {
 
 fn get_file_config_provider() -> FileConfigProvider<ServerEnvProvider> {
     let config_path = get_root_path().join("../configs/server.toml");
-    ServerConfig::config_provider(config_path.as_path().display().to_string())
+    ServerConfig::file_config_provider(config_path.as_path().display().to_string())
 }

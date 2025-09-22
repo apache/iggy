@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use configs::{ConfigFormat, RuntimeConfig};
+use configs::{ConfigFormat, ConnectorsConfig};
 use dlopen2::wrapper::{Container, WrapperApi};
 use dotenvy::dotenv;
 use error::RuntimeError;
@@ -112,7 +112,7 @@ async fn main() -> Result<(), RuntimeError> {
         env::var("IGGY_CONNECTORS_CONFIG_PATH").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
     info!("Starting Iggy Connectors Runtime, loading configuration from: {config_path}...");
 
-    let config: RuntimeConfig = RuntimeConfig::config_provider(config_path)
+    let config: ConnectorsConfig = ConnectorsConfig::config_provider(config_path)
         .load_config()
         .await
         .expect("Failed to load configuration");

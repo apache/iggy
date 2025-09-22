@@ -34,28 +34,22 @@ use serde::{Serialize, de::DeserializeOwned};
 use std::{env, fmt::Display, future::Future, marker::PhantomData, path::Path};
 use toml::{Value as TomlValue, map::Map as TomlMap};
 
-// Constants for configuration handling
 const SECRET_MASK: &str = "******";
 const ARRAY_SEPARATOR: char = '_';
 const PATH_SEPARATOR: &str = ".";
+const DISPLAY_CONFIG_ENV: &str = "IGGY_DISPLAY_CONFIG";
 
-/// Type alias for configuration profiles mapping
 type ProfileMap = FigmentMap<Profile, Dict>;
 
 /// Type alias for configuration that can be serialized, deserialized, has defaults, and can be displayed
 pub trait ConfigurationType: Serialize + DeserializeOwned + Default + Display {}
 impl<T: Serialize + DeserializeOwned + Default + Display> ConfigurationType for T {}
 
-/// Errors that can occur during configuration loading and processing
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigurationError {
-    /// Failed to load configuration from file or environment
     CannotLoadConfiguration,
-    /// Failed to serialize default configuration to TOML
     DefaultSerializationFailed,
-    /// Failed to parse default configuration TOML
     DefaultParsingFailed,
-    /// Environment variable parsing failed
     EnvironmentVariableParsingFailed,
 }
 
@@ -76,9 +70,7 @@ impl Display for ConfigurationError {
 
 impl std::error::Error for ConfigurationError {}
 
-/// Trait for configuration providers that can load configuration of a specific type
 pub trait ConfigProvider<T: ConfigurationType> {
-    /// Load configuration asynchronously
     fn load_config(self) -> impl Future<Output = Result<T, ConfigurationError>>;
 }
 
@@ -96,8 +88,8 @@ impl<P: Provider> FileConfigProvider<P> {
     /// # Arguments
     /// * `file_path` - Path to the configuration file
     /// * `env_provider` - Environment variable provider
-    /// * `default_config` - Optional default configuration data
     /// * `display_config` - Whether to display the loaded configuration
+    /// * `default_config` - Optional default configuration data
     pub fn new(
         file_path: String,
         env_provider: P,
@@ -113,15 +105,6 @@ impl<P: Provider> FileConfigProvider<P> {
     }
 }
 
-/// Custom environment variable provider with advanced override capabilities
-///
-/// This provider supports:
-/// - Prefix-based filtering of environment variables
-/// - Secret key masking for security
-/// - Complex path resolution for nested structures
-/// - Array index overrides
-/// - HashMap field overrides
-/// - JSON value field handling
 #[derive(Debug, Clone)]
 pub struct CustomEnvProvider<T: ConfigurationType> {
     prefix: String,
@@ -745,7 +728,7 @@ impl<T: ConfigurationType, P: Provider + Clone> ConfigProvider<T> for FileConfig
     async fn load_config(self) -> Result<T, ConfigurationError> {
         println!("Loading config from path: '{}'...", self.file_path);
 
-        // Start with the default configuration
+        // Start with the default configuration if provided
         let mut config_builder = Figment::new();
         if let Some(default) = self.default_config {
             config_builder = config_builder.merge(default);
@@ -773,7 +756,10 @@ impl<T: ConfigurationType, P: Provider + Clone> ConfigProvider<T> for FileConfig
         match config_result {
             Ok(config) => {
                 println!("Config loaded successfully.");
-                if self.display_config {
+                let display_config = env::var(DISPLAY_CONFIG_ENV)
+                    .map(|val| val == "1" || val.to_lowercase() == "true")
+                    .unwrap_or(self.display_config);
+                if display_config {
                     println!("Using Config: {config}");
                 }
                 Ok(config)

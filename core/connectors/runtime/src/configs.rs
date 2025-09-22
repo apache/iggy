@@ -16,7 +16,7 @@
  * under the License.
  */
 
-use crate::api::config::HttpApiConfig;
+use crate::api::config::HttpConfig;
 use figment::{
     Metadata, Profile, Provider,
     providers::{Format, Toml},
@@ -26,7 +26,7 @@ use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use iggy_common::{CustomEnvProvider, FileConfigProvider};
 use iggy_connector_sdk::{Schema, transforms::TransformType};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt::Formatter};
 use strum::Display;
 
 #[derive(
@@ -47,8 +47,8 @@ pub enum ConfigFormat {
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
-pub struct RuntimeConfig {
-    pub http: HttpApiConfig,
+pub struct ConnectorsConfig {
+    pub http: HttpConfig,
     pub iggy: IggyConfig,
     pub sinks: HashMap<String, SinkConfig>,
     pub sources: HashMap<String, SourceConfig>,
@@ -58,20 +58,9 @@ pub struct RuntimeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IggyConfig {
     pub address: String,
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub token: Option<String>,
-}
-
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct SinkConfig {
-    pub enabled: bool,
-    pub name: String,
-    pub path: String,
-    pub transforms: Option<TransformsConfig>,
-    pub streams: Vec<StreamConsumerConfig>,
-    pub config_format: Option<ConfigFormat>,
-    pub config: Option<serde_json::Value>,
+    pub username: String,
+    pub password: String,
+    pub token: String,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -91,6 +80,17 @@ pub struct StreamProducerConfig {
     pub schema: Schema,
     pub batch_length: Option<u32>,
     pub linger_time: Option<String>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct SinkConfig {
+    pub enabled: bool,
+    pub name: String,
+    pub path: String,
+    pub transforms: Option<TransformsConfig>,
+    pub streams: Vec<StreamConsumerConfig>,
+    pub config_format: Option<ConfigFormat>,
+    pub config: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -120,13 +120,114 @@ pub struct StateConfig {
     pub path: String,
 }
 
-impl std::fmt::Display for RuntimeConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl std::fmt::Display for StateConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{{ path: {} }}", self.path)
+    }
+}
+
+impl std::fmt::Display for ConnectorsConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "RuntimeConfig {{ http: {:?}, iggy: {:?}, sinks: {:?}, sources: {:?}, state: {:?} }}",
+            "{{ http: {}, iggy: {}, sinks: {:?}, sources: {:?}, state: {:} }}",
             self.http, self.iggy, self.sinks, self.sources, self.state
         )
+    }
+}
+
+impl std::fmt::Display for IggyConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ address: {}, username: {}, password: {}, token: {} }}",
+            self.address,
+            self.username,
+            if !self.password.is_empty() {
+                "****"
+            } else {
+                ""
+            },
+            if !self.token.is_empty() { "****" } else { "" },
+        )
+    }
+}
+
+impl std::fmt::Display for StreamConsumerConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ stream: {}, topics: {}, schema: {:?}, batch_length: {:?}, poll_interval: {:?}, consumer_group: {:?} }}",
+            self.stream,
+            self.topics
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<&str>>()
+                .join(", "),
+            self.schema,
+            self.batch_length,
+            self.poll_interval,
+            self.consumer_group
+        )
+    }
+}
+
+impl std::fmt::Display for StreamProducerConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ stream: {}, topic: {}, schema: {:?}, batch_length: {:?}, linger_time: {:?} }}",
+            self.stream, self.topic, self.schema, self.batch_length, self.linger_time
+        )
+    }
+}
+
+impl std::fmt::Display for SinkConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ enabled: {}, name: {}, path: {}, transforms: {:?}, streams: [{}], config_format: {:?} }}",
+            self.enabled,
+            self.name,
+            self.path,
+            self.transforms,
+            self.streams
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<String>>()
+                .join(", "),
+            self.config_format,
+        )
+    }
+}
+
+impl std::fmt::Display for SourceConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ enabled: {}, name: {}, path: {}, transforms: {:?}, streams: [{}], config_format: {:?} }}",
+            self.enabled,
+            self.name,
+            self.path,
+            self.transforms,
+            self.streams
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<String>>()
+                .join(", "),
+            self.config_format,
+        )
+    }
+}
+
+impl std::fmt::Display for TransformsConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let transforms: Vec<String> = self
+            .transforms
+            .iter()
+            .map(|(k, v)| format!("{}: {}", k, v))
+            .collect();
+        write!(f, "{{ {} }}", transforms.join(", "))
     }
 }
 
@@ -142,26 +243,14 @@ impl Default for IggyConfig {
     fn default() -> Self {
         Self {
             address: "localhost:8090".to_owned(),
-            username: Some(DEFAULT_ROOT_USERNAME.to_owned()),
-            password: Some(DEFAULT_ROOT_PASSWORD.to_owned()),
-            token: None,
+            username: DEFAULT_ROOT_USERNAME.to_owned(),
+            password: DEFAULT_ROOT_PASSWORD.to_owned(),
+            token: "".to_owned(),
         }
     }
 }
 
-impl Default for HttpApiConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            address: "localhost:8081".to_owned(),
-            cors: None,
-            api_key: None,
-            tls: None,
-        }
-    }
-}
-
-impl RuntimeConfig {
+impl ConnectorsConfig {
     pub fn config_provider(path: String) -> FileConfigProvider<ConnectorsEnvProvider> {
         let default_config = Toml::string(include_str!("../../../connectors/runtime/config.toml"));
         FileConfigProvider::new(
@@ -175,7 +264,7 @@ impl RuntimeConfig {
 
 #[derive(Debug, Clone)]
 pub struct ConnectorsEnvProvider {
-    provider: CustomEnvProvider<RuntimeConfig>,
+    provider: CustomEnvProvider<ConnectorsConfig>,
 }
 
 impl Default for ConnectorsEnvProvider {

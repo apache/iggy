@@ -195,9 +195,9 @@ pub fn resolve(config_provider_type: &str) -> Result<ConfigProviderKind, ConfigE
         DEFAULT_CONFIG_PROVIDER => {
             let path =
                 env::var("IGGY_CONFIG_PATH").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
-            Ok(ConfigProviderKind::File(ServerConfig::config_provider(
-                path,
-            )))
+            Ok(ConfigProviderKind::File(
+                ServerConfig::file_config_provider(path),
+            ))
         }
         _ => Err(ConfigError::InvalidConfigurationProvider {
             provider_type: config_provider_type.to_string(),
@@ -221,7 +221,7 @@ impl ConfigProviderKind {
 }
 
 impl ServerConfig {
-    pub async fn load(config_provider: ConfigProviderKind) -> Result<ServerConfig, ConfigError> {
+    pub async fn load(config_provider: ConfigProviderKind) -> Result<Self, ConfigError> {
         let server_config = config_provider
             .load_config()
             .await
@@ -234,7 +234,7 @@ impl ServerConfig {
         Ok(server_config)
     }
 
-    pub fn config_provider(path: String) -> FileConfigProvider<ServerEnvProvider> {
+    pub fn file_config_provider(path: String) -> FileConfigProvider<ServerEnvProvider> {
         let default_config = Toml::string(include_str!("../../../configs/server.toml"));
         FileConfigProvider::new(
             path,

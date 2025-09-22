@@ -38,24 +38,17 @@ async fn create_client(config: &IggyConfig) -> Result<IggyClient, RuntimeError> 
     let password = config.password.to_owned();
     let token = config.token.to_owned();
 
-    let connection_string = if let Some(token) = token {
-        if token.is_empty() {
-            error!("Iggy token cannot be empty (if username and password are not provided)");
-            return Err(RuntimeError::MissingIggyCredentials);
-        }
-
+    let connection_string = if !token.is_empty() {
         let redacted_token = token.chars().take(3).collect::<String>();
         info!("Using token: {redacted_token}*** for Iggy authentication");
         format!("iggy://{token}@{address}")
     } else {
         info!("Using username and password for Iggy authentication");
-        let username = username.ok_or(RuntimeError::MissingIggyCredentials)?;
         if username.is_empty() {
-            error!("Iggy password cannot be empty (if token is not provided)");
+            error!("Iggy username cannot be empty (if token is not provided)");
             return Err(RuntimeError::MissingIggyCredentials);
         }
 
-        let password = password.ok_or(RuntimeError::MissingIggyCredentials)?;
         if password.is_empty() {
             error!("Iggy password cannot be empty (if token is not provided)");
             return Err(RuntimeError::MissingIggyCredentials);

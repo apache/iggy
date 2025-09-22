@@ -77,11 +77,14 @@ async fn main() -> Result<(), McpRuntimeError> {
 
     info!("Starting Iggy MCP Server, transport: {transport}...");
 
-    let consumer_id = Identifier::from_str_value(
-        config.iggy.consumer.as_deref().unwrap_or("iggy-mcp"),
-    )
-    .map_err(|error| {
-        error!("Failed to create Iggy consumer ID: {:?}", error);
+    let consumer = if config.iggy.consumer.is_empty() {
+        "iggy-mcp"
+    } else {
+        config.iggy.consumer.as_str()
+    };
+
+    let consumer_id = Identifier::from_str_value(consumer).map_err(|error| {
+        error!("Failed to create Iggy consumer ID: {consumer}. {error}",);
         McpRuntimeError::FailedToCreateConsumerId
     })?;
     let iggy_consumer = Arc::new(iggy::prelude::Consumer::new(consumer_id));
@@ -98,8 +101,8 @@ async fn main() -> Result<(), McpRuntimeError> {
         let Ok(service) = IggyService::new(iggy_client, iggy_consumer, permissions)
             .serve(stdio())
             .await
-            .inspect_err(|e| {
-                error!("Serving error: {:?}", e);
+            .inspect_err(|error| {
+                error!("Serving error. {error}");
             })
         else {
             error!("Failed to create service");
@@ -107,15 +110,10 @@ async fn main() -> Result<(), McpRuntimeError> {
         };
 
         if let Err(error) = service.waiting().await {
-            error!("waiting error: {:?}", error);
+            error!("Waiting for service error. {error}");
         }
     } else {
-        let Some(http_config) = config.http else {
-            error!("HTTP API configuration not found");
-            return Err(McpRuntimeError::MissingConfig);
-        };
-
-        api::init(http_config, iggy_client, iggy_consumer, permissions).await?;
+        api::init(config.http, iggy_client, iggy_consumer, permissions).await?;
     }
 
     #[cfg(unix)]
