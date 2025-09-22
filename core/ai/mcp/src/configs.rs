@@ -17,7 +17,13 @@
  */
 
 use axum::http::Method;
+use figment::{
+    Metadata, Profile, Provider,
+    providers::{Format, Toml},
+    value::Dict,
+};
 use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
+use iggy_common::{CustomEnvProvider, FileConfigProvider};
 use serde::{Deserialize, Serialize};
 use strum::Display;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -176,4 +182,46 @@ pub fn configure_cors(config: &HttpCorsConfig) -> CorsLayer {
         .expose_headers(exposed_headers)
         .allow_credentials(config.allow_credentials)
         .allow_private_network(config.allow_private_network)
+}
+
+impl std::fmt::Display for McpServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "McpServerConfig {{ http: {:?}, iggy: {:?}, permissions: {:?}, transport: {:?} }}",
+            self.http, self.iggy, self.permissions, self.transport
+        )
+    }
+}
+
+impl McpServerConfig {
+    pub fn config_provider(path: String) -> FileConfigProvider<McpServerEnvProvider> {
+        let default_config = Toml::string(include_str!("../../../ai/mcp/config.toml"));
+        FileConfigProvider::new(path, default_config, McpServerEnvProvider::default())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct McpServerEnvProvider {
+    provider: CustomEnvProvider<McpServerConfig>,
+}
+
+impl Default for McpServerEnvProvider {
+    fn default() -> Self {
+        Self {
+            provider: CustomEnvProvider::new("IGGY_MCP_", &[]),
+        }
+    }
+}
+
+impl Provider for McpServerEnvProvider {
+    fn metadata(&self) -> Metadata {
+        Metadata::named("iggy-mcp-server-config")
+    }
+
+    fn data(&self) -> Result<figment::value::Map<Profile, Dict>, figment::Error> {
+        self.provider.deserialize().map_err(|_| {
+            figment::Error::from("Cannot deserialize environment variables for MCP config")
+        })
+    }
 }

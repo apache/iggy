@@ -427,12 +427,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arraydeque"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d902e3d592a523def97af8f317b08ce16b7ab854c1985a0c671e6f15cebc236"
-
-[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1573,26 +1567,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "config"
-version = "0.15.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cef036f0ecf99baef11555578630e2cca559909b4c50822dbba828c252d21c49"
-dependencies = [
- "async-trait",
- "convert_case 0.6.0",
- "json5",
- "pathdiff",
- "ron",
- "rust-ini",
- "serde-untagged",
- "serde_core",
- "serde_json",
- "toml 0.9.6",
- "winnow 0.7.13",
- "yaml-rust2",
-]
-
-[[package]]
 name = "console"
 version = "0.15.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2415,17 +2389,6 @@ name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
-
-[[package]]
-name = "erased-serde"
-version = "0.4.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "259d404d09818dec19332e31d94558aeb442fea04c817006456c24b5460bbd4b"
-dependencies = [
- "serde",
- "serde_core",
- "typeid",
-]
 
 [[package]]
 name = "err_trail"
@@ -4038,7 +4001,6 @@ version = "0.1.0"
 dependencies = [
  "axum 0.8.4",
  "axum-server",
- "config",
  "dashmap",
  "dlopen2",
  "dotenvy",
@@ -4070,10 +4032,11 @@ version = "0.1.0"
 dependencies = [
  "axum 0.8.4",
  "axum-server",
- "config",
  "dotenvy",
  "figlet-rs",
+ "figment",
  "iggy",
+ "iggy_common",
  "rmcp",
  "serde",
  "serde_json",
@@ -4557,17 +4520,6 @@ checksum = "852f13bec5eba4ba9afbeb93fd7c13fe56147f055939ae21c43a29a0ecb2702e"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "json5"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96b0db21af676c1ce64250b5f40f3ce2cf27e4e47cb91ed91eb6fe9350b430c1"
-dependencies = [
- "pest",
- "pest_derive",
- "serde",
 ]
 
 [[package]]
@@ -5761,12 +5713,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
-name = "pathdiff"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
-
-[[package]]
 name = "pbkdf2"
 version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6798,18 +6744,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ron"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b91f7eff05f748767f183df4320a63d6936e9c6107d97c9e6bdd9784f4289c94"
-dependencies = [
- "base64 0.21.7",
- "bitflags 2.9.4",
- "serde",
- "serde_derive",
-]
-
-[[package]]
 name = "route-recognizer"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7198,18 +7132,6 @@ checksum = "fd6c24dee235d0da097043389623fb913daddf92c76e9f5a1db88607a0bcbd1d"
 dependencies = [
  "serde_core",
  "serde_derive",
-]
-
-[[package]]
-name = "serde-untagged"
-version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9faf48a4a2d2693be24c6289dbe26552776eb7737074e6722891fadbe6c5058"
-dependencies = [
- "erased-serde",
- "serde",
- "serde_core",
- "typeid",
 ]
 
 [[package]]
@@ -8785,12 +8707,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "typeid"
-version = "1.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc7d623258602320d5c55d1bc22793b57daff0ec7efc270ea7d55ce1d5f5471c"
-
-[[package]]
 name = "typenum"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9848,17 +9764,6 @@ checksum = "af3a19837351dc82ba89f8a125e22a3c475f05aba604acc023d62b2739ae2909"
 dependencies = [
  "libc",
  "rustix",
-]
-
-[[package]]
-name = "yaml-rust2"
-version = "0.10.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2462ea039c445496d8793d052e13787f2b90e750b833afee748e601c17621ed9"
-dependencies = [
- "arraydeque",
- "encoding_rs",
- "hashlink",
 ]
 
 [[package]]

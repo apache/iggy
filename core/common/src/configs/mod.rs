@@ -212,6 +212,19 @@ impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
         keys: &[String],
         value: FigmentValue,
     ) {
+        if keys.is_empty() {
+            return;
+        }
+
+        // Try to detect HashMap patterns
+        if let Some(hashmap_result) =
+            Self::try_handle_hashmap_override(source, target, keys, value.clone())
+            && hashmap_result
+        {
+            return;
+        }
+
+        // Fallback to original logic for non-HashMap patterns
         let mut current_source = source;
         let mut current_target = target;
         let mut combined_keys = Vec::new();
@@ -247,6 +260,258 @@ impl<T: Serialize + DeserializeOwned + Default + Display> CustomEnvProvider<T> {
                 _ => continue,
             }
         }
+    }
+
+    fn try_handle_hashmap_override(
+        source: &Dict,
+        target: &mut Dict,
+        keys: &[String],
+        value: FigmentValue,
+    ) -> Option<bool> {
+        if keys.len() < 2 {
+            return Some(false);
+        }
+
+        let potential_hashmap_key = &keys[0];
+
+        // Check if this is actually a HashMap field in the source
+        let source_hashmap = match source.get(potential_hashmap_key) {
+            Some(FigmentValue::Dict(_, hashmap_dict)) => {
+                // For it to be a HashMap, it should either:
+                // 1. Have Dict values (actual HashMap entries)
+                // 2. Be empty (empty HashMap)
+                // 3. But NOT have regular struct fields
+
+                let has_dict_values = hashmap_dict
+                    .values()
+                    .any(|v| matches!(v, FigmentValue::Dict(_, _)));
+                let has_non_dict_values = hashmap_dict
+                    .values()
+                    .any(|v| !matches!(v, FigmentValue::Dict(_, _)));
+
+                // If it has non-Dict values mixed with Dict values, it's probably a regular struct, not a HashMap
+                if has_non_dict_values && has_dict_values {
+                    return Some(false);
+                }
+
+                // If it only has non-Dict values, it's definitely a regular struct
+                if has_non_dict_values && !has_dict_values {
+                    return Some(false);
+                }
+
+                // If it's empty or only has Dict values, it could be a HashMap
+                hashmap_dict
+            }
+            _ => return Some(false),
+        };
+
+        // Try to find the best HashMap entry key
+        if let Some((entry_key, remaining_keys)) =
+            Self::find_best_hashmap_split(source_hashmap, &keys[1..])
+        {
+            return Some(Self::apply_hashmap_override(
+                target,
+                potential_hashmap_key,
+                &entry_key,
+                &remaining_keys,
+                source_hashmap,
+                value,
+            ));
+        }
+
+        Some(false)
+    }
+
+    fn find_best_hashmap_split(
+        source_hashmap: &Dict,
+        keys: &[String],
+    ) -> Option<(String, Vec<String>)> {
+        if keys.is_empty() {
+            return None;
+        }
+
+        // First, try existing HashMap entry keys if any exist
+        if !source_hashmap.is_empty() {
+            for (existing_key, existing_value) in source_hashmap {
+                if let FigmentValue::Dict(_, entry_dict) = existing_value {
+                    // Try different ways to match this existing key
+                    for split_point in 1..=keys.len() {
+                        let candidate_key = keys[0..split_point].join("_");
+
+                        if candidate_key == *existing_key {
+                            let remaining_keys = keys[split_point..].to_vec();
+
+                            // Validate that the remaining keys form a valid path in the entry
+                            if remaining_keys.is_empty()
+                                || Self::is_valid_field_path(entry_dict, &remaining_keys)
+                            {
+                                return Some((existing_key.clone(), remaining_keys));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // For empty HashMaps or when no existing keys match, use simple split
+        let simple_entry_key = keys[0].clone();
+        let simple_remaining = keys[1..].to_vec();
+        Some((simple_entry_key, simple_remaining))
+    }
+
+    fn is_valid_field_path(dict: &Dict, keys: &[String]) -> bool {
+        if keys.is_empty() {
+            return true;
+        }
+
+        // Try different combinations to account for fields with underscores
+        for split_point in 1..=keys.len() {
+            let field_name = keys[0..split_point].join("_");
+            let remaining_keys = &keys[split_point..];
+
+            if let Some(field_value) = dict.get(&field_name) {
+                if remaining_keys.is_empty() {
+                    return true;
+                } else if let FigmentValue::Dict(_, nested_dict) = field_value {
+                    return Self::is_valid_field_path(nested_dict, remaining_keys);
+                }
+            }
+        }
+
+        // Also try the original approach with combined keys
+        let mut current_dict = dict;
+        let mut combined_keys = Vec::new();
+
+        for key in keys {
+            combined_keys.push(key.clone());
+            let combined_field = combined_keys.join("_");
+
+            if let Some(field_value) = current_dict.get(&combined_field) {
+                match field_value {
+                    FigmentValue::Dict(_, nested_dict) => {
+                        current_dict = nested_dict;
+                        combined_keys.clear();
+                    }
+                    _ => return true,
+                }
+            }
+        }
+
+        true
+    }
+
+    fn apply_hashmap_override(
+        target: &mut Dict,
+        hashmap_key: &str,
+        entry_key: &str,
+        remaining_keys: &[String],
+        source_hashmap: &Dict,
+        value: FigmentValue,
+    ) -> bool {
+        // Ensure the HashMap exists in target
+        target
+            .entry(hashmap_key.to_string())
+            .or_insert_with(|| FigmentValue::Dict(Tag::Default, Dict::new()));
+
+        if let Some(FigmentValue::Dict(_, target_hashmap)) = target.get_mut(hashmap_key) {
+            // Ensure the specific entry exists in the HashMap
+            target_hashmap
+                .entry(entry_key.to_string())
+                .or_insert_with(|| {
+                    if let Some(existing_entry) = source_hashmap.get(entry_key) {
+                        existing_entry.clone()
+                    } else {
+                        FigmentValue::Dict(Tag::Default, Dict::new())
+                    }
+                });
+
+            if remaining_keys.is_empty() {
+                target_hashmap.insert(entry_key.to_string(), value);
+            } else if let Some(FigmentValue::Dict(_, entry_dict)) =
+                target_hashmap.get_mut(entry_key)
+            {
+                // Check if we need special handling for serde_json::Value fields
+                if let Some((json_field, json_keys)) =
+                    Self::find_json_value_field_split(entry_dict, remaining_keys)
+                {
+                    Self::handle_json_value_override(entry_dict, &json_field, json_keys, value);
+                } else {
+                    Self::insert_overridden_values_from_env(
+                        &Dict::new(),
+                        entry_dict,
+                        remaining_keys.to_vec(),
+                        value,
+                    );
+                }
+            }
+            return true;
+        }
+
+        false
+    }
+
+    fn find_json_value_field_split(dict: &Dict, keys: &[String]) -> Option<(String, Vec<String>)> {
+        if keys.is_empty() {
+            return None;
+        }
+
+        // Try different split points to find a field that exists
+        for split_point in 1..=keys.len() {
+            let potential_json_field = keys[0..split_point].join("_");
+            let remaining_keys = keys[split_point..].to_vec();
+
+            if dict.contains_key(&potential_json_field) && !remaining_keys.is_empty() {
+                return Some((potential_json_field, remaining_keys));
+            }
+        }
+
+        // If no existing field matches and we have multiple keys, use first key
+        if keys.len() > 1 {
+            let potential_new_field = keys[0].clone();
+            let remaining_keys = keys[1..].to_vec();
+            return Some((potential_new_field, remaining_keys));
+        }
+
+        None
+    }
+
+    fn handle_json_value_override(
+        entry_dict: &mut Dict,
+        json_field: &str,
+        json_keys: Vec<String>,
+        value: FigmentValue,
+    ) {
+        // Ensure the JSON value field exists
+        entry_dict
+            .entry(json_field.to_string())
+            .or_insert_with(|| FigmentValue::Dict(Tag::Default, Dict::new()));
+
+        // Get or create the JSON field as a Dict
+        if let Some(json_value) = entry_dict.get_mut(json_field) {
+            let json_dict = match json_value {
+                FigmentValue::Dict(_, dict) => dict,
+                _ => {
+                    *json_value = FigmentValue::Dict(Tag::Default, Dict::new());
+                    if let FigmentValue::Dict(_, dict) = json_value {
+                        dict
+                    } else {
+                        return;
+                    }
+                }
+            };
+
+            Self::set_nested_json_field(json_dict, &json_keys, value);
+        }
+    }
+
+    fn set_nested_json_field(dict: &mut Dict, keys: &[String], value: FigmentValue) {
+        if keys.is_empty() {
+            return;
+        }
+
+        // Always try the full field name first (with underscores)
+        let full_field_name = keys.join("_");
+        dict.insert(full_field_name, value);
     }
 
     fn navigate_to_dict<'a>(target: &'a mut Dict, path: &[String]) -> Option<&'a mut Dict> {

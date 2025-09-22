@@ -125,11 +125,7 @@ impl std::fmt::Display for RuntimeConfig {
         write!(
             f,
             "RuntimeConfig {{ http: {:?}, iggy: {:?}, sinks: {:?}, sources: {:?}, state: {:?} }}",
-            self.http_api,
-            self.iggy,
-            self.sinks.keys(),
-            self.sources.keys(),
-            self.state
+            self.http_api, self.iggy, self.sinks, self.sources, self.state
         )
     }
 }

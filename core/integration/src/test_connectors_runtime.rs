@@ -28,8 +28,6 @@ use std::{collections::HashMap, net::TcpListener};
 use tokio::time::sleep;
 use uuid::Uuid;
 
-use crate::bench_utils::get_random_path;
-
 const LOCAL_STATE_PREFIX: &str = "local_state_";
 pub const CONSUMER_NAME: &str = "connectors";
 
@@ -71,7 +69,10 @@ impl TestConnectorsRuntime {
             "IGGY_CONNECTORS_IGGY_CONSUMER".to_string(),
             CONSUMER_NAME.to_string(),
         );
-        envs.insert("IGGY_CONNECTORS_STATE_PATH".to_string(), get_random_path());
+        envs.insert(
+            "IGGY_CONNECTORS_STATE_PATH".to_string(),
+            Self::get_random_path(),
+        );
         Self::create(envs, server_executable_path)
     }
 

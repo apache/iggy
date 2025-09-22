@@ -16,12 +16,12 @@
  * under the License.
  */
 
-use config::{Config, Environment, File};
 use configs::{McpServerConfig, McpTransport};
 use dotenvy::dotenv;
 use error::McpRuntimeError;
 use figlet_rs::FIGfont;
 use iggy::prelude::{Client, Identifier};
+use iggy_common::ConfigProvider;
 use rmcp::{ServiceExt, model::ErrorData, transport::stdio};
 use service::IggyService;
 use std::{env, sync::Arc};
@@ -68,14 +68,11 @@ async fn main() -> Result<(), McpRuntimeError> {
 
     let config_path = config_path.unwrap_or_else(|_| "config".to_string());
     eprintln!("Configuration file path: {config_path}");
-    let config: McpServerConfig = Config::builder()
-        .add_source(Config::try_from(&McpServerConfig::default()).expect("Failed to init config"))
-        .add_source(File::with_name(&config_path).required(false))
-        .add_source(Environment::with_prefix("IGGY_MCP").separator("_"))
-        .build()
-        .expect("Failed to build runtime config")
-        .try_deserialize()
-        .expect("Failed to deserialize runtime config");
+
+    let config: McpServerConfig = McpServerConfig::config_provider(config_path)
+        .load_config()
+        .await
+        .expect("Failed to load configuration");
 
     let transport = config.transport;
     if transport == McpTransport::Stdio {

@@ -82,7 +82,6 @@ chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.47", features = ["derive", "wrap_help"] }
 colored = "3.0.0"
 comfy-table = "7.2.1"
-config = { version = "0.15.16" }
 console-subscriber = "0.4.1"
 crc32fast = "1.5.0"
 crossbeam = "0.8.4"
