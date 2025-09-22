@@ -15,30 +15,26 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[http] # Optional HTTP API configuration
-enabled = true
-address = "127.0.0.1:8081"
-# api_key = "secret" # Optional API key for authentication to be passed as `api-key` header
-
-[http.cors] # Optional CORS configuration for HTTP API
-enabled = false
-allowed_methods = ["GET", "POST", "PUT", "DELETE"]
-allowed_origins = ["*"]
-allowed_headers = ["content-type"]
-exposed_headers = [""]
-allow_credentials = false
-allow_private_network = false
-
-[http.tls] # Optional TLS configuration for HTTP API
-enabled = false
-cert_file = "core/certs/iggy_cert.pem"
-key_file = "core/certs/iggy_key.pem"
-
-[iggy]
-address = "localhost:8090"
-username = "iggy"
-password = "iggy"
-# token = "secret" # Personal Access Token (PAT) can be used instead of username and password
-
-[state]
-path = "local_state"
+{{- if .Values.server.serviceMonitor.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  labels:
+    {{- include "iggy.labels" . | nindent 4 }}
+    {{- if .Values.server.serviceMonitor.additionalLabels }}
+    {{ toYaml .Values.server.serviceMonitor.additionalLabels }}
+    {{- end }}
+  name: {{ template "iggy.fullname" .  }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  endpoints:
+  - path: {{ .Values.server.serviceMonitor.path }}
+    port: http
+  namespaceSelector:
+    matchNames:
+    - {{ .Release.Namespace }}
+  selector:
+    matchLabels:
+      {{- include "iggy.selectorLabels" . | nindent 6 }}
+{{- end }}

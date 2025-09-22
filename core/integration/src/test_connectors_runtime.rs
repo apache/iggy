@@ -91,7 +91,7 @@ impl TestConnectorsRuntime {
 
     pub fn start(&mut self) {
         self.envs
-            .entry("IGGY_CONNECTORS_HTTP_API_ADDRESS".to_string())
+            .entry("IGGY_CONNECTORS_HTTP_ADDRESS".to_string())
             .or_insert(self.server_address.to_string());
         let mut command = if let Some(server_executable_path) = &self.server_executable_path {
             Command::new(server_executable_path)

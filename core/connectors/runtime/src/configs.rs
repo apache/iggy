@@ -48,7 +48,7 @@ pub enum ConfigFormat {
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct RuntimeConfig {
-    pub http_api: HttpApiConfig,
+    pub http: HttpApiConfig,
     pub iggy: IggyConfig,
     pub sinks: HashMap<String, SinkConfig>,
     pub sources: HashMap<String, SourceConfig>,
@@ -125,7 +125,7 @@ impl std::fmt::Display for RuntimeConfig {
         write!(
             f,
             "RuntimeConfig {{ http: {:?}, iggy: {:?}, sinks: {:?}, sources: {:?}, state: {:?} }}",
-            self.http_api, self.iggy, self.sinks, self.sources, self.state
+            self.http, self.iggy, self.sinks, self.sources, self.state
         )
     }
 }
