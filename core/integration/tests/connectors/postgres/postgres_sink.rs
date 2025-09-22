@@ -15,3 +15,10 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+
+use crate::connectors::postgres::setup;
+
+#[tokio::test]
+async fn given_valid_configuration_postgres_sink_should_start() {
+    let _client = setup().await;
+}

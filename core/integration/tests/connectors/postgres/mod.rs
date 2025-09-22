@@ -16,15 +16,14 @@
  * under the License.
  */
 
-use crate::connectors::setup_runtime;
-use iggy_binary_protocol::{StreamClient, TopicClient};
-use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize};
+use crate::connectors::{IggySetup, setup_runtime};
+use iggy::prelude::IggyClient;
 use std::collections::HashMap;
 use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
-use tokio::time;
 
-#[tokio::test]
-async fn given_valid_configuration_postgres_sink_should_start() {
+mod postgres_sink;
+
+async fn setup() -> IggyClient {
     let container = postgres::Postgres::default()
         .start()
         .await
@@ -35,40 +34,27 @@ async fn given_valid_configuration_postgres_sink_should_start() {
         .expect("Failed to get Postgres port");
 
     let mut envs = HashMap::new();
+    let iggy_setup = IggySetup::default();
     let connection_string = format!("postgres://postgres:postgres@localhost:{host_port}");
     envs.insert(
         "IGGY_CONNECTORS_SINKS_POSTGRES_CONFIG_CONNECTION_STRING".to_owned(),
         connection_string,
     );
-    println!(
-        "Connection string: {}",
-        envs["IGGY_CONNECTORS_SINKS_POSTGRES_CONFIG_CONNECTION_STRING"]
+    envs.insert(
+        "IGGY_CONNECTORS_SINKS_POSTGRES_STREAMS_0_STREAM".to_owned(),
+        iggy_setup.stream.to_owned(),
     );
-    let mut infra = setup_runtime();
-    let client = infra.create_client().await;
-    let stream_name = "test";
-    let topic_name = "test";
-    client
-        .create_stream("test", None)
-        .await
-        .expect("Failed to create stream");
-    let stream_id: Identifier = stream_name.try_into().expect("Invalid stream name");
-    client
-        .create_topic(
-            &stream_id,
-            topic_name,
-            1,
-            CompressionAlgorithm::None,
-            None,
-            None,
-            IggyExpiry::ServerDefault,
-            MaxTopicSize::ServerDefault,
-        )
-        .await
-        .expect("Failed to create topic");
-    infra
-        .start_connectors_runtime(Some("postgres/postgres.toml"), Some(envs))
+    envs.insert(
+        "IGGY_CONNECTORS_SINKS_POSTGRES_STREAMS_0_TOPICS_0".to_owned(),
+        iggy_setup.topic.to_owned(),
+    );
+    envs.insert(
+        "IGGY_CONNECTORS_SINKS_POSTGRES_STREAMS_0_SCHEMA".to_owned(),
+        "json".to_owned(),
+    );
+    let mut runtime = setup_runtime();
+    runtime
+        .init("postgres/postgres.toml", Some(envs), iggy_setup)
         .await;
-    time::sleep(std::time::Duration::from_secs(5)).await;
-    println!("Bye");
+    runtime.create_client().await
 }
