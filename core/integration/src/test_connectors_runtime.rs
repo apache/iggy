@@ -18,7 +18,7 @@
 
 use assert_cmd::prelude::CommandCargoExt;
 use rand::Rng;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -28,8 +28,9 @@ use std::{collections::HashMap, net::TcpListener};
 use tokio::time::sleep;
 use uuid::Uuid;
 
-const LOCAL_STATE_PREFIX: &str = "local_state_";
+pub const STATE_PATH_ENV_VAR: &str = "IGGY_CONNECTORS_STATE_PATH";
 pub const CONSUMER_NAME: &str = "connectors";
+const LOCAL_STATE_PREFIX: &str = "local_state_";
 
 #[derive(Debug)]
 pub struct TestConnectorsRuntime {
@@ -39,6 +40,8 @@ pub struct TestConnectorsRuntime {
     stdout_file_path: Option<PathBuf>,
     stderr_file_path: Option<PathBuf>,
     server_executable_path: Option<String>,
+    local_state_path: String,
+    cleanup: bool,
 }
 
 impl TestConnectorsRuntime {
@@ -69,15 +72,26 @@ impl TestConnectorsRuntime {
             "IGGY_CONNECTORS_IGGY_CONSUMER".to_string(),
             CONSUMER_NAME.to_string(),
         );
-        envs.insert(
-            "IGGY_CONNECTORS_STATE_PATH".to_string(),
-            Self::get_random_path(),
-        );
         Self::create(envs, server_executable_path)
     }
 
-    pub fn create(envs: HashMap<String, String>, server_executable_path: Option<String>) -> Self {
+    pub fn create(
+        mut envs: HashMap<String, String>,
+        server_executable_path: Option<String>,
+    ) -> Self {
         let server_address = Self::get_random_server_address();
+
+        // If IGGY_CONNECTORS_STATE_PATH is not set, use a random path starting with "local_state_"
+        let local_state_path = if let Some(state_path) = envs.get(STATE_PATH_ENV_VAR) {
+            state_path.to_string()
+        } else {
+            Self::get_random_path()
+        };
+
+        envs.insert(
+            "IGGY_CONNECTORS_STATE_PATH".to_string(),
+            local_state_path.clone(),
+        );
 
         Self {
             envs,
@@ -86,10 +100,13 @@ impl TestConnectorsRuntime {
             stdout_file_path: None,
             stderr_file_path: None,
             server_executable_path,
+            local_state_path,
+            cleanup: true,
         }
     }
 
     pub fn start(&mut self) {
+        self.cleanup();
         self.envs
             .entry("IGGY_CONNECTORS_HTTP_ADDRESS".to_string())
             .or_insert(self.server_address.to_string());
@@ -142,6 +159,7 @@ impl TestConnectorsRuntime {
                 }
             }
         }
+        self.cleanup();
     }
 
     pub fn is_started(&self) -> bool {
@@ -202,6 +220,16 @@ impl TestConnectorsRuntime {
         }
 
         panic!("Failed to find a free port after {max_retries} retries");
+    }
+
+    fn cleanup(&self) {
+        if !self.cleanup {
+            return;
+        }
+
+        if fs::metadata(&self.local_state_path).is_ok() {
+            fs::remove_dir_all(&self.local_state_path).unwrap();
+        }
     }
 }
 
