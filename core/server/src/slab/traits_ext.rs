@@ -64,6 +64,7 @@ pub trait ComponentsByIdMapping<T>: private::Sealed {
     type RefMut<'a>;
 }
 
+// TODO: This should be a proc macro.
 macro_rules! impl_components_mapping_for_slab {
     ($T:ident) => {
         impl<$T> private::Sealed for ($T,) {}
@@ -157,7 +158,7 @@ type MappingByIdMut<'a, E, T> =
 pub type Components<T> = <T as IntoComponents>::Components;
 pub type ComponentsById<'a, T> = <T as IntoComponentsById>::Output;
 
-// TODO: Not all hope is lost, don't get discouraged by the comment from above
+// TODO: 
 // I've figured there is actually and ergonomic improvement that can be made here.
 // Observe that the chain of constraints put on the `EntityRef` type is actually wrong.
 // We constraint the `EntityRef` to be IntoComponents + IntoComponentsById,
@@ -167,8 +168,13 @@ pub type ComponentsById<'a, T> = <T as IntoComponentsById>::Output;
 // in the `stream.rs` `topic.rs` `partitions.rs` files, we need to implement the `IntoComponentsById` trait for the output type of `IntoComponents` implementation, for `EntityRef`.
 // to make our life easier, we can create a type alias for those tuples and maybe even create a macro, to not repeat the type 3 times per entity (TupleEntityType, TupleEntityTypeRef, TupleEntityTypeRefByid).
 
-// TODO: Since those traits at impl site all they do is call `f(self.into())`
+// TODO: Since those traits at impl site, all they do is call `f(self.into())`
 // we can blanket implement those for all types that implement `From` trait.
+
+// Maybe lets not go this way with the tuple mapping madness, it already is pretty difficult to distinguish between all of the different components,
+// and everytime we add a new component to an entity, we need to update the tuple type everywhere.
+// Better idea would be to use the `EntityRef` type directly inside of the `with_components_by_id` closure 
+// -- f(components.into_components_by_id(id)) -> components.into_components_by_id(id) would return `EntityRef`, rather than the tuple.
 pub trait EntityComponentSystem<T>
 where
     <Self::Entity as IntoComponents>::Components: ComponentsMapping<T> + ComponentsByIdMapping<T>,

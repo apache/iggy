@@ -154,31 +154,6 @@ async fn main() -> Result<(), ServerError> {
         }
     }
 
-    if args.with_default_root_credentials {
-        let username_set = std::env::var("IGGY_ROOT_USERNAME").is_ok();
-        let password_set = std::env::var("IGGY_ROOT_PASSWORD").is_ok();
-
-        if !username_set || !password_set {
-            if !username_set {
-                unsafe {
-                    std::env::set_var("IGGY_ROOT_USERNAME", "iggy");
-                }
-            }
-            if !password_set {
-                unsafe {
-                    std::env::set_var("IGGY_ROOT_PASSWORD", "iggy");
-                }
-            }
-            info!(
-                "Using default root credentials (username: iggy, password: iggy) - FOR DEVELOPMENT ONLY!"
-            );
-        } else {
-            warn!(
-                "--with-default-root-credentials flag is ignored because root credentials are already set via environment variables"
-            );
-        }
-    }
-
     // FOURTH DISCRETE LOADING STEP.
     MemoryPool::init_pool(config.system.clone());
 
@@ -321,6 +296,7 @@ async fn main() -> Result<(), ServerError> {
             encryptor.clone(),
         ));
 
+        // TODO: Explore decoupling the `Log` from `Partition` entity.
         // Ergh... I knew this will backfire to include `Log` as part of the `Partition` entity,
         // We have to initialize with a default log for every partition, once we `Clone` the Streams / Topics / Partitions,
         // because `Clone` impl for `Partition` does not clone the actual log, just creates an empty one.

@@ -471,7 +471,7 @@ impl IggyShard {
                     PollingKind::Offset => {
                         let offset = value;
                         // We have to remember to keep the invariant from the if that is on line 496.
-                        // Alternatively a better design would be to get rid of that if and move the validations here.
+                        // Alternatively a better design would be to move the validations here, while keeping the validations in the original place.
                         let batches = self
                             .streams2
                             .get_messages_by_offset(
