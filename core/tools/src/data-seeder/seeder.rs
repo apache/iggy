@@ -34,16 +34,16 @@ pub async fn seed(client: &IggyClient) -> Result<(), IggyError> {
 
 async fn create_streams(client: &IggyClient) -> Result<Vec<(String, u32)>, IggyError> {
     let mut streams = Vec::new();
-    
+
     let prod_stream = client.create_stream(PROD_STREAM_NAME).await?;
     streams.push((PROD_STREAM_NAME.to_string(), prod_stream.id));
-    
+
     let test_stream = client.create_stream(TEST_STREAM_NAME).await?;
     streams.push((TEST_STREAM_NAME.to_string(), test_stream.id));
-    
+
     let dev_stream = client.create_stream(DEV_STREAM_NAME).await?;
     streams.push((DEV_STREAM_NAME.to_string(), dev_stream.id));
-    
+
     Ok(streams)
 }
 

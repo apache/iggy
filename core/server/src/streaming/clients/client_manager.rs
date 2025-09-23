@@ -49,7 +49,11 @@ pub struct ConsumerGroup {
 }
 
 impl ClientManager {
-    pub fn add_client(&mut self, address: &SocketAddr, transport: TransportProtocol) -> Rc<Session> {
+    pub fn add_client(
+        &mut self,
+        address: &SocketAddr,
+        transport: TransportProtocol,
+    ) -> Rc<Session> {
         let client_id = hash::calculate_32(address.to_string().as_bytes());
         let session = Rc::new(Session::from_client_id(client_id, *address));
         let client = Client {

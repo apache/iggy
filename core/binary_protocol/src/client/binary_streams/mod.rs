@@ -49,10 +49,7 @@ impl<B: BinaryClient> StreamClient for B {
         mapper::map_streams(response)
     }
 
-    async fn create_stream(
-        &self,
-        name: &str,
-    ) -> Result<StreamDetails, IggyError> {
+    async fn create_stream(&self, name: &str) -> Result<StreamDetails, IggyError> {
         fail_if_not_authenticated(self).await?;
         let response = self
             .send_with_response(&CreateStream {

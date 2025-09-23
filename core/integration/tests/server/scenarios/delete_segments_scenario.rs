@@ -36,10 +36,7 @@ pub async fn run(client_factory: &dyn ClientFactory, test_server: &TestServer) {
         .await
         .unwrap();
 
-    client
-        .create_stream(STREAM_NAME)
-        .await
-        .unwrap();
+    client.create_stream(STREAM_NAME).await.unwrap();
 
     client
         .create_topic(

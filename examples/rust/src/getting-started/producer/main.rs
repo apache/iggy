@@ -62,7 +62,8 @@ async fn init_system(client: &IggyClient) -> (u32, u32) {
         }
         Err(_) => {
             warn!("Stream already exists and will not be created again.");
-            client.get_stream(&Identifier::named(STREAM_NAME).unwrap())
+            client
+                .get_stream(&Identifier::named(STREAM_NAME).unwrap())
                 .await
                 .unwrap()
                 .expect("Failed to get stream")
@@ -87,20 +88,25 @@ async fn init_system(client: &IggyClient) -> (u32, u32) {
         }
         Err(_) => {
             warn!("Topic already exists and will not be created again.");
-            client.get_topic(
-                &Identifier::named(STREAM_NAME).unwrap(),
-                &Identifier::named(TOPIC_NAME).unwrap(),
-            )
-            .await
-            .unwrap()
-            .expect("Failed to get topic")
+            client
+                .get_topic(
+                    &Identifier::named(STREAM_NAME).unwrap(),
+                    &Identifier::named(TOPIC_NAME).unwrap(),
+                )
+                .await
+                .unwrap()
+                .expect("Failed to get topic")
         }
     };
 
     (stream.id, topic.id)
 }
 
-async fn produce_messages(client: &dyn Client, stream_id: u32, topic_id: u32) -> Result<(), Box<dyn Error>> {
+async fn produce_messages(
+    client: &dyn Client,
+    stream_id: u32,
+    topic_id: u32,
+) -> Result<(), Box<dyn Error>> {
     let duration = IggyDuration::from_str("500ms")?;
     let mut interval = tokio::time::interval(duration.get_duration());
     info!(

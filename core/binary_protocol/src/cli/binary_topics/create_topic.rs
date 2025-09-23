@@ -68,12 +68,22 @@ impl CliCommand for CreateTopicCmd {
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         client
-            .create_topic(&self.create_topic.stream_id, &self.create_topic.name, self.create_topic.partitions_count, self.create_topic.compression_algorithm, self.create_topic.replication_factor, self.create_topic.message_expiry, self.create_topic.max_topic_size)
+            .create_topic(
+                &self.create_topic.stream_id,
+                &self.create_topic.name,
+                self.create_topic.partitions_count,
+                self.create_topic.compression_algorithm,
+                self.create_topic.replication_factor,
+                self.create_topic.message_expiry,
+                self.create_topic.max_topic_size,
+            )
             .await
             .with_context(|| {
                 format!(
                     "Problem creating topic (name: {}, partitions count: {}) in stream with ID: {}",
-                    self.create_topic.name, self.create_topic.partitions_count, self.create_topic.stream_id
+                    self.create_topic.name,
+                    self.create_topic.partitions_count,
+                    self.create_topic.stream_id
                 )
             })?;
 

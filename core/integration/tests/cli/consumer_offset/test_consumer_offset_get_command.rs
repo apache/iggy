@@ -201,9 +201,7 @@ impl IggyCmdTestCase for TestConsumerOffsetGetCmd {
         }
 
         if let Some(stream_id) = self.actual_stream_id {
-            let stream = client
-                .delete_stream(&stream_id.try_into().unwrap())
-                .await;
+            let stream = client.delete_stream(&stream_id.try_into().unwrap()).await;
             assert!(stream.is_ok());
         }
     }

@@ -90,7 +90,9 @@ impl TestMessageFetchCmd {
 impl IggyCmdTestCase for TestMessageFetchCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
         // Create stream and capture its actual ID
-        let stream = client.create_stream(&self.stream_name).await
+        let stream = client
+            .create_stream(&self.stream_name)
+            .await
             .expect("Failed to create stream");
         self.actual_stream_id = Some(stream.id);
 
@@ -154,7 +156,9 @@ impl IggyCmdTestCase for TestMessageFetchCmd {
             assert!(stream_id.is_ok());
             let stream_id = stream_id.unwrap();
 
-            let topic = client.delete_topic(&stream_id, &topic_id.try_into().unwrap()).await;
+            let topic = client
+                .delete_topic(&stream_id, &topic_id.try_into().unwrap())
+                .await;
             assert!(topic.is_ok());
 
             let stream = client.delete_stream(&stream_id).await;
@@ -173,13 +177,7 @@ pub async fn should_be_successful() {
     iggy_cmd_test.setup().await;
     for fsync in test_parameters {
         iggy_cmd_test
-            .execute_test(TestMessageFetchCmd::new(
-                "stream",
-                "topic", 
-                1,
-                1,
-                fsync,
-            ))
+            .execute_test(TestMessageFetchCmd::new("stream", "topic", 1, 1, fsync))
             .await;
     }
 }

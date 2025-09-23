@@ -48,9 +48,7 @@ impl ServerCommandHandler for CreateStream {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let stream = shard
-            .create_stream2(session, self.name.clone())
-            .await?;
+        let stream = shard.create_stream2(session, self.name.clone()).await?;
         let created_stream_id = stream.id();
         shard_info!(
             shard.id,

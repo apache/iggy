@@ -109,10 +109,7 @@ async fn assert_message_count(client: &IggyClient, expected_count: u32) {
 
 async fn init_system(client: &IggyClient) {
     // 1. Create the stream
-    client
-        .create_stream(STREAM_NAME)
-        .await
-        .unwrap();
+    client.create_stream(STREAM_NAME).await.unwrap();
 
     // 2. Create the topic
     client
@@ -123,7 +120,7 @@ async fn init_system(client: &IggyClient) {
             Default::default(),
             None,
             IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault
+            MaxTopicSize::ServerDefault,
         )
         .await
         .unwrap();

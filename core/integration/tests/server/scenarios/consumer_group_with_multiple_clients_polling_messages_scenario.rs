@@ -17,9 +17,8 @@
  */
 
 use crate::server::scenarios::{
-    CONSUMER_GROUP_NAME, MESSAGES_COUNT, PARTITIONS_COUNT, 
-    STREAM_NAME, TOPIC_NAME, cleanup, create_client, get_consumer_group,
-    join_consumer_group,
+    CONSUMER_GROUP_NAME, MESSAGES_COUNT, PARTITIONS_COUNT, STREAM_NAME, TOPIC_NAME, cleanup,
+    create_client, get_consumer_group, join_consumer_group,
 };
 use iggy::prelude::*;
 use integration::test_server::{
@@ -50,10 +49,7 @@ async fn init_system(
     create_users: bool,
 ) {
     // 1. Create the stream
-    system_client
-        .create_stream(STREAM_NAME)
-        .await
-        .unwrap();
+    system_client.create_stream(STREAM_NAME).await.unwrap();
 
     // 2. Create the topic
     system_client

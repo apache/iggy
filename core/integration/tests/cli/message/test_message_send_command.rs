@@ -274,8 +274,14 @@ pub async fn should_be_successful() {
         (ProvideMessages::ViaStdin, PartitionSelection::Balanced),
         (ProvideMessages::ViaStdin, PartitionSelection::Id(1)),
         (ProvideMessages::AsArgs, PartitionSelection::Id(2)),
-        (ProvideMessages::AsArgs, PartitionSelection::Key(String::from("some-complex-key"))),
-        (ProvideMessages::ViaStdin, PartitionSelection::Key(String::from("another-key"))),
+        (
+            ProvideMessages::AsArgs,
+            PartitionSelection::Key(String::from("some-complex-key")),
+        ),
+        (
+            ProvideMessages::ViaStdin,
+            PartitionSelection::Key(String::from("another-key")),
+        ),
     ];
 
     iggy_cmd_test.setup().await;

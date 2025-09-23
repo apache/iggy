@@ -86,9 +86,7 @@ impl TestConsumerGroupCreateCmd {
 #[async_trait]
 impl IggyCmdTestCase for TestConsumerGroupCreateCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
-        let stream = client
-            .create_stream(&self.stream_name)
-            .await;
+        let stream = client.create_stream(&self.stream_name).await;
         assert!(stream.is_ok());
 
         let topic = client

@@ -33,10 +33,7 @@ fn create_message_payload(offset: u64) -> Bytes {
 
 async fn init_system(client: &IggyClient) {
     // 1. Create the stream
-    client
-        .create_stream(STREAM_NAME)
-        .await
-        .unwrap();
+    client.create_stream(STREAM_NAME).await.unwrap();
 
     // 2. Create the topic
     client

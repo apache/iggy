@@ -75,8 +75,7 @@ async fn handle_connection(
 ) -> Result<(), ConnectionError> {
     let address = connection.remote_address();
     info!("Client has connected: {address}");
-    let session = shard
-        .add_client(&address, TransportProtocol::Quic);
+    let session = shard.add_client(&address, TransportProtocol::Quic);
 
     let session = shard.add_client(&address, TransportProtocol::Quic);
     let client_id = session.client_id;

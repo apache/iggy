@@ -59,7 +59,7 @@ impl TestConsumerGroupListCmd {
 
     fn to_args(&self) -> Vec<String> {
         let mut command = vec![];
-        
+
         // Use actual stream ID if available, otherwise use stream name as fallback
         if let Some(stream_id) = self.actual_stream_id {
             command.push(format!("{}", stream_id));
@@ -90,7 +90,7 @@ impl IggyCmdTestCase for TestConsumerGroupListCmd {
             .expect("Failed to create stream");
         self.actual_stream_id = Some(stream.id);
 
-        // Create topic and capture its actual ID  
+        // Create topic and capture its actual ID
         let topic = client
             .create_topic(
                 &stream.id.try_into().unwrap(),
@@ -173,9 +173,7 @@ impl IggyCmdTestCase for TestConsumerGroupListCmd {
         }
 
         if let Some(stream_id) = self.actual_stream_id {
-            let stream = client
-                .delete_stream(&stream_id.try_into().unwrap())
-                .await;
+            let stream = client.delete_stream(&stream_id.try_into().unwrap()).await;
             assert!(stream.is_ok());
         }
     }

@@ -24,10 +24,7 @@ pub async fn run(client: &IggyClient) {
     login_root(client).await;
 
     let stream_name = "test-tls-stream";
-    client
-        .create_stream(stream_name)
-        .await
-        .unwrap();
+    client.create_stream(stream_name).await.unwrap();
 
     let stream = client
         .get_stream(&Identifier::named(stream_name).unwrap())

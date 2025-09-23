@@ -18,7 +18,9 @@
 
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use iggy_common::{ClusterMetadata, ClusterNode, ClusterNodeRole, ClusterNodeStatus, IggyError, TransportProtocol};
+use iggy_common::{
+    ClusterMetadata, ClusterNode, ClusterNodeRole, ClusterNodeStatus, IggyError, TransportProtocol,
+};
 use std::str::FromStr;
 use tracing::trace;
 

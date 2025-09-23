@@ -106,9 +106,7 @@ fn get_command(
     #[warn(clippy::let_and_return)]
     match command {
         Command::Stream(command) => match command {
-            StreamAction::Create(args) => {
-                Box::new(CreateStreamCmd::new(args.name.clone()))
-            }
+            StreamAction::Create(args) => Box::new(CreateStreamCmd::new(args.name.clone())),
             StreamAction::Delete(args) => Box::new(DeleteStreamCmd::new(args.stream_id.clone())),
             StreamAction::Update(args) => Box::new(UpdateStreamCmd::new(
                 args.stream_id.clone(),

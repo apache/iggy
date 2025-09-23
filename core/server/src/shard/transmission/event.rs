@@ -9,7 +9,8 @@ use crate::streaming::{
     },
 };
 use iggy_common::{
-    CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, Permissions, TransportProtocol, UserStatus
+    CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, Permissions, TransportProtocol,
+    UserStatus,
 };
 use std::net::SocketAddr;
 

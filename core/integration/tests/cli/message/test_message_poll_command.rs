@@ -238,7 +238,7 @@ impl IggyCmdTestCase for TestMessagePollCmd {
     async fn verify_server_state(&self, client: &dyn Client) {
         let stream_id = Identifier::from_str(&self.stream_name).unwrap();
         let topic_id = Identifier::from_str(&self.topic_name).unwrap();
-        
+
         let topic = client.delete_topic(&stream_id, &topic_id).await;
         assert!(topic.is_ok());
 

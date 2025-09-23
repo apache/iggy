@@ -891,7 +891,6 @@ impl ReceivedMessage {
     }
 }
 
-
 impl Stream for IggyConsumer {
     type Item = Result<ReceivedMessage, IggyError>;
 

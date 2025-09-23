@@ -17,8 +17,8 @@
  */
 
 use crate::server::scenarios::{
-    CONSUMER_GROUP_NAME, PARTITIONS_COUNT, STREAM_NAME,
-    TOPIC_NAME, USERNAME_1, USERNAME_2, USERNAME_3, cleanup, create_client, join_consumer_group,
+    CONSUMER_GROUP_NAME, PARTITIONS_COUNT, STREAM_NAME, TOPIC_NAME, USERNAME_1, USERNAME_2,
+    USERNAME_3, cleanup, create_client, join_consumer_group,
 };
 use iggy::clients::client::IggyClient;
 use iggy::prelude::ClientInfoDetails;
@@ -42,10 +42,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     login_root(&system_client).await;
 
     // 1. Create the stream
-    let stream = system_client
-        .create_stream(STREAM_NAME)
-        .await
-        .unwrap();
+    let stream = system_client.create_stream(STREAM_NAME).await.unwrap();
 
     let stream_id = stream.id;
 
@@ -91,10 +88,12 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     join_consumer_group(&client1).await;
 
     // 5. Get client1 info and validate that it contains the single consumer group
-    let client1_info = get_me_and_validate_consumer_groups(&client1, stream_id, topic_id, consumer_group_id).await;
+    let client1_info =
+        get_me_and_validate_consumer_groups(&client1, stream_id, topic_id, consumer_group_id).await;
 
     // 6. Validate that the consumer group has 1 member and this member has all partitions assigned
-    let consumer_group = get_consumer_group_and_validate_members(&system_client, 1, consumer_group_id).await;
+    let consumer_group =
+        get_consumer_group_and_validate_members(&system_client, 1, consumer_group_id).await;
     let member = &consumer_group.members[0];
     assert_eq!(member.id, client1_info.client_id);
     assert_eq!(member.partitions_count, PARTITIONS_COUNT);
@@ -107,7 +106,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     get_me_and_validate_consumer_groups(&client2, stream_id, topic_id, consumer_group_id).await;
 
     // 9. Validate that the consumer group has 2 members and partitions are distributed between them
-    let consumer_group = get_consumer_group_and_validate_members(&system_client, 2, consumer_group_id).await;
+    let consumer_group =
+        get_consumer_group_and_validate_members(&system_client, 2, consumer_group_id).await;
     let member1 = &consumer_group.members[0];
     let member2 = &consumer_group.members[1];
     assert!(member1.partitions_count >= 1 && member1.partitions_count < PARTITIONS_COUNT);
@@ -124,7 +124,8 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     get_me_and_validate_consumer_groups(&client3, stream_id, topic_id, consumer_group_id).await;
 
     // 12. Validate that the consumer group has 3 members and partitions are equally distributed between them
-    let consumer_group = get_consumer_group_and_validate_members(&system_client, 3, consumer_group_id).await;
+    let consumer_group =
+        get_consumer_group_and_validate_members(&system_client, 3, consumer_group_id).await;
     let member1 = &consumer_group.members[0];
     let member2 = &consumer_group.members[1];
     let member3 = &consumer_group.members[2];
@@ -140,10 +141,10 @@ pub async fn run(client_factory: &dyn ClientFactory) {
 }
 
 async fn get_me_and_validate_consumer_groups(
-    client: &IggyClient, 
-    stream_id: u32, 
-    topic_id: u32, 
-    consumer_group_id: u32
+    client: &IggyClient,
+    stream_id: u32,
+    topic_id: u32,
+    consumer_group_id: u32,
 ) -> ClientInfoDetails {
     let client_info = client.get_me().await.unwrap();
 

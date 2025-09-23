@@ -29,11 +29,7 @@ pub struct CreateConsumerGroupCmd {
 }
 
 impl CreateConsumerGroupCmd {
-    pub fn new(
-        stream_id: Identifier,
-        topic_id: Identifier,
-        name: String,
-    ) -> Self {
+    pub fn new(stream_id: Identifier, topic_id: Identifier, name: String) -> Self {
         Self {
             create_consumer_group: CreateConsumerGroup {
                 stream_id,

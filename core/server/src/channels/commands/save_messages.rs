@@ -74,7 +74,11 @@ pub async fn save_messages(shard: Rc<IggyShard>) -> Result<(), IggyError> {
         }
 
         if total_saved_messages > 0 {
-            shard_info!(shard.id, "Saved {} buffered messages on disk.", total_saved_messages);
+            shard_info!(
+                shard.id,
+                "Saved {} buffered messages on disk.",
+                total_saved_messages
+            );
         }
 
         trace!("Finished saving buffered messages.");

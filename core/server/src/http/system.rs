@@ -79,7 +79,8 @@ async fn get_cluster_metadata(
 ) -> Result<Json<ClusterMetadata>, CustomError> {
     let shard = state.shard.shard();
     let session = Session::stateless(identity.user_id, identity.ip_address);
-    let cluster_metadata = shard.get_cluster_metadata(&session)
+    let cluster_metadata = shard
+        .get_cluster_metadata(&session)
         .with_error_context(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - failed to get cluster metadata, user ID: {}",

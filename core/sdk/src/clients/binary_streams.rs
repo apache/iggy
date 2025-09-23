@@ -32,15 +32,8 @@ impl StreamClient for IggyClient {
         self.client.read().await.get_streams().await
     }
 
-    async fn create_stream(
-        &self,
-        name: &str,
-    ) -> Result<StreamDetails, IggyError> {
-        self.client
-            .read()
-            .await
-            .create_stream(name)
-            .await
+    async fn create_stream(&self, name: &str) -> Result<StreamDetails, IggyError> {
+        self.client.read().await.create_stream(name).await
     }
 
     async fn update_stream(&self, stream_id: &Identifier, name: &str) -> Result<(), IggyError> {

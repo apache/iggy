@@ -111,13 +111,7 @@ impl BytesSerializable for CreateConsumerGroup {
 
 impl Display for CreateConsumerGroup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}|{}|{}",
-            self.stream_id,
-            self.topic_id,
-            self.name
-        )
+        write!(f, "{}|{}|{}", self.stream_id, self.topic_id, self.name)
     }
 }
 

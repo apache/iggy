@@ -77,10 +77,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
     let topic_id = 1;
     let partition_count = 1;
 
-    client
-        .create_stream("test-stream-api")
-        .await
-        .unwrap();
+    client.create_stream("test-stream-api").await.unwrap();
     client
         .create_topic(
             &Identifier::numeric(stream_id).unwrap(),
@@ -89,7 +86,8 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
             CompressionAlgorithm::default(),
             None,
             IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault)
+            MaxTopicSize::ServerDefault,
+        )
         .await
         .unwrap();
 

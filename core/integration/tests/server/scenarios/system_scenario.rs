@@ -17,9 +17,8 @@
  */
 
 use crate::server::scenarios::{
-    CONSUMER_GROUP_NAME, CONSUMER_ID, CONSUMER_KIND, MESSAGES_COUNT,
-    PARTITION_ID, PARTITIONS_COUNT, STREAM_NAME, TOPIC_NAME,
-    get_consumer_group, leave_consumer_group,
+    CONSUMER_GROUP_NAME, CONSUMER_ID, CONSUMER_KIND, MESSAGES_COUNT, PARTITION_ID,
+    PARTITIONS_COUNT, STREAM_NAME, TOPIC_NAME, get_consumer_group, leave_consumer_group,
 };
 use bytes::Bytes;
 use iggy::prelude::*;
@@ -49,10 +48,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     assert!(streams.is_empty());
 
     // 3. Create the stream
-    let stream = client
-        .create_stream(STREAM_NAME)
-        .await
-        .unwrap();
+    let stream = client.create_stream(STREAM_NAME).await.unwrap();
 
     let stream_id = stream.id;
     assert_eq!(stream.name, STREAM_NAME);
@@ -92,9 +88,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     assert_eq!(stream.name, STREAM_NAME);
 
     // 7. Try to create the stream with the same name and validate that it fails
-    let create_stream_result = client
-        .create_stream(STREAM_NAME)
-        .await;
+    let create_stream_result = client.create_stream(STREAM_NAME).await;
     assert!(create_stream_result.is_err());
 
     // 8. Try to create the stream with the different name and validate that it succeeds

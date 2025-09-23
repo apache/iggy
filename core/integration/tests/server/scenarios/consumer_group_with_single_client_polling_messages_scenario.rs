@@ -17,9 +17,8 @@
  */
 
 use crate::server::scenarios::{
-    CONSUMER_GROUP_NAME, MESSAGES_COUNT, PARTITIONS_COUNT,
-    STREAM_NAME, TOPIC_NAME, cleanup, create_client, get_consumer_group,
-    join_consumer_group,
+    CONSUMER_GROUP_NAME, MESSAGES_COUNT, PARTITIONS_COUNT, STREAM_NAME, TOPIC_NAME, cleanup,
+    create_client, get_consumer_group, join_consumer_group,
 };
 use iggy::prelude::*;
 use integration::test_server::{ClientFactory, assert_clean_system, login_root};
@@ -42,10 +41,7 @@ pub async fn run(client_factory: &dyn ClientFactory) {
 
 async fn init_system(client: &IggyClient) {
     // 1. Create the stream
-    client
-        .create_stream(STREAM_NAME)
-        .await
-        .unwrap();
+    client.create_stream(STREAM_NAME).await.unwrap();
 
     // 2. Create the topic
     client

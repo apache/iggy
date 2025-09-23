@@ -56,10 +56,7 @@ impl StreamClient for HttpClient {
         Ok(streams)
     }
 
-    async fn create_stream(
-        &self,
-        name: &str,
-    ) -> Result<StreamDetails, IggyError> {
+    async fn create_stream(&self, name: &str) -> Result<StreamDetails, IggyError> {
         let response = self
             .post(
                 PATH,

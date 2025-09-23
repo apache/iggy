@@ -41,10 +41,7 @@ impl StreamClient for ClientWrapper {
         }
     }
 
-    async fn create_stream(
-        &self,
-        name: &str,
-    ) -> Result<StreamDetails, IggyError> {
+    async fn create_stream(&self, name: &str) -> Result<StreamDetails, IggyError> {
         match self {
             ClientWrapper::Iggy(client) => client.create_stream(name).await,
             ClientWrapper::Http(client) => client.create_stream(name).await,
