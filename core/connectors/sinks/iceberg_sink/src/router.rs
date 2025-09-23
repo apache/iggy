@@ -23,6 +23,7 @@ use std::sync::Arc;
 use arrow_json::ReaderBuilder;
 
 use async_trait::async_trait;
+use iceberg::TableIdent;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::spec::{Literal, PrimitiveLiteral, PrimitiveType, Struct, StructType};
 use iceberg::table::Table;
@@ -30,10 +31,9 @@ use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
-use iceberg::TableIdent;
 use iceberg::{
-    writer::file_writer::location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
     Catalog,
+    writer::file_writer::location_generator::{DefaultFileNameGenerator, DefaultLocationGenerator},
 };
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload, Schema};
 use parquet::file::properties::WriterProperties;
@@ -69,7 +69,7 @@ pub fn primitive_type_to_literal(pt: &PrimitiveType) -> Result<PrimitiveLiteral,
 fn get_partition_type_value(default_partition_type: &StructType) -> Result<Option<Struct>, Error> {
     let mut fields: Vec<Option<Literal>> = Vec::new();
 
-    if default_partition_type.fields().len() == 0 {
+    if default_partition_type.fields().is_empty() {
         return Ok(None);
     };
 
@@ -149,7 +149,7 @@ where
 
     let cursor = Cursor::new(json_messages);
 
-    let mut reader = ReaderBuilder::new(Arc::new(
+    let reader = ReaderBuilder::new(Arc::new(
         schema_to_arrow_schema(&table.metadata().current_schema().clone()).map_err(|err| {
             error!(
                 "Error while mapping records to Iceberg table with uuid: {}. Error {}",
@@ -168,7 +168,7 @@ where
         Error::InitError(err.to_string())
     })?;
 
-    while let Some(batch) = reader.next() {
+    for batch in reader {
         let batch_data = batch.map_err(|err| {
             error!("Error while getting record batch: {}", err);
             Error::InvalidRecord
@@ -184,7 +184,7 @@ where
         Error::InvalidRecord
     })?;
 
-    let table_commit = Transaction::new(&table);
+    let table_commit = Transaction::new(table);
 
     let action = table_commit.fast_append().add_data_files(data_files);
 
@@ -247,7 +247,7 @@ impl DynamicWriter {
         route_field_val: &str,
         catalog: &dyn Catalog,
     ) -> Result<bool, Error> {
-        let sliced_table = slice_user_table(&route_field_val.to_string());
+        let sliced_table = slice_user_table(route_field_val);
         let table_ident = &TableIdent::from_strs(&sliced_table).map_err(|err| {
             error!("Failed to load table from catalog: {}. ", err);
             Error::InitError(err.to_string())
@@ -327,8 +327,7 @@ impl Router for DynamicRouter {
                 if let Some(msgs) = writer.table_to_message.get_mut(&route_field_val_cloned) {
                     msgs.push(message);
                 } else {
-                    let mut message_vec: Vec<Arc<ConsumedMessage>> = Vec::new();
-                    message_vec.push(message);
+                    let message_vec: Vec<Arc<ConsumedMessage>> = vec![message];
                     writer
                         .table_to_message
                         .insert(route_field_val_cloned, message_vec);
@@ -342,7 +341,7 @@ impl Router for DynamicRouter {
                 None => continue,
             };
             write_data(
-                batch_messages.iter().map(|arc| Arc::clone(arc)),
+                batch_messages.iter().map(Arc::clone),
                 table_obj,
                 self.catalog.as_ref(),
                 messages_metadata.schema,
@@ -373,7 +372,7 @@ impl StaticRouter {
         let mut tables: Vec<Table> = Vec::with_capacity(declared_tables.len());
         let mut tables_found = 0;
         for declared_table in declared_tables {
-            let sliced_table = slice_user_table(&declared_table);
+            let sliced_table = slice_user_table(declared_table);
             let table_ident = &TableIdent::from_strs(sliced_table.clone()).map_err(|err| {
                 error!("Failed to load table from catalog: {}. ", err);
                 Error::InitError(err.to_string())

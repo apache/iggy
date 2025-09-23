@@ -25,7 +25,7 @@ use iceberg::Catalog;
 use iceberg_catalog_glue::{GlueCatalog, GlueCatalogConfig};
 use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use iggy_connector_sdk::{
-    sink_connector, ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata,
+    ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, sink_connector,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{error, info};
@@ -99,7 +99,7 @@ pub struct IcebergSinkConfig {
     pub store_class: IcebergSinkStoreClass,
 }
 
-pub(self) fn slice_user_table(table: &String) -> Vec<String> {
+fn slice_user_table(table: &str) -> Vec<String> {
     table.split('.').map(|s| s.to_string()).collect()
 }
 
@@ -117,7 +117,7 @@ impl IcebergSink {
             self.config.store_secret_access_key.clone(),
         );
         props.insert("s3.endpoint".to_string(), self.config.store_url.clone());
-        return Ok(props);
+        Ok(props)
     }
 
     pub fn new(id: u32, config: IcebergSinkConfig) -> Self {
@@ -162,11 +162,10 @@ impl IcebergSink {
             .warehouse(self.config.warehouse.clone())
             .build();
 
-        let catalog = GlueCatalog::new(config).await.map_err(|err| {
+        GlueCatalog::new(config).await.map_err(|err| {
             error!("Failed to get glue catalog with error: {}. Make sure the catalog is correctly declared on the config file", err);
             Error::InitError(err.to_string())
-        });
-        return catalog;
+        })
     }
 }
 
