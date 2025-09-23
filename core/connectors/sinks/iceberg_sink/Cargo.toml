@@ -30,26 +30,26 @@ readme = "../../README.md"
 [package.metadata.cargo-machete]
 ignored = ["dashmap", "once_cell"]
 
-[dependencies]
-async-trait = { workspace = true }
-dashmap = { workspace = true }
-iggy_connector_sdk = { workspace = true }
-once_cell = { workspace = true }
-reqwest = { workspace = true }
-serde = { workspace = true }
-serde_yml = { workspace = true }
-serde_json = { workspace = true }
-simd-json = { workspace = true }
-tracing = { workspace = true }
-arrow-json = { workspace = true }
-parquet = { workspace = true }
-arrow-array = { workspace = true }
-uuid = { workspace = true }
-rust-s3 = { workspace = true }
-iceberg = { workspace = true }
-iceberg-catalog-rest = { workspace = true }
-iceberg-catalog-glue = { workspace = true }
-chrono = { workspace = true }
-
 [lib]
 crate-type = ["cdylib", "lib"]
+
+[dependencies]
+arrow-array = { workspace = true }
+arrow-json = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+dashmap = { workspace = true }
+iceberg = { workspace = true }
+iceberg-catalog-glue = { workspace = true }
+iceberg-catalog-rest = { workspace = true }
+iggy_connector_sdk = { workspace = true }
+once_cell = { workspace = true }
+parquet = { workspace = true }
+reqwest = { workspace = true }
+rust-s3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+simd-json = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
