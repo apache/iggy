@@ -45,10 +45,14 @@ on:
 
 jobs:
   linux:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
-        target: [x86_64, aarch64]
+        include:
+          - target: x86_64
+            runner: ubuntu-latest
+          - target: aarch64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Download latest copy script from master
         if: inputs.use_latest_ci
@@ -90,8 +94,8 @@ jobs:
               yum install -y perl-IPC-Cmd
             fi
             python3 -m pip --version || python3 -m ensurepip
-          manylinux: "2_28"
-          args: --release --out dist --interpreter python3.8 python3.9 python3.10 python3.11 python3.12 python3.13
+          manylinux: ${{ matrix.target == 'aarch64' && 'auto' || '2_34' }}
+          args: --release --out dist --interpreter python3.10 python3.11 python3.12 python3.13
           sccache: "true"
 
       - name: Upload wheels
@@ -135,7 +139,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           working-directory: foreign/python
-          args: --release --out dist --interpreter python3.8 python3.9 python3.10 python3.11 python3.12 python3.13
+          args: --release --out dist --interpreter python3.10 python3.11 python3.12 python3.13
           sccache: "true"
 
       - name: Upload wheels
@@ -179,7 +183,7 @@ jobs:
         with:
           target: x86_64
           working-directory: foreign/python
-          args: --release --out dist --interpreter python3.9 python3.10 python3.11 python3.12 python3.13
+          args: --release --out dist --interpreter python3.10 python3.11 python3.12 python3.13
           sccache: "true"
 
       - name: Upload wheels
