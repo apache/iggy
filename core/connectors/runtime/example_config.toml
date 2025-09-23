@@ -81,7 +81,7 @@ linger_time = "5ms"
 
 [sources.random.config]
 interval = "100ms"
-# max_count = 1000
+max_count = 1000
 messages_range = [10, 50]
 payload_size = 200
 

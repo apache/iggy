@@ -741,10 +741,11 @@ impl<T: ConfigurationType, P: Provider + Clone> ConfigProvider<T> for FileConfig
             println!("Found configuration file at path: '{}'.", self.file_path);
             config_builder = config_builder.merge(Toml::file(&self.file_path));
         } else {
-            println!(
-                "Configuration file not found at path: '{}'. Using default configuration from embedded config",
+            eprintln!(
+                "Configuration file not found at path: '{}'. Cannot load configuration.",
                 self.file_path
             );
+            return Err(ConfigurationError::CannotLoadConfiguration);
         }
 
         // Merge environment variables into the configuration

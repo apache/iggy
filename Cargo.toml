@@ -133,14 +133,14 @@ rustls = { version = "0.23.32", features = ["ring"] }
 serde = { version = "1.0.226", features = ["derive", "rc"] }
 serde_json = "1.0.145"
 serde_with = { version = "3.14.1", features = ["base64", "macros"] }
-serde_yml = "0.0.12"
+serde_yaml_ng = "0.10.0"
 serial_test = "3.2.0"
 server = { path = "core/server" }
 simd-json = { version = "0.16.0", features = ["serde_impl"] }
 strum = { version = "0.27.2", features = ["derive"] }
 strum_macros = "0.27.2"
 sysinfo = "0.37.0"
-tempfile = "3.22.0"
+tempfile = "3.23.0"
 test-case = "3.3.1"
 thiserror = "2.0.16"
 tokio = { version = "1.47.1", features = ["full"] }

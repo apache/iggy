@@ -23,12 +23,11 @@ mod traits;
 mod types;
 mod utils;
 
-// Errors
 pub use error::client_error::ClientError;
 pub use error::iggy_error::{IggyError, IggyErrorDiscriminants};
 // Locking is feature gated, thus only mod level re-export.
 pub mod locking;
-// Commands
+pub use certificates::generate_self_signed_certificate;
 pub use commands::consumer_groups::*;
 pub use commands::consumer_offsets::*;
 pub use commands::messages::*;
@@ -40,14 +39,11 @@ pub use commands::system::get_cluster_metadata::*;
 pub use commands::system::*;
 pub use commands::topics::*;
 pub use commands::users::*;
-// Configs
 pub use configs::*;
-// Traits
 pub use traits::bytes_serializable::BytesSerializable;
 pub use traits::partitioner::Partitioner;
 pub use traits::sizeable::Sizeable;
 pub use traits::validatable::Validatable;
-// Types
 pub use types::args::*;
 pub use types::client::client_info::*;
 pub use types::client_state::ClientState;
@@ -87,8 +83,6 @@ pub use types::topic::*;
 pub use types::user::user_identity_info::*;
 pub use types::user::user_info::*;
 pub use types::user::user_status::*;
-// Utils
-pub use certificates::generate_self_signed_certificate;
 pub use utils::byte_size::IggyByteSize;
 pub use utils::checksum::*;
 pub use utils::crypto::*;

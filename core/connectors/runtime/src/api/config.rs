@@ -62,11 +62,11 @@ pub fn map_connector_config(
     match format {
         ConfigFormat::Json => Ok((JSON_HEADER, config.to_string())),
         ConfigFormat::Yaml => {
-            let config = serde_yml::to_value(config).map_err(|error| {
+            let config = serde_yaml_ng::to_value(config).map_err(|error| {
                 error!("Failed to convert configuration to YAML. {error}");
                 RuntimeError::CannotConvertConfiguration
             })?;
-            let config = serde_yml::to_string(&config).map_err(|error| {
+            let config = serde_yaml_ng::to_string(&config).map_err(|error| {
                 error!("Failed to serialize YAML configuration. {error}");
                 RuntimeError::CannotConvertConfiguration
             })?;

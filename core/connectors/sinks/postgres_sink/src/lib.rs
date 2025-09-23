@@ -69,10 +69,15 @@ impl PostgresSink {
 
     async fn connect(&mut self) -> Result<(), Error> {
         let max_connections = self.config.max_connections.unwrap_or(10);
+        let redacted_connection_string = self
+            .config
+            .connection_string
+            .chars()
+            .take(15)
+            .collect::<String>();
 
         info!(
-            "Connecting to PostgreSQL database with max {} connections, connection string: {}",
-            max_connections, self.config.connection_string
+            "Connecting to PostgreSQL database with max {max_connections} connections, connection string: {redacted_connection_string}",
         );
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
