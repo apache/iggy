@@ -4788,10 +4788,8 @@ dependencies = [
 name = "iggy_connector_iceberg_sink"
 version = "0.1.0"
 dependencies = [
- "arrow-array",
  "arrow-json",
  "async-trait",
- "chrono",
  "dashmap",
  "iceberg",
  "iceberg-catalog-glue",
@@ -4799,11 +4797,7 @@ dependencies = [
  "iggy_connector_sdk",
  "once_cell",
  "parquet",
- "reqwest",
- "rust-s3",
  "serde",
- "serde_json",
- "serde_yml",
  "simd-json",
  "tracing",
  "uuid",
