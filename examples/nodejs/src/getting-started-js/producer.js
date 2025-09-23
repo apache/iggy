@@ -95,20 +95,17 @@ async function produceMessages(client) {
         messages,
         partition: Partitioning.PartitionId(PARTITION_ID)
       });
-      
-      sentBatches++;
-      log('Sent %d message(s) in batch %d.', MESSAGES_PER_BATCH, sentBatches);
+      log('Sent %d message(s).', MESSAGES_PER_BATCH);
     } catch (error) {
       log('Error sending messages: %o', error);
       log('This might be due to server version compatibility. The stream and topic creation worked successfully.');
       log('Please check the Iggy server version and ensure it supports the SendMessages command.');
       // Don't throw error, just log and continue to show that other parts work
+      log('Simulated sending %d message(s).', MESSAGES_PER_BATCH);
+    } finally {
       sentBatches++;
-      log('Simulated sending %d message(s) in batch %d.', MESSAGES_PER_BATCH, sentBatches);
+      await new Promise(resolve => setTimeout(resolve, interval));
     }
-
-    // Wait for the interval
-    await new Promise(resolve => setTimeout(resolve, interval));
   }
 
   log('Sent %d batches of messages, exiting.', sentBatches);
@@ -132,34 +129,30 @@ async function main() {
     log('Connecting to Iggy server...');
     // Client connects automatically when first command is called
     log('Connected successfully.');
-
-    log('Logging in user...');
-    await client.session.login({ username: 'iggy', password: 'iggy' });
-    log('Logged in successfully.');
+    // Login will be handled automatically by the client on first command
 
     await initSystem(client);
     await produceMessages(client);
   } catch (error) {
     log('Error in main: %o', error);
-    process.exit(1);
+    process.exitCode = 1;
   } finally {
     await client.destroy();
     log('Disconnected from server.');
   }
 }
 
-// Handle uncaught exceptions
-process.on('uncaughtException', (error) => {
-  log('Uncaught Exception: %o', error);
-  process.exit(1);
-});
 
 process.on('unhandledRejection', (reason, promise) => {
   log('Unhandled Rejection at: %o, reason: %o', promise, reason);
-  process.exit(1);
+  process.exitCode = 1;
 });
 
-main().catch((error) => {
-  log('Main function error: %o', error);
-  process.exit(1);
-});
+void (async () => {
+  try {
+    await main();
+  } catch (error) {
+    log('Main function error: %o', error);
+    process.exit(1);
+  }
+})();

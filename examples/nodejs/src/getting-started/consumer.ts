@@ -133,18 +133,13 @@ async function main(): Promise<void> {
     await consumeMessages(client);
   } catch (error) {
     log('Error in main: %o', error);
-    process.exit(1);
+    process.exitCode = 1;
   } finally {
     await client.destroy();
     log('Disconnected from server.');
   }
 }
 
-// Handle uncaught exceptions
-process.on('uncaughtException', (error) => {
-  log('Uncaught Exception: %o', error);
-  process.exit(1);
-});
 
 process.on('unhandledRejection', (reason, promise) => {
   log('Unhandled Rejection at: %o, reason: %o', promise, reason);
@@ -152,8 +147,12 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  main().catch((error) => {
-    log('Main function error: %o', error);
-    process.exit(1);
-  });
+  void (async () => {
+    try {
+      await main();
+    } catch (error) {
+      log('Main function error: %o', error);
+      process.exit(1);
+    }
+  })();
 }

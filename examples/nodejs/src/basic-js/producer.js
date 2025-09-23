@@ -18,9 +18,8 @@
  */
 
 import { Client, Partitioning } from 'apache-iggy';
-import debug from 'debug';
 
-const log = debug('iggy:basic:producer');
+const log = console.log;
 
 const STREAM_ID = 1;
 const TOPIC_ID = 1;
@@ -33,8 +32,8 @@ function parseArgs() {
   const connectionString = args[0] || 'iggy+tcp://iggy:iggy@127.0.0.1:8090';
   
   if (args.length > 0 && (args[0] === '-h' || args[0] === '--help')) {
-    console.log('Usage: node producer.js [connection_string]');
-    console.log('Example: node producer.js iggy+tcp://iggy:iggy@127.0.0.1:8090');
+    log('Usage: node producer.js [connection_string]');
+    log('Example: node producer.js iggy+tcp://iggy:iggy@127.0.0.1:8090');
     process.exit(0);
   }
   
@@ -65,8 +64,7 @@ async function initSystem(client) {
     log('Topic already exists or error creating topic: %o', error);
   }
 
-  // Wait a moment for the topic to be fully created
-  await new Promise(resolve => setTimeout(resolve, 100));
+  // Server ACK confirms creation; no extra wait needed
 }
 
 async function produceMessages(client) {
@@ -102,20 +100,17 @@ async function produceMessages(client) {
         messages,
         partition: Partitioning.PartitionId(PARTITION_ID)
       });
-      
-      sentBatches++;
       log('Sent messages: %o', sentMessages);
     } catch (error) {
       log('Error sending messages: %o', error);
       log('This might be due to server version compatibility. The stream and topic creation worked successfully.');
       log('Please check the Iggy server version and ensure it supports the SendMessages command.');
       // Don't throw error, just log and continue to show that other parts work
-      sentBatches++;
       log('Simulated sending messages: %o', sentMessages);
+    } finally {
+      sentBatches++;
+      await new Promise(resolve => setTimeout(resolve, interval));
     }
-
-    // Wait for the interval
-    await new Promise(resolve => setTimeout(resolve, interval));
   }
 
   log('Sent %d batches of messages, exiting.', sentBatches);
@@ -144,34 +139,30 @@ async function main() {
     log('Connecting to Iggy server...');
     // Client connects automatically when first command is called
     log('Connected successfully.');
-
-    log('Logging in user...');
-    await client.session.login({ username, password });
-    log('Logged in successfully.');
+    // Login will be handled automatically by the client on first command
 
     await initSystem(client);
     await produceMessages(client);
   } catch (error) {
     log('Error in main: %o', error);
-    process.exit(1);
+    process.exitCode = 1;
   } finally {
     await client.destroy();
     log('Disconnected from server.');
   }
 }
 
-// Handle uncaught exceptions
-process.on('uncaughtException', (error) => {
-  log('Uncaught Exception: %o', error);
-  process.exit(1);
-});
 
 process.on('unhandledRejection', (reason, promise) => {
   log('Unhandled Rejection at: %o, reason: %o', promise, reason);
-  process.exit(1);
+  process.exitCode = 1;
 });
 
-main().catch((error) => {
-  log('Main function error: %o', error);
-  process.exit(1);
-});
+void (async () => {
+  try {
+    await main();
+  } catch (error) {
+    log('Main function error: %o', error);
+    process.exit(1);
+  }
+})();

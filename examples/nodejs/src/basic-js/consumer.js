@@ -18,9 +18,8 @@
  */
 
 import { Client, PollingStrategy, Consumer } from 'apache-iggy';
-import debug from 'debug';
 
-const log = debug('iggy:basic:consumer');
+const log = console.log;
 
 const STREAM_ID = 1;
 const TOPIC_ID = 1;
@@ -33,8 +32,8 @@ function parseArgs() {
   const connectionString = args[0] || 'iggy+tcp://iggy:iggy@127.0.0.1:8090';
   
   if (args.length > 0 && (args[0] === '-h' || args[0] === '--help')) {
-    console.log('Usage: node consumer.js [connection_string]');
-    console.log('Example: node consumer.js iggy+tcp://iggy:iggy@127.0.0.1:8090');
+    log('Usage: node consumer.js [connection_string]');
+    log('Example: node consumer.js iggy+tcp://iggy:iggy@127.0.0.1:8090');
     process.exit(0);
   }
   
@@ -77,9 +76,6 @@ async function consumeMessages(client) {
 
       if (!polledMessages || polledMessages.messages.length === 0) {
         log('No messages found in current poll - this is expected if the producer had issues sending messages');
-        consumedBatches++; // Increment even when no messages found
-        log('Completed poll attempt %d (no messages).', consumedBatches);
-        await new Promise(resolve => setTimeout(resolve, interval));
         continue;
       }
 
@@ -88,14 +84,12 @@ async function consumeMessages(client) {
       for (const message of polledMessages.messages) {
         handleMessage(message);
       }
-      
-      consumedBatches++;
-      log('Consumed %d message(s) in batch %d.', polledMessages.messages.length, consumedBatches);
-      
-      await new Promise(resolve => setTimeout(resolve, interval));
+      log('Consumed %d message(s).', polledMessages.messages.length);
     } catch (error) {
       log('Error consuming messages: %o', error);
+    } finally {
       consumedBatches++;
+      log('Completed poll attempt %d.', consumedBatches);
       await new Promise(resolve => setTimeout(resolve, interval));
     }
   }
@@ -127,32 +121,30 @@ async function main() {
     // Client connects automatically when first command is called
     log('Connected successfully.');
 
-    log('Logging in user...');
-    await client.session.login({ username, password });
-    log('Logged in successfully.');
+    // Login will be handled automatically by the client on first command
 
     await consumeMessages(client);
   } catch (error) {
     log('Error in main: %o', error);
-    process.exit(1);
+    process.exitCode = 1;
   } finally {
     await client.destroy();
     log('Disconnected from server.');
   }
 }
 
-// Handle uncaught exceptions
-process.on('uncaughtException', (error) => {
-  log('Uncaught Exception: %o', error);
-  process.exit(1);
-});
 
 process.on('unhandledRejection', (reason, promise) => {
   log('Unhandled Rejection at: %o, reason: %o', promise, reason);
-  process.exit(1);
+  process.exitCode = 1;
 });
 
-main().catch((error) => {
-  log('Main function error: %o', error);
-  process.exit(1);
-});
+// Prefer async/await style over Promise chaining for consistency
+void (async () => {
+  try {
+    await main();
+  } catch (error) {
+    log('Main function error: %o', error);
+    process.exit(1);
+  }
+})();
