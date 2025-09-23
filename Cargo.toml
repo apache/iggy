@@ -38,7 +38,6 @@ members = [
     "core/connectors/sinks/postgres_sink",
     "core/connectors/sinks/quickwit_sink",
     "core/connectors/sinks/stdout_sink",
-    "core/connectors/sources/iceberg_source",
     "core/connectors/sources/postgres_source",
     "core/connectors/sources/random_source",
     "core/integration",
@@ -172,7 +171,6 @@ arrow-array = "55.2.0"
 iceberg = "0.6.0"
 iceberg-catalog-rest = "0.6.0"
 iceberg-catalog-glue = "0.6.0"
-
 
 # Optional dependencies
 mimalloc = "0.1"
