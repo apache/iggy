@@ -730,6 +730,7 @@ impl<T: ConfigurationType, P: Provider + Clone> ConfigProvider<T> for FileConfig
 
         // Start with the default configuration if provided
         let mut config_builder = Figment::new();
+        let has_default = self.default_config.is_some();
         if let Some(default) = self.default_config {
             config_builder = config_builder.merge(default);
         } else {
@@ -741,11 +742,13 @@ impl<T: ConfigurationType, P: Provider + Clone> ConfigProvider<T> for FileConfig
             println!("Found configuration file at path: '{}'.", self.file_path);
             config_builder = config_builder.merge(Toml::file(&self.file_path));
         } else {
-            eprintln!(
-                "Configuration file not found at path: '{}'. Cannot load configuration.",
+            println!(
+                "Configuration file not found at path: '{}'.",
                 self.file_path
             );
-            return Err(ConfigurationError::CannotLoadConfiguration);
+            if has_default {
+                println!("Using default configuration as no config file was found.");
+            }
         }
 
         // Merge environment variables into the configuration
