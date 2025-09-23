@@ -1079,7 +1079,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         {
             if (response.Length == 0)
             {
-                throw new InvalidResponseException($"Invalid response status code: {response.Status}");
+                throw new IggyInvalidStatusCodeException(response.Status, $"Invalid response status code: {response.Status}");
             }
 
             var errorBuffer = new byte[response.Length];

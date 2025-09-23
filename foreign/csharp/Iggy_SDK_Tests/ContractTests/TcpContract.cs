@@ -535,7 +535,7 @@ public sealed class TcpContract
             _ => throw new ArgumentOutOfRangeException()
         }, request.PollingStrategy.Kind);
         Assert.Equal(request.PollingStrategy.Value, BitConverter.ToUInt64(result[24..32]));
-        Assert.Equal(request.Count, BitConverter.ToInt32(result[32..36]));
+        Assert.Equal(request.Count, BitConverter.ToUInt32(result[32..36]));
         Assert.Equal(request.AutoCommit, result[36] switch
         {
             0 => false,
