@@ -45,6 +45,7 @@ comfy-table = { workspace = true }
 crc32fast = { workspace = true }
 derive_more = { workspace = true }
 fast-async-mutex = { version = "0.6.7", optional = true }
+figment = { workspace = true }
 humantime = { workspace = true }
 rcgen = "0.14.4"
 rustls = { workspace = true }
@@ -54,4 +55,5 @@ serde_with = { workspace = true, features = ["base64"] }
 strum = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+toml = { workspace = true }
 tracing = { workspace = true }

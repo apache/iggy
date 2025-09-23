@@ -15,30 +15,25 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[http] # Optional HTTP API configuration
+[sinks.postgres]
 enabled = true
-address = "127.0.0.1:8081"
-api_key = "" # Optional API key for authentication to be passed as `api-key` header
+name = "Postgres sink"
+path = "../../target/debug/libiggy_connector_postgres_sink"
 
-[http.cors] # Optional CORS configuration for HTTP API
-enabled = false
-allowed_methods = ["GET", "POST", "PUT", "DELETE"]
-allowed_origins = ["*"]
-allowed_headers = ["content-type"]
-exposed_headers = [""]
-allow_credentials = false
-allow_private_network = false
+[[sinks.postgres.streams]]
+stream = ""
+topics = [""]
+schema = "json"
+batch_length = 100
+poll_interval = "5ms"
+consumer_group = "test"
 
-[http.tls] # Optional TLS configuration for HTTP API
-enabled = false
-cert_file = "core/certs/iggy_cert.pem"
-key_file = "core/certs/iggy_key.pem"
-
-[iggy]
-address = "localhost:8090"
-username = "iggy"
-password = "iggy"
-token = "" # Personal Access Token (PAT) can be used instead of username and password
-
-[state]
-path = "local_state"
+[sinks.postgres.config]
+connection_string = ""
+target_table = "iggy_messages"
+batch_size = 100
+max_connections = 10
+auto_create_table = true
+include_metadata = true
+include_checksum = true
+include_origin_timestamp = true

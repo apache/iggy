@@ -47,7 +47,7 @@ resolver = "2"
 [workspace.dependencies]
 aes-gcm = "0.10.3"
 ahash = { version = "0.8.12", features = ["serde"] }
-anyhow = "1.0.99"
+anyhow = "1.0.100"
 argon2 = "0.5.3"
 async-broadcast = "0.7.2"
 async-dropper = { version = "0.3.1", features = ["tokio", "simple"] }
@@ -79,10 +79,9 @@ byte-unit = { version = "5.1.6", default-features = false, features = [
 bytes = "1.10.1"
 charming = "0.6.0"
 chrono = { version = "0.4.42", features = ["serde"] }
-clap = { version = "4.5.47", features = ["derive", "wrap_help"] }
+clap = { version = "4.5.48", features = ["derive", "wrap_help"] }
 colored = "3.0.0"
 comfy-table = "7.2.1"
-config = { version = "0.15.16" }
 console-subscriber = "0.4.1"
 crc32fast = "1.5.0"
 crossbeam = "0.8.4"
@@ -96,6 +95,7 @@ dotenvy = "0.15.7"
 enum_dispatch = "0.3.13"
 env_logger = "0.11.8"
 figlet-rs = "0.1.5"
+figment = { version = "0.10.19", features = ["toml", "env"] }
 flume = "0.11.1"
 futures = "0.3.31"
 futures-util = "0.3.31"
@@ -129,24 +129,24 @@ rust-s3 = { version = "0.37.0", default-features = false, features = [
     "tokio-rustls-tls",
     "tags",
 ] }
-rustls = { version = "0.23.31", features = ["ring"] }
-serde = { version = "1.0.225", features = ["derive", "rc"] }
+rustls = { version = "0.23.32", features = ["ring"] }
+serde = { version = "1.0.226", features = ["derive", "rc"] }
 serde_json = "1.0.145"
-serde_with = { version = "3.14.0", features = ["base64", "macros"] }
-serde_yml = "0.0.12"
+serde_with = { version = "3.14.1", features = ["base64", "macros"] }
+serde_yaml_ng = "0.10.0"
 serial_test = "3.2.0"
 server = { path = "core/server" }
 simd-json = { version = "0.16.0", features = ["serde_impl"] }
 strum = { version = "0.27.2", features = ["derive"] }
 strum_macros = "0.27.2"
 sysinfo = "0.37.0"
-tempfile = "3.22.0"
+tempfile = "3.23.0"
 test-case = "3.3.1"
 thiserror = "2.0.16"
 tokio = { version = "1.47.1", features = ["full"] }
 tokio-rustls = "0.26.3"
 tokio-util = { version = "0.7.16", features = ["compat"] }
-toml = "0.9.6"
+toml = "0.9.7"
 tower-http = { version = "0.6.6", features = [
     "add-extension",
     "cors",

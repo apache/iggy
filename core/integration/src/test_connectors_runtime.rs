@@ -18,13 +18,7 @@
 
 use assert_cmd::prelude::CommandCargoExt;
 use rand::Rng;
-use rmcp::{
-    RoleClient, ServiceExt,
-    model::{ClientCapabilities, ClientInfo, Implementation, InitializeRequestParam},
-    service::RunningService,
-    transport::StreamableHttpClientTransport,
-};
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -32,25 +26,30 @@ use std::process::{Child, Command};
 use std::time::Duration;
 use std::{collections::HashMap, net::TcpListener};
 use tokio::time::sleep;
+use uuid::Uuid;
 
-pub const CONSUMER_NAME: &str = "mcp";
-const MCP_PATH: &str = "/mcp";
-
-pub type McpClient = RunningService<RoleClient, InitializeRequestParam>;
+pub const STATE_PATH_ENV_VAR: &str = "IGGY_CONNECTORS_STATE_PATH";
+pub const CONSUMER_NAME: &str = "connectors";
+const LOCAL_STATE_PREFIX: &str = "local_state_";
 
 #[derive(Debug)]
-pub struct TestMcpServer {
+pub struct TestConnectorsRuntime {
     envs: HashMap<String, String>,
     child_handle: Option<Child>,
     server_address: SocketAddr,
     stdout_file_path: Option<PathBuf>,
     stderr_file_path: Option<PathBuf>,
     server_executable_path: Option<String>,
+    local_state_path: String,
+    cleanup: bool,
 }
 
-impl TestMcpServer {
-    pub fn with_iggy_address(iggy_tcp_server_address: &str) -> Self {
-        Self::new(iggy_tcp_server_address, None, None)
+impl TestConnectorsRuntime {
+    pub fn with_iggy_address(
+        iggy_tcp_server_address: &str,
+        envs: Option<HashMap<String, String>>,
+    ) -> Self {
+        Self::new(iggy_tcp_server_address, envs, None)
     }
 
     pub fn new(
@@ -65,21 +64,34 @@ impl TestMcpServer {
             }
         }
 
-        envs.insert("IGGY_MCP_HTTP_PATH".to_string(), MCP_PATH.to_string());
         envs.insert(
-            "IGGY_MCP_IGGY_ADDRESS".to_string(),
+            "IGGY_CONNECTORS_IGGY_ADDRESS".to_string(),
             iggy_tcp_server_address.to_string(),
         );
         envs.insert(
-            "IGGY_MCP_IGGY_CONSUMER".to_string(),
+            "IGGY_CONNECTORS_IGGY_CONSUMER".to_string(),
             CONSUMER_NAME.to_string(),
         );
-        envs.insert("IGGY_MCP_TRANSPORT".to_string(), "http".to_string());
         Self::create(envs, server_executable_path)
     }
 
-    pub fn create(envs: HashMap<String, String>, server_executable_path: Option<String>) -> Self {
+    pub fn create(
+        mut envs: HashMap<String, String>,
+        server_executable_path: Option<String>,
+    ) -> Self {
         let server_address = Self::get_random_server_address();
+
+        // If IGGY_CONNECTORS_STATE_PATH is not set, use a random path starting with "local_state_"
+        let local_state_path = if let Some(state_path) = envs.get(STATE_PATH_ENV_VAR) {
+            state_path.to_string()
+        } else {
+            Self::get_random_path()
+        };
+
+        envs.insert(
+            "IGGY_CONNECTORS_STATE_PATH".to_string(),
+            local_state_path.clone(),
+        );
 
         Self {
             envs,
@@ -88,20 +100,25 @@ impl TestMcpServer {
             stdout_file_path: None,
             stderr_file_path: None,
             server_executable_path,
+            local_state_path,
+            cleanup: true,
         }
     }
 
     pub fn start(&mut self) {
+        self.cleanup();
         self.envs
-            .entry("IGGY_MCP_HTTP_ADDRESS".to_string())
+            .entry("IGGY_CONNECTORS_HTTP_ADDRESS".to_string())
             .or_insert(self.server_address.to_string());
         let mut command = if let Some(server_executable_path) = &self.server_executable_path {
             Command::new(server_executable_path)
         } else {
-            Command::cargo_bin("iggy-mcp").unwrap()
+            Command::cargo_bin("iggy-connectors").unwrap()
         };
         command.envs(self.envs.clone());
-        let child = command.spawn().expect("Failed to start MCP server process");
+        let child = command
+            .spawn()
+            .expect("Failed to start Connectors Runtime process");
         self.child_handle = Some(child);
     }
 
@@ -142,6 +159,7 @@ impl TestMcpServer {
                 }
             }
         }
+        self.cleanup();
     }
 
     pub fn is_started(&self) -> bool {
@@ -152,8 +170,8 @@ impl TestMcpServer {
         self.child_handle.as_ref().unwrap().id()
     }
 
-    fn get_http_mcp_api_address(&self) -> String {
-        format!("{}{MCP_PATH}", self.get_http_api_address())
+    pub fn get_random_path() -> String {
+        format!("{}{}", LOCAL_STATE_PREFIX, Uuid::now_v7().to_u128_le())
     }
 
     fn get_http_api_address(&self) -> String {
@@ -167,39 +185,18 @@ impl TestMcpServer {
     pub async fn ensure_started(&self) {
         let http_api_address = self.get_http_api_address();
         let client = reqwest::Client::new();
-        let max_retries = 3000;
+        let max_retries = 1000;
         let mut retries = 0;
         while let Err(error) = client.get(&http_api_address).send().await {
             sleep(Duration::from_millis(20)).await;
             retries += 1;
             if retries >= max_retries {
                 panic!(
-                    "Failed to ping MCP server: {http_api_address} after {max_retries} retries. {error}"
+                    "Failed to ping Connectors runtime: {http_api_address} after {max_retries} retries. {error}"
                 );
             }
         }
-        println!("MCP server address started at: {http_api_address}");
-    }
-
-    pub async fn get_client(&self) -> McpClient {
-        let mcp_http_api_address = self.get_http_mcp_api_address();
-        let transport = StreamableHttpClientTransport::from_uri(mcp_http_api_address);
-        let client_info = ClientInfo {
-            protocol_version: Default::default(),
-            capabilities: ClientCapabilities::default(),
-            client_info: Implementation {
-                name: "test-mcp-client".to_string(),
-                version: "1.0.0".to_string(),
-                ..Default::default()
-            },
-        };
-        client_info
-            .serve(transport)
-            .await
-            .inspect_err(|error| {
-                eprintln!("MCP client error: {error}");
-            })
-            .expect("Failed to create MCP client")
+        println!("Connectors runtime address started at: {http_api_address}");
     }
 
     fn get_random_server_address() -> SocketAddr {
@@ -224,9 +221,19 @@ impl TestMcpServer {
 
         panic!("Failed to find a free port after {max_retries} retries");
     }
+
+    fn cleanup(&self) {
+        if !self.cleanup {
+            return;
+        }
+
+        if fs::metadata(&self.local_state_path).is_ok() {
+            fs::remove_dir_all(&self.local_state_path).unwrap();
+        }
+    }
 }
 
-impl Drop for TestMcpServer {
+impl Drop for TestConnectorsRuntime {
     fn drop(&mut self) {
         self.stop();
     }

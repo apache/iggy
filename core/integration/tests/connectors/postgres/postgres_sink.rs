@@ -16,15 +16,9 @@
  * under the License.
  */
 
-pub mod cache_indexes;
-pub mod cluster;
-pub mod defaults;
-pub mod displays;
-pub mod http;
-pub mod quic;
-pub mod server;
-pub mod system;
-pub mod tcp;
-pub mod validators;
+use crate::connectors::postgres::setup;
 
-pub const COMPONENT: &str = "CONFIG";
+#[tokio::test]
+async fn given_valid_configuration_postgres_sink_should_start() {
+    let _client = setup().await;
+}

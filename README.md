@@ -99,7 +99,7 @@ We do also publish edge/dev/nightly releases (e.g. `0.5.0-edge.1` or `apache/igg
 ## Roadmap
 
 - **Shared-nothing** design and **io_uring** support (PoC on experimental branch, WiP on the main branch)
-- **Clustering** & data replication based on **[VSR](https://pmg.csail.mit.edu/papers/vr-revisited.pdf)** (on sandbox project using Raft, will be implemented after shared-nothing design is completed)
+- **Clustering** & data replication based on **[VSR](http://pmg.csail.mit.edu/papers/vr-revisited.pdf)** (on sandbox project using Raft, will be implemented after shared-nothing design is completed)
 
 ---
 

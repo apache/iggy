@@ -25,24 +25,17 @@ pub async fn init(config: IggyConfig) -> Result<IggyClient, McpRuntimeError> {
     let password = config.password;
     let token = config.token;
 
-    let connection_string = if let Some(token) = token {
-        if token.is_empty() {
-            error!("Iggy token cannot be empty (if username and password are not provided)");
-            return Err(McpRuntimeError::MissingIggyCredentials);
-        }
-
+    let connection_string = if !token.is_empty() {
         let redacted_token = token.chars().take(3).collect::<String>();
         info!("Using token: {redacted_token}*** for Iggy authentication");
         format!("iggy://{token}@{address}")
     } else {
         info!("Using username and password for Iggy authentication");
-        let username = username.ok_or(McpRuntimeError::MissingIggyCredentials)?;
         if username.is_empty() {
-            error!("Iggy password cannot be empty (if token is not provided)");
+            error!("Iggy username cannot be empty (if token is not provided)");
             return Err(McpRuntimeError::MissingIggyCredentials);
         }
 
-        let password = password.ok_or(McpRuntimeError::MissingIggyCredentials)?;
         if password.is_empty() {
             error!("Iggy password cannot be empty (if token is not provided)");
             return Err(McpRuntimeError::MissingIggyCredentials);

@@ -22,8 +22,6 @@ use thiserror::Error;
 pub enum McpRuntimeError {
     #[error("Failed to create service")]
     FailedToCreateService,
-    #[error("Missing configuration")]
-    MissingConfig,
     #[error("Failed to start HTTP server")]
     FailedToStartHttpServer,
     #[error("Iggy client error")]
