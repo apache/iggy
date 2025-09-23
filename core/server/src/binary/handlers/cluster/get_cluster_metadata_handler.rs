@@ -40,18 +40,14 @@ impl ServerCommandHandler for GetClusterMetadata {
         sender: &mut SenderKind,
         _length: u32,
         session: &Rc<Session>,
-        system: &Rc<IggyShard>,
+        shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
-        // TODO: fix it;
-        /*
         debug!("session: {session}, command: {self}");
 
-        let system = system.read().await;
-        let cluster_metadata = system.get_cluster_metadata(session)?;
+        let cluster_metadata = shard.get_cluster_metadata(session)?;
 
         let response = cluster_metadata.to_bytes();
         sender.send_ok_response(&response).await?;
-        */
         Ok(())
     }
 }
