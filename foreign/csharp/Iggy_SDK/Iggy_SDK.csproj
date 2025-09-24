@@ -49,10 +49,5 @@
         <InternalsVisibleTo Include="Apache.Iggy.Tests" />
         <InternalsVisibleTo Include="Apache.Iggy.Tests.Integrations" />
     </ItemGroup>
-    
-    <ItemGroup>
-      <Folder Include="Consumer\" />
-      <Folder Include="Publisher\" />
-    </ItemGroup>
 
 </Project>
