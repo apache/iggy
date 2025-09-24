@@ -21,18 +21,17 @@ mod procdump;
 use crate::configs::system::SystemConfig;
 use crate::shard::IggyShard;
 use crate::streaming::session::Session;
-use async_zip::tokio::write::ZipFileWriter;
+use async_zip::base::write::ZipFileWriter;
 use async_zip::{Compression, ZipEntryBuilder};
-use compio::fs::{File, OpenOptions};
+use compio::fs::{OpenOptions};
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use iggy_common::{IggyDuration, IggyError, Snapshot, SnapshotCompression, SystemSnapshotType};
-use std::io::Cursor;
 use std::path::PathBuf;
+// TODO: compio has an `process` module, consider using that instead, but read the docs carefully // https://compio.rs/docs/compio/process
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
 use tempfile::NamedTempFile;
-use tokio::process::Command;
-use tokio_util::compat::TokioAsyncWriteCompatExt;
 use tracing::{error, info};
 
 impl IggyShard {
@@ -54,16 +53,7 @@ impl IggyShard {
             snapshot_types
         };
 
-        // TODO: Replace this with
-        // https://github.com/bearcove/rc-zip
-        // and impl the monoio async writer, based on this example:
-        // https://youtu.be/RYHYiXMJdZI?si=d2roKeHn5lJrw2ri&t=1140
-        // and rc-zip-tokio crate.
-
-        /*
-        let cursor = Cursor::new(Vec::new());
-        let mut zip_writer = ZipFileWriter::new(cursor.compat_write());
-
+        let mut zip_writer = ZipFileWriter::new(Vec::new());
         let compression = match compression {
             SnapshotCompression::Stored => Compression::Stored,
             SnapshotCompression::Deflated => Compression::Deflate,
@@ -118,33 +108,27 @@ impl IggyShard {
                 }
             }
         }
-        */
 
-        /*
         info!(
             "Snapshot commands {:?} finished in {}",
             snapshot_types,
             IggyDuration::new(now.elapsed())
         );
 
-        let writer = zip_writer
+        let zip_data = zip_writer
             .close()
             .await
             .map_err(|_| IggyError::SnapshotFileCompletionFailed)?;
 
-        let cursor = writer.into_inner();
-        let zip_data = cursor.into_inner();
-
         info!("Final zip size: {} bytes", zip_data.len());
-        */
-        Ok(Snapshot::new(vec![]))
+        Ok(Snapshot::new(zip_data))
     }
 }
 
 async fn write_command_output_to_temp_file(
     command: &mut Command,
 ) -> Result<NamedTempFile, std::io::Error> {
-    let output = command.output().await?;
+    let output = command.output()?;
     let temp_file = NamedTempFile::new()?;
     let mut file = OpenOptions::new()
         .write(true)
@@ -169,7 +153,7 @@ async fn get_process_info() -> Result<NamedTempFile, std::io::Error> {
         .await?;
 
     let mut position = 0;
-    let ps_output = Command::new("ps").arg("aux").output().await?;
+    let ps_output = Command::new("ps").arg("aux").output()?;
     let (result, written) = file
         .write_all_at(b"=== Process List (ps aux) ===\n", 0)
         .await

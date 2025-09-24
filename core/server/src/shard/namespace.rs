@@ -16,9 +16,7 @@
  * under the License.
  */
 
-use hash32::{Hasher, Murmur3Hasher};
 use iggy_common::Identifier;
-use std::hash::Hasher as _;
 
 use crate::slab::partitions;
 

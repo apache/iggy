@@ -53,7 +53,6 @@ async-broadcast = "0.7.2"
 async-dropper = { version = "0.3.1", features = ["tokio", "simple"] }
 async-trait = "0.1.89"
 async_zip = { version = "0.0.18", features = [
-    "tokio",
     "lzma",
     "bzip2",
     "xz",

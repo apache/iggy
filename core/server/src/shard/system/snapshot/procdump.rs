@@ -16,8 +16,6 @@
  * under the License.
  */
 
-use tokio::fs::{self};
-
 /// Parse the contents of a /proc/[pid]/task/[tid]/stat file into a human-readable format
 fn parse_stat(contents: &str) -> String {
     let fields: Vec<&str> = contents.split_whitespace().collect();
@@ -137,7 +135,7 @@ pub async fn get_proc_info() -> Result<String, std::io::Error> {
     let mut result = String::new();
 
     async fn dump_file(result: &mut String, path: &str) -> Result<(), std::io::Error> {
-        match fs::read_to_string(path).await {
+        match std::fs::read_to_string(path) {
             Ok(contents) => {
                 result.push_str(&format!("=== {path} ===\n"));
 
@@ -150,13 +148,13 @@ pub async fn get_proc_info() -> Result<String, std::io::Error> {
                 result.push_str("\n\n");
             }
             Err(e) => {
-                if let Ok(metadata) = fs::metadata(path).await {
+                if let Ok(metadata) = std::fs::metadata(path) {
                     if metadata.is_dir() && path.ends_with("/fd") {
                         result.push_str(&format!("=== {path} (directory) ===\n"));
-                        if let Ok(mut rd) = fs::read_dir(path).await {
-                            while let Ok(Some(entry)) = rd.next_entry().await {
+                        if let Ok(mut rd) = std::fs::read_dir(path) {
+                            while let Some(Ok(entry)) = rd.next() {
                                 let fd_path = entry.path();
-                                match fs::read_link(&fd_path).await {
+                                match std::fs::read_link(&fd_path) {
                                     Ok(link) => {
                                         result.push_str(&format!(
                                             "{} -> {}\n",
@@ -189,9 +187,9 @@ pub async fn get_proc_info() -> Result<String, std::io::Error> {
         dump_file(&mut result, path).await?;
     }
 
-    let mut proc_dir = fs::read_dir("/proc").await?;
-    while let Ok(Some(entry)) = proc_dir.next_entry().await {
-        let file_type = entry.file_type().await?;
+    let mut proc_dir = std::fs::read_dir("/proc")?;
+    while let Some(Ok(entry)) = proc_dir.next() {
+        let file_type = entry.file_type()?;
         if file_type.is_dir()
             && let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>()
         {
