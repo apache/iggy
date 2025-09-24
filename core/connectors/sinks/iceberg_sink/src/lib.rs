@@ -143,18 +143,6 @@ impl IcebergSink {
         RestCatalog::new(catalog_config)
     }
 
-    //#[inline(always)]
-    //fn get_hms_catalog(&self) -> HmsCatalog {
-    //    let config = HmsCatalogConfig::builder()
-    //        .props(self.props)
-    //        .warehouse(self.config.bucket_name.clone())
-    //        .address(self.config.uri.clone())
-    //        .thrift_transport(HmsThriftTransport::Buffered)
-    //        .build();
-    //
-    //    HmsCatalog::new(config)
-    //}
-
     #[inline(always)]
     async fn get_glue_catalog(&self) -> Result<GlueCatalog, Error> {
         let config = GlueCatalogConfig::builder()
