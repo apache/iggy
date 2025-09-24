@@ -6,6 +6,7 @@ namespace Apache.Iggy.Consumers;
 
 public class IggyConsumerConfig
 {
+    public bool CreateIggyClient { get; set; }
     public Protocol Protocol { get; set; }
     public string Address { get; set; } = string.Empty;
     public string Login { get; set; } = string.Empty;
@@ -23,6 +24,10 @@ public class IggyConsumerConfig
     public bool AutoCommit { get; set; }
     public AutoCommitMode AutoCommitMode { get; set; }
     public int BufferSize { get; set; }
+
+    public string? ConsumerGroupName { get; set; }
+    public bool CreateConsumerGroupIfNotExists { get; set; } = true;
+    public bool JoinConsumerGroup { get; set; } = true;
 
     public ILoggerFactory? LoggerFactory { get; set; }
 

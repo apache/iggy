@@ -814,4 +814,9 @@ public class HttpMessageStream : IIggyClient
     {
         return message.ToString();
     }
+
+    public void Dispose()
+    {
+        
+    }
 }

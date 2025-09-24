@@ -25,6 +25,7 @@ public class IggyConsumerBuilder
         {
             Config = new IggyConsumerConfig
             {
+                CreateIggyClient = true,
                 StreamId = streamId,
                 TopicId = topicId
             }
@@ -136,22 +137,41 @@ public class IggyConsumerBuilder
         return this;
     }
 
+    /// <summary>
+    /// Configures consumer group settings for the consumer.
+    /// </summary>
+    /// <param name="groupName">The name of the consumer group.</param>
+    /// <param name="createIfNotExists">Whether to create the consumer group if it doesn't exist.</param>
+    /// <param name="joinGroup">Whether to join the consumer group after creation/verification.</param>
+    /// <returns>The current instance of the consumer builder with the updated consumer group settings.</returns>
+    public IggyConsumerBuilder WithConsumerGroup(string groupName, bool createIfNotExists = true, bool joinGroup = true)
+    {
+        Config.ConsumerGroupName = groupName;
+        Config.CreateConsumerGroupIfNotExists = createIfNotExists;
+        Config.JoinConsumerGroup = joinGroup;
+
+        return this;
+    }
+
     public IggyConsumer Build()
     {
-        IggyClient ??= IggyClientFactory.CreateClient(new IggyClientConfigurator()
+        if (Config.CreateIggyClient)
         {
-            Protocol = Config.Protocol,
-            BaseAdress = Config.Address,
-            ReceiveBufferSize = Config.ReceiveBufferSize,
-            SendBufferSize = Config.SendBufferSize
-        });
+            IggyClient = IggyClientFactory.CreateClient(new IggyClientConfigurator()
+            {
+                Protocol = Config.Protocol,
+                BaseAdress = Config.Address,
+                ReceiveBufferSize = Config.ReceiveBufferSize,
+                SendBufferSize = Config.SendBufferSize
+            });
+        }
 
         if (Config.BufferSize == 0)
         {
             Config.BufferSize = Config.BatchSize <= int.MaxValue ? (int)Config.BatchSize : int.MaxValue;
         }
 
-        return new IggyConsumer(IggyClient, Config,
+        return new IggyConsumer(IggyClient!, Config,
             Config.LoggerFactory?.CreateLogger<IggyConsumer>() ??
             NullLoggerFactory.Instance.CreateLogger<IggyConsumer>());
     }
