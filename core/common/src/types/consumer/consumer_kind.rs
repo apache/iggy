@@ -21,6 +21,7 @@ use crate::Identifier;
 use crate::Validatable;
 use crate::error::IggyError;
 use bytes::{BufMut, Bytes, BytesMut};
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
 use std::fmt::Display;
@@ -43,13 +44,15 @@ pub struct Consumer {
 }
 
 /// `ConsumerKind` is an enum that represents the type of consumer.
-#[derive(Debug, Serialize, Deserialize, PartialEq, Default, Copy, Clone)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Default, Copy, Clone, ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsumerKind {
     /// `Consumer` represents a regular consumer.
     #[default]
+    #[value(name = "consumer", alias = "c")]
     Consumer,
     /// `ConsumerGroup` represents a consumer group.
+    #[value(name = "consumer-group", alias = "cg")]
     ConsumerGroup,
 }
 

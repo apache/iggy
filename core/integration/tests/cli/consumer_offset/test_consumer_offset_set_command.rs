@@ -309,11 +309,11 @@ Examples:
  iggy consumer-offset set 1 stream topic 1 100
  iggy consumer-offset set consumer stream topic 1 100
 
-{USAGE_PREFIX} consumer-offset set <CONSUMER_ID> <STREAM_ID> <TOPIC_ID> <PARTITION_ID> <OFFSET>
+{USAGE_PREFIX} consumer-offset set [OPTIONS] <CONSUMER_ID> <STREAM_ID> <TOPIC_ID> <PARTITION_ID> <OFFSET>
 
 Arguments:
   <CONSUMER_ID>
-          Regular consumer for which the offset is set
+          Consumer for which the offset is set
 {CLAP_INDENT}
           Consumer ID can be specified as a consumer name or ID
 
@@ -334,6 +334,15 @@ Arguments:
           Offset to set
 
 Options:
+  -k, --kind <KIND>
+          Consumer kind: "consumer" for regular consumer, "consumer_group" for consumer group
+
+          Possible values:
+          - consumer:       `Consumer` represents a regular consumer
+          - consumer-group: `ConsumerGroup` represents a consumer group
+{CLAP_INDENT}
+          [default: consumer]
+
   -h, --help
           Print help (see a summary with '-h')
 "#,
@@ -353,17 +362,18 @@ pub async fn should_short_help_match() {
             format!(
                 r#"Set the offset of a consumer for a given partition on the server
 
-{USAGE_PREFIX} consumer-offset set <CONSUMER_ID> <STREAM_ID> <TOPIC_ID> <PARTITION_ID> <OFFSET>
+{USAGE_PREFIX} consumer-offset set [OPTIONS] <CONSUMER_ID> <STREAM_ID> <TOPIC_ID> <PARTITION_ID> <OFFSET>
 
 Arguments:
-  <CONSUMER_ID>   Regular consumer for which the offset is set
+  <CONSUMER_ID>   Consumer for which the offset is set
   <STREAM_ID>     Stream ID for which consumer offset is set
   <TOPIC_ID>      Topic ID for which consumer offset is set
   <PARTITION_ID>  Partitions ID for which consumer offset is set
   <OFFSET>        Offset to set
 
 Options:
-  -h, --help  Print help (see more with '--help')
+  -k, --kind <KIND>  Consumer kind: "consumer" for regular consumer, "consumer_group" for consumer group [default: consumer] [possible values: consumer, consumer-group]
+  -h, --help         Print help (see more with '--help')
 "#,
             ),
         ))

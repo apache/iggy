@@ -73,8 +73,8 @@ interval = "1 m"
 enabled = true
 
 # Specifies the network address and port for the HTTP server.
-# The format is "HOST:PORT". For example, "0.0.0.0:3000" listens on all network interfaces on port 3000.
-address = "0.0.0.0:3000"
+# The format is "HOST:PORT". For example, "127.0.0.1:3000" listens on localhost only on port 3000.
+address = "127.0.0.1:3000"
 
 # Maximum size of the request body in bytes. For security reasons, the default limit is 2 MB.
 max_request_size = "2 MB"
@@ -181,8 +181,8 @@ key_file = "core/certs/iggy_key.pem"
 enabled = true
 
 # Defines the network address and port for the TCP server.
-# For example, "0.0.0.0:8090" listens on all network interfaces on port 8090.
-address = "0.0.0.0:8090"
+# For example, "127.0.0.1:8090" listens on localhost only on port 8090.
+address = "127.0.0.1:8090"
 
 # Whether to use ipv4 or ipv6
 ipv6 = false
@@ -234,8 +234,8 @@ linger = "0 s"
 enabled = true
 
 # Network address and port for the QUIC server.
-# For example, "0.0.0.0:8080" binds to all interfaces on port 8080.
-address = "0.0.0.0:8080"
+# For example, "127.0.0.1:8080" binds to localhost on port 8080.
+address = "127.0.0.1:8080"
 
 # Maximum number of simultaneous bidirectional streams in QUIC.
 max_concurrent_bidi_streams = 10_000
@@ -541,3 +541,39 @@ size = "4 GiB"
 # and holds different buffer sizes, from 256 B to 512 MiB.
 # Note: This number has to be a power of 2. Minimum value is 128 due to internal implementation details.
 bucket_capacity = 8192
+
+# Cluster configuration
+[cluster]
+# Enables or disables cluster mode (boolean).
+# When enabled, this node will participate in the cluster and coordinate with other nodes.
+enabled = false
+
+# Unique cluster identifier (u32).
+# All nodes in the same cluster must share the same cluster id.
+id = 1
+
+# Unique cluster name (string).
+# All nodes in the same cluster must share the same name.
+# This prevents accidental cross-cluster communication.
+name = "iggy-cluster"
+
+# Transport protocol used for communication between nodes in the cluster (string).
+# Supported values: "tcp", "quic", "http"
+transport = "tcp"
+
+# Current node configuration
+[cluster.node]
+# This node unique identifier within the cluster (u32).
+# Must be unique across all nodes and match one of the ids in the nodes list.
+id = 1
+
+# All nodes in the cluster.
+[[cluster.nodes]]
+id = 1
+name = "iggy-node-1"
+address = "127.0.0.1:8090"
+
+[[cluster.nodes]]
+id = 2
+name = "iggy-node-2"
+address = "127.0.0.1:8091"

@@ -17,6 +17,7 @@
  */
 pub(crate) mod binary_client;
 pub(crate) mod client;
+pub(crate) mod cluster_client;
 pub(crate) mod consumer_group_client;
 pub(crate) mod consumer_offset_client;
 pub(crate) mod message_client;
@@ -30,6 +31,7 @@ pub(crate) mod user_client;
 
 pub use crate::client::binary_clients::binary_client::BinaryClient;
 pub use crate::client::binary_clients::client::Client;
+pub use crate::client::binary_clients::cluster_client::ClusterClient;
 pub use crate::client::binary_clients::consumer_group_client::ConsumerGroupClient;
 pub use crate::client::binary_clients::consumer_offset_client::ConsumerOffsetClient;
 pub use crate::client::binary_clients::message_client::MessageClient;

@@ -299,12 +299,14 @@ Examples:
  iggy consumer-offset get consumer 3 topic 1
  iggy consumer-offset get 1 stream topic 1
  iggy consumer-offset get consumer stream topic 1
+ iggy consumer-offset get cg-1 3000001 1 1 --kind consumer-group
+ iggy consumer-offset get cg-1 3000001 1 1 -k consumer-group
 
-{USAGE_PREFIX} consumer-offset get <CONSUMER_ID> <STREAM_ID> <TOPIC_ID> <PARTITION_ID>
+{USAGE_PREFIX} consumer-offset get [OPTIONS] <CONSUMER_ID> <STREAM_ID> <TOPIC_ID> <PARTITION_ID>
 
 Arguments:
   <CONSUMER_ID>
-          Regular consumer for which the offset is retrieved
+          Consumer for which the offset is retrieved
 {CLAP_INDENT}
           Consumer ID can be specified as a consumer name or ID
 
@@ -322,6 +324,15 @@ Arguments:
           Partitions ID for which consumer offset is retrieved
 
 Options:
+  -k, --kind <KIND>
+          Consumer kind: "consumer" for regular consumer, "consumer_group" for consumer group
+
+          Possible values:
+          - consumer:       `Consumer` represents a regular consumer
+          - consumer-group: `ConsumerGroup` represents a consumer group
+{CLAP_INDENT}
+          [default: consumer]
+
   -h, --help
           Print help (see a summary with '-h')
 "#,
@@ -341,16 +352,17 @@ pub async fn should_short_help_match() {
             format!(
                 r#"Retrieve the offset of a consumer for a given partition from the server
 
-{USAGE_PREFIX} consumer-offset get <CONSUMER_ID> <STREAM_ID> <TOPIC_ID> <PARTITION_ID>
+{USAGE_PREFIX} consumer-offset get [OPTIONS] <CONSUMER_ID> <STREAM_ID> <TOPIC_ID> <PARTITION_ID>
 
 Arguments:
-  <CONSUMER_ID>   Regular consumer for which the offset is retrieved
+  <CONSUMER_ID>   Consumer for which the offset is retrieved
   <STREAM_ID>     Stream ID for which consumer offset is retrieved
   <TOPIC_ID>      Topic ID for which consumer offset is retrieved
   <PARTITION_ID>  Partitions ID for which consumer offset is retrieved
 
 Options:
-  -h, --help  Print help (see more with '--help')
+  -k, --kind <KIND>  Consumer kind: "consumer" for regular consumer, "consumer_group" for consumer group [default: consumer] [possible values: consumer, consumer-group]
+  -h, --help         Print help (see more with '--help')
 "#,
             ),
         ))

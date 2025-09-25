@@ -335,25 +335,19 @@ pub async fn should_short_help_match() {
 
     iggy_cmd_test
         .execute_test_for_help_command(TestHelpCmd::new(
-            vec!["user", "create", "-h"],
+            vec!["user", "permissions", "-h"],
             format!(
-                r#"Create user with given username and password
+                r#"Set permissions for user with given ID
 
-{USAGE_PREFIX} user create [OPTIONS] <USERNAME> <PASSWORD>
+{USAGE_PREFIX} user permissions [OPTIONS] <USER_ID>
 
 Arguments:
-  <USERNAME>  Username
-  <PASSWORD>  Password
+  <USER_ID>  User ID to update
 
 Options:
-  -u, --user-status <USER_STATUS>
-          User status [default: active] [possible values: active, inactive]
-  -g, --global-permissions <GLOBAL_PERMISSIONS>
-          Set global permissions for created user
-  -s, --stream-permissions <STREAM_PERMISSIONS>
-          Set stream permissions for created user
-  -h, --help
-          Print help (see more with '--help')
+  -g, --global-permissions <GLOBAL_PERMISSIONS>  Set global permissions for created user
+  -s, --stream-permissions <STREAM_PERMISSIONS>  Set stream permissions for created user
+  -h, --help                                     Print help (see more with '--help')
 "#,
             ),
         ))

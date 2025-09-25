@@ -27,7 +27,6 @@ use axum::{
 use std::sync::Arc;
 
 const API_KEY_HEADER: &str = "api-key";
-
 const PUBLIC_PATHS: &[&str] = &["/", "/health"];
 
 pub async fn resolve_api_key(
@@ -39,13 +38,9 @@ pub async fn resolve_api_key(
         return Ok(next.run(request).await);
     }
 
-    let Some(expected_api_key) = context.api_key.as_ref() else {
+    if context.api_key.is_empty() {
         return Ok(next.run(request).await);
     };
-
-    if expected_api_key.is_empty() {
-        return Ok(next.run(request).await);
-    }
 
     let Some(api_key) = request
         .headers()
@@ -55,7 +50,7 @@ pub async fn resolve_api_key(
         return Err(StatusCode::UNAUTHORIZED);
     };
 
-    if api_key != expected_api_key {
+    if api_key != context.api_key {
         return Err(StatusCode::UNAUTHORIZED);
     }
 

@@ -22,6 +22,7 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub(crate) enum CmdToolError {
     MissingCredentials,
+    InvalidEncryptionKey,
     #[cfg(feature = "login-session")]
     MissingServerAddress,
 }
@@ -31,6 +32,9 @@ impl Display for CmdToolError {
         match self {
             Self::MissingCredentials => {
                 write!(f, "Missing iggy server credentials")
+            }
+            Self::InvalidEncryptionKey => {
+                write!(f, "Invalid encryption key provided")
             }
             #[cfg(feature = "login-session")]
             Self::MissingServerAddress => {

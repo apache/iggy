@@ -1,0 +1,423 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Pre-merge
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+env:
+  IGGY_CI_BUILD: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: read
+
+jobs:
+  # Common checks - always run
+  common:
+    name: Common checks
+    uses: ./.github/workflows/_common.yml
+    permissions:
+      contents: read
+      pull-requests: read
+
+  # Detect changes and build matrices
+  detect:
+    name: Detect changes
+    uses: ./.github/workflows/_detect.yml
+
+  # Rust components
+  test-rust:
+    name: Rust • ${{ matrix.component }}/${{ matrix.task }}
+    needs: detect
+    if: ${{ fromJson(needs.detect.outputs.rust_matrix).include[0].component != 'noop' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.rust_matrix) }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      component: ${{ matrix.component }}
+      task: ${{ matrix.task }}
+
+  # Python SDK
+  test-python:
+    name: Python • ${{ matrix.task }}
+    needs: detect
+    if: ${{ fromJson(needs.detect.outputs.python_matrix).include[0].component != 'noop' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.python_matrix) }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      component: ${{ matrix.component }}
+      task: ${{ matrix.task }}
+
+  # Node SDK
+  test-node:
+    name: Node • ${{ matrix.task }}
+    needs: detect
+    if: ${{ fromJson(needs.detect.outputs.node_matrix).include[0].component != 'noop' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.node_matrix) }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      component: ${{ matrix.component }}
+      task: ${{ matrix.task }}
+
+  # Go SDK
+  test-go:
+    name: Go • ${{ matrix.task }}
+    needs: detect
+    if: ${{ fromJson(needs.detect.outputs.go_matrix).include[0].component != 'noop' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.go_matrix) }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      component: ${{ matrix.component }}
+      task: ${{ matrix.task }}
+
+  # Java SDK
+  test-java:
+    name: Java • ${{ matrix.task }}
+    needs: detect
+    if: ${{ fromJson(needs.detect.outputs.java_matrix).include[0].component != 'noop' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.java_matrix) }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      component: ${{ matrix.component }}
+      task: ${{ matrix.task }}
+
+  # C# SDK
+  test-csharp:
+    name: C# • ${{ matrix.task }}
+    needs: detect
+    if: ${{ fromJson(needs.detect.outputs.csharp_matrix).include[0].component != 'noop' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.csharp_matrix) }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      component: ${{ matrix.component }}
+      task: ${{ matrix.task }}
+
+  # Other components
+  test-other:
+    name: Other • ${{ matrix.component }}/${{ matrix.task }}
+    needs: detect
+    if: ${{ fromJson(needs.detect.outputs.other_matrix).include[0].component != 'noop' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.other_matrix) }}
+    uses: ./.github/workflows/_test.yml
+    with:
+      component: ${{ matrix.component }}
+      task: ${{ matrix.task }}
+
+  # BDD Tests
+  test-bdd:
+    name: BDD • ${{ matrix.component }}/${{ matrix.task }}
+    needs: detect
+    if: ${{ fromJson(needs.detect.outputs.bdd_matrix).include[0].component != 'noop' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.bdd_matrix) }}
+    uses: ./.github/workflows/_test_bdd.yml
+    with:
+      component: ${{ matrix.component }}
+      task: ${{ matrix.task }}
+
+  # Examples Tests
+  test-examples:
+    name: Examples • ${{ matrix.component }}/${{ matrix.task }}
+    needs: detect
+    if: ${{ fromJson(needs.detect.outputs.examples_matrix).include[0].component != 'noop' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect.outputs.examples_matrix) }}
+    uses: ./.github/workflows/_test_examples.yml
+    with:
+      component: ${{ matrix.component }}
+      task: ${{ matrix.task }}
+
+  # Final status check
+  status:
+    name: CI Status
+    runs-on: ubuntu-latest
+    needs: [common, detect, test-rust, test-python, test-node, test-go, test-java, test-csharp, test-bdd, test-examples, test-other]
+    if: always()
+    steps:
+      - name: Get job execution times
+        id: times
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const jobs = await github.rest.actions.listJobsForWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId
+            });
+
+            const jobTimes = {};
+            const jobStatuses = {};
+
+            const formatDuration = (ms) => {
+              const seconds = Math.floor(ms / 1000);
+              const minutes = Math.floor(seconds / 60);
+              const hours = Math.floor(minutes / 60);
+              if (hours > 0) {
+                return `${hours}h ${minutes % 60}m ${seconds % 60}s`;
+              } else if (minutes > 0) {
+                return `${minutes}m ${seconds % 60}s`;
+              } else if (seconds > 0) {
+                return `${seconds}s`;
+              } else {
+                return '< 1s';
+              }
+            };
+
+            // Log job names for debugging
+            console.log('Job names found:');
+            for (const job of jobs.data.jobs) {
+              console.log(`  - ${job.name}: ${job.status} (conclusion: ${job.conclusion || 'N/A'})`);
+              jobStatuses[job.name] = job.conclusion || job.status;
+
+              // Only show duration for jobs that actually ran
+              if (job.started_at && job.completed_at) {
+                const start = new Date(job.started_at);
+                const end = new Date(job.completed_at);
+                const duration = end - start;
+                jobTimes[job.name] = formatDuration(duration);
+              } else if (job.started_at && !job.completed_at) {
+                // Job is still running
+                const start = new Date(job.started_at);
+                const duration = Date.now() - start;
+                jobTimes[job.name] = formatDuration(duration) + ' ⏳';
+              } else {
+                // Job was skipped or hasn't started
+                jobTimes[job.name] = null;
+              }
+            }
+
+            // Helper to find job info for a component
+            const findJobInfo = (prefix) => {
+              for (const [name, status] of Object.entries(jobStatuses)) {
+                if (name.startsWith(prefix)) {
+                  return {
+                    time: jobTimes[name],
+                    status: status
+                  };
+                }
+              }
+              return { time: null, status: 'skipped' };
+            };
+
+            // Format duration based on job status
+            const formatJobDuration = (info) => {
+              if (info.status === 'skipped') return '-';
+              if (info.time === null) return '-';
+              return info.time;
+            };
+
+            // Set outputs for each component
+            const rust = findJobInfo('Rust •');
+            const python = findJobInfo('Python •');
+            const node = findJobInfo('Node •');
+            const go = findJobInfo('Go •');
+            const java = findJobInfo('Java •');
+            const csharp = findJobInfo('C# •');
+            const bdd = findJobInfo('BDD •');
+            const examples = findJobInfo('Examples •');
+            const other = findJobInfo('Other •');
+
+            // For non-matrix jobs, check by exact name
+            const common = jobStatuses['Common checks']
+              ? { time: jobTimes['Common checks'], status: jobStatuses['Common checks'] }
+              : { time: null, status: 'skipped' };
+            const detect = jobStatuses['Detect changes']
+              ? { time: jobTimes['Detect changes'], status: jobStatuses['Detect changes'] }
+              : { time: null, status: 'skipped' };
+
+            // Output formatted durations
+            core.setOutput('rust_time', formatJobDuration(rust));
+            core.setOutput('python_time', formatJobDuration(python));
+            core.setOutput('node_time', formatJobDuration(node));
+            core.setOutput('go_time', formatJobDuration(go));
+            core.setOutput('java_time', formatJobDuration(java));
+            core.setOutput('csharp_time', formatJobDuration(csharp));
+            core.setOutput('bdd_time', formatJobDuration(bdd));
+            core.setOutput('examples_time', formatJobDuration(examples));
+            core.setOutput('other_time', formatJobDuration(other));
+            core.setOutput('common_time', formatJobDuration(common));
+            core.setOutput('detect_time', formatJobDuration(detect));
+
+            // Calculate total time - find the earliest job start time
+            let earliestStart = null;
+            let latestEnd = null;
+            for (const job of jobs.data.jobs) {
+              if (job.started_at) {
+                const start = new Date(job.started_at);
+                if (!earliestStart || start < earliestStart) {
+                  earliestStart = start;
+                }
+              }
+              if (job.completed_at) {
+                const end = new Date(job.completed_at);
+                if (!latestEnd || end > latestEnd) {
+                  latestEnd = end;
+                }
+              }
+            }
+
+            if (earliestStart && latestEnd) {
+              const totalDuration = latestEnd - earliestStart;
+              core.setOutput('total_time', formatDuration(totalDuration));
+            } else if (earliestStart) {
+              const totalDuration = Date.now() - earliestStart;
+              core.setOutput('total_time', formatDuration(totalDuration) + ' (running)');
+            } else {
+              core.setOutput('total_time', '-');
+            }
+
+            return jobTimes;
+
+      - name: Check status
+        run: |
+          set -euxo pipefail
+          echo "## CI Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Helper function to format status with appropriate emoji
+          format_status() {
+            local status="$1"
+            local duration="$2"
+
+            case "$status" in
+              "success")
+                if [[ "$duration" == "-" ]]; then
+                  echo "✅ success"
+                else
+                  echo "✅ success"
+                fi
+                ;;
+              "failure")
+                echo "❌ failure"
+                ;;
+              "cancelled")
+                echo "🚫 cancelled"
+                ;;
+              "skipped")
+                echo "⏭️ skipped"
+                ;;
+              *)
+                echo "⏸️ $status"
+                ;;
+            esac
+          }
+
+          # Language test results with timing
+          echo "### Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Status | Duration |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|----------|" >> $GITHUB_STEP_SUMMARY
+
+          # Detection and Common checks always run
+          detect_status=$(format_status "${{ needs.detect.result }}" "${{ steps.times.outputs.detect_time }}")
+          common_status=$(format_status "${{ needs.common.result }}" "${{ steps.times.outputs.common_time }}")
+          echo "| 🔍 Detection | $detect_status | ${{ steps.times.outputs.detect_time }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📋 Common Checks | $common_status | ${{ steps.times.outputs.common_time }} |" >> $GITHUB_STEP_SUMMARY
+
+          # Language/component tests
+          rust_status=$(format_status "${{ needs.test-rust.result }}" "${{ steps.times.outputs.rust_time }}")
+          python_status=$(format_status "${{ needs.test-python.result }}" "${{ steps.times.outputs.python_time }}")
+          node_status=$(format_status "${{ needs.test-node.result }}" "${{ steps.times.outputs.node_time }}")
+          go_status=$(format_status "${{ needs.test-go.result }}" "${{ steps.times.outputs.go_time }}")
+          java_status=$(format_status "${{ needs.test-java.result }}" "${{ steps.times.outputs.java_time }}")
+          csharp_status=$(format_status "${{ needs.test-csharp.result }}" "${{ steps.times.outputs.csharp_time }}")
+          bdd_status=$(format_status "${{ needs.test-bdd.result }}" "${{ steps.times.outputs.bdd_time }}")
+          examples_status=$(format_status "${{ needs.test-examples.result }}" "${{ steps.times.outputs.examples_time }}")
+          other_status=$(format_status "${{ needs.test-other.result }}" "${{ steps.times.outputs.other_time }}")
+
+          echo "| 🦀 Rust | $rust_status | ${{ steps.times.outputs.rust_time }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🐍 Python | $python_status | ${{ steps.times.outputs.python_time }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🟢 Node | $node_status | ${{ steps.times.outputs.node_time }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🐹 Go | $go_status | ${{ steps.times.outputs.go_time }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ☕ Java | $java_status | ${{ steps.times.outputs.java_time }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔷 C# | $csharp_status | ${{ steps.times.outputs.csharp_time }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🧪 BDD | $bdd_status | ${{ steps.times.outputs.bdd_time }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📚 Examples | $examples_status | ${{ steps.times.outputs.examples_time }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📦 Other | $other_status | ${{ steps.times.outputs.other_time }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Total workflow time:** ${{ steps.times.outputs.total_time }}" >> $GITHUB_STEP_SUMMARY
+
+          # Check for failures
+          if [[ "${{ needs.common.result }}" == "failure" ]] || \
+             [[ "${{ needs.detect.result }}" == "failure" ]] || \
+             [[ "${{ needs.test-rust.result }}" == "failure" ]] || \
+             [[ "${{ needs.test-python.result }}" == "failure" ]] || \
+             [[ "${{ needs.test-node.result }}" == "failure" ]] || \
+             [[ "${{ needs.test-go.result }}" == "failure" ]] || \
+             [[ "${{ needs.test-java.result }}" == "failure" ]] || \
+             [[ "${{ needs.test-csharp.result }}" == "failure" ]] || \
+             [[ "${{ needs.test-bdd.result }}" == "failure" ]] || \
+             [[ "${{ needs.test-examples.result }}" == "failure" ]] || \
+             [[ "${{ needs.test-other.result }}" == "failure" ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "❌ **CI Failed** - Please check the logs for details." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          elif [[ "${{ needs.common.result }}" == "cancelled" ]] || \
+               [[ "${{ needs.detect.result }}" == "cancelled" ]] || \
+               [[ "${{ needs.test-rust.result }}" == "cancelled" ]] || \
+               [[ "${{ needs.test-python.result }}" == "cancelled" ]] || \
+               [[ "${{ needs.test-node.result }}" == "cancelled" ]] || \
+               [[ "${{ needs.test-go.result }}" == "cancelled" ]] || \
+               [[ "${{ needs.test-java.result }}" == "cancelled" ]] || \
+               [[ "${{ needs.test-csharp.result }}" == "cancelled" ]] || \
+               [[ "${{ needs.test-bdd.result }}" == "cancelled" ]] || \
+               [[ "${{ needs.test-examples.result }}" == "cancelled" ]] || \
+               [[ "${{ needs.test-other.result }}" == "cancelled" ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "⚠️ **CI Cancelled** - The workflow was cancelled." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **CI Passed** - All checks completed successfully!" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  finalize_pr:
+    runs-on: ubuntu-latest
+    needs:
+      - status
+    if: always()
+    steps:
+      - name: Everything is fine
+        if: ${{ !(contains(needs.*.result, 'failure')) }}
+        run: exit 0
+
+      - name: Some tests failed
+        if: ${{ contains(needs.*.result, 'failure') }}
+        run: exit 1

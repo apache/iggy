@@ -17,7 +17,7 @@
  */
 
 use clap::{Args, Subcommand};
-use iggy::prelude::Identifier;
+use iggy::prelude::{ConsumerKind, Identifier};
 
 #[derive(Debug, Clone, Subcommand)]
 pub(crate) enum ConsumerOffsetAction {
@@ -35,6 +35,8 @@ pub(crate) enum ConsumerOffsetAction {
     ///  iggy consumer-offset get consumer 3 topic 1
     ///  iggy consumer-offset get 1 stream topic 1
     ///  iggy consumer-offset get consumer stream topic 1
+    ///  iggy consumer-offset get cg-1 3000001 1 1 --kind consumer-group
+    ///  iggy consumer-offset get cg-1 3000001 1 1 -k consumer-group
     #[clap(verbatim_doc_comment, visible_alias = "g")]
     Get(ConsumerOffsetGetArgs),
     /// Set the offset of a consumer for a given partition on the server
@@ -58,7 +60,7 @@ pub(crate) enum ConsumerOffsetAction {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct ConsumerOffsetGetArgs {
-    /// Regular consumer for which the offset is retrieved
+    /// Consumer for which the offset is retrieved
     ///
     /// Consumer ID can be specified as a consumer name or ID
     #[clap(verbatim_doc_comment)]
@@ -77,11 +79,14 @@ pub(crate) struct ConsumerOffsetGetArgs {
     /// Partitions ID for which consumer offset is retrieved
     #[arg(value_parser = clap::value_parser!(u32).range(1..))]
     pub(crate) partition_id: u32,
+    /// Consumer kind: "consumer" for regular consumer, "consumer_group" for consumer group
+    #[arg(short = 'k', long = "kind", default_value = "consumer", value_enum)]
+    pub(crate) kind: ConsumerKind,
 }
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct ConsumerOffsetSetArgs {
-    /// Regular consumer for which the offset is set
+    /// Consumer for which the offset is set
     ///
     /// Consumer ID can be specified as a consumer name or ID
     #[clap(verbatim_doc_comment)]
@@ -102,4 +107,7 @@ pub(crate) struct ConsumerOffsetSetArgs {
     pub(crate) partition_id: u32,
     /// Offset to set
     pub(crate) offset: u64,
+    /// Consumer kind: "consumer" for regular consumer, "consumer_group" for consumer group
+    #[arg(short = 'k', long = "kind", default_value = "consumer", value_enum)]
+    pub(crate) kind: ConsumerKind,
 }

@@ -16,10 +16,10 @@
 # under the License.
 
 import asyncio
-from loguru import logger
 
 # Assuming there's a Python module for iggy with similar functionalities.
-from apache_iggy import IggyClient, ReceiveMessage, PollingStrategy
+from apache_iggy import IggyClient, PollingStrategy, ReceiveMessage
+from loguru import logger
 
 STREAM_NAME = "sample-stream"
 TOPIC_NAME = "sample-topic"
@@ -43,7 +43,8 @@ async def consume_messages(client: IggyClient):
     interval = 0.5  # 500 milliseconds in seconds for asyncio.sleep
     logger.info(
         f"Messages will be consumed from stream: {STREAM_NAME}, topic: {TOPIC_NAME}, partition: {PARTITION_ID} with "
-        f"interval {interval * 1000} ms.")
+        f"interval {interval * 1000} ms."
+    )
     offset = 0
     messages_per_batch = 10
     while True:
@@ -55,7 +56,7 @@ async def consume_messages(client: IggyClient):
                 partition_id=PARTITION_ID,
                 polling_strategy=PollingStrategy.Next(),
                 count=messages_per_batch,
-                auto_commit=True
+                auto_commit=True,
             )
             if not polled_messages:
                 logger.warning("No messages found in current poll")
@@ -72,8 +73,10 @@ async def consume_messages(client: IggyClient):
 
 
 def handle_message(message: ReceiveMessage):
-    payload = message.payload().decode('utf-8')
-    logger.info(f"Handling message at offset: {message.offset()} with payload: {payload}...")
+    payload = message.payload().decode("utf-8")
+    logger.info(
+        f"Handling message at offset: {message.offset()} with payload: {payload}..."
+    )
 
 
 if __name__ == "__main__":

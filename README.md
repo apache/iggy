@@ -99,7 +99,7 @@ We do also publish edge/dev/nightly releases (e.g. `0.5.0-edge.1` or `apache/igg
 ## Roadmap
 
 - **Shared-nothing** design and **io_uring** support (PoC on experimental branch, WiP on the main branch)
-- **Clustering** & data replication based on **[VSR](https://pmg.csail.mit.edu/papers/vr-revisited.pdf)** (on sandbox project using Raft, will be implemented after shared-nothing design is completed)
+- **Clustering** & data replication based on **[VSR](http://pmg.csail.mit.edu/papers/vr-revisited.pdf)** (on sandbox project using Raft, will be implemented after shared-nothing design is completed)
 
 ---
 
@@ -126,7 +126,7 @@ Iggy CLI can be installed with `cargo install iggy-cli` and then simply accessed
 
 ## Web UI
 
-There's a dedicated Web UI for the server, which allows managing the streams, topics, partitions, browsing the messages and so on. This is an ongoing effort to build a comprehensive dashboard for administrative purposes of the Iggy server. Check the Web UI in the `/web` directory. The [docker image for Web UI](https://hub.docker.com/r/iggyrs/iggy-web-ui) is available, and can be fetched via `docker pull iggyrs/iggy-web-ui`.
+There's a dedicated Web UI for the server, which allows managing the streams, topics, partitions, browsing the messages and so on. This is an ongoing effort to build a comprehensive dashboard for administrative purposes of the Iggy server. Check the Web UI in the `/web` directory. The [docker image for Web UI](https://hub.docker.com/r/apache/iggy-web-ui) is available, and can be fetched via `docker pull apache/iggy-web-ui`.
 
 ![Web UI](assets/web_ui.png)
 
@@ -175,7 +175,7 @@ The [Model Context Protocol](https://modelcontextprotocol.io) (MCP) is an open p
 
 The official Apache Iggy images can be found in [Docker Hub](https://hub.docker.com/r/apache/iggy), simply type `docker pull apache/iggy` to pull the image.
 
-You can also find the images for all the different tooling such as Connectors, MCP Server etc. [here](https://hub.docker.com/u/apache?page=1&search=iggy).
+You can also find the images for all the different tooling such as Connectors, MCP Server etc. at [Docker Hub](https://hub.docker.com/u/apache?page=1&search=iggy).
 
 Please note that the images tagged as `latest` are based on the official, stable releases, while the `edge` ones are updated directly from latest version of the `master` branch.
 

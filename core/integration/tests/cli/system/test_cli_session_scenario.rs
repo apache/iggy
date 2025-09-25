@@ -19,7 +19,8 @@
 use crate::cli::common::IggyCmdTest;
 use crate::cli::system::test_login_cmd::{TestLoginCmd, TestLoginCmdType};
 use crate::cli::system::test_logout_cmd::TestLogoutCmd;
-use crate::cli::system::test_me_command::{Protocol, Scenario, TestMeCmd};
+use crate::cli::system::test_me_command::{Scenario, TestMeCmd};
+use iggy_common::TransportProtocol;
 use serial_test::serial;
 
 #[tokio::test]
@@ -43,7 +44,7 @@ pub async fn should_be_successful() {
     // Command shall be executed without credentials and should be successful
     iggy_cmd_test
         .execute_test(TestMeCmd::new(
-            Protocol::Tcp,
+            TransportProtocol::Tcp,
             Scenario::SuccessWithoutCredentials,
         ))
         .await;
@@ -89,7 +90,7 @@ pub async fn should_be_successful() {
     // error message.
     iggy_cmd_test
         .execute_test(TestMeCmd::new(
-            Protocol::Tcp,
+            TransportProtocol::Tcp,
             Scenario::FailureDueToSessionTimeout(server_address),
         ))
         .await;

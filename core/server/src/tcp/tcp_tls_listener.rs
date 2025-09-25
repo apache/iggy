@@ -18,9 +18,9 @@
 
 use crate::binary::sender::SenderKind;
 use crate::configs::tcp::TcpTlsConfig;
-use crate::streaming::clients::client_manager::Transport;
 use crate::streaming::systems::system::SharedSystem;
 use crate::tcp::connection_handler::{handle_connection, handle_error};
+use iggy_common::TransportProtocol;
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls_pemfile::{certs, private_key};
@@ -93,7 +93,7 @@ pub(crate) async fn start(
                     let session = system
                         .read()
                         .await
-                        .add_client(&address, Transport::Tcp)
+                        .add_client(&address, TransportProtocol::Tcp)
                         .await;
 
                     let client_id = session.client_id;

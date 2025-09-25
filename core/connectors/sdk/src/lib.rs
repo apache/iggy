@@ -126,10 +126,11 @@ impl std::fmt::Display for Payload {
 
 #[repr(C)]
 #[derive(
-    Debug, Copy, Clone, Eq, Hash, PartialEq, Serialize, Deserialize, Display, IntoStaticStr,
+    Debug, Default, Copy, Clone, Eq, Hash, PartialEq, Serialize, Deserialize, Display, IntoStaticStr,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum Schema {
+    #[default]
     #[strum(to_string = "json")]
     Json,
     #[strum(to_string = "raw")]

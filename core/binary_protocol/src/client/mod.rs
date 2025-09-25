@@ -16,6 +16,7 @@
 // under the License.
 
 pub mod binary_clients;
+pub mod binary_cluster;
 pub mod binary_consumer_groups;
 pub mod binary_consumer_offsets;
 pub mod binary_messages;

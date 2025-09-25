@@ -219,6 +219,8 @@ func TranslateErrorCode(code int) string {
 		return "partition_not_found"
 	case 3008:
 		return "no_partitions"
+	case 3021:
+		return "consumer_offset_not_found"
 	case 4000:
 		return "segment_not_found"
 	case 4001:

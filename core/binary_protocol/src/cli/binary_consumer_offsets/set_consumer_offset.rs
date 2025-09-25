@@ -36,11 +36,12 @@ impl SetConsumerOffsetCmd {
         topic_id: Identifier,
         partition_id: u32,
         offset: u64,
+        kind: ConsumerKind,
     ) -> Self {
         Self {
             set_consumer_offset: StoreConsumerOffset {
                 consumer: Consumer {
-                    kind: ConsumerKind::Consumer,
+                    kind,
                     id: consumer_id,
                 },
                 stream_id,

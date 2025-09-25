@@ -1,0 +1,96 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Post-merge
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+concurrency:
+  group: post-merge-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IGGY_CI_BUILD: true
+
+jobs:
+  plan:
+    name: Plan dockerhub components
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load publish config (base64)
+        id: cfg
+        shell: bash
+        run: |
+          if ! command -v yq >/dev/null 2>&1; then
+            YQ_VERSION="v4.47.1"
+            YQ_CHECKSUM="0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb"
+            curl -sSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64
+            echo "${YQ_CHECKSUM}  /usr/local/bin/yq" | sha256sum -c - || exit 1
+            chmod +x /usr/local/bin/yq
+          fi
+          echo "components_b64=$(yq -o=json -I=0 '.components' .github/config/publish.yml | base64 -w0)" >> "$GITHUB_OUTPUT"
+
+      - name: Build matrix
+        id: mk
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const b64 = `${{ steps.cfg.outputs.components_b64 }}` || '';
+            if (!b64) {
+              core.setOutput('matrix', JSON.stringify({ include: [{ component: 'noop' }] }));
+              return;
+            }
+            const comps = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
+            const include = Object.entries(comps)
+              .filter(([_, v]) => v && v.registry === 'dockerhub')
+              .map(([k]) => ({ component: k }));
+            const uniq = Array.from(new Map(include.map(i => [i.component, i])).values());
+            core.setOutput('matrix', JSON.stringify(uniq.length ? { include: uniq } : { include: [{ component: 'noop' }] }));
+
+  docker-edge:
+    name: ${{ matrix.component }}
+    needs: plan
+    if: ${{ fromJson(needs.plan.outputs.matrix).include[0].component != 'noop' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    env:
+      DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+      DOCKERHUB_TOKEN:    ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/utils/docker-buildx
+        with:
+          task: publish
+          libc: musl
+          component: ${{ matrix.component }}
+          version: edge
+          dry_run: ${{ github.event.repository.fork }}  # forks: always dry-run

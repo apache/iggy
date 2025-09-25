@@ -48,3 +48,14 @@ func (tms *IggyTcpClient) StoreConsumerOffset(consumer iggcon.Consumer, streamId
 	_, err := tms.sendAndFetchResponse(message, iggcon.StoreOffsetCode)
 	return err
 }
+
+func (tms *IggyTcpClient) DeleteConsumerOffset(consumer iggcon.Consumer, streamId iggcon.Identifier, topicId iggcon.Identifier, partitionId *uint32) error {
+	message := binaryserialization.DeleteOffset(iggcon.DeleteConsumerOffsetRequest{
+		Consumer:    consumer,
+		StreamId:    streamId,
+		TopicId:     topicId,
+		PartitionId: partitionId,
+	})
+	_, err := tms.sendAndFetchResponse(message, iggcon.DeleteConsumerOffsetCode)
+	return err
+}
