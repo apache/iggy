@@ -4925,6 +4925,7 @@ dependencies = [
  "parquet",
  "serde",
  "simd-json",
+ "strum 0.27.2",
  "tracing",
  "uuid",
 ]

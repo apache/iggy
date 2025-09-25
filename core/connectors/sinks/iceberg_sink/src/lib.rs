@@ -16,62 +16,31 @@
  * under the License.
  */
 
-use core::fmt;
-use std::collections::HashMap;
-
-use async_trait::async_trait;
-
-use iceberg::Catalog;
-use iceberg_catalog_glue::{GlueCatalog, GlueCatalogConfig};
-use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
-use iggy_connector_sdk::{
-    ConsumedMessage, Error, MessagesMetadata, Sink, TopicMetadata, sink_connector,
-};
+use crate::router::Router;
+use iggy_connector_sdk::{Error, sink_connector};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use strum::Display as StrumDisplay;
 
-use crate::router::{DynamicRouter, Router, StaticRouter};
-
+mod catalog;
+mod props;
 mod router;
+mod sink;
 
-#[derive(Debug, Serialize, Deserialize)]
-#[allow(non_camel_case_types)]
+#[derive(Debug, Serialize, Deserialize, StrumDisplay)]
+#[serde(rename_all = "lowercase")]
 pub enum IcebergSinkTypes {
-    rest,
-    glue,
+    REST,
+    GLUE,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[allow(non_camel_case_types)]
+#[derive(Debug, Serialize, Deserialize, StrumDisplay)]
+#[serde(rename_all = "lowercase")]
 pub enum IcebergSinkStoreClass {
-    s3,
-    fs,
-    gcs,
-    azdls,
-    oss,
-}
-
-impl fmt::Display for IcebergSinkStoreClass {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            IcebergSinkStoreClass::s3 => "s3",
-            IcebergSinkStoreClass::fs => "fs",
-            IcebergSinkStoreClass::gcs => "gcs",
-            IcebergSinkStoreClass::oss => "oss",
-            IcebergSinkStoreClass::azdls => "azdls",
-        };
-        write!(f, "{}", s)
-    }
-}
-
-impl fmt::Display for IcebergSinkTypes {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            IcebergSinkTypes::rest => "rest",
-            IcebergSinkTypes::glue => "glue",
-        };
-        write!(f, "{}", s)
-    }
+    S3,
+    FS,
+    GCS,
+    AZDLS,
+    OSS,
 }
 
 sink_connector!(IcebergSink);
@@ -80,7 +49,6 @@ sink_connector!(IcebergSink);
 pub struct IcebergSink {
     id: u32,
     config: IcebergSinkConfig,
-    props: HashMap<String, String>,
     router: Option<Box<dyn Router>>,
 }
 
@@ -104,134 +72,9 @@ fn slice_user_table(table: &str) -> Vec<String> {
 }
 
 impl IcebergSink {
-    #[inline(always)]
-    fn get_props_s3(&self) -> Result<HashMap<String, String>, Error> {
-        let mut props: HashMap<String, String> = HashMap::new();
-        props.insert("s3.region".to_string(), self.config.store_region.clone());
-        props.insert(
-            "s3.access-key-id".to_string(),
-            self.config.store_access_key_id.clone(),
-        );
-        props.insert(
-            "s3.secret-access-key".to_string(),
-            self.config.store_secret_access_key.clone(),
-        );
-        props.insert("s3.endpoint".to_string(), self.config.store_url.clone());
-        Ok(props)
-    }
-
     pub fn new(id: u32, config: IcebergSinkConfig) -> Self {
-        let props = HashMap::new();
         let router = None;
 
-        IcebergSink {
-            id,
-            config,
-            router,
-            props,
-        }
-    }
-
-    #[inline(always)]
-    fn get_rest_catalog(&self) -> RestCatalog {
-        let catalog_config = RestCatalogConfig::builder()
-            .uri(self.config.uri.clone())
-            .props(self.props.clone())
-            .warehouse(self.config.warehouse.clone())
-            .build();
-
-        RestCatalog::new(catalog_config)
-    }
-
-    #[inline(always)]
-    async fn get_glue_catalog(&self) -> Result<GlueCatalog, Error> {
-        let config = GlueCatalogConfig::builder()
-            .props(self.props.clone())
-            .warehouse(self.config.warehouse.clone())
-            .build();
-
-        GlueCatalog::new(config).await.map_err(|err| {
-            error!("Failed to get glue catalog with error: {}. Make sure the catalog is correctly declared on the config file", err);
-            Error::InitError(err.to_string())
-        })
-    }
-}
-
-#[async_trait]
-impl Sink for IcebergSink {
-    async fn open(&mut self) -> Result<(), Error> {
-        info!(
-            "Opened Iceberg sink connector with ID: {} for URL: {}",
-            self.id, self.config.uri
-        );
-
-        info!(
-            "Configuring Iceberg catalog with the following config:\n-region: {}\n-url: {}\n-store class: {}\n-catalog type: {}\n",
-            self.config.store_region,
-            self.config.store_url,
-            self.config.store_class,
-            self.config.catalog_type
-        );
-
-        // Insert adequate props for initializing file IO, else fail to open
-        self.props = match self.config.store_class {
-            IcebergSinkStoreClass::s3 => self.get_props_s3()?,
-            _ => {
-                error!(
-                    "Store class {} is not supported yet",
-                    self.config.store_class
-                );
-                return Err(Error::InvalidConfig);
-            }
-        };
-
-        let catalog: Box<dyn Catalog> = match self.config.catalog_type {
-            IcebergSinkTypes::rest => Box::new(self.get_rest_catalog()),
-            IcebergSinkTypes::glue => Box::new(self.get_glue_catalog().await?),
-        };
-
-        if self.config.dynamic_routing {
-            self.router = Some(Box::new(DynamicRouter::new(
-                catalog,
-                self.config.dynamic_route_field.clone(),
-            )))
-        } else {
-            self.router = Some(Box::new(
-                StaticRouter::new(catalog, &self.config.tables).await?,
-            ));
-        }
-
-        Ok(())
-    }
-
-    async fn consume(
-        &self,
-        _topic_metadata: &TopicMetadata,
-        messages_metadata: MessagesMetadata,
-        messages: Vec<ConsumedMessage>,
-    ) -> Result<(), Error> {
-        info!(
-            "Iceberg sink with ID: {} received: {} messages, format: {}",
-            self.id,
-            messages.len(),
-            messages_metadata.schema
-        );
-
-        match &self.router {
-            Some(router) => router.route_data(messages_metadata, messages).await?,
-            None => {
-                error!("Iceberg connector has no router configured");
-                return Err(Error::InvalidConfig);
-            }
-        };
-
-        info!("Finished successfully");
-
-        Ok(())
-    }
-
-    async fn close(&mut self) -> Result<(), Error> {
-        info!("Iceberg sink connector with ID: {} is closed.", self.id);
-        Ok(())
+        IcebergSink { id, config, router }
     }
 }
