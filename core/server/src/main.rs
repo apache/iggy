@@ -278,8 +278,11 @@ async fn main() -> Result<(), ServerError> {
         }
     });
 
-    for shard_id in shards_set {
-        let id = shard_id as u16;
+    for (id, cpu_id) in shards_set
+        .into_iter()
+        .enumerate()
+        .map(|(id, shard_id)| (id as u16, shard_id))
+    {
         let streams = streams.clone();
         let shards_table = shards_table.clone();
         let users = users.clone();
@@ -322,7 +325,7 @@ async fn main() -> Result<(), ServerError> {
         let handle = std::thread::Builder::new()
             .name(format!("shard-{id}"))
             .spawn(move || {
-                let affinity_set = HashSet::from([shard_id]);
+                let affinity_set = HashSet::from([cpu_id]);
                 let rt = create_shard_executor(affinity_set);
                 rt.block_on(async move {
                     let builder = IggyShard::builder();
