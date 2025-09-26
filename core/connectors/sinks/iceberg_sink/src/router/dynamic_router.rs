@@ -16,17 +16,14 @@
  * under the License.
  */
 
-use crate::router::{Router, write_data};
-use crate::slice_user_table;
+use crate::router::{Router, is_valid_namespaced_table, table_exists, write_data};
 use async_trait::async_trait;
 use iceberg::Catalog;
-use iceberg::TableIdent;
 use iceberg::table::Table;
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload};
 use simd_json::base::ValueAsObject;
 use std::collections::HashMap;
-use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 #[derive(Debug)]
 pub struct DynamicRouter {
@@ -36,7 +33,7 @@ pub struct DynamicRouter {
 
 pub struct DynamicWriter {
     pub tables_to_write: HashMap<String, Table>,
-    pub table_to_message: HashMap<String, Vec<Arc<ConsumedMessage>>>,
+    pub table_to_message: HashMap<String, Vec<ConsumedMessage>>,
 }
 
 impl DynamicWriter {
@@ -49,51 +46,32 @@ impl DynamicWriter {
         }
     }
 
-    fn push_to_existing(&mut self, route_field_val: &str, message: &Arc<ConsumedMessage>) -> bool {
+    fn push_to_existing(
+        &mut self,
+        route_field_val: &str,
+        message: ConsumedMessage,
+    ) -> Option<ConsumedMessage> {
         if let Some(message_vec) = self.table_to_message.get_mut(route_field_val) {
-            message_vec.push(Arc::clone(message));
-            true
+            message_vec.push(message);
+            None
         } else {
-            false
+            Some(message)
         }
     }
 
-    // This will:
-    // - Check if the table declared on the route field exists in the iceberg catalog.
-    // - If it does, it will try to load it to memory and map the name with the Table object so
-    // that we can dynamically send messages to it's correct destination.
-    async fn ensure_table_exists(
+    async fn load_table_if_exists(
         &mut self,
         route_field_val: &str,
         catalog: &dyn Catalog,
-    ) -> Result<bool, Error> {
-        let sliced_table = slice_user_table(route_field_val);
-        let table_ident = &TableIdent::from_strs(&sliced_table).map_err(|err| {
-            error!("Failed to load table from catalog: {}. ", err);
-            Error::InitError(err.to_string())
-        })?;
-
-        if !catalog.table_exists(table_ident).await.map_err(|err| {
-            error!("Failed to load table from catalog: {}. ", err);
-            Error::InitError(err.to_string())
-        })? {
-            return Ok(false);
-        }
-
-        let table_ident = TableIdent::from_strs(&sliced_table).map_err(|err| {
-            error!("Failed to load table from catalog: {}.", err);
-            Error::InitError(err.to_string())
-        })?;
-
-        let table = catalog.load_table(&table_ident).await.map_err(|err| {
-            error!("Failed to load table from catalog: {}", err);
-            Error::InitError(err.to_string())
-        })?;
+    ) -> Result<(), Error> {
+        let table = table_exists(route_field_val, catalog)
+            .await
+            .ok_or(Error::InvalidState)?;
 
         self.tables_to_write
             .insert(route_field_val.to_string(), table);
 
-        Ok(true)
+        Ok(())
     }
 }
 
@@ -128,26 +106,35 @@ impl Router for DynamicRouter {
     ) -> Result<(), crate::Error> {
         let mut writer = DynamicWriter::new();
         for message in messages {
-            let message = Arc::new(message);
             let route_field_val = match self.extract_route_field(&message) {
                 Some(val) => val,
                 None => continue,
             };
 
-            if writer.push_to_existing(&route_field_val, &message) {
+            let message = match writer.push_to_existing(&route_field_val, message) {
+                Some(msg) => msg,
+                None => continue,
+            };
+
+            if !is_valid_namespaced_table(&route_field_val) {
+                warn!(
+                    "Found invalid route field name on message: {}. Route fields should have at least 1 namespace separated by '.' character before the table",
+                    route_field_val
+                );
                 continue;
             }
 
             let route_field_val_cloned = route_field_val.clone();
 
             if writer
-                .ensure_table_exists(&route_field_val_cloned, self.catalog.as_ref())
-                .await?
+                .load_table_if_exists(&route_field_val_cloned, self.catalog.as_ref())
+                .await
+                .is_ok()
             {
                 if let Some(msgs) = writer.table_to_message.get_mut(&route_field_val_cloned) {
                     msgs.push(message);
                 } else {
-                    let message_vec: Vec<Arc<ConsumedMessage>> = vec![message];
+                    let message_vec: Vec<ConsumedMessage> = vec![message];
                     writer
                         .table_to_message
                         .insert(route_field_val_cloned, message_vec);
@@ -156,12 +143,15 @@ impl Router for DynamicRouter {
         }
 
         for (table_name, table_obj) in &writer.tables_to_write {
-            let batch_messages = match writer.table_to_message.get(table_name) {
+            let batch_messages = match writer.table_to_message.remove(table_name) {
                 Some(m) => m,
                 None => continue,
             };
+
+            let data: Vec<Payload> = batch_messages.into_iter().map(|m| m.payload).collect();
+
             write_data(
-                batch_messages.iter().map(Arc::clone),
+                &data,
                 table_obj,
                 self.catalog.as_ref(),
                 messages_metadata.schema,
@@ -169,7 +159,7 @@ impl Router for DynamicRouter {
             .await?;
             info!(
                 "Dynamically routed {} messages to {} iceberg table",
-                batch_messages.len(),
+                data.len(),
                 table_name
             );
         }

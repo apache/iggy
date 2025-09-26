@@ -16,8 +16,11 @@
  * under the License.
  */
 
+use crate::router::arrow_streamer::JsonArrowReader;
+use crate::slice_user_table;
 use arrow_json::ReaderBuilder;
 use async_trait::async_trait;
+use iceberg::TableIdent;
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::spec::{Literal, PrimitiveLiteral, PrimitiveType, Struct, StructType};
 use iceberg::table::Table;
@@ -31,13 +34,25 @@ use iceberg::{
 };
 use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload, Schema};
 use parquet::file::properties::WriterProperties;
-use std::io::Cursor;
 use std::sync::Arc;
 use tracing::{error, warn};
 use uuid::Uuid;
 
+mod arrow_streamer;
 pub mod dynamic_router;
 pub mod static_router;
+
+pub fn is_valid_namespaced_table(input: &str) -> bool {
+    let parts: Vec<&str> = input.split('.').collect();
+    parts.len() >= 2 && parts.iter().all(|part| !part.is_empty())
+}
+
+async fn table_exists(route_field_val: &str, catalog: &dyn Catalog) -> Option<Table> {
+    let sliced_table = slice_user_table(route_field_val);
+    let table_ident = TableIdent::from_strs(&sliced_table).ok()?;
+
+    catalog.load_table(&table_ident).await.ok()
+}
 
 pub fn primitive_type_to_literal(pt: &PrimitiveType) -> Result<PrimitiveLiteral, Error> {
     match pt {
@@ -82,16 +97,12 @@ fn get_partition_type_value(default_partition_type: &StructType) -> Result<Optio
     Ok(Some(Struct::from_iter(fields)))
 }
 
-async fn write_data<I, M>(
-    messages: I,
+async fn write_data(
+    messages: &[Payload],
     table: &Table,
     catalog: &dyn Catalog,
     messages_schema: Schema,
-) -> Result<(), Error>
-where
-    I: IntoIterator<Item = M>,
-    M: std::ops::Deref<Target = ConsumedMessage>,
-{
+) -> Result<(), Error> {
     let location = DefaultLocationGenerator::new(table.metadata().clone()).map_err(|err| {
         error!(
             "Failed to get location on table: {}. Error: {}",
@@ -126,28 +137,21 @@ where
         Error::InitError(err.to_string())
     })?;
 
-    let json_messages = messages
-        .into_iter()
-        .filter_map(|record| match &record.payload {
-            Payload::Json(record) => simd_json::to_string(&record).ok(),
+    let msgs: Vec<&simd_json::OwnedValue> = messages
+        .iter()
+        .filter_map(|payload| match payload {
+            Payload::Json(value) => Some(value),
             _ => {
-                warn!("Unsupported payload format: {}", messages_schema);
+                warn!(
+                    "Unsupported type of payload, expected JSON, got {}",
+                    messages_schema.to_string()
+                );
                 None
             }
         })
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect();
 
-    if json_messages.is_empty() {
-        error!(
-            "Could not serialize payload, expected JSON format, got {} instead",
-            messages_schema
-        );
-        return Err(Error::InvalidPayloadType);
-    }
-
-    let cursor = Cursor::new(json_messages);
-
+    let cursor = JsonArrowReader::new(msgs.as_slice());
     let reader = ReaderBuilder::new(Arc::new(
         schema_to_arrow_schema(&table.metadata().current_schema().clone()).map_err(|err| {
             error!(

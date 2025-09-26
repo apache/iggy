@@ -16,14 +16,12 @@
  * under the License.
  */
 
-use crate::router::{Router, write_data};
-use crate::slice_user_table;
+use crate::router::{Router, is_valid_namespaced_table, table_exists, write_data};
 use async_trait::async_trait;
 use iceberg::Catalog;
-use iceberg::TableIdent;
 use iceberg::table::Table;
-use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata};
-use tracing::{error, info};
+use iggy_connector_sdk::{ConsumedMessage, Error, MessagesMetadata, Payload};
+use tracing::{error, info, warn};
 
 #[derive(Debug)]
 pub(crate) struct StaticRouter {
@@ -37,34 +35,36 @@ impl StaticRouter {
         declared_tables: &Vec<String>,
     ) -> Result<Self, Error> {
         let mut tables: Vec<Table> = Vec::with_capacity(declared_tables.len());
-        let mut tables_found = 0;
         for declared_table in declared_tables {
-            let sliced_table = slice_user_table(declared_table);
-            let table_ident = &TableIdent::from_strs(sliced_table.clone()).map_err(|err| {
-                error!("Failed to load table from catalog: {}. ", err);
-                Error::InitError(err.to_string())
-            })?;
-            let exists = catalog.table_exists(table_ident).await.map_err(|err| {
-                error!("Failed to load table from catalog: {}", err);
-                Error::InitError(err.to_string())
-            })?;
-
-            if !exists {
+            if !is_valid_namespaced_table(declared_table) {
+                error!(
+                    "Declared table {} is not valid. It has to include at least one namespace before the table name separated by '.' character",
+                    declared_table
+                );
                 continue;
-            };
+            }
 
-            tables_found += 1;
-            let table = catalog.load_table(table_ident).await.map_err(|err| {
-                error!("Failed to load table from catalog: {}", err);
-                Error::InitError(err.to_string())
-            })?;
+            let table = match table_exists(declared_table, catalog.as_ref()).await {
+                Some(table) => table,
+                None => {
+                    warn!(
+                        "Declared table {} doesn't exist in the configured catalog. Skipping...",
+                        declared_table
+                    );
+                    continue;
+                }
+            };
             tables.push(table);
         }
         info!(
             "Static router found {} tables on iceberg catalog from {} tables declared",
-            tables_found,
+            tables.len(),
             declared_tables.len()
         );
+        if tables.is_empty() {
+            error!("No valid tables found. Can't initiate Iceberg connector");
+            return Err(Error::InvalidConfig);
+        }
         Ok(StaticRouter { tables, catalog })
     }
 }
@@ -76,9 +76,14 @@ impl Router for StaticRouter {
         messages_metadata: MessagesMetadata,
         messages: Vec<ConsumedMessage>,
     ) -> Result<(), crate::Error> {
+        let data: Vec<Payload> = messages
+            .into_iter()
+            .map(|m: ConsumedMessage| m.payload)
+            .collect();
+
         for table in &self.tables {
             write_data(
-                &messages,
+                &data,
                 table,
                 self.catalog.as_ref(),
                 messages_metadata.schema,
@@ -86,7 +91,7 @@ impl Router for StaticRouter {
             .await?;
             info!(
                 "Routed {} messages to iceberg table {} successfully",
-                messages.len(),
+                data.len(),
                 table.identifier().name()
             );
         }
