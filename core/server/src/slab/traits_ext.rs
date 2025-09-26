@@ -158,7 +158,7 @@ type MappingByIdMut<'a, E, T> =
 pub type Components<T> = <T as IntoComponents>::Components;
 pub type ComponentsById<'a, T> = <T as IntoComponentsById>::Output;
 
-// TODO: 
+// TODO:
 // I've figured there is actually and ergonomic improvement that can be made here.
 // Observe that the chain of constraints put on the `EntityRef` type is actually wrong.
 // We constraint the `EntityRef` to be IntoComponents + IntoComponentsById,
@@ -173,7 +173,7 @@ pub type ComponentsById<'a, T> = <T as IntoComponentsById>::Output;
 
 // Maybe lets not go this way with the tuple mapping madness, it already is pretty difficult to distinguish between all of the different components,
 // and everytime we add a new component to an entity, we need to update the tuple type everywhere.
-// Better idea would be to use the `EntityRef` type directly inside of the `with_components_by_id` closure 
+// Better idea would be to use the `EntityRef` type directly inside of the `with_components_by_id` closure
 // -- f(components.into_components_by_id(id)) -> components.into_components_by_id(id) would return `EntityRef`, rather than the tuple.
 pub trait EntityComponentSystem<T>
 where

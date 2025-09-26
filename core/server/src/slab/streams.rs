@@ -112,8 +112,21 @@ impl DeleteCell for Streams {
     type Idx = ContainerId;
     type Item = stream2::Stream;
 
-    fn delete(&self, _id: Self::Idx) -> Self::Item {
-        todo!()
+    fn delete(&self, id: Self::Idx) -> Self::Item {
+        let mut root_container = self.root.borrow_mut();
+        let mut indexes = self.index.borrow_mut();
+        let mut stats_container = self.stats.borrow_mut();
+
+        let root = root_container.remove(id);
+        let stats = stats_container.remove(id);
+
+        // Remove from index
+        let key = root.key();
+        indexes
+            .remove(key)
+            .expect("stream_delete: key not found in index");
+
+        stream2::Stream::new_with_components(root, stats)
     }
 }
 
@@ -718,7 +731,8 @@ impl Streams {
         });
         let (log_writer, index_writer) =
             self.with_partition_by_id_mut(stream_id, topic_id, partition_id, |(.., log)| {
-                log.active_storage_mut().shutdown()
+                let (msg, index) = log.active_storage_mut().shutdown();
+                (msg.unwrap(), index.unwrap())
             });
 
         compio::runtime::spawn(async move {

@@ -167,6 +167,16 @@ pub fn map_streams(roots: &Slab<stream2::StreamRoot>, stats: &Slab<Arc<StreamSta
 pub fn map_stream(root: &stream2::StreamRoot, stats: &StreamStats) -> Bytes {
     let mut bytes = BytesMut::new();
     extend_stream(root, stats, &mut bytes);
+    root.topics().with_components(|topics| {
+        let (roots, _, stats, ..) = topics.into_components();
+        for (root, stat) in roots
+            .iter()
+            .map(|(_, val)| val)
+            .zip(stats.iter().map(|(_, val)| val))
+        {
+            extend_topic(&root, &stat, &mut bytes);
+        }
+    });
     bytes.freeze()
 }
 

@@ -51,7 +51,7 @@ impl ServerCommandHandler for GetTopic {
             session.get_user_id(),
             numeric_stream_id as u32,
             self.topic_id.get_u32_value().unwrap_or(0),
-        );
+        )?;
 
         shard
             .streams2

@@ -52,6 +52,35 @@ impl ServerCommandHandler for DeleteConsumerGroup {
             )
         })?;
         let cg_id = cg.id();
+
+        // Remove all consumer group members from ClientManager using helper functions to resolve identifiers
+        let stream_id_usize = shard.streams2.with_stream_by_id(
+            &self.stream_id,
+            crate::streaming::streams::helpers::get_stream_id(),
+        );
+        let topic_id_usize = shard.streams2.with_topic_by_id(
+            &self.stream_id,
+            &self.topic_id,
+            crate::streaming::topics::helpers::get_topic_id(),
+        );
+
+        // Get members from the deleted consumer group and make them leave
+        let slab = cg.members().inner().shared_get();
+        for (_, member) in slab.iter() {
+            if let Err(err) = shard.client_manager.borrow_mut().leave_consumer_group(
+                member.client_id,
+                stream_id_usize,
+                topic_id_usize,
+                cg_id,
+            ) {
+                tracing::warn!(
+                    "{COMPONENT} (error: {err}) - failed to make client leave consumer group for client ID: {}, group ID: {}",
+                    member.client_id,
+                    cg_id
+                );
+            }
+        }
+
         let event = ShardEvent::DeletedConsumerGroup2 {
             id: cg_id,
             stream_id: self.stream_id.clone(),

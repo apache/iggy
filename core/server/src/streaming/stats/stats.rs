@@ -50,6 +50,24 @@ impl StreamStats {
     pub fn segments_count_inconsistent(&self) -> u32 {
         self.segments_count.load(Ordering::Relaxed)
     }
+
+    pub fn zero_out_size_bytes(&self) {
+        self.size_bytes.store(0, Ordering::Relaxed);
+    }
+
+    pub fn zero_out_messages_count(&self) {
+        self.messages_count.store(0, Ordering::Relaxed);
+    }
+
+    pub fn zero_out_segments_count(&self) {
+        self.segments_count.store(0, Ordering::Relaxed);
+    }
+
+    pub fn zero_out_all(&self) {
+        self.zero_out_size_bytes();
+        self.zero_out_messages_count();
+        self.zero_out_segments_count();
+    }
 }
 
 #[derive(Default, Debug)]
@@ -143,6 +161,43 @@ impl TopicStats {
     pub fn segments_count_inconsistent(&self) -> u32 {
         self.segments_count.load(Ordering::Relaxed)
     }
+
+    pub fn zero_out_parent_size_bytes(&self) {
+        self.parent.zero_out_size_bytes();
+    }
+
+    pub fn zero_out_parent_messages_count(&self) {
+        self.parent.zero_out_messages_count();
+    }
+
+    pub fn zero_out_parent_segments_count(&self) {
+        self.parent.zero_out_segments_count();
+    }
+
+    pub fn zero_out_parent_all(&self) {
+        self.parent.zero_out_all();
+    }
+
+    pub fn zero_out_size_bytes(&self) {
+        self.size_bytes.store(0, Ordering::Relaxed);
+        self.zero_out_parent_size_bytes();
+    }
+
+    pub fn zero_out_messages_count(&self) {
+        self.messages_count.store(0, Ordering::Relaxed);
+        self.zero_out_parent_messages_count();
+    }
+
+    pub fn zero_out_segments_count(&self) {
+        self.segments_count.store(0, Ordering::Relaxed);
+        self.zero_out_parent_segments_count();
+    }
+
+    pub fn zero_out_all(&self) {
+        self.zero_out_size_bytes();
+        self.zero_out_messages_count();
+        self.zero_out_segments_count();
+    }
 }
 
 #[derive(Default, Debug)]
@@ -235,5 +290,42 @@ impl PartitionStats {
 
     pub fn segments_count_inconsistent(&self) -> u32 {
         self.segments_count.load(Ordering::Relaxed)
+    }
+
+    pub fn zero_out_parent_size_bytes(&self) {
+        self.parent.zero_out_size_bytes();
+    }
+
+    pub fn zero_out_parent_messages_count(&self) {
+        self.parent.zero_out_messages_count();
+    }
+
+    pub fn zero_out_parent_segments_count(&self) {
+        self.parent.zero_out_segments_count();
+    }
+
+    pub fn zero_out_parent_all(&self) {
+        self.parent.zero_out_all();
+    }
+
+    pub fn zero_out_size_bytes(&self) {
+        self.size_bytes.store(0, Ordering::Relaxed);
+        self.zero_out_parent_size_bytes();
+    }
+
+    pub fn zero_out_messages_count(&self) {
+        self.messages_count.store(0, Ordering::Relaxed);
+        self.zero_out_parent_messages_count();
+    }
+
+    pub fn zero_out_segments_count(&self) {
+        self.segments_count.store(0, Ordering::Relaxed);
+        self.zero_out_parent_segments_count();
+    }
+
+    pub fn zero_out_all(&self) {
+        self.zero_out_size_bytes();
+        self.zero_out_messages_count();
+        self.zero_out_segments_count();
     }
 }

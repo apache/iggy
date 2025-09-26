@@ -1,10 +1,8 @@
 use iggy_common::IggyError;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
-use tracing::warn;
 
 use crate::configs::system::SystemConfig;
-use crate::shard_warn;
 use crate::streaming::segments::{
     indexes::{IndexReader, IndexWriter},
     messages::{MessagesReader, MessagesWriter},
@@ -51,9 +49,9 @@ impl Storage {
         })
     }
 
-    pub fn shutdown(&mut self) -> (MessagesWriter, IndexWriter) {
-        let messages_writer = self.messages_writer.take().unwrap();
-        let index_writer = self.index_writer.take().unwrap();
+    pub fn shutdown(&mut self) -> (Option<MessagesWriter>, Option<IndexWriter>) {
+        let messages_writer = self.messages_writer.take();
+        let index_writer = self.index_writer.take();
         (messages_writer, index_writer)
     }
 }

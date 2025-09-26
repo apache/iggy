@@ -89,6 +89,17 @@ impl Topic {
             stats,
         }
     }
+    pub fn new_with_components(
+        root: TopicRoot,
+        auxilary: TopicAuxilary,
+        stats: Arc<TopicStats>,
+    ) -> Self {
+        Self {
+            root,
+            auxilary,
+            stats,
+        }
+    }
 
     pub fn root(&self) -> &TopicRoot {
         &self.root

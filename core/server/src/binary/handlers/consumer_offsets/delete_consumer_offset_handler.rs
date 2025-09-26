@@ -55,13 +55,13 @@ impl ServerCommandHandler for DeleteConsumerOffset {
             .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to delete consumer offset for topic with ID: {} in stream with ID: {} partition ID: {:#?}, session: {}",
                 self.topic_id, self.stream_id, self.partition_id, session
             ))?;
+        // TODO: Get rid of this event.
         let event = ShardEvent::DeletedOffset {
             stream_id: self.stream_id,
             topic_id: self.topic_id,
             partition_id,
             polling_consumer,
         };
-        let _responses = shard.broadcast_event_to_all_shards(event).await;
         sender.send_empty_ok_response().await?;
         Ok(())
     }

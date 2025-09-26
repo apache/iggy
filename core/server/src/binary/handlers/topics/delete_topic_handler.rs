@@ -65,13 +65,13 @@ impl ServerCommandHandler for DeleteTopic {
             topic_id,
             stream_id
         );
+
         let event = ShardEvent::DeletedTopic2 {
             id: topic_id,
             stream_id: self.stream_id.clone(),
             topic_id: self.topic_id.clone(),
         };
         let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
-        // TODO: Remove all the files and directories.
 
         shard
             .state

@@ -26,8 +26,8 @@ use crate::streaming::session::Session;
 use crate::streaming::topics;
 use anyhow::Result;
 use error_set::ErrContext;
-use iggy_common::IggyError;
 use iggy_common::update_topic::UpdateTopic;
+use iggy_common::{Identifier, IggyError};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -45,6 +45,7 @@ impl ServerCommandHandler for UpdateTopic {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
+        let name_changed = !self.name.is_empty();
         shard.update_topic2(
             session,
             &self.stream_id,
@@ -54,15 +55,21 @@ impl ServerCommandHandler for UpdateTopic {
             self.compression_algorithm,
             self.max_topic_size,
             self.replication_factor,
-        );
+        )?;
+        // TODO: Tech debt.
+        let topic_id = if name_changed {
+            Identifier::named(&self.name.clone()).unwrap()
+        } else {
+            self.topic_id.clone()
+        };
         self.message_expiry = shard.streams2.with_topic_by_id(
             &self.stream_id,
-            &self.topic_id,
+            &topic_id,
             topics::helpers::get_message_expiry(),
         );
         self.max_topic_size = shard.streams2.with_topic_by_id(
             &self.stream_id,
-            &self.topic_id,
+            &topic_id,
             topics::helpers::get_max_topic_size(),
         );
         let event = ShardEvent::UpdatedTopic2 {

@@ -73,8 +73,22 @@ impl DeleteCell for Topics {
     type Item = topic2::Topic;
 
     fn delete(&self, id: Self::Idx) -> Self::Item {
-        // TODO: don't forget to remoev from the index
-        todo!()
+        let mut root_container = self.root.borrow_mut();
+        let mut auxilaries = self.auxilaries.borrow_mut();
+        let mut indexes = self.index.borrow_mut();
+        let mut stats_container = self.stats.borrow_mut();
+
+        let root = root_container.remove(id);
+        let auxilary = auxilaries.remove(id);
+        let stats = stats_container.remove(id);
+
+        // Remove from index
+        let key = root.key();
+        indexes
+            .remove(key)
+            .expect("topic_delete: key not found in index");
+
+        topic2::Topic::new_with_components(root, auxilary, stats)
     }
 }
 

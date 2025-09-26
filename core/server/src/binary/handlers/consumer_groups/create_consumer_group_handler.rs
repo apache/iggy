@@ -26,13 +26,10 @@ use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
 use crate::state::models::CreateConsumerGroupWithId;
 use crate::streaming::session::Session;
-use crate::streaming::topics::consumer_group2::MEMBERS_CAPACITY;
-use crate::streaming::{streams, topics};
 use anyhow::Result;
-use arcshift::ArcShift;
 use error_set::ErrContext;
-use iggy_common::IggyError;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
+use iggy_common::{Identifier, IggyError};
 use std::rc::Rc;
 use tracing::{debug, instrument};
 
@@ -57,6 +54,7 @@ impl ServerCommandHandler for CreateConsumerGroup {
             self.name.clone(),
         )?;
         let cg_id = cg.id();
+
         let event = ShardEvent::CreatedConsumerGroup2 {
             stream_id: self.stream_id.clone(),
             topic_id: self.topic_id.clone(),
@@ -81,8 +79,13 @@ impl ServerCommandHandler for CreateConsumerGroup {
                     "{COMPONENT} (error: {error}) - failed to apply create consumer group for stream_id: {stream_id}, topic_id: {topic_id}, group_id: {cg_id}, session: {session}"
                 )
             })?;
-        // TODO: Fixme
-        //sender.send_ok_response(&response).await?;
+        let response = shard.streams2.with_consumer_group_by_id(
+            &stream_id,
+            &topic_id,
+            &Identifier::numeric(cg_id as u32).unwrap(),
+            |(root, members)| mapper::map_consumer_group(root, members),
+        );
+        sender.send_ok_response(&response).await?;
         Ok(())
     }
 }

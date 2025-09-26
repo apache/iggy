@@ -162,31 +162,6 @@ impl IggyShard {
                 )
             })?;
 
-        let user_id = self.create_user_base(username, password, status, permissions)?;
-        self.get_user(&user_id.try_into()?)
-            .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - failed to get user with id: {user_id}")
-            })
-    }
-
-    pub fn create_user_bypass_auth(
-        &self,
-        username: &str,
-        password: &str,
-        status: UserStatus,
-        permissions: Option<Permissions>,
-    ) -> Result<u32, IggyError> {
-        let user_id = self.create_user_base(username, password, status, permissions)?;
-        Ok(user_id)
-    }
-
-    fn create_user_base(
-        &self,
-        username: &str,
-        password: &str,
-        status: UserStatus,
-        permissions: Option<Permissions>,
-    ) -> Result<u32, IggyError> {
         if self
             .users
             .borrow()
@@ -202,21 +177,45 @@ impl IggyShard {
             return Err(IggyError::UsersLimitReached);
         }
 
-        let user_id = USER_ID.fetch_add(1, Ordering::SeqCst);
+        // TODO: Tech debt, replace with Slab.
+        USER_ID.fetch_add(1, Ordering::SeqCst);
         let current_user_id = USER_ID.load(Ordering::SeqCst);
-        let user = User::new(
-            current_user_id,
-            username,
-            password,
-            status,
-            permissions.clone(),
-        );
+        self.create_user_base(current_user_id, username, password, status, permissions)?;
+        self.get_user(&current_user_id.try_into()?)
+            .with_error_context(|error| {
+                format!(
+                    "{COMPONENT} (error: {error}) - failed to get user with id: {current_user_id}"
+                )
+            })
+    }
+
+    pub fn create_user_bypass_auth(
+        &self,
+        user_id: u32,
+        username: &str,
+        password: &str,
+        status: UserStatus,
+        permissions: Option<Permissions>,
+    ) -> Result<(), IggyError> {
+        self.create_user_base(user_id, username, password, status, permissions)?;
+        Ok(())
+    }
+
+    fn create_user_base(
+        &self,
+        user_id: u32,
+        username: &str,
+        password: &str,
+        status: UserStatus,
+        permissions: Option<Permissions>,
+    ) -> Result<(), IggyError> {
+        let user = User::new(user_id, username, password, status, permissions.clone());
         self.permissioner
             .borrow_mut()
             .init_permissions_for_user(user_id, permissions);
         self.users.borrow_mut().insert(user.id, user);
         self.metrics.increment_users(1);
-        Ok(user_id)
+        Ok(())
     }
 
     pub fn delete_user(&self, session: &Session, user_id: &Identifier) -> Result<User, IggyError> {
@@ -319,7 +318,7 @@ impl IggyShard {
         }
 
         let mut user = self.get_user_mut(user_id).with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to get mutable reference to the user with id: {user_id}")
+            format!("{COMPONENT} update user (error: {error}) - failed to get mutable reference to the user with id: {user_id}")
         })?;
         if let Some(username) = username {
             user.username = username;
@@ -389,7 +388,7 @@ impl IggyShard {
         {
             let mut user = self.get_user_mut(user_id).with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to get mutable reference to the user with id: {user_id}"
+                    "{COMPONENT} update user permissions (error: {error}) - failed to get mutable reference to the user with id: {user_id}"
                 )
             })?;
             user.permissions = permissions;
@@ -438,7 +437,7 @@ impl IggyShard {
         new_password: &str,
     ) -> Result<(), IggyError> {
         let mut user = self.get_user_mut(user_id).with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to get mutable reference to the user with id: {user_id}")
+            format!("{COMPONENT} change password (error: {error}) - failed to get mutable reference to the user with id: {user_id}")
         })?;
         if !crypto::verify_password(current_password, &user.password) {
             error!(

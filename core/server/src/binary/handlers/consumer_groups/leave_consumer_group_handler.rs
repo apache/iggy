@@ -21,6 +21,7 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::sender::SenderKind;
 use crate::shard::IggyShard;
+use crate::shard::transmission::event::ShardEvent;
 use crate::streaming::session::Session;
 use anyhow::Result;
 use error_set::ErrContext;
@@ -57,6 +58,21 @@ impl ServerCommandHandler for LeaveConsumerGroup {
                     self.stream_id, self.topic_id, self.group_id, session
                 )
             })?;
+
+        // Update ClientManager and broadcast event to other shards
+        let client_id = session.client_id;
+        let stream_id = self.stream_id.clone();
+        let topic_id = self.topic_id.clone();
+        let group_id = self.group_id.clone();
+
+        let event = ShardEvent::LeftConsumerGroup {
+            client_id,
+            stream_id,
+            topic_id,
+            group_id,
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event).await;
+
         sender.send_empty_ok_response().await?;
         Ok(())
     }

@@ -20,6 +20,7 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::partitions::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
+use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use anyhow::Result;
@@ -52,7 +53,7 @@ impl ServerCommandHandler for DeleteSegments {
                 session,
                 &self.stream_id,
                 &self.topic_id,
-                self.partition_id,
+                self.partition_id as usize,
                 self.segments_count,
             )
             .await
@@ -61,6 +62,13 @@ impl ServerCommandHandler for DeleteSegments {
                     "{COMPONENT} (error: {error}) - failed to delete segments for topic with ID: {topic_id} in stream with ID: {stream_id}, session: {session}",
                 )
             })?;
+        let event = ShardEvent::DeletedSegments {
+            stream_id: self.stream_id.clone(),
+            topic_id: self.topic_id.clone(),
+            partition_id: self.partition_id as usize,
+            segments_count: self.segments_count,
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
 
         shard
             .state

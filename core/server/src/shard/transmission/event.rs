@@ -89,6 +89,7 @@ pub enum ShardEvent {
         polling_consumer: PollingConsumer,
     },
     CreatedUser {
+        user_id: u32,
         username: String,
         password: String,
         status: UserStatus,
@@ -127,11 +128,30 @@ pub enum ShardEvent {
         name: String,
     },
     LoginWithPersonalAccessToken {
+        client_id: u32,
         token: String,
+    },
+    DeletedSegments {
+        stream_id: Identifier,
+        topic_id: Identifier,
+        partition_id: usize,
+        segments_count: u32,
     },
     NewSession {
         address: SocketAddr,
         transport: TransportProtocol,
+    },
+    JoinedConsumerGroup {
+        client_id: u32,
+        stream_id: Identifier,
+        topic_id: Identifier,
+        group_id: Identifier,
+    },
+    LeftConsumerGroup {
+        client_id: u32,
+        stream_id: Identifier,
+        topic_id: Identifier,
+        group_id: Identifier,
     },
     TcpBound {
         address: SocketAddr,

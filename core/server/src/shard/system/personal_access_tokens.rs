@@ -100,7 +100,7 @@ impl IggyShard {
         let token_hash = personal_access_token.token.clone();
         let identifier = user_id.try_into()?;
         let user = self.get_user_mut(&identifier).with_error_context(|error| {
-            format!("{COMPONENT} (error: {error}) - failed to get mutable reference to the user with id: {user_id}")
+            format!("{COMPONENT} create PAT (error: {error}) - failed to get mutable reference to the user with id: {user_id}")
         })?;
 
         if user
@@ -145,7 +145,7 @@ impl IggyShard {
             .get_user_mut(&user_id.try_into()?)
             .with_error_context(|error| {
                 format!(
-                    "{COMPONENT} (error: {error}) - failed to get mutable reference to the user with id: {user_id}"
+                    "{COMPONENT} delete PAT (error: {error}) - failed to get mutable reference to the user with id: {user_id}"
                 )
             })?;
 
@@ -163,6 +163,16 @@ impl IggyShard {
         info!("Deleting personal access token: {name} for user with ID: {user_id}...");
         user.personal_access_tokens.remove(&token);
         info!("Deleted personal access token: {name} for user with ID: {user_id}.");
+        Ok(())
+    }
+
+    pub fn login_user_pat_event(&self, token: &str, client_id: u32) -> Result<(), IggyError> {
+        let active_sessions = self.active_sessions.borrow();
+        let session = active_sessions
+            .iter()
+            .find(|s| s.client_id == client_id)
+            .expect(format!("At this point session for {}, should exist.", client_id).as_str());
+        self.login_with_personal_access_token(token, Some(session))?;
         Ok(())
     }
 

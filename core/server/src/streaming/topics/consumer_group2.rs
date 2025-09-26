@@ -53,6 +53,10 @@ impl ConsumerGroupRoot {
         &self.partitions
     }
 
+    pub fn update_id(&mut self, id: usize) {
+        self.id = id;
+    }
+
     pub fn assign_partitions(&mut self, partitions: Vec<usize>) {
         self.partitions = partitions;
     }
@@ -170,6 +174,14 @@ impl ConsumerGroup {
         };
         let members = ConsumerGroupMembers { inner: members };
         Self { root, members }
+    }
+
+    pub fn new_with_components(root: ConsumerGroupRoot, members: ConsumerGroupMembers) -> Self {
+        Self { root, members }
+    }
+
+    pub fn members(&self) -> &ConsumerGroupMembers {
+        &self.members
     }
 }
 

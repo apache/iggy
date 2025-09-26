@@ -60,14 +60,12 @@ impl ServerCommandHandler for DeleteStream {
             stream2.root().name(),
             stream2.id()
         );
+
         let event = ShardEvent::DeletedStream2 {
             id: stream2.id(),
             stream_id: self.stream_id.clone(),
         };
         let _responses = shard.broadcast_event_to_all_shards(event).await;
-        // Drop the stream to force readers/writers to be dropped.
-        drop(stream2);
-        // Stream files and directories have been deleted by delete_stream_from_disk
 
         shard
             .state

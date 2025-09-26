@@ -72,6 +72,7 @@ impl ServerCommandHandler for CreateUser {
             user.id
         );
         let event = ShardEvent::CreatedUser {
+            user_id: user.id,
             username: self.username.to_owned(),
             password: self.password.to_owned(),
             status: self.status,

@@ -57,6 +57,7 @@ impl ServerCommandHandler for StoreConsumerOffset {
             .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset for stream_id: {}, topic_id: {}, partition_id: {:?}, offset: {}, session: {}",
                 self.stream_id, self.topic_id, self.partition_id, self.offset, session
             ))?;
+        // TODO: Get rid of this event.
         let event = ShardEvent::StoredOffset {
             stream_id: self.stream_id,
             topic_id: self.topic_id,
@@ -64,7 +65,6 @@ impl ServerCommandHandler for StoreConsumerOffset {
             polling_consumer,
             offset: self.offset,
         };
-        let _responses = shard.broadcast_event_to_all_shards(event).await;
         sender.send_empty_ok_response().await?;
         Ok(())
     }

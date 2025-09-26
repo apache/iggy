@@ -23,7 +23,6 @@ use iggy_common::IggyError;
 use iggy_common::IggyTimestamp;
 use iggy_common::TransportProtocol;
 use iggy_common::UserId;
-use std::fmt::{Display, Formatter};
 use std::net::SocketAddr;
 use std::rc::Rc;
 
@@ -119,7 +118,7 @@ impl ClientManager {
     }
 
     pub fn delete_client(&mut self, client_id: u32) -> Option<Client> {
-        if let Some(mut client) = self.clients.remove(&client_id) {
+        if let Some(client) = self.clients.remove(&client_id) {
             client.session.clear_user_id();
             Some(client)
         } else {
@@ -130,10 +129,13 @@ impl ClientManager {
     pub fn join_consumer_group(
         &mut self,
         client_id: u32,
-        stream_id: u32,
-        topic_id: u32,
-        group_id: u32,
+        stream_id: usize,
+        topic_id: usize,
+        group_id: usize,
     ) -> Result<(), IggyError> {
+        let stream_id = stream_id as u32;
+        let topic_id = topic_id as u32;
+        let group_id = group_id as u32;
         let client = self.clients.get_mut(&client_id);
         if client.is_none() {
             return Err(IggyError::ClientNotFound(client_id));
@@ -159,15 +161,18 @@ impl ClientManager {
     pub fn leave_consumer_group(
         &mut self,
         client_id: u32,
-        stream_id: u32,
-        topic_id: u32,
-        consumer_group_id: u32,
+        stream_id: usize,
+        topic_id: usize,
+        consumer_group_id: usize,
     ) -> Result<(), IggyError> {
+        let stream_id = stream_id as u32;
+        let topic_id = topic_id as u32;
+        let consumer_group_id = consumer_group_id as u32;
         let client = self.clients.get_mut(&client_id);
         if client.is_none() {
             return Err(IggyError::ClientNotFound(client_id));
         }
-        let mut client = client.unwrap();
+        let client = client.unwrap();
         for (index, consumer_group) in client.consumer_groups.iter().enumerate() {
             if consumer_group.stream_id == stream_id
                 && consumer_group.topic_id == topic_id
@@ -180,7 +185,21 @@ impl ClientManager {
         Ok(())
     }
 
-    pub fn delete_consumer_groups_for_stream(&mut self, stream_id: u32) {
+    pub fn delete_consumer_group(&mut self, stream_id: usize, topic_id: usize, group_id: usize) {
+        let stream_id = stream_id as u32;
+        let topic_id = topic_id as u32;
+        let group_id = group_id as u32;
+        for client in self.clients.values_mut() {
+            client.consumer_groups.retain(|consumer_group| {
+                !(consumer_group.stream_id == stream_id
+                    && consumer_group.topic_id == topic_id
+                    && consumer_group.group_id == group_id)
+            });
+        }
+    }
+
+    pub fn delete_consumer_groups_for_stream(&mut self, stream_id: usize) {
+        let stream_id = stream_id as u32;
         for client in self.clients.values_mut() {
             let indexes_to_remove = client
                 .consumer_groups
@@ -200,7 +219,9 @@ impl ClientManager {
         }
     }
 
-    pub fn delete_consumer_groups_for_topic(&mut self, stream_id: u32, topic_id: u32) {
+    pub fn delete_consumer_groups_for_topic(&mut self, stream_id: usize, topic_id: usize) {
+        let stream_id = stream_id as u32;
+        let topic_id = topic_id as u32;
         for client in self.clients.values_mut() {
             let indexes_to_remove = client
                 .consumer_groups

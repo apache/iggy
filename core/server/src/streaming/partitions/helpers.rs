@@ -62,12 +62,49 @@ pub fn insert_partition(
     move |partitions| partitions.insert(partition)
 }
 
-pub fn purge_partitions_mem() -> impl FnOnce(&mut Partitions) {
+pub fn purge_partitions_mem() -> impl FnOnce(&Partitions) {
     |partitions| {
         partitions.with_components(|components| {
-            let (_root, _stats, _deduplicator, _offset, _consumer_offset, _cg_offset, _log) =
-                components.into_components();
-            // TODO: Implement purge logic
+            let (.., stats, _, offsets, _, _, _) = components.into_components();
+            for (offset, stat) in offsets
+                .iter()
+                .map(|(_, o)| o)
+                .zip(stats.iter().map(|(_, s)| s))
+            {
+                offset.store(0, Ordering::Relaxed);
+                stat.zero_out_all();
+            }
+        })
+    }
+}
+
+pub fn purge_consumer_offsets() -> impl FnOnce(&Partitions) -> (Vec<String>, Vec<String>) {
+    |partitions| {
+        partitions.with_components(|components| {
+            let (.., consumer_offsets, cg_offsets, _) = components.into_components();
+
+            let mut consumer_offset_paths = Vec::new();
+            let mut consumer_group_offset_paths = Vec::new();
+
+            // Collect paths and clear consumer offsets
+            for (_, consumer_offset) in consumer_offsets {
+                let hdl = consumer_offset.pin();
+                for item in hdl.values() {
+                    consumer_offset_paths.push(item.path.clone());
+                }
+                hdl.clear(); // Clear the hashmap
+            }
+
+            // Collect paths and clear consumer group offsets
+            for (_, cg_offset) in cg_offsets {
+                let hdl = cg_offset.pin();
+                for item in hdl.values() {
+                    consumer_group_offset_paths.push(item.path.clone());
+                }
+                hdl.clear(); // Clear the hashmap
+            }
+
+            (consumer_offset_paths, consumer_group_offset_paths)
         })
     }
 }
@@ -119,13 +156,13 @@ pub fn store_consumer_offset(
 
 pub fn delete_consumer_offset(
     id: usize,
-) -> impl FnOnce(ComponentsById<PartitionRef>) -> Result<(), IggyError> {
+) -> impl FnOnce(ComponentsById<PartitionRef>) -> Result<String, IggyError> {
     move |(.., offsets, _, _)| {
-        offsets
-            .pin()
+        let hdl = offsets.pin();
+        let offset = hdl
             .remove(&id)
-            .map(|_| ())
-            .ok_or_else(|| IggyError::ConsumerOffsetNotFound(id))
+            .ok_or_else(|| IggyError::ConsumerOffsetNotFound(id))?;
+        Ok(offset.path.clone())
     }
 }
 
@@ -180,13 +217,13 @@ pub fn store_consumer_group_member_offset(
 
 pub fn delete_consumer_group_member_offset(
     id: usize,
-) -> impl FnOnce(ComponentsById<PartitionRef>) -> Result<(), IggyError> {
+) -> impl FnOnce(ComponentsById<PartitionRef>) -> Result<String, IggyError> {
     move |(.., offsets, _)| {
-        offsets
-            .pin()
+        let hdl = offsets.pin();
+        let offset = hdl
             .remove(&id)
-            .map(|_| ())
-            .ok_or_else(|| IggyError::ConsumerOffsetNotFound(id))
+            .ok_or_else(|| IggyError::ConsumerOffsetNotFound(id))?;
+        Ok(offset.path.clone())
     }
 }
 
@@ -215,13 +252,6 @@ pub fn delete_consumer_group_member_offset_from_disk(
             .expect("delete_consumer_group_member_offset_from_disk: offset not found");
         let path = &item.path;
         storage2::delete_persisted_offset(shard_id, path).await
-    }
-}
-
-pub fn purge_segments_mem() -> impl FnOnce(&mut Partitions) {
-    |_partitions| {
-        // TODO:
-        //partitions.segments_mut()
     }
 }
 
@@ -668,13 +698,13 @@ pub fn append_to_journal(
         let batch_messages_size = batch.size();
         let batch_messages_count = batch.count();
 
+        stats.increment_size_bytes(batch_messages_size as u64);
+        stats.increment_messages_count(batch_messages_count as u64);
+
         segment.end_timestamp = batch.last_timestamp().unwrap();
         segment.end_offset = batch.last_offset().unwrap();
 
         let (journal_messages_count, journal_size) = log.journal_mut().append(shard_id, batch)?;
-
-        stats.increment_messages_count(batch_messages_count as u64);
-        stats.increment_size_bytes(batch_messages_size as u64);
 
         let last_offset = if batch_messages_count == 0 {
             current_offset
@@ -802,14 +832,12 @@ pub fn update_index_and_increment_stats(
     batch_count: u32,
     config: &SystemConfig,
 ) -> impl FnOnce(ComponentsById<PartitionRefMut>) {
-    move |(_, stats, .., log)| {
+    move |(.., log)| {
         let segment = log.active_segment_mut();
         segment.size += saved.as_bytes_u32();
         log.active_indexes_mut().unwrap().mark_saved();
         if config.segment.cache_indexes == CacheIndexesConfig::None {
             log.active_indexes_mut().unwrap().clear();
         }
-        stats.increment_size_bytes(saved.as_bytes_u64());
-        stats.increment_messages_count(batch_count as u64);
     }
 }

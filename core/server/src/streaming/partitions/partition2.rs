@@ -117,6 +117,26 @@ impl Partition {
         }
     }
 
+    pub fn new_with_components(
+        root: PartitionRoot,
+        stats: Arc<PartitionStats>,
+        message_deduplicator: Option<MessageDeduplicator>,
+        offset: Arc<AtomicU64>,
+        consumer_offset: Arc<ConsumerOffsets>,
+        consumer_group_offset: Arc<ConsumerGroupOffsets>,
+        log: SegmentedLog<MemoryMessageJournal>,
+    ) -> Self {
+        Self {
+            root,
+            stats,
+            message_deduplicator,
+            offset,
+            consumer_offset,
+            consumer_group_offset,
+            log,
+        }
+    }
+
     pub fn stats(&self) -> &PartitionStats {
         &self.stats
     }

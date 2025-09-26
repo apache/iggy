@@ -22,6 +22,7 @@ use crate::shard::ShardInfo;
 use crate::shard::calculate_shard_assignment;
 use crate::shard::namespace::IggyNamespace;
 use crate::shard_info;
+use crate::slab::traits_ext::EntityComponentSystem;
 use crate::slab::traits_ext::EntityMarker;
 use crate::slab::traits_ext::IntoComponents;
 use crate::streaming::partitions;
@@ -105,16 +106,12 @@ impl IggyShard {
             partitions_count,
             &self.config.system,
         );
-        let stats = partitions.first().map(|p| p.stats());
-        if let Some(stats) = stats {
-            // One segment per partition created.
-            stats.increment_segments_count(partitions_count);
-        }
+
         self.metrics.increment_partitions(partitions_count);
         self.metrics.increment_segments(partitions_count);
 
         let shards_count = self.get_available_shards_count();
-        for partition_id in partitions.iter().map(|p| p.id()) {
+        for (partition_id, stats) in partitions.iter().map(|p| (p.id(), p.stats())) {
             // TODO: Create shard table recordsj.
             let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
             let shard_id = calculate_shard_assignment(&ns, shards_count);
@@ -130,6 +127,7 @@ impl IggyShard {
                 &self.config.system,
             )
             .await?;
+            stats.increment_segments_count(1);
             if is_current_shard {
                 self.init_log(stream_id, topic_id, partition_id).await?;
             }
@@ -137,7 +135,7 @@ impl IggyShard {
         Ok(partitions)
     }
 
-    async fn init_log(
+    pub async fn init_log(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
@@ -233,6 +231,7 @@ impl IggyShard {
                 self.init_log(stream_id, topic_id, id).await?;
             }
         }
+
         Ok(())
     }
 

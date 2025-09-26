@@ -19,7 +19,7 @@
 use super::COMPONENT;
 use crate::shard::IggyShard;
 use crate::shard_info;
-use crate::slab::traits_ext::{EntityMarker, InsertCell};
+use crate::slab::traits_ext::{EntityComponentSystem, EntityMarker, InsertCell, IntoComponents};
 use crate::streaming::session::Session;
 use crate::streaming::stats::stats::{StreamStats, TopicStats};
 use crate::streaming::topics::storage2::{create_topic_file_hierarchy, delete_topic_from_disk};
@@ -29,8 +29,10 @@ use error_set::ErrContext;
 use iggy_common::{
     CompressionAlgorithm, Identifier, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize,
 };
+use std::any::Any;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::u32;
 
 impl IggyShard {
     pub async fn create_topic2(
@@ -139,7 +141,7 @@ impl IggyShard {
         replication_factor: Option<u8>,
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
-        //self.ensure_topic_exists(stream_id, topic_id)?;
+        self.ensure_topic_exists(stream_id, topic_id)?;
         {
             let topic_id_val = self.streams2.with_topic_by_id(
                 stream_id,
@@ -247,6 +249,10 @@ impl IggyShard {
                     )
                 })?;
         let mut topic = self.delete_topic_base2(stream_id, topic_id);
+        // Clean up consumer groups from ClientManager for this topic
+        self.client_manager
+            .borrow_mut()
+            .delete_consumer_groups_for_topic(numeric_stream_id, topic.id());
         let parent = topic.stats().parent().clone();
         // We need to borrow topic as mutable, as we are extracting partitions out of it, in order to close them.
         let (messages_count, size_bytes, segments_count) =
@@ -304,34 +310,54 @@ impl IggyShard {
             })?;
         }
 
-        self.streams2.with_partitions_mut(
+        self.streams2.with_partitions(
             stream_id,
             topic_id,
             partitions::helpers::purge_partitions_mem(),
         );
-        self.streams2.with_partitions_mut(
+
+        let (consumer_offset_paths, consumer_group_offset_paths) = self.streams2.with_partitions(
             stream_id,
             topic_id,
-            partitions::helpers::purge_segments_mem(),
+            partitions::helpers::purge_consumer_offsets(),
         );
-        self.streams2
-            .with_topic_by_id_async(stream_id, topic_id, topics::helpers::purge_topic_disk())
-            .await;
+        for path in consumer_offset_paths {
+            self.delete_consumer_offset_from_disk(&path).await?;
+        }
+        for path in consumer_group_offset_paths {
+            self.delete_consumer_offset_from_disk(&path).await?;
+        }
+
+        self.purge_topic_base2(stream_id, topic_id).await?;
+        Ok(())
+    }
+
+    pub async fn purge_topic2_bypass_auth(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+    ) -> Result<(), IggyError> {
+        self.purge_topic_base2(stream_id, topic_id).await?;
         Ok(())
     }
 
     async fn purge_topic_base2(
         &self,
-        _stream_id: &Identifier,
-        _topic_id: &Identifier,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
     ) -> Result<(), IggyError> {
-        /*
-        self.streams2
+        let part_ids = self
+            .streams2
             .with_partitions(stream_id, topic_id, |partitions| {
-                //partitions
+                partitions.with_components(|components| {
+                    let (roots, ..) = components.into_components();
+                    roots.iter().map(|(_, root)| root.id()).collect::<Vec<_>>()
+                })
             });
-        */
-
+        for part_id in part_ids {
+            self.delete_segments_bypass_auth(stream_id, topic_id, part_id, u32::MAX)
+                .await?;
+        }
         Ok(())
     }
 }

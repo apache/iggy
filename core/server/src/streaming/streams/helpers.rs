@@ -2,7 +2,7 @@ use crate::{
     configs::system::SystemConfig,
     slab::{
         streams,
-        traits_ext::{ComponentsById, EntityComponentSystem},
+        traits_ext::{ComponentsById, EntityComponentSystem, IntoComponents},
     },
     streaming::{
         partitions,
@@ -22,6 +22,18 @@ pub fn get_stream_name() -> impl FnOnce(ComponentsById<StreamRef>) -> String {
 pub fn update_stream_name(name: String) -> impl FnOnce(ComponentsById<StreamRefMut>) {
     move |(mut root, _)| {
         root.set_name(name);
+    }
+}
+
+pub fn get_topic_ids() -> impl FnOnce(ComponentsById<StreamRef>) -> Vec<usize> {
+    |(root, _)| {
+        root.topics().with_components(|components| {
+            let (topic_roots, ..) = components.into_components();
+            topic_roots
+                .iter()
+                .map(|(_, topic)| topic.id())
+                .collect::<Vec<_>>()
+        })
     }
 }
 

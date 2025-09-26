@@ -96,6 +96,8 @@ impl Insert for Partitions {
             entity_id, id,
             "partition_insert: id mismatch when creating consumer_group_offset"
         );
+        let root = self.root.get_mut(entity_id).unwrap();
+        root.update_id(entity_id);
         entity_id
     }
 }
@@ -105,7 +107,23 @@ impl Delete for Partitions {
     type Item = Partition;
 
     fn delete(&mut self, id: Self::Idx) -> Self::Item {
-        todo!()
+        let root = self.root.remove(id);
+        let stats = self.stats.remove(id);
+        let message_deduplicator = self.message_deduplicator.remove(id);
+        let offset = self.offset.remove(id);
+        let consumer_offset = self.consumer_offset.remove(id);
+        let consumer_group_offset = self.consumer_group_offset.remove(id);
+        let log = self.log.remove(id);
+
+        Partition::new_with_components(
+            root,
+            stats,
+            message_deduplicator,
+            offset,
+            consumer_offset,
+            consumer_group_offset,
+            log,
+        )
     }
 }
 

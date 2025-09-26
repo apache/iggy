@@ -23,7 +23,7 @@ use crate::shard::IggyShard;
 use crate::streaming::session::Session;
 use async_zip::base::write::ZipFileWriter;
 use async_zip::{Compression, ZipEntryBuilder};
-use compio::fs::{OpenOptions};
+use compio::fs::OpenOptions;
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use iggy_common::{IggyDuration, IggyError, Snapshot, SnapshotCompression, SystemSnapshotType};
 use std::path::PathBuf;

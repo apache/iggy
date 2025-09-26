@@ -66,10 +66,6 @@ pub fn delete_topic(topic_id: &Identifier) -> impl FnOnce(&Topics) -> Topic {
     }
 }
 
-pub fn purge_topic_disk() -> impl AsyncFnOnce(ComponentsById<TopicRef>) {
-    async |(root, ..)| {}
-}
-
 pub fn exists(identifier: &Identifier) -> impl FnOnce(&Topics) -> bool {
     |topics| topics.exists(identifier)
 }
@@ -238,6 +234,10 @@ fn assign_partitions_to_members(
         .iter_mut()
         .for_each(|(_, member)| member.partitions.clear());
     let count = members.len();
+    if count == 0 {
+        return;
+    }
+
     for (idx, partition) in partitions.iter().enumerate() {
         let position = idx % count;
         let member = &mut members[position];
@@ -251,6 +251,7 @@ fn assign_partitions_to_members(
         );
     }
 }
+
 fn mimic_members(members: &Slab<Member>) -> Slab<Member> {
     let mut container = Slab::with_capacity(members.len());
     for (_, member) in members {

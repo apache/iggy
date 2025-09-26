@@ -56,6 +56,14 @@ where
         &self.segments
     }
 
+    pub fn segments_mut(&mut self) -> &mut Vec<Segment2> {
+        &mut self.segments
+    }
+
+    pub fn storages_mut(&mut self) -> &mut Vec<Storage> {
+        &mut self.storage
+    }
+
     pub fn storages(&self) -> &Vec<Storage> {
         &self.storage
     }
@@ -86,6 +94,10 @@ where
 
     pub fn indexes(&self) -> &Vec<Option<IggyIndexesMut>> {
         &self.indexes
+    }
+
+    pub fn indexes_mut(&mut self) -> &mut Vec<Option<IggyIndexesMut>> {
+        &mut self.indexes
     }
 
     pub fn active_indexes(&self) -> Option<&IggyIndexesMut> {

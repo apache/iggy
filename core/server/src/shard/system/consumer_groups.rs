@@ -140,12 +140,34 @@ impl IggyShard {
         topic_id: &Identifier,
         group_id: &Identifier,
     ) -> consumer_group2::ConsumerGroup {
-        self.streams2.with_consumer_groups_mut(
+        // Get numeric IDs before deletion for ClientManager cleanup
+        let stream_id_value = self
+            .streams2
+            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
+        let topic_id_value =
+            self.streams2
+                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
+        let group_id_value = self.streams2.with_consumer_group_by_id(
+            stream_id,
+            topic_id,
+            group_id,
+            topics::helpers::get_consumer_group_id(),
+        );
+
+        let cg = self.streams2.with_consumer_groups_mut(
             stream_id,
             topic_id,
             topics::helpers::delete_consumer_group(group_id),
-        )
-        // TODO: remove from the consumer_group
+        );
+
+        // Clean up ClientManager state
+        self.client_manager.borrow_mut().delete_consumer_group(
+            stream_id_value,
+            topic_id_value,
+            group_id_value,
+        );
+
+        cg
     }
 
     pub fn join_consumer_group(
@@ -180,16 +202,32 @@ impl IggyShard {
             topics::helpers::join_consumer_group(self.id, client_id),
         );
 
-        // TODO:
-        /*
-        self.client_manager.borrow_mut().join_consumer_group(session.client_id, stream_id_value, topic_id_value, group_id)
-            .with_error_context(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to make client join consumer group for client ID: {}",
-                    session.client_id
-                )
-            })?;
-            */
+        // Update ClientManager state
+        let stream_id_value = self
+            .streams2
+            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
+        let topic_id_value =
+            self.streams2
+                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
+        let group_id_value = self.streams2.with_consumer_group_by_id(
+            stream_id,
+            topic_id,
+            group_id,
+            topics::helpers::get_consumer_group_id(),
+        );
+
+        self.client_manager.borrow_mut().join_consumer_group(
+            session.client_id,
+            stream_id_value,
+            topic_id_value,
+            group_id_value,
+        )
+        .with_error_context(|error| {
+            format!(
+                "{COMPONENT} (error: {error}) - failed to make client join consumer group for client ID: {}",
+                session.client_id
+            )
+        })?;
         Ok(())
     }
 
@@ -223,8 +261,26 @@ impl IggyShard {
             topics::helpers::leave_consumer_group(self.id, session.client_id),
         );
 
-        // TODO:
-        // self.leave_consumer_group_by_client();
+        // Update ClientManager state
+        let stream_id_value = self
+            .streams2
+            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
+        let topic_id_value =
+            self.streams2
+                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
+        let group_id_value = self.streams2.with_consumer_group_by_id(
+            stream_id,
+            topic_id,
+            group_id,
+            topics::helpers::get_consumer_group_id(),
+        );
+
+        self.client_manager.borrow_mut().leave_consumer_group(
+            session.client_id,
+            stream_id_value,
+            topic_id_value,
+            group_id_value,
+        ).with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to make client leave consumer group for client ID: {}", session.client_id))?;
         Ok(())
     }
 
@@ -235,15 +291,26 @@ impl IggyShard {
         group_id: &Identifier,
         client_id: u32,
     ) -> Result<(), IggyError> {
-        // TODO:
-        /*
+        // Update ClientManager state
+        let stream_id_value = self
+            .streams2
+            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
+        let topic_id_value =
+            self.streams2
+                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
+        let group_id_value = self.streams2.with_consumer_group_by_id(
+            stream_id,
+            topic_id,
+            group_id,
+            topics::helpers::get_consumer_group_id(),
+        );
+
         self.client_manager.borrow_mut().leave_consumer_group(
             client_id,
             stream_id_value,
             topic_id_value,
-            group_id,
-        )
-        */
+            group_id_value,
+        ).with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to make client leave consumer group for client ID: {}", client_id))?;
         Ok(())
     }
 }

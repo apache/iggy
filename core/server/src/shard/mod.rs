@@ -32,7 +32,7 @@ use error_set::ErrContext;
 use futures::future::try_join_all;
 use hash32::{Hasher, Murmur3Hasher};
 use iggy_common::{
-    EncryptorKind, Identifier, IggyError, IggyTimestamp, Permissions, PollingKind, UserId,
+    EncryptorKind, IdKind, Identifier, IggyError, IggyTimestamp, Permissions, PollingKind, UserId,
     UserStatus,
     defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME},
     locking::IggyRwLockFn,
@@ -179,62 +179,6 @@ pub struct IggyShard {
 impl IggyShard {
     pub fn builder() -> IggyShardBuilder {
         Default::default()
-    }
-
-    pub fn default_from_config(server_config: ServerConfig) -> Self {
-        use crate::bootstrap::resolve_persister;
-        use crate::streaming::storage::SystemStorage;
-        use crate::versioning::SemanticVersion;
-
-        let version = SemanticVersion::current().expect("Invalid version");
-        let persister = resolve_persister(server_config.system.partition.enforce_fsync);
-        let storage = Rc::new(SystemStorage::new(
-            server_config.system.clone(),
-            persister.clone(),
-        ));
-
-        let (stop_sender, stop_receiver) = async_channel::unbounded();
-
-        let state_path = server_config.system.get_state_messages_file_path();
-        let file_state = FileState::new(&state_path, &version, persister, None);
-        let state = crate::state::StateKind::File(file_state);
-        let shards_table = Box::new(DashMap::new());
-        let shards_table = Box::leak(shards_table);
-
-        let shard = Self {
-            id: 0,
-            shards: Vec::new(),
-            shards_table: shards_table.into(),
-            version,
-            streams2: Default::default(),
-            state,
-            storage,
-            //TODO: Fix
-            encryptor: None,
-            config: server_config,
-            client_manager: Default::default(),
-            active_sessions: Default::default(),
-            permissioner: Default::default(),
-            users: Default::default(),
-            metrics: Metrics::init(),
-            messages_receiver: Cell::new(None),
-            stop_receiver,
-            stop_sender,
-            task_registry: TaskRegistry::new(),
-            is_shutting_down: AtomicBool::new(false),
-            tcp_bound_address: Cell::new(None),
-            quic_bound_address: Cell::new(None),
-        };
-        let user = User::root(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD);
-        shard
-            .create_user_bypass_auth(
-                &user.username,
-                &user.password,
-                UserStatus::Active,
-                Some(Permissions::root()),
-            )
-            .unwrap();
-        shard
     }
 
     pub async fn init(&self) -> Result<(), IggyError> {
@@ -691,6 +635,10 @@ impl IggyShard {
                 username,
                 password,
             } => self.login_user_event(client_id, &username, &password),
+            ShardEvent::LoginWithPersonalAccessToken { client_id, token } => {
+                self.login_user_pat_event(&token, client_id)?;
+                Ok(())
+            }
             ShardEvent::NewSession { address, transport } => {
                 let session = self.add_client(&address, transport);
                 self.add_active_session(session);
@@ -715,22 +663,30 @@ impl IggyShard {
                 Ok(())
             }
             ShardEvent::PurgedStream2 { stream_id } => {
-                self.purge_stream2_bypass_auth(&stream_id)?;
+                self.purge_stream2_bypass_auth(&stream_id).await?;
                 Ok(())
             }
             ShardEvent::PurgedTopic {
                 stream_id,
                 topic_id,
             } => {
-                todo!();
+                self.purge_topic2_bypass_auth(&stream_id, &topic_id).await?;
+                Ok(())
             }
             ShardEvent::CreatedUser {
+                user_id,
                 username,
                 password,
                 status,
                 permissions,
             } => {
-                self.create_user_bypass_auth(&username, &password, status, permissions.clone())?;
+                self.create_user_bypass_auth(
+                    user_id,
+                    &username,
+                    &password,
+                    status,
+                    permissions.clone(),
+                )?;
                 Ok(())
             }
             ShardEvent::DeletedUser { user_id } => {
@@ -741,8 +697,6 @@ impl IggyShard {
                 let sessions = self.active_sessions.borrow();
                 let session = sessions.iter().find(|s| s.client_id == client_id).unwrap();
                 self.logout_user(session)?;
-                self.remove_active_session(session.get_user_id());
-
                 Ok(())
             }
             ShardEvent::ChangedPassword {
@@ -763,7 +717,6 @@ impl IggyShard {
                 self.delete_personal_access_token_bypass_auth(user_id, &name)?;
                 Ok(())
             }
-            ShardEvent::LoginWithPersonalAccessToken { token: _ } => todo!(),
             ShardEvent::UpdatedUser {
                 user_id,
                 username,
@@ -792,6 +745,12 @@ impl IggyShard {
             ShardEvent::DeletedStream2 { id, stream_id } => {
                 let stream = self.delete_stream2_bypass_auth(&stream_id);
                 assert_eq!(stream.id(), id);
+
+                // Clean up consumer groups from ClientManager for this stream
+                self.client_manager
+                    .borrow_mut()
+                    .delete_consumer_groups_for_stream(id);
+
                 Ok(())
             }
             ShardEvent::CreatedTopic2 { stream_id, topic } => {
@@ -814,6 +773,16 @@ impl IggyShard {
             } => {
                 let topic = self.delete_topic_bypass_auth2(&stream_id, &topic_id);
                 assert_eq!(topic.id(), id);
+
+                // Clean up consumer groups from ClientManager for this topic using helper functions
+                let stream_id_usize = self.streams2.with_stream_by_id(
+                    &stream_id,
+                    crate::streaming::streams::helpers::get_stream_id(),
+                );
+                self.client_manager
+                    .borrow_mut()
+                    .delete_consumer_groups_for_topic(stream_id_usize, id);
+
                 Ok(())
             }
             ShardEvent::UpdatedTopic2 {
@@ -854,6 +823,36 @@ impl IggyShard {
             } => {
                 let cg = self.delete_consumer_group_bypass_auth2(&stream_id, &topic_id, &group_id);
                 assert_eq!(cg.id(), id);
+
+                // Remove all consumer group members from ClientManager using helper functions
+                let stream_id_usize = self.streams2.with_stream_by_id(
+                    &stream_id,
+                    crate::streaming::streams::helpers::get_stream_id(),
+                );
+                let topic_id_usize = self.streams2.with_topic_by_id(
+                    &stream_id,
+                    &topic_id,
+                    crate::streaming::topics::helpers::get_topic_id(),
+                );
+
+                // Get members from the deleted consumer group and make them leave
+                let slab = cg.members().inner().shared_get();
+                for (_, member) in slab.iter() {
+                    if let Err(err) = self.client_manager.borrow_mut().leave_consumer_group(
+                        member.client_id,
+                        stream_id_usize,
+                        topic_id_usize,
+                        id,
+                    ) {
+                        tracing::warn!(
+                            "Shard {} (error: {err}) - failed to make client leave consumer group for client ID: {}, group ID: {}",
+                            self.id,
+                            member.client_id,
+                            id
+                        );
+                    }
+                }
+
                 Ok(())
             }
             ShardEvent::StoredOffset {
@@ -877,13 +876,82 @@ impl IggyShard {
                 topic_id,
                 partition_id,
                 polling_consumer,
+            } => Ok(()),
+            ShardEvent::JoinedConsumerGroup {
+                client_id,
+                stream_id,
+                topic_id,
+                group_id,
             } => {
-                self.delete_consumer_offset_bypass_auth(
+                // Convert Identifiers to usizes for ClientManager using helper functions
+                let stream_id_usize = self.streams2.with_stream_by_id(
+                    &stream_id,
+                    crate::streaming::streams::helpers::get_stream_id(),
+                );
+                let topic_id_usize = self.streams2.with_topic_by_id(
                     &stream_id,
                     &topic_id,
-                    &polling_consumer,
-                    partition_id,
+                    crate::streaming::topics::helpers::get_topic_id(),
+                );
+                let group_id_usize = self.streams2.with_consumer_group_by_id(
+                    &stream_id,
+                    &topic_id,
+                    &group_id,
+                    crate::streaming::topics::helpers::get_consumer_group_id(),
+                );
+
+                self.client_manager.borrow_mut().join_consumer_group(
+                    client_id,
+                    stream_id_usize,
+                    topic_id_usize,
+                    group_id_usize,
                 )?;
+                Ok(())
+            }
+            ShardEvent::LeftConsumerGroup {
+                client_id,
+                stream_id,
+                topic_id,
+                group_id,
+            } => {
+                // Convert Identifiers to usizes for ClientManager using helper functions
+                let stream_id_usize = self.streams2.with_stream_by_id(
+                    &stream_id,
+                    crate::streaming::streams::helpers::get_stream_id(),
+                );
+                let topic_id_usize = self.streams2.with_topic_by_id(
+                    &stream_id,
+                    &topic_id,
+                    crate::streaming::topics::helpers::get_topic_id(),
+                );
+                let group_id_usize = self.streams2.with_consumer_group_by_id(
+                    &stream_id,
+                    &topic_id,
+                    &group_id,
+                    crate::streaming::topics::helpers::get_consumer_group_id(),
+                );
+
+                self.client_manager.borrow_mut().leave_consumer_group(
+                    client_id,
+                    stream_id_usize,
+                    topic_id_usize,
+                    group_id_usize,
+                )?;
+                Ok(())
+            }
+            ShardEvent::DeletedSegments {
+                stream_id,
+                topic_id,
+                partition_id,
+                segments_count,
+            } => {
+                self.delete_segments_bypass_auth(
+                    &stream_id,
+                    &topic_id,
+                    partition_id,
+                    segments_count,
+                )
+                .await?;
                 Ok(())
             }
         }
@@ -945,6 +1013,7 @@ impl IggyShard {
                         | ShardEvent::CreatedPartitions2 { .. }
                         | ShardEvent::DeletedPartitions2 { .. }
                         | ShardEvent::CreatedConsumerGroup2 { .. }
+                        | ShardEvent::CreatedPersonalAccessToken { .. }
                         | ShardEvent::DeletedConsumerGroup2 { .. }
                 ) {
                     let (sender, receiver) = async_channel::bounded(1);

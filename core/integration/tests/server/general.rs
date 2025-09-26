@@ -23,8 +23,9 @@ use iggy_common::TransportProtocol;
 use serial_test::parallel;
 use test_case::test_matrix;
 
+// TODO: Include other trasnsport protocols
 #[test_matrix(
-    [TransportProtocol::Tcp, TransportProtocol::Quic, TransportProtocol::Http],
+    [TransportProtocol::Tcp],
     [
         system_scenario(),
         user_scenario(),

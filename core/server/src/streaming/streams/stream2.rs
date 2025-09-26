@@ -110,6 +110,10 @@ impl Stream {
         Self { root, stats }
     }
 
+    pub fn new_with_components(root: StreamRoot, stats: Arc<StreamStats>) -> Self {
+        Self { root, stats }
+    }
+
     pub fn stats(&self) -> &Arc<StreamStats> {
         &self.stats
     }

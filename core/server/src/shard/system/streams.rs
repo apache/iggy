@@ -21,14 +21,11 @@ use crate::shard::IggyShard;
 use crate::slab::traits_ext::{DeleteCell, EntityMarker, InsertCell};
 
 use crate::streaming::session::Session;
-use crate::streaming::stats::stats::StreamStats;
 use crate::streaming::streams::storage2::{create_stream_file_hierarchy, delete_stream_from_disk};
 use crate::streaming::streams::{self, stream2};
 use error_set::ErrContext;
 
-use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{Identifier, IggyError, IggyTimestamp};
-use std::sync::Arc;
 
 impl IggyShard {
     pub async fn create_stream2(
@@ -127,12 +124,6 @@ impl IggyShard {
             .decrement_messages(stats.messages_count_inconsistent());
         self.metrics
             .decrement_segments(stats.segments_count_inconsistent());
-
-        /*
-        self.client_manager
-            .borrow_mut()
-            .delete_consumer_groups_for_stream(stream_id as u32);
-        */
         stream
     }
 
@@ -157,36 +148,69 @@ impl IggyShard {
                 )
             })?;
         let mut stream = self.delete_stream2_base(id);
+        // Clean up consumer groups from ClientManager for this stream
+        let stream_id_usize = stream.id();
+        self.client_manager
+            .borrow_mut()
+            .delete_consumer_groups_for_stream(stream_id_usize);
         delete_stream_from_disk(self.id, &mut stream, &self.config.system).await?;
         Ok(stream)
     }
 
-    pub async fn purge_stream2(&self, session: &Session, id: &Identifier) -> Result<(), IggyError> {
+    pub async fn purge_stream2(
+        &self,
+        session: &Session,
+        stream_id: &Identifier,
+    ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
-        // self.ensure_stream_exists(id)?;
-        let get_stream_id = crate::streaming::streams::helpers::get_stream_id();
-        let stream_id = self.streams2.with_stream_by_id(id, get_stream_id);
-        self.permissioner
-            .borrow()
-            .purge_stream(session.get_user_id(), stream_id as u32)
-            .with_error_context(|error| {
+        self.ensure_stream_exists(stream_id)?;
+        {
+            let get_stream_id = crate::streaming::streams::helpers::get_stream_id();
+            let stream_id = self.streams2.with_stream_by_id(stream_id, get_stream_id);
+            self.permissioner
+                .borrow()
+                .purge_stream(session.get_user_id(), stream_id as u32)
+                .with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - permission denied to purge stream for user {}, stream ID: {}",
                     session.get_user_id(),
                     stream_id,
                 )
             })?;
-        self.purge_stream2_base(id)?;
+        }
+
+        //TODO: Tech debt.
+        let topic_ids = self
+            .streams2
+            .with_stream_by_id(stream_id, streams::helpers::get_topic_ids());
+
+        // Purge each topic in the stream using bypass auth
+        for topic_id in topic_ids {
+            let topic_identifier = Identifier::numeric(topic_id as u32).unwrap();
+            self.purge_topic2(session, stream_id, &topic_identifier)
+                .await?;
+        }
         Ok(())
     }
 
-    pub fn purge_stream2_bypass_auth(&self, stream_id: &Identifier) -> Result<(), IggyError> {
-        self.purge_stream2_base(stream_id)?;
+    pub async fn purge_stream2_bypass_auth(&self, stream_id: &Identifier) -> Result<(), IggyError> {
+        self.purge_stream2_base(stream_id).await?;
         Ok(())
     }
 
-    fn purge_stream2_base(&self, _stream_id: &Identifier) -> Result<(), IggyError> {
-        // TODO
+    async fn purge_stream2_base(&self, stream_id: &Identifier) -> Result<(), IggyError> {
+        // Get all topic IDs in the stream
+        let topic_ids = self
+            .streams2
+            .with_stream_by_id(stream_id, streams::helpers::get_topic_ids());
+
+        // Purge each topic in the stream using bypass auth
+        for topic_id in topic_ids {
+            let topic_identifier = Identifier::numeric(topic_id as u32).unwrap();
+            self.purge_topic2_bypass_auth(stream_id, &topic_identifier)
+                .await?;
+        }
+
         Ok(())
     }
 }

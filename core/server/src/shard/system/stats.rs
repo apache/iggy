@@ -18,6 +18,7 @@
 
 use crate::VERSION;
 use crate::shard::IggyShard;
+use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::versioning::SemanticVersion;
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{IggyDuration, IggyError, Stats};
@@ -90,26 +91,40 @@ impl IggyShard {
 
         drop(sys);
 
-        //TODO:
-        /*
-        for stream in self.streams.borrow().values() {
-            stats.messages_count += stream.get_messages_count();
-            stats.segments_count += stream.get_segments_count();
-            stats.messages_size_bytes += stream.get_size();
-            stats.streams_count += 1;
-            stats.topics_count += stream.topics.len() as u32;
-            stats.partitions_count += stream
-                .topics
-                .values()
-                .map(|t| t.partitions.len() as u32)
-                .sum::<u32>();
-            stats.consumer_groups_count += stream
-                .topics
-                .values()
-                .map(|t| t.consumer_groups.borrow().len() as u32)
-                .sum::<u32>();
-        }
-        */
+        self.streams2.with_components(|stream_components| {
+            let (stream_roots, stream_stats) = stream_components.into_components();
+            // Iterate through all streams
+            for (stream_id, stream_root) in stream_roots.iter() {
+                stats.streams_count += 1;
+
+                // Get stream-level stats
+                if let Some(stream_stat) = stream_stats.get(stream_id) {
+                    stats.messages_count += stream_stat.messages_count_inconsistent();
+                    stats.segments_count += stream_stat.segments_count_inconsistent();
+                    stats.messages_size_bytes += stream_stat.size_bytes_inconsistent().into();
+                }
+
+                // Access topics within this stream
+                stream_root.topics().with_components(|topic_components| {
+                    let (topic_roots, ..) = topic_components.into_components();
+                    stats.topics_count += topic_roots.len() as u32;
+
+                    // Iterate through all topics in this stream
+                    for (_, topic_root) in topic_roots.iter() {
+                        // Count partitions in this topic
+                        topic_root
+                            .partitions()
+                            .with_components(|partition_components| {
+                                let (partition_roots, ..) = partition_components.into_components();
+                                stats.partitions_count += partition_roots.len() as u32;
+                            });
+
+                        // Count consumer groups in this topic
+                        stats.consumer_groups_count += topic_root.consumer_groups().len() as u32;
+                    }
+                });
+            }
+        });
 
         Ok(stats)
     }

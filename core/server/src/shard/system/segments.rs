@@ -1,4 +1,7 @@
+use std::error;
+
 use crate::shard::IggyShard;
+use crate::streaming;
 /* Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -16,24 +19,108 @@ use crate::shard::IggyShard;
  * specific language governing permissions and limitations
  * under the License.
  */
-use super::COMPONENT;
 use crate::streaming::session::Session;
-use error_set::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
-use iggy_common::locking::IggyRwLockFn;
 
 impl IggyShard {
+    pub async fn delete_segments_bypass_auth(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: usize,
+        segments_count: u32,
+    ) -> Result<(), IggyError> {
+        self.delete_segments_base(stream_id, topic_id, partition_id, segments_count)
+            .await
+    }
+
+    pub async fn delete_segments_base(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: usize,
+        segments_count: u32,
+    ) -> Result<(), IggyError> {
+        let (segments, storages) = self.streams2.with_partition_by_id_mut(
+            stream_id,
+            topic_id,
+            partition_id,
+            |(.., log)| {
+                let upperbound = log.segments().len();
+                let begin = upperbound.saturating_sub(segments_count as usize);
+                let segments = log
+                    .segments_mut()
+                    .drain(begin..upperbound)
+                    .collect::<Vec<_>>();
+                let storages = log
+                    .storages_mut()
+                    .drain(begin..upperbound)
+                    .collect::<Vec<_>>();
+                let _ = log
+                    .indexes_mut()
+                    .drain(begin..upperbound)
+                    .collect::<Vec<_>>();
+                (segments, storages)
+            },
+        );
+        let numeric_stream_id = self
+            .streams2
+            .with_stream_by_id(stream_id, streaming::streams::helpers::get_stream_id());
+        let numeric_topic_id = self.streams2.with_topic_by_id(
+            stream_id,
+            topic_id,
+            streaming::topics::helpers::get_topic_id(),
+        );
+
+        let create_base_segment = segments.len() > 0 && storages.len() > 0;
+        for (mut storage, segment) in storages.into_iter().zip(segments.into_iter()) {
+            let (msg_writer, index_writer) = storage.shutdown();
+            if let Some(msg_writer) = msg_writer
+                && let Some(index_writer) = index_writer
+            {
+                // We need to fsync before closing to ensure all data is written to disk.
+                msg_writer.fsync().await?;
+                index_writer.fsync().await?;
+                let path = msg_writer.path();
+                drop(msg_writer);
+                drop(index_writer);
+                compio::fs::remove_file(&path).await.map_err(|_| {
+                    tracing::error!("Failed to delete segment file at path: {}", path);
+                    IggyError::CannotDeleteFile
+                })?;
+            } else {
+                let start_offset = segment.start_offset;
+                let path = self.config.system.get_segment_path(
+                    numeric_stream_id,
+                    numeric_topic_id,
+                    partition_id,
+                    start_offset,
+                );
+                compio::fs::remove_file(&path).await.map_err(|_| {
+                    tracing::error!("Failed to delete segment file at path: {}", path);
+                    IggyError::CannotDeleteFile
+                })?;
+            }
+        }
+
+        if create_base_segment {
+            self.init_log(stream_id, topic_id, partition_id).await?;
+        }
+        Ok(())
+    }
     pub async fn delete_segments(
         &self,
         session: &Session,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: u32,
+        partition_id: usize,
         segments_count: u32,
     ) -> Result<(), IggyError> {
         // Assert authentication.
         self.ensure_authenticated(session)?;
-        todo!();
+        self.ensure_topic_exists(stream_id, topic_id)?;
+        self.delete_segments_base(stream_id, topic_id, partition_id, segments_count)
+            .await
     }
 }

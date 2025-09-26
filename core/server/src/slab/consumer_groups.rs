@@ -3,7 +3,7 @@ use crate::{
         Keyed, consumer_groups,
         traits_ext::{
             Borrow, ComponentsById, Delete, EntityComponentSystem, EntityComponentSystemMut,
-            Insert, IntoComponents, IntoComponentsById,
+            EntityMarker, Insert, IntoComponents, IntoComponentsById,
         },
     },
     streaming::topics::consumer_group2::{self, ConsumerGroupRef, ConsumerGroupRefMut},
@@ -37,6 +37,8 @@ impl Insert for ConsumerGroups {
             "consumer_group: id mismatch when inserting members"
         );
         self.index.insert(key, entity_id);
+        let root = self.root.get_mut(entity_id).unwrap();
+        root.update_id(entity_id);
         entity_id
     }
 }
@@ -46,12 +48,12 @@ impl Delete for ConsumerGroups {
     type Item = consumer_group2::ConsumerGroup;
 
     fn delete(&mut self, id: Self::Idx) -> Self::Item {
-        let (name, partitions) = self.root.remove(id).disarray();
-        let members = self.members.remove(id).into_inner();
+        let root = self.root.remove(id);
+        let members = self.members.remove(id);
         self.index
-            .remove(&name)
+            .remove(root.key())
             .expect("consumer_group_delete: key not found");
-        consumer_group2::ConsumerGroup::new(name, members, partitions)
+        consumer_group2::ConsumerGroup::new_with_components(root, members)
     }
 }
 
@@ -111,6 +113,10 @@ impl ConsumerGroups {
                 self.index.contains_key(&key)
             }
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.root.len()
     }
 
     pub fn get_index(&self, id: &Identifier) -> usize {
