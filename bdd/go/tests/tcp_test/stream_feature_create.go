@@ -18,6 +18,7 @@
 package tcp_test
 
 import (
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/onsi/ginkgo/v2"
 )
 
@@ -49,7 +50,7 @@ var _ = ginkgo.Describe("CREATE STREAM:", func() {
 			anotherStreamId := createRandomUInt32()
 			_, err = client.CreateStream(name, &anotherStreamId)
 
-			itShouldReturnSpecificError(err, "stream_name_already_exists")
+			itShouldReturnSpecificError(err, ierror.ErrStreamNameAlreadyExists)
 		})
 
 		ginkgo.Context("and tries to create stream with duplicate stream id", func() {
@@ -65,7 +66,7 @@ var _ = ginkgo.Describe("CREATE STREAM:", func() {
 
 			_, err = client.CreateStream(createRandomString(32), &streamId)
 
-			itShouldReturnSpecificError(err, "stream_id_already_exists")
+			itShouldReturnSpecificError(err, ierror.ErrStreamIdAlreadyExists)
 		})
 
 		ginkgo.Context("and tries to create stream name that's over 255 characters", func() {
@@ -75,7 +76,7 @@ var _ = ginkgo.Describe("CREATE STREAM:", func() {
 
 			_, err := client.CreateStream(name, &streamId)
 
-			itShouldReturnSpecificError(err, "stream_name_too_long")
+			itShouldReturnSpecificError(err, ierror.ErrInvalidStreamName)
 		})
 	})
 

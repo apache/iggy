@@ -19,8 +19,9 @@ package binaryserialization
 
 import (
 	"errors"
-	ierror "github.com/apache/iggy/foreign/go/errors"
 	"testing"
+
+	ierror "github.com/apache/iggy/foreign/go/errors"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 )
@@ -70,7 +71,7 @@ func TestSerializeIdentifier_EmptyStringId(t *testing.T) {
 	_, err := iggcon.NewIdentifier("")
 
 	// Check if the serialized bytes match the expected bytes
-	if !errors.Is(err, ierror.InvalidIdentifier) {
-		t.Errorf("Expected error: %v, got: %v", ierror.InvalidIdentifier, err)
+	if !errors.Is(err, ierror.ErrInvalidIdentifier) {
+		t.Errorf("Expected error: %v, got: %v", ierror.ErrInvalidIdentifier, err)
 	}
 }
