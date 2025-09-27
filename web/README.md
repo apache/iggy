@@ -50,7 +50,7 @@ The [docker image](https://hub.docker.com/r/apache/iggy-web-ui) is available, an
    **If Iggy server was run using cargo directly we need to change PUBLIC_IGGY_API_URL env in web ui root folder to:**
 
    ```sh
-   PUBLIC_IGGY_API_URL=http://0.0.0.0:3000
+   PUBLIC_IGGY_API_URL=http://127.0.0.1:3000
    ```
 
    **instead of**

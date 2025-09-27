@@ -50,7 +50,7 @@ jobs:
         if: inputs.component == 'examples-suite'
         uses: ./.github/actions/utils/setup-rust-with-cache
         with:
-          cache-targets: false  # Only cache registry and git deps, not target dir (sccache handles that)
+          cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
 
       - name: Build common binaries for all examples
         if: inputs.component == 'examples-suite'
@@ -104,6 +104,13 @@ jobs:
           echo "Running Go examples tests..."
           # Run the examples script which will use the prebuilt server binary
           ./scripts/run-go-examples-from-readme.sh
+
+      - name: Run Csharp examples
+        if: inputs.component == 'examples-suite' && inputs.task == 'examples-csharp'
+        run: |
+          echo "Running Csharp examples tests..."
+          # Run the examples script which will use the prebuilt server binary
+          ./scripts/run-csharp-examples-from-readme.sh
 
       - name: Upload reports
         if: always()

@@ -17,14 +17,22 @@
  */
 
 use axum::http::Method;
+use figment::{
+    Metadata, Profile, Provider,
+    providers::{Format, Toml},
+    value::Dict,
+};
 use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
+use iggy_common::{CustomEnvProvider, FileConfigProvider};
 use serde::{Deserialize, Serialize};
+use std::fmt::Formatter;
 use strum::Display;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct McpServerConfig {
-    pub http: Option<HttpApiConfig>,
+    pub http: HttpConfig,
     pub iggy: IggyConfig,
     pub permissions: PermissionsConfig,
     pub transport: McpTransport,
@@ -33,18 +41,10 @@ pub struct McpServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IggyConfig {
     pub address: String,
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub token: Option<String>,
-    pub consumer: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct HttpApiConfig {
-    pub address: String,
-    pub path: String,
-    pub cors: Option<HttpCorsConfig>,
-    pub tls: Option<HttpTlsConfig>,
+    pub username: String,
+    pub password: String,
+    pub token: String,
+    pub consumer: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -55,11 +55,19 @@ pub struct PermissionsConfig {
     pub delete: bool,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HttpConfig {
+    pub address: String,
+    pub path: String,
+    pub cors: HttpCorsConfig,
+    pub tls: HttpTlsConfig,
+}
+
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct HttpTlsConfig {
     pub enabled: bool,
-    pub cert: String,
-    pub key: String,
+    pub cert_file: String,
+    pub key_file: String,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize, Clone)]
@@ -87,7 +95,7 @@ pub enum McpTransport {
 impl Default for McpServerConfig {
     fn default() -> Self {
         Self {
-            http: Some(HttpApiConfig::default()),
+            http: HttpConfig::default(),
             iggy: IggyConfig::default(),
             permissions: PermissionsConfig::default(),
             transport: McpTransport::Http,
@@ -99,21 +107,21 @@ impl Default for IggyConfig {
     fn default() -> Self {
         Self {
             address: "localhost:8090".to_owned(),
-            username: Some(DEFAULT_ROOT_USERNAME.to_owned()),
-            password: Some(DEFAULT_ROOT_PASSWORD.to_owned()),
-            token: None,
-            consumer: None,
+            username: DEFAULT_ROOT_USERNAME.to_owned(),
+            password: DEFAULT_ROOT_PASSWORD.to_owned(),
+            token: "".to_owned(),
+            consumer: "iggy-mcp".to_owned(),
         }
     }
 }
 
-impl Default for HttpApiConfig {
+impl Default for HttpConfig {
     fn default() -> Self {
         Self {
             address: "localhost:8082".to_owned(),
             path: "/mcp".to_owned(),
-            tls: None,
-            cors: None,
+            cors: HttpCorsConfig::default(),
+            tls: HttpTlsConfig::default(),
         }
     }
 }
@@ -175,4 +183,115 @@ pub fn configure_cors(config: &HttpCorsConfig) -> CorsLayer {
         .expose_headers(exposed_headers)
         .allow_credentials(config.allow_credentials)
         .allow_private_network(config.allow_private_network)
+}
+
+impl std::fmt::Display for IggyConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ address: {}, username: {}, password: {}, token: {}, consumer: {} }}",
+            self.address,
+            self.username,
+            if !self.password.is_empty() {
+                "****"
+            } else {
+                ""
+            },
+            if !self.token.is_empty() { "****" } else { "" },
+            self.consumer
+        )
+    }
+}
+
+impl std::fmt::Display for PermissionsConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ create: {}, read: {}, update: {}, delete: {} }}",
+            self.create, self.read, self.update, self.delete
+        )
+    }
+}
+
+impl std::fmt::Display for McpServerConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ http: {}, iggy: {}, permissions: {:?}, transport: {} }}",
+            self.http, self.iggy, self.permissions, self.transport
+        )
+    }
+}
+
+impl std::fmt::Display for HttpConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ address: {}, path: {}, cors: {}, tls: {} }}",
+            self.address, self.path, self.cors, self.tls
+        )
+    }
+}
+
+impl std::fmt::Display for HttpTlsConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ enabled: {}, cert_file: {}, key_file: {} }}",
+            self.enabled, self.cert_file, self.key_file
+        )
+    }
+}
+
+impl std::fmt::Display for HttpCorsConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ enabled: {}, allowed_methods: {:?}, allowed_origins: {:?}, allowed_headers: {:?}, exposed_headers: {:?}, allow_credentials: {}, allow_private_network: {} }}",
+            self.enabled,
+            self.allowed_methods,
+            self.allowed_origins,
+            self.allowed_headers,
+            self.exposed_headers,
+            self.allow_credentials,
+            self.allow_private_network
+        )
+    }
+}
+
+impl McpServerConfig {
+    pub fn config_provider(path: String) -> FileConfigProvider<McpServerEnvProvider> {
+        let default_config = Toml::string(include_str!("../../../ai/mcp/config.toml"));
+        FileConfigProvider::new(
+            path,
+            McpServerEnvProvider::default(),
+            true,
+            Some(default_config),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct McpServerEnvProvider {
+    provider: CustomEnvProvider<McpServerConfig>,
+}
+
+impl Default for McpServerEnvProvider {
+    fn default() -> Self {
+        Self {
+            provider: CustomEnvProvider::new("IGGY_MCP_", &[]),
+        }
+    }
+}
+
+impl Provider for McpServerEnvProvider {
+    fn metadata(&self) -> Metadata {
+        Metadata::named("iggy-mcp-server-config")
+    }
+
+    fn data(&self) -> Result<figment::value::Map<Profile, Dict>, figment::Error> {
+        self.provider.deserialize().map_err(|_| {
+            figment::Error::from("Cannot deserialize environment variables for MCP config")
+        })
+    }
 }

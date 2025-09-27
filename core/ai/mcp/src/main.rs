@@ -16,12 +16,12 @@
  * under the License.
  */
 
-use config::{Config, Environment, File};
 use configs::{McpServerConfig, McpTransport};
 use dotenvy::dotenv;
 use error::McpRuntimeError;
 use figlet_rs::FIGfont;
 use iggy::prelude::{Client, Identifier};
+use iggy_common::ConfigProvider;
 use rmcp::{ServiceExt, model::ErrorData, transport::stdio};
 use service::IggyService;
 use std::{env, sync::Arc};
@@ -33,6 +33,8 @@ mod configs;
 mod error;
 mod service;
 mod stream;
+
+const DEFAULT_CONFIG_PATH: &str = "core/ai/mcp/config.toml";
 
 #[tokio::main]
 async fn main() -> Result<(), McpRuntimeError> {
@@ -51,16 +53,13 @@ async fn main() -> Result<(), McpRuntimeError> {
         );
     }
 
-    let config_path = env::var("IGGY_MCP_CONFIG_PATH").unwrap_or_else(|_| "config".to_string());
+    let config_path =
+        env::var("IGGY_MCP_CONFIG_PATH").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
     eprintln!("Configuration file path: {config_path}");
-    let config: McpServerConfig = Config::builder()
-        .add_source(Config::try_from(&McpServerConfig::default()).expect("Failed to init config"))
-        .add_source(File::with_name(&config_path).required(false))
-        .add_source(Environment::with_prefix("IGGY_MCP").separator("_"))
-        .build()
-        .expect("Failed to build runtime config")
-        .try_deserialize()
-        .expect("Failed to deserialize runtime config");
+    let config: McpServerConfig = McpServerConfig::config_provider(config_path)
+        .load_config()
+        .await
+        .expect("Failed to load configuration");
 
     let transport = config.transport;
     if transport == McpTransport::Stdio {
@@ -78,11 +77,14 @@ async fn main() -> Result<(), McpRuntimeError> {
 
     info!("Starting Iggy MCP Server, transport: {transport}...");
 
-    let consumer_id = Identifier::from_str_value(
-        config.iggy.consumer.as_deref().unwrap_or("iggy-mcp"),
-    )
-    .map_err(|error| {
-        error!("Failed to create Iggy consumer ID: {:?}", error);
+    let consumer = if config.iggy.consumer.is_empty() {
+        "iggy-mcp"
+    } else {
+        config.iggy.consumer.as_str()
+    };
+
+    let consumer_id = Identifier::from_str_value(consumer).map_err(|error| {
+        error!("Failed to create Iggy consumer ID: {consumer}. {error}",);
         McpRuntimeError::FailedToCreateConsumerId
     })?;
     let iggy_consumer = Arc::new(iggy::prelude::Consumer::new(consumer_id));
@@ -99,8 +101,8 @@ async fn main() -> Result<(), McpRuntimeError> {
         let Ok(service) = IggyService::new(iggy_client, iggy_consumer, permissions)
             .serve(stdio())
             .await
-            .inspect_err(|e| {
-                error!("Serving error: {:?}", e);
+            .inspect_err(|error| {
+                error!("Serving error. {error}");
             })
         else {
             error!("Failed to create service");
@@ -108,15 +110,10 @@ async fn main() -> Result<(), McpRuntimeError> {
         };
 
         if let Err(error) = service.waiting().await {
-            error!("waiting error: {:?}", error);
+            error!("Waiting for service error. {error}");
         }
     } else {
-        let Some(http_config) = config.http else {
-            error!("HTTP API configuration not found");
-            return Err(McpRuntimeError::MissingConfig);
-        };
-
-        api::init(http_config, iggy_client, iggy_consumer, permissions).await?;
+        api::init(config.http, iggy_client, iggy_consumer, permissions).await?;
     }
 
     #[cfg(unix)]
