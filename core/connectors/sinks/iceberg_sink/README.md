@@ -1,6 +1,6 @@
 # Iceberg Sink Connector
 
-The Iceberg Sink Connector allows you to consume messages from Iggy topics and store them in Iceberg tables. 
+The Iceberg Sink Connector allows you to consume messages from Iggy topics and store them in Iceberg tables.
 
 ## Features
 
@@ -26,6 +26,7 @@ store_secret_access_key = "password"
 store_region = "us-east-1"
 store_class = "s3"
 ```
+
 # Configuration Options
 
 - **tables**: The names of the Iceberg tables you want to statically route Iggy messages to. The name should include the table’s namespace, separated by a dot (`.`).  
@@ -46,9 +47,9 @@ If you don't know the names of the Iceberg tables you want to route data to in a
 Insert a field in your Iggy messages with the name of the Iceberg table the message should be routed to. The Iggy connector will parse this field at runtime and route the message to the correct table.  
 
 The Iggy Iceberg Connector will skip messages in the following cases:  
+
 - The table declared in the message field does not exist.  
 - The message does not contain the field specified in the `dynamic_route_field` configuration option.  
-
 
 ### Dynamic routing configuration example
 
@@ -76,6 +77,6 @@ value.static = "nyc.users"
 
 **Note:** The value in the message field **must** contain both the namespace and the table name, separated by a dot (`.`).  
 Example:  
+
 - Namespace: `nyc`  
 - Table name: `users`  
-
