@@ -30,7 +30,7 @@ func (tms *IggyTcpClient) GetUser(identifier iggcon.Identifier) (*iggcon.UserInf
 		return nil, err
 	}
 	if len(buffer) == 0 {
-		return nil, ierror.ResourceNotFound
+		return nil, ierror.ErrResourceNotFound
 	}
 
 	return binaryserialization.DeserializeUser(buffer)
