@@ -23,6 +23,7 @@ using Apache.Iggy.Headers;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Fixtures;
+using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
@@ -79,8 +80,8 @@ public class SendMessagesTests
         {
             Messages = _messagesWithoutHeaders,
             Partitioning = Partitioning.None(),
-            StreamId = Identifier.Numeric(Fixture.StreamId),
-            TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value)
+            StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+            TopicId = Identifier.String(Fixture.TopicRequest.Name)
         }));
     }
 
@@ -94,7 +95,7 @@ public class SendMessagesTests
             {
                 Messages = _messagesWithoutHeaders,
                 Partitioning = Partitioning.None(),
-                StreamId = Identifier.Numeric(Fixture.StreamId),
+                StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
                 TopicId = Identifier.Numeric(69)
             }));
     }
@@ -108,8 +109,8 @@ public class SendMessagesTests
         {
             Messages = _messagesWithHeaders,
             Partitioning = Partitioning.None(),
-            StreamId = Identifier.Numeric(Fixture.StreamId),
-            TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value)
+            StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+            TopicId = Identifier.String(Fixture.TopicRequest.Name)
         }));
     }
 
@@ -123,7 +124,7 @@ public class SendMessagesTests
             {
                 Messages = _messagesWithHeaders,
                 Partitioning = Partitioning.None(),
-                StreamId = Identifier.Numeric(Fixture.StreamId),
+                StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
                 TopicId = Identifier.Numeric(69)
             }));
     }
@@ -133,8 +134,8 @@ public class SendMessagesTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task SendMessages_WithEncryptor_Should_SendMessage_Successfully(Protocol protocol)
     {
-        await Fixture.Clients[protocol].SendMessagesAsync(Identifier.Numeric(Fixture.StreamId),
-            Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), Partitioning.None(),
+        await Fixture.Clients[protocol].SendMessagesAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+            Identifier.String(Fixture.TopicRequest.Name), Partitioning.None(),
             [new Message(Guid.NewGuid(), "Test message"u8.ToArray())], bytes =>
             {
                 Array.Reverse(bytes);
@@ -148,8 +149,8 @@ public class SendMessagesTests
             Consumer = Consumer.New(1),
             PartitionId = 1,
             PollingStrategy = PollingStrategy.Last(),
-            StreamId = Identifier.Numeric(Fixture.StreamId),
-            TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value)
+            StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+            TopicId = Identifier.String(Fixture.TopicRequest.Name)
         };
 
         var response = await Fixture.Clients[protocol].PollMessagesAsync(messageFetchRequest);

@@ -2,7 +2,7 @@
 
 <div align="center">
 
-[![Nuget (with prereleases)](https://img.shields.io/nuget/vpre/Iggy)](https://www.nuget.org/packages/Iggy)
+[![Nuget (with prereleases)](https://img.shields.io/nuget/v/Apache.Iggy)](https://www.nuget.org/packages/Apache.Iggy)
 
 </div>
 
@@ -398,6 +398,12 @@ then get the SDK, cd into `Iggy_SDK`
 and run following commands: `dotnet run -c Release --project Iggy_Sample_Producer` for producer,
 `dotnet run -c Release --project Iggy_Sample_Consumer`
 for consumer.
+
+## Integration Tests
+
+Integration tests are located in `Iggy_SDK/Iggy_Sample_Producer/IntegrationTests` folder.
+Tests can be run against a dockerized Iggy server with TestContainers or local Iggy server.
+To run with a local Iggy server, the environment variable `IGGY_SERVER_HOST` needs to be set.
 
 ## TODO
 

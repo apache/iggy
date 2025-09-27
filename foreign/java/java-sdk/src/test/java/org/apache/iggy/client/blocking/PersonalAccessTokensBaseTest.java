@@ -34,6 +34,16 @@ public abstract class PersonalAccessTokensBaseTest extends IntegrationTest {
         personalAccessTokensClient = client.personalAccessTokens();
 
         login();
+
+        // Clean up any existing tokens before test
+        var existingTokens = personalAccessTokensClient.getPersonalAccessTokens();
+        for (var token : existingTokens) {
+            try {
+                personalAccessTokensClient.deletePersonalAccessToken(token.name());
+            } catch (Exception e) {
+                // Ignore if already deleted
+            }
+        }
     }
 
     @Test
@@ -78,6 +88,9 @@ public abstract class PersonalAccessTokensBaseTest extends IntegrationTest {
 
         // then
         assertThat(user).isPresent();
+
+        // cleanup
+        personalAccessTokensClient.deletePersonalAccessToken("new-token");
     }
 
 }

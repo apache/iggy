@@ -28,6 +28,7 @@ use std::{panic, thread};
 mod archiver;
 mod cli;
 mod config_provider;
+mod connectors;
 mod data_integrity;
 mod mcp;
 mod sdk;

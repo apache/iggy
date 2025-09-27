@@ -38,7 +38,7 @@ cargo build --release
 
 # Start iggy-server
 echo "Running iggy-server..."
-target/release/iggy-server &> /dev/null &
+IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy target/release/iggy-server &> /dev/null &
 sleep 1
 
 # Start tcp send bench

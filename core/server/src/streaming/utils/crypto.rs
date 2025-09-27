@@ -16,12 +16,32 @@
  * under the License.
  */
 
-use bcrypt::{hash, verify};
+use argon2::{
+    Argon2,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
+};
+use rand::{Rng, distr::Alphanumeric};
+use std::ops::Range;
 
 pub fn hash_password(password: &str) -> String {
-    hash(password, 4).unwrap()
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .expect("Password hashing failed")
+        .to_string()
 }
 
 pub fn verify_password(password: &str, hash: &str) -> bool {
-    verify(password, hash).unwrap_or(false)
+    let hash = PasswordHash::new(hash).expect("Failed to parse password hash");
+    Argon2::default()
+        .verify_password(password.as_bytes(), &hash)
+        .is_ok()
+}
+
+pub fn generate_secret(range: Range<usize>) -> String {
+    let length = rand::rng().random_range(range);
+    let mut rng = rand::rng();
+    (0..length)
+        .map(|_| rng.sample(Alphanumeric) as char)
+        .collect()
 }

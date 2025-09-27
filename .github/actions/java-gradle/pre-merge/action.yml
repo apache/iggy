@@ -67,9 +67,23 @@ runs:
         # Exit with build exit code
         exit $BUILD_EXIT_CODE
 
+    - name: Setup Rust with cache
+      if: inputs.task == 'test'
+      uses: ./.github/actions/utils/setup-rust-with-cache
+      with:
+        cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
+
+    - name: Start Iggy server
+      if: inputs.task == 'test'
+      id: iggy
+      uses: ./.github/actions/utils/server-start
+      continue-on-error: true
+
     - name: Test
       if: inputs.task == 'test'
       shell: bash
+      env:
+        USE_EXTERNAL_SERVER: true
       run: |
         foreign/java/dev-support/checks/build.sh test
 
@@ -84,3 +98,10 @@ runs:
           cd foreign/java
           ./gradlew jacocoTestReport --no-daemon
         fi
+
+    - name: Stop Iggy server
+      if: inputs.task == 'test'
+      uses: ./.github/actions/utils/server-stop
+      with:
+        pid-file: ${{ steps.iggy.outputs.pid_file }}
+        log-file: ${{ steps.iggy.outputs.log_file }}

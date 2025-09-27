@@ -23,6 +23,7 @@ using Apache.Iggy.Headers;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Fixtures;
+using Apache.Iggy.Tests.Integrations.Helpers;
 using Apache.Iggy.Tests.Integrations.Models;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
@@ -47,8 +48,8 @@ public class FetchMessagesTests
                 Consumer = Consumer.New(1),
                 PartitionId = 1,
                 PollingStrategy = PollingStrategy.Next(),
-                StreamId = Identifier.Numeric(Fixture.StreamId),
-                TopicId = Identifier.Numeric(Fixture.TopicDummyRequest.TopicId!.Value)
+                StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+                TopicId = Identifier.String(Fixture.TopicDummyRequest.Name)
             }, DummyMessage.DeserializeDummyMessage);
 
         response.Messages.Count.ShouldBe(10);
@@ -80,8 +81,8 @@ public class FetchMessagesTests
             Consumer = Consumer.New(1),
             PartitionId = 1,
             PollingStrategy = PollingStrategy.Next(),
-            StreamId = Identifier.Numeric(Fixture.StreamId),
-            TopicId = Identifier.Numeric(55)
+            StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+            TopicId = Identifier.Numeric(2137)
         };
         await Should.ThrowAsync<InvalidResponseException>(() =>
             Fixture.Clients[protocol].PollMessagesAsync(invalidFetchRequest, DummyMessage.DeserializeDummyMessage));
@@ -99,8 +100,8 @@ public class FetchMessagesTests
             Consumer = Consumer.New(1),
             PartitionId = 1,
             PollingStrategy = PollingStrategy.Next(),
-            StreamId = Identifier.Numeric(Fixture.StreamId),
-            TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value)
+            StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+            TopicId = Identifier.String(Fixture.TopicRequest.Name)
         });
 
         response.Messages.Count.ShouldBe(10);
@@ -127,8 +128,8 @@ public class FetchMessagesTests
             Consumer = Consumer.New(1),
             PartitionId = 1,
             PollingStrategy = PollingStrategy.Next(),
-            StreamId = Identifier.Numeric(Fixture.StreamId),
-            TopicId = Identifier.Numeric(55)
+            StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+            TopicId = Identifier.Numeric(2137)
         };
 
         await Should.ThrowAsync<InvalidResponseException>(() =>
@@ -147,8 +148,8 @@ public class FetchMessagesTests
             Consumer = Consumer.New(1),
             PartitionId = 1,
             PollingStrategy = PollingStrategy.Next(),
-            StreamId = Identifier.Numeric(Fixture.StreamId),
-            TopicId = Identifier.Numeric(Fixture.HeadersTopicRequest.TopicId!.Value)
+            StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+            TopicId = Identifier.String(Fixture.HeadersTopicRequest.Name)
         };
 
 
@@ -177,8 +178,8 @@ public class FetchMessagesTests
             Consumer = Consumer.New(1),
             PartitionId = 1,
             PollingStrategy = PollingStrategy.Next(),
-            StreamId = Identifier.Numeric(Fixture.StreamId),
-            TopicId = Identifier.Numeric(Fixture.TopicDummyHeaderRequest.TopicId!.Value)
+            StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+            TopicId = Identifier.String(Fixture.TopicDummyHeaderRequest.Name)
         };
 
         PolledMessages<DummyMessage> response = await Fixture.Clients[protocol]
@@ -200,8 +201,8 @@ public class FetchMessagesTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task PollMessagesMessage_WithEncryptor_Should_PollMessages_Successfully(Protocol protocol)
     {
-        await Fixture.Clients[protocol].SendMessagesAsync(Identifier.Numeric(Fixture.StreamId),
-            Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value), Partitioning.None(),
+        await Fixture.Clients[protocol].SendMessagesAsync(Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+            Identifier.String(Fixture.TopicRequest.Name), Partitioning.None(),
             [new Message(Guid.NewGuid(), "Test message"u8.ToArray())], bytes =>
             {
                 Array.Reverse(bytes);
@@ -215,8 +216,8 @@ public class FetchMessagesTests
             Consumer = Consumer.New(1),
             PartitionId = 1,
             PollingStrategy = PollingStrategy.Last(),
-            StreamId = Identifier.Numeric(Fixture.StreamId),
-            TopicId = Identifier.Numeric(Fixture.TopicRequest.TopicId!.Value)
+            StreamId = Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
+            TopicId = Identifier.String(Fixture.TopicRequest.Name)
         };
 
         var response = await Fixture.Clients[protocol].PollMessagesAsync(messageFetchRequest, bytes =>

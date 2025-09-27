@@ -73,9 +73,12 @@ impl<T: Sink + std::fmt::Debug> SinkContainer<T> {
                 return -1;
             };
 
-            let Ok(config) = serde_json::from_str(config_str) else {
-                error!("Failed to parse configuration for sink connector with ID: {id}",);
-                return -1;
+            let config = match serde_json::from_str::<C>(config_str) {
+                Ok(cfg) => cfg,
+                Err(err) => {
+                    error!("Failed to parse configuration for sink connector with ID: {id}. {err}",);
+                    return -1;
+                }
             };
 
             let mut sink = factory(id, config);

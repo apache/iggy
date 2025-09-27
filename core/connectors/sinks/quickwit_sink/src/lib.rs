@@ -47,7 +47,7 @@ struct IndexConfig {
 impl QuickwitSink {
     pub fn new(id: u32, config: QuickwitSinkConfig) -> Self {
         let index_config =
-            serde_yml::from_str::<IndexConfig>(&config.index).expect("Invalid index config.");
+            serde_yaml_ng::from_str::<IndexConfig>(&config.index).expect("Invalid index config.");
         QuickwitSink {
             id,
             config,

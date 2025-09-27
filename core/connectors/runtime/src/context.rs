@@ -18,7 +18,7 @@
 
 use crate::{
     SinkConnectorWrapper, SourceConnectorWrapper,
-    configs::RuntimeConfig,
+    configs::ConnectorsConfig,
     manager::{
         sink::{SinkDetails, SinkInfo, SinkManager},
         source::{SourceDetails, SourceInfo, SourceManager},
@@ -29,22 +29,25 @@ use tracing::error;
 pub struct RuntimeContext {
     pub sinks: SinkManager,
     pub sources: SourceManager,
-    pub api_key: Option<String>,
+    pub api_key: String,
 }
 
 pub fn init(
-    config: &RuntimeConfig,
+    config: &ConnectorsConfig,
     sink_wrappers: &[SinkConnectorWrapper],
     source_wrappers: &[SourceConnectorWrapper],
 ) -> RuntimeContext {
     RuntimeContext {
         sinks: SinkManager::new(map_sinks(config, sink_wrappers)),
         sources: SourceManager::new(map_sources(config, source_wrappers)),
-        api_key: config.http_api.api_key.clone(),
+        api_key: config.http.api_key.to_owned(),
     }
 }
 
-fn map_sinks(config: &RuntimeConfig, sink_wrappers: &[SinkConnectorWrapper]) -> Vec<SinkDetails> {
+fn map_sinks(
+    config: &ConnectorsConfig,
+    sink_wrappers: &[SinkConnectorWrapper],
+) -> Vec<SinkDetails> {
     let mut sinks = vec![];
     for sink_wrapper in sink_wrappers.iter() {
         for sink_plugin in sink_wrapper.plugins.iter() {
@@ -73,7 +76,7 @@ fn map_sinks(config: &RuntimeConfig, sink_wrappers: &[SinkConnectorWrapper]) -> 
 }
 
 fn map_sources(
-    config: &RuntimeConfig,
+    config: &ConnectorsConfig,
     source_wrappers: &[SourceConnectorWrapper],
 ) -> Vec<SourceDetails> {
     let mut sources = vec![];

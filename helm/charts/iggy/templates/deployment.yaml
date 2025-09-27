@@ -1,0 +1,200 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+{{ if .Values.server.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "iggy.fullname" . }}
+  labels:
+    {{ include "iggy.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.server.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{ include "iggy.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{ toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{ include "iggy.labels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{ toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "iggy.serviceAccountName" . }}
+      securityContext:
+        {{ toYaml .Values.server.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{ toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.server.image.repository }}:{{ .Values.server.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.server.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.server.ports.http }}
+              protocol: TCP
+            - name: tcp
+              containerPort: {{ .Values.server.ports.tcp }}
+              protocol: TCP
+            - name: quic
+              containerPort: {{ .Values.server.ports.quic }}
+              protocol: TCP
+          env:
+            {{ if .Values.server.users.root.existingSecret.name }}
+            - name: IGGY_ROOT_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.server.users.root.existingSecret.name }}
+                  key: {{ .Values.server.users.root.existingSecret.usernameKey }}
+            - name: IGGY_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.server.users.root.existingSecret.name }}
+                  key: {{ .Values.server.users.root.existingSecret.passwordKey }}
+            {{ else }}{{ if .Values.server.users.root.createSecret }}
+            - name: IGGY_ROOT_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "iggy.fullname" . }}-root-credentials
+                  key: username
+            - name: IGGY_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "iggy.fullname" . }}-root-credentials
+                  key: password
+            {{- end }}{{- end}}
+            {{ if .Values.server.env }}
+            {{- range .Values.server.env }}
+            - name: {{ .name }}
+              value: {{ .value | quote }}
+            {{- end }}
+            {{ end }}
+          volumeMounts:
+            - name: iggy-server-data
+              mountPath: /local_data
+              subPath: {{ ternary "root" (printf "%s/root" .Values.server.persistence.subPath) (empty .Values.server.persistence.subPath) }}
+
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.server.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.server.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumes:
+        - name: iggy-server-data
+          {{- if .Values.server.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ if .Values.server.persistence.existingClaim }}{{ .Values.server.persistence.existingClaim }}{{- else }}{{ template "iggy.fullname" . }}{{- end }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+{{- end }}
+{{ if .Values.ui.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "iggy.fullname" . }}-ui
+  labels:
+    {{ include "iggy-ui.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.ui.replicaCount }}
+  selector:
+    matchLabels:
+      {{ include "iggy-ui.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{ toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{ include "iggy-ui.labels" . | nindent 8 }}-ui
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{ toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "iggy.serviceAccountName" . }}
+      securityContext:
+        {{ toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{ toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.ui.image.repository }}:{{ .Values.ui.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.ui.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.ui.ports.http }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+          resources:
+            {{ toYaml .Values.ui.resources | nindent 12 }}
+          env:
+            - name: PUBLIC_IGGY_API_URL
+              {{- if .Values.ui.server.endpoint }}
+              value: {{ .Values.ui.server.endpoint }}
+              {{- else }}
+              value: http://{{ include "iggy.fullname" . }}:{{ .Values.server.ports.http }}{{- end }}
+          {{- with .Values.ui.env }}
+          {{ . | toYaml | nindent 10 }}
+          {{- end }}
+      {{- with .Values.ui.nodeSelector }}
+      nodeSelector:
+        {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.ui.affinity }}
+      affinity:
+        {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.ui.tolerations }}
+      tolerations:
+        {{ toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

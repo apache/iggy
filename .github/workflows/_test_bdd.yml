@@ -50,7 +50,7 @@ jobs:
         if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
         uses: ./.github/actions/utils/setup-rust-with-cache
         with:
-          cache-targets: false  # Only cache registry and git deps, not target dir (sccache handles that)
+          cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
 
       - name: Build server for BDD tests
         if: startsWith(inputs.component, 'bdd-') && startsWith(inputs.task, 'bdd-')
@@ -89,6 +89,8 @@ jobs:
           # Export path to the pre-built server and cli binaries (relative to repo root)
           export IGGY_SERVER_PATH="target/debug/iggy-server"
           export IGGY_CLI_PATH="target/debug/iggy"
+          export IGGY_ROOT_USERNAME="iggy"
+          export IGGY_ROOT_PASSWORD="iggy"
           ./scripts/run-bdd-tests.sh "$SDK_NAME"
 
       - name: Clean up Docker resources (BDD)

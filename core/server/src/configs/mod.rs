@@ -18,7 +18,6 @@
 
 pub mod cache_indexes;
 pub mod cluster;
-pub mod config_provider;
 pub mod defaults;
 pub mod displays;
 pub mod http;

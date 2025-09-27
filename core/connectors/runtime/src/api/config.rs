@@ -19,6 +19,7 @@
 use crate::{configs::ConfigFormat, error::RuntimeError};
 use axum::http::{HeaderValue, Method};
 use serde::{Deserialize, Serialize};
+use std::fmt::Formatter;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::error;
 
@@ -28,15 +29,15 @@ pub const TOML_HEADER: HeaderValue = HeaderValue::from_static("application/toml"
 pub const TEXT_HEADER: HeaderValue = HeaderValue::from_static("text/plain");
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct HttpApiConfig {
+pub struct HttpConfig {
     pub enabled: bool,
     pub address: String,
-    pub api_key: Option<String>,
-    pub cors: Option<HttpCorsConfig>,
-    pub tls: Option<HttpTlsConfig>,
+    pub api_key: String,
+    pub cors: HttpCorsConfig,
+    pub tls: HttpTlsConfig,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct HttpCorsConfig {
     pub enabled: bool,
     pub allowed_methods: Vec<String>,
@@ -47,7 +48,7 @@ pub struct HttpCorsConfig {
     pub allow_private_network: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct HttpTlsConfig {
     pub enabled: bool,
     pub cert_file: String,
@@ -61,11 +62,11 @@ pub fn map_connector_config(
     match format {
         ConfigFormat::Json => Ok((JSON_HEADER, config.to_string())),
         ConfigFormat::Yaml => {
-            let config = serde_yml::to_value(config).map_err(|error| {
+            let config = serde_yaml_ng::to_value(config).map_err(|error| {
                 error!("Failed to convert configuration to YAML. {error}");
                 RuntimeError::CannotConvertConfiguration
             })?;
-            let config = serde_yml::to_string(&config).map_err(|error| {
+            let config = serde_yaml_ng::to_string(&config).map_err(|error| {
                 error!("Failed to serialize YAML configuration. {error}");
                 RuntimeError::CannotConvertConfiguration
             })?;
@@ -128,4 +129,52 @@ pub fn configure_cors(config: &HttpCorsConfig) -> CorsLayer {
         .expose_headers(exposed_headers)
         .allow_credentials(config.allow_credentials)
         .allow_private_network(config.allow_private_network)
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            address: "localhost:8081".to_owned(),
+            api_key: "".to_owned(),
+            cors: HttpCorsConfig::default(),
+            tls: HttpTlsConfig::default(),
+        }
+    }
+}
+
+impl std::fmt::Display for HttpConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ address: {}, api_key: {}, cors: {}, tls: {} }}",
+            self.address, self.api_key, self.cors, self.tls
+        )
+    }
+}
+
+impl std::fmt::Display for HttpTlsConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ enabled: {}, cert_file: {}, key_file: {} }}",
+            self.enabled, self.cert_file, self.key_file
+        )
+    }
+}
+
+impl std::fmt::Display for HttpCorsConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{{ enabled: {}, allowed_methods: {:?}, allowed_origins: {:?}, allowed_headers: {:?}, exposed_headers: {:?}, allow_credentials: {}, allow_private_network: {} }}",
+            self.enabled,
+            self.allowed_methods,
+            self.allowed_origins,
+            self.allowed_headers,
+            self.exposed_headers,
+            self.allow_credentials,
+            self.allow_private_network
+        )
+    }
 }

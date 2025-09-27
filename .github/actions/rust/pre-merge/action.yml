@@ -33,7 +33,7 @@ runs:
     - name: Setup Rust with cache
       uses: ./.github/actions/utils/setup-rust-with-cache
       with:
-        cache-targets: false  # Only cache registry and git deps, not target dir (sccache handles that)
+        cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
         show-stats: true
 
     - name: Install tools for specific tasks
@@ -101,7 +101,7 @@ runs:
       shell: bash
 
     - name: Backwards compatibility check
-      if: inputs.task == 'compat'
+      if: inputs.task == 'compat' && (github.event_name != 'pull_request' || !contains(github.event.pull_request.body || '', 'BREAKING'))
       run: |
         scripts/check-backwards-compat.sh \
           --master-ref master \

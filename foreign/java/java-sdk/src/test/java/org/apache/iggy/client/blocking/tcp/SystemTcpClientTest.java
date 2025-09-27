@@ -56,6 +56,6 @@ class SystemTcpClientTest extends SystemClientBaseTest {
 
         // then
         assertThat(clients).isNotNull();
-        assertThat(clients.size()).isEqualTo(1);
+        assertThat(clients.size()).isGreaterThanOrEqualTo(1); // At least our connection
     }
 }

@@ -25,8 +25,6 @@ use ahash::AHashSet;
 use error_set::ErrContext;
 use futures::future::join_all;
 use iggy_common::IggyError;
-use iggy_common::IggyTimestamp;
-use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs;
@@ -36,12 +34,6 @@ use tracing::{error, info, warn};
 
 #[derive(Debug)]
 pub struct FileStreamStorage;
-
-#[derive(Debug, Serialize, Deserialize)]
-struct StreamData {
-    name: String,
-    created_at: IggyTimestamp,
-}
 
 impl StreamStorage for FileStreamStorage {
     async fn load(&self, stream: &mut Stream, mut state: StreamState) -> Result<(), IggyError> {

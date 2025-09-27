@@ -16,13 +16,13 @@
  * under the License.
  */
 
-use config::{Config, Environment, File};
-use configs::{ConfigFormat, RuntimeConfig};
+use configs::{ConfigFormat, ConnectorsConfig};
 use dlopen2::wrapper::{Container, WrapperApi};
 use dotenvy::dotenv;
 use error::RuntimeError;
 use figlet_rs::FIGfont;
 use iggy::prelude::{Client, IggyConsumer, IggyProducer};
+use iggy_common::ConfigProvider;
 use iggy_connector_sdk::{
     StreamDecoder, StreamEncoder,
     sink::ConsumeCallback,
@@ -54,8 +54,8 @@ mod transform;
 static GLOBAL: MiMalloc = MiMalloc;
 
 static PLUGIN_ID: AtomicU32 = AtomicU32::new(1);
-
 const ALLOWED_PLUGIN_EXTENSIONS: [&str; 3] = ["so", "dylib", "dll"];
+const DEFAULT_CONFIG_PATH: &str = "core/connectors/runtime/config.toml";
 
 #[derive(WrapperApi)]
 struct SourceApi {
@@ -109,17 +109,13 @@ async fn main() -> Result<(), RuntimeError> {
         .init();
 
     let config_path =
-        env::var("IGGY_CONNECTORS_CONFIG_PATH").unwrap_or_else(|_| "config".to_string());
+        env::var("IGGY_CONNECTORS_CONFIG_PATH").unwrap_or_else(|_| DEFAULT_CONFIG_PATH.to_string());
     info!("Starting Iggy Connectors Runtime, loading configuration from: {config_path}...");
-    let builder = Config::builder()
-        .add_source(File::with_name(&config_path))
-        .add_source(Environment::with_prefix("IGGY_CONNECTORS").separator("_"));
 
-    let config: RuntimeConfig = builder
-        .build()
-        .expect("Failed to build runtime config")
-        .try_deserialize()
-        .expect("Failed to deserialize runtime config");
+    let config: ConnectorsConfig = ConnectorsConfig::config_provider(config_path)
+        .load_config()
+        .await
+        .expect("Failed to load configuration");
 
     std::fs::create_dir_all(&config.state.path).expect("Failed to create state directory");
 
@@ -170,7 +166,7 @@ async fn main() -> Result<(), RuntimeError> {
 
     let context = context::init(&config, &sink_wrappers, &source_wrappers);
     let context = Arc::new(context);
-    api::init(&config.http_api, context).await;
+    api::init(&config.http, context).await;
 
     source::handle(source_wrappers);
     sink::consume(sink_wrappers);
@@ -213,7 +209,6 @@ async fn main() -> Result<(), RuntimeError> {
 
     iggy_clients.producer.shutdown().await?;
     iggy_clients.consumer.shutdown().await?;
-
     info!("All connectors closed. Runtime shutdown complete.");
     Ok(())
 }

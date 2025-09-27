@@ -25,7 +25,7 @@ use clap::Parser;
     about = "Apache Iggy: Hyper-Efficient Message Streaming at Laser Speed",
     long_about = r#"Apache Iggy (Incubating) - A persistent message streaming platform written in Rust
 
-Apache Iggy is a high-performance message streaming platform that supports QUIC, TCP, and HTTP 
+Apache Iggy is a high-performance message streaming platform that supports QUIC, TCP, and HTTP
 transport protocols, capable of processing millions of messages per second with low latency.
 
 WEBSITE:
@@ -38,7 +38,7 @@ DOCUMENTATION:
     https://iggy.apache.org/docs
 
 CONFIGURATION:
-    The server uses a TOML configuration file. By default, it looks for 'configs/server.toml' 
+    The server uses a TOML configuration file. By default, it looks for 'configs/server.toml'
     in the current working directory. You can override this with the IGGY_CONFIG_PATH environment
     variable or use the --config-provider flag.
 
@@ -89,4 +89,20 @@ pub struct Args {
     ///   iggy-server -f                               # Short form
     #[arg(short, long, default_value_t = false, verbatim_doc_comment)]
     pub fresh: bool,
+
+    /// Use default root credentials (INSECURE - FOR DEVELOPMENT ONLY!)
+    ///
+    /// When this flag is set, the root user will be created with username 'iggy'
+    /// and password 'iggy' if it doesn't exist. If the root user already exists,
+    /// this flag has no effect and a warning will be printed.
+    ///
+    /// This flag is equivalent to setting IGGY_ROOT_USERNAME=iggy and IGGY_ROOT_PASSWORD=iggy,
+    /// but environment variables take precedence over this flag.
+    ///
+    /// WARNING: This is insecure and should only be used for development and testing!
+    ///
+    /// Examples:
+    ///   iggy-server --with-default-root-credentials     # Use 'iggy/iggy' as root credentials
+    #[arg(long, default_value_t = false, verbatim_doc_comment)]
+    pub with_default_root_credentials: bool,
 }

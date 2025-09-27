@@ -41,6 +41,6 @@ iggy_connector_sdk = { workspace = true }
 once_cell = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
-serde_yml = { workspace = true }
+serde_yaml_ng = { workspace = true }
 simd-json = { workspace = true }
 tracing = { workspace = true }
