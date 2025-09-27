@@ -33,8 +33,10 @@ pub mod consumer_builder;
 pub mod producer;
 pub mod producer_builder;
 pub mod producer_config;
+// #[cfg(feature = "async")]
 pub mod producer_dispatcher;
 pub mod producer_error_callback;
+// #[cfg(feature = "async")]
 pub mod producer_sharding;
 
 const ORDERING: std::sync::atomic::Ordering = std::sync::atomic::Ordering::SeqCst;

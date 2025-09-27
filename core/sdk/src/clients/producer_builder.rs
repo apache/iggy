@@ -17,7 +17,8 @@
 
 use crate::client_wrappers::ClientWrapper;
 use crate::clients::producer_config::{BackgroundConfig, DirectConfig};
-use crate::prelude::IggyProducer;
+use crate::clients::producer::{IggyProducer, DirectDispatcher, BackgroundDispatcher};
+use crate::runtime::Runtime;
 use iggy_common::locking::IggySharedMut;
 use iggy_common::{
     EncryptorKind, Identifier, IggyDuration, IggyExpiry, MaxTopicSize, Partitioner, Partitioning,

@@ -33,7 +33,7 @@ pub struct ProducerDispatcher {
     slots_permit: Arc<Semaphore>,
     bytes_permit: Arc<Semaphore>,
     stop_tx: broadcast::Sender<()>,
-    _join_handle: JoinHandle<()>,
+    _join_handle: Option<JoinHandle<()>>,
 }
 
 impl ProducerDispatcher {
@@ -98,7 +98,7 @@ impl ProducerDispatcher {
             bytes_permit: Arc::new(Semaphore::new(bytes_permit)),
             slots_permit: Arc::new(Semaphore::new(slot_permit)),
             stop_tx,
-            _join_handle: handle,
+            _join_handle: Some(handle),
         }
     }
 
@@ -211,21 +211,20 @@ impl ProducerDispatcher {
             .await
     }
 
-    pub async fn shutdown(mut self) {
+    pub async fn shutdown(&mut self) {
         if self.closed.swap(true, Ordering::Relaxed) {
             return;
         }
-
         let _ = self.stop_tx.send(());
-
-        for shard in self.shards.drain(..) {
+        for shard in std::mem::take(&mut self.shards).into_iter() {
             if let Err(e) = shard._handle.await {
                 tracing::error!("shard panicked: {e:?}");
             }
         }
-
-        if let Err(e) = self._join_handle.await {
-            tracing::error!("error-worker panicked: {e:?}");
+        if let Some(j) = self._join_handle.take() {
+            if let Err(e) = j.await {
+                tracing::error!("error-worker panicked: {e:?}");
+            }
         }
     }
 }
