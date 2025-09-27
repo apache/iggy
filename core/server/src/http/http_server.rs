@@ -26,6 +26,7 @@ use crate::http::metrics::metrics;
 use crate::http::shared::AppState;
 use crate::http::*;
 use crate::shard::IggyShard;
+use crate::streaming::persistence::persister::PersisterKind;
 // use crate::streaming::systems::system::SharedSystem;
 use axum::extract::DefaultBodyLimit;
 use axum::extract::connect_info::Connected;
@@ -65,7 +66,7 @@ impl<'a> Connected<cyper_axum::IncomingStream<'a, TcpListener>> for CompioSocket
 
 /// Starts the HTTP API server.
 /// Returns the address the server is listening on.
-pub async fn start(config: HttpConfig, shard: Rc<IggyShard>) -> Result<(), IggyError> {
+pub async fn start(config: HttpConfig, persister: Arc<PersisterKind>, shard: Rc<IggyShard>) -> Result<(), IggyError> {
     if shard.id != 0 {
         info!(
             "HTTP server disabled for shard {} (only runs on shard 0)",
@@ -80,7 +81,7 @@ pub async fn start(config: HttpConfig, shard: Rc<IggyShard>) -> Result<(), IggyE
         "HTTP API"
     };
 
-    let app_state = build_app_state(&config, shard).await;
+    let app_state = build_app_state(&config, persister, shard).await;
     let mut app = Router::new()
         .merge(system::router(app_state.clone(), &config.metrics))
         .merge(personal_access_tokens::router(app_state.clone()))
@@ -157,12 +158,10 @@ pub async fn start(config: HttpConfig, shard: Rc<IggyShard>) -> Result<(), IggyE
     }
 }
 
-async fn build_app_state(config: &HttpConfig, shard: Rc<IggyShard>) -> Arc<AppState> {
+async fn build_app_state(config: &HttpConfig, persister: Arc<PersisterKind>,  shard: Rc<IggyShard>) -> Arc<AppState> {
     let tokens_path;
-    let persister;
     {
         tokens_path = shard.config.system.get_state_tokens_path();
-        persister = shard.storage.persister.clone();
     }
 
     let jwt_manager = JwtManager::from_config(persister, &tokens_path, &config.jwt);

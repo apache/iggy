@@ -53,7 +53,6 @@ pub struct IggyShardBuilder {
     config: Option<ServerConfig>,
     encryptor: Option<EncryptorKind>,
     version: Option<SemanticVersion>,
-    storage: Option<SystemStorage>,
     metrics: Option<Metrics>,
 }
 
@@ -106,11 +105,6 @@ impl IggyShardBuilder {
         self
     }
 
-    pub fn storage(mut self, storage: SystemStorage) -> Self {
-        self.storage = Some(storage);
-        self
-    }
-
     pub fn metrics(mut self, metrics: Metrics) -> Self {
         self.metrics = Some(metrics);
         self
@@ -125,7 +119,6 @@ impl IggyShardBuilder {
         let users = self.users.unwrap();
         let config = self.config.unwrap();
         let connections = self.connections.unwrap();
-        let storage = self.storage.unwrap();
         let encryptor = self.encryptor;
         let version = self.version.unwrap();
         let (stop_sender, stop_receiver, frame_receiver) = connections
@@ -141,7 +134,6 @@ impl IggyShardBuilder {
             .next()
             .expect("Failed to find connection with the specified ID");
         let shards = connections.into_iter().map(Shard::new).collect();
-        let storage = Rc::new(storage);
 
         // Initialize metrics
         let metrics = self.metrics.unwrap_or_else(|| Metrics::init());
@@ -151,7 +143,6 @@ impl IggyShardBuilder {
             shards_table,
             streams2: streams, // TODO: Fixme
             users: RefCell::new(users),
-            storage: storage,
             encryptor: encryptor,
             config: config,
             version: version,

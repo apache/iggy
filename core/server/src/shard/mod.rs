@@ -75,22 +75,10 @@ use crate::{
         traits_ext::{EntityComponentSystem, EntityMarker, Insert},
     },
     state::{
-        StateKind,
-        file::FileState,
-        system::{StreamState, SystemState, UserState},
+        file::FileState, system::{StreamState, SystemState, UserState}, StateKind
     },
     streaming::{
-        clients::client_manager::ClientManager,
-        diagnostics::metrics::Metrics,
-        partitions,
-        personal_access_tokens::personal_access_token::PersonalAccessToken,
-        polling_consumer::PollingConsumer,
-        session::Session,
-        storage::SystemStorage,
-        streams, topics,
-        traits::MainOps,
-        users::{permissioner::Permissioner, user::User},
-        utils::ptr::EternalPtr,
+        clients::client_manager::ClientManager, diagnostics::metrics::Metrics, partitions, persistence::persister::PersisterKind, polling_consumer::PollingConsumer, session::Session, traits::MainOps, users::{permissioner::Permissioner, user::User}, utils::ptr::EternalPtr
     },
     tcp::tcp_server::spawn_tcp_server,
     versioning::SemanticVersion,
@@ -155,7 +143,6 @@ pub struct IggyShard {
     pub(crate) streams2: Streams,
     pub(crate) shards_table: EternalPtr<DashMap<IggyNamespace, ShardInfo>>,
     // TODO: Refactor.
-    pub(crate) storage: Rc<SystemStorage>,
     pub(crate) state: StateKind,
 
     // Temporal...
@@ -187,7 +174,7 @@ impl IggyShard {
         Ok(())
     }
 
-    pub async fn run(self: &Rc<Self>) -> Result<(), IggyError> {
+    pub async fn run(self: &Rc<Self>, persister: Arc<PersisterKind>) -> Result<(), IggyError> {
         // Workaround to ensure that the statistics are initialized before the server
         // loads streams and starts accepting connections. This is necessary to
         // have the correct statistics when the server starts.
@@ -208,6 +195,7 @@ impl IggyShard {
             println!("Starting HTTP server on shard: {}", self.id);
             tasks.push(Box::pin(http_server::start(
                 self.config.http.clone(),
+                persister,
                 self.clone(),
             )));
         }

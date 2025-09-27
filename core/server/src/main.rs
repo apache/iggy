@@ -283,7 +283,7 @@ async fn main() -> Result<(), ServerError> {
         let streams = streams.clone();
         let shards_table = shards_table.clone();
         let users = users.clone();
-        let storage = storage.clone();
+        let persister = storage.persister.clone();
         let connections = connections.clone();
         let config = config.clone();
         let encryptor = encryptor.clone();
@@ -334,14 +334,13 @@ async fn main() -> Result<(), ServerError> {
                         .shards_table(shards_table)
                         .connections(connections)
                         .config(config)
-                        .storage(storage)
                         .encryptor(encryptor)
                         .version(current_version)
                         .metrics(metrics)
                         .build();
                     let shard = Rc::new(shard);
 
-                    if let Err(e) = shard.run().await {
+                    if let Err(e) = shard.run(persister).await {
                         error!("Failed to run shard-{id}: {e}");
                     }
                     shard_info!(shard.id, "Run completed");
