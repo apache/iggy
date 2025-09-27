@@ -92,10 +92,8 @@ opentelemetry-otlp = { version = "0.30.0", features = [
 ] }
 opentelemetry-semantic-conventions = "0.30.0"
 opentelemetry_sdk = { version = "0.30.0", features = [
-    "rt-tokio",
     "logs",
     "trace",
-    "tokio",
     "experimental_async_runtime",
     "experimental_logs_batch_log_processor_with_async_runtime",
     "experimental_trace_batch_span_processor_with_async_runtime",

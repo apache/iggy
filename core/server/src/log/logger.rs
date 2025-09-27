@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use crate::log::runtime::CompioRuntime;
 use crate::VERSION;
 use crate::configs::server::{TelemetryConfig, TelemetryTransport};
 use crate::configs::system::LoggingConfig;
@@ -217,7 +218,7 @@ impl Logging {
                     .with_log_processor(
                         log_processor_with_async_runtime::BatchLogProcessor::builder(
                             log_exporter,
-                            runtime::Tokio,
+                            CompioRuntime,
                         )
                         .build(),
                     )
@@ -249,7 +250,7 @@ impl Logging {
                     .with_span_processor(
                         span_processor_with_async_runtime::BatchSpanProcessor::builder(
                             trace_exporter,
-                            runtime::Tokio,
+                            CompioRuntime
                         )
                         .build(),
                     )

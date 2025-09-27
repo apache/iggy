@@ -1,48 +1,85 @@
-use std::{pin::Pin, time::Duration};
+use std::{pin::Pin, task::Poll, time::Duration};
 
-use futures::{FutureExt, SinkExt, Stream};
+use futures::{channel::mpsc, future::poll_fn, FutureExt, SinkExt, Stream, StreamExt};
 use opentelemetry_sdk::runtime::{Runtime, RuntimeChannel, TrySend};
 
 #[derive(Clone)]
-pub struct MonoioRuntime;
+pub struct CompioRuntime;
 
-impl Runtime for MonoioRuntime {
+impl Runtime for CompioRuntime {
     fn spawn<F>(&self, future: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        // TODO: This wont' work, we init Opentelemetry in the main thread, when there is no instance of monoio runtime
-        // running yet....
-        monoio::spawn(future);
+        // It's fine to detach this task, the documentation for `spawn` method on `Runtime` trait says:
+        //
+        //
+        // "This is mainly used to run batch span processing in the background. Note, that the function
+        // does not return a handle. OpenTelemetry will use a different way to wait for the future to
+        // finish when the caller shuts down.""
+        compio::runtime::spawn(future).detach();
     }
 
     fn delay(&self, duration: Duration) -> impl Future<Output = ()> + Send + 'static {
-        let sleep = Sleep::new(duration);
-        sleep
+        compio::time::sleep(duration)
     }
 }
 
-
-pub struct Sleep {
-    pub inner: Pin<Box<monoio::time::Sleep>>,
+#[derive(Debug)]
+pub struct CompioSender<T> {
+    sender: mpsc::UnboundedSender<T>,
 }
 
-impl Sleep {
-    pub fn new(duration: Duration) -> Self {
-        Self {
-            inner: Box::pin(monoio::time::sleep(duration)),
-        }
+impl<T> CompioSender<T> {
+    pub fn new(sender: mpsc::UnboundedSender<T>) -> Self {
+        Self { sender }
+    }
+}   
+
+// Safety: Since we use compio runtime which is single-threaded, or rather the Future: !Send + !Sync, 
+// we can implement those traits, to satisfy the trait bounds from `Runtime` and `RuntimeChannel` traits.
+unsafe impl<T> Send for CompioSender<T> {}
+unsafe impl<T> Sync for CompioSender<T> {}
+
+impl<T: std::fmt::Debug + Send> TrySend for CompioSender<T>  {
+    type Message = T;
+
+    fn try_send(&self, item: Self::Message) -> Result<(), opentelemetry_sdk::runtime::TrySendError> {
+        self.sender.unbounded_send(item).map_err(|_err| {
+            // Unbounded channels can only fail if disconnected, never full
+            opentelemetry_sdk::runtime::TrySendError::ChannelClosed
+        })
     }
 }
 
-impl Future for Sleep {
-    type Output = ();
+pub struct CompioReceiver<T> {
+    receiver: mpsc::UnboundedReceiver<T>,
+}
 
-    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
-        self.inner.as_mut().poll_unpin(cx)
+impl<T> CompioReceiver<T> {
+    pub fn new(receiver: mpsc::UnboundedReceiver<T>) -> Self {
+        Self { receiver }
     }
 }
 
-// Safety: There is no way for `Sleep` future to be flipped like a burger to another thread,
-// because we create instance of OpenTelemetry SDK runtime in the main thread, and monoio futures don't require Send & Sync bounds.
-unsafe impl Send for Sleep {}
+impl<T: std::fmt::Debug + Send> Stream for CompioReceiver<T> {
+    type Item = T;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+        self.receiver.poll_next_unpin(cx)
+    }
+}
+
+impl RuntimeChannel for CompioRuntime {
+    type Receiver<T: std::fmt::Debug + Send> = CompioReceiver<T>;
+    type Sender<T: std::fmt::Debug + Send> = CompioSender<T>;
+
+    fn batch_message_channel<T: std::fmt::Debug + Send>(
+        &self,
+        _capacity: usize,
+    ) -> (Self::Sender<T>, Self::Receiver<T>) {
+        // Use the unbounded channel, this trait is used for batch processing, which naturally will limit the number of messages.
+        let (sender, receiver) = mpsc::unbounded();
+        (CompioSender::new(sender), CompioReceiver::new(receiver))
+    }
+}
