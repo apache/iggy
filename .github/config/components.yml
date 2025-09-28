@@ -237,13 +237,15 @@ components:
       - "rust-server"
       - "sdk-go"
       - "sdk-csharp"
+      - "sdk-python"
       - "ci-infrastructure"  # CI changes trigger full regression
     paths:
       - "examples/**"
       - "scripts/run-rust-examples-from-readme.sh"
       - "scripts/run-go-examples-from-readme.sh"
       - "scripts/run-csharp-examples-from-readme.sh"
-    tasks: ["examples-rust", "examples-go", "examples-csharp"]
+      - "scripts/run-python-examples-from-readme.sh"
+    tasks: ["examples-rust", "examples-go", "examples-csharp", "examples-python"]
 
   web-ui:
     paths:

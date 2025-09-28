@@ -137,19 +137,6 @@ runs:
         exit ${TEST_EXIT_CODE:-0}
       shell: bash
 
-    - name: Run Python example tests
-      if: inputs.task == 'test' && steps.iggy.outcome == 'success'
-      run: |
-        echo "Running example tests with Iggy server at ${{ steps.iggy.outputs.address }}..."
-
-        IGGY_SERVER_HOST=127.0.0.1 \
-        IGGY_SERVER_TCP_PORT=8090 \
-          ./foreign/python/scripts/test_examples.sh || TEST_EXIT_CODE=$?
-
-        # Exit with test result
-        exit ${TEST_EXIT_CODE:-0}
-      shell: bash
-
     - name: Run Python unit tests only (fallback)
       if: inputs.task == 'test' && steps.iggy.outcome != 'success'
       run: |

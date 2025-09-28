@@ -112,6 +112,13 @@ jobs:
           # Run the examples script which will use the prebuilt server binary
           ./scripts/run-csharp-examples-from-readme.sh
 
+      - name: Run Python examples
+        if: inputs.component == 'examples-suite' && inputs.task == 'examples-python'
+        run: |
+          echo "Running Python examples tests..."
+          # Run the examples script which will use the prebuilt server binary
+          ./scripts/run-python-examples-from-readme.sh
+
       - name: Upload reports
         if: always()
         uses: actions/upload-artifact@v4
