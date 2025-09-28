@@ -2,13 +2,12 @@
   import type { StreamDetails } from '$lib/domain/StreamDetails';
   import type { CloseModalFn } from '$lib/types/utilTypes';
   import { z } from 'zod';
-
   import Button from '../Button.svelte';
   import Icon from '../Icon.svelte';
   import Input from '../Input.svelte';
   import ModalBase from './ModalBase.svelte';
   import { setError, superForm, defaults } from 'sveltekit-superforms/client';
-  import { zod } from 'sveltekit-superforms/adapters';
+  import { zod4 } from 'sveltekit-superforms/adapters';
   import { fetchRouteApi } from '$lib/api/fetchRouteApi';
   import { dataHas } from '$lib/utils/dataHas';
   import { goto } from '$app/navigation';
@@ -37,10 +36,10 @@
   });
 
   const { form, errors, enhance, submitting, tainted } = superForm(
-    defaults(zod(schema)),
+    defaults(zod4(schema)),
     {
       SPA: true,
-      validators: zod(schema),
+      validators: zod4(schema),
       invalidateAll: false,
       taintedMessage: false,
       async onUpdate({ form }) {
