@@ -115,7 +115,7 @@ if [ -f "README.md" ]; then
 
         set +e
         eval "timeout 10 ${command}"
-        test_exit_code=0
+        test_exit_code=$?
         set -e
 
         # Stop at first failure
