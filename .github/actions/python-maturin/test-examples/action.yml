@@ -50,7 +50,7 @@ runs:
         cd ../..
 
         # Install dependencies for examples
-        pip -r examples/python/requirements.txt
+        pip install -r examples/python/requirements.txt
       shell: bash
 
     - name: Build Python wheel for testing
