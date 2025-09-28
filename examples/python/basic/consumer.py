@@ -24,9 +24,9 @@ from loguru import logger
 
 STREAM_NAME = "sample-stream"
 TOPIC_NAME = "sample-topic"
-STREAM_ID = 1
-TOPIC_ID = 1
-PARTITION_ID = 1
+STREAM_ID = 0
+TOPIC_ID = 0
+PARTITION_ID = 0
 BATCHES_LIMIT = 5
 
 ArgNamespace = namedtuple("ArgNamespace", ["connection_string"])

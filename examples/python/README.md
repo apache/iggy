@@ -30,7 +30,7 @@ IGGY_HTTP_ENABLED=true IGGY_TCP_ADDRESS=0.0.0.0:8090 cargo run --bin iggy-server
 and then install Python dependencies:
 
 ```bash
-pip -r requirements.txt
+pip install -r requirements.txt
 ```
 
 ## Basic Examples

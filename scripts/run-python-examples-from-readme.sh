@@ -76,12 +76,12 @@ echo "Using server binary at ${SERVER_BIN}"
 
 # Run iggy server using the prebuilt binary
 echo "Starting server from ${SERVER_BIN}..."
-IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy ${SERVER_BIN} &>${LOG_FILE} &
+IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy ${SERVER_BIN} --fresh &>${LOG_FILE} &
 echo $! >${PID_FILE}
 
 # Wait until "Iggy server has started" string is present inside iggy-server.log
 SERVER_START_TIME=0
-while ! grep -q "Iggy server has started" ${LOG_FILE}; do
+while ! grep -q "has started" ${LOG_FILE}; do
     if [ ${SERVER_START_TIME} -gt ${TIMEOUT} ]; then
         echo "Server did not start within ${TIMEOUT} seconds."
         ps fx
@@ -95,7 +95,20 @@ done
 
 cd examples/python || exit 1
 
-exit_code=0
+# Set up Python virtual environment and install dependencies
+echo "Setting up Python virtual environment..."
+python3 -m venv .venv
+# shellcheck disable=SC1091
+source .venv/bin/activate
+
+# Build and install Python SDK from repository
+echo "Building Python SDK from repository..."
+pip install -q maturin patchelf
+(cd ../../foreign/python && maturin develop -q)
+
+# Install other example dependencies (excluding apache-iggy which we built locally)
+echo "Installing example dependencies..."
+pip install -q loguru argparse
 
 # Execute all example commands from examples/python/README.md and check if they pass or fail
 exit_code=0
@@ -130,6 +143,10 @@ if [ -f "README.md" ]; then
 
     done < <(grep -E "^python " "README.md")
 fi
+
+# Deactivate and clean up virtual environment
+deactivate 2>/dev/null || true
+rm -rf .venv
 
 cd ../..
 
