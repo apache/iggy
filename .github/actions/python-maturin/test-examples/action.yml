@@ -74,3 +74,4 @@ runs:
         echo "Running Python example tests..."
         # Run the examples script which will use the prebuilt server binary
         ./scripts/run-python-examples-from-readme.sh
+      shell: bash
