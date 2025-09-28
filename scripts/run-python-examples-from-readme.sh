@@ -40,8 +40,33 @@ readonly LOG_FILE="iggy-server.log"
 readonly PID_FILE="iggy-server.pid"
 readonly TIMEOUT=300
 
-# Get target architecture from argument or use default
-TARGET="${1:-}"
+SDK_WHEEL_PATH="${1:-}"
+
+if [ -z "${SDK_WHEEL_PATH}" ]; then
+    echo "Python SDK wheel path is missing."
+    echo "Usage: $0 <SDK_WHEEL_PATH> [--target TARGET]"
+    exit 1
+fi
+
+shift 1
+
+TARGET="" # Iggy server target architecture
+
+# Get Cargo --target values from arguments or use defaults
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --target)
+            TARGET="$2"
+            shift 2
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Usage: $0 <SDK_WHEEL_PATH> [--target TARGET]"
+            exit 1
+            ;;
+    esac
+done
+
 if [ -n "${TARGET}" ]; then
     echo "Using target architecture: ${TARGET}"
 else
@@ -97,6 +122,12 @@ echo "🚀 Running python example scripts..."
 
 cd examples/python || exit 1
 
+echo "Installing dependencies"
+pip -r requirements.txt
+
+echo "Installing SDK from $SDK_WHEEL_PATH"
+pip install --force-reinstall $SDK_WHEEL_PATH
+
 exit_code=0
 
 # Execute all example commands from examples/python/README.md and check if they pass or fail
@@ -124,6 +155,7 @@ if [ -f "README.md" ]; then
             echo ""
             echo -e "\e[31mExample command failed:\e[0m ${command}"
             echo ""
+            exit_code=$test_exit_code
             break
         fi
         # Add a small delay between examples to avoid potential race conditions
