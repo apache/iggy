@@ -40,32 +40,7 @@ readonly LOG_FILE="iggy-server.log"
 readonly PID_FILE="iggy-server.pid"
 readonly TIMEOUT=300
 
-SDK_WHEEL_PATH="${1:-}"
-
-if [ -z "${SDK_WHEEL_PATH}" ]; then
-    echo "Python SDK wheel path is missing."
-    echo "Usage: $0 <SDK_WHEEL_PATH> [--target TARGET]"
-    exit 1
-fi
-
-shift 1
-
-TARGET="" # Iggy server target architecture
-
-# Get Cargo --target values from arguments or use defaults
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --target)
-            TARGET="$2"
-            shift 2
-            ;;
-        *)
-            echo "Unknown option: $1"
-            echo "Usage: $0 <SDK_WHEEL_PATH> [--target TARGET]"
-            exit 1
-            ;;
-    esac
-done
+TARGET="${1:-}" # Iggy server target architecture
 
 if [ -n "${TARGET}" ]; then
     echo "Using target architecture: ${TARGET}"
@@ -118,15 +93,7 @@ while ! grep -q "Iggy server has started" ${LOG_FILE}; do
     ((SERVER_START_TIME += 1))
 done
 
-echo "🚀 Running python example scripts..."
-
 cd examples/python || exit 1
-
-echo "Installing dependencies"
-pip -r requirements.txt
-
-echo "Installing SDK from $SDK_WHEEL_PATH"
-pip install --force-reinstall $SDK_WHEEL_PATH
 
 exit_code=0
 
