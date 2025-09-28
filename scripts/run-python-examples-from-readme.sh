@@ -97,7 +97,6 @@ echo "🚀 Running python example scripts..."
 
 cd examples/python || exit 1
 
-EXEC_TIMEOUT_SEC=10
 exit_code=0
 
 # Execute all example commands from examples/python/README.md and check if they pass or fail
@@ -115,7 +114,7 @@ if [ -f "README.md" ]; then
         echo ""
 
         set +e
-        timeout $EXEC_TIMEOUT_SEC eval "${command}"
+        eval "timeout 10 ${command}"
         test_exit_code=0
         set -e
 
