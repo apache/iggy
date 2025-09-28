@@ -25,7 +25,7 @@ using Apache.Iggy.JsonConverters;
 namespace Apache.Iggy.Messages;
 
 [JsonConverter(typeof(MessageConverter))]
-public struct Message
+public class Message
 {
     public required MessageHeader Header { get; init; }
     public required byte[] Payload { get; set; }

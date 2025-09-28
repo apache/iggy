@@ -42,7 +42,7 @@ internal class TcpMessageInvoker : IMessageInvoker
         // StreamId, TopicId, Partitioning, message count, metadata field
         var metadataLength = 2 + request.StreamId.Length + 2 + request.TopicId.Length
                              + 2 + request.Partitioning.Length + 4 + 4;
-        var messageBufferSize = TcpMessageStreamHelpers.CalculateMessageBytesCount(messages)
+        var messageBufferSize = TcpMessageStreamHelpers.CalculateMessageBytesCount(messages.ToArray())
                                 + metadataLength;
         var payloadBufferSize = messageBufferSize + 4 + BufferSizes.INITIAL_BYTES_LENGTH;
 

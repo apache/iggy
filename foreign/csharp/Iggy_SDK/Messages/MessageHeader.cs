@@ -20,7 +20,7 @@ using Apache.Iggy.JsonConverters;
 
 namespace Apache.Iggy.Messages;
 
-public struct MessageHeader
+public class MessageHeader
 {
     public ulong Checksum { get; set; }
     public UInt128 Id { get; set; }

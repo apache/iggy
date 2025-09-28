@@ -26,4 +26,10 @@ public class IggyPublisherConfig
     public byte? TopicReplicationFactor  { get; set; }
     public ulong TopicMessageExpiry  { get; set; }
     public ulong TopicMaxTopicSize  { get; set; }
+
+    public bool EnableBackgroundSending { get; set; } = false;
+    public int BackgroundQueueCapacity { get; set; } = 10000;
+    public int BackgroundBatchSize { get; set; } = 100;
+    public TimeSpan BackgroundFlushInterval { get; set; } = TimeSpan.FromMilliseconds(100);
+    public int BackgroundWorkerCount { get; set; } = 1;
 }
