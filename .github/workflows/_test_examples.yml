@@ -112,21 +112,9 @@ jobs:
           # Run the examples script which will use the prebuilt server binary
           ./scripts/run-csharp-examples-from-readme.sh
 
-      - name: Download pre-built python wheels
-        id: download-python-wheels
-        if: inputs.component == 'examples-suite' && inputs.task == 'examples-python'
-        uses: actions/download-artifact@v4
-        with:
-          name: python-test-results-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ./scripts/python-dist
-
       - name: Run Python examples
-        if: inputs.component == 'examples-suite' && inputs.task == 'examples-python' && steps.download-python-wheels.outcome == 'success'
-        run: |
-          whl_path=$(realpath "$(find ./scripts -name "*.whl")")
-          echo "Running Python examples tests..."
-          # Run the examples script which will use the prebuilt server binary
-          ./scripts/run-python-examples-from-readme.sh "$whl_path"
+        if: inputs.component == 'examples-suite' && inputs.task == 'examples-python'
+        uses: ./.github/actions/python-maturin/test-examples
 
       - name: Upload reports
         if: always()

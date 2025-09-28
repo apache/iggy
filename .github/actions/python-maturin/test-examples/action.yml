@@ -1,0 +1,76 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: python-test-examples
+description: Test Python examples
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    - name: Setup Rust with cache
+      uses: ./.github/actions/utils/setup-rust-with-cache
+      with:
+        cache-targets: false # Only cache registry and git deps, not target dir (sccache handles that)
+
+    - name: Cache pip
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: pip-${{ runner.os }}-${{ hashFiles('foreign/python/pyproject.toml') }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip wheel setuptools
+
+        # Install maturin for building
+        pip install 'maturin>=1.2,<2.0'
+
+        # Install testing dependencies from pyproject.toml
+        cd foreign/python
+        pip install -e ".[testing,examples,dev]"
+        cd ../..
+
+        # Install dependencies for examples
+        pip -r examples/python/requirements.txt
+      shell: bash
+
+    - name: Build Python wheel for testing
+      if: inputs.task == 'test' || inputs.task == 'build'
+      run: |
+        cd foreign/python
+
+        # Build the module
+        echo "Building Python wheel..."
+        maturin build -o dist
+
+        # Install the built wheel for testing
+        echo "Installing built wheel..."
+        pip install dist/*.whl --force-reinstall
+      shell: bash
+
+    - name: Run examples
+      run: |
+        cd $GITHUB_WORKSPACE
+
+        echo "Running Python example tests..."
+        # Run the examples script which will use the prebuilt server binary
+        ./scripts/run-python-examples-from-readme.sh
