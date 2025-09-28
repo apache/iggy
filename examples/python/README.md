@@ -49,8 +49,8 @@ python getting-started/consumer.py
 Core functionality with detailed configuration options:
 
 ```bash
-python basic/producer.py <connection_string>
-python basic/consumer.py <connection_string>
+python basic/producer.py
+python basic/consumer.py
 ```
 
 Demonstrates fundamental client connection, authentication, batch message sending, and polling with support for TCP/QUIC/HTTP protocols.
