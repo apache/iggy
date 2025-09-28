@@ -120,19 +120,18 @@ public class IggyConsumer : IAsyncDisposable
             throw new Exception("IggyConsumer is not initialized. Call InitAsync first.");
         }
 
-        _pollingTask = PollMessagesAsync(ct);
-        
+        if (_pollingTask == null || _pollingTask.IsCompleted)
+        {
+            _pollingTask = PollMessagesAsync(ct);
+        }
+
         do
         {
             var message = await _channel.Reader.ReadAsync(ct);
-            if (_config.Decryptor != null)
-            {
-                message.Message.Payload = _config.Decryptor(message.Message.Payload);
-            }
 
             yield return message;
 
-            if (_config.AutoCommit || _config.AutoCommitMode != AutoCommitMode.AfterReceive)
+            if (!_config.AutoCommit || _config.AutoCommitMode != AutoCommitMode.AfterReceive)
             {
                 continue;
             }
@@ -140,7 +139,7 @@ public class IggyConsumer : IAsyncDisposable
             await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId,
                 message.CurrentOffset, message.PartitionId, ct);
 
-        } while (!ct.IsCancellationRequested);
+        } while (!ct.IsCancellationRequested && !_channel.Reader.Completion.IsCompleted);
     }
 
     private async Task PollMessagesAsync(CancellationToken ct)
@@ -153,14 +152,35 @@ public class IggyConsumer : IAsyncDisposable
                 {
                     var messages = await _client.PollMessagesAsync(_config.StreamId, _config.TopicId,
                         _config.PartitionId, _config.Consumer, _config.PollingStrategy, _config.BatchSize,
-                        _config.AutoCommit, _config.Decryptor, ct);
+                        _config.AutoCommit, ct);
 
                     foreach (var message in messages.Messages)
                     {
+                        var processedMessage = message;
+
+                        if (_config.Decryptor != null)
+                        {
+                            try
+                            {
+                                var decryptedPayload = _config.Decryptor(message.Payload);
+                                processedMessage = new MessageResponse
+                                {
+                                    Header = message.Header,
+                                    Payload = decryptedPayload,
+                                    UserHeaders = message.UserHeaders
+                                };
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogError(ex, "Failed to decrypt message with offset {Offset}", message.Header.Offset);
+                                continue;
+                            }
+                        }
+
                         var receivedMessage = new ReceivedMessage()
                         {
-                            Message = message,
-                            CurrentOffset = message.Header.Offset,
+                            Message = processedMessage,
+                            CurrentOffset = processedMessage.Header.Offset,
                             PartitionId = (uint)messages.PartitionId
                         };
                         await _channel.Writer.WriteAsync(receivedMessage, ct);

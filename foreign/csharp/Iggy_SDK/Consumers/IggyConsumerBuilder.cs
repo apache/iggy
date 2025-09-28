@@ -33,7 +33,7 @@ public class IggyConsumerBuilder
     }
 
     /// <summary>
-    /// Craete consumer builder with existing iggy client. It's not needed to pass connectin data after that
+    /// Create consumer builder with existing iggy client. It's not needed to pass connectin data after that
     /// </summary>
     /// <param name="streamId">Stream id</param>
     /// <param name="topicId">Topic id</param>
@@ -123,7 +123,7 @@ public class IggyConsumerBuilder
     /// </summary>
     /// <param name="bufferSize"></param>
     /// <returns></returns>
-    public IggyConsumerBuilder WithBufferSze(int bufferSize)
+    public IggyConsumerBuilder WithBufferSize(int bufferSize)
     {
         Config.BufferSize = bufferSize;
 

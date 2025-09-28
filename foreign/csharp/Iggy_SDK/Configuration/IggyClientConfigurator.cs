@@ -16,6 +16,8 @@
 // under the License.
 
 using Apache.Iggy.Enums;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Apache.Iggy.Configuration;
 
@@ -26,4 +28,5 @@ public sealed class IggyClientConfigurator
     public int ReceiveBufferSize { get; set; } = 4096;
     public int SendBufferSize { get; set; } = 4096;
     public TlsSettings TlsSettings { get; set; } = new();
+    public ILoggerFactory LoggerFactory { get; set; } = NullLoggerFactory.Instance;
 } 

@@ -27,7 +27,7 @@ namespace Apache.Iggy.Messages;
 [JsonConverter(typeof(MessageConverter))]
 public struct Message
 {
-    public required MessageHeader Header { get; set; }
+    public required MessageHeader Header { get; init; }
     public required byte[] Payload { get; set; }
     public Dictionary<HeaderKey, HeaderValue>? UserHeaders { get; set; }
 

@@ -17,7 +17,7 @@ using Apache.Iggy.IggyClient.Implementations;
 
 namespace Apache.Iggy.Factory;
 
-public class IggyClientFactory
+public static class IggyClientFactory
 {
     public static IIggyClient CreateClient(IggyClientConfigurator options)
     {
@@ -31,7 +31,7 @@ public class IggyClientFactory
 
     private static IIggyClient CreateIggyTcpClient(IggyClientConfigurator options)
     {
-        return new TcpMessageStream(CreateTcpStream(options));
+        return new TcpMessageStream(CreateTcpStream(options), options.LoggerFactory);
     }
 
     private static IIggyClient CreateIggyHttpClient(IggyClientConfigurator options)

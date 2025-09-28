@@ -36,6 +36,10 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         .WithOutputConsumer(Consume.RedirectStdoutAndStderrToConsole())
         .WithWaitStrategy(Wait.ForUnixContainer().UntilInternalTcpPortIsAvailable(8090))
         .WithName($"{Guid.NewGuid()}")
+        .WithEnvironment("IGGY_ROOT_USERNAME", "iggy")
+        .WithEnvironment("IGGY_ROOT_PASSWORD", "iggy")
+        .WithEnvironment("IGGY_TCP_ADDRESS", "0.0.0.0:8090")
+        .WithEnvironment("IGGY_HTTP_ADDRESS", "0.0.0.0:3000")
         //.WithEnvironment("IGGY_SYSTEM_LOGGING_LEVEL", "trace")
         //.WithEnvironment("RUST_LOG", "trace")
         .WithCleanUp(true)
@@ -91,7 +95,6 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
         var client = CreateClient(Protocol.Tcp);
 
         await client.LoginUser(userName, password);
-        ;
 
         return client;
     }
