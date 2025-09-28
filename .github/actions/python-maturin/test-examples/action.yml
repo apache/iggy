@@ -53,8 +53,7 @@ runs:
         pip install -r examples/python/requirements.txt
       shell: bash
 
-    - name: Build Python wheel for testing
-      if: inputs.task == 'test' || inputs.task == 'build'
+    - name: Build and install Python wheel
       run: |
         cd foreign/python
 
