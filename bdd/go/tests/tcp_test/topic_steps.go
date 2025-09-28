@@ -19,12 +19,13 @@ package tcp_test
 
 import (
 	"fmt"
+	"math"
+
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/iggycli"
 	"github.com/onsi/ginkgo/v2"
 	"github.com/onsi/gomega"
-	"math"
 )
 
 //operations
@@ -126,7 +127,7 @@ func itShouldSuccessfullyDeleteTopic(streamId uint32, topicId uint32, client igg
 	topicIdentifier, _ := iggcon.NewIdentifier(topicId)
 	topic, err := client.GetTopic(streamIdentifier, topicIdentifier)
 
-	itShouldReturnSpecificIggyError(err, ierror.TopicIdNotFound)
+	itShouldReturnSpecificError(err, ierror.ErrTopicIdNotFound)
 	ginkgo.It("should not return topic", func() {
 		gomega.Expect(topic).To(gomega.BeNil())
 	})

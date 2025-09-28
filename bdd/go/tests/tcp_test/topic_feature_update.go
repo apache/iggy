@@ -21,6 +21,7 @@ import (
 	"math"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/onsi/ginkgo/v2"
 )
 
@@ -66,7 +67,7 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 				math.MaxUint64,
 				&replicationFactor)
 
-			itShouldReturnSpecificError(err, "topic_name_already_exists")
+			itShouldReturnSpecificError(err, ierror.ErrTopicNameAlreadyExists)
 		})
 
 		ginkgo.Context("and tries to update non-existing topic", func() {
@@ -81,7 +82,7 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 				math.MaxUint64,
 				&replicationFactor)
 
-			itShouldReturnSpecificError(err, "stream_id_not_found")
+			itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
 		})
 
 		ginkgo.Context("and tries to update non-existing stream", func() {
@@ -99,7 +100,7 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 				math.MaxUint64,
 				&replicationFactor)
 
-			itShouldReturnSpecificError(err, "topic_id_not_found")
+			itShouldReturnSpecificError(err, ierror.ErrTopicIdNotFound)
 		})
 
 		ginkgo.Context("and tries to update existing topic with a name that's over 255 characters", func() {
@@ -119,7 +120,7 @@ var _ = ginkgo.Describe("UPDATE TOPIC:", func() {
 				math.MaxUint64,
 				&replicationFactor)
 
-			itShouldReturnSpecificError(err, "topic_name_too_long")
+			itShouldReturnSpecificError(err, ierror.ErrInvalidTopicName)
 		})
 	})
 

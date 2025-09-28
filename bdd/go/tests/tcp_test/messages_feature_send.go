@@ -19,6 +19,7 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/onsi/ginkgo/v2"
 )
 
@@ -55,7 +56,7 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 				iggcon.None(),
 				messages,
 			)
-			itShouldReturnSpecificError(err, "topic_id_not_found")
+			itShouldReturnSpecificError(err, ierror.ErrTopicIdNotFound)
 		})
 
 		ginkgo.Context("and tries to send messages to the non existing stream", func() {
@@ -67,7 +68,7 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 				iggcon.None(),
 				messages,
 			)
-			itShouldReturnSpecificError(err, "stream_id_not_found")
+			itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
 		})
 
 		ginkgo.Context("and tries to send messages to non existing partition", func() {
@@ -84,7 +85,7 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 				iggcon.PartitionId(createRandomUInt32()),
 				messages,
 			)
-			itShouldReturnSpecificError(err, "partition_not_found")
+			itShouldReturnSpecificError(err, ierror.ErrPartitionNotFound)
 		})
 
 		ginkgo.Context("and tries to send messages to valid topic but with 0 messages in payload", func() {
@@ -100,7 +101,7 @@ var _ = ginkgo.Describe("SEND MESSAGES:", func() {
 				iggcon.PartitionId(createRandomUInt32()),
 				[]iggcon.IggyMessage{},
 			)
-			itShouldReturnSpecificError(err, "messages_count_should_be_greater_than_zero")
+			itShouldReturnSpecificError(err, ierror.ErrInvalidMessagesCount)
 		})
 	})
 

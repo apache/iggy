@@ -18,19 +18,73 @@
 package ierror
 
 import (
+	"errors"
+	"fmt"
+	"io"
 	"testing"
 )
 
 func TestIggyError_Error(t *testing.T) {
-	iggyErr := &IggyError{
-		Code:    42,
-		Message: "test_error",
+	cases := []struct {
+		name     string
+		err      error
+		expected string
+	}{
+		{name: "with field", err: ErrInvalidTopicId, expected: "invalid topic id"},
+		{name: "without field", err: TopicIdNotFound{1, 1}, expected: "topic with id: 1 for stream with id: 1 was not found."},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.err.Error(); got != c.expected {
+				t.Errorf("Error() = %v, want %v", got, c.expected)
+			}
+		})
+	}
+}
+
+func TestIggyError_Is(t *testing.T) {
+	cases := []struct {
+		name     string
+		err      error
+		target   error
+		expected bool
+	}{
+		{
+			name:     "different code",
+			err:      InvalidCredentials{},
+			target:   ErrInvalidStreamId,
+			expected: false,
+		}, {
+			name:     "same type, different field",
+			err:      ResourceNotFound{"key1"},
+			target:   ResourceNotFound{"key2"},
+			expected: true,
+		},
+		{
+			name:     "wrapped error with same type",
+			err:      fmt.Errorf("wrap: %w", ErrInvalidCredentials),
+			target:   ErrInvalidCredentials,
+			expected: true,
+		},
+		{
+			name:     "compare with nil",
+			err:      ErrInvalidCredentials,
+			target:   nil,
+			expected: false,
+		},
+		{
+			name:     "compare with different type",
+			err:      ErrInvalidCredentials,
+			target:   io.EOF,
+			expected: false,
+		},
 	}
 
-	expectedErrorString := "42: 'test_error'"
-	actualErrorString := iggyErr.Error()
-
-	if expectedErrorString != actualErrorString {
-		t.Errorf("Error() method mismatch, expected: %s, got: %s", expectedErrorString, actualErrorString)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := errors.Is(c.err, c.target); got != c.expected {
+				t.Errorf("errors.Is(%v, %v) = %v, want %v", c.err, c.target, got, c.expected)
+			}
+		})
 	}
 }
