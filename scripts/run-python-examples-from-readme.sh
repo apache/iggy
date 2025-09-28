@@ -95,8 +95,6 @@ done
 
 cd examples/python || exit 1
 
-exit_code=0
-
 # Execute all example commands from examples/python/README.md and check if they pass or fail
 exit_code=0
 if [ -f "README.md" ]; then
