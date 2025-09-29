@@ -165,6 +165,7 @@ compio-ws = { git = "https://github.com/krishvishal/compio-ws", branch = "main",
     "rustls",
 ] }
 tungstenite = "0.27.0"
+tokio-tungstenite = "0.27.0"
 tokio-rustls = "0.26.2"
 tokio-util = { version = "0.7.16", features = ["compat"] }
 toml = "0.9.5"

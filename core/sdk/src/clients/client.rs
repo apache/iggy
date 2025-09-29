@@ -28,6 +28,7 @@ use crate::prelude::IggyError;
 use crate::prelude::IggyProducerBuilder;
 use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
+use crate::websocket::websocket_client::WebSocketClient;
 use async_broadcast::Receiver;
 use async_trait::async_trait;
 use iggy_binary_protocol::{Client, SystemClient};
@@ -92,6 +93,9 @@ impl IggyClient {
             ))),
             TransportProtocol::Http => Ok(IggyClient::new(ClientWrapper::Http(
                 HttpClient::from_connection_string(connection_string)?,
+            ))),
+            TransportProtocol::WebSocket => Ok(IggyClient::new(ClientWrapper::WebSocket(
+                WebSocketClient::from_connection_string(connection_string)?,
             ))),
         }
     }

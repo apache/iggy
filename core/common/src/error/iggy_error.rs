@@ -179,6 +179,14 @@ pub enum IggyError {
     CannotParseUrl = 306,
     #[error("WebSocket error")]
     WebSocketError = 400,
+    #[error("WebSocket connection error")]
+    WebSocketConnectionError = 401,
+    #[error("WebSocket close error")]
+    WebSocketCloseError = 402,
+    #[error("WebSocket receive error")]
+    WebSocketReceiveError = 403,
+    #[error("WebSocket send error")]
+    WebSocketSendError = 404,
     #[error("Cannot create streams directory, Path: {0}")]
     CannotCreateStreamsDirectory(String) = 1000,
     #[error("Cannot create stream with ID: {0} directory, Path: {1}")]

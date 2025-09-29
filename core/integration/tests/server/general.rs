@@ -25,7 +25,7 @@ use test_case::test_matrix;
 
 // TODO: Include other trasnsport protocols
 #[test_matrix(
-    [TransportProtocol::Http, TransportProtocol::Tcp],
+    [TransportProtocol::Http, TransportProtocol::Tcp, TransportProtocol::WebSocket],
     [
         system_scenario(),
         user_scenario(),

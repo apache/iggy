@@ -56,6 +56,8 @@ reqwest-retry = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
+tungstenite = { workspace = true }
+tokio-tungstenite = { workspace = true }
 tokio-rustls = { workspace = true }
 tracing = { workspace = true }
 trait-variant = { workspace = true }

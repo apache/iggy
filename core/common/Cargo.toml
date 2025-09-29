@@ -40,6 +40,7 @@ bon = { workspace = true }
 byte-unit = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
+compio-ws = { workspace = true }
 clap = { workspace = true }
 comfy-table = { workspace = true }
 crc32fast = { workspace = true }

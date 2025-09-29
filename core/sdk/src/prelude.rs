@@ -45,6 +45,7 @@ pub use crate::stream_builder::IggyStreamConsumer;
 pub use crate::stream_builder::{IggyProducerConfig, IggyStreamProducer};
 pub use crate::stream_builder::{IggyStream, IggyStreamConfig};
 pub use crate::tcp::tcp_client::TcpClient;
+pub use crate::websocket::websocket_client::WebSocketClient;
 pub use iggy_binary_protocol::{
     Client, ClusterClient, ConsumerGroupClient, ConsumerOffsetClient, MessageClient,
     PartitionClient, PersonalAccessTokenClient, SegmentClient, StreamClient, SystemClient,
@@ -63,7 +64,8 @@ pub use iggy_common::{
     Sizeable, SnapshotCompression, Stats, Stream, StreamDetails, StreamPermissions,
     SystemSnapshotType, TcpClientConfig, TcpClientConfigBuilder, TcpClientReconnectionConfig,
     Topic, TopicDetails, TopicPermissions, TransportProtocol, UserId, UserStatus, Validatable,
-    defaults, locking,
+    defaults, locking, WebSocketClientConfig,
+    WebSocketClientConfigBuilder, WebSocketClientReconnectionConfig
 };
 pub use iggy_common::{
     IGGY_MESSAGE_CHECKSUM_OFFSET_RANGE, IGGY_MESSAGE_HEADER_SIZE,

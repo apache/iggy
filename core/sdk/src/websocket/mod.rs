@@ -16,18 +16,6 @@
  * under the License.
  */
 
-use crate::clients::client::IggyClient;
-use crate::http::http_client::HttpClient;
-use crate::quic::quic_client::QuicClient;
-use crate::tcp::tcp_client::TcpClient;
-use crate::websocket::websocket_client::WebSocketClient;
-
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug)]
-pub enum ClientWrapper {
-    Iggy(IggyClient),
-    Http(HttpClient),
-    Tcp(TcpClient),
-    Quic(QuicClient),
-    WebSocket(WebSocketClient),
-}
+pub mod websocket_client;
+pub(crate) mod websocket_connection_stream;
+pub(crate) mod websocket_stream;

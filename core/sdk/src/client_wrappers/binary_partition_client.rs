@@ -50,6 +50,11 @@ impl PartitionClient for ClientWrapper {
                     .create_partitions(stream_id, topic_id, partitions_count)
                     .await
             }
+            ClientWrapper::WebSocket(client) => {
+                client
+                    .create_partitions(stream_id, topic_id, partitions_count)
+                    .await
+            }
         }
     }
 
@@ -76,6 +81,11 @@ impl PartitionClient for ClientWrapper {
                     .await
             }
             ClientWrapper::Quic(client) => {
+                client
+                    .delete_partitions(stream_id, topic_id, partitions_count)
+                    .await
+            }
+            ClientWrapper::WebSocket(client) => {
                 client
                     .delete_partitions(stream_id, topic_id, partitions_count)
                     .await

@@ -16,18 +16,22 @@
  * under the License.
  */
 
-use crate::clients::client::IggyClient;
-use crate::http::http_client::HttpClient;
-use crate::quic::quic_client::QuicClient;
-use crate::tcp::tcp_client::TcpClient;
-use crate::websocket::websocket_client::WebSocketClient;
+use async_trait::async_trait;
+use iggy_common::IggyError;
 
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug)]
-pub enum ClientWrapper {
-    Iggy(IggyClient),
-    Http(HttpClient),
-    Tcp(TcpClient),
-    Quic(QuicClient),
-    WebSocket(WebSocketClient),
+/// Connection stream trait for WebSocket connections.
+/// Similar to the TCP ConnectionStream trait but adapted for WebSocket semantics.
+#[async_trait]
+pub trait ConnectionStream: Send + Sync {
+    /// Read exact amount of bytes from the stream.
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, IggyError>;
+
+    /// Write all bytes to the stream.
+    async fn write(&mut self, buf: &[u8]) -> Result<(), IggyError>;
+
+    /// Flush any buffered data.
+    async fn flush(&mut self) -> Result<(), IggyError>;
+
+    /// Shutdown the connection.
+    async fn shutdown(&mut self) -> Result<(), IggyError>;
 }

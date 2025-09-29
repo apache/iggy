@@ -59,7 +59,6 @@ pub trait ClientFactory: Sync + Send {
     fn transport(&self) -> TransportProtocol;
     fn server_addr(&self) -> String;
 }
-
 #[derive(Display, Debug)]
 enum ServerProtocolAddr {
     #[display("RAW_TCP:{_0}")]
@@ -70,6 +69,9 @@ enum ServerProtocolAddr {
 
     #[display("QUIC_UDP:{_0}")]
     QuicUdp(SocketAddr),
+
+    #[display("WEBSOCKET:{_0}")]
+    WebSocket(SocketAddr),
 }
 
 #[derive(Debug)]
@@ -323,6 +325,9 @@ impl TestServer {
                 ServerProtocolAddr::QuicUdp(addr) => {
                     ("IGGY_QUIC_ADDRESS".to_string(), addr.to_string())
                 }
+                ServerProtocolAddr::WebSocket(addr) => {
+                    ("IGGY_WEBSOCKET_ADDRESS".to_string(), addr.to_string())
+                }
             };
 
             self.envs.entry(key.0).or_insert(key.1);
@@ -405,11 +410,18 @@ impl TestServer {
                 panic!("Http address port is 0!");
             }
 
+            let websocket_addr: SocketAddr = config.websocket.address.parse().unwrap();
+            if websocket_addr.port() == 0 {
+                panic!("WebSocket address port is 0!");
+            }
+
             self.server_addrs
                 .push(ServerProtocolAddr::QuicUdp(quic_addr));
             self.server_addrs.push(ServerProtocolAddr::RawTcp(tcp_addr));
             self.server_addrs
                 .push(ServerProtocolAddr::HttpTcp(http_addr));
+            self.server_addrs
+                .push(ServerProtocolAddr::WebSocket(websocket_addr));
         } else {
             panic!(
                 "Failed to load config from file {config_path} in {MAX_PORT_WAIT_DURATION_S} s!"
@@ -487,6 +499,15 @@ impl TestServer {
         } else {
             None
         }
+    }
+
+    pub fn get_websocket_addr(&self) -> Option<String> {
+        for server_protocol_addr in &self.server_addrs {
+            if let ServerProtocolAddr::WebSocket(a) = server_protocol_addr {
+                return Some(a.to_string());
+            }
+        }
+        None
     }
 }
 

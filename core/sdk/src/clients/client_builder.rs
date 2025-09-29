@@ -25,6 +25,7 @@ use crate::prelude::{
 };
 use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
+use crate::websocket::websocket_client::WebSocketClient;
 use iggy_common::{ConnectionStringUtils, TransportProtocol};
 use std::sync::Arc;
 use tracing::error;
@@ -63,6 +64,11 @@ impl IggyClientBuilder {
                 builder.client = Some(ClientWrapper::Http(HttpClient::from_connection_string(
                     connection_string,
                 )?));
+            }
+            TransportProtocol::WebSocket => {
+                builder.client = Some(ClientWrapper::WebSocket(
+                    WebSocketClient::from_connection_string(connection_string)?,
+                ));
             }
         }
 

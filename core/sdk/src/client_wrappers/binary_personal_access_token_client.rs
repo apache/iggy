@@ -32,6 +32,7 @@ impl PersonalAccessTokenClient for ClientWrapper {
             ClientWrapper::Http(client) => client.get_personal_access_tokens().await,
             ClientWrapper::Tcp(client) => client.get_personal_access_tokens().await,
             ClientWrapper::Quic(client) => client.get_personal_access_tokens().await,
+            ClientWrapper::WebSocket(client) => client.get_personal_access_tokens().await,
         }
     }
 
@@ -45,6 +46,9 @@ impl PersonalAccessTokenClient for ClientWrapper {
             ClientWrapper::Http(client) => client.create_personal_access_token(name, expiry).await,
             ClientWrapper::Tcp(client) => client.create_personal_access_token(name, expiry).await,
             ClientWrapper::Quic(client) => client.create_personal_access_token(name, expiry).await,
+            ClientWrapper::WebSocket(client) => {
+                client.create_personal_access_token(name, expiry).await
+            }
         }
     }
 
@@ -54,6 +58,7 @@ impl PersonalAccessTokenClient for ClientWrapper {
             ClientWrapper::Http(client) => client.delete_personal_access_token(name).await,
             ClientWrapper::Tcp(client) => client.delete_personal_access_token(name).await,
             ClientWrapper::Quic(client) => client.delete_personal_access_token(name).await,
+            ClientWrapper::WebSocket(client) => client.delete_personal_access_token(name).await,
         }
     }
 
@@ -66,6 +71,9 @@ impl PersonalAccessTokenClient for ClientWrapper {
             ClientWrapper::Http(client) => client.login_with_personal_access_token(token).await,
             ClientWrapper::Tcp(client) => client.login_with_personal_access_token(token).await,
             ClientWrapper::Quic(client) => client.login_with_personal_access_token(token).await,
+            ClientWrapper::WebSocket(client) => {
+                client.login_with_personal_access_token(token).await
+            }
         }
     }
 }

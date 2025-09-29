@@ -35,6 +35,7 @@ impl TopicClient for ClientWrapper {
             ClientWrapper::Http(client) => client.get_topic(stream_id, topic_id).await,
             ClientWrapper::Tcp(client) => client.get_topic(stream_id, topic_id).await,
             ClientWrapper::Quic(client) => client.get_topic(stream_id, topic_id).await,
+            ClientWrapper::WebSocket(client) => client.get_topic(stream_id, topic_id).await,
         }
     }
 
@@ -44,6 +45,7 @@ impl TopicClient for ClientWrapper {
             ClientWrapper::Http(client) => client.get_topics(stream_id).await,
             ClientWrapper::Tcp(client) => client.get_topics(stream_id).await,
             ClientWrapper::Quic(client) => client.get_topics(stream_id).await,
+            ClientWrapper::WebSocket(client) => client.get_topics(stream_id).await,
         }
     }
 
@@ -105,6 +107,20 @@ impl TopicClient for ClientWrapper {
                         partitions_count,
                         compression_algorithm,
                         replication_factor,
+                        message_expiry,
+                        max_topic_size,
+                    )
+                    .await
+            }
+            ClientWrapper::WebSocket(client) => {
+                client
+                    .create_topic(
+                        stream_id,
+                        name,
+                        partitions_count,
+                        compression_algorithm,
+                        replication_factor,
+                        topic_id,
                         message_expiry,
                         max_topic_size,
                     )
@@ -176,6 +192,19 @@ impl TopicClient for ClientWrapper {
                     )
                     .await
             }
+            ClientWrapper::WebSocket(client) => {
+                client
+                    .update_topic(
+                        stream_id,
+                        topic_id,
+                        name,
+                        compression_algorithm,
+                        replication_factor,
+                        message_expiry,
+                        max_topic_size,
+                    )
+                    .await
+            }
         }
     }
 
@@ -189,6 +218,7 @@ impl TopicClient for ClientWrapper {
             ClientWrapper::Http(client) => client.delete_topic(stream_id, topic_id).await,
             ClientWrapper::Tcp(client) => client.delete_topic(stream_id, topic_id).await,
             ClientWrapper::Quic(client) => client.delete_topic(stream_id, topic_id).await,
+            ClientWrapper::WebSocket(client) => client.delete_topic(stream_id, topic_id).await,
         }
     }
 
@@ -202,6 +232,7 @@ impl TopicClient for ClientWrapper {
             ClientWrapper::Http(client) => client.purge_topic(stream_id, topic_id).await,
             ClientWrapper::Tcp(client) => client.purge_topic(stream_id, topic_id).await,
             ClientWrapper::Quic(client) => client.purge_topic(stream_id, topic_id).await,
+            ClientWrapper::WebSocket(client) => client.purge_topic(stream_id, topic_id).await,
         }
     }
 }

@@ -108,3 +108,11 @@ path = "src/stream-builder/stream-producer-config/main.rs"
 [[example]]
 name = "sink-data-producer"
 path = "src/sink-data-producer/main.rs"
+
+[[example]]
+name = "websocket-test"
+path = "src/websocket-test/main.rs"
+
+[[example]]
+name = "tcp-test"
+path = "src/tcp-test/main.rs"

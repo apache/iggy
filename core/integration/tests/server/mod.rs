@@ -27,6 +27,7 @@ use integration::{
     quic_client::QuicClientFactory,
     tcp_client::TcpClientFactory,
     test_server::{ClientFactory, TestServer},
+    websocket_client::WebSocketClientFactory,
 };
 use scenarios::{
     bench_scenario, consumer_group_join_scenario,
@@ -94,6 +95,10 @@ async fn run_scenario(transport: TransportProtocol, scenario: ScenarioFn) {
         TransportProtocol::Http => {
             let server_addr = test_server.get_http_api_addr().unwrap();
             Box::new(HttpClientFactory { server_addr })
+        }
+        Transport::WebSocket => {
+            let server_addr = test_server.get_websocket_addr().unwrap();
+            Box::new(WebSocketClientFactory { server_addr })
         }
     };
 
