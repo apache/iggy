@@ -102,7 +102,7 @@ var _ = ginkgo.Describe("DELETE CONSUMER OFFSET:", func() {
 				topicIdentifier,
 				&partitionId,
 			)
-			itShouldReturnSpecificIggyError(err, ierror.ConsumerOffsetNotFound)
+			itShouldReturnSpecificError(err, ierror.ErrConsumerOffsetNotFound)
 		})
 
 		ginkgo.Context("and attempts to delete an offset from a non-existing consumer group", func() {
@@ -123,7 +123,7 @@ var _ = ginkgo.Describe("DELETE CONSUMER OFFSET:", func() {
 				&partitionId,
 			)
 
-			itShouldReturnSpecificIggyError(err, ierror.ConsumerGroupIdNotFound)
+			itShouldReturnSpecificError(err, ierror.ErrConsumerGroupIdNotFound)
 		})
 
 		ginkgo.Context("and attempts to delete an offset from a non-existing stream", func() {
@@ -136,7 +136,7 @@ var _ = ginkgo.Describe("DELETE CONSUMER OFFSET:", func() {
 				randomU32Identifier(),
 				randomU32Identifier(),
 				&partitionId)
-			itShouldReturnSpecificIggyError(err, ierror.StreamIdNotFound)
+			itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
 		})
 	})
 
