@@ -264,6 +264,7 @@ public class IggyPublisher : IDisposable
         _messageWriter?.Complete();
         _cancellationTokenSource.Dispose();
         _flushSemaphore.Dispose();
+
         _disposed = true;
     }
 }

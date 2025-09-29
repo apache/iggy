@@ -11,6 +11,9 @@ public class IggyPublisherBuilder
     public IggyPublisherConfig Config { get; set; } = new ();
     public IIggyClient? IggyClient { get; set; }
 
+    private EventHandler<PublisherErrorEventArgs>? _onBackgroundError;
+    private EventHandler<MessageBatchFailedEventArgs>? _onMessageBatchFailed;
+
     public static IggyPublisherBuilder Create(IIggyClient iggyClient,  Identifier streamId, Identifier topicId)
     {
         return new IggyPublisherBuilder
@@ -83,7 +86,19 @@ public class IggyPublisherBuilder
     public IggyPublisherBuilder WithEncryptor(Func<byte[], byte[]> encryptor)
     {
         Config.Encryptor = encryptor;
-        
+
+        return this;
+    }
+
+    public IggyPublisherBuilder OnBackgroundError(EventHandler<PublisherErrorEventArgs> handler)
+    {
+        _onBackgroundError = handler;
+        return this;
+    }
+
+    public IggyPublisherBuilder OnMessageBatchFailed(EventHandler<MessageBatchFailedEventArgs> handler)
+    {
+        _onMessageBatchFailed = handler;
         return this;
     }
 
@@ -97,6 +112,18 @@ public class IggyPublisherBuilder
             SendBufferSize = Config.SendBufferSize
         });
 
-        return new IggyPublisher(IggyClient, Config);
+        var publisher = new IggyPublisher(IggyClient, Config);
+
+        if (_onBackgroundError != null)
+        {
+            publisher.OnBackgroundError += _onBackgroundError;
+        }
+
+        if (_onMessageBatchFailed != null)
+        {
+            publisher.OnMessageBatchFailed += _onMessageBatchFailed;
+        }
+
+        return publisher;
     }
 }
