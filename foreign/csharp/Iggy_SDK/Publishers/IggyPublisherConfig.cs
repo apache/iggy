@@ -31,5 +31,4 @@ public class IggyPublisherConfig
     public int BackgroundQueueCapacity { get; set; } = 10000;
     public int BackgroundBatchSize { get; set; } = 100;
     public TimeSpan BackgroundFlushInterval { get; set; } = TimeSpan.FromMilliseconds(100);
-    public int BackgroundWorkerCount { get; set; } = 1;
 }

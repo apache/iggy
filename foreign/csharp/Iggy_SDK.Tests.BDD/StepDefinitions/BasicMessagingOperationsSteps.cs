@@ -198,8 +198,8 @@ public class BasicMessagingOperationsSteps
         lastPolled.ShouldNotBeNull();
         _context.LastSendMessage.ShouldNotBeNull();
 
-        lastPolled.Header.Id.ShouldBe(_context.LastSendMessage.Value.Header.Id);
-        lastPolled.Payload.ShouldBe(_context.LastSendMessage.Value.Payload);
+        lastPolled.Header.Id.ShouldBe(_context.LastSendMessage.Header.Id);
+        lastPolled.Payload.ShouldBe(_context.LastSendMessage.Payload);
     }
 }
 

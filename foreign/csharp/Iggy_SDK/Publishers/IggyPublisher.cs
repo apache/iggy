@@ -15,9 +15,19 @@ public class IggyPublisher : IDisposable
     private readonly ChannelWriter<Message>? _messageWriter;
     private readonly ChannelReader<Message>? _messageReader;
     private readonly CancellationTokenSource _cancellationTokenSource;
-    private readonly Task[]? _backgroundTasks;
+    private Task? _backgroundTask;
     private readonly SemaphoreSlim _flushSemaphore;
     private bool _disposed = false;
+
+    /// <summary>
+    /// Fired when any error occurs in the background task
+    /// </summary>
+    public event EventHandler<PublisherErrorEventArgs>? OnBackgroundError;
+    
+    /// <summary>
+    /// Fired when a batch of messages fails to send
+    /// </summary>
+    public event EventHandler<MessageBatchFailedEventArgs>? OnMessageBatchFailed;
 
     public IggyPublisher(IIggyClient client, IggyPublisherConfig config)
     {
@@ -38,8 +48,6 @@ public class IggyPublisher : IDisposable
             _messageChannel = Channel.CreateBounded<Message>(options);
             _messageWriter = _messageChannel.Writer;
             _messageReader = _messageChannel.Reader;
-
-            _backgroundTasks = new Task[_config.BackgroundWorkerCount];
         }
     }
 
@@ -54,7 +62,7 @@ public class IggyPublisher : IDisposable
         await CreateStreamIfNeeded(ct);
         await CreateTopicIfNeeded(ct);
 
-        if (_config.EnableBackgroundSending && _backgroundTasks != null)
+        if (_config.EnableBackgroundSending)
         {
             StartBackgroundTasks();
         }
@@ -149,15 +157,12 @@ public class IggyPublisher : IDisposable
 
     private void StartBackgroundTasks()
     {
-        if (_backgroundTasks == null || _messageReader == null)
+        if (_backgroundTask == null || _messageReader == null)
         {
             return;
         }
 
-        for (var i = 0; i < _backgroundTasks.Length; i++)
-        {
-            _backgroundTasks[i] = Task.Run(async () => await BackgroundMessageProcessor(_cancellationTokenSource.Token));
-        }
+        _backgroundTask = Task.Run(async () => await BackgroundMessageProcessor(_cancellationTokenSource.Token));
     }
 
     private async Task BackgroundMessageProcessor(CancellationToken ct)
@@ -194,9 +199,9 @@ public class IggyPublisher : IDisposable
                         await _client.SendMessagesAsync(_config.StreamId, _config.TopicId, _config.Partitioning, messageBatch.ToArray(), ct);
                         messageBatch.Clear();
                     }
-                    catch (Exception)
+                    catch (Exception ex)
                     {
-                        // Log error or handle failed messages
+                        OnMessageBatchFailed?.Invoke(this, new MessageBatchFailedEventArgs(ex, messageBatch.ToArray()));
                         messageBatch.Clear();
                     }
                 }
@@ -210,6 +215,10 @@ public class IggyPublisher : IDisposable
         catch (OperationCanceledException)
         {
             // Expected when cancellation is requested
+        }
+        catch (Exception ex)
+        {
+            OnBackgroundError?.Invoke(this, new PublisherErrorEventArgs(ex, "Unexpected error in background message processor"));
         }
         finally
         {
@@ -240,11 +249,11 @@ public class IggyPublisher : IDisposable
 
         _cancellationTokenSource.Cancel();
 
-        if (_backgroundTasks != null && _isInitialized)
+        if (_backgroundTask != null && _isInitialized)
         {
             try
             {
-                Task.WaitAll(_backgroundTasks, TimeSpan.FromSeconds(5));
+                Task.WaitAll([_backgroundTask], TimeSpan.FromSeconds(5));
             }
             catch (AggregateException)
             {
@@ -256,5 +265,33 @@ public class IggyPublisher : IDisposable
         _cancellationTokenSource.Dispose();
         _flushSemaphore.Dispose();
         _disposed = true;
+    }
+}
+
+public class PublisherErrorEventArgs : EventArgs
+{
+    public Exception Exception { get; }
+    public string Message { get; }
+    public DateTime Timestamp { get; }
+
+    public PublisherErrorEventArgs(Exception exception, string message)
+    {
+        Exception = exception;
+        Message = message;
+        Timestamp = DateTime.UtcNow;
+    }
+}
+
+public class MessageBatchFailedEventArgs : EventArgs
+{
+    public Exception Exception { get; }
+    public Message[] FailedMessages { get; }
+    public DateTime Timestamp { get; }
+
+    public MessageBatchFailedEventArgs(Exception exception, Message[] failedMessages)
+    {
+        Exception = exception;
+        FailedMessages = failedMessages;
+        Timestamp = DateTime.UtcNow;
     }
 }
