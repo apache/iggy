@@ -32,7 +32,7 @@ The server should be running on `127.0.0.1:8090` with default credentials:
 
 ## Project Structure
 
-```
+```bash
 iggy/foreign/java/
 ├── java-sdk/           # Main SDK implementation
 │   ├── src/
@@ -107,7 +107,7 @@ cd iggy/foreign/java/java-sdk
 
 Test reports are generated at:
 
-```
+```bash
 java-sdk/build/reports/tests/test/index.html
 ```
 
