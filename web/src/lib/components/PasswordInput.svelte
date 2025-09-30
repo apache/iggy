@@ -46,7 +46,7 @@
       >
         <Icon
           name={isVisible ? 'eye' : 'eyeOff'}
-          class="w-[20px] h-[20px] dark:stroke-white stroke-shadeD200"
+          class="w-[20px] h-[20px] dark:stroke-white stroke-shade-d200"
         />
       </Button>
     </span>

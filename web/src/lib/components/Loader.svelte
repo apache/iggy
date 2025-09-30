@@ -11,6 +11,7 @@
 </div>
 
 <style lang="postcss">
+    @reference "../../styles/app.css";
   .loader-animation {
     animation: dots-animation 700ms infinite alternate;
   }

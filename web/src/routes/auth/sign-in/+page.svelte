@@ -36,7 +36,7 @@
       $remember.password = '';
     }
   }}
-  class="min-w-[350px] max-w-[400px] bg-white dark:bg-shadeD700 border text-color p-5 rounded-2xl card-shadow dark:shadow-lg flex flex-col gap-5"
+  class="min-w-[350px] max-w-[400px] bg-white dark:bg-shade-d700 border text-color p-5 rounded-2xl card-shadow dark:shadow-lg flex flex-col gap-5"
 >
   <span class="mx-auto font-semibold">Admin sign in</span>
 

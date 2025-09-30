@@ -30,13 +30,13 @@
 </script>
 
 <div class="flex h-full flex-row">
-  <div class="w-[290px] border-r h-full bg-shadeL200 dark:bg-shadeD900 flex flex-col">
+  <div class="w-[290px] border-r h-full bg-shade-l200 dark:bg-shade-d900 flex flex-col">
     <div class="p-7 pl-9 py-5 border-b flex gap-2 relative">
       <Icon name="search" class="absolute text-gray-400 left-3 top-1/2 -translate-y-1/2 w-[20px]" />
       <input
         bind:value={searchQuery}
         placeholder="Search streams..."
-        class="outline-none text-sm bg-transparent w-full ml-2 dark:text-white"
+        class="outline-hidden text-sm bg-transparent w-full ml-2 dark:text-white"
       />
     </div>
 
@@ -53,14 +53,14 @@
           <a
             href={typedRoute(`/dashboard/streams/${id}`)}
             class={twMerge(
-              'flex w-full flex-col border-b gap-1 px-5 py-2 transition-colors  outline-none dark:text-white hoverable',
-              isActive && 'bg-shadeL300 dark:bg-shadeD300'
+              'flex w-full flex-col border-b gap-1 px-5 py-2 transition-colors  outline-hidden dark:text-white hoverable',
+              isActive && 'bg-shade-l300 dark:bg-shade-d300'
             )}
           >
             <span
               class={twMerge(
                 'font-semibold text-base truncate',
-                isActive ? 'text-black dark:text-white' : 'text-shadeL1000  dark:text-shadeD100 '
+                isActive ? 'text-black dark:text-white' : 'text-shade-l1000  dark:text-shade-d100 '
               )}>{name}</span
             >
             <div class="grid grid-cols-2 w-full">

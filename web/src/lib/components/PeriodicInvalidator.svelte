@@ -65,6 +65,7 @@
 </Button>
 
 <style lang="postcss">
+    @reference "../../styles/app.css";
   .spin {
     animation: spin 0.3s linear infinite;
   }

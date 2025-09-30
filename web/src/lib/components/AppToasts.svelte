@@ -76,7 +76,7 @@
           aria-live="assertive"
           aria-atomic="true"
           class={twMerge(
-            'p-3 flex gap-4 items-start justify-start shadow-md w-[320px] text-base text-color dark:bg-shadeD500 relative border border-l pointer-events-auto',
+            'p-3 flex gap-4 items-start justify-start shadow-md w-[320px] text-base text-color dark:bg-shade-d500 relative border border-l pointer-events-auto',
             type === 'success' && 'border-green-600 fill-green-500 bg-green-100 border-l-[3px]',
             type === 'error' && 'border-red-600',
             type === 'info' && ''

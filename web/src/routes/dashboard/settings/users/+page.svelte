@@ -154,9 +154,9 @@
         for="{row.id}-{row.username}"
         class={twMerge(
           baseClass,
-          row.id === 1 && 'bg-shadeL800 dark:bg-shadeD1000 pointer-events-none',
+          row.id === 1 && 'bg-shade-l800 dark:bg-shade-d1000 pointer-events-none',
           $selectedUsersId.includes(row.id.toString()) &&
-            'ring-2 ring-inset ring-green500 !bg-green-300/30  '
+            'ring-2 ring-inset ring-green500 bg-green-300/30!  '
         )}
       >
         <div class="flex items-center justify-center">
@@ -187,7 +187,7 @@
           <span
             class={twMerge(
               'rounded-full block w-[70px] text-center p-1 text-white text-sm capitalize',
-              row.status === 'active' ? 'bg-green500' : 'bg-shadeD100 dark:bg-shadeD400'
+              row.status === 'active' ? 'bg-green500' : 'bg-shade-d100 dark:bg-shade-d400'
             )}
           >
             {row.status}
@@ -211,7 +211,7 @@
                           close();
                         }}
                         class={twMerge(
-                          ' grid grid-cols-[20px,1fr] gap-x-1 rounded-md items-center w-full px-2 py-2 text-sm text-color cursor-default hoverable-strong'
+                          ' grid grid-cols-[20px_1fr] gap-x-1 rounded-md items-center w-full px-2 py-2 text-sm text-color cursor-default hoverable-strong'
                         )}
                       >
                         <span>

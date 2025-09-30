@@ -42,7 +42,7 @@
           }
         }}
         class={twMerge(
-          ' grid grid-cols-[20px,1fr] gap-x-1 rounded-md items-center w-full px-2 py-2 text-sm text-color cursor-default',
+          ' grid grid-cols-[20px_1fr] gap-x-1 rounded-md items-center w-full px-2 py-2 text-sm text-color cursor-default',
           action && 'hoverable cursor-pointer'
         )}
       >

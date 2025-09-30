@@ -119,7 +119,7 @@
   </ModalConfirmation>
 
   <div class="h-[350px] flex flex-col">
-    <form method="POST" class="flex flex-col h-[300px] gap-4 flex-[3] pb-5" use:enhance>
+    <form method="POST" class="flex flex-col h-[300px] gap-4 flex-3 pb-5" use:enhance>
       <Input
         name="name"
         label="Name"
@@ -139,7 +139,7 @@
     </form>
 
     <div class="relative w-full flex-1">
-      <div class="h-[1px] border-b absolute -left-7 -right-7"></div>
+      <div class="h-px border-b absolute -left-7 -right-7"></div>
       <h2 class="text-xl text-color font-semibold mb-7 mt-5">Delete stream</h2>
 
       <form class="w-full">

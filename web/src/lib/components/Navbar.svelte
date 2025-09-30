@@ -43,7 +43,7 @@
 </script>
 
 <nav
-  class="fixed z-10 left-0 top-0 bottom-0 min-w-[90px] max-w-[90px] pb-7 pt-4 border-r flex flex-col items-center bg-shadeL300 dark:bg-shadeD1000"
+  class="fixed z-10 left-0 top-0 bottom-0 min-w-[90px] max-w-[90px] pb-7 pt-4 border-r flex flex-col items-center bg-shade-l300 dark:bg-shade-d1000"
 >
   <a href={typedRoute('/dashboard/overview')} class="flex flex-col items-center gap-5 mb-5">
     <LogoType class="w-[51px] h-[28px] pointer-events-none" />
@@ -60,7 +60,7 @@
             class={twMerge(
               'p-2 block rounded-xl transition-colors  ring-2 ring-transparent',
               active && 'ring-black dark:ring-white',
-              !active && 'hover:bg-shadeL500 dark:hover:bg-shadeD300'
+              !active && 'hover:bg-shade-l500 dark:hover:bg-shade-d300'
             )}
           >
             <Icon name={icon} class="w-[27px] h-[27px] text-black dark:text-white" />

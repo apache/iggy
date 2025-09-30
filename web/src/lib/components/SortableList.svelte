@@ -92,7 +92,7 @@
   <!-- header -->
   <div
     class={twMerge(
-      'flex h-[60px] min-h-[60px] bg-shadeL300 dark:bg-shadeD400 min-w-[1300px]',
+      'flex h-[60px] min-h-[60px] bg-shade-l300 dark:bg-shade-d400 min-w-[1300px]',
       isBodyOverflowing && 'pr-5'
     )}
   >
@@ -104,7 +104,7 @@
               key: columnName,
               asc: ordering.key !== columnName ? true : !ordering.asc
             })}
-          class="flex items-center justify-between px-5 transition-colors outline-none hover:cursor-pointer hover:bg-shadeL400 dark:hover:bg-shadeD200 dark:text-white focus:outline-none focus-visible:ring ring-inset ring-blue-600/60"
+          class="flex items-center justify-between px-5 transition-colors outline-hidden hover:cursor-pointer hover:bg-shade-l400 dark:hover:bg-shade-d200 dark:text-white focus:outline-hidden focus-visible:ring-3 ring-inset ring-blue-600/60"
         >
           <span>
             {columnDisplayedName}
@@ -115,7 +115,7 @@
               <Icon
                 name={icon}
                 class={twMerge(
-                  'fill-shadeL800 stroke-shadeL800 dark:fill-shadeL900 dark:stroke-shadeL900 w-[18px] h-fit -mb-[4px] -my-[2px]',
+                  'fill-shade-l800 stroke-shade-l800 dark:fill-shade-l900 dark:stroke-shade-l900 w-[18px] h-fit -mb-[4px] -my-[2px]',
                   ordering.key === columnName &&
                     ordering.asc &&
                     icon === 'caretUp' &&

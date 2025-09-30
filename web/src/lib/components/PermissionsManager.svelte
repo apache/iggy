@@ -389,7 +389,7 @@
             <label
               class={twMerge(
                 'flex gap-2 items-center text-color cursor-pointer',
-                streamsPerms[selectedStream.id][key].disabled && 'cursor-not-allowed text-shadeL800'
+                streamsPerms[selectedStream.id][key].disabled && 'cursor-not-allowed text-shade-l800'
               )}
               for={`stream-${key}-permission`}
             >

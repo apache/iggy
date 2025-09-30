@@ -122,7 +122,7 @@
   </ModalConfirmation>
 
   <div class="h-[400px] flex flex-col">
-    <form method="POST" class="flex flex-col gap-4 flex-[3] pb-5" use:enhance>
+    <form method="POST" class="flex flex-col gap-4 flex-3 pb-5" use:enhance>
       <Input
         name="name"
         label="Name"
@@ -139,7 +139,7 @@
         errorMessage={$errors.message_expiry?.join(',')}
       />
 
-      <span class="-mt-1 text-xs text-shadeD200 dark:text-shadeL700">
+      <span class="-mt-1 text-xs text-shade-d200 dark:text-shade-l700">
         {#if !$form.message_expiry || $form.message_expiry > numberSizes.max.u32}
           {#if $form.message_expiry === 0}
             never
@@ -161,7 +161,7 @@
     </form>
 
     <div class="relative w-full flex-1">
-      <div class="h-[1px] border-b absolute -left-7 -right-7"></div>
+      <div class="h-px border-b absolute -left-7 -right-7"></div>
       <h2 class="text-xl text-color font-semibold mb-7 mt-5">Delete topic</h2>
 
       <form class="w-full">

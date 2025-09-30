@@ -74,7 +74,7 @@
 
   <div class="relative">
     <div
-      class="rounded-md dark:bg-shadeD400 ring-1 text-color ring-gray-300 dark:ring-gray-500 flex items-center h-[40px] text-color relative focus-within:ring-2 focus-within:ring-gray-400 transition group"
+      class="rounded-md dark:bg-shade-d400 ring-1 text-color ring-gray-300 dark:ring-gray-500 flex items-center h-[40px] text-color relative focus-within:ring-2 focus-within:ring-gray-400 transition group"
     >
       <input
         id="combobox-input"
@@ -83,7 +83,7 @@
           selectedValue = noTypeCheck(e).detail.selected;
         }}
         disabled={isLoading}
-        class="w-full bg-transparent px-4 outline-none"
+        class="w-full bg-transparent px-4 outline-hidden"
       />
 
       {#if isLoading}
@@ -114,7 +114,7 @@
     >
       <ul
         use:combobox.items
-        class="absolute mt-1 z-10 max-h-[200px] w-full overflow-auto rounded-md dark:bg-shadeD400 bg-shadeL200 py-1 text-sm shadow-lg ring-1 ring-black ring-opacity-5 focus:outline-none"
+        class="absolute mt-1 z-10 max-h-[200px] w-full overflow-auto rounded-md dark:bg-shade-d400 bg-shade-l200 py-1 text-sm shadow-lg ring-1 ring-black ring-opacity-5 focus:outline-hidden"
       >
         {#each filtered as value (value.id)}
           {@const active = $combobox.active?.id === value.id}
@@ -122,8 +122,8 @@
           <li
             class={twMerge(
               'relative text-color select-none py-2 px-4  hoverable',
-              selected && 'dark:!bg-shadeD170 !bg-shadeL600',
-              active && 'dark:bg-shadeD200 bg-shadeL300'
+              selected && 'dark:!bg-shade-d170 !bg-shade-l600',
+              active && 'dark:bg-shade-d200 bg-shade-l300'
             )}
             use:combobox.item={{ value }}
           >

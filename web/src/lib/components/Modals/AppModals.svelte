@@ -78,7 +78,7 @@
 {#if $openedModal}
   <div 
     transition:fade={{ duration: 100 }} 
-    class="fixed inset-0 bg-black/40 z-[500]" 
+    class="fixed inset-0 bg-black/40 z-500" 
     onclick={() => $openedModal.props.closeModal()}
     onkeydown={(e) => {
        if (e.key === Keys.ENTER || e.key === Keys.SPACE) {

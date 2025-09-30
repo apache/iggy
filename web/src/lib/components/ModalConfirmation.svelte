@@ -46,7 +46,7 @@
 ></div>
   <div
     transition:slide={{ duration: 300 }}
-    class="absolute bottom-0 left-0 right-0 flex flex-col z-50 items-center bg-shadeL100 dark:bg-shadeD700 rounded-tl-2xl rounded-tr-2xl"
+    class="absolute bottom-0 left-0 right-0 flex flex-col z-50 items-center bg-shade-l100 dark:bg-shade-d700 rounded-tl-2xl rounded-tr-2xl"
   >
     <div class="p-5 pt-10 flex flex-col items-center border-b relative text-color">
       <Button

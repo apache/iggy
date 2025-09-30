@@ -109,7 +109,7 @@
       errorMessage={$errors.message_expiry?.join(',')}
     />
 
-    <span class="-mt-1 text-xs text-shadeD200 dark:text-shadeL700">
+    <span class="-mt-1 text-xs text-shade-d200 dark:text-shade-l700">
       {#if !$form.message_expiry || $form.message_expiry > numberSizes.max.u32}
         {#if $form.message_expiry === 0}
           never
