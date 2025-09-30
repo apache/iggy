@@ -72,7 +72,7 @@ public class IggyPublisherBuilder
         CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None, byte? replicationFactor = null,
         ulong messageExpiry = 0, ulong maxTopicSize = 0)
     {
-        Config.TopicStream = true;
+        Config.CreateTopic = true;
         Config.TopicName = name;
         Config.Partitioning = partitioning;
         Config.TopicPartitionsCount = topicPartitionsCount;

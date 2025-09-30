@@ -6,30 +6,30 @@ namespace Apache.Iggy.Publishers;
 
 public class IggyPublisherConfig
 {
-    public Protocol Protocol { get; set; }
-    public string Address { get; set; } = string.Empty;
-    public string Login { get; set; } = string.Empty;
-    public string Password { get; set; } = string.Empty;
-    public Identifier StreamId { get; set; }
-    public Identifier TopicId  { get; set; }
-    public int ReceiveBufferSize { get; set; } = 4096;
+    public Protocol Protocol { get; internal set; }
+    public string Address { get; internal set; } = string.Empty;
+    public string Login { get; internal set; } = string.Empty;
+    public string Password { get; internal set; } = string.Empty;
+    public Identifier StreamId { get; internal set; }
+    public Identifier TopicId  { get; internal set; }
+    public int ReceiveBufferSize { get; internal set; } = 4096;
 
-    public int SendBufferSize { get; set; } = 4096;
-    public Partitioning Partitioning  { get; set; }
-    public bool CreateStream { get; set; }
-    public string? StreamName { get; set; }
-    public bool TopicStream { get; set; }
-    public string? TopicName { get; set; }
-    public IMessageEncryptor? MessageEncryptor { get; set; } = null;
+    public int SendBufferSize { get; internal set; } = 4096;
+    public Partitioning Partitioning  { get; internal set; }
+    public bool CreateStream { get; internal set; }
+    public string? StreamName { get; internal set; }
+    public bool CreateTopic { get; internal set; }
+    public string? TopicName { get; internal set; }
+    public IMessageEncryptor? MessageEncryptor { get; internal set; } = null;
     
-    public uint TopicPartitionsCount { get; set; }
-    public CompressionAlgorithm TopicCompressionAlgorithm  { get; set; }
-    public byte? TopicReplicationFactor  { get; set; }
-    public ulong TopicMessageExpiry  { get; set; }
-    public ulong TopicMaxTopicSize  { get; set; }
+    public uint TopicPartitionsCount { get; internal set; }
+    public CompressionAlgorithm TopicCompressionAlgorithm  { get; internal set; }
+    public byte? TopicReplicationFactor  { get; internal set; }
+    public ulong TopicMessageExpiry  { get; internal set; }
+    public ulong TopicMaxTopicSize  { get; internal set; }
 
-    public bool EnableBackgroundSending { get; set; } = false;
-    public int BackgroundQueueCapacity { get; set; } = 10000;
-    public int BackgroundBatchSize { get; set; } = 100;
-    public TimeSpan BackgroundFlushInterval { get; set; } = TimeSpan.FromMilliseconds(100);
+    public bool EnableBackgroundSending { get; internal set; } = false;
+    public int BackgroundQueueCapacity { get; internal set; } = 10000;
+    public int BackgroundBatchSize { get; internal set; } = 100;
+    public TimeSpan BackgroundFlushInterval { get; internal set; } = TimeSpan.FromMilliseconds(100);
 }

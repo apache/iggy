@@ -16,6 +16,16 @@ public class IggyConsumer : IAsyncDisposable
     private readonly Channel<ReceivedMessage> _channel;
     private Task? _pollingTask;
 
+    /// <summary>
+    /// Fired when an error occurs during message polling
+    /// </summary>
+    public event EventHandler<ConsumerErrorEventArgs>? OnPollingError;
+
+    /// <summary>
+    /// Fired when message decryption fails
+    /// </summary>
+    public event EventHandler<MessageDecryptionFailedEventArgs>? OnMessageDecryptionFailed;
+
     public IggyConsumer(IIggyClient client, IggyConsumerConfig config, ILogger<IggyConsumer> logger)
     {
         _client = client;
@@ -173,6 +183,13 @@ public class IggyConsumer : IAsyncDisposable
                             catch (Exception ex)
                             {
                                 _logger.LogError(ex, "Failed to decrypt message with offset {Offset}", message.Header.Offset);
+                                OnMessageDecryptionFailed?.Invoke(this,
+                                    new MessageDecryptionFailedEventArgs(ex, new ReceivedMessage()
+                                    {
+                                        Message = message,
+                                        CurrentOffset = message.Header.Offset,
+                                        PartitionId = (uint)messages.PartitionId
+                                    }));
                                 continue;
                             }
                         }
@@ -192,10 +209,10 @@ public class IggyConsumer : IAsyncDisposable
                             messages.Messages[^1].Header.Offset, (uint)messages.PartitionId, ct);
                     }
                 }
-                //catch(IggyInvalidStatusCodeException ex)
                 catch (Exception ex)
                 {
                     _logger.LogError(ex, "Failed to poll messages");
+                    OnPollingError?.Invoke(this, new ConsumerErrorEventArgs(ex, "Failed to poll messages"));
                 }
 
                 await Task.Delay(10, ct);

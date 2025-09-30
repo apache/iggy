@@ -13,6 +13,9 @@ public class IggyConsumerBuilder
 {
     public IggyConsumerConfig Config { get; set; } = new ();
     public IIggyClient? IggyClient { get; private set; }
+
+    private EventHandler<ConsumerErrorEventArgs>? _onPollingError;
+    private EventHandler<MessageDecryptionFailedEventArgs>? _onMessageDecryptionFailed;
     
     /// <summary>
     /// Create consumer builder
@@ -154,6 +157,18 @@ public class IggyConsumerBuilder
         return this;
     }
 
+    public IggyConsumerBuilder OnPollingError(EventHandler<ConsumerErrorEventArgs> handler)
+    {
+        _onPollingError = handler;
+        return this;
+    }
+
+    public IggyConsumerBuilder OnMessageDecryptionFailed(EventHandler<MessageDecryptionFailedEventArgs> handler)
+    {
+        _onMessageDecryptionFailed = handler;
+        return this;
+    }
+
     public IggyConsumer Build()
     {
         if (Config.CreateIggyClient)
@@ -172,8 +187,20 @@ public class IggyConsumerBuilder
             Config.BufferSize = Config.BatchSize <= int.MaxValue ? (int)Config.BatchSize : int.MaxValue;
         }
 
-        return new IggyConsumer(IggyClient!, Config,
+        var consumer = new IggyConsumer(IggyClient!, Config,
             Config.LoggerFactory?.CreateLogger<IggyConsumer>() ??
             NullLoggerFactory.Instance.CreateLogger<IggyConsumer>());
+
+        if (_onPollingError != null)
+        {
+            consumer.OnPollingError += _onPollingError;
+        }
+
+        if (_onMessageDecryptionFailed != null)
+        {
+            consumer.OnMessageDecryptionFailed += _onMessageDecryptionFailed;
+        }
+
+        return consumer;
     }
 }

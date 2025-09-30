@@ -99,7 +99,7 @@ public class IggyPublisher : IDisposable
             return;
         }
 
-        if (!_config.TopicStream || string.IsNullOrEmpty(_config.TopicName))
+        if (!_config.CreateTopic || string.IsNullOrEmpty(_config.TopicName))
         {
             throw new Exception($"Topic {_config.TopicId} not exists");
         }
@@ -157,12 +157,12 @@ public class IggyPublisher : IDisposable
 
     private void StartBackgroundTasks()
     {
-        if (_backgroundTask == null || _messageReader == null)
+        if (_backgroundTask != null || _messageReader == null)
         {
             return;
         }
 
-        _backgroundTask = Task.Run(async () => await BackgroundMessageProcessor(_cancellationTokenSource.Token));
+        _backgroundTask = BackgroundMessageProcessor(_cancellationTokenSource.Token);
     }
 
     private async Task BackgroundMessageProcessor(CancellationToken ct)
@@ -266,33 +266,5 @@ public class IggyPublisher : IDisposable
         _flushSemaphore.Dispose();
 
         _disposed = true;
-    }
-}
-
-public class PublisherErrorEventArgs : EventArgs
-{
-    public Exception Exception { get; }
-    public string Message { get; }
-    public DateTime Timestamp { get; }
-
-    public PublisherErrorEventArgs(Exception exception, string message)
-    {
-        Exception = exception;
-        Message = message;
-        Timestamp = DateTime.UtcNow;
-    }
-}
-
-public class MessageBatchFailedEventArgs : EventArgs
-{
-    public Exception Exception { get; }
-    public Message[] FailedMessages { get; }
-    public DateTime Timestamp { get; }
-
-    public MessageBatchFailedEventArgs(Exception exception, Message[] failedMessages)
-    {
-        Exception = exception;
-        FailedMessages = failedMessages;
-        Timestamp = DateTime.UtcNow;
     }
 }
