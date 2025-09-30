@@ -1,5 +1,6 @@
 ﻿using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
+using Microsoft.Extensions.Logging;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.Publishers;
@@ -21,6 +22,7 @@ public class IggyPublisherConfig
     public bool CreateTopic { get; internal set; }
     public string? TopicName { get; internal set; }
     public IMessageEncryptor? MessageEncryptor { get; internal set; } = null;
+    public ILoggerFactory? LoggerFactory { get; internal set; } = null;
     
     public uint TopicPartitionsCount { get; internal set; }
     public CompressionAlgorithm TopicCompressionAlgorithm  { get; internal set; }

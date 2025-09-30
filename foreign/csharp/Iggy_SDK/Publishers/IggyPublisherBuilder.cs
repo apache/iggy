@@ -3,6 +3,8 @@ using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
 using Apache.Iggy.IggyClient;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.Publishers;
@@ -124,6 +126,12 @@ public class IggyPublisherBuilder
         return this;
     }
 
+    public IggyPublisherBuilder WithLogger(ILoggerFactory loggerFactory)
+    {
+        Config.LoggerFactory = loggerFactory;
+        return this;
+    }
+
     public IggyPublisher Build()
     {
         IggyClient ??= IggyClientFactory.CreateClient(new IggyClientConfigurator()
@@ -134,7 +142,9 @@ public class IggyPublisherBuilder
             SendBufferSize = Config.SendBufferSize
         });
 
-        var publisher = new IggyPublisher(IggyClient, Config);
+        var publisher = new IggyPublisher(IggyClient, Config,
+            Config.LoggerFactory?.CreateLogger<IggyPublisher>() ??
+            NullLoggerFactory.Instance.CreateLogger<IggyPublisher>());
 
         if (_onBackgroundError != null)
         {
