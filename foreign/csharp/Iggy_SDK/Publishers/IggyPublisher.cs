@@ -1,4 +1,5 @@
 using Apache.Iggy.Enums;
+using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
 using Microsoft.Extensions.Logging;
@@ -44,7 +45,7 @@ public partial class IggyPublisher : IDisposable
             var options = new BoundedChannelOptions(_config.BackgroundQueueCapacity)
             {
                 FullMode = BoundedChannelFullMode.Wait,
-                SingleReader = false,
+                SingleReader = true,
                 SingleWriter = false
             };
 
@@ -91,7 +92,7 @@ public partial class IggyPublisher : IDisposable
         if (!_config.CreateStream || string.IsNullOrEmpty(_config.StreamName))
         {
             LogStreamDoesNotExist(_config.StreamId);
-            throw new Exception($"Stream {_config.StreamId} not exists");
+            throw new StreamNotFoundException(_config.StreamId);
         }
 
         LogCreatingStream(_config.StreamId, _config.StreamName);
@@ -119,7 +120,7 @@ public partial class IggyPublisher : IDisposable
         if (!_config.CreateTopic || string.IsNullOrEmpty(_config.TopicName))
         {
             LogTopicDoesNotExist(_config.TopicId, _config.StreamId);
-            throw new Exception($"Topic {_config.TopicId} does not exist");
+            throw new TopicNotFoundException(_config.TopicId, _config.StreamId);
         }
 
         LogCreatingTopic(_config.TopicId, _config.TopicName, _config.StreamId);
@@ -145,7 +146,12 @@ public partial class IggyPublisher : IDisposable
         if (!_isInitialized)
         {
             LogSendBeforeInitialization();
-            throw new InvalidOperationException("Publisher must be initialized before sending messages. Call InitAsync() first.");
+            throw new PublisherNotInitializedException();
+        }
+
+        if (messages.Length == 0)
+        {
+            return;
         }
 
         EncryptMessages(messages);
@@ -195,7 +201,7 @@ public partial class IggyPublisher : IDisposable
     private async Task BackgroundMessageProcessor(CancellationToken ct)
     {
         var messageBatch = new List<Message>(_config.BackgroundBatchSize);
-        var timer = new PeriodicTimer(_config.BackgroundFlushInterval);
+        using var timer = new PeriodicTimer(_config.BackgroundFlushInterval);
 
         LogBackgroundProcessorStarted();
 
@@ -234,7 +240,6 @@ public partial class IggyPublisher : IDisposable
         finally
         {
             LogBackgroundProcessorStopped();
-            timer.Dispose();
         }
     }
 
@@ -257,7 +262,7 @@ public partial class IggyPublisher : IDisposable
         Exception? lastException = null;
         var delay = _config.InitialRetryDelay;
 
-        for (int attempt = 0; attempt <= _config.MaxRetryAttempts; attempt++)
+        for (var attempt = 0; attempt < _config.MaxRetryAttempts; attempt++)
         {
             try
             {
@@ -313,6 +318,7 @@ public partial class IggyPublisher : IDisposable
             LogWaitingForBackgroundTask();
             try
             {
+                
                 Task.WaitAll([_backgroundTask], TimeSpan.FromSeconds(5));
                 LogBackgroundTaskCompleted();
             }

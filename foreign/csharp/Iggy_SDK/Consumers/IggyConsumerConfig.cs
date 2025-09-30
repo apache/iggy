@@ -30,6 +30,8 @@ public class IggyConsumerConfig
     public bool CreateConsumerGroupIfNotExists { get; set; } = true;
     public bool JoinConsumerGroup { get; set; } = true;
 
+    public int PollingIntervalMs { get; set; } = 10;
+
     public ILoggerFactory? LoggerFactory { get; set; }
 
 }

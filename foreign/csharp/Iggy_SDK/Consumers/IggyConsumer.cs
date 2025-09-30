@@ -7,7 +7,7 @@ using Microsoft.Extensions.Logging;
 
 namespace Apache.Iggy.Consumers;
 
-public class IggyConsumer : IAsyncDisposable
+public partial class IggyConsumer : IAsyncDisposable
 {
     private readonly IIggyClient _client;
     private readonly IggyConsumerConfig _config;
@@ -69,14 +69,13 @@ public class IggyConsumer : IAsyncDisposable
 
             if (existingGroup == null && _config.CreateConsumerGroupIfNotExists)
             {
-                _logger.LogInformation("Creating consumer group '{GroupName}' for stream {StreamId}, topic {TopicId}",
-                    groupName, _config.StreamId, _config.TopicId);
+                LogCreatingConsumerGroup(groupName, _config.StreamId, _config.TopicId);
 
-                var createdGroup = await ConsumerGroupResponse(ct, groupName);
+                var createdGroup = await TryCreateConsumerGroupAsync(groupName, ct);
 
                 if (createdGroup)
                 {
-                    _logger.LogInformation("Successfully created consumer group '{GroupName}'", groupName);
+                    LogConsumerGroupCreated(groupName);
                 }
             }
             else if (existingGroup == null)
@@ -86,22 +85,21 @@ public class IggyConsumer : IAsyncDisposable
 
             if (_config.JoinConsumerGroup)
             {
-                _logger.LogInformation("Joining consumer group '{GroupName}' for stream {StreamId}, topic {TopicId}",
-                    groupName, _config.StreamId, _config.TopicId);
+                LogJoiningConsumerGroup(groupName, _config.StreamId, _config.TopicId);
 
                 await _client.JoinConsumerGroupAsync(_config.StreamId, _config.TopicId, Identifier.String(groupName), ct);
 
-                _logger.LogInformation("Successfully joined consumer group '{GroupName}'", groupName);
+                LogConsumerGroupJoined(groupName);
             }
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to initialize consumer group '{GroupName}'", groupName);
+            LogFailedToInitializeConsumerGroup(ex, groupName);
             throw;
         }
     }
 
-    private async Task<bool> ConsumerGroupResponse(CancellationToken ct, string groupName)
+    private async Task<bool> TryCreateConsumerGroupAsync(string groupName, CancellationToken ct)
     {
         try
         {
@@ -113,7 +111,7 @@ public class IggyConsumer : IAsyncDisposable
             // 5004 - Consumer group already exists TODO: refactor errors
             if (ex.StatusCode != 5004)
             {
-                _logger.LogError(ex, "Failed to create consumer group '{GroupName}'", groupName);
+                LogFailedToCreateConsumerGroup(ex, groupName);
                 return false;
             }
 
@@ -127,7 +125,7 @@ public class IggyConsumer : IAsyncDisposable
     {
         if (!_isInitialized)
         {
-            throw new Exception("IggyConsumer is not initialized. Call InitAsync first.");
+            throw new ConsumerNotInitializedException();
         }
 
         if (_pollingTask == null || _pollingTask.IsCompleted)
@@ -149,7 +147,7 @@ public class IggyConsumer : IAsyncDisposable
             await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId,
                 message.CurrentOffset, message.PartitionId, ct);
 
-        } while (!ct.IsCancellationRequested && !_channel.Reader.Completion.IsCompleted);
+        } while (!ct.IsCancellationRequested);
     }
 
     private async Task PollMessagesAsync(CancellationToken ct)
@@ -182,7 +180,7 @@ public class IggyConsumer : IAsyncDisposable
                             }
                             catch (Exception ex)
                             {
-                                _logger.LogError(ex, "Failed to decrypt message with offset {Offset}", message.Header.Offset);
+                                LogFailedToDecryptMessage(ex, message.Header.Offset);
                                 OnMessageDecryptionFailed?.Invoke(this,
                                     new MessageDecryptionFailedEventArgs(ex, new ReceivedMessage()
                                     {
@@ -211,22 +209,22 @@ public class IggyConsumer : IAsyncDisposable
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogError(ex, "Failed to poll messages");
+                    LogFailedToPollMessages(ex);
                     OnPollingError?.Invoke(this, new ConsumerErrorEventArgs(ex, "Failed to poll messages"));
                 }
 
-                await Task.Delay(10, ct);
+                await Task.Delay(_config.PollingIntervalMs, ct);
             }
 
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            _logger.LogDebug("Polling task cancelled");
+            LogPollingTaskCancelled();
         }
         finally
         {
             _channel.Writer.TryComplete();
-            _logger.LogDebug("Message polling stopped");
+            LogMessagePollingStopped();
         }
     }
 
@@ -245,15 +243,13 @@ public class IggyConsumer : IAsyncDisposable
             }
             catch (TimeoutException)
             {
-                _logger.LogWarning("Polling task timed out");
+                LogPollingTaskTimeout();
             }
             catch(Exception e)
             {
-                _logger.LogWarning(e, "Polling task failed with exception");
+                LogPollingTaskFailed(e);
             }
         }
-        
-        _channel.Writer.TryComplete();
 
         if (!string.IsNullOrEmpty(_config.ConsumerGroupName))
         {
@@ -262,11 +258,11 @@ public class IggyConsumer : IAsyncDisposable
                 await _client.LeaveConsumerGroupAsync(_config.StreamId, _config.TopicId,
                     Identifier.String(_config.ConsumerGroupName));
 
-                _logger.LogTrace("Left consumer group '{GroupName}'", _config.ConsumerGroupName);
+                LogLeftConsumerGroup(_config.ConsumerGroupName);
             }
             catch (Exception e)
             {
-                _logger.LogWarning(e, "Failed to leave consumer group '{GroupName}'", _config.ConsumerGroupName);
+                LogFailedToLeaveConsumerGroup(e, _config.ConsumerGroupName);
             }
         }
 
@@ -279,7 +275,7 @@ public class IggyConsumer : IAsyncDisposable
             }
             catch (Exception e)
             {
-                _logger.LogWarning(e, "Failed to logout user or dispose client");
+                LogFailedToLogoutOrDispose(e);
             }
         }
     }
