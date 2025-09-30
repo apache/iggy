@@ -101,7 +101,7 @@ impl TestMcpServer {
             Command::cargo_bin("iggy-mcp").unwrap()
         };
         command.envs(self.envs.clone());
-        let child = command.spawn().unwrap();
+        let child = command.spawn().expect("Failed to start MCP server process");
         self.child_handle = Some(child);
     }
 

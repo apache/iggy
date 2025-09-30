@@ -107,7 +107,9 @@ jobs:
           echo "🔍 Verifying commit is on master branch..."
           git fetch origin master --depth=1000
 
-          if git merge-base --is-ancestor "$COMMIT" origin/master; then
+          if ${{ inputs.dry_run }}; then
+            echo "🌵 Dry run, skipping master branch check"
+          elif git merge-base --is-ancestor "$COMMIT" origin/master; then
             echo "✅ Commit is on master branch"
           else
             echo "❌ ERROR: Commit $COMMIT is not on the master branch!"

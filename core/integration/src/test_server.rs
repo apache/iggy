@@ -30,12 +30,11 @@ use assert_cmd::prelude::CommandCargoExt;
 use async_trait::async_trait;
 use derive_more::Display;
 use futures::executor::block_on;
-use iggy_common::TransportProtocol;
-use uuid::Uuid;
-
 use iggy::prelude::UserStatus::Active;
 use iggy::prelude::*;
-use server::configs::config_provider::{ConfigProvider, FileConfigProvider};
+use iggy_common::{ConfigProvider, TransportProtocol};
+use server::configs::server::ServerConfig;
+use uuid::Uuid;
 
 pub const SYSTEM_PATH_ENV_VAR: &str = "IGGY_SYSTEM_PATH";
 pub const TEST_VERBOSITY_ENV_VAR: &str = "IGGY_TEST_VERBOSE";
@@ -310,13 +309,11 @@ impl TestServer {
 
     fn wait_until_server_has_bound(&mut self) {
         let config_path = format!("{}/runtime/current_config.toml", self.local_data_path);
-        let file_config_provider = FileConfigProvider::new(config_path.clone());
-
         let max_attempts = (MAX_PORT_WAIT_DURATION_S * 1000) / SLEEP_INTERVAL_MS;
         self.server_addrs.clear();
 
         let config = block_on(async {
-            let mut loaded_config = None;
+            let mut loaded_config: Option<ServerConfig> = None;
 
             for _ in 0..max_attempts {
                 if !Path::new(&config_path).exists() {
@@ -328,7 +325,10 @@ impl TestServer {
                     sleep(Duration::from_millis(SLEEP_INTERVAL_MS));
                     continue;
                 }
-                match file_config_provider.load_config().await {
+                match ServerConfig::file_config_provider(config_path.clone())
+                    .load_config()
+                    .await
+                {
                     Ok(config) => {
                         loaded_config = Some(config);
                         break;

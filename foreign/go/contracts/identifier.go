@@ -19,6 +19,7 @@ package iggcon
 
 import (
 	"encoding/binary"
+
 	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
@@ -43,13 +44,13 @@ func NewIdentifier[T uint32 | string](value T) (Identifier, error) {
 	case string:
 		return newStringIdentifier(v)
 	}
-	return Identifier{}, ierror.InvalidIdentifier
+	return Identifier{}, ierror.ErrInvalidIdentifier
 }
 
 // newNumericIdentifier creates a new identifier from the given numeric value.
 func newNumericIdentifier(value uint32) (Identifier, error) {
 	if value == 0 {
-		return Identifier{}, ierror.InvalidIdentifier
+		return Identifier{}, ierror.ErrInvalidIdentifier
 	}
 
 	val := make([]byte, 4)
@@ -65,7 +66,7 @@ func newNumericIdentifier(value uint32) (Identifier, error) {
 func newStringIdentifier(value string) (Identifier, error) {
 	length := len(value)
 	if length == 0 || length > 255 {
-		return Identifier{}, ierror.InvalidIdentifier
+		return Identifier{}, ierror.ErrInvalidIdentifier
 	}
 	return Identifier{
 		Kind:   StringId,
@@ -77,7 +78,7 @@ func newStringIdentifier(value string) (Identifier, error) {
 // Uint32 returns the numeric value of the identifier.
 func (id Identifier) Uint32() (uint32, error) {
 	if id.Kind != NumericId || id.Length != 4 {
-		return 0, ierror.ResourceNotFound
+		return 0, ierror.ErrResourceNotFound
 	}
 
 	return binary.LittleEndian.Uint32(id.Value), nil
@@ -86,7 +87,7 @@ func (id Identifier) Uint32() (uint32, error) {
 // String returns the string value of the identifier.
 func (id Identifier) String() (string, error) {
 	if id.Kind != StringId {
-		return "", ierror.InvalidIdentifier
+		return "", ierror.ErrInvalidIdentifier
 	}
 
 	return string(id.Value), nil

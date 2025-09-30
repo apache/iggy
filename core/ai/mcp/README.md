@@ -33,8 +33,8 @@ allow_private_network = false
 
 [http.tls] # Optional TLS configuration for HTTP API
 enabled = false
-cert = "core/certs/iggy_cert.pem"
-key = "core/certs/iggy_key.pem"
+cert_file = "core/certs/iggy_cert.pem"
+key_file = "core/certs/iggy_key.pem"
 
 [permissions]
 create = true

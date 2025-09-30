@@ -28,7 +28,7 @@ use server::channels::commands::print_sysinfo::SysInfoPrintExecutor;
 use server::channels::commands::save_messages::SaveMessagesExecutor;
 use server::channels::commands::verify_heartbeats::VerifyHeartbeatsExecutor;
 use server::channels::handler::BackgroundServerCommandHandler;
-use server::configs::config_provider;
+use server::configs;
 use server::configs::server::ServerConfig;
 use server::http::http_server;
 #[cfg(not(feature = "tokio-console"))]
@@ -68,8 +68,8 @@ async fn main() -> Result<(), ServerError> {
 
     let args = Args::parse();
 
-    let config_provider = config_provider::resolve(&args.config_provider)?;
-    let config = ServerConfig::load(&config_provider).await?;
+    let config_provider = configs::server::resolve(&args.config_provider)?;
+    let config = ServerConfig::load(config_provider).await?;
     if args.fresh {
         let system_path = config.system.get_system_path();
         if tokio::fs::metadata(&system_path).await.is_ok() {
