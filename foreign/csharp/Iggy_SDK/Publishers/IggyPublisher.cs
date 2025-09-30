@@ -174,16 +174,13 @@ public class IggyPublisher : IDisposable
         {
             while (!ct.IsCancellationRequested && _messageReader != null)
             {
-                var hasMessage = false;
-
                 while (messageBatch.Count < _config.BackgroundBatchSize &&
                        _messageReader.TryRead(out var message))
                 {
                     messageBatch.Add(message);
-                    hasMessage = true;
                 }
 
-                if (!hasMessage && messageBatch.Count == 0)
+                if (messageBatch.Count == 0)
                 {
                     if (!await timer.WaitForNextTickAsync(ct))
                     {
@@ -192,24 +189,8 @@ public class IggyPublisher : IDisposable
                     continue;
                 }
 
-                if (messageBatch.Count > 0)
-                {
-                    try
-                    {
-                        await _client.SendMessagesAsync(_config.StreamId, _config.TopicId, _config.Partitioning, messageBatch.ToArray(), ct);
-                        messageBatch.Clear();
-                    }
-                    catch (Exception ex)
-                    {
-                        OnMessageBatchFailed?.Invoke(this, new MessageBatchFailedEventArgs(ex, messageBatch.ToArray()));
-                        messageBatch.Clear();
-                    }
-                }
-
-                if (!hasMessage)
-                {
-                    await timer.WaitForNextTickAsync(ct);
-                }
+                await SendBatchWithRetry(messageBatch, ct);
+                messageBatch.Clear();
             }
         }
         catch (OperationCanceledException)
@@ -224,6 +205,48 @@ public class IggyPublisher : IDisposable
         {
             timer.Dispose();
         }
+    }
+
+    private async Task SendBatchWithRetry(List<Message> messageBatch, CancellationToken ct)
+    {
+        if (!_config.EnableRetry)
+        {
+            try
+            {
+                await _client.SendMessagesAsync(_config.StreamId, _config.TopicId, _config.Partitioning, messageBatch.ToArray(), ct);
+            }
+            catch (Exception ex)
+            {
+                OnMessageBatchFailed?.Invoke(this, new MessageBatchFailedEventArgs(ex, messageBatch.ToArray(), 0));
+            }
+            return;
+        }
+
+        Exception? lastException = null;
+        var delay = _config.InitialRetryDelay;
+
+        for (int attempt = 0; attempt <= _config.MaxRetryAttempts; attempt++)
+        {
+            try
+            {
+                await _client.SendMessagesAsync(_config.StreamId, _config.TopicId, _config.Partitioning, messageBatch.ToArray(), ct);
+                return; 
+            }
+            catch (Exception ex)
+            {
+                lastException = ex;
+
+                if (attempt < _config.MaxRetryAttempts && !ct.IsCancellationRequested)
+                {
+                    await Task.Delay(delay, ct);
+                    delay = TimeSpan.FromMilliseconds(
+                        Math.Min(delay.TotalMilliseconds * _config.RetryBackoffMultiplier, _config.MaxRetryDelay.TotalMilliseconds)
+                    );
+                }
+            }
+        }
+        
+        OnMessageBatchFailed?.Invoke(this, new MessageBatchFailedEventArgs(lastException!, messageBatch.ToArray(), _config.MaxRetryAttempts));
     }
 
     private void EncryptMessages(Message[] messages)

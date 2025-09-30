@@ -32,4 +32,11 @@ public class IggyPublisherConfig
     public int BackgroundQueueCapacity { get; internal set; } = 10000;
     public int BackgroundBatchSize { get; internal set; } = 100;
     public TimeSpan BackgroundFlushInterval { get; internal set; } = TimeSpan.FromMilliseconds(100);
+
+    // Retry configuration
+    public bool EnableRetry { get; internal set; } = true;
+    public int MaxRetryAttempts { get; internal set; } = 3;
+    public TimeSpan InitialRetryDelay { get; internal set; } = TimeSpan.FromMilliseconds(100);
+    public TimeSpan MaxRetryDelay { get; internal set; } = TimeSpan.FromSeconds(10);
+    public double RetryBackoffMultiplier { get; internal set; } = 2.0;
 }

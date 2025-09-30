@@ -103,6 +103,27 @@ public class IggyPublisherBuilder
         return this;
     }
 
+    public IggyPublisherBuilder WithRetry(bool enabled = true, int maxAttempts = 3,
+        TimeSpan? initialDelay = null, TimeSpan? maxDelay = null, double backoffMultiplier = 2.0)
+    {
+        Config.EnableRetry = enabled;
+        Config.MaxRetryAttempts = maxAttempts;
+        Config.InitialRetryDelay = initialDelay ?? TimeSpan.FromMilliseconds(100);
+        Config.MaxRetryDelay = maxDelay ?? TimeSpan.FromSeconds(10);
+        Config.RetryBackoffMultiplier = backoffMultiplier;
+        return this;
+    }
+
+    public IggyPublisherBuilder WithBackgroundSending(bool enabled = true, int queueCapacity = 10000,
+        int batchSize = 100, TimeSpan? flushInterval = null)
+    {
+        Config.EnableBackgroundSending = enabled;
+        Config.BackgroundQueueCapacity = queueCapacity;
+        Config.BackgroundBatchSize = batchSize;
+        Config.BackgroundFlushInterval = flushInterval ?? TimeSpan.FromMilliseconds(100);
+        return this;
+    }
+
     public IggyPublisher Build()
     {
         IggyClient ??= IggyClientFactory.CreateClient(new IggyClientConfigurator()
