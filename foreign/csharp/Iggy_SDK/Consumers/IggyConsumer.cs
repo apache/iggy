@@ -158,11 +158,11 @@ public class IggyConsumer : IAsyncDisposable
                     {
                         var processedMessage = message;
 
-                        if (_config.Decryptor != null)
+                        if (_config.MessageEncryptor != null)
                         {
                             try
                             {
-                                var decryptedPayload = _config.Decryptor(message.Payload);
+                                var decryptedPayload = _config.MessageEncryptor.Decrypt(message.Payload);
                                 processedMessage = new MessageResponse
                                 {
                                     Header = message.Header,

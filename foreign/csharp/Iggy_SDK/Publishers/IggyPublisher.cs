@@ -228,14 +228,14 @@ public class IggyPublisher : IDisposable
 
     private void EncryptMessages(Message[] messages)
     {
-        if (_config.Encryptor == null)
+        if (_config.MessageEncryptor == null)
         {
             return;
         }
 
         foreach (var message in messages)
         {
-            message.Payload = _config.Encryptor(message.Payload);
+            message.Payload = _config.MessageEncryptor.Encrypt(message.Payload);
             message.Header.PayloadLength = message.Payload.Length;
         }
     }

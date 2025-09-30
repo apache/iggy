@@ -1,4 +1,5 @@
 ﻿using Apache.Iggy.Configuration;
+using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
 using Apache.Iggy.IggyClient;
@@ -83,9 +84,9 @@ public class IggyPublisherBuilder
         return this;
     }
     
-    public IggyPublisherBuilder WithEncryptor(Func<byte[], byte[]> encryptor)
+    public IggyPublisherBuilder WithEncryptor(IMessageEncryptor encryptor)
     {
-        Config.Encryptor = encryptor;
+        Config.MessageEncryptor = encryptor;
 
         return this;
     }

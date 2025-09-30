@@ -1,3 +1,4 @@
+using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Kinds;
 using Microsoft.Extensions.Logging;
@@ -13,10 +14,10 @@ public class IggyConsumerConfig
     public string Password { get; set; } = string.Empty;
     public int ReceiveBufferSize { get; set; } = 4096;
     public int SendBufferSize { get; set; } = 4096;
-    
-    public Identifier StreamId { get; set; } 
+
+    public Identifier StreamId { get; set; }
     public Identifier TopicId  { get; set; }
-    public Func<byte[], byte[]>? Decryptor { get; set; } = null;
+    public IMessageEncryptor? MessageEncryptor { get; set; } = null;
     public uint? PartitionId { get; set; }
     public Kinds.Consumer Consumer { get; set; }
     public PollingStrategy PollingStrategy { get; set; }

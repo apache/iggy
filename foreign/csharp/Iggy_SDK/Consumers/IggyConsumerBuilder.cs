@@ -1,4 +1,5 @@
 using Apache.Iggy.Configuration;
+using Apache.Iggy.Encryption;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Factory;
 using Apache.Iggy.IggyClient;
@@ -75,10 +76,10 @@ public class IggyConsumerBuilder
         return this;
     }
     
-    public IggyConsumerBuilder WithDecryptor(Func<byte[], byte[]> decryptor)
+    public IggyConsumerBuilder WithDecryptor(IMessageEncryptor decryptor)
     {
-        Config.Decryptor = decryptor;
-        
+        Config.MessageEncryptor = decryptor;
+
         return this;
     }
 

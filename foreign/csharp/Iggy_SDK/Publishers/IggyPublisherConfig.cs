@@ -1,4 +1,5 @@
-﻿using Apache.Iggy.Enums;
+﻿using Apache.Iggy.Encryption;
+using Apache.Iggy.Enums;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.Publishers;
@@ -9,7 +10,7 @@ public class IggyPublisherConfig
     public string Address { get; set; } = string.Empty;
     public string Login { get; set; } = string.Empty;
     public string Password { get; set; } = string.Empty;
-    public Identifier StreamId { get; set; } 
+    public Identifier StreamId { get; set; }
     public Identifier TopicId  { get; set; }
     public int ReceiveBufferSize { get; set; } = 4096;
 
@@ -19,7 +20,7 @@ public class IggyPublisherConfig
     public string? StreamName { get; set; }
     public bool TopicStream { get; set; }
     public string? TopicName { get; set; }
-    public Func<byte[], byte[]>? Encryptor { get; set; } = null;
+    public IMessageEncryptor? MessageEncryptor { get; set; } = null;
     
     public uint TopicPartitionsCount { get; set; }
     public CompressionAlgorithm TopicCompressionAlgorithm  { get; set; }

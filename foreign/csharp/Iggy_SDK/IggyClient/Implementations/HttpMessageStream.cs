@@ -34,7 +34,6 @@ using Apache.Iggy.Exceptions;
 using Apache.Iggy.Headers;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
-using Apache.Iggy.MessagesDispatcher;
 using Apache.Iggy.StringHandlers;
 using Microsoft.Extensions.Logging;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
