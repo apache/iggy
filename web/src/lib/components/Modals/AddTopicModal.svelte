@@ -1,6 +1,6 @@
 <script lang="ts">
   import { setError, superForm, defaults } from 'sveltekit-superforms/client';
-  import { zod } from 'sveltekit-superforms/adapters';
+  import { zod4 } from 'sveltekit-superforms/adapters';
   import { z } from 'zod';
   import Input from '../Input.svelte';
   import Select from '../Select.svelte';
@@ -31,13 +31,13 @@
       .max(255, 'Name must not exceed 255 characters'),
     partitions_count: z.number().min(0).max(numberSizes.max.u32).default(1),
     message_expiry: z.number().min(0).max(numberSizes.max.u32).default(0),
-    compression_algorithm: z.enum(["none", "gzip"]).default("none"),
-    max_topic_size: z.number().min(0).max(numberSizes.max.u32).default(1_000_000_000),
+    compression_algorithm: z.enum(['none', 'gzip']).default('none'),
+    max_topic_size: z.number().min(0).max(numberSizes.max.u32).default(1_000_000_000)
   });
 
-  const { form, errors, enhance, constraints } = superForm(defaults(zod(schema)), {
+  const { form, errors, enhance, constraints } = superForm(defaults(zod4(schema)), {
     SPA: true,
-    validators: zod(schema),
+    validators: zod4(schema),
 
     async onUpdate({ form }) {
       if (!form.valid) return;
@@ -52,7 +52,7 @@
           partitions_count: form.data.partitions_count,
           message_expiry: form.data.message_expiry,
           compression_algorithm: form.data.compression_algorithm,
-          max_topic_size: form.data.max_topic_size,
+          max_topic_size: form.data.max_topic_size
         }
       });
 
@@ -109,7 +109,7 @@
       errorMessage={$errors.message_expiry?.join(',')}
     />
 
-    <span class="-mt-1 text-xs text-shadeD200 dark:text-shadeL700">
+    <span class="-mt-1 text-xs text-shade-d200 dark:text-shade-l700">
       {#if !$form.message_expiry || $form.message_expiry > numberSizes.max.u32}
         {#if $form.message_expiry === 0}
           never
@@ -123,7 +123,7 @@
       label="Compression Algorithm"
       type="text"
       name="compressionAlgorithm"
-      options={["none", "gzip"]}
+      options={['none', 'gzip']}
       bind:value={$form.compression_algorithm}
       {...$constraints.compression_algorithm}
       errorMessage={$errors.compression_algorithm?.join(',')}
@@ -139,8 +139,7 @@
     />
 
     <div class="flex justify-end gap-3 mt-auto">
-      <Button variant="text" type="button" class="w-2/5" onclick={() => closeModal()}
-        >Cancel</Button
+      <Button variant="text" type="button" class="w-2/5" onclick={() => closeModal()}>Cancel</Button
       >
       <Button type="submit" variant="contained" class="w-2/5">Create</Button>
     </div>

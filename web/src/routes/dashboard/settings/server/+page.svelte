@@ -19,7 +19,7 @@
 <SettingsLayout>
   <div class="p-5">
     <section
-      class="border rounded-md overflow-hidden mx-auto max-w-[900px] text-color text-shadeL1000"
+      class="border rounded-md overflow-hidden mx-auto max-w-[900px] text-color text-shade-l1000"
     >
       <div class="flex flex-col p-7 gap-3">
         <h3 class="text-2xl font-semibold">Cache</h3>
@@ -45,7 +45,7 @@
           </div>
         {/if}
       </div>
-      <footer class="p-5 py-4 bg-shadeL200 dark:bg-shadeD900 flex items-center justify-between">
+      <footer class="p-5 py-4 bg-shade-l200 dark:bg-shade-d900 flex items-center justify-between">
         <span class=" text-sm">
           max cache size: 80% of {data.serverStats.availableMemory.value}
         </span>

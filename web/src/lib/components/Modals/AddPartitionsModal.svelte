@@ -5,7 +5,7 @@
   import ModalBase from './ModalBase.svelte';
   import { numberSizes } from '$lib/utils/constants/numberSizes';
   import { setError, superForm, defaults } from 'sveltekit-superforms/client';
-  import { zod } from 'sveltekit-superforms/adapters';
+  import { zod4 } from 'sveltekit-superforms/adapters';
   import { fetchRouteApi } from '$lib/api/fetchRouteApi';
   import { page } from '$app/state';
   import { dataHas } from '$lib/utils/dataHas';
@@ -23,9 +23,9 @@
     partitions_count: z.number().min(1).max(numberSizes.max.u32).default(1)
   });
 
-  const { form, errors, enhance, constraints } = superForm(defaults(zod(schema)), {
+  const { form, errors, enhance, constraints } = superForm(defaults(zod4(schema)), {
     SPA: true,
-    validators: zod(schema),
+    validators: zod4(schema),
     invalidateAll: false,
     taintedMessage: false,
     async onUpdate({ form }) {
@@ -49,7 +49,8 @@
           await customInvalidateAll();
           showToast({
             type: 'success',
-            description: form.data.partitions_count > 1
+            description:
+              form.data.partitions_count > 1
                 ? `${form.data.partitions_count} partitions have been added.`
                 : '1 partition has been added.',
             duration: 3500
@@ -72,8 +73,7 @@
     />
 
     <div class="flex justify-end gap-3 mt-auto">
-      <Button variant="text" type="button" class="w-2/5" onclick={() => closeModal()}
-        >Cancel</Button
+      <Button variant="text" type="button" class="w-2/5" onclick={() => closeModal()}>Cancel</Button
       >
       <Button type="submit" variant="contained" class="w-2/5">Create</Button>
     </div>

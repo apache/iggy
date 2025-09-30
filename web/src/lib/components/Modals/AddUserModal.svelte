@@ -5,7 +5,7 @@
   import { z } from 'zod';
   import ModalBase from './ModalBase.svelte';
   import { setError, superForm, defaults } from 'sveltekit-superforms/client';
-  import { zod } from 'sveltekit-superforms/adapters';
+  import { zod4 } from 'sveltekit-superforms/adapters';
   import PasswordInput from '../PasswordInput.svelte';
   import Button from '../Button.svelte';
   import PermissionsManager from '../PermissionsManager.svelte';
@@ -29,9 +29,9 @@
     permissions: z.any().nullable().default(null)
   });
 
-  const { form, errors, enhance, constraints } = superForm(defaults(zod(schema)), {
+  const { form, errors, enhance, constraints } = superForm(defaults(zod4(schema)), {
     SPA: true,
-    validators: zod(schema),
+    validators: zod4(schema),
     taintedMessage: false,
 
     async onUpdate({ form }) {
@@ -92,14 +92,11 @@
           { name: 'Inactive', value: 'inactive' }
         ]}
         selectedValue={$form.status}
-        on:selectedValue={(e) => $form.status = e.detail as 'active' | 'inactive'}
+        on:selectedValue={(e) => ($form.status = e.detail as 'active' | 'inactive')}
       />
     </div>
 
-    <PermissionsManager
-      {streams}
-      bind:value={$form.permissions}
-    />
+    <PermissionsManager {streams} bind:value={$form.permissions} />
 
     <div class="flex justify-end gap-3 mt-16 w-[350px] ml-auto">
       <Button variant="text" type="button" class="w-2/5" onclick={() => closeModal()}>

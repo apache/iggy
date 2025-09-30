@@ -34,7 +34,7 @@
       icon: 'usersGroup',
       name: 'Users',
       href: typedRoute('/dashboard/settings/users')
-    },
+    }
     // {
     //   name: 'Terminal',
     //   icon: 'terminal',
@@ -68,9 +68,9 @@
           'absolute left-0 right-0 top-full h-[2px] -translate-y-full rounded-tl-md rounded-tr-md transition-colors duration-200',
           isActive
             ? 'dark:bg-white bg-black'
-            : 'group-hover:bg-shadeL600 dark:group-hover:bg-shadeD300'
+            : 'group-hover:bg-shade-l600 dark:group-hover:bg-shade-d300'
         )}
-></div>
+      ></div>
     </a>
   {/each}
 </div>

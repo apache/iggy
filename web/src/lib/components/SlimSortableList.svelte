@@ -33,14 +33,7 @@
     children?: import('svelte').Snippet<[any]>;
   }
 
-  let {
-    data,
-    columns,
-    emptyDataMessage,
-    gridColsClass,
-    header,
-    children
-  }: Props = $props();
+  let { data, columns, emptyDataMessage, gridColsClass, header, children }: Props = $props();
 
   let ordering: Ordering<T> = $state({
     key: 'id',
@@ -62,14 +55,14 @@
   <!-- header -->
   <div
     class={twMerge(
-      'flex h-[60px] min-h-[60px] bg-shadeL300 dark:bg-shadeD400 min-w-[1300px]',
+      'flex h-[60px] min-h-[60px] bg-shade-l300 dark:bg-shade-d400 min-w-[1300px]',
       isBodyOverflowing && 'pr-5'
     )}
   >
     <div class="w-full grid {gridColsClass}">
       {#each columns as { label, slot, key, sortable }, idx (idx)}
         {#if slot}
-          {@render header?.({ index: idx, })}
+          {@render header?.({ index: idx })}
         {:else}
           <button
             onclick={() => {
@@ -79,7 +72,7 @@
                 asc: ordering.key !== key ? true : !ordering.asc
               };
             }}
-            class="flex items-center px-5 hover:cursor-pointer hover:bg-shadeL400 dark:hover:bg-shadeD200 dark:text-white justify-between outline-none focus:outline-none focus-visible:ring ring-inset ring-blue-600/60 transition-colors"
+            class="flex items-center px-5 hover:cursor-pointer hover:bg-shade-l400 dark:hover:bg-shade-d200 dark:text-white justify-between outline-hidden focus:outline-hidden focus-visible:ring-3 ring-inset ring-blue-600/60 transition-colors"
           >
             <span>
               {label}
@@ -87,11 +80,11 @@
 
             {#if sortable}
               <div class="flex flex-col">
-                {#each asConst(['caretUp', 'caretDown']) as icon}
+                {#each asConst(['caretUp', 'caretDown']) as icon (icon)}
                   <Icon
                     name={icon}
                     class={twMerge(
-                      'fill-shadeL800 stroke-shadeL800 dark:fill-shadeL900 dark:stroke-shadeL900 w-[18px] h-fit -mb-[4px] -my-[2px]',
+                      'fill-shade-l800 stroke-shade-l800 dark:fill-shade-l900 dark:stroke-shade-l900 w-[18px] h-fit -mb-[4px] -my-[2px]',
                       ordering.key === key &&
                         ordering.asc &&
                         icon === 'caretUp' &&
@@ -120,7 +113,10 @@
     {/if}
 
     {#each orderedData as item (item.id)}
-      {@render children?.({ item, baseClass: `grid ${gridColsClass} items-center h-[65px] border-b hoverable dark:text-white`, })}
+      {@render children?.({
+        item,
+        baseClass: `grid ${gridColsClass} items-center h-[65px] border-b hoverable dark:text-white`
+      })}
     {/each}
   </div>
 </div>
