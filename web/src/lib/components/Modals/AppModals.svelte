@@ -53,7 +53,7 @@
       modal,
       props: {
         closeModal: (cb) => {
-          return new Promise<void>((res, _) => {
+          return new Promise<void>((res) => {
             openedModal.set(undefined);
             setTimeout(async () => {
               if (cb) cb();

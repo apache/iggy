@@ -64,7 +64,7 @@
     {/if}
 
     <select bind:value oninput={bubble('input')} {...inputProps}>
-      {#each options as option}
+      {#each options as option (option)}
         <option class="dark:bg-shade-d400 dark:text-white bg-white text-black">{option}</option>
       {/each}
     </select>

@@ -41,7 +41,7 @@
     toastsStore.update((v) => [...v, obj]);
 
     // 0 seconds duration means toast will never disappear
-    return new Promise((res, rej) => {
+    return new Promise((res) => {
       if (duration > 0) {
         setTimeout(() => {
           obj.remove();

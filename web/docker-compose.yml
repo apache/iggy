@@ -19,19 +19,11 @@ services:
   iggy-server:
     image: apache/iggy:edge
     environment:
-        IGGY_ROOT_USERNAME: admin
-        IGGY_ROOT_PASSWORD: admin
-        IGGY_HTTP_ENABLED: true
-        IGGY_HTTP_ADDRESS: 0.0.0.0:80
-        IGGY_TCP_ENABLED: true
-        IGGY_TCP_ADDRESS: 0.0.0.0:3000
-        IGGY_QUIC_ENABLED: true
-        IGGY_QUIC_ADDRESS: 0.0.0.0:8090
-        IGGY_HEARTBEAT_ENABLED: true
-        IGGY_HEARTBEAT_INTERVAL: 5s
+      IGGY_ROOT_USERNAME: admin
+      IGGY_ROOT_PASSWORD: admin
     ports:
-      - 8000:80
       - 3000:3000
+      - 8080:8080
       - 8090:8090
     volumes:
       - iggy-server:/local_data

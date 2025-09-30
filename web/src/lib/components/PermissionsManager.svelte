@@ -45,6 +45,7 @@
   import { twMerge } from 'tailwind-merge';
   import { noTypeCheck } from '$lib/utils/noTypeCheck';
   import { fade } from 'svelte/transition';
+  import { SvelteSet } from 'svelte/reactivity';
 
   interface Props {
     streams: Stream[];
@@ -233,7 +234,7 @@
   });
 
   let taintedStreams = $derived((() => {
-    const tainted: Set<number> = new Set([]);
+    const tainted: Set<number> = new SvelteSet([]);
 
     Object.keys(streamsPerms).forEach((streamId) => {
       Object.keys(streamsPerms[streamId]).forEach((permissionKey) => {
@@ -379,7 +380,7 @@
       <Combobox
         items={streams}
         formatter={(item) => `id: ${item.id}, ${item.name}`}
-        label={`Stream`}
+        label="Stream"
         bind:selectedValue={selectedStream}
       />
 
@@ -442,7 +443,7 @@
                 <Checkbox
                   bind:checked={streamsPerms[selectedStream.id].topicPerms[selectedTopic.id][key]
                     .checked}
-                  value={''}
+                  value=""
                 />
                 <span class="text-sm"
                   >{streamsPerms[selectedStream.id].topicPerms[selectedTopic.id][key].name}</span

@@ -7,6 +7,7 @@
   import { typedRoute } from '$lib/types/appRoutes';
   import LogoType from '$lib/components/Logo/LogoType.svelte';
   import LogoMark from '$lib/components/Logo/LogoMark.svelte';
+  import { resolve } from '$app/paths';
 
   let navItems = $derived([
     {
@@ -45,13 +46,13 @@
 <nav
   class="fixed z-10 left-0 top-0 bottom-0 min-w-[90px] max-w-[90px] pb-7 pt-4 border-r flex flex-col items-center bg-shade-l300 dark:bg-shade-d1000"
 >
-  <a href={typedRoute('/dashboard/overview')} class="flex flex-col items-center gap-5 mb-5">
+  <a href={resolve(typedRoute('/dashboard/overview'))} class="flex flex-col items-center gap-5 mb-5">
     <LogoType class="w-[51px] h-[28px] pointer-events-none" />
     <LogoMark class="w-[50px] h-[45px]" />
   </a>
 
   <ul class="flex flex-col gap-7">
-    {#each navItems as { name, icon, href, active }}
+    {#each navItems as { name, icon, href, active } (name + href)}
       <li>
         <div use:tooltip={{ placement: 'right' }}>
           <a

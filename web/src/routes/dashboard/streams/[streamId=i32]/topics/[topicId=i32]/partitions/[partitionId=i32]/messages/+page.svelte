@@ -8,6 +8,7 @@
   import Paginator from '$lib/components/Paginator.svelte';
   import type { MessagePartition } from '$lib/domain/Message';
   import type { TopicDetails } from '$lib/domain/TopicDetails';
+  import { resolve } from '$app/paths';
 
   interface Props {
     data: {
@@ -45,7 +46,7 @@
     const url = new URL(window.location.href);
     url.searchParams.set('offset', offset.toString());
     url.searchParams.set('direction', direction);
-    await goto(url, { keepFocus: true, noScroll: true });
+    await goto(resolve(url), { keepFocus: true, noScroll: true });
     currentPage = page;
   }
 
@@ -61,7 +62,7 @@
 </script>
 
 <div class="h-[80px] flex text-xs items-center pl-2 pr-5">
-  <Button variant="rounded" class="mr-5" onclick={() => goto(prevPage)}>
+  <Button variant="rounded" class="mr-5" onclick={() => goto(resolve(prevPage))}>
     <Icon name="arrowLeft" class="h-[40px] w-[30px]" />
   </Button>
 

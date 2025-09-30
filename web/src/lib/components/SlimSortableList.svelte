@@ -87,7 +87,7 @@
 
             {#if sortable}
               <div class="flex flex-col">
-                {#each asConst(['caretUp', 'caretDown']) as icon}
+                {#each asConst(['caretUp', 'caretDown']) as icon (icon)}
                   <Icon
                     name={icon}
                     class={twMerge(

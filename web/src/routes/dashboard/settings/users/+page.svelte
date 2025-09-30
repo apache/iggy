@@ -204,7 +204,7 @@
                           {/snippet}
                 {#snippet children({ close })}
                             <div>
-                    {#each userActions as { action, icon, label }}
+                    {#each userActions as { action, icon, label } (action)}
                       <button
                         onclick={() => {
                           action();

@@ -17,6 +17,7 @@
   import { browser } from '$app/environment';
   import { customInvalidateAll } from '../PeriodicInvalidator.svelte';
   import { arraySum } from '$lib/utils/arraySum';
+  import { resolve } from '$app/paths';
 
   interface Props {
     stream: StreamDetails;
@@ -84,7 +85,7 @@
       if (ok) {
         closeModal(async () => {
           if (!browser) return;
-          await goto(typedRoute('/dashboard/streams'));
+          await goto(resolve(typedRoute('/dashboard/streams')));
           await customInvalidateAll();
           showToast({
             type: 'success',

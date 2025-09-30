@@ -19,6 +19,7 @@
   import { numberSizes } from '$lib/utils/constants/numberSizes';
   import { page } from '$app/state';
   import { durationFormatter } from '$lib/utils/formatters/durationFormatter';
+  import { resolve } from '$app/paths';
 
   interface Props {
     topic: TopicDetails;
@@ -92,7 +93,7 @@
       if (ok) {
         closeModal(async () => {
           if (!browser) return;
-          await goto(onDeleteRedirectPath);
+          await goto(resolve(onDeleteRedirectPath));
           await customInvalidateAll();
           showToast({
             type: 'success',

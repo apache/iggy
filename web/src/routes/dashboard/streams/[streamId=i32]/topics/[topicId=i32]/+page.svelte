@@ -8,6 +8,7 @@
   import SortableList from '$lib/components/SortableList.svelte';
   import type { Topic } from '$lib/domain/Topic';
   import type { Partition } from '$lib/domain/Partition';
+  import { resolve } from '$app/paths';
 
   interface Props {
     data: {
@@ -23,7 +24,7 @@
 </script>
 
 <div class="h-[80px] flex text-xs items-center pl-2 pr-5">
-  <Button variant="rounded" class="mr-5" onclick={() => goto(prevPage)}>
+  <Button variant="rounded" class="mr-5" onclick={() => goto(resolve(prevPage))}>
     <Icon name="arrowLeft" class="h-[40px] w-[30px]" />
   </Button>
 

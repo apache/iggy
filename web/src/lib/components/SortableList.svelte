@@ -111,7 +111,7 @@
           </span>
 
           <div class="flex flex-col">
-            {#each asConst(['caretUp', 'caretDown']) as icon}
+            {#each asConst(['caretUp', 'caretDown']) as icon (icon)}
               <Icon
                 name={icon}
                 class={twMerge(
@@ -141,7 +141,7 @@
       </div>
     {/if}
 
-    {#each orderedData as item, index}
+    {#each orderedData as item, index (index)}
       <svelte:element
         this={hrefBuilder ? 'a' : 'div'}
         href={hrefBuilder && hrefBuilder(item)}
@@ -165,7 +165,7 @@
           e.target.style.backgroundColor = 'rgb(239 68 68)';
           isAnimating = true;
         }}
-        onoutroend={(e) => {
+        onoutroend={() => {
           isAnimating = false;
         }}
         in:slide={{ duration: animationEnabled ? 300 : 0 }}

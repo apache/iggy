@@ -9,6 +9,7 @@
   import { typedRoute } from '$lib/types/appRoutes';
   import { arrayMax } from '$lib/utils/arrayMax';
   import { onMount } from 'svelte';
+  import { resolve } from '$app/paths';
 
   interface Props {
     data: any;
@@ -23,7 +24,7 @@
 
   onMount(() => {
     if (data.streams.length > 0 && page.url.pathname === typedRoute('/dashboard/streams')) {
-      goto(typedRoute(`/dashboard/streams/${data.streams[0].id}`));
+      goto(resolve(typedRoute(`/dashboard/streams/${data.streams[0].id}`)));
     }
   });
 
@@ -51,7 +52,7 @@
         {@const isActive = page.params.streamId === id.toString()}
         <li class="last:mb-6">
           <a
-            href={typedRoute(`/dashboard/streams/${id}`)}
+            href={resolve(typedRoute(`/dashboard/streams/${id}`))}
             class={twMerge(
               'flex w-full flex-col border-b gap-1 px-5 py-2 transition-colors  outline-hidden dark:text-white hoverable',
               isActive && 'bg-shade-l300 dark:bg-shade-d300'
