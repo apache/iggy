@@ -27,7 +27,6 @@
       goto(resolve(typedRoute(`/dashboard/streams/${data.streams[0].id}`)));
     }
   });
-
 </script>
 
 <div class="flex h-full flex-row">

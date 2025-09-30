@@ -17,7 +17,7 @@
     items: T[];
     isLoading?: boolean;
     selectedValue?: T | undefined;
-    formatter?: ((item: T) => string) | undefined;
+    formatter?: ((_item: T) => string) | undefined;
   }
 
   let {
@@ -25,7 +25,7 @@
     items,
     isLoading = false,
     selectedValue = $bindable(undefined),
-    formatter = undefined,
+    formatter = undefined
   }: Props = $props();
 
   const combobox = createCombobox({ label: label || 'Actions' });
@@ -53,16 +53,18 @@
     })();
   });
 
-  let filtered = $derived((() => {
-    const value = $combobox.filter.toLowerCase().replace(/\s+/g, '');
-    return items.filter((item) => {
-      if (formatter) {
-        return formatter(item).toLowerCase().replace(/\s+/g, '').includes(value);
-      }
-      const rawName = item.name.toLowerCase().replace(/\s+/g, '');
-      return rawName.includes(value);
-    });
-  })());
+  let filtered = $derived(
+    (() => {
+      const value = $combobox.filter.toLowerCase().replace(/\s+/g, '');
+      return items.filter((item) => {
+        if (formatter) {
+          return formatter(item).toLowerCase().replace(/\s+/g, '').includes(value);
+        }
+        const rawName = item.name.toLowerCase().replace(/\s+/g, '');
+        return rawName.includes(value);
+      });
+    })()
+  );
 </script>
 
 <div class="flex flex-col gap-2">

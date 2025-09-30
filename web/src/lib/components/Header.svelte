@@ -41,7 +41,7 @@
         </Button>
       {/snippet}
 
-      {#snippet children({ close })}
+      {#snippet children({ close: _close })}
         <div class="p-1 min-w-[150px] transition-all duration-200 flex flex-col text-sm text-color">
           <span class="flex items-center justify-between gap-2 border-b px-2 py-3">
             <span>{user.username}</span>

@@ -31,8 +31,8 @@
       .max(255, 'Name must not exceed 255 characters'),
     partitions_count: z.number().min(0).max(numberSizes.max.u32).default(1),
     message_expiry: z.number().min(0).max(numberSizes.max.u32).default(0),
-    compression_algorithm: z.enum(["none", "gzip"]).default("none"),
-    max_topic_size: z.number().min(0).max(numberSizes.max.u32).default(1_000_000_000),
+    compression_algorithm: z.enum(['none', 'gzip']).default('none'),
+    max_topic_size: z.number().min(0).max(numberSizes.max.u32).default(1_000_000_000)
   });
 
   const { form, errors, enhance, constraints } = superForm(defaults(zod4(schema)), {
@@ -52,7 +52,7 @@
           partitions_count: form.data.partitions_count,
           message_expiry: form.data.message_expiry,
           compression_algorithm: form.data.compression_algorithm,
-          max_topic_size: form.data.max_topic_size,
+          max_topic_size: form.data.max_topic_size
         }
       });
 
@@ -123,7 +123,7 @@
       label="Compression Algorithm"
       type="text"
       name="compressionAlgorithm"
-      options={["none", "gzip"]}
+      options={['none', 'gzip']}
       bind:value={$form.compression_algorithm}
       {...$constraints.compression_algorithm}
       errorMessage={$errors.compression_algorithm?.join(',')}
@@ -139,8 +139,7 @@
     />
 
     <div class="flex justify-end gap-3 mt-auto">
-      <Button variant="text" type="button" class="w-2/5" onclick={() => closeModal()}
-        >Cancel</Button
+      <Button variant="text" type="button" class="w-2/5" onclick={() => closeModal()}>Cancel</Button
       >
       <Button type="submit" variant="contained" class="w-2/5">Create</Button>
     </div>

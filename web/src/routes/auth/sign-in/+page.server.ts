@@ -58,9 +58,7 @@ export const actions = {
       return message(form, 'Username or password is not valid', { status: 403 });
     }
 
-    const {
-      access_token
-    } = (await getJson(result)) as any;
+    const { access_token } = (await getJson(result)) as any;
 
     cookies.set(tokens.accessToken, access_token.token, {
       path: '/',

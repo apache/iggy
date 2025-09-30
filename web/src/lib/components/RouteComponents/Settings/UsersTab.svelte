@@ -23,9 +23,9 @@
   let { users }: Props = $props();
 
   $usersCount = users.length;
-  let filteredUsers = $derived(users.filter((user) =>
-    user.username.toLowerCase().includes($searchQuery.toLowerCase())
-  ));
+  let filteredUsers = $derived(
+    users.filter((user) => user.username.toLowerCase().includes($searchQuery.toLowerCase()))
+  );
 
   const userActions = [
     {
@@ -59,9 +59,11 @@
       : [];
   };
 
-  let allChecked = $derived(users
-    .filter((user) => user.id !== 1)
-    .every((user) => $selectedUsersId.includes(user.id.toString())));
+  let allChecked = $derived(
+    users
+      .filter((user) => user.id !== 1)
+      .every((user) => $selectedUsersId.includes(user.id.toString()))
+  );
 </script>
 
 <SlimSortableList
@@ -94,11 +96,9 @@
     },
     { label: 'Actions', sortable: false }
   ]}
-
-
 >
   {#snippet header()}
-    <div class="flex items-center justify-center" >
+    <div class="flex items-center justify-center">
       <Checkbox value="all" checked={allChecked} onclick={toggleAllChecked} />
     </div>
   {/snippet}
@@ -123,7 +123,7 @@
           />
         {/if}
       </div>
-      <div class="px-5 font-semibold ">
+      <div class="px-5 font-semibold">
         {row.id}
       </div>
 
@@ -133,7 +133,7 @@
         </span>
       </div>
 
-      <div class="px-5  whitespace-nowrap">
+      <div class="px-5 whitespace-nowrap">
         {row.createdAt}
       </div>
 
@@ -149,14 +149,14 @@
       </div>
       <div class="px-5">
         <StopPropagation>
-          <DropdownMenu placement="left-start" >
+          <DropdownMenu placement="left-start">
             {#snippet trigger()}
-                    <Button variant="rounded" class="" >
+              <Button variant="rounded" class="">
                 <Icon name="verticalDots" />
               </Button>
-                  {/snippet}
+            {/snippet}
             {#snippet children({ close })}
-                    <div>
+              <div>
                 {#each userActions as { action, icon, label } (label)}
                   <button
                     onclick={() => {
@@ -176,8 +176,8 @@
                   </button>
                 {/each}
               </div>
-                              {/snippet}
-                </DropdownMenu>
+            {/snippet}
+          </DropdownMenu>
         </StopPropagation>
       </div>
     </label>

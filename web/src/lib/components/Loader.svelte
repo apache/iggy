@@ -6,12 +6,12 @@
     <span
       class="loader-animation w-[4px] h-[4px] bg-gray-400 rounded-full"
       style="animation-delay:{delay}ms "
-></span>
+    ></span>
   {/each}
 </div>
 
 <style lang="postcss">
-    @reference "../../styles/app.css";
+  @reference "../../styles/app.css";
   .loader-animation {
     animation: dots-animation 700ms infinite alternate;
   }

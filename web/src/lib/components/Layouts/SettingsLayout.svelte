@@ -34,7 +34,7 @@
       icon: 'usersGroup',
       name: 'Users',
       href: typedRoute('/dashboard/settings/users')
-    },
+    }
     // {
     //   name: 'Terminal',
     //   icon: 'terminal',
@@ -70,7 +70,7 @@
             ? 'dark:bg-white bg-black'
             : 'group-hover:bg-shade-l600 dark:group-hover:bg-shade-d300'
         )}
-></div>
+      ></div>
     </a>
   {/each}
 </div>

@@ -24,9 +24,11 @@
   };
 
   // TODO: whether all header values should be decoded?
-  let codec = $derived(message?.user_headers?.['codec']?.value
-    ? decodeBase64(message.user_headers['codec'].value)
-    : undefined);
+  let codec = $derived(
+    message?.user_headers?.['codec']?.value
+      ? decodeBase64(message.user_headers['codec'].value)
+      : undefined
+  );
 </script>
 
 <ModalBase {closeModal} title="Message details" class="w-full max-w-[90vw] lg:max-w-[80vw]">

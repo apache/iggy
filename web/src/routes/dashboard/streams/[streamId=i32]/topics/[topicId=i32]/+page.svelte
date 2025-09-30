@@ -8,23 +8,22 @@
   import SortableList from '$lib/components/SortableList.svelte';
   import type { Topic } from '$lib/domain/Topic';
   import type { Partition } from '$lib/domain/Partition';
-  import { resolve } from '$app/paths';
 
   interface Props {
     data: {
       topic: Topic & {
         partitions: Partition[];
       };
-    }
+    };
   }
 
   let { data }: Props = $props();
   let topic = $derived(data.topic);
-  let prevPage = $derived(page.url.pathname.split('/').slice(0, 4).join('/') + '/');
+  let prevPage = $derived(`/dashboard/streams/${page.params.streamId}/`);
 </script>
 
 <div class="h-[80px] flex text-xs items-center pl-2 pr-5">
-  <Button variant="rounded" class="mr-5" onclick={() => goto(resolve(prevPage))}>
+  <Button variant="rounded" class="mr-5" onclick={() => goto(prevPage)}>
     <Icon name="arrowLeft" class="h-[40px] w-[30px]" />
   </Button>
 
@@ -35,9 +34,7 @@
     class="ml-3"
     onclick={() => openModal('TopicSettingsModal', { topic, onDeleteRedirectPath: prevPage })}
   >
-    {#snippet children()}
-      <Icon name="settings" class="dark:text-white" />
-    {/snippet}
+    <Icon name="settings" class="dark:text-white" />
     {#snippet tooltip()}
       <div>Settings</div>
     {/snippet}

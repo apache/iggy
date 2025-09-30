@@ -49,7 +49,8 @@
           await customInvalidateAll();
           showToast({
             type: 'success',
-            description: form.data.partitions_count > 1
+            description:
+              form.data.partitions_count > 1
                 ? `${form.data.partitions_count} partitions have been added.`
                 : '1 partition has been added.',
             duration: 3500
@@ -72,8 +73,7 @@
     />
 
     <div class="flex justify-end gap-3 mt-auto">
-      <Button variant="text" type="button" class="w-2/5" onclick={() => closeModal()}
-        >Cancel</Button
+      <Button variant="text" type="button" class="w-2/5" onclick={() => closeModal()}>Cancel</Button
       >
       <Button type="submit" variant="contained" class="w-2/5">Create</Button>
     </div>

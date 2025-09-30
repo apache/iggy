@@ -39,15 +39,15 @@
     tooltip?: import('svelte').Snippet;
   }
 
-  let { 
-    variant, 
-    tooltipPlacement = 'right', 
-    size = 'md', 
+  let {
+    variant,
+    tooltipPlacement = 'right',
+    size = 'md',
     class: className = '',
     children,
     tooltip: tooltipSnippet,
     onclick,
-    ...restProps 
+    ...restProps
   }: Props = $props();
 </script>
 

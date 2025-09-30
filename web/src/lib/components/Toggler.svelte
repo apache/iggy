@@ -21,5 +21,5 @@
       'absolute left-px top-1/2 -translate-y-1/2 w-[26px] h-[26px] bg-white  rounded-full border border-shade-l700 dark:border-shade-d100 transition-transform ease-in-out duration-200',
       checked && 'translate-x-[24px]'
     )}
-></div>
+  ></div>
 </label>

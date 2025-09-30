@@ -92,14 +92,11 @@
           { name: 'Inactive', value: 'inactive' }
         ]}
         selectedValue={$form.status}
-        on:selectedValue={(e) => $form.status = e.detail as 'active' | 'inactive'}
+        on:selectedValue={(e) => ($form.status = e.detail as 'active' | 'inactive')}
       />
     </div>
 
-    <PermissionsManager
-      {streams}
-      bind:value={$form.permissions}
-    />
+    <PermissionsManager {streams} bind:value={$form.permissions} />
 
     <div class="flex justify-end gap-3 mt-16 w-[350px] ml-auto">
       <Button variant="text" type="button" class="w-2/5" onclick={() => closeModal()}>

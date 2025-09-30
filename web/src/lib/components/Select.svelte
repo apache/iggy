@@ -5,8 +5,6 @@
   import type { HTMLInputTypeAttribute } from 'svelte/elements';
   import { twMerge } from 'tailwind-merge';
 
-  
-
   interface Props {
     errorMessage?: string;
     id?: string;
@@ -17,7 +15,7 @@
     value: string | number;
     prefix?: import('svelte').Snippet;
     suffix?: import('svelte').Snippet;
-    [key: string]: any
+    [key: string]: any;
   }
 
   let {

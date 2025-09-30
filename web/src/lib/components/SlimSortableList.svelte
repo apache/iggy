@@ -33,14 +33,7 @@
     children?: import('svelte').Snippet<[any]>;
   }
 
-  let {
-    data,
-    columns,
-    emptyDataMessage,
-    gridColsClass,
-    header,
-    children
-  }: Props = $props();
+  let { data, columns, emptyDataMessage, gridColsClass, header, children }: Props = $props();
 
   let ordering: Ordering<T> = $state({
     key: 'id',
@@ -69,7 +62,7 @@
     <div class="w-full grid {gridColsClass}">
       {#each columns as { label, slot, key, sortable }, idx (idx)}
         {#if slot}
-          {@render header?.({ index: idx, })}
+          {@render header?.({ index: idx })}
         {:else}
           <button
             onclick={() => {
@@ -120,7 +113,10 @@
     {/if}
 
     {#each orderedData as item (item.id)}
-      {@render children?.({ item, baseClass: `grid ${gridColsClass} items-center h-[65px] border-b hoverable dark:text-white`, })}
+      {@render children?.({
+        item,
+        baseClass: `grid ${gridColsClass} items-center h-[65px] border-b hoverable dark:text-white`
+      })}
     {/each}
   </div>
 </div>

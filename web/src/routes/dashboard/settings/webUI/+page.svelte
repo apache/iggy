@@ -7,8 +7,9 @@
 
   let intervalValue = $state($invalidateIntervalDuration);
 
-  let saveDisabled =
-    $derived(intervalValue < 500 || intervalValue > 3600000 || intervalValue === $invalidateIntervalDuration);
+  let saveDisabled = $derived(
+    intervalValue < 500 || intervalValue > 3600000 || intervalValue === $invalidateIntervalDuration
+  );
 </script>
 
 <SettingsLayout>

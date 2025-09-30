@@ -36,41 +36,38 @@
       .default(stream.name)
   });
 
-  const { form, errors, enhance, submitting, tainted } = superForm(
-    defaults(zod4(schema)),
-    {
-      SPA: true,
-      validators: zod4(schema),
-      invalidateAll: false,
-      taintedMessage: false,
-      async onUpdate({ form }) {
-        if (!form.valid) return;
+  const { form, errors, enhance, submitting, tainted } = superForm(defaults(zod4(schema)), {
+    SPA: true,
+    validators: zod4(schema),
+    invalidateAll: false,
+    taintedMessage: false,
+    async onUpdate({ form }) {
+      if (!form.valid) return;
 
-        const { data, ok } = await fetchRouteApi({
-          method: 'PUT',
-          path: `/streams/${stream.id}`,
-          body: {
-            name: form.data.name
-          }
-        });
-
-        if (dataHas(data, 'field', 'reason')) {
-          return setError(form, data.field, data.reason);
+      const { data, ok } = await fetchRouteApi({
+        method: 'PUT',
+        path: `/streams/${stream.id}`,
+        body: {
+          name: form.data.name
         }
+      });
 
-        if (ok) {
-          closeModal(async () => {
-            await customInvalidateAll();
-            showToast({
-              type: 'success',
-              description: `Stream ${form.data.name} has been updated.`,
-              duration: 3500
-            });
+      if (dataHas(data, 'field', 'reason')) {
+        return setError(form, data.field, data.reason);
+      }
+
+      if (ok) {
+        closeModal(async () => {
+          await customInvalidateAll();
+          showToast({
+            type: 'success',
+            description: `Stream ${form.data.name} has been updated.`,
+            duration: 3500
           });
-        }
+        });
       }
     }
-  );
+  });
 
   const onConfirmationResult = async (e: any) => {
     const result = e.detail as boolean;
@@ -106,17 +103,15 @@
     on:result={onConfirmationResult}
   >
     {#snippet message()}
-
-        Deleting the stream "<span class="font-semibold">{stream.name}</span>" will permenently remove
-        all associated
-        <span class="font-semibold">topics ({stream.topicsCount})</span>,
-        <span class="font-semibold"
-          >partitions ({arraySum(stream.topics.map((t) => t.partitionsCount))})</span
-        >
-        and
-        <span class="font-semibold">messages ({stream.messagesCount})</span>.
-
-      {/snippet}
+      Deleting the stream "<span class="font-semibold">{stream.name}</span>" will permenently remove
+      all associated
+      <span class="font-semibold">topics ({stream.topicsCount})</span>,
+      <span class="font-semibold"
+        >partitions ({arraySum(stream.topics.map((t) => t.partitionsCount))})</span
+      >
+      and
+      <span class="font-semibold">messages ({stream.messagesCount})</span>.
+    {/snippet}
   </ModalConfirmation>
 
   <div class="h-[350px] flex flex-col">

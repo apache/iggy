@@ -25,9 +25,9 @@
   let { data }: Props = $props();
 
   $usersCount = data.users.length;
-  let filteredUsers = $derived(data.users.filter((user) =>
-    user.username.toLowerCase().includes($searchQuery.toLowerCase())
-  ));
+  let filteredUsers = $derived(
+    data.users.filter((user) => user.username.toLowerCase().includes($searchQuery.toLowerCase()))
+  );
 
   const userActions = [
     {
@@ -61,14 +61,16 @@
       : [];
   };
 
-  let allChecked = $derived(data.users
-    .filter((user) => user.id !== 1)
-    .every((user) => $selectedUsersId.includes(user.id.toString())));
+  let allChecked = $derived(
+    data.users
+      .filter((user) => user.id !== 1)
+      .every((user) => $selectedUsersId.includes(user.id.toString()))
+  );
 </script>
 
 <SettingsLayout>
   {#snippet actions()}
-    <div  class="flex flex-col-reverse lg:flex-row gap-3 lg:gap-5 items-center">
+    <div class="flex flex-col-reverse lg:flex-row gap-3 lg:gap-5 items-center">
       {#if $selectedUsersId.length > 0}
         <div class="mr-auto flex gap-2" transition:fade={{ duration: 50 }}>
           <Button variant="containedRed">
@@ -88,10 +90,10 @@
           <div class="max-w-[170px]">
             <Input bind:value={$searchQuery} placeholder="Search" name="search">
               {#snippet prefix()}
-                        <span >
+                <span>
                   <Icon name="search" />
                 </span>
-                      {/snippet}
+              {/snippet}
             </Input>
           </div>
 
@@ -140,17 +142,15 @@
       },
       { label: 'Actions', sortable: false }
     ]}
-
-
   >
     {#snippet header()}
-        <div class="flex items-center justify-center" >
+      <div class="flex items-center justify-center">
         <Checkbox value="all" checked={allChecked} onclick={toggleAllChecked} />
       </div>
-      {/snippet}
+    {/snippet}
 
     {#snippet children({ item: row, baseClass })}
-        <label
+      <label
         for="{row.id}-{row.username}"
         class={twMerge(
           baseClass,
@@ -196,14 +196,14 @@
         <div class="px-5">
           {#if row.id !== 1}
             <StopPropagation>
-              <DropdownMenu placement="left-start" >
+              <DropdownMenu placement="left-start">
                 {#snippet trigger()}
-                            <Button variant="rounded" class="" >
+                  <Button variant="rounded" class="">
                     <Icon name="verticalDots" />
                   </Button>
-                          {/snippet}
+                {/snippet}
                 {#snippet children({ close })}
-                            <div>
+                  <div>
                     {#each userActions as { action, icon, label } (action)}
                       <button
                         onclick={() => {
@@ -223,12 +223,12 @@
                       </button>
                     {/each}
                   </div>
-                                          {/snippet}
-                        </DropdownMenu>
+                {/snippet}
+              </DropdownMenu>
             </StopPropagation>
           {/if}
         </div>
       </label>
-          {/snippet}
-    </SlimSortableList>
+    {/snippet}
+  </SlimSortableList>
 </SettingsLayout>

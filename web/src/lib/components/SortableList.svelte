@@ -27,10 +27,9 @@
   import { twMerge } from 'tailwind-merge';
   import { noTypeCheck } from '$lib/utils/noTypeCheck';
 
-
   let animationEnabled = $state(true);
   let isAnimating = $state(false);
-  let timeout: number;
+  let timeout: ReturnType<typeof setTimeout>;
 
   onNavigate(() => {
     animationEnabled = false;
@@ -48,8 +47,8 @@
     emptyDataMessage: string;
     colNames: Partial<Record<keyof T, string | undefined>>;
     rowClass: string;
-    hrefBuilder?: ((item: T) => string) | undefined;
-    onclickAction?: ((index: number) => any) | undefined;
+    hrefBuilder?: ((_item: T) => string) | undefined;
+    onclickAction?: ((_index: number) => any) | undefined;
     ariaRoleDescription?: string | undefined;
     children?: import('svelte').Snippet<[any]>;
   }
@@ -70,12 +69,14 @@
     asc: undefined
   });
 
-  let columns = $derived(Object.keys(colNames)
-    .filter((k) => colNames[k as string])
-    .map((key) => ({
-      columnDisplayedName: colNames[key as keyof T],
-      columnName: key
-    })) as { columnDisplayedName: string; columnName: keyof T }[]);
+  let columns = $derived(
+    Object.keys(colNames)
+      .filter((k) => colNames[k as string])
+      .map((key) => ({
+        columnDisplayedName: colNames[key as keyof T],
+        columnName: key
+      })) as { columnDisplayedName: string; columnName: keyof T }[]
+  );
 
   let orderedData = $derived(ordering.key ? orderData(data, ordering.key, ordering.asc!) : data);
 
@@ -175,7 +176,7 @@
         )}
       >
         <div class="flex items-center w-full {rowClass}">
-          {#if children}{@render children({ item, })}{:else}
+          {#if children}{@render children({ item })}{:else}
             {#each columns as { columnName }, idx (idx)}
               <div class={twMerge('px-5')}>
                 <span class={columnName === 'id' ? 'font-semibold' : ''}>

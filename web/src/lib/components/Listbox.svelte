@@ -25,10 +25,12 @@
     errorMessage = undefined
   }: Props<GenericOption> = $props();
 
-  let listbox = $state(createListbox({
-    label: 'Actions',
-    selected: options.find((option) => option.value === selectedValue) ?? options[0]
-  }));
+  let listbox = $state(
+    createListbox({
+      label: 'Actions',
+      selected: options.find((option) => option.value === selectedValue) ?? options[0]
+    })
+  );
 
   $effect(() => {
     const newSelectedOption = options.find((option) => option.value === selectedValue);

@@ -11,7 +11,6 @@
 
   let { currentPage, totalPages, maxVisiblePages = 5 }: Props = $props();
 
-
   const dispatch = createEventDispatcher<{ pageChange: number }>();
 
   function getVisiblePages(currentPage: number, totalPages: number, maxVisiblePages: number) {

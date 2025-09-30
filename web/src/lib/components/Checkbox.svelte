@@ -12,7 +12,7 @@
     name?: string | undefined;
     bindGroup?: string[] | undefined;
     disabled?: boolean;
-    onclick?: (e: Event) => void;
+    onclick?: (_event: Event) => void;
   }
 
   let {
@@ -49,7 +49,7 @@
     {id}
     {disabled}
     onchange={handlers(onChange, bubble('change'))}
-    onclick={onclick}
+    {onclick}
     onmousedown={() => (isMouseDown = true)}
     onmouseup={() => (isMouseDown = false)}
     onmouseleave={() => (isMouseDown = false)}
@@ -65,7 +65,7 @@
       'w-[18px] h-[18px] absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 border-neutral-300 border-2 rounded-sm transition-all pointer-events-none',
       isMouseDown && 'scale-90'
     )}
-></div>
+  ></div>
 
   <svg
     class="w-[18px] h-[18px] pointer-events-none transition-all scale-75 opacity-0 absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2"
@@ -84,7 +84,7 @@
 </div>
 
 <style lang="postcss">
-    @reference "../../styles/app.css";
+  @reference "../../styles/app.css";
 
   input[type='checkbox'] {
     @apply cursor-pointer appearance-none m-0 absolute inset-0;

@@ -19,7 +19,6 @@
   import { numberSizes } from '$lib/utils/constants/numberSizes';
   import { page } from '$app/state';
   import { durationFormatter } from '$lib/utils/formatters/durationFormatter';
-  import { resolve } from '$app/paths';
 
   interface Props {
     topic: TopicDetails;
@@ -93,7 +92,7 @@
       if (ok) {
         closeModal(async () => {
           if (!browser) return;
-          await goto(resolve(onDeleteRedirectPath));
+          await goto(onDeleteRedirectPath);
           await customInvalidateAll();
           showToast({
             type: 'success',
@@ -114,12 +113,10 @@
     on:result={onConfirmationResult}
   >
     {#snippet message()}
-
-        Deleting the topic "<span class="font-semibold">{topic.name}</span>" will permenently remove
-        all associated <span class="font-semibold">partitions ({topic.partitionsCount})</span> and
-        <span class="font-semibold">messages ({topic.messagesCount})</span>.
-
-      {/snippet}
+      Deleting the topic "<span class="font-semibold">{topic.name}</span>" will permenently remove
+      all associated <span class="font-semibold">partitions ({topic.partitionsCount})</span> and
+      <span class="font-semibold">messages ({topic.messagesCount})</span>.
+    {/snippet}
   </ModalConfirmation>
 
   <div class="h-[400px] flex flex-col">

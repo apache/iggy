@@ -11,14 +11,10 @@
     title?: string;
     titleSuffix?: import('svelte').Snippet;
     children?: import('svelte').Snippet;
-    [key: string]: any
+    [key: string]: any;
   }
 
-  let {
-    titleSuffix,
-    children,
-    ...rest_1
-  }: Props = $props();
+  let { titleSuffix, children, ...rest_1 }: Props = $props();
 
   function modalTransition(node: Element): TransitionConfig {
     const style = getComputedStyle(node);
@@ -38,8 +34,6 @@
                           opacity: ${t}`
     };
   }
-
-
 
   const { class: className, closeModal, title, ...rest } = rest_1 as Props;
 </script>

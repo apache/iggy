@@ -46,7 +46,10 @@
 <nav
   class="fixed z-10 left-0 top-0 bottom-0 min-w-[90px] max-w-[90px] pb-7 pt-4 border-r flex flex-col items-center bg-shade-l300 dark:bg-shade-d1000"
 >
-  <a href={resolve(typedRoute('/dashboard/overview'))} class="flex flex-col items-center gap-5 mb-5">
+  <a
+    href={resolve(typedRoute('/dashboard/overview'))}
+    class="flex flex-col items-center gap-5 mb-5"
+  >
     <LogoType class="w-[51px] h-[28px] pointer-events-none" />
     <LogoMark class="w-[50px] h-[45px]" />
   </a>
