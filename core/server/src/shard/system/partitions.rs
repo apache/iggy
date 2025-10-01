@@ -212,6 +212,7 @@ impl IggyShard {
         let numeric_topic_id =
             self.streams2
                 .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
+        let shards_count = self.get_available_shards_count();
         for partition in partitions {
             let actual_id = partition.id();
             let id = self.streams2.with_partitions_mut(
@@ -224,9 +225,9 @@ impl IggyShard {
                 "create_partitions_bypass_auth: partition mismatch ID, wrong creation order ?!"
             );
             let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, id);
-            let shard_info = self
-                .find_shard_table_record(&ns)
-                .expect("create_partitions_bypass_auth: missing shard table record");
+            let shard_id = crate::shard::calculate_shard_assignment(&ns, shards_count);
+            let shard_info = ShardInfo::new(shard_id);
+            self.insert_shard_table_record(ns, shard_info);
             if self.id == shard_info.id {
                 self.init_log(stream_id, topic_id, id).await?;
             }
@@ -243,13 +244,15 @@ impl IggyShard {
         partitions_count: u32,
     ) -> Result<Vec<usize>, IggyError> {
         self.ensure_authenticated(session)?;
+        self.ensure_partitions_exist(stream_id, topic_id, partitions_count)?;
+
         let numeric_stream_id = self
             .streams2
             .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
         let numeric_topic_id =
             self.streams2
                 .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
-        // Claude garbage, rework this.
+
         self.validate_partition_permissions(
             session,
             numeric_stream_id as u32,
@@ -263,7 +266,6 @@ impl IggyShard {
             .map(|p| p.stats().parent().clone())
             .expect("delete_partitions: no partitions to deletion");
         // Reassign the partitions count as it could get clamped by the `delete_partitions_base2` method.
-        let partitions_count = partitions.len() as u32;
 
         let mut deleted_ids = Vec::with_capacity(partitions.len());
         let mut total_messages_count = 0;
@@ -335,7 +337,11 @@ impl IggyShard {
         partitions_count: u32,
         partition_ids: Vec<usize>,
     ) -> Result<(), IggyError> {
-        assert_eq!(partitions_count as usize, partition_ids.len());
+        self.ensure_partitions_exist(stream_id, topic_id, partitions_count)?;
+
+        if partitions_count as usize != partition_ids.len() {
+            return Err(IggyError::InvalidPartitionsCount);
+        }
 
         let partitions = self.delete_partitions_base2(stream_id, topic_id, partitions_count);
         for (deleted_partition_id, actual_deleted_partition_id) in partitions

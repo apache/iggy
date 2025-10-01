@@ -91,6 +91,8 @@ impl IggyCmdTestCase for TestConsumerGroupDeleteCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
         let stream = client.create_stream(&self.stream_name).await;
         assert!(stream.is_ok());
+        let stream_details = stream.unwrap();
+        self.stream_id = stream_details.id;
 
         let topic = client
             .create_topic(
@@ -104,6 +106,8 @@ impl IggyCmdTestCase for TestConsumerGroupDeleteCmd {
             )
             .await;
         assert!(topic.is_ok());
+        let topic_details = topic.unwrap();
+        self.topic_id = topic_details.id;
 
         let consumer_group = client
             .create_consumer_group(
@@ -113,6 +117,8 @@ impl IggyCmdTestCase for TestConsumerGroupDeleteCmd {
             )
             .await;
         assert!(consumer_group.is_ok());
+        let consumer_group_details = consumer_group.unwrap();
+        self.group_id = consumer_group_details.id;
     }
 
     fn get_command(&self) -> IggyCmdCommand {

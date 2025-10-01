@@ -57,19 +57,11 @@ impl TestPartitionDeleteCmd {
     fn to_args(&self) -> Vec<String> {
         let mut command = vec![];
 
-        // Use actual stream ID if available, otherwise use stream name as fallback
-        if let Some(stream_id) = self.actual_stream_id {
-            command.push(format!("{}", stream_id));
-        } else {
-            command.push(self.stream_name.clone());
-        }
+        // Always use stream name for consistency with other tests
+        command.push(self.stream_name.clone());
 
-        // Use actual topic ID if available, otherwise use topic name as fallback
-        if let Some(topic_id) = self.actual_topic_id {
-            command.push(format!("{}", topic_id));
-        } else {
-            command.push(self.topic_name.clone());
-        }
+        // Always use topic name for consistency with other tests
+        command.push(self.topic_name.clone());
 
         command.push(format!("{}", self.new_partitions));
 
@@ -108,18 +100,6 @@ impl IggyCmdTestCase for TestPartitionDeleteCmd {
     }
 
     fn verify_command(&self, command_state: Assert) {
-        let stream_id = if let Some(stream_id) = self.actual_stream_id {
-            format!("{}", stream_id)
-        } else {
-            self.stream_name.clone()
-        };
-
-        let topic_id = if let Some(topic_id) = self.actual_topic_id {
-            format!("{}", topic_id)
-        } else {
-            self.topic_name.clone()
-        };
-
         let mut partitions = String::from("partition");
         if self.new_partitions > 1 {
             partitions.push('s');
@@ -127,7 +107,12 @@ impl IggyCmdTestCase for TestPartitionDeleteCmd {
 
         let message = format!(
             "Executing delete {} {partitions} for topic with ID: {} and stream with ID: {}\nDeleted {} {partitions} for topic with ID: {} and stream with ID: {}\n",
-            self.new_partitions, topic_id, stream_id, self.new_partitions, topic_id, stream_id
+            self.new_partitions,
+            self.topic_name,
+            self.stream_name,
+            self.new_partitions,
+            self.topic_name,
+            self.stream_name
         );
 
         command_state.success().stdout(diff(message));
@@ -144,14 +129,10 @@ impl IggyCmdTestCase for TestPartitionDeleteCmd {
         let topic_details = topic.unwrap().expect("Failed to get topic");
         assert_eq!(topic_details.name, self.topic_name);
         assert_eq!(topic_details.id, self.actual_topic_id.unwrap());
-        if self.new_partitions > self.partitions_count {
-            assert_eq!(topic_details.partitions_count, 0);
-        } else {
-            assert_eq!(
-                topic_details.partitions_count,
-                self.partitions_count - self.new_partitions
-            );
-        }
+        assert_eq!(
+            topic_details.partitions_count,
+            self.partitions_count - self.new_partitions
+        );
         assert_eq!(topic_details.messages_count, 0);
 
         let topic = client
@@ -203,8 +184,8 @@ pub async fn should_be_successful() {
         .execute_test(TestPartitionDeleteCmd::new(
             String::from("production"),
             String::from("test"),
+            5,
             3,
-            7,
         ))
         .await;
 }

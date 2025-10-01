@@ -127,12 +127,7 @@ impl TestMessageSendCmd {
 
     fn calculate_partition_id_from_messages_key(&self, messages_key: &[u8]) -> u32 {
         let messages_key_hash = XxHash32::oneshot(0, messages_key);
-        let mut partition_id = messages_key_hash % self.partitions_count;
-        if partition_id == 0 {
-            partition_id = self.partitions_count;
-        }
-
-        partition_id
+        messages_key_hash % self.partitions_count
     }
 
     fn get_partition_id(&self) -> u32 {
@@ -218,32 +213,77 @@ impl IggyCmdTestCase for TestMessageSendCmd {
         let topic_details = topic.unwrap().expect("Failed to get topic");
         assert_eq!(topic_details.messages_count, self.messages.len() as u64);
 
-        let polled_messages = client
-            .poll_messages(
-                &self.actual_stream_id.unwrap().try_into().unwrap(),
-                &self.actual_topic_id.unwrap().try_into().unwrap(),
-                Some(self.get_partition_id()),
-                &Consumer::default(),
-                &PollingStrategy::offset(0),
-                self.messages.len() as u32,
-                false,
-            )
-            .await;
+        // For Balanced partitioning, messages are distributed across all partitions
+        // so we need to poll from all partitions and collect messages
+        let all_messages = match &self.partitioning {
+            PartitionSelection::Balanced => {
+                let mut collected_messages = Vec::new();
+                for partition_id in 0..self.partitions_count {
+                    let polled = client
+                        .poll_messages(
+                            &self.actual_stream_id.unwrap().try_into().unwrap(),
+                            &self.actual_topic_id.unwrap().try_into().unwrap(),
+                            Some(partition_id),
+                            &Consumer::default(),
+                            &PollingStrategy::offset(0),
+                            self.messages.len() as u32,
+                            false,
+                        )
+                        .await;
+                    if let Ok(polled) = polled {
+                        collected_messages.extend(polled.messages);
+                    }
+                }
+                collected_messages
+            }
+            _ => {
+                // For specific partition or key-based partitioning
+                let polled_messages = client
+                    .poll_messages(
+                        &self.actual_stream_id.unwrap().try_into().unwrap(),
+                        &self.actual_topic_id.unwrap().try_into().unwrap(),
+                        Some(self.get_partition_id()),
+                        &Consumer::default(),
+                        &PollingStrategy::offset(0),
+                        self.messages.len() as u32,
+                        false,
+                    )
+                    .await;
 
-        assert!(polled_messages.is_ok());
-        let polled_messages = polled_messages.unwrap();
-        assert_eq!(polled_messages.messages.len(), self.messages.len());
-        assert_eq!(
-            polled_messages
-                .messages
-                .iter()
-                .map(|m| from_utf8(&m.payload.clone()).unwrap().to_string())
-                .collect::<Vec<_>>(),
-            self.messages
-        );
+                assert!(polled_messages.is_ok());
+                polled_messages.unwrap().messages
+            }
+        };
+
+        assert_eq!(all_messages.len(), self.messages.len());
+
+        // For Balanced partitioning, messages may arrive in different order
+        // so we just check that all expected messages are present
+        let expected_messages: Vec<String> = self.messages.clone();
+        let received_messages: Vec<String> = all_messages
+            .iter()
+            .map(|m| from_utf8(&m.payload.clone()).unwrap().to_string())
+            .collect();
+
+        match &self.partitioning {
+            PartitionSelection::Balanced => {
+                // For balanced, just check all messages are present (order may vary)
+                for expected in &expected_messages {
+                    assert!(
+                        received_messages.contains(expected),
+                        "Expected message '{}' not found in received messages",
+                        expected
+                    );
+                }
+            }
+            _ => {
+                // For specific partition, order should be preserved
+                assert_eq!(received_messages, expected_messages);
+            }
+        }
 
         if let Some(expected_header) = &self.header {
-            polled_messages.messages.iter().for_each(|m| {
+            all_messages.iter().for_each(|m| {
                 assert!(m.user_headers.is_some());
                 assert_eq!(expected_header, &m.user_headers_map().unwrap().unwrap());
             })
@@ -272,8 +312,8 @@ pub async fn should_be_successful() {
     let test_parameters = vec![
         (ProvideMessages::AsArgs, PartitionSelection::Balanced),
         (ProvideMessages::ViaStdin, PartitionSelection::Balanced),
-        (ProvideMessages::ViaStdin, PartitionSelection::Id(1)),
-        (ProvideMessages::AsArgs, PartitionSelection::Id(2)),
+        (ProvideMessages::ViaStdin, PartitionSelection::Id(0)),
+        (ProvideMessages::AsArgs, PartitionSelection::Id(1)),
         (
             ProvideMessages::AsArgs,
             PartitionSelection::Key(String::from("some-complex-key")),

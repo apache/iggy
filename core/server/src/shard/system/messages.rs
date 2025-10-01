@@ -56,10 +56,7 @@ impl IggyShard {
             messages_key: &[u8],
         ) -> usize {
             let messages_key_hash = hash::calculate_32(messages_key) as usize;
-            let mut partition_id = messages_key_hash % upperbound;
-            if partition_id == 0 {
-                partition_id = upperbound;
-            }
+            let partition_id = messages_key_hash % upperbound;
             shard_trace!(
                 shard_id,
                 "Calculated partition ID: {} for messages key: {:?}, hash: {}",

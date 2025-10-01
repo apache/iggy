@@ -72,34 +72,16 @@ pub(crate) async fn start(
 
     //TODO: Fix me, this needs to take into account that first shard id potentially can be greater than 0.
     if shard.id == 0 {
+        // Store bound address locally
+        shard.tcp_bound_address.set(Some(actual_addr));
+
         if addr.port() == 0 {
-            let event = ShardEvent::TcpBound {
+            // Broadcast to other shards for SO_REUSEPORT binding
+            let event = ShardEvent::AddressBound {
+                protocol: TransportProtocol::Tcp,
                 address: actual_addr,
             };
             shard.broadcast_event_to_all_shards(event).await;
-        }
-
-        let mut current_config = shard.config.clone();
-        current_config.tcp.address = actual_addr.to_string();
-
-        let runtime_path = current_config.system.get_runtime_path();
-        let current_config_path = format!("{runtime_path}/current_config.toml");
-        let current_config_content =
-            toml::to_string(&current_config).expect("Cannot serialize current_config");
-
-        let buf_result = compio::fs::write(&current_config_path, current_config_content).await;
-        match buf_result.0 {
-            Ok(_) => shard_info!(
-                shard.id,
-                "Current config written to: {}",
-                current_config_path
-            ),
-            Err(e) => shard_error!(
-                shard.id,
-                "Failed to write current config to {}: {}",
-                current_config_path,
-                e
-            ),
         }
     }
 

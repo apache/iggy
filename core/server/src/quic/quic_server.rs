@@ -36,6 +36,8 @@ use crate::quic::{COMPONENT, listener, quic_socket};
 use crate::server_error::QuicError;
 use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
+use crate::shard::transmission::event::ShardEvent;
+use crate::{shard_error, shard_info};
 
 /// Starts the QUIC server.
 /// Returns the address the server is listening on.
@@ -58,13 +60,28 @@ pub async fn spawn_quic_server(
     }
 
     let config = shard.config.quic.clone();
-    let addr: SocketAddr = config.address.parse().map_err(|e| {
+    let mut addr: SocketAddr = config.address.parse().map_err(|e| {
         error!("Failed to parse QUIC address '{}': {}", config.address, e);
         iggy_common::IggyError::QuicError
     })?;
-    info!(
+
+    if shard.id != 0 && addr.port() == 0 {
+        shard_info!(shard.id, "Waiting for QUIC address from shard 0...");
+        loop {
+            if let Some(bound_addr) = shard.quic_bound_address.get() {
+                addr = bound_addr;
+                shard_info!(shard.id, "Received QUIC address: {}", addr);
+                break;
+            }
+            compio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    shard_info!(
+        shard.id,
         "Initializing Iggy QUIC server on shard {} for address {}",
-        shard.id, addr
+        shard.id,
+        addr
     );
 
     let server_config = configure_quic(&config).map_err(|e| {
@@ -101,11 +118,28 @@ pub async fn spawn_quic_server(
         iggy_common::IggyError::CannotBindToSocket(addr.to_string())
     })?;
 
-    info!(
-        "Iggy QUIC server has started for shard {} on {}",
-        shard.id, actual_addr
+    shard_info!(
+        shard.id,
+        "Iggy QUIC server has started on: {:?}",
+        actual_addr
     );
-    shard.quic_bound_address.set(Some(actual_addr));
+
+    if shard.id == 0 {
+        // Store bound address locally
+        shard.quic_bound_address.set(Some(actual_addr));
+
+        if addr.port() == 0 {
+            // Broadcast to other shards for SO_REUSEPORT binding
+            let event = ShardEvent::AddressBound {
+                protocol: iggy_common::TransportProtocol::Quic,
+                address: actual_addr,
+            };
+            shard.broadcast_event_to_all_shards(event).await;
+        }
+    } else {
+        shard.quic_bound_address.set(Some(actual_addr));
+    }
+
     listener::start(endpoint, shard, shutdown).await
 }
 

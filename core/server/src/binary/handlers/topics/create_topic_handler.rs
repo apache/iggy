@@ -71,7 +71,13 @@ impl ServerCommandHandler for CreateTopic {
             stream_id: self.stream_id.clone(),
             topic,
         };
-        let _responses = shard.broadcast_event_to_all_shards(event).await;
+        let responses = shard.broadcast_event_to_all_shards(event).await;
+        // Await all shard responses to ensure topic is created on all shards
+        for response in responses {
+            if let crate::shard::transmission::frame::ShardResponse::ErrorResponse(err) = response {
+                return Err(err);
+            }
+        }
 
         let partitions = shard
             .create_partitions2(
@@ -86,7 +92,13 @@ impl ServerCommandHandler for CreateTopic {
             topic_id: Identifier::numeric(topic_id as u32).unwrap(),
             partitions,
         };
-        let _responses = shard.broadcast_event_to_all_shards(event).await;
+        let responses = shard.broadcast_event_to_all_shards(event).await;
+        // Await all shard responses to ensure partitions are initialized on all shards
+        for response in responses {
+            if let crate::shard::transmission::frame::ShardResponse::ErrorResponse(err) = response {
+                return Err(err);
+            }
+        }
         let response = shard.streams2.with_topic_by_id(
             &self.stream_id,
             &Identifier::numeric(topic_id as u32).unwrap(),

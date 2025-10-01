@@ -41,7 +41,7 @@ impl TestStreamPurgeCmd {
             stream_id,
             stream_name: name,
             using_identifier,
-            topic_id: 1,
+            topic_id: 0,
             topic_name: String::from("test_topic"),
         }
     }
@@ -62,7 +62,7 @@ impl IggyCmdTestCase for TestStreamPurgeCmd {
 
         let topic = client
             .create_topic(
-                &self.stream_id.try_into().unwrap(),
+                &self.stream_name.clone().try_into().unwrap(),
                 &self.topic_name,
                 10,
                 Default::default(),
@@ -80,15 +80,17 @@ impl IggyCmdTestCase for TestStreamPurgeCmd {
 
         let send_status = client
             .send_messages(
-                &self.stream_id.try_into().unwrap(),
-                &self.topic_id.try_into().unwrap(),
+                &self.stream_name.clone().try_into().unwrap(),
+                &self.topic_name.clone().try_into().unwrap(),
                 &Partitioning::default(),
                 &mut messages,
             )
             .await;
         assert!(send_status.is_ok());
 
-        let stream_state = client.get_stream(&self.stream_id.try_into().unwrap()).await;
+        let stream_state = client
+            .get_stream(&self.stream_name.clone().try_into().unwrap())
+            .await;
         assert!(stream_state.is_ok());
         let stream_state = stream_state.unwrap().expect("Stream not found");
         assert!(stream_state.size > 0);
@@ -116,13 +118,15 @@ impl IggyCmdTestCase for TestStreamPurgeCmd {
     }
 
     async fn verify_server_state(&self, client: &dyn Client) {
-        let stream_state = client.get_stream(&self.stream_id.try_into().unwrap()).await;
+        let stream_state = client
+            .get_stream(&self.stream_name.clone().try_into().unwrap())
+            .await;
         assert!(stream_state.is_ok());
         let stream_state = stream_state.unwrap().expect("Stream not found");
         assert_eq!(stream_state.size, 0);
 
         let stream_delete = client
-            .delete_stream(&self.stream_id.try_into().unwrap())
+            .delete_stream(&self.stream_name.clone().try_into().unwrap())
             .await;
         assert!(stream_delete.is_ok());
     }
@@ -136,16 +140,16 @@ pub async fn should_be_successful() {
     iggy_cmd_test.setup().await;
     iggy_cmd_test
         .execute_test(TestStreamPurgeCmd::new(
-            1,
+            0,
             String::from("production"),
             TestStreamId::Named,
         ))
         .await;
     iggy_cmd_test
         .execute_test(TestStreamPurgeCmd::new(
-            2,
+            1,
             String::from("testing"),
-            TestStreamId::Numeric,
+            TestStreamId::Named,
         ))
         .await;
 }

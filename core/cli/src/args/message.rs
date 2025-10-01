@@ -146,7 +146,7 @@ pub(crate) struct PollMessagesArgs {
     #[arg(value_parser = clap::value_parser!(Identifier))]
     pub(crate) topic_id: Identifier,
     /// Partition ID from which message will be polled
-    #[arg(value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(value_parser = clap::value_parser!(u32).range(0..))]
     pub(crate) partition_id: u32,
     /// Number of messages to poll
     #[clap(verbatim_doc_comment)]
@@ -219,7 +219,7 @@ pub(crate) struct FlushMessagesArgs {
     #[arg(value_parser = clap::value_parser!(Identifier))]
     pub(crate) topic_id: Identifier,
     /// Partition ID for which messages will be flushed
-    #[arg(value_parser = clap::value_parser!(u32).range(1..))]
+    #[arg(value_parser = clap::value_parser!(u32).range(0..))]
     pub(crate) partition_id: u32,
     /// fsync flushed data to disk
     ///

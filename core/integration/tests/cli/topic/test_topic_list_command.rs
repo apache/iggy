@@ -76,7 +76,7 @@ impl IggyCmdTestCase for TestTopicListCmd {
 
         let topic = client
             .create_topic(
-                &self.stream_id.try_into().unwrap(),
+                &self.stream_name.clone().try_into().unwrap(),
                 &self.topic_name,
                 1,
                 Default::default(),
@@ -114,14 +114,14 @@ impl IggyCmdTestCase for TestTopicListCmd {
     async fn verify_server_state(&self, client: &dyn Client) {
         let topic = client
             .delete_topic(
-                &self.stream_id.try_into().unwrap(),
-                &self.topic_id.try_into().unwrap(),
+                &self.stream_name.clone().try_into().unwrap(),
+                &self.topic_name.clone().try_into().unwrap(),
             )
             .await;
         assert!(topic.is_ok());
 
         let stream = client
-            .delete_stream(&self.stream_id.try_into().unwrap())
+            .delete_stream(&self.stream_name.clone().try_into().unwrap())
             .await;
         assert!(stream.is_ok());
     }
@@ -135,19 +135,19 @@ pub async fn should_be_successful() {
     iggy_cmd_test.setup().await;
     iggy_cmd_test
         .execute_test(TestTopicListCmd::new(
-            1,
+            0,
             String::from("main"),
-            1,
+            0,
             String::from("sync"),
-            TestStreamId::Numeric,
+            TestStreamId::Named,
             OutputFormat::Default,
         ))
         .await;
     iggy_cmd_test
         .execute_test(TestTopicListCmd::new(
-            2,
+            1,
             String::from("customer"),
-            3,
+            0,
             String::from("topic"),
             TestStreamId::Named,
             OutputFormat::List,
@@ -155,11 +155,11 @@ pub async fn should_be_successful() {
         .await;
     iggy_cmd_test
         .execute_test(TestTopicListCmd::new(
-            3,
+            2,
             String::from("production"),
-            1,
+            0,
             String::from("data"),
-            TestStreamId::Numeric,
+            TestStreamId::Named,
             OutputFormat::Table,
         ))
         .await;

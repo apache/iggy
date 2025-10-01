@@ -79,7 +79,7 @@ impl IggyCmdTestCase for TestTopicDeleteCmd {
 
         let topic = client
             .create_topic(
-                &self.stream_id.try_into().unwrap(),
+                &self.stream_name.clone().try_into().unwrap(),
                 &self.topic_name,
                 1,
                 Default::default(),
@@ -121,7 +121,9 @@ impl IggyCmdTestCase for TestTopicDeleteCmd {
     }
 
     async fn verify_server_state(&self, client: &dyn Client) {
-        let topic = client.get_topics(&self.stream_id.try_into().unwrap()).await;
+        let topic = client
+            .get_topics(&self.stream_name.clone().try_into().unwrap())
+            .await;
         assert!(topic.is_ok());
         let topics = topic.unwrap();
         assert!(topics.is_empty());
@@ -136,19 +138,19 @@ pub async fn should_be_successful() {
     iggy_cmd_test.setup().await;
     iggy_cmd_test
         .execute_test(TestTopicDeleteCmd::new(
-            1,
+            0,
             String::from("main"),
-            1,
+            0,
             String::from("sync"),
-            TestStreamId::Numeric,
-            TestTopicId::Numeric,
+            TestStreamId::Named,
+            TestTopicId::Named,
         ))
         .await;
     iggy_cmd_test
         .execute_test(TestTopicDeleteCmd::new(
-            2,
+            1,
             String::from("testing"),
-            2,
+            1,
             String::from("topic"),
             TestStreamId::Named,
             TestTopicId::Named,
@@ -156,21 +158,21 @@ pub async fn should_be_successful() {
         .await;
     iggy_cmd_test
         .execute_test(TestTopicDeleteCmd::new(
-            3,
+            2,
             String::from("prod"),
-            1,
+            0,
             String::from("named"),
             TestStreamId::Named,
-            TestTopicId::Numeric,
+            TestTopicId::Named,
         ))
         .await;
     iggy_cmd_test
         .execute_test(TestTopicDeleteCmd::new(
-            4,
+            3,
             String::from("big"),
-            1,
+            0,
             String::from("probe"),
-            TestStreamId::Numeric,
+            TestStreamId::Named,
             TestTopicId::Named,
         ))
         .await;

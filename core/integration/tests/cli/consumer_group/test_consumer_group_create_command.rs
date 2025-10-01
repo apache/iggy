@@ -88,6 +88,8 @@ impl IggyCmdTestCase for TestConsumerGroupCreateCmd {
     async fn prepare_server_state(&mut self, client: &dyn Client) {
         let stream = client.create_stream(&self.stream_name).await;
         assert!(stream.is_ok());
+        let stream_details = stream.unwrap();
+        self.stream_id = stream_details.id;
 
         let topic = client
             .create_topic(
@@ -101,6 +103,8 @@ impl IggyCmdTestCase for TestConsumerGroupCreateCmd {
             )
             .await;
         assert!(topic.is_ok());
+        let topic_details = topic.unwrap();
+        self.topic_id = topic_details.id;
     }
 
     fn get_command(&self) -> IggyCmdCommand {
@@ -186,7 +190,7 @@ pub async fn should_be_successful() {
             String::from("main"),
             1,
             String::from("sync"),
-            Some(1),
+            None,
             String::from("group1"),
             TestStreamId::Numeric,
             TestTopicId::Numeric,
@@ -198,7 +202,7 @@ pub async fn should_be_successful() {
             String::from("stream"),
             3,
             String::from("topic"),
-            Some(3),
+            None,
             String::from("group3"),
             TestStreamId::Named,
             TestTopicId::Numeric,
@@ -210,7 +214,7 @@ pub async fn should_be_successful() {
             String::from("development"),
             1,
             String::from("probe"),
-            Some(7),
+            None,
             String::from("group7"),
             TestStreamId::Numeric,
             TestTopicId::Named,
@@ -222,7 +226,7 @@ pub async fn should_be_successful() {
             String::from("production"),
             5,
             String::from("test"),
-            Some(4),
+            None,
             String::from("group4"),
             TestStreamId::Named,
             TestTopicId::Named,

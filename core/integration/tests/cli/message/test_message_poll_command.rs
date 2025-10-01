@@ -56,8 +56,7 @@ impl TestMessagePollCmd {
         show_headers: bool,
         headers: (HeaderKey, HeaderValue),
     ) -> Self {
-        assert!(partition_id <= partitions_count);
-        assert!(partition_id > 0);
+        assert!(partition_id < partitions_count);
         assert!(message_count < messages.len());
         Self {
             stream_name,
@@ -122,10 +121,9 @@ impl IggyCmdTestCase for TestMessagePollCmd {
         let stream = stream.unwrap();
         self.actual_stream_id = Some(stream.id);
 
-        let stream_id = Identifier::from_str(&self.stream_name).unwrap();
         let topic = client
             .create_topic(
-                &stream_id,
+                &stream.id.try_into().unwrap(),
                 &self.topic_name,
                 self.partitions_count,
                 Default::default(),
@@ -138,7 +136,6 @@ impl IggyCmdTestCase for TestMessagePollCmd {
         let topic = topic.unwrap();
         self.actual_topic_id = Some(topic.id);
 
-        let topic_id = Identifier::from_str(&self.topic_name).unwrap();
         let mut messages = self
             .messages
             .iter()
@@ -154,8 +151,8 @@ impl IggyCmdTestCase for TestMessagePollCmd {
 
         let send_status = client
             .send_messages(
-                &stream_id,
-                &topic_id,
+                &stream.id.try_into().unwrap(),
+                &topic.id.try_into().unwrap(),
                 &Partitioning::partition_id(self.partition_id),
                 &mut messages,
             )
@@ -236,14 +233,18 @@ impl IggyCmdTestCase for TestMessagePollCmd {
     }
 
     async fn verify_server_state(&self, client: &dyn Client) {
-        let stream_id = Identifier::from_str(&self.stream_name).unwrap();
-        let topic_id = Identifier::from_str(&self.topic_name).unwrap();
+        if let (Some(stream_id), Some(topic_id)) = (self.actual_stream_id, self.actual_topic_id) {
+            let topic = client
+                .delete_topic(
+                    &stream_id.try_into().unwrap(),
+                    &topic_id.try_into().unwrap(),
+                )
+                .await;
+            assert!(topic.is_ok());
 
-        let topic = client.delete_topic(&stream_id, &topic_id).await;
-        assert!(topic.is_ok());
-
-        let stream = client.delete_stream(&stream_id).await;
-        assert!(stream.is_ok());
+            let stream = client.delete_stream(&stream_id.try_into().unwrap()).await;
+            assert!(stream.is_ok());
+        }
     }
 }
 
@@ -271,12 +272,12 @@ pub async fn should_be_successful() {
     );
 
     let test_parameters: Vec<(u32, usize, PollingStrategy, bool)> = vec![
-        (1, 1, PollingStrategy::offset(0), true),
-        (2, 5, PollingStrategy::offset(0), true),
-        (3, 3, PollingStrategy::offset(3), true),
-        (4, 5, PollingStrategy::first(), true),
-        (1, 4, PollingStrategy::last(), true),
-        (2, 3, PollingStrategy::next(), false),
+        (0, 1, PollingStrategy::offset(0), true),
+        (1, 5, PollingStrategy::offset(0), true),
+        (2, 3, PollingStrategy::offset(3), true),
+        (3, 5, PollingStrategy::first(), true),
+        (0, 4, PollingStrategy::last(), true),
+        (1, 3, PollingStrategy::next(), false),
     ];
 
     iggy_cmd_test.setup().await;

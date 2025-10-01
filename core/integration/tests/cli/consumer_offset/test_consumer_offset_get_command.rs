@@ -222,7 +222,7 @@ pub async fn should_be_successful() {
                 String::from("consumer"),
                 String::from("stream"),
                 String::from("topic"),
-                1,
+                0,
                 using_consumer_id,
             ))
             .await;

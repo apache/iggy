@@ -22,8 +22,8 @@ pub struct TopicAuxilary {
 impl TopicAuxilary {
     pub fn get_next_partition_id(&self, shard_id: u16, upperbound: usize) -> usize {
         let mut partition_id = self.current_partition_id.fetch_add(1, Ordering::AcqRel);
-        if partition_id > upperbound {
-            partition_id = 1;
+        if partition_id >= upperbound {
+            partition_id = 0;
             self.current_partition_id
                 .swap(partition_id + 1, Ordering::Release);
         }

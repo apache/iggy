@@ -368,11 +368,6 @@ mod tests {
     }
 
     #[test]
-    fn identifier_with_a_value_of_zero_should_be_invalid() {
-        assert!(Identifier::numeric(0).is_err());
-    }
-
-    #[test]
     fn identifier_with_a_value_of_non_empty_string_should_be_valid() {
         assert!(Identifier::named("test").is_ok());
     }

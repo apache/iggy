@@ -50,6 +50,24 @@ impl IggyShard {
         Ok(())
     }
 
+    pub fn ensure_partitions_exist(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partitions_count: u32,
+    ) -> Result<(), IggyError> {
+        self.ensure_topic_exists(stream_id, topic_id)?;
+        let actual_partitions_count =
+            self.streams2
+                .with_partitions(stream_id, topic_id, |partitions| partitions.len());
+
+        if partitions_count > actual_partitions_count as u32 {
+            return Err(IggyError::InvalidPartitionsCount);
+        }
+
+        Ok(())
+    }
+
     pub fn resolve_consumer_with_partition_id(
         &self,
         stream_id: &Identifier,

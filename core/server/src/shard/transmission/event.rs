@@ -159,7 +159,8 @@ pub enum ShardEvent {
         topic_id: Identifier,
         group_id: Identifier,
     },
-    TcpBound {
+    AddressBound {
+        protocol: TransportProtocol,
         address: SocketAddr,
     },
 }

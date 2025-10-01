@@ -68,8 +68,8 @@ use error_set::ErrContext;
 use futures::future::try_join_all;
 use hash32::{Hasher, Murmur3Hasher};
 use iggy_common::{
-    EncryptorKind, IdKind, Identifier, IggyError, IggyTimestamp, Permissions, PollingKind, UserId,
-    UserStatus,
+    EncryptorKind, IdKind, Identifier, IggyError, IggyTimestamp, Permissions, PollingKind,
+    TransportProtocol, UserId, UserStatus,
     defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME},
     locking::IggyRwLockFn,
 };
@@ -181,6 +181,11 @@ impl IggyShard {
     fn init_tasks(self: &Rc<Self>) {
         continuous::spawn_message_pump(self.clone());
 
+        // Spawn config writer task on shard 0 if we need to wait for bound addresses
+        if self.id == 0 && (self.config.tcp.enabled || self.config.quic.enabled) {
+            self.spawn_config_writer_task();
+        }
+
         if self.config.tcp.enabled {
             continuous::spawn_tcp_server(self.clone());
         }
@@ -218,6 +223,68 @@ impl IggyShard {
         {
             periodic::spawn_sysinfo_printer(self.clone());
         }
+    }
+
+    fn spawn_config_writer_task(self: &Rc<Self>) {
+        let shard = self.clone();
+        let tcp_enabled = self.config.tcp.enabled;
+        let quic_enabled = self.config.quic.enabled;
+
+        compio::runtime::spawn(async move {
+            // Wait until both addresses are available (if their servers are enabled)
+            loop {
+                let tcp_ready = !tcp_enabled || shard.tcp_bound_address.get().is_some();
+                let quic_ready = !quic_enabled || shard.quic_bound_address.get().is_some();
+
+                if tcp_ready && quic_ready {
+                    // Both servers have bound, proceed to write config
+                    break;
+                }
+
+                compio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+
+            // Both servers are bound, collect addresses and write config once
+            let mut current_config = shard.config.clone();
+
+            let tcp_addr = shard.tcp_bound_address.get();
+            let quic_addr = shard.quic_bound_address.get();
+
+            shard_info!(
+                shard.id,
+                "Config writer: TCP addr = {:?}, QUIC addr = {:?}",
+                tcp_addr,
+                quic_addr
+            );
+
+            if let Some(tcp_addr) = tcp_addr {
+                current_config.tcp.address = tcp_addr.to_string();
+            }
+
+            if let Some(quic_addr) = quic_addr {
+                current_config.quic.address = quic_addr.to_string();
+            }
+
+            let runtime_path = current_config.system.get_runtime_path();
+            let config_path = format!("{runtime_path}/current_config.toml");
+            let content =
+                toml::to_string(&current_config).expect("Cannot serialize current_config");
+
+            match compio::fs::write(&config_path, content).await.0 {
+                Ok(_) => shard_info!(
+                    shard.id,
+                    "Current config written to: {} with all bound addresses",
+                    config_path
+                ),
+                Err(e) => shard_error!(
+                    shard.id,
+                    "Failed to write current config to {}: {}",
+                    config_path,
+                    e
+                ),
+            }
+        })
+        .detach();
     }
 
     pub async fn run(self: &Rc<Self>) -> Result<(), IggyError> {
@@ -736,9 +803,24 @@ impl IggyShard {
                 self.update_permissions_bypass_auth(&user_id, permissions.to_owned())?;
                 Ok(())
             }
-            ShardEvent::TcpBound { address } => {
-                info!("Received TcpBound event with address: {}", address);
-                self.tcp_bound_address.set(Some(address));
+            ShardEvent::AddressBound { protocol, address } => {
+                shard_info!(
+                    self.id,
+                    "Received AddressBound event for {:?} with address: {}",
+                    protocol,
+                    address
+                );
+                match protocol {
+                    TransportProtocol::Tcp => self.tcp_bound_address.set(Some(address)),
+                    TransportProtocol::Quic => self.quic_bound_address.set(Some(address)),
+                    _ => {
+                        shard_warn!(
+                            self.id,
+                            "Received AddressBound event for unsupported protocol: {:?}",
+                            protocol
+                        );
+                    }
+                }
                 Ok(())
             }
             ShardEvent::CreatedStream2 { id, stream } => {
