@@ -8,12 +8,14 @@ use crate::streaming::segments::{
     messages::{MessagesReader, MessagesWriter},
 };
 
-#[derive(Debug)]
+unsafe impl Send for Storage {}
+
+#[derive(Debug, Clone)]
 pub struct Storage {
-    pub messages_writer: Option<MessagesWriter>,
-    pub messages_reader: Option<MessagesReader>,
-    pub index_writer: Option<IndexWriter>,
-    pub index_reader: Option<IndexReader>,
+    pub messages_writer: Option<Rc<MessagesWriter>>,
+    pub messages_reader: Option<Rc<MessagesReader>>,
+    pub index_writer: Option<Rc<IndexWriter>>,
+    pub index_reader: Option<Rc<IndexReader>>,
 }
 
 impl Storage {
@@ -28,19 +30,21 @@ impl Storage {
     ) -> Result<Self, IggyError> {
         let size = Rc::new(AtomicU64::new(messages_size));
         let indexes_size = Rc::new(AtomicU64::new(indexes_size));
-        let messages_writer =
-            MessagesWriter::new(messages_path, size.clone(), log_fsync, file_exists).await?;
+        let messages_writer = Rc::new(
+            MessagesWriter::new(messages_path, size.clone(), log_fsync, file_exists).await?,
+        );
 
-        let index_writer =
-            IndexWriter::new(index_path, indexes_size.clone(), index_fsync, file_exists).await?;
+        let index_writer = Rc::new(
+            IndexWriter::new(index_path, indexes_size.clone(), index_fsync, file_exists).await?,
+        );
 
         if file_exists {
             messages_writer.fsync().await?;
             index_writer.fsync().await?;
         }
 
-        let messages_reader = MessagesReader::new(messages_path, size).await?;
-        let index_reader = IndexReader::new(index_path, indexes_size).await?;
+        let messages_reader = Rc::new(MessagesReader::new(messages_path, size).await?);
+        let index_reader = Rc::new(IndexReader::new(index_path, indexes_size).await?);
         Ok(Self {
             messages_writer: Some(messages_writer),
             messages_reader: Some(messages_reader),
@@ -49,7 +53,7 @@ impl Storage {
         })
     }
 
-    pub fn shutdown(&mut self) -> (Option<MessagesWriter>, Option<IndexWriter>) {
+    pub fn shutdown(&mut self) -> (Option<Rc<MessagesWriter>>, Option<Rc<IndexWriter>>) {
         let messages_writer = self.messages_writer.take();
         let index_writer = self.index_writer.take();
         (messages_writer, index_writer)

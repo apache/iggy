@@ -11,14 +11,10 @@ use crate::{
         partitions::Partitions,
         traits_ext::{
             ComponentsById, DeleteCell, EntityComponentSystem, EntityComponentSystemMutCell,
-            Insert, InsertCell, InteriorMutability, IntoComponents,
+            InsertCell, InteriorMutability, IntoComponents,
         },
     },
     streaming::{
-        partitions::{
-            journal::MemoryMessageJournal,
-            log::{Log, SegmentedLog},
-        },
         stats::stats::TopicStats,
         topics::{
             consumer_group2::{ConsumerGroupRef, ConsumerGroupRefMut},
@@ -133,12 +129,11 @@ impl EntityComponentSystem<InteriorMutability> for Topics {
     {
         f(self.into())
     }
-
+    
     fn with_components_async<O, F>(&self, f: F) -> impl Future<Output = O>
     where
-        F: for<'a> AsyncFnOnce(Self::EntityComponents<'a>) -> O,
-    {
-        f(self.into())
+        F: for<'a> AsyncFnOnce(Self::EntityComponents<'a>) -> O {
+            f(self.into())
     }
 }
 
@@ -214,7 +209,6 @@ impl Topics {
         let id = self.get_index(topic_id);
         self.with_components_by_id_async(id, async |components| f(components).await)
     }
-
     pub fn with_topic_by_id_mut<T>(
         &self,
         topic_id: &Identifier,
@@ -230,14 +224,6 @@ impl Topics {
         f: impl FnOnce(&ConsumerGroups) -> T,
     ) -> T {
         self.with_topic_by_id(topic_id, helpers::consumer_groups(f))
-    }
-
-    pub fn with_consumer_groups_async<T>(
-        &self,
-        topic_id: &Identifier,
-        f: impl AsyncFnOnce(&ConsumerGroups) -> T,
-    ) -> impl Future<Output = T> {
-        self.with_topic_by_id_async(topic_id, helpers::consumer_groups_async(f))
     }
 
     pub fn with_consumer_groups_mut<T>(
@@ -256,17 +242,6 @@ impl Topics {
     ) -> T {
         self.with_consumer_groups(topic_id, |container| {
             container.with_consumer_group_by_id(group_id, f)
-        })
-    }
-
-    pub fn with_consumer_group_by_id_async<T>(
-        &self,
-        topic_id: &Identifier,
-        group_id: &Identifier,
-        f: impl AsyncFnOnce(ComponentsById<ConsumerGroupRef>) -> T,
-    ) -> impl Future<Output = T> {
-        self.with_consumer_groups_async(topic_id, async |container| {
-            container.with_consumer_group_by_id_async(group_id, f).await
         })
     }
 
@@ -292,7 +267,6 @@ impl Topics {
     ) -> impl Future<Output = T> {
         self.with_topic_by_id_async(topic_id, helpers::partitions_async(f))
     }
-
     pub fn with_partitions_mut<T>(
         &self,
         topic_id: &Identifier,

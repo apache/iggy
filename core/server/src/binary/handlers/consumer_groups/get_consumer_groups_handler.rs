@@ -61,17 +61,16 @@ impl ServerCommandHandler for GetConsumerGroups {
             numeric_topic_id as u32,
         );
 
-        shard
-            .streams2
-            .with_consumer_groups_async(&self.stream_id, &self.topic_id, async |cgs| {
-                cgs.with_components_async(async |cgs| {
-                    let (roots, members) = cgs.into_components();
-                    let consumer_groups = mapper::map_consumer_groups(roots, members);
-                    sender.send_ok_response(&consumer_groups).await
-                })
-                .await
-            })
-            .await?;
+        let consumer_groups =
+            shard
+                .streams2
+                .with_consumer_groups(&self.stream_id, &self.topic_id, |cgs| {
+                    cgs.with_components(|cgs| {
+                        let (roots, members) = cgs.into_components();
+                        mapper::map_consumer_groups(roots, members)
+                    })
+                });
+        sender.send_ok_response(&consumer_groups).await?;
         Ok(())
     }
 }

@@ -258,26 +258,38 @@ impl IggyShard {
     ) -> Result<(), IggyError> {
         match polling_consumer {
             PollingConsumer::Consumer(id, _) => {
-                self.streams2
-                    .with_partition_by_id_async(
-                        stream_id,
-                        topic_id,
-                        partition_id,
-                        partitions::helpers::persist_consumer_offset_to_disk(self.id, *id),
-                    )
-                    .await
+                let (offset_value, path) = self.streams2.with_partition_by_id(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    |(.., offsets, _, _)| {
+                        let hdl = offsets.pin();
+                        let item = hdl
+                            .get(id)
+                            .expect("persist_consumer_offset_to_disk: offset not found");
+                        let offset = item.offset.load(std::sync::atomic::Ordering::Relaxed);
+                        let path = item.path.clone();
+                        (offset, path)
+                    },
+                );
+                partitions::storage2::persist_offset(self.id, &path, offset_value).await
             }
             PollingConsumer::ConsumerGroup(_, id) => {
-                self.streams2
-                    .with_partition_by_id_async(
-                        stream_id,
-                        topic_id,
-                        partition_id,
-                        partitions::helpers::persist_consumer_group_member_offset_to_disk(
-                            self.id, *id,
-                        ),
-                    )
-                    .await
+                let (offset_value, path) = self.streams2.with_partition_by_id(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    |(.., offsets, _)| {
+                        let hdl = offsets.pin();
+                        let item = hdl.get(id).expect(
+                            "persist_consumer_group_member_offset_to_disk: offset not found",
+                        );
+                        let offset = item.offset.load(std::sync::atomic::Ordering::Relaxed);
+                        let path = item.path.clone();
+                        (offset, path)
+                    },
+                );
+                partitions::storage2::persist_offset(self.id, &path, offset_value).await
             }
         }
     }

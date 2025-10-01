@@ -53,18 +53,13 @@ impl ServerCommandHandler for GetTopics {
             .borrow()
             .get_topics(session.get_user_id(), numeric_stream_id as u32);
 
-        shard
-            .streams2
-            .with_topics_async(&self.stream_id, async |topics| {
-                topics
-                    .with_components_async(async |topics| {
-                        let (roots, _, stats) = topics.into_components();
-                        let response = mapper::map_topics(&roots, &stats);
-                        sender.send_ok_response(&response).await
-                    })
-                    .await
+        let response = shard.streams2.with_topics(&self.stream_id, |topics| {
+            topics.with_components(|topics| {
+                let (roots, _, stats) = topics.into_components();
+                mapper::map_topics(&roots, &stats)
             })
-            .await?;
+        });
+        sender.send_ok_response(&response).await?;
         Ok(())
     }
 }

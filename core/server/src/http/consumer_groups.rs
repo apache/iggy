@@ -93,21 +93,12 @@ async fn get_consumer_group(
             numeric_topic_id as u32,
         )?;
 
-    let consumer_group = {
-        let future = SendWrapper::new(
-            state
-                .shard
-                .shard()
-                .streams2
-                .with_consumer_group_by_id_async(
-                    &identifier_stream_id,
-                    &identifier_topic_id,
-                    &identifier_group_id,
-                    async |(root, members)| mapper::map_consumer_group(root, members),
-                ),
-        );
-        future.await
-    };
+    let consumer_group = state.shard.shard().streams2.with_consumer_group_by_id(
+        &identifier_stream_id,
+        &identifier_topic_id,
+        &identifier_group_id,
+        |(root, members)| mapper::map_consumer_group(root, members),
+    );
 
     Ok(Json(consumer_group))
 }
@@ -150,20 +141,16 @@ async fn get_consumer_groups(
             numeric_topic_id as u32,
         )?;
 
-    let consumer_groups = {
-        let future = SendWrapper::new(state.shard.shard().streams2.with_consumer_groups_async(
-            &identifier_stream_id,
-            &identifier_topic_id,
-            async |cgs| {
-                cgs.with_components_async(async |cgs| {
-                    let (roots, members) = cgs.into_components();
-                    mapper::map_consumer_groups(roots, members)
-                })
-                .await
-            },
-        ));
-        future.await
-    };
+    let consumer_groups = state.shard.shard().streams2.with_consumer_groups(
+        &identifier_stream_id,
+        &identifier_topic_id,
+        |cgs| {
+            cgs.with_components(|cgs| {
+                let (roots, members) = cgs.into_components();
+                mapper::map_consumer_groups(roots, members)
+            })
+        },
+    );
 
     Ok(Json(consumer_groups))
 }
@@ -213,21 +200,12 @@ async fn create_consumer_group(
 
     // Get the created consumer group details
     let group_id_identifier = Identifier::numeric(group_id as u32).unwrap();
-    let consumer_group_details = {
-        let future = SendWrapper::new(
-            state
-                .shard
-                .shard()
-                .streams2
-                .with_consumer_group_by_id_async(
-                    &command.stream_id,
-                    &command.topic_id,
-                    &group_id_identifier,
-                    async |(root, members)| mapper::map_consumer_group(root, members),
-                ),
-        );
-        future.await
-    };
+    let consumer_group_details = state.shard.shard().streams2.with_consumer_group_by_id(
+        &command.stream_id,
+        &command.topic_id,
+        &group_id_identifier,
+        |(root, members)| mapper::map_consumer_group(root, members),
+    );
 
     // Apply state change
     let entry_command = EntryCommand::CreateConsumerGroup(CreateConsumerGroupWithId {

@@ -53,13 +53,13 @@ impl ServerCommandHandler for GetTopic {
             self.topic_id.get_u32_value().unwrap_or(0),
         )?;
 
-        shard
-            .streams2
-            .with_topic_by_id_async(&self.stream_id, &self.topic_id, async |(root, _, stats)| {
-                let response = mapper::map_topic(&root, &stats);
-                sender.send_ok_response(&response).await
-            })
-            .await?;
+        let response =
+            shard
+                .streams2
+                .with_topic_by_id(&self.stream_id, &self.topic_id, |(root, _, stats)| {
+                    mapper::map_topic(&root, &stats)
+                });
+        sender.send_ok_response(&response).await?;
         Ok(())
     }
 }

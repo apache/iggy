@@ -1,13 +1,10 @@
 use crate::{
     slab::{
-        consumer_groups::ConsumerGroups,
-        partitions::{self, ContainerId, Partitions},
-        topics::Topics,
+        consumer_groups::ConsumerGroups, partitions::Partitions, topics::Topics,
         traits_ext::ComponentsById,
     },
     streaming::{
-        partitions::log::Log,
-        streams::stream2::{StreamRef, StreamRefMut},
+        streams::stream2::StreamRef,
         topics::topic2::{TopicRef, TopicRefMut},
     },
 };
@@ -26,7 +23,6 @@ where
 {
     async |(root, ..)| f(root.topics()).await
 }
-
 pub fn topics_mut<O, F>(f: F) -> impl FnOnce(ComponentsById<StreamRef>) -> O
 where
     F: for<'a> FnOnce(&'a Topics) -> O,
@@ -47,7 +43,6 @@ where
 {
     async |(root, ..)| f(root.partitions()).await
 }
-
 pub fn partitions_mut<O, F>(f: F) -> impl FnOnce(ComponentsById<TopicRefMut>) -> O
 where
     F: for<'a> FnOnce(&'a mut Partitions) -> O,
@@ -67,11 +62,4 @@ where
     F: for<'a> FnOnce(&'a mut ConsumerGroups) -> O,
 {
     |(mut root, ..)| f(root.consumer_groups_mut())
-}
-
-pub fn consumer_groups_async<O, F>(f: F) -> impl AsyncFnOnce(ComponentsById<TopicRef>) -> O
-where
-    F: for<'a> AsyncFnOnce(&'a ConsumerGroups) -> O,
-{
-    async |(root, ..)| f(root.consumer_groups()).await
 }

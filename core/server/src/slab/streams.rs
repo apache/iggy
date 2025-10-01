@@ -1,5 +1,8 @@
 use crate::shard::task_registry::TaskRegistry;
+use crate::shard_trace;
 use crate::streaming::partitions as streaming_partitions;
+use crate::streaming::segments::IggyIndexesMut;
+use crate::streaming::segments::storage::Storage;
 use crate::{
     binary::handlers::messages::poll_messages_handler::IggyPollMetadata,
     configs::{cache_indexes::CacheIndexesConfig, system::SystemConfig},
@@ -39,6 +42,7 @@ use crate::{
     },
 };
 use ahash::AHashMap;
+use error_set::ErrContext;
 use iggy_common::{Identifier, IggyError, IggyTimestamp, PollingKind};
 use slab::Slab;
 use std::{
@@ -141,11 +145,10 @@ impl EntityComponentSystem<InteriorMutability> for Streams {
     {
         f(self.into())
     }
-
+    
     fn with_components_async<O, F>(&self, f: F) -> impl Future<Output = O>
     where
-        F: for<'a> AsyncFnOnce(Self::EntityComponents<'a>) -> O,
-    {
+        F: for<'a> AsyncFnOnce(Self::EntityComponents<'a>) -> O {
         f(self.into())
     }
 }
@@ -192,17 +195,21 @@ impl MainOps for Streams {
             self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
                 log.journal().inner().size + log.active_segment().size
             });
-        self.with_partition_by_id_async(
+        let (segment_start_offset, message_deduplicator) = self.with_partition_by_id(
             stream_id,
             topic_id,
             partition_id,
-            streaming_partitions::helpers::deduplicate_messages(
+            streaming_partitions::helpers::get_segment_start_offset_and_deduplicator(),
+        );
+
+        input
+            .prepare_for_persistence(
+                segment_start_offset,
                 current_offset,
                 current_position,
-                &mut input,
-            ),
-        )
-        .await;
+                message_deduplicator.as_ref(),
+            )
+            .await;
 
         let (journal_messages_count, journal_size) = self.with_partition_by_id_mut(
             stream_id,
@@ -460,7 +467,6 @@ impl Streams {
         let id = self.get_index(id);
         self.with_components_by_id_async(id, async |stream| f(stream).await)
     }
-
     pub fn with_stream_by_id_mut<T>(
         &self,
         id: &Identifier,
@@ -481,7 +487,6 @@ impl Streams {
     ) -> impl Future<Output = T> {
         self.with_stream_by_id_async(stream_id, helpers::topics_async(f))
     }
-
     pub fn with_topics_mut<T>(&self, stream_id: &Identifier, f: impl FnOnce(&Topics) -> T) -> T {
         self.with_stream_by_id(stream_id, helpers::topics_mut(f))
     }
@@ -507,7 +512,6 @@ impl Streams {
             container.with_topic_by_id_async(topic_id, f).await
         })
     }
-
     pub fn with_topic_by_id_mut<T>(
         &self,
         stream_id: &Identifier,
@@ -527,17 +531,6 @@ impl Streams {
     ) -> T {
         self.with_topics(stream_id, |container| {
             container.with_consumer_groups(topic_id, f)
-        })
-    }
-
-    pub fn with_consumer_groups_async<T>(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        f: impl AsyncFnOnce(&ConsumerGroups) -> T,
-    ) -> impl Future<Output = T> {
-        self.with_topics_async(stream_id, async |container| {
-            container.with_consumer_groups_async(topic_id, f).await
         })
     }
 
@@ -565,18 +558,6 @@ impl Streams {
         })
     }
 
-    pub fn with_consumer_group_by_id_async<T>(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        group_id: &Identifier,
-        f: impl AsyncFnOnce(ComponentsById<ConsumerGroupRef>) -> T,
-    ) -> impl Future<Output = T> {
-        self.with_consumer_groups_async(stream_id, topic_id, async move |container| {
-            container.with_consumer_group_by_id_async(group_id, f).await
-        })
-    }
-
     pub fn with_consumer_groups_mut<T>(
         &self,
         stream_id: &Identifier,
@@ -599,6 +580,7 @@ impl Streams {
         })
     }
 
+
     pub fn with_partitions_async<T>(
         &self,
         stream_id: &Identifier,
@@ -609,7 +591,6 @@ impl Streams {
             container.with_partitions_async(topic_id, f).await
         })
     }
-
     pub fn with_partitions_mut<T>(
         &self,
         stream_id: &Identifier,
@@ -644,7 +625,6 @@ impl Streams {
             container.with_partition_by_id_async(id, f).await
         })
     }
-
     pub fn with_partition_by_id_mut<T>(
         &self,
         stream_id: &Identifier,
@@ -677,12 +657,261 @@ impl Streams {
             helpers::get_segment_range_by_offset(offset),
         );
 
-        self.with_partition_by_id_async(
-            stream_id,
-            topic_id,
-            partition_id,
-            helpers::get_messages_by_offset_range(offset, count, range),
-        )
+        let mut remaining_count = count;
+        let mut batches = IggyMessagesBatchSet::empty();
+        let mut current_offset = offset;
+
+        for idx in range {
+            let (segment_start_offset, segment_end_offset) = self.with_partition_by_id(
+                stream_id,
+                topic_id,
+                partition_id,
+                |(_, _, _, _, _, _, log)| {
+                    let segment = &log.segments()[idx];
+                    (segment.start_offset, segment.end_offset)
+                },
+            );
+
+            let start_offset = if current_offset < segment_start_offset {
+                segment_start_offset
+            } else {
+                current_offset
+            };
+
+            let mut end_offset = start_offset + (remaining_count - 1) as u64;
+            if end_offset > segment_end_offset {
+                end_offset = segment_end_offset;
+            }
+
+            // Calculate the actual count to request from this segment
+            let count: u32 = ((end_offset - start_offset + 1) as u32).min(remaining_count);
+
+            let messages = self
+                .get_messages_by_offset_base(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    idx,
+                    start_offset,
+                    end_offset,
+                    count,
+                    segment_start_offset,
+                )
+                .await?;
+
+            let messages_count = messages.count();
+            if messages_count == 0 {
+                current_offset = segment_end_offset + 1;
+                continue;
+            }
+
+            remaining_count = remaining_count.saturating_sub(messages_count);
+
+            if let Some(last_offset) = messages.last_offset() {
+                current_offset = last_offset + 1;
+            } else if messages_count > 0 {
+                current_offset += messages_count as u64;
+            }
+
+            batches.add_batch_set(messages);
+
+            if remaining_count == 0 {
+                break;
+            }
+        }
+
+        Ok(batches)
+    }
+
+    async fn get_messages_by_offset_base(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: partitions::ContainerId,
+        idx: usize,
+        offset: u64,
+        end_offset: u64,
+        count: u32,
+        segment_start_offset: u64,
+    ) -> Result<IggyMessagesBatchSet, IggyError> {
+        if count == 0 {
+            return Ok(IggyMessagesBatchSet::default());
+        }
+
+        let (is_journal_empty, journal_first_offset, journal_last_offset) = self
+            .with_partition_by_id(
+                stream_id,
+                topic_id,
+                partition_id,
+                |(_, _, _, _, _, _, log)| {
+                    let journal = log.journal();
+                    (
+                        journal.is_empty(),
+                        journal.inner().base_offset,
+                        journal.inner().current_offset,
+                    )
+                },
+            );
+
+        // Case 0: Accumulator is empty, so all messages have to be on disk
+        if is_journal_empty {
+            return self
+                .load_messages_from_disk_by_offset(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    idx,
+                    offset,
+                    count,
+                    segment_start_offset,
+                )
+                .await;
+        }
+
+        // Case 1: All messages are in accumulator buffer
+        if offset >= journal_first_offset && end_offset <= journal_last_offset {
+            let batches = self.with_partition_by_id(
+                stream_id,
+                topic_id,
+                partition_id,
+                |(_, _, _, _, _, _, log)| {
+                    log.journal()
+                        .get(|batches| batches.get_by_offset(offset, count))
+                },
+            );
+            return Ok(batches);
+        }
+
+        // Case 2: All messages are on disk
+        if end_offset < journal_first_offset {
+            return self
+                .load_messages_from_disk_by_offset(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    idx,
+                    offset,
+                    count,
+                    segment_start_offset,
+                )
+                .await;
+        }
+
+        // Case 3: Messages span disk and accumulator buffer boundary
+        // Calculate how many messages we need from disk
+        let disk_count = if offset < journal_first_offset {
+            ((journal_first_offset - offset) as u32).min(count)
+        } else {
+            0
+        };
+        let mut combined_batch_set = IggyMessagesBatchSet::empty();
+
+        // Load messages from disk if needed
+        if disk_count > 0 {
+            let disk_messages = self
+                .load_messages_from_disk_by_offset(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    idx,
+                    offset,
+                    disk_count,
+                    segment_start_offset,
+                )
+                .await
+                .with_error_context(|error| {
+                    format!("Failed to load messages from disk, start offset: {offset}, count: {disk_count}, error: {error}")
+                })?;
+
+            if !disk_messages.is_empty() {
+                combined_batch_set.add_batch_set(disk_messages);
+            }
+        }
+
+        // Calculate how many more messages we need from the accumulator
+        let remaining_count = count - combined_batch_set.count();
+
+        if remaining_count > 0 {
+            let accumulator_start_offset = std::cmp::max(offset, journal_first_offset);
+            let journal_messages = self.with_partition_by_id(
+                stream_id,
+                topic_id,
+                partition_id,
+                |(_, _, _, _, _, _, log)| {
+                    log.journal().get(|batches| {
+                        batches.get_by_offset(accumulator_start_offset, remaining_count)
+                    })
+                },
+            );
+
+            if !journal_messages.is_empty() {
+                combined_batch_set.add_batch_set(journal_messages);
+            }
+        }
+
+        Ok(combined_batch_set)
+    }
+
+    async fn load_messages_from_disk_by_offset(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: partitions::ContainerId,
+        idx: usize,
+        start_offset: u64,
+        count: u32,
+        segment_start_offset: u64,
+    ) -> Result<IggyMessagesBatchSet, IggyError> {
+        // Convert start_offset to relative offset within the segment
+        let relative_start_offset = (start_offset - segment_start_offset) as u32;
+
+        // Use with_partition_by_id_async to perform disk I/O inside the async closure
+        self.with_partition_by_id_async(stream_id, topic_id, partition_id, async move |(.., log)| {
+            let storage = log.storages()[idx].clone();
+            let indexes = log.indexes()[idx].as_ref();
+
+            // Load indexes first
+            let indexes_to_read = if let Some(indexes) = indexes {
+                if !indexes.is_empty() {
+                    indexes.slice_by_offset(relative_start_offset, count)
+                } else {
+                    storage
+                        .index_reader
+                        .as_ref()
+                        .expect("Index reader not initialized")
+                        .load_from_disk_by_offset(relative_start_offset, count)
+                        .await?
+                }
+            } else {
+                storage
+                    .index_reader
+                    .as_ref()
+                    .expect("Index reader not initialized")
+                    .load_from_disk_by_offset(relative_start_offset, count)
+                    .await?
+            };
+
+            if indexes_to_read.is_none() {
+                return Ok(IggyMessagesBatchSet::empty());
+            }
+
+            let indexes_to_read = indexes_to_read.unwrap();
+            let batch = storage
+                .messages_reader
+                .as_ref()
+                .expect("Messages reader not initialized")
+                .load_messages_from_disk(indexes_to_read)
+                .await
+                .with_error_context(|error| format!("Failed to load messages from disk: {error}"))?;
+
+            batch
+                .validate_checksums_and_offsets(start_offset)
+                .with_error_context(|error| {
+                    format!("Failed to validate messages read from disk! error: {error}")
+                })?;
+
+            Ok(IggyMessagesBatchSet::from(batch))
+        })
         .await
     }
 
@@ -704,13 +933,200 @@ impl Streams {
             return Ok(IggyMessagesBatchSet::default());
         };
 
-        self.with_partition_by_id_async(
+        let mut remaining_count = count;
+        let mut batches = IggyMessagesBatchSet::empty();
+
+        for idx in range {
+            let segment_end_timestamp = self.with_partition_by_id(
+                stream_id,
+                topic_id,
+                partition_id,
+                |(_, _, _, _, _, _, log)| {
+                    let segment = &log.segments()[idx];
+                    segment.end_timestamp
+                },
+            );
+
+            // Skip segments that end before our timestamp
+            if segment_end_timestamp < timestamp {
+                continue;
+            }
+
+            let messages = self
+                .get_messages_by_timestamp_base(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    idx,
+                    timestamp,
+                    remaining_count,
+                )
+                .await?;
+
+            let messages_count = messages.count();
+            if messages_count == 0 {
+                continue;
+            }
+
+            remaining_count = remaining_count.saturating_sub(messages_count);
+            batches.add_batch_set(messages);
+
+            if remaining_count == 0 {
+                break;
+            }
+        }
+
+        Ok(batches)
+    }
+
+    async fn get_messages_by_timestamp_base(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: partitions::ContainerId,
+        idx: usize,
+        timestamp: u64,
+        count: u32,
+    ) -> Result<IggyMessagesBatchSet, IggyError> {
+        if count == 0 {
+            return Ok(IggyMessagesBatchSet::default());
+        }
+
+        let (is_journal_empty, journal_first_timestamp, journal_last_timestamp) = self
+            .with_partition_by_id(
+                stream_id,
+                topic_id,
+                partition_id,
+                |(_, _, _, _, _, _, log)| {
+                    let journal = log.journal();
+                    (
+                        journal.is_empty(),
+                        journal.inner().first_timestamp,
+                        journal.inner().end_timestamp,
+                    )
+                },
+            );
+
+        // Case 0: Accumulator is empty, so all messages have to be on disk
+        if is_journal_empty {
+            let (storage, index) = self.with_partition_by_id(
+                stream_id,
+                topic_id,
+                partition_id,
+                |(_, _, _, _, _, _, log)| {
+                    let storage = log.storages()[idx].clone();
+                    let indexes = log.indexes()[idx]
+                        .as_ref()
+                        .map(|indexes| indexes.slice_by_offset(0, u32::MAX).unwrap());
+                    (storage, indexes)
+                },
+            );
+            return Self::load_messages_from_disk_by_timestamp(&storage, &index, timestamp, count)
+                .await;
+        }
+
+        // Case 1: All messages are in accumulator buffer (timestamp is after journal ends)
+        if timestamp > journal_last_timestamp {
+            return Ok(IggyMessagesBatchSet::empty());
+        }
+
+        // Case 1b: Timestamp is within journal range
+        if timestamp >= journal_first_timestamp {
+            let batches = self.with_partition_by_id(
+                stream_id,
+                topic_id,
+                partition_id,
+                |(_, _, _, _, _, _, log)| {
+                    log.journal()
+                        .get(|batches| batches.get_by_timestamp(timestamp, count))
+                },
+            );
+            return Ok(batches);
+        }
+
+        // Case 2: All messages are on disk (timestamp is before journal's first timestamp)
+        let (storage, index) = self.with_partition_by_id(
             stream_id,
             topic_id,
             partition_id,
-            helpers::get_messages_by_timestamp_range(timestamp, count, range),
-        )
-        .await
+            |(_, _, _, _, _, _, log)| {
+                let storage = log.storages()[idx].clone();
+                let indexes = log.indexes()[idx]
+                    .as_ref()
+                    .map(|indexes| indexes.slice_by_timestamp(0, u32::MAX).unwrap());
+                (storage, indexes)
+            },
+        );
+
+        let disk_messages =
+            Self::load_messages_from_disk_by_timestamp(&storage, &index, timestamp, count).await?;
+
+        if disk_messages.count() >= count {
+            return Ok(disk_messages);
+        }
+
+        // Case 3: Messages span disk and accumulator buffer boundary
+        let remaining_count = count - disk_messages.count();
+        let journal_messages = self.with_partition_by_id(
+            stream_id,
+            topic_id,
+            partition_id,
+            |(_, _, _, _, _, _, log)| {
+                log.journal()
+                    .get(|batches| batches.get_by_timestamp(timestamp, remaining_count))
+            },
+        );
+
+        let mut combined_batch_set = disk_messages;
+        if !journal_messages.is_empty() {
+            combined_batch_set.add_batch_set(journal_messages);
+        }
+        Ok(combined_batch_set)
+    }
+
+    async fn load_messages_from_disk_by_timestamp(
+        storage: &Storage,
+        index: &Option<IggyIndexesMut>,
+        timestamp: u64,
+        count: u32,
+    ) -> Result<IggyMessagesBatchSet, IggyError> {
+        let indexes_to_read = if let Some(indexes) = index {
+            if !indexes.is_empty() {
+                indexes.slice_by_timestamp(timestamp, count)
+            } else {
+                storage
+                    .index_reader
+                    .as_ref()
+                    .expect("Index reader not initialized")
+                    .load_from_disk_by_timestamp(timestamp, count)
+                    .await?
+            }
+        } else {
+            storage
+                .index_reader
+                .as_ref()
+                .expect("Index reader not initialized")
+                .load_from_disk_by_timestamp(timestamp, count)
+                .await?
+        };
+
+        if indexes_to_read.is_none() {
+            return Ok(IggyMessagesBatchSet::empty());
+        }
+
+        let indexes_to_read = indexes_to_read.unwrap();
+
+        let batch = storage
+            .messages_reader
+            .as_ref()
+            .expect("Messages reader not initialized")
+            .load_messages_from_disk(indexes_to_read)
+            .await
+            .with_error_context(|error| {
+                format!("Failed to load messages from disk by timestamp: {error}")
+            })?;
+
+        Ok(IggyMessagesBatchSet::from(batch))
     }
 
     pub async fn handle_full_segment(
@@ -844,21 +1260,62 @@ impl Streams {
             streaming_partitions::helpers::commit_journal(),
         );
 
-        let (saved, batch_count) = self
-            .with_partition_by_id_async(
-                stream_id,
-                topic_id,
-                partition_id,
-                streaming_partitions::helpers::persist_batch(
-                    shard_id,
-                    stream_id,
-                    topic_id,
-                    partition_id,
-                    batches,
-                    reason.to_string(),
-                ),
-            )
+        shard_trace!(
+            shard_id,
+            "Persisting messages on disk for stream ID: {}, topic ID: {}, partition ID: {} because {}...",
+            stream_id,
+            topic_id,
+            partition_id,
+            reason
+        );
+
+        let batch_count = batches.count();
+        let batch_size = batches.size();
+
+        // Perform disk I/O inside the async closure
+        let saved = self
+            .with_partition_by_id_async(stream_id, topic_id, partition_id, async move |(.., log)| {
+                let storage = log.active_storage().clone();
+                
+                let saved = storage
+                    .messages_writer
+                    .as_ref()
+                    .expect("Messages writer not initialized")
+                    .save_batch_set(batches)
+                    .await
+                    .with_error_context(|error| {
+                        format!(
+                            "Failed to save batch of {batch_count} messages \
+                            ({batch_size} bytes) to stream ID: {stream_id}, topic ID: {topic_id}, partition ID: {partition_id}. {error}",
+                        )
+                    })?;
+
+                let unsaved_indexes_slice = log.active_indexes().unwrap().unsaved_slice();
+                let indexes_len = unsaved_indexes_slice.len();
+                
+                storage
+                    .index_writer
+                    .as_ref()
+                    .expect("Index writer not initialized")
+                    .save_indexes(unsaved_indexes_slice)
+                    .await
+                    .with_error_context(|error| {
+                        format!("Failed to save index of {indexes_len} indexes to stream ID: {stream_id}, topic ID: {topic_id} {partition_id}. {error}",)
+                    })?;
+
+                Ok::<_, IggyError>(saved)
+            })
             .await?;
+
+        shard_trace!(
+            shard_id,
+            "Persisted {} messages on disk for stream ID: {}, topic ID: {}, for partition with ID: {}, total bytes written: {}.",
+            batch_count,
+            stream_id,
+            topic_id,
+            partition_id,
+            saved
+        );
 
         self.with_partition_by_id_mut(
             stream_id,
@@ -880,58 +1337,37 @@ impl Streams {
         topic_id: &Identifier,
         partition_id: usize,
     ) -> Result<(), IggyError> {
-        let has_storage =
-            self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
-                let storage = log.active_storage();
-                storage.messages_writer.is_some() && storage.index_writer.is_some()
-            });
+        self.with_partition_by_id_async(stream_id, topic_id, partition_id, async move |(.., log)| {
+            let storage = log.active_storage();
 
-        if !has_storage {
-            return Ok(());
-        }
+            if storage.messages_writer.is_none() || storage.index_writer.is_none() {
+                return Ok(());
+            }
 
-        self.with_partition_by_id_async(
-            stream_id,
-            topic_id,
-            partition_id,
-            async move |(.., log)| {
-                let storage = log.active_storage();
-
-                if let Some(ref messages_writer) = storage.messages_writer {
-                    if let Err(e) = messages_writer.fsync().await {
-                        tracing::error!(
-                            "Failed to fsync messages writer for partition {}: {}",
-                            partition_id,
-                            e
-                        );
-                        return Err(e);
-                    }
+            if let Some(ref messages_writer) = storage.messages_writer {
+                if let Err(e) = messages_writer.fsync().await {
+                    tracing::error!(
+                        "Failed to fsync messages writer for partition {}: {}",
+                        partition_id,
+                        e
+                    );
+                    return Err(e);
                 }
-                Ok(())
-            },
-        )
-        .await?;
+            }
 
-        self.with_partition_by_id_async(
-            stream_id,
-            topic_id,
-            partition_id,
-            async move |(.., log)| {
-                if let Some(ref index_writer) = log.active_storage().index_writer {
-                    if let Err(e) = index_writer.fsync().await {
-                        tracing::error!(
-                            "Failed to fsync index writer for partition {}: {}",
-                            partition_id,
-                            e
-                        );
-                        return Err(e);
-                    }
+            if let Some(ref index_writer) = storage.index_writer {
+                if let Err(e) = index_writer.fsync().await {
+                    tracing::error!(
+                        "Failed to fsync index writer for partition {}: {}",
+                        partition_id,
+                        e
+                    );
+                    return Err(e);
                 }
-                Ok(())
-            },
-        )
-        .await?;
+            }
 
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 }

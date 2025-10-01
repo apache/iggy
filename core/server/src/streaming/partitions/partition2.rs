@@ -17,7 +17,10 @@ use crate::{
 };
 use iggy_common::{Identifier, IggyTimestamp};
 use slab::Slab;
-use std::sync::{Arc, atomic::AtomicU64};
+use std::{
+    rc::Rc,
+    sync::{Arc, atomic::AtomicU64},
+};
 
 #[derive(Debug, Clone)]
 pub struct ConsumerOffsets(papaya::HashMap<usize, consumer_offset::ConsumerOffset>);
@@ -87,7 +90,7 @@ impl std::ops::DerefMut for ConsumerGroupOffsets {
 pub struct Partition {
     root: PartitionRoot,
     stats: Arc<PartitionStats>,
-    message_deduplicator: Option<MessageDeduplicator>,
+    message_deduplicator: Option<Arc<MessageDeduplicator>>,
     offset: Arc<AtomicU64>,
     consumer_offset: Arc<ConsumerOffsets>,
     consumer_group_offset: Arc<ConsumerGroupOffsets>,
@@ -106,6 +109,7 @@ impl Partition {
         log: SegmentedLog<MemoryMessageJournal>,
     ) -> Self {
         let root = PartitionRoot::new(created_at, should_increment_offset);
+        let message_deduplicator = message_deduplicator.map(Arc::new);
         Self {
             root,
             stats,
@@ -120,7 +124,7 @@ impl Partition {
     pub fn new_with_components(
         root: PartitionRoot,
         stats: Arc<PartitionStats>,
-        message_deduplicator: Option<MessageDeduplicator>,
+        message_deduplicator: Option<Arc<MessageDeduplicator>>,
         offset: Arc<AtomicU64>,
         consumer_offset: Arc<ConsumerOffsets>,
         consumer_group_offset: Arc<ConsumerGroupOffsets>,
@@ -172,7 +176,7 @@ impl IntoComponents for Partition {
     type Components = (
         PartitionRoot,
         Arc<PartitionStats>,
-        Option<MessageDeduplicator>,
+        Option<Arc<MessageDeduplicator>>,
         Arc<AtomicU64>,
         Arc<ConsumerOffsets>,
         Arc<ConsumerGroupOffsets>,
@@ -233,7 +237,7 @@ impl PartitionRoot {
 pub struct PartitionRef<'a> {
     root: &'a Slab<PartitionRoot>,
     stats: &'a Slab<Arc<PartitionStats>>,
-    message_deduplicator: &'a Slab<Option<MessageDeduplicator>>,
+    message_deduplicator: &'a Slab<Option<Arc<MessageDeduplicator>>>,
     offset: &'a Slab<Arc<AtomicU64>>,
     consumer_offset: &'a Slab<Arc<ConsumerOffsets>>,
     consumer_group_offset: &'a Slab<Arc<ConsumerGroupOffsets>>,
@@ -244,7 +248,7 @@ impl<'a> PartitionRef<'a> {
     pub fn new(
         root: &'a Slab<PartitionRoot>,
         stats: &'a Slab<Arc<PartitionStats>>,
-        message_deduplicator: &'a Slab<Option<MessageDeduplicator>>,
+        message_deduplicator: &'a Slab<Option<Arc<MessageDeduplicator>>>,
         offset: &'a Slab<Arc<AtomicU64>>,
         consumer_offset: &'a Slab<Arc<ConsumerOffsets>>,
         consumer_group_offset: &'a Slab<Arc<ConsumerGroupOffsets>>,
@@ -266,7 +270,7 @@ impl<'a> IntoComponents for PartitionRef<'a> {
     type Components = (
         &'a Slab<PartitionRoot>,
         &'a Slab<Arc<PartitionStats>>,
-        &'a Slab<Option<MessageDeduplicator>>,
+        &'a Slab<Option<Arc<MessageDeduplicator>>>,
         &'a Slab<Arc<AtomicU64>>,
         &'a Slab<Arc<ConsumerOffsets>>,
         &'a Slab<Arc<ConsumerGroupOffsets>>,
@@ -291,7 +295,7 @@ impl<'a> IntoComponentsById for PartitionRef<'a> {
     type Output = (
         &'a PartitionRoot,
         &'a Arc<PartitionStats>,
-        &'a Option<MessageDeduplicator>,
+        &'a Option<Arc<MessageDeduplicator>>,
         &'a Arc<AtomicU64>,
         &'a Arc<ConsumerOffsets>,
         &'a Arc<ConsumerGroupOffsets>,
@@ -314,7 +318,7 @@ impl<'a> IntoComponentsById for PartitionRef<'a> {
 pub struct PartitionRefMut<'a> {
     root: &'a mut Slab<PartitionRoot>,
     stats: &'a mut Slab<Arc<PartitionStats>>,
-    message_deduplicator: &'a mut Slab<Option<MessageDeduplicator>>,
+    message_deduplicator: &'a mut Slab<Option<Arc<MessageDeduplicator>>>,
     offset: &'a mut Slab<Arc<AtomicU64>>,
     consumer_offset: &'a mut Slab<Arc<ConsumerOffsets>>,
     consumer_group_offset: &'a mut Slab<Arc<ConsumerGroupOffsets>>,
@@ -325,7 +329,7 @@ impl<'a> PartitionRefMut<'a> {
     pub fn new(
         root: &'a mut Slab<PartitionRoot>,
         stats: &'a mut Slab<Arc<PartitionStats>>,
-        message_deduplicator: &'a mut Slab<Option<MessageDeduplicator>>,
+        message_deduplicator: &'a mut Slab<Option<Arc<MessageDeduplicator>>>,
         offset: &'a mut Slab<Arc<AtomicU64>>,
         consumer_offset: &'a mut Slab<Arc<ConsumerOffsets>>,
         consumer_group_offset: &'a mut Slab<Arc<ConsumerGroupOffsets>>,
@@ -347,7 +351,7 @@ impl<'a> IntoComponents for PartitionRefMut<'a> {
     type Components = (
         &'a mut Slab<PartitionRoot>,
         &'a mut Slab<Arc<PartitionStats>>,
-        &'a mut Slab<Option<MessageDeduplicator>>,
+        &'a mut Slab<Option<Arc<MessageDeduplicator>>>,
         &'a mut Slab<Arc<AtomicU64>>,
         &'a mut Slab<Arc<ConsumerOffsets>>,
         &'a mut Slab<Arc<ConsumerGroupOffsets>>,
@@ -372,7 +376,7 @@ impl<'a> IntoComponentsById for PartitionRefMut<'a> {
     type Output = (
         &'a mut PartitionRoot,
         &'a mut Arc<PartitionStats>,
-        &'a mut Option<MessageDeduplicator>,
+        &'a mut Option<Arc<MessageDeduplicator>>,
         &'a mut Arc<AtomicU64>,
         &'a mut Arc<ConsumerOffsets>,
         &'a mut Arc<ConsumerGroupOffsets>,

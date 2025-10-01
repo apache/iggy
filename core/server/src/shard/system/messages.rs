@@ -281,16 +281,23 @@ impl IggyShard {
                                         &self.config.system,
                                     ),
                                 );
-                                self.streams2
-                                    .with_partition_by_id_async(
-                                        &stream_id,
-                                        &topic_id,
-                                        partition_id,
-                                        partitions::helpers::persist_consumer_offset_to_disk(
-                                            self.id,
-                                            consumer_id,
-                                        ),
-                                    )
+
+                                let (offset_value, path) = self.streams2.with_partition_by_id(
+                                    &stream_id,
+                                    &topic_id,
+                                    partition_id,
+                                    |(.., offsets, _, _)| {
+                                        let hdl = offsets.pin();
+                                        let item = hdl.get(&consumer_id).expect(
+                                            "persist_consumer_offset_to_disk: offset not found",
+                                        );
+                                        let offset =
+                                            item.offset.load(std::sync::atomic::Ordering::Relaxed);
+                                        let path = item.path.clone();
+                                        (offset, path)
+                                    },
+                                );
+                                partitions::storage2::persist_offset(self.id, &path, offset_value)
                                     .await?;
                             }
                             PollingConsumer::ConsumerGroup(cg_id, _) => {
@@ -307,16 +314,23 @@ impl IggyShard {
                                         &self.config.system,
                                     ),
                                 );
-                                self.streams2.with_partition_by_id_async(
+
+                                let (offset_value, path) = self.streams2.with_partition_by_id(
                                     &stream_id,
                                     &topic_id,
                                     partition_id,
-                                    partitions::helpers::persist_consumer_group_member_offset_to_disk(
-                                        self.id,
-                                        cg_id,
-                                    ),
-                                )
-                                .await?;
+                                    |(.., offsets, _)| {
+                                        let hdl = offsets.pin();
+                                        let item = hdl
+                                            .get(&cg_id)
+                                            .expect("persist_consumer_group_member_offset_to_disk: offset not found");
+                                        let offset = item.offset.load(std::sync::atomic::Ordering::Relaxed);
+                                        let path = item.path.clone();
+                                        (offset, path)
+                                    },
+                                );
+                                partitions::storage2::persist_offset(self.id, &path, offset_value)
+                                    .await?;
                             }
                         }
                     }

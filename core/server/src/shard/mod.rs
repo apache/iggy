@@ -572,55 +572,58 @@ impl IggyShard {
                     );
                     match consumer {
                         PollingConsumer::Consumer(consumer_id, _) => {
-                            self.streams2.with_partition_by_id(
+                            let (offset_value, path) = self.streams2.with_partition_by_id(
                                 &stream_id,
                                 &topic_id,
                                 partition_id,
-                                partitions::helpers::store_consumer_offset(
-                                    consumer_id,
-                                    numeric_stream_id,
-                                    numeric_topic_id,
-                                    partition_id,
-                                    offset,
-                                    &self.config.system,
-                                ),
-                            );
-                            self.streams2
-                                .with_partition_by_id_async(
-                                    &stream_id,
-                                    &topic_id,
-                                    partition_id,
-                                    partitions::helpers::persist_consumer_offset_to_disk(
-                                        self.id,
+                                |(.., offsets, _, _)| {
+                                    let hdl = offsets.pin();
+                                    let item = hdl.get_or_insert(
                                         consumer_id,
-                                    ),
-                                )
-                                .await?;
+                                        crate::streaming::partitions::consumer_offset::ConsumerOffset::default_for_consumer(
+                                            consumer_id as u32,
+                                            &self.config.system.get_consumer_offsets_path(numeric_stream_id, numeric_topic_id, partition_id),
+                                        ),
+                                    );
+                                    item.offset.store(offset, std::sync::atomic::Ordering::Relaxed);
+                                    let offset_value = item.offset.load(std::sync::atomic::Ordering::Relaxed);
+                                    let path = item.path.clone();
+                                    (offset_value, path)
+                                },
+                            );
+                            crate::streaming::partitions::storage2::persist_offset(
+                                self.id,
+                                &path,
+                                offset_value,
+                            )
+                            .await?;
                         }
                         PollingConsumer::ConsumerGroup(cg_id, _) => {
-                            self.streams2.with_partition_by_id(
+                            let (offset_value, path) = self.streams2.with_partition_by_id(
                                 &stream_id,
                                 &topic_id,
                                 partition_id,
-                                partitions::helpers::store_consumer_group_member_offset(
-                                    cg_id,
-                                    numeric_stream_id,
-                                    numeric_topic_id,
-                                    partition_id,
-                                    offset,
-                                    &self.config.system,
-                                ),
-                            );
-                            self.streams2.with_partition_by_id_async(
-                                    &stream_id,
-                                    &topic_id,
-                                    partition_id,
-                                    partitions::helpers::persist_consumer_group_member_offset_to_disk(
-                                        self.id,
+                                |(.., offsets, _)| {
+                                    let hdl = offsets.pin();
+                                    let item = hdl.get_or_insert(
                                         cg_id,
-                                    ),
-                                )
-                                .await?;
+                                        crate::streaming::partitions::consumer_offset::ConsumerOffset::default_for_consumer_group(
+                                            cg_id as u32,
+                                            &self.config.system.get_consumer_group_offsets_path(numeric_stream_id, numeric_topic_id, partition_id),
+                                        ),
+                                    );
+                                    item.offset.store(offset, std::sync::atomic::Ordering::Relaxed);
+                                    let offset_value = item.offset.load(std::sync::atomic::Ordering::Relaxed);
+                                    let path = item.path.clone();
+                                    (offset_value, path)
+                                },
+                            );
+                            crate::streaming::partitions::storage2::persist_offset(
+                                self.id,
+                                &path,
+                                offset_value,
+                            )
+                            .await?;
                         }
                     }
                 }
