@@ -104,7 +104,7 @@ impl ConsumerGroupClient for ClientWrapper {
             }
             ClientWrapper::WebSocket(client) => {
                 client
-                    .create_consumer_group(stream_id, topic_id, name, group_id)
+                    .create_consumer_group(stream_id, topic_id, name)
                     .await
             }
         }

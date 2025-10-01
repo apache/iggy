@@ -2,7 +2,6 @@ use crate::binary::sender::SenderKind;
 use crate::configs::websocket::WebSocketConfig;
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
-use crate::streaming::clients::client_manager::Transport;
 use crate::websocket::connection_handler::{handle_connection, handle_error};
 use crate::websocket::websocket_sender::WebSocketSender;
 use crate::{shard_error, shard_info};
@@ -11,6 +10,7 @@ use compio_ws::accept_async_with_config;
 use error_set::ErrContext;
 use futures::FutureExt;
 use iggy_common::IggyError;
+use iggy_common::TransportProtocol;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
@@ -79,13 +79,13 @@ pub async fn start(
                                 Ok(websocket) => {
                                     info!("WebSocket handshake successful from: {}", remote_addr);
 
-                                    let session = shard_clone.add_client(&remote_addr, Transport::WebSocket);
+                                    let session = shard_clone.add_client(&remote_addr, TransportProtocol::WebSocket);
                                     let client_id = session.client_id;
                                     shard_clone.add_active_session(session.clone());
 
                                     let event = ShardEvent::NewSession {
                                         address: remote_addr,
-                                        transport: Transport::WebSocket,
+                                        transport: TransportProtocol::WebSocket,
                                     };
                                     let _ = shard_clone.broadcast_event_to_all_shards(event.into()).await;
 

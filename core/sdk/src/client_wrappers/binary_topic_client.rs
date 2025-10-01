@@ -120,7 +120,6 @@ impl TopicClient for ClientWrapper {
                         partitions_count,
                         compression_algorithm,
                         replication_factor,
-                        topic_id,
                         message_expiry,
                         max_topic_size,
                     )

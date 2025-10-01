@@ -49,10 +49,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     client.connect().await?;
     info!("✓ Connected to server");
 
-    // // Manual login like other examples do
-    // info!("Logging in...");
-    // client.login_user("iggy", "iggy").await?;
-    // info!("✓ Login successful");
+    // Manual login like other examples do
+    info!("Logging in...");
+    client.login_user("iggy", "iggy").await?;
+    info!("✓ Login successful");
 
     // // Test ping/health check
     // info!("Testing ping...");

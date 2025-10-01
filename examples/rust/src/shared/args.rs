@@ -158,6 +158,24 @@ pub struct Args {
 
     #[arg(long, default_value = "5s")]
     pub quic_heartbeat_interval: String,
+
+    #[arg(long, default_value = "127.0.0.1:8095")]
+    pub websocket_server_address: String,
+
+    #[arg(long, default_value = "true")]
+    pub websocket_reconnection_enabled: bool,
+
+    #[arg(long)]
+    pub websocket_reconnection_max_retries: Option<u32>,
+
+    #[arg(long, default_value = "1s")]
+    pub websocket_reconnection_interval: String,
+
+    #[arg(long, default_value = "5s")]
+    pub websocket_reconnection_reestablish_after: String,
+
+    #[arg(long, default_value = "5s")]
+    pub websocket_heartbeat_interval: String,
 }
 
 impl Args {
@@ -219,6 +237,12 @@ impl Default for Args {
             quic_max_idle_timeout: 10000,
             quic_validate_certificate: false,
             quic_heartbeat_interval: "5s".to_string(),
+            websocket_server_address: "127.0.0.1:8095".to_string(),
+            websocket_reconnection_enabled: true,
+            websocket_reconnection_max_retries: None,
+            websocket_reconnection_interval: "1s".to_string(),
+            websocket_reconnection_reestablish_after: "5s".to_string(),
+            websocket_heartbeat_interval: "5s".to_string(),
         }
     }
 }
@@ -312,6 +336,14 @@ impl Args {
             quic_max_idle_timeout: self.quic_max_idle_timeout,
             quic_validate_certificate: self.quic_validate_certificate,
             quic_heartbeat_interval: self.quic_heartbeat_interval.clone(),
+            websocket_server_address: self.websocket_server_address.clone(),
+            websocket_reconnection_enabled: self.websocket_reconnection_enabled,
+            websocket_reconnection_max_retries: self.websocket_reconnection_max_retries,
+            websocket_reconnection_interval: self.websocket_reconnection_interval.clone(),
+            websocket_reconnection_reestablish_after: self
+                .websocket_reconnection_reestablish_after
+                .clone(),
+            websocket_heartbeat_interval: self.websocket_heartbeat_interval.clone(),
         }
     }
 

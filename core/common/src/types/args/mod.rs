@@ -198,6 +198,27 @@ pub struct ArgsOptional {
     #[arg(long, default_missing_value(Some("true")), num_args(0..1))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quic_validate_certificate: Option<bool>,
+
+    /// The optional server address for the WebSocket transport
+    ///
+    /// [default: 127.0.0.1:8095]
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub websocket_server_address: Option<String>,
+
+    /// The optional number of max reconnect retries for the WebSocket transport
+    ///
+    /// [default: 3]
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub websocket_reconnection_max_retries: Option<u32>,
+
+    /// The optional reconnect interval for the WebSocket transport
+    ///
+    /// [default: "1s"]
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub websocket_reconnection_interval: Option<String>,
 }
 
 /// The arguments used by the `ClientProviderConfig` to create a client.
@@ -301,11 +322,30 @@ pub struct Args {
 
     /// The optional heartbeat interval for the QUIC transport
     pub quic_heartbeat_interval: String,
+
+    /// The optional server address for the WebSocket transport
+    pub websocket_server_address: String,
+
+    /// The optional number of maximum reconnect retries for the WebSocket transport
+    pub websocket_reconnection_enabled: bool,
+
+    /// The optional number of maximum reconnect retries for the WebSocket transport
+    pub websocket_reconnection_max_retries: Option<u32>,
+
+    /// The optional reconnect interval for the WebSocket transport
+    pub websocket_reconnection_interval: String,
+
+    /// The optional re-establish after last connection interval for WebSocket
+    pub websocket_reconnection_reestablish_after: String,
+
+    /// The optional heartbeat interval for the WebSocket transport
+    pub websocket_heartbeat_interval: String,
 }
 
 const QUIC_TRANSPORT: &str = "quic";
 const HTTP_TRANSPORT: &str = "http";
 const TCP_TRANSPORT: &str = "tcp";
+const WEBSOCKET_TRANSPORT: &str = "websocket";
 
 impl Args {
     pub fn get_server_address(&self) -> Option<String> {
@@ -318,6 +358,10 @@ impl Args {
                     .replace("localhost", "127.0.0.1"),
             ),
             TCP_TRANSPORT => Some(self.tcp_server_address.replace("localhost", "127.0.0.1")),
+            WEBSOCKET_TRANSPORT => Some(
+                self.websocket_server_address
+                    .replace("localhost", "127.0.0.1"),
+            ),
             _ => None,
         }
     }
@@ -359,6 +403,12 @@ impl Default for Args {
             quic_max_idle_timeout: 10000,
             quic_validate_certificate: false,
             quic_heartbeat_interval: "5s".to_string(),
+            websocket_server_address: "127.0.0.1:8095".to_string(),
+            websocket_reconnection_enabled: true,
+            websocket_reconnection_max_retries: None,
+            websocket_reconnection_interval: "1s".to_string(),
+            websocket_reconnection_reestablish_after: "5s".to_string(),
+            websocket_heartbeat_interval: "5s".to_string(),
         }
     }
 }
@@ -446,6 +496,19 @@ impl From<Vec<ArgsOptional>> for Args {
             }
             if let Some(quic_validate_certificate) = optional_args.quic_validate_certificate {
                 args.quic_validate_certificate = quic_validate_certificate;
+            }
+            if let Some(websocket_server_address) = optional_args.websocket_server_address {
+                args.websocket_server_address = websocket_server_address;
+            }
+            if let Some(websocket_reconnection_retries) =
+                optional_args.websocket_reconnection_max_retries
+            {
+                args.websocket_reconnection_max_retries = Some(websocket_reconnection_retries);
+            }
+            if let Some(websocket_reconnection_interval) =
+                optional_args.websocket_reconnection_interval
+            {
+                args.websocket_reconnection_interval = websocket_reconnection_interval;
             }
         }
 

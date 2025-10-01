@@ -96,7 +96,7 @@ async fn run_scenario(transport: TransportProtocol, scenario: ScenarioFn) {
             let server_addr = test_server.get_http_api_addr().unwrap();
             Box::new(HttpClientFactory { server_addr })
         }
-        Transport::WebSocket => {
+        TransportProtocol::WebSocket => {
             let server_addr = test_server.get_websocket_addr().unwrap();
             Box::new(WebSocketClientFactory { server_addr })
         }
