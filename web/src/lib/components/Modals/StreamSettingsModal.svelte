@@ -2,13 +2,12 @@
   import type { StreamDetails } from '$lib/domain/StreamDetails';
   import type { CloseModalFn } from '$lib/types/utilTypes';
   import { z } from 'zod';
-
   import Button from '../Button.svelte';
   import Icon from '../Icon.svelte';
   import Input from '../Input.svelte';
   import ModalBase from './ModalBase.svelte';
   import { setError, superForm, defaults } from 'sveltekit-superforms/client';
-  import { zod } from 'sveltekit-superforms/adapters';
+  import { zod4 } from 'sveltekit-superforms/adapters';
   import { fetchRouteApi } from '$lib/api/fetchRouteApi';
   import { dataHas } from '$lib/utils/dataHas';
   import { goto } from '$app/navigation';
@@ -18,6 +17,7 @@
   import { browser } from '$app/environment';
   import { customInvalidateAll } from '../PeriodicInvalidator.svelte';
   import { arraySum } from '$lib/utils/arraySum';
+  import { resolve } from '$app/paths';
 
   interface Props {
     stream: StreamDetails;
@@ -36,41 +36,38 @@
       .default(stream.name)
   });
 
-  const { form, errors, enhance, submitting, tainted } = superForm(
-    defaults(zod(schema)),
-    {
-      SPA: true,
-      validators: zod(schema),
-      invalidateAll: false,
-      taintedMessage: false,
-      async onUpdate({ form }) {
-        if (!form.valid) return;
+  const { form, errors, enhance, submitting, tainted } = superForm(defaults(zod4(schema)), {
+    SPA: true,
+    validators: zod4(schema),
+    invalidateAll: false,
+    taintedMessage: false,
+    async onUpdate({ form }) {
+      if (!form.valid) return;
 
-        const { data, ok } = await fetchRouteApi({
-          method: 'PUT',
-          path: `/streams/${stream.id}`,
-          body: {
-            name: form.data.name
-          }
-        });
-
-        if (dataHas(data, 'field', 'reason')) {
-          return setError(form, data.field, data.reason);
+      const { data, ok } = await fetchRouteApi({
+        method: 'PUT',
+        path: `/streams/${stream.id}`,
+        body: {
+          name: form.data.name
         }
+      });
 
-        if (ok) {
-          closeModal(async () => {
-            await customInvalidateAll();
-            showToast({
-              type: 'success',
-              description: `Stream ${form.data.name} has been updated.`,
-              duration: 3500
-            });
+      if (dataHas(data, 'field', 'reason')) {
+        return setError(form, data.field, data.reason);
+      }
+
+      if (ok) {
+        closeModal(async () => {
+          await customInvalidateAll();
+          showToast({
+            type: 'success',
+            description: `Stream ${form.data.name} has been updated.`,
+            duration: 3500
           });
-        }
+        });
       }
     }
-  );
+  });
 
   const onConfirmationResult = async (e: any) => {
     const result = e.detail as boolean;
@@ -85,7 +82,7 @@
       if (ok) {
         closeModal(async () => {
           if (!browser) return;
-          await goto(typedRoute('/dashboard/streams'));
+          await goto(resolve(typedRoute('/dashboard/streams')));
           await customInvalidateAll();
           showToast({
             type: 'success',
@@ -106,21 +103,19 @@
     on:result={onConfirmationResult}
   >
     {#snippet message()}
-
-        Deleting the stream "<span class="font-semibold">{stream.name}</span>" will permenently remove
-        all associated
-        <span class="font-semibold">topics ({stream.topicsCount})</span>,
-        <span class="font-semibold"
-          >partitions ({arraySum(stream.topics.map((t) => t.partitionsCount))})</span
-        >
-        and
-        <span class="font-semibold">messages ({stream.messagesCount})</span>.
-
-      {/snippet}
+      Deleting the stream "<span class="font-semibold">{stream.name}</span>" will permenently remove
+      all associated
+      <span class="font-semibold">topics ({stream.topicsCount})</span>,
+      <span class="font-semibold"
+        >partitions ({arraySum(stream.topics.map((t) => t.partitionsCount))})</span
+      >
+      and
+      <span class="font-semibold">messages ({stream.messagesCount})</span>.
+    {/snippet}
   </ModalConfirmation>
 
   <div class="h-[350px] flex flex-col">
-    <form method="POST" class="flex flex-col h-[300px] gap-4 flex-[3] pb-5" use:enhance>
+    <form method="POST" class="flex flex-col h-[300px] gap-4 flex-3 pb-5" use:enhance>
       <Input
         name="name"
         label="Name"
@@ -140,7 +135,7 @@
     </form>
 
     <div class="relative w-full flex-1">
-      <div class="h-[1px] border-b absolute -left-7 -right-7"></div>
+      <div class="h-px border-b absolute -left-7 -right-7"></div>
       <h2 class="text-xl text-color font-semibold mb-7 mt-5">Delete stream</h2>
 
       <form class="w-full">

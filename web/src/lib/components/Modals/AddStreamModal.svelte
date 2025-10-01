@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { CloseModalFn } from '$lib/types/utilTypes';
   import { setError, superForm, defaults } from 'sveltekit-superforms/client';
-  import { zod } from 'sveltekit-superforms/adapters';
+  import { zod4 } from 'sveltekit-superforms/adapters';
   import { z } from 'zod';
   import Button from '../Button.svelte';
   import Input from '../Input.svelte';
@@ -27,42 +27,39 @@
       .max(255, 'Name must not exceed 255 characters')
   });
 
-  const { form, errors, enhance, constraints, submitting } = superForm(
-    defaults(zod(schema)),
-    {
-      SPA: true,
-      validators: zod(schema),
-      invalidateAll: false,
-      taintedMessage: false,
-      async onUpdate({ form }) {
-        if (!form.valid) return;
+  const { form, errors, enhance, constraints, submitting } = superForm(defaults(zod4(schema)), {
+    SPA: true,
+    validators: zod4(schema),
+    invalidateAll: false,
+    taintedMessage: false,
+    async onUpdate({ form }) {
+      if (!form.valid) return;
 
-        const { data, ok } = await fetchRouteApi({
-          method: 'POST',
-          path: '/streams',
-          body: {
-            stream_id: form.data.stream_id,
-            name: form.data.name
-          }
-        });
-
-        if (dataHas(data, 'field', 'reason')) {
-          return setError(form, data.field, data.reason);
+      const { data, ok } = await fetchRouteApi({
+        method: 'POST',
+        path: '/streams',
+        body: {
+          stream_id: form.data.stream_id,
+          name: form.data.name
         }
+      });
 
-        if (ok) {
-          closeModal(async () => {
-            await customInvalidateAll();
-            showToast({
-              type: 'success',
-              description: `Stream ${form.data.name} has been added.`,
-              duration: 3500
-            });
+      if (dataHas(data, 'field', 'reason')) {
+        return setError(form, data.field, data.reason);
+      }
+
+      if (ok) {
+        closeModal(async () => {
+          await customInvalidateAll();
+          showToast({
+            type: 'success',
+            description: `Stream ${form.data.name} has been added.`,
+            duration: 3500
           });
-        }
+        });
       }
     }
-  );
+  });
 </script>
 
 <ModalBase {closeModal} title="Add new stream">
@@ -83,8 +80,7 @@
     />
 
     <div class="flex justify-end gap-3 mt-auto w-full">
-      <Button type="button" variant="text" class="w-2/5" onclick={() => closeModal()}
-        >Cancel</Button
+      <Button type="button" variant="text" class="w-2/5" onclick={() => closeModal()}>Cancel</Button
       >
       <Button type="submit" variant="contained" class="w-2/5" disabled={$submitting}>Create</Button>
     </div>

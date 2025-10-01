@@ -37,7 +37,10 @@ export type Topic = {
 };
 
 export function topicMapper(item: any): Topic {
-  const messageExpirySeconds = item.message_expiry == null || item.message_expiry >= numberSizes.max.u32 ? 0 : item.message_expiry;
+  const messageExpirySeconds =
+    item.message_expiry == null || item.message_expiry >= numberSizes.max.u32
+      ? 0
+      : item.message_expiry;
   return {
     id: item.id,
     name: item.name,
@@ -49,7 +52,7 @@ export function topicMapper(item: any): Topic {
     partitionsCount: item.partitions_count,
     createdAt: formatDate(item.created_at),
     compressionAlgorithm: item.compression_algorithm ?? 0,
-    maxTopicSize: item.max_topic_size,
+    maxTopicSize: item.max_topic_size
   };
 }
 

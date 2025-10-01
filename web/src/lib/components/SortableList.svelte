@@ -27,10 +27,9 @@
   import { twMerge } from 'tailwind-merge';
   import { noTypeCheck } from '$lib/utils/noTypeCheck';
 
-
   let animationEnabled = $state(true);
   let isAnimating = $state(false);
-  let timeout: number;
+  let timeout: ReturnType<typeof setTimeout>;
 
   onNavigate(() => {
     animationEnabled = false;
@@ -48,8 +47,8 @@
     emptyDataMessage: string;
     colNames: Partial<Record<keyof T, string | undefined>>;
     rowClass: string;
-    hrefBuilder?: ((item: T) => string) | undefined;
-    onclickAction?: ((index: number) => any) | undefined;
+    hrefBuilder?: ((_item: T) => string) | undefined;
+    onclickAction?: ((_index: number) => any) | undefined;
     ariaRoleDescription?: string | undefined;
     children?: import('svelte').Snippet<[any]>;
   }
@@ -70,12 +69,14 @@
     asc: undefined
   });
 
-  let columns = $derived(Object.keys(colNames)
-    .filter((k) => colNames[k as string])
-    .map((key) => ({
-      columnDisplayedName: colNames[key as keyof T],
-      columnName: key
-    })) as { columnDisplayedName: string; columnName: keyof T }[]);
+  let columns = $derived(
+    Object.keys(colNames)
+      .filter((k) => colNames[k as string])
+      .map((key) => ({
+        columnDisplayedName: colNames[key as keyof T],
+        columnName: key
+      })) as { columnDisplayedName: string; columnName: keyof T }[]
+  );
 
   let orderedData = $derived(ordering.key ? orderData(data, ordering.key, ordering.asc!) : data);
 
@@ -92,7 +93,7 @@
   <!-- header -->
   <div
     class={twMerge(
-      'flex h-[60px] min-h-[60px] bg-shadeL300 dark:bg-shadeD400 min-w-[1300px]',
+      'flex h-[60px] min-h-[60px] bg-shade-l300 dark:bg-shade-d400 min-w-[1300px]',
       isBodyOverflowing && 'pr-5'
     )}
   >
@@ -104,18 +105,18 @@
               key: columnName,
               asc: ordering.key !== columnName ? true : !ordering.asc
             })}
-          class="flex items-center justify-between px-5 transition-colors outline-none hover:cursor-pointer hover:bg-shadeL400 dark:hover:bg-shadeD200 dark:text-white focus:outline-none focus-visible:ring ring-inset ring-blue-600/60"
+          class="flex items-center justify-between px-5 transition-colors outline-hidden hover:cursor-pointer hover:bg-shade-l400 dark:hover:bg-shade-d200 dark:text-white focus:outline-hidden focus-visible:ring-3 ring-inset ring-blue-600/60"
         >
           <span>
             {columnDisplayedName}
           </span>
 
           <div class="flex flex-col">
-            {#each asConst(['caretUp', 'caretDown']) as icon}
+            {#each asConst(['caretUp', 'caretDown']) as icon (icon)}
               <Icon
                 name={icon}
                 class={twMerge(
-                  'fill-shadeL800 stroke-shadeL800 dark:fill-shadeL900 dark:stroke-shadeL900 w-[18px] h-fit -mb-[4px] -my-[2px]',
+                  'fill-shade-l800 stroke-shade-l800 dark:fill-shade-l900 dark:stroke-shade-l900 w-[18px] h-fit -mb-[4px] -my-[2px]',
                   ordering.key === columnName &&
                     ordering.asc &&
                     icon === 'caretUp' &&
@@ -141,7 +142,7 @@
       </div>
     {/if}
 
-    {#each orderedData as item, index}
+    {#each orderedData as item, index (index)}
       <svelte:element
         this={hrefBuilder ? 'a' : 'div'}
         href={hrefBuilder && hrefBuilder(item)}
@@ -165,7 +166,7 @@
           e.target.style.backgroundColor = 'rgb(239 68 68)';
           isAnimating = true;
         }}
-        onoutroend={(e) => {
+        onoutroend={() => {
           isAnimating = false;
         }}
         in:slide={{ duration: animationEnabled ? 300 : 0 }}
@@ -175,7 +176,7 @@
         )}
       >
         <div class="flex items-center w-full {rowClass}">
-          {#if children}{@render children({ item, })}{:else}
+          {#if children}{@render children({ item })}{:else}
             {#each columns as { columnName }, idx (idx)}
               <div class={twMerge('px-5')}>
                 <span class={columnName === 'id' ? 'font-semibold' : ''}>

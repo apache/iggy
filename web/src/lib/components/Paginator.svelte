@@ -11,7 +11,6 @@
 
   let { currentPage, totalPages, maxVisiblePages = 5 }: Props = $props();
 
-
   const dispatch = createEventDispatcher<{ pageChange: number }>();
 
   function getVisiblePages(currentPage: number, totalPages: number, maxVisiblePages: number) {
@@ -61,7 +60,7 @@
     {/if}
   {/if}
 
-  {#each visiblePages as page}
+  {#each visiblePages as page (page)}
     <Button
       variant={currentPage === page ? 'contained' : 'text'}
       onclick={() => emitPageChange(page)}

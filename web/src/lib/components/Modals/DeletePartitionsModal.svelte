@@ -5,7 +5,7 @@
   import { z } from 'zod';
   import ModalBase from './ModalBase.svelte';
   import { setError, superForm, defaults } from 'sveltekit-superforms/client';
-  import { zod } from 'sveltekit-superforms/adapters';
+  import { zod4 } from 'sveltekit-superforms/adapters';
   import Button from '../Button.svelte';
 
   import ModalConfirmation from '../ModalConfirmation.svelte';
@@ -40,47 +40,45 @@
     partitions_count: z.coerce.number().min(1).max(topic.partitionsCount).default(1)
   });
 
-  const { form, errors, enhance, constraints, validateForm } = superForm(
-    defaults(zod(schema)),
-    {
-      SPA: true,
-      validators: zod(schema),
+  const { form, errors, enhance, constraints, validateForm } = superForm(defaults(zod4(schema)), {
+    SPA: true,
+    validators: zod4(schema),
 
-      async onUpdate({ form }) {
-        if (!form.valid) return;
-        if (!page.params.streamId || !page.params.topicId) return;
+    async onUpdate({ form }) {
+      if (!form.valid) return;
+      if (!page.params.streamId || !page.params.topicId) return;
 
-        const { data, ok } = await fetchRouteApi({
-          method: 'DELETE',
-          path: `/streams/${+page.params.streamId}/topics/${+page.params.topicId}/partitions`,
-          queryParams: {
-            partitions_count: form.data.partitions_count
-          }
-        });
-
-        if (dataHas(data, 'field', 'reason')) {
-          return setError(form, data.field, data.reason);
+      const { data, ok } = await fetchRouteApi({
+        method: 'DELETE',
+        path: `/streams/${+page.params.streamId}/topics/${+page.params.topicId}/partitions`,
+        queryParams: {
+          partitions_count: form.data.partitions_count
         }
+      });
 
-        if (ok) {
-          closeModal(async () => {
-            await customInvalidateAll();
-            showToast({
-              type: 'success',
-              description: form.data.partitions_count > 1
-                  ? `${form.data.partitions_count} partitions have been deleted.`
-                  : '1 partition has been deleted.',
-              duration: 3500
-            });
+      if (dataHas(data, 'field', 'reason')) {
+        return setError(form, data.field, data.reason);
+      }
+
+      if (ok) {
+        closeModal(async () => {
+          await customInvalidateAll();
+          showToast({
+            type: 'success',
+            description:
+              form.data.partitions_count > 1
+                ? `${form.data.partitions_count} partitions have been deleted.`
+                : '1 partition has been deleted.',
+            duration: 3500
           });
-        }
+        });
       }
     }
-  );
+  });
 
-  let messagesToDelete = $derived(arraySum(
-    topic.partitions.slice($form.partitions_count).map((p) => p.messagesCount)
-  ));
+  let messagesToDelete = $derived(
+    arraySum(topic.partitions.slice($form.partitions_count).map((p) => p.messagesCount))
+  );
 </script>
 
 <ModalBase {closeModal} title="Delete partitions">
@@ -91,13 +89,11 @@
     on:result={onConfirmationResult}
   >
     {#snippet message()}
-
-        Deleting the <span class="font-semibold">{$form.partitions_count}</span>
-        {$form.partitions_count > 1 ? 'partitions' : 'partition'} from topic
-        <span class="font-semibold">"{topic.name}"</span> will permenently remove all associated
-        messages <span class="font-semibold">({messagesToDelete})</span>.
-
-      {/snippet}
+      Deleting the <span class="font-semibold">{$form.partitions_count}</span>
+      {$form.partitions_count > 1 ? 'partitions' : 'partition'} from topic
+      <span class="font-semibold">"{topic.name}"</span> will permenently remove all associated
+      messages <span class="font-semibold">({messagesToDelete})</span>.
+    {/snippet}
   </ModalConfirmation>
   <div class="h-[300px] flex flex-col">
     <form bind:this={formElement} method="POST" class="flex flex-col h-[300px] gap-4" use:enhance>

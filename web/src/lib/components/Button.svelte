@@ -5,21 +5,21 @@
   import { twMerge } from 'tailwind-merge';
 
   const baseClasses =
-    'flex items-center justify-center font-semibold transition-all gap-2 rounded-[4px] focus:outline-none focus-visible:ring focus:ring-blue-600/60 ring-offset-2 ring-offset-white dark:ring-offset-shadeD700  ';
+    'flex items-center justify-center font-semibold transition-all gap-2 rounded-[4px] focus:outline-hidden focus-visible:ring-3 focus:ring-blue-600/60 ring-offset-2 ring-offset-white dark:ring-offset-shade-d700  ';
 
   const disabledClasses =
     'disabled:bg-zinc-300  dark:disabled:bg-zinc-500 disabled:text-zinc-700 disabled:pointer-events-none';
 
   const variants = {
     rounded:
-      'w-[40px] h-[40px] rounded-full dark:text-white flex items-center justify-center dark:hover:bg-shadeD300 hover:bg-shadeL500',
+      'w-[40px] h-[40px] rounded-full dark:text-white flex items-center justify-center dark:hover:bg-shade-d300 hover:bg-shade-l500',
     outlined:
-      'border-black dark:border-white dark:text-white border-2 bg-transparent dark:hover:bg-shadeD400 hover:bg-shadeL400',
+      'border-black dark:border-white dark:text-white border-2 bg-transparent dark:hover:bg-shade-d400 hover:bg-shade-l400',
     outlinedRed: 'border-2 border-red-500 text-red-500 hover:text-red-600 hover:border-red-600 ',
     contained:
-      'bg-black hover:bg-shadeD600 text-white dark:bg-white dark:text-black dark:text-black hover:shadow-lg dark:shadow-shadeD300',
-    containedRed: 'bg-red-500 hover:bg-red-600  text-white hover:shadow-lg',
-    text: 'bg-transparent text-color enabled:dark:hover:bg-shadeD500 hover:bg-shadeL400'
+      'bg-black hover:bg-shade-d600 text-white dark:bg-white dark:text-black dark:text-black hover:shadow-lg dark:shadow-shade-d300',
+    containedRed: 'bg-red-500 hover:bg-red-600 text-white hover:shadow-lg',
+    text: 'bg-transparent text-color enabled:dark:hover:bg-shade-d500 hover:bg-shade-l400'
   };
 
   const sizes = {
@@ -39,15 +39,15 @@
     tooltip?: import('svelte').Snippet;
   }
 
-  let { 
-    variant, 
-    tooltipPlacement = 'right', 
-    size = 'md', 
+  let {
+    variant,
+    tooltipPlacement = 'right',
+    size = 'md',
     class: className = '',
     children,
     tooltip: tooltipSnippet,
     onclick,
-    ...restProps 
+    ...restProps
   }: Props = $props();
 </script>
 

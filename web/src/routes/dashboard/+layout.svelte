@@ -16,7 +16,7 @@
 <Header user={data.user} />
 
 <main
-  class="fixed left-[90px] top-[55px] bottom-0 right-0 bg-shadeL100 dark:bg-shadeD700 flex flex-col"
+  class="fixed left-[90px] top-[55px] bottom-0 right-0 bg-shade-l100 dark:bg-shade-d700 flex flex-col"
 >
   {@render children?.()}
 </main>

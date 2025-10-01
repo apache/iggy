@@ -7,8 +7,9 @@
 
   let intervalValue = $state($invalidateIntervalDuration);
 
-  let saveDisabled =
-    $derived(intervalValue < 500 || intervalValue > 3600000 || intervalValue === $invalidateIntervalDuration);
+  let saveDisabled = $derived(
+    intervalValue < 500 || intervalValue > 3600000 || intervalValue === $invalidateIntervalDuration
+  );
 </script>
 
 <SettingsLayout>
@@ -29,7 +30,7 @@
         </div>
       </div>
       <footer
-        class="p-5 py-4 bg-shadeL200 dark:bg-shadeD900 flex items-center gap-5 justify-between"
+        class="p-5 py-4 bg-shade-l200 dark:bg-shade-d900 flex items-center gap-5 justify-between"
       >
         <span class=" text-sm">
           The entire server state will be refreshed at provided intervals. Max: 1 hour, min: 500 ms.

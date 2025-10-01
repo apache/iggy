@@ -209,9 +209,37 @@ Run the tests:
 
 `cargo test`
 
+Set root user credentials (OPTIONAL):
+
+Iggy requires credentials to authenticate request to the server.
+You can set the root user **before** starting the server.
+
+(macOS/Linux)
+
+```bash
+export IGGY_ROOT_USERNAME=iggy
+export IGGY_ROOT_PASSWORD=iggy
+```
+
+(Windows(Powershell))
+
+```bash
+$env:IGGY_ROOT_USERNAME = "iggy"
+$env:IGGY_ROOT_PASSWORD = "iggy"
+```
+
+By default, `iggy-server` will generate a randomized root user password and print it to `stdout`, when there's
+NO users created.
+
 Start the server:
 
 `cargo run --bin iggy-server`
+
+One can use default root credentials with optional `--with-default-root-credentials`.
+This flag is equivalent to setting `IGGY_ROOT_USERNAME=iggy` and `IGGY_ROOT_PASSWORD=iggy`, plus
+it should only be used for development and testing.
+
+`cargo run --bin iggy-server --with-default-root-credentials`
 
 For configuration options and detailed help:
 
@@ -228,6 +256,9 @@ You can also use environment variables to override any configuration setting:
 - Enable HTTP transport
    `IGGY_HTTP_ENABLED=true cargo run --bin iggy-server`
 
+- Set custom root user credentials
+   `IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy cargo run --bin iggy-server`
+
 To quickly generate the sample data:
 
 `cargo run --bin data-seeder-tool`
@@ -236,39 +267,39 @@ To quickly generate the sample data:
 
 Create a stream with name `dev` (numerical ID will be assigned by server automatically) using default credentials and `tcp` transport (available transports: `quic`, `tcp`, `http`, default `tcp`):
 
-`cargo run --bin iggy -- --transport tcp --username iggy --password iggy stream create dev`
+`cargo run --bin iggy -- --transport tcp --username <iggy_username> --password <iggy_password> stream create dev`
 
 List available streams:
 
-`cargo run --bin iggy -- --username iggy --password iggy stream list`
+`cargo run --bin iggy -- --username <iggy_username> --password <iggy_password> stream list`
 
 Get `dev` stream details:
 
-`cargo run --bin iggy -- -u iggy -p iggy stream get dev`
+`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> stream get dev`
 
 Create a topic named `sample` (numerical ID will be assigned by server automatically) for stream `dev`, with 2 partitions (IDs 1 and 2), disabled compression (`none`) and disabled message expiry (skipped optional parameter):
 
-`cargo run --bin iggy -- -u iggy -p iggy topic create dev sample 2 none`
+`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> topic create dev sample 2 none`
 
 List available topics for stream `dev`:
 
-`cargo run --bin iggy -- -u iggy -p iggy topic list dev`
+`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> topic list dev`
 
 Get topic details for topic `sample` in stream `dev`:
 
-`cargo run --bin iggy -- -u iggy -p iggy topic get dev sample`
+`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> topic get dev sample`
 
 Send a message 'hello world' (message ID 1) to the stream `dev` to topic `sample` and partition 1:
 
-`cargo run --bin iggy -- -u iggy -p iggy message send --partition-id 1 dev sample "hello world"`
+`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message send --partition-id 1 dev sample "hello world"`
 
 Send another message 'lorem ipsum' (message ID 2) to the same stream, topic and partition:
 
-`cargo run --bin iggy -- -u iggy -p iggy message send --partition-id 1 dev sample "lorem ipsum"`
+`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message send --partition-id 1 dev sample "lorem ipsum"`
 
 Poll messages by a regular consumer with ID 1 from the stream `dev` for topic `sample` and partition with ID 1, starting with offset 0, messages count 2, without auto commit (storing consumer offset on server):
 
-`cargo run --bin iggy -- -u iggy -p iggy message poll --consumer 1 --offset 0 --message-count 2 --auto-commit dev sample 1`
+`cargo run --bin iggy -- -u <iggy_username> -p <iggy_password> message poll --consumer 1 --offset 0 --message-count 2 --auto-commit dev sample 1`
 
 Finally, restart the server to see it is able to load the persisted data.
 

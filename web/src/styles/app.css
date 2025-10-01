@@ -17,60 +17,116 @@
  * under the License.
  */
 
-@import url('./tooltip.css');
-@import url('./variables.css');
+@import url('./tooltip.css') layer(base);
+@import url('./variables.css') layer(base);
 
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import 'tailwindcss';
 
-.transitions-disabled * {
-  -webkit-transition: none !important;
-  -moz-transition: none !important;
-  -o-transition: none !important;
-  -ms-transition: none !important;
-  transition: none !important;
+@custom-variant dark (&:is(.dark *));
+
+@theme {
+  --ease-in-expo: cubic-bezier(0.95, 0.05, 0.795, 0.035);
+
+  --backdrop-blur-xs: 2px;
+  --backdrop-blur-xxs: 1px;
+
+  --color-shade-d100: var(--shadeD100);
+  --color-shade-d150: var(--shadeD150);
+  --color-shade-d170: var(--shadeD170);
+  --color-shade-d200: var(--shadeD200);
+  --color-shade-d300: var(--shadeD300);
+  --color-shade-d400: var(--shadeD400);
+  --color-shade-d500: var(--shadeD500);
+  --color-shade-d600: var(--shadeD600);
+  --color-shade-d700: var(--shadeD700);
+  --color-shade-d800: var(--shadeD800);
+  --color-shade-d900: var(--shadeD900);
+  --color-shade-d1000: var(--shadeD1000);
+  --color-shade-d1100: var(--shadeD1100);
+  --color-shade-l100: var(--shadeL100);
+  --color-shade-l200: var(--shadeL200);
+  --color-shade-l300: var(--shadeL300);
+  --color-shade-l400: var(--shadeL400);
+  --color-shade-l500: var(--shadeL500);
+  --color-shade-l600: var(--shadeL600);
+  --color-shade-l700: var(--shadeL700);
+  --color-shade-l800: var(--shadeL800);
+  --color-shade-l900: var(--shadeL900);
+  --color-shade-l1000: var(--shadeL1000);
+  --color-green100: var(--green100);
+  --color-green200: var(--green200);
+  --color-green300: var(--green300);
+  --color-green400: var(--green400);
+  --color-green500: var(--green500);
+}
+
+/*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+}
+
+@utility debug {
+  outline: 2px solid red;
+}
+
+@utility noData {
+  @apply text-gray-400 text-xl;
+}
+
+@utility chip {
+  @apply bg-gray-300 dark:bg-shade-d300 dark:text-white rounded-3xl px-3 py-1 whitespace-nowrap;
+}
+
+@utility text-color {
+  @apply text-black dark:text-white;
+}
+
+@utility text-color-gray {
+  @apply text-shade-l1000 dark:text-white;
+}
+
+@utility card-shadow {
+  box-shadow:
+    rgb(145 157 171 / 20%) 0 0 2px 0,
+    rgb(145 158 171 / 12%) 0 12px 24px -4px;
+}
+
+@layer utilities {
+  .transitions-disabled * {
+    -webkit-transition: none !important;
+    -moz-transition: none !important;
+    -o-transition: none !important;
+    -ms-transition: none !important;
+    transition: none !important;
+  }
 }
 
 @layer base {
   *,
   ::before,
   ::after {
-    @apply border-shadeL500 dark:border-shadeD300;
+    @apply border-shade-l500 dark:border-shade-d300;
   }
 
   .hoverable {
-    @apply dark:hover:bg-shadeD200 hover:bg-shadeL300 hover:cursor-pointer transition-colors;
+    @apply dark:hover:bg-shade-d200 hover:bg-shade-l300 hover:cursor-pointer transition-colors;
   }
 
   .hoverable-strong {
-    @apply hover:bg-shadeL500 dark:hover:bg-shadeD1000 hover:cursor-pointer transition-colors;
-  }
-}
-
-@layer components {
-  .debug {
-    outline: 2px solid red;
-  }
-
-  .noData {
-    @apply text-gray-400 text-xl;
-  }
-
-  .chip {
-    @apply bg-gray-300 dark:bg-shadeD300 dark:text-white rounded-3xl px-3 py-1 whitespace-nowrap;
-  }
-
-  .text-color {
-    @apply text-black dark:text-white;
-  }
-
-  .text-color-gray {
-    @apply text-shadeL1000 dark:text-white;
-  }
-
-  .card-shadow {
-    box-shadow: rgb(145 157 171 / 20%) 0px 0px 2px 0px, rgb(145 158 171 / 12%) 0px 12px 24px -4px;
+    @apply hover:bg-shade-l500 dark:hover:bg-shade-d1000 hover:cursor-pointer transition-colors;
   }
 }
 
@@ -82,20 +138,20 @@
 
 /* Track */
 ::-webkit-scrollbar-track {
-  @apply bg-shadeL500;
+  @apply bg-shade-l500;
 }
 
 .dark ::-webkit-scrollbar-track {
-  @apply bg-shadeD300;
+  @apply bg-shade-d300;
 }
 
 /* Handle */
 ::-webkit-scrollbar-thumb {
-  @apply rounded-md bg-shadeL800;
+  @apply rounded-md bg-shade-l800;
 }
 
 .dark ::-webkit-scrollbar-thumb {
-  @apply rounded-md bg-shadeD1000;
+  @apply rounded-md bg-shade-d1000;
 }
 
 /* Handle on hover */

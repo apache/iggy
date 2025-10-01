@@ -4,6 +4,7 @@
   import Icon from './Icon.svelte';
   import { isNumber } from '$lib/utils/parsers';
   import { twMerge } from 'tailwind-merge';
+  import { resolve } from '$app/paths';
 
   type Crumb = {
     path: string;
@@ -51,12 +52,12 @@
 </script>
 
 <div class="flex items-center">
-  <a href={typedRoute('/dashboard/overview')}>
-    <Icon name="home" class="dark:fill-shadeD900 dark:stroke-white mr-2" />
+  <a href={resolve(typedRoute('/dashboard/overview'))}>
+    <Icon name="home" class="dark:fill-shade-d900 dark:stroke-white mr-2" />
   </a>
 
   <span class="flex mr-2">
-    <span class="text-shadeL800">/</span>
+    <span class="text-shade-l800">/</span>
   </span>
 
   {#each crumbs as { path, label }, idx (idx)}
@@ -68,8 +69,10 @@
       </span>
     {:else}
       <a href={path} class="flex ml-1">
-        <span class={twMerge('font-medium text-gray-600 dark:text-shadeL800')}>{label}</span>
-        <span class="font-medium text-shadeL800 w-[10px] flex items-center justify-center ml-1">/</span>
+        <span class={twMerge('font-medium text-gray-600 dark:text-shade-l800')}>{label}</span>
+        <span class="font-medium text-shade-l800 w-[10px] flex items-center justify-center ml-1"
+          >/</span
+        >
       </a>
     {/if}
   {/each}
