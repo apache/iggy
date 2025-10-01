@@ -7,7 +7,7 @@ using System.Threading.Channels;
 
 namespace Apache.Iggy.Publishers;
 
-public partial class IggyPublisher : IDisposable
+public partial class IggyPublisher : IAsyncDisposable
 {
     private readonly IIggyClient _client;
     private readonly IggyPublisherConfig _config;
@@ -302,7 +302,7 @@ public partial class IggyPublisher : IDisposable
         }
     }
 
-    public void Dispose()
+    public async ValueTask DisposeAsync()
     {
         if (_disposed)
         {
@@ -318,17 +318,34 @@ public partial class IggyPublisher : IDisposable
             LogWaitingForBackgroundTask();
             try
             {
-                
-                Task.WaitAll([_backgroundTask], TimeSpan.FromSeconds(5));
+                await _backgroundTask.WaitAsync(TimeSpan.FromSeconds(5));
                 LogBackgroundTaskCompleted();
             }
-            catch (AggregateException)
+            catch (TimeoutException)
             {
                 LogBackgroundTaskTimeout();
+            }
+            catch (Exception e)
+            {
+                LogBackgroundProcessorError(e);
             }
         }
 
         _messageWriter?.Complete();
+
+        if (_config.CreateIggyClient && _isInitialized)
+        {
+            try
+            {
+                await _client.LogoutUser();
+                _client.Dispose();
+            }
+            catch (Exception e)
+            {
+                LogFailedToLogoutOrDispose(e);
+            }
+        }
+
         _cancellationTokenSource.Dispose();
 
         _disposed = true;

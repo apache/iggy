@@ -14,7 +14,9 @@ public partial class IggyConsumer : IAsyncDisposable
     private readonly ILogger<IggyConsumer> _logger;
     private bool _isInitialized;
     private readonly Channel<ReceivedMessage> _channel;
+    private readonly CancellationTokenSource _cancellationTokenSource;
     private Task? _pollingTask;
+    private bool _disposed;
 
     /// <summary>
     /// Fired when an error occurs during message polling
@@ -31,6 +33,7 @@ public partial class IggyConsumer : IAsyncDisposable
         _client = client;
         _config = config;
         _logger = logger;
+        _cancellationTokenSource = new CancellationTokenSource();
         _channel = Channel.CreateBounded<ReceivedMessage>(new BoundedChannelOptions(config.BufferSize)
         {
             SingleReader = true,
@@ -130,7 +133,8 @@ public partial class IggyConsumer : IAsyncDisposable
 
         if (_pollingTask == null || _pollingTask.IsCompleted)
         {
-            _pollingTask = PollMessagesAsync(ct);
+            var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _cancellationTokenSource.Token);
+            _pollingTask = PollMessagesAsync(linkedCts.Token);
         }
 
         do
@@ -230,12 +234,14 @@ public partial class IggyConsumer : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        if (!_isInitialized)
+        if (_disposed)
         {
             return;
         }
-        
-        if (_pollingTask != null)
+
+        await _cancellationTokenSource.CancelAsync();
+
+        if (_pollingTask != null && _isInitialized)
         {
             try
             {
@@ -245,13 +251,13 @@ public partial class IggyConsumer : IAsyncDisposable
             {
                 LogPollingTaskTimeout();
             }
-            catch(Exception e)
+            catch (Exception e)
             {
                 LogPollingTaskFailed(e);
             }
         }
 
-        if (!string.IsNullOrEmpty(_config.ConsumerGroupName))
+        if (!string.IsNullOrEmpty(_config.ConsumerGroupName) && _isInitialized)
         {
             try
             {
@@ -266,7 +272,7 @@ public partial class IggyConsumer : IAsyncDisposable
             }
         }
 
-        if (_config.CreateIggyClient)
+        if (_config.CreateIggyClient && _isInitialized)
         {
             try
             {
@@ -278,5 +284,9 @@ public partial class IggyConsumer : IAsyncDisposable
                 LogFailedToLogoutOrDispose(e);
             }
         }
+
+        _cancellationTokenSource.Dispose();
+
+        _disposed = true;
     }
 }

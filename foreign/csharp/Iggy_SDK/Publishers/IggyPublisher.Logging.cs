@@ -197,4 +197,10 @@ public partial class IggyPublisher
         Level = LogLevel.Error,
         Message = "Failed to send batch of {Count} messages after {Attempts} attempts")]
     private partial void LogFailedToSendBatchAfterRetries(Exception exception, int count, int attempts);
+
+    [LoggerMessage(
+        EventId = 406,
+        Level = LogLevel.Error,
+        Message = "Failed to logout or dispose client")]
+    private partial void LogFailedToLogoutOrDispose(Exception exception);
 }

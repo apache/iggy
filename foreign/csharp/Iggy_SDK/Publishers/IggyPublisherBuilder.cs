@@ -23,19 +23,21 @@ public class IggyPublisherBuilder
         {
             Config = new IggyPublisherConfig
             {
+                CreateIggyClient = false,
                 StreamId = streamId,
                 TopicId = topicId
             },
             IggyClient = iggyClient
         };
     }
-    
+
     public static IggyPublisherBuilder Create(Identifier streamId, Identifier topicId)
     {
         return new IggyPublisherBuilder
         {
             Config = new IggyPublisherConfig
             {
+                CreateIggyClient = true,
                 StreamId = streamId,
                 TopicId = topicId
             }
@@ -134,15 +136,18 @@ public class IggyPublisherBuilder
 
     public IggyPublisher Build()
     {
-        IggyClient ??= IggyClientFactory.CreateClient(new IggyClientConfigurator()
+        if (Config.CreateIggyClient)
         {
-            Protocol = Config.Protocol,
-            BaseAdress = Config.Address,
-            ReceiveBufferSize = Config.ReceiveBufferSize,
-            SendBufferSize = Config.SendBufferSize
-        });
+            IggyClient = IggyClientFactory.CreateClient(new IggyClientConfigurator()
+            {
+                Protocol = Config.Protocol,
+                BaseAdress = Config.Address,
+                ReceiveBufferSize = Config.ReceiveBufferSize,
+                SendBufferSize = Config.SendBufferSize
+            });
+        }
 
-        var publisher = new IggyPublisher(IggyClient, Config,
+        var publisher = new IggyPublisher(IggyClient!, Config,
             Config.LoggerFactory?.CreateLogger<IggyPublisher>() ??
             NullLoggerFactory.Instance.CreateLogger<IggyPublisher>());
 
