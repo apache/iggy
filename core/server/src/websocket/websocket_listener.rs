@@ -1,10 +1,11 @@
 use crate::binary::sender::SenderKind;
 use crate::configs::websocket::WebSocketConfig;
 use crate::shard::IggyShard;
+use crate::shard::task_registry::ShutdownToken;
 use crate::shard::transmission::event::ShardEvent;
 use crate::websocket::connection_handler::{handle_connection, handle_error};
 use crate::websocket::websocket_sender::WebSocketSender;
-use crate::{shard_error, shard_info};
+use crate::{shard_debug, shard_error, shard_info};
 use compio::net::TcpListener;
 use compio_ws::accept_async_with_config;
 use error_set::ErrContext;
@@ -13,14 +14,24 @@ use iggy_common::IggyError;
 use iggy_common::TransportProtocol;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::time::Duration;
 use tracing::{error, info};
 
 pub async fn start(
-    addr: SocketAddr,
+    config: WebSocketConfig,
     shard: Rc<IggyShard>,
-    config: &WebSocketConfig,
+    shutdown: ShutdownToken,
 ) -> Result<(), IggyError> {
+    let addr: SocketAddr = config
+        .address
+        .parse()
+        .with_error_context(|error| {
+            format!(
+                "WebSocket (error: {error}) - failed to parse address: {}",
+                config.address
+            )
+        })
+        .map_err(|_| IggyError::InvalidConfiguration)?;
+
     let listener = TcpListener::bind(addr)
         .await
         .with_error_context(|error| {
@@ -36,6 +47,13 @@ pub async fn start(
         local_addr
     );
 
+    if shard.id == 0 {
+        let event = ShardEvent::WebSocketBound {
+            address: local_addr,
+        };
+        shard.broadcast_event_to_all_shards(event).await;
+    }
+
     let ws_config = config.to_tungstenite_config();
     shard_info!(
         shard.id,
@@ -45,37 +63,41 @@ pub async fn start(
         config.accept_unmasked_frames
     );
 
+    accept_loop(listener, ws_config.unwrap(), shard, shutdown).await
+}
+
+async fn accept_loop(
+    listener: TcpListener,
+    ws_config: compio_ws::WebSocketConfig,
+    shard: Rc<IggyShard>,
+    shutdown: ShutdownToken,
+) -> Result<(), IggyError> {
     loop {
         let shard = shard.clone();
         let ws_config = ws_config.clone();
-        let shutdown_check = async {
-            loop {
-                if shard.is_shutting_down() {
-                    return;
-                }
-                compio::time::sleep(Duration::from_millis(100)).await;
-            }
-        };
-
         let accept_future = listener.accept();
+
         futures::select! {
-            _ = shutdown_check.fuse() => {
-                shard_info!(shard.id, "WebSocket Server detected shutdown flag, no longer accepting connections");
+            _ = shutdown.wait().fuse() => {
+                shard_debug!(shard.id, "WebSocket Server received shutdown signal, no longer accepting connections");
                 break;
             }
             result = accept_future.fuse() => {
                 match result {
                     Ok((tcp_stream, remote_addr)) => {
                         if shard.is_shutting_down() {
-                            shard_info!(shard.id, "Rejecting new connection from {} during shutdown", remote_addr);
+                            shard_info!(shard.id, "Rejecting new WebSocket connection from {} during shutdown", remote_addr);
                             continue;
                         }
                         shard_info!(shard.id, "Accepted new WebSocket connection from: {}", remote_addr);
+
                         let shard_clone = shard.clone();
                         let ws_config_clone = ws_config.clone();
-                        shard.task_registry.spawn_tracked(async move {
-                            // Use the configured WebSocket config during handshake
-                            match accept_async_with_config(tcp_stream, ws_config_clone).await {
+                        let registry = shard.task_registry.clone();
+                        let registry_clone = registry.clone();
+
+                        registry.spawn_connection(async move {
+                            match accept_async_with_config(tcp_stream, Some(ws_config_clone)).await {
                                 Ok(websocket) => {
                                     info!("WebSocket handshake successful from: {}", remote_addr);
 
@@ -87,16 +109,22 @@ pub async fn start(
                                         address: remote_addr,
                                         transport: TransportProtocol::WebSocket,
                                     };
-                                    let _ = shard_clone.broadcast_event_to_all_shards(event.into()).await;
+                                    let _ = shard_clone.broadcast_event_to_all_shards(event).await;
 
                                     let sender = WebSocketSender::new(websocket);
                                     let mut sender_kind = SenderKind::get_websocket_sender(sender);
-                                    let client_stop_receiver = shard_clone.task_registry.add_connection(client_id);
+                                    let client_stop_receiver = registry_clone.add_connection(client_id);
 
                                     if let Err(error) = handle_connection(&session, &mut sender_kind, &shard_clone, client_stop_receiver).await {
                                         handle_error(error);
                                     }
-                                    shard_clone.task_registry.remove_connection(&client_id);
+                                    registry_clone.remove_connection(&client_id);
+
+                                    if let Err(error) = sender_kind.shutdown().await {
+                                        shard_error!(shard_clone.id, "Failed to shutdown WebSocket stream for client: {}, address: {}. {}", client_id, remote_addr, error);
+                                    } else {
+                                        shard_info!(shard_clone.id, "Successfully closed WebSocket stream for client: {}, address: {}.", client_id, remote_addr);
+                                    }
                                 }
                                 Err(error) => {
                                     error!("WebSocket handshake failed from {}: {:?}", remote_addr, error);

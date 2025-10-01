@@ -39,8 +39,6 @@ const REQUEST_INITIAL_BYTES_LENGTH: usize = 4;
 const RESPONSE_INITIAL_BYTES_LENGTH: usize = 8;
 const NAME: &str = "WebSocket";
 
-/// WebSocket client for interacting with the Iggy API.
-/// It provides the same interface as TCP and QUIC clients but uses WebSocket transport.
 #[derive(Debug)]
 pub struct WebSocketClient {
     stream: Arc<Mutex<Option<WebSocketConnectionStream>>>,
@@ -184,7 +182,6 @@ impl WebSocketClient {
             );
             self.set_state(ClientState::Connecting).await;
 
-            // Handle reconnection timing
             if retry_count > 0 {
                 let elapsed = self
                     .connected_at
@@ -204,7 +201,6 @@ impl WebSocketClient {
                 }
             }
 
-            // Parse server address
             let server_addr = self
                 .config
                 .server_address
@@ -214,7 +210,6 @@ impl WebSocketClient {
                     IggyError::InvalidConfiguration
                 })?;
 
-            // Establish TCP connection
             let tcp_stream = match TcpStream::connect(&server_addr).await {
                 Ok(stream) => stream,
                 Err(error) => {
@@ -254,19 +249,15 @@ impl WebSocketClient {
                 }
             };
 
-            // Build WebSocket URL
             let ws_url = format!("ws://{}", server_addr);
 
-            // Create WebSocket request
             let request = ws_url.into_client_request().map_err(|e| {
                 error!("Failed to create WebSocket request: {}", e);
                 IggyError::InvalidConfiguration
             })?;
 
-            // Convert WebSocket config
             let tungstenite_config = self.config.ws_config.to_tungstenite_config();
 
-            // Perform WebSocket handshake using tokio-tungstenite
             let (websocket_stream, response) =
                 match client_async_with_config(request, tcp_stream, tungstenite_config).await {
                     Ok(result) => result,
@@ -295,10 +286,8 @@ impl WebSocketClient {
                 response.status()
             );
 
-            // Create connection stream
             let connection_stream = WebSocketConnectionStream::new(server_addr, websocket_stream);
 
-            // Store connection details
             *self.stream.lock().await = Some(connection_stream);
             *self.client_address.lock().await = Some(server_addr);
             self.set_state(ClientState::Connected).await;
@@ -311,7 +300,6 @@ impl WebSocketClient {
                 server_addr
             );
 
-            // Auto-login if enabled
             self.auto_login().await?;
             return Ok(());
         }
@@ -404,7 +392,6 @@ impl WebSocketClient {
             IggyError::NotConnected
         })?;
 
-        // Create request buffer: [code(4 bytes)] + [payload]
         let mut request = BytesMut::with_capacity(REQUEST_INITIAL_BYTES_LENGTH + payload.len());
         request.put_u32_le(code);
         request.put_slice(&payload);
@@ -415,11 +402,9 @@ impl WebSocketClient {
             payload.len()
         );
 
-        // Send request
         stream.write(&request).await?;
         stream.flush().await?;
 
-        // Read response length (8 bytes: status + length)
         let mut response_initial_buffer = vec![0u8; RESPONSE_INITIAL_BYTES_LENGTH];
         stream.read(&mut response_initial_buffer).await?;
 
@@ -458,7 +443,6 @@ impl WebSocketClient {
             return Ok(Bytes::new());
         }
 
-        // Read response payload
         let mut response_buffer = vec![0u8; length];
         stream.read(&mut response_buffer).await?;
 

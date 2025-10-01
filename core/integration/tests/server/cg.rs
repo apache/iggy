@@ -24,7 +24,7 @@ use test_case::test_matrix;
 
 // Consumer group scenarios do not support HTTP
 #[test_matrix(
-    [TransportProtocol::Tcp, TransportProtocol::Quic],
+    [TransportProtocol::Tcp, TransportProtocol::Quic, TransportProtocol::WebSocket],
     [
         join_scenario(),
         single_client_scenario(),

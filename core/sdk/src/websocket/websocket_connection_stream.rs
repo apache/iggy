@@ -161,7 +161,7 @@ impl ConnectionStream for WebSocketConnectionStream {
         debug!(
             "WebSocket write {} bytes: {:02x?}",
             buf.len(),
-            &buf[..buf.len().min(16)] // Log first 16 bytes
+            &buf[..buf.len().min(16)]
         );
 
         self.stream
@@ -189,7 +189,6 @@ impl ConnectionStream for WebSocketConnectionStream {
     }
 
     async fn flush(&mut self) -> Result<(), IggyError> {
-        // WebSocket frames are sent immediately, but we can implement this for consistency
         trace!(
             "Flushing WebSocket stream for client: {}",
             self.client_address

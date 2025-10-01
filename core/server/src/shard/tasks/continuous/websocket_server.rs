@@ -16,13 +16,24 @@
  * under the License.
  */
 
-mod http_server;
-mod message_pump;
-mod quic_server;
-mod tcp_server;
-mod websocket_server;
-pub use http_server::spawn_http_server;
-pub use message_pump::spawn_message_pump;
-pub use quic_server::spawn_quic_server;
-pub use tcp_server::spawn_tcp_server;
-pub use websocket_server::spawn_websocket_server;
+use crate::shard::IggyShard;
+use crate::shard::task_registry::ShutdownToken;
+use iggy_common::IggyError;
+use std::rc::Rc;
+
+pub fn spawn_websocket_server(shard: Rc<IggyShard>) {
+    let shard_clone = shard.clone();
+    shard
+        .task_registry
+        .continuous("websocket_server")
+        .critical(true)
+        .run(move |shutdown| websocket_server_task(shard_clone, shutdown))
+        .spawn();
+}
+
+async fn websocket_server_task(
+    shard: Rc<IggyShard>,
+    shutdown: ShutdownToken,
+) -> Result<(), IggyError> {
+    crate::websocket::websocket_server::spawn_websocket_server(shard, shutdown).await
+}

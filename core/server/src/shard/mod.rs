@@ -192,12 +192,7 @@ impl IggyShard {
         }
 
         if self.config.websocket.enabled && self.id == 0 {
-            tasks.push(Box::pin(
-                crate::websocket::websocket_server::spawn_websocket_server(
-                    self.clone(),
-                    self.config.websocket.clone(),
-                ),
-            ));
+            continuous::spawn_websocket_server(self.clone());
         }
 
         if self.config.heartbeat.enabled {
