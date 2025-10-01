@@ -1,8 +1,10 @@
 ﻿using System.Runtime.CompilerServices;
 using System.Threading.Channels;
 using Apache.Iggy.Contracts;
+using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
+using Apache.Iggy.Kinds;
 using Microsoft.Extensions.Logging;
 
 namespace Apache.Iggy.Consumers;
@@ -17,6 +19,7 @@ public partial class IggyConsumer : IAsyncDisposable
     private readonly CancellationTokenSource _cancellationTokenSource;
     private Task? _pollingTask;
     private bool _disposed;
+    private PollingStrategy _currentPollingStrategy;
 
     /// <summary>
     /// Fired when an error occurs during message polling
@@ -52,6 +55,8 @@ public partial class IggyConsumer : IAsyncDisposable
         await _client.LoginUser(_config.Login, _config.Password, ct);
 
         await InitializeConsumerGroupAsync(ct);
+
+        _currentPollingStrategy = _config.PollingStrategy;
 
         _isInitialized = true;
     }
@@ -163,7 +168,7 @@ public partial class IggyConsumer : IAsyncDisposable
                 try
                 {
                     var messages = await _client.PollMessagesAsync(_config.StreamId, _config.TopicId,
-                        _config.PartitionId, _config.Consumer, _config.PollingStrategy, _config.BatchSize,
+                        _config.PartitionId, _config.Consumer, _currentPollingStrategy, _config.BatchSize,
                         _config.AutoCommit, ct);
 
                     foreach (var message in messages.Messages)
@@ -209,6 +214,12 @@ public partial class IggyConsumer : IAsyncDisposable
                     {
                         await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId,
                             messages.Messages[^1].Header.Offset, (uint)messages.PartitionId, ct);
+                    }
+
+                    if (messages.Messages.Any())
+                    {
+                        var lastOffset = messages.Messages[^1].Header.Offset;
+                        _currentPollingStrategy = PollingStrategy.Offset(lastOffset + 1);
                     }
                 }
                 catch (Exception ex)
