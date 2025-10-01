@@ -164,12 +164,7 @@ impl EntityComponentSystem<Borrow> for Partitions {
     {
         f(self.into())
     }
-    
-    fn with_components_async<O, F>(&self, f: F) -> impl Future<Output = O>
-    where
-        F: for<'a> AsyncFnOnce(Self::EntityComponents<'a>) -> O {
-        f(self.into())
-    }
+
 }
 
 impl EntityComponentSystemMut for Partitions {
@@ -226,11 +221,4 @@ impl Partitions {
         self.with_components_by_id_mut(id, |components| f(components))
     }
 
-    pub fn with_partition_by_id_async<T>(
-        &self,
-        id: ContainerId,
-        f: impl AsyncFnOnce(ComponentsById<PartitionRef>) -> T,
-    ) -> impl Future<Output = T> {
-        self.with_components_by_id_async(id, async move |components| f(components).await)
-    }
 }

@@ -81,12 +81,6 @@ impl EntityComponentSystem<Borrow> for ConsumerGroups {
     {
         f(self.into())
     }
-    
-    fn with_components_async<O, F>(&self, f: F) -> impl Future<Output = O>
-    where
-        F: for<'a> AsyncFnOnce(Self::EntityComponents<'a>) -> O {
-       f(self.into())
-    }
 }
 
 impl EntityComponentSystemMut for ConsumerGroups {

@@ -145,12 +145,6 @@ impl EntityComponentSystem<InteriorMutability> for Streams {
     {
         f(self.into())
     }
-    
-    fn with_components_async<O, F>(&self, f: F) -> impl Future<Output = O>
-    where
-        F: for<'a> AsyncFnOnce(Self::EntityComponents<'a>) -> O {
-        f(self.into())
-    }
 }
 
 impl EntityComponentSystemMutCell for Streams {
@@ -459,14 +453,6 @@ impl Streams {
         self.with_components_by_id(id, |stream| f(stream))
     }
 
-    pub fn with_stream_by_id_async<T>(
-        &self,
-        id: &Identifier,
-        f: impl AsyncFnOnce(ComponentsById<StreamRef>) -> T,
-    ) -> impl Future<Output = T> {
-        let id = self.get_index(id);
-        self.with_components_by_id_async(id, async |stream| f(stream).await)
-    }
     pub fn with_stream_by_id_mut<T>(
         &self,
         id: &Identifier,
@@ -480,13 +466,6 @@ impl Streams {
         self.with_stream_by_id(stream_id, helpers::topics(f))
     }
 
-    pub fn with_topics_async<T>(
-        &self,
-        stream_id: &Identifier,
-        f: impl AsyncFnOnce(&Topics) -> T,
-    ) -> impl Future<Output = T> {
-        self.with_stream_by_id_async(stream_id, helpers::topics_async(f))
-    }
     pub fn with_topics_mut<T>(&self, stream_id: &Identifier, f: impl FnOnce(&Topics) -> T) -> T {
         self.with_stream_by_id(stream_id, helpers::topics_mut(f))
     }
@@ -502,16 +481,6 @@ impl Streams {
         })
     }
 
-    pub fn with_topic_by_id_async<T>(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        f: impl AsyncFnOnce(ComponentsById<TopicRef>) -> T,
-    ) -> impl Future<Output = T> {
-        self.with_topics_async(stream_id, async |container| {
-            container.with_topic_by_id_async(topic_id, f).await
-        })
-    }
     pub fn with_topic_by_id_mut<T>(
         &self,
         stream_id: &Identifier,
@@ -580,17 +549,6 @@ impl Streams {
         })
     }
 
-
-    pub fn with_partitions_async<T>(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        f: impl AsyncFnOnce(&Partitions) -> T,
-    ) -> impl Future<Output = T> {
-        self.with_topics_async(stream_id, async |container| {
-            container.with_partitions_async(topic_id, f).await
-        })
-    }
     pub fn with_partitions_mut<T>(
         &self,
         stream_id: &Identifier,
@@ -614,17 +572,6 @@ impl Streams {
         })
     }
 
-    pub fn with_partition_by_id_async<T>(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        id: partitions::ContainerId,
-        f: impl AsyncFnOnce(ComponentsById<PartitionRef>) -> T,
-    ) -> impl Future<Output = T> {
-        self.with_partitions_async(stream_id, topic_id, async move |container| {
-            container.with_partition_by_id_async(id, f).await
-        })
-    }
     pub fn with_partition_by_id_mut<T>(
         &self,
         stream_id: &Identifier,
@@ -683,7 +630,6 @@ impl Streams {
                 end_offset = segment_end_offset;
             }
 
-            // Calculate the actual count to request from this segment
             let count: u32 = ((end_offset - start_offset + 1) as u32).min(remaining_count);
 
             let messages = self
@@ -862,57 +808,66 @@ impl Streams {
         count: u32,
         segment_start_offset: u64,
     ) -> Result<IggyMessagesBatchSet, IggyError> {
-        // Convert start_offset to relative offset within the segment
         let relative_start_offset = (start_offset - segment_start_offset) as u32;
 
-        // Use with_partition_by_id_async to perform disk I/O inside the async closure
-        self.with_partition_by_id_async(stream_id, topic_id, partition_id, async move |(.., log)| {
-            let storage = log.storages()[idx].clone();
-            let indexes = log.indexes()[idx].as_ref();
-
-            // Load indexes first
-            let indexes_to_read = if let Some(indexes) = indexes {
-                if !indexes.is_empty() {
-                    indexes.slice_by_offset(relative_start_offset, count)
-                } else {
-                    storage
-                        .index_reader
-                        .as_ref()
-                        .expect("Index reader not initialized")
-                        .load_from_disk_by_offset(relative_start_offset, count)
-                        .await?
-                }
-            } else {
-                storage
+        let (index_reader, messages_reader, indexes) = self.with_partition_by_id(
+            stream_id,
+            topic_id,
+            partition_id,
+            |(_, _, _, _, _, _, log)| {
+                let index_reader = log.storages()[idx]
                     .index_reader
                     .as_ref()
                     .expect("Index reader not initialized")
+                    .clone();
+                let message_reader = log.storages()[idx]
+                    .messages_reader
+                    .as_ref()
+                    .expect("Messages reader not initialized")
+                    .clone();
+                let indexes = log.indexes()[idx].as_ref().map(|indexes| {
+                    indexes
+                        .slice_by_offset(relative_start_offset, count)
+                        .unwrap_or_default()
+                });
+                (index_reader, message_reader, indexes)
+            },
+        );
+
+        let indexes_to_read = if let Some(indexes) = indexes {
+            if !indexes.is_empty() {
+                Some(indexes)
+            } else {
+                index_reader
+                    .as_ref()
                     .load_from_disk_by_offset(relative_start_offset, count)
                     .await?
-            };
-
-            if indexes_to_read.is_none() {
-                return Ok(IggyMessagesBatchSet::empty());
             }
-
-            let indexes_to_read = indexes_to_read.unwrap();
-            let batch = storage
-                .messages_reader
+        } else {
+            index_reader
                 .as_ref()
-                .expect("Messages reader not initialized")
-                .load_messages_from_disk(indexes_to_read)
-                .await
-                .with_error_context(|error| format!("Failed to load messages from disk: {error}"))?;
+                .load_from_disk_by_offset(relative_start_offset, count)
+                .await?
+        };
 
-            batch
-                .validate_checksums_and_offsets(start_offset)
-                .with_error_context(|error| {
-                    format!("Failed to validate messages read from disk! error: {error}")
-                })?;
+        if indexes_to_read.is_none() {
+            return Ok(IggyMessagesBatchSet::empty());
+        }
 
-            Ok(IggyMessagesBatchSet::from(batch))
-        })
-        .await
+        let indexes_to_read = indexes_to_read.unwrap();
+        let batch = messages_reader
+            .as_ref()
+            .load_messages_from_disk(indexes_to_read)
+            .await
+            .with_error_context(|error| format!("Failed to load messages from disk: {error}"))?;
+
+        batch
+            .validate_checksums_and_offsets(start_offset)
+            .with_error_context(|error| {
+                format!("Failed to validate messages read from disk! error: {error}")
+            })?;
+
+        Ok(IggyMessagesBatchSet::from(batch))
     }
 
     pub async fn get_messages_by_timestamp(
@@ -947,7 +902,6 @@ impl Streams {
                 },
             );
 
-            // Skip segments that end before our timestamp
             if segment_end_timestamp < timestamp {
                 continue;
             }
@@ -1009,19 +963,15 @@ impl Streams {
 
         // Case 0: Accumulator is empty, so all messages have to be on disk
         if is_journal_empty {
-            let (storage, index) = self.with_partition_by_id(
-                stream_id,
-                topic_id,
-                partition_id,
-                |(_, _, _, _, _, _, log)| {
-                    let storage = log.storages()[idx].clone();
-                    let indexes = log.indexes()[idx]
-                        .as_ref()
-                        .map(|indexes| indexes.slice_by_offset(0, u32::MAX).unwrap());
-                    (storage, indexes)
-                },
-            );
-            return Self::load_messages_from_disk_by_timestamp(&storage, &index, timestamp, count)
+            return self
+                .load_messages_from_disk_by_timestamp(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    idx,
+                    timestamp,
+                    count,
+                )
                 .await;
         }
 
@@ -1045,21 +995,16 @@ impl Streams {
         }
 
         // Case 2: All messages are on disk (timestamp is before journal's first timestamp)
-        let (storage, index) = self.with_partition_by_id(
-            stream_id,
-            topic_id,
-            partition_id,
-            |(_, _, _, _, _, _, log)| {
-                let storage = log.storages()[idx].clone();
-                let indexes = log.indexes()[idx]
-                    .as_ref()
-                    .map(|indexes| indexes.slice_by_timestamp(0, u32::MAX).unwrap());
-                (storage, indexes)
-            },
-        );
-
-        let disk_messages =
-            Self::load_messages_from_disk_by_timestamp(&storage, &index, timestamp, count).await?;
+        let disk_messages = self
+            .load_messages_from_disk_by_timestamp(
+                stream_id,
+                topic_id,
+                partition_id,
+                idx,
+                timestamp,
+                count,
+            )
+            .await?;
 
         if disk_messages.count() >= count {
             return Ok(disk_messages);
@@ -1085,27 +1030,50 @@ impl Streams {
     }
 
     async fn load_messages_from_disk_by_timestamp(
-        storage: &Storage,
-        index: &Option<IggyIndexesMut>,
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: partitions::ContainerId,
+        idx: usize,
         timestamp: u64,
         count: u32,
     ) -> Result<IggyMessagesBatchSet, IggyError> {
-        let indexes_to_read = if let Some(indexes) = index {
-            if !indexes.is_empty() {
-                indexes.slice_by_timestamp(timestamp, count)
-            } else {
-                storage
+        let (index_reader, messages_reader, indexes) = self.with_partition_by_id(
+            stream_id,
+            topic_id,
+            partition_id,
+            |(_, _, _, _, _, _, log)| {
+                let index_reader = log.storages()[idx]
                     .index_reader
                     .as_ref()
                     .expect("Index reader not initialized")
+                    .clone();
+                let messages_reader = log.storages()[idx]
+                    .messages_reader
+                    .as_ref()
+                    .expect("Messages reader not initialized")
+                    .clone();
+                let indexes = log.indexes()[idx].as_ref().map(|indexes| {
+                    indexes
+                        .slice_by_timestamp(timestamp, count)
+                        .unwrap_or_default()
+                });
+                (index_reader, messages_reader, indexes)
+            },
+        );
+
+        let indexes_to_read = if let Some(indexes) = indexes {
+            if !indexes.is_empty() {
+                Some(indexes)
+            } else {
+                index_reader
+                    .as_ref()
                     .load_from_disk_by_timestamp(timestamp, count)
                     .await?
             }
         } else {
-            storage
-                .index_reader
+            index_reader
                 .as_ref()
-                .expect("Index reader not initialized")
                 .load_from_disk_by_timestamp(timestamp, count)
                 .await?
         };
@@ -1116,10 +1084,8 @@ impl Streams {
 
         let indexes_to_read = indexes_to_read.unwrap();
 
-        let batch = storage
-            .messages_reader
+        let batch = messages_reader
             .as_ref()
-            .expect("Messages reader not initialized")
             .load_messages_from_disk(indexes_to_read)
             .await
             .with_error_context(|error| {
@@ -1272,40 +1238,48 @@ impl Streams {
         let batch_count = batches.count();
         let batch_size = batches.size();
 
-        // Perform disk I/O inside the async closure
-        let saved = self
-            .with_partition_by_id_async(stream_id, topic_id, partition_id, async move |(.., log)| {
-                let storage = log.active_storage().clone();
-                
-                let saved = storage
-                    .messages_writer
-                    .as_ref()
-                    .expect("Messages writer not initialized")
-                    .save_batch_set(batches)
-                    .await
-                    .with_error_context(|error| {
-                        format!(
-                            "Failed to save batch of {batch_count} messages \
-                            ({batch_size} bytes) to stream ID: {stream_id}, topic ID: {topic_id}, partition ID: {partition_id}. {error}",
-                        )
-                    })?;
+        // Extract storage before async operations
+        let (messages_writer, index_writer) =
+            self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
+                (
+                    log.active_storage()
+                        .messages_writer
+                        .as_ref()
+                        .expect("Messages writer not initialized")
+                        .clone(),
+                    log.active_storage()
+                        .index_writer
+                        .as_ref()
+                        .expect("Index writer not initialized")
+                        .clone(),
+                )
+            });
 
-                let unsaved_indexes_slice = log.active_indexes().unwrap().unsaved_slice();
-                let indexes_len = unsaved_indexes_slice.len();
-                
-                storage
-                    .index_writer
-                    .as_ref()
-                    .expect("Index writer not initialized")
-                    .save_indexes(unsaved_indexes_slice)
-                    .await
-                    .with_error_context(|error| {
-                        format!("Failed to save index of {indexes_len} indexes to stream ID: {stream_id}, topic ID: {topic_id} {partition_id}. {error}",)
-                    })?;
+        let saved = messages_writer
+            .as_ref()
+            .save_batch_set(batches)
+            .await
+            .with_error_context(|error| {
+                format!(
+                    "Failed to save batch of {batch_count} messages \
+                    ({batch_size} bytes) to stream ID: {stream_id}, topic ID: {topic_id}, partition ID: {partition_id}. {error}",
+                )
+            })?;
 
-                Ok::<_, IggyError>(saved)
-            })
-            .await?;
+        // Extract unsaved indexes before async operation
+        let unsaved_indexes_slice =
+            self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
+                log.active_indexes().unwrap().unsaved_slice()
+            });
+
+        let indexes_len = unsaved_indexes_slice.len();
+        index_writer
+            .as_ref()
+            .save_indexes(unsaved_indexes_slice)
+            .await
+            .with_error_context(|error| {
+                format!("Failed to save index of {indexes_len} indexes to stream ID: {stream_id}, topic ID: {topic_id} {partition_id}. {error}",)
+            })?;
 
         shard_trace!(
             shard_id,
@@ -1337,37 +1311,36 @@ impl Streams {
         topic_id: &Identifier,
         partition_id: usize,
     ) -> Result<(), IggyError> {
-        self.with_partition_by_id_async(stream_id, topic_id, partition_id, async move |(.., log)| {
-            let storage = log.active_storage();
+        let storage = self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
+            log.active_storage().clone()
+        });
 
-            if storage.messages_writer.is_none() || storage.index_writer.is_none() {
-                return Ok(());
+        if storage.messages_writer.is_none() || storage.index_writer.is_none() {
+            return Ok(());
+        }
+
+        if let Some(ref messages_writer) = storage.messages_writer {
+            if let Err(e) = messages_writer.fsync().await {
+                tracing::error!(
+                    "Failed to fsync messages writer for partition {}: {}",
+                    partition_id,
+                    e
+                );
+                return Err(e);
             }
+        }
 
-            if let Some(ref messages_writer) = storage.messages_writer {
-                if let Err(e) = messages_writer.fsync().await {
-                    tracing::error!(
-                        "Failed to fsync messages writer for partition {}: {}",
-                        partition_id,
-                        e
-                    );
-                    return Err(e);
-                }
+        if let Some(ref index_writer) = storage.index_writer {
+            if let Err(e) = index_writer.fsync().await {
+                tracing::error!(
+                    "Failed to fsync index writer for partition {}: {}",
+                    partition_id,
+                    e
+                );
+                return Err(e);
             }
+        }
 
-            if let Some(ref index_writer) = storage.index_writer {
-                if let Err(e) = index_writer.fsync().await {
-                    tracing::error!(
-                        "Failed to fsync index writer for partition {}: {}",
-                        partition_id,
-                        e
-                    );
-                    return Err(e);
-                }
-            }
-
-            Ok(())
-        })
-        .await
+        Ok(())
     }
 }

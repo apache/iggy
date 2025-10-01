@@ -188,22 +188,11 @@ where
     where
         F: for<'a> FnOnce(Self::EntityComponents<'a>) -> O;
 
-    fn with_components_async<O, F>(&self, f: F) -> impl Future<Output = O>
-    where
-        F: for<'a> AsyncFnOnce(Self::EntityComponents<'a>) -> O;
-
     fn with_components_by_id<O, F>(&self, id: Self::Idx, f: F) -> O
     where
         F: for<'a> FnOnce(ComponentsById<'a, Self::EntityComponents<'a>>) -> O,
     {
         self.with_components(|components| f(components.into_components_by_id(id)))
-    }
-
-    fn with_components_by_id_async<O, F>(&self, id: Self::Idx, f: F) -> impl Future<Output = O>
-    where
-        F: for<'a> AsyncFnOnce(ComponentsById<'a, Self::EntityComponents<'a>>) -> O,
-    {
-        self.with_components_async(async |components| f(components.into_components_by_id(id)).await)
     }
 }
 

@@ -129,12 +129,6 @@ impl EntityComponentSystem<InteriorMutability> for Topics {
     {
         f(self.into())
     }
-    
-    fn with_components_async<O, F>(&self, f: F) -> impl Future<Output = O>
-    where
-        F: for<'a> AsyncFnOnce(Self::EntityComponents<'a>) -> O {
-            f(self.into())
-    }
 }
 
 impl EntityComponentSystemMutCell for Topics {
@@ -201,14 +195,6 @@ impl Topics {
         self.with_components_by_id(id, |components| f(components))
     }
 
-    pub fn with_topic_by_id_async<T>(
-        &self,
-        topic_id: &Identifier,
-        f: impl AsyncFnOnce(ComponentsById<TopicRef>) -> T,
-    ) -> impl Future<Output = T> {
-        let id = self.get_index(topic_id);
-        self.with_components_by_id_async(id, async |components| f(components).await)
-    }
     pub fn with_topic_by_id_mut<T>(
         &self,
         topic_id: &Identifier,
@@ -260,13 +246,6 @@ impl Topics {
         self.with_topic_by_id(topic_id, helpers::partitions(f))
     }
 
-    pub fn with_partitions_async<T>(
-        &self,
-        topic_id: &Identifier,
-        f: impl AsyncFnOnce(&Partitions) -> T,
-    ) -> impl Future<Output = T> {
-        self.with_topic_by_id_async(topic_id, helpers::partitions_async(f))
-    }
     pub fn with_partitions_mut<T>(
         &self,
         topic_id: &Identifier,
