@@ -56,7 +56,7 @@ pub struct PostgresSourceConfig {
     pub replication_slot: Option<String>,
     pub publication_name: Option<String>,
     pub capture_operations: Option<Vec<String>>, // INSERT, UPDATE, DELETE
-    pub cdc_backend: Option<String>, // "builtin" | "pg_replicate"
+    pub cdc_backend: Option<String>,             // "builtin" | "pg_replicate"
 }
 
 #[derive(Debug)]
@@ -173,11 +173,7 @@ impl PostgresSource {
     }
 
     async fn poll_cdc(&self) -> Result<Vec<ProducedMessage>, Error> {
-        let backend = self
-            .config
-            .cdc_backend
-            .as_deref()
-            .unwrap_or("builtin");
+        let backend = self.config.cdc_backend.as_deref().unwrap_or("builtin");
         match backend {
             "builtin" => self.poll_cdc_builtin().await,
             "pg_replicate" => {
@@ -646,12 +642,11 @@ impl Source for PostgresSource {
         match self.config.mode.as_str() {
             "cdc" => {
                 self.setup_cdc().await?;
-                let backend = self
-                    .config
-                    .cdc_backend
-                    .as_deref()
-                    .unwrap_or("builtin");
-                info!("PostgreSQL CDC mode enabled (backend: {}) for connector ID: {}", backend, self.id);
+                let backend = self.config.cdc_backend.as_deref().unwrap_or("builtin");
+                info!(
+                    "PostgreSQL CDC mode enabled (backend: {}) for connector ID: {}",
+                    backend, self.id
+                );
             }
             "polling" => {
                 info!(
@@ -726,7 +721,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_build_polling_query_with_last_offset() {
+    fn given_last_offset_polling_query_should_be_built() {
         let src = PostgresSource::new(
             1,
             PostgresSourceConfig {
@@ -749,15 +744,16 @@ mod tests {
             },
             None,
         );
-        let q = src.build_polling_query("users", "updated_at", &Some("2024-01-01".to_string()), 500);
+        let query =
+            src.build_polling_query("users", "updated_at", &Some("2024-01-01".to_string()), 500);
         assert_eq!(
-            q,
+            query,
             "SELECT * FROM users WHERE updated_at > '2024-01-01' ORDER BY updated_at ASC LIMIT 500"
         );
     }
 
     #[test]
-    fn test_build_polling_query_with_initial_offset() {
+    fn given_initial_offset_polling_query_should_be_built() {
         let src = PostgresSource::new(
             1,
             PostgresSourceConfig {
@@ -780,15 +776,15 @@ mod tests {
             },
             None,
         );
-        let q = src.build_polling_query("users", "id", &None, 1000);
+        let query = src.build_polling_query("users", "id", &None, 1000);
         assert_eq!(
-            q,
+            query,
             "SELECT * FROM users WHERE id > '100' ORDER BY id ASC LIMIT 1000"
         );
     }
 
     #[test]
-    fn test_parse_insert_message() {
+    fn given_insert_message_should_parse_correctly() {
         let src = PostgresSource::new(
             1,
             PostgresSourceConfig {
@@ -811,14 +807,17 @@ mod tests {
             },
             None,
         );
-        		let data = "INSERT: table public.users: id[1] name['Alice'] active[true]";
-		let rec = src.parse_logical_replication_message(data, &["INSERT"]).unwrap();
+
+        let data = "INSERT: table public.users: id[1] name['Alice'] active[true]";
+        let rec = src
+            .parse_logical_replication_message(data, &["INSERT"])
+            .unwrap();
         assert_eq!(rec.table_name, "users");
         assert_eq!(rec.operation_type, "INSERT");
     }
 
     #[test]
-    fn test_parse_update_message() {
+    fn given_update_message_should_parse_correctly() {
         let src = PostgresSource::new(
             1,
             PostgresSourceConfig {
@@ -841,14 +840,17 @@ mod tests {
             },
             None,
         );
-        		let data = "UPDATE: table public.orders: id[42] total[99.5]";
-		let rec = src.parse_logical_replication_message(data, &["UPDATE"]).unwrap();
+
+        let data = "UPDATE: table public.orders: id[42] total[99.5]";
+        let rec = src
+            .parse_logical_replication_message(data, &["UPDATE"])
+            .unwrap();
         assert_eq!(rec.table_name, "orders");
         assert_eq!(rec.operation_type, "UPDATE");
     }
 
     #[test]
-    fn test_parse_delete_message() {
+    fn given_delete_message_should_parse_correctly() {
         let src = PostgresSource::new(
             1,
             PostgresSourceConfig {
@@ -871,8 +873,11 @@ mod tests {
             },
             None,
         );
-        		let data = "DELETE: table public.products: id[7]";
-		let rec = src.parse_logical_replication_message(data, &["DELETE"]).unwrap();
+
+        let data = "DELETE: table public.products: id[7]";
+        let rec = src
+            .parse_logical_replication_message(data, &["DELETE"])
+            .unwrap();
         assert_eq!(rec.table_name, "products");
         assert_eq!(rec.operation_type, "DELETE");
     }
