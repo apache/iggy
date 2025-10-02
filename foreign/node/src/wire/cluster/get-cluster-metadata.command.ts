@@ -17,21 +17,21 @@
  * under the License.
  */
 
-
-import type { CommandResponse, ClientProvider } from '../client/client.type.js';
-
-// export type ArgTypes<F extends Function> = F extends (...args: infer A) => any ? A : never;
-
-export type Command<I, O> = {
-  code: number,
-  serialize: (args: I) => Buffer,
-  deserialize: (r: CommandResponse) => O
-}
+import type { CommandResponse } from '../../client/index.js';
+import { wrapCommand } from '../command.utils.js';
+import { COMMAND_CODE } from '../command.code.js';
+import { deserializeMetadata, type ClusterMetadata } from './cluster.utils.js';
 
 
-export function wrapCommand<I, O>(cmd: Command<I, O>) {
-  return (getClient: ClientProvider) =>
-    async (arg: I) => cmd.deserialize(
-      await (await getClient()).sendCommand(cmd.code, cmd.serialize(arg))
-    );
+export const GET_CLUSTER_METADATA = {
+  code: COMMAND_CODE.GetClusterMetadata,
+  
+  serialize: () => {
+    return Buffer.alloc(0);
+  },
+
+  deserialize: (r: CommandResponse): ClusterMetadata => deserializeMetadata(r.data)
 };
+
+
+export const getClusterMetadata = wrapCommand<void, ClusterMetadata>(GET_CLUSTER_METADATA);

@@ -24,6 +24,7 @@ export const COMMAND_CODE = {
   Ping: 1,
   GetStats: 10,
   GetSnapshot: 11,                    // @TODO GET_SNAPSHOT_FILE_CODE: u32 = 11
+  GetClusterMetadata: 12,             // GET_CLUSTER_METADATA_CODE: u32 = 12
   GetMe: 20,
   GetClient: 21,
   GetClients: 22,
