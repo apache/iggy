@@ -14,7 +14,6 @@
       partitionMessages: MessagePartition;
       topic: TopicDetails;
       pagination: {
-        offset: number;
         count: number;
       };
     };
@@ -23,7 +22,9 @@
   let { data }: Props = $props();
   let topic = $derived(data.topic);
   let partitionMessages = $derived(data.partitionMessages);
-  let prevPage = $derived(page.url.pathname.split('/').slice(0, 6).join('/') + '/');
+  let prevPage = $derived(
+    `/dashboard/streams/${page.params.streamId}/topics/${page.params.topicId}/partitions/`
+  );
 
   let direction = $state(page.url.searchParams.get('direction') || 'desc');
   let currentPage = $state(1);
@@ -45,7 +46,7 @@
     const url = new URL(window.location.href);
     url.searchParams.set('offset', offset.toString());
     url.searchParams.set('direction', direction);
-    await goto(url, { keepFocus: true, noScroll: true });
+    await goto(url.toString(), { keepFocus: true, noScroll: true });
     currentPage = page;
   }
 
@@ -71,7 +72,11 @@
 
   <div class="flex gap-3 ml-7">
     <div class="chip">
-      <span>Messages: {partitionMessages.messages.length > 0 ? partitionMessages.currentOffset + 1 : 0}</span>
+      <span
+        >Messages: {partitionMessages.messages.length > 0
+          ? partitionMessages.currentOffset + 1
+          : 0}</span
+      >
     </div>
   </div>
 
@@ -116,4 +121,3 @@
 <div class="mt-2 mb-2">
   <Paginator {currentPage} {totalPages} maxVisiblePages={5} on:pageChange={onPageChange} />
 </div>
-

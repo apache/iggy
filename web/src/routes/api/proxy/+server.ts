@@ -29,8 +29,8 @@ export const POST: RequestHandler = async ({ request, cookies }) => {
     const message = `routes/api/proxy/+server.ts no path or body or method provided`;
     console.error(message);
     error(500, {
-            message
-          });
+      message
+    });
   }
 
   const result = await fetchIggyApi({ body, path, method, cookies, queryParams });

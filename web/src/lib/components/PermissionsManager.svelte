@@ -45,6 +45,7 @@
   import { twMerge } from 'tailwind-merge';
   import { noTypeCheck } from '$lib/utils/noTypeCheck';
   import { fade } from 'svelte/transition';
+  import { SvelteSet } from 'svelte/reactivity';
 
   interface Props {
     streams: Stream[];
@@ -177,53 +178,55 @@
     }
   });
 
-  let streamsPerms = $state((() => {
-    const tempPerms: StreamsPerms = {};
+  let streamsPerms = $state(
+    (() => {
+      const tempPerms: StreamsPerms = {};
 
-    streams.forEach((s) => {
-      tempPerms[s.id] = {
-        manage_stream: {
-          name: 'Manage stream',
-          globalPermsKey: 'manage_streams',
-          checked: false,
-          disabled: false
-        },
-        read_stream: {
-          name: 'Read stream',
-          globalPermsKey: 'read_streams',
-          checked: false,
-          disabled: false
-        },
-        read_topics: {
-          name: 'Read topics',
-          globalPermsKey: 'read_topics',
-          checked: false,
-          disabled: false
-        },
-        poll_messages: {
-          name: 'Poll messages',
-          globalPermsKey: 'poll_messages',
-          checked: false,
-          disabled: false
-        },
-        send_messages: {
-          name: 'Send messages',
-          globalPermsKey: 'send_messages',
-          checked: false,
-          disabled: false
-        },
-        manage_topics: {
-          name: 'Manage topics',
-          globalPermsKey: 'manage_topics',
-          checked: false,
-          disabled: false
-        },
-        topicPerms: {}
-      };
-    });
+      streams.forEach((s) => {
+        tempPerms[s.id] = {
+          manage_stream: {
+            name: 'Manage stream',
+            globalPermsKey: 'manage_streams',
+            checked: false,
+            disabled: false
+          },
+          read_stream: {
+            name: 'Read stream',
+            globalPermsKey: 'read_streams',
+            checked: false,
+            disabled: false
+          },
+          read_topics: {
+            name: 'Read topics',
+            globalPermsKey: 'read_topics',
+            checked: false,
+            disabled: false
+          },
+          poll_messages: {
+            name: 'Poll messages',
+            globalPermsKey: 'poll_messages',
+            checked: false,
+            disabled: false
+          },
+          send_messages: {
+            name: 'Send messages',
+            globalPermsKey: 'send_messages',
+            checked: false,
+            disabled: false
+          },
+          manage_topics: {
+            name: 'Manage topics',
+            globalPermsKey: 'manage_topics',
+            checked: false,
+            disabled: false
+          },
+          topicPerms: {}
+        };
+      });
 
-    return tempPerms;
-  })() satisfies StreamsPerms);
+      return tempPerms;
+    })() satisfies StreamsPerms
+  );
 
   run(() => {
     if (selectedStream) fetchTopics(selectedStream.id);
@@ -232,34 +235,36 @@
     buildTopicsPerms(topics);
   });
 
-  let taintedStreams = $derived((() => {
-    const tainted: Set<number> = new Set([]);
+  let taintedStreams = $derived(
+    (() => {
+      const tainted: Set<number> = new SvelteSet([]);
 
-    Object.keys(streamsPerms).forEach((streamId) => {
-      Object.keys(streamsPerms[streamId]).forEach((permissionKey) => {
-        if (permissionKey === 'topicPerms') {
-          const perm = streamsPerms[streamId][permissionKey];
+      Object.keys(streamsPerms).forEach((streamId) => {
+        Object.keys(streamsPerms[streamId]).forEach((permissionKey) => {
+          if (permissionKey === 'topicPerms') {
+            const perm = streamsPerms[streamId][permissionKey];
 
-          Object.keys(perm).forEach((topicId) => {
-            const topicPerm = perm[topicId];
-            const isTopicTained = Object.keys(topicPerm)
-              .map((k) => topicPerm[k])
-              .some((p) => p.checked);
+            Object.keys(perm).forEach((topicId) => {
+              const topicPerm = perm[topicId];
+              const isTopicTained = Object.keys(topicPerm)
+                .map((k) => topicPerm[k])
+                .some((p) => p.checked);
 
-            if (isTopicTained) tainted.add(streamId);
-          });
-        } else {
-          const perm = streamsPerms[streamId][permissionKey];
-          if (perm.checked && !perm.disabled) tainted.add(streamId);
-        }
+              if (isTopicTained) tainted.add(streamId);
+            });
+          } else {
+            const perm = streamsPerms[streamId][permissionKey];
+            if (perm.checked && !perm.disabled) tainted.add(streamId);
+          }
+        });
       });
-    });
 
-    return Array.from(tainted);
-  })().map((taintedStreamId) => {
-    const name = streams.find((stream) => stream.id === +taintedStreamId)!.name;
-    return { name, id: +taintedStreamId };
-  }));
+      return Array.from(tainted);
+    })().map((taintedStreamId) => {
+      const name = streams.find((stream) => stream.id === +taintedStreamId)!.name;
+      return { name, id: +taintedStreamId };
+    })
+  );
 
   $effect(() => {
     function formatGlobalPermissions() {
@@ -269,16 +274,19 @@
       }, {});
     }
 
-    function hasAnyPermissionChecked(permissionsObj: Record<string, any>, excludeKeys: string[] = []) {
+    function hasAnyPermissionChecked(
+      permissionsObj: Record<string, any>,
+      excludeKeys: string[] = []
+    ) {
       return Object.keys(permissionsObj)
-        .filter(key => !excludeKeys.includes(key))
-        .some(key => permissionsObj[key].checked);
+        .filter((key) => !excludeKeys.includes(key))
+        .some((key) => permissionsObj[key].checked);
     }
 
     function formatTopicPermissions(topicPerms: Record<string, any>) {
       const result = {};
 
-      Object.keys(topicPerms).forEach(topicId => {
+      Object.keys(topicPerms).forEach((topicId) => {
         const topicPerm = topicPerms[topicId];
 
         if (!hasAnyPermissionChecked(topicPerm)) {
@@ -299,11 +307,11 @@
     function formatStreamPermissions() {
       const result = {};
 
-      Object.keys(streamsPerms).forEach(streamId => {
+      Object.keys(streamsPerms).forEach((streamId) => {
         const streamPerm = streamsPerms[streamId];
         const topicPerms = streamPerm.topicPerms;
 
-        const hasStreamPermissions = hasAnyPermissionChecked(streamPerm, ["topicPerms"]);
+        const hasStreamPermissions = hasAnyPermissionChecked(streamPerm, ['topicPerms']);
 
         const formattedTopics = formatTopicPermissions(topicPerms);
         const hasTopicPermissions = Object.keys(formattedTopics).length > 0;
@@ -379,7 +387,7 @@
       <Combobox
         items={streams}
         formatter={(item) => `id: ${item.id}, ${item.name}`}
-        label={`Stream`}
+        label="Stream"
         bind:selectedValue={selectedStream}
       />
 
@@ -389,7 +397,8 @@
             <label
               class={twMerge(
                 'flex gap-2 items-center text-color cursor-pointer',
-                streamsPerms[selectedStream.id][key].disabled && 'cursor-not-allowed text-shadeL800'
+                streamsPerms[selectedStream.id][key].disabled &&
+                  'cursor-not-allowed text-shade-l800'
               )}
               for={`stream-${key}-permission`}
             >
@@ -440,9 +449,10 @@
             {#each Object.keys(streamsPerms[selectedStream.id].topicPerms[selectedTopic.id]) as key (key)}
               <label class="flex gap-2 items-center text-color cursor-pointer">
                 <Checkbox
-                  bind:checked={streamsPerms[selectedStream.id].topicPerms[selectedTopic.id][key]
-                    .checked}
-                  value={''}
+                  bind:checked={
+                    streamsPerms[selectedStream.id].topicPerms[selectedTopic.id][key].checked
+                  }
+                  value=""
                 />
                 <span class="text-sm"
                   >{streamsPerms[selectedStream.id].topicPerms[selectedTopic.id][key].name}</span
