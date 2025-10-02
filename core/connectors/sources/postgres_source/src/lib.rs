@@ -56,6 +56,7 @@ pub struct PostgresSourceConfig {
     pub replication_slot: Option<String>,
     pub publication_name: Option<String>,
     pub capture_operations: Option<Vec<String>>, // INSERT, UPDATE, DELETE
+    pub cdc_backend: Option<String>,             // "builtin" | "pg_replicate"
 }
 
 #[derive(Debug)]
@@ -172,6 +173,31 @@ impl PostgresSource {
     }
 
     async fn poll_cdc(&self) -> Result<Vec<ProducedMessage>, Error> {
+        let backend = self.config.cdc_backend.as_deref().unwrap_or("builtin");
+        match backend {
+            "builtin" => self.poll_cdc_builtin().await,
+            "pg_replicate" => {
+                #[cfg(feature = "cdc_pg_replicate")]
+                {
+                    return Err(Error::InitError(
+                        "pg_replicate backend not yet implemented".to_string(),
+                    ));
+                }
+                #[cfg(not(feature = "cdc_pg_replicate"))]
+                {
+                    return Err(Error::InitError(
+                        "cdc_backend 'pg_replicate' requested but feature 'cdc_pg_replicate' is not enabled at build time".to_string(),
+                    ));
+                }
+            }
+            other => Err(Error::InitError(format!(
+                "Unsupported cdc_backend '{}'. Use 'builtin' or 'pg_replicate'",
+                other
+            ))),
+        }
+    }
+
+    async fn poll_cdc_builtin(&self) -> Result<Vec<ProducedMessage>, Error> {
         let pool = self
             .pool
             .as_ref()
@@ -616,7 +642,11 @@ impl Source for PostgresSource {
         match self.config.mode.as_str() {
             "cdc" => {
                 self.setup_cdc().await?;
-                info!("PostgreSQL CDC mode enabled for connector ID: {}", self.id);
+                let backend = self.config.cdc_backend.as_deref().unwrap_or("builtin");
+                info!(
+                    "PostgreSQL CDC mode enabled (backend: {}) for connector ID: {}",
+                    backend, self.id
+                );
             }
             "polling" => {
                 info!(
@@ -683,5 +713,172 @@ impl Source for PostgresSource {
             self.id, state.processed_rows
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_last_offset_polling_query_should_be_built() {
+        let src = PostgresSource::new(
+            1,
+            PostgresSourceConfig {
+                connection_string: "postgres://localhost/db".to_string(),
+                mode: "polling".to_string(),
+                tables: vec!["users".to_string()],
+                poll_interval: Some("5s".to_string()),
+                batch_size: Some(500),
+                tracking_column: Some("updated_at".to_string()),
+                initial_offset: None,
+                max_connections: None,
+                enable_wal_cdc: None,
+                custom_query: None,
+                snake_case_columns: None,
+                include_metadata: None,
+                replication_slot: None,
+                publication_name: None,
+                capture_operations: None,
+                cdc_backend: None,
+            },
+            None,
+        );
+        let query =
+            src.build_polling_query("users", "updated_at", &Some("2024-01-01".to_string()), 500);
+        assert_eq!(
+            query,
+            "SELECT * FROM users WHERE updated_at > '2024-01-01' ORDER BY updated_at ASC LIMIT 500"
+        );
+    }
+
+    #[test]
+    fn given_initial_offset_polling_query_should_be_built() {
+        let src = PostgresSource::new(
+            1,
+            PostgresSourceConfig {
+                connection_string: "postgres://localhost/db".to_string(),
+                mode: "polling".to_string(),
+                tables: vec!["users".to_string()],
+                poll_interval: Some("5s".to_string()),
+                batch_size: Some(1000),
+                tracking_column: Some("id".to_string()),
+                initial_offset: Some("100".to_string()),
+                max_connections: None,
+                enable_wal_cdc: None,
+                custom_query: None,
+                snake_case_columns: None,
+                include_metadata: None,
+                replication_slot: None,
+                publication_name: None,
+                capture_operations: None,
+                cdc_backend: None,
+            },
+            None,
+        );
+        let query = src.build_polling_query("users", "id", &None, 1000);
+        assert_eq!(
+            query,
+            "SELECT * FROM users WHERE id > '100' ORDER BY id ASC LIMIT 1000"
+        );
+    }
+
+    #[test]
+    fn given_insert_message_should_parse_correctly() {
+        let src = PostgresSource::new(
+            1,
+            PostgresSourceConfig {
+                connection_string: String::new(),
+                mode: "cdc".to_string(),
+                tables: vec![],
+                poll_interval: None,
+                batch_size: None,
+                tracking_column: None,
+                initial_offset: None,
+                max_connections: None,
+                enable_wal_cdc: None,
+                custom_query: None,
+                snake_case_columns: None,
+                include_metadata: None,
+                replication_slot: None,
+                publication_name: None,
+                capture_operations: None,
+                cdc_backend: None,
+            },
+            None,
+        );
+
+        let data = "INSERT: table public.users: id[1] name['Alice'] active[true]";
+        let rec = src
+            .parse_logical_replication_message(data, &["INSERT"])
+            .unwrap();
+        assert_eq!(rec.table_name, "users");
+        assert_eq!(rec.operation_type, "INSERT");
+    }
+
+    #[test]
+    fn given_update_message_should_parse_correctly() {
+        let src = PostgresSource::new(
+            1,
+            PostgresSourceConfig {
+                connection_string: String::new(),
+                mode: "cdc".to_string(),
+                tables: vec![],
+                poll_interval: None,
+                batch_size: None,
+                tracking_column: None,
+                initial_offset: None,
+                max_connections: None,
+                enable_wal_cdc: None,
+                custom_query: None,
+                snake_case_columns: None,
+                include_metadata: None,
+                replication_slot: None,
+                publication_name: None,
+                capture_operations: None,
+                cdc_backend: None,
+            },
+            None,
+        );
+
+        let data = "UPDATE: table public.orders: id[42] total[99.5]";
+        let rec = src
+            .parse_logical_replication_message(data, &["UPDATE"])
+            .unwrap();
+        assert_eq!(rec.table_name, "orders");
+        assert_eq!(rec.operation_type, "UPDATE");
+    }
+
+    #[test]
+    fn given_delete_message_should_parse_correctly() {
+        let src = PostgresSource::new(
+            1,
+            PostgresSourceConfig {
+                connection_string: String::new(),
+                mode: "cdc".to_string(),
+                tables: vec![],
+                poll_interval: None,
+                batch_size: None,
+                tracking_column: None,
+                initial_offset: None,
+                max_connections: None,
+                enable_wal_cdc: None,
+                custom_query: None,
+                snake_case_columns: None,
+                include_metadata: None,
+                replication_slot: None,
+                publication_name: None,
+                capture_operations: None,
+                cdc_backend: None,
+            },
+            None,
+        );
+
+        let data = "DELETE: table public.products: id[7]";
+        let rec = src
+            .parse_logical_replication_message(data, &["DELETE"])
+            .unwrap();
+        assert_eq!(rec.table_name, "products");
+        assert_eq!(rec.operation_type, "DELETE");
     }
 }
