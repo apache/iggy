@@ -19,6 +19,7 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/onsi/ginkgo/v2"
 )
 
@@ -54,7 +55,7 @@ var _ = ginkgo.Describe("CREATE CONSUMER GROUP:", func() {
 				createRandomString(16),
 				&groupId)
 
-			itShouldReturnSpecificError(err, "stream_id_not_found")
+			itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
 		})
 
 		ginkgo.Context("and tries to create consumer group for a non existing topic", func() {
@@ -70,7 +71,7 @@ var _ = ginkgo.Describe("CREATE CONSUMER GROUP:", func() {
 				&groupId,
 			)
 
-			itShouldReturnSpecificError(err, "topic_id_not_found")
+			itShouldReturnSpecificError(err, ierror.ErrTopicIdNotFound)
 		})
 
 		ginkgo.Context("and tries to create consumer group with duplicate group name", func() {
@@ -89,8 +90,7 @@ var _ = ginkgo.Describe("CREATE CONSUMER GROUP:", func() {
 				name,
 				&groupId,
 			)
-
-			itShouldReturnSpecificError(err, "cannot_create_consumer_groups_directory")
+			itShouldReturnSpecificError(err, ierror.ErrConsumerGroupNameAlreadyExists)
 		})
 
 		ginkgo.Context("and tries to create consumer group with duplicate group id", func() {
@@ -108,7 +108,7 @@ var _ = ginkgo.Describe("CREATE CONSUMER GROUP:", func() {
 				createRandomString(16),
 				&groupId)
 
-			itShouldReturnSpecificError(err, "consumer_group_already_exists")
+			itShouldReturnSpecificError(err, ierror.ErrConsumerGroupIdAlreadyExists)
 		})
 
 		ginkgo.Context("and tries to create group with name that's over 255 characters", func() {
@@ -126,7 +126,7 @@ var _ = ginkgo.Describe("CREATE CONSUMER GROUP:", func() {
 				createRandomString(256),
 				&groupId)
 
-			itShouldReturnSpecificError(err, "consumer_group_name_too_long")
+			itShouldReturnSpecificError(err, ierror.ErrInvalidConsumerGroupName)
 		})
 	})
 

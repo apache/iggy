@@ -22,7 +22,7 @@
 </script>
 
 <header
-  class="h-[55px] min-h-[55px] z-20 max-h-[55px] fixed top-0 left-[90px] right-0 border-b px-4 flex items-center justify-between bg-shadeL200 dark:bg-shadeD900"
+  class="h-[55px] min-h-[55px] z-20 max-h-[55px] fixed top-0 left-[90px] right-0 border-b px-4 flex items-center justify-between bg-shade-l200 dark:bg-shade-d900"
 >
   <div class="flex gap-4">
     <PeriodicInvalidator />
@@ -30,7 +30,7 @@
   </div>
 
   <StopPropagation>
-    <DropdownMenu placement="bottom-end" class="!p-0">
+    <DropdownMenu placement="bottom-end" class="p-0!">
       {#snippet trigger()}
         <Button variant="rounded">
           <Icon
@@ -41,7 +41,7 @@
         </Button>
       {/snippet}
 
-      {#snippet children({ close })}
+      {#snippet children({ close: _close })}
         <div class="p-1 min-w-[150px] transition-all duration-200 flex flex-col text-sm text-color">
           <span class="flex items-center justify-between gap-2 border-b px-2 py-3">
             <span>{user.username}</span>
@@ -57,7 +57,7 @@
             </label>
             <label
               for="theme"
-              class=" relative hover:cursor-pointer border hover:border-shadeD100 focus-within:ring-2 focus-within:ring-blue-600/40 rounded-md flex items-center gap-1"
+              class=" relative hover:cursor-pointer border hover:border-shade-d100 focus-within:ring-2 focus-within:ring-blue-600/40 rounded-md flex items-center gap-1"
             >
               <Icon
                 name={themeIcon}
@@ -67,7 +67,7 @@
                 name="theme"
                 id="theme"
                 bind:value={$theme}
-                class="dark:bg-black text-color text-xs rounded-md outline-none hover:cursor-pointer pl-6 w-[90px] py-1 px-3"
+                class="dark:bg-black text-color text-xs rounded-md outline-hidden hover:cursor-pointer pl-6 w-[90px] py-1 px-3"
               >
                 <option value="dark">Dark</option>
                 <option value="light">Light</option>
@@ -81,7 +81,7 @@
           </div>
           <form class="w-full" method="POST" action={typedRoute('/auth/logout')}>
             <button
-              class="flex w-full items-center justify-between gap-2 px-2 py-2 hover:bg-shadeL300 dark:hover:bg-shadeD1000 rounded-md my-1 dark:hover:text-white"
+              class="flex w-full items-center justify-between gap-2 px-2 py-2 hover:bg-shade-l300 dark:hover:bg-shade-d1000 rounded-md my-1 dark:hover:text-white"
             >
               <span>Log Out</span>
 

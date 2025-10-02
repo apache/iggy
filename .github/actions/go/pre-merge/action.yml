@@ -60,6 +60,14 @@ runs:
         go mod tidy
         git diff --exit-code go.mod go.sum
 
+    - name: Check Generated Code
+      shell: bash
+      if: inputs.task == 'test'
+      run: |
+        cd foreign/go
+        go generate ./...
+        git diff --exit-code errors/errors_gen.go
+
     - name: Test
       shell: bash
       if: inputs.task == 'test'

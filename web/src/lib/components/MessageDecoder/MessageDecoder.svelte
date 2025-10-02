@@ -92,7 +92,11 @@
   {#if decodeState.status === 'success'}
     <div class="flex items-center gap-3">
       <p class="font-bold">Codec: {selectedDecoder}</p>
-      <Button variant="text" onclick={() => (decodeState = { status: 'idle', forceChangeDecoder: true })}>Change decoder</Button>
+      <Button
+        variant="text"
+        onclick={() => (decodeState = { status: 'idle', forceChangeDecoder: true })}
+        >Change decoder</Button
+      >
     </div>
     <div class="w-full mt-2">
       <pre class="bg-gray-100 dark:bg-gray-800 p-1 rounded-md overflow-auto"><code
