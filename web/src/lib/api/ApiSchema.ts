@@ -121,7 +121,7 @@ type Topics =
       method: 'POST';
       path: `/streams/${number}/topics`;
       body: {
-        compression_algorithm: "none" | "gzip";
+        compression_algorithm: 'none' | 'gzip';
         max_topic_size: number;
         message_expiry: number;
         name: string;
