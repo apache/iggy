@@ -16,12 +16,13 @@
  * under the License.
  */
 
-use std::fs::File;
-use std::io::BufReader;
-use std::net::SocketAddr;
-use std::rc::Rc;
-use std::sync::Arc;
-
+use crate::configs::quic::QuicConfig;
+use crate::quic::{COMPONENT, listener, quic_socket};
+use crate::server_error::QuicError;
+use crate::shard::IggyShard;
+use crate::shard::task_registry::ShutdownToken;
+use crate::shard::transmission::event::ShardEvent;
+use crate::shard_info;
 use anyhow::Result;
 use compio_quic::{
     Endpoint, EndpointConfig, IdleTimeout, ServerBuilder, ServerConfig, TransportConfig, VarInt,
@@ -29,15 +30,12 @@ use compio_quic::{
 use error_set::ErrContext;
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tracing::{error, info, trace, warn};
-
-use crate::configs::quic::QuicConfig;
-use crate::quic::{COMPONENT, listener, quic_socket};
-use crate::server_error::QuicError;
-use crate::shard::IggyShard;
-use crate::shard::task_registry::ShutdownToken;
-use crate::shard::transmission::event::ShardEvent;
-use crate::{shard_error, shard_info};
+use std::fs::File;
+use std::io::BufReader;
+use std::net::SocketAddr;
+use std::rc::Rc;
+use std::sync::Arc;
+use tracing::{error, trace, warn};
 
 /// Starts the QUIC server.
 /// Returns the address the server is listening on.

@@ -67,26 +67,26 @@ impl IggyShard {
         let now = Instant::now();
 
         for snapshot_type in snapshot_types {
+            info!("Processing snapshot type: {:?}", snapshot_type);
             match get_command_result(snapshot_type, self.config.system.clone()).await {
                 Ok(temp_file) => {
+                    info!(
+                        "Got temp file for {:?}: {}",
+                        snapshot_type,
+                        temp_file.path().display()
+                    );
                     let filename = format!("{snapshot_type}.txt");
                     let entry = ZipEntryBuilder::new(filename.clone().into(), compression);
 
-                    let file = OpenOptions::new()
-                        .read(true)
-                        .open(temp_file.path())
-                        .await
-                        .map_err(|e| {
-                            error!("Failed to open temporary file: {}", e);
-                            IggyError::SnapshotFileCompletionFailed
-                        })?;
+                    // Read file using compio fs
+                    let content = match compio::fs::read(temp_file.path()).await {
+                        Ok(data) => data,
+                        Err(e) => {
+                            error!("Failed to read temporary file: {}", e);
+                            continue;
+                        }
+                    };
 
-                    let content = Vec::new();
-                    let (result, content) = file.read_exact_at(content, 0).await.into();
-                    if let Err(e) = result {
-                        error!("Failed to read temporary file: {}", e);
-                        continue;
-                    }
                     info!(
                         "Read {} bytes from temp file for {}",
                         content.len(),
@@ -129,19 +129,41 @@ async fn write_command_output_to_temp_file(
     command: &mut Command,
 ) -> Result<NamedTempFile, std::io::Error> {
     let output = command.output()?;
+
+    info!(
+        "Command output: {} bytes, stderr: {}",
+        output.stdout.len(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
     let temp_file = NamedTempFile::new()?;
+
+    // Use compio to write the file - create/truncate to ensure clean write
     let mut file = OpenOptions::new()
+        .create(true)
         .write(true)
+        .truncate(true)
         .open(temp_file.path())
         .await?;
-    let (result, _) = file.write_all_at(output.stdout, 0).await.into();
+
+    // Write the command output - compio takes ownership of the buffer
+    let stdout = output.stdout;
+    let (result, _buf) = file.write_all_at(stdout, 0).await.into();
     result?;
+
     file.sync_all().await?;
+
+    info!(
+        "Wrote {} bytes to temp file: {}",
+        _buf.len(),
+        temp_file.path().display()
+    );
+
     Ok(temp_file)
 }
 
 async fn get_filesystem_overview() -> Result<NamedTempFile, std::io::Error> {
-    write_command_output_to_temp_file(Command::new("ls").args(["-la", "/tmp", "/proc"])).await
+    write_command_output_to_temp_file(&mut Command::new("ls").args(["-la", "/tmp", "/proc"])).await
 }
 
 async fn get_process_info() -> Result<NamedTempFile, std::io::Error> {
@@ -190,7 +212,7 @@ async fn get_resource_usage() -> Result<NamedTempFile, std::io::Error> {
 }
 
 async fn get_test_snapshot() -> Result<NamedTempFile, std::io::Error> {
-    write_command_output_to_temp_file(Command::new("echo").arg("test")).await
+    write_command_output_to_temp_file(&mut Command::new("echo").arg("test")).await
 }
 
 async fn get_server_logs(config: Arc<SystemConfig>) -> Result<NamedTempFile, std::io::Error> {
