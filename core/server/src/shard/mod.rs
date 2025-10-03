@@ -597,9 +597,11 @@ impl IggyShard {
                             ),
                         };
 
-                        let Some(consumer_offset) = consumer_offset else {
-                            return Err(IggyError::ConsumerOffsetNotFound(consumer_id));
-                        };
+                        let batches = if consumer_offset.is_none() {
+                            let batches = self.streams2.get_messages_by_offset(&stream_id, &topic_id, partition_id, 0, count).await?;
+                            Ok(batches)
+                        } else {
+                            let consumer_offset = consumer_offset.unwrap();
                         let offset = consumer_offset + 1;
                         trace!(
                             "Getting next messages for consumer id: {} for partition: {} from offset: {}...",
@@ -616,6 +618,8 @@ impl IggyShard {
                             )
                             .await?;
                         Ok(batches)
+                        };
+                        batches
                     }
                 }?;
 
