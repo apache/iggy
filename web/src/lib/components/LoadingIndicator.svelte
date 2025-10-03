@@ -41,7 +41,7 @@
   });
 </script>
 
-<div class="fixed left-0 right-0 top-0 pointer-events-none z-[999]">
+<div class="fixed left-0 right-0 top-0 pointer-events-none z-999">
   <div
     class="bg-green500 h-[2px]"
     style="width: {progress.current}%; opacity:{opacity.current};"
