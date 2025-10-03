@@ -64,7 +64,7 @@ impl Default for Identifier {
         Self {
             kind: IdKind::default(),
             length: 4,
-            value: 1u32.to_le_bytes().to_vec(),
+            value: 0u32.to_le_bytes().to_vec(),
         }
     }
 }
