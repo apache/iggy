@@ -381,7 +381,9 @@ impl MainOps for Streams {
                 };
 
                 let Some(consumer_offset) = consumer_offset else {
-                    let batches = self.get_messages_by_offset(stream_id, topic_id, partition_id, 0, count).await?;
+                    let batches = self
+                        .get_messages_by_offset(stream_id, topic_id, partition_id, 0, count)
+                        .await?;
                     return Ok((metadata, batches));
                 };
                 let offset = consumer_offset + 1;
