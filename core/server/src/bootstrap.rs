@@ -235,12 +235,10 @@ pub fn create_shard_connections(
     shards_set: &HashSet<usize>,
 ) -> (Vec<ShardConnector<ShardFrame>>, Vec<(u16, StopSender)>) {
     let shards_count = shards_set.len();
-    let mut shards_vec: Vec<usize> = shards_set.iter().cloned().collect();
-    shards_vec.sort();
 
-    let connectors: Vec<ShardConnector<ShardFrame>> = shards_vec
-        .into_iter()
-        .map(|id| ShardConnector::new(id as u16, shards_count))
+    // Create connectors with sequential IDs (0, 1, 2, ...) regardless of CPU core numbers
+    let connectors: Vec<ShardConnector<ShardFrame>> = (0..shards_count)
+        .map(|idx| ShardConnector::new(idx as u16, shards_count))
         .collect();
 
     let shutdown_handles = connectors

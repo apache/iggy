@@ -276,7 +276,7 @@ async fn main() -> Result<(), ServerError> {
     for (id, cpu_id) in shards_set
         .into_iter()
         .enumerate()
-        .map(|(id, shard_id)| (id as u16, shard_id))
+        .map(|(idx, cpu)| (idx as u16, cpu))
     {
         let streams = streams.clone();
         let shards_table = shards_table.clone();
