@@ -29,7 +29,7 @@ impl MessageClient for ClientWrapper {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
         consumer: &Consumer,
         strategy: &PollingStrategy,
         count: u32,
@@ -126,7 +126,7 @@ impl MessageClient for ClientWrapper {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partitioning_id: u32,
+        partitioning_id: usize,
         fsync: bool,
     ) -> Result<(), IggyError> {
         match self {

@@ -31,7 +31,7 @@ impl<B: BinaryClient> ConsumerOffsetClient for B {
         consumer: &Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
         offset: u64,
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
@@ -51,7 +51,7 @@ impl<B: BinaryClient> ConsumerOffsetClient for B {
         consumer: &Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
     ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
         fail_if_not_authenticated(self).await?;
         let response = self
@@ -74,7 +74,7 @@ impl<B: BinaryClient> ConsumerOffsetClient for B {
         consumer: &Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;
         self.send_with_response(&DeleteConsumerOffset {

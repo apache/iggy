@@ -266,9 +266,9 @@ where
     }
 
     fn log_statistics(
-        actor_id: u32,
+        actor_id: usize,
         total_messages: u64,
-        total_batches: u64,
+        total_batches: usize,
         messages_per_batch: &BenchmarkNumericParameter,
         metrics: &BenchmarkIndividualMetrics,
     ) {

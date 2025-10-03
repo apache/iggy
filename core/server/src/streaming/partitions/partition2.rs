@@ -401,7 +401,7 @@ pub fn create_and_insert_partitions_mem(
     stream_id: &Identifier,
     topic_id: &Identifier,
     parent_stats: Arc<TopicStats>,
-    partitions_count: u32,
+    partitions_count: usize,
     config: &SystemConfig,
 ) -> Vec<Partition> {
     let range = 0..partitions_count as usize;

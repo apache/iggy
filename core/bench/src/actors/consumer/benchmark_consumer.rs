@@ -136,7 +136,7 @@ impl<C: BenchmarkConsumerClient> BenchmarkConsumer<C> {
         Self::log_statistics(
             self.config.consumer_id,
             messages_processed,
-            u32::try_from(batches_processed).unwrap_or(u32::MAX),
+            usize::try_from(batches_processed).unwrap_or(usize::MAX),
             &self.config.messages_per_batch,
             &metrics,
         );
@@ -180,9 +180,9 @@ impl<C: BenchmarkConsumerClient> BenchmarkConsumer<C> {
     }
 
     pub fn log_statistics(
-        consumer_id: u32,
+        consumer_id: usize,
         total_messages: u64,
-        message_batches: u32,
+        message_batches: usize,
         messages_per_batch: &BenchmarkNumericParameter,
         metrics: &BenchmarkIndividualMetrics,
     ) {

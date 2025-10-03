@@ -96,7 +96,7 @@ pub trait Benchmarkable: Send {
     /// This method is called before the benchmark is executed.
     async fn init_streams(&self) -> Result<(), IggyError> {
         let number_of_streams = self.args().streams();
-        let partitions_count: u32 = self.args().number_of_partitions();
+        let partitions_count: usize = self.args().number_of_partitions();
         let client = self.client_factory().create_client().await;
         let client = IggyClient::create(client, None, None);
         login_root(&client).await;

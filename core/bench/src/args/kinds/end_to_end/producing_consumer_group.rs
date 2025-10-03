@@ -28,7 +28,7 @@ use crate::args::{
 };
 use clap::{CommandFactory, Parser, error::ErrorKind};
 use iggy::prelude::IggyByteSize;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 
 #[derive(Parser, Debug, Clone)]
 pub struct EndToEndProducingConsumerGroupArgs {
@@ -37,23 +37,23 @@ pub struct EndToEndProducingConsumerGroupArgs {
 
     /// Number of streams
     #[arg(long, short = 's', default_value_t = DEFAULT_BALANCED_NUMBER_OF_STREAMS)]
-    pub streams: NonZeroU32,
+    pub streams: NonZeroUsize,
 
     /// Partitions per stream
     #[arg(long, short = 'a', default_value_t = DEFAULT_BALANCED_NUMBER_OF_PARTITIONS)]
-    pub partitions: NonZeroU32,
+    pub partitions: NonZeroUsize,
 
     /// Number of consumer groups
     #[arg(long, short = 'g', default_value_t = DEFAULT_NUMBER_OF_CONSUMER_GROUPS)]
-    pub consumer_groups: NonZeroU32,
+    pub consumer_groups: NonZeroUsize,
 
     /// Number of active producers
     #[arg(long, short = 'p', default_value_t = DEFAULT_NUMBER_OF_PRODUCERS)]
-    pub producers: NonZeroU32,
+    pub producers: NonZeroUsize,
 
     /// Number of active consumers
     #[arg(long, short = 'c', default_value_t = DEFAULT_NUMBER_OF_CONSUMERS)]
-    pub consumers: NonZeroU32,
+    pub consumers: NonZeroUsize,
 
     /// Max topic size in human readable format, e.g. "1GiB", "2MB", "1GiB". If not provided then topic size will be unlimited.
     #[arg(long, short = 'T')]
@@ -61,19 +61,19 @@ pub struct EndToEndProducingConsumerGroupArgs {
 }
 
 impl BenchmarkKindProps for EndToEndProducingConsumerGroupArgs {
-    fn streams(&self) -> u32 {
+    fn streams(&self) -> usize {
         self.streams.get()
     }
 
-    fn partitions(&self) -> u32 {
+    fn partitions(&self) -> usize {
         self.partitions.get()
     }
 
-    fn consumers(&self) -> u32 {
+    fn consumers(&self) -> usize {
         self.consumers.get()
     }
 
-    fn producers(&self) -> u32 {
+    fn producers(&self) -> usize {
         self.producers.get()
     }
 
@@ -81,7 +81,7 @@ impl BenchmarkKindProps for EndToEndProducingConsumerGroupArgs {
         &self.transport
     }
 
-    fn number_of_consumer_groups(&self) -> u32 {
+    fn number_of_consumer_groups(&self) -> usize {
         self.consumer_groups.get()
     }
 

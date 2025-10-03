@@ -99,7 +99,7 @@ pub async fn collect_server_logs_and_save_to_file(
     })
 }
 
-fn message_batches_from_metrics(individual_metrics: &[BenchmarkIndividualMetrics]) -> u64 {
+fn message_batches_from_metrics(individual_metrics: &[BenchmarkIndividualMetrics]) -> usize {
     individual_metrics
         .iter()
         .map(|s| s.summary.total_message_batches)

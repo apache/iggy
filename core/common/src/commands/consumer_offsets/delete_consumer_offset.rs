@@ -45,7 +45,7 @@ pub struct DeleteConsumerOffset {
     #[serde(skip)]
     pub topic_id: Identifier,
     /// Partition ID on which the offset is stored. Has to be specified for the regular consumer. For consumer group it is ignored (use `None`).
-    pub partition_id: Option<u32>,
+    pub partition_id: Option<usize>,
 }
 
 impl Default for DeleteConsumerOffset {
@@ -83,7 +83,7 @@ impl BytesSerializable for DeleteConsumerOffset {
         bytes.put_slice(&stream_id_bytes);
         bytes.put_slice(&topic_id_bytes);
         if let Some(partition_id) = self.partition_id {
-            bytes.put_u32_le(partition_id);
+            bytes.put_slice(&partition_id.to_le_bytes());
         } else {
             bytes.put_u32_le(0);
         }
@@ -111,7 +111,7 @@ impl BytesSerializable for DeleteConsumerOffset {
             bytes[position..position + 4]
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
+        ) as usize;
         let partition_id = if partition_id == 0 {
             None
         } else {

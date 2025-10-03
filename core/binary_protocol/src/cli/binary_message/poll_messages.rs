@@ -40,7 +40,7 @@ impl PollMessagesCmd {
     pub fn new(
         stream_id: Identifier,
         topic_id: Identifier,
-        partition_id: u32,
+        partition_id: usize,
         message_count: u32,
         auto_commit: bool,
         offset: Option<u64>,

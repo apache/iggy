@@ -36,7 +36,7 @@ pub fn from_records(
     records: &[BenchmarkRecord],
     benchmark_kind: BenchmarkKind,
     actor_kind: ActorKind,
-    actor_id: u32,
+    actor_id: usize,
     sampling_time: IggyDuration,
     moving_average_window: u32,
 ) -> BenchmarkIndividualMetrics {
@@ -98,7 +98,7 @@ pub fn from_records(
 fn create_empty_metrics(
     benchmark_kind: BenchmarkKind,
     actor_kind: ActorKind,
-    actor_id: u32,
+    actor_id: usize,
 ) -> BenchmarkIndividualMetrics {
     BenchmarkIndividualMetrics {
         summary: BenchmarkIndividualMetricsSummary {
@@ -130,7 +130,7 @@ fn create_empty_metrics(
     }
 }
 
-fn extract_totals(records: &[BenchmarkRecord]) -> (f64, u64, u64, u64, u64) {
+fn extract_totals(records: &[BenchmarkRecord]) -> (f64, u64, u64, u64, usize) {
     let last_record = records.last().unwrap();
     let total_time_secs = last_record.elapsed_time_us as f64 / 1_000_000.0;
     (

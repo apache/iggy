@@ -38,12 +38,12 @@ use tracing::{debug, trace};
 
 #[derive(Debug)]
 pub struct IggyPollMetadata {
-    pub partition_id: u32,
+    pub partition_id: usize,
     pub current_offset: u64,
 }
 
 impl IggyPollMetadata {
-    pub fn new(partition_id: u32, current_offset: u64) -> Self {
+    pub fn new(partition_id: usize, current_offset: u64) -> Self {
         Self {
             partition_id,
             current_offset,
@@ -101,7 +101,7 @@ impl ServerCommandHandler for PollMessages {
         let mut partition_id_buf = PooledBuffer::with_capacity(4);
         let mut current_offset_buf = PooledBuffer::with_capacity(8);
         let mut count_buf = PooledBuffer::with_capacity(4);
-        partition_id_buf.put_u32_le(metadata.partition_id);
+        partition_id_buf.put_slice(&metadata.partition_id.to_le_bytes());
         current_offset_buf.put_u64_le(metadata.current_offset);
         count_buf.put_u32_le(batch.count());
 

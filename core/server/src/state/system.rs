@@ -58,7 +58,7 @@ pub struct StreamState {
 pub struct TopicState {
     pub id: u32,
     pub name: String,
-    pub partitions: BTreeMap<u32, PartitionState>,
+    pub partitions: BTreeMap<usize, PartitionState>,
     pub consumer_groups: BTreeMap<u32, ConsumerGroupState>,
     pub compression_algorithm: CompressionAlgorithm,
     pub message_expiry: IggyExpiry,
@@ -69,7 +69,7 @@ pub struct TopicState {
 
 #[derive(Debug, Clone)]
 pub struct PartitionState {
-    pub id: u32,
+    pub id: usize,
     pub created_at: IggyTimestamp,
 }
 

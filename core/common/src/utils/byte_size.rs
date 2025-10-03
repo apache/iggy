@@ -124,6 +124,23 @@ impl From<Option<u64>> for IggyByteSize {
     }
 }
 
+/// Converts a `usize` bytes to `IggyByteSize`.
+impl From<usize> for IggyByteSize {
+    fn from(byte_size: usize) -> Self {
+        IggyByteSize(Byte::from_u64(byte_size as u64))
+    }
+}
+
+/// Converts an `Option<usize>` to `IggyByteSize` bytes.
+impl From<Option<usize>> for IggyByteSize {
+    fn from(bytes_size: Option<usize>) -> Self {
+        match bytes_size {
+            Some(value) => IggyByteSize(Byte::from_u64(value as u64)),
+            None => IggyByteSize(Byte::from_u64(0)),
+        }
+    }
+}
+
 impl FromStr for IggyByteSize {
     type Err = IggyError;
 

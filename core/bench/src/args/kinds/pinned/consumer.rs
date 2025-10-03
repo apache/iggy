@@ -23,6 +23,7 @@ use crate::args::{
 use clap::{CommandFactory, Parser, error::ErrorKind};
 use iggy::prelude::IggyByteSize;
 use std::num::NonZeroU32;
+use std::num::NonZeroUsize;
 
 #[derive(Parser, Debug, Clone)]
 pub struct PinnedConsumerArgs {
@@ -32,27 +33,27 @@ pub struct PinnedConsumerArgs {
     /// Number of streams
     /// If not provided then number of streams will be equal to number of consumers.
     #[arg(long, short = 's')]
-    pub streams: Option<NonZeroU32>,
+    pub streams: Option<NonZeroUsize>,
 
     /// Number of consumers
     #[arg(long, short = 'c', default_value_t = DEFAULT_NUMBER_OF_PRODUCERS)]
-    pub consumers: NonZeroU32,
+    pub consumers: NonZeroUsize,
 }
 
 impl BenchmarkKindProps for PinnedConsumerArgs {
-    fn streams(&self) -> u32 {
+    fn streams(&self) -> usize {
         self.streams.unwrap_or(self.consumers).get()
     }
 
-    fn partitions(&self) -> u32 {
+    fn partitions(&self) -> usize {
         0
     }
 
-    fn consumers(&self) -> u32 {
+    fn consumers(&self) -> usize {
         self.consumers.get()
     }
 
-    fn producers(&self) -> u32 {
+    fn producers(&self) -> usize {
         0
     }
 
@@ -60,7 +61,7 @@ impl BenchmarkKindProps for PinnedConsumerArgs {
         &self.transport
     }
 
-    fn number_of_consumer_groups(&self) -> u32 {
+    fn number_of_consumer_groups(&self) -> usize {
         0
     }
 

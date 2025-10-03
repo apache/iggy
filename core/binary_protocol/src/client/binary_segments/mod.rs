@@ -29,7 +29,7 @@ impl<B: BinaryClient> SegmentClient for B {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: u32,
+        partition_id: usize,
         segments_count: u32,
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;

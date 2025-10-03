@@ -87,11 +87,7 @@ async fn get_consumer_group(
         .shard()
         .permissioner
         .borrow()
-        .get_consumer_group(
-            session.get_user_id(),
-            numeric_stream_id as u32,
-            numeric_topic_id as u32,
-        )?;
+        .get_consumer_group(session.get_user_id(), numeric_stream_id, numeric_topic_id)?;
 
     let consumer_group = state.shard.shard().streams2.with_consumer_group_by_id(
         &identifier_stream_id,
@@ -135,11 +131,7 @@ async fn get_consumer_groups(
         .shard()
         .permissioner
         .borrow()
-        .get_consumer_groups(
-            session.get_user_id(),
-            numeric_stream_id as u32,
-            numeric_topic_id as u32,
-        )?;
+        .get_consumer_groups(session.get_user_id(), numeric_stream_id, numeric_topic_id)?;
 
     let consumer_groups = state.shard.shard().streams2.with_consumer_groups(
         &identifier_stream_id,

@@ -29,7 +29,7 @@ pub struct CreatePartitionsCmd {
 }
 
 impl CreatePartitionsCmd {
-    pub fn new(stream_id: Identifier, topic_id: Identifier, partitions_count: u32) -> Self {
+    pub fn new(stream_id: Identifier, topic_id: Identifier, partitions_count: usize) -> Self {
         Self {
             create_partition: CreatePartitions {
                 stream_id,

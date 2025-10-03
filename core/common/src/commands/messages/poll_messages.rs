@@ -24,7 +24,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 
-pub const DEFAULT_PARTITION_ID: u32 = 1;
+pub const DEFAULT_PARTITION_ID: usize = 1;
 pub const DEFAULT_NUMBER_OF_MESSAGES_TO_POLL: u32 = 10;
 
 /// `PollMessages` command is used to poll messages from a topic in a stream.
@@ -49,7 +49,7 @@ pub struct PollMessages {
     pub topic_id: Identifier,
     /// Partition ID from which messages will be polled. Has to be specified for the regular consumer. For consumer group it is ignored (use `None`).
     #[serde(default = "PollMessages::default_partition_id")]
-    pub partition_id: Option<u32>,
+    pub partition_id: Option<usize>,
     /// Polling strategy which specifies from where to start polling messages.
     #[serde(default = "PollingStrategy::default", flatten)]
     pub strategy: PollingStrategy,
@@ -65,7 +65,7 @@ impl PollMessages {
     pub fn bytes(
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
         consumer: &Consumer,
         strategy: &PollingStrategy,
         count: u32,
@@ -85,7 +85,7 @@ impl PollMessages {
         bytes.put_slice(&stream_id_bytes);
         bytes.put_slice(&topic_id_bytes);
         if let Some(partition_id) = partition_id {
-            bytes.put_u32_le(partition_id);
+            bytes.put_slice(&partition_id.to_le_bytes());
         } else {
             bytes.put_u32_le(0);
         }
@@ -104,7 +104,7 @@ impl PollMessages {
         DEFAULT_NUMBER_OF_MESSAGES_TO_POLL
     }
 
-    pub fn default_partition_id() -> Option<u32> {
+    pub fn default_partition_id() -> Option<usize> {
         Some(DEFAULT_PARTITION_ID)
     }
 }
@@ -169,7 +169,7 @@ impl BytesSerializable for PollMessages {
             bytes[position..position + 4]
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
+        ) as usize;
         let partition_id = match partition_id {
             0 => None,
             partition_id => Some(partition_id),

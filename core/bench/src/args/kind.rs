@@ -121,19 +121,19 @@ impl BenchmarkKindCommand {
 }
 
 impl BenchmarkKindProps for BenchmarkKindCommand {
-    fn streams(&self) -> u32 {
+    fn streams(&self) -> usize {
         self.inner().streams()
     }
 
-    fn partitions(&self) -> u32 {
+    fn partitions(&self) -> usize {
         self.inner().partitions()
     }
 
-    fn consumers(&self) -> u32 {
+    fn consumers(&self) -> usize {
         self.inner().consumers()
     }
 
-    fn producers(&self) -> u32 {
+    fn producers(&self) -> usize {
         self.inner().producers()
     }
 
@@ -141,7 +141,7 @@ impl BenchmarkKindProps for BenchmarkKindCommand {
         self.inner().transport_command()
     }
 
-    fn number_of_consumer_groups(&self) -> u32 {
+    fn number_of_consumer_groups(&self) -> usize {
         self.inner().number_of_consumer_groups()
     }
 

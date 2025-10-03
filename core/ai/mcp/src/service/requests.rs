@@ -78,7 +78,7 @@ pub struct CreateTopic {
     pub name: String,
 
     #[schemars(description = "partitions count (required, must be greater than 0)")]
-    pub partitions_count: u32,
+    pub partitions_count: usize,
 
     #[schemars(description = "compression algorithm (optional, can be one of 'none', 'gzip')")]
     pub compression_algorithm: Option<String>,
@@ -144,7 +144,7 @@ pub struct CreatePartitions {
     pub topic_id: String,
 
     #[schemars(description = "partitions count (required, must be greater than 0)")]
-    pub partitions_count: u32,
+    pub partitions_count: usize,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -156,7 +156,7 @@ pub struct DeletePartitions {
     pub topic_id: String,
 
     #[schemars(description = "partitions count (required, must be greater than 0)")]
-    pub partitions_count: u32,
+    pub partitions_count: usize,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -168,7 +168,7 @@ pub struct DeleteSegments {
     pub topic_id: String,
 
     #[schemars(description = "partition identifier (number)")]
-    pub partition_id: u32,
+    pub partition_id: usize,
 
     #[schemars(description = "segments count (required, must be greater than 0)")]
     pub segments_count: u32,
@@ -183,7 +183,7 @@ pub struct PollMessages {
     pub topic_id: String,
 
     #[schemars(description = "partition identifier (optional, number)")]
-    pub partition_id: Option<u32>,
+    pub partition_id: Option<usize>,
 
     #[schemars(description = "strategy (optional, string)")]
     pub strategy: Option<String>,
@@ -210,7 +210,7 @@ pub struct SendMessages {
     pub topic_id: String,
 
     #[schemars(description = "partition identifier (optional, number)")]
-    pub partition_id: Option<u32>,
+    pub partition_id: Option<usize>,
 
     #[schemars(description = "partitioning (optional, string)")]
     pub partitioning: Option<String>,
@@ -300,7 +300,7 @@ pub struct GetConsumerOffset {
     pub topic_id: String,
 
     #[schemars(description = "partition identifier (optional, number)")]
-    pub partition_id: Option<u32>,
+    pub partition_id: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -312,7 +312,7 @@ pub struct StoreConsumerOffset {
     pub topic_id: String,
 
     #[schemars(description = "partition identifier (optional, number)")]
-    pub partition_id: Option<u32>,
+    pub partition_id: Option<usize>,
 
     #[schemars(description = "offset (required, number)")]
     pub offset: u64,
@@ -327,7 +327,7 @@ pub struct DeleteConsumerOffset {
     pub topic_id: String,
 
     #[schemars(description = "partition identifier (optional, number)")]
-    pub partition_id: Option<u32>,
+    pub partition_id: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -411,7 +411,7 @@ pub struct Permissions {
     pub global: Option<GlobalPermissions>,
 
     #[schemars(description = "stream permissions (optional)")]
-    pub streams: Option<HashMap<u32, StreamPermissions>>,
+    pub streams: Option<HashMap<usize, StreamPermissions>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -468,7 +468,7 @@ pub struct StreamPermissions {
     pub send_messages: Option<bool>,
 
     #[schemars(description = "topics permissions (optional)")]
-    pub topics: Option<HashMap<u32, TopicPermissions>>,
+    pub topics: Option<HashMap<usize, TopicPermissions>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

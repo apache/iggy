@@ -39,10 +39,10 @@ pub fn get_partition_ids() -> impl FnOnce(&Partitions) -> Vec<usize> {
 }
 
 pub fn delete_partitions(
-    partitions_count: u32,
+    partitions_count: usize,
 ) -> impl FnOnce(&mut Partitions) -> Vec<partition2::Partition> {
     move |partitions| {
-        let current_count = partitions.len() as u32;
+        let current_count = partitions.len() as usize;
         let partitions_to_delete = partitions_count.min(current_count);
         let start_idx = (current_count - partitions_to_delete) as usize;
         let range = start_idx..current_count as usize;

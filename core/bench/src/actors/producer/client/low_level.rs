@@ -87,7 +87,7 @@ impl ProducerClient for LowLevelProducerClient {
 
 impl BenchmarkInit for LowLevelProducerClient {
     async fn setup(&mut self) -> Result<(), IggyError> {
-        let default_partition_id = 0u32;
+        let default_partition_id = 0usize;
         let partitions = self.config.partitions;
 
         let client = self.client_factory.create_client().await;

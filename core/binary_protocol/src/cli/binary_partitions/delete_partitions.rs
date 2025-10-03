@@ -29,7 +29,7 @@ pub struct DeletePartitionsCmd {
 }
 
 impl DeletePartitionsCmd {
-    pub fn new(stream_id: Identifier, topic_id: Identifier, partitions_count: u32) -> Self {
+    pub fn new(stream_id: Identifier, topic_id: Identifier, partitions_count: usize) -> Self {
         Self {
             delete_partitions: DeletePartitions {
                 stream_id,

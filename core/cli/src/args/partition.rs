@@ -62,8 +62,8 @@ pub(crate) struct PartitionCreateArgs {
     #[arg(value_parser = clap::value_parser!(Identifier))]
     pub(crate) topic_id: Identifier,
     /// Partitions count to be created
-    #[arg(value_parser = clap::value_parser!(u32).range(1..100_001))]
-    pub(crate) partitions_count: u32,
+    #[arg(value_parser = clap::value_parser!(usize))]
+    pub(crate) partitions_count: usize,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -79,6 +79,6 @@ pub(crate) struct PartitionDeleteArgs {
     #[arg(value_parser = clap::value_parser!(Identifier))]
     pub(crate) topic_id: Identifier,
     /// Partitions count to be deleted
-    #[arg(value_parser = clap::value_parser!(u32).range(1..100_001))]
-    pub(crate) partitions_count: u32,
+    #[arg(value_parser = clap::value_parser!(usize))]
+    pub(crate) partitions_count: usize,
 }

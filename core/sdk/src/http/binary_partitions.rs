@@ -30,7 +30,7 @@ impl PartitionClient for HttpClient {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partitions_count: u32,
+        partitions_count: usize,
     ) -> Result<(), IggyError> {
         self.post(
             &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
@@ -48,7 +48,7 @@ impl PartitionClient for HttpClient {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partitions_count: u32,
+        partitions_count: usize,
     ) -> Result<(), IggyError> {
         self.delete_with_query(
             &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),

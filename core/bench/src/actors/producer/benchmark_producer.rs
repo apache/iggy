@@ -189,9 +189,9 @@ impl<P: BenchmarkProducerClient> BenchmarkProducer<P> {
     }
 
     fn log_statistics(
-        producer_id: u32,
+        producer_id: usize,
         total_messages: u64,
-        message_batches: u64,
+        message_batches: usize,
         messages_per_batch: &BenchmarkNumericParameter,
         metrics: &BenchmarkIndividualMetrics,
     ) {

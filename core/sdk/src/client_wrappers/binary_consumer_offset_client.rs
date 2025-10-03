@@ -28,7 +28,7 @@ impl ConsumerOffsetClient for ClientWrapper {
         consumer: &Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
         offset: u64,
     ) -> Result<(), IggyError> {
         match self {
@@ -60,7 +60,7 @@ impl ConsumerOffsetClient for ClientWrapper {
         consumer: &Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
     ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
         match self {
             ClientWrapper::Iggy(client) => {
@@ -91,7 +91,7 @@ impl ConsumerOffsetClient for ClientWrapper {
         consumer: &Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
     ) -> Result<(), IggyError> {
         match self {
             ClientWrapper::Iggy(client) => {

@@ -32,7 +32,7 @@ use tracing::error;
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PolledMessages {
     /// The identifier of the partition. If it's '0', then there's no partition assigned to the consumer group member.
-    pub partition_id: u32,
+    pub partition_id: usize,
     /// The current offset of the partition.
     pub current_offset: u64,
     /// The count of messages.
@@ -62,7 +62,7 @@ impl BytesSerializable for PolledMessages {
             bytes[0..4]
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
+        ) as usize;
         let current_offset = u64::from_le_bytes(
             bytes[4..12]
                 .try_into()

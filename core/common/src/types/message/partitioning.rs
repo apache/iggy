@@ -73,7 +73,7 @@ impl Partitioning {
     }
 
     /// Partition the messages using the provided partition ID.
-    pub fn partition_id(partition_id: u32) -> Self {
+    pub fn partition_id(partition_id: usize) -> Self {
         Partitioning {
             kind: PartitioningKind::PartitionId,
             length: 4,

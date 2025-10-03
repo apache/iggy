@@ -34,7 +34,7 @@ use std::fmt::Display;
 pub struct FlushUnsavedBuffer {
     pub stream_id: Identifier,
     pub topic_id: Identifier,
-    pub partition_id: u32,
+    pub partition_id: usize,
     pub fsync: bool,
 }
 
@@ -71,7 +71,7 @@ impl BytesSerializable for FlushUnsavedBuffer {
             BytesMut::with_capacity(stream_id_bytes.len() + topic_id_bytes.len() + 4 + 1);
         bytes.put_slice(&stream_id_bytes);
         bytes.put_slice(&topic_id_bytes);
-        bytes.put_u32_le(self.partition_id);
+        bytes.put_slice(&self.partition_id.to_le_bytes());
         bytes.put_u8(if self.fsync { 1 } else { 0 });
         bytes.freeze()
     }
@@ -89,7 +89,7 @@ impl BytesSerializable for FlushUnsavedBuffer {
             bytes[position..position + 4]
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
+        ) as usize;
         position += 4;
         let fsync = bytes[position] == 1;
         Ok(FlushUnsavedBuffer {

@@ -25,14 +25,14 @@ use serde::{Deserialize, Serialize};
 pub struct BenchmarkIndividualMetricsSummary {
     pub benchmark_kind: BenchmarkKind,
     pub actor_kind: ActorKind,
-    pub actor_id: u32,
+    pub actor_id: usize,
     #[serde(serialize_with = "round_float")]
     pub total_time_secs: f64,
     pub total_user_data_bytes: u64,
     pub total_bytes: u64,
     pub total_messages: u64,
     #[serde(default)]
-    pub total_message_batches: u64,
+    pub total_message_batches: usize,
     #[serde(serialize_with = "round_float")]
     pub throughput_megabytes_per_second: f64,
     #[serde(serialize_with = "round_float")]

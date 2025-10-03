@@ -34,10 +34,10 @@ use tracing::{error, info};
 
 pub async fn create_consumer(
     client: &IggyClient,
-    consumer_group_id: Option<&u32>,
+    consumer_group_id: Option<&usize>,
     stream_id: &Identifier,
     topic_id: &Identifier,
-    consumer_id: u32,
+    consumer_id: usize,
 ) -> Consumer {
     match consumer_group_id {
         Some(consumer_group_id) => {
@@ -45,20 +45,23 @@ pub async fn create_consumer(
                 "Consumer #{} → joining consumer group #{}",
                 consumer_id, consumer_group_id
             );
-            let cg_identifier = Identifier::try_from(*consumer_group_id).unwrap();
+            let cg_identifier = Identifier::try_from((*consumer_group_id) as u32).unwrap();
             client
                 .join_consumer_group(stream_id, topic_id, &cg_identifier)
                 .await
                 .expect("Failed to join consumer group");
             Consumer::group(cg_identifier)
         }
-        None => Consumer::new(consumer_id.try_into().unwrap()),
+        None => Consumer::new((consumer_id as u32).try_into().unwrap()),
     }
 }
 
-pub fn rate_limit_per_actor(total_rate: Option<IggyByteSize>, actors: u32) -> Option<IggyByteSize> {
+pub fn rate_limit_per_actor(
+    total_rate: Option<IggyByteSize>,
+    actors: usize,
+) -> Option<IggyByteSize> {
     total_rate.and_then(|rl| {
-        let per_actor = rl.as_bytes_u64() / u64::from(actors);
+        let per_actor = rl.as_bytes_usize() / actors;
         if per_actor > 0 {
             Some(per_actor.into())
         } else {

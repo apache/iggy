@@ -73,7 +73,7 @@ impl IggyShard {
 
         self.permissioner
             .borrow()
-            .update_stream(session.get_user_id(), id as u32)
+            .update_stream(session.get_user_id(), id)
             .with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to update stream, user ID: {}, stream ID: {}",
@@ -139,7 +139,7 @@ impl IggyShard {
             .with_stream_by_id(id, streams::helpers::get_stream_id());
         self.permissioner
             .borrow()
-            .delete_stream(session.get_user_id(), stream_id as u32)
+            .delete_stream(session.get_user_id(), stream_id)
             .with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - permission denied to delete stream for user {}, stream ID: {}",
@@ -169,7 +169,7 @@ impl IggyShard {
             let stream_id = self.streams2.with_stream_by_id(stream_id, get_stream_id);
             self.permissioner
                 .borrow()
-                .purge_stream(session.get_user_id(), stream_id as u32)
+                .purge_stream(session.get_user_id(), stream_id)
                 .with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - permission denied to purge stream for user {}, stream ID: {}",

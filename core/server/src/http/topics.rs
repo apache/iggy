@@ -94,7 +94,7 @@ async fn get_topic(
     state.shard.shard()
         .permissioner
         .borrow()
-        .get_topic(session.get_user_id(), numeric_stream_id as u32, numeric_topic_id as u32)
+        .get_topic(session.get_user_id(), numeric_stream_id, numeric_topic_id)
         .with_error_context(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - permission denied to get topic with ID: {topic_id} in stream with ID: {stream_id} for user with ID: {}",
@@ -134,7 +134,7 @@ async fn get_topics(
     state.shard.shard()
         .permissioner
         .borrow()
-        .get_topics(session.get_user_id(), numeric_stream_id as u32)
+        .get_topics(session.get_user_id(), numeric_stream_id)
         .with_error_context(|error| {
             format!(
                 "{COMPONENT} (error: {error}) - permission denied to get topics in stream with ID: {stream_id} for user with ID: {}",

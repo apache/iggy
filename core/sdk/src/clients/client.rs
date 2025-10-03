@@ -128,7 +128,7 @@ impl IggyClient {
         name: &str,
         stream: &str,
         topic: &str,
-        partition: u32,
+        partition: usize,
     ) -> Result<IggyConsumerBuilder, IggyError> {
         Ok(IggyConsumerBuilder::new(
             self.client.clone(),

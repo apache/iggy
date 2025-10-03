@@ -29,5 +29,5 @@ pub trait Partitioner: Send + Sync + Debug {
         stream_id: &Identifier,
         topic_id: &Identifier,
         messages: &[IggyMessage],
-    ) -> Result<u32, IggyError>;
+    ) -> Result<usize, IggyError>;
 }

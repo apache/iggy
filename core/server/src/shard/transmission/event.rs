@@ -45,7 +45,7 @@ pub enum ShardEvent {
     DeletedPartitions2 {
         stream_id: Identifier,
         topic_id: Identifier,
-        partitions_count: u32,
+        partitions_count: usize,
         partition_ids: Vec<usize>,
     },
     CreatedTopic2 {

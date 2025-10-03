@@ -31,7 +31,7 @@ pub trait PartitionClient {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partitions_count: u32,
+        partitions_count: usize,
     ) -> Result<(), IggyError>;
     /// Delete last N partitions for a topic by unique ID or name.
     ///
@@ -42,6 +42,6 @@ pub trait PartitionClient {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partitions_count: u32,
+        partitions_count: usize,
     ) -> Result<(), IggyError>;
 }

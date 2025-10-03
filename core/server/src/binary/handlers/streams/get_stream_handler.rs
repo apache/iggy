@@ -52,7 +52,7 @@ impl ServerCommandHandler for GetStream {
         shard
             .permissioner
             .borrow()
-            .get_stream(session.get_user_id(), stream_id as u32)
+            .get_stream(session.get_user_id(), stream_id)
             .with_error_context(|_| {
                 format!(
                     "permission denied to get stream with ID: {} for user with ID: {}",

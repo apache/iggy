@@ -51,7 +51,7 @@ impl ServerCommandHandler for GetTopics {
         shard
             .permissioner
             .borrow()
-            .get_topics(session.get_user_id(), numeric_stream_id as u32);
+            .get_topics(session.get_user_id(), numeric_stream_id);
 
         let response = shard.streams2.with_topics(&self.stream_id, |topics| {
             topics.with_components(|topics| {

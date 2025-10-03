@@ -43,10 +43,10 @@ pub struct Args {
     pub topic_id: String,
 
     #[arg(long, default_value = "1")]
-    pub partition_id: u32,
+    pub partition_id: usize,
 
     #[arg(long, default_value = "1")]
-    pub partitions_count: u32,
+    pub partitions_count: usize,
 
     #[arg(long, default_value = "1")]
     pub compression_algorithm: u8,

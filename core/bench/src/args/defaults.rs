@@ -17,8 +17,8 @@
  */
 
 use iggy::prelude::IggyByteSize;
-use nonzero_lit::u32;
-use std::num::NonZeroU32;
+use nonzero_lit::{u32, usize};
+use std::num::{NonZeroU32, NonZeroUsize};
 
 pub const DEFAULT_HTTP_SERVER_ADDRESS: &str = "127.0.0.1:3000";
 
@@ -30,19 +30,19 @@ pub const DEFAULT_QUIC_SERVER_NAME: &str = "localhost";
 pub const DEFAULT_QUIC_VALIDATE_CERTIFICATE: bool = false;
 
 pub const DEFAULT_MESSAGES_PER_BATCH: NonZeroU32 = u32!(1000);
-pub const DEFAULT_MESSAGE_BATCHES: NonZeroU32 = u32!(1000);
+pub const DEFAULT_MESSAGE_BATCHES: NonZeroUsize = usize!(1000);
 pub const DEFAULT_MESSAGE_SIZE: NonZeroU32 = u32!(1000);
 pub const DEFAULT_TOTAL_MESSAGES_SIZE: IggyByteSize = IggyByteSize::new(8_000_000);
 
-pub const DEFAULT_PINNED_NUMBER_OF_STREAMS: NonZeroU32 = u32!(8);
-pub const DEFAULT_BALANCED_NUMBER_OF_STREAMS: NonZeroU32 = u32!(1);
+pub const DEFAULT_PINNED_NUMBER_OF_STREAMS: NonZeroUsize = usize!(8);
+pub const DEFAULT_BALANCED_NUMBER_OF_STREAMS: NonZeroUsize = usize!(1);
 
-pub const DEFAULT_PINNED_NUMBER_OF_PARTITIONS: NonZeroU32 = u32!(1);
-pub const DEFAULT_BALANCED_NUMBER_OF_PARTITIONS: NonZeroU32 = u32!(24);
+pub const DEFAULT_PINNED_NUMBER_OF_PARTITIONS: NonZeroUsize = usize!(1);
+pub const DEFAULT_BALANCED_NUMBER_OF_PARTITIONS: NonZeroUsize = usize!(24);
 
-pub const DEFAULT_NUMBER_OF_CONSUMERS: NonZeroU32 = u32!(8);
-pub const DEFAULT_NUMBER_OF_CONSUMER_GROUPS: NonZeroU32 = u32!(1);
-pub const DEFAULT_NUMBER_OF_PRODUCERS: NonZeroU32 = u32!(8);
+pub const DEFAULT_NUMBER_OF_CONSUMERS: NonZeroUsize = usize!(8);
+pub const DEFAULT_NUMBER_OF_CONSUMER_GROUPS: NonZeroUsize = usize!(1);
+pub const DEFAULT_NUMBER_OF_PRODUCERS: NonZeroUsize = usize!(8);
 
 pub const DEFAULT_PERFORM_CLEANUP: bool = false;
 pub const DEFAULT_SERVER_STDOUT_VISIBILITY: bool = false;

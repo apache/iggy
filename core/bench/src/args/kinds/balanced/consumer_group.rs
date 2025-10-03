@@ -27,7 +27,7 @@ use crate::args::{
 };
 use clap::{CommandFactory, Parser, error::ErrorKind};
 use iggy::prelude::IggyByteSize;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 
 /// Polling benchmark with consumer group
 #[derive(Parser, Debug, Clone)]
@@ -37,31 +37,31 @@ pub struct BalancedConsumerGroupArgs {
 
     /// Number of streams
     #[arg(long, short = 's', default_value_t = DEFAULT_BALANCED_NUMBER_OF_STREAMS)]
-    pub streams: NonZeroU32,
+    pub streams: NonZeroUsize,
 
     /// Number of consumers
     #[arg(long, short = 'c', default_value_t = DEFAULT_NUMBER_OF_CONSUMERS)]
-    pub consumers: NonZeroU32,
+    pub consumers: NonZeroUsize,
 
     /// Number of consumer groups
     #[arg(long, short = 'g', default_value_t = DEFAULT_NUMBER_OF_CONSUMER_GROUPS)]
-    pub consumer_groups: NonZeroU32,
+    pub consumer_groups: NonZeroUsize,
 }
 
 impl BenchmarkKindProps for BalancedConsumerGroupArgs {
-    fn streams(&self) -> u32 {
+    fn streams(&self) -> usize {
         self.streams.get()
     }
 
-    fn partitions(&self) -> u32 {
+    fn partitions(&self) -> usize {
         0
     }
 
-    fn consumers(&self) -> u32 {
+    fn consumers(&self) -> usize {
         self.consumers.get()
     }
 
-    fn producers(&self) -> u32 {
+    fn producers(&self) -> usize {
         0
     }
 
@@ -69,7 +69,7 @@ impl BenchmarkKindProps for BalancedConsumerGroupArgs {
         &self.transport
     }
 
-    fn number_of_consumer_groups(&self) -> u32 {
+    fn number_of_consumer_groups(&self) -> usize {
         self.consumer_groups.get()
     }
 

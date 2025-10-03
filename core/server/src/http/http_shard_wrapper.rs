@@ -51,7 +51,7 @@ impl HttpSafeShard {
         consumer: Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
     ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
         let future = SendWrapper::new(self.shard().get_consumer_offset(
             session,
@@ -69,7 +69,7 @@ impl HttpSafeShard {
         consumer: Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
         offset: u64,
     ) -> Result<(), IggyError> {
         let future = SendWrapper::new(self.shard().store_consumer_offset(
@@ -90,7 +90,7 @@ impl HttpSafeShard {
         consumer: Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
     ) -> Result<(), IggyError> {
         let future = SendWrapper::new(self.shard().delete_consumer_offset(
             session,
@@ -257,7 +257,7 @@ impl HttpSafeShard {
         stream_id: Identifier,
         topic_id: Identifier,
         consumer: Consumer,
-        maybe_partition_id: Option<u32>,
+        maybe_partition_id: Option<usize>,
         args: PollingArgs,
     ) -> Result<(IggyPollMetadata, IggyMessagesBatchSet), IggyError> {
         let future = SendWrapper::new(self.shard().poll_messages(

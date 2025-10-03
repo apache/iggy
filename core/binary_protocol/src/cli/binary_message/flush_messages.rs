@@ -26,7 +26,7 @@ use tracing::{Level, event};
 pub struct FlushMessagesCmd {
     stream_id: Identifier,
     topic_id: Identifier,
-    partition_id: u32,
+    partition_id: usize,
     fsync: bool,
 }
 
@@ -34,7 +34,7 @@ impl FlushMessagesCmd {
     pub fn new(
         stream_id: Identifier,
         topic_id: Identifier,
-        partition_id: u32,
+        partition_id: usize,
         fsync: bool,
     ) -> Self {
         Self {

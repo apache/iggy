@@ -32,7 +32,7 @@ impl MessageClient for HttpClient {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
         consumer: &Consumer,
         strategy: &PollingStrategy,
         count: u32,
@@ -85,7 +85,7 @@ impl MessageClient for HttpClient {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: u32,
+        partition_id: usize,
         fsync: bool,
     ) -> Result<(), IggyError> {
         let _ = self
@@ -115,7 +115,7 @@ fn get_path(stream_id: &str, topic_id: &str) -> String {
 fn get_path_flush_unsaved_buffer(
     stream_id: &str,
     topic_id: &str,
-    partition_id: u32,
+    partition_id: usize,
     fsync: bool,
 ) -> String {
     format!("streams/{stream_id}/topics/{topic_id}/messages/flush/{partition_id}/fsync={fsync}")

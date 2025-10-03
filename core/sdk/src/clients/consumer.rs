@@ -33,7 +33,7 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::time;
@@ -103,7 +103,7 @@ pub struct IggyConsumer {
     joined_consumer_group: Arc<AtomicBool>,
     stream_id: Arc<Identifier>,
     topic_id: Arc<Identifier>,
-    partition_id: Option<u32>,
+    partition_id: Option<usize>,
     polling_strategy: PollingStrategy,
     poll_interval_micros: u64,
     batch_length: u32,
@@ -111,18 +111,18 @@ pub struct IggyConsumer {
     auto_commit_after_polling: bool,
     auto_join_consumer_group: bool,
     create_consumer_group_if_not_exists: bool,
-    last_stored_offsets: Arc<DashMap<u32, AtomicU64>>,
-    last_consumed_offsets: Arc<DashMap<u32, AtomicU64>>,
-    current_offsets: Arc<DashMap<u32, AtomicU64>>,
+    last_stored_offsets: Arc<DashMap<usize, AtomicU64>>,
+    last_consumed_offsets: Arc<DashMap<usize, AtomicU64>>,
+    current_offsets: Arc<DashMap<usize, AtomicU64>>,
     poll_future: Option<PollMessagesFuture>,
     buffered_messages: VecDeque<IggyMessage>,
     encryptor: Option<Arc<EncryptorKind>>,
-    store_offset_sender: flume::Sender<(u32, u64)>,
+    store_offset_sender: flume::Sender<(usize, u64)>,
     store_offset_after_each_message: bool,
     store_offset_after_all_messages: bool,
     store_after_every_nth_message: u64,
     last_polled_at: Arc<AtomicU64>,
-    current_partition_id: Arc<AtomicU32>,
+    current_partition_id: Arc<AtomicUsize>,
     reconnection_retry_interval: IggyDuration,
     init_retries: Option<u32>,
     init_retry_interval: IggyDuration,
@@ -137,7 +137,7 @@ impl IggyConsumer {
         consumer: Consumer,
         stream_id: Identifier,
         topic_id: Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
         polling_interval: Option<IggyDuration>,
         polling_strategy: PollingStrategy,
         batch_length: u32,
@@ -198,7 +198,7 @@ impl IggyConsumer {
                 _ => 0,
             },
             last_polled_at: Arc::new(AtomicU64::new(0)),
-            current_partition_id: Arc::new(AtomicU32::new(0)),
+            current_partition_id: Arc::new(AtomicUsize::new(0)),
             reconnection_retry_interval,
             init_retries,
             init_retry_interval,
@@ -226,7 +226,7 @@ impl IggyConsumer {
     }
 
     /// Returns the current partition ID of the consumer.
-    pub fn partition_id(&self) -> u32 {
+    pub fn partition_id(&self) -> usize {
         self.current_partition_id.load(ORDERING)
     }
 
@@ -234,7 +234,7 @@ impl IggyConsumer {
     pub async fn store_offset(
         &self,
         offset: u64,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
     ) -> Result<(), IggyError> {
         let partition_id = if let Some(partition_id) = partition_id {
             partition_id
@@ -256,13 +256,13 @@ impl IggyConsumer {
 
     /// Retrieves the last consumed offset for the specified partition ID.
     /// To get the current partition ID use `partition_id()`
-    pub fn get_last_consumed_offset(&self, partition_id: u32) -> Option<u64> {
+    pub fn get_last_consumed_offset(&self, partition_id: usize) -> Option<u64> {
         let offset = self.last_consumed_offsets.get(&partition_id)?;
         Some(offset.load(ORDERING))
     }
 
     /// Deletes the consumer offset on the server either for the current partition or the provided partition ID.
-    pub async fn delete_offset(&self, partition_id: Option<u32>) -> Result<(), IggyError> {
+    pub async fn delete_offset(&self, partition_id: Option<usize>) -> Result<(), IggyError> {
         let client = self.client.read().await;
         client
             .delete_consumer_offset(
@@ -276,7 +276,7 @@ impl IggyConsumer {
 
     /// Retrieves the last stored offset (on the server) for the specified partition ID.
     /// To get the current partition ID use `partition_id()`
-    pub fn get_last_stored_offset(&self, partition_id: u32) -> Option<u64> {
+    pub fn get_last_stored_offset(&self, partition_id: usize) -> Option<u64> {
         let offset = self.last_stored_offsets.get(&partition_id)?;
         Some(offset.load(ORDERING))
     }
@@ -412,9 +412,9 @@ impl IggyConsumer {
         consumer: &Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: u32,
+        partition_id: usize,
         offset: u64,
-        last_stored_offsets: &DashMap<u32, AtomicU64>,
+        last_stored_offsets: &DashMap<usize, AtomicU64>,
         allow_replay: bool,
     ) -> Result<(), IggyError> {
         trace!(
@@ -485,7 +485,7 @@ impl IggyConsumer {
         });
     }
 
-    pub(crate) fn send_store_offset(&self, partition_id: u32, offset: u64) {
+    pub(crate) fn send_store_offset(&self, partition_id: usize, offset: u64) {
         if let Err(error) = self.store_offset_sender.send((partition_id, offset)) {
             error!(
                 "Failed to send offset to store: {error}, please verify if `init()` on IggyConsumer object has been called."
@@ -878,11 +878,11 @@ impl IggyConsumer {
 pub struct ReceivedMessage {
     pub message: IggyMessage,
     pub current_offset: u64,
-    pub partition_id: u32,
+    pub partition_id: usize,
 }
 
 impl ReceivedMessage {
-    pub fn new(message: IggyMessage, current_offset: u64, partition_id: u32) -> Self {
+    pub fn new(message: IggyMessage, current_offset: u64, partition_id: usize) -> Self {
         Self {
             message,
             current_offset,

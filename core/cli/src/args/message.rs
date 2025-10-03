@@ -80,7 +80,7 @@ pub(crate) struct SendMessagesArgs {
     pub(crate) topic_id: Identifier,
     /// ID of the partition to which the message will be sent
     #[clap(short, long, group = "partitioning")]
-    pub(crate) partition_id: Option<u32>,
+    pub(crate) partition_id: Option<usize>,
     /// Messages key which will be used to partition the messages
     ///
     /// Value of the key will be used by the server to calculate the partition ID
@@ -146,8 +146,8 @@ pub(crate) struct PollMessagesArgs {
     #[arg(value_parser = clap::value_parser!(Identifier))]
     pub(crate) topic_id: Identifier,
     /// Partition ID from which message will be polled
-    #[arg(value_parser = clap::value_parser!(u32).range(1..))]
-    pub(crate) partition_id: u32,
+    #[arg(value_parser = clap::value_parser!(usize))]
+    pub(crate) partition_id: usize,
     /// Number of messages to poll
     #[clap(verbatim_doc_comment)]
     #[clap(short, long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
@@ -219,8 +219,8 @@ pub(crate) struct FlushMessagesArgs {
     #[arg(value_parser = clap::value_parser!(Identifier))]
     pub(crate) topic_id: Identifier,
     /// Partition ID for which messages will be flushed
-    #[arg(value_parser = clap::value_parser!(u32).range(1..))]
-    pub(crate) partition_id: u32,
+    #[arg(value_parser = clap::value_parser!(usize))]
+    pub(crate) partition_id: usize,
     /// fsync flushed data to disk
     ///
     /// If option is enabled then the data is flushed to disk and fsynced,

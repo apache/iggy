@@ -127,7 +127,7 @@ async fn send_messages(
 async fn flush_unsaved_buffer(
     State(state): State<Arc<AppState>>,
     Extension(identity): Extension<Identity>,
-    Path((stream_id, topic_id, partition_id, fsync)): Path<(String, String, u32, bool)>,
+    Path((stream_id, topic_id, partition_id, fsync)): Path<(String, String, usize, bool)>,
 ) -> Result<StatusCode, CustomError> {
     let stream_id = Identifier::from_str_value(&stream_id)?;
     let topic_id = Identifier::from_str_value(&topic_id)?;

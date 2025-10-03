@@ -36,7 +36,7 @@ impl CreateTopicCmd {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         stream_id: Identifier,
-        partitions_count: u32,
+        partitions_count: usize,
         compression_algorithm: CompressionAlgorithm,
         name: String,
         message_expiry: IggyExpiry,

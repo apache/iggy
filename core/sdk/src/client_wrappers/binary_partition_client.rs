@@ -27,7 +27,7 @@ impl PartitionClient for ClientWrapper {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partitions_count: u32,
+        partitions_count: usize,
     ) -> Result<(), IggyError> {
         match self {
             ClientWrapper::Iggy(client) => {
@@ -57,7 +57,7 @@ impl PartitionClient for ClientWrapper {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partitions_count: u32,
+        partitions_count: usize,
     ) -> Result<(), IggyError> {
         match self {
             ClientWrapper::Iggy(client) => {

@@ -31,7 +31,7 @@ pub trait SegmentClient {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: u32,
+        partition_id: usize,
         segments_count: u32,
     ) -> Result<(), IggyError>;
 }

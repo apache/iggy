@@ -83,8 +83,8 @@ impl IggyShard {
             .borrow()
             .append_messages(
                 user_id,
-                numeric_stream_id as u32,
-                numeric_topic_id as u32,
+                numeric_stream_id,
+                numeric_topic_id,
             )
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - permission denied to append messages for user {} on stream ID: {}, topic ID: {}", user_id, numeric_stream_id as u32, numeric_topic_id as u32)
@@ -177,7 +177,7 @@ impl IggyShard {
         stream_id: Identifier,
         topic_id: Identifier,
         consumer: Consumer,
-        maybe_partition_id: Option<u32>,
+        maybe_partition_id: Option<usize>,
         args: PollingArgs,
     ) -> Result<(IggyPollMetadata, IggyMessagesBatchSet), IggyError> {
         let numeric_stream_id = self
@@ -189,7 +189,7 @@ impl IggyShard {
 
         self.permissioner
             .borrow()
-            .poll_messages(user_id, numeric_stream_id as u32, numeric_topic_id as u32)
+            .poll_messages(user_id, numeric_stream_id, numeric_topic_id)
             .with_error_context(|error| format!(
                 "{COMPONENT} (error: {error}) - permission denied to poll messages for user {} on stream ID: {}, topic ID: {}",
                 user_id,
@@ -231,7 +231,7 @@ impl IggyShard {
             || args.count == 0
         {
             return Ok((
-                IggyPollMetadata::new(partition_id as u32, current_offset),
+                IggyPollMetadata::new(partition_id, current_offset),
                 IggyMessagesBatchSet::empty(),
             ));
         }
@@ -382,8 +382,8 @@ impl IggyShard {
             .borrow()
             .append_messages(
                 session.get_user_id(),
-                numeric_stream_id as u32,
-                numeric_topic_id as u32,
+                numeric_stream_id,
+                numeric_topic_id,
             )
             .with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - permission denied to append messages for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), numeric_stream_id as u32, numeric_topic_id as u32)

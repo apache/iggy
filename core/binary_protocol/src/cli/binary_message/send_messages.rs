@@ -42,7 +42,7 @@ impl SendMessagesCmd {
     pub fn new(
         stream_id: Identifier,
         topic_id: Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
         message_key: Option<String>,
         messages: Option<Vec<String>>,
         headers: Vec<(HeaderKey, HeaderValue)>,

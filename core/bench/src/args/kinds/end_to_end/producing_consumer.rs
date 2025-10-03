@@ -24,7 +24,7 @@ use crate::args::{
 };
 use clap::{CommandFactory, Parser, error::ErrorKind};
 use iggy::prelude::IggyByteSize;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 
 #[derive(Parser, Debug, Clone)]
 pub struct EndToEndProducingConsumerArgs {
@@ -33,11 +33,11 @@ pub struct EndToEndProducingConsumerArgs {
 
     /// Number of streams
     #[arg(long, short = 's', default_value_t = DEFAULT_PINNED_NUMBER_OF_STREAMS)]
-    pub streams: NonZeroU32,
+    pub streams: NonZeroUsize,
 
     /// Number of producing consumers
     #[arg(long, short = 'p', default_value_t = DEFAULT_NUMBER_OF_PRODUCERS)]
-    pub producing_consumers: NonZeroU32,
+    pub producing_consumers: NonZeroUsize,
 
     /// Max topic size in human readable format, e.g. "1GiB", "2MB", "1GiB". If not provided then the server default will be used.
     #[arg(long, short = 'T')]
@@ -45,19 +45,19 @@ pub struct EndToEndProducingConsumerArgs {
 }
 
 impl BenchmarkKindProps for EndToEndProducingConsumerArgs {
-    fn streams(&self) -> u32 {
+    fn streams(&self) -> usize {
         self.streams.get()
     }
 
-    fn partitions(&self) -> u32 {
+    fn partitions(&self) -> usize {
         1
     }
 
-    fn consumers(&self) -> u32 {
+    fn consumers(&self) -> usize {
         self.producing_consumers.get()
     }
 
-    fn producers(&self) -> u32 {
+    fn producers(&self) -> usize {
         self.producing_consumers.get()
     }
 
@@ -65,7 +65,7 @@ impl BenchmarkKindProps for EndToEndProducingConsumerArgs {
         &self.transport
     }
 
-    fn number_of_consumer_groups(&self) -> u32 {
+    fn number_of_consumer_groups(&self) -> usize {
         0
     }
 

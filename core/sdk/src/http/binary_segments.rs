@@ -28,7 +28,7 @@ impl SegmentClient for HttpClient {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: u32,
+        partition_id: usize,
         segments_count: u32,
     ) -> Result<(), IggyError> {
         self.delete_with_query(
@@ -49,6 +49,6 @@ impl SegmentClient for HttpClient {
     }
 }
 
-fn get_path(stream_id: &str, topic_id: &str, partition_id: u32) -> String {
+fn get_path(stream_id: &str, topic_id: &str, partition_id: usize) -> String {
     format!("streams/{stream_id}/topics/{topic_id}/partitions/{partition_id}")
 }

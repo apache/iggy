@@ -30,7 +30,7 @@ pub trait ConsumerOffsetClient {
         consumer: &Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
         offset: u64,
     ) -> Result<(), IggyError>;
     /// Get the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
@@ -41,7 +41,7 @@ pub trait ConsumerOffsetClient {
         consumer: &Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
     ) -> Result<Option<ConsumerOffsetInfo>, IggyError>;
     /// Delete the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
     ///
@@ -51,6 +51,6 @@ pub trait ConsumerOffsetClient {
         consumer: &Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
     ) -> Result<(), IggyError>;
 }

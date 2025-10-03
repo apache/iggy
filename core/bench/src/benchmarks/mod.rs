@@ -28,5 +28,5 @@ pub mod pinned_consumer;
 pub mod pinned_producer;
 pub mod pinned_producer_and_consumer;
 
-pub const CONSUMER_GROUP_BASE_ID: u32 = 0;
+pub const CONSUMER_GROUP_BASE_ID: usize = 0;
 pub const CONSUMER_GROUP_NAME_PREFIX: &str = "cg";

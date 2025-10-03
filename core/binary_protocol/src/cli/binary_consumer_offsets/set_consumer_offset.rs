@@ -34,7 +34,7 @@ impl SetConsumerOffsetCmd {
         consumer_id: Identifier,
         stream_id: Identifier,
         topic_id: Identifier,
-        partition_id: u32,
+        partition_id: usize,
         offset: u64,
         kind: ConsumerKind,
     ) -> Self {

@@ -46,7 +46,7 @@ pub struct CreateTopic {
     #[serde(skip)]
     pub stream_id: Identifier,
     /// Number of partitions in the topic, max value is 1000.
-    pub partitions_count: u32,
+    pub partitions_count: usize,
     /// Compression algorithm for the topic.
     pub compression_algorithm: CompressionAlgorithm,
     /// Message expiry, if `NeverExpire` then messages will never expire.
@@ -105,7 +105,7 @@ impl BytesSerializable for CreateTopic {
         let stream_id_bytes = self.stream_id.to_bytes();
         let mut bytes = BytesMut::with_capacity(19 + stream_id_bytes.len() + self.name.len());
         bytes.put_slice(&stream_id_bytes);
-        bytes.put_u32_le(self.partitions_count);
+        bytes.put_slice(&self.partitions_count.to_le_bytes());
         bytes.put_u8(self.compression_algorithm.as_code());
         bytes.put_u64_le(self.message_expiry.into());
         bytes.put_u64_le(self.max_topic_size.into());
@@ -130,7 +130,7 @@ impl BytesSerializable for CreateTopic {
             bytes[position..position + 4]
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
+        ) as usize;
         let compression_algorithm = CompressionAlgorithm::from_code(bytes[position + 4])?;
         let message_expiry = u64::from_le_bytes(
             bytes[position + 5..position + 13]

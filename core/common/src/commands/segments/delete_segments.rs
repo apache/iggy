@@ -41,7 +41,7 @@ pub struct DeleteSegments {
     pub topic_id: Identifier,
     /// Unique partition ID (numeric or name).
     #[serde(skip)]
-    pub partition_id: u32,
+    pub partition_id: usize,
     /// Number of segments in the partition to delete, max value is 1000.
     pub segments_count: u32,
 }
@@ -58,7 +58,7 @@ impl Default for DeleteSegments {
             segments_count: 1,
             stream_id: Identifier::default(),
             topic_id: Identifier::default(),
-            partition_id: u32::default(),
+            partition_id: usize::default(),
         }
     }
 }
@@ -81,7 +81,7 @@ impl BytesSerializable for DeleteSegments {
         );
         bytes.put_slice(&stream_id_bytes);
         bytes.put_slice(&topic_id_bytes);
-        bytes.put_u32_le(self.partition_id);
+        bytes.put_slice(&self.partition_id.to_le_bytes());
         bytes.put_u32_le(self.segments_count);
         bytes.freeze()
     }
@@ -100,7 +100,7 @@ impl BytesSerializable for DeleteSegments {
             bytes[position..position + std::mem::size_of::<u32>()]
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
+        ) as usize;
         position += std::mem::size_of::<u32>();
         let segments_count = u32::from_le_bytes(
             bytes[position..position + std::mem::size_of::<u32>()]

@@ -54,8 +54,8 @@ impl IggyShard {
                 .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
             self.permissioner.borrow().create_consumer_group(
                 session.get_user_id(),
-                stream_id as u32,
-                topic_id as u32,
+                stream_id,
+                topic_id,
             ).with_error_context(|error| format!("{COMPONENT} (error: {error}) - permission denied to create consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), stream_id, topic_id))?;
         }
         let cg = self.create_and_insert_consumer_group_mem(stream_id, topic_id, name);
@@ -117,8 +117,8 @@ impl IggyShard {
                 .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
             self.permissioner.borrow().delete_consumer_group(
                 session.get_user_id(),
-                stream_id as u32,
-                topic_id as u32,
+                stream_id,
+                topic_id,
             ).with_error_context(|error| format!("{COMPONENT} (error: {error}) - permission denied to delete consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), stream_id, topic_id))?;
         }
         let cg = self.delete_consumer_group_base2(stream_id, topic_id, group_id);
@@ -190,8 +190,8 @@ impl IggyShard {
                 .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
             self.permissioner.borrow().join_consumer_group(
                 session.get_user_id(),
-                stream_id as u32,
-                topic_id as u32,
+                stream_id,
+                topic_id,
             ).with_error_context(|error| format!("{COMPONENT} (error: {error}) - permission denied to join consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), stream_id, topic_id))?;
         }
         let client_id = session.client_id;
@@ -250,8 +250,8 @@ impl IggyShard {
                 .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
             self.permissioner.borrow().leave_consumer_group(
                 session.get_user_id(),
-                stream_id as u32,
-                topic_id as u32,
+                stream_id,
+                topic_id,
             ).with_error_context(|error| format!("{COMPONENT} (error: {error}) - permission denied to leave consumer group for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), stream_id, topic_id))?;
         }
         self.streams2.with_consumer_group_by_id_mut(

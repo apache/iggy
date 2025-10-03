@@ -43,7 +43,7 @@ pub struct BenchmarkState {
 #[derive(Debug)]
 struct BenchmarkParams<'a> {
     message_size: BenchmarkNumericParameter,
-    message_batches: u64,
+    message_batches: usize,
     messages_per_batch: BenchmarkNumericParameter,
     transport: BenchmarkTransport,
     remark: &'a Option<String>,

@@ -197,7 +197,7 @@ pub struct TopicMetadata {
 #[repr(C)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MessagesMetadata {
-    pub partition_id: u32,
+    pub partition_id: usize,
     pub current_offset: u64,
     pub schema: Schema,
 }

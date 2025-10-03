@@ -174,7 +174,7 @@ impl BenchmarkReportLight {
             .sum()
     }
 
-    pub fn total_message_batches(&self) -> u64 {
+    pub fn total_message_batches(&self) -> usize {
         let batches = self
             .individual_metrics
             .iter()

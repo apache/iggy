@@ -54,7 +54,7 @@ enum BenchmarkFinishConditionType {
 
 pub struct BenchmarkFinishCondition {
     kind: BenchmarkFinishConditionType,
-    total: u64,
+    total: usize,
     left_total: Arc<AtomicI64>,
     mode: BenchmarkFinishConditionMode,
 }
@@ -100,16 +100,18 @@ impl BenchmarkFinishCondition {
         Arc::new(match (total_data, batches_count) {
             (None, Some(count)) => {
                 let count_per_actor = (count.get() * total_data_multiplier) / total_data_factor;
+                let count_per_actor_i64 =
+                    i64::try_from(count_per_actor).expect("count_per_actor overflow");
 
                 Self {
                     kind: BenchmarkFinishConditionType::ByMessageBatchesCount,
-                    total: u64::from(count_per_actor),
-                    left_total: Arc::new(AtomicI64::new(i64::from(count_per_actor))),
+                    total: usize::from(count_per_actor),
+                    left_total: Arc::new(AtomicI64::new(count_per_actor_i64)),
                     mode,
                 }
             }
             (Some(size), None) => {
-                let bytes_per_actor = size.as_bytes_u64() / u64::from(total_data_factor);
+                let bytes_per_actor = size.as_bytes_usize() / usize::from(total_data_factor);
 
                 Self {
                     kind: BenchmarkFinishConditionType::ByTotalData,
@@ -154,7 +156,7 @@ impl BenchmarkFinishCondition {
         self.left() <= 0
     }
 
-    pub const fn total(&self) -> u64 {
+    pub const fn total(&self) -> usize {
         self.total
     }
 

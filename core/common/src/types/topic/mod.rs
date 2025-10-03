@@ -94,7 +94,7 @@ pub struct TopicDetails {
     /// The total number of messages in the topic.
     pub messages_count: u64,
     /// The total number of partitions in the topic.
-    pub partitions_count: u32,
+    pub partitions_count: usize,
     /// The collection of partitions in the topic.
     pub partitions: Vec<Partition>,
 }

@@ -274,7 +274,7 @@ impl MainOps for Streams {
             partition_id,
             |(_, _, _, offset, ..)| offset.load(Ordering::Relaxed),
         );
-        let metadata = IggyPollMetadata::new(partition_id as u32, current_offset);
+        let metadata = IggyPollMetadata::new(partition_id, current_offset);
         let count = args.count;
         let strategy = args.strategy;
         let value = strategy.value;

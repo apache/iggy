@@ -56,7 +56,7 @@ impl IggyShard {
         topic_id: &Identifier,
         consumer: &Consumer,
         client_id: u32,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
         calculate_partition_id: bool,
     ) -> Option<(PollingConsumer, usize)> {
         match consumer.kind {

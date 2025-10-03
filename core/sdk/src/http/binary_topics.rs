@@ -66,7 +66,7 @@ impl TopicClient for HttpClient {
         &self,
         stream_id: &Identifier,
         name: &str,
-        partitions_count: u32,
+        partitions_count: usize,
         compression_algorithm: CompressionAlgorithm,
         replication_factor: Option<u8>,
         message_expiry: IggyExpiry,

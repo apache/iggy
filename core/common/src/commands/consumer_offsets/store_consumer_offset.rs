@@ -46,7 +46,7 @@ pub struct StoreConsumerOffset {
     #[serde(skip)]
     pub topic_id: Identifier,
     /// Partition ID on which the offset is stored. Has to be specified for the regular consumer. For consumer group it is ignored (use `None`).
-    pub partition_id: Option<u32>,
+    pub partition_id: Option<usize>,
     /// Offset to store.
     pub offset: u64,
 }
@@ -87,7 +87,7 @@ impl BytesSerializable for StoreConsumerOffset {
         bytes.put_slice(&stream_id_bytes);
         bytes.put_slice(&topic_id_bytes);
         if let Some(partition_id) = self.partition_id {
-            bytes.put_u32_le(partition_id);
+            bytes.put_slice(&partition_id.to_le_bytes());
         } else {
             bytes.put_u32_le(0);
         }
@@ -112,7 +112,7 @@ impl BytesSerializable for StoreConsumerOffset {
         position += stream_id.get_size_bytes().as_bytes_usize();
         let topic_id = Identifier::from_bytes(bytes.slice(position..))?;
         position += topic_id.get_size_bytes().as_bytes_usize();
-        let partition_id = u32::from_le_bytes(
+        let partition_id = usize::from_le_bytes(
             bytes[position..position + 4]
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,

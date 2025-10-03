@@ -33,7 +33,7 @@ use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 use iggy::prelude::{IggyByteSize, IggyDuration, TransportProtocol};
 use std::net::SocketAddr;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -56,7 +56,7 @@ pub struct IggyBenchArgs {
     /// Number of message batches per actor (producer / consumer / producing consumer).
     /// This argument is mutually exclusive with `total_messages_size`.
     #[arg(long, short = 'b', group = "data_to_process")]
-    pub message_batches: Option<NonZeroU32>,
+    pub message_batches: Option<NonZeroUsize>,
 
     /// Total size of all messages to process in bytes (aggregate, for all actors).
     /// This argument is mutually exclusive with `message_batches`.
@@ -193,7 +193,7 @@ impl IggyBenchArgs {
         self.messages_per_batch
     }
 
-    pub const fn message_batches(&self) -> Option<NonZeroU32> {
+    pub const fn message_batches(&self) -> Option<NonZeroUsize> {
         self.message_batches
     }
 
@@ -213,19 +213,19 @@ impl IggyBenchArgs {
         )
     }
 
-    pub fn streams(&self) -> u32 {
+    pub fn streams(&self) -> usize {
         self.benchmark_kind.inner().streams()
     }
 
-    pub fn number_of_partitions(&self) -> u32 {
+    pub fn number_of_partitions(&self) -> usize {
         self.benchmark_kind.inner().partitions()
     }
 
-    pub fn consumers(&self) -> u32 {
+    pub fn consumers(&self) -> usize {
         self.benchmark_kind.inner().consumers()
     }
 
-    pub fn producers(&self) -> u32 {
+    pub fn producers(&self) -> usize {
         self.benchmark_kind.inner().producers()
     }
 
@@ -233,7 +233,7 @@ impl IggyBenchArgs {
         self.benchmark_kind.as_simple_kind()
     }
 
-    pub fn number_of_consumer_groups(&self) -> u32 {
+    pub fn number_of_consumer_groups(&self) -> usize {
         self.benchmark_kind.inner().number_of_consumer_groups()
     }
 

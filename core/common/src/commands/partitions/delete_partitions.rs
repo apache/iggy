@@ -41,7 +41,7 @@ pub struct DeletePartitions {
     #[serde(skip)]
     pub topic_id: Identifier,
     /// Number of partitions in the topic to delete, max value is 1000.
-    pub partitions_count: u32,
+    pub partitions_count: usize,
 }
 
 impl Command for DeletePartitions {
@@ -77,7 +77,7 @@ impl BytesSerializable for DeletePartitions {
         let mut bytes = BytesMut::with_capacity(4 + stream_id_bytes.len() + topic_id_bytes.len());
         bytes.put_slice(&stream_id_bytes);
         bytes.put_slice(&topic_id_bytes);
-        bytes.put_u32_le(self.partitions_count);
+        bytes.put_slice(&self.partitions_count.to_le_bytes());
         bytes.freeze()
     }
 
@@ -95,7 +95,7 @@ impl BytesSerializable for DeletePartitions {
             bytes[position..position + 4]
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
+        ) as usize;
         let command = DeletePartitions {
             stream_id,
             topic_id,

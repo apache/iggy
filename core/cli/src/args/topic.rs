@@ -106,9 +106,9 @@ pub(crate) struct TopicCreateArgs {
     pub(crate) name: String,
     /// Topic ID to create
     #[clap(short, long)]
-    pub(crate) topic_id: Option<u32>,
+    pub(crate) topic_id: Option<usize>,
     /// Number of partitions inside the topic
-    pub(crate) partitions_count: u32,
+    pub(crate) partitions_count: usize,
     /// Compression algorithm for the topic, set to "none" for no compression
     #[arg(value_parser = clap::value_parser!(CompressionAlgorithm), verbatim_doc_comment)]
     pub(crate) compression_algorithm: CompressionAlgorithm,

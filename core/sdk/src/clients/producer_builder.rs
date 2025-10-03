@@ -45,7 +45,7 @@ pub struct IggyProducerBuilder {
     partitioner: Option<Arc<dyn Partitioner>>,
     create_stream_if_not_exists: bool,
     create_topic_if_not_exists: bool,
-    topic_partitions_count: u32,
+    topic_partitions_count: usize,
     topic_replication_factor: Option<u8>,
     send_retries_count: Option<u32>,
     send_retries_interval: Option<IggyDuration>,
@@ -164,7 +164,7 @@ impl IggyProducerBuilder {
     /// Creates the topic if it does not exist - requires user to have the necessary permissions.
     pub fn create_topic_if_not_exists(
         self,
-        partitions_count: u32,
+        partitions_count: usize,
         replication_factor: Option<u8>,
         message_expiry: IggyExpiry,
         max_size: MaxTopicSize,

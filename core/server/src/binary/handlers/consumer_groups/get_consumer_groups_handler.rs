@@ -57,8 +57,8 @@ impl ServerCommandHandler for GetConsumerGroups {
             .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
         shard.permissioner.borrow().get_consumer_groups(
             session.get_user_id(),
-            numeric_stream_id as u32,
-            numeric_topic_id as u32,
+            numeric_stream_id,
+            numeric_topic_id,
         );
 
         let consumer_groups =

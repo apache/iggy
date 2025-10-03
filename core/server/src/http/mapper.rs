@@ -66,7 +66,7 @@ pub fn map_topic_details(root: &TopicRoot, stats: &TopicStats) -> TopicDetails {
         name: root.name().clone(),
         size: stats.size_bytes_inconsistent().into(),
         messages_count: stats.messages_count_inconsistent(),
-        partitions_count: partitions.len() as u32,
+        partitions_count: partitions.len(),
         partitions,
         message_expiry: root.message_expiry(),
         compression_algorithm: root.compression_algorithm(),
@@ -83,7 +83,7 @@ pub fn map_topic_details_empty_partitions(root: &TopicRoot, stats: &TopicStats) 
         name: root.name().clone(),
         size: stats.size_bytes_inconsistent().into(),
         messages_count: stats.messages_count_inconsistent(),
-        partitions_count: root.partitions().len() as u32,
+        partitions_count: root.partitions().len(),
         partitions: Vec::new(), // Empty partitions for create response, consistent with binary handler
         message_expiry: root.message_expiry(),
         compression_algorithm: root.compression_algorithm(),

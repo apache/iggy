@@ -46,7 +46,7 @@ pub struct GetConsumerOffset {
     pub topic_id: Identifier,
     /// Partition ID on which the offset is stored. Has to be specified for the regular consumer. For consumer group it is ignored (use `None`).
     #[serde(default = "default_partition_id")]
-    pub partition_id: Option<u32>,
+    pub partition_id: Option<usize>,
 }
 
 impl Default for GetConsumerOffset {
@@ -66,7 +66,7 @@ impl Command for GetConsumerOffset {
     }
 }
 
-fn default_partition_id() -> Option<u32> {
+fn default_partition_id() -> Option<usize> {
     Some(1)
 }
 
@@ -88,7 +88,7 @@ impl BytesSerializable for GetConsumerOffset {
         bytes.put_slice(&stream_id_bytes);
         bytes.put_slice(&topic_id_bytes);
         if let Some(partition_id) = self.partition_id {
-            bytes.put_u32_le(partition_id);
+            bytes.put_slice(&partition_id.to_le_bytes());
         } else {
             bytes.put_u32_le(0);
         }
@@ -116,7 +116,7 @@ impl BytesSerializable for GetConsumerOffset {
             bytes[position..position + 4]
                 .try_into()
                 .map_err(|_| IggyError::InvalidNumberEncoding)?,
-        );
+        ) as usize;
         let partition_id = if partition_id == 0 {
             None
         } else {

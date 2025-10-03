@@ -33,7 +33,7 @@ pub struct IggyProducerConfig {
     /// Name of the topic. Must be unique.
     topic_name: String,
     /// Sets the number of partitions to create for the topic
-    topic_partitions_count: u32,
+    topic_partitions_count: usize,
     /// Set the topic replication factor
     topic_replication_factor: Option<u8>,
     /// The max number of messages to send in a batch. Must be greater than 0.
@@ -100,7 +100,7 @@ impl IggyProducerConfig {
         stream_name: String,
         topic_id: Identifier,
         topic_name: String,
-        topic_partitions_count: u32,
+        topic_partitions_count: usize,
         topic_replication_factor: Option<u8>,
         batch_length: u32,
         linger_time: IggyDuration,
@@ -193,7 +193,7 @@ impl IggyProducerConfig {
         &self.partitioning
     }
 
-    pub fn topic_partitions_count(&self) -> u32 {
+    pub fn topic_partitions_count(&self) -> usize {
         self.topic_partitions_count
     }
 

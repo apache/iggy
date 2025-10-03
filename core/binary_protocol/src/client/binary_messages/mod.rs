@@ -29,7 +29,7 @@ impl<B: BinaryClient> MessageClient for B {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
         consumer: &Consumer,
         strategy: &PollingStrategy,
         count: u32,
@@ -73,7 +73,7 @@ impl<B: BinaryClient> MessageClient for B {
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: u32,
+        partition_id: usize,
         fsync: bool,
     ) -> Result<(), IggyError> {
         fail_if_not_authenticated(self).await?;

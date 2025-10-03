@@ -49,7 +49,7 @@ pub struct IggyConsumerConfig {
     /// The type of consumer. It can be either `Consumer` or `ConsumerGroup`. ConsumerGroup is default.
     consumer_kind: ConsumerKind,
     /// Sets the number of partitions for ConsumerKind `Consumer`. Does not apply to `ConsumerGroup`.
-    partitions_count: u32,
+    partitions_count: usize,
     /// Sets the replication factor for the consumed topic.
     replication_factor: Option<u8>,
     /// The polling interval for messages.
@@ -137,7 +137,7 @@ impl IggyConsumerConfig {
         consumer_kind: ConsumerKind,
         polling_interval: IggyDuration,
         polling_strategy: PollingStrategy,
-        partitions_count: u32,
+        partitions_count: usize,
         replication_factor: Option<u8>,
         encryptor: Option<Arc<EncryptorKind>>,
         polling_retry_interval: IggyDuration,
@@ -258,7 +258,7 @@ impl IggyConsumerConfig {
         self.polling_strategy
     }
 
-    pub fn partitions_count(&self) -> u32 {
+    pub fn partitions_count(&self) -> usize {
         self.partitions_count
     }
 

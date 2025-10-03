@@ -29,7 +29,7 @@ impl ConsumerOffsetClient for IggyClient {
         consumer: &Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
         offset: u64,
     ) -> Result<(), IggyError> {
         self.client
@@ -44,7 +44,7 @@ impl ConsumerOffsetClient for IggyClient {
         consumer: &Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
     ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
         self.client
             .read()
@@ -58,7 +58,7 @@ impl ConsumerOffsetClient for IggyClient {
         consumer: &Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
     ) -> Result<(), IggyError> {
         self.client
             .read()

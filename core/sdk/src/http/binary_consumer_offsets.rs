@@ -33,7 +33,7 @@ impl ConsumerOffsetClient for HttpClient {
         consumer: &Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
         offset: u64,
     ) -> Result<(), IggyError> {
         self.put(
@@ -55,7 +55,7 @@ impl ConsumerOffsetClient for HttpClient {
         consumer: &Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
     ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
         let response = self
             .get_with_query(
@@ -88,7 +88,7 @@ impl ConsumerOffsetClient for HttpClient {
         consumer: &Consumer,
         stream_id: &Identifier,
         topic_id: &Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
     ) -> Result<(), IggyError> {
         let partition_id = partition_id
             .map(|id| format!("?partition_id={id}"))

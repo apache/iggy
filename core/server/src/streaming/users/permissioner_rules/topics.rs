@@ -20,7 +20,12 @@ use crate::streaming::users::permissioner::Permissioner;
 use iggy_common::IggyError;
 
 impl Permissioner {
-    pub fn get_topic(&self, user_id: u32, stream_id: u32, topic_id: u32) -> Result<(), IggyError> {
+    pub fn get_topic(
+        &self,
+        user_id: u32,
+        stream_id: usize,
+        topic_id: usize,
+    ) -> Result<(), IggyError> {
         if let Some(global_permissions) = self.users_permissions.get(&user_id)
             && (global_permissions.read_streams
                 || global_permissions.manage_streams
@@ -47,7 +52,7 @@ impl Permissioner {
         Err(IggyError::Unauthorized)
     }
 
-    pub fn get_topics(&self, user_id: u32, stream_id: u32) -> Result<(), IggyError> {
+    pub fn get_topics(&self, user_id: u32, stream_id: usize) -> Result<(), IggyError> {
         if let Some(global_permissions) = self.users_permissions.get(&user_id)
             && (global_permissions.read_streams
                 || global_permissions.manage_streams
@@ -74,7 +79,7 @@ impl Permissioner {
         Err(IggyError::Unauthorized)
     }
 
-    pub fn create_topic(&self, user_id: u32, stream_id: u32) -> Result<(), IggyError> {
+    pub fn create_topic(&self, user_id: u32, stream_id: usize) -> Result<(), IggyError> {
         if let Some(global_permissions) = self.users_permissions.get(&user_id)
             && (global_permissions.manage_streams || global_permissions.manage_topics)
         {
@@ -93,8 +98,8 @@ impl Permissioner {
     pub fn update_topic(
         &self,
         user_id: u32,
-        stream_id: u32,
-        topic_id: u32,
+        stream_id: usize,
+        topic_id: usize,
     ) -> Result<(), IggyError> {
         self.manage_topic(user_id, stream_id, topic_id)
     }
@@ -102,8 +107,8 @@ impl Permissioner {
     pub fn delete_topic(
         &self,
         user_id: u32,
-        stream_id: u32,
-        topic_id: u32,
+        stream_id: usize,
+        topic_id: usize,
     ) -> Result<(), IggyError> {
         self.manage_topic(user_id, stream_id, topic_id)
     }
@@ -111,13 +116,18 @@ impl Permissioner {
     pub fn purge_topic(
         &self,
         user_id: u32,
-        stream_id: u32,
-        topic_id: u32,
+        stream_id: usize,
+        topic_id: usize,
     ) -> Result<(), IggyError> {
         self.manage_topic(user_id, stream_id, topic_id)
     }
 
-    fn manage_topic(&self, user_id: u32, stream_id: u32, topic_id: u32) -> Result<(), IggyError> {
+    fn manage_topic(
+        &self,
+        user_id: u32,
+        stream_id: usize,
+        topic_id: usize,
+    ) -> Result<(), IggyError> {
         if let Some(global_permissions) = self.users_permissions.get(&user_id)
             && (global_permissions.manage_streams || global_permissions.manage_topics)
         {

@@ -20,11 +20,11 @@ use super::{output::BenchmarkOutputCommand, transport::BenchmarkTransportCommand
 use iggy::prelude::{IggyByteSize, TransportProtocol};
 
 pub trait BenchmarkKindProps {
-    fn streams(&self) -> u32;
-    fn partitions(&self) -> u32;
-    fn number_of_consumer_groups(&self) -> u32;
-    fn consumers(&self) -> u32;
-    fn producers(&self) -> u32;
+    fn streams(&self) -> usize;
+    fn partitions(&self) -> usize;
+    fn number_of_consumer_groups(&self) -> usize;
+    fn consumers(&self) -> usize;
+    fn producers(&self) -> usize;
     fn transport_command(&self) -> &BenchmarkTransportCommand;
     fn max_topic_size(&self) -> Option<IggyByteSize>;
     fn validate(&self);

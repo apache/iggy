@@ -30,7 +30,7 @@ pub struct IggyConsumerBuilder {
     consumer: Consumer,
     stream: Identifier,
     topic: Identifier,
-    partition: Option<u32>,
+    partition: Option<usize>,
     polling_strategy: PollingStrategy,
     polling_interval: Option<IggyDuration>,
     batch_length: u32,
@@ -52,7 +52,7 @@ impl IggyConsumerBuilder {
         consumer: Consumer,
         stream_id: Identifier,
         topic_id: Identifier,
-        partition_id: Option<u32>,
+        partition_id: Option<usize>,
         encryptor: Option<Arc<EncryptorKind>>,
         polling_interval: Option<IggyDuration>,
     ) -> Self {
@@ -91,7 +91,7 @@ impl IggyConsumerBuilder {
     }
 
     /// Sets the partition identifier.
-    pub fn partition(self, partition: Option<u32>) -> Self {
+    pub fn partition(self, partition: Option<usize>) -> Self {
         Self { partition, ..self }
     }
 

@@ -50,7 +50,7 @@ pub(crate) struct SegmentDeleteArgs {
     pub(crate) topic_id: Identifier,
     /// Partition ID to delete segments
     #[arg(value_parser = clap::value_parser!(Identifier))]
-    pub(crate) partition_id: u32,
+    pub(crate) partition_id: usize,
     /// Segments count to be deleted
     #[arg(value_parser = clap::value_parser!(u32).range(1..100_001))]
     pub(crate) segments_count: u32,

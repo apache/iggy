@@ -108,7 +108,7 @@ impl Metrics {
         self.topics.dec_by(count as i64);
     }
 
-    pub fn increment_partitions(&self, count: u32) {
+    pub fn increment_partitions(&self, count: usize) {
         self.partitions.inc_by(count as i64);
     }
 
@@ -116,7 +116,7 @@ impl Metrics {
         self.partitions.dec_by(count as i64);
     }
 
-    pub fn increment_segments(&self, count: u32) {
+    pub fn increment_segments(&self, count: usize) {
         self.segments.inc_by(count as i64);
     }
 

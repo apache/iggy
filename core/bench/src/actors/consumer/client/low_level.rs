@@ -34,7 +34,7 @@ pub struct LowLevelConsumerClient {
     consumer: Option<Consumer>,
     stream_id: Identifier,
     topic_id: Identifier,
-    partition_id: Option<u32>,
+    partition_id: Option<usize>,
     polling_strategy: PollingStrategy,
     auto_commit: bool,
     offset: u64,
@@ -120,7 +120,7 @@ impl ConsumerClient for LowLevelConsumerClient {
 impl BenchmarkInit for LowLevelConsumerClient {
     async fn setup(&mut self) -> Result<(), IggyError> {
         let topic_id_str = "topic-1";
-        let default_partition_id = 0u32;
+        let default_partition_id = 0usize;
 
         let client = self.client_factory.create_client().await;
         let client = IggyClient::create(client, None, None);
