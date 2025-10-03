@@ -368,7 +368,7 @@ Options:
 {CLAP_INDENT}
           Consumer ID can be specified as a consumer name or ID
 {CLAP_INDENT}
-          [default: 1]
+          [default: 0]
 
   -s, --show-headers
           Include the message headers in the output
@@ -419,7 +419,7 @@ Options:
   -f, --first                          Polling strategy - start polling from the first message in the partition
   -l, --last                           Polling strategy - start polling from the last message in the partition
   -n, --next                           Polling strategy - start polling from the next message
-  -c, --consumer <CONSUMER>            Regular consumer which will poll messages [default: 1]
+  -c, --consumer <CONSUMER>            Regular consumer which will poll messages [default: 0]
   -s, --show-headers                   Include the message headers in the output
       --output-file <OUTPUT_FILE>      Store polled message into file in binary format
   -h, --help                           Print help (see more with '--help')
