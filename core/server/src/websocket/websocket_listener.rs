@@ -63,12 +63,12 @@ pub async fn start(
         config.accept_unmasked_frames
     );
 
-    accept_loop(listener, ws_config.unwrap(), shard, shutdown).await
+    accept_loop(listener, ws_config, shard, shutdown).await
 }
 
 async fn accept_loop(
     listener: TcpListener,
-    ws_config: compio_ws::WebSocketConfig,
+    ws_config: Option<compio_ws::WebSocketConfig>,
     shard: Rc<IggyShard>,
     shutdown: ShutdownToken,
 ) -> Result<(), IggyError> {
@@ -97,7 +97,7 @@ async fn accept_loop(
                         let registry_clone = registry.clone();
 
                         registry.spawn_connection(async move {
-                            match accept_async_with_config(tcp_stream, Some(ws_config_clone)).await {
+                            match accept_async_with_config(tcp_stream, ws_config_clone).await {
                                 Ok(websocket) => {
                                     info!("WebSocket handshake successful from: {}", remote_addr);
 
@@ -121,6 +121,7 @@ async fn accept_loop(
                                     registry_clone.remove_connection(&client_id);
 
                                     if let Err(error) = sender_kind.shutdown().await {
+                                        println!("!!!we are here!!!");
                                         shard_error!(shard_clone.id, "Failed to shutdown WebSocket stream for client: {}, address: {}. {}", client_id, remote_addr, error);
                                     } else {
                                         shard_info!(shard_clone.id, "Successfully closed WebSocket stream for client: {}, address: {}.", client_id, remote_addr);
