@@ -19,12 +19,11 @@
 
 package org.apache.iggy.client.async.tcp;
 
-import io.netty.buffer.Unpooled;
-import org.apache.iggy.client.async.AsyncConsumerGroupsClient;
-import org.apache.iggy.client.async.AsyncMessagesClient;
-import org.apache.iggy.client.async.AsyncStreamsClient;
-import org.apache.iggy.client.async.AsyncTopicsClient;
-import org.apache.iggy.client.blocking.tcp.CommandCode;
+import org.apache.iggy.client.async.ConsumerGroupsClient;
+import org.apache.iggy.client.async.MessagesClient;
+import org.apache.iggy.client.async.StreamsClient;
+import org.apache.iggy.client.async.TopicsClient;
+import org.apache.iggy.client.async.UsersClient;
 
 import java.util.concurrent.CompletableFuture;
 
@@ -37,10 +36,11 @@ public class AsyncIggyTcpClient {
     private final String host;
     private final int port;
     private AsyncTcpConnection connection;
-    private AsyncMessagesClient messagesClient;
-    private AsyncConsumerGroupsClient consumerGroupsClient;
-    private AsyncStreamsClient streamsClient;
-    private AsyncTopicsClient topicsClient;
+    private MessagesClient messagesClient;
+    private ConsumerGroupsClient consumerGroupsClient;
+    private StreamsClient streamsClient;
+    private TopicsClient topicsClient;
+    private UsersClient usersClient;
 
     public AsyncIggyTcpClient(String host, int port) {
         this.host = host;
@@ -54,43 +54,28 @@ public class AsyncIggyTcpClient {
         connection = new AsyncTcpConnection(host, port);
         return connection.connect()
             .thenRun(() -> {
-                messagesClient = new AsyncMessagesTcpClient(connection);
-                consumerGroupsClient = new AsyncConsumerGroupsTcpClient(connection);
-                streamsClient = new AsyncStreamsTcpClient(connection);
-                topicsClient = new AsyncTopicsTcpClient(connection);
+                messagesClient = new MessagesTcpClient(connection);
+                consumerGroupsClient = new ConsumerGroupsTcpClient(connection);
+                streamsClient = new StreamsTcpClient(connection);
+                topicsClient = new TopicsTcpClient(connection);
+                usersClient = new UsersTcpClient(connection);
             });
     }
 
     /**
-     * Logs in to the server asynchronously.
+     * Gets the async users client.
      */
-    public CompletableFuture<Void> login(String username, String password) {
-        String version = "0.6.30";
-        String context = "java-sdk";
-
-        var payload = Unpooled.buffer();
-        var usernameBytes = AsyncBytesSerializer.toBytes(username);
-        var passwordBytes = AsyncBytesSerializer.toBytes(password);
-
-        payload.writeBytes(usernameBytes);
-        payload.writeBytes(passwordBytes);
-        payload.writeIntLE(version.length());
-        payload.writeBytes(version.getBytes());
-        payload.writeIntLE(context.length());
-        payload.writeBytes(context.getBytes());
-
-        return connection.sendAsync(CommandCode.User.LOGIN.getValue(), payload)
-            .thenAccept(response -> {
-                // Login successful, response contains user info
-                // For now, just release the buffer
-                response.release();
-            });
+    public UsersClient users() {
+        if (usersClient == null) {
+            throw new IllegalStateException("Client not connected. Call connect() first.");
+        }
+        return usersClient;
     }
 
     /**
      * Gets the async messages client.
      */
-    public AsyncMessagesClient messages() {
+    public MessagesClient messages() {
         if (messagesClient == null) {
             throw new IllegalStateException("Client not connected. Call connect() first.");
         }
@@ -100,7 +85,7 @@ public class AsyncIggyTcpClient {
     /**
      * Gets the async consumer groups client.
      */
-    public AsyncConsumerGroupsClient consumerGroups() {
+    public ConsumerGroupsClient consumerGroups() {
         if (consumerGroupsClient == null) {
             throw new IllegalStateException("Client not connected. Call connect() first.");
         }
@@ -110,7 +95,7 @@ public class AsyncIggyTcpClient {
     /**
      * Gets the async streams client.
      */
-    public AsyncStreamsClient streams() {
+    public StreamsClient streams() {
         if (streamsClient == null) {
             throw new IllegalStateException("Client not connected. Call connect() first.");
         }
@@ -120,7 +105,7 @@ public class AsyncIggyTcpClient {
     /**
      * Gets the async topics client.
      */
-    public AsyncTopicsClient topics() {
+    public TopicsClient topics() {
         if (topicsClient == null) {
             throw new IllegalStateException("Client not connected. Call connect() first.");
         }

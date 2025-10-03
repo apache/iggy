@@ -25,6 +25,8 @@ import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -35,6 +37,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * Manages the connection lifecycle and request/response correlation.
  */
 public class AsyncTcpConnection {
+    private static final Logger logger = LoggerFactory.getLogger(AsyncTcpConnection.class);
 
     private final String host;
     private final int port;
@@ -122,27 +125,27 @@ public class AsyncTcpConnection {
 
         // Debug: print frame bytes
         byte[] frameBytes = new byte[Math.min(frame.readableBytes(), 30)];
-        frame.getBytes(0, frameBytes);
-        StringBuilder hex = new StringBuilder();
-        for (byte b : frameBytes) {
-            hex.append(String.format("%02x ", b));
+        if (logger.isTraceEnabled()) {
+            frame.getBytes(0, frameBytes);
+            StringBuilder hex = new StringBuilder();
+            for (byte b : frameBytes) {
+                hex.append(String.format("%02x ", b));
+            }
+            logger.trace("Sending frame with command: {}, payload size: {}, frame payload size (with command): {}, total frame size: {}",
+                commandCode, payloadSize, framePayloadSize, frame.readableBytes());
+            logger.trace("Frame bytes (hex): {}", hex.toString());
         }
-
-        System.out.println("Sending frame with command: " + commandCode + ", payload size: " + payloadSize +
-            ", frame payload size (with command): " + framePayloadSize +
-            ", total frame size: " + frame.readableBytes());
-        System.out.println("  Frame bytes (hex): " + hex.toString());
 
         payload.release();
 
         // Send the frame
         channel.writeAndFlush(frame).addListener((ChannelFutureListener) future -> {
             if (!future.isSuccess()) {
-                System.err.println("Failed to send frame: " + future.cause().getMessage());
+                logger.error("Failed to send frame: {}", future.cause().getMessage());
                 pendingRequests.remove(requestId);
                 responseFuture.completeExceptionally(future.cause());
             } else {
-                System.out.println("Frame sent successfully to " + channel.remoteAddress());
+                logger.trace("Frame sent successfully to {}", channel.remoteAddress());
             }
         });
 

@@ -39,7 +39,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.stream.IntStream;
 
-import static org.junit.jupiter.api.Assertions.*;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Test class specifically for testing poll message functionality with different consumer scenarios.
@@ -74,7 +75,7 @@ public class AsyncPollMessageTest {
             }
             client = new AsyncIggyTcpClient("127.0.0.1", 8090);
             client.connect().get(5, TimeUnit.SECONDS);
-            client.login("iggy", "iggy").get(5, TimeUnit.SECONDS);
+            client.users().loginAsync("iggy", "iggy").get(5, TimeUnit.SECONDS);
             logger.info("Client reconnected successfully");
         }
     }
@@ -96,7 +97,7 @@ public class AsyncPollMessageTest {
         // Initialize client
         client = new AsyncIggyTcpClient("127.0.0.1", 8090);
         client.connect().get(5, TimeUnit.SECONDS);
-        client.login("iggy", "iggy").get(5, TimeUnit.SECONDS);
+        client.users().loginAsync("iggy", "iggy").get(5, TimeUnit.SECONDS);
         logger.info("Successfully connected and logged in");
 
         // Create unique stream for this test run
@@ -163,7 +164,7 @@ public class AsyncPollMessageTest {
         logger.info("TEST 1: Polling with NULL consumer");
 
         // This test demonstrates the issue: server doesn't respond to null consumer
-        assertThrows(TimeoutException.class, () -> {
+        assertThatThrownBy(() -> {
             client.messages().pollMessagesAsync(
                 StreamId.of(TEST_STREAM),
                 TopicId.of(TEST_TOPIC),
@@ -173,7 +174,7 @@ public class AsyncPollMessageTest {
                 10L,
                 false
             ).get(3, TimeUnit.SECONDS);
-        });
+        }).isInstanceOf(TimeoutException.class);
 
         logger.info("CONFIRMED: Null consumer causes timeout (server doesn't respond)");
     }
@@ -199,7 +200,7 @@ public class AsyncPollMessageTest {
             ).get(5, TimeUnit.SECONDS);
 
             // Server accepts any valid consumer ID format
-            assertNotNull(polledMessages);
+            assertThat(polledMessages).isNotNull();
             logger.info("Server accepted consumer ID 99999 and returned {} messages",
                 polledMessages.messages().size());
         } catch (ExecutionException e) {
@@ -227,7 +228,7 @@ public class AsyncPollMessageTest {
                 false
             ).get(5, TimeUnit.SECONDS);
 
-            assertNotNull(polledMessages);
+            assertThat(polledMessages).isNotNull();
             logger.info("Successfully polled {} messages with consumer ID 1",
                 polledMessages.messages().size());
 
@@ -262,7 +263,7 @@ public class AsyncPollMessageTest {
                 false
             ).get(5, TimeUnit.SECONDS);
 
-            assertNotNull(polledMessages);
+            assertThat(polledMessages).isNotNull();
             logger.info("Successfully polled {} messages with session consumer",
                 polledMessages.messages().size());
 

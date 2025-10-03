@@ -21,34 +21,7 @@ polling functionality.
 # Navigate to Iggy server directory
 cd /path/to/iggy
 
-# Start server with default credentials
-cargo run --bin iggy-server -- --with-default-root-credentials
-```
-
-The server should be running on `127.0.0.1:8090` with default credentials:
-
-- Username: `iggy`
-- Password: `iggy`
-
-## Project Structure
-
-```bash
-iggy/foreign/java/
-├── java-sdk/           # Main SDK implementation
-│   ├── src/
-│   │   ├── main/      # Source code
-│   │   │   └── java/org/apache/iggy/
-│   │   │       ├── client/
-│   │   │       │   ├── async/        # Async client implementation
-│   │   │       │   └── blocking/     # Blocking client implementation
-│   │   │       └── ...
-│   │   └── test/      # Test code
-│   │       └── java/org/apache/iggy/client/async/
-│   │           └── AsyncPollMessageTest.java  # test for polling fn
-│   └── build.gradle
-├── examples/          # Example applications
-└── gradlew           # Gradle wrapper
-```
+READ the README.md and start iggy-server as prescribed there.
 
 ## Building the Project
 

@@ -115,7 +115,7 @@ public class AsyncConsumerExample {
         asyncClient.connect()
             .thenCompose(v -> {
                 log.info("Connected! Logging in...");
-                return asyncClient.login("iggy", "iggy");
+                return asyncClient.users().loginAsync("iggy", "iggy");
             })
             .thenCompose(v -> {
                 log.info("Logged in! Joining consumer group...");

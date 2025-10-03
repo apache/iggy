@@ -39,14 +39,15 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
-import static org.junit.jupiter.api.Assertions.*;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Integration test for the complete async client flow.
  * Tests connection, authentication, stream/topic management, and message operations.
  */
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
-public class AsyncClientIntegrationTest {
+class AsyncClientIntegrationTest {
     private static final Logger logger = LoggerFactory.getLogger(AsyncClientIntegrationTest.class);
 
     private static final String HOST = "127.0.0.1";
@@ -69,7 +70,7 @@ public class AsyncClientIntegrationTest {
         client.connect()
             .thenCompose(v -> {
                 logger.info("Connected to Iggy server");
-                return client.login(USERNAME, PASSWORD);
+                return client.users().loginAsync(USERNAME, PASSWORD);
             })
             .get(5, TimeUnit.SECONDS);
 
@@ -106,8 +107,8 @@ public class AsyncClientIntegrationTest {
             .createStreamAsync(Optional.empty(), TEST_STREAM)
             .get(5, TimeUnit.SECONDS);
 
-        assertNotNull(streamDetails);
-        assertEquals(TEST_STREAM, streamDetails.name());
+        assertThat(streamDetails).isNotNull();
+        assertThat(streamDetails.name()).isEqualTo(TEST_STREAM);
         logger.info("Successfully created stream: {}", streamDetails.name());
     }
 
@@ -120,8 +121,8 @@ public class AsyncClientIntegrationTest {
             .getStreamAsync(StreamId.of(TEST_STREAM))
             .get(5, TimeUnit.SECONDS);
 
-        assertTrue(streamOpt.isPresent());
-        assertEquals(TEST_STREAM, streamOpt.get().name());
+        assertThat(streamOpt).isPresent();
+        assertThat(streamOpt.get().name()).isEqualTo(TEST_STREAM);
         logger.info("Successfully retrieved stream: {}", streamOpt.get().name());
     }
 
@@ -143,9 +144,9 @@ public class AsyncClientIntegrationTest {
             )
             .get(5, TimeUnit.SECONDS);
 
-        assertNotNull(topicDetails);
-        assertEquals(TEST_TOPIC, topicDetails.name());
-        assertEquals(2, topicDetails.partitionsCount());
+        assertThat(topicDetails).isNotNull();
+        assertThat(topicDetails.name()).isEqualTo(TEST_TOPIC);
+        assertThat(topicDetails.partitionsCount()).isEqualTo(2);
         logger.info("Successfully created topic: {} with {} partitions",
             topicDetails.name(), topicDetails.partitionsCount());
     }
@@ -162,8 +163,8 @@ public class AsyncClientIntegrationTest {
             )
             .get(5, TimeUnit.SECONDS);
 
-        assertTrue(topicOpt.isPresent());
-        assertEquals(TEST_TOPIC, topicOpt.get().name());
+        assertThat(topicOpt).isPresent();
+        assertThat(topicOpt.get().name()).isEqualTo(TEST_TOPIC);
         logger.info("Successfully retrieved topic: {}", topicOpt.get().name());
     }
 
@@ -210,16 +211,16 @@ public class AsyncClientIntegrationTest {
             )
             .get(5, TimeUnit.SECONDS);
 
-        assertNotNull(polledMessages);
-        assertEquals(PARTITION_ID, polledMessages.partitionId());
-        assertFalse(polledMessages.messages().isEmpty());
+        assertThat(polledMessages).isNotNull();
+        assertThat(polledMessages.partitionId()).isEqualTo(PARTITION_ID);
+        assertThat(polledMessages.messages()).isNotEmpty();
         logger.info("Successfully polled {} messages from partition {}",
             polledMessages.messages().size(), polledMessages.partitionId());
 
         // Verify message content
         for (var message : polledMessages.messages()) {
             String content = new String(message.payload());
-            assertTrue(content.startsWith("Test message"));
+            assertThat(content).startsWith("Test message");
             logger.debug("Polled message: {}", content);
         }
     }
@@ -272,8 +273,8 @@ public class AsyncClientIntegrationTest {
             )
             .get(5, TimeUnit.SECONDS);
 
-        assertNotNull(polledMessages);
-        assertTrue(polledMessages.messages().size() >= messageCount);
+        assertThat(polledMessages).isNotNull();
+        assertThat(polledMessages.messages().size()).isGreaterThanOrEqualTo(messageCount);
         logger.info("Successfully polled {} messages", polledMessages.messages().size());
     }
 
@@ -305,8 +306,8 @@ public class AsyncClientIntegrationTest {
             )
             .get(5, TimeUnit.SECONDS);
 
-        assertTrue(updatedTopic.isPresent());
-        assertEquals(CompressionAlgorithm.Gzip, updatedTopic.get().compressionAlgorithm());
+        assertThat(updatedTopic).isPresent();
+        assertThat(updatedTopic.get().compressionAlgorithm()).isEqualTo(CompressionAlgorithm.Gzip);
         logger.info("Successfully updated topic with compression: {}",
             updatedTopic.get().compressionAlgorithm());
     }
@@ -349,15 +350,16 @@ public class AsyncClientIntegrationTest {
             )
             .get(5, TimeUnit.SECONDS);
 
-        assertFalse(deletedTopic.isPresent());
+        assertThat(deletedTopic).isNotPresent();
         logger.info("Successfully deleted topic: {}", tempTopic);
     }
 
     // TODO: Re-enable when server supports null consumer polling
     // This test uses null consumer in concurrent poll operations which causes timeout
     // @Test
+    // @Test
     @Order(10)
-    public void testConcurrentOperations_DISABLED() throws Exception {
+    void testConcurrentOperations_DISABLED() throws Exception {
         logger.info("Testing concurrent async operations");
 
         // Create multiple concurrent operations

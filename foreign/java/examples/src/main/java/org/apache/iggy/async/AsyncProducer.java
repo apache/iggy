@@ -74,7 +74,7 @@ public class AsyncProducer {
         return client.connect()
             .thenCompose(v -> {
                 logger.info("Connected to Iggy server at {}:{}", HOST, PORT);
-                return client.login(USERNAME, PASSWORD);
+                return client.users().loginAsync(USERNAME, PASSWORD);
             })
             .thenCompose(v -> {
                 logger.info("Logged in successfully as user: {}", USERNAME);
