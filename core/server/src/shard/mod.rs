@@ -548,7 +548,7 @@ impl IggyShard {
                             partition_id,
                             |(_, _, _, offset, _, _, _)| {
                                 let current_offset = offset.load(Ordering::Relaxed);
-                                let mut requested_count = 0;
+                                let mut requested_count = count as u64;
                                 if requested_count > current_offset + 1 {
                                     requested_count = current_offset + 1
                                 }

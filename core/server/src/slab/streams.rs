@@ -607,6 +607,10 @@ impl Streams {
         let mut current_offset = offset;
 
         for idx in range {
+            if remaining_count == 0 {
+                break;
+            }
+
             let (segment_start_offset, segment_end_offset) = self.with_partition_by_id(
                 stream_id,
                 topic_id,
@@ -658,10 +662,6 @@ impl Streams {
             }
 
             batches.add_batch_set(messages);
-
-            if remaining_count == 0 {
-                break;
-            }
         }
 
         Ok(batches)
@@ -890,6 +890,10 @@ impl Streams {
         let mut batches = IggyMessagesBatchSet::empty();
 
         for idx in range {
+            if remaining_count == 0 {
+                break;
+            }
+
             let segment_end_timestamp = self.with_partition_by_id(
                 stream_id,
                 topic_id,
@@ -922,10 +926,6 @@ impl Streams {
 
             remaining_count = remaining_count.saturating_sub(messages_count);
             batches.add_batch_set(messages);
-
-            if remaining_count == 0 {
-                break;
-            }
         }
 
         Ok(batches)
