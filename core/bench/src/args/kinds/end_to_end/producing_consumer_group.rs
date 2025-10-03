@@ -101,7 +101,7 @@ impl BenchmarkKindProps for EndToEndProducingConsumerGroupArgs {
             .exit();
         }
 
-        let cg_number = self.consumer_groups.get();
+        let cg_number = self.number_of_consumer_groups();
         if cg_number < streams {
             cmd.error(
                 ErrorKind::ArgumentConflict,
