@@ -164,7 +164,6 @@ impl EntityComponentSystem<Borrow> for Partitions {
     {
         f(self.into())
     }
-
 }
 
 impl EntityComponentSystemMut for Partitions {
@@ -220,5 +219,4 @@ impl Partitions {
     ) -> T {
         self.with_components_by_id_mut(id, |components| f(components))
     }
-
 }

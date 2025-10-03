@@ -20,6 +20,7 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::messages::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
+use crate::shard::transmission::event::ShardEvent;
 use crate::streaming::session::Session;
 use anyhow::Result;
 use error_set::ErrContext;
@@ -44,10 +45,10 @@ impl ServerCommandHandler for FlushUnsavedBuffer {
 
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
-        let partition_id = self.partition_id;
+        let partition_id = self.partition_id as usize;
         let fsync = self.fsync;
         shard
-            .flush_unsaved_buffer(session, stream_id, topic_id, partition_id, fsync)
+            .flush_unsaved_buffer(session, &stream_id, &topic_id, partition_id, fsync)
             .await
             .with_error_context(|error| {
                 format!(
@@ -55,6 +56,13 @@ impl ServerCommandHandler for FlushUnsavedBuffer {
                     self.stream_id, self.topic_id, self.partition_id, session
                 )
             })?;
+        let event = ShardEvent::FlushUnsavedBuffer {
+            stream_id,
+            topic_id,
+            partition_id,
+            fsync,
+        };
+        let _responses = shard.broadcast_event_to_all_shards(event).await;
         sender.send_empty_ok_response().await?;
         Ok(())
     }

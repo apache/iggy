@@ -230,6 +230,11 @@ async fn main() -> Result<(), ServerError> {
         }
     }
 
+    #[cfg(feature = "disable-mimalloc")]
+    warn!("Using default system allocator because code was build with `disable-mimalloc` feature");
+    #[cfg(not(feature = "disable-mimalloc"))]
+    info!("Using mimalloc allocator");
+
     // DISCRETE STEP.
     // Increment the metrics.
     let metrics = Metrics::init();
@@ -343,7 +348,6 @@ async fn main() -> Result<(), ServerError> {
     }
 
     let shutdown_handles_for_signal = shutdown_handles.clone();
-
     ctrlc::set_handler(move || {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -367,7 +371,9 @@ async fn main() -> Result<(), ServerError> {
     info!("Iggy server is running. Press Ctrl+C or send SIGTERM to shutdown.");
 
     for (idx, handle) in handles.into_iter().enumerate() {
-        handle.join().expect("Failed to join shard thread");
+        handle
+            .join()
+            .expect(format!("Failed to join shard thread-{}", idx).as_str());
     }
 
     let shutdown_duration_msg = {
@@ -389,81 +395,5 @@ async fn main() -> Result<(), ServerError> {
         shutdown_duration_msg
     );
 
-    /*
-    #[cfg(feature = "disable-mimalloc")]
-    warn!("Using default system allocator because code was build with `disable-mimalloc` feature");
-    #[cfg(not(feature = "disable-mimalloc"))]
-    info!("Using mimalloc allocator");
-
-    let system = SharedSystem::new(System::new(
-        config.system.clone(),
-        config.cluster.clone(),
-        config.cluster.clone(),
-        config.data_maintenance.clone(),
-        config.personal_access_token.clone(),
-    ));
-    */
-
-    /*
-
-    let mut current_config = config.clone();
-
-    if config.http.enabled {
-        let http_addr = http_server::start(config.http, system.clone()).await;
-        current_config.http.address = http_addr.to_string();
-    }
-
-    if config.quic.enabled {
-        let quic_addr = quic_server::start(config.quic, system.clone());
-        current_config.quic.address = quic_addr.to_string();
-    }
-
-    if config.tcp.enabled {
-        let tcp_addr = tcp_server::start(config.tcp, system.clone()).await;
-        current_config.tcp.address = tcp_addr.to_string();
-    }
-
-    let runtime_path = current_config.system.get_runtime_path();
-    let current_config_path = format!("{runtime_path}/current_config.toml");
-    let current_config_content =
-        toml::to_string(&current_config).expect("Cannot serialize current_config");
-    tokio::fs::write(current_config_path, current_config_content).await?;
-
-    let elapsed_time = startup_timestamp.elapsed();
-    info!(
-        "Iggy server has started - overall startup took {} ms.",
-        elapsed_time.as_millis()
-    );
-
-    #[cfg(unix)]
-    tokio::select! {
-        _ = ctrl_c.recv() => {
-            info!("Received SIGINT. Shutting down Iggy server...");
-        },
-        _ = sigterm.recv() => {
-            info!("Received SIGTERM. Shutting down Iggy server...");
-        }
-    }
-
-    #[cfg(windows)]
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => {
-            info!("Received CTRL-C. Shutting down Iggy server...");
-        }
-        Err(err) => {
-            eprintln!("Unable to listen for shutdown signal: {}", err);
-        }
-    }
-
-    let shutdown_timestamp = Instant::now();
-    let mut system = system.write().await;
-    system.shutdown().await?;
-    let elapsed_time = shutdown_timestamp.elapsed();
-
-    info!(
-        "Iggy server has shutdown successfully. Shutdown took {} ms.",
-        elapsed_time.as_millis()
-    );
-    */
     Ok(())
 }

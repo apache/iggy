@@ -131,12 +131,13 @@ async fn flush_unsaved_buffer(
 ) -> Result<StatusCode, CustomError> {
     let stream_id = Identifier::from_str_value(&stream_id)?;
     let topic_id = Identifier::from_str_value(&topic_id)?;
+    let partition_id = partition_id as usize;
     let session = Session::stateless(identity.user_id, identity.ip_address);
 
     let flush_future = SendWrapper::new(state.shard.shard().flush_unsaved_buffer(
         &session,
-        stream_id,
-        topic_id,
+        &stream_id,
+        &topic_id,
         partition_id,
         fsync,
     ));

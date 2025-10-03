@@ -25,6 +25,7 @@ use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
 };
 use crate::shard_trace;
+use crate::streaming::partitions::journal::Journal;
 use crate::streaming::polling_consumer::PollingConsumer;
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet};
 use crate::streaming::session::Session;
@@ -362,13 +363,71 @@ impl IggyShard {
     pub async fn flush_unsaved_buffer(
         &self,
         session: &Session,
-        stream_id: Identifier,
-        topic_id: Identifier,
-        partition_id: u32,
-        fsync: bool,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: usize,
+        _fsync: bool,
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
-        todo!();
+        let numeric_stream_id = self
+            .streams2
+            .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
+
+        let numeric_topic_id =
+            self.streams2
+                .with_topic_by_id(&stream_id, &topic_id, topics::helpers::get_topic_id());
+
+        // Validate permissions for given user on stream and topic.
+        self.permissioner
+            .borrow()
+            .append_messages(
+                session.get_user_id(),
+                numeric_stream_id as u32,
+                numeric_topic_id as u32,
+            )
+            .with_error_context(|error| {
+                format!("{COMPONENT} (error: {error}) - permission denied to append messages for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), numeric_stream_id as u32, numeric_topic_id as u32)
+            })?;
+
+        self.flush_unsaved_buffer_base(stream_id, topic_id, partition_id)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn flush_unsaved_buffer_bypass_auth(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: usize,
+    ) -> Result<(), IggyError> {
+        self.flush_unsaved_buffer_base(stream_id, topic_id, partition_id)
+            .await
+    }
+
+    async fn flush_unsaved_buffer_base(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: usize,
+    ) -> Result<(), IggyError> {
+        let batches = self.streams2.with_partition_by_id_mut(
+            &stream_id,
+            &topic_id,
+            partition_id,
+            |(.., log)| log.journal_mut().commit(),
+        );
+
+        self.streams2
+            .persist_messages_to_disk(
+                self.id,
+                &stream_id,
+                &topic_id,
+                partition_id,
+                batches,
+                &self.config.system,
+            )
+            .await?;
+        Ok(())
     }
 
     async fn decrypt_messages(

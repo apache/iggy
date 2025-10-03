@@ -144,7 +144,6 @@ pub async fn load_streams(
                     parent_stats.clone(),
                 )
                 .await?;
-                // Insert partition into the container
                 streams.with_components_by_id(stream_id as usize, |(root, ..)| {
                     root.topics()
                         .with_components_by_id_mut(topic_id, |(mut root, ..)| {
@@ -335,13 +334,12 @@ pub fn create_shard_executor(cpu_set: HashSet<usize>) -> Runtime {
     // TODO: The event interval tick, could be configured based on the fact
     // How many clients we expect to have connected.
     // This roughly estimates the number of tasks we will create.
-
     let mut proactor = compio::driver::ProactorBuilder::new();
 
     proactor
         .capacity(4096)
         .coop_taskrun(true)
-        .taskrun_flag(true); // TODO: Try enabling this.
+        .taskrun_flag(true);
 
     // FIXME(hubcio): Only set thread_pool_limit(0) on non-macOS platforms
     // This causes a freeze on macOS with compio fs operations
@@ -403,7 +401,6 @@ pub async fn load_segments(
     partition_path: String,
     stats: Arc<PartitionStats>,
 ) -> Result<SegmentedLog<MemoryMessageJournal>, IggyError> {
-    // Read directory entries to find log files using async fs_utils
     let mut log_files = collect_log_files(&partition_path).await?;
     log_files.sort_by(|a, b| a.path.file_name().cmp(&b.path.file_name()));
     let mut log = SegmentedLog::<MemoryMessageJournal>::default();
@@ -417,12 +414,10 @@ pub async fn load_segments(
 
         let start_offset = log_file_name.parse::<u64>().unwrap();
 
-        // Build file paths directly
         let messages_file_path = format!("{}/{}.{}", partition_path, log_file_name, LOG_EXTENSION);
         let index_file_path = format!("{}/{}.{}", partition_path, log_file_name, INDEX_EXTENSION);
         let time_index_path = index_file_path.replace(INDEX_EXTENSION, "timeindex");
 
-        // Check if index files exist
         async fn try_exists(path: &str) -> Result<bool, std::io::Error> {
             match compio::fs::metadata(path).await {
                 Ok(_) => Ok(true),
@@ -440,7 +435,6 @@ pub async fn load_segments(
             CacheIndexesConfig::All | CacheIndexesConfig::OpenSegment
         );
 
-        // Rebuild indexes if index cache is enabled and index at path does not exist
         if index_cache_enabled && (!index_path_exists || time_index_path_exists) {
             warn!(
                 "Index at path {} does not exist, rebuilding it based on {}...",
@@ -469,7 +463,6 @@ pub async fn load_segments(
             compio::fs::remove_file(&time_index_path).await.unwrap();
         }
 
-        // Get file metadata to determine segment properties
         let messages_metadata = compio::fs::metadata(&messages_file_path)
             .await
             .map_err(|_| IggyError::CannotReadPartitions)?;
@@ -480,7 +473,6 @@ pub async fn load_segments(
             Err(_) => 0, // Default to 0 if index file doesn't exist
         };
 
-        // Create storage for the segment using existing files
         let storage = Storage::new(
             &messages_file_path,
             &index_file_path,
@@ -488,12 +480,10 @@ pub async fn load_segments(
             index_size as u64,
             config.partition.enforce_fsync,
             config.partition.enforce_fsync,
-            true, // file_exists = true for existing segments
+            true,
         )
         .await?;
 
-        // Load indexes from disk to calculate the correct end offset and cache them if needed
-        // This matches the logic in Segment::load_from_disk method
         let loaded_indexes = {
             storage.
             index_reader
@@ -505,7 +495,6 @@ pub async fn load_segments(
             .map_err(|_| IggyError::CannotReadFile)?
         };
 
-        // Calculate end offset based on loaded indexes
         let end_offset = if loaded_indexes.count() == 0 {
             0
         } else {
@@ -522,14 +511,12 @@ pub async fn load_segments(
             )
         };
 
-        // Create the new Segment with proper values from file system
         let mut segment = Segment2::new(
             start_offset,
             config.segment.size,
             config.segment.message_expiry,
         );
 
-        // Set properties based on file data
         segment.start_timestamp = start_timestamp;
         segment.end_timestamp = end_timestamp;
         segment.end_offset = end_offset;
@@ -585,20 +572,15 @@ pub async fn load_segments(
             }
         }
 
-        // Add segment to log
         log.add_persisted_segment(segment, storage);
 
-        // Increment stats for partition - this matches the behavior from partition storage load method
         stats.increment_segments_count(1);
 
-        // Increment size and message counts based on the loaded segment data
         stats.increment_size_bytes(messages_size as u64);
 
-        // Calculate message count from segment data (end_offset - start_offset + 1 if there are messages)
         let messages_count = if end_offset > start_offset {
             (end_offset - start_offset + 1) as u64
         } else if messages_size > 0 {
-            // Fallback: estimate based on loaded indexes count if available
             loaded_indexes.count() as u64
         } else {
             0
@@ -608,21 +590,18 @@ pub async fn load_segments(
             stats.increment_messages_count(messages_count);
         }
 
-        // Now handle index caching based on configuration
         let should_cache_indexes = match config.segment.cache_indexes {
             CacheIndexesConfig::All => true,
-            CacheIndexesConfig::OpenSegment => false, // Will be handled after all segments are loaded
+            CacheIndexesConfig::OpenSegment => false,
             CacheIndexesConfig::None => false,
         };
 
-        // Set the loaded indexes if we should cache them
         if should_cache_indexes {
             let segment_index = log.segments().len() - 1;
             log.set_segment_indexes(segment_index, loaded_indexes);
         }
     }
 
-    // Handle OpenSegment cache configuration: only the last segment should keep its indexes
     if matches!(
         config.segment.cache_indexes,
         CacheIndexesConfig::OpenSegment
@@ -630,7 +609,6 @@ pub async fn load_segments(
     {
         let segments_count = log.segments().len();
         if segments_count > 0 {
-            // Use the IndexReader from the last segment's storage to load indexes
             let last_storage = log.storages().last().unwrap();
             match last_storage.index_reader.as_ref() {
                 Some(index_reader) => {
@@ -655,11 +633,9 @@ async fn load_partition(
     partition_state: crate::state::system::PartitionState,
     parent_stats: Arc<TopicStats>,
 ) -> Result<partition2::Partition, IggyError> {
-    use std::sync::atomic::AtomicU64;
     let stats = Arc::new(PartitionStats::new(parent_stats));
     let partition_id = partition_state.id as u32;
 
-    // Load segments from disk to determine should_increment_offset and current offset
     let partition_path = config.get_partition_path(stream_id, topic_id, partition_id as usize);
     let log_files = collect_log_files(&partition_path).await?;
     let should_increment_offset = !log_files.is_empty()
@@ -675,7 +651,6 @@ async fn load_partition(
 
                 let start_offset = log_file_name.parse::<u64>().unwrap();
 
-                // Build file paths directly
                 let messages_file_path =
                     format!("{}/{}.{}", partition_path, start_offset, LOG_EXTENSION);
                 std::fs::metadata(&messages_file_path).is_ok_and(|metadata| metadata.len() > 0)
@@ -686,6 +661,7 @@ async fn load_partition(
         "Loading partition with ID: {} for stream with ID: {} and topic with ID: {}, for path: {} from disk...",
         partition_id, stream_id, topic_id, partition_path
     );
+
     // Load consumer offsets
     let message_deduplicator = create_message_deduplicator(config);
     let consumer_offset_path =

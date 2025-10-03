@@ -958,6 +958,16 @@ impl IggyShard {
                 .await?;
                 Ok(())
             }
+            ShardEvent::FlushUnsavedBuffer {
+                stream_id,
+                topic_id,
+                partition_id,
+                ..
+            } => {
+                self.flush_unsaved_buffer_bypass_auth(&stream_id, &topic_id, partition_id)
+                    .await?;
+                Ok(())
+            }
         }
     }
 

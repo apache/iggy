@@ -1,8 +1,6 @@
 use crate::shard::task_registry::TaskRegistry;
 use crate::shard_trace;
 use crate::streaming::partitions as streaming_partitions;
-use crate::streaming::segments::IggyIndexesMut;
-use crate::streaming::segments::storage::Storage;
 use crate::{
     binary::handlers::messages::poll_messages_handler::IggyPollMetadata,
     configs::{cache_indexes::CacheIndexesConfig, system::SystemConfig},
@@ -1235,9 +1233,24 @@ impl Streams {
             reason
         );
 
+        let batch_count = self
+            .persist_messages_to_disk(shard_id, stream_id, topic_id, partition_id, batches, config)
+            .await?;
+
+        Ok(batch_count)
+    }
+
+    pub async fn persist_messages_to_disk(
+        &self,
+        shard_id: u16,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: usize,
+        batches: IggyMessagesBatchSet,
+        config: &SystemConfig,
+    ) -> Result<u32, IggyError> {
         let batch_count = batches.count();
         let batch_size = batches.size();
-
         // Extract storage before async operations
         let (messages_writer, index_writer) =
             self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {

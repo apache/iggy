@@ -260,10 +260,6 @@ impl TopicRoot {
         f(self)
     }
 
-    pub async fn invoke_async<T>(&self, f: impl AsyncFnOnce(&Self) -> T) -> T {
-        f(self).await
-    }
-
     pub fn update_id(&mut self, id: usize) {
         self.id = id;
     }

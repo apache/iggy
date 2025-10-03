@@ -16,6 +16,12 @@ use std::net::SocketAddr;
 
 #[derive(Debug, Clone)]
 pub enum ShardEvent {
+    FlushUnsavedBuffer {
+        stream_id: Identifier,
+        topic_id: Identifier,
+        partition_id: usize,
+        fsync: bool,
+    },
     CreatedStream2 {
         id: usize,
         stream: stream2::Stream,
