@@ -34,6 +34,10 @@ ignored = ["dashmap", "once_cell", "futures", "simd-json"]
 [lib]
 crate-type = ["cdylib", "lib"]
 
+[features]
+# Placeholder feature for future CDC using Supabase's ETL framework
+cdc_pg_replicate = []
+
 [dependencies]
 async-trait = { workspace = true }
 chrono = { workspace = true }
