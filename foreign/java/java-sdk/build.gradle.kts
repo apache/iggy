@@ -48,10 +48,10 @@ checkstyle {
 }
 
 dependencies {
-    implementation("org.apache.httpcomponents.client5:httpclient5:5.4")
+    implementation("org.apache.httpcomponents.client5:httpclient5:5.4.3")
     implementation("com.fasterxml.jackson.core:jackson-databind:2.18.0")
     implementation("com.fasterxml.jackson.datatype:jackson-datatype-jdk8:2.18.0")
-    implementation("org.apache.commons:commons-lang3:3.17.0")
+    implementation("org.apache.commons:commons-lang3:3.18.0")
     implementation("org.slf4j:slf4j-api:2.0.16")
     implementation("com.google.code.findbugs:jsr305:3.0.2")
     implementation("io.projectreactor:reactor-core:3.6.11")
