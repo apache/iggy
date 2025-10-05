@@ -112,15 +112,7 @@ public static class Utils
             var topicIdentifier = Identifier.Numeric(TOPIC_ID);
             logger.LogInformation("Sending messages count: {Count}", messagesPerBatch);
 
-            await client.SendMessagesAsync(
-                new MessageSendRequest
-                {
-                    StreamId = streamIdentifier,
-                    TopicId = topicIdentifier,
-                    Partitioning = partitioning,
-                    Messages = messages
-                }
-            );
+            await client.SendMessagesAsync(streamIdentifier, topicIdentifier, partitioning, messages);
 
             sentBatches++;
             logger.LogInformation("Sent messages: {Messages}.", serializableMessages);
@@ -139,14 +131,20 @@ public static class Utils
 
         argumentName = argumentName ?? throw new ArgumentNullException(argumentName);
         if (argumentName != "--tcp-server-address")
+        {
             throw new FormatException(
                 $"Invalid argument {argumentName}! Usage: --tcp-server-address <server-address>"
             );
+        }
+
         tcpServerAddr = tcpServerAddr ?? throw new ArgumentNullException(tcpServerAddr);
         if (!IPEndPoint.TryParse(tcpServerAddr, out _))
+        {
             throw new FormatException(
                 $"Invalid server address {tcpServerAddr}! Usage: --tcp-server-address <server-address>"
             );
+        }
+
         logger.LogInformation("Using server address: {TcpServerAddr}", tcpServerAddr);
         return tcpServerAddr;
     }

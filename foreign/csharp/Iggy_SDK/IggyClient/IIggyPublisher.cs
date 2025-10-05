@@ -22,7 +22,7 @@ namespace Apache.Iggy.IggyClient;
 
 public interface IIggyPublisher
 {
-    Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning, Message[] messages,
+    Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning, IList<Message> messages,
         CancellationToken token = default);
 
     Task FlushUnsavedBufferAsync(Identifier streamId, Identifier topicId, uint partitionId, bool fsync,

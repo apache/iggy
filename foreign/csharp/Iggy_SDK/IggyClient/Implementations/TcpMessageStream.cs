@@ -219,7 +219,7 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendWithResponseAsync(payload, token);
     }
 
-    public async Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning, Message[] messages,
+    public async Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning, IList<Message> messages,
         CancellationToken token = default)
     {
         var metadataLength = 2 + streamId.Length + 2 + topicId.Length

@@ -43,7 +43,7 @@ internal static class TcpMessageStreamHelpers
         return (status, length);
     }
 
-    internal static int CalculateMessageBytesCount(Message[] messages)
+    internal static int CalculateMessageBytesCount(IList<Message> messages)
     {
         var bytesCount = 0;
         foreach (var message in messages)

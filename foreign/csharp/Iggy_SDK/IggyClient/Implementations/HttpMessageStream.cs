@@ -234,7 +234,7 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
 
-    public async Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning, Message[] messages,
+    public async Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning, IList<Message> messages,
         CancellationToken token = default)
     {
         var request = new MessageSendRequest
