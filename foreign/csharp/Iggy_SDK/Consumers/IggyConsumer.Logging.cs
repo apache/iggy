@@ -30,19 +30,6 @@ public partial class IggyConsumer
         Message = "Successfully joined consumer group '{GroupName}'")]
     private partial void LogConsumerGroupJoined(string groupName);
 
-    // Debug logs
-    [LoggerMessage(
-        EventId = 1,
-        Level = LogLevel.Debug,
-        Message = "Polling task cancelled")]
-    private partial void LogPollingTaskCancelled();
-
-    [LoggerMessage(
-        EventId = 2,
-        Level = LogLevel.Debug,
-        Message = "Message polling stopped")]
-    private partial void LogMessagePollingStopped();
-
     // Trace logs
     [LoggerMessage(
         EventId = 200,
@@ -51,18 +38,6 @@ public partial class IggyConsumer
     private partial void LogLeftConsumerGroup(string groupName);
 
     // Warning logs
-    [LoggerMessage(
-        EventId = 300,
-        Level = LogLevel.Warning,
-        Message = "Polling task timed out")]
-    private partial void LogPollingTaskTimeout();
-
-    [LoggerMessage(
-        EventId = 301,
-        Level = LogLevel.Warning,
-        Message = "Polling task failed with exception")]
-    private partial void LogPollingTaskFailed(Exception exception);
-
     [LoggerMessage(
         EventId = 302,
         Level = LogLevel.Warning,
@@ -87,16 +62,4 @@ public partial class IggyConsumer
         Level = LogLevel.Error,
         Message = "Failed to create consumer group '{GroupName}'")]
     private partial void LogFailedToCreateConsumerGroup(Exception exception, string groupName);
-
-    [LoggerMessage(
-        EventId = 402,
-        Level = LogLevel.Error,
-        Message = "Failed to decrypt message with offset {Offset}")]
-    private partial void LogFailedToDecryptMessage(Exception exception, ulong offset);
-
-    [LoggerMessage(
-        EventId = 403,
-        Level = LogLevel.Error,
-        Message = "Failed to poll messages")]
-    private partial void LogFailedToPollMessages(Exception exception);
 }

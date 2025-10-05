@@ -3,7 +3,6 @@ using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
 using Microsoft.Extensions.Logging;
-using System.Threading.Channels;
 
 namespace Apache.Iggy.Publishers;
 
@@ -14,44 +13,65 @@ public partial class IggyPublisher : IAsyncDisposable
     private readonly ILogger<IggyPublisher> _logger;
     private bool _isInitialized = false;
 
-    private readonly Channel<Message>? _messageChannel;
-    private readonly ChannelWriter<Message>? _messageWriter;
-    private readonly ChannelReader<Message>? _messageReader;
-    private readonly CancellationTokenSource _cancellationTokenSource;
-    private Task? _backgroundTask;
+    private readonly BackgroundMessageProcessor? _backgroundProcessor;
     private bool _disposed = false;
 
     /// <summary>
     /// Fired when any error occurs in the background task
     /// </summary>
-    public event EventHandler<PublisherErrorEventArgs>? OnBackgroundError;
-    
+    public event EventHandler<PublisherErrorEventArgs>? OnBackgroundError
+    {
+        add
+        {
+            if (_backgroundProcessor != null)
+            {
+                _backgroundProcessor.OnBackgroundError += value;
+            }
+        }
+        remove
+        {
+            if (_backgroundProcessor != null)
+            {
+                _backgroundProcessor.OnBackgroundError -= value;
+            }
+        }
+    }
+
     /// <summary>
     /// Fired when a batch of messages fails to send
     /// </summary>
-    public event EventHandler<MessageBatchFailedEventArgs>? OnMessageBatchFailed;
+    public event EventHandler<MessageBatchFailedEventArgs>? OnMessageBatchFailed
+    {
+        add
+        {
+            if (_backgroundProcessor != null)
+            {
+                _backgroundProcessor.OnMessageBatchFailed += value;
+            }
+        }
+        remove
+        {
+            if (_backgroundProcessor != null)
+            {
+                _backgroundProcessor.OnMessageBatchFailed -= value;
+            }
+        }
+    }
 
     public IggyPublisher(IIggyClient client, IggyPublisherConfig config, ILogger<IggyPublisher> logger)
     {
         _client = client;
         _config = config;
         _logger = logger;
-        _cancellationTokenSource = new CancellationTokenSource();
 
         if (_config.EnableBackgroundSending)
         {
             LogInitializingBackgroundSending(_config.BackgroundQueueCapacity, _config.BackgroundBatchSize);
 
-            var options = new BoundedChannelOptions(_config.BackgroundQueueCapacity)
-            {
-                FullMode = BoundedChannelFullMode.Wait,
-                SingleReader = true,
-                SingleWriter = false
-            };
+            var processorLogger = _config.LoggerFactory?.CreateLogger<BackgroundMessageProcessor>()
+                ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<BackgroundMessageProcessor>.Instance;
 
-            _messageChannel = Channel.CreateBounded<Message>(options);
-            _messageWriter = _messageChannel.Writer;
-            _messageReader = _messageChannel.Reader;
+            _backgroundProcessor = new BackgroundMessageProcessor(_client, _config, processorLogger);
         }
     }
 
@@ -73,7 +93,7 @@ public partial class IggyPublisher : IAsyncDisposable
 
         if (_config.EnableBackgroundSending)
         {
-            StartBackgroundTasks();
+            _backgroundProcessor?.Start();
             LogBackgroundSendingStarted();
         }
 
@@ -156,12 +176,12 @@ public partial class IggyPublisher : IAsyncDisposable
 
         EncryptMessages(messages);
 
-        if (_config.EnableBackgroundSending && _messageWriter != null)
+        if (_config.EnableBackgroundSending && _backgroundProcessor != null)
         {
             LogQueuingMessages(messages.Length);
             foreach (var message in messages)
             {
-                await _messageWriter.WriteAsync(message, ct);
+                await _backgroundProcessor.MessageWriter.WriteAsync(message, ct);
             }
         }
         else
@@ -173,119 +193,19 @@ public partial class IggyPublisher : IAsyncDisposable
 
     public async Task WaitUntilAllSends(CancellationToken ct = default)
     {
-        if (!_config.EnableBackgroundSending || _messageReader == null)
+        if (!_config.EnableBackgroundSending || _backgroundProcessor == null)
         {
             return;
         }
 
         LogWaitingForPendingMessages();
 
-        while (_messageReader.Count > 0 && !ct.IsCancellationRequested)
+        while (_backgroundProcessor.MessageReader.Count > 0 && !ct.IsCancellationRequested)
         {
             await Task.Delay(10, ct);
         }
 
         LogAllPendingMessagesSent();
-    }
-
-    private void StartBackgroundTasks()
-    {
-        if (_backgroundTask != null || _messageReader == null)
-        {
-            return;
-        }
-
-        _backgroundTask = BackgroundMessageProcessor(_cancellationTokenSource.Token);
-    }
-
-    private async Task BackgroundMessageProcessor(CancellationToken ct)
-    {
-        var messageBatch = new List<Message>(_config.BackgroundBatchSize);
-        using var timer = new PeriodicTimer(_config.BackgroundFlushInterval);
-
-        LogBackgroundProcessorStarted();
-
-        try
-        {
-            while (!ct.IsCancellationRequested && _messageReader != null)
-            {
-                while (messageBatch.Count < _config.BackgroundBatchSize &&
-                       _messageReader.TryRead(out var message))
-                {
-                    messageBatch.Add(message);
-                }
-
-                if (messageBatch.Count == 0)
-                {
-                    if (!await timer.WaitForNextTickAsync(ct))
-                    {
-                        break;
-                    }
-                    continue;
-                }
-
-                await SendBatchWithRetry(messageBatch, ct);
-                messageBatch.Clear();
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            LogBackgroundProcessorCancelled();
-        }
-        catch (Exception ex)
-        {
-            LogBackgroundProcessorError(ex);
-            OnBackgroundError?.Invoke(this, new PublisherErrorEventArgs(ex, "Unexpected error in background message processor"));
-        }
-        finally
-        {
-            LogBackgroundProcessorStopped();
-        }
-    }
-
-    private async Task SendBatchWithRetry(List<Message> messageBatch, CancellationToken ct)
-    {
-        if (!_config.EnableRetry)
-        {
-            try
-            {
-                await _client.SendMessagesAsync(_config.StreamId, _config.TopicId, _config.Partitioning, messageBatch.ToArray(), ct);
-            }
-            catch (Exception ex)
-            {
-                LogFailedToSendBatch(ex, messageBatch.Count);
-                OnMessageBatchFailed?.Invoke(this, new MessageBatchFailedEventArgs(ex, messageBatch.ToArray(), 0));
-            }
-            return;
-        }
-
-        Exception? lastException = null;
-        var delay = _config.InitialRetryDelay;
-
-        for (var attempt = 0; attempt < _config.MaxRetryAttempts; attempt++)
-        {
-            try
-            {
-                await _client.SendMessagesAsync(_config.StreamId, _config.TopicId, _config.Partitioning, messageBatch.ToArray(), ct);
-                return;
-            }
-            catch (Exception ex)
-            {
-                lastException = ex;
-
-                if (attempt < _config.MaxRetryAttempts && !ct.IsCancellationRequested)
-                {
-                    LogRetryingBatch(ex, messageBatch.Count, attempt + 1, _config.MaxRetryAttempts + 1, delay.TotalMilliseconds);
-                    await Task.Delay(delay, ct);
-                    delay = TimeSpan.FromMilliseconds(
-                        Math.Min(delay.TotalMilliseconds * _config.RetryBackoffMultiplier, _config.MaxRetryDelay.TotalMilliseconds)
-                    );
-                }
-            }
-        }
-
-        LogFailedToSendBatchAfterRetries(lastException!, messageBatch.Count, _config.MaxRetryAttempts + 1);
-        OnMessageBatchFailed?.Invoke(this, new MessageBatchFailedEventArgs(lastException!, messageBatch.ToArray(), _config.MaxRetryAttempts));
     }
 
     private void EncryptMessages(Message[] messages)
@@ -311,27 +231,10 @@ public partial class IggyPublisher : IAsyncDisposable
 
         LogDisposingPublisher();
 
-        _cancellationTokenSource.Cancel();
-
-        if (_backgroundTask != null && _isInitialized)
+        if (_backgroundProcessor != null)
         {
-            LogWaitingForBackgroundTask();
-            try
-            {
-                await _backgroundTask.WaitAsync(TimeSpan.FromSeconds(5));
-                LogBackgroundTaskCompleted();
-            }
-            catch (TimeoutException)
-            {
-                LogBackgroundTaskTimeout();
-            }
-            catch (Exception e)
-            {
-                LogBackgroundProcessorError(e);
-            }
+            await _backgroundProcessor.DisposeAsync();
         }
-
-        _messageWriter?.Complete();
 
         if (_config.CreateIggyClient && _isInitialized)
         {
@@ -345,8 +248,6 @@ public partial class IggyPublisher : IAsyncDisposable
                 LogFailedToLogoutOrDispose(e);
             }
         }
-
-        _cancellationTokenSource.Dispose();
 
         _disposed = true;
         LogPublisherDisposed();

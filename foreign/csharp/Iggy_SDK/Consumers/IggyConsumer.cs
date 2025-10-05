@@ -1,10 +1,7 @@
-﻿using System.Runtime.CompilerServices;
-using System.Threading.Channels;
-using Apache.Iggy.Contracts;
+using System.Runtime.CompilerServices;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
-using Apache.Iggy.Kinds;
 using Microsoft.Extensions.Logging;
 
 namespace Apache.Iggy.Consumers;
@@ -15,36 +12,39 @@ public partial class IggyConsumer : IAsyncDisposable
     private readonly IggyConsumerConfig _config;
     private readonly ILogger<IggyConsumer> _logger;
     private bool _isInitialized;
-    private readonly Channel<ReceivedMessage> _channel;
-    private readonly CancellationTokenSource _cancellationTokenSource;
-    private Task? _pollingTask;
+    private readonly BackgroundMessagePoller _backgroundPoller;
     private bool _disposed;
-    private PollingStrategy _currentPollingStrategy;
 
     /// <summary>
     /// Fired when an error occurs during message polling
     /// </summary>
-    public event EventHandler<ConsumerErrorEventArgs>? OnPollingError;
+    public event EventHandler<ConsumerErrorEventArgs>? OnPollingError
+    {
+        add => _backgroundPoller.OnPollingError += value;
+        remove => _backgroundPoller.OnPollingError -= value;
+    }
 
     /// <summary>
     /// Fired when message decryption fails
     /// </summary>
-    public event EventHandler<MessageDecryptionFailedEventArgs>? OnMessageDecryptionFailed;
+    public event EventHandler<MessageDecryptionFailedEventArgs>? OnMessageDecryptionFailed
+    {
+        add => _backgroundPoller.OnMessageDecryptionFailed += value;
+        remove => _backgroundPoller.OnMessageDecryptionFailed -= value;
+    }
 
     public IggyConsumer(IIggyClient client, IggyConsumerConfig config, ILogger<IggyConsumer> logger)
     {
         _client = client;
         _config = config;
         _logger = logger;
-        _cancellationTokenSource = new CancellationTokenSource();
-        _channel = Channel.CreateBounded<ReceivedMessage>(new BoundedChannelOptions(config.BufferSize)
-        {
-            SingleReader = true,
-            SingleWriter = true,
-            FullMode = BoundedChannelFullMode.Wait
-        });
+
+        var pollerLogger = _config.LoggerFactory?.CreateLogger<BackgroundMessagePoller>()
+            ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<BackgroundMessagePoller>.Instance;
+
+        _backgroundPoller = new BackgroundMessagePoller(_client, _config, pollerLogger);
     }
-    
+
     public async Task InitAsync(CancellationToken ct = default)
     {
         if (_isInitialized)
@@ -55,8 +55,6 @@ public partial class IggyConsumer : IAsyncDisposable
         await _client.LoginUser(_config.Login, _config.Password, ct);
 
         await InitializeConsumerGroupAsync(ct);
-
-        _currentPollingStrategy = _config.PollingStrategy;
 
         _isInitialized = true;
     }
@@ -136,15 +134,11 @@ public partial class IggyConsumer : IAsyncDisposable
             throw new ConsumerNotInitializedException();
         }
 
-        if (_pollingTask == null || _pollingTask.IsCompleted)
-        {
-            var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, _cancellationTokenSource.Token);
-            _pollingTask = PollMessagesAsync(linkedCts.Token);
-        }
+        _backgroundPoller.Start(ct);
 
         do
         {
-            var message = await _channel.Reader.ReadAsync(ct);
+            var message = await _backgroundPoller.MessageReader.ReadAsync(ct);
 
             yield return message;
 
@@ -159,90 +153,6 @@ public partial class IggyConsumer : IAsyncDisposable
         } while (!ct.IsCancellationRequested);
     }
 
-    private async Task PollMessagesAsync(CancellationToken ct)
-    {
-        try
-        {
-            while (!ct.IsCancellationRequested)
-            {
-                try
-                {
-                    var messages = await _client.PollMessagesAsync(_config.StreamId, _config.TopicId,
-                        _config.PartitionId, _config.Consumer, _currentPollingStrategy, _config.BatchSize,
-                        _config.AutoCommit, ct);
-
-                    foreach (var message in messages.Messages)
-                    {
-                        var processedMessage = message;
-
-                        if (_config.MessageEncryptor != null)
-                        {
-                            try
-                            {
-                                var decryptedPayload = _config.MessageEncryptor.Decrypt(message.Payload);
-                                processedMessage = new MessageResponse
-                                {
-                                    Header = message.Header,
-                                    Payload = decryptedPayload,
-                                    UserHeaders = message.UserHeaders
-                                };
-                            }
-                            catch (Exception ex)
-                            {
-                                LogFailedToDecryptMessage(ex, message.Header.Offset);
-                                OnMessageDecryptionFailed?.Invoke(this,
-                                    new MessageDecryptionFailedEventArgs(ex, new ReceivedMessage()
-                                    {
-                                        Message = message,
-                                        CurrentOffset = message.Header.Offset,
-                                        PartitionId = (uint)messages.PartitionId
-                                    }));
-                                continue;
-                            }
-                        }
-
-                        var receivedMessage = new ReceivedMessage()
-                        {
-                            Message = processedMessage,
-                            CurrentOffset = processedMessage.Header.Offset,
-                            PartitionId = (uint)messages.PartitionId
-                        };
-                        await _channel.Writer.WriteAsync(receivedMessage, ct);
-                    }
-
-                    if (messages.Messages.Any() && _config.AutoCommitMode == AutoCommitMode.AfterPoll)
-                    {
-                        await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId,
-                            messages.Messages[^1].Header.Offset, (uint)messages.PartitionId, ct);
-                    }
-
-                    if (messages.Messages.Any())
-                    {
-                        var lastOffset = messages.Messages[^1].Header.Offset;
-                        _currentPollingStrategy = PollingStrategy.Offset(lastOffset + 1);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    LogFailedToPollMessages(ex);
-                    OnPollingError?.Invoke(this, new ConsumerErrorEventArgs(ex, "Failed to poll messages"));
-                }
-
-                await Task.Delay(_config.PollingIntervalMs, ct);
-            }
-
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            LogPollingTaskCancelled();
-        }
-        finally
-        {
-            _channel.Writer.TryComplete();
-            LogMessagePollingStopped();
-        }
-    }
-
     public async ValueTask DisposeAsync()
     {
         if (_disposed)
@@ -250,23 +160,7 @@ public partial class IggyConsumer : IAsyncDisposable
             return;
         }
 
-        await _cancellationTokenSource.CancelAsync();
-
-        if (_pollingTask != null && _isInitialized)
-        {
-            try
-            {
-                await _pollingTask.WaitAsync(TimeSpan.FromSeconds(5));
-            }
-            catch (TimeoutException)
-            {
-                LogPollingTaskTimeout();
-            }
-            catch (Exception e)
-            {
-                LogPollingTaskFailed(e);
-            }
-        }
+        await _backgroundPoller.DisposeAsync();
 
         if (!string.IsNullOrEmpty(_config.ConsumerGroupName) && _isInitialized)
         {
@@ -295,8 +189,6 @@ public partial class IggyConsumer : IAsyncDisposable
                 LogFailedToLogoutOrDispose(e);
             }
         }
-
-        _cancellationTokenSource.Dispose();
 
         _disposed = true;
     }

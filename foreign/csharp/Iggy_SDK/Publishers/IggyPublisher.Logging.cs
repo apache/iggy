@@ -55,40 +55,10 @@ public partial class IggyPublisher
     private partial void LogAllPendingMessagesSent();
 
     [LoggerMessage(
-        EventId = 10,
-        Level = LogLevel.Debug,
-        Message = "Background message processor started")]
-    private partial void LogBackgroundProcessorStarted();
-
-    [LoggerMessage(
-        EventId = 11,
-        Level = LogLevel.Debug,
-        Message = "Background message processor cancelled")]
-    private partial void LogBackgroundProcessorCancelled();
-
-    [LoggerMessage(
-        EventId = 12,
-        Level = LogLevel.Debug,
-        Message = "Background message processor stopped")]
-    private partial void LogBackgroundProcessorStopped();
-
-    [LoggerMessage(
         EventId = 14,
         Level = LogLevel.Debug,
         Message = "Disposing publisher")]
     private partial void LogDisposingPublisher();
-
-    [LoggerMessage(
-        EventId = 15,
-        Level = LogLevel.Debug,
-        Message = "Waiting for background task to complete")]
-    private partial void LogWaitingForBackgroundTask();
-
-    [LoggerMessage(
-        EventId = 16,
-        Level = LogLevel.Debug,
-        Message = "Background task completed")]
-    private partial void LogBackgroundTaskCompleted();
 
     // Information logs
     [LoggerMessage(
@@ -132,7 +102,7 @@ public partial class IggyPublisher
         Level = LogLevel.Information,
         Message = "Topic {TopicId} created successfully in stream {StreamId}")]
     private partial void LogTopicCreated(Identifier topicId, Identifier streamId);
-    
+
 
     [LoggerMessage(
         EventId = 108,
@@ -146,20 +116,7 @@ public partial class IggyPublisher
         Level = LogLevel.Trace,
         Message = "Queuing {Count} messages for background sending")]
     private partial void LogQueuingMessages(int count);
-    
 
-    // Warning logs
-    [LoggerMessage(
-        EventId = 300,
-        Level = LogLevel.Warning,
-        Message = "Failed to send batch of {Count} messages (attempt {Attempt}/{MaxAttempts}). Retrying in {Delay}ms")]
-    private partial void LogRetryingBatch(Exception exception, int count, int attempt, int maxAttempts, double delay);
-
-    [LoggerMessage(
-        EventId = 301,
-        Level = LogLevel.Warning,
-        Message = "Background task did not complete within timeout")]
-    private partial void LogBackgroundTaskTimeout();
 
     // Error logs
     [LoggerMessage(
@@ -179,24 +136,6 @@ public partial class IggyPublisher
         Level = LogLevel.Error,
         Message = "Attempted to send messages before publisher initialization")]
     private partial void LogSendBeforeInitialization();
-
-    [LoggerMessage(
-        EventId = 403,
-        Level = LogLevel.Error,
-        Message = "Failed to send batch of {Count} messages")]
-    private partial void LogFailedToSendBatch(Exception exception, int count);
-
-    [LoggerMessage(
-        EventId = 404,
-        Level = LogLevel.Error,
-        Message = "Unexpected error in background message processor")]
-    private partial void LogBackgroundProcessorError(Exception exception);
-
-    [LoggerMessage(
-        EventId = 405,
-        Level = LogLevel.Error,
-        Message = "Failed to send batch of {Count} messages after {Attempts} attempts")]
-    private partial void LogFailedToSendBatchAfterRetries(Exception exception, int count, int attempts);
 
     [LoggerMessage(
         EventId = 406,
