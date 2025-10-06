@@ -1182,10 +1182,10 @@ impl IggyShard {
                         | ShardEvent::DeletedConsumerGroup2 { .. }
                 ) {
                 */
-                    let (sender, receiver) = async_channel::bounded(1);
-                    conn.send(ShardFrame::new(event.into(), Some(sender.clone())));
-                    Some(receiver.clone())
-                    /*
+                let (sender, receiver) = async_channel::bounded(1);
+                conn.send(ShardFrame::new(event.into(), Some(sender.clone())));
+                Some(receiver.clone())
+                /*
                 } else {
                     conn.send(ShardFrame::new(event.into(), None));
                     None
