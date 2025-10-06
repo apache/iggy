@@ -41,8 +41,8 @@ WORKDIR /workspace/foreign/python
 RUN pip3 install --no-cache-dir -r /workspace/bdd/python/requirements.txt
 
 # Build and install the Iggy Python SDK
-RUN maturin build --out dist && \
-    pip3 install dist/*.whl
+RUN maturin build --interpreter python3 --out dist && \
+    pip3 install dist/*cp313*.whl
 
 # Set up BDD test directory
 WORKDIR /app

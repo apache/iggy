@@ -27,10 +27,22 @@ services:
         PREBUILT_IGGY_CLI: ${IGGY_CLI_PATH:-target/debug/iggy}
         LIBC: glibc
         PROFILE: debug
-    command: ["--fresh"]
+    command: ["--fresh", "--with-default-root-credentials"]
+    cap_add:
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/iggy", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+      start_period: 2s
     environment:
-      - IGGY_ROOT_USERNAME=iggy
-      - IGGY_ROOT_PASSWORD=iggy
       - RUST_LOG=info
       - IGGY_SYSTEM_PATH=local_data
       - IGGY_TCP_ADDRESS=0.0.0.0:8090
@@ -105,7 +117,8 @@ services:
       context: ..
       dockerfile: bdd/node/Dockerfile
     depends_on:
-      - iggy-server
+      iggy-server:
+        condition: service_healthy
     environment:
       - IGGY_ROOT_USERNAME=iggy
       - IGGY_ROOT_PASSWORD=iggy
@@ -132,27 +145,5 @@ networks:
   iggy-bdd-network:
     driver: bridge
 
-  node-bdd:
-    build:
-      context: ..
-      dockerfile: bdd/node/Dockerfile
-    depends_on:
-      iggy-server:
-        condition: service_healthy
-    environment:
-      - IGGY_TCP_ADDRESS=iggy-server:8090
-    command: ["npm", "run", "test:bdd"]
-
-  csharp-bdd:
-    build:
-      context: ..
-      dockerfile: bdd/csharp/Dockerfile
-    depends_on:
-      iggy-server:
-        condition: service_healthy
-    environment:
-      - IGGY_TCP_ADDRESS=iggy-server:8090
-    command: ["dotnet", "test"]
-    
 volumes:
   iggy_data:

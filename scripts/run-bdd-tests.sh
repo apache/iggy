@@ -33,8 +33,23 @@ cleanup(){
 }
 trap cleanup EXIT INT TERM
 
+# Check if Docker supports cap_add
+check_docker_capabilities(){
+  if ! docker info | grep -q "Security Options"; then
+    log "⚠️  Warning: Docker may not support security options"
+  fi
+
+  # Verify cap_add is supported by checking docker compose config
+  if ! docker compose config >/dev/null 2>&1; then
+    log "❌ Error: docker-compose.yml validation failed"
+    exit 1
+  fi
+}
+
 log "🧪 Running BDD tests for SDK: ${SDK}"
 log "📁 Feature file: ${FEATURE}"
+
+check_docker_capabilities
 
 run_suite(){
   local svc="$1" emoji="$2" label="$3"

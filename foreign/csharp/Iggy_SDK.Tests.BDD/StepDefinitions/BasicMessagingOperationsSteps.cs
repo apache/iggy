@@ -70,10 +70,10 @@ public class BasicMessagingOperationsSteps
         streams.Count.ShouldBe(0);
     }
 
-    [When(@"I create a stream with ID (\d+) and name (.*)")]
-    public async Task WhenICreateAStreamWithIdAndName(uint streamId, string streamName)
+    [When(@"I create a stream with name (.*)")]
+    public async Task WhenICreateAStreamWithName(string streamName)
     {
-        _context.CreatedStream = await _context.IggyClient.CreateStreamAsync(streamName, streamId);
+        _context.CreatedStream = await _context.IggyClient.CreateStreamAsync(streamName);
     }
 
     [Then(@"the stream should be created successfully")]
@@ -84,19 +84,17 @@ public class BasicMessagingOperationsSteps
         _context.CreatedStream.Name.ShouldNotBeNullOrEmpty();
     }
 
-    [Then(@"the stream should have ID (\d+) and name (.*)")]
-    public void ThenTheStreamShouldHaveIdAndName(uint expectedId, string expectedName)
+    [Then(@"the stream should have name (.*)")]
+    public void ThenTheStreamShouldHaveName(string expectedName)
     {
-        _context.CreatedStream!.Id.ShouldBe(expectedId);
         _context.CreatedStream!.Name.ShouldBe(expectedName);
     }
 
-    [When(@"I create a topic with ID (\d+) and name (.*) in stream (\d+) with (\d+) partitions")]
-    public async Task WhenICreateATopicWithIdAndNameInStreamWithPartitions(uint topicId, string topicName,
+    [When(@"I create a topic with name (.*) in stream (\d+) with (\d+) partitions")]
+    public async Task WhenICreateATopicWithNameInStreamWithPartitions(string topicName,
         uint streamId, uint partitions)
     {
         _context.CreatedTopic = await _context.IggyClient.CreateTopicAsync(Identifier.Numeric(streamId),
-            topicId: topicId,
             name: topicName,
             partitionsCount: partitions);
     }
@@ -109,10 +107,9 @@ public class BasicMessagingOperationsSteps
         _context.CreatedTopic.Name.ShouldNotBeNullOrEmpty();
     }
 
-    [Then(@"the topic should have ID (\d+) and name (.*)")]
-    public void ThenTheTopicShouldHaveIdAndName(uint expectedId, string expectedName)
+    [Then(@"the topic should have name (.*)")]
+    public void ThenTheTopicShouldHaveName(string expectedName)
     {
-        _context.CreatedTopic!.Id.ShouldBe(expectedId);
         _context.CreatedTopic!.Name.ShouldBe(expectedName);
     }
 
