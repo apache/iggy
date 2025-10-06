@@ -63,6 +63,7 @@ use crate::{
 };
 use ahash::{AHashMap, AHashSet, HashMap};
 use builder::IggyShardBuilder;
+use compio::io::AsyncWriteAtExt;
 use dashmap::DashMap;
 use error_set::ErrContext;
 use futures::future::try_join_all;
@@ -236,97 +237,98 @@ impl IggyShard {
         let quic_enabled = self.config.quic.enabled;
         let http_enabled = self.config.http.enabled;
 
-        // Get receiver from the notification channel
         let notify_receiver = shard.config_writer_receiver.clone();
 
-        compio::runtime::spawn(async move {
-            // Wait for notifications until all servers have bound
-            loop {
-                // Wait for a notification from any server binding
-                let _ = notify_receiver.recv().await;
-
-                // Check if all required servers have bound
-                let tcp_ready = !tcp_enabled || shard.tcp_bound_address.get().is_some();
-                let quic_ready = !quic_enabled || shard.quic_bound_address.get().is_some();
-                let http_ready = !http_enabled || shard.http_bound_address.get().is_some();
-
-                if tcp_ready && quic_ready && http_ready {
-                    // All servers have bound, proceed to write config
-                    break;
-                }
-            }
-
-            // All servers are bound, collect addresses and write config once
-            let mut current_config = shard.config.clone();
-
-            let tcp_addr = shard.tcp_bound_address.get();
-            let quic_addr = shard.quic_bound_address.get();
-            let http_addr = shard.http_bound_address.get();
-
-            shard_info!(
-                shard.id,
-                "Config writer: TCP addr = {:?}, QUIC addr = {:?}, HTTP addr = {:?}",
-                tcp_addr,
-                quic_addr,
-                http_addr
-            );
-
-            if let Some(tcp_addr) = tcp_addr {
-                current_config.tcp.address = tcp_addr.to_string();
-            }
-
-            if let Some(quic_addr) = quic_addr {
-                current_config.quic.address = quic_addr.to_string();
-            }
-
-            if let Some(http_addr) = http_addr {
-                current_config.http.address = http_addr.to_string();
-            }
-
-            let runtime_path = current_config.system.get_runtime_path();
-            let config_path = format!("{runtime_path}/current_config.toml");
-            let content =
-                toml::to_string(&current_config).expect("Cannot serialize current_config");
-
-            // Write config file and ensure it's flushed to disk
-            match compio::fs::write(&config_path, content).await.0 {
-                Ok(_) => {
-                    // Open file and fsync to ensure data is persisted to disk
-                    match compio::fs::OpenOptions::new()
-                        .write(true)
-                        .open(&config_path)
+        self.task_registry
+            .oneshot("config_writer")
+            .critical(false)
+            .run(move |_shutdown| async move {
+                // Wait for notifications until all servers have bound
+                loop {
+                    notify_receiver
+                        .recv()
                         .await
-                    {
-                        Ok(file) => match file.sync_all().await {
-                            Ok(_) => shard_info!(
-                                shard.id,
-                                "Current config written and synced to: {} with all bound addresses",
-                                config_path
-                            ),
-                            Err(e) => shard_error!(
-                                shard.id,
-                                "Failed to fsync current config to {}: {}",
-                                config_path,
-                                e
-                            ),
-                        },
-                        Err(e) => shard_error!(
-                            shard.id,
-                            "Failed to open current config for fsync {}: {}",
-                            config_path,
-                            e
-                        ),
+                        .map_err(|_| IggyError::CannotWriteToFile)
+                        .with_error_context(|_| {
+                            "config_writer: notification channel closed before all servers bound"
+                        })?;
+
+                    let tcp_ready = !tcp_enabled || shard.tcp_bound_address.get().is_some();
+                    let quic_ready = !quic_enabled || shard.quic_bound_address.get().is_some();
+                    let http_ready = !http_enabled || shard.http_bound_address.get().is_some();
+
+                    if tcp_ready && quic_ready && http_ready {
+                        break;
                     }
                 }
-                Err(e) => shard_error!(
+
+                let mut current_config = shard.config.clone();
+
+                let tcp_addr = shard.tcp_bound_address.get();
+                let quic_addr = shard.quic_bound_address.get();
+                let http_addr = shard.http_bound_address.get();
+
+                shard_info!(
                     shard.id,
-                    "Failed to write current config to {}: {}",
-                    config_path,
-                    e
-                ),
-            }
-        })
-        .detach();
+                    "Config writer: TCP addr = {:?}, QUIC addr = {:?}, HTTP addr = {:?}",
+                    tcp_addr,
+                    quic_addr,
+                    http_addr
+                );
+
+                if let Some(tcp_addr) = tcp_addr {
+                    current_config.tcp.address = tcp_addr.to_string();
+                }
+
+                if let Some(quic_addr) = quic_addr {
+                    current_config.quic.address = quic_addr.to_string();
+                }
+
+                if let Some(http_addr) = http_addr {
+                    current_config.http.address = http_addr.to_string();
+                }
+
+                let runtime_path = current_config.system.get_runtime_path();
+                let config_path = format!("{runtime_path}/current_config.toml");
+                let content = toml::to_string(&current_config)
+                    .map_err(|_| IggyError::CannotWriteToFile)
+                    .with_error_context(|_| "config_writer: cannot serialize current_config")?;
+
+                let mut file = compio::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&config_path)
+                    .await
+                    .map_err(|_| IggyError::CannotWriteToFile)
+                    .with_error_context(|_| {
+                        format!("config_writer: failed to open current config at {config_path}")
+                    })?;
+
+                file.write_all_at(content.into_bytes(), 0)
+                    .await
+                    .0
+                    .map_err(|_| IggyError::CannotWriteToFile)
+                    .with_error_context(|_| {
+                        format!("config_writer: failed to write current config to {config_path}")
+                    })?;
+
+                file.sync_all()
+                    .await
+                    .map_err(|_| IggyError::CannotWriteToFile)
+                    .with_error_context(|_| {
+                        format!("config_writer: failed to fsync current config to {config_path}")
+                    })?;
+
+                shard_info!(
+                    shard.id,
+                    "Current config written and synced to: {} with all bound addresses",
+                    config_path
+                );
+
+                Ok(())
+            })
+            .spawn();
     }
 
     pub async fn run(self: &Rc<Self>) -> Result<(), IggyError> {
