@@ -178,8 +178,8 @@ pub fn load_consumer_offsets(
     }
 
     let mut consumer_offsets = Vec::new();
-    let mut dir_entries = dir_entries.unwrap();
-    while let Some(dir_entry) = dir_entries.next() {
+    let dir_entries = dir_entries.unwrap();
+    for dir_entry in dir_entries {
         let dir_entry = dir_entry.unwrap();
         let metadata = dir_entry.metadata();
         if metadata.is_err() {

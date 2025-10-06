@@ -101,11 +101,8 @@ impl ConsumerClient for LowLevelConsumerClient {
         let total_bytes = batch_total_size_bytes(&polled);
 
         self.offset += messages_count;
-        match self.polling_strategy.kind {
-            PollingKind::Offset => {
-                self.polling_strategy.value += messages_count;
-            }
-            _ => {}
+        if self.polling_strategy.kind == PollingKind::Offset {
+            self.polling_strategy.value += messages_count;
         }
 
         Ok(Some(BatchMetrics {

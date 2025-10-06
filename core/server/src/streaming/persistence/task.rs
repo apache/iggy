@@ -16,6 +16,7 @@
  * under the License.
  */
 
+use super::persister::PersisterKind;
 use crate::streaming::persistence::COMPONENT;
 use bytes::Bytes;
 use compio::runtime::Task;
@@ -25,7 +26,7 @@ use iggy_common::IggyError;
 use std::{any::Any, sync::Arc, time::Duration};
 use tracing::error;
 
-use super::persister::PersisterKind;
+// TODO(hubcio): remove log persister task and all its configs
 
 pub struct LogPersisterTask {
     _sender: Option<Sender<Bytes>>,

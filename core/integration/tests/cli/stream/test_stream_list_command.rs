@@ -27,18 +27,13 @@ use predicates::str::{contains, starts_with};
 use serial_test::parallel;
 
 struct TestStreamListCmd {
-    stream_id: u32,
     name: String,
     output: OutputFormat,
 }
 
 impl TestStreamListCmd {
-    fn new(stream_id: u32, name: String, output: OutputFormat) -> Self {
-        Self {
-            stream_id,
-            name,
-            output,
-        }
+    fn new(name: String, output: OutputFormat) -> Self {
+        Self { name, output }
     }
 
     fn to_args(&self) -> Vec<&str> {

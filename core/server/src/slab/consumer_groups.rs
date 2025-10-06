@@ -112,6 +112,10 @@ impl ConsumerGroups {
         self.root.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.root.is_empty()
+    }
+
     pub fn get_index(&self, id: &Identifier) -> usize {
         match id.kind {
             iggy_common::IdKind::Numeric => id.get_u32_value().unwrap() as usize,

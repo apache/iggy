@@ -171,7 +171,7 @@ impl IggyShard {
         let session = active_sessions
             .iter()
             .find(|s| s.client_id == client_id)
-            .expect(format!("At this point session for {}, should exist.", client_id).as_str());
+            .unwrap_or_else(|| panic!("At this point session for {}, should exist.", client_id));
         self.login_with_personal_access_token(token, Some(session))?;
         Ok(())
     }

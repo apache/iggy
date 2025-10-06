@@ -368,11 +368,11 @@ impl IggyShard {
         self.ensure_authenticated(session)?;
         let numeric_stream_id = self
             .streams2
-            .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
+            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
 
         let numeric_topic_id =
             self.streams2
-                .with_topic_by_id(&stream_id, &topic_id, topics::helpers::get_topic_id());
+                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
 
         // Validate permissions for given user on stream and topic.
         self.permissioner

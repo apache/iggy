@@ -106,26 +106,15 @@ impl SystemState {
         // Create root user if does not exist.
         let root_exists = state_entries
             .iter()
-            .find(|entry| {
+            .any(|entry| {
                 entry
                     .command()
-                    .and_then(|command| match command {
-                        EntryCommand::CreateUser(payload)
-                            if payload.user_id == DEFAULT_ROOT_USER_ID =>
-                        {
-                            Ok(true)
-                        }
-                        _ => Ok(false),
+                    .map(|command| matches!(command, EntryCommand::CreateUser(payload) if payload.user_id == DEFAULT_ROOT_USER_ID))
+                    .unwrap_or_else(|err| {
+                        error!("Failed to check if root user exists: {err}");
+                        false
                     })
-                    .map_or_else(
-                        |err| {
-                            error!("Failed to check if root user exists: {err}");
-                            false
-                        },
-                        |v| v,
-                    )
-            })
-            .is_some();
+            });
 
         if !root_exists {
             info!("No users found, creating the root user...");

@@ -59,7 +59,7 @@ impl ServerCommandHandler for GetStream {
                     self.stream_id,
                     session.get_user_id(),
                 )
-            });
+            })?;
         let response = shard
             .streams2
             .with_components_by_id(stream_id, |(root, stats)| mapper::map_stream(&root, &stats));

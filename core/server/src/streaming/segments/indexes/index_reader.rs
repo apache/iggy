@@ -339,7 +339,7 @@ impl IndexReader {
     ) -> Result<PooledBuffer, std::io::Error> {
         if use_pool {
             let len = len as usize;
-            let buf = PooledBuffer::with_capacity(len as usize);
+            let buf = PooledBuffer::with_capacity(len);
             let (result, buf) = self
                 .file
                 .read_exact_at(buf.slice(..len), offset as u64)

@@ -52,7 +52,6 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::time::Instant;
 use tracing::{error, info, instrument, warn};
 
 const COMPONENT: &str = "MAIN";
@@ -63,7 +62,6 @@ static SHUTDOWN_START_TIME: AtomicU64 = AtomicU64::new(0);
 #[instrument(skip_all, name = "trace_start_server")]
 #[compio::main]
 async fn main() -> Result<(), ServerError> {
-    let startup_timestamp = Instant::now();
     let standard_font = FIGfont::standard().unwrap();
     let figure = standard_font.convert("Iggy Server");
     println!("{}", figure.unwrap());
@@ -373,7 +371,7 @@ async fn main() -> Result<(), ServerError> {
     for (idx, handle) in handles.into_iter().enumerate() {
         handle
             .join()
-            .expect(format!("Failed to join shard thread-{}", idx).as_str());
+            .unwrap_or_else(|_| panic!("Failed to join shard thread-{}", idx));
     }
 
     let shutdown_duration_msg = {

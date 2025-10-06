@@ -13,8 +13,8 @@ pub struct ConsumerOffset {
 impl Clone for ConsumerOffset {
     fn clone(&self) -> Self {
         Self {
-            kind: self.kind.clone(),
-            consumer_id: self.consumer_id.clone(),
+            kind: self.kind,
+            consumer_id: self.consumer_id,
             offset: AtomicU64::new(0),
             path: self.path.clone(),
         }

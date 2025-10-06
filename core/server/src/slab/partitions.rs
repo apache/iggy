@@ -13,7 +13,7 @@ use crate::{
                 PartitionRefMut,
             },
         },
-        stats::stats::PartitionStats,
+        stats::PartitionStats,
     },
 };
 use slab::Slab;
@@ -194,6 +194,10 @@ impl Default for Partitions {
 impl Partitions {
     pub fn len(&self) -> usize {
         self.root.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.root.is_empty()
     }
 
     pub fn insert_default_log(&mut self) -> ContainerId {

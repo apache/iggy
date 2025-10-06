@@ -15,7 +15,7 @@ use crate::{
         },
     },
     streaming::{
-        stats::stats::TopicStats,
+        stats::TopicStats,
         topics::{
             consumer_group2::{ConsumerGroupRef, ConsumerGroupRefMut},
             topic2::{self, TopicRef, TopicRefMut},
@@ -196,7 +196,7 @@ impl Topics {
         f: impl FnOnce(ComponentsById<TopicRef>) -> T,
     ) -> T {
         let id = self.get_index(topic_id);
-        self.with_components_by_id(id, |components| f(components))
+        self.with_components_by_id(id, f)
     }
 
     pub fn with_topic_by_id_mut<T>(
@@ -205,7 +205,7 @@ impl Topics {
         f: impl FnOnce(ComponentsById<TopicRefMut>) -> T,
     ) -> T {
         let id = self.get_index(topic_id);
-        self.with_components_by_id_mut(id, |components| f(components))
+        self.with_components_by_id_mut(id, f)
     }
 
     pub fn with_consumer_groups<T>(

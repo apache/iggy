@@ -12,7 +12,7 @@ use crate::{
         topics::Topics,
         traits_ext::{EntityMarker, InsertCell, IntoComponents, IntoComponentsById},
     },
-    streaming::stats::stats::StreamStats,
+    streaming::stats::StreamStats,
 };
 
 #[derive(Debug, Clone)]

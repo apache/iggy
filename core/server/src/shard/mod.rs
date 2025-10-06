@@ -37,7 +37,7 @@ use crate::{
             message::{ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult},
         },
     },
-    shard_error, shard_info, shard_warn,
+    shard_error, shard_info,
     slab::{streams::Streams, traits_ext::EntityMarker},
     state::StateKind,
     streaming::{
@@ -622,7 +622,7 @@ impl IggyShard {
                             ),
                         };
 
-                        let batches = if consumer_offset.is_none() {
+                        if consumer_offset.is_none() {
                             let batches = self
                                 .streams2
                                 .get_messages_by_offset(
@@ -652,8 +652,7 @@ impl IggyShard {
                                 )
                                 .await?;
                             Ok(batches)
-                        };
-                        batches
+                        }
                     }
                 }?;
 
@@ -863,13 +862,6 @@ impl IggyShard {
                         self.http_bound_address.set(Some(address));
                         // Notify config writer that a server has bound
                         let _ = self.config_writer_notify.try_send(());
-                    }
-                    _ => {
-                        shard_warn!(
-                            self.id,
-                            "Received AddressBound event for unsupported protocol: {:?}",
-                            protocol
-                        );
                     }
                 }
                 Ok(())

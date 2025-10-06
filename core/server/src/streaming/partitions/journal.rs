@@ -119,5 +119,5 @@ pub trait Journal {
     // This could be merged together with `append`, but not doing this for two reasons.
     // 1. In case of the `Journal` being used as part of structure that utilizes interior mutability, async with borrow_mut is not possible.
     // 2. Having it as separate function allows for more optimal usage patterns, e.g. batching multiple appends before flushing.
-    async fn flush(&self) -> Result<(), IggyError>;
+    fn flush(&self) -> impl Future<Output = Result<(), IggyError>>;
 }

@@ -150,7 +150,7 @@ async fn create_stream(
                 .shard()
                 .streams2
                 .with_components_by_id(created_stream_id, |(root, stats)| {
-                    crate::http::mapper::map_stream_details(&*root, &**stats)
+                    crate::http::mapper::map_stream_details(&root, &stats)
                 })
         })();
 

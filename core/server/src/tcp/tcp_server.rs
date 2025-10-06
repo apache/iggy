@@ -34,7 +34,6 @@ pub async fn spawn_tcp_server(
     } else {
         "Iggy TCP"
     };
-    let ip_v6 = shard.config.tcp.ipv6;
     let socket_config = &shard.config.tcp.socket;
     let addr: SocketAddr = shard
         .config

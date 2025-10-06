@@ -23,7 +23,7 @@ use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::streaming::clients::client_manager::Client;
 use crate::streaming::partitions::partition2::PartitionRoot;
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
-use crate::streaming::stats::stats::{PartitionStats, StreamStats, TopicStats};
+use crate::streaming::stats::{PartitionStats, StreamStats, TopicStats};
 use crate::streaming::streams::stream2;
 use crate::streaming::topics::consumer_group2::{ConsumerGroupMembers, ConsumerGroupRoot, Member};
 use crate::streaming::topics::topic2::{self, TopicRoot};

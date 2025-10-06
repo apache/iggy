@@ -10,7 +10,7 @@ use crate::{
         traits_ext::{ComponentsById, Delete, DeleteCell, EntityMarker},
     },
     streaming::{
-        stats::stats::TopicStats,
+        stats::TopicStats,
         topics::{
             consumer_group2::{
                 self, ConsumerGroupMembers, ConsumerGroupRef, ConsumerGroupRefMut, Member,
@@ -183,13 +183,13 @@ fn add_member(
     shard_id: u16,
     id: usize,
     members: &mut ConsumerGroupMembers,
-    partitions: &Vec<usize>,
+    partitions: &[usize],
     client_id: u32,
 ) {
     members.inner_mut().rcu(move |members| {
         let mut members = mimic_members(members);
         Member::new(client_id).insert_into(&mut members);
-        assign_partitions_to_members(shard_id, id, &mut members, partitions.clone());
+        assign_partitions_to_members(shard_id, id, &mut members, partitions.to_vec());
         members
     });
 }
@@ -199,7 +199,7 @@ fn delete_member(
     id: usize,
     client_id: u32,
     members: &mut ConsumerGroupMembers,
-    partitions: &Vec<usize>,
+    partitions: &[usize],
 ) {
     let member_id = members
         .inner()
@@ -214,7 +214,7 @@ fn delete_member(
             entry.id = idx;
             true
         });
-        assign_partitions_to_members(shard_id, id, &mut members, partitions.clone());
+        assign_partitions_to_members(shard_id, id, &mut members, partitions.to_vec());
         members
     });
 }

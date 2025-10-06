@@ -221,7 +221,7 @@ async fn test_get_messages_by_offset(
     // Test 1: All messages from start
     let args = PollingArgs::new(PollingStrategy::offset(0), total_sent_messages, false);
     let (_, all_loaded_messages) = streams
-        .poll_messages(&namespace, consumer.clone(), args)
+        .poll_messages(&namespace, consumer, args)
         .await
         .unwrap();
     assert_eq!(
@@ -244,7 +244,7 @@ async fn test_get_messages_by_offset(
             false,
         );
         let (_, middle_messages) = streams
-            .poll_messages(&namespace, consumer.clone(), args)
+            .poll_messages(&namespace, consumer, args)
             .await
             .unwrap();
 
@@ -262,7 +262,7 @@ async fn test_get_messages_by_offset(
         let final_offset = *batch_offsets.last().unwrap();
         let args = PollingArgs::new(PollingStrategy::offset(final_offset + 1), 1, false);
         let (_, no_messages) = streams
-            .poll_messages(&namespace, consumer.clone(), args)
+            .poll_messages(&namespace, consumer, args)
             .await
             .unwrap();
         assert_eq!(
@@ -277,7 +277,7 @@ async fn test_get_messages_by_offset(
     let subset_size = std::cmp::min(3, total_sent_messages);
     let args = PollingArgs::new(PollingStrategy::offset(0), subset_size, false);
     let (_, subset_messages) = streams
-        .poll_messages(&namespace, consumer.clone(), args)
+        .poll_messages(&namespace, consumer, args)
         .await
         .unwrap();
     assert_eq!(
@@ -294,7 +294,7 @@ async fn test_get_messages_by_offset(
         let span_size = 8; // Should span across 2nd, 3rd, and into 4th batch
         let args = PollingArgs::new(PollingStrategy::offset(span_offset), span_size, false);
         let (_, batches) = streams
-            .poll_messages(&namespace, consumer.clone(), args)
+            .poll_messages(&namespace, consumer, args)
             .await
             .unwrap();
         assert_eq!(
@@ -372,7 +372,7 @@ async fn test_get_messages_by_offset(
             false,
         );
         let (_, chunk) = streams
-            .poll_messages(&namespace, consumer.clone(), args)
+            .poll_messages(&namespace, consumer, args)
             .await
             .unwrap();
 

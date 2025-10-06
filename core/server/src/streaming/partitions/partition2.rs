@@ -12,7 +12,7 @@ use crate::{
             consumer_offset, helpers::create_message_deduplicator, journal::MemoryMessageJournal,
             log::SegmentedLog,
         },
-        stats::stats::{PartitionStats, TopicStats},
+        stats::{PartitionStats, TopicStats},
     },
 };
 use iggy_common::{Identifier, IggyTimestamp};

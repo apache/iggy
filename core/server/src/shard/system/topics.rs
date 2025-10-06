@@ -21,7 +21,7 @@ use crate::shard::IggyShard;
 use crate::shard_info;
 use crate::slab::traits_ext::{EntityComponentSystem, EntityMarker, InsertCell, IntoComponents};
 use crate::streaming::session::Session;
-use crate::streaming::stats::stats::{StreamStats, TopicStats};
+use crate::streaming::stats::{StreamStats, TopicStats};
 use crate::streaming::topics::storage2::{create_topic_file_hierarchy, delete_topic_from_disk};
 use crate::streaming::topics::topic2::{self};
 use crate::streaming::{partitions, streams, topics};
@@ -31,7 +31,6 @@ use iggy_common::{
 };
 use std::str::FromStr;
 use std::sync::Arc;
-use std::u32;
 
 impl IggyShard {
     pub async fn create_topic2(

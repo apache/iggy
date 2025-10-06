@@ -26,7 +26,7 @@ use crate::{
         segments::{
             IggyMessagesBatchMut, IggyMessagesBatchSet, Segment2, storage::create_segment_storage,
         },
-        stats::stats::StreamStats,
+        stats::StreamStats,
         streams::{
             self,
             stream2::{self, StreamRef, StreamRefMut},
@@ -451,7 +451,7 @@ impl Streams {
         f: impl FnOnce(ComponentsById<StreamRef>) -> T,
     ) -> T {
         let id = self.get_index(id);
-        self.with_components_by_id(id, |stream| f(stream))
+        self.with_components_by_id(id, f)
     }
 
     pub fn with_stream_by_id_mut<T>(
@@ -460,7 +460,7 @@ impl Streams {
         f: impl FnOnce(ComponentsById<StreamRefMut>) -> T,
     ) -> T {
         let id = self.get_index(id);
-        self.with_components_by_id_mut(id, |stream| f(stream))
+        self.with_components_by_id_mut(id, f)
     }
 
     pub fn with_topics<T>(&self, stream_id: &Identifier, f: impl FnOnce(&Topics) -> T) -> T {
@@ -587,6 +587,10 @@ impl Streams {
 
     pub fn len(&self) -> usize {
         self.root.borrow().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.root.borrow().is_empty()
     }
 
     pub async fn get_messages_by_offset(
@@ -1335,26 +1339,26 @@ impl Streams {
             return Ok(());
         }
 
-        if let Some(ref messages_writer) = storage.messages_writer {
-            if let Err(e) = messages_writer.fsync().await {
-                tracing::error!(
-                    "Failed to fsync messages writer for partition {}: {}",
-                    partition_id,
-                    e
-                );
-                return Err(e);
-            }
+        if let Some(ref messages_writer) = storage.messages_writer
+            && let Err(e) = messages_writer.fsync().await
+        {
+            tracing::error!(
+                "Failed to fsync messages writer for partition {}: {}",
+                partition_id,
+                e
+            );
+            return Err(e);
         }
 
-        if let Some(ref index_writer) = storage.index_writer {
-            if let Err(e) = index_writer.fsync().await {
-                tracing::error!(
-                    "Failed to fsync index writer for partition {}: {}",
-                    partition_id,
-                    e
-                );
-                return Err(e);
-            }
+        if let Some(ref index_writer) = storage.index_writer
+            && let Err(e) = index_writer.fsync().await
+        {
+            tracing::error!(
+                "Failed to fsync index writer for partition {}: {}",
+                partition_id,
+                e
+            );
+            return Err(e);
         }
 
         Ok(())

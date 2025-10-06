@@ -32,7 +32,7 @@ use crate::{
         persistence::persister::{FilePersister, FileWithSyncPersister, PersisterKind},
         personal_access_tokens::personal_access_token::PersonalAccessToken,
         segments::{Segment2, storage::Storage},
-        stats::stats::{PartitionStats, StreamStats, TopicStats},
+        stats::{PartitionStats, StreamStats, TopicStats},
         storage::SystemStorage,
         streams::stream2,
         topics::{consumer_group2, topic2},
@@ -631,7 +631,7 @@ async fn load_partition(
     parent_stats: Arc<TopicStats>,
 ) -> Result<partition2::Partition, IggyError> {
     let stats = Arc::new(PartitionStats::new(parent_stats));
-    let partition_id = partition_state.id as u32;
+    let partition_id = partition_state.id;
 
     let partition_path = config.get_partition_path(stream_id, topic_id, partition_id as usize);
     let log_files = collect_log_files(&partition_path).await?;

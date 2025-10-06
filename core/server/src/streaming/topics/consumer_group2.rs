@@ -196,8 +196,8 @@ pub struct Member {
 impl Clone for Member {
     fn clone(&self) -> Self {
         Self {
-            id: self.id.clone(),
-            client_id: self.client_id.clone(),
+            id: self.id,
+            client_id: self.client_id,
             partitions: self.partitions.clone(),
             current_partition_idx: AtomicUsize::new(0),
         }

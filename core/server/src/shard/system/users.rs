@@ -64,11 +64,7 @@ impl IggyShard {
     pub fn try_get_user(&self, user_id: &Identifier) -> Result<Option<User>, IggyError> {
         match user_id.kind {
             IdKind::Numeric => {
-                let user = self
-                    .users
-                    .borrow()
-                    .get(&user_id.get_u32_value()?)
-                    .map(|user| user.clone());
+                let user = self.users.borrow().get(&user_id.get_u32_value()?).cloned();
                 Ok(user)
             }
             IdKind::String => {
@@ -226,7 +222,6 @@ impl IggyShard {
 
     fn delete_user_base(&self, user_id: &Identifier) -> Result<User, IggyError> {
         let existing_user_id;
-        let existing_username;
         {
             let user = self.get_user(user_id).with_error_context(|error| {
                 format!("{COMPONENT} (error: {error}) - failed to get user with id: {user_id}")
@@ -237,7 +232,6 @@ impl IggyShard {
             }
 
             existing_user_id = user.id;
-            existing_username = user.username.clone();
         }
 
         let user = self
@@ -448,7 +442,7 @@ impl IggyShard {
         let session = active_sessions
             .iter()
             .find(|s| s.client_id == client_id)
-            .expect(format!("At this point session for {}, should exist.", client_id).as_str());
+            .unwrap_or_else(|| panic!("At this point session for {}, should exist.", client_id));
         self.login_user_with_credentials(username, Some(password), Some(session))?;
         Ok(())
     }

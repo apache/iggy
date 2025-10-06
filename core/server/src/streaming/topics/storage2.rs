@@ -74,7 +74,7 @@ pub async fn delete_topic_from_disk(
             topic_id,
             partition_id,
             &mut log,
-            &config,
+            config,
         )
         .await?;
         messages_count += stats.messages_count_inconsistent();

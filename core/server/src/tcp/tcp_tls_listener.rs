@@ -194,7 +194,6 @@ async fn accept_loop(
                         let acceptor = acceptor.clone();
 
                         // Perform TLS handshake in a separate task to avoid blocking the accept loop
-                        let task_shard = shard_clone.clone();
                         let registry = shard.task_registry.clone();
                         let registry_clone = registry.clone();
                         registry.spawn_connection(async move {

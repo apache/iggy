@@ -35,7 +35,6 @@ impl Clone for MessageDeduplicator {
         let builder = Self::setup_cache_builder(builder, self.max_entries, self.ttl);
         let cache = builder.build();
 
-        self.cache.clone();
         // Transfer data from the original cache to the new one
         for (key, value) in self.cache.iter() {
             cache.insert(*key, value);

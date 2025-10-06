@@ -240,10 +240,8 @@ impl MemoryPool {
             );
         }
 
-        if was_pool_allocated {
-            if let Some(orig_idx) = self.best_fit(original_capacity) {
-                self.dec_bucket_in_use(orig_idx);
-            }
+        if was_pool_allocated && let Some(orig_idx) = self.best_fit(original_capacity) {
+            self.dec_bucket_in_use(orig_idx);
         }
 
         match self.best_fit(current_capacity) {

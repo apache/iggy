@@ -120,9 +120,7 @@ impl IggyShard {
                         topics::helpers::get_current_partition_id_unchecked(member_id),
                     )
                 };
-                let Some(partition_id) = partition_id else {
-                    return None;
-                };
+                let partition_id = partition_id?;
 
                 Some((
                     PollingConsumer::consumer_group(cg_id, member_id),
