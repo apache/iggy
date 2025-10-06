@@ -16,6 +16,10 @@
  * under the License.
  */
 
+use super::{
+    IggyShard, TaskRegistry, transmission::connector::ShardConnector,
+    transmission::frame::ShardFrame,
+};
 use crate::{
     configs::server::ServerConfig,
     shard::{Shard, ShardInfo, namespace::IggyNamespace},
@@ -31,11 +35,6 @@ use std::{
     cell::{Cell, RefCell},
     rc::Rc,
     sync::atomic::AtomicBool,
-};
-
-use super::{
-    IggyShard, TaskRegistry, transmission::connector::ShardConnector,
-    transmission::frame::ShardFrame,
 };
 
 #[derive(Default)]
@@ -132,28 +131,37 @@ impl IggyShardBuilder {
         let shards = connections.into_iter().map(Shard::new).collect();
 
         // Initialize metrics
-        let metrics = self.metrics.unwrap_or_else(|| Metrics::init());
+        let metrics = self.metrics.unwrap_or_else(Metrics::init);
 
         // Create TaskRegistry for this shard
         let task_registry = Rc::new(TaskRegistry::new(id));
 
+        // Create notification channel for config writer
+        let (config_writer_notify, config_writer_receiver) = async_channel::bounded(1);
+
+        // Trigger initial check in case servers bind before task starts
+        let _ = config_writer_notify.try_send(());
+
         IggyShard {
-            id: id,
-            shards: shards,
+            id,
+            shards,
             shards_table,
             streams2: streams, // TODO: Fixme
             users: RefCell::new(users),
-            encryptor: encryptor,
-            config: config,
-            version: version,
-            state: state,
-            stop_receiver: stop_receiver,
-            stop_sender: stop_sender,
+            encryptor,
+            config,
+            version,
+            state,
+            stop_receiver,
+            stop_sender,
             messages_receiver: Cell::new(Some(frame_receiver)),
-            metrics: metrics,
+            metrics,
             is_shutting_down: AtomicBool::new(false),
             tcp_bound_address: Cell::new(None),
             quic_bound_address: Cell::new(None),
+            http_bound_address: Cell::new(None),
+            config_writer_notify,
+            config_writer_receiver,
             task_registry,
             permissioner: Default::default(),
             client_manager: Default::default(),

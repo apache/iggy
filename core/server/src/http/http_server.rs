@@ -124,6 +124,15 @@ pub async fn start_http_server(
             .expect("Failed to get local address for HTTP server");
         info!("Started {api_name} on: {address}");
 
+        // Notify shard about the bound address
+        use crate::shard::transmission::event::ShardEvent;
+        use iggy_common::TransportProtocol;
+        let event = ShardEvent::AddressBound {
+            protocol: TransportProtocol::Http,
+            address,
+        };
+        shard.handle_event(event).await.ok();
+
         let service = app.into_make_service_with_connect_info::<CompioSocketAddr>();
 
         // Spawn the server in a task so we can handle shutdown
@@ -154,6 +163,15 @@ pub async fn start_http_server(
             .expect("Failed to get local address for HTTPS / TLS server");
 
         info!("Started {api_name} on: {address}");
+
+        // Notify shard about the bound address
+        use crate::shard::transmission::event::ShardEvent;
+        use iggy_common::TransportProtocol;
+        let event = ShardEvent::AddressBound {
+            protocol: TransportProtocol::Http,
+            address,
+        };
+        shard.handle_event(event).await.ok();
 
         let service = app.into_make_service_with_connect_info::<SocketAddr>();
 

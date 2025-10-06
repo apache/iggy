@@ -361,17 +361,26 @@ impl TestServer {
         });
 
         if let Some(config) = config {
-            self.server_addrs.push(ServerProtocolAddr::QuicUdp(
-                config.quic.address.parse().unwrap(),
-            ));
+            let quic_addr: SocketAddr = config.quic.address.parse().unwrap();
+            if quic_addr.port() == 0 {
+                panic!("Quic address port is 0!");
+            }
 
-            self.server_addrs.push(ServerProtocolAddr::RawTcp(
-                config.tcp.address.parse().unwrap(),
-            ));
+            let tcp_addr: SocketAddr = config.tcp.address.parse().unwrap();
+            if tcp_addr.port() == 0 {
+                panic!("Tcp address port is 0!");
+            }
 
-            self.server_addrs.push(ServerProtocolAddr::HttpTcp(
-                config.http.address.parse().unwrap(),
-            ));
+            let http_addr: SocketAddr = config.http.address.parse().unwrap();
+            if http_addr.port() == 0 {
+                panic!("Http address port is 0!");
+            }
+
+            self.server_addrs
+                .push(ServerProtocolAddr::QuicUdp(quic_addr));
+            self.server_addrs.push(ServerProtocolAddr::RawTcp(tcp_addr));
+            self.server_addrs
+                .push(ServerProtocolAddr::HttpTcp(http_addr));
         } else {
             panic!(
                 "Failed to load config from file {config_path} in {MAX_PORT_WAIT_DURATION_S} s!"

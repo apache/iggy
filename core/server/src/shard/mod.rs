@@ -164,6 +164,9 @@ pub struct IggyShard {
     pub(crate) is_shutting_down: AtomicBool,
     pub(crate) tcp_bound_address: Cell<Option<SocketAddr>>,
     pub(crate) quic_bound_address: Cell<Option<SocketAddr>>,
+    pub(crate) http_bound_address: Cell<Option<SocketAddr>>,
+    config_writer_notify: async_channel::Sender<()>,
+    config_writer_receiver: async_channel::Receiver<()>,
     pub(crate) task_registry: Rc<TaskRegistry>,
 }
 
@@ -182,7 +185,9 @@ impl IggyShard {
         continuous::spawn_message_pump(self.clone());
 
         // Spawn config writer task on shard 0 if we need to wait for bound addresses
-        if self.id == 0 && (self.config.tcp.enabled || self.config.quic.enabled) {
+        if self.id == 0
+            && (self.config.tcp.enabled || self.config.quic.enabled || self.config.http.enabled)
+        {
             self.spawn_config_writer_task();
         }
 
@@ -229,32 +234,41 @@ impl IggyShard {
         let shard = self.clone();
         let tcp_enabled = self.config.tcp.enabled;
         let quic_enabled = self.config.quic.enabled;
+        let http_enabled = self.config.http.enabled;
+
+        // Get receiver from the notification channel
+        let notify_receiver = shard.config_writer_receiver.clone();
 
         compio::runtime::spawn(async move {
-            // Wait until both addresses are available (if their servers are enabled)
+            // Wait for notifications until all servers have bound
             loop {
+                // Wait for a notification from any server binding
+                let _ = notify_receiver.recv().await;
+
+                // Check if all required servers have bound
                 let tcp_ready = !tcp_enabled || shard.tcp_bound_address.get().is_some();
                 let quic_ready = !quic_enabled || shard.quic_bound_address.get().is_some();
+                let http_ready = !http_enabled || shard.http_bound_address.get().is_some();
 
-                if tcp_ready && quic_ready {
-                    // Both servers have bound, proceed to write config
+                if tcp_ready && quic_ready && http_ready {
+                    // All servers have bound, proceed to write config
                     break;
                 }
-
-                compio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
 
-            // Both servers are bound, collect addresses and write config once
+            // All servers are bound, collect addresses and write config once
             let mut current_config = shard.config.clone();
 
             let tcp_addr = shard.tcp_bound_address.get();
             let quic_addr = shard.quic_bound_address.get();
+            let http_addr = shard.http_bound_address.get();
 
             shard_info!(
                 shard.id,
-                "Config writer: TCP addr = {:?}, QUIC addr = {:?}",
+                "Config writer: TCP addr = {:?}, QUIC addr = {:?}, HTTP addr = {:?}",
                 tcp_addr,
-                quic_addr
+                quic_addr,
+                http_addr
             );
 
             if let Some(tcp_addr) = tcp_addr {
@@ -265,17 +279,45 @@ impl IggyShard {
                 current_config.quic.address = quic_addr.to_string();
             }
 
+            if let Some(http_addr) = http_addr {
+                current_config.http.address = http_addr.to_string();
+            }
+
             let runtime_path = current_config.system.get_runtime_path();
             let config_path = format!("{runtime_path}/current_config.toml");
             let content =
                 toml::to_string(&current_config).expect("Cannot serialize current_config");
 
+            // Write config file and ensure it's flushed to disk
             match compio::fs::write(&config_path, content).await.0 {
-                Ok(_) => shard_info!(
-                    shard.id,
-                    "Current config written to: {} with all bound addresses",
-                    config_path
-                ),
+                Ok(_) => {
+                    // Open file and fsync to ensure data is persisted to disk
+                    match compio::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&config_path)
+                        .await
+                    {
+                        Ok(file) => match file.sync_all().await {
+                            Ok(_) => shard_info!(
+                                shard.id,
+                                "Current config written and synced to: {} with all bound addresses",
+                                config_path
+                            ),
+                            Err(e) => shard_error!(
+                                shard.id,
+                                "Failed to fsync current config to {}: {}",
+                                config_path,
+                                e
+                            ),
+                        },
+                        Err(e) => shard_error!(
+                            shard.id,
+                            "Failed to open current config for fsync {}: {}",
+                            config_path,
+                            e
+                        ),
+                    }
+                }
                 Err(e) => shard_error!(
                     shard.id,
                     "Failed to write current config to {}: {}",
@@ -712,7 +754,7 @@ impl IggyShard {
         }
     }
 
-    async fn handle_event(&self, event: ShardEvent) -> Result<(), IggyError> {
+    pub(crate) async fn handle_event(&self, event: ShardEvent) -> Result<(), IggyError> {
         match event {
             ShardEvent::LoginUser {
                 client_id,
@@ -824,8 +866,21 @@ impl IggyShard {
                     address
                 );
                 match protocol {
-                    TransportProtocol::Tcp => self.tcp_bound_address.set(Some(address)),
-                    TransportProtocol::Quic => self.quic_bound_address.set(Some(address)),
+                    TransportProtocol::Tcp => {
+                        self.tcp_bound_address.set(Some(address));
+                        // Notify config writer that a server has bound
+                        let _ = self.config_writer_notify.try_send(());
+                    }
+                    TransportProtocol::Quic => {
+                        self.quic_bound_address.set(Some(address));
+                        // Notify config writer that a server has bound
+                        let _ = self.config_writer_notify.try_send(());
+                    }
+                    TransportProtocol::Http => {
+                        self.http_bound_address.set(Some(address));
+                        // Notify config writer that a server has bound
+                        let _ = self.config_writer_notify.try_send(());
+                    }
                     _ => {
                         shard_warn!(
                             self.id,
