@@ -18,27 +18,17 @@
 
 use super::COMPONENT;
 use crate::shard::IggyShard;
-use crate::state::command::EntryCommand;
-use crate::state::models::CreateUserWithId;
-use crate::state::system::UserState;
-use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use crate::streaming::session::Session;
 use crate::streaming::users::user::User;
 use crate::streaming::utils::crypto;
-use crate::{IGGY_ROOT_PASSWORD_ENV, IGGY_ROOT_USERNAME_ENV};
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::Permissions;
 use iggy_common::UserStatus;
-use iggy_common::create_user::CreateUser;
-use iggy_common::defaults::*;
-use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{IdKind, Identifier};
 use std::cell::RefMut;
-use std::env;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 
 static USER_ID: AtomicU32 = AtomicU32::new(1);
 const MAX_USERS: usize = u32::MAX as usize;
@@ -111,10 +101,7 @@ impl IggyShard {
             IdKind::String => {
                 let username = user_id.get_cow_str_value()?;
                 let users = self.users.borrow_mut();
-                let exists = users
-                    .iter()
-                    .find(|(_, user)| user.username == username)
-                    .is_some();
+                let exists = users.iter().any(|(_, user)| user.username == username);
                 if !exists {
                     return Err(IggyError::ResourceNotFound(user_id.to_string()));
                 }

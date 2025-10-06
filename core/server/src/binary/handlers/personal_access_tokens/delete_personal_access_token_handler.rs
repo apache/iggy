@@ -56,7 +56,7 @@ impl ServerCommandHandler for DeletePersonalAccessToken {
             user_id: session.get_user_id(),
             name: self.name.clone(),
         };
-        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+        let _responses = shard.broadcast_event_to_all_shards(event).await;
 
         shard
             .state

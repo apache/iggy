@@ -16,7 +16,6 @@
  * under the License.
  */
 
-use super::COMPONENT;
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
@@ -57,7 +56,7 @@ impl ServerCommandHandler for GetConsumerGroup {
             session.get_user_id(),
             numeric_stream_id as u32,
             numeric_topic_id as u32,
-        );
+        )?;
 
         let consumer_group = shard.streams2.with_consumer_group_by_id(
             &self.stream_id,

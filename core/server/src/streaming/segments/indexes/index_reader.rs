@@ -20,22 +20,16 @@ use super::IggyIndexesMut;
 use crate::streaming::utils::PooledBuffer;
 use bytes::BytesMut;
 use compio::{
-    BufResult,
     buf::{IntoInner, IoBuf},
     fs::{File, OpenOptions},
     io::AsyncReadAtExt,
 };
 use error_set::ErrContext;
 use iggy_common::{INDEX_SIZE, IggyError, IggyIndex, IggyIndexView};
-use ring::error;
 use std::{
     io::ErrorKind,
-    os::unix::fs::FileExt,
     rc::Rc,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 use tracing::{error, trace};
 

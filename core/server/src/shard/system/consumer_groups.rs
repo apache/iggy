@@ -181,7 +181,7 @@ impl IggyShard {
         self.ensure_consumer_group_exists(stream_id, topic_id, group_id)?;
         {
             let topic_id = self.streams2.with_topic_by_id(
-                &stream_id,
+                stream_id,
                 topic_id,
                 topics::helpers::get_topic_id(),
             );

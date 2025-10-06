@@ -73,7 +73,7 @@ impl ServerCommandHandler for UpdateUser {
             username: self.username.clone(),
             status: self.status,
         };
-        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+        let _responses = shard.broadcast_event_to_all_shards(event).await;
 
         let user_id = self.user_id.clone();
         shard

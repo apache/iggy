@@ -87,7 +87,7 @@ impl ServerCommandHandler for DeleteConsumerGroup {
             topic_id: self.topic_id.clone(),
             group_id: self.group_id.clone(),
         };
-        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+        let _responses = shard.broadcast_event_to_all_shards(event).await;
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
         shard

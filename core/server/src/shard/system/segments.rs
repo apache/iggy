@@ -1,5 +1,3 @@
-use std::error;
-
 use crate::shard::IggyShard;
 use crate::streaming;
 /* Licensed to the Apache Software Foundation (ASF) under one
@@ -73,7 +71,7 @@ impl IggyShard {
             streaming::topics::helpers::get_topic_id(),
         );
 
-        let create_base_segment = segments.len() > 0 && storages.len() > 0;
+        let create_base_segment = !segments.is_empty() && !storages.is_empty();
         for (mut storage, segment) in storages.into_iter().zip(segments.into_iter()) {
             let (msg_writer, index_writer) = storage.shutdown();
             if let Some(msg_writer) = msg_writer

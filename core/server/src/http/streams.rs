@@ -66,7 +66,7 @@ async fn get_stream(
             .shard()
             .streams2
             .with_stream_by_id(&stream_id, |(root, stats)| {
-                crate::http::mapper::map_stream_details(&*root, &**stats)
+                crate::http::mapper::map_stream_details(&root, &stats)
             })
     })();
 
@@ -79,7 +79,7 @@ async fn get_streams(State(state): State<Arc<AppState>>) -> Result<Json<Vec<Stre
     let streams = SendWrapper::new(|| {
         state.shard.shard().streams2.with_components(|stream_ref| {
             let (roots, stats) = stream_ref.into_components();
-            crate::http::mapper::map_streams_from_slabs(&*roots, &*stats)
+            crate::http::mapper::map_streams_from_slabs(&roots, &stats)
         })
     })();
 

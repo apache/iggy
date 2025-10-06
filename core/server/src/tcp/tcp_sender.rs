@@ -20,13 +20,11 @@ use crate::binary::sender::Sender;
 use crate::streaming::utils::PooledBuffer;
 use crate::tcp::COMPONENT;
 use crate::{server_error::ServerError, tcp::sender};
-use bytes::BytesMut;
-use compio::buf::{IoBuf, IoBufMut};
+use compio::buf::IoBufMut;
 use compio::io::AsyncWrite;
 use compio::net::TcpStream;
 use error_set::ErrContext;
 use iggy_common::IggyError;
-use nix::libc;
 
 #[derive(Debug)]
 pub struct TcpSender {

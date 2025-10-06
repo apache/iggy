@@ -16,6 +16,8 @@
  * under the License.
  */
 
+//TODO: Fix me use shard instead of system
+/*
 use crate::streaming::common::test_setup::TestSetup;
 use iggy::prelude::{SnapshotCompression, SystemSnapshotType};
 use server::configs::cluster::ClusterConfig;
@@ -25,8 +27,7 @@ use std::io::{Cursor, Read};
 use std::net::{Ipv4Addr, SocketAddr};
 use zip::ZipArchive;
 
-//TODO: Fix me use shard instead of system
-/*
+
 #[tokio::test]
 async fn should_create_snapshot_file() {
     let setup = TestSetup::init().await;

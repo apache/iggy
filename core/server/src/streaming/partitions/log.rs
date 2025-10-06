@@ -1,10 +1,6 @@
-use crate::{
-    configs::system::SystemConfig,
-    slab::partitions::{self},
-    streaming::{
-        partitions::journal::Journal,
-        segments::{IggyIndexesMut, Segment2, storage::Storage},
-    },
+use crate::streaming::{
+    partitions::journal::Journal,
+    segments::{IggyIndexesMut, Segment2, storage::Storage},
 };
 use iggy_common::INDEX_SIZE;
 use ringbuffer::AllocRingBuffer;

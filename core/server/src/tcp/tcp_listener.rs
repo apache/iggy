@@ -29,9 +29,7 @@ use futures::FutureExt;
 use iggy_common::{IggyError, TransportProtocol};
 use std::net::SocketAddr;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info};
 
 async fn create_listener(
     addr: SocketAddr,
@@ -149,7 +147,7 @@ async fn accept_loop(
                         // Broadcast session to all shards.
                         let event = ShardEvent::NewSession { address, transport };
                         // TODO: Fixme look inside of broadcast_event_to_all_shards method.
-                        let _responses = shard_clone.broadcast_event_to_all_shards(event.into()).await;
+                        let _responses = shard_clone.broadcast_event_to_all_shards(event).await;
 
                         let client_id = session.client_id;
                         shard_info!(shard.id, "Created new session: {}", session);

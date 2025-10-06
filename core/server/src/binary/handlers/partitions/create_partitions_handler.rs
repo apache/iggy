@@ -21,7 +21,6 @@ use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::partitions::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
-use crate::slab::traits_ext::EntityMarker;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use crate::streaming::{streams, topics};
@@ -59,7 +58,7 @@ impl ServerCommandHandler for CreatePartitions {
             topic_id: self.topic_id.clone(),
             partitions,
         };
-        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+        let _responses = shard.broadcast_event_to_all_shards(event).await;
         // TODO: Rebalance the consumer group.
 
         let stream_id = shard

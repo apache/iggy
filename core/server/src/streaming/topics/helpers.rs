@@ -5,20 +5,15 @@ use crate::{
     slab::{
         Keyed,
         consumer_groups::{self, ConsumerGroups},
-        partitions::{self, Partitions},
+        partitions::{self},
         topics::{self, Topics},
-        traits_ext::{
-            ComponentsById, Delete, DeleteCell, EntityComponentSystem, EntityComponentSystemMut,
-            EntityMarker, Insert, IntoComponents,
-        },
+        traits_ext::{ComponentsById, Delete, DeleteCell, EntityMarker},
     },
     streaming::{
-        partitions::partition2,
         stats::stats::TopicStats,
         topics::{
             consumer_group2::{
-                self, ConsumerGroupMembers, ConsumerGroupRef, ConsumerGroupRefMut,
-                MEMBERS_CAPACITY, Member,
+                self, ConsumerGroupMembers, ConsumerGroupRef, ConsumerGroupRefMut, Member,
             },
             topic2::{Topic, TopicRef, TopicRefMut, TopicRoot},
         },

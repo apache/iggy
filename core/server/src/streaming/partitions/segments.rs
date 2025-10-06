@@ -16,15 +16,6 @@
  * under the License.
  */
 
-use std::sync::atomic::Ordering;
-
-use crate::streaming::partitions::COMPONENT;
-use crate::streaming::segments::*;
-use error_set::ErrContext;
-use iggy_common::IggyError;
-use iggy_common::IggyTimestamp;
-use tracing::info;
-
 pub struct DeletedSegment {
     pub end_offset: u64,
     pub messages_count: u32,

@@ -31,7 +31,7 @@ pub struct MessageDeduplicator {
 /// pointers to the shared internal data structures.
 impl Clone for MessageDeduplicator {
     fn clone(&self) -> Self {
-        let mut builder = Cache::builder();
+        let builder = Cache::builder();
         let builder = Self::setup_cache_builder(builder, self.max_entries, self.ttl);
         let cache = builder.build();
 
@@ -65,8 +65,8 @@ impl MessageDeduplicator {
 
     /// Creates a new message deduplicator with the given max entries and time to live for each ID.
     pub fn new(max_entries: Option<u64>, ttl: Option<IggyDuration>) -> Self {
-        let mut builder = Cache::builder();
-        let mut builder = Self::setup_cache_builder(builder, max_entries, ttl);
+        let builder = Cache::builder();
+        let builder = Self::setup_cache_builder(builder, max_entries, ttl);
         let cache = builder.build();
 
         Self {

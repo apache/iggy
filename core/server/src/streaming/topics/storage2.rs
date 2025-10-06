@@ -1,4 +1,3 @@
-use super::COMPONENT;
 use compio::fs::create_dir_all;
 use iggy_common::IggyError;
 use std::path::Path;

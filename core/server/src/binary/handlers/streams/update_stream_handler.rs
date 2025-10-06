@@ -56,7 +56,7 @@ impl ServerCommandHandler for UpdateStream {
             stream_id: self.stream_id.clone(),
             name: self.name.clone(),
         };
-        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+        let _responses = shard.broadcast_event_to_all_shards(event).await;
         shard
             .state
             .apply(session.get_user_id(), &EntryCommand::UpdateStream(self))

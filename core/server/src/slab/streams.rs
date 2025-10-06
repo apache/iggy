@@ -1188,7 +1188,7 @@ impl Streams {
         );
 
         let storage = create_segment_storage(
-            &config,
+            config,
             numeric_stream_id,
             numeric_topic_id,
             partition_id,

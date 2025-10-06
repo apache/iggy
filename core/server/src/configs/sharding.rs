@@ -21,31 +21,18 @@ use std::collections::HashSet;
 use std::str::FromStr;
 use std::thread::available_parallelism;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct ShardingConfig {
     #[serde(default)]
     pub cpu_allocation: CpuAllocation,
 }
 
-impl Default for ShardingConfig {
-    fn default() -> Self {
-        ShardingConfig {
-            cpu_allocation: CpuAllocation::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum CpuAllocation {
+    #[default]
     All,
     Count(usize),
     Range(usize, usize),
-}
-
-impl Default for CpuAllocation {
-    fn default() -> Self {
-        CpuAllocation::All
-    }
 }
 
 impl CpuAllocation {

@@ -81,7 +81,7 @@ impl ServerCommandHandler for UpdateTopic {
             max_topic_size: self.max_topic_size,
             replication_factor: self.replication_factor,
         };
-        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+        let _responses = shard.broadcast_event_to_all_shards(event).await;
         let topic_id = self.topic_id.clone();
         let stream_id = self.stream_id.clone();
 

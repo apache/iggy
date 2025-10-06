@@ -60,7 +60,7 @@ impl ServerCommandHandler for PurgeTopic {
             stream_id: self.stream_id.clone(),
             topic_id: self.topic_id.clone(),
         };
-        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+        let _responses = shard.broadcast_event_to_all_shards(event).await;
 
         shard
             .state

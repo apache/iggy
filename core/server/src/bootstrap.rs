@@ -324,8 +324,7 @@ pub fn create_root_user() -> User {
     if password.len() > MAX_PASSWORD_LENGTH {
         panic!("Root password is too long.");
     }
-    let user = User::root(&username, &password);
-    user
+    User::root(&username, &password)
 }
 
 pub fn create_shard_executor(cpu_set: HashSet<usize>) -> Runtime {

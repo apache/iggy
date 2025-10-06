@@ -111,7 +111,7 @@ impl BenchmarkInit for HighLevelConsumerClient {
         let mut consumer = if let Some(cg_id) = self.config.consumer_group_id {
             let consumer_group_name = format!("cg_{cg_id}");
             client
-                .consumer_group(&consumer_group_name, &stream_id_str, &topic_id_str)?
+                .consumer_group(&consumer_group_name, &stream_id_str, topic_id_str)?
                 .batch_length(self.config.messages_per_batch.get())
                 .auto_commit(AutoCommit::When(AutoCommitWhen::PollingMessages))
                 .create_consumer_group_if_not_exists()
@@ -125,7 +125,7 @@ impl BenchmarkInit for HighLevelConsumerClient {
                 .consumer(
                     &format!("hl_consumer_{}", self.config.consumer_id),
                     &stream_id_str,
-                    &topic_id_str,
+                    topic_id_str,
                     0,
                 )?
                 .polling_strategy(PollingStrategy::offset(0))

@@ -17,10 +17,7 @@ use crate::{
 };
 use iggy_common::{Identifier, IggyTimestamp};
 use slab::Slab;
-use std::{
-    rc::Rc,
-    sync::{Arc, atomic::AtomicU64},
-};
+use std::sync::{Arc, atomic::AtomicU64};
 
 #[derive(Debug, Clone)]
 pub struct ConsumerOffsets(papaya::HashMap<usize, consumer_offset::ConsumerOffset>);

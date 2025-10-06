@@ -1,6 +1,6 @@
-use futures::{FutureExt, SinkExt, Stream, StreamExt, channel::mpsc, future::poll_fn};
+use futures::{Stream, StreamExt, channel::mpsc};
 use opentelemetry_sdk::runtime::{Runtime, RuntimeChannel, TrySend};
-use std::{pin::Pin, task::Poll, time::Duration};
+use std::{pin::Pin, time::Duration};
 
 #[derive(Clone)]
 pub struct CompioRuntime;

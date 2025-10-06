@@ -1,14 +1,10 @@
-use crate::configs::system::SystemConfig;
 use crate::shard_trace;
 use crate::slab::streams::Streams;
 use crate::slab::topics;
 use crate::slab::traits_ext::{EntityMarker, InsertCell, IntoComponents, IntoComponentsById};
 use crate::slab::{Keyed, consumer_groups::ConsumerGroups, partitions::Partitions};
-use crate::streaming::partitions::log::SegmentedLog;
 use crate::streaming::stats::stats::{StreamStats, TopicStats};
-use iggy_common::{
-    CompressionAlgorithm, Identifier, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize,
-};
+use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, IggyTimestamp, MaxTopicSize};
 use slab::Slab;
 use std::cell::{Ref, RefMut};
 use std::sync::Arc;

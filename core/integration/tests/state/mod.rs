@@ -18,7 +18,6 @@
 
 use compio::fs::create_dir;
 use iggy::prelude::{Aes256GcmEncryptor, EncryptorKind};
-use server::bootstrap::create_directories;
 use server::state::file::FileState;
 use server::streaming::persistence::persister::{FileWithSyncPersister, PersisterKind};
 use server::streaming::utils::file::overwrite;

@@ -25,7 +25,7 @@ use crate::streaming::streams::storage2::{create_stream_file_hierarchy, delete_s
 use crate::streaming::streams::{self, stream2};
 use error_set::ErrContext;
 
-use iggy_common::{Identifier, IggyError, IggyTimestamp};
+use iggy_common::{Identifier, IggyError};
 
 impl IggyShard {
     pub async fn create_stream2(
@@ -217,6 +217,8 @@ impl IggyShard {
 
 #[cfg(test)]
 mod tests {
+    //TODO: Fixme
+    /*
     use super::*;
     use crate::configs::server::{DataMaintenanceConfig, PersonalAccessTokenConfig};
     use crate::configs::system::SystemConfig;
@@ -230,8 +232,7 @@ mod tests {
         sync::Arc,
     };
 
-    //TODO: Fixme
-    /*
+
     #[tokio::test]
     async fn should_get_stream_by_id_and_name() {
         let tempdir = tempfile::TempDir::new().unwrap();

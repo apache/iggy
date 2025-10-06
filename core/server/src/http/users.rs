@@ -140,7 +140,7 @@ async fn create_user(
     {
         let username = command.username.clone();
         let entry_command = EntryCommand::CreateUser(CreateUserWithId {
-            user_id: user_id,
+            user_id,
             command: CreateUser {
                 username: command.username.to_owned(),
                 password: crypto::hash_password(&command.password),

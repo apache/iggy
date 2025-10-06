@@ -27,10 +27,7 @@ use iggy_common::IggyError;
 use std::rc::Rc;
 use std::{
     io::ErrorKind,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 use tracing::{error, trace};
 
@@ -84,7 +81,7 @@ impl MessagesReader {
 
         Ok(Self {
             file_path: file_path.to_string(),
-            file: file.into(),
+            file,
             messages_size_bytes,
         })
     }

@@ -3,13 +3,8 @@ use crate::{
     configs::system::SystemConfig,
     io::fs_utils::remove_dir_all,
     shard_error, shard_info, shard_trace,
-    streaming::{
-        partitions::{
-            consumer_offset::ConsumerOffset,
-            journal::MemoryMessageJournal,
-            log::{Log, SegmentedLog},
-        },
-        segments::Segment2,
+    streaming::partitions::{
+        consumer_offset::ConsumerOffset, journal::MemoryMessageJournal, log::SegmentedLog,
     },
 };
 use compio::{
@@ -18,12 +13,7 @@ use compio::{
 };
 use error_set::ErrContext;
 use iggy_common::{ConsumerKind, IggyError};
-use std::{
-    io::Read,
-    ops::Deref,
-    path::Path,
-    sync::{Arc, atomic::AtomicU64},
-};
+use std::{io::Read, path::Path, sync::atomic::AtomicU64};
 use tracing::{error, trace};
 
 pub async fn create_partition_file_hierarchy(

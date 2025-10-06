@@ -21,10 +21,10 @@ use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::users::COMPONENT, sender::SenderKind};
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
+use crate::shard_info;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use crate::streaming::utils::crypto;
-use crate::{shard_debug, shard_info};
 use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
@@ -77,7 +77,7 @@ impl ServerCommandHandler for ChangePassword {
             current_password: self.current_password.clone(),
             new_password: self.new_password.clone(),
         };
-        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+        let _responses = shard.broadcast_event_to_all_shards(event).await;
 
         // For the security of the system, we hash the password before storing it in metadata.
         shard

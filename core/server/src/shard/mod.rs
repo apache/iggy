@@ -28,7 +28,6 @@ use self::tasks::{continuous, periodic};
 use crate::{
     binary::handlers::messages::poll_messages_handler::IggyPollMetadata,
     configs::server::ServerConfig,
-    io::fs_utils,
     shard::{
         namespace::{IggyFullNamespace, IggyNamespace},
         task_registry::TaskRegistry,
@@ -39,20 +38,12 @@ use crate::{
         },
     },
     shard_error, shard_info, shard_warn,
-    slab::{
-        streams::Streams,
-        traits_ext::{EntityComponentSystem, EntityMarker, Insert},
-    },
-    state::{
-        StateKind,
-        file::FileState,
-        system::{StreamState, SystemState, UserState},
-    },
+    slab::{streams::Streams, traits_ext::EntityMarker},
+    state::StateKind,
     streaming::{
         clients::client_manager::ClientManager,
         diagnostics::metrics::Metrics,
         partitions,
-        persistence::persister::PersisterKind,
         polling_consumer::PollingConsumer,
         session::Session,
         traits::MainOps,
@@ -61,34 +52,24 @@ use crate::{
     },
     versioning::SemanticVersion,
 };
-use ahash::{AHashMap, AHashSet, HashMap};
+use ahash::HashMap;
 use builder::IggyShardBuilder;
 use compio::io::AsyncWriteAtExt;
 use dashmap::DashMap;
 use error_set::ErrContext;
-use futures::future::try_join_all;
 use hash32::{Hasher, Murmur3Hasher};
 use iggy_common::{
-    EncryptorKind, IdKind, Identifier, IggyError, IggyTimestamp, Permissions, PollingKind,
-    TransportProtocol, UserId, UserStatus,
-    defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME},
-    locking::IggyRwLockFn,
+    EncryptorKind, Identifier, IggyError, IggyTimestamp, PollingKind, TransportProtocol, UserId,
 };
 use std::hash::Hasher as _;
 use std::{
     cell::{Cell, RefCell},
-    future::Future,
     net::SocketAddr,
-    ops::Deref,
-    pin::Pin,
     rc::Rc,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU32, Ordering},
-    },
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
     time::{Duration, Instant},
 };
-use tracing::{debug, error, info, instrument, trace, warn};
+use tracing::{debug, error, instrument, trace};
 use transmission::connector::{Receiver, ShardConnector, StopReceiver, StopSender};
 
 pub const COMPONENT: &str = "SHARD";

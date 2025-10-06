@@ -17,7 +17,6 @@
  */
 
 use crate::prelude::Client;
-use crate::prelude::IggyConsumer;
 use crate::prelude::TcpClientConfig;
 use crate::tcp::tcp_connection_stream::TcpConnectionStream;
 use crate::tcp::tcp_connection_stream_kind::ConnectionStreamKind;

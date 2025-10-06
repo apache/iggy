@@ -60,7 +60,7 @@ impl ServerCommandHandler for CreateConsumerGroup {
             topic_id: self.topic_id.clone(),
             cg,
         };
-        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+        let _responses = shard.broadcast_event_to_all_shards(event).await;
 
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();

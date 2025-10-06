@@ -17,22 +17,14 @@
  */
 
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::messages::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::sender::SenderKind;
 use crate::shard::IggyShard;
 use crate::shard::system::messages::PollingArgs;
-use crate::shard::transmission::frame::ShardResponse;
-use crate::shard::transmission::message::{ShardMessage, ShardRequest, ShardRequestPayload};
-use crate::streaming::segments::IggyMessagesBatchSet;
 use crate::streaming::session::Session;
 use crate::streaming::utils::PooledBuffer;
-use crate::to_iovec;
 use anyhow::Result;
-use bytes::BytesMut;
-use error_set::ErrContext;
 use iggy_common::{IggyError, PollMessages};
-use std::io::IoSlice;
 use std::rc::Rc;
 use tracing::{debug, trace};
 

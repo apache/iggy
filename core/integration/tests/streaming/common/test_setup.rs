@@ -17,7 +17,6 @@
  */
 
 use compio::fs;
-use log::error;
 use server::bootstrap::create_directories;
 use server::configs::system::SystemConfig;
 use server::streaming::persistence::persister::{FileWithSyncPersister, PersisterKind};

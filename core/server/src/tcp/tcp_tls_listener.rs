@@ -210,7 +210,7 @@ async fn accept_loop(
                                     // Broadcast session to all shards.
                                     let event = ShardEvent::NewSession { address, transport };
                                     // TODO: Fixme look inside of broadcast_event_to_all_shards method.
-                                    let _responses = shard_clone.broadcast_event_to_all_shards(event.into()).await;
+                                    let _responses = shard_clone.broadcast_event_to_all_shards(event).await;
 
                                     let client_id = session.client_id;
                                     shard_info!(shard_clone.id, "Created new session: {}", session);

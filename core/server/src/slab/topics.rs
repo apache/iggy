@@ -147,6 +147,10 @@ impl Topics {
         self.root.borrow().len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.root.borrow().is_empty()
+    }
+
     pub fn exists(&self, id: &Identifier) -> bool {
         match id.kind {
             iggy_common::IdKind::Numeric => {

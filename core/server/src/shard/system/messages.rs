@@ -35,7 +35,7 @@ use crate::streaming::{partitions, streams, topics};
 use error_set::ErrContext;
 use iggy_common::{
     BytesSerializable, Consumer, EncryptorKind, IGGY_MESSAGE_HEADER_SIZE, Identifier, IggyError,
-    IggyTimestamp, Partitioning, PartitioningKind, PollingKind, PollingStrategy,
+    Partitioning, PartitioningKind, PollingKind, PollingStrategy,
 };
 use std::sync::atomic::Ordering;
 use tracing::{error, trace};
@@ -267,8 +267,8 @@ impl IggyShard {
                         match consumer {
                             PollingConsumer::Consumer(consumer_id, _) => {
                                 self.streams2.with_partition_by_id(
-                                    &stream_id,
-                                    &topic_id,
+                                    stream_id,
+                                    topic_id,
                                     partition_id,
                                     partitions::helpers::store_consumer_offset(
                                         consumer_id,
@@ -281,8 +281,8 @@ impl IggyShard {
                                 );
 
                                 let (offset_value, path) = self.streams2.with_partition_by_id(
-                                    &stream_id,
-                                    &topic_id,
+                                    stream_id,
+                                    topic_id,
                                     partition_id,
                                     |(.., offsets, _, _)| {
                                         let hdl = offsets.pin();
@@ -300,8 +300,8 @@ impl IggyShard {
                             }
                             PollingConsumer::ConsumerGroup(cg_id, _) => {
                                 self.streams2.with_partition_by_id(
-                                    &stream_id,
-                                    &topic_id,
+                                    stream_id,
+                                    topic_id,
                                     partition_id,
                                     partitions::helpers::store_consumer_group_member_offset(
                                         cg_id,
@@ -314,8 +314,8 @@ impl IggyShard {
                                 );
 
                                 let (offset_value, path) = self.streams2.with_partition_by_id(
-                                    &stream_id,
-                                    &topic_id,
+                                    stream_id,
+                                    topic_id,
                                     partition_id,
                                     |(.., offsets, _)| {
                                         let hdl = offsets.pin();
@@ -408,8 +408,8 @@ impl IggyShard {
         partition_id: usize,
     ) -> Result<(), IggyError> {
         let batches = self.streams2.with_partition_by_id_mut(
-            &stream_id,
-            &topic_id,
+            stream_id,
+            topic_id,
             partition_id,
             |(.., log)| log.journal_mut().commit(),
         );
@@ -417,8 +417,8 @@ impl IggyShard {
         self.streams2
             .persist_messages_to_disk(
                 self.id,
-                &stream_id,
-                &topic_id,
+                stream_id,
+                topic_id,
                 partition_id,
                 batches,
                 &self.config.system,

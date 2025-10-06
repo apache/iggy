@@ -23,10 +23,7 @@ use error_set::ErrContext;
 use iggy_common::INDEX_SIZE;
 use iggy_common::IggyError;
 use std::rc::Rc;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::trace;
 
 use crate::streaming::utils::PooledBuffer;

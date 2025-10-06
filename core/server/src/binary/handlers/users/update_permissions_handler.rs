@@ -61,7 +61,7 @@ impl ServerCommandHandler for UpdatePermissions {
             user_id: self.user_id.clone(),
             permissions: self.permissions.clone(),
         };
-        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+        let _responses = shard.broadcast_event_to_all_shards(event).await;
 
         shard
             .state

@@ -75,7 +75,7 @@ async fn create_partitions(
             topic_id: command.topic_id.clone(),
             partitions,
         };
-        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+        let _responses = shard.broadcast_event_to_all_shards(event).await;
 
         let numeric_stream_id = shard
             .streams2

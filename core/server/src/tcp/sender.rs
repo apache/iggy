@@ -16,16 +16,13 @@
  * under the License.
  */
 
-use bytes::{Bytes, BytesMut};
 use compio::{
     BufResult,
-    buf::{IoBuf, IoBufMut},
-    io::{AsyncRead, AsyncReadAtExt, AsyncReadExt, AsyncWriteExt},
+    buf::IoBufMut,
+    io::{AsyncReadExt, AsyncWriteExt},
 };
 use iggy_common::IggyError;
-use nix::libc;
-use std::io::IoSlice;
-use tracing::{debug, error, warn};
+use tracing::debug;
 
 use crate::streaming::utils::PooledBuffer;
 

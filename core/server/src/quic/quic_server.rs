@@ -147,7 +147,7 @@ fn configure_quic(config: &QuicConfig) -> Result<ServerConfig, QuicError> {
         false => load_certificates(&config.certificate.cert_file, &config.certificate.key_file)?,
     };
 
-    let mut builder = ServerBuilder::new_with_single_cert(certificates, private_key)
+    let builder = ServerBuilder::new_with_single_cert(certificates, private_key)
         .with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to create QUIC server builder")
         })

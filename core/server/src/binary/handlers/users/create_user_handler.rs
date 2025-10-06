@@ -33,7 +33,7 @@ use anyhow::Result;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::create_user::CreateUser;
-use tracing::{debug, instrument};
+use tracing::instrument;
 
 impl ServerCommandHandler for CreateUser {
     fn code(&self) -> u32 {
@@ -78,7 +78,7 @@ impl ServerCommandHandler for CreateUser {
             status: self.status,
             permissions: self.permissions.clone(),
         };
-        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+        let _responses = shard.broadcast_event_to_all_shards(event).await;
         let user_id = user.id;
         let response = mapper::map_user(&user);
 

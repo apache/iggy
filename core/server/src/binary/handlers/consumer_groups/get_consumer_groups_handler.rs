@@ -17,7 +17,6 @@
  */
 
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
-use crate::binary::handlers::consumer_groups::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::sender::SenderKind;
@@ -26,7 +25,6 @@ use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::streaming::session::Session;
 use crate::streaming::{streams, topics};
 use anyhow::Result;
-use error_set::ErrContext;
 use iggy_common::IggyError;
 use iggy_common::get_consumer_groups::GetConsumerGroups;
 use std::rc::Rc;
@@ -59,7 +57,7 @@ impl ServerCommandHandler for GetConsumerGroups {
             session.get_user_id(),
             numeric_stream_id as u32,
             numeric_topic_id as u32,
-        );
+        )?;
 
         let consumer_groups =
             shard

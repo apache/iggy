@@ -22,12 +22,9 @@ use error_set::ErrContext;
 use iggy_common::{IggyByteSize, IggyError};
 use std::{
     rc::Rc,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
-use tracing::{error, trace};
+use tracing::trace;
 
 /// A dedicated struct for writing to the messages file.
 #[derive(Debug)]

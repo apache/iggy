@@ -22,7 +22,6 @@ use crate::streaming::clients::client_manager::Client;
 use crate::streaming::session::Session;
 use error_set::ErrContext;
 use iggy_common::IggyError;
-use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{Identifier, TransportProtocol};
 use std::net::SocketAddr;
 use std::rc::Rc;

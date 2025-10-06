@@ -24,7 +24,7 @@ use crate::streaming::session::Session;
 use async_zip::base::write::ZipFileWriter;
 use async_zip::{Compression, ZipEntryBuilder};
 use compio::fs::OpenOptions;
-use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
+use compio::io::AsyncWriteAtExt;
 use iggy_common::{IggyDuration, IggyError, Snapshot, SnapshotCompression, SystemSnapshotType};
 use std::path::PathBuf;
 // TODO: compio has an `process` module, consider using that instead, but read the docs carefully // https://compio.rs/docs/compio/process
@@ -163,7 +163,7 @@ async fn write_command_output_to_temp_file(
 }
 
 async fn get_filesystem_overview() -> Result<NamedTempFile, std::io::Error> {
-    write_command_output_to_temp_file(&mut Command::new("ls").args(["-la", "/tmp", "/proc"])).await
+    write_command_output_to_temp_file(Command::new("ls").args(["-la", "/tmp", "/proc"])).await
 }
 
 async fn get_process_info() -> Result<NamedTempFile, std::io::Error> {
@@ -212,7 +212,7 @@ async fn get_resource_usage() -> Result<NamedTempFile, std::io::Error> {
 }
 
 async fn get_test_snapshot() -> Result<NamedTempFile, std::io::Error> {
-    write_command_output_to_temp_file(&mut Command::new("echo").arg("test")).await
+    write_command_output_to_temp_file(Command::new("echo").arg("test")).await
 }
 
 async fn get_server_logs(config: Arc<SystemConfig>) -> Result<NamedTempFile, std::io::Error> {

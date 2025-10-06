@@ -16,14 +16,6 @@
  * under the License.
  */
 
-use crate::streaming::partitions::COMPONENT;
-use crate::streaming::polling_consumer::PollingConsumer;
-use crate::streaming::segments::*;
-use error_set::ErrContext;
-use iggy_common::{IggyError, IggyTimestamp, Sizeable};
-use std::sync::atomic::Ordering;
-use tracing::trace;
-
 /*
 impl Partition {
     /// Retrieves messages by timestamp (up to a specified count).

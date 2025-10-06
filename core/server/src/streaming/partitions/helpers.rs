@@ -1,10 +1,9 @@
 use error_set::ErrContext;
 use iggy_common::{ConsumerOffsetInfo, Identifier, IggyByteSize, IggyError};
 use std::{
-    ops::{AsyncFnOnce, Index},
+    ops::AsyncFnOnce,
     sync::{Arc, atomic::Ordering},
 };
-use sysinfo::Component;
 
 use crate::{
     configs::{cache_indexes::CacheIndexesConfig, system::SystemConfig},
@@ -19,7 +18,7 @@ use crate::{
         deduplication::message_deduplicator::MessageDeduplicator,
         partitions::{
             consumer_offset::ConsumerOffset,
-            journal::{Journal, MemoryMessageJournal},
+            journal::Journal,
             partition2::{self, PartitionRef, PartitionRefMut},
             storage2,
         },

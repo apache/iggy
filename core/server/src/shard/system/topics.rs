@@ -29,7 +29,6 @@ use error_set::ErrContext;
 use iggy_common::{
     CompressionAlgorithm, Identifier, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize,
 };
-use std::any::Any;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::u32;

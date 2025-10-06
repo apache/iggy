@@ -46,7 +46,7 @@ pub fn store_consumer_offset(
 ) -> impl FnOnce(ComponentsById<StreamRef>) {
     move |(root, ..)| {
         let stream_id = root.id();
-        root.topics().with_topic_by_id(&topic_id, |(root, ..)| {
+        root.topics().with_topic_by_id(topic_id, |(root, ..)| {
             let topic_id = root.id();
             root.partitions().with_components_by_id(
                 partition_id,
@@ -72,7 +72,7 @@ pub fn store_consumer_group_member_offset(
 ) -> impl FnOnce(ComponentsById<StreamRef>) {
     move |(root, ..)| {
         let stream_id = root.id();
-        root.topics().with_topic_by_id(&topic_id, |(root, ..)| {
+        root.topics().with_topic_by_id(topic_id, |(root, ..)| {
             let topic_id = root.id();
             root.partitions().with_components_by_id(
                 partition_id,

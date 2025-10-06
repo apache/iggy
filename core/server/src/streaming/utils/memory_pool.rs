@@ -21,10 +21,9 @@ use bytes::BytesMut;
 use crossbeam::queue::ArrayQueue;
 use human_repr::HumanCount;
 use once_cell::sync::OnceCell;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use tracing::{error, info, trace, warn};
+use tracing::{info, trace, warn};
 
 /// Global memory pool instance. Use `memory_pool()` to access it.
 pub static MEMORY_POOL: OnceCell<MemoryPool> = OnceCell::new();

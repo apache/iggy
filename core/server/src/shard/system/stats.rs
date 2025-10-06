@@ -20,7 +20,6 @@ use crate::VERSION;
 use crate::shard::IggyShard;
 use crate::slab::traits_ext::{EntityComponentSystem, IntoComponents};
 use crate::versioning::SemanticVersion;
-use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{IggyDuration, IggyError, Stats};
 use std::sync::OnceLock;
 use sysinfo::{Pid, ProcessesToUpdate, System as SysinfoSystem};

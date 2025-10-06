@@ -34,7 +34,6 @@ use axum::http::Method;
 use axum::{Router, middleware};
 use axum_server::tls_rustls::RustlsConfig;
 use compio_net::TcpListener;
-use futures::FutureExt;
 use iggy_common::IggyError;
 use std::net::SocketAddr;
 use std::path::PathBuf;

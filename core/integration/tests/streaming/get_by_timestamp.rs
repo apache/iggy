@@ -29,8 +29,6 @@ use server::streaming::segments::IggyMessagesBatchMut;
 use server::streaming::traits::MainOps;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::thread::sleep;
 use test_case::test_matrix;
 

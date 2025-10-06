@@ -174,7 +174,7 @@ pub fn map_stream(root: &stream2::StreamRoot, stats: &StreamStats) -> Bytes {
             .map(|(_, val)| val)
             .zip(stats.iter().map(|(_, val)| val))
         {
-            extend_topic(&root, &stat, &mut bytes);
+            extend_topic(root, stat, &mut bytes);
         }
     });
     bytes.freeze()

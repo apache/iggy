@@ -22,11 +22,9 @@ use crate::shard::ShardInfo;
 use crate::shard::calculate_shard_assignment;
 use crate::shard::namespace::IggyNamespace;
 use crate::shard_info;
-use crate::slab::traits_ext::EntityComponentSystem;
 use crate::slab::traits_ext::EntityMarker;
 use crate::slab::traits_ext::IntoComponents;
 use crate::streaming::partitions;
-use crate::streaming::partitions::helpers::create_message_deduplicator;
 use crate::streaming::partitions::journal::MemoryMessageJournal;
 use crate::streaming::partitions::log::SegmentedLog;
 use crate::streaming::partitions::partition2;
@@ -35,17 +33,12 @@ use crate::streaming::partitions::storage2::delete_partitions_from_disk;
 use crate::streaming::segments::Segment2;
 use crate::streaming::segments::storage::create_segment_storage;
 use crate::streaming::session::Session;
-use crate::streaming::stats::stats::PartitionStats;
-use crate::streaming::stats::stats::TopicStats;
 use crate::streaming::streams;
 use crate::streaming::topics;
 
 use error_set::ErrContext;
 use iggy_common::Identifier;
 use iggy_common::IggyError;
-use iggy_common::IggyTimestamp;
-use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 impl IggyShard {
     fn validate_partition_permissions(

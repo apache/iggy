@@ -61,7 +61,7 @@ impl ServerCommandHandler for LogoutUser {
         let event = ShardEvent::LogoutUser {
             client_id: session.client_id,
         };
-        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+        let _responses = shard.broadcast_event_to_all_shards(event).await;
         session.clear_user_id();
         sender.send_empty_ok_response().await?;
         Ok(())

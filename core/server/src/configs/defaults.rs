@@ -37,8 +37,6 @@ use crate::configs::system::{
 use crate::configs::tcp::{TcpConfig, TcpTlsConfig};
 use iggy_common::IggyByteSize;
 use iggy_common::IggyDuration;
-use iggy_common::TransportProtocol;
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 

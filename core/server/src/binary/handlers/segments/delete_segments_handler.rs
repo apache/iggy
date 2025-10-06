@@ -68,7 +68,7 @@ impl ServerCommandHandler for DeleteSegments {
             partition_id: self.partition_id as usize,
             segments_count: self.segments_count,
         };
-        let _responses = shard.broadcast_event_to_all_shards(event.into()).await;
+        let _responses = shard.broadcast_event_to_all_shards(event).await;
 
         shard
             .state
