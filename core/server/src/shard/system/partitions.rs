@@ -102,7 +102,6 @@ impl IggyShard {
 
         let shards_count = self.get_available_shards_count();
         for (partition_id, stats) in partitions.iter().map(|p| (p.id(), p.stats())) {
-            // TODO: Create shard table recordsj.
             let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
             let shard_id = calculate_shard_assignment(&ns, shards_count);
             let shard_info = ShardInfo::new(shard_id);
