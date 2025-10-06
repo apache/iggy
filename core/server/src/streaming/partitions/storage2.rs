@@ -4,7 +4,7 @@ use crate::{
     io::fs_utils::remove_dir_all,
     shard_error, shard_info, shard_trace,
     streaming::partitions::{
-        consumer_offset::ConsumerOffset, journal::MemoryMessageJournal, log::SegmentedLog,
+        consumer_offset::ConsumerOffset,
     },
 };
 use compio::{
@@ -109,11 +109,8 @@ pub async fn delete_partitions_from_disk(
     stream_id: usize,
     topic_id: usize,
     partition_id: usize,
-    log: &mut SegmentedLog<MemoryMessageJournal>,
     config: &SystemConfig,
 ) -> Result<(), IggyError> {
-    //TODO:
-    //log.close().await;
 
     let partition_path = config.get_partition_path(stream_id, topic_id, partition_id);
     remove_dir_all(&partition_path).await.map_err(|_| {
@@ -172,7 +169,7 @@ pub fn load_consumer_offsets(
     kind: ConsumerKind,
 ) -> Result<Vec<ConsumerOffset>, IggyError> {
     trace!("Loading consumer offsets from path: {path}...");
-    let dir_entries = std::fs::read_dir(&path);
+    let dir_entries = std::fs::read_dir(path);
     if dir_entries.is_err() {
         return Err(IggyError::CannotReadConsumerOffsets(path.to_owned()));
     }

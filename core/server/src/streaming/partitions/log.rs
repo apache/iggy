@@ -17,8 +17,8 @@ where
     journal: J,
     // Ring buffer tracking recently accessed segment indices for cleanup optimization.
     // A background task uses this to identify and close file descriptors for unused segments.
-    access_map: AllocRingBuffer<usize>,
-    cache: (),
+    _access_map: AllocRingBuffer<usize>,
+    _cache: (),
     segments: Vec<Segment2>,
     indexes: Vec<Option<IggyIndexesMut>>,
     storage: Vec<Storage>,
@@ -31,8 +31,8 @@ where
     fn default() -> Self {
         Self {
             journal: J::default(),
-            access_map: AllocRingBuffer::with_capacity_power_of_2(ACCESS_MAP_CAPACITY),
-            cache: (),
+            _access_map: AllocRingBuffer::with_capacity_power_of_2(ACCESS_MAP_CAPACITY),
+            _cache: (),
             segments: Vec::with_capacity(SEGMENTS_CAPACITY),
             storage: Vec::with_capacity(SEGMENTS_CAPACITY),
             indexes: Vec::with_capacity(SEGMENTS_CAPACITY),

@@ -116,7 +116,7 @@ impl IggyShardBuilder {
         let connections = self.connections.unwrap();
         let encryptor = self.encryptor;
         let version = self.version.unwrap();
-        let (stop_sender, stop_receiver, frame_receiver) = connections
+        let (_, stop_receiver, frame_receiver) = connections
             .iter()
             .filter(|c| c.id == id)
             .map(|c| {
@@ -150,10 +150,9 @@ impl IggyShardBuilder {
             users: RefCell::new(users),
             encryptor,
             config,
-            version,
+            _version: version,
             state,
             stop_receiver,
-            stop_sender,
             messages_receiver: Cell::new(Some(frame_receiver)),
             metrics,
             is_shutting_down: AtomicBool::new(false),

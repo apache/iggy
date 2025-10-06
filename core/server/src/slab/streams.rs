@@ -1,6 +1,7 @@
 use crate::shard::task_registry::TaskRegistry;
 use crate::shard_trace;
 use crate::streaming::partitions as streaming_partitions;
+use crate::streaming::stats::StreamStats;
 use crate::{
     binary::handlers::messages::poll_messages_handler::IggyPollMetadata,
     configs::{cache_indexes::CacheIndexesConfig, system::SystemConfig},
@@ -26,7 +27,6 @@ use crate::{
         segments::{
             IggyMessagesBatchMut, IggyMessagesBatchSet, Segment2, storage::create_segment_storage,
         },
-        stats::StreamStats,
         streams::{
             self,
             stream2::{self, StreamRef, StreamRefMut},
@@ -381,10 +381,7 @@ impl MainOps for Streams {
                 };
 
                 let Some(consumer_offset) = consumer_offset else {
-                    let batches = self
-                        .get_messages_by_offset(stream_id, topic_id, partition_id, 0, count)
-                        .await?;
-                    return Ok((metadata, batches));
+                    return Err(IggyError::ConsumerOffsetNotFound(consumer_id));
                 };
                 let offset = consumer_offset + 1;
                 trace!(
@@ -585,14 +582,6 @@ impl Streams {
         })
     }
 
-    pub fn len(&self) -> usize {
-        self.root.borrow().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.root.borrow().is_empty()
-    }
-
     pub async fn get_messages_by_offset(
         &self,
         stream_id: &Identifier,
@@ -614,10 +603,6 @@ impl Streams {
         let mut current_offset = offset;
 
         for idx in range {
-            if remaining_count == 0 {
-                break;
-            }
-
             let (segment_start_offset, segment_end_offset) = self.with_partition_by_id(
                 stream_id,
                 topic_id,
@@ -669,11 +654,16 @@ impl Streams {
             }
 
             batches.add_batch_set(messages);
+
+            if remaining_count == 0 {
+                break;
+            }
         }
 
         Ok(batches)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn get_messages_by_offset_base(
         &self,
         stream_id: &Identifier,
@@ -803,6 +793,7 @@ impl Streams {
         Ok(combined_batch_set)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn load_messages_from_disk_by_offset(
         &self,
         stream_id: &Identifier,
@@ -897,10 +888,6 @@ impl Streams {
         let mut batches = IggyMessagesBatchSet::empty();
 
         for idx in range {
-            if remaining_count == 0 {
-                break;
-            }
-
             let segment_end_timestamp = self.with_partition_by_id(
                 stream_id,
                 topic_id,
@@ -933,6 +920,10 @@ impl Streams {
 
             remaining_count = remaining_count.saturating_sub(messages_count);
             batches.add_batch_set(messages);
+
+            if remaining_count == 0 {
+                break;
+            }
         }
 
         Ok(batches)
@@ -1317,7 +1308,6 @@ impl Streams {
             partition_id,
             streaming_partitions::helpers::update_index_and_increment_stats(
                 saved,
-                batch_count,
                 config,
             ),
         );

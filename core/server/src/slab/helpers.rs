@@ -17,12 +17,6 @@ where
     |(root, ..)| f(root.topics())
 }
 
-pub fn topics_async<O, F>(f: F) -> impl AsyncFnOnce(ComponentsById<StreamRef>) -> O
-where
-    F: for<'a> AsyncFnOnce(&'a Topics) -> O,
-{
-    async |(root, ..)| f(root.topics()).await
-}
 pub fn topics_mut<O, F>(f: F) -> impl FnOnce(ComponentsById<StreamRef>) -> O
 where
     F: for<'a> FnOnce(&'a Topics) -> O,
@@ -37,12 +31,6 @@ where
     |(root, ..)| f(root.partitions())
 }
 
-pub fn partitions_async<O, F>(f: F) -> impl AsyncFnOnce(ComponentsById<TopicRef>) -> O
-where
-    F: for<'a> AsyncFnOnce(&'a Partitions) -> O,
-{
-    async |(root, ..)| f(root.partitions()).await
-}
 pub fn partitions_mut<O, F>(f: F) -> impl FnOnce(ComponentsById<TopicRefMut>) -> O
 where
     F: for<'a> FnOnce(&'a mut Partitions) -> O,

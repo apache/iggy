@@ -23,7 +23,6 @@ use crate::binary::handlers::consumer_offsets::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::sender::SenderKind;
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::streaming::session::Session;
 use anyhow::Result;
 use error_set::ErrContext;
@@ -44,7 +43,7 @@ impl ServerCommandHandler for StoreConsumerOffset {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let (polling_consumer, partition_id) = shard
+        shard
             .store_consumer_offset(
                 session,
                 self.consumer,
@@ -57,14 +56,6 @@ impl ServerCommandHandler for StoreConsumerOffset {
             .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to store consumer offset for stream_id: {}, topic_id: {}, partition_id: {:?}, offset: {}, session: {}",
                 self.stream_id, self.topic_id, self.partition_id, self.offset, session
             ))?;
-        // TODO: Get rid of this event.
-        let event = ShardEvent::StoredOffset {
-            stream_id: self.stream_id,
-            topic_id: self.topic_id,
-            partition_id,
-            polling_consumer,
-            offset: self.offset,
-        };
         sender.send_empty_ok_response().await?;
         Ok(())
     }

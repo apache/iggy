@@ -77,21 +77,18 @@ pub async fn should_be_successful() {
     iggy_cmd_test.setup().await;
     iggy_cmd_test
         .execute_test(TestStreamListCmd::new(
-            1,
             String::from("prod"),
             OutputFormat::Default,
         ))
         .await;
     iggy_cmd_test
         .execute_test(TestStreamListCmd::new(
-            2,
             String::from("testing"),
             OutputFormat::List,
         ))
         .await;
     iggy_cmd_test
         .execute_test(TestStreamListCmd::new(
-            3,
             String::from("misc"),
             OutputFormat::Table,
         ))

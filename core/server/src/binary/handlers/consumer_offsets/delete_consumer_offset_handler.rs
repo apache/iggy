@@ -21,7 +21,6 @@ use crate::binary::handlers::consumer_offsets::COMPONENT;
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::sender::SenderKind;
 use crate::shard::IggyShard;
-use crate::shard::transmission::event::ShardEvent;
 use crate::streaming::session::Session;
 use anyhow::Result;
 use error_set::ErrContext;
@@ -43,7 +42,7 @@ impl ServerCommandHandler for DeleteConsumerOffset {
         shard: &Rc<IggyShard>,
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
-        let (polling_consumer, partition_id) = shard
+        shard
             .delete_consumer_offset(
                 session,
                 self.consumer,
@@ -55,13 +54,6 @@ impl ServerCommandHandler for DeleteConsumerOffset {
             .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to delete consumer offset for topic with ID: {} in stream with ID: {} partition ID: {:#?}, session: {}",
                 self.topic_id, self.stream_id, self.partition_id, session
             ))?;
-        // TODO: Get rid of this event.
-        let event = ShardEvent::DeletedOffset {
-            stream_id: self.stream_id,
-            topic_id: self.topic_id,
-            partition_id,
-            polling_consumer,
-        };
         sender.send_empty_ok_response().await?;
         Ok(())
     }

@@ -271,7 +271,7 @@ impl IggyShard {
             let ns = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
             self.remove_shard_table_record(&ns);
 
-            self.delete_partition_dir(numeric_stream_id, numeric_topic_id, partition_id, &mut log)
+            self.delete_partition_dir(numeric_stream_id, numeric_topic_id, partition_id)
                 .await?;
             let segments_count = stats.segments_count_inconsistent();
             let messages_count = stats.messages_count_inconsistent();
@@ -297,14 +297,12 @@ impl IggyShard {
         stream_id: usize,
         topic_id: usize,
         partition_id: usize,
-        log: &mut SegmentedLog<MemoryMessageJournal>,
     ) -> Result<(), IggyError> {
         delete_partitions_from_disk(
             self.id,
             stream_id,
             topic_id,
             partition_id,
-            log,
             &self.config.system,
         )
         .await

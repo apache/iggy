@@ -70,7 +70,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tracing::{debug, error, instrument, trace};
-use transmission::connector::{Receiver, ShardConnector, StopReceiver, StopSender};
+use transmission::connector::{Receiver, ShardConnector, StopReceiver};
 
 pub const COMPONENT: &str = "SHARD";
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -123,7 +123,7 @@ impl ShardInfo {
 pub struct IggyShard {
     pub id: u16,
     shards: Vec<Shard>,
-    version: SemanticVersion,
+    _version: SemanticVersion,
 
     // Heart transplant of the old streams structure.
     pub(crate) streams2: Streams,
@@ -142,7 +142,6 @@ pub struct IggyShard {
     pub(crate) metrics: Metrics,
     pub messages_receiver: Cell<Option<Receiver<ShardFrame>>>,
     pub(crate) stop_receiver: StopReceiver,
-    pub(crate) stop_sender: StopSender,
     pub(crate) is_shutting_down: AtomicBool,
     pub(crate) tcp_bound_address: Cell<Option<SocketAddr>>,
     pub(crate) quic_bound_address: Cell<Option<SocketAddr>>,
@@ -983,29 +982,7 @@ impl IggyShard {
                 }
 
                 Ok(())
-            }
-            ShardEvent::StoredOffset {
-                stream_id,
-                topic_id,
-                partition_id,
-                polling_consumer,
-                offset,
-            } => {
-                self.store_consumer_offset_bypass_auth(
-                    &stream_id,
-                    &topic_id,
-                    &polling_consumer,
-                    partition_id,
-                    offset,
-                );
-                Ok(())
-            }
-            ShardEvent::DeletedOffset {
-                stream_id,
-                topic_id,
-                partition_id,
-                polling_consumer,
-            } => Ok(()),
+            },
             ShardEvent::JoinedConsumerGroup {
                 client_id,
                 stream_id,

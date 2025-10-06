@@ -326,6 +326,7 @@ impl TopicRoot {
 }
 
 // TODO: Move to separate module.
+#[allow(clippy::too_many_arguments)]
 pub fn create_and_insert_topics_mem(
     streams: &Streams,
     stream_id: &Identifier,

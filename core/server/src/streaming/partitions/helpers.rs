@@ -290,7 +290,6 @@ pub fn get_segment_range_by_timestamp(
     timestamp: u64,
 ) -> impl FnOnce(ComponentsById<PartitionRef>) -> Result<std::ops::Range<usize>, IggyError> {
     move |(.., log)| -> Result<std::ops::Range<usize>, IggyError> {
-        let segments = log.segments();
         let start = log
             .segments()
             .iter()
@@ -513,7 +512,6 @@ pub fn persist_batch(
 
 pub fn update_index_and_increment_stats(
     saved: IggyByteSize,
-    batch_count: u32,
     config: &SystemConfig,
 ) -> impl FnOnce(ComponentsById<PartitionRefMut>) {
     move |(.., log)| {

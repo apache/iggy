@@ -1,7 +1,6 @@
 use crate::streaming::{
     partitions::partition2,
     personal_access_tokens::personal_access_token::PersonalAccessToken,
-    polling_consumer::PollingConsumer,
     streams::stream2,
     topics::{
         consumer_group2::{self},
@@ -80,19 +79,6 @@ pub enum ShardEvent {
         id: usize,
         stream_id: Identifier,
         topic_id: Identifier,
-    },
-    StoredOffset {
-        stream_id: Identifier,
-        topic_id: Identifier,
-        partition_id: usize,
-        polling_consumer: PollingConsumer,
-        offset: u64,
-    },
-    DeletedOffset {
-        stream_id: Identifier,
-        topic_id: Identifier,
-        partition_id: usize,
-        polling_consumer: PollingConsumer,
     },
     CreatedUser {
         user_id: u32,

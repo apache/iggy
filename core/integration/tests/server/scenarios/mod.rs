@@ -41,7 +41,6 @@ const CONSUMER_GROUP_NAME: &str = "test-consumer-group";
 const USERNAME_1: &str = "user1";
 const USERNAME_2: &str = "user2";
 const USERNAME_3: &str = "user3";
-const CONSUMER_ID: u32 = 1;
 const CONSUMER_KIND: ConsumerKind = ConsumerKind::Consumer;
 const MESSAGES_COUNT: u32 = 1337;
 

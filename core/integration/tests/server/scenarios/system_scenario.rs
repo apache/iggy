@@ -140,14 +140,12 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     assert_eq!(topic.partitions.len(), PARTITIONS_COUNT as usize);
     assert_eq!(topic.size, 0);
     assert_eq!(topic.messages_count, 0);
-    let mut id = 0;
-    for topic_partition in topic.partitions {
-        assert_eq!(topic_partition.id, id);
+    for (id, topic_partition) in topic.partitions.iter().enumerate() {
+        assert_eq!(topic_partition.id, id as u32);
         assert_eq!(topic_partition.segments_count, 1);
         assert_eq!(topic_partition.size, 0);
         assert_eq!(topic_partition.current_offset, 0);
         assert_eq!(topic_partition.messages_count, 0);
-        id += 1;
     }
 
     // 12. Get topic details by name

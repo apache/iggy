@@ -90,7 +90,7 @@ pub async fn start(
         })?;
     let actual_addr = listener.local_addr().map_err(|e| {
         // TODO(hubcio): macro doesn't work properly with syntax like {e}
-        shard_error!(shard.id, "Failed to get local address: {e}");
+        shard_error!(shard.id, "Failed to get local address: {}", e);
         IggyError::CannotBindToSocket(addr.to_string())
     })?;
     shard_info!(

@@ -5,7 +5,6 @@ use crate::{
     slab::{
         Keyed,
         consumer_groups::{self, ConsumerGroups},
-        partitions::{self},
         topics::{self, Topics},
         traits_ext::{ComponentsById, Delete, DeleteCell, EntityMarker},
     },
@@ -253,29 +252,4 @@ fn mimic_members(members: &Slab<Member>) -> Slab<Member> {
         Member::new(member.client_id).insert_into(&mut container);
     }
     container
-}
-
-fn reassign_partitions(
-    shard_id: u16,
-    partitions: Vec<partitions::ContainerId>,
-) -> impl FnOnce(ComponentsById<ConsumerGroupRefMut>) {
-    move |(root, members)| {
-        root.assign_partitions(partitions);
-        let partitions = root.partitions();
-        let id = root.id();
-        reassign_partitions_to_members(shard_id, id, members, partitions);
-    }
-}
-
-fn reassign_partitions_to_members(
-    shard_id: u16,
-    id: usize,
-    members: &mut ConsumerGroupMembers,
-    partitions: &Vec<usize>,
-) {
-    members.inner_mut().rcu(move |members| {
-        let mut members = mimic_members(members);
-        assign_partitions_to_members(shard_id, id, &mut members, partitions.clone());
-        members
-    });
 }
