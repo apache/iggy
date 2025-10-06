@@ -32,6 +32,9 @@ pub mod system;
 
 pub const COMPONENT: &str = "STATE";
 
+// TODO(hubcio): I don't like this approach, we should avoid mocking and simplify it all.
+
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum StateKind {
     File(file::FileState),

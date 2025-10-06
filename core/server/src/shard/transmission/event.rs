@@ -13,6 +13,7 @@ use iggy_common::{
 };
 use std::net::SocketAddr;
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum ShardEvent {
     FlushUnsavedBuffer {

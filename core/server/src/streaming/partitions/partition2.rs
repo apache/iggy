@@ -95,7 +95,7 @@ pub struct Partition {
 }
 
 impl Partition {
-    #[allow(clippy::too_many_arguments)] 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         created_at: IggyTimestamp,
         should_increment_offset: bool,

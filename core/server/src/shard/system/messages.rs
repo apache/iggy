@@ -167,6 +167,7 @@ impl IggyShard {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn poll_messages(
         &self,
         client_id: u32,

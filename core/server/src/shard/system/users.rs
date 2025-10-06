@@ -136,7 +136,7 @@ impl IggyShard {
     ) -> Result<User, IggyError> {
         self.ensure_authenticated(session)?;
         self.permissioner
-        .borrow()
+            .borrow()
             .create_user(session.get_user_id())
             .with_error_context(|error| {
                 format!(
@@ -521,7 +521,8 @@ impl IggyShard {
     }
 
     fn logout_user_base(&self, user_id: u32, client_id: u32) -> Result<(), IggyError> {
-        let user = self
+        // TODO(hubcio): not sure if user is needed here
+        let _user = self
             .get_user(&Identifier::numeric(user_id)?)
             .with_error_context(|error| {
                 format!(

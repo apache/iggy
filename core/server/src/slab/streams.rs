@@ -1306,10 +1306,7 @@ impl Streams {
             stream_id,
             topic_id,
             partition_id,
-            streaming_partitions::helpers::update_index_and_increment_stats(
-                saved,
-                config,
-            ),
+            streaming_partitions::helpers::update_index_and_increment_stats(saved, config),
         );
 
         Ok(batch_count)

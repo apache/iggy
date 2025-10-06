@@ -108,7 +108,7 @@ impl IggyShard {
     }
 
     pub fn delete_stream2_bypass_auth(&self, id: &Identifier) -> stream2::Stream {
-       self.delete_stream2_base(id)
+        self.delete_stream2_base(id)
     }
 
     fn delete_stream2_base(&self, id: &Identifier) -> stream2::Stream {

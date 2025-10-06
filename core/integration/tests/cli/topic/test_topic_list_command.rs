@@ -31,7 +31,6 @@ use serial_test::parallel;
 struct TestTopicListCmd {
     stream_id: u32,
     stream_name: String,
-    topic_id: u32,
     topic_name: String,
     using_stream_id: TestStreamId,
     output: OutputFormat,
@@ -41,7 +40,6 @@ impl TestTopicListCmd {
     fn new(
         stream_id: u32,
         stream_name: String,
-        topic_id: u32,
         topic_name: String,
         using_stream_id: TestStreamId,
         output: OutputFormat,
@@ -49,7 +47,6 @@ impl TestTopicListCmd {
         Self {
             stream_id,
             stream_name,
-            topic_id,
             topic_name,
             using_stream_id,
             output,
@@ -137,7 +134,6 @@ pub async fn should_be_successful() {
         .execute_test(TestTopicListCmd::new(
             0,
             String::from("main"),
-            0,
             String::from("sync"),
             TestStreamId::Named,
             OutputFormat::Default,
@@ -147,7 +143,6 @@ pub async fn should_be_successful() {
         .execute_test(TestTopicListCmd::new(
             1,
             String::from("customer"),
-            0,
             String::from("topic"),
             TestStreamId::Named,
             OutputFormat::List,
@@ -157,7 +152,6 @@ pub async fn should_be_successful() {
         .execute_test(TestTopicListCmd::new(
             2,
             String::from("production"),
-            0,
             String::from("data"),
             TestStreamId::Named,
             OutputFormat::Table,

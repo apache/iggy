@@ -25,12 +25,14 @@ use crate::{
 };
 use iggy_common::Identifier;
 
+#[allow(clippy::large_enum_variant)]
 pub enum ShardSendRequestResult {
     // TODO: In the future we can add other variants, for example backpressure from the destination shard,
     Recoil(ShardMessage),
     Response(ShardResponse),
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ShardMessage {
     Request(ShardRequest),

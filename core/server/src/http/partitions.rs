@@ -23,7 +23,6 @@ use crate::http::shared::AppState;
 use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
-use crate::streaming::{streams, topics};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::post;
@@ -76,7 +75,8 @@ async fn create_partitions(
             partitions,
         };
         let _responses = shard.broadcast_event_to_all_shards(event).await;
-
+        // TODO: Replace with new mechanism
+        /*
         let numeric_stream_id = shard
             .streams2
             .with_stream_by_id(&command.stream_id, streams::helpers::get_stream_id());
@@ -86,8 +86,7 @@ async fn create_partitions(
             topics::helpers::get_topic_id(),
         );
 
-        // TODO: Replace with new mechanism
-        /*
+
         let records = shard
             .create_shard_table_records(&partition_ids, numeric_stream_id, numeric_topic_id)
             .collect::<Vec<_>>();

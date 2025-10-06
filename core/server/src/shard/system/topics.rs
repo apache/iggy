@@ -21,16 +21,12 @@ use crate::shard::IggyShard;
 use crate::shard_info;
 use crate::slab::traits_ext::{EntityComponentSystem, EntityMarker, InsertCell, IntoComponents};
 use crate::streaming::session::Session;
-use crate::streaming::stats::{StreamStats, TopicStats};
 use crate::streaming::topics::storage2::{create_topic_file_hierarchy, delete_topic_from_disk};
 use crate::streaming::topics::topic2::{self};
 use crate::streaming::{partitions, streams, topics};
 use error_set::ErrContext;
-use iggy_common::{
-    CompressionAlgorithm, Identifier, IggyError, IggyExpiry, IggyTimestamp, MaxTopicSize,
-};
+use iggy_common::{CompressionAlgorithm, Identifier, IggyError, IggyExpiry, MaxTopicSize};
 use std::str::FromStr;
-use std::sync::Arc;
 
 impl IggyShard {
     #[allow(clippy::too_many_arguments)]

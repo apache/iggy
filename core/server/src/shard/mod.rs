@@ -982,7 +982,7 @@ impl IggyShard {
                 }
 
                 Ok(())
-            },
+            }
             ShardEvent::JoinedConsumerGroup {
                 client_id,
                 stream_id,

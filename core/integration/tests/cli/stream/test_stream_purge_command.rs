@@ -31,7 +31,6 @@ struct TestStreamPurgeCmd {
     stream_id: u32,
     stream_name: String,
     using_identifier: TestStreamId,
-    topic_id: u32,
     topic_name: String,
 }
 
@@ -41,7 +40,6 @@ impl TestStreamPurgeCmd {
             stream_id,
             stream_name: name,
             using_identifier,
-            topic_id: 0,
             topic_name: String::from("test_topic"),
         }
     }

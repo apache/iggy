@@ -36,7 +36,6 @@ use std::time::Duration;
 struct TestTopicCreateCmd {
     stream_id: u32,
     stream_name: String,
-    topic_id: Option<u32>,
     topic_name: String,
     partitions_count: u32,
     compression_algorithm: CompressionAlgorithm,
@@ -51,7 +50,6 @@ impl TestTopicCreateCmd {
     fn new(
         stream_id: u32,
         stream_name: String,
-        topic_id: Option<u32>,
         topic_name: String,
         partitions_count: u32,
         compression_algorithm: CompressionAlgorithm,
@@ -63,7 +61,6 @@ impl TestTopicCreateCmd {
         Self {
             stream_id,
             stream_name,
-            topic_id,
             topic_name,
             partitions_count,
             compression_algorithm,
@@ -188,7 +185,6 @@ pub async fn should_be_successful() {
         .execute_test(TestTopicCreateCmd::new(
             0,
             String::from("main"),
-            None,
             String::from("sync"),
             1,
             Default::default(),
@@ -202,7 +198,6 @@ pub async fn should_be_successful() {
         .execute_test(TestTopicCreateCmd::new(
             1,
             String::from("testing"),
-            None,
             String::from("topic"),
             5,
             Default::default(),
@@ -216,7 +211,6 @@ pub async fn should_be_successful() {
         .execute_test(TestTopicCreateCmd::new(
             2,
             String::from("prod"),
-            None,
             String::from("named"),
             1,
             Default::default(),
@@ -230,7 +224,6 @@ pub async fn should_be_successful() {
         .execute_test(TestTopicCreateCmd::new(
             3,
             String::from("big"),
-            None,
             String::from("probe"),
             2,
             Default::default(),

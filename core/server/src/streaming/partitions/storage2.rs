@@ -1,11 +1,7 @@
 use super::COMPONENT;
 use crate::{
-    configs::system::SystemConfig,
-    io::fs_utils::remove_dir_all,
-    shard_error, shard_info, shard_trace,
-    streaming::partitions::{
-        consumer_offset::ConsumerOffset,
-    },
+    configs::system::SystemConfig, io::fs_utils::remove_dir_all, shard_error, shard_info,
+    shard_trace, streaming::partitions::consumer_offset::ConsumerOffset,
 };
 use compio::{
     fs::{self, OpenOptions, create_dir_all},
@@ -111,7 +107,6 @@ pub async fn delete_partitions_from_disk(
     partition_id: usize,
     config: &SystemConfig,
 ) -> Result<(), IggyError> {
-
     let partition_path = config.get_partition_path(stream_id, topic_id, partition_id);
     remove_dir_all(&partition_path).await.map_err(|_| {
         IggyError::CannotDeletePartitionDirectory(

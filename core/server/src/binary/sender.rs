@@ -16,8 +16,6 @@
  * under the License.
  */
 
-use std::future::Future;
-
 use crate::streaming::utils::PooledBuffer;
 use crate::tcp::tcp_sender::TcpSender;
 use crate::tcp::tcp_tls_sender::TcpTlsSender;
@@ -27,6 +25,7 @@ use compio::net::TcpStream;
 use compio_quic::{RecvStream, SendStream};
 use compio_tls::TlsStream;
 use iggy_common::IggyError;
+use std::future::Future;
 
 macro_rules! forward_async_methods {
     (
@@ -68,6 +67,7 @@ pub trait Sender {
     fn shutdown(&mut self) -> impl Future<Output = Result<(), ServerError>>;
 }
 
+#[allow(clippy::large_enum_variant)]
 pub enum SenderKind {
     Tcp(TcpSender),
     TcpTls(TcpTlsSender),

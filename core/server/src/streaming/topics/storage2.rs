@@ -68,14 +68,7 @@ pub async fn delete_topic_from_disk(
         let partition = partitions.delete(id);
         let (root, stats, _, _, _, _, _log) = partition.into_components();
         let partition_id = root.id();
-        delete_partitions_from_disk(
-            shard_id,
-            stream_id,
-            topic_id,
-            partition_id,
-            config,
-        )
-        .await?;
+        delete_partitions_from_disk(shard_id, stream_id, topic_id, partition_id, config).await?;
         messages_count += stats.messages_count_inconsistent();
         size_bytes += stats.size_bytes_inconsistent();
         segments_count += stats.segments_count_inconsistent();
