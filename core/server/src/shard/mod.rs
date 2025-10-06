@@ -867,6 +867,11 @@ impl IggyShard {
                         // Notify config writer that a server has bound
                         let _ = self.config_writer_notify.try_send(());
                     }
+                    TransportProtocol::WebSocket => {
+                        self.websocket_bound_address.set(Some(address));
+                        // Notify config writer that a server has bound
+                        let _ = self.config_writer_notify.try_send(());
+                    }
                 }
                 Ok(())
             }
