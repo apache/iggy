@@ -48,6 +48,8 @@ pub(crate) async fn handle_connection(
             }
         };
 
+        println!("we are here at 1");
+
         let length =
             u32::from_le_bytes(initial_buffer[0..INITIAL_BYTES_LENGTH].try_into().unwrap());
         let (res, mut code_buffer_out) = sender.read(code_buffer).await;
@@ -60,9 +62,13 @@ pub(crate) async fn handle_connection(
         length_buffer = BytesMut::from(initial_buffer);
         code_buffer = BytesMut::from(code_buffer_out);
 
+        println!("we are here at 2");
+
         debug!("Received a WebSocket request, length: {length}, code: {code}");
         let command = ServerCommand::from_code_and_reader(code, sender, length - 4).await?;
         debug!("Received a WebSocket command: {command}, payload size: {length}");
+
+        println!("we are here at 3");
 
         match command.handle(sender, length, session, shard).await {
             Ok(_) => {

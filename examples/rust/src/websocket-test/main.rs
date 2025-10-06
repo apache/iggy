@@ -18,6 +18,7 @@
 
 use iggy::prelude::*;
 use std::sync::Arc;
+use std::time::Duration;
 use std::{error::Error, str::FromStr};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
@@ -34,7 +35,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // For now, create a simple WebSocket client without auto-login
     // We'll connect and then login manually like other examples
     let websocket_config = WebSocketClientConfig {
-        server_address: "127.0.0.1:8080".to_string(), // WebSocket port
+        server_address: "127.0.0.1:8092".to_string(), // WebSocket port
         auto_login: AutoLogin::Disabled,              // Disable auto-login for now
         ..Default::default()
     };
@@ -48,6 +49,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     info!("Connecting to server...");
     client.connect().await?;
     info!("✓ Connected to server");
+
+    // tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    // info!("Disconnecting gracefully...");
+    // client.disconnect().await?;
+    // info!("✓ Disconnected from server");
 
     // Manual login like other examples do
     info!("Logging in...");

@@ -190,21 +190,21 @@ impl Client for IggyClient {
         }
 
         let client = self.client.clone();
-        spawn(async move {
-            loop {
-                debug!("Sending the heartbeat...");
-                if let Err(error) = client.read().await.ping().await {
-                    error!("There was an error when sending a heartbeat. {error}");
-                    if error == IggyError::ClientShutdown {
-                        warn!("The client has been shut down - stopping the heartbeat.");
-                        return;
-                    }
-                } else {
-                    debug!("Heartbeat was sent successfully.");
-                }
-                sleep(heartbeat_interval.get_duration()).await
-            }
-        });
+        // spawn(async move {
+        //     loop {
+        //         debug!("Sending the heartbeat...");
+        //         if let Err(error) = client.read().await.ping().await {
+        //             error!("There was an error when sending a heartbeat. {error}");
+        //             if error == IggyError::ClientShutdown {
+        //                 warn!("The client has been shut down - stopping the heartbeat.");
+        //                 return;
+        //             }
+        //         } else {
+        //             debug!("Heartbeat was sent successfully.");
+        //         }
+        //         sleep(heartbeat_interval.get_duration()).await
+        //     }
+        // });
         Ok(())
     }
 

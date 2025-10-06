@@ -18,6 +18,7 @@
 
 use iggy::prelude::*;
 use std::sync::Arc;
+use std::time::Duration;
 use std::{error::Error, str::FromStr};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
@@ -33,7 +34,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Create a simple TCP client without auto-login
     let tcp_config = TcpClientConfig {
-        server_address: "127.0.0.1:8080".to_string(), // TCP port
+        server_address: "127.0.0.1:8090".to_string(), // TCP port
         auto_login: AutoLogin::Disabled,              // Disable auto-login for now
         ..Default::default()
     };
@@ -48,10 +49,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     client.connect().await?;
     info!("✓ Connected to server");
 
-    // Manual login like other examples do
-    info!("Logging in...");
-    client.login_user("iggy", "iggy").await?;
-    info!("✓ Login successful");
+    // info!("Sleeping for 100ms...");
+    // tokio::time::sleep(Duration::from_millis(100)).await;
+    // info!("Sleeping for 100ms done");
+
+    // info!("Disconnecting...");
+    // client.disconnect().await?;
+    // info!("✓ Disconnected from server");
+
+    // // Manual login like other examples do
+    // info!("Logging in...");
+    // client.login_user("iggy", "iggy").await?;
+    // info!("✓ Login successful");
 
     // // Test ping/health check
     // info!("Testing ping...");

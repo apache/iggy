@@ -116,11 +116,14 @@ async fn accept_loop(
                                     let client_stop_receiver = registry_clone.add_connection(client_id);
 
                                     if let Err(error) = handle_connection(&session, &mut sender_kind, &shard_clone, client_stop_receiver).await {
+                                        println!("error = {:?}", error);
+                                        println!("!!!we are here!!!");
                                         handle_error(error);
                                     }
                                     registry_clone.remove_connection(&client_id);
 
                                     if let Err(error) = sender_kind.shutdown().await {
+                                        println!("error = {:?}", error);
                                         println!("!!!we are here!!!");
                                         shard_error!(shard_clone.id, "Failed to shutdown WebSocket stream for client: {}, address: {}. {}", client_id, remote_addr, error);
                                     } else {
