@@ -20,6 +20,7 @@ package tcp
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"log"
 	"net"
 	"sync"
@@ -111,9 +112,10 @@ func NewIggyTcpClient(options ...Option) (*IggyTcpClient, error) {
 }
 
 const (
-	InitialBytesLength   = 4
-	ExpectedResponseSize = 8
-	MaxStringLength      = 255
+	RequestInitialBytesLength  = 4
+	ResponseInitialBytesLength = 8
+	MaxStringLength            = 255
+	MaxPartitionCount          = 1000
 )
 
 func (tms *IggyTcpClient) read(expectedSize int) (int, []byte, error) {
@@ -154,31 +156,20 @@ func (tms *IggyTcpClient) sendAndFetchResponse(message []byte, command iggcon.Co
 		return nil, err
 	}
 
-	_, buffer, err := tms.read(ExpectedResponseSize)
+	readBytes, buffer, err := tms.read(ResponseInitialBytesLength)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read response for TCP request: %w", err)
+	}
+
+	if readBytes != ResponseInitialBytesLength {
+		return nil, fmt.Errorf("received an invalid or empty response: %w", ierror.EmptyResponse{})
+	}
+
+	if status := ierror.Code(binary.LittleEndian.Uint32(buffer[0:4])); status != 0 {
+		return nil, ierror.FromCode(status)
 	}
 
 	length := int(binary.LittleEndian.Uint32(buffer[4:]))
-	if responseCode := getResponseCode(buffer); responseCode != 0 {
-		// TEMP: See https://github.com/apache/iggy/pull/604 for context.
-		// from: https://github.com/apache/iggy/blob/master/sdk/src/tcp/client.rs#L326
-		if responseCode == 2012 ||
-			responseCode == 2013 ||
-			responseCode == 1011 ||
-			responseCode == 1012 ||
-			responseCode == 46 ||
-			responseCode == 51 ||
-			responseCode == 5001 ||
-			responseCode == 5004 {
-			// do nothing
-		} else {
-			return nil, ierror.MapFromCode(responseCode)
-		}
-
-		return buffer, ierror.MapFromCode(responseCode)
-	}
-
 	if length <= 1 {
 		return []byte{}, nil
 	}
@@ -193,13 +184,9 @@ func (tms *IggyTcpClient) sendAndFetchResponse(message []byte, command iggcon.Co
 
 func createPayload(message []byte, command iggcon.CommandCode) []byte {
 	messageLength := len(message) + 4
-	messageBytes := make([]byte, InitialBytesLength+messageLength)
+	messageBytes := make([]byte, RequestInitialBytesLength+messageLength)
 	binary.LittleEndian.PutUint32(messageBytes[:4], uint32(messageLength))
 	binary.LittleEndian.PutUint32(messageBytes[4:8], uint32(command))
 	copy(messageBytes[8:], message)
 	return messageBytes
-}
-
-func getResponseCode(buffer []byte) int {
-	return int(binary.LittleEndian.Uint32(buffer[:4]))
 }

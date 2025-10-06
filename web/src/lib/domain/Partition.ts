@@ -17,7 +17,6 @@
  * under the License.
  */
 
-
 import { formatDate } from '$lib/utils/formatters/dateFormatter';
 
 export type Partition = {

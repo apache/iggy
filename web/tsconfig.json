@@ -10,7 +10,7 @@
     "skipLibCheck": true,
     "sourceMap": true,
     "strict": true,
-    "noErrorTruncation": true,
+    "noErrorTruncation": true
   }
   // Path aliases are handled by https://kit.svelte.dev/docs/configuration#alias
   //

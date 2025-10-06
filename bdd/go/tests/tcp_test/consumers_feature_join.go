@@ -19,6 +19,7 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/onsi/ginkgo/v2"
 )
 
@@ -57,7 +58,7 @@ var _ = ginkgo.Describe("JOIN CONSUMER GROUP:", func() {
 				randomU32Identifier(),
 			)
 
-			itShouldReturnSpecificError(err, "consumer_group_not_found")
+			itShouldReturnSpecificError(err, ierror.ErrConsumerGroupIdNotFound)
 		})
 
 		ginkgo.Context("and tries to join consumer non-existing topic", func() {
@@ -71,7 +72,7 @@ var _ = ginkgo.Describe("JOIN CONSUMER GROUP:", func() {
 				randomU32Identifier(),
 			)
 
-			itShouldReturnSpecificError(err, "topic_id_not_found")
+			itShouldReturnSpecificError(err, ierror.ErrTopicIdNotFound)
 		})
 
 		ginkgo.Context("and tries to join consumer for non-existing topic and stream", func() {
@@ -82,7 +83,7 @@ var _ = ginkgo.Describe("JOIN CONSUMER GROUP:", func() {
 				randomU32Identifier(),
 			)
 
-			itShouldReturnSpecificError(err, "stream_id_not_found")
+			itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
 		})
 	})
 

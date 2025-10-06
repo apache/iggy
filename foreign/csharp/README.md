@@ -405,6 +405,8 @@ Integration tests are located in `Iggy_SDK/Iggy_Sample_Producer/IntegrationTests
 Tests can be run against a dockerized Iggy server with TestContainers or local Iggy server.
 To run with a local Iggy server, the environment variable `IGGY_SERVER_HOST` needs to be set.
 
-## TODO
+## ROADMAP - TODO
 
-- Add support for `ASP.NET Core` Dependency Injection
+- [ ] Consumer/Publisher client - WIP
+- [ ] Error handling with status codes and descriptions
+- [ ] Add support for `ASP.NET Core` Dependency Injection

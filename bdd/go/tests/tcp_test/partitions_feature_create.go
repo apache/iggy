@@ -19,6 +19,7 @@ package tcp_test
 
 import (
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/onsi/ginkgo/v2"
 )
 
@@ -51,7 +52,7 @@ var _ = ginkgo.Describe("CREATE PARTITION:", func() {
 				10,
 			)
 
-			itShouldReturnSpecificError(err, "stream_id_not_found")
+			itShouldReturnSpecificError(err, ierror.ErrStreamIdNotFound)
 		})
 
 		ginkgo.Context("and tries to create partitions for a non existing topic", func() {
@@ -65,7 +66,7 @@ var _ = ginkgo.Describe("CREATE PARTITION:", func() {
 				10,
 			)
 
-			itShouldReturnSpecificError(err, "topic_id_not_found")
+			itShouldReturnSpecificError(err, ierror.ErrTopicIdNotFound)
 		})
 	})
 
