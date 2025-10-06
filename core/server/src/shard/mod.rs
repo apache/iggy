@@ -1167,6 +1167,7 @@ impl IggyShard {
                 // TODO: Fixme, maybe we should send response_sender
                 // and propagate errors back.
                 let event = event.clone();
+                /*
                 if matches!(
                     &event,
                     ShardEvent::CreatedStream2 { .. }
@@ -1180,13 +1181,16 @@ impl IggyShard {
                         | ShardEvent::CreatedPersonalAccessToken { .. }
                         | ShardEvent::DeletedConsumerGroup2 { .. }
                 ) {
+                */
                     let (sender, receiver) = async_channel::bounded(1);
                     conn.send(ShardFrame::new(event.into(), Some(sender.clone())));
                     Some(receiver.clone())
+                    /*
                 } else {
                     conn.send(ShardFrame::new(event.into(), None));
                     None
                 }
+                */
             })
         {
             match maybe_receiver {
