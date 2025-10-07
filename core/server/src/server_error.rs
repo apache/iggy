@@ -20,7 +20,7 @@ use compio_quic::{ConnectionError as QuicConnectionError, ReadError, WriteError}
 use error_set::error_set;
 use rusty_s3::BucketError;
 use std::array::TryFromSliceError;
-use tokio::io;
+use std::io;
 
 error_set!(
     ServerError = ConfigError || ArchiverError || ConnectionError || LogError || CompatError || QuicError;

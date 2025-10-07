@@ -95,9 +95,9 @@ impl MessageDeduplicator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::sleep;
+    use compio::time::sleep;
 
-    #[tokio::test]
+    #[compio::test]
     async fn message_deduplicator_should_insert_only_unique_identifiers() {
         let max_entries = 1000;
         let ttl = "1s".parse::<IggyDuration>().unwrap();
@@ -110,7 +110,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn message_deduplicator_should_evict_identifiers_after_given_time_to_live() {
         let max_entries = 3;
         let ttl = "100ms".parse::<IggyDuration>().unwrap();

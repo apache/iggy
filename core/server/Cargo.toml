@@ -87,7 +87,6 @@ opentelemetry-otlp = { version = "0.30.0", features = [
     "http",
     "http-proto",
     "reqwest-client",
-    "tokio",
 ] }
 opentelemetry-semantic-conventions = "0.30.0"
 opentelemetry_sdk = { version = "0.30.0", features = [
@@ -115,10 +114,7 @@ strum = { workspace = true }
 sysinfo = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
 compio = { workspace = true }
-tokio-rustls = { workspace = true }
-tokio-util = { workspace = true }
 toml = { workspace = true }
 tower-http = { workspace = true }
 test-case = { workspace = true }

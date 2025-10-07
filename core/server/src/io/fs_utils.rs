@@ -92,7 +92,7 @@ pub async fn walk_dir(root: impl AsRef<Path>) -> io::Result<Vec<DirEntry>> {
 }
 
 /// Removes a directory and all its contents.
-/// This is the equivalent of `tokio::fs::remove_dir_all` for monoio.
+/// This is the equivalent of `tokio::fs::remove_dir_all` for compio.
 /// Uses walk_dir to traverse the directory tree without recursion.
 pub async fn remove_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     for entry in walk_dir(path).await? {

@@ -216,70 +216,227 @@ impl IggyShard {
 
 #[cfg(test)]
 mod tests {
-    //TODO: Fixme
-    /*
     use super::*;
-    use crate::configs::server::{DataMaintenanceConfig, PersonalAccessTokenConfig};
-    use crate::configs::system::SystemConfig;
+    use crate::configs::server::ServerConfig;
+    use crate::shard::ShardInfo;
+    use crate::shard::transmission::connector::ShardConnector;
+    use crate::slab::streams::Streams;
     use crate::state::{MockState, StateKind};
-    use crate::streaming::persistence::persister::{FileWithSyncPersister, PersisterKind};
-    use crate::streaming::storage::SystemStorage;
+    use crate::streaming::session::Session;
+    use crate::streaming::streams;
     use crate::streaming::users::user::User;
+    use crate::streaming::utils::ptr::EternalPtr;
+    use crate::versioning::SemanticVersion;
+    use ahash::HashMap;
+    use dashmap::DashMap;
     use iggy_common::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
-    use std::{
-        net::{Ipv4Addr, SocketAddr},
-        sync::Arc,
-    };
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::rc::Rc;
 
+    fn create_test_shard() -> Rc<IggyShard> {
+        let _tempdir = tempfile::TempDir::new().unwrap();
+        let config = ServerConfig::default();
 
-    #[tokio::test]
-    async fn should_get_stream_by_id_and_name() {
-        let tempdir = tempfile::TempDir::new().unwrap();
-        let config = Rc::new(SystemConfig {
-            path: tempdir.path().to_str().unwrap().to_string(),
-            ..Default::default()
-        });
-        let storage = SystemStorage::new(
-            config.clone(),
-            Arc::new(PersisterKind::FileWithSync(FileWithSyncPersister {})),
-        );
+        let streams = Streams::default();
+        let shards_table = Box::new(DashMap::new());
+        let shards_table = Box::leak(shards_table);
+        let shards_table: EternalPtr<DashMap<crate::shard::namespace::IggyNamespace, ShardInfo>> =
+            shards_table.into();
 
-        let stream_id = 1;
-        let stream_name = "test";
-        let mut system = System::create(
-            config,
-            storage,
-            Arc::new(StateKind::Mock(MockState::new())),
-            None,
-            DataMaintenanceConfig::default(),
-            PersonalAccessTokenConfig::default(),
-        );
+        let users = HashMap::default();
+        let state = StateKind::Mock(MockState::new());
+
+        // Create single shard connection
+        let connections = vec![ShardConnector::new(0, 1)];
+
+        let builder = IggyShard::builder();
+        let shard = builder
+            .id(0)
+            .streams(streams)
+            .shards_table(shards_table)
+            .state(state)
+            .users(users)
+            .connections(connections)
+            .config(config)
+            .encryptor(None)
+            .version(SemanticVersion::current().unwrap())
+            .build();
+
+        Rc::new(shard)
+    }
+
+    #[compio::test]
+    async fn should_create_and_get_stream_by_id_and_name() {
+        let shard = create_test_shard();
+
+        let stream_name = "test_stream";
+
+        // Initialize root user and session
         let root = User::root(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD);
-        let permissions = root.permissions.clone();
         let session = Session::new(
             1,
             root.id,
             SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 1234),
         );
-        system
+
+        shard.users.borrow_mut().insert(root.id, root);
+        shard
             .permissioner
-            .init_permissions_for_user(root.id, permissions);
-        system
-            .create_stream(&session, Some(stream_id), stream_name)
+            .borrow_mut()
+            .init(&[&User::root(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)]);
+
+        // Create stream
+        let stream = shard
+            .create_stream2(&session, stream_name.to_string())
             .await
             .unwrap();
 
-        let stream = system.get_stream(&Identifier::numeric(stream_id).unwrap());
-        assert!(stream.is_ok());
-        let stream = stream.unwrap();
-        assert_eq!(stream.stream_id, stream_id);
-        assert_eq!(stream.name, stream_name);
+        let stream_id = stream.id();
+        assert_eq!(stream.root().name(), stream_name);
 
-        let stream = system.get_stream(&Identifier::named(stream_name).unwrap());
-        assert!(stream.is_ok());
-        let stream = stream.unwrap();
-        assert_eq!(stream.stream_id, stream_id);
-        assert_eq!(stream.name, stream_name);
+        // Verify stream exists by ID
+        assert!(
+            shard
+                .streams2
+                .exists(&Identifier::numeric(stream_id as u32).unwrap())
+        );
+
+        // Verify stream exists by name
+        assert!(
+            shard
+                .streams2
+                .exists(&Identifier::from_str_value(stream_name).unwrap())
+        );
+
+        // Verify we can access stream data by ID
+        let retrieved_name = shard.streams2.with_stream_by_id(
+            &Identifier::numeric(stream_id as u32).unwrap(),
+            streams::helpers::get_stream_name(),
+        );
+        assert_eq!(retrieved_name, stream_name);
+
+        // Verify we can access stream data by name
+        let retrieved_id = shard.streams2.with_stream_by_id(
+            &Identifier::from_str_value(stream_name).unwrap(),
+            streams::helpers::get_stream_id(),
+        );
+        assert_eq!(retrieved_id, stream_id);
     }
-    */
+
+    #[compio::test]
+    async fn should_update_stream_name() {
+        let shard = create_test_shard();
+
+        let initial_name = "initial_stream";
+        let updated_name = "updated_stream";
+
+        // Initialize root user and session
+        let root = User::root(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD);
+        let session = Session::new(
+            1,
+            root.id,
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 1234),
+        );
+
+        shard.users.borrow_mut().insert(root.id, root);
+        shard
+            .permissioner
+            .borrow_mut()
+            .init(&[&User::root(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)]);
+
+        // Create stream
+        let stream = shard
+            .create_stream2(&session, initial_name.to_string())
+            .await
+            .unwrap();
+
+        let stream_id = stream.id();
+
+        // Update stream name
+        shard
+            .update_stream2(
+                &session,
+                &Identifier::numeric(stream_id as u32).unwrap(),
+                updated_name.to_string(),
+            )
+            .unwrap();
+
+        // Verify old name doesn't exist
+        assert!(
+            !shard
+                .streams2
+                .exists(&Identifier::from_str_value(initial_name).unwrap())
+        );
+
+        // Verify new name exists
+        assert!(
+            shard
+                .streams2
+                .exists(&Identifier::from_str_value(updated_name).unwrap())
+        );
+
+        // Verify stream data
+        let retrieved_name = shard.streams2.with_stream_by_id(
+            &Identifier::numeric(stream_id as u32).unwrap(),
+            streams::helpers::get_stream_name(),
+        );
+        assert_eq!(retrieved_name, updated_name);
+    }
+
+    #[compio::test]
+    async fn should_delete_stream() {
+        let shard = create_test_shard();
+
+        let stream_name = "to_be_deleted";
+
+        // Initialize root user and session
+        let root = User::root(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD);
+        let session = Session::new(
+            1,
+            root.id,
+            SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 1234),
+        );
+
+        shard.users.borrow_mut().insert(root.id, root);
+        shard
+            .permissioner
+            .borrow_mut()
+            .init(&[&User::root(DEFAULT_ROOT_USERNAME, DEFAULT_ROOT_PASSWORD)]);
+
+        // Create stream
+        let stream = shard
+            .create_stream2(&session, stream_name.to_string())
+            .await
+            .unwrap();
+
+        let stream_id = stream.id();
+
+        // Verify stream exists
+        assert!(
+            shard
+                .streams2
+                .exists(&Identifier::numeric(stream_id as u32).unwrap())
+        );
+
+        // Delete stream
+        let deleted_stream = shard
+            .delete_stream2(&session, &Identifier::numeric(stream_id as u32).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(deleted_stream.id(), stream_id);
+        assert_eq!(deleted_stream.root().name(), stream_name);
+
+        // Verify stream no longer exists
+        assert!(
+            !shard
+                .streams2
+                .exists(&Identifier::numeric(stream_id as u32).unwrap())
+        );
+        assert!(
+            !shard
+                .streams2
+                .exists(&Identifier::from_str_value(stream_name).unwrap())
+        );
+    }
 }

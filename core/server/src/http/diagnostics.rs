@@ -26,7 +26,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use tokio::time::Instant;
+use std::time::Instant;
 use tracing::{debug, error};
 
 pub async fn request_diagnostics(

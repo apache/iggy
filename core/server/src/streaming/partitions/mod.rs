@@ -20,7 +20,6 @@ pub mod consumer_offset;
 pub mod helpers;
 pub mod journal;
 pub mod log;
-pub mod messages;
 pub mod partition2;
 pub mod segments;
 pub mod storage2;
