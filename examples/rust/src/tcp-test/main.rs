@@ -18,7 +18,6 @@
 
 use iggy::prelude::*;
 use std::sync::Arc;
-use std::time::Duration;
 use std::{error::Error, str::FromStr};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
@@ -32,7 +31,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     info!("Testing TCP client...");
 
-    // Create a simple TCP client without auto-login
     let tcp_config = TcpClientConfig {
         server_address: "127.0.0.1:8090".to_string(), // TCP port
         auto_login: AutoLogin::Disabled,              // Disable auto-login for now
@@ -49,115 +47,106 @@ async fn main() -> Result<(), Box<dyn Error>> {
     client.connect().await?;
     info!("✓ Connected to server");
 
-    // info!("Sleeping for 100ms...");
-    // tokio::time::sleep(Duration::from_millis(100)).await;
-    // info!("Sleeping for 100ms done");
+    // Manual login like other examples do
+    info!("Logging in...");
+    client.login_user("iggy", "iggy").await?;
+    info!("✓ Login successful");
 
-    // info!("Disconnecting...");
-    // client.disconnect().await?;
-    // info!("✓ Disconnected from server");
+    // Test ping/health check
+    info!("Testing ping...");
+    client.ping().await?;
+    info!("✓ Ping successful");
 
-    // // Manual login like other examples do
-    // info!("Logging in...");
-    // client.login_user("iggy", "iggy").await?;
-    // info!("✓ Login successful");
+    // Test stream operations
+    let stream_name = "tcp-test-stream";
+    let topic_name = "tcp-test-topic";
+    let stream_id = Identifier::named(stream_name)?;
+    let topic_id = Identifier::named(topic_name)?;
 
-    // // Test ping/health check
-    // info!("Testing ping...");
-    // client.ping().await?;
-    // info!("✓ Ping successful");
+    info!("Creating test stream...");
+    match client.create_stream(stream_name).await {
+        Ok(_) => info!("✓ Stream created"),
+        Err(IggyError::StreamNameAlreadyExists(_)) => info!("✓ Stream already exists"),
+        Err(e) => return Err(e.into()),
+    }
 
-    // // Test stream operations
-    // let stream_name = "tcp-test-stream";
-    // let topic_name = "tcp-test-topic";
-    // let stream_id = Identifier::named(stream_name)?;
-    // let topic_id = Identifier::named(topic_name)?;
+    info!("Creating test topic...");
+    match client
+        .create_topic(
+            &stream_id,
+            topic_name,
+            1,
+            CompressionAlgorithm::None,
+            None,
+            IggyExpiry::NeverExpire,
+            MaxTopicSize::ServerDefault,
+        )
+        .await
+    {
+        Ok(_) => info!("✓ Topic created"),
+        Err(IggyError::TopicNameAlreadyExists(_, _)) => info!("✓ Topic already exists"),
+        Err(e) => return Err(e.into()),
+    }
 
-    // info!("Creating test stream...");
-    // match client.create_stream(stream_name, None).await {
-    //     Ok(_) => info!("✓ Stream created"),
-    //     Err(IggyError::StreamNameAlreadyExists(_)) => info!("✓ Stream already exists"),
-    //     Err(e) => return Err(e.into()),
-    // }
+    // Test message production
+    info!("Sending test messages...");
+    let test_messages = vec![
+        IggyMessage::from_str("Hello TCP!")?,
+        IggyMessage::from_str("Testing binary protocol over TCP")?,
+        IggyMessage::from_str("Message 3 with some data: 12345")?,
+    ];
 
-    // info!("Creating test topic...");
-    // match client
-    //     .create_topic(
-    //         &stream_id,
-    //         topic_name,
-    //         1, // partitions
-    //         CompressionAlgorithm::None,
-    //         None,
-    //         None,
-    //         IggyExpiry::NeverExpire,
-    //         MaxTopicSize::ServerDefault,
-    //     )
-    //     .await
-    // {
-    //     Ok(_) => info!("✓ Topic created"),
-    //     Err(IggyError::TopicNameAlreadyExists(_, _)) => info!("✓ Topic already exists"),
-    //     Err(e) => return Err(e.into()),
-    // }
+    let mut messages = test_messages;
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await?;
+    info!("✓ Messages sent successfully");
 
-    // // Test message production
-    // info!("Sending test messages...");
-    // let test_messages = vec![
-    //     IggyMessage::from_str("Hello TCP!")?,
-    //     IggyMessage::from_str("Testing binary protocol over TCP")?,
-    //     IggyMessage::from_str("Message 3 with some data: 12345")?,
-    // ];
+    // Test message consumption
+    info!("Polling messages...");
+    let polled_messages = client
+        .poll_messages(
+            &stream_id,
+            &topic_id,
+            None,
+            &Consumer::default(),
+            &PollingStrategy::offset(0),
+            3,
+            false,
+        )
+        .await?;
 
-    // let mut messages = test_messages;
-    // client
-    //     .send_messages(
-    //         &stream_id,
-    //         &topic_id,
-    //         &Partitioning::partition_id(1),
-    //         &mut messages,
-    //     )
-    //     .await?;
-    // info!("✓ Messages sent successfully");
+    info!("✓ Polled {} messages", polled_messages.messages.len());
+    for (i, message) in polled_messages.messages.iter().enumerate() {
+        let payload = String::from_utf8_lossy(&message.payload);
+        info!(
+            "  Message {}: {} (offset: {})",
+            i + 1,
+            payload,
+            message.header.offset
+        );
+    }
 
-    // // Test message consumption
-    // info!("Polling messages...");
-    // let polled_messages = client
-    //     .poll_messages(
-    //         &stream_id,
-    //         &topic_id,
-    //         Some(1),
-    //         &Consumer::default(),
-    //         &PollingStrategy::offset(0),
-    //         3,
-    //         false,
-    //     )
-    //     .await?;
+    // Test stats
+    info!("Getting server stats...");
+    let stats = client.get_stats().await?;
+    info!(
+        "✓ Stats retrieved - {} streams, {} topics",
+        stats.streams_count, stats.topics_count
+    );
 
-    // info!("✓ Polled {} messages", polled_messages.messages.len());
-    // for (i, message) in polled_messages.messages.iter().enumerate() {
-    //     let payload = String::from_utf8_lossy(&message.payload);
-    //     info!(
-    //         "  Message {}: {} (offset: {})",
-    //         i + 1,
-    //         payload,
-    //         message.header.offset
-    //     );
-    // }
+    // Cleanup
+    info!("Cleaning up test data...");
+    client.delete_stream(&stream_id).await.ok();
 
-    // // Test stats
-    // info!("Getting server stats...");
-    // let stats = client.get_stats().await?;
-    // info!(
-    //     "✓ Stats retrieved - {} streams, {} topics",
-    //     stats.streams_count, stats.topics_count
-    // );
+    info!("Disconnecting...");
+    client.disconnect().await?;
 
-    // // Cleanup
-    // info!("Cleaning up test data...");
-    // client.delete_stream(&stream_id).await.ok(); // Ignore errors during cleanup
-
-    // info!("Disconnecting...");
-    // client.disconnect().await?;
-
-    // info!("✓ TCP client test completed successfully!");
+    info!("✓ TCP client test completed successfully!");
     Ok(())
 }

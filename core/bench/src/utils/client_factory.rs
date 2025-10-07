@@ -23,6 +23,7 @@ use integration::http_client::HttpClientFactory;
 use integration::quic_client::QuicClientFactory;
 use integration::tcp_client::TcpClientFactory;
 use integration::test_server::ClientFactory;
+use integration::websocket_client::WebSocketClientFactory;
 use std::sync::Arc;
 
 pub fn create_client_factory(args: &IggyBenchArgs) -> Arc<dyn ClientFactory> {
@@ -46,6 +47,9 @@ pub fn create_client_factory(args: &IggyBenchArgs) -> Arc<dyn ClientFactory> {
             }
         }
         TransportProtocol::Quic => Arc::new(QuicClientFactory {
+            server_addr: args.server_address().to_owned(),
+        }),
+        TransportProtocol::WebSocket => Arc::new(WebSocketClientFactory {
             server_addr: args.server_address().to_owned(),
         }),
     }

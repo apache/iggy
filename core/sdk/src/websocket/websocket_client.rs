@@ -21,7 +21,6 @@ use crate::{prelude::Client, websocket::websocket_stream::ConnectionStream};
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
-use futures_util::{SinkExt, StreamExt};
 use iggy_binary_protocol::{BinaryClient, BinaryTransport, PersonalAccessTokenClient, UserClient};
 use iggy_common::{
     AutoLogin, ClientState, Command, ConnectionString, Credentials, DiagnosticEvent, IggyDuration,
@@ -392,7 +391,9 @@ impl WebSocketClient {
             IggyError::NotConnected
         })?;
 
-        let mut request = BytesMut::with_capacity(REQUEST_INITIAL_BYTES_LENGTH + payload.len());
+        let payload_length = payload.len() + REQUEST_INITIAL_BYTES_LENGTH;
+        let mut request = BytesMut::with_capacity(4 + REQUEST_INITIAL_BYTES_LENGTH + payload.len());
+        request.put_u32_le(payload_length as u32);
         request.put_u32_le(code);
         request.put_slice(&payload);
 

@@ -31,4 +31,7 @@ pub enum BenchmarkTransport {
     #[display("QUIC")]
     #[serde(rename = "quic")]
     Quic,
+    #[display("WEBSOCKET")]
+    #[serde(rename = "websocket")]
+    WebSocket,
 }
