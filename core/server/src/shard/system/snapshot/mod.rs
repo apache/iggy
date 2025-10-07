@@ -27,12 +27,18 @@ use compio::fs::OpenOptions;
 use compio::io::AsyncWriteAtExt;
 use iggy_common::{IggyDuration, IggyError, Snapshot, SnapshotCompression, SystemSnapshotType};
 use std::path::PathBuf;
-// TODO: compio has an `process` module, consider using that instead, but read the docs carefully // https://compio.rs/docs/compio/process
-use std::process::Command;
-use std::sync::Arc;
 use std::time::Instant;
 use tempfile::NamedTempFile;
 use tracing::{error, info};
+
+// TODO(hubcio): compio has a `process` module, but it currently blocks the executor when the runtime
+// has thread_pool_limit(0) configured (which we do on non-macOS platforms in bootstrap.rs).
+// To use compio::process::Command, we need to either:
+// 1. Enable thread pool by removing/increasing thread_pool_limit(0)
+// 2. Use std::process::Command with compio::runtime::spawn_blocking (requires thread pool)
+// 3. Find alternative approach that doesn't rely on thread pool
+// See: https://compio.rs/docs/compio/process and bootstrap::create_shard_executor
+use std::process::Command;
 
 impl IggyShard {
     pub async fn get_snapshot(
@@ -68,7 +74,7 @@ impl IggyShard {
 
         for snapshot_type in snapshot_types {
             info!("Processing snapshot type: {:?}", snapshot_type);
-            match get_command_result(snapshot_type, self.config.system.clone()).await {
+            match get_command_result(snapshot_type, &self.config.system).await {
                 Ok(temp_file) => {
                     info!(
                         "Got temp file for {:?}: {}",
@@ -215,7 +221,7 @@ async fn get_test_snapshot() -> Result<NamedTempFile, std::io::Error> {
     write_command_output_to_temp_file(Command::new("echo").arg("test")).await
 }
 
-async fn get_server_logs(config: Arc<SystemConfig>) -> Result<NamedTempFile, std::io::Error> {
+async fn get_server_logs(config: &SystemConfig) -> Result<NamedTempFile, std::io::Error> {
     let base_directory = PathBuf::from(config.get_system_path());
     let logs_subdirectory = PathBuf::from(&config.logging.path);
     let logs_path = base_directory.join(logs_subdirectory);
@@ -228,7 +234,7 @@ async fn get_server_logs(config: Arc<SystemConfig>) -> Result<NamedTempFile, std
     write_command_output_to_temp_file(Command::new("sh").args(["-c", &list_and_cat])).await
 }
 
-async fn get_server_config(config: Arc<SystemConfig>) -> Result<NamedTempFile, std::io::Error> {
+async fn get_server_config(config: &SystemConfig) -> Result<NamedTempFile, std::io::Error> {
     let base_directory = PathBuf::from(config.get_system_path());
     let config_path = base_directory.join("runtime").join("current_config.toml");
 
@@ -237,7 +243,7 @@ async fn get_server_config(config: Arc<SystemConfig>) -> Result<NamedTempFile, s
 
 async fn get_command_result(
     snapshot_type: &SystemSnapshotType,
-    config: Arc<SystemConfig>,
+    config: &SystemConfig,
 ) -> Result<NamedTempFile, std::io::Error> {
     match snapshot_type {
         SystemSnapshotType::FilesystemOverview => get_filesystem_overview().await,

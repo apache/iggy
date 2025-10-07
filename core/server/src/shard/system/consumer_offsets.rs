@@ -193,14 +193,23 @@ impl IggyShard {
         partition_id: usize,
         offset: u64,
     ) {
-        // TODO: This can use `with_partition_by_id` directly.
+        let stream_id_num = self
+            .streams2
+            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
+        let topic_id_num =
+            self.streams2
+                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
+
         match polling_consumer {
             PollingConsumer::Consumer(id, _) => {
-                self.streams2.with_stream_by_id(
+                self.streams2.with_partition_by_id(
                     stream_id,
-                    streams::helpers::store_consumer_offset(
+                    topic_id,
+                    partition_id,
+                    partitions::helpers::store_consumer_offset(
                         *id,
-                        topic_id,
+                        stream_id_num,
+                        topic_id_num,
                         partition_id,
                         offset,
                         &self.config.system,
@@ -208,11 +217,14 @@ impl IggyShard {
                 );
             }
             PollingConsumer::ConsumerGroup(_, id) => {
-                self.streams2.with_stream_by_id(
+                self.streams2.with_partition_by_id(
                     stream_id,
-                    streams::helpers::store_consumer_group_member_offset(
+                    topic_id,
+                    partition_id,
+                    partitions::helpers::store_consumer_group_member_offset(
                         *id,
-                        topic_id,
+                        stream_id_num,
+                        topic_id_num,
                         partition_id,
                         offset,
                         &self.config.system,

@@ -515,21 +515,11 @@ impl IggyShard {
     pub fn logout_user(&self, session: &Session) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
         let client_id = session.client_id;
-        let user_id = session.get_user_id();
-        self.logout_user_base(user_id, client_id)?;
+        self.logout_user_base(client_id)?;
         Ok(())
     }
 
-    fn logout_user_base(&self, user_id: u32, client_id: u32) -> Result<(), IggyError> {
-        // TODO(hubcio): not sure if user is needed here
-        let _user = self
-            .get_user(&Identifier::numeric(user_id)?)
-            .with_error_context(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to get user with id: {}",
-                    user_id,
-                )
-            })?;
+    fn logout_user_base(&self, client_id: u32) -> Result<(), IggyError> {
         if client_id > 0 {
             let mut client_manager = self.client_manager.borrow_mut();
             client_manager.clear_user_id(client_id)?;

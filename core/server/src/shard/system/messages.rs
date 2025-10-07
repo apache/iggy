@@ -24,13 +24,12 @@ use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
 };
-use crate::shard_trace;
 use crate::streaming::partitions::journal::Journal;
 use crate::streaming::polling_consumer::PollingConsumer;
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet};
 use crate::streaming::session::Session;
 use crate::streaming::traits::MainOps;
-use crate::streaming::utils::{PooledBuffer, hash};
+use crate::streaming::utils::PooledBuffer;
 use crate::streaming::{partitions, streams, topics};
 use error_set::ErrContext;
 use iggy_common::{
@@ -49,24 +48,6 @@ impl IggyShard {
         partitioning: &Partitioning,
         batch: IggyMessagesBatchMut,
     ) -> Result<(), IggyError> {
-        // TODO: move to helpers.
-        fn calculate_partition_id_by_messages_key_hash(
-            shard_id: u16,
-            upperbound: usize,
-            messages_key: &[u8],
-        ) -> usize {
-            let messages_key_hash = hash::calculate_32(messages_key) as usize;
-            let partition_id = messages_key_hash % upperbound;
-            shard_trace!(
-                shard_id,
-                "Calculated partition ID: {} for messages key: {:?}, hash: {}",
-                partition_id,
-                messages_key,
-                messages_key_hash
-            );
-            partition_id
-        }
-
         let numeric_stream_id = self
             .streams2
             .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
@@ -108,11 +89,13 @@ impl IggyShard {
                         ) as usize),
                         PartitioningKind::MessagesKey => {
                             let upperbound = root.partitions().len();
-                            Ok(calculate_partition_id_by_messages_key_hash(
-                                self.id,
-                                upperbound,
-                                &partitioning.value,
-                            ))
+                            Ok(
+                                topics::helpers::calculate_partition_id_by_messages_key_hash(
+                                    self.id,
+                                    upperbound,
+                                    &partitioning.value,
+                                ),
+                            )
                         }
                     },
                 )?;

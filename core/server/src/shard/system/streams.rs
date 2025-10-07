@@ -178,18 +178,7 @@ impl IggyShard {
             })?;
         }
 
-        //TODO: Tech debt.
-        let topic_ids = self
-            .streams2
-            .with_stream_by_id(stream_id, streams::helpers::get_topic_ids());
-
-        // Purge each topic in the stream using bypass auth
-        for topic_id in topic_ids {
-            let topic_identifier = Identifier::numeric(topic_id as u32).unwrap();
-            self.purge_topic2(session, stream_id, &topic_identifier)
-                .await?;
-        }
-        Ok(())
+        self.purge_stream2_base(stream_id).await
     }
 
     pub async fn purge_stream2_bypass_auth(&self, stream_id: &Identifier) -> Result<(), IggyError> {

@@ -16,6 +16,7 @@ use crate::{
             },
             topic2::{Topic, TopicRef, TopicRefMut, TopicRoot},
         },
+        utils::hash,
     },
 };
 use iggy_common::{CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize};
@@ -49,6 +50,23 @@ pub fn get_message_expiry() -> impl FnOnce(ComponentsById<TopicRef>) -> IggyExpi
 
 pub fn get_max_topic_size() -> impl FnOnce(ComponentsById<TopicRef>) -> MaxTopicSize {
     |(root, _, _)| root.max_topic_size()
+}
+
+pub fn calculate_partition_id_by_messages_key_hash(
+    shard_id: u16,
+    upperbound: usize,
+    messages_key: &[u8],
+) -> usize {
+    let messages_key_hash = hash::calculate_32(messages_key) as usize;
+    let partition_id = messages_key_hash % upperbound;
+    shard_trace!(
+        shard_id,
+        "Calculated partition ID: {} for messages key: {:?}, hash: {}",
+        partition_id,
+        messages_key,
+        messages_key_hash
+    );
+    partition_id
 }
 
 pub fn delete_topic(topic_id: &Identifier) -> impl FnOnce(&Topics) -> Topic {
