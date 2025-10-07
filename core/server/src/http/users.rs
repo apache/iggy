@@ -137,6 +137,26 @@ async fn create_user(
     let user_id = user.id;
     let response = Json(mapper::map_user(&user));
 
+    // Send event for user creation
+    {
+        let broadcast_future = SendWrapper::new(async {
+            use crate::shard::transmission::event::ShardEvent;
+            let event = ShardEvent::CreatedUser {
+                user_id,
+                username: command.username.to_owned(),
+                password: command.password.to_owned(),
+                status: command.status,
+                permissions: command.permissions.clone(),
+            };
+            let _responses = state
+                .shard
+                .shard()
+                .broadcast_event_to_all_shards(event)
+                .await;
+        });
+        broadcast_future.await;
+    }
+
     {
         let username = command.username.clone();
         let entry_command = EntryCommand::CreateUser(CreateUserWithId {
@@ -192,6 +212,24 @@ async fn update_user(
             format!("{COMPONENT} (error: {error}) - failed to update user, user ID: {user_id}")
         })?;
 
+    // Send event for user update
+    {
+        let broadcast_future = SendWrapper::new(async {
+            use crate::shard::transmission::event::ShardEvent;
+            let event = ShardEvent::UpdatedUser {
+                user_id: command.user_id.clone(),
+                username: command.username.clone(),
+                status: command.status,
+            };
+            let _responses = state
+                .shard
+                .shard()
+                .broadcast_event_to_all_shards(event)
+                .await;
+        });
+        broadcast_future.await;
+    }
+
     {
         let username = command.username.clone();
         let entry_command = EntryCommand::UpdateUser(command);
@@ -234,6 +272,23 @@ async fn update_permissions(
                 "{COMPONENT} (error: {error}) - failed to update permissions, user ID: {user_id}"
             )
         })?;
+
+    // Send event for permissions update
+    {
+        let broadcast_future = SendWrapper::new(async {
+            use crate::shard::transmission::event::ShardEvent;
+            let event = ShardEvent::UpdatedPermissions {
+                user_id: command.user_id.clone(),
+                permissions: command.permissions.clone(),
+            };
+            let _responses = state
+                .shard
+                .shard()
+                .broadcast_event_to_all_shards(event)
+                .await;
+        });
+        broadcast_future.await;
+    }
 
     {
         let entry_command = EntryCommand::UpdatePermissions(command);
@@ -279,6 +334,24 @@ async fn change_password(
             format!("{COMPONENT} (error: {error}) - failed to change password, user ID: {user_id}")
         })?;
 
+    // Send event for password change
+    {
+        let broadcast_future = SendWrapper::new(async {
+            use crate::shard::transmission::event::ShardEvent;
+            let event = ShardEvent::ChangedPassword {
+                user_id: command.user_id.clone(),
+                current_password: command.current_password.clone(),
+                new_password: command.new_password.clone(),
+            };
+            let _responses = state
+                .shard
+                .shard()
+                .broadcast_event_to_all_shards(event)
+                .await;
+        });
+        broadcast_future.await;
+    }
+
     {
         let entry_command = EntryCommand::ChangePassword(command);
         let future = SendWrapper::new(
@@ -315,6 +388,22 @@ async fn delete_user(
         .with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to delete user with ID: {user_id}")
         })?;
+
+    // Send event for user deletion
+    {
+        let broadcast_future = SendWrapper::new(async {
+            use crate::shard::transmission::event::ShardEvent;
+            let event = ShardEvent::DeletedUser {
+                user_id: identifier_user_id.clone(),
+            };
+            let _responses = state
+                .shard
+                .shard()
+                .broadcast_event_to_all_shards(event)
+                .await;
+        });
+        broadcast_future.await;
+    }
 
     {
         let entry_command = EntryCommand::DeleteUser(DeleteUser {

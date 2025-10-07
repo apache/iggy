@@ -40,11 +40,11 @@ impl IggyShard {
         partition_id: usize,
         segments_count: u32,
     ) -> Result<(), IggyError> {
-        let (segments, storages) = self.streams2.with_partition_by_id_mut(
+        let (segments, storages, stats) = self.streams2.with_partition_by_id_mut(
             stream_id,
             topic_id,
             partition_id,
-            |(.., log)| {
+            |(_, stats,.., log)| {
                 let upperbound = log.segments().len();
                 let begin = upperbound.saturating_sub(segments_count as usize);
                 let segments = log
@@ -59,7 +59,7 @@ impl IggyShard {
                     .indexes_mut()
                     .drain(begin..upperbound)
                     .collect::<Vec<_>>();
-                (segments, storages)
+                (segments, storages, stats.clone())
             },
         );
         let numeric_stream_id = self
@@ -71,7 +71,6 @@ impl IggyShard {
             streaming::topics::helpers::get_topic_id(),
         );
 
-        let create_base_segment = !segments.is_empty() && !storages.is_empty();
         for (mut storage, segment) in storages.into_iter().zip(segments.into_iter()) {
             let (msg_writer, index_writer) = storage.shutdown();
             if let Some(msg_writer) = msg_writer
@@ -101,12 +100,12 @@ impl IggyShard {
                 })?;
             }
         }
-
-        if create_base_segment {
-            self.init_log(stream_id, topic_id, partition_id).await?;
-        }
+        self.init_log(stream_id, topic_id, partition_id).await?;
+        // TODO: Tech debt. make the increment seg count be part of init_log.
+        stats.increment_segments_count(1);
         Ok(())
     }
+
     pub async fn delete_segments(
         &self,
         session: &Session,

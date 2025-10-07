@@ -282,6 +282,7 @@ async fn update_topic(
 
     let session = Session::stateless(identity.user_id, identity.ip_address);
 
+    let name_changed = !command.name.is_empty();
     state.shard.shard().update_topic2(
         &session,
         &command.stream_id,
@@ -297,12 +298,41 @@ async fn update_topic(
         )
     })?;
 
+    // TODO: Tech debt.
+    let topic_id = if name_changed {
+        Identifier::named(&command.name.clone()).unwrap()
+    } else {
+        command.topic_id.clone()
+    };
+
     // Get the updated values from the topic
     let (message_expiry, max_topic_size) = state.shard.shard().streams2.with_topic_by_id(
         &command.stream_id,
-        &command.topic_id,
+        &topic_id,
         |(root, _, _)| (root.message_expiry(), root.max_topic_size()),
     );
+
+    // Send event for topic update
+    {
+        let broadcast_future = SendWrapper::new(async {
+            use crate::shard::transmission::event::ShardEvent;
+            let event = ShardEvent::UpdatedTopic2 {
+                stream_id: command.stream_id.clone(),
+                topic_id: command.topic_id.clone(),
+                name: command.name.clone(),
+                message_expiry: command.message_expiry,
+                compression_algorithm: command.compression_algorithm,
+                max_topic_size: command.max_topic_size,
+                replication_factor: command.replication_factor,
+            };
+            let _responses = state
+                .shard
+                .shard()
+                .broadcast_event_to_all_shards(event)
+                .await;
+        });
+        broadcast_future.await;
+    }
 
     command.message_expiry = message_expiry;
     command.max_topic_size = max_topic_size;
@@ -333,7 +363,7 @@ async fn delete_topic(
 
     let session = Session::stateless(identity.user_id, identity.ip_address);
 
-    {
+    let topic = {
         let future = SendWrapper::new(state.shard.shard().delete_topic2(
             &session,
             &identifier_stream_id,
@@ -345,6 +375,26 @@ async fn delete_topic(
             "{COMPONENT} (error: {error}) - failed to delete topic with ID: {topic_id} in stream with ID: {stream_id}",
         )
     })?;
+
+    let topic_id_numeric = topic.root().id();
+
+    // Send event for topic deletion
+    {
+        let broadcast_future = SendWrapper::new(async {
+            use crate::shard::transmission::event::ShardEvent;
+            let event = ShardEvent::DeletedTopic2 {
+                id: topic_id_numeric,
+                stream_id: identifier_stream_id.clone(),
+                topic_id: identifier_topic_id.clone(),
+            };
+            let _responses = state
+                .shard
+                .shard()
+                .broadcast_event_to_all_shards(event)
+                .await;
+        });
+        broadcast_future.await;
+    }
 
     {
         let entry_command = EntryCommand::DeleteTopic(DeleteTopic {
@@ -390,6 +440,23 @@ async fn purge_topic(
             "{COMPONENT} (error: {error}) - failed to purge topic, stream ID: {stream_id}, topic ID: {topic_id}"
         )
     })?;
+
+    // Send event for topic purge
+    {
+        let broadcast_future = SendWrapper::new(async {
+            use crate::shard::transmission::event::ShardEvent;
+            let event = ShardEvent::PurgedTopic {
+                stream_id: identifier_stream_id.clone(),
+                topic_id: identifier_topic_id.clone(),
+            };
+            let _responses = state
+                .shard
+                .shard()
+                .broadcast_event_to_all_shards(event)
+                .await;
+        });
+        broadcast_future.await;
+    }
 
     {
         let entry_command = EntryCommand::PurgeTopic(PurgeTopic {

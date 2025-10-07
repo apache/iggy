@@ -236,53 +236,86 @@ async fn delete_consumer_group(
     let identifier_topic_id = Identifier::from_str_value(&topic_id)?;
     let identifier_group_id = Identifier::from_str_value(&group_id)?;
 
-    let session = Session::stateless(identity.user_id, identity.ip_address);
+    let result = SendWrapper::new(async move {
+        let session = Session::stateless(identity.user_id, identity.ip_address);
 
-    // Delete using the new API
-    let consumer_group = state.shard.shard().delete_consumer_group2(
-        &session,
-        &identifier_stream_id,
-        &identifier_topic_id,
-        &identifier_group_id
-    )
-    .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to delete consumer group with ID: {group_id} for topic with ID: {topic_id} in stream with ID: {stream_id}"))?;
+        // Delete using the new API
+        let consumer_group = state.shard.shard().delete_consumer_group2(
+            &session,
+            &identifier_stream_id,
+            &identifier_topic_id,
+            &identifier_group_id
+        )
+        .with_error_context(|error| format!("{COMPONENT} (error: {error}) - failed to delete consumer group with ID: {group_id} for topic with ID: {topic_id} in stream with ID: {stream_id}"))?;
 
-    let cg_id = consumer_group.id();
+        let cg_id = consumer_group.id();
 
-    // Send event for consumer group deletion
-    {
-        let broadcast_future = SendWrapper::new(async {
-            use crate::shard::transmission::event::ShardEvent;
-            let event = ShardEvent::DeletedConsumerGroup2 {
-                id: cg_id,
-                stream_id: identifier_stream_id.clone(),
-                topic_id: identifier_topic_id.clone(),
-                group_id: identifier_group_id.clone(),
-            };
-            let _responses = state
+        // Remove all consumer group members from ClientManager
+        let stream_id_usize = state.shard.shard().streams2.with_stream_by_id(
+            &identifier_stream_id,
+            crate::streaming::streams::helpers::get_stream_id(),
+        );
+        let topic_id_usize = state.shard.shard().streams2.with_topic_by_id(
+            &identifier_stream_id,
+            &identifier_topic_id,
+            crate::streaming::topics::helpers::get_topic_id(),
+        );
+
+        // TODO: Tech debt, repeated code from `delete_consumer_group_handler.rs`
+        // Get members from the deleted consumer group and make them leave
+        let slab = consumer_group.members().inner().shared_get();
+        for (_, member) in slab.iter() {
+            if let Err(err) = state.shard.shard().client_manager.borrow_mut().leave_consumer_group(
+                member.client_id,
+                stream_id_usize,
+                topic_id_usize,
+                cg_id,
+            ) {
+                tracing::warn!(
+                    "{COMPONENT} (error: {err}) - failed to make client leave consumer group for client ID: {}, group ID: {}",
+                    member.client_id,
+                    cg_id
+                );
+            }
+        }
+
+        // Send event for consumer group deletion
+        {
+            let broadcast_future = SendWrapper::new(async {
+                use crate::shard::transmission::event::ShardEvent;
+                let event = ShardEvent::DeletedConsumerGroup2 {
+                    id: cg_id,
+                    stream_id: identifier_stream_id.clone(),
+                    topic_id: identifier_topic_id.clone(),
+                    group_id: identifier_group_id.clone(),
+                };
+                let _responses = state
+                    .shard
+                    .shard()
+                    .broadcast_event_to_all_shards(event)
+                    .await;
+            });
+            broadcast_future.await;
+        }
+
+        // Apply state change
+        let entry_command = EntryCommand::DeleteConsumerGroup(DeleteConsumerGroup {
+            stream_id: identifier_stream_id,
+            topic_id: identifier_topic_id,
+            group_id: identifier_group_id,
+        });
+        let state_future = SendWrapper::new(
+            state
                 .shard
                 .shard()
-                .broadcast_event_to_all_shards(event)
-                .await;
-        });
-        broadcast_future.await;
-    }
+                .state
+                .apply(identity.user_id, &entry_command),
+        );
 
-    // Apply state change
-    let entry_command = EntryCommand::DeleteConsumerGroup(DeleteConsumerGroup {
-        stream_id: identifier_stream_id,
-        topic_id: identifier_topic_id,
-        group_id: identifier_group_id,
+        state_future.await?;
+
+        Ok::<StatusCode, CustomError>(StatusCode::NO_CONTENT)
     });
-    let state_future = SendWrapper::new(
-        state
-            .shard
-            .shard()
-            .state
-            .apply(identity.user_id, &entry_command),
-    );
 
-    state_future.await?;
-
-    Ok(StatusCode::NO_CONTENT)
+    result.await
 }

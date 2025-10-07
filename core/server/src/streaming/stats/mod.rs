@@ -327,5 +327,6 @@ impl PartitionStats {
         self.zero_out_size_bytes();
         self.zero_out_messages_count();
         self.zero_out_segments_count();
+        self.zero_out_parent_all();
     }
 }

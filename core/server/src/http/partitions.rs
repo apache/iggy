@@ -111,18 +111,38 @@ async fn delete_partitions(
     query.validate()?;
 
     let session = Session::stateless(identity.user_id, identity.ip_address);
-    let delete_future = SendWrapper::new(state.shard.shard().delete_partitions2(
-        &session,
-        &query.stream_id,
-        &query.topic_id,
-        query.partitions_count,
-    ));
+    let deleted_partition_ids = {
+        let delete_future = SendWrapper::new(state.shard.shard().delete_partitions2(
+            &session,
+            &query.stream_id,
+            &query.topic_id,
+            query.partitions_count,
+        ));
 
-    delete_future.await.with_error_context(|error| {
-        format!(
-            "{COMPONENT} (error: {error}) - failed to delete partitions for topic with ID: {topic_id} in stream with ID: {stream_id}"
-        )
-    })?;
+        delete_future.await.with_error_context(|error| {
+            format!(
+                "{COMPONENT} (error: {error}) - failed to delete partitions for topic with ID: {topic_id} in stream with ID: {stream_id}"
+            )
+        })?
+    };
+
+    // Send event for partition deletion
+    {
+        let broadcast_future = SendWrapper::new(async {
+            let event = ShardEvent::DeletedPartitions2 {
+                stream_id: query.stream_id.clone(),
+                topic_id: query.topic_id.clone(),
+                partitions_count: query.partitions_count,
+                partition_ids: deleted_partition_ids,
+            };
+            let _responses = state
+                .shard
+                .shard()
+                .broadcast_event_to_all_shards(event)
+                .await;
+        });
+        broadcast_future.await;
+    }
 
     let command = EntryCommand::DeletePartitions(DeletePartitions {
         stream_id: query.stream_id.clone(),

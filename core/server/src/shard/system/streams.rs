@@ -147,11 +147,30 @@ impl IggyShard {
                 )
             })?;
         let mut stream = self.delete_stream2_base(id);
-        // Clean up consumer groups from ClientManager for this stream
         let stream_id_usize = stream.id();
+        
+        // Clean up consumer groups from ClientManager for this stream
         self.client_manager
             .borrow_mut()
             .delete_consumer_groups_for_stream(stream_id_usize);
+        
+        // Remove all entries from shards_table for this stream (all topics and partitions)
+        let namespaces_to_remove: Vec<_> = self.shards_table
+            .iter()
+            .filter_map(|entry| {
+                let (ns, _) = entry.pair();
+                if ns.stream_id() == stream_id_usize {
+                    Some(*ns)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        
+        for ns in namespaces_to_remove {
+            self.remove_shard_table_record(&ns);
+        }
+        
         delete_stream_from_disk(self.id, &mut stream, &self.config.system).await?;
         Ok(stream)
     }

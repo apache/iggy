@@ -184,6 +184,23 @@ async fn update_stream(
                 )
             })?;
 
+        // Send event for stream update
+        {
+            let broadcast_future = SendWrapper::new(async {
+                use crate::shard::transmission::event::ShardEvent;
+                let event = ShardEvent::UpdatedStream2 {
+                    stream_id: command.stream_id.clone(),
+                    name: command.name.clone(),
+                };
+                let _responses = state
+                    .shard
+                    .shard()
+                    .broadcast_event_to_all_shards(event)
+                    .await;
+            });
+            broadcast_future.await;
+        }
+
         // Apply state change using wrapper method
         let entry_command = EntryCommand::UpdateStream(command);
         state.shard.apply_state(identity.user_id, &entry_command).await.with_error_context(|error| {
@@ -209,16 +226,37 @@ async fn delete_stream(
     let result = SendWrapper::new(async move {
         let session = Session::stateless(identity.user_id, identity.ip_address);
 
-        // Delete stream using wrapper method
-        state
-            .shard
-            .delete_stream(&session, &identifier_stream_id)
-            .await
-            .with_error_context(|error| {
-                format!(
-                    "{COMPONENT} (error: {error}) - failed to delete stream with ID: {stream_id}",
-                )
-            })?;
+        // Delete stream and get the stream entity
+        let stream = {
+            let future = SendWrapper::new(state.shard.shard().delete_stream2(
+                &session,
+                &identifier_stream_id,
+            ));
+            future.await
+        }.with_error_context(|error| {
+            format!(
+                "{COMPONENT} (error: {error}) - failed to delete stream with ID: {stream_id}",
+            )
+        })?;
+
+        let stream_id_numeric = stream.root().id();
+
+        // Send event for stream deletion
+        {
+            let broadcast_future = SendWrapper::new(async {
+                use crate::shard::transmission::event::ShardEvent;
+                let event = ShardEvent::DeletedStream2 {
+                    id: stream_id_numeric,
+                    stream_id: identifier_stream_id.clone(),
+                };
+                let _responses = state
+                    .shard
+                    .shard()
+                    .broadcast_event_to_all_shards(event)
+                    .await;
+            });
+            broadcast_future.await;
+        }
 
         // Apply state change using wrapper method
         let entry_command = EntryCommand::DeleteStream(DeleteStream {
@@ -258,6 +296,22 @@ async fn purge_stream(
                     "{COMPONENT} (error: {error}) - failed to purge stream, stream ID: {stream_id}"
                 )
             })?;
+
+        // Send event for stream purge
+        {
+            let broadcast_future = SendWrapper::new(async {
+                use crate::shard::transmission::event::ShardEvent;
+                let event = ShardEvent::PurgedStream2 {
+                    stream_id: identifier_stream_id.clone(),
+                };
+                let _responses = state
+                    .shard
+                    .shard()
+                    .broadcast_event_to_all_shards(event)
+                    .await;
+            });
+            broadcast_future.await;
+        }
 
         // Apply state change using wrapper method
         let entry_command = EntryCommand::PurgeStream(PurgeStream {

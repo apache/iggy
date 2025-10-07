@@ -45,7 +45,6 @@ impl ServerCommandHandler for UpdateStream {
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
         let stream_id = self.stream_id.clone();
-
         shard
         .update_stream2(session, &self.stream_id, self.name.clone())
         .with_error_context(|error| {

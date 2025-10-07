@@ -218,10 +218,30 @@ impl IggyShard {
                     )
                 })?;
         let mut topic = self.delete_topic_base2(stream_id, topic_id);
+        let topic_id_numeric = topic.id();
+        
         // Clean up consumer groups from ClientManager for this topic
         self.client_manager
             .borrow_mut()
-            .delete_consumer_groups_for_topic(numeric_stream_id, topic.id());
+            .delete_consumer_groups_for_topic(numeric_stream_id, topic_id_numeric);
+        
+        // Remove all partition entries from shards_table for this topic
+        let namespaces_to_remove: Vec<_> = self.shards_table
+            .iter()
+            .filter_map(|entry| {
+                let (ns, _) = entry.pair();
+                if ns.stream_id() == numeric_stream_id && ns.topic_id() == topic_id_numeric {
+                    Some(*ns)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        
+        for ns in namespaces_to_remove {
+            self.remove_shard_table_record(&ns);
+        }
+        
         let parent = topic.stats().parent().clone();
         // We need to borrow topic as mutable, as we are extracting partitions out of it, in order to close them.
         let (messages_count, size_bytes, segments_count) =
@@ -279,12 +299,6 @@ impl IggyShard {
             })?;
         }
 
-        self.streams2.with_partitions(
-            stream_id,
-            topic_id,
-            partitions::helpers::purge_partitions_mem(),
-        );
-
         let (consumer_offset_paths, consumer_group_offset_paths) = self.streams2.with_partitions(
             stream_id,
             topic_id,
@@ -323,6 +337,12 @@ impl IggyShard {
                     roots.iter().map(|(_, root)| root.id()).collect::<Vec<_>>()
                 })
             });
+
+        self.streams2.with_partitions(
+            stream_id,
+            topic_id,
+            partitions::helpers::purge_partitions_mem(),
+        );
         for part_id in part_ids {
             self.delete_segments_bypass_auth(stream_id, topic_id, part_id, u32::MAX)
                 .await?;
