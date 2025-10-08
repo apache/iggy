@@ -21,7 +21,7 @@ public sealed class PolledMessages
 {
     public required int PartitionId { get; init; }
     public required ulong CurrentOffset { get; init; }
-    public required IReadOnlyList<MessageResponse> Messages { get; init; }
+    public required IReadOnlyList<MessageResponse> Messages { get; set; }
 
     public static PolledMessages Empty =>
         new()

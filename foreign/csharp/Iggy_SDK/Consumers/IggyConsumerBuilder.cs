@@ -98,7 +98,7 @@ public class IggyConsumerBuilder
     /// </summary>
     /// <param name="partitionId">The identifier of the partition to consume from.</param>
     /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining.</returns>
-    public IggyConsumerBuilder WithPartitions(uint partitionId)
+    public IggyConsumerBuilder WithPartitionId(uint partitionId)
     {
         Config.PartitionId = partitionId;
 

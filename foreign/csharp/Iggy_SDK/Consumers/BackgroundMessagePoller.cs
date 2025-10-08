@@ -1,5 +1,7 @@
+using System.Collections.Concurrent;
 using System.Threading.Channels;
 using Apache.Iggy.Contracts;
+using Apache.Iggy.Enums;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
 using Microsoft.Extensions.Logging;
@@ -16,6 +18,7 @@ internal sealed partial class BackgroundMessagePoller : IAsyncDisposable
     private Task? _pollingTask;
     private bool _disposed;
     private PollingStrategy _currentPollingStrategy;
+    private readonly ConcurrentDictionary<int, ulong> _lastPolledOffset = new ();
 
     public event EventHandler<ConsumerErrorEventArgs>? OnPollingError;
     public event EventHandler<MessageDecryptionFailedEventArgs>? OnMessageDecryptionFailed;
@@ -63,6 +66,17 @@ internal sealed partial class BackgroundMessagePoller : IAsyncDisposable
                         _config.PartitionId, _config.Consumer, _currentPollingStrategy, _config.BatchSize,
                         _config.AutoCommit, ct);
 
+                    if (_lastPolledOffset.TryGetValue(messages.PartitionId, out var value))
+                    {
+                        messages.Messages = messages.Messages.Where(x => x.Header.Offset > value).ToList();
+                    }
+                    
+                    if (!messages.Messages.Any())
+                    {
+                        await Task.Delay(_config.PollingIntervalMs, ct);
+                        continue;
+                    }
+                    
                     foreach (var message in messages.Messages)
                     {
                         var processedMessage = message;
@@ -101,14 +115,16 @@ internal sealed partial class BackgroundMessagePoller : IAsyncDisposable
                         };
                         await _channel.Writer.WriteAsync(receivedMessage, ct);
                     }
+                    
+                    _lastPolledOffset[messages.PartitionId] = messages.Messages[^1].Header.Offset;
 
-                    if (messages.Messages.Any() && _config.AutoCommitMode == AutoCommitMode.AfterPoll)
+                    if (_config.AutoCommitMode == AutoCommitMode.AfterPoll)
                     {
                         await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId,
                             messages.Messages[^1].Header.Offset, (uint)messages.PartitionId, ct);
                     }
 
-                    if (messages.Messages.Any())
+                    if (_config.PollingStrategy.Kind == MessagePolling.Offset)
                     {
                         var lastOffset = messages.Messages[^1].Header.Offset;
                         _currentPollingStrategy = PollingStrategy.Offset(lastOffset + 1);
@@ -122,7 +138,6 @@ internal sealed partial class BackgroundMessagePoller : IAsyncDisposable
 
                 await Task.Delay(_config.PollingIntervalMs, ct);
             }
-
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {

@@ -92,6 +92,11 @@ public partial class IggyConsumer : IAsyncDisposable
         await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId, offset, partitionId, ct);
     }
 
+    public async Task DeleteOffsetAsync(uint partitionId, CancellationToken ct = default)
+    {
+        await _client.DeleteOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId, partitionId, ct); 
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (_disposed)
