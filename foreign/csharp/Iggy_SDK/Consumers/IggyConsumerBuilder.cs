@@ -11,8 +11,8 @@ namespace Apache.Iggy.Consumers;
 
 public class IggyConsumerBuilder
 {
-    public IggyConsumerConfig Config { get; set; } = new ();
-    public IIggyClient? IggyClient { get; private set; }
+    private IggyConsumerConfig Config { get; set; } = new ();
+    private IIggyClient? IggyClient { get; set; }
 
     private EventHandler<ConsumerErrorEventArgs>? _onPollingError;
     private EventHandler<MessageDecryptionFailedEventArgs>? _onMessageDecryptionFailed;
@@ -22,8 +22,8 @@ public class IggyConsumerBuilder
     /// </summary>
     /// <param name="streamId">Stream id</param>
     /// <param name="topicId">Topic id</param>
-    /// <returns></returns>
-    public static IggyConsumerBuilder Create(Identifier streamId, Identifier topicId)
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining</returns>
+    public static IggyConsumerBuilder Create(Identifier streamId, Identifier topicId, Consumer consumer)
     {
         return new IggyConsumerBuilder
         {
@@ -31,26 +31,28 @@ public class IggyConsumerBuilder
             {
                 CreateIggyClient = true,
                 StreamId = streamId,
-                TopicId = topicId
+                TopicId = topicId,
+                Consumer = consumer
             }
         };
     }
 
     /// <summary>
-    /// Create consumer builder with existing iggy client. It's not needed to pass connectin data after that
+    /// Create consumer builder with existing iggy client. It's not needed to pass connection data after that
     /// </summary>
     /// <param name="streamId">Stream id</param>
     /// <param name="topicId">Topic id</param>
     /// <param name="iggyClient">Iggy client</param>
-    /// <returns></returns>
-    public static IggyConsumerBuilder Create(IIggyClient iggyClient, Identifier streamId, Identifier topicId)
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining</returns>
+    public static IggyConsumerBuilder Create(IIggyClient iggyClient, Identifier streamId, Identifier topicId, Consumer consumer)
     {
         return new IggyConsumerBuilder()
         {
             Config = new IggyConsumerConfig()
             {
                 StreamId = streamId,
-                TopicId = topicId
+                TopicId = topicId,
+                Consumer = consumer
             },
             IggyClient = iggyClient
         };
@@ -65,7 +67,7 @@ public class IggyConsumerBuilder
     /// <param name="password">The password for authentication.</param>
     /// <param name="receiveBufferSize">The size of the receive buffer.</param>
     /// <param name="sendBufferSize">The size of the send buffer.</param>
-    /// <returns>The current instance of the consumer builder with the updated connection settings.</returns>
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining.</returns>
     public IggyConsumerBuilder WithConnection(Protocol protocol, string address, string login, string password,
         int receiveBufferSize = 4096, int sendBufferSize = 4096)
     {
@@ -78,7 +80,12 @@ public class IggyConsumerBuilder
     
         return this;
     }
-    
+
+    /// <summary>
+    /// Sets a message decryptor for the consumer, enabling decryption of incoming messages.
+    /// </summary>
+    /// <param name="decryptor">The decryptor implementation to handle message decryption.</param>
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining.</returns>
     public IggyConsumerBuilder WithDecryptor(IMessageEncryptor decryptor)
     {
         Config.MessageEncryptor = decryptor;
@@ -86,20 +93,25 @@ public class IggyConsumerBuilder
         return this;
     }
 
-    public IggyConsumerBuilder WithPartition(uint partitionId)
+    /// <summary>
+    /// Specifies the partition for the consumer to consume messages from.
+    /// </summary>
+    /// <param name="partitionId">The identifier of the partition to consume from.</param>
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining.</returns>
+    public IggyConsumerBuilder WithPartitions(uint partitionId)
     {
         Config.PartitionId = partitionId;
 
         return this;
     }
 
-    public IggyConsumerBuilder WithConsumer(Kinds.Consumer consumer)
-    {
-        Config.Consumer = consumer;
-
-        return this;
-    }
-
+    /// <summary>
+    /// Configures the consumer builder with a specified polling strategy.
+    /// A polling strategy defines the starting point for message consumption.
+    /// After first poll, poll strategy is updated to the next message offset.
+    /// </summary>
+    /// <param name="pollingStrategy">A strategy that defines how and from where messages are polled.</param>
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining.</returns>
     public IggyConsumerBuilder WithPollingStrategy(PollingStrategy pollingStrategy)
     {
         Config.PollingStrategy = pollingStrategy;
@@ -107,6 +119,11 @@ public class IggyConsumerBuilder
         return this;
     }
 
+    /// <summary>
+    /// Sets the batch size for the consumer. Default is 100.
+    /// </summary>
+    /// <param name="batchSize">The size of the batch to be consumed at one time.</param>
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining.</returns>
     public IggyConsumerBuilder WithBatchSize(uint batchSize)
     {
         Config.BatchSize = batchSize;
@@ -114,26 +131,36 @@ public class IggyConsumerBuilder
         return this;
     }
 
-    public IggyConsumerBuilder WithAutoCommit(AutoCommitMode autoCommit)
+    /// <summary>
+    /// Configures the consumer builder with the specified auto-commit mode.
+    /// </summary>
+    /// <param name="autoCommit">The auto-commit mode to set for the consumer.</param>
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining.</returns>
+    public IggyConsumerBuilder WithAutoCommitMode(AutoCommitMode autoCommit)
     {
         Config.AutoCommit = autoCommit == AutoCommitMode.Auto;
         Config.AutoCommitMode = autoCommit;
 
         return this;
     }
-    
+
     /// <summary>
-    /// Set size of internal bounded channel
+    /// Sets the buffer size of internal bounded channel. Default is 100.
     /// </summary>
-    /// <param name="bufferSize"></param>
-    /// <returns></returns>
+    /// <param name="bufferSize">The size of the buffer to be used.</param>
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining.</returns>
     public IggyConsumerBuilder WithBufferSize(int bufferSize)
     {
-        Config.BufferSize = bufferSize;
+        Config.ChannelBufferSize = bufferSize;
 
         return this;
     }
 
+    /// <summary>
+    /// Sets the logger factory for the consumer builder.
+    /// </summary>
+    /// <param name="loggerFactory">The logger factory to be used for logging.</param>
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining.</returns>
     public IggyConsumerBuilder WithLogger(ILoggerFactory loggerFactory)
     {
         Config.LoggerFactory = loggerFactory;
@@ -144,10 +171,10 @@ public class IggyConsumerBuilder
     /// <summary>
     /// Configures consumer group settings for the consumer.
     /// </summary>
-    /// <param name="groupName">The name of the consumer group.</param>
+    /// <param name="groupName">The name of the consumer group if consumer kind is numeric</param>
     /// <param name="createIfNotExists">Whether to create the consumer group if it doesn't exist.</param>
     /// <param name="joinGroup">Whether to join the consumer group after creation/verification.</param>
-    /// <returns>The current instance of the consumer builder with the updated consumer group settings.</returns>
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining.</returns>
     public IggyConsumerBuilder WithConsumerGroup(string groupName, bool createIfNotExists = true, bool joinGroup = true)
     {
         Config.ConsumerGroupName = groupName;
@@ -157,18 +184,32 @@ public class IggyConsumerBuilder
         return this;
     }
 
+    /// <summary>
+    /// Sets an event handler for handling polling errors in the consumer.
+    /// </summary>
+    /// <param name="handler">The event handler to handle polling errors.</param>
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining.</returns>
     public IggyConsumerBuilder OnPollingError(EventHandler<ConsumerErrorEventArgs> handler)
     {
         _onPollingError = handler;
         return this;
     }
 
+    /// <summary>
+    /// Registers an event handler for message decryption failure events.
+    /// </summary>
+    /// <param name="handler">The event handler to be executed when a message decryption failure occurs.</param>
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining.</returns>
     public IggyConsumerBuilder OnMessageDecryptionFailed(EventHandler<MessageDecryptionFailedEventArgs> handler)
     {
         _onMessageDecryptionFailed = handler;
         return this;
     }
 
+    /// <summary>
+    /// Builds and returns an instance of <see cref="IggyConsumer"/> configured with the specified options.
+    /// </summary>
+    /// <returns>An instance of <see cref="IggyConsumer"/> based on the current builder configuration.</returns>
     public IggyConsumer Build()
     {
         if (Config.CreateIggyClient)
@@ -182,9 +223,9 @@ public class IggyConsumerBuilder
             });
         }
 
-        if (Config.BufferSize == 0)
+        if (Config.ChannelBufferSize == 0)
         {
-            Config.BufferSize = Config.BatchSize <= int.MaxValue ? (int)Config.BatchSize : int.MaxValue;
+            Config.ChannelBufferSize = Config.BatchSize <= int.MaxValue ? (int)Config.BatchSize : int.MaxValue;
         }
 
         var consumer = new IggyConsumer(IggyClient!, Config,

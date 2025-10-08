@@ -72,13 +72,12 @@ public class IggyPublisherBuilder
         return this;
     }
 
-    public IggyPublisherBuilder CreateTopicIfNotExists(string name, Partitioning partitioning, uint topicPartitionsCount = 1,
+    public IggyPublisherBuilder CreateTopicIfNotExists(string name, uint topicPartitionsCount = 1,
         CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None, byte? replicationFactor = null,
         ulong messageExpiry = 0, ulong maxTopicSize = 0)
     {
         Config.CreateTopic = true;
         Config.TopicName = name;
-        Config.Partitioning = partitioning;
         Config.TopicPartitionsCount = topicPartitionsCount;
         Config.TopicCompressionAlgorithm = compressionAlgorithm;
         Config.TopicReplicationFactor = replicationFactor;

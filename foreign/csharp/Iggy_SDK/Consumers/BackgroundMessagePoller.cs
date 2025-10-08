@@ -31,7 +31,7 @@ internal sealed partial class BackgroundMessagePoller : IAsyncDisposable
         _config = config;
         _logger = logger;
         _cancellationTokenSource = new CancellationTokenSource();
-        _channel = Channel.CreateBounded<ReceivedMessage>(new BoundedChannelOptions(config.BufferSize)
+        _channel = Channel.CreateBounded<ReceivedMessage>(new BoundedChannelOptions(config.ChannelBufferSize)
         {
             SingleReader = true,
             SingleWriter = true,
@@ -42,11 +42,13 @@ internal sealed partial class BackgroundMessagePoller : IAsyncDisposable
 
     public void Start(CancellationToken externalCt = default)
     {
-        if (_pollingTask == null || _pollingTask.IsCompleted)
+        if (_pollingTask is { IsCompleted: false })
         {
-            var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(externalCt, _cancellationTokenSource.Token);
-            _pollingTask = PollMessagesAsync(linkedCts.Token);
+            return;
         }
+
+        var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(externalCt, _cancellationTokenSource.Token);
+        _pollingTask = PollMessagesAsync(linkedCts.Token);
     }
 
     private async Task PollMessagesAsync(CancellationToken ct)

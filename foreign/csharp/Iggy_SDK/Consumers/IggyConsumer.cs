@@ -14,6 +14,7 @@ public partial class IggyConsumer : IAsyncDisposable
     private bool _isInitialized;
     private readonly BackgroundMessagePoller _backgroundPoller;
     private bool _disposed;
+    private string? _consumerGroupName;
 
     /// <summary>
     /// Fired when an error occurs during message polling
@@ -40,7 +41,7 @@ public partial class IggyConsumer : IAsyncDisposable
         _logger = logger;
 
         var pollerLogger = _config.LoggerFactory?.CreateLogger<BackgroundMessagePoller>()
-            ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<BackgroundMessagePoller>.Instance;
+                           ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<BackgroundMessagePoller>.Instance;
 
         _backgroundPoller = new BackgroundMessagePoller(_client, _config, pollerLogger);
     }
@@ -52,81 +53,16 @@ public partial class IggyConsumer : IAsyncDisposable
             return;
         }
 
-        await _client.LoginUser(_config.Login, _config.Password, ct);
+        if (_config.CreateIggyClient)
+        {
+            await _client.LoginUser(_config.Login, _config.Password, ct);
+        }
 
         await InitializeConsumerGroupAsync(ct);
 
         _isInitialized = true;
     }
-
-    private async Task InitializeConsumerGroupAsync(CancellationToken ct)
-    {
-        if (string.IsNullOrEmpty(_config.ConsumerGroupName))
-        {
-            return;
-        }
-
-        var groupName = _config.ConsumerGroupName;
-
-        try
-        {
-            var existingGroup = await _client.GetConsumerGroupByIdAsync(_config.StreamId, _config.TopicId,
-                Identifier.String(groupName), ct);
-
-            if (existingGroup == null && _config.CreateConsumerGroupIfNotExists)
-            {
-                LogCreatingConsumerGroup(groupName, _config.StreamId, _config.TopicId);
-
-                var createdGroup = await TryCreateConsumerGroupAsync(groupName, ct);
-
-                if (createdGroup)
-                {
-                    LogConsumerGroupCreated(groupName);
-                }
-            }
-            else if (existingGroup == null)
-            {
-                throw new ConsumerGroupNotFoundException(_config.ConsumerGroupName);
-            }
-
-            if (_config.JoinConsumerGroup)
-            {
-                LogJoiningConsumerGroup(groupName, _config.StreamId, _config.TopicId);
-
-                await _client.JoinConsumerGroupAsync(_config.StreamId, _config.TopicId, Identifier.String(groupName), ct);
-
-                LogConsumerGroupJoined(groupName);
-            }
-        }
-        catch (Exception ex)
-        {
-            LogFailedToInitializeConsumerGroup(ex, groupName);
-            throw;
-        }
-    }
-
-    private async Task<bool> TryCreateConsumerGroupAsync(string groupName, CancellationToken ct)
-    {
-        try
-        {
-            await _client.CreateConsumerGroupAsync(_config.StreamId, _config.TopicId,
-                groupName, token: ct);
-        }
-        catch (IggyInvalidStatusCodeException ex)
-        {
-            // 5004 - Consumer group already exists TODO: refactor errors
-            if (ex.StatusCode != 5004)
-            {
-                LogFailedToCreateConsumerGroup(ex, groupName);
-                return false;
-            }
-
-            return true;
-        }
-
-        return true;
-    }
-
+    
     public async IAsyncEnumerable<ReceivedMessage> ReceiveAsync([EnumeratorCancellation] CancellationToken ct = default)
     {
         if (!_isInitialized)
@@ -142,15 +78,18 @@ public partial class IggyConsumer : IAsyncDisposable
 
             yield return message;
 
-            if (!_config.AutoCommit || _config.AutoCommitMode != AutoCommitMode.AfterReceive)
+            if (_config.AutoCommitMode == AutoCommitMode.AfterReceive)
             {
-                continue;
+                await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId,
+                    message.CurrentOffset, message.PartitionId, ct);
             }
 
-            await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId,
-                message.CurrentOffset, message.PartitionId, ct);
-
         } while (!ct.IsCancellationRequested);
+    }
+
+    public async Task StoreOffsetAsync(ulong offset, uint partitionId, CancellationToken ct = default)
+    {
+        await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId, offset, partitionId, ct);
     }
 
     public async ValueTask DisposeAsync()
@@ -162,18 +101,18 @@ public partial class IggyConsumer : IAsyncDisposable
 
         await _backgroundPoller.DisposeAsync();
 
-        if (!string.IsNullOrEmpty(_config.ConsumerGroupName) && _isInitialized)
+        if (!string.IsNullOrEmpty(_consumerGroupName) && _isInitialized)
         {
             try
             {
                 await _client.LeaveConsumerGroupAsync(_config.StreamId, _config.TopicId,
-                    Identifier.String(_config.ConsumerGroupName));
+                    Identifier.String(_consumerGroupName));
 
-                LogLeftConsumerGroup(_config.ConsumerGroupName);
+                LogLeftConsumerGroup(_consumerGroupName);
             }
             catch (Exception e)
             {
-                LogFailedToLeaveConsumerGroup(e, _config.ConsumerGroupName);
+                LogFailedToLeaveConsumerGroup(e, _consumerGroupName);
             }
         }
 
@@ -191,5 +130,81 @@ public partial class IggyConsumer : IAsyncDisposable
         }
 
         _disposed = true;
+    }
+
+    private async Task InitializeConsumerGroupAsync(CancellationToken ct)
+    {
+        if (_config.Consumer.Type == ConsumerType.Consumer)
+        {
+            return;
+        }
+
+        _consumerGroupName = _config.Consumer.Id.Kind == IdKind.String
+            ? _config.Consumer.Id.GetString()
+            : _config.ConsumerGroupName;
+
+        if (string.IsNullOrEmpty(_consumerGroupName))
+        {
+            throw new InvalidConsumerGroupNameException("Consumer group name is empty or null.");
+        }
+        
+        try
+        { 
+            var existingGroup = await _client.GetConsumerGroupByIdAsync(_config.StreamId, _config.TopicId,
+                Identifier.String(_consumerGroupName), ct);
+
+            if (existingGroup == null && _config.CreateConsumerGroupIfNotExists)
+            {
+                LogCreatingConsumerGroup(_consumerGroupName, _config.StreamId, _config.TopicId);
+
+                var createdGroup = await TryCreateConsumerGroupAsync(_consumerGroupName, _config.Consumer.Id, ct);
+
+                if (createdGroup)
+                {
+                    LogConsumerGroupCreated(_consumerGroupName);
+                }
+            }
+            else if (existingGroup == null)
+            {
+                throw new ConsumerGroupNotFoundException(_consumerGroupName);
+            }
+
+            if (_config.JoinConsumerGroup)
+            {
+                LogJoiningConsumerGroup(_consumerGroupName, _config.StreamId, _config.TopicId);
+
+                await _client.JoinConsumerGroupAsync(_config.StreamId, _config.TopicId, Identifier.String(_consumerGroupName), ct);
+
+                LogConsumerGroupJoined(_consumerGroupName);
+            }
+        }
+        catch (Exception ex)
+        {
+            LogFailedToInitializeConsumerGroup(ex, _consumerGroupName);
+            throw;
+        }
+    }
+
+    private async Task<bool> TryCreateConsumerGroupAsync(string groupName, Identifier groupId,  CancellationToken ct)
+    {
+        try
+        {
+            uint? id = groupId.Kind == IdKind.Numeric ? groupId.GetUInt32() : null;
+            await _client.CreateConsumerGroupAsync(_config.StreamId, _config.TopicId,
+                groupName, id, ct);
+        }
+        catch (IggyInvalidStatusCodeException ex)
+        {
+            // 5004 - Consumer group already exists TODO: refactor errors
+            if (ex.StatusCode != 5004)
+            {
+                LogFailedToCreateConsumerGroup(ex, groupName);
+                return false;
+            }
+
+            return true;
+        }
+
+        return true;
     }
 }

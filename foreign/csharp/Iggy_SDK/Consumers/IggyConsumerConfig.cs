@@ -19,19 +19,18 @@ public class IggyConsumerConfig
     public Identifier TopicId  { get; set; }
     public IMessageEncryptor? MessageEncryptor { get; set; } = null;
     public uint? PartitionId { get; set; }
-    public Kinds.Consumer Consumer { get; set; }
+    public Consumer Consumer { get; set; }
     public PollingStrategy PollingStrategy { get; set; }
-    public uint BatchSize { get; set; }
+    public uint BatchSize { get; set; } = 100;
     public bool AutoCommit { get; set; }
     public AutoCommitMode AutoCommitMode { get; set; }
-    public int BufferSize { get; set; }
+    public int ChannelBufferSize { get; set; } = 100;
 
     public string? ConsumerGroupName { get; set; }
     public bool CreateConsumerGroupIfNotExists { get; set; } = true;
     public bool JoinConsumerGroup { get; set; } = true;
 
-    public int PollingIntervalMs { get; set; } = 10;
+    public int PollingIntervalMs { get; set; } = 100;
 
     public ILoggerFactory? LoggerFactory { get; set; }
-
 }

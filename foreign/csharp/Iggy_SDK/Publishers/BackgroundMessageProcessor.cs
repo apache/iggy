@@ -16,6 +16,7 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
     private readonly CancellationTokenSource _cancellationTokenSource;
     private Task? _backgroundTask;
     private bool _disposed = false;
+    private bool _sending;
 
     public event EventHandler<PublisherErrorEventArgs>? OnBackgroundError;
     public event EventHandler<MessageBatchFailedEventArgs>? OnMessageBatchFailed;
@@ -55,6 +56,8 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
         _backgroundTask = RunBackgroundProcessor(_cancellationTokenSource.Token);
         LogBackgroundProcessorStarted();
     }
+    
+    public bool IsSending => _sending;
 
     private async Task RunBackgroundProcessor(CancellationToken ct)
     {
@@ -69,6 +72,7 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
                        _messageReader.TryRead(out var message))
                 {
                     messageBatch.Add(message);
+                    _sending = true;
                 }
 
                 if (messageBatch.Count == 0)
@@ -82,6 +86,7 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
 
                 await SendBatchWithRetry(messageBatch, ct);
                 messageBatch.Clear();
+                _sending = false;
             }
         }
         catch (OperationCanceledException)
@@ -96,6 +101,7 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
         finally
         {
             LogBackgroundProcessorStopped();
+            _sending = false;
         }
     }
 

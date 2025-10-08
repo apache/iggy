@@ -17,7 +17,7 @@ public class IggyPublisherConfig
     public int ReceiveBufferSize { get; internal set; } = 4096;
 
     public int SendBufferSize { get; internal set; } = 4096;
-    public Partitioning Partitioning  { get; internal set; }
+    public Partitioning Partitioning  { get; internal set; } = Partitioning.None();
     public bool CreateStream { get; internal set; }
     public string? StreamName { get; internal set; }
     public bool CreateTopic { get; internal set; }

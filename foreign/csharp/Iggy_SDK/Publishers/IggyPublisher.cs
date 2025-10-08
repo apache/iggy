@@ -57,6 +57,9 @@ public partial class IggyPublisher : IAsyncDisposable
             }
         }
     }
+    
+    public Identifier StreamId => _config.StreamId;
+    public Identifier TopicId => _config.TopicId;
 
     public IggyPublisher(IIggyClient client, IggyPublisherConfig config, ILogger<IggyPublisher> logger)
     {
@@ -83,10 +86,13 @@ public partial class IggyPublisher : IAsyncDisposable
             return;
         }
 
+        
         LogInitializingPublisher(_config.StreamId, _config.TopicId);
-
-        await _client.LoginUser(_config.Login, _config.Password, ct);
-        LogUserLoggedIn(_config.Login);
+        if (_config.CreateIggyClient)
+        {
+            await _client.LoginUser(_config.Login, _config.Password, ct);
+            LogUserLoggedIn(_config.Login);
+        }
 
         await CreateStreamIfNeeded(ct);
         await CreateTopicIfNeeded(ct);
@@ -161,7 +167,7 @@ public partial class IggyPublisher : IAsyncDisposable
         LogTopicCreated(_config.TopicId, _config.StreamId);
     }
 
-    public async Task SendMessages(Message[] messages, CancellationToken ct = default)
+    public async Task SendMessages(IList<Message> messages, CancellationToken ct = default)
     {
         if (!_isInitialized)
         {
@@ -169,7 +175,7 @@ public partial class IggyPublisher : IAsyncDisposable
             throw new PublisherNotInitializedException();
         }
 
-        if (messages.Length == 0)
+        if (messages.Count == 0)
         {
             return;
         }
@@ -178,7 +184,7 @@ public partial class IggyPublisher : IAsyncDisposable
 
         if (_config.EnableBackgroundSending && _backgroundProcessor != null)
         {
-            LogQueuingMessages(messages.Length);
+            LogQueuingMessages(messages.Count);
             foreach (var message in messages)
             {
                 await _backgroundProcessor.MessageWriter.WriteAsync(message, ct);
@@ -187,7 +193,7 @@ public partial class IggyPublisher : IAsyncDisposable
         else
         {
             await _client.SendMessagesAsync(_config.StreamId, _config.TopicId, _config.Partitioning, messages, ct);
-            LogSuccessfullySentMessages(messages.Length);
+            LogSuccessfullySentMessages(messages.Count);
         }
     }
 
@@ -200,7 +206,8 @@ public partial class IggyPublisher : IAsyncDisposable
 
         LogWaitingForPendingMessages();
 
-        while (_backgroundProcessor.MessageReader.Count > 0 && !ct.IsCancellationRequested)
+        while (_backgroundProcessor.MessageReader.Count > 0 ||
+               _backgroundProcessor.IsSending) 
         {
             await Task.Delay(10, ct);
         }
@@ -208,7 +215,7 @@ public partial class IggyPublisher : IAsyncDisposable
         LogAllPendingMessagesSent();
     }
 
-    private void EncryptMessages(Message[] messages)
+    private void EncryptMessages(IList<Message> messages)
     {
         if (_config.MessageEncryptor == null)
         {
