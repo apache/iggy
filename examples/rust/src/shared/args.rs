@@ -159,7 +159,7 @@ pub struct Args {
     #[arg(long, default_value = "5s")]
     pub quic_heartbeat_interval: String,
 
-    #[arg(long, default_value = "127.0.0.1:8095")]
+    #[arg(long, default_value = "127.0.0.1:8092")]
     pub websocket_server_address: String,
 
     #[arg(long, default_value = "true")]
@@ -237,7 +237,7 @@ impl Default for Args {
             quic_max_idle_timeout: 10000,
             quic_validate_certificate: false,
             quic_heartbeat_interval: "5s".to_string(),
-            websocket_server_address: "127.0.0.1:8095".to_string(),
+            websocket_server_address: "127.0.0.1:8092".to_string(),
             websocket_reconnection_enabled: true,
             websocket_reconnection_max_retries: None,
             websocket_reconnection_interval: "1s".to_string(),

@@ -605,9 +605,3 @@ cpu_allocation = "all"
 
 enabled = true
 address = "0.0.0.0:8092"
-# max_frame_size = "1 MB"
-# max_message_size = "10 MB"
-# read_buffer_size = "100 KB"
-# write_buffer_size = "100 KB"
-# max_write_buffer_size = "100 KB"
-# accept_unmasked_frames = false
