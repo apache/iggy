@@ -25,12 +25,8 @@ services:
       - 3000:3000
       - 8080:8080
       - 8090:8090
-  iggy-ui:
-    build: .
-    environment:
-      PUBLIC_IGGY_API_URL: http://iggy-server:3000
-    ports:
-      - 3050:3050
+    volumes:
+      - iggy-server:/local_data
 
 volumes:
   iggy-server:
