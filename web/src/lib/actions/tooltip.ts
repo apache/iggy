@@ -150,7 +150,7 @@ export function tooltip(
     ['mouseenter', showTooltip],
     ['mouseleave', hideTooltip],
     ['focus', showTooltip],
-    ['blur', hideTooltip]
+    ['blur-sm', hideTooltip]
   ] as const;
 
   if (!clickable) {

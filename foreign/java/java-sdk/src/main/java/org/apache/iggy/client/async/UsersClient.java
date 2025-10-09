@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -17,35 +17,30 @@
  * under the License.
  */
 
-module.exports = {
-  root: true,
-  extends: [
-    'eslint:recommended',
-    'plugin:@typescript-eslint/recommended',
-    'plugin:svelte/recommended',
-    'prettier'
-  ],
-  parser: '@typescript-eslint/parser',
-  plugins: ['@typescript-eslint'],
+package org.apache.iggy.client.async;
 
-  parserOptions: {
-    sourceType: 'module',
-    ecmaVersion: 2020,
-    extraFileExtensions: ['.svelte']
-  },
+import org.apache.iggy.user.IdentityInfo;
 
-  env: {
-    browser: true,
-    es2017: true,
-    node: true
-  },
-  overrides: [
-    {
-      files: ['*.svelte'],
-      parser: 'svelte-eslint-parser',
-      parserOptions: {
-        parser: '@typescript-eslint/parser'
-      }
-    }
-  ]
-};
+import java.util.concurrent.CompletableFuture;
+
+/**
+ * Async client for user management operations.
+ */
+public interface UsersClient {
+
+    /**
+     * Logs in to the server with the specified username and password.
+     *
+     * @param username The username to login with
+     * @param password The password to login with
+     * @return A CompletableFuture that completes with the user's identity information
+     */
+    CompletableFuture<IdentityInfo> loginAsync(String username, String password);
+
+    /**
+     * Logs out from the server.
+     *
+     * @return A CompletableFuture that completes when logout is successful
+     */
+    CompletableFuture<Void> logoutAsync();
+}

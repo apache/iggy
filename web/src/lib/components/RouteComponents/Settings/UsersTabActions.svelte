@@ -24,13 +24,13 @@
       <div class="max-w-[170px]">
         <Input bind:value={$searchQuery} placeholder="Search" name="search">
           {#snippet prefix()}
-                    <span >
+            <span>
               <Icon name="search" />
             </span>
-                  {/snippet}
+          {/snippet}
         </Input>
       </div>
-      <!-- 
+      <!--
       <Button variant="contained" onclick={() => openModal('AddUserModal', {streams: })}>
         <Icon name="plus" />
         Add user

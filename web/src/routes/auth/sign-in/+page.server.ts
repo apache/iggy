@@ -20,7 +20,7 @@
 import { fail, redirect } from '@sveltejs/kit';
 import type { Actions } from './$types';
 import { message, superValidate } from 'sveltekit-superforms/server';
-import { zod } from 'sveltekit-superforms/adapters';
+import { zod4 } from 'sveltekit-superforms/adapters';
 import { z } from 'zod';
 import { typedRoute } from '$lib/types/appRoutes';
 import { fetchIggyApi } from '$lib/api/fetchApi';
@@ -33,14 +33,14 @@ const schema = z.object({
 });
 
 export const load = async () => {
-  const form = await superValidate(zod(schema));
+  const form = await superValidate(zod4(schema));
 
   return { form };
 };
 
 export const actions = {
   default: async ({ request, cookies }) => {
-    const form = await superValidate(request, zod(schema));
+    const form = await superValidate(request, zod4(schema));
 
     if (!form.valid) {
       return fail(400, { form });
@@ -58,9 +58,7 @@ export const actions = {
       return message(form, 'Username or password is not valid', { status: 403 });
     }
 
-    const {
-      access_token
-    } = (await getJson(result)) as any;
+    const { access_token } = (await getJson(result)) as any;
 
     cookies.set(tokens.accessToken, access_token.token, {
       path: '/',
