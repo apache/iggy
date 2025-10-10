@@ -15,21 +15,31 @@
 # specific language governing permissions and limitations
 # under the License.
 
-FROM node:lts-alpine AS base
-ARG IGGY_CI_BUILD
-ENV IGGY_CI_BUILD=${IGGY_CI_BUILD}
-ENV NPM_CONFIG_LOGLEVEL=warn
-ENV NPM_CONFIG_COLOR=false
-WORKDIR /home/node/app
-COPY --chown=node:node . /home/node/app/
+FROM node:lts-alpine AS deps
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --prefer-offline --no-audit
 
-FROM base AS development
-WORKDIR /home/node/app
-RUN npm install
+FROM node:lts-alpine AS builder
+WORKDIR /app
 
-FROM base AS production
-WORKDIR /home/node/app
-COPY --chown=node:node --from=development /home/node/app/node_modules /home/node/app/node_modules
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+
 RUN npm run build
+FROM node:lts-alpine AS production
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci --production --prefer-offline --no-audit
+
+COPY --from=builder /app/build ./build
+USER node
+
 EXPOSE 3050
-CMD ["npm", "run", "preview"]
+
+ENV PORT=3050
+ENV NODE_ENV=production
+
+CMD ["node", "build"]
