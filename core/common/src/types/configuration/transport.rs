@@ -32,7 +32,7 @@ pub enum TransportProtocol {
     Quic = 2,
     #[strum(to_string = "http")]
     Http = 3,
-    #[strum(to_string = "websocket")]
+    #[strum(to_string = "ws")]
     WebSocket = 4,
 }
 

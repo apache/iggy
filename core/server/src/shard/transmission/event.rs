@@ -150,7 +150,4 @@ pub enum ShardEvent {
         protocol: TransportProtocol,
         address: SocketAddr,
     },
-    WebSocketBound {
-        address: SocketAddr,
-    },
 }

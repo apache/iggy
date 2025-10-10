@@ -65,12 +65,12 @@ pub async fn start(
         local_addr
     );
 
-    if shard.id == 0 {
-        let event = ShardEvent::WebSocketBound {
-            address: local_addr,
-        };
-        shard.broadcast_event_to_all_shards(event).await;
-    }
+    // Notify shard about the bound address
+    let event = ShardEvent::AddressBound {
+        protocol: TransportProtocol::WebSocket,
+        address: local_addr,
+    };
+    shard.handle_event(event).await.ok();
 
     let ws_config = config.to_tungstenite_config();
     shard_info!(

@@ -477,7 +477,7 @@ mod tests {
 
     #[test]
     fn should_succeed_from_connection_string() {
-        let connection_string = "iggy+websocket://user:secret@127.0.0.1:8080";
+        let connection_string = "iggy+ws://user:secret@127.0.0.1:8080";
         let client = WebSocketClient::from_connection_string(connection_string);
         assert!(client.is_ok());
     }
@@ -510,29 +510,28 @@ mod tests {
 
     #[test]
     fn should_fail_without_username() {
-        let connection_string = "iggy+websocket://:secret@127.0.0.1:8080";
+        let connection_string = "iggy+ws://:secret@127.0.0.1:8080";
         let client = WebSocketClient::from_connection_string(connection_string);
         assert!(client.is_err());
     }
 
     #[test]
     fn should_fail_without_password() {
-        let connection_string = "iggy+websocket://user:@127.0.0.1:8080";
+        let connection_string = "iggy+ws://user:@127.0.0.1:8080";
         let client = WebSocketClient::from_connection_string(connection_string);
         assert!(client.is_err());
     }
 
     #[test]
     fn should_fail_without_server_address() {
-        let connection_string = "iggy+websocket://user:secret@:8080";
+        let connection_string = "iggy+ws://user:secret@:8080";
         let client = WebSocketClient::from_connection_string(connection_string);
         assert!(client.is_err());
     }
 
     #[test]
     fn should_fail_with_invalid_options() {
-        let connection_string =
-            "iggy+websocket://user:secret@127.0.0.1:8080?invalid_option=invalid";
+        let connection_string = "iggy+ws://user:secret@127.0.0.1:8080?invalid_option=invalid";
         let client = WebSocketClient::from_connection_string(connection_string);
         assert!(client.is_err());
     }

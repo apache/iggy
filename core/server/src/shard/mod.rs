@@ -160,7 +160,10 @@ impl IggyShard {
 
         // Spawn config writer task on shard 0 if we need to wait for bound addresses
         if self.id == 0
-            && (self.config.tcp.enabled || self.config.quic.enabled || self.config.http.enabled)
+            && (self.config.tcp.enabled
+                || self.config.quic.enabled
+                || self.config.http.enabled
+                || self.config.websocket.enabled)
         {
             self.spawn_config_writer_task();
         }
@@ -179,12 +182,12 @@ impl IggyShard {
             continuous::spawn_quic_server(self.clone());
         }
 
-        if self.config.message_saver.enabled {
-            periodic::spawn_message_saver(self.clone());
-        }
-
         if self.config.websocket.enabled && self.id == 0 {
             continuous::spawn_websocket_server(self.clone());
+        }
+
+        if self.config.message_saver.enabled {
+            periodic::spawn_message_saver(self.clone());
         }
 
         if self.config.heartbeat.enabled {
@@ -195,15 +198,7 @@ impl IggyShard {
             periodic::spawn_personal_access_token_cleaner(self.clone());
         }
 
-        if self
-            .config
-            .system
-            .logging
-            .sysinfo_print_interval
-            .as_micros()
-            > 0
-            && self.id == 0
-        {
+        if !self.config.system.logging.sysinfo_print_interval.is_zero() && self.id == 0 {
             periodic::spawn_sysinfo_printer(self.clone());
         }
     }
@@ -213,6 +208,7 @@ impl IggyShard {
         let tcp_enabled = self.config.tcp.enabled;
         let quic_enabled = self.config.quic.enabled;
         let http_enabled = self.config.http.enabled;
+        let websocket_enabled = self.config.websocket.enabled;
 
         let notify_receiver = shard.config_writer_receiver.clone();
 
@@ -233,8 +229,10 @@ impl IggyShard {
                     let tcp_ready = !tcp_enabled || shard.tcp_bound_address.get().is_some();
                     let quic_ready = !quic_enabled || shard.quic_bound_address.get().is_some();
                     let http_ready = !http_enabled || shard.http_bound_address.get().is_some();
+                    let websocket_ready =
+                        !websocket_enabled || shard.websocket_bound_address.get().is_some();
 
-                    if tcp_ready && quic_ready && http_ready {
+                    if tcp_ready && quic_ready && http_ready && websocket_ready {
                         break;
                     }
                 }
@@ -244,13 +242,15 @@ impl IggyShard {
                 let tcp_addr = shard.tcp_bound_address.get();
                 let quic_addr = shard.quic_bound_address.get();
                 let http_addr = shard.http_bound_address.get();
+                let websocket_addr = shard.websocket_bound_address.get();
 
                 shard_info!(
                     shard.id,
-                    "Config writer: TCP addr = {:?}, QUIC addr = {:?}, HTTP addr = {:?}",
+                    "Config writer: TCP addr = {:?}, QUIC addr = {:?}, HTTP addr = {:?}, WebSocket addr = {:?}",
                     tcp_addr,
                     quic_addr,
-                    http_addr
+                    http_addr,
+                    websocket_addr
                 );
 
                 if let Some(tcp_addr) = tcp_addr {
@@ -263,6 +263,10 @@ impl IggyShard {
 
                 if let Some(http_addr) = http_addr {
                     current_config.http.address = http_addr.to_string();
+                }
+
+                if let Some(websocket_addr) = websocket_addr {
+                    current_config.websocket.address = websocket_addr.to_string();
                 }
 
                 let runtime_path = current_config.system.get_runtime_path();
@@ -1012,10 +1016,6 @@ impl IggyShard {
                     topic_id_usize,
                     group_id_usize,
                 )?;
-                Ok(())
-            }
-            ShardEvent::WebSocketBound { address } => {
-                self.websocket_bound_address.set(Some(address));
                 Ok(())
             }
             ShardEvent::LeftConsumerGroup {

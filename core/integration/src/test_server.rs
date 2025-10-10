@@ -301,6 +301,7 @@ impl TestServer {
             ServerProtocolAddr::QuicUdp(addr),
             ServerProtocolAddr::RawTcp(addr),
             ServerProtocolAddr::HttpTcp(addr),
+            ServerProtocolAddr::WebSocket(addr),
         ]
     }
 
@@ -310,6 +311,7 @@ impl TestServer {
             ServerProtocolAddr::QuicUdp(addr),
             ServerProtocolAddr::RawTcp(addr),
             ServerProtocolAddr::HttpTcp(addr),
+            ServerProtocolAddr::WebSocket(addr),
         ]
     }
 
@@ -357,7 +359,7 @@ impl TestServer {
                 match file_config_provider.load_config().await {
                     Ok(config) => {
                         // Verify config contains fresh addresses, not stale defaults
-                        // Default ports: TCP=8090, HTTP=3000, QUIC=8080
+                        // Default ports: TCP=8090, HTTP=3000, QUIC=8080, WebSocket=8092
                         let tcp_port: u16 = config
                             .tcp
                             .address
@@ -379,8 +381,19 @@ impl TestServer {
                             .nth(1)
                             .and_then(|s| s.parse().ok())
                             .unwrap_or(0);
+                        let websocket_port: u16 = config
+                            .websocket
+                            .address
+                            .split(':')
+                            .nth(1)
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0);
 
-                        if tcp_port == 8090 || http_port == 3000 || quic_port == 8080 {
+                        if tcp_port == 8090
+                            || http_port == 3000
+                            || quic_port == 8080
+                            || websocket_port == 8092
+                        {
                             sleep(Duration::from_millis(SLEEP_INTERVAL_MS));
                             continue;
                         }
