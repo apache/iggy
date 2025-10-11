@@ -145,18 +145,6 @@ public class IggyConsumerBuilder
     }
 
     /// <summary>
-    /// Sets the buffer size of internal bounded channel. Default is 100.
-    /// </summary>
-    /// <param name="bufferSize">The size of the buffer to be used.</param>
-    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining.</returns>
-    public IggyConsumerBuilder WithBufferSize(int bufferSize)
-    {
-        Config.ChannelBufferSize = bufferSize;
-
-        return this;
-    }
-
-    /// <summary>
     /// Sets the logger factory for the consumer builder.
     /// </summary>
     /// <param name="loggerFactory">The logger factory to be used for logging.</param>
@@ -221,11 +209,6 @@ public class IggyConsumerBuilder
                 ReceiveBufferSize = Config.ReceiveBufferSize,
                 SendBufferSize = Config.SendBufferSize
             });
-        }
-
-        if (Config.ChannelBufferSize == 0)
-        {
-            Config.ChannelBufferSize = Config.BatchSize <= int.MaxValue ? (int)Config.BatchSize : int.MaxValue;
         }
 
         var consumer = new IggyConsumer(IggyClient!, Config,

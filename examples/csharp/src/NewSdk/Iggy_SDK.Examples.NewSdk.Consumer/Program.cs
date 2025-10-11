@@ -41,8 +41,7 @@ var consumer = client.CreateConsumerBuilder(Identifier.String("new-sdk-stream"),
         Consumer.Group("new-sdk-consumer-group"))
     .WithPollingStrategy(PollingStrategy.Next())
     .WithConsumerGroup("new-sdk-consumer-group", true, true)
-    .WithBatchSize(10)
-    .WithBufferSize(50)
+    .WithBatchSize(20)
     .WithAutoCommitMode(AutoCommitMode.AfterReceive)
     .WithLogger(loggerFactory)
     .Build();
@@ -62,5 +61,5 @@ var cancellationTokenSource = new CancellationTokenSource();
 await foreach (var message in consumer.ReceiveAsync().WithCancellation(cancellationTokenSource.Token))
 {
     Utils.HandleMessage(message, logger);
-    await Task.Delay(5000);
+    await Task.Delay(200);
 }

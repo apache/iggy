@@ -24,7 +24,6 @@ public class IggyConsumerConfig
     public uint BatchSize { get; set; } = 100;
     public bool AutoCommit { get; set; }
     public AutoCommitMode AutoCommitMode { get; set; }
-    public int ChannelBufferSize { get; set; } = 100;
 
     public string? ConsumerGroupName { get; set; }
     public bool CreateConsumerGroupIfNotExists { get; set; } = true;

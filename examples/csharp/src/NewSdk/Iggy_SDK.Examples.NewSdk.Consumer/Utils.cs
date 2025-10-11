@@ -95,7 +95,8 @@ public static class Utils
                        throw new Exception("Could not deserialize envelope.");
 
         logger.LogInformation(
-            "Handling message type: {MessageType} at offset: {Offset}...",
+            "[{Partition}] Handling message type: {MessageType} at offset: {Offset}",
+            message.PartitionId,
             envelope.MessageType,
             message.CurrentOffset
         );

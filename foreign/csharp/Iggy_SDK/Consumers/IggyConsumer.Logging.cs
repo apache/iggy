@@ -62,4 +62,46 @@ public partial class IggyConsumer
         Level = LogLevel.Error,
         Message = "Failed to create consumer group '{GroupName}'")]
     private partial void LogFailedToCreateConsumerGroup(Exception exception, string groupName);
+    
+    [LoggerMessage(
+        EventId = 1,
+        Level = LogLevel.Debug,
+        Message = "Polling task cancelled")]
+    private partial void LogPollingTaskCancelled();
+
+    [LoggerMessage(
+        EventId = 2,
+        Level = LogLevel.Debug,
+        Message = "Message polling stopped")]
+    private partial void LogMessagePollingStopped();
+
+    [LoggerMessage(
+        EventId = 402,
+        Level = LogLevel.Error,
+        Message = "Failed to decrypt message with offset {Offset}")]
+    private partial void LogFailedToDecryptMessage(Exception exception, ulong offset);
+
+    [LoggerMessage(
+        EventId = 403,
+        Level = LogLevel.Error,
+        Message = "Failed to poll messages")]
+    private partial void LogFailedToPollMessages(Exception exception);
+
+    [LoggerMessage(
+        EventId = 300,
+        Level = LogLevel.Warning,
+        Message = "Returned monotonic time went backwards, now < lastPolledAt: ({Now} < {LastPolledAt})")]
+    private partial void LogMonotonicTimeWentBackwards(long now, long lastPolledAt);
+
+    [LoggerMessage(
+        EventId = 201,
+        Level = LogLevel.Trace,
+        Message = "No need to wait before polling messages. {Now} - {LastPolledAt} = {Elapsed}")]
+    private partial void LogNoNeedToWaitBeforePolling(long now, long lastPolledAt, long elapsed);
+
+    [LoggerMessage(
+        EventId = 202,
+        Level = LogLevel.Trace,
+        Message = "Waiting for {Remaining} milliseconds before polling messages")]
+    private partial void LogWaitingBeforePolling(long remaining);
 }
