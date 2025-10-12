@@ -219,8 +219,21 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
                     LogRetryingBatch(ex, messageBatch.Count, attempt + 1, _config.MaxRetryAttempts + 1,
                         delay.TotalMilliseconds);
                     await Task.Delay(delay, ct);
-                    delay = TimeSpan.FromMilliseconds(Math.Min(delay.TotalMilliseconds * _config.RetryBackoffMultiplier,
-                        _config.MaxRetryDelay.TotalMilliseconds));
+
+                    var nextDelayMs = delay.TotalMilliseconds * _config.RetryBackoffMultiplier;
+
+                    // Check for overflow or invalid values
+                    if (double.IsInfinity(nextDelayMs) || double.IsNaN(nextDelayMs) ||
+                        nextDelayMs > _config.MaxRetryDelay.TotalMilliseconds)
+                    {
+                        delay = _config.MaxRetryDelay;
+                    }
+                    else
+                    {
+                        // Ensure we don't exceed TimeSpan.MaxValue
+                        delay = TimeSpan.FromMilliseconds(
+                            Math.Min(nextDelayMs, TimeSpan.MaxValue.TotalMilliseconds));
+                    }
                 }
             }
         }

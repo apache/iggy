@@ -45,7 +45,7 @@ public class BasicMessagingOperationsSteps
     {
         _context.IggyClient = IggyClientFactory.CreateClient(new IggyClientConfigurator()
         {
-            BaseAdress = _context.TcpUrl,
+            BaseAddress = _context.TcpUrl,
             Protocol = Protocol.Tcp
         });
 

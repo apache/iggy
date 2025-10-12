@@ -258,8 +258,11 @@ public class IggyPublisherBuilder
     /// </summary>
     /// <returns>A fully configured <see cref="IggyPublisher" /> instance ready to send messages.</returns>
     /// <exception cref="ArgumentNullException">Thrown when IggyClient is null and CreateIggyClient is false.</exception>
+    /// <exception cref="InvalidOperationException">Thrown when the configuration is invalid.</exception>
     public IggyPublisher Build()
     {
+        Validate();
+
         if (Config.CreateIggyClient)
         {
             IggyClient = IggyClientFactory.CreateClient(new IggyClientConfigurator
@@ -286,5 +289,120 @@ public class IggyPublisherBuilder
         }
 
         return publisher;
+    }
+
+    /// <summary>
+    ///     Validates the publisher configuration and throws if invalid.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">Thrown when the configuration is invalid.</exception>
+    protected virtual void Validate()
+    {
+        if (Config.CreateIggyClient)
+        {
+            if (string.IsNullOrWhiteSpace(Config.Address))
+            {
+                throw new InvalidOperationException("Address must be provided when CreateIggyClient is true.");
+            }
+
+            if (string.IsNullOrWhiteSpace(Config.Login))
+            {
+                throw new InvalidOperationException("Login must be provided when CreateIggyClient is true.");
+            }
+
+            if (string.IsNullOrWhiteSpace(Config.Password))
+            {
+                throw new InvalidOperationException("Password must be provided when CreateIggyClient is true.");
+            }
+        }
+        else
+        {
+            if (IggyClient == null)
+            {
+                throw new InvalidOperationException(
+                    "IggyClient must be provided when CreateIggyClient is false.");
+            }
+        }
+
+        if (Config.CreateStream && string.IsNullOrWhiteSpace(Config.StreamName))
+        {
+            throw new InvalidOperationException("StreamName must be provided when CreateStream is true.");
+        }
+
+        if (Config.CreateTopic)
+        {
+            if (string.IsNullOrWhiteSpace(Config.TopicName))
+            {
+                throw new InvalidOperationException("TopicName must be provided when CreateTopic is true.");
+            }
+
+            if (Config.TopicPartitionsCount == 0)
+            {
+                throw new InvalidOperationException("TopicPartitionsCount must be greater than 0.");
+            }
+        }
+
+        if (Config.ReceiveBufferSize <= 0)
+        {
+            throw new InvalidOperationException("ReceiveBufferSize must be greater than 0.");
+        }
+
+        if (Config.SendBufferSize <= 0)
+        {
+            throw new InvalidOperationException("SendBufferSize must be greater than 0.");
+        }
+
+        if (Config.EnableBackgroundSending)
+        {
+            if (Config.BackgroundQueueCapacity <= 0)
+            {
+                throw new InvalidOperationException(
+                    "BackgroundQueueCapacity must be greater than 0 when EnableBackgroundSending is true.");
+            }
+
+            if (Config.BackgroundBatchSize <= 0)
+            {
+                throw new InvalidOperationException(
+                    "BackgroundBatchSize must be greater than 0 when EnableBackgroundSending is true.");
+            }
+
+            if (Config.BackgroundFlushInterval <= TimeSpan.Zero)
+            {
+                throw new InvalidOperationException(
+                    "BackgroundFlushInterval must be greater than zero when EnableBackgroundSending is true.");
+            }
+
+            if (Config.BackgroundDisposalTimeout <= TimeSpan.Zero)
+            {
+                throw new InvalidOperationException(
+                    "BackgroundDisposalTimeout must be greater than zero when EnableBackgroundSending is true.");
+            }
+        }
+
+        if (Config.EnableRetry)
+        {
+            if (Config.MaxRetryAttempts <= 0)
+            {
+                throw new InvalidOperationException(
+                    "MaxRetryAttempts must be greater than 0 when EnableRetry is true.");
+            }
+
+            if (Config.InitialRetryDelay <= TimeSpan.Zero)
+            {
+                throw new InvalidOperationException(
+                    "InitialRetryDelay must be greater than zero when EnableRetry is true.");
+            }
+
+            if (Config.MaxRetryDelay <= TimeSpan.Zero)
+            {
+                throw new InvalidOperationException(
+                    "MaxRetryDelay must be greater than zero when EnableRetry is true.");
+            }
+
+            if (Config.InitialRetryDelay > Config.MaxRetryDelay)
+            {
+                throw new InvalidOperationException(
+                    "InitialRetryDelay must be less than or equal to MaxRetryDelay.");
+            }
+        }
     }
 }

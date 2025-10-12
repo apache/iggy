@@ -64,6 +64,8 @@ public class IggyPublisherBuilder<T> : IggyPublisherBuilder
     /// <exception cref="InvalidOperationException">Thrown when the configuration is invalid</exception>
     public new IggyPublisher<T> Build()
     {
+        Validate();
+
         if (Config.CreateIggyClient)
         {
             IggyClient = IggyClientFactory.CreateClient(new IggyClientConfigurator
@@ -97,7 +99,26 @@ public class IggyPublisherBuilder<T> : IggyPublisherBuilder
         return publisher;
     }
 
-    // Note: All fluent configuration methods (WithConnection, WithPartitioning, etc.)
-    // are inherited from the base IggyPublisherBuilder class and continue to work
-    // with the typed builder, maintaining full backward compatibility.
+    /// <summary>
+    ///     Validates the typed publisher configuration, including serializer validation.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">Thrown when the configuration is invalid.</exception>
+    protected override void Validate()
+    {
+        base.Validate();
+
+        if (Config is IggyPublisherConfig<T> typedConfig)
+        {
+            if (typedConfig.Serializer == null)
+            {
+                throw new InvalidOperationException(
+                    $"Serializer must be provided for typed publisher IggyPublisher<{typeof(T).Name}>.");
+            }
+        }
+        else
+        {
+            throw new InvalidOperationException(
+                $"Config must be of type IggyPublisherConfig<{typeof(T).Name}>.");
+        }
+    }
 }

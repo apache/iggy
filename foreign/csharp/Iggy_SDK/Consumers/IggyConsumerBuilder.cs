@@ -205,8 +205,11 @@ public class IggyConsumerBuilder
     ///     Builds and returns an instance of <see cref="IggyConsumer" /> configured with the specified options.
     /// </summary>
     /// <returns>An instance of <see cref="IggyConsumer" /> based on the current builder configuration.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when the configuration is invalid.</exception>
     public IggyConsumer Build()
     {
+        Validate();
+
         if (Config.CreateIggyClient)
         {
             IggyClient = IggyClientFactory.CreateClient(new IggyClientConfigurator
@@ -228,5 +231,69 @@ public class IggyConsumerBuilder
         }
 
         return consumer;
+    }
+
+    /// <summary>
+    ///     Validates the consumer configuration and throws if invalid.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">Thrown when the configuration is invalid.</exception>
+    protected virtual void Validate()
+    {
+        if (Config.CreateIggyClient)
+        {
+            if (string.IsNullOrWhiteSpace(Config.Address))
+            {
+                throw new InvalidOperationException("Address must be provided when CreateIggyClient is true.");
+            }
+
+            if (string.IsNullOrWhiteSpace(Config.Login))
+            {
+                throw new InvalidOperationException("Login must be provided when CreateIggyClient is true.");
+            }
+
+            if (string.IsNullOrWhiteSpace(Config.Password))
+            {
+                throw new InvalidOperationException("Password must be provided when CreateIggyClient is true.");
+            }
+        }
+        else
+        {
+            if (IggyClient == null)
+            {
+                throw new InvalidOperationException(
+                    "IggyClient must be provided when CreateIggyClient is false.");
+            }
+        }
+
+        if (Config.ReceiveBufferSize <= 0)
+        {
+            throw new InvalidOperationException("ReceiveBufferSize must be greater than 0.");
+        }
+
+        if (Config.SendBufferSize <= 0)
+        {
+            throw new InvalidOperationException("SendBufferSize must be greater than 0.");
+        }
+
+        if (Config.BatchSize == 0)
+        {
+            throw new InvalidOperationException("BatchSize must be greater than 0.");
+        }
+
+        if (Config.PollingIntervalMs < 0)
+        {
+            throw new InvalidOperationException("PollingIntervalMs cannot be negative.");
+        }
+
+        if (Config.Consumer.Type == ConsumerType.ConsumerGroup)
+        {
+            if (Config.Consumer.Id.Kind == IdKind.Numeric &&
+                Config.CreateConsumerGroupIfNotExists &&
+                string.IsNullOrWhiteSpace(Config.ConsumerGroupName))
+            {
+                throw new InvalidOperationException(
+                    "ConsumerGroupName must be provided when using numeric consumer group ID with CreateConsumerGroupIfNotExists enabled.");
+            }
+        }
     }
 }

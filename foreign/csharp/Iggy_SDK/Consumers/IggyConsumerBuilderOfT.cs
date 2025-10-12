@@ -69,6 +69,8 @@ public class IggyConsumerBuilder<T> : IggyConsumerBuilder
     /// <exception cref="InvalidOperationException">Thrown when the configuration is invalid</exception>
     public new IggyConsumer<T> Build()
     {
+        Validate();
+
         if (Config.CreateIggyClient)
         {
             IggyClient = IggyClientFactory.CreateClient(new IggyClientConfigurator
@@ -95,5 +97,28 @@ public class IggyConsumerBuilder<T> : IggyConsumerBuilder
         }
 
         return consumer;
+    }
+
+    /// <summary>
+    ///     Validates the typed consumer configuration, including deserializer validation.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">Thrown when the configuration is invalid.</exception>
+    protected override void Validate()
+    {
+        base.Validate();
+
+        if (Config is IggyConsumerConfig<T> typedConfig)
+        {
+            if (typedConfig.Deserializer == null)
+            {
+                throw new InvalidOperationException(
+                    $"Deserializer must be provided for typed consumer IggyConsumer<{typeof(T).Name}>.");
+            }
+        }
+        else
+        {
+            throw new InvalidOperationException(
+                $"Config must be of type IggyConsumerConfig<{typeof(T).Name}>.");
+        }
     }
 }

@@ -41,7 +41,7 @@ for (var i = 0; i < producerCount; i++)
 {
     var bus = IggyClientFactory.CreateClient(new IggyClientConfigurator()
     {
-        BaseAdress = "127.0.0.1:8090",
+        BaseAddress = "127.0.0.1:8090",
         Protocol = Protocol.Tcp,
         LoggerFactory = loggerFactory,
 #if OS_LINUX

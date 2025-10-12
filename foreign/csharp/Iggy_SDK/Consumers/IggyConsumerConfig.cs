@@ -12,8 +12,13 @@ namespace Apache.Iggy.Consumers;
 public class IggyConsumerConfig<T> : IggyConsumerConfig
 {
     /// <summary>
-    ///     The deserializer used to convert message payloads to type T
+    ///     Gets or sets the deserializer used to convert message payloads to type T.
+    ///     This property is required and cannot be null. The builder will validate that a deserializer
+    ///     is provided before creating the consumer instance.
     /// </summary>
+    /// <exception cref="InvalidOperationException">
+    ///     Thrown during consumer build if this property is null.
+    /// </exception>
     public required IDeserializer<T> Deserializer { get; set; }
 }
 

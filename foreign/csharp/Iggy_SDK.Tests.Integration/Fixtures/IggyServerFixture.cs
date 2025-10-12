@@ -131,17 +131,9 @@ public class IggyServerFixture : IAsyncInitializer, IAsyncDisposable
 
         return IggyClientFactory.CreateClient(new IggyClientConfigurator()
         {
-            BaseAdress = address,
+            BaseAddress = address,
             Protocol = protocol
         });
-
-        // return MessageStreamFactory.CreateMessageStream(new MessageStreamConfigurator
-        // {
-        //     BaseAdress = address,
-        //     Protocol = protocol,
-        //     MessageBatchingSettings = BatchingSettings,
-        //     MessagePollingSettings = PollingSettings
-        // });
     }
 
     public static IEnumerable<Func<Protocol>> ProtocolData()

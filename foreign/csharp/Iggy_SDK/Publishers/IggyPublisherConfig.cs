@@ -12,8 +12,13 @@ namespace Apache.Iggy.Publishers;
 public class IggyPublisherConfig<T> : IggyPublisherConfig
 {
     /// <summary>
-    ///     The serializer used to convert objects of type T to message payloads
+    ///     Gets or sets the serializer used to convert objects of type T to message payloads.
+    ///     This property is required and cannot be null. The builder will validate that a serializer
+    ///     is provided before creating the publisher instance.
     /// </summary>
+    /// <exception cref="InvalidOperationException">
+    ///     Thrown during publisher build if this property is null.
+    /// </exception>
     public required ISerializer<T> Serializer { get; set; }
 }
 
