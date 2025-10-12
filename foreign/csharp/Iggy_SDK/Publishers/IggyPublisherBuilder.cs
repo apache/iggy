@@ -225,14 +225,16 @@ public class IggyPublisherBuilder
     /// <param name="queueCapacity">The maximum number of messages that can be queued. Default is 10,000.</param>
     /// <param name="batchSize">The number of messages to send in each batch. Default is 100.</param>
     /// <param name="flushInterval">The interval at which to flush pending messages. Default is 100ms.</param>
+    /// <param name="disposalTimeout">The timeout to wait for the background processor to complete during disposal. Default is 5 seconds.</param>
     /// <returns>The builder instance for method chaining.</returns>
     public IggyPublisherBuilder WithBackgroundSending(bool enabled = true, int queueCapacity = 10000,
-        int batchSize = 100, TimeSpan? flushInterval = null)
+        int batchSize = 100, TimeSpan? flushInterval = null, TimeSpan? disposalTimeout = null)
     {
         Config.EnableBackgroundSending = enabled;
         Config.BackgroundQueueCapacity = queueCapacity;
         Config.BackgroundBatchSize = batchSize;
         Config.BackgroundFlushInterval = flushInterval ?? TimeSpan.FromMilliseconds(100);
+        Config.BackgroundDisposalTimeout = disposalTimeout ?? TimeSpan.FromSeconds(5);
         return this;
     }
 
@@ -260,7 +262,7 @@ public class IggyPublisherBuilder
             IggyClient = IggyClientFactory.CreateClient(new IggyClientConfigurator
             {
                 Protocol = Config.Protocol,
-                BaseAdress = Config.Address,
+                BaseAddress = Config.Address,
                 ReceiveBufferSize = Config.ReceiveBufferSize,
                 SendBufferSize = Config.SendBufferSize
             });

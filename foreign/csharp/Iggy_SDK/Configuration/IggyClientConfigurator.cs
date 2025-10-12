@@ -23,7 +23,7 @@ namespace Apache.Iggy.Configuration;
 
 public sealed class IggyClientConfigurator
 {
-    public string BaseAdress { get; set; } = "http://127.0.0.1:3000";
+    public string BaseAddress { get; set; } = "http://127.0.0.1:3000";
     public Protocol Protocol { get; set; } = Protocol.Http;
     public int ReceiveBufferSize { get; set; } = 4096;
     public int SendBufferSize { get; set; } = 4096;

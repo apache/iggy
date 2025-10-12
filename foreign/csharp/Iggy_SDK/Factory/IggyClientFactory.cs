@@ -41,7 +41,7 @@ public static class IggyClientFactory
     
     private static IConnectionStream CreateTcpStream(IggyClientConfigurator options)
     {
-        var urlPortSplitter = options.BaseAdress.Split(":");
+        var urlPortSplitter = options.BaseAddress.Split(":");
         if (urlPortSplitter.Length > 2)
         {
             throw new InvalidBaseAdressException();
@@ -73,7 +73,7 @@ public static class IggyClientFactory
     private static HttpClient CreateHttpClient(IggyClientConfigurator options)
     {
         var client = new HttpClient();
-        client.BaseAddress = new Uri(options.BaseAdress);
+        client.BaseAddress = new Uri(options.BaseAddress);
         return client;
     }
 }

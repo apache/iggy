@@ -30,7 +30,7 @@ var logger = loggerFactory.CreateLogger<Program>();
 
 var client = IggyClientFactory.CreateClient(new IggyClientConfigurator()
 {
-    BaseAdress = Utils.GetTcpServerAddr(args, logger),
+    BaseAddress = Utils.GetTcpServerAddr(args, logger),
     Protocol = Protocol.Tcp,
     LoggerFactory = loggerFactory
 });

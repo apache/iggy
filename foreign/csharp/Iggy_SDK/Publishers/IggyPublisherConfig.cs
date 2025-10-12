@@ -142,14 +142,14 @@ public class IggyPublisherConfig
     ///     When the topic reaches this size, oldest messages will be deleted.
     ///     Only used when <see cref="CreateTopic" /> is true.
     /// </summary>
-    public ulong TopicMaxTopicSize { get; internal set; }
+    public ulong TopicMaxTopicSize { get; set; }
 
     /// <summary>
     ///     Gets or sets a value indicating whether background sending is enabled.
     ///     When enabled, messages are queued and sent asynchronously in batches.
     ///     Default is false (synchronous sending).
     /// </summary>
-    public bool EnableBackgroundSending { get; internal set; } = false;
+    public bool EnableBackgroundSending { get; set; } = false;
 
     /// <summary>
     ///     Gets or sets the capacity of the background message queue.
@@ -157,7 +157,7 @@ public class IggyPublisherConfig
     ///     Only used when <see cref="EnableBackgroundSending" /> is true.
     ///     Default is 10,000 messages.
     /// </summary>
-    public int BackgroundQueueCapacity { get; internal set; } = 10000;
+    public int BackgroundQueueCapacity { get;  set; } = 10000;
 
     /// <summary>
     ///     Gets or sets the number of messages to send in each batch.
@@ -165,7 +165,7 @@ public class IggyPublisherConfig
     ///     Only used when <see cref="EnableBackgroundSending" /> is true.
     ///     Default is 100 messages.
     /// </summary>
-    public int BackgroundBatchSize { get; internal set; } = 100;
+    public int BackgroundBatchSize { get; set; } = 100;
 
     /// <summary>
     ///     Gets or sets the interval at which to flush pending messages.
@@ -173,14 +173,21 @@ public class IggyPublisherConfig
     ///     Only used when <see cref="EnableBackgroundSending" /> is true.
     ///     Default is 100 milliseconds.
     /// </summary>
-    public TimeSpan BackgroundFlushInterval { get; internal set; } = TimeSpan.FromMilliseconds(100);
+    public TimeSpan BackgroundFlushInterval { get; set; } = TimeSpan.FromMilliseconds(100);
+
+    /// <summary>
+    ///     Gets or sets the timeout to wait for the background processor to complete during disposal.
+    ///     Only used when <see cref="EnableBackgroundSending" /> is true.
+    ///     Default is 5 seconds.
+    /// </summary>
+    public TimeSpan BackgroundDisposalTimeout { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
     ///     Gets or sets a value indicating whether retry is enabled for failed sends.
     ///     When enabled, failed send operations will be retried according to the retry policy.
     ///     Default is true.
     /// </summary>
-    public bool EnableRetry { get; internal set; } = true;
+    public bool EnableRetry { get;  set; } = true;
 
     /// <summary>
     ///     Gets or sets the maximum number of retry attempts.
@@ -188,7 +195,7 @@ public class IggyPublisherConfig
     ///     Only used when <see cref="EnableRetry" /> is true.
     ///     Default is 3 attempts.
     /// </summary>
-    public int MaxRetryAttempts { get; internal set; } = 3;
+    public int MaxRetryAttempts { get;  set; } = 3;
 
     /// <summary>
     ///     Gets or sets the initial delay before the first retry.
@@ -196,7 +203,7 @@ public class IggyPublisherConfig
     ///     Only used when <see cref="EnableRetry" /> is true.
     ///     Default is 100 milliseconds.
     /// </summary>
-    public TimeSpan InitialRetryDelay { get; internal set; } = TimeSpan.FromMilliseconds(100);
+    public TimeSpan InitialRetryDelay { get; set; } = TimeSpan.FromMilliseconds(100);
 
     /// <summary>
     ///     Gets or sets the maximum delay between retries.
@@ -204,7 +211,7 @@ public class IggyPublisherConfig
     ///     Only used when <see cref="EnableRetry" /> is true.
     ///     Default is 10 seconds.
     /// </summary>
-    public TimeSpan MaxRetryDelay { get; internal set; } = TimeSpan.FromSeconds(10);
+    public TimeSpan MaxRetryDelay { get; set; } = TimeSpan.FromSeconds(10);
 
     /// <summary>
     ///     Gets or sets the multiplier for exponential backoff retry delays.
@@ -212,5 +219,5 @@ public class IggyPublisherConfig
     ///     Only used when <see cref="EnableRetry" /> is true.
     ///     Default is 2.0 (doubles the delay each time).
     /// </summary>
-    public double RetryBackoffMultiplier { get; internal set; } = 2.0;
+    public double RetryBackoffMultiplier { get; set; } = 2.0;
 }

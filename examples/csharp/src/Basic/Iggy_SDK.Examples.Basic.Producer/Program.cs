@@ -40,7 +40,7 @@ logger.LogInformation(
 
 var client = IggyClientFactory.CreateClient(new IggyClientConfigurator()
 {
-    BaseAdress = settings.BaseAddress,
+    BaseAddress = settings.BaseAddress,
     Protocol = settings.Protocol,
     LoggerFactory = loggerFactory
 });
