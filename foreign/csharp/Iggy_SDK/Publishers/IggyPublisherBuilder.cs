@@ -9,15 +9,36 @@ using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.Publishers;
 
+/// <summary>
+///     Fluent builder for creating and configuring <see cref="IggyPublisher" /> instances.
+///     Provides a convenient API for setting up publishers with various configuration options
+///     including connection settings, partitioning, encryption, retry logic, and background sending.
+/// </summary>
 public class IggyPublisherBuilder
 {
-    public IggyPublisherConfig Config { get; set; } = new ();
-    public IIggyClient? IggyClient { get; set; }
-
     private EventHandler<PublisherErrorEventArgs>? _onBackgroundError;
     private EventHandler<MessageBatchFailedEventArgs>? _onMessageBatchFailed;
 
-    public static IggyPublisherBuilder Create(IIggyClient iggyClient,  Identifier streamId, Identifier topicId)
+    /// <summary>
+    ///     Gets or sets the publisher configuration.
+    /// </summary>
+    public IggyPublisherConfig Config { get; set; } = new();
+
+    /// <summary>
+    ///     Gets or sets the Iggy client instance to use.
+    ///     When null and <see cref="IggyPublisherConfig.CreateIggyClient" /> is true, a new client will be created during
+    ///     build.
+    /// </summary>
+    public IIggyClient? IggyClient { get; set; }
+
+    /// <summary>
+    ///     Creates a new publisher builder using an existing Iggy client instance.
+    /// </summary>
+    /// <param name="iggyClient">The existing Iggy client to use.</param>
+    /// <param name="streamId">The identifier of the target stream.</param>
+    /// <param name="topicId">The identifier of the target topic.</param>
+    /// <returns>A new instance of <see cref="IggyPublisherBuilder" />.</returns>
+    public static IggyPublisherBuilder Create(IIggyClient iggyClient, Identifier streamId, Identifier topicId)
     {
         return new IggyPublisherBuilder
         {
@@ -31,6 +52,12 @@ public class IggyPublisherBuilder
         };
     }
 
+    /// <summary>
+    ///     Creates a new publisher builder that will create its own Iggy client.
+    /// </summary>
+    /// <param name="streamId">The identifier of the target stream.</param>
+    /// <param name="topicId">The identifier of the target topic.</param>
+    /// <returns>A new instance of <see cref="IggyPublisherBuilder" />.</returns>
     public static IggyPublisherBuilder Create(Identifier streamId, Identifier topicId)
     {
         return new IggyPublisherBuilder
@@ -44,6 +71,28 @@ public class IggyPublisherBuilder
         };
     }
 
+    /// <summary>
+    ///     Creates a new publisher builder using an existing configuration.
+    /// </summary>
+    /// <param name="config">The configuration to use for the publisher.</param>
+    /// <returns>A new instance of <see cref="IggyPublisherBuilder" />.</returns>
+    public static IggyPublisherBuilder Create(IggyPublisherConfig config)
+    {
+        return new IggyPublisherBuilder { Config = config };
+    }
+
+
+    /// <summary>
+    ///     Configures the connection settings for the publisher's Iggy client.
+    ///     Only used when the builder creates its own client.
+    /// </summary>
+    /// <param name="protocol">The protocol to use (TCP, QUIC, or HTTP).</param>
+    /// <param name="address">The server address to connect to (format depends on protocol).</param>
+    /// <param name="login">The login username for authentication.</param>
+    /// <param name="password">The password for authentication.</param>
+    /// <param name="receiveBufferSize">The size of the receive buffer in bytes. Default is 4096.</param>
+    /// <param name="sendBufferSize">The size of the send buffer in bytes. Default is 4096.</param>
+    /// <returns>The builder instance for method chaining.</returns>
     public IggyPublisherBuilder WithConnection(Protocol protocol, string address, string login, string password,
         int receiveBufferSize = 4096, int sendBufferSize = 4096)
     {
@@ -53,10 +102,19 @@ public class IggyPublisherBuilder
         Config.Password = password;
         Config.ReceiveBufferSize = receiveBufferSize;
         Config.SendBufferSize = sendBufferSize;
-    
+
         return this;
     }
 
+    /// <summary>
+    ///     Configures the partitioning strategy for messages sent by the publisher.
+    ///     Determines how messages are distributed across topic partitions.
+    /// </summary>
+    /// <param name="partitioning">
+    ///     The partitioning configuration to use (e.g., balanced, partition-specific, or message-key
+    ///     based).
+    /// </param>
+    /// <returns>The builder instance for method chaining.</returns>
     public IggyPublisherBuilder WithPartitioning(Partitioning partitioning)
     {
         Config.Partitioning = partitioning;
@@ -64,6 +122,11 @@ public class IggyPublisherBuilder
         return this;
     }
 
+    /// <summary>
+    ///     Enables automatic stream creation if the target stream does not exist.
+    /// </summary>
+    /// <param name="name">The name to use when creating the stream.</param>
+    /// <returns>The builder instance for method chaining.</returns>
     public IggyPublisherBuilder CreateStreamIfNotExists(string name)
     {
         Config.CreateStream = true;
@@ -72,6 +135,16 @@ public class IggyPublisherBuilder
         return this;
     }
 
+    /// <summary>
+    ///     Enables automatic topic creation if the target topic does not exist.
+    /// </summary>
+    /// <param name="name">The name to use when creating the topic.</param>
+    /// <param name="topicPartitionsCount">The number of partitions for the topic. Default is 1.</param>
+    /// <param name="compressionAlgorithm">The compression algorithm to use for messages in the topic. Default is None.</param>
+    /// <param name="replicationFactor">The replication factor for the topic. Null means server default.</param>
+    /// <param name="messageExpiry">The message expiry time in seconds (0 for no expiry). Default is 0.</param>
+    /// <param name="maxTopicSize">The maximum size of the topic in bytes (0 for unlimited). Default is 0.</param>
+    /// <returns>The builder instance for method chaining.</returns>
     public IggyPublisherBuilder CreateTopicIfNotExists(string name, uint topicPartitionsCount = 1,
         CompressionAlgorithm compressionAlgorithm = CompressionAlgorithm.None, byte? replicationFactor = null,
         ulong messageExpiry = 0, ulong maxTopicSize = 0)
@@ -83,10 +156,15 @@ public class IggyPublisherBuilder
         Config.TopicReplicationFactor = replicationFactor;
         Config.TopicMessageExpiry = messageExpiry;
         Config.TopicMaxTopicSize = maxTopicSize;
-        
+
         return this;
     }
-    
+
+    /// <summary>
+    ///     Configures message encryption using the specified encryptor.
+    /// </summary>
+    /// <param name="encryptor">The message encryptor to use for encrypting message payloads.</param>
+    /// <returns>The builder instance for method chaining.</returns>
     public IggyPublisherBuilder WithEncryptor(IMessageEncryptor encryptor)
     {
         Config.MessageEncryptor = encryptor;
@@ -94,18 +172,40 @@ public class IggyPublisherBuilder
         return this;
     }
 
+    /// <summary>
+    ///     Registers an event handler for background processing errors.
+    ///     Only invoked when background sending is enabled.
+    /// </summary>
+    /// <param name="handler">The event handler to invoke when background errors occur.</param>
+    /// <returns>The builder instance for method chaining.</returns>
     public IggyPublisherBuilder OnBackgroundError(EventHandler<PublisherErrorEventArgs> handler)
     {
         _onBackgroundError = handler;
         return this;
     }
 
+    /// <summary>
+    ///     Registers an event handler for failed message batch sends.
+    ///     Invoked when a batch of messages fails to send after all retry attempts are exhausted.
+    /// </summary>
+    /// <param name="handler">The event handler to invoke when message batches fail to send.</param>
+    /// <returns>The builder instance for method chaining.</returns>
     public IggyPublisherBuilder OnMessageBatchFailed(EventHandler<MessageBatchFailedEventArgs> handler)
     {
         _onMessageBatchFailed = handler;
         return this;
     }
 
+    /// <summary>
+    ///     Configures retry behavior for failed message sends.
+    ///     Uses exponential backoff with configurable parameters.
+    /// </summary>
+    /// <param name="enabled">Whether retry is enabled. Default is true.</param>
+    /// <param name="maxAttempts">The maximum number of retry attempts. Default is 3.</param>
+    /// <param name="initialDelay">The initial delay before the first retry. Default is 100ms.</param>
+    /// <param name="maxDelay">The maximum delay between retries. Default is 10 seconds.</param>
+    /// <param name="backoffMultiplier">The multiplier for exponential backoff. Default is 2.0.</param>
+    /// <returns>The builder instance for method chaining.</returns>
     public IggyPublisherBuilder WithRetry(bool enabled = true, int maxAttempts = 3,
         TimeSpan? initialDelay = null, TimeSpan? maxDelay = null, double backoffMultiplier = 2.0)
     {
@@ -117,6 +217,15 @@ public class IggyPublisherBuilder
         return this;
     }
 
+    /// <summary>
+    ///     Configures background message sending for asynchronous, batched message delivery.
+    ///     When enabled, messages are queued and sent in batches for improved throughput.
+    /// </summary>
+    /// <param name="enabled">Whether background sending is enabled. Default is true.</param>
+    /// <param name="queueCapacity">The maximum number of messages that can be queued. Default is 10,000.</param>
+    /// <param name="batchSize">The number of messages to send in each batch. Default is 100.</param>
+    /// <param name="flushInterval">The interval at which to flush pending messages. Default is 100ms.</param>
+    /// <returns>The builder instance for method chaining.</returns>
     public IggyPublisherBuilder WithBackgroundSending(bool enabled = true, int queueCapacity = 10000,
         int batchSize = 100, TimeSpan? flushInterval = null)
     {
@@ -127,17 +236,28 @@ public class IggyPublisherBuilder
         return this;
     }
 
+    /// <summary>
+    ///     Configures the logger factory for diagnostic logging.
+    /// </summary>
+    /// <param name="loggerFactory">The logger factory to use for creating loggers.</param>
+    /// <returns>The builder instance for method chaining.</returns>
     public IggyPublisherBuilder WithLogger(ILoggerFactory loggerFactory)
     {
         Config.LoggerFactory = loggerFactory;
         return this;
     }
 
+    /// <summary>
+    ///     Builds and returns a configured <see cref="IggyPublisher" /> instance.
+    ///     Creates the Iggy client if needed, wires up all event handlers, and initializes the publisher.
+    /// </summary>
+    /// <returns>A fully configured <see cref="IggyPublisher" /> instance ready to send messages.</returns>
+    /// <exception cref="ArgumentNullException">Thrown when IggyClient is null and CreateIggyClient is false.</exception>
     public IggyPublisher Build()
     {
         if (Config.CreateIggyClient)
         {
-            IggyClient = IggyClientFactory.CreateClient(new IggyClientConfigurator()
+            IggyClient = IggyClientFactory.CreateClient(new IggyClientConfigurator
             {
                 Protocol = Config.Protocol,
                 BaseAdress = Config.Address,

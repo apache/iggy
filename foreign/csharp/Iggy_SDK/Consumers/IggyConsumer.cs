@@ -10,23 +10,28 @@ using Microsoft.Extensions.Logging;
 
 namespace Apache.Iggy.Consumers;
 
+/// <summary>
+///     High-level consumer for receiving messages from Iggy streams.
+///     Provides automatic polling, offset management, and consumer group support.
+/// </summary>
 public partial class IggyConsumer : IAsyncDisposable
 {
+    private readonly Channel<ReceivedMessage> _channel;
     private readonly IIggyClient _client;
     private readonly IggyConsumerConfig _config;
+    private readonly ConcurrentDictionary<int, ulong> _lastPolledOffset = new();
     private readonly ILogger<IggyConsumer> _logger;
-    private bool _isInitialized;
-    private readonly Channel<ReceivedMessage> _channel;
-    private readonly ConcurrentDictionary<int, ulong> _lastPolledOffset = new ();
-    private bool _disposed;
     private string? _consumerGroupName;
+    private bool _disposed;
+    private bool _isInitialized;
     private long _lastPolledAtMs;
 
     /// <summary>
-    /// Fired when an error occurs during message polling
+    ///     Initializes a new instance of the <see cref="IggyConsumer" /> class
     /// </summary>
-    public event EventHandler<ConsumerErrorEventArgs>? OnPollingError;
-
+    /// <param name="client">The Iggy client for server communication</param>
+    /// <param name="config">Consumer configuration settings</param>
+    /// <param name="logger">Logger instance for diagnostic output</param>
     public IggyConsumer(IIggyClient client, IggyConsumerConfig config, ILogger<IggyConsumer> logger)
     {
         _client = client;
@@ -39,65 +44,9 @@ public partial class IggyConsumer : IAsyncDisposable
         });
     }
 
-    public async Task InitAsync(CancellationToken ct = default)
-    {
-        if (_isInitialized)
-        {
-            return;
-        }
-
-        if (_config.Consumer.Type == ConsumerType.ConsumerGroup && _config.PartitionId != null)
-        {
-            _logger.LogWarning("PartitionId is ignored when ConsumerType is ConsumerGroup");
-            _config.PartitionId = null;
-        }
-        
-        if (_config.CreateIggyClient)
-        {
-            await _client.LoginUser(_config.Login, _config.Password, ct);
-        }
-
-        await InitializeConsumerGroupAsync(ct);
-
-        _isInitialized = true;
-    }
-    
-    public async IAsyncEnumerable<ReceivedMessage> ReceiveAsync([EnumeratorCancellation] CancellationToken ct = default)
-    {
-        if (!_isInitialized)
-        {
-            throw new ConsumerNotInitializedException();
-        }
-
-        do
-        {
-            if (!_channel.Reader.TryRead(out var message))
-            {
-                await PollMessagesAsync(ct);
-                continue;
-            }
-
-            yield return message;
-
-            if (_config.AutoCommitMode == AutoCommitMode.AfterReceive)
-            {
-                await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId,
-                    message.CurrentOffset, message.PartitionId, ct);
-            }
-
-        } while (!ct.IsCancellationRequested);
-    }
-
-    public async Task StoreOffsetAsync(ulong offset, uint partitionId, CancellationToken ct = default)
-    {
-        await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId, offset, partitionId, ct);
-    }
-
-    public async Task DeleteOffsetAsync(uint partitionId, CancellationToken ct = default)
-    {
-        await _client.DeleteOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId, partitionId, ct); 
-    }
-
+    /// <summary>
+    ///     Disposes the consumer, leaving consumer groups and logging out if applicable
+    /// </summary>
     public async ValueTask DisposeAsync()
     {
         if (_disposed)
@@ -136,6 +85,98 @@ public partial class IggyConsumer : IAsyncDisposable
         _disposed = true;
     }
 
+    /// <summary>
+    ///     Fired when an error occurs during message polling
+    /// </summary>
+    public event EventHandler<ConsumerErrorEventArgs>? OnPollingError;
+
+    /// <summary>
+    ///     Initializes the consumer by logging in (if needed) and setting up consumer groups
+    /// </summary>
+    /// <param name="ct">Cancellation token</param>
+    /// <exception cref="InvalidConsumerGroupNameException">Thrown when consumer group name is invalid</exception>
+    /// <exception cref="ConsumerGroupNotFoundException">Thrown when consumer group doesn't exist and auto-creation is disabled</exception>
+    public async Task InitAsync(CancellationToken ct = default)
+    {
+        if (_isInitialized)
+        {
+            return;
+        }
+
+        if (_config.Consumer.Type == ConsumerType.ConsumerGroup && _config.PartitionId != null)
+        {
+            _logger.LogWarning("PartitionId is ignored when ConsumerType is ConsumerGroup");
+            _config.PartitionId = null;
+        }
+
+        if (_config.CreateIggyClient)
+        {
+            await _client.LoginUser(_config.Login, _config.Password, ct);
+        }
+
+        await InitializeConsumerGroupAsync(ct);
+
+        _isInitialized = true;
+    }
+
+    /// <summary>
+    ///     Receives messages asynchronously from the consumer as an async stream.
+    ///     Messages are automatically polled from the server and buffered in a bounded channel.
+    /// </summary>
+    /// <param name="ct">Cancellation token to stop receiving messages</param>
+    /// <returns>An async enumerable of received messages</returns>
+    /// <exception cref="ConsumerNotInitializedException">Thrown when InitAsync has not been called</exception>
+    public async IAsyncEnumerable<ReceivedMessage> ReceiveAsync([EnumeratorCancellation] CancellationToken ct = default)
+    {
+        if (!_isInitialized)
+        {
+            throw new ConsumerNotInitializedException();
+        }
+
+        do
+        {
+            if (!_channel.Reader.TryRead(out var message))
+            {
+                await PollMessagesAsync(ct);
+                continue;
+            }
+
+            yield return message;
+
+            if (_config.AutoCommitMode == AutoCommitMode.AfterReceive)
+            {
+                await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId,
+                    message.CurrentOffset, message.PartitionId, ct);
+            }
+        } while (!ct.IsCancellationRequested);
+    }
+
+    /// <summary>
+    ///     Manually stores the consumer offset for a specific partition.
+    ///     Use this when auto-commit is disabled or when you need manual offset control.
+    /// </summary>
+    /// <param name="offset">The offset to store</param>
+    /// <param name="partitionId">The partition ID</param>
+    /// <param name="ct">Cancellation token</param>
+    public async Task StoreOffsetAsync(ulong offset, uint partitionId, CancellationToken ct = default)
+    {
+        await _client.StoreOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId, offset, partitionId, ct);
+    }
+
+    /// <summary>
+    ///     Deletes the stored consumer offset for a specific partition.
+    ///     The next poll will start from the beginning or based on the polling strategy.
+    /// </summary>
+    /// <param name="partitionId">The partition ID</param>
+    /// <param name="ct">Cancellation token</param>
+    public async Task DeleteOffsetAsync(uint partitionId, CancellationToken ct = default)
+    {
+        await _client.DeleteOffsetAsync(_config.Consumer, _config.StreamId, _config.TopicId, partitionId, ct);
+    }
+
+    /// <summary>
+    ///     Initializes consumer group if configured, creating and joining as needed
+    /// </summary>
     private async Task InitializeConsumerGroupAsync(CancellationToken ct)
     {
         if (_config.Consumer.Type == ConsumerType.Consumer)
@@ -151,9 +192,9 @@ public partial class IggyConsumer : IAsyncDisposable
         {
             throw new InvalidConsumerGroupNameException("Consumer group name is empty or null.");
         }
-        
+
         try
-        { 
+        {
             var existingGroup = await _client.GetConsumerGroupByIdAsync(_config.StreamId, _config.TopicId,
                 Identifier.String(_consumerGroupName), ct);
 
@@ -177,7 +218,8 @@ public partial class IggyConsumer : IAsyncDisposable
             {
                 LogJoiningConsumerGroup(_consumerGroupName, _config.StreamId, _config.TopicId);
 
-                await _client.JoinConsumerGroupAsync(_config.StreamId, _config.TopicId, Identifier.String(_consumerGroupName), ct);
+                await _client.JoinConsumerGroupAsync(_config.StreamId, _config.TopicId,
+                    Identifier.String(_consumerGroupName), ct);
 
                 LogConsumerGroupJoined(_consumerGroupName);
             }
@@ -189,7 +231,11 @@ public partial class IggyConsumer : IAsyncDisposable
         }
     }
 
-    private async Task<bool> TryCreateConsumerGroupAsync(string groupName, Identifier groupId,  CancellationToken ct)
+    /// <summary>
+    ///     Attempts to create a consumer group, handling the case where it already exists
+    /// </summary>
+    /// <returns>True if the group was created or already exists, false on error</returns>
+    private async Task<bool> TryCreateConsumerGroupAsync(string groupName, Identifier groupId, CancellationToken ct)
     {
         try
         {
@@ -212,6 +258,10 @@ public partial class IggyConsumer : IAsyncDisposable
         return true;
     }
 
+    /// <summary>
+    ///     Polls messages from the server and writes them to the internal channel.
+    ///     Handles decryption, offset tracking, and auto-commit logic.
+    /// </summary>
     private async Task PollMessagesAsync(CancellationToken ct)
     {
         try
@@ -238,7 +288,7 @@ public partial class IggyConsumer : IAsyncDisposable
             foreach (var message in messages.Messages)
             {
                 var processedMessage = message;
-                MessageStatus status = MessageStatus.Success;
+                var status = MessageStatus.Success;
                 Exception? error = null;
 
                 if (_config.MessageEncryptor != null)
@@ -261,7 +311,7 @@ public partial class IggyConsumer : IAsyncDisposable
                     }
                 }
 
-                var receivedMessage = new ReceivedMessage()
+                var receivedMessage = new ReceivedMessage
                 {
                     Message = processedMessage,
                     CurrentOffset = processedMessage.Header.Offset,
@@ -296,6 +346,10 @@ public partial class IggyConsumer : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    ///     Implements polling interval throttling to avoid excessive server requests.
+    ///     Uses monotonic time tracking to ensure proper intervals even with clock adjustments.
+    /// </summary>
     private async Task WaitBeforePollingAsync(CancellationToken ct)
     {
         var intervalMs = _config.PollingIntervalMs;

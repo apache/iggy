@@ -24,9 +24,9 @@ using Iggy_SDK.Examples.NewSdk.Producer;
 using Microsoft.Extensions.Logging;
 
 var loggerFactory = LoggerFactory.Create(b => { b.AddConsole(); });
-var logger = loggerFactory.CreateLogger<Program>();
+ILogger<Program> logger = loggerFactory.CreateLogger<Program>();
 
-var client = IggyClientFactory.CreateClient(new IggyClientConfigurator()
+var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
 {
     BaseAdress = Utils.GetTcpServerAddr(args, logger),
     Protocol = Protocol.Tcp,
@@ -37,8 +37,8 @@ await client.LoginUser("iggy", "iggy");
 
 var publisher = client.CreatePublisherBuilder(Identifier.String("new-sdk-stream"), Identifier.String("new-sdk-topic"))
     .CreateStreamIfNotExists("new-sdk-stream")
-    .CreateTopicIfNotExists("new-sdk-topic", topicPartitionsCount: 4)
-    .WithBackgroundSending(true, batchSize:5, flushInterval: TimeSpan.FromSeconds(1))
+    .CreateTopicIfNotExists("new-sdk-topic", 4)
+    .WithBackgroundSending(batchSize: 5, flushInterval: TimeSpan.FromSeconds(1))
     .WithLogger(loggerFactory)
     .Build();
 

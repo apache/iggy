@@ -3,21 +3,94 @@ using Apache.Iggy.Exceptions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Apache.Iggy.Publishers;
 
+/// <summary>
+///     High-level publisher for sending messages to Iggy streams and topics.
+///     Supports background message batching, automatic retry, encryption, and stream/topic auto-creation.
+/// </summary>
 public partial class IggyPublisher : IAsyncDisposable
 {
+    private readonly BackgroundMessageProcessor? _backgroundProcessor;
     private readonly IIggyClient _client;
     private readonly IggyPublisherConfig _config;
     private readonly ILogger<IggyPublisher> _logger;
-    private bool _isInitialized = false;
-
-    private readonly BackgroundMessageProcessor? _backgroundProcessor;
-    private bool _disposed = false;
+    private bool _disposed;
+    private bool _isInitialized;
 
     /// <summary>
-    /// Fired when any error occurs in the background task
+    ///     Gets the identifier of the stream this publisher sends messages to.
+    /// </summary>
+    public Identifier StreamId => _config.StreamId;
+
+    /// <summary>
+    ///     Gets the identifier of the topic this publisher sends messages to.
+    /// </summary>
+    public Identifier TopicId => _config.TopicId;
+
+    /// <summary>
+    ///     Initializes a new instance of the <see cref="IggyPublisher" /> class.
+    /// </summary>
+    /// <param name="client">The Iggy client to use for communication.</param>
+    /// <param name="config">Publisher configuration settings.</param>
+    /// <param name="logger">Logger instance for diagnostic output.</param>
+    public IggyPublisher(IIggyClient client, IggyPublisherConfig config, ILogger<IggyPublisher> logger)
+    {
+        _client = client;
+        _config = config;
+        _logger = logger;
+
+        if (_config.EnableBackgroundSending)
+        {
+            LogInitializingBackgroundSending(_config.BackgroundQueueCapacity, _config.BackgroundBatchSize);
+
+            ILogger<BackgroundMessageProcessor> processorLogger
+                = _config.LoggerFactory?.CreateLogger<BackgroundMessageProcessor>()
+                  ?? NullLogger<BackgroundMessageProcessor>.Instance;
+
+            _backgroundProcessor = new BackgroundMessageProcessor(_client, _config, processorLogger);
+        }
+    }
+
+    /// <summary>
+    ///     Disposes the publisher, stops the background processor if running,
+    ///     and logs out and disposes the client if it was created by the publisher.
+    /// </summary>
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        LogDisposingPublisher();
+
+        if (_backgroundProcessor != null)
+        {
+            await _backgroundProcessor.DisposeAsync();
+        }
+
+        if (_config.CreateIggyClient && _isInitialized)
+        {
+            try
+            {
+                await _client.LogoutUser();
+                _client.Dispose();
+            }
+            catch (Exception e)
+            {
+                LogFailedToLogoutOrDispose(e);
+            }
+        }
+
+        _disposed = true;
+        LogPublisherDisposed();
+    }
+
+    /// <summary>
+    ///     Fired when any error occurs in the background task
     /// </summary>
     public event EventHandler<PublisherErrorEventArgs>? OnBackgroundError
     {
@@ -38,7 +111,7 @@ public partial class IggyPublisher : IAsyncDisposable
     }
 
     /// <summary>
-    /// Fired when a batch of messages fails to send
+    ///     Fired when a batch of messages fails to send
     /// </summary>
     public event EventHandler<MessageBatchFailedEventArgs>? OnMessageBatchFailed
     {
@@ -57,27 +130,14 @@ public partial class IggyPublisher : IAsyncDisposable
             }
         }
     }
-    
-    public Identifier StreamId => _config.StreamId;
-    public Identifier TopicId => _config.TopicId;
 
-    public IggyPublisher(IIggyClient client, IggyPublisherConfig config, ILogger<IggyPublisher> logger)
-    {
-        _client = client;
-        _config = config;
-        _logger = logger;
-
-        if (_config.EnableBackgroundSending)
-        {
-            LogInitializingBackgroundSending(_config.BackgroundQueueCapacity, _config.BackgroundBatchSize);
-
-            var processorLogger = _config.LoggerFactory?.CreateLogger<BackgroundMessageProcessor>()
-                ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<BackgroundMessageProcessor>.Instance;
-
-            _backgroundProcessor = new BackgroundMessageProcessor(_client, _config, processorLogger);
-        }
-    }
-
+    /// <summary>
+    ///     Initializes the publisher by authenticating, ensuring stream and topic exist,
+    ///     and starting the background processor if enabled.
+    /// </summary>
+    /// <param name="ct">Cancellation token to cancel initialization.</param>
+    /// <exception cref="StreamNotFoundException">Thrown when the stream doesn't exist and auto-creation is disabled.</exception>
+    /// <exception cref="TopicNotFoundException">Thrown when the topic doesn't exist and auto-creation is disabled.</exception>
     public async Task InitAsync(CancellationToken ct = default)
     {
         if (_isInitialized)
@@ -86,7 +146,7 @@ public partial class IggyPublisher : IAsyncDisposable
             return;
         }
 
-        
+
         LogInitializingPublisher(_config.StreamId, _config.TopicId);
         if (_config.CreateIggyClient)
         {
@@ -107,6 +167,11 @@ public partial class IggyPublisher : IAsyncDisposable
         LogPublisherInitialized();
     }
 
+    /// <summary>
+    ///     Creates the stream if it doesn't exist and auto-creation is enabled in the configuration.
+    /// </summary>
+    /// <param name="ct">Cancellation token to cancel the operation.</param>
+    /// <exception cref="StreamNotFoundException">Thrown when the stream doesn't exist and auto-creation is disabled.</exception>
     private async Task CreateStreamIfNeeded(CancellationToken ct)
     {
         if (await _client.GetStreamByIdAsync(_config.StreamId, ct) != null)
@@ -135,6 +200,11 @@ public partial class IggyPublisher : IAsyncDisposable
         LogStreamCreated(_config.StreamId);
     }
 
+    /// <summary>
+    ///     Creates the topic if it doesn't exist and auto-creation is enabled in the configuration.
+    /// </summary>
+    /// <param name="ct">Cancellation token to cancel the operation.</param>
+    /// <exception cref="TopicNotFoundException">Thrown when the topic doesn't exist and auto-creation is disabled.</exception>
     private async Task CreateTopicIfNeeded(CancellationToken ct)
     {
         if (await _client.GetTopicByIdAsync(_config.StreamId, _config.TopicId, ct) != null)
@@ -167,6 +237,14 @@ public partial class IggyPublisher : IAsyncDisposable
         LogTopicCreated(_config.TopicId, _config.StreamId);
     }
 
+    /// <summary>
+    ///     Sends a collection of messages to the configured stream and topic.
+    ///     If background sending is enabled, messages are queued for asynchronous processing.
+    ///     Otherwise, messages are sent immediately.
+    /// </summary>
+    /// <param name="messages">The messages to send.</param>
+    /// <param name="ct">Cancellation token to cancel the send operation.</param>
+    /// <exception cref="PublisherNotInitializedException">Thrown when attempting to send before initialization.</exception>
     public async Task SendMessages(IList<Message> messages, CancellationToken ct = default)
     {
         if (!_isInitialized)
@@ -197,6 +275,11 @@ public partial class IggyPublisher : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    ///     Waits until all queued messages have been sent by the background processor.
+    ///     Only applicable when background sending is enabled. Returns immediately otherwise.
+    /// </summary>
+    /// <param name="ct">Cancellation token to cancel the wait operation.</param>
     public async Task WaitUntilAllSends(CancellationToken ct = default)
     {
         if (!_config.EnableBackgroundSending || _backgroundProcessor == null)
@@ -207,7 +290,7 @@ public partial class IggyPublisher : IAsyncDisposable
         LogWaitingForPendingMessages();
 
         while (_backgroundProcessor.MessageReader.Count > 0 ||
-               _backgroundProcessor.IsSending) 
+               _backgroundProcessor.IsSending)
         {
             await Task.Delay(10, ct);
         }
@@ -215,6 +298,11 @@ public partial class IggyPublisher : IAsyncDisposable
         LogAllPendingMessagesSent();
     }
 
+    /// <summary>
+    ///     Encrypts all messages in the list using the configured message encryptor, if available.
+    ///     Updates the payload length in the message header after encryption.
+    /// </summary>
+    /// <param name="messages">The messages to encrypt.</param>
     private void EncryptMessages(IList<Message> messages)
     {
         if (_config.MessageEncryptor == null)
@@ -227,36 +315,5 @@ public partial class IggyPublisher : IAsyncDisposable
             message.Payload = _config.MessageEncryptor.Encrypt(message.Payload);
             message.Header.PayloadLength = message.Payload.Length;
         }
-    }
-
-    public async ValueTask DisposeAsync()
-    {
-        if (_disposed)
-        {
-            return;
-        }
-
-        LogDisposingPublisher();
-
-        if (_backgroundProcessor != null)
-        {
-            await _backgroundProcessor.DisposeAsync();
-        }
-
-        if (_config.CreateIggyClient && _isInitialized)
-        {
-            try
-            {
-                await _client.LogoutUser();
-                _client.Dispose();
-            }
-            catch (Exception e)
-            {
-                LogFailedToLogoutOrDispose(e);
-            }
-        }
-
-        _disposed = true;
-        LogPublisherDisposed();
     }
 }

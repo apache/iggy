@@ -9,88 +9,23 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Apache.Iggy.Consumers;
 
-public interface IDeserializer<out T>
-{
-    T Deserialize(byte[] data);
-}
-
-public class IggyConsumerBuilder<T> : IggyConsumerBuilder
-{
-    public static IggyConsumerBuilder<T> Create(Identifier streamId, Identifier topicId, Consumer consumer, IDeserializer<T> deserializer)
-    {
-        return new IggyConsumerBuilder<T>
-        {
-            Config = new IggyConsumerConfig<T>
-            {
-                CreateIggyClient = true,
-                StreamId = streamId,
-                TopicId = topicId,
-                Consumer = consumer,
-                Deserializer = deserializer
-            },
-        };
-    }
-    
-    public static IggyConsumerBuilder<T> Create(IIggyClient iggyClient, Identifier streamId, Identifier topicId, Consumer consumer, IDeserializer<T> deserializer)
-    {
-        return new IggyConsumerBuilder<T>()
-        {
-            Config = new IggyConsumerConfig<T>()
-            {
-                StreamId = streamId,
-                TopicId = topicId,
-                Consumer = consumer,
-                Deserializer = deserializer
-            },
-            IggyClient = iggyClient
-        };
-    }
-
-    public new IggyConsumer<T> Build()
-    {
-        if (Config.CreateIggyClient)
-        {
-            IggyClient = IggyClientFactory.CreateClient(new IggyClientConfigurator()
-            {
-                Protocol = Config.Protocol,
-                BaseAdress = Config.Address,
-                ReceiveBufferSize = Config.ReceiveBufferSize,
-                SendBufferSize = Config.SendBufferSize
-            });
-        }
-
-        if (Config is not IggyConsumerConfig<T> config)
-        {
-            throw new InvalidOperationException("Invalid consumer config");
-        }
-        
-        var consumer = new IggyConsumer<T>(IggyClient!, config,
-            Config.LoggerFactory?.CreateLogger<IggyConsumer<T>>() ??
-            NullLoggerFactory.Instance.CreateLogger<IggyConsumer<T>>());
-
-        if (_onPollingError != null)
-        {
-            consumer.OnPollingError += _onPollingError;
-        }
-
-        return consumer;
-    } 
-}
-
+/// <summary>
+///     Builder for creating <see cref="IggyConsumer" /> instances with fluent configuration API
+/// </summary>
 public class IggyConsumerBuilder
 {
-    internal IggyConsumerConfig Config { get; set; } = new ();
+    protected EventHandler<ConsumerErrorEventArgs>? _onPollingError;
+    internal IggyConsumerConfig Config { get; set; } = new();
     internal IIggyClient? IggyClient { get; set; }
 
-    protected EventHandler<ConsumerErrorEventArgs>? _onPollingError;
-
     /// <summary>
-    /// Create consumer builder
+    ///     Creates a new consumer builder that will create its own Iggy client.
+    ///     You must configure connection settings using <see cref="WithConnection" />.
     /// </summary>
-    /// <param name="streamId">Stream id</param>
-    /// <param name="topicId">Topic id</param>
-    /// <param name="consumer">Consumer</param>
-    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining</returns>
+    /// <param name="streamId">The stream identifier to consume from</param>
+    /// <param name="topicId">The topic identifier to consume from</param>
+    /// <param name="consumer">Consumer configuration (single consumer or consumer group)</param>
+    /// <returns>A new instance of <see cref="IggyConsumerBuilder" /> to allow method chaining</returns>
     public static IggyConsumerBuilder Create(Identifier streamId, Identifier topicId, Consumer consumer)
     {
         return new IggyConsumerBuilder
@@ -106,18 +41,20 @@ public class IggyConsumerBuilder
     }
 
     /// <summary>
-    /// Create consumer builder with existing iggy client. It's not needed to pass connection data after that
+    ///     Creates a new consumer builder using an existing Iggy client.
+    ///     Connection settings are not needed as the client is already configured.
     /// </summary>
-    /// <param name="streamId">Stream id</param>
-    /// <param name="topicId">Topic id</param>
-    /// <param name="iggyClient">Iggy client</param>
-    /// <param name="consumer">Consumer</param>
-    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining</returns>
-    public static IggyConsumerBuilder Create(IIggyClient iggyClient, Identifier streamId, Identifier topicId, Consumer consumer)
+    /// <param name="iggyClient">The existing Iggy client instance to use</param>
+    /// <param name="streamId">The stream identifier to consume from</param>
+    /// <param name="topicId">The topic identifier to consume from</param>
+    /// <param name="consumer">Consumer configuration (single consumer or consumer group)</param>
+    /// <returns>A new instance of <see cref="IggyConsumerBuilder" /> to allow method chaining</returns>
+    public static IggyConsumerBuilder Create(IIggyClient iggyClient, Identifier streamId, Identifier topicId,
+        Consumer consumer)
     {
-        return new IggyConsumerBuilder()
+        return new IggyConsumerBuilder
         {
-            Config = new IggyConsumerConfig()
+            Config = new IggyConsumerConfig
             {
                 StreamId = streamId,
                 TopicId = topicId,
@@ -128,7 +65,7 @@ public class IggyConsumerBuilder
     }
 
     /// <summary>
-    /// Configures the connection settings for the consumer.
+    ///     Configures the connection settings for the consumer.
     /// </summary>
     /// <param name="protocol">The protocol to use for the connection (e.g., TCP, UDP).</param>
     /// <param name="address">The address of the server to connect to.</param>
@@ -136,7 +73,7 @@ public class IggyConsumerBuilder
     /// <param name="password">The password for authentication.</param>
     /// <param name="receiveBufferSize">The size of the receive buffer.</param>
     /// <param name="sendBufferSize">The size of the send buffer.</param>
-    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining.</returns>
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining.</returns>
     public IggyConsumerBuilder WithConnection(Protocol protocol, string address, string login, string password,
         int receiveBufferSize = 4096, int sendBufferSize = 4096)
     {
@@ -146,15 +83,15 @@ public class IggyConsumerBuilder
         Config.Password = password;
         Config.ReceiveBufferSize = receiveBufferSize;
         Config.SendBufferSize = sendBufferSize;
-    
+
         return this;
     }
 
     /// <summary>
-    /// Sets a message decryptor for the consumer, enabling decryption of incoming messages.
+    ///     Sets a message decryptor for the consumer, enabling decryption of incoming messages.
     /// </summary>
     /// <param name="decryptor">The decryptor implementation to handle message decryption.</param>
-    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining.</returns>
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining.</returns>
     public IggyConsumerBuilder WithDecryptor(IMessageEncryptor decryptor)
     {
         Config.MessageEncryptor = decryptor;
@@ -163,10 +100,10 @@ public class IggyConsumerBuilder
     }
 
     /// <summary>
-    /// Specifies the partition for the consumer to consume messages from.
+    ///     Specifies the partition for the consumer to consume messages from.
     /// </summary>
     /// <param name="partitionId">The identifier of the partition to consume from.</param>
-    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining.</returns>
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining.</returns>
     public IggyConsumerBuilder WithPartitionId(uint partitionId)
     {
         Config.PartitionId = partitionId;
@@ -175,12 +112,12 @@ public class IggyConsumerBuilder
     }
 
     /// <summary>
-    /// Configures the consumer builder with a specified polling strategy.
-    /// A polling strategy defines the starting point for message consumption.
-    /// After first poll, poll strategy is updated to the next message offset.
+    ///     Configures the consumer builder with a specified polling strategy.
+    ///     A polling strategy defines the starting point for message consumption.
+    ///     After first poll, poll strategy is updated to the next message offset.
     /// </summary>
     /// <param name="pollingStrategy">A strategy that defines how and from where messages are polled.</param>
-    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining.</returns>
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining.</returns>
     public IggyConsumerBuilder WithPollingStrategy(PollingStrategy pollingStrategy)
     {
         Config.PollingStrategy = pollingStrategy;
@@ -189,10 +126,10 @@ public class IggyConsumerBuilder
     }
 
     /// <summary>
-    /// Sets the batch size for the consumer. Default is 100.
+    ///     Sets the batch size for the consumer. Default is 100.
     /// </summary>
     /// <param name="batchSize">The size of the batch to be consumed at one time.</param>
-    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining.</returns>
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining.</returns>
     public IggyConsumerBuilder WithBatchSize(uint batchSize)
     {
         Config.BatchSize = batchSize;
@@ -201,10 +138,10 @@ public class IggyConsumerBuilder
     }
 
     /// <summary>
-    /// Configures the consumer builder with the specified auto-commit mode.
+    ///     Configures the consumer builder with the specified auto-commit mode.
     /// </summary>
     /// <param name="autoCommit">The auto-commit mode to set for the consumer.</param>
-    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining.</returns>
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining.</returns>
     public IggyConsumerBuilder WithAutoCommitMode(AutoCommitMode autoCommit)
     {
         Config.AutoCommit = autoCommit == AutoCommitMode.Auto;
@@ -214,10 +151,10 @@ public class IggyConsumerBuilder
     }
 
     /// <summary>
-    /// Sets the logger factory for the consumer builder.
+    ///     Sets the logger factory for the consumer builder.
     /// </summary>
     /// <param name="loggerFactory">The logger factory to be used for logging.</param>
-    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining.</returns>
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining.</returns>
     public IggyConsumerBuilder WithLogger(ILoggerFactory loggerFactory)
     {
         Config.LoggerFactory = loggerFactory;
@@ -226,12 +163,12 @@ public class IggyConsumerBuilder
     }
 
     /// <summary>
-    /// Configures consumer group settings for the consumer.
+    ///     Configures consumer group settings for the consumer.
     /// </summary>
     /// <param name="groupName">The name of the consumer group if consumer kind is numeric</param>
     /// <param name="createIfNotExists">Whether to create the consumer group if it doesn't exist.</param>
     /// <param name="joinGroup">Whether to join the consumer group after creation/verification.</param>
-    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining.</returns>
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining.</returns>
     public IggyConsumerBuilder WithConsumerGroup(string groupName, bool createIfNotExists = true, bool joinGroup = true)
     {
         Config.ConsumerGroupName = groupName;
@@ -242,10 +179,21 @@ public class IggyConsumerBuilder
     }
 
     /// <summary>
-    /// Sets an event handler for handling polling errors in the consumer.
+    ///     Sets the interval between polling attempts to control the rate of server requests
+    /// </summary>
+    /// <param name="interval">The polling interval as a TimeSpan. Set to TimeSpan.Zero to disable throttling.</param>
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining</returns>
+    public IggyConsumerBuilder WithPollingInterval(TimeSpan interval)
+    {
+        Config.PollingIntervalMs = (int)interval.TotalMilliseconds;
+        return this;
+    }
+
+    /// <summary>
+    ///     Sets an event handler for handling polling errors in the consumer.
     /// </summary>
     /// <param name="handler">The event handler to handle polling errors.</param>
-    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining.</returns>
+    /// <returns>The current instance of <see cref="IggyConsumerBuilder" /> to allow method chaining.</returns>
     public IggyConsumerBuilder OnPollingError(EventHandler<ConsumerErrorEventArgs> handler)
     {
         _onPollingError = handler;
@@ -254,14 +202,14 @@ public class IggyConsumerBuilder
 
 
     /// <summary>
-    /// Builds and returns an instance of <see cref="IggyConsumer"/> configured with the specified options.
+    ///     Builds and returns an instance of <see cref="IggyConsumer" /> configured with the specified options.
     /// </summary>
-    /// <returns>An instance of <see cref="IggyConsumer"/> based on the current builder configuration.</returns>
+    /// <returns>An instance of <see cref="IggyConsumer" /> based on the current builder configuration.</returns>
     public IggyConsumer Build()
     {
         if (Config.CreateIggyClient)
         {
-            IggyClient = IggyClientFactory.CreateClient(new IggyClientConfigurator()
+            IggyClient = IggyClientFactory.CreateClient(new IggyClientConfigurator
             {
                 Protocol = Config.Protocol,
                 BaseAdress = Config.Address,
