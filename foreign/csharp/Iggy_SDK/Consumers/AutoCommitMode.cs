@@ -21,7 +21,7 @@ public enum AutoCommitMode
     AfterReceive,
     
     /// <summary>
-    /// Offset will not be store automaticly
+    /// Offset will not be stored automatically
     /// </summary>
     Disabled
 }

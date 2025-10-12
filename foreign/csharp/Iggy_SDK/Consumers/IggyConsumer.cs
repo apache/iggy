@@ -38,10 +38,7 @@ public partial class IggyConsumer : IAsyncDisposable
         _config = config;
         _logger = logger;
 
-        _channel = Channel.CreateBounded<ReceivedMessage>(new BoundedChannelOptions((int)_config.BatchSize)
-        {
-            FullMode = BoundedChannelFullMode.Wait
-        });
+        _channel = Channel.CreateUnbounded<ReceivedMessage>();
     }
 
     /// <summary>
@@ -320,12 +317,9 @@ public partial class IggyConsumer : IAsyncDisposable
                     Error = error
                 };
 
-                if (!_channel.Writer.TryWrite(receivedMessage))
-                {
-                    break;
-                }
+                await _channel.Writer.WriteAsync(receivedMessage, ct);
 
-                _lastPolledOffset[messages.PartitionId] = messages.Messages[^1].Header.Offset;
+                _lastPolledOffset[messages.PartitionId] = message.Header.Offset;
             }
 
             if (_config.AutoCommitMode == AutoCommitMode.AfterPoll)
