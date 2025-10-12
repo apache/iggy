@@ -6,6 +6,18 @@ using Partitioning = Apache.Iggy.Kinds.Partitioning;
 namespace Apache.Iggy.Publishers;
 
 /// <summary>
+///     Configuration for a typed Iggy publisher that serializes objects of type T to messages
+/// </summary>
+/// <typeparam name="T">The type to serialize to messages</typeparam>
+public class IggyPublisherConfig<T> : IggyPublisherConfig
+{
+    /// <summary>
+    ///     The serializer used to convert objects of type T to message payloads
+    /// </summary>
+    public required ISerializer<T> Serializer { get; set; }
+}
+
+/// <summary>
 ///     Configuration settings for <see cref="IggyPublisher" />.
 ///     Provides comprehensive options for configuring message publishing behavior including
 ///     connection settings, stream/topic management, background processing, and retry policies.
@@ -157,7 +169,7 @@ public class IggyPublisherConfig
     ///     Only used when <see cref="EnableBackgroundSending" /> is true.
     ///     Default is 10,000 messages.
     /// </summary>
-    public int BackgroundQueueCapacity { get;  set; } = 10000;
+    public int BackgroundQueueCapacity { get; set; } = 10000;
 
     /// <summary>
     ///     Gets or sets the number of messages to send in each batch.
@@ -187,7 +199,7 @@ public class IggyPublisherConfig
     ///     When enabled, failed send operations will be retried according to the retry policy.
     ///     Default is true.
     /// </summary>
-    public bool EnableRetry { get;  set; } = true;
+    public bool EnableRetry { get; set; } = true;
 
     /// <summary>
     ///     Gets or sets the maximum number of retry attempts.
@@ -195,7 +207,7 @@ public class IggyPublisherConfig
     ///     Only used when <see cref="EnableRetry" /> is true.
     ///     Default is 3 attempts.
     /// </summary>
-    public int MaxRetryAttempts { get;  set; } = 3;
+    public int MaxRetryAttempts { get; set; } = 3;
 
     /// <summary>
     ///     Gets or sets the initial delay before the first retry.

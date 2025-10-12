@@ -16,20 +16,20 @@ namespace Apache.Iggy.Publishers;
 /// </summary>
 public class IggyPublisherBuilder
 {
-    private EventHandler<PublisherErrorEventArgs>? _onBackgroundError;
-    private EventHandler<MessageBatchFailedEventArgs>? _onMessageBatchFailed;
+    protected EventHandler<PublisherErrorEventArgs>? _onBackgroundError;
+    protected EventHandler<MessageBatchFailedEventArgs>? _onMessageBatchFailed;
 
     /// <summary>
     ///     Gets or sets the publisher configuration.
     /// </summary>
-    public IggyPublisherConfig Config { get; set; } = new();
+    internal IggyPublisherConfig Config { get; set; } = new();
 
     /// <summary>
     ///     Gets or sets the Iggy client instance to use.
     ///     When null and <see cref="IggyPublisherConfig.CreateIggyClient" /> is true, a new client will be created during
     ///     build.
     /// </summary>
-    public IIggyClient? IggyClient { get; set; }
+    internal IIggyClient? IggyClient { get; set; }
 
     /// <summary>
     ///     Creates a new publisher builder using an existing Iggy client instance.
@@ -225,7 +225,10 @@ public class IggyPublisherBuilder
     /// <param name="queueCapacity">The maximum number of messages that can be queued. Default is 10,000.</param>
     /// <param name="batchSize">The number of messages to send in each batch. Default is 100.</param>
     /// <param name="flushInterval">The interval at which to flush pending messages. Default is 100ms.</param>
-    /// <param name="disposalTimeout">The timeout to wait for the background processor to complete during disposal. Default is 5 seconds.</param>
+    /// <param name="disposalTimeout">
+    ///     The timeout to wait for the background processor to complete during disposal. Default is
+    ///     5 seconds.
+    /// </param>
     /// <returns>The builder instance for method chaining.</returns>
     public IggyPublisherBuilder WithBackgroundSending(bool enabled = true, int queueCapacity = 10000,
         int batchSize = 100, TimeSpan? flushInterval = null, TimeSpan? disposalTimeout = null)
