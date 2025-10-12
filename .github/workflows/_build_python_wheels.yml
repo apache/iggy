@@ -51,8 +51,16 @@ jobs:
         include:
           - target: x86_64
             runner: ubuntu-latest
+            manylinux: 2_34
+          - target: x86_64
+            runner: ubuntu-latest
+            manylinux: musllinux_1_2
           - target: aarch64
             runner: ubuntu-24.04-arm
+            manylinux: auto
+          - target: aarch64
+            runner: ubuntu-24.04-arm
+            manylinux: musllinux_1_2
     steps:
       - name: Download latest copy script from master
         if: inputs.use_latest_ci
@@ -94,7 +102,7 @@ jobs:
               yum install -y perl-IPC-Cmd
             fi
             python3 -m pip --version || python3 -m ensurepip
-          manylinux: ${{ matrix.target == 'aarch64' && 'auto' || '2_34' }}
+          manylinux: ${{ matrix.manylinux }}
           args: --release --out dist --interpreter python3.10 python3.11 python3.12 python3.13
           sccache: "true"
 
@@ -102,7 +110,7 @@ jobs:
         if: inputs.upload_artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-linux-${{ matrix.target }}
+          name: wheels-linux-${{ matrix.target }}-${{ matrix.manylinux }}
           path: foreign/python/dist
           retention-days: 7
 

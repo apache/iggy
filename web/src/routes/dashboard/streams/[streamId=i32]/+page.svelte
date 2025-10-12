@@ -10,7 +10,7 @@
 
   interface Props {
     data: {
-      streamDetails: StreamDetails
+      streamDetails: StreamDetails;
     };
   }
 
@@ -28,9 +28,7 @@
     class="ml-3"
     onclick={() => openModal('StreamSettingsModal', { stream })}
   >
-    {#snippet children()}
-      <Icon name="settings" class="dark:text-white" />
-    {/snippet}
+    <Icon name="settings" class="dark:text-white" />
     {#snippet tooltip()}
       <div>Settings</div>
     {/snippet}
@@ -82,4 +80,3 @@
     sizeBytes: undefined
   }}
 />
-
