@@ -5,6 +5,11 @@ using Microsoft.Extensions.Logging;
 
 namespace Apache.Iggy.Consumers;
 
+public class IggyConsumerConfig<T> : IggyConsumerConfig
+{
+    public required IDeserializer<T> Deserializer { get; set; }
+}
+
 public class IggyConsumerConfig
 {
     public bool CreateIggyClient { get; set; }

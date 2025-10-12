@@ -44,6 +44,10 @@ var consumer = client.CreateConsumerBuilder(Identifier.String("new-sdk-stream"),
     .WithBatchSize(20)
     .WithAutoCommitMode(AutoCommitMode.AfterReceive)
     .WithLogger(loggerFactory)
+    .OnPollingError((s, e) =>
+    {
+        logger.LogError("Polling error: {Message}", e.Exception.Message);
+    })
     .Build();
     
 await consumer.InitAsync();
@@ -63,3 +67,4 @@ await foreach (var message in consumer.ReceiveAsync().WithCancellation(cancellat
     Utils.HandleMessage(message, logger);
     await Task.Delay(200);
 }
+

@@ -27,11 +27,6 @@ public partial class IggyConsumer : IAsyncDisposable
     /// </summary>
     public event EventHandler<ConsumerErrorEventArgs>? OnPollingError;
 
-    /// <summary>
-    /// Fired when message decryption fails
-    /// </summary>
-    public event EventHandler<MessageDecryptionFailedEventArgs>? OnMessageDecryptionFailed;
-
     public IggyConsumer(IIggyClient client, IggyConsumerConfig config, ILogger<IggyConsumer> logger)
     {
         _client = client;
@@ -51,6 +46,12 @@ public partial class IggyConsumer : IAsyncDisposable
             return;
         }
 
+        if (_config.Consumer.Type == ConsumerType.ConsumerGroup && _config.PartitionId != null)
+        {
+            _logger.LogWarning("PartitionId is ignored when ConsumerType is ConsumerGroup");
+            _config.PartitionId = null;
+        }
+        
         if (_config.CreateIggyClient)
         {
             await _client.LoginUser(_config.Login, _config.Password, ct);
@@ -237,6 +238,8 @@ public partial class IggyConsumer : IAsyncDisposable
             foreach (var message in messages.Messages)
             {
                 var processedMessage = message;
+                MessageStatus status = MessageStatus.Success;
+                Exception? error = null;
 
                 if (_config.MessageEncryptor != null)
                 {
@@ -253,14 +256,8 @@ public partial class IggyConsumer : IAsyncDisposable
                     catch (Exception ex)
                     {
                         LogFailedToDecryptMessage(ex, message.Header.Offset);
-                        OnMessageDecryptionFailed?.Invoke(this,
-                            new MessageDecryptionFailedEventArgs(ex, new ReceivedMessage()
-                            {
-                                Message = message,
-                                CurrentOffset = message.Header.Offset,
-                                PartitionId = (uint)messages.PartitionId
-                            }));
-                        continue;
+                        status = MessageStatus.DecryptionFailed;
+                        error = ex;
                     }
                 }
 
@@ -268,14 +265,16 @@ public partial class IggyConsumer : IAsyncDisposable
                 {
                     Message = processedMessage,
                     CurrentOffset = processedMessage.Header.Offset,
-                    PartitionId = (uint)messages.PartitionId
+                    PartitionId = (uint)messages.PartitionId,
+                    Status = status,
+                    Error = error
                 };
-                
+
                 if (!_channel.Writer.TryWrite(receivedMessage))
                 {
                     break;
                 }
-                
+
                 _lastPolledOffset[messages.PartitionId] = messages.Messages[^1].Header.Offset;
             }
 

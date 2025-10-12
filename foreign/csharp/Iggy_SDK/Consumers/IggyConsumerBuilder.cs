@@ -9,19 +9,87 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Apache.Iggy.Consumers;
 
+public interface IDeserializer<out T>
+{
+    T Deserialize(byte[] data);
+}
+
+public class IggyConsumerBuilder<T> : IggyConsumerBuilder
+{
+    public static IggyConsumerBuilder<T> Create(Identifier streamId, Identifier topicId, Consumer consumer, IDeserializer<T> deserializer)
+    {
+        return new IggyConsumerBuilder<T>
+        {
+            Config = new IggyConsumerConfig<T>
+            {
+                CreateIggyClient = true,
+                StreamId = streamId,
+                TopicId = topicId,
+                Consumer = consumer,
+                Deserializer = deserializer
+            },
+        };
+    }
+    
+    public static IggyConsumerBuilder<T> Create(IIggyClient iggyClient, Identifier streamId, Identifier topicId, Consumer consumer, IDeserializer<T> deserializer)
+    {
+        return new IggyConsumerBuilder<T>()
+        {
+            Config = new IggyConsumerConfig<T>()
+            {
+                StreamId = streamId,
+                TopicId = topicId,
+                Consumer = consumer,
+                Deserializer = deserializer
+            },
+            IggyClient = iggyClient
+        };
+    }
+
+    public new IggyConsumer<T> Build()
+    {
+        if (Config.CreateIggyClient)
+        {
+            IggyClient = IggyClientFactory.CreateClient(new IggyClientConfigurator()
+            {
+                Protocol = Config.Protocol,
+                BaseAdress = Config.Address,
+                ReceiveBufferSize = Config.ReceiveBufferSize,
+                SendBufferSize = Config.SendBufferSize
+            });
+        }
+
+        if (Config is not IggyConsumerConfig<T> config)
+        {
+            throw new InvalidOperationException("Invalid consumer config");
+        }
+        
+        var consumer = new IggyConsumer<T>(IggyClient!, config,
+            Config.LoggerFactory?.CreateLogger<IggyConsumer<T>>() ??
+            NullLoggerFactory.Instance.CreateLogger<IggyConsumer<T>>());
+
+        if (_onPollingError != null)
+        {
+            consumer.OnPollingError += _onPollingError;
+        }
+
+        return consumer;
+    } 
+}
+
 public class IggyConsumerBuilder
 {
-    private IggyConsumerConfig Config { get; set; } = new ();
-    private IIggyClient? IggyClient { get; set; }
+    internal IggyConsumerConfig Config { get; set; } = new ();
+    internal IIggyClient? IggyClient { get; set; }
 
-    private EventHandler<ConsumerErrorEventArgs>? _onPollingError;
-    private EventHandler<MessageDecryptionFailedEventArgs>? _onMessageDecryptionFailed;
-    
+    protected EventHandler<ConsumerErrorEventArgs>? _onPollingError;
+
     /// <summary>
     /// Create consumer builder
     /// </summary>
     /// <param name="streamId">Stream id</param>
     /// <param name="topicId">Topic id</param>
+    /// <param name="consumer">Consumer</param>
     /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining</returns>
     public static IggyConsumerBuilder Create(Identifier streamId, Identifier topicId, Consumer consumer)
     {
@@ -43,6 +111,7 @@ public class IggyConsumerBuilder
     /// <param name="streamId">Stream id</param>
     /// <param name="topicId">Topic id</param>
     /// <param name="iggyClient">Iggy client</param>
+    /// <param name="consumer">Consumer</param>
     /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining</returns>
     public static IggyConsumerBuilder Create(IIggyClient iggyClient, Identifier streamId, Identifier topicId, Consumer consumer)
     {
@@ -183,16 +252,6 @@ public class IggyConsumerBuilder
         return this;
     }
 
-    /// <summary>
-    /// Registers an event handler for message decryption failure events.
-    /// </summary>
-    /// <param name="handler">The event handler to be executed when a message decryption failure occurs.</param>
-    /// <returns>The current instance of <see cref="IggyConsumerBuilder"/> to allow method chaining.</returns>
-    public IggyConsumerBuilder OnMessageDecryptionFailed(EventHandler<MessageDecryptionFailedEventArgs> handler)
-    {
-        _onMessageDecryptionFailed = handler;
-        return this;
-    }
 
     /// <summary>
     /// Builds and returns an instance of <see cref="IggyConsumer"/> configured with the specified options.
@@ -218,11 +277,6 @@ public class IggyConsumerBuilder
         if (_onPollingError != null)
         {
             consumer.OnPollingError += _onPollingError;
-        }
-
-        if (_onMessageDecryptionFailed != null)
-        {
-            consumer.OnMessageDecryptionFailed += _onMessageDecryptionFailed;
         }
 
         return consumer;

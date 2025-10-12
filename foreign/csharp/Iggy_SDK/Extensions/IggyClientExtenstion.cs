@@ -12,8 +12,15 @@ public static class IggyClientExtenstion
         return IggyConsumerBuilder.Create(client, streamId, topicId, consumer);
     }
     
+    public static IggyConsumerBuilder CreateConsumerBuilder<T>(this IIggyClient client, Identifier streamId, Identifier topicId, Consumer consumer, IDeserializer<T> deserializer) where T : IDeserializer<T>
+    {
+        return IggyConsumerBuilder.Create(client, streamId, topicId, consumer);
+    }
+    
     public static IggyPublisherBuilder CreatePublisherBuilder(this IIggyClient client, Identifier streamId, Identifier topicId)
     {
         return IggyPublisherBuilder.Create(client, streamId, topicId);
     }
+    
+    
 }
