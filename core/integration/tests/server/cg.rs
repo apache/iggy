@@ -22,6 +22,7 @@ use iggy_common::TransportProtocol;
 use serial_test::parallel;
 use test_case::test_matrix;
 
+// TODO: Add `QUIC` and `WebSocket` transports.
 // Consumer group scenarios do not support HTTP
 #[test_matrix(
     [TransportProtocol::Tcp],

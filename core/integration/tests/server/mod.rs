@@ -79,6 +79,8 @@ fn bench_scenario() -> ScenarioFn {
 }
 
 async fn run_scenario(transport: TransportProtocol, scenario: ScenarioFn) {
+    // TODO: Need to enable `TCP_NODELAY` flag for TCP transports, due to small messages being used in the test.
+    // For some reason TCP in compio can't deal with it, but in tokio it works fine.
     let mut extra_envs = HashMap::new();
     extra_envs.insert("IGGY_TCP_SOCKET_OVERRIDE_DEFAULTS".to_string(), "true".to_string());
     extra_envs.insert(
