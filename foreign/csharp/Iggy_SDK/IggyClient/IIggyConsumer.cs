@@ -25,8 +25,10 @@ public interface IIggyConsumer
     Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
         Consumer consumer, PollingStrategy pollingStrategy, uint count, bool autoCommit,
         CancellationToken token = default);
-    
-    Task<PolledMessages> PollMessagesAsync(MessageFetchRequest request, CancellationToken token = default) =>
-        PollMessagesAsync(request.StreamId, request.TopicId, request.PartitionId, request.Consumer,
+
+    Task<PolledMessages> PollMessagesAsync(MessageFetchRequest request, CancellationToken token = default)
+    {
+        return PollMessagesAsync(request.StreamId, request.TopicId, request.PartitionId, request.Consumer,
             request.PollingStrategy, request.Count, request.AutoCommit, token);
+    }
 }

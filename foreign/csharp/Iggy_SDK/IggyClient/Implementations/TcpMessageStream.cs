@@ -17,18 +17,13 @@
 
 using System.Buffers;
 using System.Buffers.Binary;
-using System.IO.Hashing;
-using System.Runtime.CompilerServices;
 using System.Text;
-using System.Threading.Channels;
-using Apache.Iggy.Configuration;
 using Apache.Iggy.ConnectionStream;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Contracts.Tcp;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
-using Apache.Iggy.Headers;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Mappers;
 using Apache.Iggy.Messages;
@@ -40,10 +35,10 @@ namespace Apache.Iggy.IggyClient.Implementations;
 
 public sealed class TcpMessageStream : IIggyClient, IDisposable
 {
-    private readonly IConnectionStream _stream;
     private readonly ILogger<TcpMessageStream> _logger;
     private readonly SemaphoreSlim _semaphore;
-    
+    private readonly IConnectionStream _stream;
+
     internal TcpMessageStream(IConnectionStream stream, ILoggerFactory loggerFactory)
     {
         _stream = stream;
@@ -58,7 +53,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         _semaphore.Dispose();
     }
 
-    public async Task<StreamResponse?> CreateStreamAsync(string name, uint? streamId = null, CancellationToken token = default)
+    public async Task<StreamResponse?> CreateStreamAsync(string name, uint? streamId = null,
+        CancellationToken token = default)
     {
         var message = TcpContracts.CreateStream(name, streamId);
         var payload = new byte[4 + BufferSizes.INITIAL_BYTES_LENGTH + message.Length];
@@ -219,7 +215,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendWithResponseAsync(payload, token);
     }
 
-    public async Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning, IList<Message> messages,
+    public async Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning,
+        IList<Message> messages,
         CancellationToken token = default)
     {
         var metadataLength = 2 + streamId.Length + 2 + topicId.Length
@@ -258,7 +255,8 @@ public sealed class TcpMessageStream : IIggyClient, IDisposable
         await SendWithResponseAsync(payload, token);
     }
 
-    public async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId, Consumer consumer,
+    public async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
+        Consumer consumer,
         PollingStrategy pollingStrategy, uint count, bool autoCommit, CancellationToken token = default)
     {
         var messageBufferSize = CalculateMessageBufferSize(streamId, topicId, consumer);

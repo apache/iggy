@@ -51,15 +51,6 @@ var consumer = client.CreateConsumerBuilder(Identifier.String("new-sdk-stream"),
     .Build();
 
 await consumer.InitAsync();
-var me = await client.GetMeAsync();
-var tt= await client.GetConsumerGroupByIdAsync(Identifier.String("new-sdk-stream"), Identifier.String("new-sdk-topic"),
-    Identifier.String("new-sdk-consumer-group"));
-var offsets = await client.GetOffsetAsync(Consumer.Group("new-sdk-consumer-group"), Identifier.String("new-sdk-stream"),
-    Identifier.String("new-sdk-topic"), 2);
-await consumer.DeleteOffsetAsync(1);
-await consumer.DeleteOffsetAsync(2);
-await consumer.DeleteOffsetAsync(3);
-await consumer.DeleteOffsetAsync(4);
 var cancellationTokenSource = new CancellationTokenSource();
 
 await foreach (var message in consumer.ReceiveAsync().WithCancellation(cancellationTokenSource.Token))
