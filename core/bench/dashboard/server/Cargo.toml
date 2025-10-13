@@ -32,7 +32,7 @@ clap = { workspace = true }
 dashmap = { workspace = true }
 file-operation = "0.8.4"
 notify = "8.2.0"
-octocrab = "0.45.0"
+octocrab = "0.47.0"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
