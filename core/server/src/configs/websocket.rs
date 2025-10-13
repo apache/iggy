@@ -37,6 +37,16 @@ pub struct WebSocketConfig {
     pub max_frame_size: Option<String>,
     #[serde(default)]
     pub accept_unmasked_frames: bool,
+    #[serde(default)]
+    pub tls: WebSocketTlsConfig,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct WebSocketTlsConfig {
+    pub enabled: bool,
+    pub self_signed: bool,
+    pub cert_file: String,
+    pub key_file: String,
 }
 
 impl WebSocketConfig {

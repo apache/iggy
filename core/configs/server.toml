@@ -605,3 +605,9 @@ cpu_allocation = "all"
 
 enabled = true
 address = "0.0.0.0:8092"
+
+[websocket.tls]
+enabled = true
+self_signed = true
+cert_file = "core/certs/iggy_cert.pem"
+key_file = "core/certs/iggy_key.pem"

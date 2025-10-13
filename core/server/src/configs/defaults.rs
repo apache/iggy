@@ -35,7 +35,7 @@ use crate::configs::system::{
     StateConfig, StreamConfig, SystemConfig, TopicConfig,
 };
 use crate::configs::tcp::{TcpConfig, TcpTlsConfig};
-use crate::configs::websocket::WebSocketConfig;
+use crate::configs::websocket::{WebSocketConfig, WebSocketTlsConfig};
 use iggy_common::IggyByteSize;
 use iggy_common::IggyDuration;
 use std::sync::Arc;
@@ -184,6 +184,18 @@ impl Default for WebSocketConfig {
             max_message_size: None,
             max_frame_size: None,
             accept_unmasked_frames: false,
+            tls: WebSocketTlsConfig::default(),
+        }
+    }
+}
+
+impl Default for WebSocketTlsConfig {
+    fn default() -> WebSocketTlsConfig {
+        WebSocketTlsConfig {
+            enabled: SERVER_CONFIG.websocket.tls.enabled,
+            self_signed: SERVER_CONFIG.websocket.tls.self_signed,
+            cert_file: SERVER_CONFIG.websocket.tls.cert_file.parse().unwrap(),
+            key_file: SERVER_CONFIG.websocket.tls.key_file.parse().unwrap(),
         }
     }
 }
