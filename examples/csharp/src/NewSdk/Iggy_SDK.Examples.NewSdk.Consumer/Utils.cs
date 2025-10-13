@@ -30,63 +30,6 @@ namespace Iggy_SDK.Examples.NewSdk.Consumer;
 
 public static class Utils
 {
-    private const uint STREAM_ID = 1;
-    private const uint TOPIC_ID = 4;
-    private const uint PARTITION_ID = 1;
-    private const uint BATCHES_LIMIT = 5;
-
-    // public static async Task ConsumeMessages(IIggyClient client, ILogger logger)
-    // {
-    //     var interval = TimeSpan.FromMilliseconds(500);
-    //     logger.LogInformation(
-    //         "Messages will be consumed from stream: {StreamId}, topic: {TopicId}, partition: {PartitionId} with interval {Interval}.",
-    //         STREAM_ID,
-    //         TOPIC_ID,
-    //         PARTITION_ID,
-    //         interval
-    //     );
-    //
-    //     var offset = 0ul;
-    //     uint messagesPerBatch = 10;
-    //     var consumedBatches = 0;
-    //     var consumer = Apache.Iggy.Kinds.Consumer.New(1);
-    //     while (true)
-    //     {
-    //         if (consumedBatches == BATCHES_LIMIT)
-    //         {
-    //             logger.LogInformation(
-    //                 "Consumed {ConsumedBatches} batches of messages, exiting.",
-    //                 consumedBatches
-    //             );
-    //             return;
-    //         }
-    //
-    //         var streamIdentifier = Identifier.Numeric(STREAM_ID);
-    //         var topicIdentifier = Identifier.Numeric(TOPIC_ID);
-    //         var polledMessages = await client.PollMessagesAsync(
-    //             streamIdentifier,
-    //             topicIdentifier,
-    //             PARTITION_ID,
-    //             consumer,
-    //             PollingStrategy.Offset(offset),
-    //             messagesPerBatch,
-    //             false
-    //         );
-    //
-    //         if (!polledMessages.Messages.Any())
-    //         {
-    //             logger.LogInformation("No messages found.");
-    //             await Task.Delay(interval);
-    //             continue;
-    //         }
-    //
-    //         offset += (ulong)polledMessages.Messages.Count;
-    //         foreach (var message in polledMessages.Messages) HandleMessage(message, logger);
-    //         consumedBatches++;
-    //         await Task.Delay(interval);
-    //     }
-    // }
-
     public static void HandleMessage(ReceivedMessage message, ILogger logger)
     {
         
