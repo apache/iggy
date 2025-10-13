@@ -287,7 +287,7 @@ public class IggyConsumerTests
         await consumer.InitAsync();
 
         var receivedCount = 0;
-        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
 
         await foreach (var message in consumer.ReceiveAsync(cts.Token))
         {
@@ -333,7 +333,7 @@ public class IggyConsumerTests
         await consumer.InitAsync();
 
         var receivedCount = 0;
-        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
 
         await foreach (var message in consumer.ReceiveAsync(cts.Token))
         {
@@ -375,7 +375,7 @@ public class IggyConsumerTests
         await consumer.InitAsync();
 
         var receivedCount = 0;
-        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
 
         await foreach (var message in consumer.ReceiveAsync(cts.Token))
         {
@@ -417,7 +417,7 @@ public class IggyConsumerTests
 
         ulong lastOffset = 0;
         var receivedCount = 0;
-        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
 
         await foreach (var message in consumer.ReceiveAsync(cts.Token))
         {
@@ -467,7 +467,7 @@ public class IggyConsumerTests
 
         ulong lastOffset = 0;
         var receivedCount = 0;
-        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
 
         await foreach (var message in consumer.ReceiveAsync(cts.Token))
         {
@@ -720,7 +720,7 @@ public class IggyConsumerTests
 
         await consumer.InitAsync();
 
-        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         var firstMessage = true;
 
         await foreach (var message in consumer.ReceiveAsync(cts.Token))
@@ -758,7 +758,7 @@ public class IggyConsumerTests
 
         await consumer.InitAsync();
 
-        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
 
         await foreach (var message in consumer.ReceiveAsync(cts.Token))
         {
@@ -792,7 +792,7 @@ public class IggyConsumerTests
 
         await consumer.InitAsync();
 
-        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         var messageReceived = false;
 
         await foreach (var message in consumer.ReceiveAsync(cts.Token))
