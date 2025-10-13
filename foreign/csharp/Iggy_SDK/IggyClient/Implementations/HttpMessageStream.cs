@@ -566,7 +566,8 @@ public class HttpMessageStream : IIggyClient
     }
 
     public async Task<AuthResponse?> LoginUser(string userName, string password, CancellationToken token = default)
-    { // TODO: get version 
+    {
+        // TODO: get version 
         var json = JsonSerializer.Serialize(new LoginUserRequest(userName, password, "", Context),
             _jsonSerializerOptions);
 

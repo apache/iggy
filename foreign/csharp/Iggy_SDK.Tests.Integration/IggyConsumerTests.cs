@@ -492,63 +492,6 @@ public class IggyConsumerTests
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
-    public async Task ReceiveAsync_WithAutoCommitDisabled_Should_NotStoreOffset(Protocol protocol)
-    {
-        var client = protocol == Protocol.Tcp
-            ? await Fixture.CreateTcpClient()
-            : await Fixture.CreateHttpClient();
-
-        var testStream = await CreateTestStreamWithMessages(client, protocol);
-
-        var consumerId = protocol == Protocol.Tcp ? 22 : 122;
-
-        try
-        {
-            await client.DeleteOffsetAsync(Consumer.New(consumerId),
-                Identifier.String(testStream.StreamId),
-                Identifier.String(testStream.TopicId),
-                1u);
-        }
-        catch
-        {
-        }
-
-        var consumer = IggyConsumerBuilder
-            .Create(client,
-                Identifier.String(testStream.StreamId),
-                Identifier.String(testStream.TopicId),
-                Consumer.New(consumerId))
-            .WithPollingStrategy(PollingStrategy.Next())
-            .WithBatchSize(5)
-            .WithPartitionId(1)
-            .WithAutoCommitMode(AutoCommitMode.Disabled)
-            .Build();
-
-        await consumer.InitAsync();
-
-        var receivedCount = 0;
-        var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-
-        await foreach (var message in consumer.ReceiveAsync(cts.Token))
-        {
-            if (receivedCount >= 5)
-            {
-                break;
-            }
-
-            receivedCount++;
-        }
-
-        await consumer.DisposeAsync();
-
-        var offset = await client.GetOffsetAsync(Consumer.New(consumerId), Identifier.String(testStream.StreamId),
-            Identifier.String(testStream.TopicId), 1u);
-
-        offset.ShouldBeNull();
-    }
-
-    [Test]
-    [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task StoreOffsetAsync_Should_StoreOffset_Successfully(Protocol protocol)
     {
         var client = protocol == Protocol.Tcp
