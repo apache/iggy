@@ -19,10 +19,11 @@ using System.Text;
 using Apache.Iggy.Consumers;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
+using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Attributes;
 using Apache.Iggy.Tests.Integrations.Fixtures;
-using Apache.Iggy.Tests.Integrations.Helpers;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
@@ -30,17 +31,23 @@ namespace Apache.Iggy.Tests.Integrations;
 
 public class IggyConsumerTests
 {
-    [ClassDataSource<IggyConsumerFixture>(Shared = SharedType.PerClass)]
-    public required IggyConsumerFixture Fixture { get; init; }
+    [ClassDataSource<IggyServerFixture>(Shared = SharedType.PerAssembly)]
+    public required IggyServerFixture Fixture { get; init; }
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task InitAsync_WithSingleConsumer_Should_Initialize_Successfully(Protocol protocol)
     {
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStreamWithMessages(client, protocol);
+
         var consumer = IggyConsumerBuilder
-            .Create(Fixture.Clients[protocol],
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicId),
+            .Create(client,
+                Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
                 Consumer.New(1))
             .WithPollingStrategy(PollingStrategy.Next())
             .WithBatchSize(10)
@@ -56,14 +63,20 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task InitAsync_WithConsumerGroup_Should_Initialize_Successfully(Protocol protocol)
     {
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStreamWithMessages(client, protocol);
+
         var consumer = IggyConsumerBuilder
-            .Create(Fixture.Clients[protocol],
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicId),
+            .Create(client,
+                Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
                 Consumer.Group("test-group-init"))
             .WithPollingStrategy(PollingStrategy.Next())
             .WithBatchSize(10)
-            .WithConsumerGroup("test-group-init", createIfNotExists: true, joinGroup: true)
+            .WithConsumerGroup("test-group-init")
             .Build();
 
         await Should.NotThrowAsync(() => consumer.InitAsync());
@@ -74,10 +87,16 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task InitAsync_CalledTwice_Should_NotThrow(Protocol protocol)
     {
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStreamWithMessages(client, protocol);
+
         var consumer = IggyConsumerBuilder
-            .Create(Fixture.Clients[protocol],
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicId),
+            .Create(client,
+                Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
                 Consumer.New(2))
             .WithPollingStrategy(PollingStrategy.Next())
             .WithBatchSize(10)
@@ -93,10 +112,16 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ReceiveAsync_WithoutInit_Should_Throw_ConsumerNotInitializedException(Protocol protocol)
     {
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStreamWithMessages(client, protocol);
+
         var consumer = IggyConsumerBuilder
-            .Create(Fixture.Clients[protocol],
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicId),
+            .Create(client,
+                Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
                 Consumer.New(3))
             .WithPollingStrategy(PollingStrategy.Next())
             .WithBatchSize(10)
@@ -105,7 +130,7 @@ public class IggyConsumerTests
 
         await Should.ThrowAsync<ConsumerNotInitializedException>(async () =>
         {
-            var enumerator = consumer.ReceiveAsync().GetAsyncEnumerator();
+            IAsyncEnumerator<ReceivedMessage> enumerator = consumer.ReceiveAsync().GetAsyncEnumerator();
             await enumerator.MoveNextAsync();
         });
 
@@ -117,23 +142,27 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task InitAsync_WithConsumerGroup_Should_CreateGroup_WhenNotExists(Protocol protocol)
     {
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStreamWithMessages(client, protocol);
+
         var groupName = $"test-group-create-{Guid.NewGuid()}";
         var consumer = IggyConsumerBuilder
-            .Create(Fixture.Clients[protocol],
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicId),
+            .Create(client,
+                Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
                 Consumer.Group(groupName))
             .WithPollingStrategy(PollingStrategy.Next())
             .WithBatchSize(10)
-            .WithConsumerGroup(groupName, createIfNotExists: true, joinGroup: true)
+            .WithConsumerGroup(groupName)
             .Build();
 
         await consumer.InitAsync();
 
-        // Verify group was created
-        var group = await Fixture.Clients[protocol].GetConsumerGroupByIdAsync(
-            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            Identifier.String(Fixture.TopicId),
+        var group = await client.GetConsumerGroupByIdAsync(Identifier.String(testStream.StreamId),
+            Identifier.String(testStream.TopicId),
             Identifier.String(groupName));
 
         group.ShouldNotBeNull();
@@ -148,15 +177,21 @@ public class IggyConsumerTests
     public async Task InitAsync_WithConsumerGroup_Should_Throw_WhenGroupNotExists_AndAutoCreateDisabled(
         Protocol protocol)
     {
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStreamWithMessages(client, protocol);
+
         var groupName = $"nonexistent-group-{Guid.NewGuid()}";
         var consumer = IggyConsumerBuilder
-            .Create(Fixture.Clients[protocol],
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicId),
+            .Create(client,
+                Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
                 Consumer.Group(groupName))
             .WithPollingStrategy(PollingStrategy.Next())
             .WithBatchSize(10)
-            .WithConsumerGroup(groupName, createIfNotExists: false, joinGroup: true)
+            .WithConsumerGroup(groupName, false)
             .Build();
 
         await Should.ThrowAsync<ConsumerGroupNotFoundException>(() => consumer.InitAsync());
@@ -168,23 +203,26 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task InitAsync_WithConsumerGroup_Should_JoinGroup_Successfully(Protocol protocol)
     {
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStreamWithMessages(client, protocol);
+
         var groupName = $"test-group-join-{Guid.NewGuid()}";
 
-        // Create group first
-        await Fixture.Clients[protocol].CreateConsumerGroupAsync(
-            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            Identifier.String(Fixture.TopicId),
-            groupName,
-            null);
+        await client.CreateConsumerGroupAsync(Identifier.String(testStream.StreamId),
+            Identifier.String(testStream.TopicId),
+            groupName);
 
         var consumer = IggyConsumerBuilder
-            .Create(Fixture.Clients[protocol],
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicId),
+            .Create(client,
+                Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
                 Consumer.Group(groupName))
             .WithPollingStrategy(PollingStrategy.Next())
             .WithBatchSize(10)
-            .WithConsumerGroup(groupName, createIfNotExists: false, joinGroup: true)
+            .WithConsumerGroup(groupName, false)
             .Build();
 
         await Should.NotThrowAsync(() => consumer.InitAsync());
@@ -196,25 +234,29 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DisposeAsync_Should_LeaveConsumerGroup(Protocol protocol)
     {
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStreamWithMessages(client, protocol);
+
         var groupName = $"test-group-leave-{Guid.NewGuid()}";
 
         var consumer = IggyConsumerBuilder
-            .Create(Fixture.Clients[protocol],
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicId),
+            .Create(client,
+                Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
                 Consumer.Group(groupName))
             .WithPollingStrategy(PollingStrategy.Next())
             .WithBatchSize(10)
-            .WithConsumerGroup(groupName, createIfNotExists: true, joinGroup: true)
+            .WithConsumerGroup(groupName)
             .Build();
 
         await consumer.InitAsync();
         await consumer.DisposeAsync();
 
-        // Verify consumer left the group (members count should be 0)
-        var group = await Fixture.Clients[protocol].GetConsumerGroupByIdAsync(
-            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            Identifier.String(Fixture.TopicId),
+        var group = await client.GetConsumerGroupByIdAsync(Identifier.String(testStream.StreamId),
+            Identifier.String(testStream.TopicId),
             Identifier.String(groupName));
 
         group.ShouldNotBeNull();
@@ -225,10 +267,16 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ReceiveAsync_WithSingleConsumer_Should_ReceiveMessages_Successfully(Protocol protocol)
     {
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStreamWithMessages(client, protocol);
+
         var consumer = IggyConsumerBuilder
-            .Create(Fixture.Clients[protocol],
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicId),
+            .Create(client,
+                Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
                 Consumer.New(10))
             .WithPollingStrategy(PollingStrategy.Next())
             .WithBatchSize(10)
@@ -264,11 +312,17 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ReceiveAsync_WithBatchSize_Should_RespectBatchSize(Protocol protocol)
     {
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStreamWithMessages(client, protocol);
+
         var batchSize = 5u;
         var consumer = IggyConsumerBuilder
-            .Create(Fixture.Clients[protocol],
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicId),
+            .Create(client,
+                Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
                 Consumer.New(11))
             .WithPollingStrategy(PollingStrategy.Next())
             .WithBatchSize(batchSize)
@@ -299,13 +353,17 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ReceiveAsync_WithPollingInterval_Should_RespectInterval(Protocol protocol)
     {
-        // This test verifies that polling interval throttling is working
-        // by checking that the consumer is configured with a polling interval
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStreamWithMessages(client, protocol);
+
         var pollingInterval = TimeSpan.FromMilliseconds(100);
         var consumer = IggyConsumerBuilder
-            .Create(Fixture.Clients[protocol],
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicId),
+            .Create(client,
+                Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
                 Consumer.New(12))
             .WithPollingStrategy(PollingStrategy.Next())
             .WithBatchSize(5)
@@ -319,7 +377,6 @@ public class IggyConsumerTests
         var receivedCount = 0;
         var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
 
-        // Simply verify that messages can be received with polling interval configured
         await foreach (var message in consumer.ReceiveAsync(cts.Token))
         {
             message.ShouldNotBeNull();
@@ -338,12 +395,17 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ReceiveAsync_WithAutoCommitAfterReceive_Should_StoreOffset(Protocol protocol)
     {
-        // Use different consumer IDs for TCP vs HTTP to avoid offset conflicts
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStreamWithMessages(client, protocol);
+
         var consumerId = protocol == Protocol.Tcp ? 20 : 120;
         var consumer = IggyConsumerBuilder
-            .Create(Fixture.Clients[protocol],
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicId),
+            .Create(client,
+                Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
                 Consumer.New(consumerId))
             .WithPollingStrategy(PollingStrategy.First())
             .WithBatchSize(10)
@@ -363,17 +425,16 @@ public class IggyConsumerTests
             {
                 break;
             }
-            
+
             lastOffset = message.CurrentOffset;
             receivedCount++;
         }
 
         await consumer.DisposeAsync();
 
-        // Verify offset was stored - should be offset 4 (0-based, 5 messages = offsets 0-4)
-        var offset = await Fixture.Clients[protocol].GetOffsetAsync(Consumer.New(consumerId),
-            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            Identifier.String(Fixture.TopicId),
+        var offset = await client.GetOffsetAsync(Consumer.New(consumerId),
+            Identifier.String(testStream.StreamId),
+            Identifier.String(testStream.TopicId),
             1u);
 
         offset.ShouldNotBeNull();
@@ -384,12 +445,17 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ReceiveAsync_WithAutoCommitAfterPoll_Should_StoreOffset(Protocol protocol)
     {
-        // Use different consumer IDs for TCP vs HTTP to avoid offset conflicts
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStreamWithMessages(client, protocol);
+
         var consumerId = protocol == Protocol.Tcp ? 21 : 121;
         var consumer = IggyConsumerBuilder
-            .Create(Fixture.Clients[protocol],
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicId),
+            .Create(client,
+                Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
                 Consumer.New(consumerId))
             .WithPollingStrategy(PollingStrategy.First())
             .WithBatchSize(5)
@@ -415,10 +481,9 @@ public class IggyConsumerTests
 
         await consumer.DisposeAsync();
 
-        // Verify offset was stored - should be offset 4 (0-based, 5 messages = offsets 0-4)
-        var offset = await Fixture.Clients[protocol].GetOffsetAsync(Consumer.New(consumerId),
-            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            Identifier.String(Fixture.TopicId),
+        var offset = await client.GetOffsetAsync(Consumer.New(consumerId),
+            Identifier.String(testStream.StreamId),
+            Identifier.String(testStream.TopicId),
             1u);
 
         offset.ShouldNotBeNull();
@@ -429,26 +494,29 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ReceiveAsync_WithAutoCommitDisabled_Should_NotStoreOffset(Protocol protocol)
     {
-        // Use different consumer IDs for TCP vs HTTP to avoid offset conflicts
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStreamWithMessages(client, protocol);
+
         var consumerId = protocol == Protocol.Tcp ? 22 : 122;
 
-        // Clean up any existing offset from previous test runs
         try
         {
-            await Fixture.Clients[protocol].DeleteOffsetAsync(Consumer.New(consumerId),
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicId),
+            await client.DeleteOffsetAsync(Consumer.New(consumerId),
+                Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
                 1u);
         }
         catch
         {
-            // Ignore errors if offset doesn't exist
         }
 
         var consumer = IggyConsumerBuilder
-            .Create(Fixture.Clients[protocol],
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicId),
+            .Create(client,
+                Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
                 Consumer.New(consumerId))
             .WithPollingStrategy(PollingStrategy.Next())
             .WithBatchSize(5)
@@ -473,10 +541,9 @@ public class IggyConsumerTests
 
         await consumer.DisposeAsync();
 
-        // Verify offset was NOT stored
-        var offset = await Fixture.Clients[protocol].GetOffsetAsync(Consumer.New(consumerId),
-            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            Identifier.String(Fixture.TopicId),
+        var offset = await client.GetOffsetAsync(Consumer.New(consumerId),
+            Identifier.String(testStream.StreamId),
+            Identifier.String(testStream.TopicId),
             1u);
 
         offset.ShouldBeNull();
@@ -486,12 +553,17 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task StoreOffsetAsync_Should_StoreOffset_Successfully(Protocol protocol)
     {
-        // Use different consumer IDs for TCP vs HTTP to avoid offset conflicts
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStreamWithMessages(client, protocol);
+
         var consumerId = protocol == Protocol.Tcp ? 30 : 130;
         var consumer = IggyConsumerBuilder
-            .Create(Fixture.Clients[protocol],
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicId),
+            .Create(client,
+                Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
                 Consumer.New(consumerId))
             .WithPollingStrategy(PollingStrategy.Next())
             .WithBatchSize(5)
@@ -504,10 +576,9 @@ public class IggyConsumerTests
         var testOffset = 42ul;
         await Should.NotThrowAsync(() => consumer.StoreOffsetAsync(testOffset, 1));
 
-        // Verify offset was stored
-        var offset = await Fixture.Clients[protocol].GetOffsetAsync(Consumer.New(consumerId),
-            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            Identifier.String(Fixture.TopicId),
+        var offset = await client.GetOffsetAsync(Consumer.New(consumerId),
+            Identifier.String(testStream.StreamId),
+            Identifier.String(testStream.TopicId),
             1u);
 
         offset.ShouldNotBeNull();
@@ -521,11 +592,17 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DeleteOffsetAsync_Should_DeleteOffset_Successfully(Protocol protocol)
     {
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStreamWithMessages(client, protocol);
+
         var consumerId = protocol == Protocol.Tcp ? 31 : 131;
         var consumer = IggyConsumerBuilder
-            .Create(Fixture.Clients[protocol],
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicId),
+            .Create(client,
+                Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
                 Consumer.New(consumerId))
             .WithPollingStrategy(PollingStrategy.Next())
             .WithBatchSize(5)
@@ -538,17 +615,17 @@ public class IggyConsumerTests
         var testOffset = 50ul;
         await consumer.StoreOffsetAsync(testOffset, 1);
 
-        var offset = await Fixture.Clients[protocol].GetOffsetAsync(Consumer.New(consumerId),
-            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            Identifier.String(Fixture.TopicId),
+        var offset = await client.GetOffsetAsync(Consumer.New(consumerId),
+            Identifier.String(testStream.StreamId),
+            Identifier.String(testStream.TopicId),
             1u);
         offset.ShouldNotBeNull();
 
         await Should.NotThrowAsync(() => consumer.DeleteOffsetAsync(1));
 
-        var deletedOffset = await Fixture.Clients[protocol].GetOffsetAsync(Consumer.New(consumerId),
-            Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-            Identifier.String(Fixture.TopicId),
+        var deletedOffset = await client.GetOffsetAsync(Consumer.New(consumerId),
+            Identifier.String(testStream.StreamId),
+            Identifier.String(testStream.TopicId),
             1u);
 
         deletedOffset.ShouldBeNull();
@@ -560,10 +637,16 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DisposeAsync_Should_NotThrow(Protocol protocol)
     {
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStreamWithMessages(client, protocol);
+
         var consumer = IggyConsumerBuilder
-            .Create(Fixture.Clients[protocol],
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicId),
+            .Create(client,
+                Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
                 Consumer.New(40))
             .WithPollingStrategy(PollingStrategy.Next())
             .WithBatchSize(10)
@@ -578,10 +661,16 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DisposeAsync_CalledTwice_Should_NotThrow(Protocol protocol)
     {
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStreamWithMessages(client, protocol);
+
         var consumer = IggyConsumerBuilder
-            .Create(Fixture.Clients[protocol],
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicId),
+            .Create(client,
+                Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
                 Consumer.New(41))
             .WithPollingStrategy(PollingStrategy.Next())
             .WithBatchSize(10)
@@ -597,10 +686,16 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task DisposeAsync_WithoutInit_Should_NotThrow(Protocol protocol)
     {
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStreamWithMessages(client, protocol);
+
         var consumer = IggyConsumerBuilder
-            .Create(Fixture.Clients[protocol],
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicId),
+            .Create(client,
+                Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
                 Consumer.New(42))
             .WithPollingStrategy(PollingStrategy.Next())
             .WithBatchSize(10)
@@ -614,17 +709,23 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task OnPollingError_Should_Fire_WhenPollingFails(Protocol protocol)
     {
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStreamWithMessages(client, protocol);
+
         var errorFired = false;
         Exception? capturedError = null;
 
         var consumer = IggyConsumerBuilder
-            .Create(Fixture.Clients[protocol],
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicId),
+            .Create(client,
+                Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
                 Consumer.New(50))
             .WithPollingStrategy(PollingStrategy.Next())
             .WithBatchSize(10)
-            .WithPartitionId(999) // Invalid partition
+            .WithPartitionId(999)
             .WithAutoCommitMode(AutoCommitMode.Disabled)
             .OnPollingError((sender, args) =>
             {
@@ -646,7 +747,6 @@ public class IggyConsumerTests
         }
         catch (OperationCanceledException)
         {
-            // Expected
         }
 
         errorFired.ShouldBeTrue();
@@ -659,11 +759,17 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ReceiveAsync_WithOffsetStrategy_Should_StartFromOffset(Protocol protocol)
     {
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStreamWithMessages(client, protocol);
+
         var startOffset = 10ul;
         var consumer = IggyConsumerBuilder
-            .Create(Fixture.Clients[protocol],
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicId),
+            .Create(client,
+                Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
                 Consumer.New(60))
             .WithPollingStrategy(PollingStrategy.Offset(startOffset))
             .WithBatchSize(5)
@@ -692,10 +798,16 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ReceiveAsync_WithFirstStrategy_Should_StartFromBeginning(Protocol protocol)
     {
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStreamWithMessages(client, protocol);
+
         var consumer = IggyConsumerBuilder
-            .Create(Fixture.Clients[protocol],
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicId),
+            .Create(client,
+                Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
                 Consumer.New(61))
             .WithPollingStrategy(PollingStrategy.First())
             .WithBatchSize(1)
@@ -720,10 +832,16 @@ public class IggyConsumerTests
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task ReceiveAsync_WithLastStrategy_Should_StartFromEnd(Protocol protocol)
     {
+        var client = protocol == Protocol.Tcp
+            ? await Fixture.CreateTcpClient()
+            : await Fixture.CreateHttpClient();
+
+        var testStream = await CreateTestStreamWithMessages(client, protocol);
+
         var consumer = IggyConsumerBuilder
-            .Create(Fixture.Clients[protocol],
-                Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
-                Identifier.String(Fixture.TopicId),
+            .Create(client,
+                Identifier.String(testStream.StreamId),
+                Identifier.String(testStream.TopicId),
                 Consumer.New(62))
             .WithPollingStrategy(PollingStrategy.Last())
             .WithBatchSize(1)
@@ -738,7 +856,6 @@ public class IggyConsumerTests
 
         await foreach (var message in consumer.ReceiveAsync(cts.Token))
         {
-            // Should be near the end
             message.CurrentOffset.ShouldBeGreaterThan(0ul);
             messageReceived = true;
             break;
@@ -747,4 +864,34 @@ public class IggyConsumerTests
         messageReceived.ShouldBeTrue();
         await consumer.DisposeAsync();
     }
+
+    private async Task<TestStreamInfo> CreateTestStreamWithMessages(IIggyClient client, Protocol protocol,
+        uint partitionsCount = 5, int messagesPerPartition = 100)
+    {
+        var streamId = $"stream_{Guid.NewGuid()}_{protocol.ToString().ToLowerInvariant()}";
+        var topicId = "test_topic";
+
+        await client.CreateStreamAsync(streamId);
+        await client.CreateTopicAsync(Identifier.String(streamId), topicId, partitionsCount);
+
+        for (uint partitionId = 1; partitionId <= partitionsCount; partitionId++)
+        {
+            var messages = new List<Message>();
+            for (var i = 0; i < messagesPerPartition; i++)
+            {
+                var message = new Message(Guid.NewGuid(),
+                    Encoding.UTF8.GetBytes($"Test message {i} for partition {partitionId}"));
+                messages.Add(message);
+            }
+
+            await client.SendMessagesAsync(Identifier.String(streamId),
+                Identifier.String(topicId),
+                Partitioning.PartitionId((int)partitionId),
+                messages);
+        }
+
+        return new TestStreamInfo(streamId, topicId, partitionsCount, messagesPerPartition);
+    }
+
+    private record TestStreamInfo(string StreamId, string TopicId, uint PartitionsCount, int MessagesPerPartition);
 }

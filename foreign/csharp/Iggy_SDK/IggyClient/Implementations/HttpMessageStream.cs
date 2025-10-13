@@ -15,27 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Buffers.Binary;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
-using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using System.Threading.Channels;
-using Apache.Iggy.Configuration;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Auth;
 using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Contracts.Http.Auth;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
-using Apache.Iggy.Headers;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
 using Apache.Iggy.StringHandlers;
-using Microsoft.Extensions.Logging;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.IggyClient.Implementations;
@@ -43,7 +37,7 @@ namespace Apache.Iggy.IggyClient.Implementations;
 public class HttpMessageStream : IIggyClient
 {
     private const string Context = "csharp-sdk";
-    
+
     private readonly HttpClient _httpClient;
 
     //TODO - create mechanism for refreshing jwt token
@@ -234,7 +228,8 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
 
-    public async Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning, IList<Message> messages,
+    public async Task SendMessagesAsync(Identifier streamId, Identifier topicId, Partitioning partitioning,
+        IList<Message> messages,
         CancellationToken token = default)
     {
         var request = new MessageSendRequest
@@ -247,9 +242,10 @@ public class HttpMessageStream : IIggyClient
         var json = JsonSerializer.Serialize(request, _jsonSerializerOptions);
         var data = new StringContent(json, Encoding.UTF8, "application/json");
 
-        var response = await _httpClient.PostAsync($"/streams/{request.StreamId}/topics/{request.TopicId}/messages", data,
+        var response = await _httpClient.PostAsync($"/streams/{request.StreamId}/topics/{request.TopicId}/messages",
+            data,
             token);
-        
+
         if (!response.IsSuccessStatusCode)
         {
             await HandleResponseAsync(response);
@@ -269,12 +265,13 @@ public class HttpMessageStream : IIggyClient
         }
     }
 
-    public async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId, Consumer consumer,
+    public async Task<PolledMessages> PollMessagesAsync(Identifier streamId, Identifier topicId, uint? partitionId,
+        Consumer consumer,
         PollingStrategy pollingStrategy, uint count, bool autoCommit, CancellationToken token = default)
     {
-        var url = CreateUrl(
-            $"/streams/{streamId}/topics/{topicId}/messages?consumer_id={consumer.Id}" +
-            $"&partition_id={partitionId}&kind={pollingStrategy.Kind}&value={pollingStrategy.Value}&count={count}&auto_commit={autoCommit}");
+        var partitionIdParam = partitionId.HasValue ? $"&partition_id={partitionId.Value}" : string.Empty;
+        var url = CreateUrl($"/streams/{streamId}/topics/{topicId}/messages?consumer_id={consumer.Id}" +
+                            $"{partitionIdParam}&kind={pollingStrategy.Kind}&value={pollingStrategy.Value}&count={count}&auto_commit={autoCommit}");
 
         var response = await _httpClient.GetAsync(url, token);
         if (response.IsSuccessStatusCode)
@@ -307,8 +304,9 @@ public class HttpMessageStream : IIggyClient
     public async Task<OffsetResponse?> GetOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId,
         uint? partitionId, CancellationToken token = default)
     {
+        var partitionIdParam = partitionId.HasValue ? $"&partition_id={partitionId.Value}" : string.Empty;
         var response = await _httpClient.GetAsync($"/streams/{streamId}/topics/{topicId}/" +
-                                                  $"consumer-offsets?consumer_id={consumer.Id}&partition_id={partitionId}",
+                                                  $"consumer-offsets?consumer_id={consumer.Id}{partitionIdParam}",
             token);
         if (response.IsSuccessStatusCode)
         {
@@ -322,8 +320,9 @@ public class HttpMessageStream : IIggyClient
     public async Task DeleteOffsetAsync(Consumer consumer, Identifier streamId, Identifier topicId, uint? partitionId,
         CancellationToken token = default)
     {
+        var partitionIdParam = partitionId.HasValue ? $"?partition_id={partitionId.Value}" : string.Empty;
         var response = await _httpClient.DeleteAsync(
-            $"/streams/{streamId}/topics/{topicId}/consumer-offsets/{consumer}?partition_id={partitionId}", token);
+            $"/streams/{streamId}/topics/{topicId}/consumer-offsets/{consumer}{partitionIdParam}", token);
         await HandleResponseAsync(response);
     }
 
@@ -674,44 +673,16 @@ public class HttpMessageStream : IIggyClient
         return null;
     }
 
-    // private async Task StartPollingMessagesAsync<TMessage>(MessageFetchRequest request,
-    //     Func<byte[], TMessage> deserializer, TimeSpan interval, ChannelWriter<MessageResponse<TMessage>> writer,
-    //     Func<byte[], byte[]>? decryptor = null,
-    //     CancellationToken token = default)
-    // {
-    //     var timer = new PeriodicTimer(interval);
-    //     while (await timer.WaitForNextTickAsync(token) || token.IsCancellationRequested)
-    //     {
-    //         try
-    //         {
-    //             PolledMessages<TMessage> fetchResponse
-    //                 = await PollMessagesAsync(request, deserializer, decryptor, token);
-    //             if (fetchResponse.Messages.Count == 0)
-    //             {
-    //                 continue;
-    //             }
-    //
-    //             foreach (MessageResponse<TMessage> messageResponse in fetchResponse.Messages)
-    //             {
-    //                 await writer.WriteAsync(messageResponse, token);
-    //             }
-    //         }
-    //         catch (Exception e)
-    //         {
-    //             _logger.LogError(e,
-    //                 "Error encountered while polling messages - Stream ID: {StreamId}, Topic ID: {TopicId}, Partition ID: {PartitionId}",
-    //                 request.StreamId, request.TopicId, request.PartitionId);
-    //         }
-    //     }
-    //
-    //     writer.Complete();
-    // }
+    public void Dispose()
+    {
+    }
 
     private static async Task HandleResponseAsync(HttpResponseMessage response, bool shouldThrowOnGetNotFound = false)
     {
-        if ((int)response.StatusCode > 300 
-            && (int)response.StatusCode < 500 
-            && !(response.RequestMessage!.Method == HttpMethod.Get && response.StatusCode == HttpStatusCode.NotFound && !shouldThrowOnGetNotFound))
+        if ((int)response.StatusCode > 300
+            && (int)response.StatusCode < 500
+            && !(response.RequestMessage!.Method == HttpMethod.Get && response.StatusCode == HttpStatusCode.NotFound &&
+                 !shouldThrowOnGetNotFound))
         {
             var err = await response.Content.ReadAsStringAsync();
             throw new InvalidResponseException(err);
@@ -726,10 +697,5 @@ public class HttpMessageStream : IIggyClient
     private static string CreateUrl(ref MessageRequestInterpolationHandler message)
     {
         return message.ToString();
-    }
-
-    public void Dispose()
-    {
-        
     }
 }
