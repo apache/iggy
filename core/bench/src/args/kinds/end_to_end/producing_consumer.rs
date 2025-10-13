@@ -75,7 +75,7 @@ impl BenchmarkKindProps for EndToEndProducingConsumerArgs {
 
     fn validate(&self) {
         let mut cmd = IggyBenchArgs::command();
-        let streams = self.streams.get();
+        let streams = self.streams();
         let producing_consumers = self.producers();
         if streams > producing_consumers {
             cmd.error(

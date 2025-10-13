@@ -82,7 +82,7 @@ impl BenchmarkKindProps for BalancedProducerArgs {
     }
 
     fn validate(&self) {
-        let partitions = self.partitions.get();
+        let partitions = self.partitions();
         let mut cmd = IggyBenchArgs::command();
 
         if partitions < 2 {
