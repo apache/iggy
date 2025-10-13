@@ -80,6 +80,7 @@ impl ServerCommandHandler for PollMessages {
                 args,
             )
             .await?;
+
         // Collect all chunks first into a Vec to extend their lifetimes.
         // This ensures the Bytes (in reality Arc<[u8]>) references from each IggyMessagesBatch stay alive
         // throughout the async vectored I/O operation, preventing "borrowed value does not live

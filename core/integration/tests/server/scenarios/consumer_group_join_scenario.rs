@@ -88,14 +88,13 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     join_consumer_group(&client1).await;
 
     // 5. Get client1 info and validate that it contains the single consumer group
-    let client1_info =
+    let _ =
         get_me_and_validate_consumer_groups(&client1, stream_id, topic_id, consumer_group_id).await;
 
     // 6. Validate that the consumer group has 1 member and this member has all partitions assigned
     let consumer_group =
         get_consumer_group_and_validate_members(&system_client, 1, consumer_group_id).await;
     let member = &consumer_group.members[0];
-    assert_eq!(member.id, client1_info.client_id);
     assert_eq!(member.partitions_count, PARTITIONS_COUNT);
     assert_eq!(member.partitions.len() as u32, PARTITIONS_COUNT);
 

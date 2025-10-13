@@ -25,19 +25,18 @@ use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
 };
 use crate::streaming::partitions::journal::Journal;
-use crate::streaming::polling_consumer::PollingConsumer;
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet};
 use crate::streaming::session::Session;
 use crate::streaming::traits::MainOps;
 use crate::streaming::utils::PooledBuffer;
-use crate::streaming::{partitions, streams, topics};
+use crate::streaming::{streams, topics};
 use error_set::ErrContext;
 use iggy_common::{
     BytesSerializable, Consumer, EncryptorKind, IGGY_MESSAGE_HEADER_SIZE, Identifier, IggyError,
     Partitioning, PartitioningKind, PollingKind, PollingStrategy,
 };
 use std::sync::atomic::Ordering;
-use tracing::{error, trace};
+use tracing::error;
 
 impl IggyShard {
     pub async fn append_messages(
@@ -244,77 +243,17 @@ impl IggyShard {
                         let offset = batches
                             .last_offset()
                             .expect("Batch set should have at least one batch");
-                        trace!(
-                            "Last offset: {} will be automatically stored for {}, stream: {}, topic: {}, partition: {}",
-                            offset, consumer, numeric_stream_id, numeric_topic_id, partition_id
-                        );
-                        match consumer {
-                            PollingConsumer::Consumer(consumer_id, _) => {
-                                self.streams2.with_partition_by_id(
-                                    stream_id,
-                                    topic_id,
-                                    partition_id,
-                                    partitions::helpers::store_consumer_offset(
-                                        consumer_id,
-                                        numeric_stream_id,
-                                        numeric_topic_id,
-                                        partition_id,
-                                        offset,
-                                        &self.config.system,
-                                    ),
-                                );
-
-                                let (offset_value, path) = self.streams2.with_partition_by_id(
-                                    stream_id,
-                                    topic_id,
-                                    partition_id,
-                                    |(.., offsets, _, _)| {
-                                        let hdl = offsets.pin();
-                                        let item = hdl.get(&consumer_id).expect(
-                                            "persist_consumer_offset_to_disk: offset not found",
-                                        );
-                                        let offset =
-                                            item.offset.load(std::sync::atomic::Ordering::Relaxed);
-                                        let path = item.path.clone();
-                                        (offset, path)
-                                    },
-                                );
-                                partitions::storage2::persist_offset(self.id, &path, offset_value)
-                                    .await?;
-                            }
-                            PollingConsumer::ConsumerGroup(cg_id, _) => {
-                                self.streams2.with_partition_by_id(
-                                    stream_id,
-                                    topic_id,
-                                    partition_id,
-                                    partitions::helpers::store_consumer_group_member_offset(
-                                        cg_id,
-                                        numeric_stream_id,
-                                        numeric_topic_id,
-                                        partition_id,
-                                        offset,
-                                        &self.config.system,
-                                    ),
-                                );
-
-                                let (offset_value, path) = self.streams2.with_partition_by_id(
-                                    stream_id,
-                                    topic_id,
-                                    partition_id,
-                                    |(.., offsets, _)| {
-                                        let hdl = offsets.pin();
-                                        let item = hdl
-                                            .get(&cg_id)
-                                            .expect("persist_consumer_group_member_offset_to_disk: offset not found");
-                                        let offset = item.offset.load(std::sync::atomic::Ordering::Relaxed);
-                                        let path = item.path.clone();
-                                        (offset, path)
-                                    },
-                                );
-                                partitions::storage2::persist_offset(self.id, &path, offset_value)
-                                    .await?;
-                            }
-                        }
+                        self.streams2
+                            .auto_commit_consumer_offset(
+                                self.id,
+                                &self.config.system,
+                                stream_id,
+                                topic_id,
+                                partition_id,
+                                consumer,
+                                offset,
+                            )
+                            .await?;
                     }
                     Ok((metadata, batches))
                 } else {

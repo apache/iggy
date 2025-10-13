@@ -380,18 +380,23 @@ impl MainOps for Streams {
                     ),
                 };
 
-                let Some(consumer_offset) = consumer_offset else {
-                    return Err(IggyError::ConsumerOffsetNotFound(consumer_id));
-                };
-                let offset = consumer_offset + 1;
-                trace!(
-                    "Getting next messages for consumer id: {} for partition: {} from offset: {}...",
-                    consumer_id, partition_id, offset
-                );
-                let batches = self
-                    .get_messages_by_offset(stream_id, topic_id, partition_id, offset, count)
-                    .await?;
-                Ok(batches)
+                if consumer_offset.is_none() {
+                    let batches = self
+                        .get_messages_by_offset(stream_id, topic_id, partition_id, 0, count)
+                        .await?;
+                    Ok(batches)
+                } else {
+                    let consumer_offset = consumer_offset.unwrap();
+                    let offset = consumer_offset + 1;
+                    trace!(
+                        "Getting next messages for consumer id: {} for partition: {} from offset: {}...",
+                        consumer_id, partition_id, offset
+                    );
+                    let batches = self
+                        .get_messages_by_offset(stream_id, topic_id, partition_id, offset, count)
+                        .await?;
+                    Ok(batches)
+                }
             }
         }?;
         Ok((metadata, batches))
@@ -590,6 +595,10 @@ impl Streams {
         offset: u64,
         count: u32,
     ) -> Result<IggyMessagesBatchSet, IggyError> {
+        if count == 0 {
+            return Ok(IggyMessagesBatchSet::default());
+        }
+
         use crate::streaming::partitions::helpers;
         let range = self.with_partition_by_id(
             stream_id,
@@ -603,6 +612,10 @@ impl Streams {
         let mut current_offset = offset;
 
         for idx in range {
+            if remaining_count == 0 {
+                break;
+            }
+
             let (segment_start_offset, segment_end_offset) = self.with_partition_by_id(
                 stream_id,
                 topic_id,
@@ -613,18 +626,16 @@ impl Streams {
                 },
             );
 
-            let start_offset = if current_offset < segment_start_offset {
+            let offset = if current_offset < segment_start_offset {
                 segment_start_offset
             } else {
                 current_offset
             };
 
-            let mut end_offset = start_offset + (remaining_count - 1) as u64;
+            let mut end_offset = offset + (remaining_count - 1).max(1) as u64;
             if end_offset > segment_end_offset {
                 end_offset = segment_end_offset;
             }
-
-            let count: u32 = ((end_offset - start_offset + 1) as u32).min(remaining_count);
 
             let messages = self
                 .get_messages_by_offset_base(
@@ -632,9 +643,9 @@ impl Streams {
                     topic_id,
                     partition_id,
                     idx,
-                    start_offset,
+                    offset,
                     end_offset,
-                    count,
+                    remaining_count,
                     segment_start_offset,
                 )
                 .await?;
@@ -654,10 +665,6 @@ impl Streams {
             }
 
             batches.add_batch_set(messages);
-
-            if remaining_count == 0 {
-                break;
-            }
         }
 
         Ok(batches)
@@ -675,10 +682,6 @@ impl Streams {
         count: u32,
         segment_start_offset: u64,
     ) -> Result<IggyMessagesBatchSet, IggyError> {
-        if count == 0 {
-            return Ok(IggyMessagesBatchSet::default());
-        }
-
         let (is_journal_empty, journal_first_offset, journal_last_offset) = self
             .with_partition_by_id(
                 stream_id,
@@ -888,6 +891,10 @@ impl Streams {
         let mut batches = IggyMessagesBatchSet::empty();
 
         for idx in range {
+            if remaining_count == 0 {
+                break;
+            }
+
             let segment_end_timestamp = self.with_partition_by_id(
                 stream_id,
                 topic_id,
@@ -920,10 +927,6 @@ impl Streams {
 
             remaining_count = remaining_count.saturating_sub(messages_count);
             batches.add_batch_set(messages);
-
-            if remaining_count == 0 {
-                break;
-            }
         }
 
         Ok(batches)
@@ -1346,6 +1349,74 @@ impl Streams {
                 e
             );
             return Err(e);
+        }
+
+        Ok(())
+    }
+
+    pub async fn auto_commit_consumer_offset(
+        &self,
+        shard_id: u16,
+        config: &SystemConfig,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: usize,
+        consumer: PollingConsumer,
+        offset: u64,
+    ) -> Result<(), IggyError> {
+        let numeric_stream_id = self.with_stream_by_id(stream_id, streams::helpers::get_stream_id());
+        let numeric_topic_id = self.with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
+
+        trace!(
+            "Last offset: {} will be automatically stored for {}, stream: {}, topic: {}, partition: {}",
+            offset, consumer, numeric_stream_id, numeric_topic_id, partition_id
+        );
+
+        match consumer {
+            PollingConsumer::Consumer(consumer_id, _) => {
+                let (offset_value, path) = self.with_partition_by_id(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    |(.., offsets, _, _)| {
+                        let hdl = offsets.pin();
+                        let item = hdl.get_or_insert(
+                            consumer_id,
+                            crate::streaming::partitions::consumer_offset::ConsumerOffset::default_for_consumer(
+                                consumer_id as u32,
+                                &config.get_consumer_offsets_path(numeric_stream_id, numeric_topic_id, partition_id),
+                            ),
+                        );
+                        item.offset.store(offset, Ordering::Relaxed);
+                        let offset_value = item.offset.load(Ordering::Relaxed);
+                        let path = item.path.clone();
+                        (offset_value, path)
+                    },
+                );
+                crate::streaming::partitions::storage2::persist_offset(shard_id, &path, offset_value).await?;
+            }
+            PollingConsumer::ConsumerGroup(cg_id, _) => {
+                let (offset_value, path) = self.with_partition_by_id(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    |(.., offsets, _)| {
+                        let hdl = offsets.pin();
+                        let item = hdl.get_or_insert(
+                            cg_id,
+                            crate::streaming::partitions::consumer_offset::ConsumerOffset::default_for_consumer_group(
+                                cg_id as u32,
+                                &config.get_consumer_group_offsets_path(numeric_stream_id, numeric_topic_id, partition_id),
+                            ),
+                        );
+                        item.offset.store(offset, Ordering::Relaxed);
+                        let offset_value = item.offset.load(Ordering::Relaxed);
+                        let path = item.path.clone();
+                        (offset_value, path)
+                    },
+                );
+                crate::streaming::partitions::storage2::persist_offset(shard_id, &path, offset_value).await?;
+            }
         }
 
         Ok(())

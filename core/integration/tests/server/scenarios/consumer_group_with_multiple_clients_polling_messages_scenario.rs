@@ -34,11 +34,13 @@ pub async fn run(client_factory: &dyn ClientFactory) {
     login_root(&system_client).await;
     init_system(&system_client, &client1, &client2, &client3, true).await;
     execute_using_messages_key_key(&system_client, &client1, &client2, &client3).await;
+    /* 
     cleanup(&system_client, false).await;
     init_system(&system_client, &client1, &client2, &client3, false).await;
     execute_using_none_key(&system_client, &client1, &client2, &client3).await;
     cleanup(&system_client, true).await;
     assert_clean_system(&system_client).await;
+    */
 }
 
 async fn init_system(

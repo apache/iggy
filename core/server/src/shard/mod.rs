@@ -26,7 +26,6 @@ pub mod transmission;
 
 use self::tasks::{continuous, periodic};
 use crate::{
-    binary::handlers::messages::poll_messages_handler::IggyPollMetadata,
     configs::server::ServerConfig,
     shard::{
         namespace::{IggyFullNamespace, IggyNamespace},
@@ -41,8 +40,8 @@ use crate::{
     slab::{streams::Streams, traits_ext::EntityMarker, users::Users},
     state::StateKind,
     streaming::{
-        clients::client_manager::ClientManager, diagnostics::metrics::Metrics, partitions,
-        polling_consumer::PollingConsumer, session::Session, traits::MainOps,
+        clients::client_manager::ClientManager, diagnostics::metrics::Metrics,
+        session::Session, traits::MainOps,
         users::permissioner::Permissioner, utils::ptr::EternalPtr,
     },
     versioning::SemanticVersion,
@@ -53,7 +52,7 @@ use dashmap::DashMap;
 use error_set::ErrContext;
 use hash32::{Hasher, Murmur3Hasher};
 use iggy_common::{
-    EncryptorKind, Identifier, IggyError, IggyTimestamp, PollingKind, TransportProtocol,
+    EncryptorKind, Identifier, IggyError, TransportProtocol,
 };
 use std::hash::Hasher as _;
 use std::{
@@ -63,7 +62,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
-use tracing::{debug, error, instrument, trace};
+use tracing::{debug, error, instrument};
 use transmission::connector::{Receiver, ShardConnector, StopReceiver};
 
 pub const COMPONENT: &str = "SHARD";
@@ -488,242 +487,25 @@ impl IggyShard {
                 Ok(ShardResponse::SendMessages)
             }
             ShardRequestPayload::PollMessages { args, consumer } => {
-                let current_offset = self.streams2.with_partition_by_id(
-                    &stream_id,
-                    &topic_id,
-                    partition_id,
-                    |(_, _, _, offset, ..)| offset.load(Ordering::Relaxed),
-                );
-                let metadata = IggyPollMetadata::new(partition_id as u32, current_offset);
-                let count = args.count;
-                let strategy = args.strategy;
-                let value = strategy.value;
-                let batches = match strategy.kind {
-                    PollingKind::Offset => {
-                        let offset = value;
-                        // We have to remember to keep the invariant from the if that is on line 496.
-                        // Alternatively a better design would be to move the validations here, while keeping the validations in the original place.
-                        let batches = self
-                            .streams2
-                            .get_messages_by_offset(
-                                &stream_id,
-                                &topic_id,
-                                partition_id,
-                                offset,
-                                count,
-                            )
-                            .await?;
-                        Ok(batches)
-                    }
-                    PollingKind::Timestamp => {
-                        let timestamp = IggyTimestamp::from(value);
-                        let timestamp_ts = timestamp.as_micros();
-                        trace!(
-                            "Getting {count} messages by timestamp: {} for partition: {}...",
-                            timestamp_ts, partition_id
-                        );
+                let auto_commit = args.auto_commit;
+                let ns = IggyFullNamespace::new(stream_id, topic_id, partition_id);
+                let (metadata, batches) = self.streams2.poll_messages(&ns, consumer, args).await?;
 
-                        let batches = self
-                            .streams2
-                            .get_messages_by_timestamp(
-                                &stream_id,
-                                &topic_id,
-                                partition_id,
-                                timestamp_ts,
-                                count,
-                            )
-                            .await?;
-                        Ok(batches)
-                    }
-                    PollingKind::First => {
-                        let first_offset = self.streams2.with_partition_by_id(
-                            &stream_id,
-                            &topic_id,
-                            partition_id,
-                            |(_, _, _, _, _, _, log)| {
-                                log.segments()
-                                    .first()
-                                    .map(|segment| segment.start_offset)
-                                    .unwrap_or(0)
-                            },
-                        );
-
-                        let batches = self
-                            .streams2
-                            .get_messages_by_offset(
-                                &stream_id,
-                                &topic_id,
-                                partition_id,
-                                first_offset,
-                                count,
-                            )
-                            .await?;
-                        Ok(batches)
-                    }
-                    PollingKind::Last => {
-                        let (start_offset, actual_count) = self.streams2.with_partition_by_id(
-                            &stream_id,
-                            &topic_id,
-                            partition_id,
-                            |(_, _, _, offset, _, _, _)| {
-                                let current_offset = offset.load(Ordering::Relaxed);
-                                let mut requested_count = count as u64;
-                                if requested_count > current_offset + 1 {
-                                    requested_count = current_offset + 1
-                                }
-                                let start_offset = 1 + current_offset - requested_count;
-                                (start_offset, requested_count as u32)
-                            },
-                        );
-
-                        let batches = self
-                            .streams2
-                            .get_messages_by_offset(
-                                &stream_id,
-                                &topic_id,
-                                partition_id,
-                                start_offset,
-                                actual_count,
-                            )
-                            .await?;
-                        Ok(batches)
-                    }
-                    PollingKind::Next => {
-                        let (consumer_offset, consumer_id) = match consumer {
-                            PollingConsumer::Consumer(consumer_id, _) => (
-                                self.streams2
-                                    .with_partition_by_id(
-                                        &stream_id,
-                                        &topic_id,
-                                        partition_id,
-                                        partitions::helpers::get_consumer_offset(consumer_id),
-                                    )
-                                    .map(|c_offset| c_offset.stored_offset),
-                                consumer_id,
-                            ),
-                            PollingConsumer::ConsumerGroup(cg_id, _) => (
-                                self.streams2
-                                    .with_partition_by_id(
-                                        &stream_id,
-                                        &topic_id,
-                                        partition_id,
-                                        partitions::helpers::get_consumer_group_member_offset(
-                                            cg_id,
-                                        ),
-                                    )
-                                    .map(|cg_offset| cg_offset.stored_offset),
-                                cg_id,
-                            ),
-                        };
-
-                        if consumer_offset.is_none() {
-                            let batches = self
-                                .streams2
-                                .get_messages_by_offset(
-                                    &stream_id,
-                                    &topic_id,
-                                    partition_id,
-                                    0,
-                                    count,
-                                )
-                                .await?;
-                            Ok(batches)
-                        } else {
-                            let consumer_offset = consumer_offset.unwrap();
-                            let offset = consumer_offset + 1;
-                            trace!(
-                                "Getting next messages for consumer id: {} for partition: {} from offset: {}...",
-                                consumer_id, partition_id, offset
-                            );
-                            let batches = self
-                                .streams2
-                                .get_messages_by_offset(
-                                    &stream_id,
-                                    &topic_id,
-                                    partition_id,
-                                    offset,
-                                    count,
-                                )
-                                .await?;
-                            Ok(batches)
-                        }
-                    }
-                }?;
-
-                let numeric_stream_id = self.streams2.with_stream_by_id(
-                    &stream_id,
-                    crate::streaming::streams::helpers::get_stream_id(),
-                );
-                let numeric_topic_id = self.streams2.with_topic_by_id(
-                    &stream_id,
-                    &topic_id,
-                    crate::streaming::topics::helpers::get_topic_id(),
-                );
-
-                if args.auto_commit && !batches.is_empty() {
+                if auto_commit && !batches.is_empty() {
                     let offset = batches
                         .last_offset()
                         .expect("Batch set should have at least one batch");
-                    trace!(
-                        "Last offset: {} will be automatically stored for {}, stream: {}, topic: {}, partition: {}",
-                        offset, consumer, numeric_stream_id, numeric_topic_id, partition_id
-                    );
-                    match consumer {
-                        PollingConsumer::Consumer(consumer_id, _) => {
-                            let (offset_value, path) = self.streams2.with_partition_by_id(
-                                &stream_id,
-                                &topic_id,
-                                partition_id,
-                                |(.., offsets, _, _)| {
-                                    let hdl = offsets.pin();
-                                    let item = hdl.get_or_insert(
-                                        consumer_id,
-                                        crate::streaming::partitions::consumer_offset::ConsumerOffset::default_for_consumer(
-                                            consumer_id as u32,
-                                            &self.config.system.get_consumer_offsets_path(numeric_stream_id, numeric_topic_id, partition_id),
-                                        ),
-                                    );
-                                    item.offset.store(offset, std::sync::atomic::Ordering::Relaxed);
-                                    let offset_value = item.offset.load(std::sync::atomic::Ordering::Relaxed);
-                                    let path = item.path.clone();
-                                    (offset_value, path)
-                                },
-                            );
-                            crate::streaming::partitions::storage2::persist_offset(
-                                self.id,
-                                &path,
-                                offset_value,
-                            )
-                            .await?;
-                        }
-                        PollingConsumer::ConsumerGroup(cg_id, _) => {
-                            let (offset_value, path) = self.streams2.with_partition_by_id(
-                                &stream_id,
-                                &topic_id,
-                                partition_id,
-                                |(.., offsets, _)| {
-                                    let hdl = offsets.pin();
-                                    let item = hdl.get_or_insert(
-                                        cg_id,
-                                        crate::streaming::partitions::consumer_offset::ConsumerOffset::default_for_consumer_group(
-                                            cg_id as u32,
-                                            &self.config.system.get_consumer_group_offsets_path(numeric_stream_id, numeric_topic_id, partition_id),
-                                        ),
-                                    );
-                                    item.offset.store(offset, std::sync::atomic::Ordering::Relaxed);
-                                    let offset_value = item.offset.load(std::sync::atomic::Ordering::Relaxed);
-                                    let path = item.path.clone();
-                                    (offset_value, path)
-                                },
-                            );
-                            crate::streaming::partitions::storage2::persist_offset(
-                                self.id,
-                                &path,
-                                offset_value,
-                            )
-                            .await?;
-                        }
-                    }
+                    self.streams2
+                        .auto_commit_consumer_offset(
+                            self.id,
+                            &self.config.system,
+                            ns.stream_id(),
+                            ns.topic_id(),
+                            partition_id,
+                            consumer,
+                            offset,
+                        )
+                        .await?;
                 }
                 Ok(ShardResponse::PollMessages((metadata, batches)))
             }

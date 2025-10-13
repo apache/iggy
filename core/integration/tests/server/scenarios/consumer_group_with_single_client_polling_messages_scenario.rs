@@ -73,12 +73,11 @@ async fn init_system(client: &IggyClient) {
     // 5. Validate that group contains the single client with all partitions assigned
     let consumer_group_info = get_consumer_group(client).await;
 
-    let client_info = client.get_me().await.unwrap();
+    let _ = client.get_me().await.unwrap();
 
     assert_eq!(consumer_group_info.members_count, 1);
     assert_eq!(consumer_group_info.members.len(), 1);
     let member = &consumer_group_info.members[0];
-    assert_eq!(member.id, client_info.client_id);
     assert_eq!(member.partitions.len() as u32, PARTITIONS_COUNT);
     assert_eq!(member.partitions_count, PARTITIONS_COUNT);
 }

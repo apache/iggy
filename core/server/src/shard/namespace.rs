@@ -55,6 +55,7 @@ pub const PARTITION_MASK: u64 = (1u64 << PARTITION_BITS) - 1;
 pub const TOPIC_MASK: u64 = (1u64 << TOPIC_BITS) - 1;
 pub const STREAM_MASK: u64 = (1u64 << STREAM_BITS) - 1;
 
+#[derive(Debug)]
 pub struct IggyFullNamespace {
     stream: Identifier,
     topic: Identifier,
