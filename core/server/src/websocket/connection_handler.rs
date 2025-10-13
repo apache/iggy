@@ -69,14 +69,14 @@ pub(crate) async fn handle_connection(
         let length =
             u32::from_le_bytes(initial_buffer[0..INITIAL_BYTES_LENGTH].try_into().unwrap());
         let (res, mut code_buffer_out) = sender.read(code_buffer).await;
-        let _ = res?;
+        res?;
         let code: u32 =
             u32::from_le_bytes(code_buffer_out[0..INITIAL_BYTES_LENGTH].try_into().unwrap());
 
         initial_buffer.clear();
         code_buffer_out.clear();
-        length_buffer = BytesMut::from(initial_buffer);
-        code_buffer = BytesMut::from(code_buffer_out);
+        length_buffer = initial_buffer;
+        code_buffer = code_buffer_out;
 
         debug!("Received a WebSocket request, length: {length}, code: {code}");
         let command = ServerCommand::from_code_and_reader(code, sender, length - 4).await?;

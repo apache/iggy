@@ -360,6 +360,7 @@ impl IggyBenchArgs {
             BenchmarkTransportCommand::Tcp(_) => "tcp",
             BenchmarkTransportCommand::Quic(_) => "quic",
             BenchmarkTransportCommand::Http(_) => "http",
+            BenchmarkTransportCommand::WebSocket(_) => "ws",
         };
 
         let actors = match &self.benchmark_kind {

@@ -201,7 +201,7 @@ pub struct ArgsOptional {
 
     /// The optional server address for the WebSocket transport
     ///
-    /// [default: 127.0.0.1:8095]
+    /// [default: 127.0.0.1:8092]
     #[arg(long)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub websocket_server_address: Option<String>,
@@ -403,7 +403,7 @@ impl Default for Args {
             quic_max_idle_timeout: 10000,
             quic_validate_certificate: false,
             quic_heartbeat_interval: "5s".to_string(),
-            websocket_server_address: "127.0.0.1:8095".to_string(),
+            websocket_server_address: "127.0.0.1:8092".to_string(),
             websocket_reconnection_enabled: true,
             websocket_reconnection_max_retries: None,
             websocket_reconnection_interval: "1s".to_string(),

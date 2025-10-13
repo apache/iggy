@@ -177,7 +177,7 @@ Options:
       --websocket-server-address <WEBSOCKET_SERVER_ADDRESS>
           The optional server address for the WebSocket transport
 {CLAP_INDENT}
-          [default: 127.0.0.1:8095]
+          [default: 127.0.0.1:8092]
 
       --websocket-reconnection-max-retries <WEBSOCKET_RECONNECTION_MAX_RETRIES>
           The optional number of max reconnect retries for the WebSocket transport

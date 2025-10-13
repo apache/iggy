@@ -53,34 +53,34 @@ impl WebSocketConfig {
 
         let mut config = TungsteniteConfig::default();
 
-        if let Some(read_buf_size_str) = &self.read_buffer_size {
-            if let Ok(byte_size) = read_buf_size_str.parse::<IggyByteSize>() {
-                config = config.read_buffer_size(byte_size.as_bytes_u64() as usize);
-            }
+        if let Some(read_buf_size_str) = &self.read_buffer_size
+            && let Ok(byte_size) = read_buf_size_str.parse::<IggyByteSize>()
+        {
+            config = config.read_buffer_size(byte_size.as_bytes_u64() as usize);
         }
 
-        if let Some(write_buf_size_str) = &self.write_buffer_size {
-            if let Ok(byte_size) = write_buf_size_str.parse::<IggyByteSize>() {
-                config = config.write_buffer_size(byte_size.as_bytes_u64() as usize);
-            }
+        if let Some(write_buf_size_str) = &self.write_buffer_size
+            && let Ok(byte_size) = write_buf_size_str.parse::<IggyByteSize>()
+        {
+            config = config.write_buffer_size(byte_size.as_bytes_u64() as usize);
         }
 
-        if let Some(max_write_buf_size_str) = &self.max_write_buffer_size {
-            if let Ok(byte_size) = max_write_buf_size_str.parse::<IggyByteSize>() {
-                config = config.max_write_buffer_size(byte_size.as_bytes_u64() as usize);
-            }
+        if let Some(max_write_buf_size_str) = &self.max_write_buffer_size
+            && let Ok(byte_size) = max_write_buf_size_str.parse::<IggyByteSize>()
+        {
+            config = config.max_write_buffer_size(byte_size.as_bytes_u64() as usize);
         }
 
-        if let Some(msg_size_str) = &self.max_message_size {
-            if let Ok(byte_size) = msg_size_str.parse::<IggyByteSize>() {
-                config = config.max_message_size(Some(byte_size.as_bytes_u64() as usize));
-            }
+        if let Some(msg_size_str) = &self.max_message_size
+            && let Ok(byte_size) = msg_size_str.parse::<IggyByteSize>()
+        {
+            config = config.max_message_size(Some(byte_size.as_bytes_u64() as usize));
         }
 
-        if let Some(frame_size_str) = &self.max_frame_size {
-            if let Ok(byte_size) = frame_size_str.parse::<IggyByteSize>() {
-                config = config.max_frame_size(Some(byte_size.as_bytes_u64() as usize));
-            }
+        if let Some(frame_size_str) = &self.max_frame_size
+            && let Ok(byte_size) = frame_size_str.parse::<IggyByteSize>()
+        {
+            config = config.max_frame_size(Some(byte_size.as_bytes_u64() as usize));
         }
 
         config = config.accept_unmasked_frames(self.accept_unmasked_frames);
