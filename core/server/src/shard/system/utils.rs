@@ -3,8 +3,7 @@ use iggy_common::{Consumer, ConsumerKind, Identifier, IggyError};
 use crate::{
     shard::IggyShard,
     streaming::{
-        polling_consumer::PollingConsumer,
-        topics::{self},
+        polling_consumer::PollingConsumer, streams::helpers::get_stream_id, topics::{self}
     },
 };
 
@@ -63,6 +62,38 @@ impl IggyShard {
 
         if partitions_count > actual_partitions_count as u32 {
             return Err(IggyError::InvalidPartitionsCount);
+        }
+
+        Ok(())
+    }
+
+    pub fn ensure_partition_exists(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: usize,
+    ) -> Result<(), IggyError> {
+        self.ensure_topic_exists(stream_id, topic_id)?;
+        let partition_exists = self.streams2.with_topic_by_id(
+            stream_id,
+            topic_id,
+            |(root, ..)| root.partitions().exists(partition_id),
+        );
+
+        if !partition_exists {
+            let numeric_stream_id = self
+                .streams2
+                .with_stream_by_id(stream_id, get_stream_id());
+            let numeric_topic_id = self.streams2.with_topic_by_id(
+                stream_id,
+                topic_id,
+                topics::helpers::get_topic_id(),
+            );
+            return Err(IggyError::PartitionNotFound(
+                partition_id as u32,
+                numeric_topic_id as u32,
+                numeric_stream_id as u32,
+            ));
         }
 
         Ok(())

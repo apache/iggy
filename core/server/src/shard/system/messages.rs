@@ -47,6 +47,8 @@ impl IggyShard {
         partitioning: &Partitioning,
         batch: IggyMessagesBatchMut,
     ) -> Result<(), IggyError> {
+        self.ensure_topic_exists(&stream_id, &topic_id)?;
+        
         let numeric_stream_id = self
             .streams2
             .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
@@ -99,6 +101,7 @@ impl IggyShard {
                     },
                 )?;
 
+        self.ensure_partition_exists(&stream_id, &topic_id, partition_id)?;
         let namespace = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
         let payload = ShardRequestPayload::SendMessages { batch };
         let request = ShardRequest::new(stream_id.clone(), topic_id.clone(), partition_id, payload);
@@ -160,6 +163,8 @@ impl IggyShard {
         maybe_partition_id: Option<u32>,
         args: PollingArgs,
     ) -> Result<(IggyPollMetadata, IggyMessagesBatchSet), IggyError> {
+        self.ensure_topic_exists(&stream_id, &topic_id)?;
+        
         let numeric_stream_id = self
             .streams2
             .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
@@ -189,17 +194,7 @@ impl IggyShard {
             return Ok((IggyPollMetadata::new(0, 0), IggyMessagesBatchSet::empty()));
         };
 
-        let has_partition = self
-            .streams2
-            .with_topic_by_id(&stream_id, &topic_id, |(root, ..)| {
-                root.partitions().exists(partition_id)
-            });
-        if !has_partition {
-            return Err(IggyError::NoPartitions(
-                numeric_topic_id as u32,
-                numeric_stream_id as u32,
-            ));
-        }
+        self.ensure_partition_exists(&stream_id, &topic_id, partition_id)?;
 
         let current_offset = self.streams2.with_partition_by_id(
             &stream_id,

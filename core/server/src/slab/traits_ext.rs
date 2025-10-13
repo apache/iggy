@@ -53,102 +53,6 @@ mod private {
     pub trait Sealed {}
 }
 
-//TODO: Maybe two seperate traits for Ref and RefMut.
-pub trait ComponentsMapping<T>: private::Sealed {
-    type Ref<'a>;
-    type RefMut<'a>;
-}
-
-pub trait ComponentsByIdMapping<T>: private::Sealed {
-    type Ref<'a>;
-    type RefMut<'a>;
-}
-
-// TODO: This should be a proc macro.
-macro_rules! impl_components_mapping_for_slab {
-    ($T:ident) => {
-        impl<$T> private::Sealed for ($T,) {}
-
-        impl<$T> ComponentsMapping<Borrow> for ($T,)
-            where for<'a> $T :'a
-        {
-            type Ref<'a> = (&'a ::slab::Slab<$T>,);
-            type RefMut<'a> = (&'a mut ::slab::Slab<$T>,);
-        }
-
-        impl<$T> ComponentsMapping<InteriorMutability> for ($T,)
-            where for<'a> $T :'a
-        {
-            type Ref<'a> = (::std::cell::Ref<'a, ::slab::Slab<$T>>,);
-            type RefMut<'a> = (::std::cell::RefMut<'a, ::slab::Slab<$T>>,);
-        }
-
-        impl<$T> ComponentsByIdMapping<Borrow> for ($T,)
-            where for<'a> $T :'a
-        {
-            type Ref<'a> = (&'a $T,);
-            type RefMut<'a> = (&'a mut $T,);
-        }
-
-        impl<$T> ComponentsByIdMapping<InteriorMutability> for ($T,)
-            where for<'a> $T :'a
-        {
-            type Ref<'a> = (::std::cell::Ref<'a, $T>,);
-            type RefMut<'a> = (::std::cell::RefMut<'a, $T>,);
-        }
-    };
-
-    ($T:ident, $($rest:ident),+) => {
-        impl<$T, $($rest),+> private::Sealed for ($T, $($rest),+) {}
-
-        impl<$T, $($rest),+> ComponentsMapping<Borrow> for ($T, $($rest),+)
-            where
-                for<'a> $T :'a,
-                $(for<'a> $rest: 'a),+
-        {
-            type Ref<'a> = (&'a ::slab::Slab<$T>, $(&'a ::slab::Slab<$rest>),+);
-            type RefMut<'a> = (&'a mut ::slab::Slab<$T>, $(&'a mut ::slab::Slab<$rest>),+);
-        }
-
-        impl<$T, $($rest),+> ComponentsMapping<InteriorMutability> for ($T, $($rest),+)
-            where
-                for<'a> $T :'a,
-                $(for<'a> $rest: 'a),+
-        {
-            type Ref<'a> = (std::cell::Ref<'a, ::slab::Slab<$T>>, $(::std::cell::Ref<'a, ::slab::Slab<$rest>>),+);
-            type RefMut<'a> = (std::cell::RefMut<'a, ::slab::Slab<$T>>, $(::std::cell::RefMut<'a, ::slab::Slab<$rest>>),+);
-        }
-
-        impl<$T, $($rest),+> ComponentsByIdMapping<Borrow> for ($T, $($rest),+)
-            where
-                for<'a> $T :'a,
-                $(for<'a> $rest: 'a),+
-        {
-            type Ref<'a> = (&'a $T, $(&'a $rest),+);
-            type RefMut<'a> = (&'a mut $T, $(&'a mut $rest),+);
-        }
-
-        impl<$T, $($rest),+> ComponentsByIdMapping<InteriorMutability> for ($T, $($rest),+)
-            where
-                for<'a> $T :'a,
-                $(for<'a> $rest: 'a),+
-        {
-            type Ref<'a> = (std::cell::Ref<'a, $T>, $(::std::cell::Ref<'a, $rest>),+);
-            type RefMut<'a> = (std::cell::RefMut<'a, $T>, $(::std::cell::RefMut<'a, $rest>),+);
-        }
-        impl_components_mapping_for_slab!($($rest),+);
-    };
-}
-impl_components_mapping_for_slab!(T1, T2, T3, T4, T5, T6, T7, T8);
-
-type Mapping<'a, E, T> = <<E as IntoComponents>::Components as ComponentsMapping<T>>::Ref<'a>;
-type MappingMut<'a, E, T> = <<E as IntoComponents>::Components as ComponentsMapping<T>>::RefMut<'a>;
-
-type MappingById<'a, E, T> =
-    <<E as IntoComponents>::Components as ComponentsByIdMapping<T>>::Ref<'a>;
-type MappingByIdMut<'a, E, T> =
-    <<E as IntoComponents>::Components as ComponentsByIdMapping<T>>::RefMut<'a>;
-
 // I think it's better to *NOT* use `Components` directly on the `with` methods.
 // Instead use the `Self::EntityRef` type directly.
 // This way we can auto implement the `with_by_id` method.
@@ -175,14 +79,10 @@ pub type ComponentsById<'a, T> = <T as IntoComponentsById>::Output;
 // and everytime we add a new component to an entity, we need to update the tuple type everywhere.
 // Better idea would be to use the `EntityRef` type directly inside of the `with_components_by_id` closure
 // -- f(components.into_components_by_id(id)) -> components.into_components_by_id(id) would return `EntityRef`, rather than the tuple.
-pub trait EntityComponentSystem<T>
-where
-    <Self::Entity as IntoComponents>::Components: ComponentsMapping<T> + ComponentsByIdMapping<T>,
-{
+pub trait EntityComponentSystem<T> {
     type Idx;
     type Entity: IntoComponents + EntityMarker;
-    type EntityComponents<'a>: IntoComponents<Components = Mapping<'a, Self::Entity, T>>
-        + IntoComponentsById<Idx = Self::Idx, Output = MappingById<'a, Self::Entity, T>>;
+    type EntityComponents<'a>: IntoComponents + IntoComponentsById<Idx = Self::Idx>;
 
     fn with_components<O, F>(&self, f: F) -> O
     where
@@ -197,8 +97,7 @@ where
 }
 
 pub trait EntityComponentSystemMut: EntityComponentSystem<Borrow> {
-    type EntityComponentsMut<'a>: IntoComponents<Components = MappingMut<'a, Self::Entity, Borrow>>
-        + IntoComponentsById<Idx = Self::Idx, Output = MappingByIdMut<'a, Self::Entity, Borrow>>;
+    type EntityComponentsMut<'a>: IntoComponents + IntoComponentsById<Idx = Self::Idx>;
 
     fn with_components_mut<O, F>(&mut self, f: F) -> O
     where
@@ -213,11 +112,7 @@ pub trait EntityComponentSystemMut: EntityComponentSystem<Borrow> {
 }
 
 pub trait EntityComponentSystemMutCell: EntityComponentSystem<InteriorMutability> {
-    type EntityComponentsMut<'a>: IntoComponents<Components = MappingMut<'a, Self::Entity, InteriorMutability>>
-        + IntoComponentsById<
-            Idx = Self::Idx,
-            Output = MappingByIdMut<'a, Self::Entity, InteriorMutability>,
-        >;
+    type EntityComponentsMut<'a>: IntoComponents + IntoComponentsById<Idx = Self::Idx>;
 
     fn with_components_mut<O, F>(&self, f: F) -> O
     where

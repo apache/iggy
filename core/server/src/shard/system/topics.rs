@@ -279,6 +279,7 @@ impl IggyShard {
         topic_id: &Identifier,
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
+        self.ensure_topic_exists(stream_id, topic_id)?;
         {
             let topic_id = self.streams2.with_topic_by_id(
                 stream_id,
