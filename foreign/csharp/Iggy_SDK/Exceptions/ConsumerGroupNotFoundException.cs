@@ -11,7 +11,7 @@ public class ConsumerGroupNotFoundException : Exception
 {
     public string ConsumerGroupName { get; }
 
-    public ConsumerGroupNotFoundException(string consumerGroupName) : base("Consumer Group " + consumerGroupName + " not found")
+    public ConsumerGroupNotFoundException(string consumerGroupName) : base($"Consumer Group {consumerGroupName} not found")
     {
         ConsumerGroupName = consumerGroupName;
     }

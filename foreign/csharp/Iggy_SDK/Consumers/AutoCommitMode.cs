@@ -18,27 +18,27 @@
 namespace Apache.Iggy.Consumers;
 
 /// <summary>
-/// Auto commit modes
+///     Auto commit modes
 /// </summary>
 public enum AutoCommitMode
 {
     /// <summary>
-    /// Set auto commit to true on polling messages
+    ///     Set auto commit to true on polling messages
     /// </summary>
     Auto,
-    
+
     /// <summary>
-    /// Set offset after polling messages
+    ///     Set offset after polling messages
     /// </summary>
     AfterPoll,
-    
+
     /// <summary>
-    /// Set offset after receive message
+    ///     Set offset after receive message
     /// </summary>
     AfterReceive,
-    
+
     /// <summary>
-    /// Offset will not be stored automatically
+    ///     Offset will not be stored automatically
     /// </summary>
     Disabled
 }

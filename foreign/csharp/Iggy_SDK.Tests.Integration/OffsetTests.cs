@@ -98,7 +98,7 @@ public class OffsetTests
         offset.PartitionId.ShouldBe(1);
         offset.CurrentOffset.ShouldBe(3u);
     }
-    
+
     [Test]
     [SkipHttp]
     [DependsOn(nameof(GetOffset_ConsumerGroup_ByName_Should_GetOffset_Successfully))]
@@ -107,12 +107,12 @@ public class OffsetTests
     {
         await Fixture.Clients[protocol].DeleteOffsetAsync(Consumer.Group("test_consumer_group"),
             Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), Identifier.String(Fixture.TopicRequest.Name),
-             1);
-        
+            1);
+
         var offset = await Fixture.Clients[protocol].GetOffsetAsync(Consumer.Group("test_consumer_group"),
             Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)), Identifier.String(Fixture.TopicRequest.Name),
-            1); 
-        
+            1);
+
         offset.ShouldBeNull();
     }
 }

@@ -32,7 +32,6 @@ public static class Utils
 {
     public static void HandleMessage(ReceivedMessage message, ILogger logger)
     {
-        
         var payload = Encoding.UTF8.GetString(message.Message.Payload);
         var envelope = JsonSerializer.Deserialize<Envelope>(payload) ??
                        throw new Exception("Could not deserialize envelope.");

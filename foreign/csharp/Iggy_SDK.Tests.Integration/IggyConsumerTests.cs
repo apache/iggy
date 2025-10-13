@@ -541,10 +541,8 @@ public class IggyConsumerTests
 
         await consumer.DisposeAsync();
 
-        var offset = await client.GetOffsetAsync(Consumer.New(consumerId),
-            Identifier.String(testStream.StreamId),
-            Identifier.String(testStream.TopicId),
-            1u);
+        var offset = await client.GetOffsetAsync(Consumer.New(consumerId), Identifier.String(testStream.StreamId),
+            Identifier.String(testStream.TopicId), 1u);
 
         offset.ShouldBeNull();
     }

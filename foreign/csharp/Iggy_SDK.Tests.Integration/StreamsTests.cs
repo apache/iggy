@@ -112,18 +112,18 @@ public class StreamsTests
         await Fixture.Clients[protocol].SendMessagesAsync(Identifier.Numeric(StreamId.GetWithProtocol(protocol)),
             Identifier.String(topicRequest1.Name), Partitioning.None(),
             [
-                new(Guid.NewGuid(), "Test message 1"u8.ToArray()),
-                new(Guid.NewGuid(), "Test message 2"u8.ToArray()), 
-                new(Guid.NewGuid(), "Test message 3"u8.ToArray())
+                new Message(Guid.NewGuid(), "Test message 1"u8.ToArray()),
+                new Message(Guid.NewGuid(), "Test message 2"u8.ToArray()),
+                new Message(Guid.NewGuid(), "Test message 3"u8.ToArray())
             ]);
 
 
         await Fixture.Clients[protocol].SendMessagesAsync(Identifier.Numeric(StreamId.GetWithProtocol(protocol)),
             Identifier.String(topicRequest2.Name), Partitioning.None(), [
-                new(Guid.NewGuid(), "Test message 4"u8.ToArray()),
-                new(Guid.NewGuid(), "Test message 5"u8.ToArray()),
-                new(Guid.NewGuid(), "Test message 6"u8.ToArray()),
-                new(Guid.NewGuid(), "Test message 7"u8.ToArray())
+                new Message(Guid.NewGuid(), "Test message 4"u8.ToArray()),
+                new Message(Guid.NewGuid(), "Test message 5"u8.ToArray()),
+                new Message(Guid.NewGuid(), "Test message 6"u8.ToArray()),
+                new Message(Guid.NewGuid(), "Test message 7"u8.ToArray())
             ]);
 
         var response = await Fixture.Clients[protocol]

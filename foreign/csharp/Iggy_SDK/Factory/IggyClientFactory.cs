@@ -38,7 +38,7 @@ public static class IggyClientFactory
     {
         return new HttpMessageStream(CreateHttpClient(options));
     }
-    
+
     private static IConnectionStream CreateTcpStream(IggyClientConfigurator options)
     {
         var urlPortSplitter = options.BaseAddress.Split(":");
@@ -46,7 +46,7 @@ public static class IggyClientFactory
         {
             throw new InvalidBaseAdressException();
         }
-        
+
         var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         socket.Connect(urlPortSplitter[0], int.Parse(urlPortSplitter[1]));
         socket.SendBufferSize = options.SendBufferSize;
@@ -69,7 +69,7 @@ public static class IggyClientFactory
 
         return new TcpTlsConnectionStream(sslStream);
     }
-    
+
     private static HttpClient CreateHttpClient(IggyClientConfigurator options)
     {
         var client = new HttpClient();

@@ -44,7 +44,7 @@
         <PackageReference Include="Microsoft.Extensions.Logging" />
         <PackageReference Include="System.IO.Hashing" />
     </ItemGroup>
-    
+
     <ItemGroup>
         <InternalsVisibleTo Include="Apache.Iggy.Tests" />
         <InternalsVisibleTo Include="Apache.Iggy.Tests.Integrations" />

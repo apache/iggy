@@ -97,7 +97,7 @@ public class TopicsTests
         response.MaxTopicSize.ShouldBe(TopicRequest.MaxTopicSize);
         response.MessagesCount.ShouldBe(0u);
     }
-    
+
     [Test]
     [DependsOn(nameof(Get_ExistingTopic_Should_ReturnValidResponse))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
@@ -281,7 +281,7 @@ public class TopicsTests
         var topic = await Fixture.Clients[protocol].GetTopicByIdAsync(
             Identifier.String(Fixture.StreamId.GetWithProtocol(protocol)),
             Identifier.Numeric(TopicRequest.TopicId!.Value));
-        
+
         topic.ShouldBeNull();
     }
 

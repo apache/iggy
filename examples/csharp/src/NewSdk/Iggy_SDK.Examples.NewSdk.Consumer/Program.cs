@@ -49,7 +49,7 @@ var consumer = client.CreateConsumerBuilder(Identifier.String("new-sdk-stream"),
         logger.LogError("Polling error: {Message}", e.Exception.Message);
     })
     .Build();
-    
+
 await consumer.InitAsync();
 var me = await client.GetMeAsync();
 var tt= await client.GetConsumerGroupByIdAsync(Identifier.String("new-sdk-stream"), Identifier.String("new-sdk-topic"),
@@ -67,4 +67,3 @@ await foreach (var message in consumer.ReceiveAsync().WithCancellation(cancellat
     Utils.HandleMessage(message, logger);
     await Task.Delay(200);
 }
-

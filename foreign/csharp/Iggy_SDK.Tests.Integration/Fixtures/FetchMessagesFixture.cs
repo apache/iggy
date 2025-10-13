@@ -16,14 +16,12 @@
 // // under the License.
 
 using System.Text;
-using Apache.Iggy.Contracts;
 using Apache.Iggy.Contracts.Http;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Headers;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Helpers;
-using Apache.Iggy.Tests.Integrations.Models;
 using TUnit.Core.Interfaces;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
@@ -56,8 +54,9 @@ public class FetchMessagesFixture : IAsyncInitializer
 
             await client.Value.SendMessagesAsync(streamId, Identifier.String(TopicRequest.Name), Partitioning.None(),
                 CreateMessagesWithoutHeader(MessageCount));
-            
-            await client.Value.SendMessagesAsync(streamId, Identifier.String(TopicHeadersRequest.Name), Partitioning.None(), CreateMessagesWithHeader(MessageCount));
+
+            await client.Value.SendMessagesAsync(streamId, Identifier.String(TopicHeadersRequest.Name),
+                Partitioning.None(), CreateMessagesWithHeader(MessageCount));
         }
     }
 

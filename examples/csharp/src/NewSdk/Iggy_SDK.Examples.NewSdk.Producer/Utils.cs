@@ -17,22 +17,17 @@
 
 using System.Net;
 using System.Text;
-using Apache.Iggy;
-using Apache.Iggy.Enums;
-using Apache.Iggy.Exceptions;
-using Apache.Iggy.IggyClient;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Publishers;
 using Iggy_SDK.Examples.Shared;
 using Microsoft.Extensions.Logging;
-using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Iggy_SDK.Examples.NewSdk.Producer;
 
 public static class Utils
 {
     private const uint BATCHES_LIMIT = 5;
-    
+
     public static async Task ProduceMessages(IggyPublisher publisher, ILogger logger)
     {
         var interval = TimeSpan.FromMilliseconds(500);
@@ -58,7 +53,7 @@ public static class Utils
                 return;
             }
 
-            var serializableMessages = Enumerable
+            List<ISerializableMessage> serializableMessages = Enumerable
                 .Range(0, messagesPerBatch)
                 .Aggregate(new List<ISerializableMessage>(), (list, _) =>
                 {
@@ -67,7 +62,7 @@ public static class Utils
                     return list;
                 });
 
-            var messages = serializableMessages.Select(serializableMessage =>
+            List<Message> messages = serializableMessages.Select(serializableMessage =>
                 {
                     var jsonEnvelope = serializableMessage.ToJsonEnvelope();
                     return new Message(Guid.NewGuid(), Encoding.UTF8.GetBytes(jsonEnvelope));

@@ -15,18 +15,14 @@
 // // specific language governing permissions and limitations
 // // under the License.
 
-using System.Text;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
 using Apache.Iggy.Headers;
 using Apache.Iggy.Kinds;
-using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Fixtures;
 using Apache.Iggy.Tests.Integrations.Helpers;
-using Apache.Iggy.Tests.Integrations.Models;
 using Shouldly;
-using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
 namespace Apache.Iggy.Tests.Integrations;
 
@@ -34,7 +30,7 @@ public class FetchMessagesTests
 {
     [ClassDataSource<FetchMessagesFixture>(Shared = SharedType.PerClass)]
     public required FetchMessagesFixture Fixture { get; init; }
-    
+
 
     [Test]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]

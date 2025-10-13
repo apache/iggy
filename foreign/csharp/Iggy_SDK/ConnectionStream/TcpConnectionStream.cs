@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-using System.Net.Sockets;
-
 namespace Apache.Iggy.ConnectionStream;
 
 public sealed class TcpConnectionStream : IConnectionStream
