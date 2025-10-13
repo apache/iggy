@@ -4,14 +4,13 @@ use std::fmt::Display;
 #[derive(Default, Debug, Clone)]
 pub struct Segment2 {
     pub sealed: bool,
-    pub max_size_bytes: IggyByteSize,
     pub message_expiry: IggyExpiry,
     pub start_timestamp: u64,
     pub end_timestamp: u64,
     pub start_offset: u64,
     pub end_offset: u64,
-    // TODO: Maybe use IggyByteSize here?
-    pub size: u32,
+    pub size: IggyByteSize,     // u64
+    pub max_size: IggyByteSize, // u64
 }
 
 impl Display for Segment2 {
@@ -20,7 +19,7 @@ impl Display for Segment2 {
             f,
             "Segment2 {{ sealed: {}, max_size_bytes: {}, message_expiry: {:?}, start_timestamp: {}, end_timestamp: {}, start_offset: {}, end_offset: {}, size: {} }}",
             self.sealed,
-            self.max_size_bytes,
+            self.max_size,
             self.message_expiry,
             self.start_timestamp,
             self.end_timestamp,
@@ -40,18 +39,18 @@ impl Segment2 {
     ) -> Self {
         Self {
             sealed: false,
-            max_size_bytes,
+            max_size: max_size_bytes,
             message_expiry,
             start_timestamp: 0,
             end_timestamp: 0,
             start_offset,
             end_offset: start_offset,
-            size: 0,
+            size: IggyByteSize::default(),
         }
     }
 
     pub fn is_full(&self) -> bool {
-        if self.size >= self.max_size_bytes.as_bytes_u32() {
+        if self.size >= self.max_size {
             return true;
         }
 

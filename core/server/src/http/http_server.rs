@@ -134,18 +134,21 @@ pub async fn start_http_server(
 
         let service = app.into_make_service_with_connect_info::<CompioSocketAddr>();
 
-        // Spawn the server in a task so we can handle shutdown
-        // TODO(hubcio): investigate if we can use TaskRegistry here
-        let _server_task =
-            compio::runtime::spawn(async move { cyper_axum::serve(listener, service).await });
+        let shutdown_token = shutdown.clone();
+        let result = cyper_axum::serve(listener, service)
+            .with_graceful_shutdown(async move { shutdown_token.wait().await })
+            .await;
 
-        // Wait for shutdown signal
-        shutdown.wait().await;
-        info!("{api_name} received shutdown signal, stopping server");
-
-        // The server task will complete when all connections are closed
-        // For now, we just return as cyper_axum doesn't have a graceful shutdown API
-        Ok(())
+        match result {
+            Ok(()) => {
+                info!("{api_name} shut down gracefully");
+                Ok(())
+            }
+            Err(error) => {
+                error!("{api_name} server error: {}", error);
+                Err(IggyError::CannotBindToSocket(format!("HTTP: {}", error)))
+            }
+        }
     } else {
         let tls_config = RustlsConfig::from_pem_file(
             PathBuf::from(config.tls.cert_file),
@@ -174,30 +177,32 @@ pub async fn start_http_server(
         shard.handle_event(event).await.ok();
 
         let service = app.into_make_service_with_connect_info::<SocketAddr>();
-
-        // Create a handle for graceful shutdown
         let handle = axum_server::Handle::new();
         let shutdown_handle = handle.clone();
+        let api_name_for_task = api_name;
+        shard
+            .task_registry
+            .oneshot("http_shutdown_listener")
+            .critical(false)
+            .run(move |shutdown: ShutdownToken| async move {
+                shutdown.wait().await;
+                info!("Initiating graceful shutdown for {api_name_for_task}");
+                shutdown_handle.graceful_shutdown(None);
+                Ok(())
+            })
+            .spawn();
 
-        // Spawn a task to handle shutdown
-        let shutdown_clone = shutdown.clone();
-        compio::runtime::spawn(async move {
-            shutdown_clone.wait().await;
-            info!("Initiating graceful shutdown for {api_name}");
-            shutdown_handle.graceful_shutdown(None);
-        })
-        .detach();
-
-        // Run the server with the handle
         let server = axum_server::from_tcp_rustls(listener, tls_config).handle(handle);
-
-        if let Err(error) = server.serve(service).await {
-            error!("Failed to start {api_name} server, error: {}", error);
-            return Err(IggyError::CannotBindToSocket(format!("HTTPS: {}", error)));
+        match server.serve(service).await {
+            Ok(()) => {
+                info!("{api_name} shut down gracefully");
+                Ok(())
+            }
+            Err(error) => {
+                error!("Failed to start {api_name} server, error: {}", error);
+                Err(IggyError::CannotBindToSocket(format!("HTTPS: {}", error)))
+            }
         }
-
-        info!("{api_name} server stopped gracefully");
-        Ok(())
     }
 }
 

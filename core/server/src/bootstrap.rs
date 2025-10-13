@@ -46,7 +46,7 @@ use ahash::HashMap;
 use compio::{fs::create_dir_all, runtime::Runtime};
 use error_set::ErrContext;
 use iggy_common::{
-    ConsumerKind, IggyError,
+    ConsumerKind, IggyByteSize, IggyError,
     defaults::{
         DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH,
         MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
@@ -513,7 +513,7 @@ pub async fn load_segments(
         segment.start_timestamp = start_timestamp;
         segment.end_timestamp = end_timestamp;
         segment.end_offset = end_offset;
-        segment.size = messages_size;
+        segment.size = IggyByteSize::from(messages_size as u64);
         segment.sealed = true; // Persisted segments are assumed to be sealed
 
         if config.partition.validate_checksum {

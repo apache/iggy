@@ -71,7 +71,7 @@ pub async fn spawn_quic_server(
                 shard_info!(shard.id, "Received QUIC address: {}", addr);
                 break;
             }
-            compio::time::sleep(std::time::Duration::from_millis(10)).await;
+            compio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
 

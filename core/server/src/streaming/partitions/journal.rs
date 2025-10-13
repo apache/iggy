@@ -2,7 +2,7 @@ use crate::{
     shard_trace,
     streaming::segments::{IggyMessagesBatchMut, IggyMessagesBatchSet},
 };
-use iggy_common::IggyError;
+use iggy_common::{IggyByteSize, IggyError};
 use std::fmt::Debug;
 
 // TODO: Will have to revisit this Journal abstraction....
@@ -15,7 +15,7 @@ pub struct Inner {
     pub first_timestamp: u64,
     pub end_timestamp: u64,
     pub messages_count: u32,
-    pub size: u32,
+    pub size: IggyByteSize,
 }
 
 #[derive(Default, Debug)]
@@ -61,9 +61,9 @@ impl Journal for MemoryMessageJournal {
         self.inner.end_timestamp = last_timestamp;
         self.inner.messages_count += batch_messages_count;
         self.inner.current_offset = self.inner.base_offset + self.inner.messages_count as u64 - 1;
-        self.inner.size += batch_size;
+        self.inner.size = IggyByteSize::from(self.inner.size.as_bytes_u64() + batch_size as u64);
 
-        Ok((self.inner.messages_count, self.inner.size))
+        Ok((self.inner.messages_count, self.inner.size.as_bytes_u32()))
     }
 
     async fn flush(&self) -> Result<(), IggyError> {
@@ -82,7 +82,7 @@ impl Journal for MemoryMessageJournal {
         self.inner.base_offset = self.inner.current_offset + 1;
         self.inner.first_timestamp = 0;
         self.inner.end_timestamp = 0;
-        self.inner.size = 0;
+        self.inner.size = IggyByteSize::default();
         self.inner.messages_count = 0;
         std::mem::take(&mut self.batches)
     }

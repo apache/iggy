@@ -516,7 +516,7 @@ pub fn update_index_and_increment_stats(
 ) -> impl FnOnce(ComponentsById<PartitionRefMut>) {
     move |(.., log)| {
         let segment = log.active_segment_mut();
-        segment.size += saved.as_bytes_u32();
+        segment.size = IggyByteSize::from(segment.size.as_bytes_u64() + saved.as_bytes_u64());
         log.active_indexes_mut().unwrap().mark_saved();
         if config.segment.cache_indexes == CacheIndexesConfig::None {
             log.active_indexes_mut().unwrap().clear();

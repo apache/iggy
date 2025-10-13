@@ -137,7 +137,7 @@ pub struct IggyShard {
     pub(crate) is_shutting_down: AtomicBool,
     pub(crate) tcp_bound_address: Cell<Option<SocketAddr>>,
     pub(crate) quic_bound_address: Cell<Option<SocketAddr>>,
-    pub websocket_bound_address: Cell<Option<SocketAddr>>,
+    pub(crate) websocket_bound_address: Cell<Option<SocketAddr>>,
     pub(crate) http_bound_address: Cell<Option<SocketAddr>>,
     config_writer_notify: async_channel::Sender<()>,
     config_writer_receiver: async_channel::Receiver<()>,

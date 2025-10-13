@@ -45,7 +45,6 @@ pub(crate) async fn start(
     shard: Rc<IggyShard>,
     shutdown: ShutdownToken,
 ) -> Result<(), IggyError> {
-    //TODO: Fix me, this needs to take into account that first shard id potentially can be greater than 0.
     if shard.id != 0 && addr.port() == 0 {
         shard_info!(shard.id, "Waiting for TCP address from shard 0...");
         loop {
@@ -54,7 +53,7 @@ pub(crate) async fn start(
                 shard_info!(shard.id, "Received TCP address: {}", addr);
                 break;
             }
-            compio::time::sleep(Duration::from_millis(10)).await;
+            compio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
@@ -70,13 +69,9 @@ pub(crate) async fn start(
         IggyError::CannotBindToSocket(addr.to_string())
     })?;
 
-    //TODO: Fix me, this needs to take into account that first shard id potentially can be greater than 0.
     if shard.id == 0 {
-        // Store bound address locally
         shard.tcp_bound_address.set(Some(actual_addr));
-
         if addr.port() == 0 {
-            // Broadcast to other shards for SO_REUSEPORT binding
             let event = ShardEvent::AddressBound {
                 protocol: TransportProtocol::Tcp,
                 address: actual_addr,

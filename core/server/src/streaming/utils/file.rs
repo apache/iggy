@@ -51,6 +51,5 @@ pub async fn rename(old_path: &str, new_path: &str) -> Result<(), std::io::Error
 }
 
 pub async fn exists(path: &str) -> Result<bool, std::io::Error> {
-    //TODO: Does monoio support that ?
     std::fs::exists(path)
 }

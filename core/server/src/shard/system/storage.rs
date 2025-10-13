@@ -19,7 +19,6 @@
 use super::COMPONENT;
 use crate::shard::system::info::SystemInfo;
 use crate::streaming::persistence::persister::PersisterKind;
-use crate::streaming::storage::SystemInfoStorage;
 use crate::streaming::utils::PooledBuffer;
 use crate::streaming::utils::file;
 use anyhow::Context;
@@ -40,10 +39,8 @@ impl FileSystemInfoStorage {
     pub fn new(path: String, persister: Arc<PersisterKind>) -> Self {
         Self { path, persister }
     }
-}
 
-impl SystemInfoStorage for FileSystemInfoStorage {
-    async fn load(&self) -> Result<SystemInfo, IggyError> {
+    pub async fn load(&self) -> Result<SystemInfo, IggyError> {
         let file = file::open(&self.path).await;
         if file.is_err() {
             return Err(IggyError::ResourceNotFound(self.path.to_owned()));
@@ -85,7 +82,7 @@ impl SystemInfoStorage for FileSystemInfoStorage {
         Ok(system_info)
     }
 
-    async fn save(&self, system_info: &SystemInfo) -> Result<(), IggyError> {
+    pub async fn save(&self, system_info: &SystemInfo) -> Result<(), IggyError> {
         let data = bincode::serde::encode_to_vec(system_info, bincode::config::standard())
             .with_context(|| "Failed to serialize system info")
             .map_err(|_| IggyError::CannotSerializeResource)?;

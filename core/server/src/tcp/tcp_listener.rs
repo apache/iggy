@@ -69,7 +69,6 @@ pub async fn start(
     shard: Rc<IggyShard>,
     shutdown: ShutdownToken,
 ) -> Result<(), IggyError> {
-    //TODO: Fix me, this needs to take into account that first shard id potentially can be greater than 0.
     if shard.id != 0 && addr.port() == 0 {
         shard_info!(shard.id, "Waiting for TCP address from shard 0...");
         loop {
@@ -78,7 +77,7 @@ pub async fn start(
                 shard_info!(shard.id, "Received TCP address: {}", addr);
                 break;
             }
-            compio::time::sleep(Duration::from_millis(10)).await;
+            compio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
