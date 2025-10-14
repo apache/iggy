@@ -24,7 +24,7 @@ use iggy::prelude::*;
 use integration::test_server::{
     ClientFactory, assert_clean_system, create_user, login_root, login_user,
 };
-use std::str::{FromStr, from_utf8};
+use std::str::FromStr;
 
 pub async fn run(client_factory: &dyn ClientFactory) {
     let system_client = create_client(client_factory).await;

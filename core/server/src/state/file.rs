@@ -17,7 +17,7 @@
  */
 
 use crate::state::command::EntryCommand;
-use crate::state::{COMPONENT, State, StateEntry};
+use crate::state::{COMPONENT, StateEntry};
 use crate::streaming::persistence::persister::PersisterKind;
 use crate::streaming::utils::file;
 use crate::versioning::SemanticVersion;
@@ -80,10 +80,8 @@ impl FileState {
     pub fn term(&self) -> u64 {
         self.term.load(Ordering::SeqCst)
     }
-}
 
-impl State for FileState {
-    async fn init(&self) -> Result<Vec<StateEntry>, IggyError> {
+    pub async fn init(&self) -> Result<Vec<StateEntry>, IggyError> {
         assert!(Path::new(&self.path).exists());
 
         let entries = self.load_entries().await.with_error_context(|error| {
@@ -101,7 +99,7 @@ impl State for FileState {
         Ok(entries)
     }
 
-    async fn load_entries(&self) -> Result<Vec<StateEntry>, IggyError> {
+    pub async fn load_entries(&self) -> Result<Vec<StateEntry>, IggyError> {
         if !Path::new(&self.path).exists() {
             return Err(IggyError::StateFileNotFound);
         }
@@ -297,7 +295,7 @@ impl State for FileState {
         Ok(entries)
     }
 
-    async fn apply(&self, user_id: u32, command: &EntryCommand) -> Result<(), IggyError> {
+    pub async fn apply(&self, user_id: u32, command: &EntryCommand) -> Result<(), IggyError> {
         debug!("Applying state entry with command: {command}, user ID: {user_id}");
         let timestamp = IggyTimestamp::now();
         let index = if self.entries_count.load(Ordering::SeqCst) == 0 {

@@ -49,10 +49,6 @@ pub struct Borrow;
 /// Marker type for component containers that use interior mutability.
 pub struct InteriorMutability;
 
-mod private {
-    pub trait Sealed {}
-}
-
 // I think it's better to *NOT* use `Components` directly on the `with` methods.
 // Instead use the `Self::EntityRef` type directly.
 // This way we can auto implement the `with_by_id` method.

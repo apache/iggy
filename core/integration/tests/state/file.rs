@@ -21,7 +21,6 @@ use bytes::Bytes;
 use iggy::prelude::BytesSerializable;
 use iggy_common::create_stream::CreateStream;
 use iggy_common::create_user::CreateUser;
-use server::state::State;
 use server::state::command::EntryCommand;
 use server::state::entry::StateEntry;
 use server::state::models::{CreateStreamWithId, CreateUserWithId};

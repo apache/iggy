@@ -17,8 +17,9 @@
  */
 
 use crate::bootstrap::create_root_user;
+use crate::state::file::FileState;
 use crate::state::models::CreateUserWithId;
-use crate::state::{COMPONENT, EntryCommand, StateEntry, StateKind};
+use crate::state::{COMPONENT, EntryCommand, StateEntry};
 use crate::streaming::personal_access_tokens::personal_access_token::PersonalAccessToken;
 use ahash::AHashMap;
 use error_set::ErrContext;
@@ -98,7 +99,7 @@ pub struct ConsumerGroupState {
 }
 
 impl SystemState {
-    pub async fn load(state: StateKind) -> Result<Self, IggyError> {
+    pub async fn load(state: FileState) -> Result<Self, IggyError> {
         let mut state_entries = state.init().await.with_error_context(|error| {
             format!("{COMPONENT} (error: {error}) - failed to initialize state entries")
         })?;

@@ -48,7 +48,7 @@ impl IggyShard {
         batch: IggyMessagesBatchMut,
     ) -> Result<(), IggyError> {
         self.ensure_topic_exists(&stream_id, &topic_id)?;
-        
+
         let numeric_stream_id = self
             .streams2
             .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
@@ -164,7 +164,7 @@ impl IggyShard {
         args: PollingArgs,
     ) -> Result<(IggyPollMetadata, IggyMessagesBatchSet), IggyError> {
         self.ensure_topic_exists(&stream_id, &topic_id)?;
-        
+
         let numeric_stream_id = self
             .streams2
             .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());

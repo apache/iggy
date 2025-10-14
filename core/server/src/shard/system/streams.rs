@@ -231,7 +231,8 @@ mod tests {
     use crate::shard::transmission::connector::ShardConnector;
     use crate::slab::streams::Streams;
     use crate::slab::users::Users;
-    use crate::state::{MockState, StateKind};
+    use crate::state::file::FileState;
+    use crate::streaming::persistence::persister::{FilePersister, PersisterKind};
     use crate::streaming::session::Session;
     use crate::streaming::streams;
     use crate::streaming::users::user::User;
@@ -241,9 +242,11 @@ mod tests {
     use iggy_common::defaults::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
     use std::net::{Ipv4Addr, SocketAddr};
     use std::rc::Rc;
+    use std::sync::Arc;
 
     fn create_test_shard() -> Rc<IggyShard> {
-        let _tempdir = tempfile::TempDir::new().unwrap();
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let state_path = tempdir.path().join("state.log");
         let config = ServerConfig::default();
 
         let streams = Streams::default();
@@ -252,7 +255,12 @@ mod tests {
         let shards_table: EternalPtr<DashMap<crate::shard::namespace::IggyNamespace, ShardInfo>> =
             shards_table.into();
         let users = Users::new();
-        let state = StateKind::Mock(MockState::new());
+        let state = FileState::new(
+            &state_path.to_string_lossy(),
+            &SemanticVersion::current().unwrap(),
+            Arc::new(PersisterKind::File(FilePersister)),
+            None,
+        );
         let connections = vec![ShardConnector::new(0, 1)];
 
         let builder = IggyShard::builder();

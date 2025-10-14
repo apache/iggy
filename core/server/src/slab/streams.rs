@@ -1369,6 +1369,7 @@ impl Streams {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn auto_commit_consumer_offset(
         &self,
         shard_id: u16,
@@ -1379,8 +1380,10 @@ impl Streams {
         consumer: PollingConsumer,
         offset: u64,
     ) -> Result<(), IggyError> {
-        let numeric_stream_id = self.with_stream_by_id(stream_id, streams::helpers::get_stream_id());
-        let numeric_topic_id = self.with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
+        let numeric_stream_id =
+            self.with_stream_by_id(stream_id, streams::helpers::get_stream_id());
+        let numeric_topic_id =
+            self.with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
 
         trace!(
             "Last offset: {} will be automatically stored for {}, stream: {}, topic: {}, partition: {}",
@@ -1408,7 +1411,12 @@ impl Streams {
                         (offset_value, path)
                     },
                 );
-                crate::streaming::partitions::storage2::persist_offset(shard_id, &path, offset_value).await?;
+                crate::streaming::partitions::storage2::persist_offset(
+                    shard_id,
+                    &path,
+                    offset_value,
+                )
+                .await?;
             }
             PollingConsumer::ConsumerGroup(cg_id, _) => {
                 let (offset_value, path) = self.with_partition_by_id(
@@ -1430,7 +1438,12 @@ impl Streams {
                         (offset_value, path)
                     },
                 );
-                crate::streaming::partitions::storage2::persist_offset(shard_id, &path, offset_value).await?;
+                crate::streaming::partitions::storage2::persist_offset(
+                    shard_id,
+                    &path,
+                    offset_value,
+                )
+                .await?;
             }
         }
 

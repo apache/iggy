@@ -31,7 +31,7 @@ use std::time::Instant;
 use tempfile::NamedTempFile;
 use tracing::{error, info};
 
-// TODO(hubcio): compio has a `process` module, but it currently blocks the executor when the runtime
+// NOTE(hubcio): compio has a `process` module, but it currently blocks the executor when the runtime
 // has thread_pool_limit(0) configured (which we do on non-macOS platforms in bootstrap.rs).
 // To use compio::process::Command, we need to either:
 // 1. Enable thread pool by removing/increasing thread_pool_limit(0)

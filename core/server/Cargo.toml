@@ -141,5 +141,4 @@ vergen-git2 = { version = "1.0.7", features = [
 ] }
 
 [dev-dependencies]
-mockall = { workspace = true }
 serial_test = { workspace = true }

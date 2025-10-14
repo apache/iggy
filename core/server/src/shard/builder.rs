@@ -24,7 +24,7 @@ use crate::{
     configs::server::ServerConfig,
     shard::{Shard, ShardInfo, namespace::IggyNamespace},
     slab::{streams::Streams, users::Users},
-    state::StateKind,
+    state::file::FileState,
     streaming::{diagnostics::metrics::Metrics, utils::ptr::EternalPtr},
     versioning::SemanticVersion,
 };
@@ -37,7 +37,7 @@ pub struct IggyShardBuilder {
     id: Option<u16>,
     streams: Option<Streams>,
     shards_table: Option<EternalPtr<DashMap<IggyNamespace, ShardInfo>>>,
-    state: Option<StateKind>,
+    state: Option<FileState>,
     users: Option<Users>,
     connections: Option<Vec<ShardConnector<ShardFrame>>>,
     config: Option<ServerConfig>,
@@ -85,7 +85,7 @@ impl IggyShardBuilder {
         self
     }
 
-    pub fn state(mut self, state: StateKind) -> Self {
+    pub fn state(mut self, state: FileState) -> Self {
         self.state = Some(state);
         self
     }

@@ -24,17 +24,11 @@ use compio::io::AsyncWriteAtExt;
 use error_set::ErrContext;
 use iggy_common::IggyError;
 use std::fmt::Debug;
-use std::future::Future;
-
-#[cfg(test)]
-use mockall::automock;
 
 #[derive(Debug)]
 pub enum PersisterKind {
     File(FilePersister),
     FileWithSync(FileWithSyncPersister),
-    #[cfg(test)]
-    Mock(MockPersister),
 }
 
 impl PersisterKind {
@@ -42,8 +36,6 @@ impl PersisterKind {
         match self {
             PersisterKind::File(p) => p.append(path, bytes).await,
             PersisterKind::FileWithSync(p) => p.append(path, bytes).await,
-            #[cfg(test)]
-            PersisterKind::Mock(p) => p.append(path, bytes).await,
         }
     }
 
@@ -51,8 +43,6 @@ impl PersisterKind {
         match self {
             PersisterKind::File(p) => p.overwrite(path, bytes).await,
             PersisterKind::FileWithSync(p) => p.overwrite(path, bytes).await,
-            #[cfg(test)]
-            PersisterKind::Mock(p) => p.overwrite(path, bytes).await,
         }
     }
 
@@ -60,32 +50,15 @@ impl PersisterKind {
         match self {
             PersisterKind::File(p) => p.delete(path).await,
             PersisterKind::FileWithSync(p) => p.delete(path).await,
-            #[cfg(test)]
-            PersisterKind::Mock(p) => p.delete(path).await,
         }
     }
-}
-
-#[cfg_attr(test, automock)]
-pub trait Persister {
-    fn append<B: IoBuf>(&self, path: &str, bytes: B)
-    -> impl Future<Output = Result<(), IggyError>>;
-    fn overwrite<B: IoBuf>(
-        &self,
-        path: &str,
-        bytes: B,
-    ) -> impl Future<Output = Result<(), IggyError>>;
-    fn delete(&self, path: &str) -> impl Future<Output = Result<(), IggyError>>;
 }
 
 #[derive(Debug)]
 pub struct FilePersister;
 
-#[derive(Debug)]
-pub struct FileWithSyncPersister;
-
-impl Persister for FilePersister {
-    async fn append<B: IoBuf>(&self, path: &str, bytes: B) -> Result<(), IggyError> {
+impl FilePersister {
+    pub async fn append<B: IoBuf>(&self, path: &str, bytes: B) -> Result<(), IggyError> {
         let (mut file, position) = file::append(path)
             .await
             .with_error_context(|error| {
@@ -102,7 +75,7 @@ impl Persister for FilePersister {
         Ok(())
     }
 
-    async fn overwrite<B: IoBuf>(&self, path: &str, bytes: B) -> Result<(), IggyError> {
+    pub async fn overwrite<B: IoBuf>(&self, path: &str, bytes: B) -> Result<(), IggyError> {
         let mut file = file::overwrite(path)
             .await
             .with_error_context(|error| {
@@ -120,7 +93,7 @@ impl Persister for FilePersister {
         Ok(())
     }
 
-    async fn delete(&self, path: &str) -> Result<(), IggyError> {
+    pub async fn delete(&self, path: &str) -> Result<(), IggyError> {
         remove_file(path)
             .await
             .with_error_context(|error| {
@@ -131,8 +104,11 @@ impl Persister for FilePersister {
     }
 }
 
-impl Persister for FileWithSyncPersister {
-    async fn append<B: IoBuf>(&self, path: &str, bytes: B) -> Result<(), IggyError> {
+#[derive(Debug)]
+pub struct FileWithSyncPersister;
+
+impl FileWithSyncPersister {
+    pub async fn append<B: IoBuf>(&self, path: &str, bytes: B) -> Result<(), IggyError> {
         let (mut file, position) = file::append(path)
             .await
             .with_error_context(|error| {
@@ -157,7 +133,7 @@ impl Persister for FileWithSyncPersister {
         Ok(())
     }
 
-    async fn overwrite<B: IoBuf>(&self, path: &str, bytes: B) -> Result<(), IggyError> {
+    pub async fn overwrite<B: IoBuf>(&self, path: &str, bytes: B) -> Result<(), IggyError> {
         let mut file = file::overwrite(path)
             .await
             .with_error_context(|error| {
@@ -183,7 +159,7 @@ impl Persister for FileWithSyncPersister {
         Ok(())
     }
 
-    async fn delete(&self, path: &str) -> Result<(), IggyError> {
+    pub async fn delete(&self, path: &str) -> Result<(), IggyError> {
         remove_file(path)
             .await
             .with_error_context(|error| {

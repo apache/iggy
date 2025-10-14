@@ -3,7 +3,9 @@ use iggy_common::{Consumer, ConsumerKind, Identifier, IggyError};
 use crate::{
     shard::IggyShard,
     streaming::{
-        polling_consumer::PollingConsumer, streams::helpers::get_stream_id, topics::{self}
+        polling_consumer::PollingConsumer,
+        streams::helpers::get_stream_id,
+        topics::{self},
     },
 };
 
@@ -74,16 +76,14 @@ impl IggyShard {
         partition_id: usize,
     ) -> Result<(), IggyError> {
         self.ensure_topic_exists(stream_id, topic_id)?;
-        let partition_exists = self.streams2.with_topic_by_id(
-            stream_id,
-            topic_id,
-            |(root, ..)| root.partitions().exists(partition_id),
-        );
+        let partition_exists = self
+            .streams2
+            .with_topic_by_id(stream_id, topic_id, |(root, ..)| {
+                root.partitions().exists(partition_id)
+            });
 
         if !partition_exists {
-            let numeric_stream_id = self
-                .streams2
-                .with_stream_by_id(stream_id, get_stream_id());
+            let numeric_stream_id = self.streams2.with_stream_by_id(stream_id, get_stream_id());
             let numeric_topic_id = self.streams2.with_topic_by_id(
                 stream_id,
                 topic_id,

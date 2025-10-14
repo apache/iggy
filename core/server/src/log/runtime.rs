@@ -10,13 +10,9 @@ impl Runtime for CompioRuntime {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        // It's fine to detach this task, the documentation for `spawn` method on `Runtime` trait says:
-        //
-        //
-        // "This is mainly used to run batch span processing in the background. Note, that the function
+        // This is mainly used to run batch span processing in the background. Note, that the function
         // does not return a handle. OpenTelemetry will use a different way to wait for the future to
-        // finish when the caller shuts down.""
-        // TODO(hubcio): investigate if we can use TaskRegistry API for task spawn
+        // finish when the caller shuts down.
         compio::runtime::spawn(future).detach();
     }
 

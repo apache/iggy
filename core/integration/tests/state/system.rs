@@ -25,7 +25,6 @@ use iggy_common::create_stream::CreateStream;
 use iggy_common::create_topic::CreateTopic;
 use iggy_common::create_user::CreateUser;
 use iggy_common::delete_stream::DeleteStream;
-use server::state::State;
 use server::state::command::EntryCommand;
 use server::state::models::{
     CreateConsumerGroupWithId, CreatePersonalAccessTokenWithHash, CreateStreamWithId,

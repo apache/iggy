@@ -38,11 +38,10 @@ use crate::{
     },
     shard_error, shard_info,
     slab::{streams::Streams, traits_ext::EntityMarker, users::Users},
-    state::StateKind,
+    state::file::FileState,
     streaming::{
-        clients::client_manager::ClientManager, diagnostics::metrics::Metrics,
-        session::Session, traits::MainOps,
-        users::permissioner::Permissioner, utils::ptr::EternalPtr,
+        clients::client_manager::ClientManager, diagnostics::metrics::Metrics, session::Session,
+        traits::MainOps, users::permissioner::Permissioner, utils::ptr::EternalPtr,
     },
     versioning::SemanticVersion,
 };
@@ -51,9 +50,7 @@ use compio::io::AsyncWriteAtExt;
 use dashmap::DashMap;
 use error_set::ErrContext;
 use hash32::{Hasher, Murmur3Hasher};
-use iggy_common::{
-    EncryptorKind, Identifier, IggyError, TransportProtocol,
-};
+use iggy_common::{EncryptorKind, Identifier, IggyError, TransportProtocol};
 use std::hash::Hasher as _;
 use std::{
     cell::{Cell, RefCell},
@@ -120,7 +117,7 @@ pub struct IggyShard {
     pub(crate) streams2: Streams,
     pub(crate) shards_table: EternalPtr<DashMap<IggyNamespace, ShardInfo>>,
     // TODO: Refactor.
-    pub(crate) state: StateKind,
+    pub(crate) state: FileState,
 
     // Temporal...
     pub(crate) encryptor: Option<EncryptorKind>,

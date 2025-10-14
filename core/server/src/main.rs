@@ -39,7 +39,6 @@ use server::shard::{IggyShard, ShardInfo, calculate_shard_assignment};
 use server::slab::traits_ext::{
     EntityComponentSystem, EntityComponentSystemMutCell, IntoComponents,
 };
-use server::state::StateKind;
 use server::state::file::FileState;
 use server::state::system::SystemState;
 use server::streaming::diagnostics::metrics::Metrics;
@@ -81,12 +80,11 @@ async fn main() -> Result<(), ServerError> {
         );
     }
     let args = Args::parse();
+
     // FIRST DISCRETE LOADING STEP.
-    // TODO: I think we could get rid of config provider, since we support only TOML
-    // as config provider.
-    let config_provider = config_provider::resolve(&args.config_provider)?;
     // Load config and create directories.
     // Remove `local_data` directory if run with `--fresh` flag.
+    let config_provider = config_provider::resolve(&args.config_provider)?;
     let config = load_config(&config_provider)
         .await
         .with_error_context(|error| {
@@ -197,12 +195,12 @@ async fn main() -> Result<(), ServerError> {
 
     // TENTH DISCRETE LOADING STEP.
     let state_persister = resolve_persister(config.system.state.enforce_fsync);
-    let state = StateKind::File(FileState::new(
+    let state = FileState::new(
         &config.system.get_state_messages_file_path(),
         &current_version,
         state_persister,
         encryptor.clone(),
-    ));
+    );
     let state = SystemState::load(state).await?;
     let (streams_state, users_state) = state.decompose();
     let streams = load_streams(streams_state.into_values(), &config.system).await?;
@@ -284,12 +282,12 @@ async fn main() -> Result<(), ServerError> {
         let encryptor = encryptor.clone();
         let metrics = metrics.clone();
         let state_persister = resolve_persister(config.system.state.enforce_fsync);
-        let state = StateKind::File(FileState::new(
+        let state = FileState::new(
             &config.system.get_state_messages_file_path(),
             &current_version,
             state_persister,
             encryptor.clone(),
-        ));
+        );
 
         // TODO: Explore decoupling the `Log` from `Partition` entity.
         // Ergh... I knew this will backfire to include `Log` as part of the `Partition` entity,
