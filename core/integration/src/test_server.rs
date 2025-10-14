@@ -408,33 +408,41 @@ impl TestServer {
         });
 
         if let Some(config) = config {
-            let quic_addr: SocketAddr = config.quic.address.parse().unwrap();
-            if quic_addr.port() == 0 {
-                panic!("Quic address port is 0!");
+            // Only validate and add enabled protocols
+            if config.quic.enabled {
+                let quic_addr: SocketAddr = config.quic.address.parse().unwrap();
+                if quic_addr.port() == 0 {
+                    panic!("Quic address port is 0!");
+                }
+                self.server_addrs
+                    .push(ServerProtocolAddr::QuicUdp(quic_addr));
             }
 
-            let tcp_addr: SocketAddr = config.tcp.address.parse().unwrap();
-            if tcp_addr.port() == 0 {
-                panic!("Tcp address port is 0!");
+            if config.tcp.enabled {
+                let tcp_addr: SocketAddr = config.tcp.address.parse().unwrap();
+                if tcp_addr.port() == 0 {
+                    panic!("Tcp address port is 0!");
+                }
+                self.server_addrs.push(ServerProtocolAddr::RawTcp(tcp_addr));
             }
 
-            let http_addr: SocketAddr = config.http.address.parse().unwrap();
-            if http_addr.port() == 0 {
-                panic!("Http address port is 0!");
+            if config.http.enabled {
+                let http_addr: SocketAddr = config.http.address.parse().unwrap();
+                if http_addr.port() == 0 {
+                    panic!("Http address port is 0!");
+                }
+                self.server_addrs
+                    .push(ServerProtocolAddr::HttpTcp(http_addr));
             }
 
-            let websocket_addr: SocketAddr = config.websocket.address.parse().unwrap();
-            if websocket_addr.port() == 0 {
-                panic!("WebSocket address port is 0!");
+            if config.websocket.enabled {
+                let websocket_addr: SocketAddr = config.websocket.address.parse().unwrap();
+                if websocket_addr.port() == 0 {
+                    panic!("WebSocket address port is 0!");
+                }
+                self.server_addrs
+                    .push(ServerProtocolAddr::WebSocket(websocket_addr));
             }
-
-            self.server_addrs
-                .push(ServerProtocolAddr::QuicUdp(quic_addr));
-            self.server_addrs.push(ServerProtocolAddr::RawTcp(tcp_addr));
-            self.server_addrs
-                .push(ServerProtocolAddr::HttpTcp(http_addr));
-            self.server_addrs
-                .push(ServerProtocolAddr::WebSocket(websocket_addr));
         } else {
             panic!(
                 "Failed to load config from file {config_path} in {MAX_PORT_WAIT_DURATION_S} s!"

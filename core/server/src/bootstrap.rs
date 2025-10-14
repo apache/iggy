@@ -38,7 +38,7 @@ use crate::{
         streams::stream2,
         topics::{consumer_group2, topic2},
         users::user::User,
-        utils::file::overwrite,
+        utils::{crypto, file::overwrite},
     },
     versioning::SemanticVersion,
 };
@@ -48,8 +48,8 @@ use error_set::ErrContext;
 use iggy_common::{
     ConsumerKind, IggyByteSize, IggyError,
     defaults::{
-        DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH,
-        MIN_PASSWORD_LENGTH, MIN_USERNAME_LENGTH,
+        DEFAULT_ROOT_USERNAME, MAX_PASSWORD_LENGTH, MAX_USERNAME_LENGTH, MIN_PASSWORD_LENGTH,
+        MIN_USERNAME_LENGTH,
     },
 };
 use std::{collections::HashSet, env, path::Path, sync::Arc};
@@ -289,9 +289,8 @@ pub async fn create_directories(config: &SystemConfig) -> Result<(), IggyError> 
 }
 
 pub fn create_root_user() -> User {
-    info!("Creating root user...");
-    let username = env::var(IGGY_ROOT_USERNAME_ENV);
-    let password = env::var(IGGY_ROOT_PASSWORD_ENV);
+    let mut username = env::var(IGGY_ROOT_USERNAME_ENV);
+    let mut password = env::var(IGGY_ROOT_PASSWORD_ENV);
     if (username.is_ok() && password.is_err()) || (username.is_err() && password.is_ok()) {
         panic!(
             "When providing the custom root user credentials, both username and password must be set."
@@ -300,11 +299,15 @@ pub fn create_root_user() -> User {
     if username.is_ok() && password.is_ok() {
         info!("Using the custom root user credentials.");
     } else {
-        info!("Using the default root user credentials.");
+        info!("Using the default root user credentials...");
+        username = Ok(DEFAULT_ROOT_USERNAME.to_string());
+        let generated_password = crypto::generate_secret(20..40);
+        println!("Generated root user password: {generated_password}");
+        password = Ok(generated_password);
     }
 
-    let username = username.unwrap_or(DEFAULT_ROOT_USERNAME.to_string());
-    let password = password.unwrap_or(DEFAULT_ROOT_PASSWORD.to_string());
+    let username = username.expect("Root username is not set.");
+    let password = password.expect("Root password is not set.");
     if username.is_empty() || password.is_empty() {
         panic!("Root user credentials are not set.");
     }
@@ -320,6 +323,7 @@ pub fn create_root_user() -> User {
     if password.len() > MAX_PASSWORD_LENGTH {
         panic!("Root password is too long.");
     }
+
     User::root(&username, &password)
 }
 

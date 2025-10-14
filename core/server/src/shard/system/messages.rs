@@ -281,9 +281,11 @@ impl IggyShard {
         stream_id: &Identifier,
         topic_id: &Identifier,
         partition_id: usize,
-        _fsync: bool,
+        fsync: bool,
     ) -> Result<(), IggyError> {
         self.ensure_authenticated(session)?;
+        self.ensure_partition_exists(stream_id, topic_id, partition_id)?;
+
         let numeric_stream_id = self
             .streams2
             .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
@@ -304,7 +306,7 @@ impl IggyShard {
                 format!("{COMPONENT} (error: {error}) - permission denied to append messages for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), numeric_stream_id as u32, numeric_topic_id as u32)
             })?;
 
-        self.flush_unsaved_buffer_base(stream_id, topic_id, partition_id)
+        self.flush_unsaved_buffer_base(stream_id, topic_id, partition_id, fsync)
             .await?;
         Ok(())
     }
@@ -314,8 +316,10 @@ impl IggyShard {
         stream_id: &Identifier,
         topic_id: &Identifier,
         partition_id: usize,
+        fsync: bool,
     ) -> Result<(), IggyError> {
-        self.flush_unsaved_buffer_base(stream_id, topic_id, partition_id)
+        self.ensure_partition_exists(stream_id, topic_id, partition_id)?;
+        self.flush_unsaved_buffer_base(stream_id, topic_id, partition_id, fsync)
             .await
     }
 
@@ -324,6 +328,7 @@ impl IggyShard {
         stream_id: &Identifier,
         topic_id: &Identifier,
         partition_id: usize,
+        fsync: bool,
     ) -> Result<(), IggyError> {
         let batches = self.streams2.with_partition_by_id_mut(
             stream_id,
@@ -342,6 +347,14 @@ impl IggyShard {
                 &self.config.system,
             )
             .await?;
+
+        // Ensure all data is flushed to disk before returning
+        if fsync {
+            self.streams2
+                .fsync_all_messages(stream_id, topic_id, partition_id)
+                .await?;
+        }
+
         Ok(())
     }
 

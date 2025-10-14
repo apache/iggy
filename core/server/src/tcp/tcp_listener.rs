@@ -103,6 +103,9 @@ pub async fn start(
         shard.tcp_bound_address.set(Some(actual_addr));
 
         if addr.port() == 0 {
+            // Notify config writer on shard 0
+            let _ = shard.config_writer_notify.try_send(());
+
             // Broadcast to other shards for SO_REUSEPORT binding
             let event = ShardEvent::AddressBound {
                 protocol: TransportProtocol::Tcp,

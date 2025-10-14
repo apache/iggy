@@ -130,7 +130,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         .send_messages(
             &Identifier::numeric(stream_id).unwrap(),
             &Identifier::numeric(topic_id).unwrap(),
-            &Partitioning::partition_id(1),
+            &Partitioning::partition_id(0),
             &mut messages_batch_1,
         )
         .await
@@ -160,7 +160,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         .poll_messages(
             &Identifier::numeric(stream_id).unwrap(),
             &Identifier::numeric(topic_id).unwrap(),
-            Some(1),
+            Some(0),
             &consumer,
             &PollingStrategy::offset(0),
             messages_per_batch.try_into().unwrap(),
@@ -275,7 +275,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         .send_messages(
             &Identifier::numeric(stream_id).unwrap(),
             &Identifier::numeric(topic_id).unwrap(),
-            &Partitioning::partition_id(1), // Use specific partition for testing
+            &Partitioning::partition_id(0), // Use specific partition for testing
             &mut messages_batch_2,
         )
         .await
@@ -300,7 +300,7 @@ async fn should_fill_data_with_headers_and_verify_after_restart_using_api(encryp
         .poll_messages(
             &Identifier::numeric(stream_id).unwrap(),
             &Identifier::numeric(topic_id).unwrap(),
-            Some(1),
+            Some(0),
             &consumer,
             &PollingStrategy::offset(0),
             messages_per_batch as u32 * 2,

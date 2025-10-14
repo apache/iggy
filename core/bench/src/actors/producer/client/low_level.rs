@@ -49,7 +49,7 @@ impl LowLevelProducerClient {
             client: None,
             stream_id: Identifier::default(),
             topic_id: Identifier::default(),
-            partitioning: Partitioning::partition_id(1),
+            partitioning: Partitioning::partition_id(0),
         }
     }
 }

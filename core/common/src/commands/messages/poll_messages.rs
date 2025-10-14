@@ -24,7 +24,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 
-pub const DEFAULT_PARTITION_ID: u32 = 1;
+pub const DEFAULT_PARTITION_ID: u32 = 0;
 pub const DEFAULT_NUMBER_OF_MESSAGES_TO_POLL: u32 = 10;
 
 /// `PollMessages` command is used to poll messages from a topic in a stream.

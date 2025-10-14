@@ -135,7 +135,7 @@ pub struct IggyShard {
     pub(crate) quic_bound_address: Cell<Option<SocketAddr>>,
     pub(crate) websocket_bound_address: Cell<Option<SocketAddr>>,
     pub(crate) http_bound_address: Cell<Option<SocketAddr>>,
-    config_writer_notify: async_channel::Sender<()>,
+    pub(crate) config_writer_notify: async_channel::Sender<()>,
     config_writer_receiver: async_channel::Receiver<()>,
     pub(crate) task_registry: Rc<TaskRegistry>,
 }
@@ -847,9 +847,9 @@ impl IggyShard {
                 stream_id,
                 topic_id,
                 partition_id,
-                ..
+                fsync,
             } => {
-                self.flush_unsaved_buffer_bypass_auth(&stream_id, &topic_id, partition_id)
+                self.flush_unsaved_buffer_bypass_auth(&stream_id, &topic_id, partition_id, fsync)
                     .await?;
                 Ok(())
             }

@@ -67,7 +67,7 @@ impl Command for GetConsumerOffset {
 }
 
 fn default_partition_id() -> Option<u32> {
-    Some(1)
+    Some(0)
 }
 
 impl Validatable<IggyError> for GetConsumerOffset {

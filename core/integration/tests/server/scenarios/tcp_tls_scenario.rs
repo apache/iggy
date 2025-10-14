@@ -69,7 +69,7 @@ pub async fn run(client: &IggyClient) {
         .poll_messages(
             &Identifier::named(stream_name).unwrap(),
             &Identifier::named(topic_name).unwrap(),
-            Some(1),
+            Some(0),
             &Consumer::default(),
             &PollingStrategy::offset(0),
             1,

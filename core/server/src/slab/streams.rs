@@ -1337,8 +1337,15 @@ impl Streams {
         partition_id: usize,
     ) -> Result<(), IggyError> {
         let storage = self.with_partition_by_id(stream_id, topic_id, partition_id, |(.., log)| {
-            log.active_storage().clone()
+            if !log.has_segments() {
+                return None;
+            }
+            Some(log.active_storage().clone())
         });
+
+        let Some(storage) = storage else {
+            return Ok(());
+        };
 
         if storage.messages_writer.is_none() || storage.index_writer.is_none() {
             return Ok(());

@@ -127,6 +127,9 @@ pub async fn spawn_quic_server(
         shard.quic_bound_address.set(Some(actual_addr));
 
         if addr.port() == 0 {
+            // Notify config writer on shard 0
+            let _ = shard.config_writer_notify.try_send(());
+
             // Broadcast to other shards for SO_REUSEPORT binding
             let event = ShardEvent::AddressBound {
                 protocol: iggy_common::TransportProtocol::Quic,

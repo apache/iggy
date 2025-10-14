@@ -72,6 +72,9 @@ pub(crate) async fn start(
     if shard.id == 0 {
         shard.tcp_bound_address.set(Some(actual_addr));
         if addr.port() == 0 {
+            // Notify config writer on shard 0
+            let _ = shard.config_writer_notify.try_send(());
+
             let event = ShardEvent::AddressBound {
                 protocol: TransportProtocol::Tcp,
                 address: actual_addr,
