@@ -163,7 +163,7 @@ async fn mcp_server_should_return_topic_details() {
         "get_topic",
         Some(json!({"stream_id": STREAM_NAME, "topic_id": TOPIC_NAME})),
         |topic| {
-            assert_eq!(topic.id, 1);
+            assert_eq!(topic.id, 0);
             assert_eq!(topic.name, TOPIC_NAME);
             assert_eq!(topic.messages_count, 1);
         },
