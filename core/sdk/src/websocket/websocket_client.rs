@@ -17,7 +17,11 @@
  */
 
 use crate::websocket::websocket_connection_stream::WebSocketConnectionStream;
-use crate::{prelude::Client, websocket::websocket_stream::ConnectionStream};
+use crate::websocket::websocket_stream_kind::WebSocketStreamKind;
+use crate::websocket::websocket_tls_connection_stream::WebSocketTlsConnectionStream;
+use rustls::{ClientConfig, pki_types::pem::PemObject};
+
+use crate::prelude::Client;
 use async_broadcast::{Receiver, Sender, broadcast};
 use async_trait::async_trait;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -31,7 +35,10 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
-use tokio_tungstenite::{client_async_with_config, tungstenite::client::IntoClientRequest};
+use tokio_tungstenite::{
+    Connector, client_async_with_config, connect_async_tls_with_config,
+    tungstenite::client::IntoClientRequest,
+};
 use tracing::{debug, error, info, trace, warn};
 
 const REQUEST_INITIAL_BYTES_LENGTH: usize = 4;
@@ -40,7 +47,7 @@ const NAME: &str = "WebSocket";
 
 #[derive(Debug)]
 pub struct WebSocketClient {
-    stream: Arc<Mutex<Option<WebSocketConnectionStream>>>,
+    stream: Arc<Mutex<Option<WebSocketStreamKind>>>,
     pub(crate) config: Arc<WebSocketClientConfig>,
     pub(crate) state: Mutex<ClientState>,
     client_address: Mutex<Option<SocketAddr>>,
@@ -175,9 +182,10 @@ impl WebSocketClient {
         let mut retry_count = 0;
 
         loop {
+            let protocol = if self.config.tls_enabled { "wss" } else { "ws" };
             info!(
-                "{NAME} client is connecting to server: {}...",
-                self.config.server_address
+                "{NAME} client is connecting to server: {}://{}...",
+                protocol, self.config.server_address
             );
             self.set_state(ClientState::Connecting).await;
 
@@ -209,83 +217,23 @@ impl WebSocketClient {
                     IggyError::InvalidConfiguration
                 })?;
 
-            let tcp_stream = match TcpStream::connect(&server_addr).await {
-                Ok(stream) => stream,
-                Err(error) => {
-                    error!(
-                        "Failed to connect to server: {}. Error: {}",
-                        self.config.server_address, error
-                    );
-
-                    if !self.config.reconnection.enabled {
-                        warn!("Automatic reconnection is disabled.");
+            let connection_stream = if self.config.tls_enabled {
+                match self.connect_tls(server_addr, &mut retry_count).await {
+                    Ok(stream) => stream,
+                    Err(IggyError::CannotEstablishConnection) => {
                         return Err(IggyError::CannotEstablishConnection);
                     }
-
-                    let unlimited_retries = self.config.reconnection.max_retries.is_none();
-                    let max_retries = self.config.reconnection.max_retries.unwrap_or_default();
-                    let max_retries_str = self
-                        .config
-                        .reconnection
-                        .max_retries
-                        .map(|r| r.to_string())
-                        .unwrap_or_else(|| "unlimited".to_string());
-
-                    let interval_str = self.config.reconnection.interval.as_human_time_string();
-                    if unlimited_retries || retry_count < max_retries {
-                        retry_count += 1;
-                        info!(
-                            "Retrying to connect to server ({retry_count}/{max_retries_str}): {} in: {interval_str}",
-                            self.config.server_address,
-                        );
-                        sleep(self.config.reconnection.interval.get_duration()).await;
-                        continue;
+                    Err(_) => continue, // retry
+                }
+            } else {
+                match self.connect_plain(server_addr, &mut retry_count).await {
+                    Ok(stream) => stream,
+                    Err(IggyError::CannotEstablishConnection) => {
+                        return Err(IggyError::CannotEstablishConnection);
                     }
-
-                    self.set_state(ClientState::Disconnected).await;
-                    self.publish_event(DiagnosticEvent::Disconnected).await;
-                    return Err(IggyError::CannotEstablishConnection);
+                    Err(_) => continue, // retry
                 }
             };
-
-            let ws_url = format!("ws://{}", server_addr);
-
-            let request = ws_url.into_client_request().map_err(|e| {
-                error!("Failed to create WebSocket request: {}", e);
-                IggyError::InvalidConfiguration
-            })?;
-
-            let tungstenite_config = self.config.ws_config.to_tungstenite_config();
-
-            let (websocket_stream, response) =
-                match client_async_with_config(request, tcp_stream, tungstenite_config).await {
-                    Ok(result) => result,
-                    Err(error) => {
-                        error!("WebSocket handshake failed: {}", error);
-
-                        if !self.config.reconnection.enabled {
-                            return Err(IggyError::WebSocketConnectionError);
-                        }
-
-                        let unlimited_retries = self.config.reconnection.max_retries.is_none();
-                        let max_retries = self.config.reconnection.max_retries.unwrap_or_default();
-
-                        if unlimited_retries || retry_count < max_retries {
-                            retry_count += 1;
-                            sleep(self.config.reconnection.interval.get_duration()).await;
-                            continue;
-                        }
-
-                        return Err(IggyError::WebSocketConnectionError);
-                    }
-                };
-
-            debug!(
-                "WebSocket connection established. Response status: {}",
-                response.status()
-            );
-
-            let connection_stream = WebSocketConnectionStream::new(server_addr, websocket_stream);
 
             *self.stream.lock().await = Some(connection_stream);
             *self.client_address.lock().await = Some(server_addr);
@@ -302,6 +250,166 @@ impl WebSocketClient {
             self.auto_login().await?;
             return Ok(());
         }
+    }
+
+    async fn connect_plain(
+        &self,
+        server_addr: SocketAddr,
+        retry_count: &mut u32,
+    ) -> Result<WebSocketStreamKind, IggyError> {
+        let tcp_stream = match TcpStream::connect(&server_addr).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                error!(
+                    "Failed to connect to server: {}. Error: {}",
+                    self.config.server_address, error
+                );
+                return self.handle_connection_error(retry_count).await;
+            }
+        };
+
+        let ws_url = format!("ws://{}", server_addr);
+        let request = ws_url.into_client_request().map_err(|e| {
+            error!("Failed to create WebSocket request: {}", e);
+            IggyError::InvalidConfiguration
+        })?;
+
+        let tungstenite_config = self.config.ws_config.to_tungstenite_config();
+
+        let (websocket_stream, response) =
+            match client_async_with_config(request, tcp_stream, tungstenite_config).await {
+                Ok(result) => result,
+                Err(error) => {
+                    error!("WebSocket handshake failed: {}", error);
+                    return self.handle_connection_error(retry_count).await;
+                }
+            };
+
+        debug!(
+            "WebSocket connection established. Response status: {}",
+            response.status()
+        );
+
+        let connection_stream = WebSocketConnectionStream::new(server_addr, websocket_stream);
+        Ok(WebSocketStreamKind::Plain(connection_stream))
+    }
+
+    async fn connect_tls(
+        &self,
+        server_addr: SocketAddr,
+        retry_count: &mut u32,
+    ) -> Result<WebSocketStreamKind, IggyError> {
+        let tls_config = self.build_tls_config()?;
+        let connector = Connector::Rustls(Arc::new(tls_config));
+
+        let domain = if !self.config.tls_domain.is_empty() {
+            self.config.tls_domain.clone()
+        } else {
+            server_addr.ip().to_string()
+        };
+
+        let ws_url = format!("wss://{}:{}", domain, server_addr.port());
+        let tungstenite_config = self.config.ws_config.to_tungstenite_config();
+
+        debug!("Initiating WebSocket TLS connection to: {}", ws_url);
+        println!("Initiating WebSocket TLS connection to: {}", ws_url);
+        println!("tungstenite_config: {:?}", tungstenite_config);
+        let (websocket_stream, response) =
+            match connect_async_tls_with_config(ws_url, tungstenite_config, false, Some(connector))
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    error!("WebSocket TLS handshake failed: {}", error);
+                    return self.handle_connection_error(retry_count).await;
+                }
+            };
+
+        debug!(
+            "WebSocket TLS connection established. Response status: {}",
+            response.status()
+        );
+
+        let connection_stream = WebSocketTlsConnectionStream::new(server_addr, websocket_stream);
+        Ok(WebSocketStreamKind::Tls(connection_stream))
+    }
+
+    fn build_tls_config(&self) -> Result<ClientConfig, IggyError> {
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        }
+
+        let config = if self.config.tls_validate_certificate {
+            let mut root_cert_store = rustls::RootCertStore::empty();
+
+            if let Some(certificate_path) = &self.config.tls_ca_file {
+                // load CA certificates from file
+                for cert in rustls::pki_types::CertificateDer::pem_file_iter(certificate_path)
+                    .map_err(|error| {
+                        error!("Failed to read the CA file: {certificate_path}. {error}");
+                        IggyError::InvalidTlsCertificatePath
+                    })?
+                {
+                    let certificate = cert.map_err(|error| {
+                        error!("Failed to read a certificate from the CA file: {certificate_path}. {error}");
+                        IggyError::InvalidTlsCertificate
+                    })?;
+                    root_cert_store.add(certificate).map_err(|error| {
+                        error!(
+                            "Failed to add a certificate to the root certificate store. {error}"
+                        );
+                        IggyError::InvalidTlsCertificate
+                    })?;
+                }
+            } else {
+                root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            }
+
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_cert_store)
+                .with_no_client_auth()
+        } else {
+            // skip certificate validation (development/self-signed certs)
+            use crate::tcp::tcp_tls_verifier::NoServerVerification;
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoServerVerification))
+                .with_no_client_auth()
+        };
+
+        Ok(config)
+    }
+
+    async fn handle_connection_error<T>(&self, retry_count: &mut u32) -> Result<T, IggyError> {
+        if !self.config.reconnection.enabled {
+            warn!("Automatic reconnection is disabled.");
+            return Err(IggyError::CannotEstablishConnection);
+        }
+
+        let unlimited_retries = self.config.reconnection.max_retries.is_none();
+        let max_retries = self.config.reconnection.max_retries.unwrap_or_default();
+        let max_retries_str = self
+            .config
+            .reconnection
+            .max_retries
+            .map(|r| r.to_string())
+            .unwrap_or_else(|| "unlimited".to_string());
+
+        let interval_str = self.config.reconnection.interval.as_human_time_string();
+
+        if unlimited_retries || *retry_count < max_retries {
+            *retry_count += 1;
+            info!(
+                "Retrying to connect to server ({}/{}): {} in: {}",
+                retry_count, max_retries_str, self.config.server_address, interval_str
+            );
+            sleep(self.config.reconnection.interval.get_duration()).await;
+            return Err(IggyError::Disconnected); // signal to retry
+        }
+
+        self.set_state(ClientState::Disconnected).await;
+        self.publish_event(DiagnosticEvent::Disconnected).await;
+        Err(IggyError::CannotEstablishConnection)
     }
 
     async fn auto_login(&self) -> Result<(), IggyError> {

@@ -19,3 +19,5 @@
 pub mod websocket_client;
 pub(crate) mod websocket_connection_stream;
 pub(crate) mod websocket_stream;
+pub(crate) mod websocket_stream_kind;
+pub(crate) mod websocket_tls_connection_stream;

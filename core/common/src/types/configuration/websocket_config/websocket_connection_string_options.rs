@@ -78,8 +78,8 @@ impl WebSocketConnectionStringOptions {
         &self.tls_domain
     }
 
-    pub fn tls_ca_file(&self) -> &Option<String> {
-        &self.tls_ca_file
+    pub fn tls_ca_file(&self) -> Option<&str> {
+        self.tls_ca_file.as_deref()
     }
 
     pub fn tls_validate_certificate(&self) -> bool {
@@ -201,9 +201,9 @@ impl Default for WebSocketConnectionStringOptions {
             max_frame_size: None,
             accept_unmasked_frames: None,
             tls_enabled: false,
-            tls_domain: "localhost".to_string(),
+            tls_domain: "".to_string(),
             tls_ca_file: None,
-            tls_validate_certificate: true,
+            tls_validate_certificate: false,
         }
     }
 }

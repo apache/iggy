@@ -36,6 +36,14 @@ pub struct WebSocketClientConfig {
     pub heartbeat_interval: IggyDuration,
     /// WebSocket-specific configuration.
     pub ws_config: WebSocketConfig,
+    /// Whether tls is enabled
+    pub tls_enabled: bool,
+    /// The domain to use for TLS
+    pub tls_domain: String,
+    /// The path to the CA file for TLS
+    pub tls_ca_file: Option<String>,
+    /// Whether to validate the TLS certificate
+    pub tls_validate_certificate: bool,
 }
 
 /// WebSocket-specific configuration that maps to tungstenite options.
@@ -59,11 +67,15 @@ pub struct WebSocketConfig {
 impl Default for WebSocketClientConfig {
     fn default() -> Self {
         WebSocketClientConfig {
-            server_address: "127.0.0.1:8080".to_string(),
+            server_address: "127.0.0.1:8092".to_string(),
             auto_login: AutoLogin::Disabled,
             reconnection: WebSocketClientReconnectionConfig::default(),
             heartbeat_interval: IggyDuration::from_str("5s").unwrap(),
             ws_config: WebSocketConfig::default(),
+            tls_enabled: false,
+            tls_domain: "localhost".to_string(),
+            tls_ca_file: None,
+            tls_validate_certificate: false,
         }
     }
 }
@@ -156,6 +168,10 @@ impl From<ConnectionString<WebSocketConnectionStringOptions>> for WebSocketClien
             reconnection: connection_string.options().reconnection().to_owned(),
             heartbeat_interval: connection_string.options().heartbeat_interval(),
             ws_config,
+            tls_enabled: options.tls_enabled(),
+            tls_domain: options.tls_domain().into(),
+            tls_ca_file: options.tls_ca_file().map(|s| s.to_string()),
+            tls_validate_certificate: options.tls_validate_certificate(),
         }
     }
 }

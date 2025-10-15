@@ -24,18 +24,21 @@ use iggy_common::IggyError;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
-use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 use tracing::{debug, error, trace};
 
 #[derive(Debug)]
-pub struct WebSocketConnectionStream {
+pub struct WebSocketTlsConnectionStream {
     client_address: SocketAddr,
-    stream: WebSocketStream<TcpStream>,
+    stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
     read_buffer: BytesMut,
 }
 
-impl WebSocketConnectionStream {
-    pub fn new(client_address: SocketAddr, stream: WebSocketStream<TcpStream>) -> Self {
+impl WebSocketTlsConnectionStream {
+    pub fn new(
+        client_address: SocketAddr,
+        stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    ) -> Self {
         Self {
             client_address,
             stream,
@@ -49,7 +52,7 @@ impl WebSocketConnectionStream {
             match self.stream.next().await {
                 Some(Ok(Message::Binary(data))) => {
                     trace!(
-                        "Received WebSocket binary message from {}, size: {} bytes",
+                        "Received WebSocket TLS binary message from {}, size: {} bytes",
                         self.client_address,
                         data.len()
                     );
@@ -58,7 +61,7 @@ impl WebSocketConnectionStream {
                 }
                 Some(Ok(Message::Text(text))) => {
                     trace!(
-                        "Received WebSocket text message from {}, converting to binary",
+                        "Received WebSocket TLS text message from {}, converting to binary",
                         self.client_address
                     );
                     self.read_buffer.extend_from_slice(text.as_bytes());
@@ -66,12 +69,12 @@ impl WebSocketConnectionStream {
                 }
                 Some(Ok(Message::Ping(data))) => {
                     trace!(
-                        "Received WebSocket ping from {}, sending pong",
+                        "Received WebSocket TLS ping from {}, sending pong",
                         self.client_address
                     );
                     if let Err(e) = self.stream.send(Message::Pong(data)).await {
                         error!(
-                            "Failed to send WebSocket pong to {}: {}",
+                            "Failed to send WebSocket TLS pong to {}: {}",
                             self.client_address, e
                         );
                         return Err(IggyError::WebSocketSendError);
@@ -79,23 +82,22 @@ impl WebSocketConnectionStream {
                     continue;
                 }
                 Some(Ok(Message::Pong(_))) => {
-                    trace!("Received WebSocket pong from {}", self.client_address);
+                    trace!("Received WebSocket TLS pong from {}", self.client_address);
                     continue;
                 }
                 Some(Ok(Message::Close(_))) => {
                     debug!(
-                        "WebSocket connection closed by client: {}",
+                        "WebSocket TLS connection closed by client: {}",
                         self.client_address
                     );
                     return Err(IggyError::ConnectionClosed);
                 }
                 Some(Ok(Message::Frame(_))) => {
-                    // Raw frames - just continue
                     continue;
                 }
                 Some(Err(e)) => {
                     error!(
-                        "Failed to read WebSocket message from {}: {}",
+                        "Failed to read WebSocket TLS message from {}: {}",
                         self.client_address, e
                     );
                     return match e {
@@ -113,7 +115,10 @@ impl WebSocketConnectionStream {
                     };
                 }
                 None => {
-                    debug!("WebSocket stream ended for client: {}", self.client_address);
+                    debug!(
+                        "WebSocket TLS stream ended for client: {}",
+                        self.client_address
+                    );
                     return Err(IggyError::ConnectionClosed);
                 }
             }
@@ -122,7 +127,7 @@ impl WebSocketConnectionStream {
 }
 
 #[async_trait]
-impl ConnectionStream for WebSocketConnectionStream {
+impl ConnectionStream for WebSocketTlsConnectionStream {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, IggyError> {
         let requested_bytes = buf.len();
 
@@ -138,7 +143,7 @@ impl ConnectionStream for WebSocketConnectionStream {
         let _consumed = self.read_buffer.split_to(requested_bytes);
 
         trace!(
-            "Read {} bytes from WebSocket stream for client: {}",
+            "Read {} bytes from WebSocket TLS stream for client: {}",
             requested_bytes, self.client_address
         );
 
@@ -147,13 +152,13 @@ impl ConnectionStream for WebSocketConnectionStream {
 
     async fn write(&mut self, buf: &[u8]) -> Result<(), IggyError> {
         trace!(
-            "Writing {} bytes to WebSocket stream for client: {}",
+            "Writing {} bytes to WebSocket TLS stream for client: {}",
             buf.len(),
             self.client_address
         );
 
         debug!(
-            "WebSocket write {} bytes: {:02x?}",
+            "WebSocket TLS write {} bytes: {:02x?}",
             buf.len(),
             &buf[..buf.len().min(16)]
         );
@@ -163,7 +168,7 @@ impl ConnectionStream for WebSocketConnectionStream {
             .await
             .map_err(|e| {
                 error!(
-                    "Failed to write data to WebSocket connection for client: {}: {}",
+                    "Failed to write data to WebSocket TLS connection for client: {}: {}",
                     self.client_address, e
                 );
                 match e {
@@ -184,7 +189,7 @@ impl ConnectionStream for WebSocketConnectionStream {
 
     async fn flush(&mut self) -> Result<(), IggyError> {
         trace!(
-            "Flushing WebSocket stream for client: {}",
+            "Flushing WebSocket TLS stream for client: {}",
             self.client_address
         );
         Ok(())
@@ -192,7 +197,7 @@ impl ConnectionStream for WebSocketConnectionStream {
 
     async fn shutdown(&mut self) -> Result<(), IggyError> {
         debug!(
-            "Shutting down WebSocket connection for client: {}",
+            "Shutting down WebSocket TLS connection for client: {}",
             self.client_address
         );
 
@@ -204,7 +209,7 @@ impl ConnectionStream for WebSocketConnectionStream {
 
         self.stream.send(close_message).await.map_err(|e| {
             error!(
-                "Failed to send close frame to WebSocket connection for client: {}: {}",
+                "Failed to send close frame to WebSocket TLS connection for client: {}: {}",
                 self.client_address, e
             );
             IggyError::WebSocketCloseError

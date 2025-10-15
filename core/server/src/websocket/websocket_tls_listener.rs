@@ -22,7 +22,6 @@ use crate::shard::IggyShard;
 use crate::shard::task_registry::ShutdownToken;
 use crate::shard::transmission::event::ShardEvent;
 use crate::websocket::connection_handler::{handle_connection, handle_error};
-use crate::websocket::websocket_tls_sender::WebSocketTlsSender;
 use crate::{shard_debug, shard_error, shard_info, shard_warn};
 use compio::net::TcpListener;
 use compio_tls::TlsAcceptor;
@@ -128,7 +127,15 @@ pub async fn start(
         config.accept_unmasked_frames
     );
 
-    accept_loop(listener, acceptor, ws_config, shard, shutdown).await
+    let result = accept_loop(listener, acceptor, ws_config, shard.clone(), shutdown).await;
+
+    shard_info!(
+        shard.id,
+        "WebSocket TLS listener task exiting with result: {:?}",
+        result
+    );
+
+    result
 }
 
 async fn accept_loop(
@@ -138,6 +145,11 @@ async fn accept_loop(
     shard: Rc<IggyShard>,
     shutdown: ShutdownToken,
 ) -> Result<(), IggyError> {
+    shard_info!(
+        shard.id,
+        "WebSocket TLS accept loop started, waiting for connections..."
+    );
+
     loop {
         let shard = shard.clone();
         let ws_config = ws_config.clone();
@@ -163,14 +175,11 @@ async fn accept_loop(
                         let registry = shard.task_registry.clone();
                         let registry_clone = registry.clone();
 
-                        // Perform TLS and WebSocket handshakes in a separate task
                         registry.spawn_connection(async move {
-                            // First, perform TLS handshake
                             match acceptor.accept(tcp_stream).await {
                                 Ok(tls_stream) => {
                                     shard_info!(shard_clone.id, "TLS handshake successful for {}, performing WebSocket upgrade...", remote_addr);
 
-                                    // Now perform WebSocket handshake on top of TLS
                                     match accept_async_with_config(tls_stream, ws_config_clone).await {
                                         Ok(websocket) => {
                                             info!("WebSocket TLS handshake successful from: {}", remote_addr);
@@ -184,8 +193,9 @@ async fn accept_loop(
                                                 transport: TransportProtocol::WebSocket,
                                             };
                                             let _ = shard_clone.broadcast_event_to_all_shards(event).await;
-                                            let sender = WebSocketTlsSender::new(websocket);
-                                            let mut sender_kind = SenderKind::get_websocket_tls_sender(sender);
+
+                                            let sender = crate::websocket::websocket_tls_sender::WebSocketTlsSender::new(websocket);
+                                            let mut sender_kind = SenderKind::WebSocketTls(sender);
                                             let client_stop_receiver = registry_clone.add_connection(client_id);
 
                                             if let Err(error) = handle_connection(&session, &mut sender_kind, &shard_clone, client_stop_receiver).await {

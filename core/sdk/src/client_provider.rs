@@ -182,6 +182,10 @@ impl ClientProviderConfig {
                         AutoLogin::Disabled
                     },
                     ws_config: WebSocketConfig::default(),
+                    tls_enabled: args.websocket_tls_enabled,
+                    tls_domain: args.websocket_tls_domain,
+                    tls_ca_file: args.websocket_tls_ca_file,
+                    tls_validate_certificate: args.websocket_tls_validate_certificate,
                 }));
             }
         }

@@ -340,6 +340,18 @@ pub struct Args {
 
     /// The optional heartbeat interval for the WebSocket transport
     pub websocket_heartbeat_interval: String,
+
+    /// The optional TLS enabled for the WebSocket transport
+    pub websocket_tls_enabled: bool,
+
+    /// The optional TLS domain for the WebSocket transport
+    pub websocket_tls_domain: String,
+
+    /// The optional TLS CA file for the WebSocket transport
+    pub websocket_tls_ca_file: Option<String>,
+
+    /// The optional TLS validate certificate for the WebSocket transport
+    pub websocket_tls_validate_certificate: bool,
 }
 
 const QUIC_TRANSPORT: &str = "quic";
@@ -409,6 +421,10 @@ impl Default for Args {
             websocket_reconnection_interval: "1s".to_string(),
             websocket_reconnection_reestablish_after: "5s".to_string(),
             websocket_heartbeat_interval: "5s".to_string(),
+            websocket_tls_enabled: false,
+            websocket_tls_domain: "localhost".to_string(),
+            websocket_tls_ca_file: None,
+            websocket_tls_validate_certificate: false,
         }
     }
 }

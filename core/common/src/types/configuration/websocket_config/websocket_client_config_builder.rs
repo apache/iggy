@@ -21,7 +21,7 @@ use std::net::SocketAddr;
 
 /// Builder for the WebSocket client configuration.
 /// Allows configuring the WebSocket client with custom settings or using defaults:
-/// - `server_address`: Default is "127.0.0.1:8080"
+/// - `server_address`: Default is "127.0.0.1:8092"
 /// - `auto_login`: Default is AutoLogin::Disabled.
 /// - `reconnection`: Default is enabled unlimited retries and 1 second interval.
 /// - `heartbeat_interval`: Default is 5 seconds.
