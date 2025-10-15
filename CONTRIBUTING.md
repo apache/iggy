@@ -47,6 +47,10 @@ coming onto our [Discussions](https://github.com/apache/Iggy/discussions) and di
 This way we can talk through the solution and discuss if a change that large is even needed!
 This will produce a quicker response to the change and likely produce code that aligns better with our process.
 
+### Hooks
+
+Iggy uses [hk](hk.jdx.dev) for managing git hooks, these should be installed to make sure formatting is done, build works and tests passes before a pull request is opened. The hooks run conditionally depending on the changed files and will trigger tasks for any changed project. Tasks launched by hooks require tools to be installed and setup for each project they run for, i.e. virtualenv has to be setup and activated for `foreign/python`.
+
 ### CI
 
 Currently, Iggy uses GitHub Actions to run tests. The workflows are defined in `.github/workflows`.
