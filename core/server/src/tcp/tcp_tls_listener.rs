@@ -210,6 +210,7 @@ async fn accept_loop(
                                     let _responses = shard_clone.broadcast_event_to_all_shards(event).await;
 
                                     let client_id = session.client_id;
+                                    let user_id = session.get_user_id();
                                     shard_info!(shard_clone.id, "Created new session: {}", session);
 
                                     let conn_stop_receiver = registry_clone.add_connection(client_id);
@@ -220,6 +221,8 @@ async fn accept_loop(
                                         handle_error(error);
                                     }
                                     registry_clone.remove_connection(&client_id);
+                                    let event = ShardEvent::ClientDisconnected { client_id, user_id };
+                                    let _responses = shard_for_conn.broadcast_event_to_all_shards(event).await;
 
                                     if let Err(error) = sender.shutdown().await {
                                         shard_error!(shard.id, "Failed to shutdown TCP TLS stream for client: {}, address: {}. {}", client_id, address, error);

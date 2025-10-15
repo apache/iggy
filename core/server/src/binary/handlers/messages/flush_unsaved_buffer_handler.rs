@@ -48,7 +48,7 @@ impl ServerCommandHandler for FlushUnsavedBuffer {
         let topic_id = self.topic_id.clone();
         let partition_id = self.partition_id;
         let fsync = self.fsync;
-        
+
         shard
             .flush_unsaved_buffer(
                 user_id,

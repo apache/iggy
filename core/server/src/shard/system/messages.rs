@@ -352,7 +352,7 @@ impl IggyShard {
             stream_id,
             topic_id,
             partition_id,
-            partitions::helpers::commit_journal()
+            partitions::helpers::commit_journal(),
         );
 
         self.streams2

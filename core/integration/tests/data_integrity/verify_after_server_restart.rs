@@ -42,7 +42,7 @@ fn cache_none() -> &'static str {
 
 // TODO(numminex) - Move the message generation method from benchmark run to a special method.
 #[test_matrix(
-    [cache_all(), cache_open_segment(), cache_none()] 
+    [cache_all(), cache_open_segment(), cache_none()]
 )]
 #[tokio::test]
 #[parallel]
