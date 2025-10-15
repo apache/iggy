@@ -135,9 +135,9 @@ async fn flush_unsaved_buffer(
     let session = Session::stateless(identity.user_id, identity.ip_address);
 
     let flush_future = SendWrapper::new(state.shard.shard().flush_unsaved_buffer(
-        &session,
-        &stream_id,
-        &topic_id,
+        identity.user_id,
+        stream_id,
+        topic_id,
         partition_id,
         fsync,
     ));

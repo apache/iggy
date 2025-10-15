@@ -29,7 +29,7 @@ use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessa
 use crate::streaming::session::Session;
 use crate::streaming::traits::MainOps;
 use crate::streaming::utils::PooledBuffer;
-use crate::streaming::{streams, topics};
+use crate::streaming::{partitions, streams, topics};
 use error_set::ErrContext;
 use iggy_common::{
     BytesSerializable, Consumer, EncryptorKind, IGGY_MESSAGE_HEADER_SIZE, Identifier, IggyError,
@@ -277,53 +277,71 @@ impl IggyShard {
 
     pub async fn flush_unsaved_buffer(
         &self,
-        session: &Session,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
+        user_id: u32,
+        stream_id: Identifier,
+        topic_id: Identifier,
         partition_id: usize,
         fsync: bool,
     ) -> Result<(), IggyError> {
-        self.ensure_authenticated(session)?;
-        self.ensure_partition_exists(stream_id, topic_id, partition_id)?;
+        self.ensure_partition_exists(&stream_id, &topic_id, partition_id)?;
 
         let numeric_stream_id = self
             .streams2
-            .with_stream_by_id(stream_id, streams::helpers::get_stream_id());
+            .with_stream_by_id(&stream_id, streams::helpers::get_stream_id());
 
         let numeric_topic_id =
             self.streams2
-                .with_topic_by_id(stream_id, topic_id, topics::helpers::get_topic_id());
+                .with_topic_by_id(&stream_id, &topic_id, topics::helpers::get_topic_id());
 
         // Validate permissions for given user on stream and topic.
         self.permissioner
             .borrow()
-            .append_messages(
-                session.get_user_id(),
-                numeric_stream_id,
-                numeric_topic_id,
-            )
+            .append_messages(user_id, numeric_stream_id, numeric_topic_id)
             .with_error_context(|error| {
-                format!("{COMPONENT} (error: {error}) - permission denied to append messages for user {} on stream ID: {}, topic ID: {}", session.get_user_id(), numeric_stream_id as u32, numeric_topic_id as u32)
+                format!("{COMPONENT} (error: {error}) - permission denied to flush unsaved buffer for user {} on stream ID: {}, topic ID: {}", user_id, numeric_stream_id as u32, numeric_topic_id as u32)
             })?;
 
-        self.flush_unsaved_buffer_base(stream_id, topic_id, partition_id, fsync)
-            .await?;
+        self.ensure_partition_exists(&stream_id, &topic_id, partition_id)?;
+
+        let namespace = IggyNamespace::new(numeric_stream_id, numeric_topic_id, partition_id);
+        let payload = ShardRequestPayload::FlushUnsavedBuffer { fsync };
+        let request = ShardRequest::new(stream_id.clone(), topic_id.clone(), partition_id, payload);
+        let message = ShardMessage::Request(request);
+        match self
+            .send_request_to_shard_or_recoil(&namespace, message)
+            .await?
+        {
+            ShardSendRequestResult::Recoil(message) => {
+                if let ShardMessage::Request(ShardRequest {
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    payload,
+                }) = message
+                    && let ShardRequestPayload::FlushUnsavedBuffer { fsync } = payload
+                {
+                    self.flush_unsaved_buffer_base(&stream_id, &topic_id, partition_id, fsync)
+                        .await?;
+                    Ok(())
+                } else {
+                    unreachable!(
+                        "Expected a FlushUnsavedBuffer request inside of FlushUnsavedBuffer handler, impossible state"
+                    );
+                }
+            }
+            ShardSendRequestResult::Response(response) => match response {
+                ShardResponse::FlushUnsavedBuffer => Ok(()),
+                ShardResponse::ErrorResponse(err) => Err(err),
+                _ => unreachable!(
+                    "Expected a FlushUnsavedBuffer response inside of FlushUnsavedBuffer handler, impossible state"
+                ),
+            },
+        }?;
+
         Ok(())
     }
 
-    pub async fn flush_unsaved_buffer_bypass_auth(
-        &self,
-        stream_id: &Identifier,
-        topic_id: &Identifier,
-        partition_id: usize,
-        fsync: bool,
-    ) -> Result<(), IggyError> {
-        self.ensure_partition_exists(stream_id, topic_id, partition_id)?;
-        self.flush_unsaved_buffer_base(stream_id, topic_id, partition_id, fsync)
-            .await
-    }
-
-    async fn flush_unsaved_buffer_base(
+    pub(crate) async fn flush_unsaved_buffer_base(
         &self,
         stream_id: &Identifier,
         topic_id: &Identifier,
@@ -334,7 +352,7 @@ impl IggyShard {
             stream_id,
             topic_id,
             partition_id,
-            |(.., log)| log.journal_mut().commit(),
+            partitions::helpers::commit_journal()
         );
 
         self.streams2

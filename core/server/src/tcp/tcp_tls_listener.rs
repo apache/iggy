@@ -216,6 +216,7 @@ async fn accept_loop(
                                     let shard_for_conn = shard_clone.clone();
                                     let mut sender = SenderKind::get_tcp_tls_sender(tls_stream);
                                     if let Err(error) = handle_connection(&session, &mut sender, &shard_for_conn, conn_stop_receiver).await {
+                                        shard_for_conn.delete_client(session.client_id);
                                         handle_error(error);
                                     }
                                     registry_clone.remove_connection(&client_id);

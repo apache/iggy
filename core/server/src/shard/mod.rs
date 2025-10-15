@@ -309,7 +309,7 @@ impl IggyShard {
     }
 
     pub async fn run(self: &Rc<Self>) -> Result<(), IggyError> {
-        let now = Instant::now();
+        let now: Instant = Instant::now();
 
         // Workaround to ensure that the statistics are initialized before the server
         // loads streams and starts accepting connections. This is necessary to
@@ -510,347 +510,357 @@ impl IggyShard {
                 }
                 Ok(ShardResponse::PollMessages((metadata, batches)))
             }
+            ShardRequestPayload::FlushUnsavedBuffer { fsync } => {
+                self.flush_unsaved_buffer_base(&stream_id, &topic_id, partition_id, fsync)
+                    .await?;
+                Ok(ShardResponse::FlushUnsavedBuffer)
+            }
         }
     }
 
     pub(crate) async fn handle_event(&self, event: ShardEvent) -> Result<(), IggyError> {
         match event {
             ShardEvent::LoginUser {
-                client_id,
-                username,
-                password,
-            } => self.login_user_event(client_id, &username, &password),
+                        client_id,
+                        username,
+                        password,
+                    } => self.login_user_event(client_id, &username, &password),
             ShardEvent::LoginWithPersonalAccessToken { client_id, token } => {
-                self.login_user_pat_event(&token, client_id)?;
-                Ok(())
-            }
+                        self.login_user_pat_event(&token, client_id)?;
+                        Ok(())
+                    }
             ShardEvent::NewSession { address, transport } => {
-                let session = self.add_client(&address, transport);
-                self.add_active_session(session);
-                Ok(())
-            }
+                        let session = self.add_client(&address, transport);
+                        self.add_active_session(session);
+                        Ok(())
+                    }
             ShardEvent::DeletedPartitions2 {
-                stream_id,
-                topic_id,
-                partitions_count,
-                partition_ids,
-            } => {
-                self.delete_partitions2_bypass_auth(
-                    &stream_id,
-                    &topic_id,
-                    partitions_count,
-                    partition_ids,
-                )?;
-                Ok(())
-            }
+                        stream_id,
+                        topic_id,
+                        partitions_count,
+                        partition_ids,
+                    } => {
+                        self.delete_partitions2_bypass_auth(
+                            &stream_id,
+                            &topic_id,
+                            partitions_count,
+                            partition_ids,
+                        )?;
+                        Ok(())
+                    }
             ShardEvent::UpdatedStream2 { stream_id, name } => {
-                self.update_stream2_bypass_auth(&stream_id, &name)?;
-                Ok(())
-            }
+                        self.update_stream2_bypass_auth(&stream_id, &name)?;
+                        Ok(())
+                    }
             ShardEvent::PurgedStream2 { stream_id } => {
-                self.purge_stream2_bypass_auth(&stream_id).await?;
-                Ok(())
-            }
+                        self.purge_stream2_bypass_auth(&stream_id).await?;
+                        Ok(())
+                    }
             ShardEvent::PurgedTopic {
-                stream_id,
-                topic_id,
-            } => {
-                self.purge_topic2_bypass_auth(&stream_id, &topic_id).await?;
-                Ok(())
-            }
+                        stream_id,
+                        topic_id,
+                    } => {
+                        self.purge_topic2_bypass_auth(&stream_id, &topic_id).await?;
+                        Ok(())
+                    }
             ShardEvent::CreatedUser {
-                user_id,
-                username,
-                password,
-                status,
-                permissions,
-            } => {
-                self.create_user_bypass_auth(
-                    user_id,
-                    &username,
-                    &password,
-                    status,
-                    permissions.clone(),
-                )?;
-                Ok(())
-            }
+                        user_id,
+                        username,
+                        password,
+                        status,
+                        permissions,
+                    } => {
+                        self.create_user_bypass_auth(
+                            user_id,
+                            &username,
+                            &password,
+                            status,
+                            permissions.clone(),
+                        )?;
+                        Ok(())
+                    }
             ShardEvent::DeletedUser { user_id } => {
-                self.delete_user_bypass_auth(&user_id)?;
-                Ok(())
-            }
+                        self.delete_user_bypass_auth(&user_id)?;
+                        Ok(())
+                    }
             ShardEvent::LogoutUser { client_id } => {
-                let sessions = self.active_sessions.borrow();
-                let session = sessions.iter().find(|s| s.client_id == client_id).unwrap();
-                self.logout_user(session)?;
-                Ok(())
-            }
+                        let sessions = self.active_sessions.borrow();
+                        let session = sessions.iter().find(|s| s.client_id == client_id).unwrap();
+                        self.logout_user(session)?;
+                        Ok(())
+                    }
             ShardEvent::ChangedPassword {
-                user_id,
-                current_password,
-                new_password,
-            } => {
-                self.change_password_bypass_auth(&user_id, &current_password, &new_password)?;
-                Ok(())
-            }
+                        user_id,
+                        current_password,
+                        new_password,
+                    } => {
+                        self.change_password_bypass_auth(&user_id, &current_password, &new_password)?;
+                        Ok(())
+                    }
             ShardEvent::CreatedPersonalAccessToken {
-                personal_access_token,
-            } => {
-                self.create_personal_access_token_bypass_auth(personal_access_token.to_owned())?;
-                Ok(())
-            }
+                        personal_access_token,
+                    } => {
+                        self.create_personal_access_token_bypass_auth(personal_access_token.to_owned())?;
+                        Ok(())
+                    }
             ShardEvent::DeletedPersonalAccessToken { user_id, name } => {
-                self.delete_personal_access_token_bypass_auth(user_id, &name)?;
-                Ok(())
-            }
+                        self.delete_personal_access_token_bypass_auth(user_id, &name)?;
+                        Ok(())
+                    }
             ShardEvent::UpdatedUser {
-                user_id,
-                username,
-                status,
-            } => {
-                self.update_user_bypass_auth(&user_id, username.to_owned(), status)?;
-                Ok(())
-            }
+                        user_id,
+                        username,
+                        status,
+                    } => {
+                        self.update_user_bypass_auth(&user_id, username.to_owned(), status)?;
+                        Ok(())
+                    }
             ShardEvent::UpdatedPermissions {
-                user_id,
-                permissions,
-            } => {
-                self.update_permissions_bypass_auth(&user_id, permissions.to_owned())?;
-                Ok(())
-            }
+                        user_id,
+                        permissions,
+                    } => {
+                        self.update_permissions_bypass_auth(&user_id, permissions.to_owned())?;
+                        Ok(())
+                    }
             ShardEvent::AddressBound { protocol, address } => {
-                shard_info!(
-                    self.id,
-                    "Received AddressBound event for {:?} with address: {}",
-                    protocol,
-                    address
-                );
-                match protocol {
-                    TransportProtocol::Tcp => {
-                        self.tcp_bound_address.set(Some(address));
-                        // Notify config writer that a server has bound
-                        let _ = self.config_writer_notify.try_send(());
-                    }
-                    TransportProtocol::Quic => {
-                        self.quic_bound_address.set(Some(address));
-                        // Notify config writer that a server has bound
-                        let _ = self.config_writer_notify.try_send(());
-                    }
-                    TransportProtocol::Http => {
-                        self.http_bound_address.set(Some(address));
-                        // Notify config writer that a server has bound
-                        let _ = self.config_writer_notify.try_send(());
-                    }
-                    TransportProtocol::WebSocket => {
-                        self.websocket_bound_address.set(Some(address));
-                        // Notify config writer that a server has bound
-                        let _ = self.config_writer_notify.try_send(());
-                    }
-                }
-                Ok(())
-            }
-            ShardEvent::CreatedStream2 { id, stream } => {
-                let stream_id = self.create_stream2_bypass_auth(stream);
-                assert_eq!(stream_id, id);
-                Ok(())
-            }
-            ShardEvent::DeletedStream2 { id, stream_id } => {
-                let stream = self.delete_stream2_bypass_auth(&stream_id);
-                assert_eq!(stream.id(), id);
-
-                // Clean up consumer groups from ClientManager for this stream
-                self.client_manager
-                    .borrow_mut()
-                    .delete_consumer_groups_for_stream(id);
-
-                Ok(())
-            }
-            ShardEvent::CreatedTopic2 { stream_id, topic } => {
-                let _topic_id = self.create_topic2_bypass_auth(&stream_id, topic);
-                Ok(())
-            }
-            ShardEvent::CreatedPartitions2 {
-                stream_id,
-                topic_id,
-                partitions,
-            } => {
-                self.create_partitions2_bypass_auth(&stream_id, &topic_id, partitions)
-                    .await?;
-                Ok(())
-            }
-            ShardEvent::DeletedTopic2 {
-                id,
-                stream_id,
-                topic_id,
-            } => {
-                let topic = self.delete_topic_bypass_auth2(&stream_id, &topic_id);
-                assert_eq!(topic.id(), id);
-
-                // Clean up consumer groups from ClientManager for this topic using helper functions
-                let stream_id_usize = self.streams2.with_stream_by_id(
-                    &stream_id,
-                    crate::streaming::streams::helpers::get_stream_id(),
-                );
-                self.client_manager
-                    .borrow_mut()
-                    .delete_consumer_groups_for_topic(stream_id_usize, id);
-
-                Ok(())
-            }
-            ShardEvent::UpdatedTopic2 {
-                stream_id,
-                topic_id,
-                name,
-                message_expiry,
-                compression_algorithm,
-                max_topic_size,
-                replication_factor,
-            } => {
-                self.update_topic_bypass_auth2(
-                    &stream_id,
-                    &topic_id,
-                    name.clone(),
-                    message_expiry,
-                    compression_algorithm,
-                    max_topic_size,
-                    replication_factor,
-                )?;
-                Ok(())
-            }
-            ShardEvent::CreatedConsumerGroup2 {
-                stream_id,
-                topic_id,
-                cg,
-            } => {
-                let cg_id = cg.id();
-                let id = self.create_consumer_group_bypass_auth2(&stream_id, &topic_id, cg);
-                assert_eq!(id, cg_id);
-                Ok(())
-            }
-            ShardEvent::DeletedConsumerGroup2 {
-                id,
-                stream_id,
-                topic_id,
-                group_id,
-            } => {
-                let cg = self.delete_consumer_group_bypass_auth2(&stream_id, &topic_id, &group_id);
-                assert_eq!(cg.id(), id);
-
-                // Remove all consumer group members from ClientManager using helper functions
-                let stream_id_usize = self.streams2.with_stream_by_id(
-                    &stream_id,
-                    crate::streaming::streams::helpers::get_stream_id(),
-                );
-                let topic_id_usize = self.streams2.with_topic_by_id(
-                    &stream_id,
-                    &topic_id,
-                    crate::streaming::topics::helpers::get_topic_id(),
-                );
-
-                // Get members from the deleted consumer group and make them leave
-                let slab = cg.members().inner().shared_get();
-                for (_, member) in slab.iter() {
-                    if let Err(err) = self.client_manager.borrow_mut().leave_consumer_group(
-                        member.client_id,
-                        stream_id_usize,
-                        topic_id_usize,
-                        id,
-                    ) {
-                        tracing::warn!(
-                            "Shard {} (error: {err}) - failed to make client leave consumer group for client ID: {}, group ID: {}",
+                        shard_info!(
                             self.id,
-                            member.client_id,
-                            id
+                            "Received AddressBound event for {:?} with address: {}",
+                            protocol,
+                            address
                         );
+                        match protocol {
+                            TransportProtocol::Tcp => {
+                                self.tcp_bound_address.set(Some(address));
+                                // Notify config writer that a server has bound
+                                let _ = self.config_writer_notify.try_send(());
+                            }
+                            TransportProtocol::Quic => {
+                                self.quic_bound_address.set(Some(address));
+                                // Notify config writer that a server has bound
+                                let _ = self.config_writer_notify.try_send(());
+                            }
+                            TransportProtocol::Http => {
+                                self.http_bound_address.set(Some(address));
+                                // Notify config writer that a server has bound
+                                let _ = self.config_writer_notify.try_send(());
+                            }
+                            TransportProtocol::WebSocket => {
+                                self.websocket_bound_address.set(Some(address));
+                                // Notify config writer that a server has bound
+                                let _ = self.config_writer_notify.try_send(());
+                            }
+                        }
+                        Ok(())
                     }
-                }
+            ShardEvent::CreatedStream2 { id, stream } => {
+                        let stream_id = self.create_stream2_bypass_auth(stream);
+                        assert_eq!(stream_id, id);
+                        Ok(())
+                    }
+            ShardEvent::DeletedStream2 { id, stream_id } => {
+                        let stream = self.delete_stream2_bypass_auth(&stream_id);
+                        assert_eq!(stream.id(), id);
 
-                Ok(())
-            }
+                        // Clean up consumer groups from ClientManager for this stream
+                        self.client_manager
+                            .borrow_mut()
+                            .delete_consumer_groups_for_stream(id);
+
+                        Ok(())
+                    }
+            ShardEvent::CreatedTopic2 { stream_id, topic } => {
+                        let _topic_id = self.create_topic2_bypass_auth(&stream_id, topic);
+                        Ok(())
+                    }
+            ShardEvent::CreatedPartitions2 {
+                        stream_id,
+                        topic_id,
+                        partitions,
+                    } => {
+                        self.create_partitions2_bypass_auth(&stream_id, &topic_id, partitions)
+                            .await?;
+                        Ok(())
+                    }
+            ShardEvent::DeletedTopic2 {
+                        id,
+                        stream_id,
+                        topic_id,
+                    } => {
+                        let topic = self.delete_topic_bypass_auth2(&stream_id, &topic_id);
+                        assert_eq!(topic.id(), id);
+
+                        // Clean up consumer groups from ClientManager for this topic using helper functions
+                        let stream_id_usize = self.streams2.with_stream_by_id(
+                            &stream_id,
+                            crate::streaming::streams::helpers::get_stream_id(),
+                        );
+                        self.client_manager
+                            .borrow_mut()
+                            .delete_consumer_groups_for_topic(stream_id_usize, id);
+
+                        Ok(())
+                    }
+            ShardEvent::UpdatedTopic2 {
+                        stream_id,
+                        topic_id,
+                        name,
+                        message_expiry,
+                        compression_algorithm,
+                        max_topic_size,
+                        replication_factor,
+                    } => {
+                        self.update_topic_bypass_auth2(
+                            &stream_id,
+                            &topic_id,
+                            name.clone(),
+                            message_expiry,
+                            compression_algorithm,
+                            max_topic_size,
+                            replication_factor,
+                        )?;
+                        Ok(())
+                    }
+            ShardEvent::CreatedConsumerGroup2 {
+                        stream_id,
+                        topic_id,
+                        cg,
+                    } => {
+                        let cg_id = cg.id();
+                        let id = self.create_consumer_group_bypass_auth2(&stream_id, &topic_id, cg);
+                        assert_eq!(id, cg_id);
+                        Ok(())
+                    }
+            ShardEvent::DeletedConsumerGroup2 {
+                        id,
+                        stream_id,
+                        topic_id,
+                        group_id,
+                    } => {
+                        let cg = self.delete_consumer_group_bypass_auth2(&stream_id, &topic_id, &group_id);
+                        assert_eq!(cg.id(), id);
+
+                        // Remove all consumer group members from ClientManager using helper functions
+                        let stream_id_usize = self.streams2.with_stream_by_id(
+                            &stream_id,
+                            crate::streaming::streams::helpers::get_stream_id(),
+                        );
+                        let topic_id_usize = self.streams2.with_topic_by_id(
+                            &stream_id,
+                            &topic_id,
+                            crate::streaming::topics::helpers::get_topic_id(),
+                        );
+
+                        // Get members from the deleted consumer group and make them leave
+                        let slab = cg.members().inner().shared_get();
+                        for (_, member) in slab.iter() {
+                            if let Err(err) = self.client_manager.borrow_mut().leave_consumer_group(
+                                member.client_id,
+                                stream_id_usize,
+                                topic_id_usize,
+                                id,
+                            ) {
+                                tracing::warn!(
+                                    "Shard {} (error: {err}) - failed to make client leave consumer group for client ID: {}, group ID: {}",
+                                    self.id,
+                                    member.client_id,
+                                    id
+                                );
+                            }
+                        }
+
+                        Ok(())
+                    }
             ShardEvent::JoinedConsumerGroup {
-                client_id,
-                stream_id,
-                topic_id,
-                group_id,
-            } => {
-                // Convert Identifiers to usizes for ClientManager using helper functions
-                let stream_id_usize = self.streams2.with_stream_by_id(
-                    &stream_id,
-                    crate::streaming::streams::helpers::get_stream_id(),
-                );
-                let topic_id_usize = self.streams2.with_topic_by_id(
-                    &stream_id,
-                    &topic_id,
-                    crate::streaming::topics::helpers::get_topic_id(),
-                );
-                let group_id_usize = self.streams2.with_consumer_group_by_id(
-                    &stream_id,
-                    &topic_id,
-                    &group_id,
-                    crate::streaming::topics::helpers::get_consumer_group_id(),
-                );
+                        client_id,
+                        stream_id,
+                        topic_id,
+                        group_id,
+                    } => {
+                        // Convert Identifiers to usizes for ClientManager using helper functions
+                        let stream_id_usize = self.streams2.with_stream_by_id(
+                            &stream_id,
+                            crate::streaming::streams::helpers::get_stream_id(),
+                        );
+                        let topic_id_usize = self.streams2.with_topic_by_id(
+                            &stream_id,
+                            &topic_id,
+                            crate::streaming::topics::helpers::get_topic_id(),
+                        );
+                        let group_id_usize = self.streams2.with_consumer_group_by_id(
+                            &stream_id,
+                            &topic_id,
+                            &group_id,
+                            crate::streaming::topics::helpers::get_consumer_group_id(),
+                        );
 
-                self.client_manager.borrow_mut().join_consumer_group(
-                    client_id,
-                    stream_id_usize,
-                    topic_id_usize,
-                    group_id_usize,
-                )?;
-                Ok(())
-            }
+                        self.client_manager.borrow_mut().join_consumer_group(
+                            client_id,
+                            stream_id_usize,
+                            topic_id_usize,
+                            group_id_usize,
+                        )?;
+                        Ok(())
+                    }
             ShardEvent::LeftConsumerGroup {
-                client_id,
-                stream_id,
-                topic_id,
-                group_id,
-            } => {
-                // Convert Identifiers to usizes for ClientManager using helper functions
-                let stream_id_usize = self.streams2.with_stream_by_id(
-                    &stream_id,
-                    crate::streaming::streams::helpers::get_stream_id(),
-                );
-                let topic_id_usize = self.streams2.with_topic_by_id(
-                    &stream_id,
-                    &topic_id,
-                    crate::streaming::topics::helpers::get_topic_id(),
-                );
-                let group_id_usize = self.streams2.with_consumer_group_by_id(
-                    &stream_id,
-                    &topic_id,
-                    &group_id,
-                    crate::streaming::topics::helpers::get_consumer_group_id(),
-                );
+                        client_id,
+                        stream_id,
+                        topic_id,
+                        group_id,
+                    } => {
+                        // Convert Identifiers to usizes for ClientManager using helper functions
+                        let stream_id_usize = self.streams2.with_stream_by_id(
+                            &stream_id,
+                            crate::streaming::streams::helpers::get_stream_id(),
+                        );
+                        let topic_id_usize = self.streams2.with_topic_by_id(
+                            &stream_id,
+                            &topic_id,
+                            crate::streaming::topics::helpers::get_topic_id(),
+                        );
+                        let group_id_usize = self.streams2.with_consumer_group_by_id(
+                            &stream_id,
+                            &topic_id,
+                            &group_id,
+                            crate::streaming::topics::helpers::get_consumer_group_id(),
+                        );
 
-                self.client_manager.borrow_mut().leave_consumer_group(
-                    client_id,
-                    stream_id_usize,
-                    topic_id_usize,
-                    group_id_usize,
-                )?;
-                Ok(())
-            }
+                        self.client_manager.borrow_mut().leave_consumer_group(
+                            client_id,
+                            stream_id_usize,
+                            topic_id_usize,
+                            group_id_usize,
+                        )?;
+                        Ok(())
+                    }
             ShardEvent::DeletedSegments {
-                stream_id,
-                topic_id,
-                partition_id,
-                segments_count,
-            } => {
-                self.delete_segments_bypass_auth(
-                    &stream_id,
-                    &topic_id,
-                    partition_id,
-                    segments_count,
-                )
-                .await?;
-                Ok(())
-            }
+                        stream_id,
+                        topic_id,
+                        partition_id,
+                        segments_count,
+                    } => {
+                        self.delete_segments_bypass_auth(
+                            &stream_id,
+                            &topic_id,
+                            partition_id,
+                            segments_count,
+                        )
+                        .await?;
+                        Ok(())
+                    }
             ShardEvent::FlushUnsavedBuffer {
-                stream_id,
-                topic_id,
-                partition_id,
-                fsync,
-            } => {
-                self.flush_unsaved_buffer_bypass_auth(&stream_id, &topic_id, partition_id, fsync)
-                    .await?;
+                        stream_id,
+                        topic_id,
+                        partition_id,
+                        fsync,
+                    } => {
+                        self.flush_unsaved_buffer_base(&stream_id, &topic_id, partition_id, fsync)
+                            .await?;
+                        Ok(())
+                    }
+            ShardEvent::ClientDisconnected { client_id, user_id } => {
+                self.delete_client(client_id);
+                self.remove_active_session(user_id);
                 Ok(())
             }
         }

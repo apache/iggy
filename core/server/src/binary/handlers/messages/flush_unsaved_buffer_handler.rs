@@ -43,26 +43,27 @@ impl ServerCommandHandler for FlushUnsavedBuffer {
     ) -> Result<(), IggyError> {
         debug!("session: {session}, command: {self}");
 
+        let user_id = session.get_user_id();
         let stream_id = self.stream_id.clone();
         let topic_id = self.topic_id.clone();
-        let partition_id = self.partition_id as usize;
+        let partition_id = self.partition_id;
         let fsync = self.fsync;
+        
         shard
-            .flush_unsaved_buffer(session, &stream_id, &topic_id, partition_id, fsync)
+            .flush_unsaved_buffer(
+                user_id,
+                self.stream_id,
+                self.topic_id,
+                partition_id as usize,
+                fsync,
+            )
             .await
             .with_error_context(|error| {
                 format!(
                     "{COMPONENT} (error: {error}) - failed to flush unsaved buffer for stream_id: {}, topic_id: {}, partition_id: {}, session: {}",
-                    self.stream_id, self.topic_id, self.partition_id, session
+                    stream_id, topic_id, partition_id, session
                 )
             })?;
-        let event = ShardEvent::FlushUnsavedBuffer {
-            stream_id,
-            topic_id,
-            partition_id,
-            fsync,
-        };
-        let _responses = shard.broadcast_event_to_all_shards(event).await;
         sender.send_empty_ok_response().await?;
         Ok(())
     }

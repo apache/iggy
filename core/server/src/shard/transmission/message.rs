@@ -72,6 +72,9 @@ pub enum ShardRequestPayload {
         consumer: PollingConsumer,
         args: PollingArgs,
     },
+    FlushUnsavedBuffer {
+        fsync: bool,
+    },
 }
 
 impl From<ShardRequest> for ShardMessage {

@@ -42,7 +42,7 @@ fn cache_none() -> &'static str {
 
 // TODO(numminex) - Move the message generation method from benchmark run to a special method.
 #[test_matrix(
-    [cache_open_segment(), cache_all(), cache_none()]
+    [cache_all(), cache_open_segment(), cache_none()] 
 )]
 #[tokio::test]
 #[parallel]
@@ -179,6 +179,7 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
         "pinned-consumer",
         IggyByteSize::from(amount_of_data_to_process.as_bytes_u64() * 2),
     );
+    drop(client_after_restart);
 
     // 11. Connect and login to newly started server
     let client = IggyClient::create(

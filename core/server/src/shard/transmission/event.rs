@@ -134,6 +134,10 @@ pub enum ShardEvent {
         address: SocketAddr,
         transport: TransportProtocol,
     },
+    ClientDisconnected {
+        client_id: u32,
+        user_id: u32,
+    },
     JoinedConsumerGroup {
         client_id: u32,
         stream_id: Identifier,

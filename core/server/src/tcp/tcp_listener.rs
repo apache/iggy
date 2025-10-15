@@ -152,6 +152,7 @@ async fn accept_loop(
                         let _responses = shard_clone.broadcast_event_to_all_shards(event).await;
 
                         let client_id = session.client_id;
+                        let user_id = session.get_user_id();
                         shard_info!(shard.id, "Created new session: {}", session);
                         let mut sender = SenderKind::get_tcp_sender(stream);
 
@@ -162,9 +163,12 @@ async fn accept_loop(
                         let registry_clone = registry.clone();
                         registry.spawn_connection(async move {
                             if let Err(error) = handle_connection(&session, &mut sender, &shard_for_conn, conn_stop_receiver).await {
+                                shard_for_conn.delete_client(session.client_id);
                                 handle_error(error);
                             }
                             registry_clone.remove_connection(&client_id);
+                            let event = ShardEvent::ClientDisconnected { client_id, user_id };
+                            let _responses = shard_for_conn.broadcast_event_to_all_shards(event).await;
 
                             if let Err(error) = sender.shutdown().await {
                                 shard_error!(shard.id, "Failed to shutdown TCP stream for client: {}, address: {}. {}", client_id, address, error);

@@ -27,6 +27,7 @@ use crate::{
 pub enum ShardResponse {
     PollMessages((IggyPollMetadata, IggyMessagesBatchSet)),
     SendMessages,
+    FlushUnsavedBuffer,
     Event,
     ErrorResponse(IggyError),
 }
