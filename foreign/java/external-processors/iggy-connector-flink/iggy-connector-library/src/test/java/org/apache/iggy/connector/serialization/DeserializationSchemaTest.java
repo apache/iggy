@@ -157,7 +157,7 @@ class DeserializationSchemaTest {
     }
 
     // Helper implementation for testing
-    private static class TestDeserializationSchema implements DeserializationSchema<String> {
+    private static final class TestDeserializationSchema implements DeserializationSchema<String> {
         @Override
         public String deserialize(byte[] data, RecordMetadata metadata) {
             return new String(data, StandardCharsets.UTF_8);

@@ -172,7 +172,7 @@ class TypeDescriptorTest {
     }
 
     // Helper class for testing custom types
-    private static class CustomClass {
+    private static final class CustomClass {
         private String value;
     }
 }

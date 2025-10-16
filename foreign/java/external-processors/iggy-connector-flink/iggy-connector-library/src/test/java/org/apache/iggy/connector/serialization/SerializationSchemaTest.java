@@ -188,7 +188,7 @@ class SerializationSchemaTest {
     }
 
     // Helper implementation for testing
-    private static class TestSerializationSchema implements SerializationSchema<String> {
+    private static final class TestSerializationSchema implements SerializationSchema<String> {
         @Override
         public byte[] serialize(String element) {
             return element.getBytes(StandardCharsets.UTF_8);
@@ -196,7 +196,7 @@ class SerializationSchemaTest {
     }
 
     // Helper class for testing custom types
-    private static class TestRecord {
+    private static final class TestRecord {
         private final String data;
         private final int partitionKey;
 
