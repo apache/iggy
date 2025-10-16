@@ -18,7 +18,6 @@
 
 use crate::IggyError;
 use crate::text;
-use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::aead::{Aead, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, KeyInit};
 use std::fmt::Debug;
@@ -63,7 +62,7 @@ impl Aes256GcmEncryptor {
             return Err(IggyError::InvalidEncryptionKey);
         }
         Ok(Self {
-            cipher: Aes256Gcm::new(GenericArray::from_slice(key)),
+            cipher: Aes256Gcm::new(key.into()),
         })
     }
 
@@ -84,7 +83,7 @@ impl Encryptor for Aes256GcmEncryptor {
     }
 
     fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, IggyError> {
-        let nonce = GenericArray::from_slice(&data[0..12]);
+        let nonce = (&data[0..12]).into();
         let payload = self.cipher.decrypt(nonce, &data[12..]);
         if payload.is_err() {
             return Err(IggyError::CannotDecryptData);

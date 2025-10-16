@@ -24,9 +24,7 @@ use crate::shard::transmission::frame::ShardResponse;
 use crate::shard::transmission::message::{
     ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult,
 };
-use crate::streaming::partitions::journal::Journal;
 use crate::streaming::segments::{IggyIndexesMut, IggyMessagesBatchMut, IggyMessagesBatchSet};
-use crate::streaming::session::Session;
 use crate::streaming::traits::MainOps;
 use crate::streaming::utils::PooledBuffer;
 use crate::streaming::{partitions, streams, topics};
