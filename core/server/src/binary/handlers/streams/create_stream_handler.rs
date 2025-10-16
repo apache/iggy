@@ -55,7 +55,6 @@ impl ServerCommandHandler for CreateStream {
             created_stream_id,
             stream.root().name()
         );
-        // No need to broadcast here anymore - create_stream2 handles it internally
 
         let response = shard
             .streams2

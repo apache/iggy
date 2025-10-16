@@ -18,10 +18,9 @@
 
 use super::COMPONENT;
 use crate::shard::IggyShard;
-use crate::shard_info;
 use crate::slab::traits_ext::{EntityComponentSystem, EntityMarker, InsertCell, IntoComponents};
 use crate::streaming::session::Session;
-use crate::streaming::topics::storage2::{create_topic_file_hierarchy, delete_topic_from_disk};
+use crate::streaming::topics::storage2::delete_topic_from_disk;
 use crate::streaming::topics::topic2::{self};
 use crate::streaming::{partitions, streams, topics};
 use error_set::ErrContext;
@@ -40,10 +39,7 @@ impl IggyShard {
         max_topic_size: MaxTopicSize,
         replication_factor: Option<u8>,
     ) -> Result<topic2::Topic, IggyError> {
-        use crate::shard::transmission::frame::ShardResponse;
-        use crate::shard::transmission::message::{
-            ShardMessage, ShardRequest, ShardRequestPayload,
-        };
+        use crate::shard::metadata::operations::CreateTopicOp;
 
         self.ensure_authenticated(session)?;
         self.ensure_stream_exists(stream_id)?;
@@ -74,105 +70,16 @@ impl IggyShard {
             ));
         }
 
-        // If we're not shard 0, forward to shard 0
-        if self.id != 0 {
-            // Create a metadata request for shard 0
-            let request = ShardRequest::new(
-                stream_id.clone(),
-                Identifier::numeric(0).unwrap(), // dummy topic_id for metadata request
-                0,                               // dummy partition_id
-                ShardRequestPayload::CreateTopic {
-                    session_id: session.client_id,
-                    stream_id: stream_id.clone(),
-                    name: name.clone(),
-                    partitions_count: 0, // Will be added separately
-                    message_expiry,
-                    compression_algorithm: compression,
-                    max_topic_size,
-                    replication_factor,
-                },
-            );
-
-            // Send to shard 0 and wait for response
-            let response = self.shards[0]
-                .send_request(ShardMessage::Request(request))
-                .await?;
-
-            match response {
-                ShardResponse::CreatedTopic { topic_id } => {
-                    // Wait a bit for the broadcast to arrive and populate our local state
-                    // This is a simple approach - in production you'd want proper synchronization
-                    compio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-                    // Return the topic from our local state
-                    let topic = self.streams2.with_topic_by_id(
-                        stream_id,
-                        &Identifier::numeric(topic_id as u32).unwrap(),
-                        |(root, aux, stats)| {
-                            topic2::Topic::new_with_components(
-                                root.clone(),
-                                aux.clone(),
-                                stats.clone(),
-                            )
-                        },
-                    );
-                    Ok(topic)
-                }
-                ShardResponse::ErrorResponse(err) => Err(err),
-                _ => Err(IggyError::InvalidCommand),
-            }
-        } else {
-            // We're shard 0, handle the creation directly
-            let config = &self.config.system;
-            let parent_stats = self
-                .streams2
-                .with_stream_by_id(stream_id, |(_, stats)| stats.clone());
-            let message_expiry = config.resolve_message_expiry(message_expiry);
-            shard_info!(self.id, "Topic message expiry: {}", message_expiry);
-            let max_topic_size = config.resolve_max_topic_size(max_topic_size)?;
-
-            // Generate the next topic ID
-            let topic_id = self
-                .next_topic_id
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-            // Create topic with the assigned ID
-            let mut topic = topic2::Topic::new(
-                name,
-                std::sync::Arc::new(crate::streaming::stats::TopicStats::new(parent_stats)),
-                iggy_common::IggyTimestamp::now(),
-                replication_factor.unwrap_or(1),
-                message_expiry,
-                compression,
-                max_topic_size,
-            );
-
-            // Set the ID
-            use crate::slab::traits_ext::EntityMarker;
-            topic.update_id(topic_id);
-
-            // Insert into our local state
-            let _slab_id = self
-                .streams2
-                .with_topics(stream_id, |topics| topics.insert(topic.clone()));
-            self.metrics.increment_topics(1);
-
-            // Create file hierarchy for the topic
-            create_topic_file_hierarchy(self.id, numeric_stream_id, topic_id, &self.config.system)
-                .await?;
-
-            // Broadcast to all other shards (not including ourselves)
-            use crate::shard::transmission::event::ShardEvent;
-            let event = ShardEvent::CreatedTopic2 {
-                stream_id: stream_id.clone(),
-                topic: topic.clone(),
-            };
-
-            // We don't care about broadcast failures for metadata - it's eventually consistent
-            let _ = self.broadcast_event_to_all_shards(event).await;
-
-            Ok(topic)
-        }
+        // Use the metadata coordinator for the operation
+        let operation = CreateTopicOp::new(
+            stream_id.clone(),
+            name,
+            message_expiry,
+            compression,
+            max_topic_size,
+            replication_factor,
+        );
+        self.coordinate_metadata_operation(operation).await
     }
 
     pub fn create_topic2_bypass_auth(&self, stream_id: &Identifier, topic: topic2::Topic) -> usize {

@@ -20,7 +20,7 @@ use super::COMPONENT;
 use crate::shard::IggyShard;
 use crate::slab::traits_ext::{DeleteCell, EntityMarker, InsertCell};
 use crate::streaming::session::Session;
-use crate::streaming::streams::storage2::{create_stream_file_hierarchy, delete_stream_from_disk};
+use crate::streaming::streams::storage2::delete_stream_from_disk;
 use crate::streaming::streams::{self, stream2};
 use error_set::ErrContext;
 use iggy_common::{Identifier, IggyError};
@@ -31,11 +31,9 @@ impl IggyShard {
         session: &Session,
         name: String,
     ) -> Result<stream2::Stream, IggyError> {
-        use crate::shard::transmission::frame::ShardResponse;
-        use crate::shard::transmission::message::{
-            ShardMessage, ShardRequest, ShardRequestPayload,
-        };
+        use crate::shard::metadata::operations::CreateStreamOp;
 
+        // Validation
         self.ensure_authenticated(session)?;
         self.permissioner
             .borrow()
@@ -49,78 +47,9 @@ impl IggyShard {
             return Err(IggyError::StreamNameAlreadyExists(name));
         }
 
-        // If we're not shard 0, forward to shard 0
-        if self.id != 0 {
-            // Create a metadata request for shard 0
-            let request = ShardRequest::new(
-                Identifier::numeric(0).unwrap(), // dummy stream_id for metadata request
-                Identifier::numeric(0).unwrap(), // dummy topic_id
-                0,                               // dummy partition_id
-                ShardRequestPayload::CreateStream {
-                    session_id: session.client_id,
-                    name: name.clone(),
-                },
-            );
-
-            // Send to shard 0 and wait for response
-            let response = self.shards[0]
-                .send_request(ShardMessage::Request(request))
-                .await?;
-
-            match response {
-                ShardResponse::CreatedStream { stream_id } => {
-                    // Wait a bit for the broadcast to arrive and populate our local state
-                    compio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-                    // Return the stream from our local state
-                    let stream = self.streams2.with_stream_by_id(
-                        &Identifier::numeric(stream_id as u32).unwrap(),
-                        |(root, stats)| {
-                            stream2::Stream::new_with_components(root.clone(), stats.clone())
-                        },
-                    );
-                    Ok(stream)
-                }
-                ShardResponse::ErrorResponse(err) => Err(err),
-                _ => Err(IggyError::InvalidCommand),
-            }
-        } else {
-            // We're shard 0, handle the creation directly
-            // Generate the next stream ID
-            let stream_id = self
-                .next_stream_id
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-            // Create stream with the assigned ID
-            let mut stream = stream2::Stream::new(
-                name,
-                std::sync::Arc::new(crate::streaming::stats::StreamStats::default()),
-                iggy_common::IggyTimestamp::now(),
-            );
-
-            // Set the ID
-            use crate::slab::traits_ext::EntityMarker;
-            stream.update_id(stream_id);
-
-            // Insert into our local state
-            let _slab_id = self.streams2.insert(stream.clone());
-            self.metrics.increment_streams(1);
-
-            // Create file hierarchy for the stream
-            create_stream_file_hierarchy(self.id, stream_id, &self.config.system).await?;
-
-            // Broadcast to all other shards (not including ourselves)
-            use crate::shard::transmission::event::ShardEvent;
-            let event = ShardEvent::CreatedStream2 {
-                id: stream_id,
-                stream: stream.clone(),
-            };
-
-            // We don't care about broadcast failures for metadata - it's eventually consistent
-            let _ = self.broadcast_event_to_all_shards(event).await;
-
-            Ok(stream)
-        }
+        // Use the metadata coordinator for the operation
+        let operation = CreateStreamOp::new(name);
+        self.coordinate_metadata_operation(operation).await
     }
 
     pub fn create_stream2_bypass_auth(&self, stream: stream2::Stream) -> usize {
