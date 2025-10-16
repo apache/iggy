@@ -31,26 +31,21 @@ repositories {
 }
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_17
-    targetCompatibility = JavaVersion.VERSION_17
     withJavadocJar()
     withSourcesJar()
 }
 
 checkstyle {
     toolVersion = "10.23.1"
+    configFile = file("../../../dev-support/checkstyle/checkstyle.xml")
 }
 
 val flinkVersion = "1.18.0"
 val iggyVersion = "0.5.0-SNAPSHOT"
 
 dependencies {
-    // Iggy SDK - use local if building within Iggy project
-    if (file("../../../java-sdk").exists()) {
-        api(project(":iggy"))
-    } else {
-        api("org.apache.iggy:iggy:${iggyVersion}")
-    }
+    // Iggy SDK - use local project when building within Iggy repository
+    api(project(":iggy"))
 
     // Flink dependencies (provided - not bundled with connector)
     compileOnly("org.apache.flink:flink-connector-base:${flinkVersion}")

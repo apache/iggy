@@ -27,7 +27,7 @@ import java.util.Objects;
  * This is a framework-agnostic representation that can be used
  * by different stream processing engines.
  */
-public class PartitionInfo implements Serializable {
+public final class PartitionInfo implements Serializable {
 
     private static final long serialVersionUID = 1L;
 

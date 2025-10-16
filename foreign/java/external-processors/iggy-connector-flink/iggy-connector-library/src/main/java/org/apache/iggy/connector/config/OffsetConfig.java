@@ -27,7 +27,7 @@ import java.util.Objects;
  * Configuration for offset management strategies.
  * Defines how offsets should be initialized, committed, and tracked.
  */
-public class OffsetConfig implements Serializable {
+public final class OffsetConfig implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
@@ -116,7 +116,8 @@ public class OffsetConfig implements Serializable {
     /**
      * Builder for {@link OffsetConfig}.
      */
-    public static class Builder {
+    @SuppressWarnings("checkstyle:HiddenField")
+    public static final class Builder {
         private OffsetResetStrategy resetStrategy = OffsetResetStrategy.LATEST;
         private Duration commitInterval = Duration.ofSeconds(5);
         private boolean autoCommit = true;

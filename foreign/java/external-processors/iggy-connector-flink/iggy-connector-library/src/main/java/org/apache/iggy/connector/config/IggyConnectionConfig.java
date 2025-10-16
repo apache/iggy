@@ -38,7 +38,7 @@ import java.util.Objects;
  *     .build();
  * }</pre>
  */
-public class IggyConnectionConfig implements Serializable {
+public final class IggyConnectionConfig implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
@@ -51,6 +51,7 @@ public class IggyConnectionConfig implements Serializable {
     private final Duration retryBackoff;
     private final boolean enableTls;
 
+    @SuppressWarnings("checkstyle:ParameterNumber")
     private IggyConnectionConfig(
             String serverAddress,
             String username,
@@ -158,7 +159,8 @@ public class IggyConnectionConfig implements Serializable {
     /**
      * Builder for {@link IggyConnectionConfig}.
      */
-    public static class Builder {
+    @SuppressWarnings("checkstyle:HiddenField")
+    public static final class Builder {
         private String serverAddress;
         private String username;
         private String password;

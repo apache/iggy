@@ -8,7 +8,7 @@ This library provides framework-agnostic abstractions and Flink-specific impleme
 
 ### Package Structure
 
-```
+```text
 org.apache.iggy.connector/
 ├── config/              - Configuration classes (connection, offset, retry)
 ├── serialization/       - Serialization/deserialization interfaces
@@ -29,6 +29,7 @@ org.apache.iggy.connector/
 The `org.apache.iggy.connector.*` packages (excluding `flink`) are designed to be framework-agnostic and reusable across different stream processing engines (Spark, Beam, etc.).
 
 **Design Principles:**
+
 - No Flink imports in common packages
 - Interface-based for extensibility
 - Serializable for distributed execution
@@ -37,6 +38,7 @@ The `org.apache.iggy.connector.*` packages (excluding `flink`) are designed to b
 ### Flink Integration
 
 The `org.apache.iggy.connector.flink.*` packages provide Flink-specific implementations:
+
 - Implement Flink's Source and Sink APIs
 - Wrap common abstractions with Flink-specific adapters
 - Handle Flink checkpointing and state management

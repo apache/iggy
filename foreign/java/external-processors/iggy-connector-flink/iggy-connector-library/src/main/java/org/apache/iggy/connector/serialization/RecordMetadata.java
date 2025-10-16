@@ -27,7 +27,7 @@ import java.util.Objects;
  * Contains information like offset, partition, timestamp that may be
  * useful during deserialization.
  */
-public class RecordMetadata implements Serializable {
+public final class RecordMetadata implements Serializable {
 
     private static final long serialVersionUID = 1L;
     private static final RecordMetadata EMPTY = new RecordMetadata(null, null, null, null);

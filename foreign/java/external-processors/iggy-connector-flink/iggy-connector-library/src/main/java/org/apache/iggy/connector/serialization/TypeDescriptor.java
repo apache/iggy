@@ -30,7 +30,7 @@ import java.util.Objects;
  *
  * @param <T> The described type
  */
-public class TypeDescriptor<T> implements Serializable {
+public final class TypeDescriptor<T> implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
