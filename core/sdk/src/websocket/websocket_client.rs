@@ -568,7 +568,7 @@ mod tests {
     #[test]
     fn should_be_created_with_default_config() {
         let client = WebSocketClient::default();
-        assert_eq!(client.config.server_address, "127.0.0.1:8080");
+        assert_eq!(client.config.server_address, "127.0.0.1:8092");
         assert_eq!(
             client.config.heartbeat_interval,
             IggyDuration::from_str("5s").unwrap()
@@ -585,7 +585,7 @@ mod tests {
 
     #[test]
     fn should_succeed_from_connection_string() {
-        let connection_string = "iggy+ws://user:secret@127.0.0.1:8080";
+        let connection_string = "iggy+ws://user:secret@127.0.0.1:8092";
         let client = WebSocketClient::from_connection_string(connection_string);
         assert!(client.is_ok());
     }

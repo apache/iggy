@@ -152,7 +152,6 @@ async fn accept_loop(
 
     loop {
         let shard = shard.clone();
-        let ws_config = ws_config.clone();
         let acceptor = acceptor.clone();
         let accept_future = listener.accept();
 
@@ -171,7 +170,7 @@ async fn accept_loop(
                         shard_info!(shard.id, "Accepted new TCP connection for WebSocket TLS handshake from: {}", remote_addr);
 
                         let shard_clone = shard.clone();
-                        let ws_config_clone = ws_config.clone();
+                        let ws_config_clone = ws_config;
                         let registry = shard.task_registry.clone();
                         let registry_clone = registry.clone();
 

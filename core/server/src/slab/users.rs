@@ -137,4 +137,48 @@ impl Users {
     pub fn get_id_by_username(&self, username: &str) -> Option<usize> {
         self.index.borrow().get(username).copied()
     }
+
+    pub fn update_username(
+        &self,
+        identifier: &Identifier,
+        new_username: String,
+    ) -> Result<(), IggyError> {
+        let id = match identifier.kind {
+            iggy_common::IdKind::Numeric => identifier.get_u32_value()? as usize,
+            iggy_common::IdKind::String => {
+                let username = identifier.get_string_value()?;
+                let index = self.index.borrow();
+                *index
+                    .get(&username)
+                    .ok_or_else(|| IggyError::ResourceNotFound(username.to_string()))?
+            }
+        };
+        let old_username = {
+            let users = self.users.borrow();
+            let user = users
+                .get(id)
+                .ok_or_else(|| IggyError::ResourceNotFound(identifier.to_string()))?;
+            user.username.clone()
+        };
+        if old_username == new_username {
+            return Ok(());
+        }
+        tracing::trace!(
+            "Updating username: '{}' → '{}' for user ID: {}",
+            old_username,
+            new_username,
+            id
+        );
+        {
+            let mut users = self.users.borrow_mut();
+            let user = users
+                .get_mut(id)
+                .ok_or_else(|| IggyError::ResourceNotFound(identifier.to_string()))?;
+            user.username = new_username.clone();
+        }
+        let mut index = self.index.borrow_mut();
+        index.remove(&old_username);
+        index.insert(new_username, id);
+        Ok(())
+    }
 }

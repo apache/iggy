@@ -114,13 +114,18 @@ impl IggyShard {
 
     pub fn create_user_bypass_auth(
         &self,
-        _user_id: u32, // Ignored - Slab auto-assigns IDs
+        expected_user_id: u32,
         username: &str,
         password: &str,
         status: UserStatus,
         permissions: Option<Permissions>,
     ) -> Result<(), IggyError> {
-        self.create_user_base(username, password, status, permissions)?;
+        let assigned_user_id = self.create_user_base(username, password, status, permissions)?;
+        assert_eq!(
+            assigned_user_id as u32, expected_user_id,
+            "User ID mismatch: expected {}, got {}. This indicates shards are out of sync.",
+            expected_user_id, assigned_user_id
+        );
         Ok(())
     }
 
@@ -226,6 +231,9 @@ impl IggyShard {
         username: Option<String>,
         status: Option<UserStatus>,
     ) -> Result<User, IggyError> {
+        let user = self.get_user(user_id)?;
+        let numeric_user_id = Identifier::numeric(user.id).unwrap();
+
         if let Some(ref new_username) = username {
             let user = self.get_user(user_id)?;
             let existing_user = self.get_user(&new_username.to_owned().try_into()?);
@@ -233,19 +241,21 @@ impl IggyShard {
                 error!("User: {new_username} already exists.");
                 return Err(IggyError::UserAlreadyExists);
             }
+
+            self.users.update_username(user_id, new_username.clone())?;
         }
 
-        self.users.with_user_mut(user_id, |user| {
-            if let Some(username) = username {
-                user.username = username;
-            }
-            if let Some(status) = status {
+        if let Some(status) = status {
+            self.users.with_user_mut(&numeric_user_id, |user| {
                 user.status = status;
-            }
-            user.clone()
-        }).with_error_context(|error| {
-            format!("{COMPONENT} update user (error: {error}) - failed to update user with id: {user_id}")
-        })
+            }).with_error_context(|error| {
+                format!("{COMPONENT} update user (error: {error}) - failed to update user with id: {user_id}")
+            })?;
+        }
+        self.get_user(&numeric_user_id)
+            .with_error_context(|error| {
+                format!("{COMPONENT} update user (error: {error}) - failed to get updated user with id: {user_id}")
+            })
     }
 
     pub fn update_permissions(
