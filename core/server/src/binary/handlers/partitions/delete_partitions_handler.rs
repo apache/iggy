@@ -19,6 +19,7 @@
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::partitions::COMPONENT, sender::SenderKind};
+use crate::shard::BroadcastResult;
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
@@ -61,8 +62,33 @@ impl ServerCommandHandler for DeletePartitions {
             partitions_count: self.partitions_count,
             partition_ids: deleted_partition_ids,
         };
-        let _responses = shard.broadcast_event_to_all_shards(event).await;
-        // TODO: Rebalance the consumer group.
+        match shard.broadcast_event_to_all_shards(event).await {
+            BroadcastResult::Success(_) => {}
+
+            BroadcastResult::PartialSuccess { errors, .. } => {
+                for (shard_id, error) in errors {
+                    tracing::warn!("Shard {} failed to process event: {:?}", shard_id, error);
+                }
+            }
+
+            BroadcastResult::Failure(_) => {
+                return Err(IggyError::ShardCommunicationError(0));
+            }
+        }
+
+        let remaining_partition_ids = shard.streams2.with_topic_by_id(
+            &self.stream_id,
+            &self.topic_id,
+            crate::streaming::topics::helpers::get_partition_ids(),
+        );
+        shard.streams2.with_topic_by_id_mut(
+            &self.stream_id,
+            &self.topic_id,
+            crate::streaming::topics::helpers::rebalance_consumer_group(
+                shard.id,
+                &remaining_partition_ids,
+            ),
+        );
 
         shard
         .state

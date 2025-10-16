@@ -20,6 +20,7 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::{handlers::streams::COMPONENT, sender::SenderKind};
+use crate::shard::BroadcastResult;
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
 use crate::shard_info;
@@ -60,7 +61,27 @@ impl ServerCommandHandler for CreateStream {
             id: created_stream_id,
             stream,
         };
-        let _responses = shard.broadcast_event_to_all_shards(event).await;
+
+        // Broadcast the event and handle potential failures
+        match shard.broadcast_event_to_all_shards(event).await {
+            BroadcastResult::Success(_) => {
+                // All shards successfully received the event
+            }
+            BroadcastResult::PartialSuccess { errors, .. } => {
+                // Some shards failed, but we can continue as at least some succeeded
+                for (shard_id, error) in errors {
+                    tracing::warn!(
+                        "Shard {} failed to process CreatedStream2 event: {:?}",
+                        shard_id,
+                        error
+                    );
+                }
+            }
+            BroadcastResult::Failure(_err) => {
+                // All shards failed - this is critical for stream creation
+                return Err(IggyError::ShardCommunicationError(0)); // 0 indicates all shards failed
+            }
+        }
 
         let response = shard
             .streams2

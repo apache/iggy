@@ -36,7 +36,7 @@ use crate::{
             message::{ShardMessage, ShardRequest, ShardRequestPayload, ShardSendRequestResult},
         },
     },
-    shard_error, shard_info,
+    shard_error, shard_info, shard_warn,
     slab::{streams::Streams, traits_ext::EntityMarker, users::Users},
     state::file::FileState,
     streaming::{
@@ -49,6 +49,7 @@ use builder::IggyShardBuilder;
 use compio::io::AsyncWriteAtExt;
 use dashmap::DashMap;
 use error_set::ErrContext;
+use futures::future::join_all;
 use hash32::{Hasher, Murmur3Hasher};
 use iggy_common::{EncryptorKind, Identifier, IggyError, TransportProtocol};
 use std::hash::Hasher as _;
@@ -64,6 +65,30 @@ use transmission::connector::{Receiver, ShardConnector, StopReceiver};
 
 pub const COMPONENT: &str = "SHARD";
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+pub const BROADCAST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Result type for broadcast operations
+#[derive(Debug)]
+pub enum BroadcastError {
+    PartialFailure {
+        succeeded: Vec<u16>,
+        failed: Vec<(u16, IggyError)>,
+    },
+    TotalFailure(IggyError),
+    Timeout {
+        responded: Vec<u16>,
+        timed_out: Vec<u16>,
+    },
+}
+
+pub enum BroadcastResult {
+    Success(Vec<ShardResponse>),
+    PartialSuccess {
+        responses: Vec<ShardResponse>,
+        errors: Vec<(u16, IggyError)>,
+    },
+    Failure(BroadcastError),
+}
 
 pub(crate) struct Shard {
     id: u16,
@@ -672,7 +697,9 @@ impl IggyShard {
                 Ok(())
             }
             ShardEvent::CreatedTopic2 { stream_id, topic } => {
-                let _topic_id = self.create_topic2_bypass_auth(&stream_id, topic);
+                let topic_id_from_event = topic.id();
+                let topic_id = self.create_topic2_bypass_auth(&stream_id, topic.clone());
+                assert_eq!(topic_id, topic_id_from_event);
                 Ok(())
             }
             ShardEvent::CreatedPartitions2 {
@@ -898,59 +925,74 @@ impl IggyShard {
         }
     }
 
-    pub async fn broadcast_event_to_all_shards(&self, event: ShardEvent) -> Vec<ShardResponse> {
-        let mut responses = Vec::with_capacity(self.get_available_shards_count() as usize);
-        for maybe_receiver in self
-            .shards
-            .iter()
-            .filter_map(|shard| {
-                if shard.id != self.id {
-                    Some(shard.connection.clone())
-                } else {
-                    None
-                }
-            })
-            .map(|conn| {
-                // TODO: Fixme, maybe we should send response_sender
-                // and propagate errors back.
-                let event = event.clone();
-                /*
-                if matches!(
-                    &event,
-                    ShardEvent::CreatedStream2 { .. }
-                        | ShardEvent::DeletedStream2 { .. }
-                        | ShardEvent::CreatedTopic2 { .. }
-                        | ShardEvent::DeletedTopic2 { .. }
-                        | ShardEvent::UpdatedTopic2 { .. }
-                        | ShardEvent::CreatedPartitions2 { .. }
-                        | ShardEvent::DeletedPartitions2 { .. }
-                        | ShardEvent::CreatedConsumerGroup2 { .. }
-                        | ShardEvent::CreatedPersonalAccessToken { .. }
-                        | ShardEvent::DeletedConsumerGroup2 { .. }
-                ) {
-                */
+    pub async fn broadcast_event_to_all_shards(&self, event: ShardEvent) -> BroadcastResult {
+        let event = Rc::new(event);
+        let timeout_duration = BROADCAST_TIMEOUT;
+
+        // Create futures for all shards in parallel
+        let mut futures = Vec::new();
+        let mut shard_ids = Vec::new();
+
+        for shard in self.shards.iter().filter(|s| s.id != self.id) {
+            let event_ref = Rc::clone(&event);
+            let conn = shard.connection.clone();
+            let shard_id = shard.id;
+            shard_ids.push(shard_id);
+
+            let future = async move {
                 let (sender, receiver) = async_channel::bounded(1);
-                conn.send(ShardFrame::new(event.into(), Some(sender.clone())));
-                Some(receiver.clone())
-                /*
-                } else {
-                    conn.send(ShardFrame::new(event.into(), None));
-                    None
+                conn.send(ShardFrame::new(
+                    ShardMessage::Event((*event_ref).clone()),
+                    Some(sender),
+                ));
+
+                match compio::time::timeout(timeout_duration, receiver.recv()).await {
+                    Ok(Ok(response)) => Ok((shard_id, response)),
+                    Ok(Err(_)) => Err((shard_id, IggyError::ShardCommunicationError(shard_id))),
+                    Err(_) => Err((shard_id, IggyError::TaskTimeout)),
                 }
-                */
-            })
-        {
-            match maybe_receiver {
-                Some(receiver) => {
-                    let response = receiver.recv().await.unwrap();
-                    responses.push(response);
-                }
-                None => {
-                    responses.push(ShardResponse::Event);
+            };
+
+            futures.push(future);
+        }
+
+        // If no other shards exist, return success with empty responses
+        if futures.is_empty() {
+            return BroadcastResult::Success(Vec::new());
+        }
+
+        // Collect all results in parallel
+        let results = join_all(futures).await;
+
+        // Process results
+        let mut responses = Vec::new();
+        let mut errors = Vec::new();
+
+        for result in results {
+            match result {
+                Ok((_, response)) => responses.push(response),
+                Err((shard_id, error)) => {
+                    // Log the error for observability
+                    shard_warn!(
+                        self.id,
+                        "Failed to broadcast event to shard {}: {:?}",
+                        shard_id,
+                        error
+                    );
+                    errors.push((shard_id, error));
                 }
             }
         }
-        responses
+
+        if errors.is_empty() {
+            BroadcastResult::Success(responses)
+        } else if responses.is_empty() {
+            BroadcastResult::Failure(BroadcastError::TotalFailure(
+                IggyError::ShardCommunicationError(0), // 0 indicates all shards failed
+            ))
+        } else {
+            BroadcastResult::PartialSuccess { responses, errors }
+        }
     }
 
     pub fn add_active_session(&self, session: Rc<Session>) {

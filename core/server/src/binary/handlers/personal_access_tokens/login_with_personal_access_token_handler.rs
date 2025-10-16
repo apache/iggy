@@ -1,3 +1,4 @@
+use crate::shard::BroadcastResult;
 use crate::shard::transmission::event::ShardEvent;
 /* Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
@@ -60,7 +61,19 @@ impl ServerCommandHandler for LoginWithPersonalAccessToken {
             token: self.token,
             client_id: session.client_id,
         };
-        let _responses = shard.broadcast_event_to_all_shards(event).await;
+        match shard.broadcast_event_to_all_shards(event).await {
+            BroadcastResult::Success(_) => {}
+
+            BroadcastResult::PartialSuccess { errors, .. } => {
+                for (shard_id, error) in errors {
+                    tracing::warn!("Shard {} failed to process event: {:?}", shard_id, error);
+                }
+            }
+
+            BroadcastResult::Failure(_) => {
+                return Err(IggyError::ShardCommunicationError(0));
+            }
+        }
         let identity_info = mapper::map_identity_info(user.id);
         sender.send_ok_response(&identity_info).await?;
         Ok(())

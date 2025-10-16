@@ -20,6 +20,7 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::{handlers::personal_access_tokens::COMPONENT, sender::SenderKind};
+use crate::shard::BroadcastResult;
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
 use crate::state::command::EntryCommand;
@@ -60,7 +61,19 @@ impl ServerCommandHandler for CreatePersonalAccessToken {
         let event = ShardEvent::CreatedPersonalAccessToken {
             personal_access_token: personal_access_token.clone(),
         };
-        let _responses = shard.broadcast_event_to_all_shards(event).await;
+        match shard.broadcast_event_to_all_shards(event).await {
+            BroadcastResult::Success(_) => {}
+
+            BroadcastResult::PartialSuccess { errors, .. } => {
+                for (shard_id, error) in errors {
+                    tracing::warn!("Shard {} failed to process event: {:?}", shard_id, error);
+                }
+            }
+
+            BroadcastResult::Failure(_) => {
+                return Err(IggyError::ShardCommunicationError(0));
+            }
+        }
 
         shard
             .state

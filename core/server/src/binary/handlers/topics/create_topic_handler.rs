@@ -20,6 +20,7 @@ use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHa
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::mapper;
 use crate::binary::{handlers::topics::COMPONENT, sender::SenderKind};
+use crate::shard::BroadcastResult;
 use crate::shard::IggyShard;
 use crate::shard::transmission::event::ShardEvent;
 use crate::slab::traits_ext::EntityMarker;
@@ -71,7 +72,26 @@ impl ServerCommandHandler for CreateTopic {
             stream_id: self.stream_id.clone(),
             topic,
         };
-        let _responses = shard.broadcast_event_to_all_shards(event).await;
+
+        match shard.broadcast_event_to_all_shards(event).await {
+            BroadcastResult::Success(_) => {
+                // All shards successfully received the event
+            }
+            BroadcastResult::PartialSuccess { errors, .. } => {
+                // Some shards failed, but we can continue
+                for (shard_id, error) in errors {
+                    tracing::warn!(
+                        "Shard {} failed to process CreatedTopic2 event: {:?}",
+                        shard_id,
+                        error
+                    );
+                }
+            }
+            BroadcastResult::Failure(_) => {
+                // All shards failed - critical for topic creation
+                return Err(IggyError::ShardCommunicationError(0));
+            }
+        }
         let partitions = shard
             .create_partitions2(
                 session,
@@ -85,7 +105,26 @@ impl ServerCommandHandler for CreateTopic {
             topic_id: Identifier::numeric(topic_id as u32).unwrap(),
             partitions,
         };
-        let _responses = shard.broadcast_event_to_all_shards(event).await;
+
+        match shard.broadcast_event_to_all_shards(event).await {
+            BroadcastResult::Success(_) => {
+                // All shards successfully received the event
+            }
+            BroadcastResult::PartialSuccess { errors, .. } => {
+                // Some shards failed, but we can continue
+                for (shard_id, error) in errors {
+                    tracing::warn!(
+                        "Shard {} failed to process CreatedPartitions2 event: {:?}",
+                        shard_id,
+                        error
+                    );
+                }
+            }
+            BroadcastResult::Failure(_) => {
+                // All shards failed - critical for partitions creation
+                return Err(IggyError::ShardCommunicationError(0));
+            }
+        }
         let response = shard.streams2.with_topic_by_id(
             &self.stream_id,
             &Identifier::numeric(topic_id as u32).unwrap(),

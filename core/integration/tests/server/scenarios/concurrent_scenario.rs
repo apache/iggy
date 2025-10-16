@@ -21,8 +21,8 @@ use futures::future::join_all;
 use iggy::prelude::*;
 use integration::test_server::{ClientFactory, login_root};
 
-const OPERATIONS_COUNT: usize = 20;
-const MULTIPLE_CLIENT_COUNT: usize = 10;
+const OPERATIONS_COUNT: usize = 100;
+const MULTIPLE_CLIENT_COUNT: usize = 20;
 const OPERATIONS_PER_CLIENT: usize = OPERATIONS_COUNT / MULTIPLE_CLIENT_COUNT;
 const USER_PASSWORD: &str = "secret";
 const TEST_STREAM_NAME: &str = "race-test-stream";
@@ -33,6 +33,8 @@ pub enum ResourceType {
     User,
     Stream,
     Topic,
+    // TODO(hubcio): add ConsumerGroup
+    // TODO(hubcio): add Partition
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

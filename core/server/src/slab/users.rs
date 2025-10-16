@@ -153,6 +153,7 @@ impl Users {
                     .ok_or_else(|| IggyError::ResourceNotFound(username.to_string()))?
             }
         };
+
         let old_username = {
             let users = self.users.borrow();
             let user = users
@@ -160,15 +161,18 @@ impl Users {
                 .ok_or_else(|| IggyError::ResourceNotFound(identifier.to_string()))?;
             user.username.clone()
         };
+
         if old_username == new_username {
             return Ok(());
         }
+
         tracing::trace!(
             "Updating username: '{}' → '{}' for user ID: {}",
             old_username,
             new_username,
             id
         );
+
         {
             let mut users = self.users.borrow_mut();
             let user = users
@@ -176,9 +180,82 @@ impl Users {
                 .ok_or_else(|| IggyError::ResourceNotFound(identifier.to_string()))?;
             user.username = new_username.clone();
         }
+
         let mut index = self.index.borrow_mut();
         index.remove(&old_username);
         index.insert(new_username, id);
+
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_common::UserStatus;
+
+    #[test]
+    fn test_username_update_should_maintain_index() {
+        let users = Users::new();
+
+        let mut user = User::new(0, "alice", "password", UserStatus::Active, None);
+        user.id = 0;
+        let id = users.insert(user);
+
+        let alice_id = Identifier::named("alice").unwrap();
+        assert!(users.get_by_identifier(&alice_id).unwrap().is_some());
+        assert_eq!(
+            users
+                .get_by_identifier(&alice_id)
+                .unwrap()
+                .unwrap()
+                .username,
+            "alice"
+        );
+
+        users.update_username(&alice_id, "bob".to_string()).unwrap();
+
+        let bob_id = Identifier::named("bob").unwrap();
+        let bob_lookup = users.get_by_identifier(&bob_id);
+
+        assert!(
+            bob_lookup.unwrap().is_some(),
+            "User should be findable by new username 'bob'"
+        );
+
+        let numeric_id = Identifier::numeric(id as u32).unwrap();
+        let user_by_id = users.get_by_identifier(&numeric_id).unwrap().unwrap();
+        assert_eq!(user_by_id.username, "bob");
+    }
+
+    #[test]
+    fn test_insert_updates_index() {
+        let users = Users::new();
+
+        let user = User::new(0, "alice", "password", UserStatus::Active, None);
+        let id = users.insert(user);
+
+        let alice_id = Identifier::named("alice").unwrap();
+        assert!(users.get_by_identifier(&alice_id).unwrap().is_some());
+
+        let numeric_id = Identifier::numeric(id as u32).unwrap();
+        assert!(users.get_by_identifier(&numeric_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_remove_updates_index() {
+        let users = Users::new();
+
+        let user = User::new(0, "alice", "password", UserStatus::Active, None);
+        let id = users.insert(user);
+
+        let removed = users.remove(id);
+        assert!(removed.is_some());
+
+        let alice_id = Identifier::named("alice").unwrap();
+        assert!(users.get_by_identifier(&alice_id).unwrap().is_none());
+
+        let numeric_id = Identifier::numeric(id as u32).unwrap();
+        assert!(users.get_by_identifier(&numeric_id).unwrap().is_none());
     }
 }

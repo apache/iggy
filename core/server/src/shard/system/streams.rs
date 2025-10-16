@@ -19,12 +19,10 @@
 use super::COMPONENT;
 use crate::shard::IggyShard;
 use crate::slab::traits_ext::{DeleteCell, EntityMarker, InsertCell};
-
 use crate::streaming::session::Session;
 use crate::streaming::streams::storage2::{create_stream_file_hierarchy, delete_stream_from_disk};
 use crate::streaming::streams::{self, stream2};
 use error_set::ErrContext;
-
 use iggy_common::{Identifier, IggyError};
 
 impl IggyShard {

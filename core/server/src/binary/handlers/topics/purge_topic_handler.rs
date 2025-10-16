@@ -19,7 +19,7 @@
 use crate::binary::command::{BinaryServerCommand, ServerCommand, ServerCommandHandler};
 use crate::binary::handlers::utils::receive_and_validate;
 use crate::binary::{handlers::topics::COMPONENT, sender::SenderKind};
-use crate::shard::IggyShard;
+use crate::shard::{BroadcastResult, IggyShard};
 use crate::state::command::EntryCommand;
 use crate::streaming::session::Session;
 use anyhow::Result;
@@ -60,7 +60,19 @@ impl ServerCommandHandler for PurgeTopic {
             stream_id: self.stream_id.clone(),
             topic_id: self.topic_id.clone(),
         };
-        let _responses = shard.broadcast_event_to_all_shards(event).await;
+        match shard.broadcast_event_to_all_shards(event).await {
+            BroadcastResult::Success(_) => {}
+
+            BroadcastResult::PartialSuccess { errors, .. } => {
+                for (shard_id, error) in errors {
+                    tracing::warn!("Shard {} failed to process event: {:?}", shard_id, error);
+                }
+            }
+
+            BroadcastResult::Failure(_) => {
+                return Err(IggyError::ShardCommunicationError(0));
+            }
+        }
 
         shard
             .state

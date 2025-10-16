@@ -121,11 +121,13 @@ impl IggyShard {
         permissions: Option<Permissions>,
     ) -> Result<(), IggyError> {
         let assigned_user_id = self.create_user_base(username, password, status, permissions)?;
+
         assert_eq!(
             assigned_user_id as u32, expected_user_id,
             "User ID mismatch: expected {}, got {}. This indicates shards are out of sync.",
             expected_user_id, assigned_user_id
         );
+
         Ok(())
     }
 
@@ -235,7 +237,6 @@ impl IggyShard {
         let numeric_user_id = Identifier::numeric(user.id).unwrap();
 
         if let Some(ref new_username) = username {
-            let user = self.get_user(user_id)?;
             let existing_user = self.get_user(&new_username.to_owned().try_into()?);
             if existing_user.is_ok() && existing_user.unwrap().id != user.id {
                 error!("User: {new_username} already exists.");
@@ -252,6 +253,7 @@ impl IggyShard {
                 format!("{COMPONENT} update user (error: {error}) - failed to update user with id: {user_id}")
             })?;
         }
+
         self.get_user(&numeric_user_id)
             .with_error_context(|error| {
                 format!("{COMPONENT} update user (error: {error}) - failed to get updated user with id: {user_id}")
