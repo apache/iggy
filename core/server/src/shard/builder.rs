@@ -30,7 +30,11 @@ use crate::{
 };
 use dashmap::DashMap;
 use iggy_common::EncryptorKind;
-use std::{cell::Cell, rc::Rc, sync::atomic::AtomicBool};
+use std::{
+    cell::Cell,
+    rc::Rc,
+    sync::atomic::{AtomicBool, AtomicUsize},
+};
 
 #[derive(Default)]
 pub struct IggyShardBuilder {
@@ -161,6 +165,8 @@ impl IggyShardBuilder {
             permissioner: Default::default(),
             client_manager: Default::default(),
             active_sessions: Default::default(),
+            next_stream_id: AtomicUsize::new(0),
+            next_topic_id: AtomicUsize::new(0),
         }
     }
 }

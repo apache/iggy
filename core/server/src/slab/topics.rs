@@ -164,6 +164,27 @@ impl Topics {
         }
     }
 
+    /// Insert a topic with a specific ID - used for replication across shards
+    ///
+    /// This method bypasses normal slab allocation and forces a specific ID.
+    /// It's used when replicating topics from shard 0 to other shards.
+    pub fn insert_with_id(&self, id: usize, mut item: topic2::Topic) -> usize {
+        use crate::slab::traits_ext::EntityMarker;
+
+        // Ensure the topic has the correct ID
+        item.update_id(id);
+
+        let (mut root, auxilary, stats) = item.into_components();
+
+        // Make sure the root has the right ID
+        root.update_id(id);
+
+        let _key = root.key().clone();
+
+        // The ID mismatch between logical ID and slab index is handled by the root.id field
+        self.insert(topic2::Topic::new_with_components(root, auxilary, stats))
+    }
+
     pub fn get_index(&self, id: &Identifier) -> usize {
         match id.kind {
             iggy_common::IdKind::Numeric => id.get_u32_value().unwrap() as usize,

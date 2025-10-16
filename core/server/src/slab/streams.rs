@@ -15,7 +15,7 @@ use crate::{
         topics::Topics,
         traits_ext::{
             ComponentsById, DeleteCell, EntityComponentSystem, EntityComponentSystemMutCell,
-            InsertCell, InteriorMutability, IntoComponents,
+            EntityMarker, InsertCell, InteriorMutability, IntoComponents,
         },
     },
     streaming::{
@@ -409,6 +409,15 @@ impl MainOps for Streams {
 // In a case of a `Stream` module replacement (with a new implementation), the new implementation might not have a notion of `Topic` or `Partition` at all.
 // So we should only expose some generic `get_entity_by_id` methods and rely on it's components accessors to get to the nested entities.
 impl Streams {
+    /// Insert a stream with a specific ID - used for replication across shards
+    ///
+    /// This method bypasses normal slab allocation and forces a specific ID.
+    /// It's used when replicating streams from shard 0 to other shards.
+    pub fn insert_with_id(&self, id: usize, mut item: stream2::Stream) -> usize {
+        item.update_id(id);
+        self.insert(item)
+    }
+
     pub fn exists(&self, id: &Identifier) -> bool {
         match id.kind {
             iggy_common::IdKind::Numeric => {

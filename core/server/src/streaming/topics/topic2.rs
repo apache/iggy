@@ -15,6 +15,14 @@ pub struct TopicAuxilary {
     current_partition_id: Arc<AtomicUsize>,
 }
 
+impl Default for TopicAuxilary {
+    fn default() -> Self {
+        Self {
+            current_partition_id: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
 impl TopicAuxilary {
     pub fn get_next_partition_id(&self, shard_id: u16, upperbound: usize) -> usize {
         let mut partition_id = self.current_partition_id.fetch_add(1, Ordering::AcqRel);

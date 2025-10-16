@@ -67,31 +67,7 @@ impl ServerCommandHandler for CreateTopic {
             .streams2
             .with_stream_by_id(&self.stream_id, streams::helpers::get_stream_id());
         let topic_id = topic.id();
-        // Send events for topic creation.
-        let event = ShardEvent::CreatedTopic2 {
-            stream_id: self.stream_id.clone(),
-            topic,
-        };
-
-        match shard.broadcast_event_to_all_shards(event).await {
-            BroadcastResult::Success(_) => {
-                // All shards successfully received the event
-            }
-            BroadcastResult::PartialSuccess { errors, .. } => {
-                // Some shards failed, but we can continue
-                for (shard_id, error) in errors {
-                    tracing::warn!(
-                        "Shard {} failed to process CreatedTopic2 event: {:?}",
-                        shard_id,
-                        error
-                    );
-                }
-            }
-            BroadcastResult::Failure(_) => {
-                // All shards failed - critical for topic creation
-                return Err(IggyError::ShardCommunicationError(0));
-            }
-        }
+        // No need to broadcast here anymore - create_topic2 handles it internally
         let partitions = shard
             .create_partitions2(
                 session,

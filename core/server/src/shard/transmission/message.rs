@@ -75,6 +75,30 @@ pub enum ShardRequestPayload {
     FlushUnsavedBuffer {
         fsync: bool,
     },
+    // Metadata operations - always handled by shard 0
+    CreateStream {
+        session_id: u32,
+        name: String,
+    },
+    CreateTopic {
+        session_id: u32,
+        stream_id: Identifier,
+        name: String,
+        partitions_count: u32,
+        message_expiry: iggy_common::IggyExpiry,
+        compression_algorithm: iggy_common::CompressionAlgorithm,
+        max_topic_size: iggy_common::MaxTopicSize,
+        replication_factor: Option<u8>,
+    },
+    DeleteStream {
+        session_id: u32,
+        stream_id: Identifier,
+    },
+    DeleteTopic {
+        session_id: u32,
+        stream_id: Identifier,
+        topic_id: Identifier,
+    },
 }
 
 impl From<ShardRequest> for ShardMessage {

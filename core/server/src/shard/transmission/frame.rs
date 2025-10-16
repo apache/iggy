@@ -30,6 +30,11 @@ pub enum ShardResponse {
     FlushUnsavedBuffer,
     Event,
     ErrorResponse(IggyError),
+    // Metadata operation responses
+    CreatedStream { stream_id: usize },
+    CreatedTopic { topic_id: usize },
+    DeletedStream,
+    DeletedTopic,
 }
 
 #[derive(Debug)]

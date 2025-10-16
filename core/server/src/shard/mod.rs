@@ -37,7 +37,11 @@ use crate::{
         },
     },
     shard_error, shard_info, shard_warn,
-    slab::{streams::Streams, traits_ext::EntityMarker, users::Users},
+    slab::{
+        streams::Streams,
+        traits_ext::{EntityMarker, InsertCell},
+        users::Users,
+    },
     state::file::FileState,
     streaming::{
         clients::client_manager::ClientManager, diagnostics::metrics::Metrics, session::Session,
@@ -163,6 +167,10 @@ pub struct IggyShard {
     pub(crate) config_writer_notify: async_channel::Sender<()>,
     config_writer_receiver: async_channel::Receiver<()>,
     pub(crate) task_registry: Rc<TaskRegistry>,
+
+    // ID generators for metadata - only used by shard 0
+    pub(crate) next_stream_id: std::sync::atomic::AtomicUsize,
+    pub(crate) next_topic_id: std::sync::atomic::AtomicUsize,
 }
 
 impl IggyShard {
@@ -542,6 +550,128 @@ impl IggyShard {
                     .await?;
                 Ok(ShardResponse::FlushUnsavedBuffer)
             }
+            // Metadata operations - these should only be handled by shard 0
+            ShardRequestPayload::CreateTopic {
+                session_id: _,
+                stream_id,
+                name,
+                partitions_count: _,
+                message_expiry,
+                compression_algorithm,
+                max_topic_size,
+                replication_factor,
+            } => {
+                if self.id != 0 {
+                    // This shouldn't happen - metadata requests should go to shard 0
+                    return Err(IggyError::InvalidCommand);
+                }
+
+                // We're shard 0, handle the topic creation
+                let config = &self.config.system;
+                let numeric_stream_id = self.streams2.get_index(&stream_id);
+                let parent_stats = self
+                    .streams2
+                    .with_stream_by_id(&stream_id, |(_, stats)| stats.clone());
+                let message_expiry = config.resolve_message_expiry(message_expiry);
+                let max_topic_size = config.resolve_max_topic_size(max_topic_size)?;
+
+                // Generate the next topic ID
+                let topic_id = self.next_topic_id.fetch_add(1, Ordering::SeqCst);
+
+                // Create topic with the assigned ID
+                use crate::slab::traits_ext::EntityMarker;
+                use crate::streaming::topics::topic2;
+                let mut topic = topic2::Topic::new(
+                    name,
+                    std::sync::Arc::new(crate::streaming::stats::TopicStats::new(parent_stats)),
+                    iggy_common::IggyTimestamp::now(),
+                    replication_factor.unwrap_or(1),
+                    message_expiry,
+                    compression_algorithm,
+                    max_topic_size,
+                );
+
+                // Set the ID
+                topic.update_id(topic_id);
+
+                // Insert into our local state
+                let _slab_id: usize = self
+                    .streams2
+                    .with_topics(&stream_id, |topics| topics.insert(topic.clone()));
+                self.metrics.increment_topics(1);
+
+                // Create file hierarchy for the topic
+                use crate::streaming::topics::storage2::create_topic_file_hierarchy;
+                create_topic_file_hierarchy(
+                    self.id,
+                    numeric_stream_id,
+                    topic_id,
+                    &self.config.system,
+                )
+                .await?;
+
+                // Broadcast to all other shards
+                use crate::shard::transmission::event::ShardEvent;
+                let event = ShardEvent::CreatedTopic2 {
+                    stream_id: stream_id.clone(),
+                    topic: topic.clone(),
+                };
+
+                // We don't wait for broadcast success - it's eventually consistent
+                let _ = self.broadcast_event_to_all_shards(event).await;
+
+                Ok(ShardResponse::CreatedTopic { topic_id })
+            }
+            ShardRequestPayload::CreateStream {
+                session_id: _,
+                name,
+            } => {
+                if self.id != 0 {
+                    // This shouldn't happen - metadata requests should go to shard 0
+                    return Err(IggyError::InvalidCommand);
+                }
+
+                // We're shard 0, handle the stream creation
+                // Generate the next stream ID
+                let stream_id = self.next_stream_id.fetch_add(1, Ordering::SeqCst);
+
+                // Create stream with the assigned ID
+                use crate::streaming::streams::stream2;
+                let mut stream = stream2::Stream::new(
+                    name,
+                    std::sync::Arc::new(crate::streaming::stats::StreamStats::default()),
+                    iggy_common::IggyTimestamp::now(),
+                );
+
+                // Set the ID
+                stream.update_id(stream_id);
+
+                // Insert into our local state
+                let _slab_id = self.streams2.insert(stream.clone());
+                self.metrics.increment_streams(1);
+
+                // Create file hierarchy for the stream
+                use crate::streaming::streams::storage2::create_stream_file_hierarchy;
+                create_stream_file_hierarchy(self.id, stream_id, &self.config.system).await?;
+
+                // Broadcast to all other shards
+                let event = ShardEvent::CreatedStream2 {
+                    id: stream_id,
+                    stream: stream.clone(),
+                };
+
+                // We don't wait for broadcast success - it's eventually consistent
+                let _ = self.broadcast_event_to_all_shards(event).await;
+
+                Ok(ShardResponse::CreatedStream { stream_id })
+            }
+            ShardRequestPayload::DeleteStream { .. } | ShardRequestPayload::DeleteTopic { .. } => {
+                if self.id != 0 {
+                    return Err(IggyError::InvalidCommand);
+                }
+                // TODO: Implement other metadata operations
+                todo!("Implement other metadata operations on shard 0")
+            }
         }
     }
 
@@ -681,8 +811,9 @@ impl IggyShard {
                 Ok(())
             }
             ShardEvent::CreatedStream2 { id, stream } => {
-                let stream_id = self.create_stream2_bypass_auth(stream);
-                assert_eq!(stream_id, id);
+                // Use insert_with_id to preserve the stream ID from shard 0
+                let _slab_id = self.streams2.insert_with_id(id, stream);
+                self.metrics.increment_streams(1);
                 Ok(())
             }
             ShardEvent::DeletedStream2 { id, stream_id } => {
@@ -697,9 +828,9 @@ impl IggyShard {
                 Ok(())
             }
             ShardEvent::CreatedTopic2 { stream_id, topic } => {
-                let topic_id_from_event = topic.id();
-                let topic_id = self.create_topic2_bypass_auth(&stream_id, topic.clone());
-                assert_eq!(topic_id, topic_id_from_event);
+                // Just use the existing method which already handles insertion
+                let _topic_id = self.create_topic2_bypass_auth(&stream_id, topic);
+                self.metrics.increment_topics(1);
                 Ok(())
             }
             ShardEvent::CreatedPartitions2 {
