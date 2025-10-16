@@ -174,10 +174,12 @@ impl IggyShard {
 
         // JWT token cleaner task is spawned inside HTTP server because it needs `AppState`.
 
-        if self.config.quic.enabled {
+        // TODO(hubcio): QUIC doesn't properly work on all shards, especially tests `concurrent` and `system_scenario`.
+        // it's probably related to Endpoint not Cloned between shards, but all shards are creating its own instance.
+        // This way packet CID is invalid. (crypto-related stuff)
+        if self.config.quic.enabled && self.id == 0 {
             continuous::spawn_quic_server(self.clone());
         }
-
         if self.config.websocket.enabled && self.id == 0 {
             continuous::spawn_websocket_server(self.clone());
         }
