@@ -62,7 +62,20 @@ impl ServerCommandHandler for DeletePartitions {
             partition_ids: deleted_partition_ids,
         };
         let _responses = shard.broadcast_event_to_all_shards(event).await;
-        // TODO: Rebalance the consumer group.
+
+        let remaining_partition_ids = shard.streams2.with_topic_by_id(
+            &self.stream_id,
+            &self.topic_id,
+            crate::streaming::topics::helpers::get_partition_ids(),
+        );
+        shard.streams2.with_topic_by_id_mut(
+            &self.stream_id,
+            &self.topic_id,
+            crate::streaming::topics::helpers::rebalance_consumer_group(
+                shard.id,
+                &remaining_partition_ids,
+            ),
+        );
 
         shard
         .state

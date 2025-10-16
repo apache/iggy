@@ -6,7 +6,10 @@ use crate::{
         Keyed,
         consumer_groups::{self, ConsumerGroups},
         topics::{self, Topics},
-        traits_ext::{ComponentsById, Delete, DeleteCell, EntityMarker},
+        traits_ext::{
+            ComponentsById, Delete, DeleteCell, EntityComponentSystem, EntityComponentSystemMut,
+            EntityMarker, IntoComponents,
+        },
     },
     streaming::{
         stats::TopicStats,
@@ -42,6 +45,15 @@ pub fn get_stats() -> impl FnOnce(ComponentsById<TopicRef>) -> Arc<TopicStats> {
 
 pub fn get_topic_id() -> impl FnOnce(ComponentsById<TopicRef>) -> topics::ContainerId {
     |(root, _, _)| root.id()
+}
+
+pub fn get_partition_ids() -> impl FnOnce(ComponentsById<TopicRef>) -> Vec<usize> {
+    |(root, ..)| {
+        root.partitions().with_components(|components| {
+            let (roots, ..) = components.into_components();
+            roots.iter().map(|(id, _)| id).collect()
+        })
+    }
 }
 
 pub fn get_message_expiry() -> impl FnOnce(ComponentsById<TopicRef>) -> IggyExpiry {
@@ -144,6 +156,28 @@ pub fn leave_consumer_group(
     }
 }
 
+pub fn rebalance_consumer_group(
+    shard_id: u16,
+    partition_ids: &[usize],
+) -> impl FnOnce(ComponentsById<TopicRefMut>) {
+    move |(mut root, ..)| {
+        root.consumer_groups_mut()
+            .with_components_mut(|components| {
+                let (all_roots, all_members) = components.into_components();
+                for ((_, consumer_group_root), (_, members)) in
+                    all_roots.iter().zip(all_members.iter_mut())
+                {
+                    let id = consumer_group_root.id();
+                    members.inner_mut().rcu(|existing_members| {
+                        let mut new_members = mimic_members(existing_members);
+                        assign_partitions_to_members(shard_id, id, &mut new_members, partition_ids);
+                        new_members
+                    });
+                }
+            });
+    }
+}
+
 pub fn get_consumer_group_member_id(
     client_id: u32,
 ) -> impl FnOnce(ComponentsById<ConsumerGroupRef>) -> usize {
@@ -206,7 +240,7 @@ fn add_member(
     members.inner_mut().rcu(move |members| {
         let mut members = mimic_members(members);
         Member::new(client_id).insert_into(&mut members);
-        assign_partitions_to_members(shard_id, id, &mut members, partitions.to_vec());
+        assign_partitions_to_members(shard_id, id, &mut members, partitions);
         members
     });
 }
@@ -231,7 +265,7 @@ fn delete_member(
             entry.id = idx;
             true
         });
-        assign_partitions_to_members(shard_id, id, &mut members, partitions.to_vec());
+        assign_partitions_to_members(shard_id, id, &mut members, partitions);
         members
     });
 }
@@ -240,7 +274,7 @@ fn assign_partitions_to_members(
     shard_id: u16,
     id: usize,
     members: &mut Slab<Member>,
-    partitions: Vec<usize>,
+    partitions: &[usize],
 ) {
     members
         .iter_mut()
