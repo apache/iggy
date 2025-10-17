@@ -239,7 +239,7 @@ One can use default root credentials with optional `--with-default-root-credenti
 This flag is equivalent to setting `IGGY_ROOT_USERNAME=iggy` and `IGGY_ROOT_PASSWORD=iggy`, plus
 it should only be used for development and testing.
 
-`cargo run --bin iggy-server --with-default-root-credentials`
+`cargo run --bin iggy-server -- --with-default-root-credentials`
 
 For configuration options and detailed help:
 
