@@ -205,13 +205,12 @@ pub enum IggyError {
     CannotDeleteStream(u32) = 1007,
     #[error("Failed to delete stream directory with ID: {0}")]
     CannotDeleteStreamDirectory(u32) = 1008,
-    //TODO: Fix the stream not found errors.
     #[error("Stream with ID: {0} was not found.")]
-    StreamIdNotFound(u32) = 1009,
+    StreamIdNotFound(Identifier) = 1009,
     #[error("Stream with name: {0} was not found.")]
     StreamNameNotFound(String) = 1010,
-    #[error("Stream with ID: {0} already exists.")]
-    StreamIdAlreadyExists(u32) = 1011,
+    #[error("Stream with directory {0} was not found.")]
+    StreamDirectoryNotFound(String) = 1011,
     #[error("Stream with name: {0} already exists.")]
     StreamNameAlreadyExists(String) = 1012,
     #[error("Invalid stream name")]
@@ -225,9 +224,9 @@ pub enum IggyError {
     )]
     InvalidTopicSize(MaxTopicSize, IggyByteSize) = 1019,
     #[error("Cannot create topics directory for stream with ID: {0}, Path: {1}")]
-    CannotCreateTopicsDirectory(u32, String) = 2000,
+    CannotCreateTopicsDirectory(Identifier, String) = 2000,
     #[error("Failed to create directory for topic with ID: {0} for stream with ID: {1}, Path: {2}")]
-    CannotCreateTopicDirectory(u32, u32, String) = 2001,
+    CannotCreateTopicDirectory(usize, usize, String) = 2001,
     #[error("Failed to create topic info file for topic with ID: {0} for stream with ID: {1}.")]
     CannotCreateTopicInfo(u32, u32) = 2002,
     #[error("Failed to update topic info for topic with ID: {0} for stream with ID: {1}.")]
@@ -245,13 +244,11 @@ pub enum IggyError {
     #[error("Cannot poll topic")]
     CannotPollTopic = 2009,
     #[error("Topic with ID: {0} for stream with ID: {1} was not found.")]
-    TopicIdNotFound(u32, u32) = 2010,
+    TopicIdNotFound(Identifier, Identifier) = 2010,
     #[error("Topic with name: {0} for stream with ID: {1} was not found.")]
     TopicNameNotFound(String, String) = 2011,
-    #[error("Topic with ID: {0} for stream with ID: {1} already exists.")]
-    TopicIdAlreadyExists(u32, u32) = 2012,
     #[error("Topic with name: {0} for stream with ID: {1} already exists.")]
-    TopicNameAlreadyExists(String, u32) = 2013,
+    TopicNameAlreadyExists(String, Identifier) = 2013,
     #[error("Invalid topic name")]
     InvalidTopicName = 2014,
     #[error("Too many partitions")]
@@ -264,16 +261,18 @@ pub enum IggyError {
     InvalidReplicationFactor = 2018,
     #[error("Invalid partitions count")]
     InvalidPartitionsCount = 2019,
+    #[error("Topic directory: {0} not found")]
+    TopicDirectoryNotFound(String) = 2020,
     #[error("Cannot create partition with ID: {0} for stream with ID: {1} and topic with ID: {2}")]
-    CannotCreatePartition(u32, u32, u32) = 3000,
+    CannotCreatePartition(usize, usize, usize) = 3000,
     #[error(
         "Failed to create directory for partitions for stream with ID: {0} and topic with ID: {1}"
     )]
-    CannotCreatePartitionsDirectory(u32, u32) = 3001,
+    CannotCreatePartitionsDirectory(usize, usize) = 3001,
     #[error(
         "Failed to create directory for partition with ID: {0} for stream with ID: {1} and topic with ID: {2}"
     )]
-    CannotCreatePartitionDirectory(u32, u32, u32) = 3002,
+    CannotCreatePartitionDirectory(usize, usize, usize) = 3002,
     #[error("Cannot open partition log file")]
     CannotOpenPartitionLogFile = 3003,
     #[error("Cannot read partitions directories.")]
@@ -281,17 +280,17 @@ pub enum IggyError {
     #[error(
         "Failed to delete partition with ID: {0} for stream with ID: {1} and topic with ID: {2}"
     )]
-    CannotDeletePartition(u32, u32, u32) = 3005,
+    CannotDeletePartition(usize, Identifier, Identifier) = 3005,
     #[error(
         "Failed to delete partition directory with ID: {0} for stream with ID: {1} and topic with ID: {2}"
     )]
-    CannotDeletePartitionDirectory(u32, u32, u32) = 3006,
+    CannotDeletePartitionDirectory(usize, usize, usize) = 3006,
     #[error("Partition with ID: {0} for topic with ID: {1} for stream with ID: {2} was not found.")]
-    PartitionNotFound(u32, u32, u32) = 3007,
+    PartitionNotFound(usize, Identifier, Identifier) = 3007,
     #[error("Topic with ID: {0} for stream with ID: {1} has no partitions.")]
-    NoPartitions(u32, u32) = 3008,
+    NoPartitions(Identifier, Identifier) = 3008,
     #[error("Cannot read partitions for topic with ID: {0} for stream with ID: {1}")]
-    TopicFull(u32, u32) = 3009,
+    TopicFull(Identifier, Identifier) = 3009,
     #[error("Failed to delete consumer offsets directory for path: {0}")]
     CannotDeleteConsumerOffsetsDirectory(String) = 3010,
     #[error("Failed to delete consumer offset file for path: {0}")]
@@ -309,7 +308,7 @@ pub enum IggyError {
     #[error("Segment not found")]
     SegmentNotFound = 4000,
     #[error("Segment with start offset: {0} and partition with ID: {1} is closed")]
-    SegmentClosed(u64, u32) = 4001,
+    SegmentClosed(u64, usize) = 4001,
     #[error("Segment size is invalid")]
     InvalidSegmentSize(u64) = 4002,
     #[error("Failed to create segment log file for Path: {0}.")]
@@ -406,29 +405,27 @@ pub enum IggyError {
     #[error("Invalid offset: {0}")]
     InvalidOffset(u64) = 4100,
     #[error("Consumer group with ID: {0} for topic with ID: {1} was not found.")]
-    ConsumerGroupIdNotFound(u32, u32) = 5000,
-    #[error("Consumer group with ID: {0} for topic with ID: {1} already exists.")]
-    ConsumerGroupIdAlreadyExists(u32, u32) = 5001,
+    ConsumerGroupIdNotFound(Identifier, Identifier) = 5000,
     #[error("Invalid consumer group ID")]
     InvalidConsumerGroupId = 5002,
     #[error("Consumer group with name: {0} for topic with ID: {1} was not found.")]
-    ConsumerGroupNameNotFound(String, String) = 5003,
+    ConsumerGroupNameNotFound(String, Identifier) = 5003,
     #[error("Consumer group with name: {0} for topic with ID: {1} already exists.")]
-    ConsumerGroupNameAlreadyExists(String, u32) = 5004,
+    ConsumerGroupNameAlreadyExists(String, Identifier) = 5004,
     #[error("Invalid consumer group name")]
     InvalidConsumerGroupName = 5005,
     #[error(
         "Consumer group member with ID: {0} for group with ID: {1} for topic with ID: {2} was not found."
     )]
-    ConsumerGroupMemberNotFound(u32, u32, u32) = 5006,
+    ConsumerGroupMemberNotFound(usize, Identifier, Identifier) = 5006,
     #[error(
         "Failed to create consumer group info file for ID: {0} for topic with ID: {1} for stream with ID: {2}."
     )]
-    CannotCreateConsumerGroupInfo(u32, u32, u32) = 5007,
+    CannotCreateConsumerGroupInfo(usize, Identifier, Identifier) = 5007,
     #[error(
         "Failed to delete consumer group info file for ID: {0} for topic with ID: {1} for stream with ID: {2}."
     )]
-    CannotDeleteConsumerGroupInfo(u32, u32, u32) = 5008,
+    CannotDeleteConsumerGroupInfo(usize, Identifier, Identifier) = 5008,
     #[error("Base offset is missing")]
     MissingBaseOffsetRetainedMessageBatch = 6000,
     #[error("Last offset delta is missing")]

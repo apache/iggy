@@ -29,9 +29,9 @@ pub async fn create_partition_file_hierarchy(
     );
     if !Path::new(&partition_path).exists() && create_dir_all(&partition_path).await.is_err() {
         return Err(IggyError::CannotCreatePartitionDirectory(
-            partition_id as u32,
-            stream_id as u32,
-            topic_id as u32,
+            partition_id,
+            stream_id,
+            topic_id,
         ));
     }
 
@@ -45,9 +45,9 @@ pub async fn create_partition_file_hierarchy(
             topic_id
         );
         return Err(IggyError::CannotCreatePartition(
-            partition_id as u32,
-            stream_id as u32,
-            topic_id as u32,
+            partition_id,
+            stream_id,
+            topic_id,
         ));
     }
 
@@ -63,9 +63,9 @@ pub async fn create_partition_file_hierarchy(
             topic_id
         );
         return Err(IggyError::CannotCreatePartition(
-            partition_id as u32,
-            stream_id as u32,
-            topic_id as u32,
+            partition_id,
+            stream_id,
+            topic_id,
         ));
     }
 
@@ -82,9 +82,9 @@ pub async fn create_partition_file_hierarchy(
             topic_id
         );
         return Err(IggyError::CannotCreatePartition(
-            partition_id as u32,
-            stream_id as u32,
-            topic_id as u32,
+            partition_id,
+            stream_id,
+            topic_id,
         ));
     }
 
@@ -109,11 +109,7 @@ pub async fn delete_partitions_from_disk(
 ) -> Result<(), IggyError> {
     let partition_path = config.get_partition_path(stream_id, topic_id, partition_id);
     remove_dir_all(&partition_path).await.map_err(|_| {
-        IggyError::CannotDeletePartitionDirectory(
-            stream_id as u32,
-            topic_id as u32,
-            partition_id as u32,
-        )
+        IggyError::CannotDeletePartitionDirectory(stream_id, topic_id, partition_id)
     })?;
     shard_info!(
         shard_id,

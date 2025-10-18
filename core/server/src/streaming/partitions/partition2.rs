@@ -231,7 +231,6 @@ impl PartitionRoot {
     }
 }
 
-// TODO: Create a macro to impl those PartitionRef/PartitionRefMut structs and it's traits.
 pub struct PartitionRef<'a> {
     root: &'a Slab<PartitionRoot>,
     stats: &'a Slab<Arc<PartitionStats>>,

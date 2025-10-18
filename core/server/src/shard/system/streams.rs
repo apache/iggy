@@ -115,8 +115,8 @@ impl IggyShard {
         let stats = stream.stats();
 
         self.metrics.decrement_streams(1);
-        self.metrics.decrement_topics(0); // TODO: stats doesn't have topic count
-        self.metrics.decrement_partitions(0); // TODO: stats doesn't have partition count
+        self.metrics.decrement_topics(0);
+        self.metrics.decrement_partitions(0);
         self.metrics
             .decrement_messages(stats.messages_count_inconsistent());
         self.metrics

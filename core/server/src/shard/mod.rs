@@ -115,13 +115,10 @@ pub struct IggyShard {
     shards: Vec<Shard>,
     _version: SemanticVersion,
 
-    // Heart transplant of the old streams structure.
     pub(crate) streams2: Streams,
     pub(crate) shards_table: EternalPtr<DashMap<IggyNamespace, ShardInfo>>,
-    // TODO: Refactor.
     pub(crate) state: FileState,
 
-    // Temporal...
     pub(crate) encryptor: Option<EncryptorKind>,
     pub(crate) config: ServerConfig,
     //TODO: This could be shared.

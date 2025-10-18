@@ -20,9 +20,7 @@ pub async fn create_topic_file_hierarchy(
     let partitions_path = config.get_partitions_path(stream_id, topic_id);
     if !Path::new(&topic_path).exists() && create_dir_all(&topic_path).await.is_err() {
         return Err(IggyError::CannotCreateTopicDirectory(
-            topic_id as u32,
-            stream_id as u32,
-            topic_path,
+            topic_id, stream_id, topic_path,
         ));
     }
     shard_info!(
@@ -34,8 +32,7 @@ pub async fn create_topic_file_hierarchy(
 
     if !Path::new(&partitions_path).exists() && create_dir_all(&partitions_path).await.is_err() {
         return Err(IggyError::CannotCreatePartitionsDirectory(
-            stream_id as u32,
-            topic_id as u32,
+            stream_id, topic_id,
         ));
     }
     Ok(())
@@ -50,10 +47,7 @@ pub async fn delete_topic_from_disk(
     let topic_path = config.get_topic_path(stream_id, topic.id());
     let topic_id = topic.id();
     if !Path::new(&topic_path).exists() {
-        return Err(IggyError::TopicIdNotFound(
-            topic_id as u32,
-            stream_id as u32,
-        ));
+        return Err(IggyError::TopicDirectoryNotFound(topic_path));
     }
     // First lets go over the partitions and it's logs and delete them from disk.
     let ids = topic.root().partitions().with_components(|components| {

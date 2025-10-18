@@ -32,7 +32,7 @@ pub async fn delete_stream_from_disk(
     let stream_id = stream.id();
     let stream_path = config.get_stream_path(stream_id);
     if !Path::new(&stream_path).exists() {
-        return Err(IggyError::StreamIdNotFound(stream_id as u32));
+        return Err(IggyError::StreamDirectoryNotFound(stream_path));
     }
 
     // Gather all topic ids.

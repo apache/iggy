@@ -829,9 +829,10 @@ impl IggyConsumer {
         {
             if !create_consumer_group_if_not_exists {
                 error!("Consumer group does not exist and auto-creation is disabled.");
+                let topic_identifier = Identifier::from_identifier(&topic_id);
                 return Err(IggyError::ConsumerGroupNameNotFound(
                     name.to_owned(),
-                    topic_id.get_string_value().unwrap_or_default(),
+                    topic_identifier,
                 ));
             }
 

@@ -88,7 +88,6 @@ impl DeleteCell for Topics {
     }
 }
 
-//TODO: those from impls could use a macro aswell.
 impl<'a> From<&'a Topics> for topic2::TopicRef<'a> {
     fn from(value: &'a Topics) -> Self {
         let root = value.root.borrow();

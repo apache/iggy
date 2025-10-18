@@ -94,7 +94,6 @@ impl IntoComponents for ConsumerGroup {
     }
 }
 
-// TODO: Create a macro to impl those ConsumerGroupRef/ConsumerGroupRefMut structs and it's traits.
 pub struct ConsumerGroupRef<'a> {
     root: &'a Slab<ConsumerGroupRoot>,
     members: &'a Slab<ConsumerGroupMembers>,

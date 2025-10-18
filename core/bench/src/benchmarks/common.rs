@@ -87,20 +87,10 @@ pub async fn init_consumer_groups(
             "Creating test consumer group: name={},  stream={}, topic={}",
             consumer_group_name, stream_name, topic_id
         );
-        match client
+        if let Err(err) = client
             .create_consumer_group(&stream_id, &topic_id, &consumer_group_name)
-            .await
-        {
-            Err(IggyError::ConsumerGroupIdAlreadyExists(_, _)) => {
-                info!(
-                    "Consumer group with id {} already exists",
-                    consumer_group_id
-                );
-            }
-            Err(err) => {
-                error!("Error when creating consumer group {consumer_group_id}: {err}");
-            }
-            Ok(_) => {}
+            .await {
+            error!("Error when creating consumer group {consumer_group_id}: {err}");
         }
     }
     Ok(())

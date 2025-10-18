@@ -465,9 +465,7 @@ fn validate_results(results: &[OperationResult], scenario_type: ScenarioType) {
                     matches!(
                         err,
                         IggyError::UserAlreadyExists
-                            | IggyError::StreamIdAlreadyExists(_)
                             | IggyError::StreamNameAlreadyExists(_)
-                            | IggyError::TopicIdAlreadyExists(_, _)
                             | IggyError::TopicNameAlreadyExists(_, _)
                             | IggyError::HttpResponseError(400, _)
                     ),

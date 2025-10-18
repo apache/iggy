@@ -59,10 +59,7 @@ impl IggyShard {
             topics::helpers::exists(&Identifier::from_str(&name).unwrap()),
         );
         if exists {
-            return Err(IggyError::TopicNameAlreadyExists(
-                name,
-                numeric_stream_id as u32,
-            ));
+            return Err(IggyError::TopicNameAlreadyExists(name, stream_id.clone()));
         }
 
         let config = &self.config.system;
