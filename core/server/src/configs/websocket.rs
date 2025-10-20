@@ -50,17 +50,7 @@ pub struct WebSocketTlsConfig {
 }
 
 impl WebSocketConfig {
-    pub fn to_tungstenite_config(&self) -> Option<TungsteniteConfig> {
-        if self.read_buffer_size.is_none()
-            && self.write_buffer_size.is_none()
-            && self.max_write_buffer_size.is_none()
-            && self.max_message_size.is_none()
-            && self.max_frame_size.is_none()
-            && !self.accept_unmasked_frames
-        {
-            return None;
-        }
-
+    pub fn to_tungstenite_config(&self) -> TungsteniteConfig {
         let mut config = TungsteniteConfig::default();
 
         if let Some(read_buf_size_str) = &self.read_buffer_size
@@ -95,7 +85,7 @@ impl WebSocketConfig {
 
         config = config.accept_unmasked_frames(self.accept_unmasked_frames);
 
-        Some(config)
+        config
     }
 }
 

@@ -72,7 +72,6 @@ pub(crate) async fn handle_connection(
         res?;
         let code: u32 =
             u32::from_le_bytes(code_buffer_out[0..INITIAL_BYTES_LENGTH].try_into().unwrap());
-
         initial_buffer.clear();
         code_buffer_out.clear();
         length_buffer = initial_buffer;
@@ -89,17 +88,39 @@ pub(crate) async fn handle_connection(
                 );
             }
             Err(error) => {
-                error!("Command was not handled successfully, session: {session}, error: {error}.");
-                if let IggyError::ClientNotFound(_) = error {
-                    sender.send_error_response(error).await?;
-                    debug!("WebSocket error response was sent to: {session}.");
-                    error!("Session: {session} will be deleted.");
-                    return Err(ConnectionError::from(IggyError::ClientNotFound(
-                        session.client_id,
-                    )));
-                } else {
-                    sender.send_error_response(error).await?;
-                    debug!("WebSocket error response was sent to: {session}.");
+                match error {
+                    IggyError::TcpError | IggyError::ConnectionClosed | IggyError::Disconnected => {
+                        info!(
+                            "Client {} closed connection during request processing",
+                            session.client_id
+                        );
+                        return Err(ConnectionError::from(IggyError::ConnectionClosed));
+                    }
+                    IggyError::ClientNotFound(_) => {
+                        error!("Command failed for session: {session}, error: {error}.");
+                        sender.send_error_response(error.clone()).await?;
+                        return Err(ConnectionError::from(error));
+                    }
+                    _ => {
+                        error!("Command failed for session: {session}, error: {error}.");
+                        // try to send error response, but if it fails due to broken pipe, that's ok?
+                        match sender.send_error_response(error).await {
+                            Ok(_) => {
+                                debug!("WebSocket error response was sent to: {session}.");
+                            }
+                            Err(IggyError::ConnectionClosed) => {
+                                info!(
+                                    "Could not send error response to {} - client already disconnected",
+                                    session.client_id
+                                );
+                                return Err(ConnectionError::from(IggyError::ConnectionClosed));
+                            }
+                            Err(send_err) => {
+                                error!("Failed to send error response: {send_err}");
+                                return Err(ConnectionError::from(send_err));
+                            }
+                        }
+                    }
                 }
             }
         }

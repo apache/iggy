@@ -277,7 +277,7 @@ impl WebSocketClient {
         let tungstenite_config = self.config.ws_config.to_tungstenite_config();
 
         let (websocket_stream, response) =
-            match client_async_with_config(request, tcp_stream, tungstenite_config).await {
+            match client_async_with_config(request, tcp_stream, Some(tungstenite_config)).await {
                 Ok(result) => result,
                 Err(error) => {
                     error!("WebSocket handshake failed: {}", error);
@@ -312,18 +312,20 @@ impl WebSocketClient {
         let tungstenite_config = self.config.ws_config.to_tungstenite_config();
 
         debug!("Initiating WebSocket TLS connection to: {}", ws_url);
-        println!("Initiating WebSocket TLS connection to: {}", ws_url);
-        println!("tungstenite_config: {:?}", tungstenite_config);
-        let (websocket_stream, response) =
-            match connect_async_tls_with_config(ws_url, tungstenite_config, false, Some(connector))
-                .await
-            {
-                Ok(result) => result,
-                Err(error) => {
-                    error!("WebSocket TLS handshake failed: {}", error);
-                    return self.handle_connection_error(retry_count).await;
-                }
-            };
+        let (websocket_stream, response) = match connect_async_tls_with_config(
+            ws_url,
+            Some(tungstenite_config),
+            false,
+            Some(connector),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                error!("WebSocket TLS handshake failed: {}", error);
+                return self.handle_connection_error(retry_count).await;
+            }
+        };
 
         debug!(
             "WebSocket TLS connection established. Response status: {}",
@@ -451,9 +453,7 @@ impl WebSocketClient {
         info!("{NAME} client: {client_address} is disconnecting from server...");
         self.set_state(ClientState::Disconnected).await;
 
-        if let Some(mut stream) = self.stream.lock().await.take() {
-            let _ = stream.shutdown().await;
-        }
+        self.stream.lock().await.take();
 
         self.publish_event(DiagnosticEvent::Disconnected).await;
         let now = IggyTimestamp::now();
@@ -469,7 +469,13 @@ impl WebSocketClient {
         let client_address = self.get_client_address_value().await;
         info!("Shutting down the {NAME} client: {client_address}");
 
-        self.disconnect().await?;
+        self.set_state(ClientState::Disconnected).await;
+
+        let stream = self.stream.lock().await.take();
+        if let Some(mut stream) = stream {
+            let _ = stream.shutdown().await;
+        }
+
         self.set_state(ClientState::Shutdown).await;
         self.publish_event(DiagnosticEvent::Shutdown).await;
         info!("{NAME} client: {client_address} has been shutdown.");

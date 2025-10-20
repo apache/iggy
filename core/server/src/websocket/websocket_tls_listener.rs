@@ -117,7 +117,6 @@ pub async fn start(
         "WebSocket TLS Server",
         local_addr
     );
-
     let ws_config = config.to_tungstenite_config();
     shard_info!(
         shard.id,
@@ -141,7 +140,7 @@ pub async fn start(
 async fn accept_loop(
     listener: TcpListener,
     acceptor: TlsAcceptor,
-    ws_config: Option<compio_ws::WebSocketConfig>,
+    ws_config: compio_ws::WebSocketConfig,
     shard: Rc<IggyShard>,
     shutdown: ShutdownToken,
 ) -> Result<(), IggyError> {
@@ -170,7 +169,7 @@ async fn accept_loop(
                         shard_info!(shard.id, "Accepted new TCP connection for WebSocket TLS handshake from: {}", remote_addr);
 
                         let shard_clone = shard.clone();
-                        let ws_config_clone = ws_config;
+                        let  ws_config_clone = ws_config;
                         let registry = shard.task_registry.clone();
                         let registry_clone = registry.clone();
 
@@ -179,7 +178,7 @@ async fn accept_loop(
                                 Ok(tls_stream) => {
                                     shard_info!(shard_clone.id, "TLS handshake successful for {}, performing WebSocket upgrade...", remote_addr);
 
-                                    match accept_async_with_config(tls_stream, ws_config_clone).await {
+                                    match accept_async_with_config(tls_stream, Some(ws_config_clone)).await {
                                         Ok(websocket) => {
                                             info!("WebSocket TLS handshake successful from: {}", remote_addr);
 
@@ -202,10 +201,15 @@ async fn accept_loop(
                                             }
                                             registry_clone.remove_connection(&client_id);
 
-                                            if let Err(error) = sender_kind.shutdown().await {
-                                                shard_error!(shard_clone.id, "Failed to shutdown WebSocket TLS stream for client: {}, address: {}. {}", client_id, remote_addr, error);
-                                            } else {
-                                                shard_info!(shard_clone.id, "Successfully closed WebSocket TLS stream for client: {}, address: {}.", client_id, remote_addr);
+                                            match sender_kind.shutdown().await {
+                                                Ok(_) => {
+                                                    shard_info!(shard_clone.id, "Successfully closed WebSocket TLS stream for client: {}, address: {}.", client_id, remote_addr);
+                                                }
+                                                Err(_) => {
+                                                    // shutdown failures during client disconnect are expected and normal
+                                                    // real errors would have been caught earlier in handle_connection
+                                                    shard_debug!(shard_clone.id, "WebSocket TLS shutdown completed with error for client: {} (likely client already disconnected)", client_id);
+                                                }
                                             }
                                         }
                                         Err(error) => {

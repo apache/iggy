@@ -81,7 +81,7 @@ pub async fn start(
         config.accept_unmasked_frames
     );
 
-    accept_loop(listener, ws_config, shard, shutdown).await
+    accept_loop(listener, Some(ws_config), shard, shutdown).await
 }
 
 async fn accept_loop(
@@ -137,10 +137,15 @@ async fn accept_loop(
                                     }
                                     registry_clone.remove_connection(&client_id);
 
-                                    if let Err(error) = sender_kind.shutdown().await {
-                                        shard_error!(shard_clone.id, "Failed to shutdown WebSocket stream for client: {}, address: {}. {}", client_id, remote_addr, error);
-                                    } else {
-                                        shard_info!(shard_clone.id, "Successfully closed WebSocket stream for client: {}, address: {}.", client_id, remote_addr);
+                                    match sender_kind.shutdown().await {
+                                        Ok(_) => {
+                                            shard_info!(shard_clone.id, "Successfully closed WebSocket stream for client: {}, address: {}.", client_id, remote_addr);
+                                        }
+                                        Err(_) => {
+                                            // shutdown failures during client disconnect are expected and normal
+                                            // real errors would have been caught earlier in handle_connection
+                                            shard_debug!(shard_clone.id, "WebSocket shutdown completed with error for client: {} (likely client already disconnected)", client_id);
+                                        }
                                     }
                                 }
                                 Err(error) => {

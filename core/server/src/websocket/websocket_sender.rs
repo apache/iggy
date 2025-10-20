@@ -26,7 +26,7 @@ use compio_ws::TungsteniteError;
 use compio_ws::{WebSocketMessage as Message, WebSocketStream};
 use iggy_common::IggyError;
 use std::ptr;
-use tracing::debug;
+use tracing::{debug, warn};
 
 const READ_BUFFER_CAPACITY: usize = 8192;
 const WRITE_BUFFER_CAPACITY: usize = 8192;
@@ -52,10 +52,23 @@ impl WebSocketSender {
             return Ok(());
         }
         let data = self.write_buffer.split().freeze();
-        self.stream
-            .send(Message::Binary(data))
-            .await
-            .map_err(|_| IggyError::TcpError)
+        debug!("WebSocket sending data: {:?}", data.to_vec());
+
+        self.stream.send(Message::Binary(data)).await.map_err(|e| {
+            debug!("WebSocket send error: {:?}", e);
+            match e {
+                TungsteniteError::ConnectionClosed | TungsteniteError::AlreadyClosed => {
+                    IggyError::ConnectionClosed
+                }
+                TungsteniteError::Io(ref io_err)
+                    if io_err.kind() == std::io::ErrorKind::BrokenPipe =>
+                {
+                    warn!("Broken pipe detected (client closed connection)");
+                    IggyError::ConnectionClosed
+                }
+                _ => IggyError::TcpError,
+            }
+        })
     }
 }
 
@@ -171,6 +184,17 @@ impl Sender for WebSocketSender {
         self.stream
             .send(Message::Binary(response_bytes.freeze()))
             .await
-            .map_err(|_| IggyError::TcpError)
+            .map_err(|e| match e {
+                TungsteniteError::ConnectionClosed | TungsteniteError::AlreadyClosed => {
+                    IggyError::ConnectionClosed
+                }
+                TungsteniteError::Io(ref io_err)
+                    if io_err.kind() == std::io::ErrorKind::BrokenPipe =>
+                {
+                    warn!("Broken pipe in vectored send - client closed connection");
+                    IggyError::ConnectionClosed
+                }
+                _ => IggyError::TcpError,
+            })
     }
 }

@@ -161,7 +161,7 @@ compio-tls = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b
     "rustls",
 ] }
 compio-io = { git = "https://github.com/compio-rs/compio.git", rev = "fe4243f0b6811ebc325afd081c9b087b4d9817be" }
-compio-ws = { git = "https://github.com/krishvishal/compio-ws", branch = "main", features = [
+compio-ws = { git = "https://github.com/krishvishal/compio-ws", features = [
     "rustls",
 ] }
 tungstenite = "0.27.0"
