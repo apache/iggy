@@ -28,7 +28,7 @@ use futures::FutureExt;
 use iggy_common::IggyError;
 use std::io::ErrorKind;
 use std::rc::Rc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 const INITIAL_BYTES_LENGTH: usize = 4;
 
@@ -90,7 +90,7 @@ pub(crate) async fn handle_connection(
             Err(error) => {
                 match error {
                     IggyError::TcpError | IggyError::ConnectionClosed | IggyError::Disconnected => {
-                        info!(
+                        warn!(
                             "Client {} closed connection during request processing",
                             session.client_id
                         );
@@ -109,7 +109,7 @@ pub(crate) async fn handle_connection(
                                 debug!("WebSocket error response was sent to: {session}.");
                             }
                             Err(IggyError::ConnectionClosed) => {
-                                info!(
+                                warn!(
                                     "Could not send error response to {} - client already disconnected",
                                     session.client_id
                                 );
