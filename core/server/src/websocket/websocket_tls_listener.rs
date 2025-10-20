@@ -24,6 +24,7 @@ use crate::shard::transmission::event::ShardEvent;
 use crate::websocket::connection_handler::{handle_connection, handle_error};
 use crate::{shard_debug, shard_error, shard_info, shard_warn};
 use compio::net::TcpListener;
+use compio_net::TcpOpts;
 use compio_tls::TlsAcceptor;
 use compio_ws::accept_async_with_config;
 use error_set::ErrContext;
@@ -38,12 +39,19 @@ use std::rc::Rc;
 use std::sync::Arc;
 use tracing::{error, info, trace};
 
+async fn create_listener(addr: SocketAddr) -> Result<TcpListener, std::io::Error> {
+    // Required by the thread-per-core model...
+    // We create bunch of sockets on different threads, that bind to exactly the same address and port.
+    let opts = TcpOpts::new().reuse_port(true).reuse_address(true);
+    TcpListener::bind_with_options(addr, opts).await
+}
+
 pub async fn start(
     config: WebSocketConfig,
     shard: Rc<IggyShard>,
     shutdown: ShutdownToken,
 ) -> Result<(), IggyError> {
-    let addr: SocketAddr = config
+    let mut addr: SocketAddr = config
         .address
         .parse()
         .with_error_context(|error| {
@@ -54,7 +62,26 @@ pub async fn start(
         })
         .map_err(|_| IggyError::InvalidConfiguration)?;
 
-    let listener = TcpListener::bind(addr)
+    if shard.id != 0 && addr.port() == 0 {
+        shard_info!(
+            shard.id,
+            "Waiting for WebSocket TLS address from shard 0..."
+        );
+        loop {
+            if let Some(bound_addr) = shard.websocket_bound_address.get() {
+                addr = bound_addr;
+                shard_info!(
+                    shard.id,
+                    "Received WebSocket TLS address from shard 0: {}",
+                    addr
+                );
+                break;
+            }
+            compio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    let listener = create_listener(addr)
         .await
         .with_error_context(|error| {
             format!("WebSocket TLS (error: {error}) - failed to bind to address: {addr}")

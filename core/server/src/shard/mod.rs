@@ -179,7 +179,7 @@ impl IggyShard {
         if self.config.quic.enabled && self.id == 0 {
             continuous::spawn_quic_server(self.clone());
         }
-        if self.config.websocket.enabled && self.id == 0 {
+        if self.config.websocket.enabled {
             continuous::spawn_websocket_server(self.clone());
         }
 
