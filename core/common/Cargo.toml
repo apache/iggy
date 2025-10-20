@@ -47,7 +47,7 @@ derive_more = { workspace = true }
 fast-async-mutex = { version = "0.6.7", optional = true }
 figment = { workspace = true }
 humantime = { workspace = true }
-rcgen = "0.14.4"
+rcgen = "0.14.5"
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
